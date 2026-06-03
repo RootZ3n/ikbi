@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Runtime state (never commit)
+state/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Local, per-user Claude Code settings (not shared)
+.claude/settings.local.json
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+.idea/
+.vscode/

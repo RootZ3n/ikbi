@@ -1,0 +1,59 @@
+# ikbi — sample systemd unit (NOT installed automatically).
+#
+# Install:
+#   sudo cp deploy/ikbi.service /etc/systemd/system/ikbi.service
+#   # edit User/WorkingDirectory/ExecStart paths below to match the deploy
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ikbi
+#
+# Inspect:
+#   systemctl status ikbi
+#   journalctl -u ikbi -f      # structured JSON logs land in the journal
+
+[Unit]
+Description=ikbi — build/repair engine for a lab of agents
+Documentation=https://github.com/your-org/ikbi
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# --- adjust to your deploy ---
+User=ikbi
+Group=ikbi
+WorkingDirectory=/opt/ikbi
+ExecStart=/usr/bin/node /opt/ikbi/dist/index.js
+# -----------------------------
+
+# Localhost-only by default. Reachable over Tailscale without a public bind.
+# Set IKBI_ALLOW_PUBLIC_BIND=true ONLY if you deliberately bind a public iface.
+Environment=NODE_ENV=production
+Environment=IKBI_BIND_HOST=127.0.0.1
+Environment=IKBI_PORT=18796
+Environment=IKBI_STATE_ROOT=/var/lib/ikbi
+Environment=IKBI_LOG_LEVEL=info
+
+# Restart on failure; let the clean-shutdown path drain on stop.
+Restart=on-failure
+RestartSec=2s
+# SIGTERM triggers the graceful shutdown handler; give it time to drain.
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+
+# Logs to the journal (stdout/stderr -> journald). Already structured JSON.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ikbi
+
+# Hardening (safe defaults; relax if a feature needs more).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# Persisted runtime state directory (maps to IKBI_STATE_ROOT above).
+StateDirectory=ikbi
+ReadWritePaths=/var/lib/ikbi
+
+[Install]
+WantedBy=multi-user.target
