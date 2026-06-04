@@ -282,3 +282,20 @@ test("a failing install is reported installed:false with the exit code + a failu
   assert.equal(r.exitCode, 1);
   assert.equal(rc.calls.at(-1)?.input.outcome.status, "failure");
 });
+
+// ── fail-closed on an unsupported package manager (Hermes L1) ────────────────
+
+test("an unsupported packageManager (caller bypassing the TS type) is denied, NOT thrown; no gate, no exec", async () => {
+  const ex = fakeExecFile();
+  const gate = capturingGate();
+  const rc = fakeReceipts();
+  const di = createDependencyInstall({ config: cfg(), gateWall: gate.gateWall, execFile: ex.fn, readLockfile: fakeLockfile().fn, receipts: rc.receipts, publish: () => {} });
+
+  // "yarn" is not in PM_SPECS — a crafted/JS caller could reach this past the type.
+  const r = await di.run({ parentCtx: makeCtx("verified"), workspace: WORKSPACE, packageManager: "yarn" as never });
+  assert.equal(r.denied, true, "graceful deny, not a thrown TypeError");
+  assert.match(r.reason ?? "", /unsupported package manager/);
+  assert.equal(gate.inputs.length, 0, "the guard is before the gate — no gate call");
+  assert.equal(ex.calls.length, 0, "no execFile");
+  assert.equal(rc.calls.at(-1)?.input.outcome.status, "rejected", "a rejected receipt is written");
+});

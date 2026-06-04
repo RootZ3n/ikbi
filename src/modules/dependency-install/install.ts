@@ -150,9 +150,19 @@ export function createDependencyInstall(deps: DependencyInstallDeps = {}): Depen
   async function run(request: InstallRequest): Promise<InstallResult> {
     const { parentCtx, workspace } = request;
     const pm = request.packageManager ?? config.defaultPackageManager;
-    const spec = PM_SPECS[pm];
     const identity = isValidatedIdentity(parentCtx.identity) ? parentCtx.identity.identity : undefined;
     const requestId = parentCtx.requestId;
+
+    // FAIL-CLOSED GUARD: a runtime-invalid pm (a caller bypassing the TS type) must
+    // NOT make PM_SPECS[pm] undefined and throw a TypeError outside the try/catch.
+    // Deny gracefully BEFORE any spec dereference (and before the gate) — no execFile.
+    if (!(pm in PM_SPECS)) {
+      const reason = `unsupported package manager "${pm}"`;
+      emit(depinstallFailed, { packageManager: pm, reason }, identity, requestId);
+      await receipt(identity, { status: "rejected", error: reason }, { action: "exec", packageManager: pm }, undefined, requestId, workspace.id);
+      return { installed: false, denied: true, reason };
+    }
+    const spec = PM_SPECS[pm];
     const base: DepInstallEventPayload = { packageManager: pm, mode: spec.mode };
 
     emit(depinstallRequested, base, identity, requestId);
