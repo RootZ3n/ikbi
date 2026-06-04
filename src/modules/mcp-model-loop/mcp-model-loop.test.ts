@@ -122,13 +122,26 @@ function capturingGate() {
   return { gateWall, inputs, order };
 }
 
-/** A gate that always denies. */
+/** A gate that always denies (session AND tool calls). */
 function denyingGate() {
   const inputs: GateWallEvaluateInput[] = [];
   const gateWall: GateWall = {
     evaluate: async (input): Promise<PromoteGovernance> => {
       inputs.push(input);
       return { allow: false, reason: "denied by test policy", gateId: "g1" };
+    },
+  };
+  return { gateWall, inputs };
+}
+
+/** A gate that ALLOWS the session (mcp.connect) but DENIES every tool call. */
+function sessionAllowToolDenyGate() {
+  const inputs: GateWallEvaluateInput[] = [];
+  const gateWall: GateWall = {
+    evaluate: async (input): Promise<PromoteGovernance> => {
+      inputs.push(input);
+      const isSession = input.action.kind === "exec" && input.action.command === "mcp.connect";
+      return isSession ? { allow: true, reason: "session ok", gateId: "gs" } : { allow: false, reason: "denied by test policy", gateId: "g1" };
     },
   };
   return { gateWall, inputs };
@@ -182,25 +195,29 @@ test("every tool call is gated (kind:exec) BEFORE the transport is touched", asy
   const loop = createMcpModelLoop(deps);
 
   const r = await loop.run({ parentCtx: makeCtx("verified"), goal: "g" });
-  assert.equal(gate.inputs.length, 1, "the call was gated");
-  const action = gate.inputs[0]?.action;
-  assert.equal(action?.kind, "exec");
-  assert.equal(action?.kind === "exec" ? action.command : undefined, "search", "the tool name is the gated command");
-  assert.equal(r.gatedCalls, 1);
+  // TWO gates now: the SESSION gate (mcp.connect) first, then the per-tool-call gate.
+  assert.equal(gate.inputs.length, 2, "session gate + per-call gate");
+  const a0 = gate.inputs[0]?.action;
+  assert.equal(a0?.kind === "exec" ? a0.command : undefined, "mcp.connect", "the SESSION is gated FIRST, before any transport call");
+  const toolGate = gate.inputs.find((i) => i.action.kind === "exec" && i.action.command === "search");
+  assert.ok(toolGate, "the tool call is also gated (kind:exec, command=search)");
+  assert.equal(r.gatedCalls, 1, "gatedCalls counts tool calls (the session gate is separate)");
   assert.equal(tp.events.includes("callTool"), true, "an allowed call reached the transport");
   // gate happened before the transport call.
   assert.ok(tp.events.indexOf("callTool") > tp.events.indexOf("listTools"));
 });
 
-test("a denying gate REFUSES the call: transport.callTool is NEVER invoked; a denial is fed back neutralized", async () => {
+test("a denying per-call gate REFUSES the call: transport.callTool NEVER invoked; denial fed back neutralized", async () => {
+  // The SESSION is allowed (so connect/listTools/loop proceed) but each tool call is denied.
   const tp = fakeTransport();
   const sm = scriptedModel([modelResponse({ finishReason: "tool_calls", toolCalls: [toolCall("search", "{}")] })]);
-  const gate = denyingGate();
+  const gate = sessionAllowToolDenyGate();
   const { deps, neutralize } = baseDeps({ transport: tp.transport, invokeModel: sm.invokeModel, gateWall: gate.gateWall });
   const loop = createMcpModelLoop(deps);
 
   const r = await loop.run({ parentCtx: makeCtx("verified"), goal: "g" });
   assert.equal(r.deniedCalls, 1);
+  assert.ok(tp.events.includes("connect"), "the session was allowed, so connect happened");
   assert.equal(tp.callToolArgs.length, 0, "the transport was NEVER invoked for a denied call");
   assert.ok(!tp.events.includes("callTool"));
   // The denial is fed back THROUGH the neutralize chokepoint (still untrusted).
@@ -208,18 +225,28 @@ test("a denying gate REFUSES the call: transport.callTool is NEVER invoked; a de
   assert.match(neutralize.calls[0]?.content ?? "", /DENIED by policy/);
 });
 
-test("no transport call occurs without a preceding gate allow", async () => {
-  // Probation tier ⇒ real gate-wall denies ⇒ no transport call.
+// ── INVARIANT 2b: SESSION GATE (Codex blocker fix) ───────────────────────────
+
+test("SESSION GATE: a denying gate refuses the session — transport NEVER touched (no connect/listTools/callTool)", async () => {
   const tp = fakeTransport();
   const sm = scriptedModel([modelResponse({ finishReason: "tool_calls", toolCalls: [toolCall("search", "{}")] })]);
-  const gate = capturingGate();
-  const { deps } = baseDeps({ transport: tp.transport, invokeModel: sm.invokeModel, gateWall: gate.gateWall });
+  const gate = denyingGate();
+  const { deps, neutralize } = baseDeps({ transport: tp.transport, invokeModel: sm.invokeModel, gateWall: gate.gateWall });
   const loop = createMcpModelLoop(deps);
 
-  const r = await loop.run({ parentCtx: makeCtx("probation"), goal: "g" });
-  assert.equal(r.gatedCalls, 1);
-  assert.equal(r.deniedCalls, 1, "probation ⇒ gate-wall denies");
-  assert.equal(tp.callToolArgs.length, 0, "no transport call without an allow");
+  const r = await loop.run({ parentCtx: makeCtx("verified"), goal: "g" });
+  assert.equal(r.completed, false);
+  assert.equal(r.stopReason, "gate_denied");
+  assert.match(r.reason ?? "", /session denied/);
+  // THE FIX: no transport call without a preceding allow — connect/listTools/callTool all skipped.
+  assert.equal(tp.events.length, 0, "transport NEVER touched (no connect, no listTools, no close)");
+  assert.equal(tp.callToolArgs.length, 0);
+  assert.equal(sm.calls.length, 0, "the model was never invoked");
+  assert.equal(neutralize.calls.length, 0, "nothing to neutralize");
+  // Exactly ONE gate call — the session gate — and it denied.
+  assert.equal(gate.inputs.length, 1, "only the session gate ran");
+  const a = gate.inputs[0]?.action;
+  assert.equal(a?.kind === "exec" ? a.command : undefined, "mcp.connect");
 });
 
 // ── bounded loop ─────────────────────────────────────────────────────────────

@@ -148,11 +148,30 @@ export function createMcpModelLoop(deps: McpModelLoopDeps = {}): McpModelLoop {
 
     emit(mcpLoopStarted, {}, identity, runId);
 
+    // (c) SESSION GATE: authorize talking to the MCP server AT ALL, BEFORE any
+    // transport call. connect() reaches an external server and listTools() ingests
+    // UNTRUSTED tool definitions from it — both are outbound actions. Deny ⇒ no
+    // connect, no discovery, no loop. (Defense in depth: this authorizes the server;
+    // the per-tool-call gate below authorizes each individual tool action.)
+    const sessionGovernance = await gateWall.evaluate({
+      grant,
+      action: { kind: "exec", command: "mcp.connect", args: ["mcp-session"], sudo: false, purpose: "mcp session" },
+      identity,
+    });
+    emit(mcpToolGated, { toolName: "mcp.connect", allow: sessionGovernance.allow }, identity, runId);
+    if (!sessionGovernance.allow) {
+      const reason = `mcp session denied by policy: ${sessionGovernance.reason ?? "not permitted"}`;
+      emit(mcpLoopFailed, { stopReason: "gate_denied", reason }, identity, runId);
+      // Nothing was connected — the transport is NEVER touched on a session denial.
+      return { completed: false, rounds, stopReason: "gate_denied", neutralizedCount, gatedCalls, deniedCalls, reason };
+    }
+
     let stopReason = "stop";
     let lastContent = "";
     let connected = false;
     try {
-      // (c) connect + discover tools (map to provider ModelTool[]).
+      // (d) connect + discover tools (map to provider ModelTool[]) — only after the
+      // session gate ALLOWED.
       await transport.connect();
       connected = true;
       const toolDefs = await transport.listTools();
