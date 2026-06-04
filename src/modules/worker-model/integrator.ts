@@ -39,12 +39,12 @@ export const integrator: RoleFn = async (ctx) => {
     const rejected = Array.isArray(builderDetail.rejectedToolCalls) ? builderDetail.rejectedToolCalls : [];
 
     const builderOk = builder?.outcome === "success" && filesWritten.length > 0;
+    const noRejectedToolCalls = rejected.length === 0;
     const criticPass = detailOf(critic).pass === true;
     const verifierPass = detailOf(verifier).verdict === "pass";
 
-    if (builderOk && criticPass && verifierPass) {
-      const note = rejected.length > 0 ? ` (note: ${rejected.length} rejected tool call(s))` : "";
-      const rationale = `promote: builder wrote ${filesWritten.length} file(s), critic pass, verifier pass${note}`;
+    if (builderOk && noRejectedToolCalls && criticPass && verifierPass) {
+      const rationale = `promote: builder wrote ${filesWritten.length} file(s), no rejected tool calls, critic pass, verifier pass`;
       return {
         role: "integrator",
         outcome: "success", // "did its job" — the verdict is in detail.decision
@@ -54,10 +54,14 @@ export const integrator: RoleFn = async (ctx) => {
     }
 
     // Identify the FIRST failing gate for a human-readable rationale (fail-closed).
+    // A rejected tool call is an ATTEMPTED policy-boundary violation (3-eyes ruling):
+    // promotion must not normalize a run that tried an out-of-policy tool action,
+    // even though confinement held and the later checks passed.
     let why: string;
     if (builder === undefined) why = "no builder result";
     else if (builder.outcome !== "success") why = `builder outcome "${builder.outcome}"`;
     else if (filesWritten.length === 0) why = "builder wrote no files";
+    else if (!noRejectedToolCalls) why = `builder attempted ${rejected.length} out-of-policy tool call(s)`;
     else if (critic === undefined) why = "no critic result";
     else if (!criticPass) why = "critic pass=false";
     else if (verifier === undefined) why = "no verifier result";

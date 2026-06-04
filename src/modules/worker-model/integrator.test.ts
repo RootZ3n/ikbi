@@ -81,11 +81,20 @@ test("a required prior result absent → discard (fail-closed)", async () => {
   assert.equal(decisionOf(await integrator(ctxWith([]))), "discard"); // nothing
 });
 
-test("rejectedToolCalls are NOTED but do not alone block promote", async () => {
+test("non-empty rejectedToolCalls forces DISCARD even when every other gate is green (3-eyes ruling)", async () => {
+  // builder success + files written + critic pass + verifier pass, but the builder
+  // ATTEMPTED an out-of-policy tool call → promotion must not normalize that.
   const builderWithRejects: RoleResult = { role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["a.ts"], rejectedToolCalls: [{ tool: "write_file", error: "escape" }] } };
   const r = await integrator(ctxWith([builderWithRejects, criticPass, verifierPass]));
-  assert.equal(decisionOf(r), "promote", "critic+verifier are the gates, not rejectedToolCalls");
-  assert.match(rationaleOf(r), /1 rejected tool call/);
+  assert.equal(r.outcome, "success", "the integrator still reached a decision");
+  assert.equal(decisionOf(r), "discard", "a rejected tool call blocks promote");
+  assert.match(rationaleOf(r), /attempted 1 out-of-policy tool call/);
+});
+
+test("empty rejectedToolCalls with all gates green → promote", async () => {
+  const r = await integrator(ctxWith([builderOk, criticPass, verifierPass]));
+  assert.equal(decisionOf(r), "promote");
+  assert.match(rationaleOf(r), /no rejected tool calls/);
 });
 
 test("the integrator is deterministic — it never calls invokeModel", async () => {
