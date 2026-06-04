@@ -16,7 +16,7 @@ import type { AgentIdentity } from "../../core/identity/contract.js";
 import type { OperationContext } from "../../core/identity/resolver.js";
 import { autonomyForTier, asTier, type TrustDecision } from "../../core/trust/index.js";
 import { tierRank, TRUST_FLOOR } from "../../core/trust/index.js";
-import type { DiscardResult, PromoteResult, WorkspaceEvaluation, WorkspaceHandle } from "../../core/workspace/contract.js";
+import type { DiscardResult, PromoteGovernance, PromoteResult, WorkspaceEvaluation, WorkspaceHandle } from "../../core/workspace/contract.js";
 import { createOrchestrator, type OrchestratorDeps } from "./orchestrator.js";
 import { integrator as realIntegrator } from "./integrator.js";
 import {
@@ -504,4 +504,56 @@ test("short-circuit: a builder hard-failure → integrator never runs → discar
   assert.equal(ws.calls.promote, 0);
   assert.equal(ws.calls.discard, 1);
   assert.ok(!result.roles.some((r) => r.role === "integrator"), "integrator never dispatched (loop broke at builder)");
+});
+
+// ── P1: gate-wall governance wiring ────────────────────────────────────────
+
+/** A workspaces fake that captures the promote approval (incl. governance). */
+function capturingWorkspaces() {
+  let approval: { evaluation: WorkspaceEvaluation; governance?: PromoteGovernance; message?: string } | undefined;
+  const calls = { discard: 0 };
+  const handle = fakeWorkspaceHandle();
+  const workspaces: NonNullable<OrchestratorDeps["workspaces"]> = {
+    allocate: async () => handle,
+    promote: async (h, a): Promise<PromoteResult> => {
+      approval = a;
+      return { promoted: true, workspaceId: h.id, targetBranch: h.baseBranch, beforeRef: "a", afterRef: "b" };
+    },
+    discard: async (h): Promise<DiscardResult> => {
+      calls.discard += 1;
+      return { workspaceId: h.id, removed: true };
+    },
+  };
+  return { workspaces, captured: () => approval, calls };
+}
+
+test("gate-wall wired: a DENYING gateWall → governance.allow=false reaches promote", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = capturingWorkspaces();
+  const gateWall = { evaluate: async (): Promise<PromoteGovernance> => ({ allow: false, reason: "denied by policy", gateId: "g1" }) };
+  const cap = capturingRoles();
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, gateWall, roles: cap.roles }));
+  await orch.run(task, parentCtx);
+  assert.equal(ws.captured()?.governance?.allow, false, "the deny verdict is passed into promote");
+  assert.match(ws.captured()?.governance?.reason ?? "", /denied by policy/);
+});
+
+test("gate-wall wired: an ALLOWING gateWall → governance.allow=true reaches promote", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = capturingWorkspaces();
+  const gateWall = { evaluate: async (): Promise<PromoteGovernance> => ({ allow: true, reason: "permitted", gateId: "g2" }) };
+  const cap = capturingRoles();
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, gateWall, roles: cap.roles }));
+  await orch.run(task, parentCtx);
+  assert.equal(ws.captured()?.governance?.allow, true);
+});
+
+test("NO gate-wall dep → promote carries an EXPLICIT auditable advisory allow", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = capturingWorkspaces();
+  const cap = capturingRoles();
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: cap.roles }));
+  await orch.run(task, parentCtx);
+  assert.equal(ws.captured()?.governance?.allow, true);
+  assert.match(ws.captured()?.governance?.reason ?? "", /advisory mode/);
 });

@@ -32,7 +32,7 @@ import { neutralizeUntrusted as coreNeutralize } from "../../core/injection/inde
 import { receipts as coreReceipts } from "../../core/receipt/index.js";
 import { trust as coreTrust } from "../../core/trust/index.js";
 import { workspaces as coreWorkspaces } from "../../core/workspace/index.js";
-import type { DiscardResult, PromoteResult, WorkspaceEvaluation, WorkspaceHandle } from "../../core/workspace/contract.js";
+import type { DiscardResult, PromoteGovernance, PromoteResult, WorkspaceEvaluation, WorkspaceHandle } from "../../core/workspace/contract.js";
 import type { ModelRequest, ModelResponse } from "../../core/provider/contract.js";
 
 import { builder } from "./builder.js";
@@ -71,8 +71,21 @@ export interface OrchestratorDeps {
   readonly trust?: { recordOutcome: (input: RecordOutcomeInput) => Promise<TrustDecision> };
   readonly workspaces?: {
     allocate: (opts: { targetRepo: string; identity: AgentIdentity; baseBranch?: string; label?: string }) => Promise<WorkspaceHandle>;
-    promote: (handle: WorkspaceHandle, approval: { evaluation: WorkspaceEvaluation; message?: string }) => Promise<PromoteResult>;
+    promote: (handle: WorkspaceHandle, approval: { evaluation: WorkspaceEvaluation; governance?: PromoteGovernance; message?: string }) => Promise<PromoteResult>;
     discard: (handle: WorkspaceHandle) => Promise<DiscardResult>;
+  };
+  /**
+   * Governance evaluator (gate-wall). Optional: when absent, promote falls back to
+   * an explicit auditable advisory allow. When present, its PromoteGovernance verdict
+   * is passed into promote — the workspace manager is fail-closed on governance.
+   */
+  readonly gateWall?: {
+    evaluate: (input: {
+      grant: AutonomyGrant;
+      task: WorkerTask;
+      results: readonly RoleResult[];
+      identity: AgentIdentity;
+    }) => Promise<PromoteGovernance>;
   };
   readonly receipts?: { append: (input: unknown, identity: AgentIdentity) => Promise<unknown> };
   readonly events?: EventBusSurface;
@@ -156,6 +169,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   const events = deps.events ?? coreEvents;
   const invokeModel = deps.invokeModel ?? lazyInvokeModel;
   const neutralizeUntrusted = deps.neutralizeUntrusted ?? coreNeutralize;
+  const gateWall = deps.gateWall; // optional — absent → explicit advisory allow at promote
   const roles: Record<WorkerRole, RoleFn> = { ...DEFAULT_ROLES, ...deps.roles };
 
   const engine: RoleEngine = { invokeModel, neutralizeUntrusted };
@@ -313,8 +327,17 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     let promoted = false;
     let reason: string | undefined;
     if (decision.promote) {
+      // GOVERNANCE (gate-wall): the workspace manager is fail-closed on governance.
+      // The governance subject is the run's parent tier grant (derived here — no
+      // per-run grant is in scope at the promote point). Absent a gate-wall dep, fall
+      // back to an EXPLICIT, auditable advisory allow (never a silent undefined).
+      const governanceGrant = autonomyForTier(asTier(parentIdentity.trustTier ?? TRUST_FLOOR, TRUST_FLOOR));
+      const governance: PromoteGovernance = gateWall
+        ? await gateWall.evaluate({ grant: governanceGrant, task, results, identity: parentIdentity })
+        : { allow: true, reason: "gate-wall not wired (advisory mode)" };
       const promote = await workspaces.promote(workspace, {
         evaluation: decision.evaluation, // sourced from the integrator, NOT hardcoded
+        governance,
         message: `worker-model: ${task.goal}${decision.rationale !== undefined ? ` — ${decision.rationale}` : ""}`,
       });
       promoted = promote.promoted;
