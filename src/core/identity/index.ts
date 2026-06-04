@@ -19,6 +19,7 @@
 
 import { config } from "../config.js";
 import { childLogger } from "../log.js";
+import { trust } from "../trust/index.js";
 import { IdentityResolver } from "./resolver.js";
 import { AgentRegistry, assertStrongToken, hashToken } from "./registry.js";
 import type { IdentityClaim } from "./contract.js";
@@ -73,8 +74,13 @@ function buildDefaultRegistry(): AgentRegistry {
 /** The process-wide agents registry (read/update path for who-can-call). */
 export const registry: AgentRegistry = buildDefaultRegistry();
 
-/** The process-wide identity resolver. */
-export const resolver = new IdentityResolver({ registry, logger: log });
+/**
+ * The process-wide identity resolver, wired to the trust system via the Phase-3
+ * `TrustTierResolver` seam: resolution returns each agent's EARNED tier (from
+ * trust's durable state), clamped within the identity bounds. Call
+ * `trust.preload()` at startup so the resolver's tier cache is warm.
+ */
+export const resolver = new IdentityResolver({ registry, logger: log, trustResolver: trust });
 
 /** Resolve an incoming claim (+ trusted context) to a validated identity (fail-closed). */
 export function resolveIdentity(claim: IdentityClaim, ctx?: ResolveContext): ValidatedIdentity {

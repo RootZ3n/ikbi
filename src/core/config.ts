@@ -39,7 +39,33 @@ export interface IkbiConfig {
   readonly substrate: SubstrateConfig;
   /** Receipt store (audit trail) configuration. */
   readonly receipt: ReceiptConfig;
+  /** Trust system (governance) configuration. */
+  readonly trust: TrustConfig;
 }
+
+/** Configuration for the trust system (earned tiers + deterministic transitions). */
+export interface TrustConfig {
+  /** Directory for per-agent durable trust state. `IKBI_TRUST_DIR`, default `<stateRoot>/trust`. */
+  readonly dir: string;
+  /** Consecutive substantive successes required to promote one tier. `IKBI_TRUST_PROMOTE_STREAK`, default 20. */
+  readonly promoteStreak: number;
+  /** Consecutive failures required to demote one tier. `IKBI_TRUST_DEMOTE_STREAK`, default 3. */
+  readonly demoteStreak: number;
+  /** Min DISTINCT substantive operations a promotion streak must span (anti-farming). `IKBI_TRUST_PROMOTE_MIN_DISTINCT_OPS`, default 2. */
+  readonly promoteMinDistinctOps: number;
+  /**
+   * MAC key for trust-state integrity, kept SEPARATE from the trust dir so a
+   * hand-edited/forged trust doc is rejected at load (an agent with a write
+   * primitive cannot self-promote by editing the file). `IKBI_TRUST_HMAC_KEY`.
+   * A built-in dev default is used if unset (logged as insecure).
+   */
+  readonly hmacKey: string;
+  /** True when `hmacKey` is the insecure built-in default (for a startup warning). */
+  readonly hmacKeyIsDefault: boolean;
+}
+
+/** Insecure built-in trust MAC key used only when IKBI_TRUST_HMAC_KEY is unset. */
+const DEFAULT_TRUST_HMAC_KEY = "ikbi-dev-default-trust-hmac-key-change-me";
 
 /**
  * Configuration for the receipt store — a lean, retention-bounded OPERATIONAL log
@@ -291,6 +317,22 @@ function loadConfig(env: NodeJS.ProcessEnv = process.env): IkbiConfig {
     },
     identity: loadIdentityConfig(env, stateRoot),
     receipt: loadReceiptConfig(env, stateRoot),
+    trust: {
+      dir: optStr(env.IKBI_TRUST_DIR)
+        ? isAbsolute(env.IKBI_TRUST_DIR as string)
+          ? (env.IKBI_TRUST_DIR as string)
+          : resolve(process.cwd(), env.IKBI_TRUST_DIR as string)
+        : resolve(stateRoot, "trust"),
+      promoteStreak: parsePositiveInt("IKBI_TRUST_PROMOTE_STREAK", env.IKBI_TRUST_PROMOTE_STREAK, 20),
+      demoteStreak: parsePositiveInt("IKBI_TRUST_DEMOTE_STREAK", env.IKBI_TRUST_DEMOTE_STREAK, 3),
+      promoteMinDistinctOps: parsePositiveInt(
+        "IKBI_TRUST_PROMOTE_MIN_DISTINCT_OPS",
+        env.IKBI_TRUST_PROMOTE_MIN_DISTINCT_OPS,
+        2,
+      ),
+      hmacKey: optStr(env.IKBI_TRUST_HMAC_KEY) ?? DEFAULT_TRUST_HMAC_KEY,
+      hmacKeyIsDefault: optStr(env.IKBI_TRUST_HMAC_KEY) === undefined,
+    },
     substrate: {
       lockTimeoutMs: parsePositiveInt("IKBI_LOCK_TIMEOUT_MS", env.IKBI_LOCK_TIMEOUT_MS, 10_000),
       lockStaleMs: parsePositiveInt("IKBI_LOCK_STALE_MS", env.IKBI_LOCK_STALE_MS, 30_000),
