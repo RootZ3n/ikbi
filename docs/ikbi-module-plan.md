@@ -150,7 +150,7 @@ With Step S done, these parallelize cleanly and concurrently (own dirs):
 | gate-wall | trust (`autonomyForTier`), workspace (`PromoteGovernance` seam), receipts, events, identity |
 | subagent-spawning | worker-model, workspace, identity (`spawnedFrom`), events |
 | mcp→model-loop | provider (tool-loop), injection (MCP results untrusted), egress, gate-wall (outbound tool-call gating), events, identity |
-| dependency-install | egress, gate-wall, workspace (install in sandbox), receipts, identity |
+| dependency-install | egress, gate-wall, workspace (install in sandbox), receipts, identity, events (install lifecycle) |
 | governed-sudo/curl | egress, gate-wall, receipts, identity, events |
 | lab-context-memory | receipts (read-seam, project-scoped), substrate (durable projections), events |
 | cognition-layer | provider, lab-context-memory, worker-model |
