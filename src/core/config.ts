@@ -41,6 +41,18 @@ export interface IkbiConfig {
   readonly receipt: ReceiptConfig;
   /** Trust system (governance) configuration. */
   readonly trust: TrustConfig;
+  /** Event bus configuration. */
+  readonly events: EventsConfig;
+}
+
+/** Configuration for the in-process event bus. */
+export interface EventsConfig {
+  /**
+   * Default per-subscriber bounded queue size. Beyond this, the bus drops per the
+   * subscription's drop policy (loudly logged) — an unbounded queue would be a
+   * memory leak under load. `IKBI_EVENT_MAX_QUEUE`, default 1000.
+   */
+  readonly maxQueue: number;
 }
 
 /** Configuration for the trust system (earned tiers + deterministic transitions). */
@@ -332,6 +344,9 @@ function loadConfig(env: NodeJS.ProcessEnv = process.env): IkbiConfig {
       ),
       hmacKey: optStr(env.IKBI_TRUST_HMAC_KEY) ?? DEFAULT_TRUST_HMAC_KEY,
       hmacKeyIsDefault: optStr(env.IKBI_TRUST_HMAC_KEY) === undefined,
+    },
+    events: {
+      maxQueue: parsePositiveInt("IKBI_EVENT_MAX_QUEUE", env.IKBI_EVENT_MAX_QUEUE, 1000),
     },
     substrate: {
       lockTimeoutMs: parsePositiveInt("IKBI_LOCK_TIMEOUT_MS", env.IKBI_LOCK_TIMEOUT_MS, 10_000),
