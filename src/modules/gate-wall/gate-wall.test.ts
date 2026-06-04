@@ -146,3 +146,25 @@ test("exec payload/receipt carry kind:exec + command + sudo, and DO NOT log args
   const serialized = JSON.stringify(receiptCalls[0]!.input);
   assert.ok(!serialized.includes("secret-pkg"), "full args are NOT logged verbatim into the gate receipt");
 });
+
+test("promote receipt/events log structural identifiers only — NEVER task.goal verbatim (Codex blocker)", async () => {
+  const { gw, events, receiptCalls } = harness();
+  const goal = "deploy with API_KEY=GOAL-SECRET-TOKEN to prod";
+  const action = { kind: "promote" as const, task: { taskId: "t-9", targetRepo: "/repo", goal }, results: [] };
+  await gw.evaluate({ grant: autonomyForTier("trusted"), action, identity: IDENTITY });
+
+  // The free-text goal must NOT appear anywhere in the receipt or the events.
+  const receiptStr = JSON.stringify(receiptCalls[0]!.input);
+  const eventStr = JSON.stringify(events);
+  assert.ok(!receiptStr.includes("GOAL-SECRET-TOKEN"), "task.goal is NOT logged in the gate receipt");
+  assert.ok(!eventStr.includes("GOAL-SECRET-TOKEN"), "task.goal is NOT logged in the gate events");
+
+  // Structural identifiers ARE present (taskId / targetRepo / resultsCount), goal only by length.
+  const meta = (receiptCalls[0]!.input as { metadata: Record<string, unknown> }).metadata;
+  assert.equal(meta.action, "promote");
+  assert.equal(meta.taskId, "t-9");
+  assert.equal(meta.targetRepo, "/repo");
+  assert.equal(meta.resultsCount, 0);
+  assert.equal(meta.goalLength, goal.length, "the goal is summarized by length, not content");
+  assert.ok(meta.goal === undefined, "no verbatim goal field");
+});

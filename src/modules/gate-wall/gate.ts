@@ -50,10 +50,18 @@ interface ActionAudit {
  */
 function auditAction(action: GateWallAction): ActionAudit {
   if (action.kind === "promote") {
+    // task.goal is FREE USER TEXT (possibly sensitive) — log structural identifiers
+    // only (taskId/targetRepo/resultsCount) + the goal LENGTH, never the goal text.
+    // Same conservative posture as the exec branch (command + argCount, not full args).
     return {
       kind: "promote",
-      summary: `promote "${action.task.goal}"`,
-      metadata: { taskId: action.task.taskId, goal: action.task.goal },
+      summary: `promote task ${action.task.taskId} (${action.results.length} role result(s))`,
+      metadata: {
+        taskId: action.task.taskId,
+        targetRepo: action.task.targetRepo,
+        resultsCount: action.results.length,
+        goalLength: action.task.goal.length,
+      },
       requestId: action.task.taskId,
       project: action.task.targetRepo,
     };
