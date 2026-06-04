@@ -14,10 +14,13 @@
  *
  * Decision (promote ONLY if ALL gates hold; otherwise discard — fail-closed):
  *   - builder produced work: outcome "success" AND detail.filesWritten non-empty;
+ *   - no policy violations:  detail.rejectedToolCalls is a PRESENT, EMPTY array. A
+ *                            non-empty array (an attempted out-of-policy tool call)
+ *                            OR a missing/non-array field (cannot confirm clean)
+ *                            BOTH force discard — fail-closed, matching the egress
+ *                            default-deny posture;
  *   - critic approved:       detail.pass === true;
  *   - verifier passed:       detail.verdict === "pass".
- * builder.detail.rejectedToolCalls (if any) is NOTED in the rationale but does not
- * alone force discard — the critic/verifier verdicts are the gates.
  */
 
 import type { RoleFn, RoleResult } from "./contract.js";
@@ -36,10 +39,12 @@ export const integrator: RoleFn = async (ctx) => {
 
     const builderDetail = detailOf(builder);
     const filesWritten = Array.isArray(builderDetail.filesWritten) ? builderDetail.filesWritten : [];
-    const rejected = Array.isArray(builderDetail.rejectedToolCalls) ? builderDetail.rejectedToolCalls : [];
+    // FAIL-CLOSED: a missing/non-array rejectedToolCalls means "cannot confirm clean"
+    // → undefined (never []), so the gate below does NOT pass on an absent field.
+    const rejected = Array.isArray(builderDetail.rejectedToolCalls) ? builderDetail.rejectedToolCalls : undefined;
 
     const builderOk = builder?.outcome === "success" && filesWritten.length > 0;
-    const noRejectedToolCalls = rejected.length === 0;
+    const noRejectedToolCalls = rejected !== undefined && rejected.length === 0;
     const criticPass = detailOf(critic).pass === true;
     const verifierPass = detailOf(verifier).verdict === "pass";
 
@@ -61,7 +66,8 @@ export const integrator: RoleFn = async (ctx) => {
     if (builder === undefined) why = "no builder result";
     else if (builder.outcome !== "success") why = `builder outcome "${builder.outcome}"`;
     else if (filesWritten.length === 0) why = "builder wrote no files";
-    else if (!noRejectedToolCalls) why = `builder attempted ${rejected.length} out-of-policy tool call(s)`;
+    else if (rejected === undefined) why = "builder did not report tool-call policy status (cannot confirm clean)";
+    else if (rejected.length > 0) why = `builder attempted ${rejected.length} out-of-policy tool call(s)`;
     else if (critic === undefined) why = "no critic result";
     else if (!criticPass) why = "critic pass=false";
     else if (verifier === undefined) why = "no verifier result";

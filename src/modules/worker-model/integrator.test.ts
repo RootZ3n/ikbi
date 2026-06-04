@@ -97,6 +97,23 @@ test("empty rejectedToolCalls with all gates green → promote", async () => {
   assert.match(rationaleOf(r), /no rejected tool calls/);
 });
 
+test("FAIL-CLOSED: MISSING rejectedToolCalls (undefined) → discard even with all other gates green", async () => {
+  // builder success + files + critic pass + verifier pass, but the field is absent →
+  // cannot confirm the run was clean → must not promote (Hermes MEDIUM-1).
+  const builderNoStatus: RoleResult = { role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["a.ts"] } };
+  const r = await integrator(ctxWith([builderNoStatus, criticPass, verifierPass]));
+  assert.equal(r.outcome, "success");
+  assert.equal(decisionOf(r), "discard");
+  assert.match(rationaleOf(r), /cannot confirm clean/);
+});
+
+test("FAIL-CLOSED: a NON-ARRAY rejectedToolCalls → discard", async () => {
+  const builderBadStatus: RoleResult = { role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["a.ts"], rejectedToolCalls: "nope" } };
+  const r = await integrator(ctxWith([builderBadStatus, criticPass, verifierPass]));
+  assert.equal(decisionOf(r), "discard");
+  assert.match(rationaleOf(r), /cannot confirm clean/);
+});
+
 test("the integrator is deterministic — it never calls invokeModel", async () => {
   let invoked = false;
   await integrator(ctxWith([builderOk, criticPass, verifierPass], () => (invoked = true)));
