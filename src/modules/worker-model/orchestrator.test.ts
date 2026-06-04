@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import { pino } from "pino";
+
+import type { ModelResponse } from "../../core/provider/contract.js";
 
 import type { EventBusSurface, EventInput, IkbiEvent } from "../../core/events/index.js";
 import { beginOperation, IdentityResolver } from "../../core/identity/resolver.js";
@@ -322,14 +327,49 @@ test("a failed run emits worker.failed", async () => {
   assert.ok(!bus.sent.some((e) => e.type === "worker.completed"));
 });
 
-// ── default role stubs ─────────────────────────────────────────────────────
+// ── integration: real Pass-A roles + still-stubbed builder/integrator ───────
 
-test("default (un-injected) roles are stubs → run does not promote", async () => {
+function okModelResponse(): ModelResponse {
+  return {
+    contractVersion: "1.1.0", model: "mimo-v2.5", provider: "mimo", providerModelId: "mimo-v2.5",
+    content: "- a finding", finishReason: "stop", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+    cost: { usd: 0, promptUsd: 0, cachedUsd: 0, completionUsd: 0, rate: { promptPerMTok: 0, completionPerMTok: 0 } },
+    latencyMs: 1, fellBack: false, attempts: [],
+  };
+}
+
+test("real scout/critic/verifier + stubbed builder/integrator → coherent WorkerResult", async () => {
+  // scout is now a real role: give it a real workspace dir + a working model so it
+  // succeeds, then the still-stubbed BUILDER short-circuits the run to "stub".
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-orch-"));
+  writeFileSync(join(dir, "a.ts"), "export const a = 1;");
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
-  const ws = fakeWorkspaces(true);
-  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, workspaces: ws.workspaces }));
-  const result = await orch.run(task, parentCtx);
-  assert.equal(result.outcome, "stub", "scout stub short-circuits the run");
-  assert.equal(ws.calls.promote, 0);
-  assert.equal(ws.calls.discard, 1);
+
+  const handle: WorkspaceHandle = { ...fakeWorkspaceHandle(), id: "wsabcd", path: dir, targetRepo: dir };
+  const calls = { promote: 0, discard: 0 };
+  const workspaces: NonNullable<OrchestratorDeps["workspaces"]> = {
+    allocate: async () => handle,
+    promote: async (h): Promise<PromoteResult> => {
+      calls.promote += 1;
+      return { promoted: true, workspaceId: h.id, targetBranch: h.baseBranch, beforeRef: "a", afterRef: "b" };
+    },
+    discard: async (): Promise<DiscardResult> => {
+      calls.discard += 1;
+      return { workspaceId: handle.id, removed: true };
+    },
+  };
+
+  const orch = createOrchestrator(
+    baseDeps({ resolveIdentity, roleClaim, workspaces, invokeModel: async () => okModelResponse() }),
+  );
+  const result = await orch.run({ taskId: "t-1", targetRepo: dir, goal: "do the thing" }, parentCtx);
+
+  // scout (real) succeeds; builder (stub) returns "stub" → short-circuit → discard.
+  assert.equal(result.outcome, "stub");
+  assert.equal(calls.promote, 0);
+  assert.equal(calls.discard, 1);
+  assert.equal(result.roles[0]?.role, "scout");
+  assert.equal(result.roles[0]?.outcome, "success", "real scout ran and succeeded");
+  assert.equal(result.roles[1]?.role, "builder");
+  assert.equal(result.roles[1]?.outcome, "stub", "builder still stubbed → short-circuits");
 });
