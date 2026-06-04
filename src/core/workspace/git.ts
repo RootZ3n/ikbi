@@ -1,0 +1,170 @@
+/**
+ * ikbi workspace primitive — git worktree mechanics.
+ *
+ * Thin, safe wrapper over the `git` CLI (array args via execFile — no shell, no
+ * injection). Worktrees give isolation; the promote path computes the merge
+ * OFF-worktree (`merge-tree --write-tree` + `commit-tree`) and lands it via a
+ * single compare-and-swap `update-ref`, so the target is never half-merged.
+ */
+
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+import { WorkspaceError } from "./contract.js";
+
+const exec = promisify(execFile);
+const MAX_BUFFER = 64 * 1024 * 1024;
+
+export interface GitResult {
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly code: number;
+}
+
+/** Run a git command in `cwd`. Throws WorkspaceError("git") on non-zero unless the code is in `okCodes`. */
+export async function runGit(cwd: string, args: readonly string[], opts?: { okCodes?: readonly number[] }): Promise<GitResult> {
+  try {
+    const { stdout, stderr } = await exec("git", args as string[], { cwd, maxBuffer: MAX_BUFFER });
+    return { stdout, stderr, code: 0 };
+  } catch (err) {
+    const e = err as { code?: number | string; stdout?: string; stderr?: string };
+    const code = typeof e.code === "number" ? e.code : 1;
+    if (opts?.okCodes?.includes(code)) {
+      return { stdout: e.stdout ?? "", stderr: e.stderr ?? "", code };
+    }
+    throw new WorkspaceError("git", `git ${args.join(" ")} failed (code ${code}): ${(e.stderr ?? "").trim().slice(0, 500)}`, { cause: err });
+  }
+}
+
+export async function isGitRepo(repo: string): Promise<boolean> {
+  const r = await runGit(repo, ["rev-parse", "--is-inside-work-tree"], { okCodes: [128] }).catch(() => undefined);
+  return r !== undefined && r.code === 0 && r.stdout.trim() === "true";
+}
+
+export async function currentBranch(repo: string): Promise<string> {
+  const r = await runGit(repo, ["rev-parse", "--abbrev-ref", "HEAD"]);
+  return r.stdout.trim();
+}
+
+export async function revParse(repo: string, ref: string): Promise<string> {
+  const r = await runGit(repo, ["rev-parse", ref]);
+  return r.stdout.trim();
+}
+
+/** True if `ancestor` is an ancestor of `descendant`. */
+export async function isAncestor(repo: string, ancestor: string, descendant: string): Promise<boolean> {
+  const r = await runGit(repo, ["merge-base", "--is-ancestor", ancestor, descendant], { okCodes: [1] });
+  return r.code === 0;
+}
+
+export async function addWorktree(repo: string, path: string, branch: string, baseBranch: string): Promise<void> {
+  await runGit(repo, ["worktree", "add", "--quiet", path, "-b", branch, baseBranch]);
+}
+
+export async function removeWorktree(repo: string, path: string): Promise<void> {
+  // code 128 if the worktree path is already gone — tolerate (prune handles the admin entry).
+  await runGit(repo, ["worktree", "remove", "--force", path], { okCodes: [128, 1] });
+}
+
+export async function pruneWorktrees(repo: string): Promise<void> {
+  await runGit(repo, ["worktree", "prune"]);
+}
+
+export interface WorktreeEntry {
+  readonly path: string;
+  readonly branch?: string;
+}
+
+/** List the repo's worktrees (porcelain). */
+export async function listWorktrees(repo: string): Promise<WorktreeEntry[]> {
+  const r = await runGit(repo, ["worktree", "list", "--porcelain"]);
+  const entries: WorktreeEntry[] = [];
+  let path: string | undefined;
+  let branch: string | undefined;
+  for (const line of r.stdout.split("\n")) {
+    if (line.startsWith("worktree ")) {
+      if (path !== undefined) entries.push({ path, ...(branch ? { branch } : {}) });
+      path = line.slice("worktree ".length).trim();
+      branch = undefined;
+    } else if (line.startsWith("branch ")) {
+      branch = line.slice("branch ".length).trim().replace(/^refs\/heads\//, "");
+    } else if (line.trim() === "" && path !== undefined) {
+      entries.push({ path, ...(branch ? { branch } : {}) });
+      path = undefined;
+      branch = undefined;
+    }
+  }
+  if (path !== undefined) entries.push({ path, ...(branch ? { branch } : {}) });
+  return entries;
+}
+
+export async function deleteBranch(repo: string, branch: string): Promise<void> {
+  await runGit(repo, ["branch", "-D", branch], { okCodes: [1] });
+}
+
+/** List local branch names under a prefix. */
+export async function listBranches(repo: string, prefix: string): Promise<string[]> {
+  const r = await runGit(repo, ["for-each-ref", "--format=%(refname:short)", `refs/heads/${prefix}`]);
+  return r.stdout.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
+}
+
+/** Stage everything and commit in a worktree. Returns false if there was nothing to commit. */
+export async function commitAll(worktreePath: string, message: string): Promise<boolean> {
+  await runGit(worktreePath, ["add", "-A"]);
+  const status = await runGit(worktreePath, ["status", "--porcelain"]);
+  if (status.stdout.trim().length === 0) return false;
+  await runGit(worktreePath, ["commit", "--quiet", "-m", message]);
+  return true;
+}
+
+/** The committed diff of `scratch` relative to `base` (for the judge / evaluation seam). */
+export async function diffRange(repo: string, base: string, scratch: string): Promise<string> {
+  const r = await runGit(repo, ["diff", `${base}..${scratch}`]);
+  return r.stdout;
+}
+
+export interface MergeComputation {
+  readonly clean: boolean;
+  /** The merged tree OID (when clean). */
+  readonly tree?: string;
+  /** Conflicted file paths (when not clean). */
+  readonly conflicts: readonly string[];
+}
+
+/**
+ * Compute a merge of `other` into `base` WITHOUT touching any worktree
+ * (`git merge-tree --write-tree`). Clean => returns the merged tree OID; conflict
+ * => returns the conflicted paths (and the target is left untouched).
+ */
+export async function computeMerge(repo: string, base: string, other: string): Promise<MergeComputation> {
+  const r = await runGit(repo, ["merge-tree", "--write-tree", base, other], { okCodes: [1] });
+  const lines = r.stdout.split("\n");
+  if (r.code === 0) {
+    return { clean: true, tree: (lines[0] ?? "").trim(), conflicts: [] };
+  }
+  // Conflict: the output includes conflicted file info; extract distinct paths best-effort.
+  const conflicts = new Set<string>();
+  for (const line of lines) {
+    const m = /^\d{6} [0-9a-f]+ [123]\t(.+)$/.exec(line);
+    if (m?.[1]) conflicts.add(m[1]);
+  }
+  return { clean: false, conflicts: [...conflicts] };
+}
+
+/** Create a merge commit object with the given tree + parents. Returns its OID. */
+export async function commitTree(repo: string, tree: string, parents: readonly string[], message: string): Promise<string> {
+  const args = ["commit-tree", tree];
+  for (const p of parents) args.push("-p", p);
+  args.push("-m", message);
+  const r = await runGit(repo, args);
+  return r.stdout.trim();
+}
+
+/**
+ * Atomic compare-and-swap ref update: set `ref` to `newSha` only if it is
+ * currently `oldSha`. This is the single target-mutating step of promote — it
+ * lands fully or fails cleanly (and is safe against a concurrent target move).
+ */
+export async function updateRefCas(repo: string, ref: string, newSha: string, oldSha: string): Promise<void> {
+  await runGit(repo, ["update-ref", ref, newSha, oldSha]);
+}

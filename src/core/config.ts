@@ -43,6 +43,16 @@ export interface IkbiConfig {
   readonly trust: TrustConfig;
   /** Event bus configuration. */
   readonly events: EventsConfig;
+  /** Workspace primitive (isolated worktrees) configuration. */
+  readonly workspace: WorkspaceConfig;
+}
+
+/** Configuration for the disposable-workspace primitive. */
+export interface WorkspaceConfig {
+  /** Root dir for worktrees + the workspace registry. `IKBI_WORKSPACE_ROOT`, default `<stateRoot>/workspaces`. */
+  readonly root: string;
+  /** Max concurrently-allocated workspaces (bounds disk). `IKBI_WORKSPACE_MAX`, default 32. */
+  readonly max: number;
 }
 
 /** Configuration for the in-process event bus. */
@@ -347,6 +357,14 @@ function loadConfig(env: NodeJS.ProcessEnv = process.env): IkbiConfig {
     },
     events: {
       maxQueue: parsePositiveInt("IKBI_EVENT_MAX_QUEUE", env.IKBI_EVENT_MAX_QUEUE, 1000),
+    },
+    workspace: {
+      root: optStr(env.IKBI_WORKSPACE_ROOT)
+        ? isAbsolute(env.IKBI_WORKSPACE_ROOT as string)
+          ? (env.IKBI_WORKSPACE_ROOT as string)
+          : resolve(process.cwd(), env.IKBI_WORKSPACE_ROOT as string)
+        : resolve(stateRoot, "workspaces"),
+      max: parsePositiveInt("IKBI_WORKSPACE_MAX", env.IKBI_WORKSPACE_MAX, 32),
     },
     substrate: {
       lockTimeoutMs: parsePositiveInt("IKBI_LOCK_TIMEOUT_MS", env.IKBI_LOCK_TIMEOUT_MS, 10_000),
