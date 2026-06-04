@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -140,6 +140,39 @@ test("DocumentStore corrupt policy: throw (fail-closed) vs quarantine", async ()
     assert.ok(!entries.includes("bad.json"), "corrupt file moved aside");
     assert.ok(entries.some((n) => n.startsWith("bad.json.corrupt.")), "quarantined sidecar exists");
   } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("path confinement is STRUCTURAL: a permissive idPattern still cannot escape the dir", async () => {
+  const dir = await tmp();
+  try {
+    // Deliberately permissive pattern (allows slashes/dots) — confinement must still hold.
+    const s = new DocumentStore<Counter>({ dir, locks: manager(), logger: silent, fsync: false, idPattern: /^.*$/ });
+    for (const evil of ["../../etc/passwd", "../escape", "a/../../b", "/abs/olute"]) {
+      await assert.rejects(s.put(evil, { n: 1 }), (e: unknown) => e instanceof SubstrateError && e.kind === "invalid_key");
+      await assert.rejects(s.get(evil), (e: unknown) => e instanceof SubstrateError && e.kind === "invalid_key");
+    }
+    // A nested-but-confined id is still rejected by the default having no dirs — but an escape is the key point.
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("quarantine FAILURE surfaces as corrupt_state (not silently treated as missing)", async (t) => {
+  if (typeof process.getuid === "function" && process.getuid() === 0) {
+    t.skip("running as root bypasses directory permissions");
+    return;
+  }
+  const dir = await tmp();
+  try {
+    await writeFile(join(dir, "bad.json"), "{ not json");
+    const s = store<Counter>(dir, silent, "quarantine");
+    // Remove write permission on the dir so the quarantine rename fails.
+    await chmod(dir, 0o500);
+    await assert.rejects(s.get("bad"), (e: unknown) => e instanceof SubstrateError && e.kind === "corrupt_state");
+  } finally {
+    await chmod(dir, 0o700).catch(() => undefined);
     await rm(dir, { recursive: true, force: true });
   }
 });

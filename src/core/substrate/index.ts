@@ -8,14 +8,27 @@
  *     await readModifyWrite(path, (cur) => next, deps);      // no lost updates
  *     const store = createDocumentStore<T>({ dir });         // JSON doc store
  *
- * The default `locks` (in-process mutex + file-lock manager) and `createDocumentStore`
- * are wired from `config`. Nothing in the engine hand-rolls file writes or locks —
- * the receipt store, trust store, registry persistence and workspace allocation
- * all build on this.
+ * The default `locks` (in-process mutex + file-lock manager) and the store/log
+ * factories are wired from `config`. Nothing in the engine hand-rolls file writes
+ * or locks — the receipt store, trust store, registry persistence and workspace
+ * allocation all build on this.
+ *
+ * Cross-process semantics (precise): the DEFAULT provides in-process mutual
+ * exclusion + atomic writes, which makes cross-process READS safe (a reader, even
+ * in another process, never sees a torn write). Cross-process WRITE serialization
+ * (no lost update across separate processes) is OPT-IN via `crossProcess: true` /
+ * a `file` lock — used when the CLI and the service may write the same state.
+ *
+ * Two canonical persistence primitives:
+ *   - `DocumentStore` / `createDocumentStore` — full-document RMW for small,
+ *     document-oriented state (trust, workspace, registry snapshots).
+ *   - `AtomicAppendLog` / `createAppendLog` — O(1) line-delimited-JSON appends for
+ *     append-heavy ordered/audit state (receipts, event logs).
  */
 
 import { config } from "../config.js";
 import { childLogger } from "../log.js";
+import { AtomicAppendLog, type AppendLogOptions } from "./append.js";
 import { LockManager } from "./lock.js";
 import { DocumentStore, type DocumentStoreOptions, readModifyWrite, type RmwDeps } from "./store.js";
 
@@ -43,6 +56,21 @@ export function createDocumentStore<T>(
   });
 }
 
+/** Create an append log wired to the default lock manager + logger + config. */
+export function createAppendLog<T>(
+  opts: Omit<AppendLogOptions, "locks" | "logger"> & {
+    locks?: AppendLogOptions["locks"];
+    logger?: AppendLogOptions["logger"];
+  },
+): AtomicAppendLog<T> {
+  return new AtomicAppendLog<T>({
+    fsync: config.substrate.fsync,
+    locks: opts.locks ?? locks,
+    logger: opts.logger ?? log,
+    ...opts,
+  });
+}
+
 /** A `readModifyWrite` bound to the default lock manager + logger + config. */
 export function safeUpdate<T>(
   path: string,
@@ -54,11 +82,14 @@ export function safeUpdate<T>(
 }
 
 // --- re-export the canonical primitives + contract ---
-export { atomicWriteFile, atomicWriteJson, sweepTempFiles, isTempFile } from "./atomic.js";
+export { atomicWriteFile, atomicWriteJson, sweepTempFiles, isTempFile, isCorruptSidecar, classifyDirFsyncError } from "./atomic.js";
+export type { SweepOptions, AtomicWriteInternals } from "./atomic.js";
 export { KeyedMutex, LockManager, acquireFileLock } from "./lock.js";
 export type { AcquireOptions, LockManagerDeps, FileLockDeps } from "./lock.js";
 export { DocumentStore, readModifyWrite, readJsonFile } from "./store.js";
 export type { DocumentStoreOptions, RmwDeps } from "./store.js";
+export { AtomicAppendLog } from "./append.js";
+export type { AppendLogOptions, AppendResult, ReadResult } from "./append.js";
 export {
   SUBSTRATE_CONTRACT_VERSION,
   SubstrateError,
@@ -68,4 +99,6 @@ export {
   type Release,
   type RmwOptions,
   type SubstrateErrorKind,
+  type AppendReadOptions,
+  type LogOffset,
 } from "./contract.js";

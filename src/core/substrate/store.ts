@@ -12,7 +12,7 @@
  */
 
 import { readFile, unlink, readdir, rename } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { resolve, sep } from "node:path";
 import type { Logger } from "pino";
 
 import { atomicWriteJson, isTempFile, sweepTempFiles } from "./atomic.js";
@@ -42,7 +42,17 @@ export async function readJsonFile<T>(
   } catch (cause) {
     if (policy === "quarantine") {
       const aside = `${path}.corrupt.${now()}`;
-      await rename(path, aside).catch(() => undefined);
+      try {
+        await rename(path, aside);
+      } catch (renameCause) {
+        // Quarantine FAILED — the corrupt file is still in place. Fail-closed:
+        // higher layers must not treat a still-present corrupt file as "missing".
+        logger.error({ event: "corrupt_state_quarantine_failed", path }, "failed to quarantine corrupt state file");
+        throw new SubstrateError("corrupt_state", `failed to quarantine corrupt state file ${path}`, {
+          path,
+          cause: renameCause,
+        });
+      }
       logger.warn({ event: "corrupt_state_quarantined", path, aside }, "quarantined corrupt state file");
       return undefined;
     }
@@ -187,7 +197,12 @@ export class DocumentStore<T> {
     );
   }
 
-  /** List document ids (excludes temp/corrupt sidecar files). */
+  /**
+   * List document ids (excludes temp/corrupt sidecar files).
+   * KNOWN FUTURE CONCERN: this is O(directory size) — fine for the small
+   * document-oriented stores this is meant for; a large/indexed listing is a
+   * later concern if a store ever grows big.
+   */
   async list(): Promise<string[]> {
     let entries: string[];
     try {
@@ -206,9 +221,17 @@ export class DocumentStore<T> {
   }
 
   private pathFor(id: string): string {
-    if (typeof id !== "string" || !this.idPattern.test(id) || id === "." || id === "..") {
+    if (typeof id !== "string" || id.length === 0 || id === "." || id === ".." || !this.idPattern.test(id)) {
       throw new SubstrateError("invalid_key", `invalid document id: ${JSON.stringify(id)}`);
     }
-    return join(this.dir, id + DOC_EXT);
+    // STRUCTURAL confinement: regardless of how permissive idPattern is, the
+    // resolved path MUST remain under the store directory. This is the real
+    // traversal guard — the pattern is only a first filter.
+    const root = resolve(this.dir);
+    const full = resolve(this.dir, id + DOC_EXT);
+    if (full !== root && !full.startsWith(root + sep)) {
+      throw new SubstrateError("invalid_key", `document id escapes the store directory: ${JSON.stringify(id)}`);
+    }
+    return full;
   }
 }

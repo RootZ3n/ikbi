@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -145,27 +145,52 @@ test("file lock recovers a stale lock from a dead PID", async () => {
   }
 });
 
-test("file lock recovers a lock that is stale by age", async () => {
+test("a LIVE-PID lock is NEVER stolen on age alone (no split-brain on a slow holder)", async () => {
   const dir = await tmp();
   try {
     const lockPath = join(dir, "z.lock");
+    // A lock held by THIS (alive) process, but very old — simulates a slow/paused holder.
     await writeFile(
       lockPath,
-      JSON.stringify({ pid: process.pid, host: hostname(), acquiredAt: Date.now() - 100_000, nonce: "old" }),
+      JSON.stringify({ pid: process.pid, host: hostname(), acquiredAt: Date.now() - 10_000_000, nonce: "live" }),
     );
-    // staleMs small => the existing lock is too old even though our PID is alive.
-    const rel = await acquireFileLock(lockPath, 1000, { logger: silent, staleMs: 1000 });
+    // Even with a tiny staleMs, a live holder is not stolen — acquisition times out.
+    await assert.rejects(
+      acquireFileLock(lockPath, 60, { logger: silent, staleMs: 1 }),
+      (e: unknown) => e instanceof SubstrateError && e.kind === "lock_timeout",
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a corrupt lock file is recoverable only after it has been broken longer than staleMs", async () => {
+  const dir = await tmp();
+  try {
+    const lockPath = join(dir, "c.lock");
+    await writeFile(lockPath, "not json at all");
+
+    // Fresh corrupt lock (possibly mid-creation): NOT stolen.
+    await assert.rejects(
+      acquireFileLock(lockPath, 60, { logger: silent, staleMs: 30_000 }),
+      (e: unknown) => e instanceof SubstrateError && e.kind === "lock_timeout",
+    );
+
+    // Aged corrupt lock: recoverable.
+    const old = new Date(Date.now() - 120_000);
+    await utimes(lockPath, old, old);
+    const rel = await acquireFileLock(lockPath, 1000, { logger: silent, staleMs: 30_000 });
     await rel();
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });
 
-test("a corrupt lock file is treated as recoverable", async () => {
+test("cross-process file lock works for the FIRST file in a brand-new directory", async () => {
   const dir = await tmp();
   try {
-    const lockPath = join(dir, "c.lock");
-    await writeFile(lockPath, "not json at all");
+    // Lock path inside a not-yet-existing subdirectory.
+    const lockPath = join(dir, "fresh", "nested", "x.lock");
     const rel = await acquireFileLock(lockPath, 1000, { logger: silent, staleMs: 30_000 });
     await rel();
   } finally {

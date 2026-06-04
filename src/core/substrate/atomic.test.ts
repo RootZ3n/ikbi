@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { atomicWriteJson, isTempFile, sweepTempFiles } from "./atomic.js";
+import { atomicWriteFile, atomicWriteJson, classifyDirFsyncError, isTempFile, sweepTempFiles } from "./atomic.js";
+import { SubstrateError } from "./contract.js";
 
 async function tmp(): Promise<string> {
   return mkdtemp(join(tmpdir(), "ikbi-atomic-"));
@@ -66,19 +67,56 @@ test("a reader NEVER sees a partial write under heavy concurrent writes+reads", 
   }
 });
 
-test("sweepTempFiles removes orphaned temp files (crash cleanup) and nothing else", async () => {
+test("sweepTempFiles reaps OLD orphaned temp + corrupt sidecars (crash cleanup), nothing else", async () => {
   const dir = await tmp();
   try {
     const path = join(dir, "keep.json");
     await atomicWriteJson(path, { keep: true });
-    // Simulate temp files orphaned by a crash mid-write.
+    // Simulate sidecars orphaned by a crash mid-write / earlier quarantine.
     await writeFile(`${path}.ikbi-tmp.999.deadbe`, "partial{");
     await writeFile(join(dir, "other.json.ikbi-tmp.1.aa"), "x");
-    const swept = await sweepTempFiles(dir);
-    assert.equal(swept, 2);
+    await writeFile(join(dir, "gone.json.corrupt.123"), "junk");
+    // Use a future clock so the just-written sidecars count as "old" deterministically.
+    const swept = await sweepTempFiles(dir, { olderThanMs: 0, now: () => Date.now() + 60_000 });
+    assert.equal(swept, 3);
     assert.deepEqual(await readdir(dir), ["keep.json"]);
     assert.deepEqual(JSON.parse(await readFile(path, "utf8")), { keep: true });
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("sweepTempFiles does NOT reap a fresh (in-flight) temp file", async () => {
+  const dir = await tmp();
+  try {
+    await writeFile(join(dir, "live.json.ikbi-tmp.1.bb"), "in flight");
+    const swept = await sweepTempFiles(dir); // default 60s threshold; fresh file kept
+    assert.equal(swept, 0);
+    assert.ok((await readdir(dir)).includes("live.json.ikbi-tmp.1.bb"));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a real directory-fsync failure surfaces as write_failed (durability not falsely reported)", async () => {
+  const dir = await tmp();
+  try {
+    const path = join(dir, "d.json");
+    const throwingDirFsync = async (): Promise<void> => {
+      throw Object.assign(new Error("simulated EIO"), { code: "EIO" });
+    };
+    await assert.rejects(
+      atomicWriteFile(path, "data\n", { fsync: true }, { fsyncDir: throwingDirFsync }),
+      (e: unknown) => e instanceof SubstrateError && e.kind === "write_failed",
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("classifyDirFsyncError: unsupported errno is ignored, real errno throws", () => {
+  assert.equal(classifyDirFsyncError("EINVAL"), "ignore");
+  assert.equal(classifyDirFsyncError("ENOTSUP"), "ignore");
+  assert.equal(classifyDirFsyncError("EIO"), "throw");
+  assert.equal(classifyDirFsyncError(undefined), "throw");
 });
