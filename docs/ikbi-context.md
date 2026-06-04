@@ -97,6 +97,23 @@ Each phase has a deliverable, a specific verification bar, and a commit. We
 checkpoint between phases (verify against the bar, then proceed) — we do NOT
 re-open settled decisions. Stop only if something breaks.
 
+## Building a module against the frozen core (contract versioning)
+
+The frozen core contracts are versioned and registered in one place,
+`src/core/contracts/` (`CONTRACT_VERSIONS`). Each contract carries a
+`*_CONTRACT_VERSION` (all currently `1.0.0`). The compatibility rule:
+
+- A new OPTIONAL field is additive → MINOR bump (modules keep working).
+- Changing/removing an existing field is breaking → MAJOR bump + coordination.
+- A module targeting `X@a.b.c` is compatible with present `X@A.B.C` iff same major
+  and present ≥ target.
+
+A module that builds against a contract should pin the version it targets and call
+`assertContractCompatible(name, target)` at startup — a mismatch throws a clear
+`ContractVersionError` rather than drifting silently. Use `checkCompatibility` for
+a non-throwing verdict. This is the single compatibility surface for the parallel
+MODULE phase; do NOT re-derive contract versions elsewhere.
+
 ## Downstream notes — receipts are EPHEMERAL operational data
 
 The receipt store (Phase 5) is a lean, retention-bounded operational log
