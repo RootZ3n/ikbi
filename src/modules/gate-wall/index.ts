@@ -23,6 +23,9 @@ export { createGateWall, gateWall, type GateWallDeps } from "./gate.js";
 export {
   CONTRACT_VERSION,
   type GateWall,
+  type GateWallAction,
+  type GateWallActionExec,
+  type GateWallActionPromote,
   type GateWallEvaluateInput,
   type PromoteGovernance,
 } from "./contract.js";

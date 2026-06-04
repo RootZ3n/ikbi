@@ -82,8 +82,9 @@ export interface OrchestratorDeps {
   readonly gateWall?: {
     evaluate: (input: {
       grant: AutonomyGrant;
-      task: WorkerTask;
-      results: readonly RoleResult[];
+      // Action-tagged input (gate-wall ≥1.1.0). The orchestrator only ever gates a
+      // promote; the broader GateWallAction union lives in gate-wall's contract.
+      action: { kind: "promote"; task: WorkerTask; results: readonly RoleResult[] };
       identity: AgentIdentity;
     }) => Promise<PromoteGovernance>;
   };
@@ -333,7 +334,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       // back to an EXPLICIT, auditable advisory allow (never a silent undefined).
       const governanceGrant = autonomyForTier(asTier(parentIdentity.trustTier ?? TRUST_FLOOR, TRUST_FLOOR));
       const governance: PromoteGovernance = gateWall
-        ? await gateWall.evaluate({ grant: governanceGrant, task, results, identity: parentIdentity })
+        ? await gateWall.evaluate({ grant: governanceGrant, action: { kind: "promote", task, results }, identity: parentIdentity })
         : { allow: true, reason: "gate-wall not wired (advisory mode)" };
       const promote = await workspaces.promote(workspace, {
         evaluation: decision.evaluation, // sourced from the integrator, NOT hardcoded

@@ -24,11 +24,51 @@ import type { AgentIdentity } from "../../core/identity/contract.js";
 import { receipts as coreReceipts } from "../../core/receipt/index.js";
 import { gateWallConfig, type GateWallConfig } from "./config.js";
 import { gateAllowed, gateDenied, gateEvaluated, type GateEventPayload } from "./events.js";
-import type { GateWall, GateWallEvaluateInput, PromoteGovernance } from "./contract.js";
+import type { GateWall, GateWallAction, GateWallEvaluateInput, PromoteGovernance } from "./contract.js";
 
 const GATE_ID_PREFIX = "gate";
 const GATE_OPERATION = "gate.evaluate";
 const EVENT_SOURCE = "gate-wall";
+
+/** A compact, action-tagged audit descriptor — what is gated, for receipts/events. */
+interface ActionAudit {
+  readonly kind: GateWallAction["kind"];
+  /** One-line human summary for the receipt detail. */
+  readonly summary: string;
+  /** Structured action fields for the receipt metadata. */
+  readonly metadata: Record<string, unknown>;
+  /** Correlation id for the receipt, when the action carries one. */
+  readonly requestId?: string;
+  /** Project scope for the receipt, when the action carries one. */
+  readonly project?: string;
+}
+
+/**
+ * Describe an action for the audit trail WITHOUT influencing the verdict. For exec,
+ * log the command + arg COUNT + sudo flag only — never the full args verbatim (that
+ * is governed-exec's own receipt concern).
+ */
+function auditAction(action: GateWallAction): ActionAudit {
+  if (action.kind === "promote") {
+    return {
+      kind: "promote",
+      summary: `promote "${action.task.goal}"`,
+      metadata: { taskId: action.task.taskId, goal: action.task.goal },
+      requestId: action.task.taskId,
+      project: action.task.targetRepo,
+    };
+  }
+  return {
+    kind: "exec",
+    summary: `exec ${action.sudo ? "sudo " : ""}${action.command} (${action.args.length} args)`,
+    metadata: {
+      command: action.command,
+      argCount: action.args.length,
+      sudo: action.sudo,
+      ...(action.purpose !== undefined ? { purpose: action.purpose } : {}),
+    },
+  };
+}
 
 /** Injectable dependencies (tests substitute receipts / publish / clock / id). */
 export interface GateWallDeps {
@@ -49,7 +89,9 @@ export function createGateWall(deps: GateWallDeps = {}): GateWall {
   async function evaluate(input: GateWallEvaluateInput): Promise<PromoteGovernance> {
     const tier = input.grant.tier;
     const gateId = newGateId();
+    const audit = auditAction(input.action);
 
+    // DECISION: a pure function of the grant — the action does NOT influence it.
     let governance: PromoteGovernance;
     if (!config.enabled) {
       governance = { allow: false, reason: "gate-wall disabled — denying (fail-closed)", gateId };
@@ -67,20 +109,21 @@ export function createGateWall(deps: GateWallDeps = {}): GateWall {
       };
     }
 
-    const payload: GateEventPayload = { tier, allow: governance.allow, reason: governance.reason ?? "", gateId };
+    const payload: GateEventPayload = { tier, kind: audit.kind, allow: governance.allow, reason: governance.reason ?? "", gateId };
     const attribution = { identity: input.identity, operation: GATE_OPERATION };
     publish(gateEvaluated.create(payload, { source: EVENT_SOURCE, attribution }));
     publish((governance.allow ? gateAllowed : gateDenied).create(payload, { source: EVENT_SOURCE, attribution }));
 
     // The EVALUATION succeeded (status "success") regardless of allow/deny — the
-    // verdict lives in governance.allow / the recorded metadata.
+    // verdict lives in governance.allow / the recorded metadata. The action descriptor
+    // records WHAT was gated (compact: exec logs command/argCount/sudo, not full args).
     await receipts.append(
       {
         operation: GATE_OPERATION,
-        outcome: { status: "success", ...(governance.reason !== undefined ? { detail: governance.reason } : {}) },
-        metadata: { tier, allow: governance.allow, reason: governance.reason, gateId },
-        requestId: input.task.taskId,
-        project: input.task.targetRepo,
+        outcome: { status: "success", detail: `${audit.summary} → ${governance.allow ? "allow" : "deny"}` },
+        metadata: { tier, action: audit.kind, allow: governance.allow, reason: governance.reason, gateId, ...audit.metadata },
+        ...(audit.requestId !== undefined ? { requestId: audit.requestId } : {}),
+        ...(audit.project !== undefined ? { project: audit.project } : {}),
       },
       input.identity,
     );

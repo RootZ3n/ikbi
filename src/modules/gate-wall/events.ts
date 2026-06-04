@@ -6,11 +6,14 @@
  */
 
 import { defineEvent } from "../../core/events/index.js";
+import type { GateWallAction } from "./contract.js";
 
 /** Payload common to the gate lifecycle events. */
 export interface GateEventPayload {
   /** The trust tier evaluated. */
   readonly tier: string;
+  /** The kind of action gated (promote | exec) — what the verdict applies to. */
+  readonly kind: GateWallAction["kind"];
   /** The verdict. */
   readonly allow: boolean;
   /** Human/audit reason for the verdict. */
