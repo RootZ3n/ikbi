@@ -229,3 +229,42 @@ With Step S done, these parallelize cleanly and concurrently (own dirs):
 `Step S` (CC solo) → then `egress` (3-eyes) ∥ `caching` (2-eyes) → then `worker-model`
 (3-eyes) → then open the P1 fan-out. Resolve decisions #1–#6 before Step S, #7 before
 the worker phase, #8–#10 before the relevant P1 modules.
+
+---
+
+## 8. Fan-out conventions (hard rules)
+
+> Codified from Hermes's 2-eyes review of Step S. The integration seams make the
+> shared engine files (config/server/cli) extension-only, but seams are not
+> enforcement — these four rules close the gaps the seams leave open. Every module
+> prompt carries them; they are not optional.
+
+### Event type namespacing
+
+Every module-defined event type MUST be prefixed `<module>.<event>` (e.g.
+`egress.blocked`, `caching.evicted`). `defineEvent` accepts any string and does
+NOT enforce this — collision is silent. The engine-scoped `engine.kill` is the
+reserved exception. Rationale: two modules defining the same bare type silently
+overlap on the bus.
+
+### Route path namespacing
+
+Every route a module registers MUST live under `/<module>/...`. Module NAMES are
+unique at registration (registry throws on dup), but PATHS are not enforced until
+Fastify `ready()`. Rationale: surface path collisions at design time, not boot.
+
+### No direct configEnv reads
+
+A module MUST read config only through `moduleEnv("<name>")`. Importing `configEnv`
+directly and reading raw keys is forbidden — it bypasses prefix isolation. There is
+no linter for this; it is a discipline rule. Rationale: `moduleEnv` is the only
+structural isolation boundary; bypassing it reintroduces cross-module config bleed.
+
+### Barrel wiring — post-merge pass
+
+`src/modules/index.ts` is the SOLE shared file in the fan-out. Builders MUST NOT
+edit it. Each module lands its own file with a self-contained registrar
+(registerRoutes/registerCommand from its own file). Import lines into the barrel
+are added by the operator in a single post-merge wiring pass during integration.
+Rationale: keeps "no two builders share a file" literally true during parallel
+build; avoids a contention point exactly when builders should be independent.
