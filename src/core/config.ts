@@ -33,7 +33,34 @@ export interface IkbiConfig {
   readonly provider: ProviderConfig;
   /** Prompt-injection chokepoint configuration. */
   readonly injection: InjectionConfig;
+  /** Agent identity / multi-tenancy configuration. */
+  readonly identity: IdentityConfig;
 }
+
+/** Configuration for the agent identity / multi-tenancy layer. */
+export interface IdentityConfig {
+  /** Path to the JSON agents registry (who-can-call). `IKBI_IDENTITY_REGISTRY`, default `<stateRoot>/agents.json`. */
+  readonly registryFile: string;
+  /**
+   * Bootstrap operator token (plaintext env, hashed at load — never stored raw).
+   * Establishes the human operator identity. `IKBI_OPERATOR_TOKEN`. Undefined =
+   * no bootstrapped operator (operator must be in the registry file, or absent).
+   */
+  readonly operatorToken: string | undefined;
+  /** Agent id assigned to the bootstrapped operator. `IKBI_OPERATOR_AGENT_ID`, default "operator". */
+  readonly operatorAgentId: string;
+  /**
+   * Pepper (global salt) for the token-hash KDF. Kept SEPARATE from the registry
+   * so a stolen registry file resists offline brute force. `IKBI_IDENTITY_TOKEN_SALT`.
+   * A built-in dev default is used if unset (logged as insecure — set it in prod).
+   */
+  readonly tokenSalt: string;
+  /** True when `tokenSalt` is the insecure built-in default (for a startup warning). */
+  readonly tokenSaltIsDefault: boolean;
+}
+
+/** Insecure built-in pepper used only when IKBI_IDENTITY_TOKEN_SALT is unset. */
+const DEFAULT_TOKEN_SALT = "ikbi-dev-default-token-salt-change-me";
 
 /** Configuration for the prompt-injection chokepoint. */
 export interface InjectionConfig {
@@ -230,7 +257,26 @@ function loadConfig(env: NodeJS.ProcessEnv = process.env): IkbiConfig {
         160,
       ),
     },
+    identity: loadIdentityConfig(env, stateRoot),
   });
+}
+
+function loadIdentityConfig(env: NodeJS.ProcessEnv, stateRoot: string): IdentityConfig {
+  const regRaw = optStr(env.IKBI_IDENTITY_REGISTRY);
+  const registryFile = regRaw
+    ? isAbsolute(regRaw)
+      ? regRaw
+      : resolve(process.cwd(), regRaw)
+    : resolve(stateRoot, "agents.json");
+
+  const saltRaw = optStr(env.IKBI_IDENTITY_TOKEN_SALT);
+  return {
+    registryFile,
+    operatorToken: optStr(env.IKBI_OPERATOR_TOKEN),
+    operatorAgentId: optStr(env.IKBI_OPERATOR_AGENT_ID) ?? "operator",
+    tokenSalt: saltRaw ?? DEFAULT_TOKEN_SALT,
+    tokenSaltIsDefault: saltRaw === undefined,
+  };
 }
 
 /** The resolved configuration for this process. Loaded once at import. */

@@ -77,13 +77,28 @@ export interface AgentIdentity {
    */
   readonly functionalRole?: string;
   /**
-   * How much the agent is TRUSTED — its governance tier (e.g. "probation",
-   * "verified", "trusted"). Drives permissions/gating in later phases. Distinct
-   * from what the agent does.
+   * How much the AGENT is TRUSTED — its governance tier (e.g. "probation",
+   * "verified", "trusted", "operator"). Drives permissions/gating. Distinct from
+   * what the agent does. This models AGENT trust ONLY — the trust ikbi places in
+   * a model/provider is the shadow-workspace module's separate concern and must
+   * NOT be overloaded onto this field. Established/validated by the identity layer
+   * (Phase 3); the dynamic-trust phase adjusts it via a pluggable seam.
    */
   readonly trustTier?: string;
-  /** Optional opaque tenant/session correlation id. */
+  /**
+   * Canonical multi-turn correlation key: the opaque tenant/session id that ties
+   * a sequence of related requests from the same caller together. Use this (not
+   * ad-hoc keys) to correlate a conversation/operation across turns.
+   */
   readonly sessionId?: string;
+  /**
+   * ADDITIVE (Phase 3 coordination, backward-compatible): when this identity is a
+   * deterministically-spawned subagent, the agentId of the spawning parent. The
+   * correlation + trust-inheritance hook for the (later) subagent-spawning module,
+   * so spawned agents need not each be pre-registered. Set only through a trusted
+   * spawn path, never from client claims. Existing fields are unchanged.
+   */
+  readonly spawnedFrom?: string;
 }
 
 /** The single request type for every model invocation. */
