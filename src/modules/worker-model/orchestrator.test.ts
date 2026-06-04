@@ -332,15 +332,17 @@ test("a failed run emits worker.failed", async () => {
 function okModelResponse(): ModelResponse {
   return {
     contractVersion: "1.1.0", model: "mimo-v2.5", provider: "mimo", providerModelId: "mimo-v2.5",
-    content: "- a finding", finishReason: "stop", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+    content: "PASS\n- a finding", finishReason: "stop", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
     cost: { usd: 0, promptUsd: 0, cachedUsd: 0, completionUsd: 0, rate: { promptPerMTok: 0, completionPerMTok: 0 } },
     latencyMs: 1, fellBack: false, attempts: [],
   };
 }
 
-test("real scout/critic/verifier + stubbed builder/integrator → coherent WorkerResult", async () => {
-  // scout is now a real role: give it a real workspace dir + a working model so it
-  // succeeds, then the still-stubbed BUILDER short-circuits the run to "stub".
+test("real scout/builder/critic + stubbed verifier/integrator → coherent success → promote", async () => {
+  // scout, builder, critic are now REAL roles. Give them a real workspace dir + a
+  // working model. verifier/integrator are overridden here ONLY so the real verifier
+  // does not spawn `pnpm` in a unit test (verifier is exercised in verifier.test.ts);
+  // they are not the subject of this pass.
   const dir = mkdtempSync(join(tmpdir(), "ikbi-orch-"));
   writeFileSync(join(dir, "a.ts"), "export const a = 1;");
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
@@ -358,18 +360,23 @@ test("real scout/critic/verifier + stubbed builder/integrator → coherent Worke
       return { workspaceId: handle.id, removed: true };
     },
   };
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    verifier: async () => ({ role: "verifier", outcome: "success", summary: "checks ok (stubbed in test)" }),
+    integrator: async () => ({ role: "integrator", outcome: "success", summary: "promote ok (stubbed in test)" }),
+  };
 
   const orch = createOrchestrator(
-    baseDeps({ resolveIdentity, roleClaim, workspaces, invokeModel: async () => okModelResponse() }),
+    baseDeps({ resolveIdentity, roleClaim, workspaces, roles, invokeModel: async () => okModelResponse() }),
   );
   const result = await orch.run({ taskId: "t-1", targetRepo: dir, goal: "do the thing" }, parentCtx);
 
-  // scout (real) succeeds; builder (stub) returns "stub" → short-circuit → discard.
-  assert.equal(result.outcome, "stub");
-  assert.equal(calls.promote, 0);
-  assert.equal(calls.discard, 1);
-  assert.equal(result.roles[0]?.role, "scout");
-  assert.equal(result.roles[0]?.outcome, "success", "real scout ran and succeeded");
-  assert.equal(result.roles[1]?.role, "builder");
-  assert.equal(result.roles[1]?.outcome, "stub", "builder still stubbed → short-circuits");
+  // All five roles succeed → orchestrator promotes.
+  assert.equal(result.outcome, "success");
+  assert.equal(calls.promote, 1);
+  assert.equal(calls.discard, 0);
+  assert.deepEqual(result.roles.map((r) => r.role), ["scout", "builder", "critic", "verifier", "integrator"]);
+  for (const r of result.roles) assert.equal(r.outcome, "success", `${r.role} succeeded`);
+  // Builder really ran its (real) loop — its detail carries the chokepoint counter.
+  const builderDetail = result.roles[1]?.detail as { neutralizedCount: number } | undefined;
+  assert.equal(builderDetail?.neutralizedCount, 0, "real builder ran (no tools this run)");
 });
