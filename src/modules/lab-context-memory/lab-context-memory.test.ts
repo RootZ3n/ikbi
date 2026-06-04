@@ -18,19 +18,24 @@ import type { LabMemEventPayload } from "./events.js";
 
 const silent = () => pino({ level: "silent" });
 
-/** Validated identities for two distinct lab agents (ikbi + ptah). */
+/** Validated identities for the lab agents (ikbi, ptah, luna). */
 function identities() {
   const resolver = new IdentityResolver({
     registry: new AgentRegistry({
       agents: [
         { agentId: "ikbi", kind: "agent", defaultTrustTier: "trusted", tokenHashes: [hashToken("ikbi-secret")] },
         { agentId: "ptah", kind: "agent", defaultTrustTier: "trusted", tokenHashes: [hashToken("ptah-secret")] },
+        { agentId: "luna", kind: "agent", defaultTrustTier: "trusted", tokenHashes: [hashToken("luna-secret")] },
       ],
     }),
     logger: silent(),
     now: () => 1000,
   });
-  return { ikbi: resolver.resolve({ token: "ikbi-secret" }), ptah: resolver.resolve({ token: "ptah-secret" }) };
+  return {
+    ikbi: resolver.resolve({ token: "ikbi-secret" }),
+    ptah: resolver.resolve({ token: "ptah-secret" }),
+    luna: resolver.resolve({ token: "luna-secret" }),
+  };
 }
 
 function cfg(over: Partial<LabContextMemoryConfig> = {}): LabContextMemoryConfig {
@@ -90,18 +95,20 @@ const clock = (start = 1000) => {
 // ── THE HEADLINE: cross-agent byProject ──────────────────────────────────────
 
 test("byProject returns EVERY agent's contributions to a project (lab memory, not ikbi memory)", async () => {
-  const { ikbi, ptah } = identities();
+  const { ikbi, ptah, luna } = identities();
   const ms = memStore();
   const mem = createLabMemory({ config: cfg(), store: ms.store, publish: () => {}, now: () => 1000 });
 
+  // THREE distinct lab agents contribute to "Luak" — not a two-case coincidence.
   await mem.record({ project: "Luak", kind: "activity", key: "fix-1", value: { summary: "ikbi fixed the parser" } }, ikbi);
   await mem.record({ project: "Luak", kind: "capability", key: "module-y", value: { name: "module Y" } }, ptah);
+  await mem.record({ project: "Luak", kind: "activity", key: "tune-1", value: { summary: "luna tuned the model" } }, luna);
   await mem.record({ project: "Other", kind: "activity", key: "x", value: { summary: "elsewhere" } }, ikbi);
 
   const luak = await mem.byProject("Luak");
   const agents = luak.map((e) => e.agent).sort();
-  assert.deepEqual(agents, ["ikbi", "ptah"], "both agents' Luak entries are visible to a single project query");
-  assert.equal(luak.length, 2);
+  assert.deepEqual(agents, ["ikbi", "luna", "ptah"], "all three agents' Luak entries are visible to a single project query");
+  assert.equal(luak.length, 3);
   assert.ok(!luak.some((e) => e.project === "Other"), "scoped to the project");
 });
 

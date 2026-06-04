@@ -2,9 +2,11 @@
  * ikbi lab-context-memory — THE MODULE CONTRACT (versioned).
  *
  * This is the canonical SHARED LAB-WIDE memory substrate — NOT ikbi-only memory.
- * The lab has multiple agents (ikbi, Ptah, Peh); any agent's contributions to a
- * project are visible to any other agent's query. Example: Peh, asked about project
- * "Luak", queries this store and surfaces what Ptah AND ikbi did there.
+ * The lab has FOUR agents that share this memory — ikbi, Ptah, Luna, Peh; any
+ * agent's contributions to a project are visible to any other agent's query.
+ * Example: Peh, asked about project "Luak", queries this store and surfaces what
+ * Ptah, Luna AND ikbi did there. ikbi is writer #1; the others wire in via the
+ * (deferred) external transport.
  *
  * ikbi is WRITER #1 and the first consumer (via `projectFromReceipts`), but the
  * schema + API are CROSS-AGENT from day one: entries are project-scoped, agent-
@@ -49,7 +51,7 @@ export interface MemoryEntry {
   readonly id: string;
   /** The lab project this is about (e.g. "Luak") — the cross-agent grouping. */
   readonly project: string;
-  /** Which agent this memory is attributed to (ikbi, Ptah, Peh, …) — an agentId. */
+  /** Which agent this memory is attributed to (ikbi, Ptah, Luna, Peh, …) — an agentId. */
   readonly agent: string;
   readonly kind: MemoryKind;
   /** Stable sub-key within (project, agent, kind). */
