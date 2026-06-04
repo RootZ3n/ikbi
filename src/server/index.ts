@@ -11,6 +11,7 @@ import Fastify from "fastify";
 
 import { config } from "../core/config.js";
 import { log } from "../core/log.js";
+import { routes } from "./registry.js";
 
 /**
  * Readiness flag. Flipped to `true` once the service has fully started, and back
@@ -45,6 +46,12 @@ export function buildServer() {
     }
     return { status: "ready", ready: true };
   });
+
+  // Compose every module's routes via the route-registrar SEAM. Modules register
+  // from their own files (see server/registry.ts) — this file never names them,
+  // so endpoint-exposing modules are added WITHOUT editing server/index.ts. Each
+  // registrar runs in its own Fastify encapsulation context.
+  routes.applyTo(app as unknown as Parameters<typeof routes.applyTo>[0]);
 
   return app;
 }

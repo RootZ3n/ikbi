@@ -28,8 +28,15 @@
 
 import type { AgentIdentity } from "../provider/contract.js";
 
-/** Semantic version of the identity contract. Bump on breaking change. */
-export const IDENTITY_CONTRACT_VERSION = "1.0.0";
+/**
+ * Semantic version of the identity contract.
+ *
+ * 1.1.0 — additive: `OperationContext.dryRun` (the dry-run/plan-only seam, Step S).
+ *         A new OPTIONAL field → MINOR bump per the codified compatibility rule;
+ *         modules pinning identity@1.0.x stay compatible (they ignore the field).
+ * 1.0.0 — frozen-core identity contract.
+ */
+export const IDENTITY_CONTRACT_VERSION = "1.1.0";
 
 /** Whether the caller is the human operator or an (autonomous) agent. */
 export type IdentityKind = "operator" | "agent";

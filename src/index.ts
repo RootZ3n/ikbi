@@ -10,6 +10,10 @@
 import { config } from "./core/config.js";
 import { log } from "./core/log.js";
 import { setReady, startServer } from "./server/index.js";
+// Side-effect import: loading the modules barrel runs each module's route/command
+// registrations BEFORE the server is built, so the route-registrar seam composes
+// every module's endpoints. Modules add themselves to src/modules/index.ts.
+import "./modules/index.js";
 
 async function main(): Promise<void> {
   log.info({ env: config.env, stateRoot: config.stateRoot }, "ikbi starting");

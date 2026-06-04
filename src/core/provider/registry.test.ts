@@ -2,7 +2,18 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { ModelProvider, ProviderInvocation, ProviderResult } from "./contract.js";
+import { registerFetchGuard } from "./fetch-guard.js";
+import type { FetchLike } from "./providers/openai-compatible.js";
 import { ModelRegistry, type ModelSpec } from "./registry.js";
+
+// applyRoster constructs OpenAICompatibleProvider for roster provider entries via
+// the fail-closed fetch-guard seam. In production the network-egress floor
+// registers a guard first; mirror that here. The stub throws if invoked — these
+// tests assert roster parsing/declaration, not network I/O.
+const guardStub: FetchLike = async () => {
+  throw new Error("egress guard stub: not exercised in this test");
+};
+registerFetchGuard(guardStub);
 
 const dummyProvider = (id: string): ModelProvider => ({
   id,

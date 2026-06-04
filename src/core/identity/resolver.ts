@@ -115,6 +115,16 @@ export interface OperationContext {
   readonly identity: ValidatedIdentity;
   readonly requestId?: string;
   readonly startedAt: number;
+  /**
+   * Dry-run / plan-only SEAM (Step S). When true, a side-effecting module MUST
+   * COMPUTE and REPORT the change it WOULD make, and SKIP the irreversible action
+   * (no writes, no spawns, no network mutations, no commits). Additive + optional:
+   * `undefined` means a normal (executing) operation. This is the CONVENTION only —
+   * the engine threads the flag immutably; each module is responsible for honoring
+   * it. The dry-run/plan-only MODULE (a later leaf) builds the reporting surface on
+   * top of this seam.
+   */
+  readonly dryRun?: boolean;
 }
 
 /** Result of re-checking whether an established identity is still valid. */
@@ -288,12 +298,13 @@ export class IdentityResolver {
  */
 export function beginOperation(
   identity: ValidatedIdentity,
-  opts?: { requestId?: string; now?: number },
+  opts?: { requestId?: string; now?: number; dryRun?: boolean },
 ): OperationContext {
   return Object.freeze({
     contractVersion: IDENTITY_CONTRACT_VERSION,
     identity,
     ...(opts?.requestId !== undefined ? { requestId: opts.requestId } : {}),
     startedAt: opts?.now ?? Date.now(),
+    ...(opts?.dryRun !== undefined ? { dryRun: opts.dryRun } : {}),
   });
 }

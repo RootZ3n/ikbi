@@ -410,3 +410,12 @@ export const config: IkbiConfig = loadConfig();
 
 /** Exposed for tests: load a config from an arbitrary env without touching the singleton. */
 export { loadConfig };
+
+/**
+ * The raw process environment this config was loaded from — the per-module config
+ * SEAM. core `config.ts` stays frozen to CORE knobs; a MODULE never adds a field
+ * to `IkbiConfig`. Instead it owns its own typed slice by reading its `IKBI_*`
+ * block from here via `moduleEnv(...)` (see `src/core/module-config.ts`). This is
+ * a frozen, shallow snapshot taken at load — modules read, never mutate.
+ */
+export const configEnv: Readonly<NodeJS.ProcessEnv> = Object.freeze({ ...process.env });

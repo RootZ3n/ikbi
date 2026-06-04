@@ -21,8 +21,21 @@ test("the registry lists all 8 frozen contracts with versions", () => {
     [...CONTRACT_NAMES].sort(),
     ["events", "identity", "injection", "provider", "receipt", "substrate", "trust", "workspace"],
   );
-  // All currently at 1.0.0.
-  for (const name of CONTRACT_NAMES) assert.equal(CONTRACT_VERSIONS[name], "1.0.0");
+  // Frozen-core contracts at their additive-bumped versions:
+  //  - identity 1.1.0 — the `OperationContext.dryRun` seam (Step S).
+  //  - provider 1.1.0 — the fetch-guard seam (Step F).
+  // Both are additive-MINOR per the codified rule; the rest remain 1.0.0.
+  const expected: Record<string, string> = {
+    provider: "1.1.0",
+    injection: "1.0.0",
+    identity: "1.1.0",
+    substrate: "1.0.0",
+    receipt: "1.0.0",
+    trust: "1.0.0",
+    events: "1.0.0",
+    workspace: "1.0.0",
+  };
+  for (const name of CONTRACT_NAMES) assert.equal(CONTRACT_VERSIONS[name], expected[name]);
 });
 
 test("the registry is sourced from the contracts themselves (single source of truth)", async () => {
@@ -68,10 +81,12 @@ test("assertContractCompatible throws a clear typed error on mismatch", () => {
 });
 
 test("checkCompatibility reports a non-throwing verdict + reason", () => {
+  // A module pinning identity@1.0.0 stays compatible with the present 1.1.0 (the
+  // additive dryRun seam) — the codified additive-minor rule, demonstrated.
   assert.deepEqual(checkCompatibility("identity", "1.0.0"), {
     contract: "identity",
     target: "1.0.0",
-    present: "1.0.0",
+    present: "1.1.0",
     compatible: true,
     reason: "compatible (same major; present >= target)",
   });
