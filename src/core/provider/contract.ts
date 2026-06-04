@@ -10,8 +10,17 @@
  * This file has zero internal imports on purpose — it is pure contract.
  */
 
-/** Semantic version of the request/response contract. Bump on breaking change. */
-export const CONTRACT_VERSION = "1.0.0";
+/**
+ * Semantic version of the request/response contract.
+ *
+ * 1.1.0 — additive: provider fetch-guard seam (registerFetchGuard/resolveFetchGuard,
+ *         fail-closed). The network-egress floor (Step F) registers a guarded fetch;
+ *         absent a guard, construction fails closed rather than using raw
+ *         globalThis.fetch. New OPTIONAL seam → MINOR bump; modules pinning
+ *         provider@1.0.x stay compatible.
+ * 1.0.0 — frozen-core provider contract.
+ */
+export const CONTRACT_VERSION = "1.1.0";
 
 // ---------------------------------------------------------------------------
 // Request

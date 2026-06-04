@@ -3,8 +3,18 @@ import { test } from "node:test";
 
 import type { ProviderInvocation } from "../contract.js";
 import { ProviderError } from "../contract.js";
+import { registerFetchGuard } from "../fetch-guard.js";
 import { createMimoProvider, createOpenRouterProvider } from "./index.js";
 import { type FetchLike, OpenAICompatibleProvider } from "./openai-compatible.js";
+
+// In production the network-egress floor registers a guarded fetch BEFORE any
+// provider constructs (fail-closed seam). Mirror that precondition for the
+// factory/construction tests below that don't inject their own fetchImpl. The
+// stub throws if actually called — these tests assert construction, not I/O.
+const guardStub: FetchLike = async () => {
+  throw new Error("egress guard stub: not exercised in this test");
+};
+registerFetchGuard(guardStub);
 
 function invocation(overrides?: Partial<ProviderInvocation["request"]>): ProviderInvocation {
   return {

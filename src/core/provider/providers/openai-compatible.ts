@@ -24,6 +24,7 @@ import type {
   TokenUsage,
 } from "../contract.js";
 import { ProviderError } from "../contract.js";
+import { resolveFetchGuard } from "../fetch-guard.js";
 
 /** Minimal fetch signature we depend on (matches the global `fetch`). */
 export type FetchLike = (
@@ -184,15 +185,13 @@ export class OpenAICompatibleProvider implements ModelProvider {
     this.apiKey = opts.apiKey;
     this.extraHeaders = opts.extraHeaders ?? {};
     this.maxErrorDetail = opts.maxErrorDetail ?? DEFAULT_MAX_ERROR_DETAIL;
-    const f = opts.fetchImpl ?? (globalThis.fetch as unknown as FetchLike | undefined);
-    if (f === undefined) {
-      throw new ProviderError("No fetch implementation available", {
-        kind: "config",
-        provider: opts.id,
-        retriable: false,
-      });
-    }
-    this.fetchImpl = f;
+    // Outbound HTTP is gated by the network-egress floor (the fetch-guard seam).
+    // An explicit fetchImpl (tests) still wins; absent one, we resolve the
+    // process-wide GUARDED fetch — FAIL-CLOSED: resolveFetchGuard() throws
+    // EgressGuardMissingError if the egress floor has not loaded. We NEVER fall
+    // back to raw globalThis.fetch, so no provider can reach the network un-guarded.
+    // This is the single chokepoint every construction site flows through.
+    this.fetchImpl = opts.fetchImpl ?? resolveFetchGuard();
   }
 
   async invoke(inv: ProviderInvocation): Promise<ProviderResult> {
