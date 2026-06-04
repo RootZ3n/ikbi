@@ -31,6 +31,26 @@ export interface IkbiConfig {
   readonly env: string;
   /** Model provider layer configuration. */
   readonly provider: ProviderConfig;
+  /** Prompt-injection chokepoint configuration. */
+  readonly injection: InjectionConfig;
+}
+
+/** Configuration for the prompt-injection chokepoint. */
+export interface InjectionConfig {
+  /**
+   * Max bytes of untrusted content the scanner inspects. Content beyond this is
+   * still wrapped (wrapping is unconditional), but the scan is marked truncated.
+   * `IKBI_INJECTION_MAX_SCAN_BYTES`, default 1_000_000.
+   */
+  readonly maxScanBytes: number;
+  /**
+   * Hard cap (bytes) on raw content accepted for wrapping. Content beyond this is
+   * truncated with an explicit marker — closes the memory/context-DoS vector.
+   * `IKBI_INJECTION_MAX_CONTENT_BYTES`, default 5_000_000.
+   */
+  readonly maxContentBytes: number;
+  /** Max characters of a matched excerpt retained in findings/logs. `IKBI_INJECTION_EXCERPT_MAX`, default 160. */
+  readonly excerptMaxChars: number;
 }
 
 /** A provider HTTP endpoint (base URL + optional API key). */
@@ -193,6 +213,23 @@ function loadConfig(env: NodeJS.ProcessEnv = process.env): IkbiConfig {
     logLevel,
     env: runtimeEnv,
     provider: loadProviderConfig(env, stateRoot),
+    injection: {
+      maxScanBytes: parsePositiveInt(
+        "IKBI_INJECTION_MAX_SCAN_BYTES",
+        env.IKBI_INJECTION_MAX_SCAN_BYTES,
+        1_000_000,
+      ),
+      maxContentBytes: parsePositiveInt(
+        "IKBI_INJECTION_MAX_CONTENT_BYTES",
+        env.IKBI_INJECTION_MAX_CONTENT_BYTES,
+        5_000_000,
+      ),
+      excerptMaxChars: parsePositiveInt(
+        "IKBI_INJECTION_EXCERPT_MAX",
+        env.IKBI_INJECTION_EXCERPT_MAX,
+        160,
+      ),
+    },
   });
 }
 

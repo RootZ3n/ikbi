@@ -34,6 +34,15 @@ export interface ModelMessage {
   readonly toolCallId?: string;
   /** Optional name (e.g. the tool name for a tool message). */
   readonly name?: string;
+  /**
+   * ADDITIVE (Phase 2 coordination, backward-compatible): marks this message as
+   * carrying neutralized UNTRUSTED content (the output of the injection
+   * chokepoint). It is structural isolation metadata — untrusted content travels
+   * as its own data-role message, never merged into a system/instruction
+   * message. Optional; does not change wire serialization. Existing Phase 1
+   * fields are unchanged. See `src/core/injection`.
+   */
+  readonly untrusted?: boolean;
 }
 
 /** A tool the model may call. Parameters are a JSON Schema object. For later tool-use. */
