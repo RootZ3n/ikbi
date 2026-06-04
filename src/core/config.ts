@@ -37,6 +37,23 @@ export interface IkbiConfig {
   readonly identity: IdentityConfig;
   /** Concurrency-safe substrate configuration. */
   readonly substrate: SubstrateConfig;
+  /** Receipt store (audit trail) configuration. */
+  readonly receipt: ReceiptConfig;
+}
+
+/**
+ * Configuration for the receipt store — a lean, retention-bounded OPERATIONAL log
+ * (attributed, ordered, durable troubleshooting data). It is NOT a cryptographic
+ * audit ledger; see the note in src/core/receipt/contract.ts.
+ */
+export interface ReceiptConfig {
+  /** Directory for the receipt log. `IKBI_RECEIPT_DIR`, default `<stateRoot>/receipts`. */
+  readonly dir: string;
+  /**
+   * Retention window in days. Receipts older than this are hard-deleted by
+   * `prune()`. `IKBI_RECEIPT_RETENTION_DAYS`, default 30 (operator-configurable).
+   */
+  readonly retentionDays: number;
 }
 
 /** Configuration for the concurrency-safe substrate (atomic writes + locking). */
@@ -273,6 +290,7 @@ function loadConfig(env: NodeJS.ProcessEnv = process.env): IkbiConfig {
       ),
     },
     identity: loadIdentityConfig(env, stateRoot),
+    receipt: loadReceiptConfig(env, stateRoot),
     substrate: {
       lockTimeoutMs: parsePositiveInt("IKBI_LOCK_TIMEOUT_MS", env.IKBI_LOCK_TIMEOUT_MS, 10_000),
       lockStaleMs: parsePositiveInt("IKBI_LOCK_STALE_MS", env.IKBI_LOCK_STALE_MS, 30_000),
@@ -296,6 +314,19 @@ function loadIdentityConfig(env: NodeJS.ProcessEnv, stateRoot: string): Identity
     operatorAgentId: optStr(env.IKBI_OPERATOR_AGENT_ID) ?? "operator",
     tokenSalt: saltRaw ?? DEFAULT_TOKEN_SALT,
     tokenSaltIsDefault: saltRaw === undefined,
+  };
+}
+
+function loadReceiptConfig(env: NodeJS.ProcessEnv, stateRoot: string): ReceiptConfig {
+  const dirRaw = optStr(env.IKBI_RECEIPT_DIR);
+  const dir = dirRaw
+    ? isAbsolute(dirRaw)
+      ? dirRaw
+      : resolve(process.cwd(), dirRaw)
+    : resolve(stateRoot, "receipts");
+  return {
+    dir,
+    retentionDays: parsePositiveInt("IKBI_RECEIPT_RETENTION_DAYS", env.IKBI_RECEIPT_RETENTION_DAYS, 30),
   };
 }
 

@@ -97,6 +97,27 @@ Each phase has a deliverable, a specific verification bar, and a commit. We
 checkpoint between phases (verify against the bar, then proceed) — we do NOT
 re-open settled decisions. Stop only if something breaks.
 
+## Downstream notes — receipts are EPHEMERAL operational data
+
+The receipt store (Phase 5) is a lean, retention-bounded operational log
+(attributed, ordered, durable; tamper-evidence intentionally omitted —
+single-operator local engine). Receipts are hard-deleted after the retention
+window (`IKBI_RECEIPT_RETENTION_DAYS`, default 30). Phases that build on receipts
+MUST account for this:
+
+- **Memory persists its OWN derived projections.** Receipts are ephemeral — once
+  pruned they are gone. Learned patterns / projections must live in memory's own
+  durable state, NEVER re-derived on demand from receipts (the source rows may no
+  longer exist). Project memory over receipts as they arrive; persist the result.
+- **Trust is retention-window-scoped.** `summarizeAgent().firstTimestamp` is the
+  oldest SURVIVING receipt, not the agent's true first appearance. If trust needs
+  lifetime / all-time stats, it must persist those itself; the receipt store only
+  reflects the current retention window.
+- **Undo is near-term only.** The reversibility hook (`ReceiptChange`) lets undo
+  reverse an operation while its receipt exists; after the retention window the
+  receipt — and thus the undo data — is gone, so the operation can no longer be
+  reversed via receipts. Undo is a near-term capability, not an indefinite one.
+
 ## Your job on any task
 
 Build exactly what the phase prompt specifies, to its contract, verified. Don't
