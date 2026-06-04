@@ -8,6 +8,7 @@
 
 import { config } from "../config.js";
 import { childLogger } from "../log.js";
+import { cachedInvoke } from "../../modules/cache/index.js";
 import { ProviderInvoker } from "./invoke.js";
 import type { ModelRequest, ModelResponse } from "./contract.js";
 import {
@@ -75,9 +76,17 @@ export const invoker = new ProviderInvoker({
   logger: log,
 });
 
-/** The frozen entry point. Every model call in the engine goes through this. */
+/**
+ * The frozen entry point. Every model call in the engine goes through this.
+ *
+ * The caching floor wraps here — ABOVE the invoker loop and the egress guard. A
+ * cache hit returns a stored response with no network call; a miss falls through
+ * to the unchanged invoker path and stores ONLY on a fully successful response
+ * (errors/timeouts/guard denials are never cached). Opt-out-safe: when caching is
+ * disabled this is an exact passthrough to `invoker.invokeModel`.
+ */
 export function invokeModel(request: ModelRequest): Promise<ModelResponse> {
-  return invoker.invokeModel(request);
+  return cachedInvoke(request, () => invoker.invokeModel(request));
 }
 
 // --- re-export the frozen contract + building blocks ---
