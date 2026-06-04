@@ -35,6 +35,21 @@ export interface IkbiConfig {
   readonly injection: InjectionConfig;
   /** Agent identity / multi-tenancy configuration. */
   readonly identity: IdentityConfig;
+  /** Concurrency-safe substrate configuration. */
+  readonly substrate: SubstrateConfig;
+}
+
+/** Configuration for the concurrency-safe substrate (atomic writes + locking). */
+export interface SubstrateConfig {
+  /** Default lock acquisition timeout. `IKBI_LOCK_TIMEOUT_MS`, default 10000. */
+  readonly lockTimeoutMs: number;
+  /**
+   * Age after which a cross-process file lock is considered stale and may be
+   * recovered (alongside dead-PID detection). `IKBI_LOCK_STALE_MS`, default 30000.
+   */
+  readonly lockStaleMs: number;
+  /** Whether atomic writes fsync (durability). `IKBI_FSYNC`, default true. */
+  readonly fsync: boolean;
 }
 
 /** Configuration for the agent identity / multi-tenancy layer. */
@@ -258,6 +273,11 @@ function loadConfig(env: NodeJS.ProcessEnv = process.env): IkbiConfig {
       ),
     },
     identity: loadIdentityConfig(env, stateRoot),
+    substrate: {
+      lockTimeoutMs: parsePositiveInt("IKBI_LOCK_TIMEOUT_MS", env.IKBI_LOCK_TIMEOUT_MS, 10_000),
+      lockStaleMs: parsePositiveInt("IKBI_LOCK_STALE_MS", env.IKBI_LOCK_STALE_MS, 30_000),
+      fsync: parseBool(env.IKBI_FSYNC, true),
+    },
   });
 }
 
