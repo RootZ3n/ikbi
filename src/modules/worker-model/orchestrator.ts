@@ -32,7 +32,7 @@ import { neutralizeUntrusted as coreNeutralize } from "../../core/injection/inde
 import { receipts as coreReceipts } from "../../core/receipt/index.js";
 import { trust as coreTrust } from "../../core/trust/index.js";
 import { workspaces as coreWorkspaces } from "../../core/workspace/index.js";
-import type { DiscardResult, PromoteResult, WorkspaceHandle } from "../../core/workspace/contract.js";
+import type { DiscardResult, PromoteResult, WorkspaceEvaluation, WorkspaceHandle } from "../../core/workspace/contract.js";
 import type { ModelRequest, ModelResponse } from "../../core/provider/contract.js";
 
 import { builder } from "./builder.js";
@@ -71,7 +71,7 @@ export interface OrchestratorDeps {
   readonly trust?: { recordOutcome: (input: RecordOutcomeInput) => Promise<TrustDecision> };
   readonly workspaces?: {
     allocate: (opts: { targetRepo: string; identity: AgentIdentity; baseBranch?: string; label?: string }) => Promise<WorkspaceHandle>;
-    promote: (handle: WorkspaceHandle, approval: { evaluation: { approved: boolean }; message?: string }) => Promise<PromoteResult>;
+    promote: (handle: WorkspaceHandle, approval: { evaluation: WorkspaceEvaluation; message?: string }) => Promise<PromoteResult>;
     discard: (handle: WorkspaceHandle) => Promise<DiscardResult>;
   };
   readonly receipts?: { append: (input: unknown, identity: AgentIdentity) => Promise<unknown> };
@@ -95,6 +95,47 @@ const DEFAULT_ROLES: Record<WorkerRole, RoleFn> = { scout, builder, critic, veri
 async function lazyInvokeModel(request: ModelRequest): Promise<ModelResponse> {
   const mod = await import("../../core/provider/index.js");
   return mod.invokeModel(request);
+}
+
+/** The promote/discard decision read from the integrator's result. */
+interface IntegratorDecision {
+  readonly promote: boolean;
+  readonly evaluation: WorkspaceEvaluation;
+  readonly rationale?: string;
+}
+
+/**
+ * Read the integrator's promote/discard DECISION (fail-closed, safely narrowed).
+ * Promote ONLY on an affirmative, well-formed integrator promote decision —
+ * integrator absent, outcome !== "success", `decision !== "promote"`, or a
+ * malformed/non-approving evaluation all fall to DISCARD. Never throws on
+ * malformed detail (it is an open `Record<string, unknown>`).
+ */
+function readIntegratorDecision(integ: RoleResult | undefined): IntegratorDecision {
+  const deny = (rationale?: string): IntegratorDecision => ({
+    promote: false,
+    evaluation: { approved: false },
+    ...(rationale !== undefined ? { rationale } : {}),
+  });
+  if (integ === undefined || integ.outcome !== "success") return deny();
+  const detail = integ.detail;
+  if (typeof detail !== "object" || detail === null) return deny();
+  const d = detail as Record<string, unknown>;
+  const rationale = typeof d.rationale === "string" ? d.rationale : undefined;
+  if (d.decision !== "promote") return deny(rationale);
+  // A promote decision MUST carry a well-formed APPROVING evaluation.
+  const ev = d.evaluation;
+  if (typeof ev !== "object" || ev === null || (ev as Record<string, unknown>).approved !== true) {
+    return deny(rationale);
+  }
+  const e = ev as Record<string, unknown>;
+  const evaluation: WorkspaceEvaluation = {
+    approved: true,
+    ...(typeof e.score === "number" ? { score: e.score } : {}),
+    ...(typeof e.reason === "string" ? { reason: e.reason } : {}),
+    ...(typeof e.evaluatorId === "string" ? { evaluatorId: e.evaluatorId } : {}),
+  };
+  return { promote: true, evaluation, ...(rationale !== undefined ? { rationale } : {}) };
 }
 
 /** Build an orchestrator. The default deps wire the real frozen singletons. */
@@ -263,22 +304,33 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       throw err;
     }
 
-    // Terminal: promote on full success, discard otherwise.
+    // Terminal: ENACT the integrator's promote/discard DECISION (the integrator
+    // decides; the orchestrator owns the lifecycle). Promote IFF the integrator
+    // returned an affirmative, well-formed promote decision; anything else discards
+    // (fail-closed). If a role hard-failed, the loop broke before the integrator ran,
+    // so its result is absent → fail-closed discard. That composition is intentional.
+    const decision = readIntegratorDecision(results.find((r) => r.role === "integrator"));
     let promoted = false;
     let reason: string | undefined;
-    if (overall === "success") {
+    if (decision.promote) {
       const promote = await workspaces.promote(workspace, {
-        evaluation: { approved: true },
-        message: `worker-model: ${task.goal}`,
+        evaluation: decision.evaluation, // sourced from the integrator, NOT hardcoded
+        message: `worker-model: ${task.goal}${decision.rationale !== undefined ? ` — ${decision.rationale}` : ""}`,
       });
       promoted = promote.promoted;
       if (!promoted) {
+        // Conflict: the workspace is reconcilable — downgrade to partial, do NOT discard.
         overall = "partial";
         reason = promote.reason ?? "promote did not land (conflict)";
       }
     } else {
       await workspaces.discard(workspace);
-      reason = `run ended with role outcome "${overall}"`;
+      reason =
+        decision.rationale ??
+        (overall !== "success" ? `run ended with role outcome "${overall}"` : "integrator did not approve promote");
+      // Roles ran to completion but the work was judged not promotable → not a
+      // misleading "success".
+      if (overall === "success") overall = "rejected";
     }
 
     const result: WorkerResult = {

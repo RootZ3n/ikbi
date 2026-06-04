@@ -1,17 +1,82 @@
 /**
- * ikbi worker-model — INTEGRATOR role (stub, pass-1).
+ * ikbi worker-model — INTEGRATOR role (Pass C: the promote DECISION).
  *
- * Scoped (pending 3-eyes): produces the promote DECISION on success / discard on
- * failure. NOTE: the workspace lifecycle (allocate/promote/discard) is EXECUTED by
- * the orchestrator (freeze-critical) — the integrator role supplies the decision
- * the orchestrator enacts, it does not call workspace.promote itself. Body lands
- * in a follow-up pass.
+ * Runs last. Weighs scout/builder/critic/verifier results and returns a
+ * fail-closed promote/discard DECISION. It does NOT call workspace.promote/discard
+ * — the lifecycle stays orchestrator-owned; the integrator only DECIDES, and the
+ * orchestrator enacts (see orchestrator.ts decision wiring).
+ *
+ * SUBTLE — outcome vs decision (mirrors critic's pass-vs-outcome): the integrator
+ * returning `outcome: "success"` means "the integrator DID ITS JOB (reached a
+ * decision)", NOT "promote". The actual promote/discard verdict lives in
+ * `detail.decision`. `outcome: "failure"` is reserved for the integrator's OWN
+ * infrastructure error — which the orchestrator treats as discard (fail-closed).
+ *
+ * Decision (promote ONLY if ALL gates hold; otherwise discard — fail-closed):
+ *   - builder produced work: outcome "success" AND detail.filesWritten non-empty;
+ *   - critic approved:       detail.pass === true;
+ *   - verifier passed:       detail.verdict === "pass".
+ * builder.detail.rejectedToolCalls (if any) is NOTED in the rationale but does not
+ * alone force discard — the critic/verifier verdicts are the gates.
  */
 
-import type { RoleFn } from "./contract.js";
+import type { RoleFn, RoleResult } from "./contract.js";
 
-export const integrator: RoleFn = async (ctx) => ({
-  role: "integrator",
-  outcome: "stub",
-  summary: `integrator role not implemented (pass 1) for task ${ctx.task.taskId}`,
-});
+/** Safe accessor for a role result's open detail bag. */
+function detailOf(result: RoleResult | undefined): Record<string, unknown> {
+  const d = result?.detail;
+  return typeof d === "object" && d !== null ? (d as Record<string, unknown>) : {};
+}
+
+export const integrator: RoleFn = async (ctx) => {
+  try {
+    const builder = ctx.priorResults.find((r) => r.role === "builder");
+    const critic = ctx.priorResults.find((r) => r.role === "critic");
+    const verifier = ctx.priorResults.find((r) => r.role === "verifier");
+
+    const builderDetail = detailOf(builder);
+    const filesWritten = Array.isArray(builderDetail.filesWritten) ? builderDetail.filesWritten : [];
+    const rejected = Array.isArray(builderDetail.rejectedToolCalls) ? builderDetail.rejectedToolCalls : [];
+
+    const builderOk = builder?.outcome === "success" && filesWritten.length > 0;
+    const criticPass = detailOf(critic).pass === true;
+    const verifierPass = detailOf(verifier).verdict === "pass";
+
+    if (builderOk && criticPass && verifierPass) {
+      const note = rejected.length > 0 ? ` (note: ${rejected.length} rejected tool call(s))` : "";
+      const rationale = `promote: builder wrote ${filesWritten.length} file(s), critic pass, verifier pass${note}`;
+      return {
+        role: "integrator",
+        outcome: "success", // "did its job" — the verdict is in detail.decision
+        summary: rationale,
+        detail: { decision: "promote", rationale, evaluation: { approved: true } },
+      };
+    }
+
+    // Identify the FIRST failing gate for a human-readable rationale (fail-closed).
+    let why: string;
+    if (builder === undefined) why = "no builder result";
+    else if (builder.outcome !== "success") why = `builder outcome "${builder.outcome}"`;
+    else if (filesWritten.length === 0) why = "builder wrote no files";
+    else if (critic === undefined) why = "no critic result";
+    else if (!criticPass) why = "critic pass=false";
+    else if (verifier === undefined) why = "no verifier result";
+    else why = "verifier verdict=fail";
+
+    const rationale = `discard: ${why}`;
+    return {
+      role: "integrator",
+      outcome: "success", // it reached a decision — discard is a valid, successful decision
+      summary: rationale,
+      detail: { decision: "discard", rationale, evaluation: { approved: false } },
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      role: "integrator",
+      outcome: "failure", // the integrator's OWN failure → orchestrator discards (fail-closed)
+      summary: `integrator failed: ${msg}`,
+      detail: { decision: "discard", rationale: `integrator error: ${msg}`, evaluation: { approved: false } },
+    };
+  }
+};

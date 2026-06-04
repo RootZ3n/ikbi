@@ -16,8 +16,9 @@ import type { AgentIdentity } from "../../core/identity/contract.js";
 import type { OperationContext } from "../../core/identity/resolver.js";
 import { autonomyForTier, asTier, type TrustDecision } from "../../core/trust/index.js";
 import { tierRank, TRUST_FLOOR } from "../../core/trust/index.js";
-import type { DiscardResult, PromoteResult, WorkspaceHandle } from "../../core/workspace/contract.js";
+import type { DiscardResult, PromoteResult, WorkspaceEvaluation, WorkspaceHandle } from "../../core/workspace/contract.js";
 import { createOrchestrator, type OrchestratorDeps } from "./orchestrator.js";
+import { integrator as realIntegrator } from "./integrator.js";
 import {
   WORKER_ROLES,
   WorkerError,
@@ -129,7 +130,13 @@ function capturingRoles(outcomeFor: (role: WorkerRole) => WorkerOutcome = () => 
   for (const r of WORKER_ROLES) {
     roles[r] = async (ctx) => {
       seen.push(ctx);
-      return { role: r, outcome: outcomeFor(r), summary: r };
+      const outcome = outcomeFor(r);
+      // The integrator returns a well-formed PROMOTE decision by default so the
+      // orchestrator's decision wiring promotes on the happy path.
+      if (r === "integrator" && outcome === "success") {
+        return { role: r, outcome, summary: r, detail: { decision: "promote", rationale: "test: promote", evaluation: { approved: true } } };
+      }
+      return { role: r, outcome, summary: r };
     };
   }
   return { seen, roles };
@@ -271,6 +278,7 @@ test("promote conflict downgrades the run to partial (not promoted)", async () =
   const result = await orch.run(task, parentCtx);
   assert.equal(result.outcome, "partial");
   assert.equal(result.promoted, false);
+  assert.equal(ws.calls.discard, 0, "a conflict is reconcilable — the workspace is NOT discarded");
 });
 
 // ── receipts + trust attributed to the ROLE identity ───────────────────────
@@ -362,7 +370,12 @@ test("real scout/builder/critic + stubbed verifier/integrator → coherent succe
   };
   const roles: Partial<Record<WorkerRole, RoleFn>> = {
     verifier: async () => ({ role: "verifier", outcome: "success", summary: "checks ok (stubbed in test)" }),
-    integrator: async () => ({ role: "integrator", outcome: "success", summary: "promote ok (stubbed in test)" }),
+    integrator: async () => ({
+      role: "integrator",
+      outcome: "success",
+      summary: "promote ok (stubbed in test)",
+      detail: { decision: "promote", rationale: "stubbed promote", evaluation: { approved: true } },
+    }),
   };
 
   const orch = createOrchestrator(
@@ -379,4 +392,116 @@ test("real scout/builder/critic + stubbed verifier/integrator → coherent succe
   // Builder really ran its (real) loop — its detail carries the chokepoint counter.
   const builderDetail = result.roles[1]?.detail as { neutralizedCount: number } | undefined;
   assert.equal(builderDetail?.neutralizedCount, 0, "real builder ran (no tools this run)");
+});
+
+// ── Pass C: integrator decision wiring ─────────────────────────────────────
+
+/** scout/builder/critic/verifier as plain success fakes (orchestrator reads only integrator). */
+const successFakes = (): Partial<Record<WorkerRole, RoleFn>> => ({
+  scout: async () => ({ role: "scout", outcome: "success", summary: "s" }),
+  builder: async () => ({ role: "builder", outcome: "success", summary: "b" }),
+  critic: async () => ({ role: "critic", outcome: "success", summary: "c" }),
+  verifier: async () => ({ role: "verifier", outcome: "success", summary: "v" }),
+});
+
+test("LATENT-BUG FIX: all roles succeed but critic pass=false → integrator discards → NO promote", async () => {
+  // The load-bearing test. The REAL integrator weighs a pass=false critique and
+  // decides discard; the orchestrator must enact that, not promote on overall==success.
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    scout: async () => ({ role: "scout", outcome: "success", summary: "s" }),
+    builder: async () => ({ role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["a.ts"], rejectedToolCalls: [] } }),
+    critic: async () => ({ role: "critic", outcome: "success", summary: "c", detail: { pass: false, feedback: "not good" } }),
+    verifier: async () => ({ role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: [] } }),
+    integrator: realIntegrator,
+  };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles }));
+  const result = await orch.run(task, parentCtx);
+
+  assert.equal(ws.calls.promote, 0, "a pass=false critique is NOT promoted (bug closed)");
+  assert.equal(ws.calls.discard, 1, "discarded instead");
+  assert.equal(result.promoted, false);
+  const integ = result.roles.find((r) => r.role === "integrator");
+  assert.equal(integ?.outcome, "success", "integrator did its job (reached a decision)");
+  assert.equal((integ?.detail as { decision: string }).decision, "discard");
+});
+
+test("happy path: orchestrator promotes with the evaluation SOURCED from the integrator", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  let captured: { evaluation: WorkspaceEvaluation; message?: string } | undefined;
+  const handle = fakeWorkspaceHandle();
+  const calls = { discard: 0 };
+  const workspaces: NonNullable<OrchestratorDeps["workspaces"]> = {
+    allocate: async () => handle,
+    promote: async (h, approval): Promise<PromoteResult> => {
+      captured = approval;
+      return { promoted: true, workspaceId: h.id, targetBranch: h.baseBranch, beforeRef: "a", afterRef: "b" };
+    },
+    discard: async (h): Promise<DiscardResult> => {
+      calls.discard += 1;
+      return { workspaceId: h.id, removed: true };
+    },
+  };
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...successFakes(),
+    integrator: async () => ({
+      role: "integrator",
+      outcome: "success",
+      summary: "promote",
+      detail: { decision: "promote", rationale: "all gates pass", evaluation: { approved: true, reason: "from-integrator", score: 0.91 } },
+    }),
+  };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, workspaces, roles }));
+  const result = await orch.run(task, parentCtx);
+
+  assert.equal(result.promoted, true);
+  assert.equal(calls.discard, 0);
+  assert.equal(captured?.evaluation.approved, true);
+  assert.equal(captured?.evaluation.reason, "from-integrator", "evaluation came from the integrator, not a hardcoded {approved:true}");
+  assert.equal(captured?.evaluation.score, 0.91);
+  assert.match(captured?.message ?? "", /all gates pass/);
+});
+
+test("fail-closed: a promote decision with a malformed/absent evaluation → discard, no promote, no throw", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...successFakes(),
+    // decision says promote but there is NO approving evaluation → must fail closed.
+    integrator: async () => ({ role: "integrator", outcome: "success", summary: "x", detail: { decision: "promote" } }),
+  };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles }));
+  const result = await orch.run(task, parentCtx);
+  assert.equal(ws.calls.promote, 0);
+  assert.equal(ws.calls.discard, 1);
+  assert.equal(result.promoted, false);
+});
+
+test("fail-closed: an integrator that errored (outcome failure) → discard", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...successFakes(),
+    integrator: async () => ({ role: "integrator", outcome: "failure", summary: "boom", detail: { decision: "promote", evaluation: { approved: true } } }),
+  };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles }));
+  await orch.run(task, parentCtx);
+  assert.equal(ws.calls.promote, 0, "a failed integrator never promotes, even if detail says promote");
+  assert.equal(ws.calls.discard, 1);
+});
+
+test("short-circuit: a builder hard-failure → integrator never runs → discard, no promote", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...successFakes(),
+    builder: async () => ({ role: "builder", outcome: "failure", summary: "boom" }),
+    integrator: realIntegrator,
+  };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles }));
+  const result = await orch.run(task, parentCtx);
+  assert.equal(ws.calls.promote, 0);
+  assert.equal(ws.calls.discard, 1);
+  assert.ok(!result.roles.some((r) => r.role === "integrator"), "integrator never dispatched (loop broke at builder)");
 });
