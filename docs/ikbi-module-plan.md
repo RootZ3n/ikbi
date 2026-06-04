@@ -149,7 +149,7 @@ With Step S done, these parallelize cleanly and concurrently (own dirs):
 | worker-model | provider, injection, identity, trust, workspace, events, receipts, caching |
 | gate-wall | trust (`autonomyForTier`), workspace (`PromoteGovernance` seam), receipts, events, identity |
 | subagent-spawning | worker-model, workspace, identity (`spawnedFrom`), events |
-| mcp→model-loop | provider (tool-loop), injection (MCP results untrusted), egress, events, identity |
+| mcp→model-loop | provider (tool-loop), injection (MCP results untrusted), egress, gate-wall (outbound tool-call gating), events, identity |
 | dependency-install | egress, gate-wall, workspace (install in sandbox), receipts, identity |
 | governed-sudo/curl | egress, gate-wall, receipts, identity, events |
 | lab-context-memory | receipts (read-seam, project-scoped), substrate (durable projections), events |
@@ -211,6 +211,14 @@ With Step S done, these parallelize cleanly and concurrently (own dirs):
 8. **MCP untrusted-content enforcement.** Confirm MCP tool results are MANDATORY
    through `neutralizeUntrusted` (source `mcp_result`) before entering the model
    loop — enforced by the module, not optional.
+
+   Security-driven dependency correction (not architecture drift): mcp→model-loop
+   gates outbound MCP tool calls through gate-wall's exec action. MCP tool
+   invocations are outbound actions; leaving them ungoverned would make MCP a bypass
+   around the governed-exec/gate-wall enforcement layer. gate-wall added to
+   mcp→model-loop's contract-deps accordingly. Decision #8 (neutralize MCP results
+   inbound) is unchanged; this addresses the outbound direction the original table
+   did not cover.
 9. **Memory projection schema.** What learned projections `lab-context-memory`
    persists (since receipts age out): success/failure patterns per agent+project,
    capability registry of "what exists," drift baselines? Its durable schema is a
