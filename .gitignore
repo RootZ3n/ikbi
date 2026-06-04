@@ -6,6 +6,8 @@ dist/
 
 # Runtime state (never commit)
 state/
+# Legacy/alternate lab-memory location (default now lives under state/; belt-and-suspenders)
+.ikbi/
 
 # Environment / secrets
 .env

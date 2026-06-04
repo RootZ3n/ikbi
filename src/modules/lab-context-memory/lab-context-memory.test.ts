@@ -13,7 +13,8 @@ import type { ValidatedIdentity } from "../../core/identity/resolver.js";
 import type { Receipt, ReceiptQuery } from "../../core/receipt/contract.js";
 import { createLabMemory, type MemoryStore } from "./memory.js";
 import { LabMemoryError, type MemoryEntry } from "./contract.js";
-import type { LabContextMemoryConfig } from "./config.js";
+import { DEFAULT_MEMORY_DIR, loadLabContextMemoryConfig, type LabContextMemoryConfig } from "./config.js";
+import { config as coreConfig } from "../../core/config.js";
 import type { LabMemEventPayload } from "./events.js";
 
 const silent = () => pino({ level: "silent" });
@@ -259,4 +260,22 @@ test("labmem.* events emit on record/project/query without leaking entry values"
   assert.ok(types.includes("labmem.queried"));
   for (const e of ev.sent) assert.equal(e.source, "lab-context-memory");
   assert.ok(!JSON.stringify(ev.sent).includes("ENTRY-SECRET"), "entry values are NOT in events");
+});
+
+// ── default dir lives under the (gitignored) state root; env override wins ────
+
+test("the default memory dir lives UNDER the engine state root (covered by the state/ gitignore)", () => {
+  assert.equal(DEFAULT_MEMORY_DIR, join(coreConfig.stateRoot, "lab-context-memory"), "default mirrors receipts/trust under stateRoot");
+  assert.ok(DEFAULT_MEMORY_DIR.startsWith(coreConfig.stateRoot), "default is inside the state root, not a CWD .ikbi/ path");
+});
+
+test("IKBI_LAB_CONTEXT_MEMORY_DIR override still wins (operator points at a shared lab location)", () => {
+  // A fake reader standing in for moduleEnv: DIR resolves to the override.
+  const reader = {
+    bool: (_s: string, fb: boolean) => fb,
+    int: (_s: string, fb: number) => fb,
+    path: (_s: string, _fb: string) => "/srv/lab/shared-memory",
+  } as unknown as Parameters<typeof loadLabContextMemoryConfig>[0];
+  const cfg = loadLabContextMemoryConfig(reader);
+  assert.equal(cfg.memoryDir, "/srv/lab/shared-memory", "the env override repoints the store");
 });

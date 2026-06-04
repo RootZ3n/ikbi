@@ -5,19 +5,31 @@
  * (module plan ## 8). The reader auto-prefixes `IKBI_LAB_CONTEXT_MEMORY_`.
  *
  *   IKBI_LAB_CONTEXT_MEMORY_ENABLED  on/off. DEFAULT ON. Disabled ⇒ writes refuse.
- *   IKBI_LAB_CONTEXT_MEMORY_DIR      the SHARED LAB-MEMORY directory. Named with the
- *                                    ikbi prefix today, but this is the cross-agent
- *                                    store other lab agents (Ptah, Peh) will point at
- *                                    once their transport/auth lands — NOT ikbi-private.
+ *   IKBI_LAB_CONTEXT_MEMORY_DIR      the SHARED LAB-MEMORY directory. DEFAULT lives
+ *                                    UNDER the engine state root (`<stateRoot>/lab-
+ *                                    context-memory`), exactly like receipts/trust/
+ *                                    workspaces — so the gitignored `state/` covers it
+ *                                    and lab memory can never be committed. Set this
+ *                                    override to point at a SHARED lab location that
+ *                                    other agents (Ptah, Peh, …) also use — NOT
+ *                                    ikbi-private. The override always wins.
  *   IKBI_LAB_CONTEXT_MEMORY_MAX_RECEIPTS_PER_PROJECTION  cap per projection run.
  */
 
+import { resolve } from "node:path";
+
+import { config } from "../../core/config.js";
 import { moduleEnv } from "../../core/module-config.js";
 
 const env = moduleEnv("lab-context-memory");
 
-/** Default shared lab-memory directory (operator points other agents at the same dir later). */
-export const DEFAULT_MEMORY_DIR = ".ikbi/lab-context-memory";
+/**
+ * Default lab-memory directory — UNDER the shared engine state root (the same
+ * `config.stateRoot` receipts/trust/workspaces derive from), so the `state/`
+ * gitignore covers it and lab data cannot accidentally be committed. The env
+ * override repoints it at a shared lab location when other agents wire in.
+ */
+export const DEFAULT_MEMORY_DIR = resolve(config.stateRoot, "lab-context-memory");
 /** Cap on receipts read per projection run (bounded work). */
 export const DEFAULT_MAX_RECEIPTS_PER_PROJECTION = 1_000;
 
