@@ -1,0 +1,335 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+
+import { pino } from "pino";
+
+import type { EventBusSurface, EventInput, IkbiEvent } from "../../core/events/index.js";
+import { beginOperation, IdentityResolver } from "../../core/identity/resolver.js";
+import { AgentRegistry, hashToken } from "../../core/identity/registry.js";
+import type { AgentRecord } from "../../core/identity/registry.js";
+import type { AgentIdentity } from "../../core/identity/contract.js";
+import type { OperationContext } from "../../core/identity/resolver.js";
+import { autonomyForTier, asTier, type TrustDecision } from "../../core/trust/index.js";
+import { tierRank, TRUST_FLOOR } from "../../core/trust/index.js";
+import type { DiscardResult, PromoteResult, WorkspaceHandle } from "../../core/workspace/contract.js";
+import { createOrchestrator, type OrchestratorDeps } from "./orchestrator.js";
+import {
+  WORKER_ROLES,
+  WorkerError,
+  type RoleContext,
+  type RoleFn,
+  type WorkerOutcome,
+  type WorkerRole,
+  type WorkerTask,
+} from "./contract.js";
+
+const silent = () => pino({ level: "silent" });
+
+/** Build a resolver over a fresh registry (mints REAL ValidatedIdentities). */
+function makeResolver(agents: AgentRecord[]) {
+  const registry = new AgentRegistry({ agents });
+  return new IdentityResolver({ registry, logger: silent(), now: () => 1000 });
+}
+
+/** A parent context + a role-resolving function, both backed by one registry. */
+function makeIdentities(parentTier: string, workerTier: string) {
+  const resolver = makeResolver([
+    { agentId: "parent-1", kind: "agent", functionalRole: "lead", defaultTrustTier: parentTier, tokenHashes: [hashToken("parent-secret")] },
+    { agentId: "worker-1", kind: "agent", functionalRole: "worker", defaultTrustTier: workerTier, tokenHashes: [hashToken("worker-secret")] },
+  ]);
+  const parent = resolver.resolve({ token: "parent-secret" });
+  const parentCtx = beginOperation(parent, { requestId: "req-1" });
+  const resolveIdentity: NonNullable<OrchestratorDeps["resolveIdentity"]> = (claim, ctx) => resolver.resolve(claim, ctx);
+  const roleClaim: NonNullable<OrchestratorDeps["roleClaim"]> = () => ({ token: "worker-secret" });
+  return { parentCtx, resolveIdentity, roleClaim };
+}
+
+function fakeWorkspaceHandle(): WorkspaceHandle {
+  return {
+    id: "wsabcd",
+    targetRepo: "/repo",
+    baseBranch: "main",
+    baseRef: "deadbeef",
+    scratchBranch: "ikbi/ws/wsabcd",
+    path: "/tmp/wsabcd",
+    identity: { agentId: "parent-1" },
+    state: "allocated",
+    createdAt: 1000,
+  };
+}
+
+function fakeWorkspaces(promoteOk = true) {
+  const calls = { allocate: [] as unknown[], promote: 0, discard: 0 };
+  const handle = fakeWorkspaceHandle();
+  const workspaces: NonNullable<OrchestratorDeps["workspaces"]> = {
+    allocate: async (opts) => {
+      calls.allocate.push(opts);
+      return handle;
+    },
+    promote: async (h): Promise<PromoteResult> => {
+      calls.promote += 1;
+      return promoteOk
+        ? { promoted: true, workspaceId: h.id, targetBranch: h.baseBranch, beforeRef: "a", afterRef: "b" }
+        : { promoted: false, workspaceId: h.id, targetBranch: h.baseBranch, beforeRef: "a", conflicts: ["x.ts"], reason: "conflict" };
+    },
+    discard: async (h): Promise<DiscardResult> => {
+      calls.discard += 1;
+      return { workspaceId: h.id, removed: true };
+    },
+  };
+  return { workspaces, calls, handle };
+}
+
+function fakeTrust() {
+  const calls: Array<{ agentId: string; operation: string; status: string }> = [];
+  const trust = {
+    recordOutcome: async (input: { agentId: string; operation: string; status: string; defaultTrustTier: string }): Promise<TrustDecision> => {
+      calls.push({ agentId: input.agentId, operation: input.operation, status: input.status });
+      const tier = asTier(input.defaultTrustTier, TRUST_FLOOR);
+      return { agentId: input.agentId, tier, previousTier: tier, autonomy: autonomyForTier(tier) };
+    },
+  };
+  return { trust, calls };
+}
+
+function fakeReceipts() {
+  const calls: Array<{ operation: string; agentId: string; spawnedFrom?: string }> = [];
+  const receipts = {
+    append: async (input: unknown, identity: AgentIdentity): Promise<unknown> => {
+      const op = (input as { operation: string }).operation;
+      calls.push({ operation: op, agentId: identity.agentId, ...(identity.spawnedFrom !== undefined ? { spawnedFrom: identity.spawnedFrom } : {}) });
+      return {};
+    },
+  };
+  return { receipts, calls };
+}
+
+function fakeBus() {
+  const sent: Array<EventInput<unknown>> = [];
+  const bus: EventBusSurface = {
+    publish: <P>(input: EventInput<P>): IkbiEvent<P> => {
+      sent.push(input as EventInput<unknown>);
+      return { ...input, contractVersion: "1.0.0", id: `e${sent.length}`, seq: sent.length, timestamp: 0 } as IkbiEvent<P>;
+    },
+    subscribe: () => ({ id: "sub", unsubscribe: () => {}, stats: () => ({ delivered: 0, dropped: 0, failures: 0, queued: 0 }) }),
+    flush: async () => {},
+  };
+  return { bus, sent };
+}
+
+/** Capturing role set that records each RoleContext and returns a chosen outcome. */
+function capturingRoles(outcomeFor: (role: WorkerRole) => WorkerOutcome = () => "success") {
+  const seen: RoleContext[] = [];
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {};
+  for (const r of WORKER_ROLES) {
+    roles[r] = async (ctx) => {
+      seen.push(ctx);
+      return { role: r, outcome: outcomeFor(r), summary: r };
+    };
+  }
+  return { seen, roles };
+}
+
+const ENABLED = { enabled: true, roleTimeoutMs: 1000, maxConcurrentRuns: 1 };
+const task: WorkerTask = { taskId: "t-1", targetRepo: "/repo", goal: "do the thing" };
+
+function baseDeps(extra: Partial<OrchestratorDeps>): OrchestratorDeps {
+  const ws = fakeWorkspaces();
+  const tr = fakeTrust();
+  const rc = fakeReceipts();
+  const bus = fakeBus();
+  return {
+    config: ENABLED,
+    workspaces: ws.workspaces,
+    trust: tr.trust,
+    receipts: rc.receipts,
+    events: bus.bus,
+    invokeModel: async () => {
+      throw new Error("invokeModel not used in these tests");
+    },
+    ...extra,
+  };
+}
+
+// ── disabled-config behavior (explicit error) ──────────────────────────────
+
+test("a disabled worker-model throws WorkerError(disabled) — no silent no-op", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const orch = createOrchestrator(baseDeps({ config: { ...ENABLED, enabled: false }, resolveIdentity, roleClaim }));
+  await assert.rejects(() => orch.run(task, parentCtx), (e: unknown) => e instanceof WorkerError && e.kind === "disabled");
+});
+
+// ── identity validation ────────────────────────────────────────────────────
+
+test("run rejects a context that does not carry a validated identity", async () => {
+  const { resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const fakeCtx = {
+    contractVersion: "1.1.0",
+    identity: { kind: "agent", identity: { agentId: "spoof", trustTier: "operator" }, authMethod: "agent_token", resolvedAt: 0 },
+    startedAt: 0,
+  } as unknown as OperationContext;
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim }));
+  await assert.rejects(() => orch.run(task, fakeCtx), (e: unknown) => e instanceof WorkerError && e.kind === "identity");
+});
+
+// ── #10 ANTI-ESCALATION (the load-bearing test) ────────────────────────────
+
+test("#10: a spawned role can NEVER exceed the parent's tier (clamped down)", async () => {
+  // Parent at "probation"; the worker role agent is registered "trusted".
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("probation", "trusted");
+  const cap = capturingRoles();
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles }));
+  await orch.run(task, parentCtx);
+
+  assert.equal(cap.seen.length, 5, "all roles dispatched");
+  for (const ctx of cap.seen) {
+    assert.equal(ctx.identity.trustTier, "probation", `role ${ctx.role} clamped to parent tier, not "trusted"`);
+    assert.ok(
+      tierRank(asTier(ctx.identity.trustTier ?? TRUST_FLOOR, TRUST_FLOOR)) >= tierRank("probation"),
+      "role tier never out-ranks the parent",
+    );
+    // The autonomy follows the clamped tier (probation ⇒ sandboxed).
+    assert.equal(ctx.autonomy.sandboxed, true);
+  }
+});
+
+test("#10: clamping holds across parent tiers; a lower role tier is left unchanged", async () => {
+  // Parent "verified", worker registered "trusted" ⇒ role clamped to "verified".
+  {
+    const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("verified", "trusted");
+    const cap = capturingRoles();
+    const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles }));
+    await orch.run(task, parentCtx);
+    for (const ctx of cap.seen) assert.equal(ctx.identity.trustTier, "verified");
+  }
+  // Parent "trusted", worker registered "probation" ⇒ role stays "probation" (below parent, not raised).
+  {
+    const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "probation");
+    const cap = capturingRoles();
+    const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles }));
+    await orch.run(task, parentCtx);
+    for (const ctx of cap.seen) assert.equal(ctx.identity.trustTier, "probation");
+  }
+});
+
+// ── dispatch order + spawnedFrom propagation ───────────────────────────────
+
+test("roles dispatch in canonical order, each carrying spawnedFrom = parent", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const cap = capturingRoles();
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles }));
+  await orch.run(task, parentCtx);
+
+  assert.deepEqual(cap.seen.map((c) => c.role), ["scout", "builder", "critic", "verifier", "integrator"]);
+  for (const ctx of cap.seen) {
+    assert.equal(ctx.identity.spawnedFrom, "parent-1", "spawned under the parent");
+    assert.equal(ctx.identity.functionalRole, ctx.role, "functionalRole set to the role");
+  }
+});
+
+// ── workspace lifecycle: promote on success / discard on failure ───────────
+
+test("success path: workspace allocated then PROMOTED (not discarded)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const cap = capturingRoles();
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, workspaces: ws.workspaces }));
+  const result = await orch.run(task, parentCtx);
+
+  assert.equal(ws.calls.allocate.length, 1, "allocated once");
+  assert.equal(ws.calls.promote, 1, "promoted");
+  assert.equal(ws.calls.discard, 0, "not discarded");
+  assert.equal(result.outcome, "success");
+  assert.equal(result.promoted, true);
+  assert.equal(result.workspaceId, "wsabcd");
+});
+
+test("failure path: a role failure short-circuits, workspace DISCARDED (not promoted)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const cap = capturingRoles((r) => (r === "builder" ? "failure" : "success"));
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, workspaces: ws.workspaces }));
+  const result = await orch.run(task, parentCtx);
+
+  assert.deepEqual(cap.seen.map((c) => c.role), ["scout", "builder"], "short-circuited after builder");
+  assert.equal(ws.calls.promote, 0, "not promoted");
+  assert.equal(ws.calls.discard, 1, "discarded");
+  assert.equal(result.outcome, "failure");
+  assert.equal(result.promoted, false);
+});
+
+test("promote conflict downgrades the run to partial (not promoted)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(false); // promote returns promoted:false (conflict)
+  const cap = capturingRoles();
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, workspaces: ws.workspaces }));
+  const result = await orch.run(task, parentCtx);
+  assert.equal(result.outcome, "partial");
+  assert.equal(result.promoted, false);
+});
+
+// ── receipts + trust attributed to the ROLE identity ───────────────────────
+
+test("each role's outcome is recorded to receipts + trust under the ROLE identity", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const tr = fakeTrust();
+  const rc = fakeReceipts();
+  const cap = capturingRoles();
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, trust: tr.trust, receipts: rc.receipts }));
+  await orch.run(task, parentCtx);
+
+  assert.equal(rc.calls.length, 5, "one receipt per role");
+  assert.equal(tr.calls.length, 5, "one trust outcome per role");
+  for (const c of rc.calls) {
+    assert.equal(c.agentId, "worker-1", "receipt attributed to the role identity");
+    assert.equal(c.spawnedFrom, "parent-1", "role identity carries spawnedFrom");
+  }
+  assert.deepEqual(tr.calls.map((c) => c.operation), WORKER_ROLES.map((r) => `worker.role.${r}`));
+  for (const c of tr.calls) assert.equal(c.status, "success");
+});
+
+// ── events: source + identity attribution ──────────────────────────────────
+
+test("worker.* events emit with source worker-model and identity attribution", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const bus = fakeBus();
+  const cap = capturingRoles();
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, events: bus.bus }));
+  await orch.run(task, parentCtx);
+
+  const types = bus.sent.map((e) => e.type);
+  assert.ok(types.includes("worker.started"));
+  assert.equal(types.filter((t) => t === "worker.role.dispatched").length, 5);
+  assert.equal(types.filter((t) => t === "worker.role.completed").length, 5);
+  assert.ok(types.includes("worker.completed"));
+
+  for (const e of bus.sent) assert.equal(e.source, "worker-model");
+
+  const started = bus.sent.find((e) => e.type === "worker.started");
+  assert.equal(started?.attribution?.identity?.agentId, "parent-1", "run events attributed to parent");
+  const dispatched = bus.sent.find((e) => e.type === "worker.role.dispatched");
+  assert.equal(dispatched?.attribution?.identity?.agentId, "worker-1", "role events attributed to the role identity");
+  assert.equal(dispatched?.attribution?.identity?.spawnedFrom, "parent-1");
+});
+
+test("a failed run emits worker.failed", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const bus = fakeBus();
+  const cap = capturingRoles((r) => (r === "scout" ? "failure" : "success"));
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, events: bus.bus }));
+  await orch.run(task, parentCtx);
+  assert.ok(bus.sent.some((e) => e.type === "worker.failed"));
+  assert.ok(!bus.sent.some((e) => e.type === "worker.completed"));
+});
+
+// ── default role stubs ─────────────────────────────────────────────────────
+
+test("default (un-injected) roles are stubs → run does not promote", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, workspaces: ws.workspaces }));
+  const result = await orch.run(task, parentCtx);
+  assert.equal(result.outcome, "stub", "scout stub short-circuits the run");
+  assert.equal(ws.calls.promote, 0);
+  assert.equal(ws.calls.discard, 1);
+});
