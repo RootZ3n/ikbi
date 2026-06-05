@@ -26,8 +26,9 @@
  *    verification as UNTRUSTED if the builder modified the script surface the verifier
  *    relies on. A test suite the builder rewrote cannot verify the builder's own work.
  *    Fail-closed: a mutated-scripts build CANNOT pass verification (in competitive mode
- *    the judge then disqualifies it). When no diff source is wired, integrity cannot be
- *    proven — a documented limitation surfaced in the verdict detail.
+ *    the judge then disqualifies it). The guard is MANDATORY: without a diff source to
+ *    inspect, integrity cannot be proven, so verification fails closed (untrusted) — a
+ *    missing diff capability is treated exactly like a diff read failure.
  * ─────────────────────────────────────────────────────────────────────────────
  *
  * Read-only: the checks below (`tsc --noEmit`, `test`) do not mutate the workspace.
@@ -86,7 +87,11 @@ export interface VerifierDeps {
    * ValidatedIdentity (#10) + honors `dryRun`. Absent ⇒ the verifier fails closed.
    */
   readonly parentCtx?: OperationContext;
-  /** Workspace diff source (base..scratch) for the LAYER-2 script-integrity guard. */
+  /**
+   * Workspace diff source (base..scratch) for the MANDATORY LAYER-2 script-integrity
+   * guard. Optional in the type (injectable/omittable for tests), but a verifier built
+   * WITHOUT it fails closed at run time (untrusted) — it cannot prove script integrity.
+   */
   readonly diff?: (workspace: WorkspaceHandle) => Promise<string>;
 }
 
@@ -161,25 +166,27 @@ function mapExec(name: string, command: string, res: ExecResult): { check: Check
 export function createVerifier(deps: VerifierDeps = {}): RoleFn {
   const governedExec = deps.governedExec ?? lazyGovernedExec();
   return async (ctx) => {
-    // ── LAYER 2: SCRIPT-INTEGRITY GUARD (before ANY check) ────────────────────
-    let integrityNote: string | undefined;
-    if (deps.diff !== undefined) {
-      let diffText: string;
-      try {
-        diffText = await deps.diff(ctx.workspace);
-      } catch (err) {
-        // Cannot read the diff ⇒ cannot prove integrity ⇒ fail-closed UNTRUSTED.
-        return untrusted(`verification untrusted: workspace diff unavailable (${err instanceof Error ? err.message : String(err)})`);
-      }
-      const mutation = detectScriptMutation(diffText);
-      if (mutation.mutated) {
-        // The builder controls the test command — a passing result cannot be trusted and
-        // must NOT feed the judge/promote. Do NOT run the mutated script as a real check.
-        return untrusted(`verification untrusted: ${mutation.reason}`);
-      }
-    } else {
-      // No diff source wired ⇒ integrity cannot be proven (documented limitation).
-      integrityNote = "integrity unverified: no workspace diff source wired";
+    // ── LAYER 2: SCRIPT-INTEGRITY GUARD (MANDATORY, before ANY check) ─────────
+    // The guard is not optional: WITHOUT the ability to inspect the diff the verifier
+    // cannot prove the builder didn't rewrite package.json's scripts, so it cannot
+    // safely verify. A missing diff capability fails closed EXACTLY like a diff read
+    // failure — both return untrusted before any governed-exec call. (A guard that
+    // silently disappears when its input is absent is not a guard.)
+    if (deps.diff === undefined) {
+      return untrusted("verification untrusted: script-integrity guard unavailable — no workspace diff source wired");
+    }
+    let diffText: string;
+    try {
+      diffText = await deps.diff(ctx.workspace);
+    } catch (err) {
+      // Cannot read the diff ⇒ cannot prove integrity ⇒ fail-closed UNTRUSTED.
+      return untrusted(`verification untrusted: workspace diff unavailable (${err instanceof Error ? err.message : String(err)})`);
+    }
+    const mutation = detectScriptMutation(diffText);
+    if (mutation.mutated) {
+      // The builder controls the test command — a passing result cannot be trusted and
+      // must NOT feed the judge/promote. Do NOT run the mutated script as a real check.
+      return untrusted(`verification untrusted: ${mutation.reason}`);
     }
 
     // ── LAYER 1: GOVERNED CHECKS ──────────────────────────────────────────────
@@ -211,7 +218,7 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
         role: "verifier",
         outcome: "stub",
         summary: "dry-run: governed checks reported intent, executed nothing",
-        detail: { verdict: "dry-run", checks, ...(integrityNote !== undefined ? { integrityNote } : {}) },
+        detail: { verdict: "dry-run", checks },
       };
     }
 
@@ -221,7 +228,7 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
       role: "verifier",
       outcome: allPass ? "success" : "failure",
       summary: allPass ? "all checks passed" : `checks failed: ${failed.join(", ")}`,
-      detail: { verdict: allPass ? "pass" : "fail", checks, ...(integrityNote !== undefined ? { integrityNote } : {}) },
+      detail: { verdict: allPass ? "pass" : "fail", checks },
     };
   };
 }

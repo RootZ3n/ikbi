@@ -177,6 +177,36 @@ test("LAYER 2 clean: a code change / dependency bump (no scripts change) → the
   assert.equal(exec.calls.length, 2, "both governed checks ran — no false-positive untrusted");
 });
 
+// ── LAYER 2: GUARD MANDATORY — diff-not-wired & diff-throws fail CLOSED ───────
+
+test("LAYER 2 no-diff: a verifier built WITHOUT a diff source fails CLOSED (untrusted, zero governed-exec calls)", async () => {
+  // The script-integrity guard is mandatory: with no diff to inspect, the verifier
+  // cannot prove the builder didn't rewrite the test script → it must NOT verify.
+  const exec = execStub(() => ({ executed: true, exitCode: 0, stdoutTail: "would-pass" }));
+  const { ctx } = makeCtx();
+  const result = await createVerifier({ governedExec: exec.governedExec, parentCtx: makeParentCtx() })(ctx); // NO diff dep
+
+  assert.equal(result.outcome, "failure", "a missing integrity guard fails closed, NOT open");
+  const detail = result.detail as { verdict: string; checks: CheckResult[] };
+  assert.equal(detail.verdict, "untrusted");
+  assert.deepEqual(detail.checks, [], "no checks ran");
+  assert.match(result.summary ?? "", /script-integrity guard unavailable/);
+  assert.equal(exec.calls.length, 0, "the governed checks NEVER ran on the no-diff path (no governed-exec call)");
+});
+
+test("LAYER 2 diff-throws: an unreadable workspace diff fails CLOSED (untrusted) — regression", async () => {
+  const exec = execStub(() => { throw new Error("governed-exec must NOT run when integrity is unprovable"); });
+  const { ctx } = makeCtx();
+  const throwingDiff = async () => { throw new Error("git diff failed"); };
+  const result = await createVerifier({ governedExec: exec.governedExec, parentCtx: makeParentCtx(), diff: throwingDiff })(ctx);
+
+  assert.equal(result.outcome, "failure");
+  const detail = result.detail as { verdict: string; checks: CheckResult[] };
+  assert.equal(detail.verdict, "untrusted");
+  assert.match(result.summary ?? "", /diff unavailable/);
+  assert.equal(exec.calls.length, 0, "no governed check ran when the diff could not be read");
+});
+
 // ── LAYER 2: detectScriptMutation unit coverage ──────────────────────────────
 
 test("detectScriptMutation: flags test/build/tsc + the scripts key; ignores deps and non-package files", () => {
