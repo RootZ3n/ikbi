@@ -36,3 +36,5 @@ import "./dependency-install/index.js";
 import "./lab-context-memory/index.js";
 import "./agent-router/index.js";
 import "./self-observation/index.js";
+// Orchestration layer above worker-model (registers the `batch` command on import).
+import "./batch-planner/index.js";
