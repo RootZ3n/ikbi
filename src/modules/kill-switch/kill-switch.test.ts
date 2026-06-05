@@ -8,6 +8,8 @@ import { IdentityResolver } from "../../core/identity/resolver.js";
 import { AgentRegistry, hashToken } from "../../core/identity/registry.js";
 import type { ValidatedIdentity } from "../../core/identity/resolver.js";
 import type { KillSignal } from "../../core/kill-switch.js";
+import { events as coreEvents } from "../../core/events/index.js";
+import { publishKill as corePublishKill } from "../../core/kill-switch.js";
 import { createKillSwitch, type LatchStore } from "./killswitch.js";
 import type { KillState } from "./contract.js";
 import type { KillSwitchConfig } from "./config.js";
@@ -76,11 +78,90 @@ test("a NON-operator attempting an operator kill is REJECTED — not published, 
   assert.equal((await ks.isKilled({})).killed, false, "the engine is NOT killed by an unauthorized request");
 });
 
-test("engine reasons (degraded/shutdown) engage from a validated identity (not operator-gated)", async () => {
-  const ks = mk({ store: memStore().store, publishKill: publishKillSpy().publishKill });
-  const r = await ks.degrade({ note: "circuit open" }, AGENT()); // non-operator, but reason=degraded
-  assert.equal(r.engaged, true);
-  const sig = (await ks.status()).signals[0];
+// ── AUTHORIZATION BY IMPACT (C3a — the gate is on IMPACT, not the reason string) ──
+
+test("C3a: a NON-operator is REJECTED for a work-halting kill of ANY reason/scope (gate by impact)", async () => {
+  // The bug was that only reason==="operator" was gated — a non-operator could engage a
+  // policy/shutdown hard engine kill. Prove EVERY work-halting (reason, scope) is rejected.
+  const reasons: Array<KillSignal["reason"]> = ["operator", "policy", "shutdown"];
+  const scopes: Array<{ scope: KillSignal["scope"]; target?: string }> = [
+    { scope: "engine" },
+    { scope: "agent", target: "worker-7" },
+    { scope: "run", target: "task-42" },
+    { scope: "operation", target: "req-1" },
+  ];
+  for (const reason of reasons) {
+    for (const { scope, target } of scopes) {
+      const ms = memStore();
+      const pk = publishKillSpy();
+      const ev = captureEvents();
+      const ks = mk({ store: ms.store, publishKill: pk.publishKill, publish: ev.publish });
+      const signal: KillSignal = { reason, mode: "hard", scope, ...(target !== undefined ? { target } : {}) };
+      const r = await ks.kill(signal, AGENT()); // a VALIDATED non-operator
+      assert.equal(r.engaged, false, `non-operator ${reason}/${scope} must be rejected`);
+      assert.match(r.reason ?? "", /operator-tier/);
+      assert.equal(pk.calls.length, 0, "no seam publish on an unauthorized kill");
+      assert.equal(ms.m.get("state")?.signals.length ?? 0, 0, "no latch set");
+      assert.ok(ev.types().includes("killswitch.rejected"));
+      assert.equal((await ks.isKilled({ agentId: "worker-7", runId: "task-42", requestId: "req-1" })).killed, false, "isKilled stays false");
+    }
+  }
+});
+
+test("C3a: an operator-tier identity CAN engage a work-halting kill of ANY reason", async () => {
+  for (const reason of ["operator", "policy", "shutdown"] as Array<KillSignal["reason"]>) {
+    const ks = mk({ store: memStore().store, publishKill: publishKillSpy().publishKill });
+    const r = await ks.kill({ reason, mode: "hard", scope: "engine" }, OPERATOR());
+    assert.equal(r.engaged, true, `operator ${reason} engages`);
+    assert.equal((await ks.isKilled({})).killed, true);
+  }
+});
+
+// ── C3b — THE FORGE TEST: a raw seam publish cannot forge an OBEYED kill ──────
+
+test("C3b forge: a direct core publishKill does NOT make isKilled killed — only an authorized engage does", async () => {
+  const ms = memStore();
+  // Default subscribe/seam wiring (the real core bus) — NOT injecting publishKill/onKill.
+  const ks = createKillSwitch({ config: CFG, store: ms.store, now: () => 1 });
+  // A direct, UNGATED core publishKill (bypassing the module authorization entirely).
+  corePublishKill({ reason: "operator", mode: "hard", scope: "engine", note: "forged" });
+  await coreEvents.flush();
+  assert.equal((await ks.isKilled({})).killed, false, "a raw seam event cannot forge an obeyed kill");
+  assert.equal(ms.m.get("state")?.signals.length ?? 0, 0, "a raw event is NOT a write path to the durable latch");
+  // ONLY the authorized module path makes isKilled true.
+  await ks.kill(engineKill, OPERATOR());
+  assert.equal((await ks.isKilled({})).killed, true, "the authorized module engage is the sole writer of the obeyed latch");
+});
+
+// ── BLOCKER 4 — the durable latch read FAILS CLOSED ──────────────────────────
+
+test("blocker 4: an unreadable latch (store throws on read) is treated as KILLED, not clear (fail-closed)", async () => {
+  const ev = captureEvents();
+  const throwingStore: LatchStore = {
+    get: async () => { throw new Error("substrate read failed"); },
+    put: async () => {},
+  };
+  const ks = mk({ store: throwingStore, publishKill: publishKillSpy().publishKill, publish: ev.publish });
+  const check = await ks.isKilled({ agentId: "anyone" });
+  assert.equal(check.killed, true, "a failed latch read must fail CLOSED (assume killed)");
+  assert.equal(check.signal?.scope, "engine", "fail-closed kill is engine-scope (everyone)");
+  assert.equal(check.signal?.mode, "soft", "fail-closed kill is a soft kill (prevent new work)");
+  assert.ok(ev.types().includes("killswitch.unreadable"), "a LOUD unreadable-latch event was emitted");
+});
+
+// ── FIX 5 — degrade() is OPERATOR-GATED (a degraded kill halts work) ─────────
+
+test("FIX 5: a non-operator degrade() is REJECTED; an operator degrade() engages a soft degraded kill", async () => {
+  const nonOp = mk({ store: memStore().store, publishKill: publishKillSpy().publishKill });
+  const bad = await nonOp.degrade({ note: "circuit open" }, AGENT());
+  assert.equal(bad.engaged, false, "a non-operator cannot degrade (engine-scope stop-new-work is a DoS surface)");
+  assert.match(bad.reason ?? "", /operator-tier/);
+  assert.equal((await nonOp.isKilled({})).killed, false, "no degraded kill engaged by a non-operator");
+
+  const op = mk({ store: memStore().store, publishKill: publishKillSpy().publishKill });
+  const ok = await op.degrade({ note: "circuit open" }, OPERATOR());
+  assert.equal(ok.engaged, true, "an operator CAN manually degrade");
+  const sig = (await op.status()).signals[0];
   assert.equal(sig?.reason, "degraded");
   assert.equal(sig?.mode, "soft", "degrade is a soft kill (stop new work, finish in-flight)");
 });

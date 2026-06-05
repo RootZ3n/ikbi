@@ -14,13 +14,17 @@
  *       checkpoint; "soft" finishes the current safe step then stops. True mid-model-call
  *       abort is NOT v1 (it needs an AbortSignal threaded through OperationContext — a
  *       deferred frozen-core change). At role/level granularity, v1 hard ≈ soft.
- *   (2) OPERATOR/ENGINE-ONLY AUTHORIZATION — an "operator" kill MUST come from an
- *       operator-tier identity; a non-operator attempting one is REJECTED (not honored,
- *       not published). The raw core publishKill gates nothing; THIS module is the gate.
- *   (3) DEGRADED-SOFT-KILL now, auto-trigger as a SEAM — `degrade()` publishes a
- *       reason:"degraded" mode:"soft" kill (stop new work, finish in-flight). What
- *       DETECTS degradation (circuit-breaker/drift/resource pressure) and calls it is a
- *       deferred seam — a caller invokes `degrade()`.
+ *   (2) AUTHORIZATION BY IMPACT — ANY kill that HALTS work requires an operator-tier
+ *       identity, keyed on IMPACT (does it stop work?) NOT on the `reason` string
+ *       (reason is audit metadata). A non-operator attempting a halt of any reason
+ *       (operator/policy/shutdown/degraded) is REJECTED (not honored, not published).
+ *       The raw core publishKill gates nothing AND is not a write path to the obeyed
+ *       latch (it cannot forge a kill); THIS module's authorized path is the sole gate.
+ *   (3) DEGRADED-SOFT-KILL now, auto-trigger as a SEAM — `degrade()` engages a
+ *       reason:"degraded" mode:"soft" kill (stop new work, finish in-flight). Because a
+ *       degraded kill halts work it is OPERATOR-GATED in v1 (same as kill). What DETECTS
+ *       degradation (circuit-breaker/drift/resource pressure) is a deferred engine-internal
+ *       seam that will call `degrade()` through an engine-internal identity.
  *
  * No frozen-core change (built on the existing kill seam + OperationContext as-is).
  *

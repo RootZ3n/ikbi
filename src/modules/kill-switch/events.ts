@@ -22,3 +22,10 @@ export const killswitchRejected = defineEvent<{ reason: KillReason; scope: KillS
 
 /** The latch was cleared (un-killed) by an operator. */
 export const killswitchCleared = defineEvent<{ clearedCount: number }>("killswitch.cleared");
+
+/**
+ * The durable latch could NOT be read (store error / corruption) — a LOUD fail-closed
+ * signal. The module assumes an engine-scope soft kill until an operator clears or a
+ * restart recovers the read. A killed engine must never silently forget it was killed.
+ */
+export const killswitchUnreadable = defineEvent<{ why: string }>("killswitch.unreadable");

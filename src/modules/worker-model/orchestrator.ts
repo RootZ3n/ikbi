@@ -570,6 +570,18 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         candidates.push(buildCandidate(ws, builderResult, verifierResult, await safeDiffLines(ws)));
       }
 
+      // COOPERATIVE KILL CHECKPOINT (before the IRREVERSIBLE boundary — C6): a kill that
+      // arrives during the FINAL candidate (after the between-candidates check) must NOT
+      // judge or promote. Discard EVERY workspace (no half-promote), surface the kill,
+      // return rejected. Every promote has a kill check immediately before it.
+      const finalKill = await killHalt(task, parentIdentity, parentCtx);
+      if (finalKill !== undefined) {
+        for (const h of handles) await safeDiscard(workspaces, h);
+        const repId = handles[0]?.id;
+        events.publish(workerFailed.create({ taskId: task.taskId, reason: finalKill, ...(repId !== undefined ? { workspaceId: repId } : {}) }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
+        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: repId !== undefined ? rolesByWs.get(repId) ?? [] : [], ...(repId !== undefined ? { workspaceId: repId } : {}), promoted: false, reason: finalKill };
+      }
+
       // 4. JUDGE — pure, no model call. Selects the winner (or null = fail-closed).
       const verdict = judge.judge(candidates);
       events.publish(

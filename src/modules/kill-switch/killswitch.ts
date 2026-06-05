@@ -2,12 +2,23 @@
  * ikbi kill-switch — the durable, authorized kill consumer of the Step-S seam.
  *
  * SAFETY-CRITICAL (3-eyes):
- *  - AUTHORIZATION: an "operator" kill requires an operator-tier identity; a
- *    non-operator is REJECTED — never published, never latched. `clear()` is
- *    operator-only. The raw core publishKill gates nothing; this is the gate.
+ *  - AUTHORIZATION BY IMPACT: ANY kill that HALTS work requires an operator-tier
+ *    identity — the authorization is keyed on IMPACT (does this stop work?), NOT on the
+ *    `reason` string (reason is audit metadata only). A non-operator engaging a
+ *    policy/shutdown/degraded halt is REJECTED exactly like an operator-reason one —
+ *    never published, never latched. `clear()` is operator-only.
+ *  - UNFORGEABLE LATCH: the durable latch is the SOLE source of truth for isKilled(),
+ *    and it is written ONLY by this module's authorized engage()/degrade() path. The
+ *    module does NOT warm/trust the latch from raw inbound engine.kill events — so a
+ *    direct, ungated core publishKill() emits an observable event but CANNOT forge an
+ *    obeyed kill the checkpoints honor. The authorized module path is the only writer.
  *  - DURABLE LATCH: kills persist to a substrate DocumentStore under the state root,
  *    so a kill SURVIVES a restart until an operator clears it. The latch is the source
- *    of truth; isKilled reads it (lazily loaded, kept warm via the seam subscription).
+ *    of truth; isKilled reads it (lazily loaded, warmed from the durable store on boot).
+ *  - FAIL-CLOSED: an unreadable latch (store error / corruption) is NOT treated as
+ *    "not killed" — the module assumes an engine-scope soft kill + emits a LOUD event
+ *    until an operator clears or a restart recovers. A killed engine must never
+ *    silently forget it was killed.
  *  - COOPERATIVE: isKilled is the read the long-running loops call at checkpoints;
  *    this module never aborts anyone — the loops obey.
  */
@@ -19,14 +30,12 @@ import { isValidatedIdentity } from "../../core/identity/index.js";
 import type { ValidatedIdentity } from "../../core/identity/index.js";
 import {
   killTargets,
-  onKill as coreOnKill,
   publishKill as corePublishKill,
   type KillSignal,
   type KillTarget,
 } from "../../core/kill-switch.js";
-import type { Subscription } from "../../core/events/index.js";
 import { killSwitchConfig, LATCH_ID, type KillSwitchConfig } from "./config.js";
-import { killswitchCleared, killswitchEngaged, killswitchRejected } from "./events.js";
+import { killswitchCleared, killswitchEngaged, killswitchRejected, killswitchUnreadable } from "./events.js";
 import type { ClearResult, KillCheck, KillResult, KillState, KillStatus, KillSwitch, DegradeOptions } from "./contract.js";
 
 const EVENT_SOURCE = "kill-switch";
@@ -36,10 +45,35 @@ function signalKey(s: KillSignal): string {
   return `${s.reason}|${s.mode}|${s.scope}|${s.target ?? ""}`;
 }
 
-/** Is this identity operator-tier (the authorization bar for an operator kill / clear)? */
+/** Is this identity operator-tier (the authorization bar for a work-halting kill / clear)? */
 function isOperatorTier(identity: ValidatedIdentity): boolean {
   return isValidatedIdentity(identity) && identity.identity.trustTier === "operator";
 }
+
+/**
+ * Does this signal HALT work? AUTHORIZATION IS BY IMPACT (C3a), not by `reason`. A
+ * "soft" kill stops NEW work; a "hard" kill aborts the current step at the next
+ * checkpoint — BOTH halt work, at every scope (engine/agent/run/operation halts its
+ * subjects). So every kill mode halts; the `reason` string is audit metadata and must
+ * NOT be the authorization key (treating reason:"operator" as the only gated case was
+ * the bug — a non-operator could engage a policy/shutdown/degraded halt).
+ */
+function haltsWork(signal: KillSignal): boolean {
+  return signal.mode === "soft" || signal.mode === "hard";
+}
+
+/**
+ * The FAIL-CLOSED kill assumed when the durable latch is UNREADABLE (store error /
+ * corruption). An engine-scope soft kill (prevent new work) held in memory until an
+ * operator clears or a restart recovers the read. NOT persisted — it is a safe derived
+ * state, not an authorized latch write.
+ */
+const UNREADABLE_LATCH_KILL: KillSignal = Object.freeze({
+  reason: "policy",
+  mode: "soft",
+  scope: "engine",
+  note: "fail-closed: durable kill latch unreadable",
+});
 
 /** Minimal latch store surface (substitutable in tests). */
 export interface LatchStore {
@@ -52,10 +86,9 @@ export interface KillSwitchDeps {
   readonly config?: KillSwitchConfig;
   readonly store?: LatchStore;
   readonly publishKill?: (signal: KillSignal, opts?: { source?: string }) => void;
-  readonly onKill?: (handler: (signal: KillSignal) => void) => Subscription;
   readonly publish?: (input: EventInput<unknown>) => void;
   readonly now?: () => number;
-  /** Subscribe to the bus at construction to keep the latch warm (default true; tests set false). */
+  /** Warm the durable latch from the store at construction (default true; tests set false). */
   readonly subscribe?: boolean;
 }
 
@@ -75,8 +108,18 @@ export function createKillSwitch(deps: KillSwitchDeps = {}): KillSwitch {
     if (loaded) return;
     if (loadPromise === undefined) {
       loadPromise = (async () => {
-        const s = await store.get(LATCH_ID).catch(() => undefined);
-        signals = s !== undefined ? [...s.signals] : [];
+        try {
+          const s = await store.get(LATCH_ID);
+          // A successful read returning undefined is a genuine "no latch" (not killed).
+          signals = s !== undefined ? [...s.signals] : [];
+        } catch (err) {
+          // FAIL CLOSED (blocker 4): an UNREADABLE latch (store error / corruption) must
+          // NOT be silently treated as "not killed" — that would let a killed engine
+          // forget it was killed. Assume an engine-scope soft kill (prevent new work) +
+          // emit a LOUD event, until an operator clears or a restart recovers the read.
+          signals = [UNREADABLE_LATCH_KILL];
+          emit(killswitchUnreadable, { why: err instanceof Error ? err.message : String(err) });
+        }
         loaded = true;
       })();
     }
@@ -99,26 +142,26 @@ export function createKillSwitch(deps: KillSwitchDeps = {}): KillSwitch {
     publish(event.create(payload, { source: EVENT_SOURCE }));
   }
 
-  // Keep the in-memory latch WARM from the live bus (a kill from another path syncs in).
-  const subscribe = deps.subscribe ?? true;
-  if (subscribe) {
-    const sub = (deps.onKill ?? coreOnKill)((signal: KillSignal) => {
-      void ensureLoaded().then(() => latch(signal));
-    });
-    void sub; // held for process lifetime
-  }
-  // Warm the latch shortly after construction (honors a persisted kill near boot).
-  void ensureLoaded();
+  // UNFORGEABLE LATCH (C3b): the module does NOT subscribe to raw inbound engine.kill
+  // events to warm its latch — that was the forge vector (anything can publishKill
+  // ungated). The obeyed latch is written ONLY by the authorized engage()/degrade()
+  // path below. Here we merely warm from the DURABLE store on boot, so a persisted kill
+  // is honored before the first operation (a raw event is observability, not a write path).
+  const warmOnBoot = deps.subscribe ?? true;
+  if (warmOnBoot) void ensureLoaded();
 
   async function engage(signal: KillSignal, identity: ValidatedIdentity): Promise<KillResult> {
     if (!isValidatedIdentity(identity)) {
       emit(killswitchRejected, { reason: signal.reason, scope: signal.scope, why: "no validated identity" });
       return { engaged: false, reason: "no validated identity" };
     }
-    // AUTHORIZATION (Decision 2): an operator kill REQUIRES an operator-tier identity.
-    if (signal.reason === "operator" && !isOperatorTier(identity)) {
-      emit(killswitchRejected, { reason: signal.reason, scope: signal.scope, why: "operator kill requires an operator-tier identity" });
-      return { engaged: false, reason: "operator kill requires an operator-tier identity" };
+    // AUTHORIZATION BY IMPACT (C3a): ANY kill that HALTS work requires an operator-tier
+    // identity — regardless of `reason`. A non-operator can no longer engage a
+    // policy/shutdown/degraded halt by choosing a non-"operator" reason string (that was
+    // the bug: the gate keyed on reason, not impact). reason is audit metadata only.
+    if (haltsWork(signal) && !isOperatorTier(identity)) {
+      emit(killswitchRejected, { reason: signal.reason, scope: signal.scope, why: "a work-halting kill requires an operator-tier identity" });
+      return { engaged: false, reason: "a work-halting kill requires an operator-tier identity" };
     }
     await ensureLoaded();
     latch(signal);
@@ -132,6 +175,14 @@ export function createKillSwitch(deps: KillSwitchDeps = {}): KillSwitch {
     return engage(signal, identity);
   }
 
+  /**
+   * Engage a degraded soft-kill (stop new work, finish in-flight). A degraded kill HALTS
+   * work, so it routes through engage()'s authorization-by-impact gate (FIX 5, routed A):
+   * in v1 it is OPERATOR-GATED, identical to kill() — a non-operator, non-engine caller
+   * cannot degrade (an engine-scope stop-new-work is a DoS surface). The deferred
+   * auto-trigger (circuit-breaker / drift / resource pressure) is an engine-internal seam
+   * that will call this through an engine-internal identity; that path is not built here.
+   */
   async function degrade(opts: DegradeOptions, identity: ValidatedIdentity): Promise<KillResult> {
     const signal: KillSignal = { reason: "degraded", mode: "soft", scope: opts.scope ?? "engine", ...(opts.target !== undefined ? { target: opts.target } : {}), ...(opts.note !== undefined ? { note: opts.note } : {}) };
     return engage(signal, identity);

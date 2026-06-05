@@ -222,6 +222,32 @@ test("competitive: per-workspace builders are spawned through the #10 clamp (no 
   for (const t of cap.builderTiers) assert.equal(t, "verified", "clamped to the parent tier, NOT the worker's trusted");
 });
 
+// ── C6: KILL AFTER THE FINAL CANDIDATE, BEFORE JUDGE/PROMOTE ─────────────────
+
+test("competitive C6: a kill after the final candidate but before judge ⇒ all discarded, no judge, no promote, rejected", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = compWorkspaces();
+  const cap = compRoles((id) => (id === "ws0" ? { typecheck: 0, test: 0 } : { typecheck: 0, test: 0 }));
+  // killHalt call order (competitiveN=2): 1 pre-allocate, 2 before ws0, 3 before ws1,
+  // 4 the NEW final checkpoint (after the last verifier, before judge). Kill ONLY at 4.
+  let calls = 0;
+  const killCheck: NonNullable<OrchestratorDeps["killCheck"]> = async () => {
+    calls += 1;
+    return calls >= 4 ? { killed: true, signal: { mode: "hard" } } : { killed: false };
+  };
+  let judged = 0;
+  const judge = { judge: (c: readonly BuildCandidate[]) => { judged += 1; return deterministicJudge.judge(c); } };
+  const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: cap.roles, judge, killCheck }));
+
+  const r = await orch.run(task, parentCtx);
+  assert.equal(judged, 0, "the judge was NOT called — a kill before the irreversible boundary stops it");
+  assert.equal(ws.promoted.length, 0, "nothing promoted");
+  assert.deepEqual([...ws.discarded].sort(), ["ws0", "ws1"], "EVERY candidate workspace discarded (no leak, no half-promote)");
+  assert.equal(r.promoted, false);
+  assert.equal(r.outcome, "rejected");
+  assert.match(r.reason ?? "", /kill-switch/);
+});
+
 // ── CANDIDATE MAPPING: verifier/builder/diff → BuildCandidate fields ─────────
 
 test("competitive: the judge receives correctly-mapped BuildCandidates", async () => {
