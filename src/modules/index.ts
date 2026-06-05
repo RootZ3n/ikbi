@@ -38,3 +38,6 @@ import "./agent-router/index.js";
 import "./self-observation/index.js";
 // Orchestration layer above worker-model (registers the `batch` command on import).
 import "./batch-planner/index.js";
+// Kill-switch LAST — its index reads the durable latch at engine start (graceful
+// degradation), and registers the `kill`/`unkill`/`kill-status` operator commands.
+import "./kill-switch/index.js";

@@ -14,7 +14,7 @@ export const batchDecomposed = defineEvent<{ batchId: string; subtaskCount: numb
 export const batchLevelStarted = defineEvent<{ batchId: string; level: number; subtaskCount: number }>("batch.level.started");
 /** One subtask's worker run completed. */
 export const batchSubtaskCompleted = defineEvent<{ batchId: string; subtaskId: string; outcome: SubtaskStatus; promoted: boolean }>("batch.subtask.completed");
-/** Scheduling stopped early (conflict or failure). */
-export const batchStopped = defineEvent<{ batchId: string; reason: "conflict" | "failure"; subtaskId: string }>("batch.stopped");
+/** Scheduling stopped early (conflict, failure, or kill). */
+export const batchStopped = defineEvent<{ batchId: string; reason: "conflict" | "failure" | "kill"; subtaskId: string }>("batch.stopped");
 /** The batch finished. */
 export const batchCompleted = defineEvent<{ batchId: string; status: BatchStatus; promotedCount: number }>("batch.completed");

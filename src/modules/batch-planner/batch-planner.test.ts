@@ -246,6 +246,42 @@ test("disabled ⇒ rejected; non-validated identity ⇒ rejected (no model call)
   assert.equal(invoked, 0, "no model call on a refusal");
 });
 
+// ── COOPERATIVE KILL CHECKPOINT (prevent new work, intact promotes) ──────────
+
+test("kill BEFORE decompose ⇒ no model call, nothing built, status stopped-on-kill", async () => {
+  let invoked = 0;
+  const im = async () => { invoked += 1; return modelResponse(PLAN); };
+  const fw = fakeRunWorker();
+  const r = await planner({ invokeModel: im, runWorker: fw.runWorker, killCheck: async () => ({ killed: true, signal: { mode: "hard" } }) }).planAndRun(input(makeCtx()));
+  assert.equal(r.status, "stopped-on-kill");
+  assert.equal(invoked, 0, "no decomposition model call when killed before start");
+  assert.equal(fw.calls.length, 0, "nothing built");
+  assert.equal(r.promotedCount, 0);
+  assert.match(r.reason ?? "", /kill-switch/);
+});
+
+test("kill BEFORE a later level ⇒ earlier levels intact, remaining not-reached, promotes kept", async () => {
+  const fw = fakeRunWorker();
+  // killCheck order: #1 pre-decompose (live), #2 pre-level-0 (live), #3 pre-level-1 (KILLED).
+  let calls = 0;
+  const killCheck = async () => { calls += 1; return { killed: calls >= 3, signal: { mode: "soft" } }; };
+  const r = await planner({ invokeModel: async () => modelResponse(PLAN), runWorker: fw.runWorker, killCheck }).planAndRun(input(makeCtx()));
+  assert.equal(r.status, "stopped-on-kill");
+  const ran = fw.calls.map((t) => t.taskId.replace(/^batch-\d+-/, "")).sort();
+  assert.deepEqual(ran, ["a", "b"], "only level 0 ran; c (level 1) and d (level 2) were never started");
+  assert.equal(r.outcomes.find((o) => o.subtaskId === "c")?.status, "not-reached");
+  assert.equal(r.outcomes.find((o) => o.subtaskId === "d")?.status, "not-reached");
+  assert.equal(r.promotedCount, 2, "a + b promoted and intact (a kill never un-promotes)");
+});
+
+test("not killed ⇒ the batch proceeds normally (checkpoint transparent)", async () => {
+  const fw = fakeRunWorker();
+  const r = await planner({ invokeModel: async () => modelResponse(PLAN), runWorker: fw.runWorker, killCheck: async () => ({ killed: false }) }).planAndRun(input(makeCtx()));
+  assert.equal(r.status, "completed");
+  assert.equal(r.promotedCount, 4);
+  assert.equal(fw.calls.length, 4);
+});
+
 // ── CLI registration + handler ───────────────────────────────────────────────
 
 test("`ikbi batch` is registered (no built-in collision); parseBatchArgs handles --repo", () => {

@@ -128,6 +128,12 @@ export interface BatchPlannerDeps {
   readonly runWorker?: (task: WorkerTask, ctx: OperationContext) => Promise<WorkerResult>;
   /** The conflict-policy seam. Default: stop-and-report (v1). */
   readonly conflictPolicy?: ConflictPolicy;
+  /**
+   * Cooperative kill checkpoint (read-only). Default: the live kill-switch (lazily
+   * imported). Checked before decompose + before each level; a kill stops scheduling
+   * (later levels not run, promoted work intact). NEVER publishes a kill — only OBEYS.
+   */
+  readonly killCheck?: (target: { agentId?: string; runId?: string; requestId?: string }) => Promise<{ killed: boolean; signal?: { mode?: string } }>;
   readonly publish?: (input: EventInput<unknown>) => void;
   readonly now?: () => number;
 }
@@ -144,6 +150,13 @@ export function createBatchPlanner(deps: BatchPlannerDeps = {}): BatchPlanner {
   const neutralize = deps.neutralizeUntrusted ?? coreNeutralize;
   const toUntrusted = deps.toUntrustedMessage ?? coreToUntrusted;
   const runWorker = deps.runWorker ?? coreRunWorker;
+  // Cooperative kill checkpoint (read-only, lazy default — obeys a kill, never publishes).
+  const killCheck =
+    deps.killCheck ??
+    (async (target: { agentId?: string; runId?: string; requestId?: string }) => {
+      const mod = await import("../kill-switch/index.js");
+      return mod.killSwitch.isKilled(target);
+    });
   const conflictPolicy = deps.conflictPolicy ?? stopAndReport;
   const publish = deps.publish ?? ((input: EventInput<unknown>) => void coreEvents.publish(input));
   const now = deps.now ?? Date.now;
@@ -167,6 +180,14 @@ export function createBatchPlanner(deps: BatchPlannerDeps = {}): BatchPlanner {
     if (!config.enabled) return reject("batch-planner is disabled");
     if (!isValidatedIdentity(input.parentCtx.identity)) return reject("parent identity is not a validated identity");
     const identity = input.parentCtx.identity.identity;
+    const killTarget = { agentId: identity.agentId, runId: batchId, ...(input.parentCtx.requestId !== undefined ? { requestId: input.parentCtx.requestId } : {}) };
+
+    // COOPERATIVE KILL CHECKPOINT (prevent NEW work): no decomposition model call, no
+    // builds, when a kill targets this batch.
+    if ((await killCheck(killTarget)).killed) {
+      emit(batchStopped, { batchId, reason: "kill", subtaskId: "" }, identity);
+      return { batchId, status: "stopped-on-kill", outcomes: [], reason: "halted by kill-switch before decomposition", promotedCount: 0 };
+    }
 
     // DECOMPOSE + VALIDATE (fail-closed → rejected, build nothing).
     let subtasks: Subtask[];
@@ -186,10 +207,16 @@ export function createBatchPlanner(deps: BatchPlannerDeps = {}): BatchPlanner {
     // RUN LEVELS — parallel within a level, gated across levels.
     const outcomes = new Map<string, SubtaskOutcome>();
     let promotedCount = 0;
-    let stopped: { reason: "conflict" | "failure"; subtaskId: string } | undefined;
+    let stopped: { reason: "conflict" | "failure" | "kill"; subtaskId: string } | undefined;
 
     for (let li = 0; li < levels.length && stopped === undefined; li += 1) {
       const level = levels[li]!;
+      // COOPERATIVE KILL CHECKPOINT (prevent NEW work): refuse to START a new level when
+      // a kill targets this batch — remaining levels stay not-reached, promoted work intact.
+      if ((await killCheck(killTarget)).killed) {
+        stopped = { reason: "kill", subtaskId: level[0] ?? "" };
+        break;
+      }
       emit(batchLevelStarted, { batchId, level: li, subtaskCount: level.length }, identity);
 
       const levelResults = await Promise.all(
@@ -231,7 +258,14 @@ export function createBatchPlanner(deps: BatchPlannerDeps = {}): BatchPlanner {
       if (!outcomes.has(st.subtaskId)) outcomes.set(st.subtaskId, { subtaskId: st.subtaskId, status: "not-reached", level: levelOf.get(st.subtaskId) ?? -1, promoted: false });
     }
 
-    const status = stopped === undefined ? "completed" : stopped.reason === "conflict" ? "stopped-on-conflict" : "stopped-on-failure";
+    const status =
+      stopped === undefined
+        ? "completed"
+        : stopped.reason === "conflict"
+          ? "stopped-on-conflict"
+          : stopped.reason === "kill"
+            ? "stopped-on-kill"
+            : "stopped-on-failure";
     if (stopped !== undefined) emit(batchStopped, { batchId, reason: stopped.reason, subtaskId: stopped.subtaskId }, identity);
     emit(batchCompleted, { batchId, status, promotedCount }, identity);
 

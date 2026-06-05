@@ -73,7 +73,7 @@ export interface SubtaskOutcome {
 }
 
 /** The overall batch status. */
-export type BatchStatus = "completed" | "stopped-on-conflict" | "stopped-on-failure" | "rejected";
+export type BatchStatus = "completed" | "stopped-on-conflict" | "stopped-on-failure" | "stopped-on-kill" | "rejected";
 
 /** The result of a batch run — plan + per-subtask outcomes + overall status. */
 export interface BatchResult {

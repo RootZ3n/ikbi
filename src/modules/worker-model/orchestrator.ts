@@ -109,6 +109,12 @@ export interface OrchestratorDeps {
   readonly roles?: Partial<Record<WorkerRole, RoleFn>>;
   /** Competitive-mode judge (pure no-model scorer). Default: the live deterministic judge. */
   readonly judge?: { judge: (candidates: readonly BuildCandidate[]) => JudgeResult };
+  /**
+   * Cooperative kill checkpoint (read-only). Default: the live kill-switch (lazily
+   * imported). Checked before starting + at role boundaries; a kill stops cleanly
+   * (discard, no half-promote). NEVER publishes a kill — the loop only OBEYS.
+   */
+  readonly killCheck?: (target: { agentId?: string; runId?: string; requestId?: string }) => Promise<{ killed: boolean; signal?: { mode?: string; reason?: string } }>;
 }
 
 /** A role identity spawned under the parent ceiling (#10). */
@@ -187,6 +193,14 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   const neutralizeUntrusted = deps.neutralizeUntrusted ?? coreNeutralize;
   const gateWall = deps.gateWall; // optional — absent → explicit advisory allow at promote
   const judge = deps.judge ?? deterministicJudge; // competitive-mode scorer (pure, no model)
+  // Cooperative kill checkpoint (read-only). Lazy default so worker-model load never
+  // eagerly constructs the kill-switch; the loop OBEYS a kill, it never publishes one.
+  const killCheck =
+    deps.killCheck ??
+    (async (target: { agentId?: string; runId?: string; requestId?: string }) => {
+      const mod = await import("../kill-switch/index.js");
+      return mod.killSwitch.isKilled(target);
+    });
   const roles: Record<WorkerRole, RoleFn> = { ...DEFAULT_ROLES, ...deps.roles };
 
   const engine: RoleEngine = { invokeModel, neutralizeUntrusted };
@@ -258,6 +272,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     });
   }
 
+  /** Cooperative kill checkpoint: does an active kill target THIS run? (read-only; never publishes). */
+  async function killHalt(task: WorkerTask, parentIdentity: AgentIdentity, parentCtx: OperationContext): Promise<string | undefined> {
+    const k = await killCheck({ agentId: parentIdentity.agentId, runId: task.taskId, ...(parentCtx.requestId !== undefined ? { requestId: parentCtx.requestId } : {}) });
+    return k.killed ? `halted by kill-switch (${k.signal?.mode ?? "soft"})` : undefined;
+  }
+
   /** Run a worker task under the parent operation context. */
   async function run(task: WorkerTask, parentCtx: OperationContext): Promise<WorkerResult> {
     if (!config.enabled) {
@@ -273,6 +293,14 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     if (config.competitive === true) {
       const n = Math.max(MIN_COMPETITIVE_N, Math.min(MAX_COMPETITIVE_N, config.competitiveN ?? MIN_COMPETITIVE_N));
       return runCompetitive(task, parentCtx, parentIdentity, n);
+    }
+
+    // COOPERATIVE KILL CHECKPOINT (prevent NEW work): if a kill targets this run, do
+    // not allocate or start anything.
+    const preKill = await killHalt(task, parentIdentity, parentCtx);
+    if (preKill !== undefined) {
+      events.publish(workerFailed.create({ taskId: task.taskId, reason: preKill }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } }));
+      return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason: preKill };
     }
 
     const workspace = await workspaces.allocate({
@@ -291,6 +319,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 
     const results: RoleResult[] = [];
     let overall: WorkerResult["outcome"] = "success";
+    let killedReason: string | undefined;
 
     try {
       for (const role of WORKER_ROLES) {
@@ -328,6 +357,14 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           overall = result.outcome;
           break; // short-circuit on the first non-success
         }
+
+        // COOPERATIVE KILL CHECKPOINT (role boundary): obey a kill before the NEXT role.
+        // "hard"/"soft" both stop here at role granularity (true mid-role abort deferred).
+        killedReason = await killHalt(task, parentIdentity, parentCtx);
+        if (killedReason !== undefined) {
+          overall = "rejected";
+          break;
+        }
       }
     } catch (err) {
       // Infrastructure failure mid-run (e.g. escalation guard): discard + fail.
@@ -340,6 +377,19 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         ),
       );
       throw err;
+    }
+
+    // Terminal: a KILL halted the run mid-loop ⇒ discard cleanly (NEVER promote a
+    // half-run), surface the kill, return.
+    if (killedReason !== undefined) {
+      await safeDiscard(workspaces, workspace);
+      events.publish(
+        workerFailed.create(
+          { taskId: task.taskId, reason: killedReason, workspaceId: workspace.id },
+          { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } },
+        ),
+      );
+      return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: results, workspaceId: workspace.id, promoted: false, reason: killedReason };
     }
 
     // Terminal: ENACT the integrator's promote/discard DECISION (the integrator
@@ -472,6 +522,13 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       ),
     );
 
+    // COOPERATIVE KILL CHECKPOINT (prevent NEW work): do not allocate when killed.
+    const preKill = await killHalt(task, parentIdentity, parentCtx);
+    if (preKill !== undefined) {
+      events.publish(workerFailed.create({ taskId: task.taskId, reason: preKill }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
+      return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason: preKill };
+    }
+
     const handles: WorkspaceHandle[] = [];
     const rolesByWs = new Map<string, RoleResult[]>();
     try {
@@ -496,6 +553,14 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       //    worktree. The per-workspace builder is spawned through the SAME #10 clamp.
       const candidates: BuildCandidate[] = [];
       for (const ws of handles) {
+        // COOPERATIVE KILL CHECKPOINT (between candidates): stop cleanly, discard EVERY
+        // workspace (no half-promote), surface the kill.
+        const killReason = await killHalt(task, parentIdentity, parentCtx);
+        if (killReason !== undefined) {
+          for (const h of handles) await safeDiscard(workspaces, h);
+          events.publish(workerFailed.create({ taskId: task.taskId, reason: killReason, workspaceId: handles[0]?.id ?? ws.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
+          return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: rolesByWs.get(handles[0]?.id ?? "") ?? [], ...(handles[0] !== undefined ? { workspaceId: handles[0].id } : {}), promoted: false, reason: killReason };
+        }
         const builderResult = await dispatchRole("builder", spawnRole("builder", parentCtx), task, ws, [scoutResult]);
         let verifierResult: RoleResult | undefined;
         if (builderResult.outcome === "success") {
