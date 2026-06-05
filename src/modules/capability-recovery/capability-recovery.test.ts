@@ -12,9 +12,12 @@ import type { NeutralizedContent, UntrustedContext } from "../../core/injection/
 import type { Receipt, ReceiptQuery } from "../../core/receipt/contract.js";
 import type { MemoryEntry } from "../lab-context-memory/index.js";
 import type { DriftReport } from "../drift-prevention/index.js";
+import { commands } from "../../cli/registry.js";
 import { createCapabilityRecovery, parseRecoveryPlan, type DriftReader, type LabMemoryReader, type ReceiptReader, type ToUntrustedFn } from "./recovery.js";
-import { CapabilityRecoveryError, type CauseClass } from "./contract.js";
+import { CapabilityRecoveryError, type CapabilityRecovery, type CapabilityRecoveryInput, type CapabilityRecoveryPlan, type CauseClass } from "./contract.js";
 import type { CapabilityRecoveryConfig } from "./config.js";
+// Importing cli.js registers the `recover` command at module load.
+import { createRecoverCli, parseRecoverArgs } from "./cli.js";
 
 const silent = () => pino({ level: "silent" });
 const CFG: CapabilityRecoveryConfig = { enabled: true, maxMemoryEntries: 40, maxReceipts: 100 };
@@ -212,4 +215,108 @@ test("disabled ⇒ refuse (no model call); non-validated identity ⇒ refuse (no
     (e: unknown) => e instanceof CapabilityRecoveryError && e.kind === "identity",
   );
   assert.equal(sm.calls.length, 0, "no model call on a refusal");
+});
+
+// ── `ikbi recover` OPERATOR DIAGNOSTIC COMMAND (M8/M9) ───────────────────────
+
+const OPERATOR_TOKEN = "operator-token-value";
+
+/** A resolver over an operator agent (the real identity path for the CLI). */
+function cliResolver() {
+  const resolver = new IdentityResolver({
+    registry: new AgentRegistry({ agents: [{ agentId: "operator", kind: "operator", defaultTrustTier: "operator", tokenHashes: [hashToken(OPERATOR_TOKEN)] }] }),
+    logger: silent(),
+    now: () => 1000,
+  });
+  return (claim: { token?: string }) => resolver.resolve(claim);
+}
+
+/** A fake assess surface recording every call (proves DIAGNOSE-ONLY + a fixed plan). */
+function fakeRecovery(plan: CapabilityRecoveryPlan) {
+  const calls: CapabilityRecoveryInput[] = [];
+  const recovery: CapabilityRecovery = { assess: async (input) => { calls.push(input); return plan; } };
+  return { recovery, calls };
+}
+
+function cliCapture() {
+  let out = "";
+  let err = "";
+  let exit: number | undefined;
+  return { stdout: (s: string) => void (out += s), stderr: (s: string) => void (err += s), setExit: (c: number) => void (exit = c), get out() { return out; }, get err() { return err; }, get exit() { return exit; } };
+}
+
+const SAMPLE_PLAN: CapabilityRecoveryPlan = {
+  capability: "test-execution",
+  status: "unavailable",
+  lastKnownGood: { when: 900, source: "receipt:worker.role.verifier" },
+  evidenceOfBreakage: ["worker.role.verifier failed (failure)"],
+  likelyCause: "dependency",
+  causeConfidence: 0.85,
+  rationale: "pnpm is missing from the worktree",
+  recommendedRepair: { module: "dependency-install", action: "install pnpm", payload: { package: "pnpm" } },
+};
+
+test("`ikbi recover` is registered (no built-in collision); parseRecoverArgs handles --project", () => {
+  assert.ok(commands.has("recover"), "the recover command registered on cli.js import");
+  for (const b of ["version", "models", "providers", "help", "build", "batch"]) assert.notEqual(b, "recover");
+  assert.deepEqual(parseRecoverArgs(["test-execution", "--project", "demo"]), { project: "demo", rest: ["test-execution"] });
+  assert.deepEqual(parseRecoverArgs(["provider-routing"]), { rest: ["provider-routing"] });
+});
+
+test("recover fails closed (friendly) with no operator token — no assess call", async () => {
+  const fr = fakeRecovery(SAMPLE_PLAN);
+  const cap = cliCapture();
+  const cli = createRecoverCli({ capabilityRecovery: fr.recovery, resolveIdentity: cliResolver(), operatorToken: undefined, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit, now: () => 1 });
+  await cli.recover(["test-execution"]);
+  assert.equal(cap.exit, 1);
+  assert.match(cap.err, /no operator identity.*IKBI_OPERATOR_TOKEN/);
+  assert.equal(fr.calls.length, 0, "no assessment without an operator identity");
+  assert.equal(cap.out, "");
+});
+
+test("recover with no capability ⇒ usage hint, no assess call", async () => {
+  const fr = fakeRecovery(SAMPLE_PLAN);
+  const cap = cliCapture();
+  const cli = createRecoverCli({ capabilityRecovery: fr.recovery, resolveIdentity: cliResolver(), operatorToken: OPERATOR_TOKEN, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit, now: () => 1 });
+  await cli.recover([]);
+  assert.equal(cap.exit, 1);
+  assert.match(cap.err, /needs a capability/);
+  assert.equal(fr.calls.length, 0);
+});
+
+test("recover PRINTS the diagnosis (capability/status/likelyCause/recommendedRepair) — readable plan", async () => {
+  const fr = fakeRecovery(SAMPLE_PLAN);
+  const cap = cliCapture();
+  const cli = createRecoverCli({ capabilityRecovery: fr.recovery, resolveIdentity: cliResolver(), operatorToken: OPERATOR_TOKEN, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit, now: () => 1 });
+  await cli.recover(["test-execution", "--project", "demo"]);
+
+  assert.equal(cap.exit, undefined, "a clean diagnosis does not exit non-zero");
+  // assess got the parsed capability + project, attributed to the operator context.
+  assert.equal(fr.calls.length, 1, "assess was called exactly once");
+  assert.equal(fr.calls[0]?.capability, "test-execution");
+  assert.equal(fr.calls[0]?.project, "demo");
+  // The diagnosis fields are printed.
+  const printed = JSON.parse(cap.out) as Record<string, unknown>;
+  assert.equal(printed.capability, "test-execution");
+  assert.equal(printed.status, "unavailable");
+  assert.equal(printed.likelyCause, "dependency");
+  assert.equal(printed.causeConfidence, 0.85);
+  assert.match(String(printed.rationale), /pnpm/);
+  assert.equal((printed.recommendedRepair as { module: string }).module, "dependency-install", "which module should repair it");
+  assert.equal((printed.recommendedRepair as { action: string }).action, "install pnpm");
+});
+
+test("recover is NON-EXECUTING: it DIAGNOSES + prints, it does NOT dispatch the recommendedRepair", async () => {
+  // The plan recommends worker-model; the command must print it as DATA, never invoke it.
+  const codePlan: CapabilityRecoveryPlan = { capability: "x", status: "degraded", evidenceOfBreakage: [], likelyCause: "code", causeConfidence: 0.6, rationale: "logic regression", recommendedRepair: { module: "worker-model", action: "build", payload: { goal: "fix it" } } };
+  const fr = fakeRecovery(codePlan);
+  const cap = cliCapture();
+  const cli = createRecoverCli({ capabilityRecovery: fr.recovery, resolveIdentity: cliResolver(), operatorToken: OPERATOR_TOKEN, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit, now: () => 1 });
+  await cli.recover(["x"]);
+
+  assert.equal(fr.calls.length, 1, "the command's ONLY action is assess() — no repair dispatch");
+  const printed = JSON.parse(cap.out) as { recommendedRepair: { module: string } };
+  assert.equal(printed.recommendedRepair.module, "worker-model", "the recommendation is reported as data, not invoked");
+  // The repair payload is NOT echoed (module + action only — a recommendation, not a dispatch).
+  assert.ok(!cap.out.includes("\"payload\""), "the command prints module+action only, never executes the repair");
 });
