@@ -20,6 +20,10 @@ import "../modules/index.js";
 import { config } from "../core/config.js";
 import { registry } from "../core/provider/index.js";
 import { commands } from "./registry.js";
+// The DEFAULT router: input that is not a known command is treated as a GOAL and
+// deliberated by cognition-layer (which decides the path + recommends the next
+// command). Imported AFTER the barrel so the egress guard is already registered.
+import { cognitionRouter } from "../modules/cognition-layer/index.js";
 
 /** Built-in command names — reserved, cannot be shadowed by a module command. */
 const BUILTINS = new Set(["version", "models", "providers", "help"]);
@@ -29,7 +33,10 @@ function printUsage(): void {
   const lines = [
     `ikbi v${config.version} — build/repair engine (skeleton)`,
     "",
-    "Usage: ikbi <command>",
+    "Usage: ikbi <command> | ikbi <goal...> [--project <name>]",
+    "",
+    "A bare <goal> (anything that is not a command below) is deliberated by the",
+    "cognition layer, which decides the path and recommends the next command.",
     "",
     "Commands:",
     "  version            Print the ikbi version",
@@ -107,9 +114,10 @@ async function run(argv: readonly string[]): Promise<void> {
         await moduleCmd.run(argv.slice(1));
         return;
       }
-      process.stderr.write(`ikbi: unknown command "${cmd}"\n\n`);
-      printUsage();
-      process.exitCode = 1;
+      // DEFAULT ROUTER: not a known command ⇒ treat the WHOLE input as a goal and let
+      // cognition-layer deliberate which path is appropriate (it reports + recommends
+      // the next command; it does not auto-execute).
+      await cognitionRouter.route(argv);
     }
   }
 }
