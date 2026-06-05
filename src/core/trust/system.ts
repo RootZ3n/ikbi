@@ -257,13 +257,37 @@ export class TrustSystem implements TrustTierResolver {
     };
   }
 
-  /** OPERATOR action: clear an agent's non-recoverable injection flag (operator reset). */
-  async operatorReset(input: { agentId: string; kind: "agent"; defaultTrustTier: string }): Promise<TrustState> {
+  /**
+   * OPERATOR action: clear an agent's non-recoverable injection flag (operator reset).
+   *
+   * GATED like `grantTier` (this is a durable operator trust write): the caller must
+   * be a GENUINELY-MINTED operator identity. Provenance THEN authorization — a
+   * forged/cast `{ kind: "operator" }` object fails `isValidatedIdentity` before the
+   * operator check, closing the unauthenticated-write hole (operatorReset previously
+   * took no identity and was "operator" by naming only).
+   *
+   * PURPOSE-SCOPED: this clears the injection flag on EXISTING state. It is NOT a
+   * tier-granting path — tier-setting is `grantTier`'s audited job. So for a
+   * no-prior-state agent it creates state at the FLOOR (never the caller-supplied
+   * `defaultTrustTier`), so a reset cannot be a backdoor tier grant.
+   */
+  async operatorReset(
+    input: { agentId: string; kind: "agent"; defaultTrustTier: string },
+    granter: ValidatedIdentity,
+  ): Promise<TrustState> {
+    if (!isValidatedIdentity(granter)) {
+      throw new TrustError("config", "operator reset requires a validated identity");
+    }
+    if (!isOperator(granter)) {
+      throw new TrustError("config", "only an operator-tier identity may reset trust");
+    }
     const now = this.now();
     let newState: TrustState | undefined;
     const persisted = await this.store.update(docKey(input.agentId), (cur) => {
       const verified = cur === undefined ? undefined : verifyUnwrap(this.key, cur);
-      const base = verified ?? freshState(input, now);
+      // No prior state => create at the FLOOR, NOT the caller-supplied tier (reset is
+      // flag-clearing, never a tier grant). An existing state keeps its earned tier.
+      const base = verified ?? freshState({ ...input, defaultTrustTier: TRUST_FLOOR }, now);
       newState = clearInjectionFlag(base, now);
       return wrap(this.key, newState);
     });
@@ -271,7 +295,7 @@ export class TrustSystem implements TrustTierResolver {
     this.cache.set(input.agentId, state);
     this.checked.add(input.agentId);
     this.failedClosed.delete(input.agentId);
-    this.log.info({ event: "trust_operator_reset", agentId: input.agentId, tier: state.tier }, "operator cleared injection flag");
+    this.log.info({ event: "trust_operator_reset", agentId: input.agentId, granter: granter.identity.agentId, tier: state.tier }, "operator cleared injection flag");
     return state;
   }
 

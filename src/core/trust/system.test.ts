@@ -215,7 +215,7 @@ test("INJECTION non-recoverable: flagged agent cannot auto-recover until operato
     assert.equal(trust.resolve(AGENT), "probation", "no auto-recovery while injection-flagged");
 
     // Operator reset clears the flag; promotion resumes.
-    await trust.operatorReset({ agentId: "builder-3", kind: "agent", defaultTrustTier: "probation" });
+    await trust.operatorReset({ agentId: "builder-3", kind: "agent", defaultTrustTier: "probation" }, operatorId());
     assert.equal(trust.getState("builder-3")?.injectionFlagged, false);
     await trust.recordOutcome(rec("success", "build"));
     const d = await trust.recordOutcome(rec("success", "test"));
@@ -374,6 +374,64 @@ test("grantTier: the CODEX FORGE is BLOCKED — a cast {kind:'operator'} object 
     assert.equal((await store.list()).length, 0, "no operator_grant was written by the forged caller");
     assert.equal(trust.getState("victim"), undefined, "the target did not become trusted");
     assert.equal(trust.resolve({ agentId: "victim", kind: "agent", defaultTrustTier: "probation" }), "untrusted", "the target still resolves to the cold floor");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("operatorReset: the CODEX REPRO is BLOCKED — a forged/non-operator caller cannot reset (no unauthenticated trust write)", async () => {
+  const dir = await tmp();
+  try {
+    const { trust, store } = makeTrust(dir);
+    // Codex's exact repro: a forged granter trying to mint durable trusted state.
+    const forged = { kind: "operator", identity: { agentId: "forged-op" }, authMethod: "operator_token", resolvedAt: 1 } as unknown as ValidatedIdentity;
+    await assert.rejects(
+      trust.operatorReset({ agentId: "builder-3", kind: "agent", defaultTrustTier: "trusted" }, forged),
+      /validated identity/,
+      "a forged caller is rejected on provenance",
+    );
+    // A genuine but NON-operator identity is rejected on authorization.
+    await assert.rejects(
+      trust.operatorReset({ agentId: "builder-3", kind: "agent", defaultTrustTier: "trusted" }, agentId()),
+      /only an operator/,
+      "a genuine non-operator is rejected on authorization",
+    );
+    assert.equal((await store.list()).length, 0, "no durable write by an unauthorized caller");
+    assert.equal(trust.resolve(AGENT), "untrusted", "the target stays at the floor");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("operatorReset: NO BACKDOOR TIER GRANT — a fresh-agent reset does not mint a caller-supplied tier", async () => {
+  const dir = await tmp();
+  try {
+    const { trust } = makeTrust(dir);
+    // A genuine operator resets a NO-PRIOR-STATE agent with defaultTrustTier="trusted".
+    // operatorReset is flag-clearing, NOT a tier grant: the result must be the FLOOR,
+    // not the caller-supplied "trusted" (that backdoor was Codex's escalation).
+    const state = await trust.operatorReset({ agentId: "fresh", kind: "agent", defaultTrustTier: "trusted" }, operatorId());
+    assert.equal(state.tier, "untrusted", "a fresh reset creates at the floor, not the caller's tier");
+    assert.equal(state.injectionFlagged, false);
+    assert.equal(trust.resolve({ agentId: "fresh", kind: "agent", defaultTrustTier: "trusted" }), "untrusted", "no trust was minted via operatorReset");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("operatorReset: a GENUINE OPERATOR still clears the injection flag (regression — purpose intact, tier unchanged)", async () => {
+  const dir = await tmp();
+  try {
+    const { trust } = makeTrust(dir, { promoteStreak: 2, demoteStreak: 2 });
+    await trust.recordOutcome(rec("success", "build"));
+    await trust.recordOutcome(rec("success", "test")); // -> verified
+    await trust.recordOutcome(rec("success", "edit", { injection: true })); // demote + flag
+    assert.equal(trust.getState("builder-3")?.injectionFlagged, true);
+    const tierBefore = trust.getState("builder-3")?.tier;
+
+    const state = await trust.operatorReset({ agentId: "builder-3", kind: "agent", defaultTrustTier: "probation" }, operatorId());
+    assert.equal(state.injectionFlagged, false, "the flag is cleared (operatorReset's actual purpose)");
+    assert.equal(state.tier, tierBefore, "the earned tier is unchanged — reset clears the flag, it does not re-tier");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
