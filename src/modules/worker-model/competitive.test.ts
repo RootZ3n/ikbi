@@ -1,0 +1,246 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+
+import { pino } from "pino";
+
+import type { EventBusSurface, EventInput, IkbiEvent } from "../../core/events/index.js";
+import { beginOperation, IdentityResolver } from "../../core/identity/resolver.js";
+import { AgentRegistry, hashToken } from "../../core/identity/registry.js";
+import type { AgentRecord } from "../../core/identity/registry.js";
+import type { AgentIdentity } from "../../core/identity/contract.js";
+import { autonomyForTier, asTier, type TrustDecision } from "../../core/trust/index.js";
+import { TRUST_FLOOR } from "../../core/trust/index.js";
+import type { DiscardResult, PromoteGovernance, PromoteResult, WorkspaceHandle } from "../../core/workspace/contract.js";
+import type { BuildCandidate } from "../deterministic-judge/index.js";
+import { deterministicJudge } from "../deterministic-judge/index.js";
+import { createOrchestrator, type OrchestratorDeps } from "./orchestrator.js";
+import { type RoleContext, type RoleFn, type WorkerRole, type WorkerTask } from "./contract.js";
+
+const silent = () => pino({ level: "silent" });
+
+function makeResolver(agents: AgentRecord[]) {
+  return new IdentityResolver({ registry: new AgentRegistry({ agents }), logger: silent(), now: () => 1000 });
+}
+
+function makeIdentities(parentTier: string, workerTier: string) {
+  const resolver = makeResolver([
+    { agentId: "parent-1", kind: "agent", functionalRole: "lead", defaultTrustTier: parentTier, tokenHashes: [hashToken("parent-secret")] },
+    { agentId: "worker-1", kind: "agent", functionalRole: "worker", defaultTrustTier: workerTier, tokenHashes: [hashToken("worker-secret")] },
+  ]);
+  const parentCtx = beginOperation(resolver.resolve({ token: "parent-secret" }), { requestId: "req-1" });
+  const resolveIdentity: NonNullable<OrchestratorDeps["resolveIdentity"]> = (claim, ctx) => resolver.resolve(claim, ctx);
+  const roleClaim: NonNullable<OrchestratorDeps["roleClaim"]> = () => ({ token: "worker-secret" });
+  return { parentCtx, resolveIdentity, roleClaim };
+}
+
+function baseHandle(id: string): WorkspaceHandle {
+  return { id, targetRepo: "/repo", baseBranch: "main", baseRef: "deadbeef", scratchBranch: `ikbi/ws/${id}`, path: `/tmp/${id}`, identity: { agentId: "parent-1" }, state: "allocated", createdAt: 1000 };
+}
+
+/** Fake workspaces: ids "ws0","ws1",…; promote honors governance; records lifecycle. */
+function compWorkspaces(opts: { conflict?: boolean; failAllocateAt?: number } = {}) {
+  const allocated: string[] = [];
+  const promoted: string[] = [];
+  const discarded: string[] = [];
+  let i = 0;
+  const workspaces: NonNullable<OrchestratorDeps["workspaces"]> = {
+    allocate: async () => {
+      if (opts.failAllocateAt !== undefined && i === opts.failAllocateAt) throw new Error("allocate failed");
+      const h = baseHandle(`ws${i++}`);
+      allocated.push(h.id);
+      return h;
+    },
+    promote: async (h, a): Promise<PromoteResult> => {
+      promoted.push(h.id);
+      if (a.governance !== undefined && a.governance.allow === false) return { promoted: false, workspaceId: h.id, targetBranch: h.baseBranch, beforeRef: "a", reason: "governance denied" };
+      if (opts.conflict === true) return { promoted: false, workspaceId: h.id, targetBranch: h.baseBranch, beforeRef: "a", conflicts: ["x.ts"], reason: "conflict" };
+      return { promoted: true, workspaceId: h.id, targetBranch: h.baseBranch, beforeRef: "a", afterRef: "b" };
+    },
+    discard: async (h): Promise<DiscardResult> => {
+      discarded.push(h.id);
+      return { workspaceId: h.id, removed: true };
+    },
+    diff: async () => "line1\nline2\nline3",
+  };
+  return { workspaces, allocated, promoted, discarded };
+}
+
+const fakeTrust = () => ({
+  recordOutcome: async (i: { agentId: string; operation: string; status: string; defaultTrustTier: string }): Promise<TrustDecision> => {
+    const tier = asTier(i.defaultTrustTier, TRUST_FLOOR);
+    return { agentId: i.agentId, tier, previousTier: tier, autonomy: autonomyForTier(tier) };
+  },
+});
+const fakeReceipts = () => ({ append: async (_i: unknown, _id: AgentIdentity): Promise<unknown> => ({}) });
+function fakeBus() {
+  const sent: Array<EventInput<unknown>> = [];
+  const bus: EventBusSurface = {
+    publish: <P>(input: EventInput<P>): IkbiEvent<P> => { sent.push(input as EventInput<unknown>); return { ...input, contractVersion: "1.0.0", id: "e", seq: 1, timestamp: 0 } as IkbiEvent<P>; },
+    subscribe: () => ({ id: "s", unsubscribe: () => {}, stats: () => ({ delivered: 0, dropped: 0, failures: 0, queued: 0 }) }),
+    flush: async () => {},
+  };
+  return { bus, sent };
+}
+
+/** verifier checks for a candidate: typecheck/test exit codes + a parseable count. */
+function checks(typecheck: number, testExit: number, passed = 10, total = 10) {
+  return [
+    { name: "typecheck", command: "pnpm tsc --noEmit", exitCode: typecheck, outputTail: "" },
+    { name: "test", command: "pnpm test", exitCode: testExit, outputTail: `# tests ${total}\n# pass ${passed}\n` },
+  ];
+}
+
+/**
+ * Fake roles that branch on the workspace id so different workspaces yield different
+ * candidates. `outcomes(wsId)` returns { builderOk, toolRounds, typecheck, test }.
+ * Records each builder's spawned identity tier (for the #10 clamp assertion).
+ */
+function compRoles(outcomes: (wsId: string) => { builderOk?: boolean; toolRounds?: number; typecheck?: number; test?: number; passed?: number }) {
+  const builderTiers: string[] = [];
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    scout: async () => ({ role: "scout", outcome: "success", summary: "s" }),
+    builder: async (ctx: RoleContext) => {
+      builderTiers.push(String(ctx.identity.trustTier));
+      const o = outcomes(ctx.workspace.id);
+      if (o.builderOk === false) return { role: "builder", outcome: "failure", summary: "b-fail", detail: { toolRounds: 0, filesWritten: [], rejectedToolCalls: [], stopReason: "error" } };
+      return { role: "builder", outcome: "success", summary: "b", detail: { toolRounds: o.toolRounds ?? 2, filesWritten: ["a.ts"], rejectedToolCalls: [], stopReason: "stop" } };
+    },
+    verifier: async (ctx: RoleContext) => {
+      const o = outcomes(ctx.workspace.id);
+      const c = checks(o.typecheck ?? 0, o.test ?? 0, o.passed ?? 10);
+      return { role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: c } };
+    },
+  };
+  return { roles, builderTiers };
+}
+
+const COMP = { enabled: true, roleTimeoutMs: 1000, maxConcurrentRuns: 1, competitive: true, competitiveN: 2 };
+const SINGLE = { enabled: true, roleTimeoutMs: 1000, maxConcurrentRuns: 1 };
+const task: WorkerTask = { taskId: "t-1", targetRepo: "/repo", goal: "do the thing" };
+
+function deps(extra: Partial<OrchestratorDeps>): OrchestratorDeps {
+  return { config: COMP, trust: fakeTrust(), receipts: fakeReceipts(), events: fakeBus().bus, invokeModel: async () => { throw new Error("unused"); }, ...extra };
+}
+
+// ── OFF BY DEFAULT (regression guard) ────────────────────────────────────────
+
+test("competitive OFF ⇒ single-workspace path (one allocate), unchanged behavior", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = compWorkspaces();
+  const cap = compRoles(() => ({}));
+  // SINGLE config + a promoting integrator stub via default roles is not present, so use
+  // capturing roles that succeed; single-mode reads the integrator decision.
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    critic: async () => ({ role: "critic", outcome: "success", summary: "c" }),
+    integrator: async () => ({ role: "integrator", outcome: "success", summary: "i", detail: { decision: "promote", evaluation: { approved: true } } }),
+  };
+  const orch = createOrchestrator(deps({ config: SINGLE, resolveIdentity, roleClaim, workspaces: ws.workspaces, roles }));
+  await orch.run(task, parentCtx);
+  assert.equal(ws.allocated.length, 1, "single mode allocates exactly ONE workspace");
+});
+
+// ── COMPETITIVE WINNER: best promoted, losers discarded, no leak ─────────────
+
+test("competitive: the better candidate wins — winner promoted, loser discarded, no leaked workspace", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = compWorkspaces();
+  // ws0 passes tests; ws1 FAILS tests ⇒ ws1 disqualified ⇒ ws0 wins.
+  const cap = compRoles((id) => (id === "ws0" ? { typecheck: 0, test: 0 } : { typecheck: 0, test: 1 }));
+  const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: cap.roles }));
+
+  const r = await orch.run(task, parentCtx);
+  assert.equal(r.promoted, true);
+  assert.equal(r.outcome, "success");
+  assert.equal(r.workspaceId, "ws0", "the winning workspace");
+  assert.deepEqual(ws.promoted, ["ws0"], "only the winner is promoted");
+  assert.deepEqual(ws.discarded, ["ws1"], "the loser is discarded");
+  // every allocated workspace is promoted XOR discarded — no leak.
+  for (const id of ws.allocated) assert.ok(ws.promoted.includes(id) || ws.discarded.includes(id), `${id} not leaked`);
+});
+
+// ── NO-PASS: every candidate disqualified ⇒ all discarded, nothing promoted ──
+
+test("competitive no-pass: all candidates disqualified ⇒ all discarded, nothing promoted, fail-closed", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = compWorkspaces();
+  const cap = compRoles(() => ({ typecheck: 1, test: 0 })); // BOTH fail typecheck
+  const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: cap.roles }));
+
+  const r = await orch.run(task, parentCtx);
+  assert.equal(r.promoted, false);
+  assert.notEqual(r.outcome, "success");
+  assert.ok(r.reason, "a fail-closed reason");
+  assert.equal(ws.promoted.length, 0, "nothing promoted");
+  assert.deepEqual([...ws.discarded].sort(), ["ws0", "ws1"], "every workspace discarded");
+});
+
+// ── CLEANUP ON ERROR: no leaked worktree ─────────────────────────────────────
+
+test("competitive: an allocation failure discards everything already allocated (no leak)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = compWorkspaces({ failAllocateAt: 1 }); // ws0 allocates, ws1 throws
+  const cap = compRoles(() => ({}));
+  const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: cap.roles }));
+
+  await assert.rejects(() => orch.run(task, parentCtx));
+  assert.deepEqual(ws.allocated, ["ws0"], "only ws0 was allocated before the failure");
+  assert.deepEqual(ws.discarded, ["ws0"], "the allocated workspace was discarded (no leak)");
+  assert.equal(ws.promoted.length, 0);
+});
+
+// ── GATE AT PROMOTE: judge selects, gate-wall authorizes (separate) ──────────
+
+test("competitive: a denying gate-wall blocks the winner's promote ⇒ all discarded, fail-closed", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = compWorkspaces();
+  const cap = compRoles((id) => (id === "ws0" ? { typecheck: 0, test: 0 } : { typecheck: 0, test: 1 }));
+  const captured: BuildCandidate[][] = [];
+  const judge = { judge: (c: readonly BuildCandidate[]) => { captured.push([...c]); return deterministicJudge.judge(c); } };
+  const denyGate = { evaluate: async (): Promise<PromoteGovernance> => ({ allow: false, reason: "denied by policy", gateId: "g" }) };
+  const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: cap.roles, judge, gateWall: denyGate }));
+
+  const r = await orch.run(task, parentCtx);
+  // The judge DID pick a winner (ws0 survived) — proving select vs authorize are separate.
+  assert.equal(captured[0]?.length, 2, "the judge scored both candidates");
+  assert.equal(r.promoted, false, "the gate blocked the promote");
+  assert.ok(ws.promoted.includes("ws0"), "promote was attempted on the winner");
+  assert.deepEqual([...ws.discarded].sort(), ["ws0", "ws1"], "winner + loser both discarded (fail-closed)");
+});
+
+// ── #10 CLAMP PRESERVED through the competitive path ─────────────────────────
+
+test("competitive: per-workspace builders are spawned through the #10 clamp (no escalation)", async () => {
+  // Parent "verified"; worker credential "trusted" (more trusted) ⇒ roles clamp to "verified".
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("verified", "trusted");
+  const ws = compWorkspaces();
+  const cap = compRoles((id) => (id === "ws0" ? { typecheck: 0, test: 0 } : { typecheck: 0, test: 0 }));
+  const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: cap.roles }));
+
+  await orch.run(task, parentCtx);
+  assert.equal(cap.builderTiers.length, 2, "a builder spawned per workspace");
+  for (const t of cap.builderTiers) assert.equal(t, "verified", "clamped to the parent tier, NOT the worker's trusted");
+});
+
+// ── CANDIDATE MAPPING: verifier/builder/diff → BuildCandidate fields ─────────
+
+test("competitive: the judge receives correctly-mapped BuildCandidates", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = compWorkspaces();
+  const cap = compRoles((id) => (id === "ws0" ? { toolRounds: 4, typecheck: 0, test: 0, passed: 9 } : { typecheck: 0, test: 0 }));
+  let seen: readonly BuildCandidate[] = [];
+  const judge = { judge: (c: readonly BuildCandidate[]) => { seen = c; return deterministicJudge.judge(c); } };
+  const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: cap.roles, judge }));
+
+  await orch.run(task, parentCtx);
+  const c0 = seen.find((c) => c.workspaceId === "ws0")!;
+  assert.equal(c0.typecheckPass, true, "typecheck exit 0 ⇒ pass");
+  assert.equal(c0.testsPass, true, "test exit 0 ⇒ pass");
+  assert.deepEqual(c0.testCount, { passed: 9, total: 10 }, "test count parsed from the verifier output");
+  assert.equal(c0.toolRounds, 4, "toolRounds from the builder detail");
+  assert.equal(c0.maxToolRounds, 20, "the builder ceiling");
+  assert.equal(c0.filesWritten, 1);
+  assert.equal(c0.rejectedToolCalls, 0);
+  assert.equal(c0.stopReason, "stop");
+  assert.equal(c0.diffLines, 3, "diff line count from workspaces.diff");
+});

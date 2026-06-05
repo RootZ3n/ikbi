@@ -9,6 +9,10 @@
  *
  * This pass ships the CONTRACT + ORCHESTRATOR; the five role bodies are stubbed and
  * land (with real review) in a follow-up. 3-eyes bar — not frozen until Codex.
+ *
+ * MODULE DEP: competitive build mode consumes the `deterministic-judge` module (a
+ * PURE, no-model scorer) to pick the winner among N build candidates. It is a module
+ * dependency (not a frozen-core pin); the judge selects, gate-wall still authorizes.
  */
 
 import { assertContractCompatible } from "../../core/contracts/index.js";

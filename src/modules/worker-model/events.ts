@@ -32,3 +32,18 @@ export const workerCompleted = defineEvent<{
 
 /** A run failed (a role failed/rejected/stub, or an infrastructure error). (Attribution: parent.) */
 export const workerFailed = defineEvent<{ taskId: string; reason: string; workspaceId?: string }>("worker.failed");
+
+// ── competitive build mode (AMG) — counts + winner id only, no candidate detail ──
+
+/** A competitive run started — N workspaces about to be allocated. (Attribution: parent.) */
+export const workerCompetitiveStarted = defineEvent<{ taskId: string; candidateCount: number }>("worker.competitive.started");
+
+/** The judge picked a winner (or null). (Attribution: parent.) */
+export const workerCompetitiveJudged = defineEvent<{ taskId: string; candidateCount: number; winnerWorkspaceId: string | null }>(
+  "worker.competitive.judged",
+);
+
+/** A competitive run finished — winner promoted/discarded resolved. (Attribution: parent.) */
+export const workerCompetitiveCompleted = defineEvent<{ taskId: string; candidateCount: number; winnerWorkspaceId: string | null }>(
+  "worker.competitive.completed",
+);

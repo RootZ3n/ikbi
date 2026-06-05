@@ -35,13 +35,24 @@ import { workspaces as coreWorkspaces } from "../../core/workspace/index.js";
 import type { DiscardResult, PromoteGovernance, PromoteResult, WorkspaceEvaluation, WorkspaceHandle } from "../../core/workspace/contract.js";
 import type { ModelRequest, ModelResponse } from "../../core/provider/contract.js";
 
-import { builder } from "./builder.js";
+import { deterministicJudge } from "../deterministic-judge/index.js";
+import type { BuildCandidate, JudgeResult } from "../deterministic-judge/index.js";
+
+import { builder, MAX_TOOL_ITERATIONS } from "./builder.js";
 import { critic } from "./critic.js";
 import { integrator } from "./integrator.js";
 import { scout } from "./scout.js";
 import { verifier } from "./verifier.js";
-import { workerModelConfig, type WorkerModelConfig } from "./config.js";
 import {
+  MAX_COMPETITIVE_N,
+  MIN_COMPETITIVE_N,
+  workerModelConfig,
+  type WorkerModelConfig,
+} from "./config.js";
+import {
+  workerCompetitiveCompleted,
+  workerCompetitiveJudged,
+  workerCompetitiveStarted,
   workerCompleted,
   workerFailed,
   workerRoleCompleted,
@@ -73,6 +84,8 @@ export interface OrchestratorDeps {
     allocate: (opts: { targetRepo: string; identity: AgentIdentity; baseBranch?: string; label?: string }) => Promise<WorkspaceHandle>;
     promote: (handle: WorkspaceHandle, approval: { evaluation: WorkspaceEvaluation; governance?: PromoteGovernance; message?: string }) => Promise<PromoteResult>;
     discard: (handle: WorkspaceHandle) => Promise<DiscardResult>;
+    /** Unified diff of the workspace vs its base (competitive mode reads it for the diff signal). Optional. */
+    diff?: (handle: WorkspaceHandle) => Promise<string>;
   };
   /**
    * Governance evaluator (gate-wall). Optional: when absent, promote falls back to
@@ -94,6 +107,8 @@ export interface OrchestratorDeps {
   readonly neutralizeUntrusted?: RoleEngine["neutralizeUntrusted"];
   /** Role implementations (default: the five stubs). Tests override to drive outcomes. */
   readonly roles?: Partial<Record<WorkerRole, RoleFn>>;
+  /** Competitive-mode judge (pure no-model scorer). Default: the live deterministic judge. */
+  readonly judge?: { judge: (candidates: readonly BuildCandidate[]) => JudgeResult };
 }
 
 /** A role identity spawned under the parent ceiling (#10). */
@@ -171,6 +186,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   const invokeModel = deps.invokeModel ?? lazyInvokeModel;
   const neutralizeUntrusted = deps.neutralizeUntrusted ?? coreNeutralize;
   const gateWall = deps.gateWall; // optional — absent → explicit advisory allow at promote
+  const judge = deps.judge ?? deterministicJudge; // competitive-mode scorer (pure, no model)
   const roles: Record<WorkerRole, RoleFn> = { ...DEFAULT_ROLES, ...deps.roles };
 
   const engine: RoleEngine = { invokeModel, neutralizeUntrusted };
@@ -251,6 +267,13 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       throw new WorkerError("identity", "run requires an OperationContext carrying a validated identity");
     }
     const parentIdentity = parentCtx.identity.identity;
+
+    // COMPETITIVE BUILD MODE (default OFF). When on, take the N-workspace path and
+    // return; otherwise fall through to the single-workspace path below — BYTE-UNCHANGED.
+    if (config.competitive === true) {
+      const n = Math.max(MIN_COMPETITIVE_N, Math.min(MAX_COMPETITIVE_N, config.competitiveN ?? MIN_COMPETITIVE_N));
+      return runCompetitive(task, parentCtx, parentIdentity, n);
+    }
 
     const workspace = await workspaces.allocate({
       targetRepo: task.targetRepo,
@@ -385,7 +408,189 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     return result;
   }
 
+  // ── COMPETITIVE BUILD MODE (AMG) ────────────────────────────────────────────
+
+  /** Dispatch one role in one workspace (events + recordRole), returning its result. */
+  async function dispatchRole(role: WorkerRole, spawned: SpawnedRole, task: WorkerTask, workspace: WorkspaceHandle, priorResults: readonly RoleResult[]): Promise<RoleResult> {
+    events.publish(
+      workerRoleDispatched.create(
+        { taskId: task.taskId, role, ...(spawned.identity.trustTier !== undefined ? { tier: spawned.identity.trustTier } : {}) },
+        { source: EVENT_SOURCE, attribution: { identity: spawned.identity, operation: `worker.role.${role}`, runId: task.taskId } },
+      ),
+    );
+    const ctx: RoleContext = { task, role, identity: spawned.identity, autonomy: spawned.autonomy, workspace, priorResults: [...priorResults], engine };
+    const result = await roles[role](ctx);
+    events.publish(
+      workerRoleCompleted.create(
+        { taskId: task.taskId, role, outcome: result.outcome },
+        { source: EVENT_SOURCE, attribution: { identity: spawned.identity, operation: `worker.role.${role}`, runId: task.taskId } },
+      ),
+    );
+    await recordRole(task, workspace, spawned, result);
+    return result;
+  }
+
+  /** Best-effort diff line-count (the diff SIGNAL is neutral when unavailable). */
+  async function safeDiffLines(workspace: WorkspaceHandle): Promise<number | undefined> {
+    if (workspaces.diff === undefined) return undefined;
+    try {
+      const d = await workspaces.diff(workspace);
+      return d.length === 0 ? 0 : d.split("\n").length;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Map a builder + verifier result (+ diff) to the objective BuildCandidate the judge scores. */
+  function buildCandidate(workspace: WorkspaceHandle, builderResult: RoleResult, verifierResult: RoleResult | undefined, diffLines: number | undefined): BuildCandidate {
+    const bd = (builderResult.detail ?? {}) as Record<string, unknown>;
+    const toolRounds = typeof bd.toolRounds === "number" ? bd.toolRounds : 0;
+    const filesWritten = Array.isArray(bd.filesWritten) ? bd.filesWritten.length : 0;
+    const rejectedToolCalls = Array.isArray(bd.rejectedToolCalls) ? bd.rejectedToolCalls.length : 0;
+    const stopReason = typeof bd.stopReason === "string" ? bd.stopReason : builderResult.outcome === "success" ? "stop" : "error";
+    const v = readVerifier(verifierResult);
+    return {
+      workspaceId: workspace.id,
+      typecheckPass: v.typecheckPass,
+      testsPass: v.testsPass,
+      ...(v.testCount !== undefined ? { testCount: v.testCount } : {}),
+      toolRounds,
+      maxToolRounds: MAX_TOOL_ITERATIONS,
+      rejectedToolCalls,
+      filesWritten,
+      ...(diffLines !== undefined ? { diffLines } : {}),
+      stopReason,
+    };
+  }
+
+  /** Run N independent build attempts, judge them, promote the winner, discard the rest. */
+  async function runCompetitive(task: WorkerTask, parentCtx: OperationContext, parentIdentity: AgentIdentity, n: number): Promise<WorkerResult> {
+    events.publish(
+      workerCompetitiveStarted.create(
+        { taskId: task.taskId, candidateCount: n },
+        { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } },
+      ),
+    );
+
+    const handles: WorkspaceHandle[] = [];
+    const rolesByWs = new Map<string, RoleResult[]>();
+    try {
+      // 1. allocate N isolated worktrees (the workspace layer is already concurrent-capable).
+      for (let i = 0; i < n; i += 1) {
+        handles.push(
+          await workspaces.allocate({
+            targetRepo: task.targetRepo,
+            identity: parentIdentity,
+            ...(task.baseBranch !== undefined ? { baseBranch: task.baseBranch } : {}),
+            label: `worker:${task.taskId}:c${i}`,
+          }),
+        );
+      }
+
+      // 2. scout ONCE (shared, read-only, in the first worktree's clean base state) —
+      //    its findings seed every builder. (Per-workspace scout is a future option.)
+      const scoutResult = await dispatchRole("scout", spawnRole("scout", parentCtx), task, handles[0]!, []);
+
+      // 3. builder + verifier PER workspace (sequential in v1; parallelism is a future
+      //    optimization). Each builder writes into ITS worktree; each verifier checks ITS
+      //    worktree. The per-workspace builder is spawned through the SAME #10 clamp.
+      const candidates: BuildCandidate[] = [];
+      for (const ws of handles) {
+        const builderResult = await dispatchRole("builder", spawnRole("builder", parentCtx), task, ws, [scoutResult]);
+        let verifierResult: RoleResult | undefined;
+        if (builderResult.outcome === "success") {
+          verifierResult = await dispatchRole("verifier", spawnRole("verifier", parentCtx), task, ws, [scoutResult, builderResult]);
+        }
+        rolesByWs.set(ws.id, [scoutResult, builderResult, ...(verifierResult !== undefined ? [verifierResult] : [])]);
+        candidates.push(buildCandidate(ws, builderResult, verifierResult, await safeDiffLines(ws)));
+      }
+
+      // 4. JUDGE — pure, no model call. Selects the winner (or null = fail-closed).
+      const verdict = judge.judge(candidates);
+      events.publish(
+        workerCompetitiveJudged.create(
+          { taskId: task.taskId, candidateCount: n, winnerWorkspaceId: verdict.winner?.workspaceId ?? null },
+          { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } },
+        ),
+      );
+
+      // 5a. NO-PASS (fail-closed): the judge rejected all → discard EVERY workspace, promote nothing.
+      if (verdict.winner === null) {
+        for (const ws of handles) await safeDiscard(workspaces, ws);
+        const reason = verdict.reason ?? "no candidate passed the judge";
+        const repId = verdict.ranking[0]?.workspaceId ?? handles[0]?.id;
+        events.publish(workerCompetitiveCompleted.create({ taskId: task.taskId, candidateCount: n, winnerWorkspaceId: null }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
+        events.publish(workerFailed.create({ taskId: task.taskId, reason, ...(repId !== undefined ? { workspaceId: repId } : {}) }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
+        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: repId !== undefined ? rolesByWs.get(repId) ?? [] : [], ...(repId !== undefined ? { workspaceId: repId } : {}), promoted: false, reason };
+      }
+
+      // 5b. WINNER: promote it (gate-wall STILL governs), discard ALL losers.
+      const winner = handles.find((h) => h.id === verdict.winner!.workspaceId)!;
+      const winnerRoles = rolesByWs.get(winner.id) ?? [];
+      const governanceGrant = autonomyForTier(asTier(parentIdentity.trustTier ?? TRUST_FLOOR, TRUST_FLOOR));
+      const governance: PromoteGovernance = gateWall
+        ? await gateWall.evaluate({ grant: governanceGrant, action: { kind: "promote", task, results: winnerRoles }, identity: parentIdentity })
+        : { allow: true, reason: "gate-wall not wired (advisory mode)" };
+      const promote = await workspaces.promote(winner, {
+        evaluation: { approved: true, score: verdict.winner.composite, evaluatorId: "deterministic-judge" },
+        governance,
+        message: `worker-model (competitive): ${task.goal}`,
+      });
+      for (const ws of handles) if (ws.id !== winner.id) await safeDiscard(workspaces, ws);
+
+      let promoted = promote.promoted;
+      let outcome: WorkerResult["outcome"] = "success";
+      let reason: string | undefined;
+      if (!promoted) {
+        // The winner did not land — gate denial or conflict. Fail-closed: discard the
+        // winner too (so EVERY workspace is now discarded). A conflict is reconcilable
+        // (partial); a governance deny is a rejection.
+        await safeDiscard(workspaces, winner);
+        outcome = promote.conflicts !== undefined && promote.conflicts.length > 0 ? "partial" : "rejected";
+        reason = promote.reason ?? "winner not promoted (gate denied or conflict)";
+      }
+
+      events.publish(workerCompetitiveCompleted.create({ taskId: task.taskId, candidateCount: n, winnerWorkspaceId: winner.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
+      if (outcome === "success" || outcome === "partial") {
+        events.publish(workerCompleted.create({ taskId: task.taskId, outcome, promoted, workspaceId: winner.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
+      } else {
+        events.publish(workerFailed.create({ taskId: task.taskId, reason: reason ?? outcome, workspaceId: winner.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
+      }
+      return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome, roles: winnerRoles, workspaceId: winner.id, promoted, ...(reason !== undefined ? { reason } : {}) };
+    } catch (err) {
+      // Mid-run failure (allocation / role / judge): discard EVERY allocated workspace —
+      // no leaked worktree — then fail.
+      for (const ws of handles) await safeDiscard(workspaces, ws);
+      const reason = err instanceof Error ? err.message : String(err);
+      events.publish(workerFailed.create({ taskId: task.taskId, reason, ...(handles[0] !== undefined ? { workspaceId: handles[0].id } : {}) }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
+      throw err;
+    }
+  }
+
   return { run, spawnRole };
+}
+
+/** Parse the verifier's check results into the candidate's pass flags + (best-effort) test count. */
+function readVerifier(verifierResult: RoleResult | undefined): { typecheckPass: boolean; testsPass: boolean; testCount?: { passed: number; total: number } } {
+  // Builder failed (no verify ran) ⇒ both gates fail.
+  if (verifierResult === undefined) return { typecheckPass: false, testsPass: false };
+  const detail = (verifierResult.detail ?? {}) as Record<string, unknown>;
+  const checks = Array.isArray(detail.checks) ? (detail.checks as Array<Record<string, unknown>>) : [];
+  const find = (name: string) => checks.find((c) => c.name === name);
+  const typecheck = find("typecheck");
+  const test = find("test");
+  const typecheckPass = typecheck !== undefined && typecheck.exitCode === 0;
+  const testsPass = test !== undefined && test.exitCode === 0;
+  const testCount = test !== undefined && typeof test.outputTail === "string" ? parseTestCount(test.outputTail) : undefined;
+  return { typecheckPass, testsPass, ...(testCount !== undefined ? { testCount } : {}) };
+}
+
+/** Parse the node:test summary tail ("# tests N" / "# pass N") into a count, when present. */
+function parseTestCount(output: string): { passed: number; total: number } | undefined {
+  const tests = /# tests (\d+)/.exec(output);
+  const pass = /# pass (\d+)/.exec(output);
+  if (tests !== null && pass !== null) return { passed: Number(pass[1]), total: Number(tests[1]) };
+  return undefined;
 }
 
 /** Best-effort discard that never masks the original error. */
