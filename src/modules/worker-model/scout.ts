@@ -4,8 +4,14 @@
  * Scoped (pending 3-eyes): gather repo/context relevant to the goal and produce
  * findings. STRICTLY READ-ONLY — scout never writes, stages, or mutates anything
  * under the workspace or target repo; it only lists/reads a BOUNDED set of files
- * and asks a model to analyze them. It does NOT touch untrusted content and does
- * NOT call `neutralizeUntrusted` (that seam is the builder's, Pass B).
+ * and asks a model to analyze them.
+ *
+ * UNTRUSTED INPUT (C4): the goal, task metadata, and especially the repository
+ * EXCERPTS (raw file contents — a malicious repo file could embed instructions) are
+ * untrusted DATA. Each enters the prompt through `ctx.engine.neutralizeUntrusted` +
+ * `toUntrustedMessage` (a structurally-isolated data-role message, `untrusted: true`),
+ * never raw-concatenated into the trusted SYSTEM instructions. Same chokepoint the
+ * newer modules use (agent-router / cognition).
  *
  * Every model call carries `identity: ctx.identity` — the spawned, ceiling-clamped
  * role identity (#10).
@@ -14,7 +20,8 @@
 import { type Dirent, readdirSync, readFileSync } from "node:fs";
 import { extname, join, relative } from "node:path";
 
-import type { ModelRequest } from "../../core/provider/contract.js";
+import { toUntrustedMessage } from "../../core/injection/index.js";
+import type { ModelMessage, ModelRequest } from "../../core/provider/contract.js";
 import type { RoleFn } from "./contract.js";
 
 /** A single thing scout learned. Lives in the open `detail` bag — NOT a contract type. */
@@ -109,6 +116,11 @@ export const scout: RoleFn = async (ctx) => {
     const files = gatherFiles(root); // bounded, read-only
     const { text, used } = buildContext(files, root);
 
+    // C4: each untrusted block is neutralized + wrapped as an isolated data-role
+    // message (untrusted:true) — never raw-concatenated into the trusted system prompt.
+    const untrusted = (raw: string, origin: string): ModelMessage =>
+      toUntrustedMessage(ctx.engine.neutralizeUntrusted(raw, { source: "external", identity: ctx.identity, origin }), { role: "user" });
+
     const request: ModelRequest = {
       model: SCOUT_MODEL,
       temperature: SCOUT_TEMPERATURE,
@@ -116,13 +128,9 @@ export const scout: RoleFn = async (ctx) => {
       identity: ctx.identity, // the spawned, ceiling-clamped role identity (#10)
       messages: [
         { role: "system", content: SCOUT_SYSTEM },
-        {
-          role: "user",
-          content:
-            `Goal:\n${ctx.task.goal}\n\n` +
-            `Task metadata: ${JSON.stringify(ctx.task.metadata ?? {})}\n\n` +
-            `Repository excerpts (${used} file(s)):\n${text}`,
-        },
+        untrusted(`Goal:\n${ctx.task.goal}`, "scout_goal"),
+        untrusted(`Task metadata: ${JSON.stringify(ctx.task.metadata ?? {})}`, "scout_metadata"),
+        untrusted(`Repository excerpts (${used} file(s)):\n${text}`, "scout_repo_excerpts"),
       ],
     };
 

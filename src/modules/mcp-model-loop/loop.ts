@@ -177,9 +177,13 @@ export function createMcpModelLoop(deps: McpModelLoopDeps = {}): McpModelLoop {
       const toolDefs = await transport.listTools();
       const tools: ModelTool[] = toolDefs.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters }));
 
+      // C4: the goal is untrusted user DATA — neutralize + wrap as an isolated data-role
+      // message (untrusted:true), never raw in the trusted system prompt. (Same chokepoint
+      // as the tool-result path below; the goal is separate and not counted there.)
+      const safeGoal = neutralize(`Goal:\n${goal}`, { source: "external", identity, origin: "mcp_loop_goal" });
       const messages: ModelMessage[] = [
         { role: "system", content: SYSTEM },
-        { role: "user", content: `Goal:\n${goal}` },
+        toUntrusted(safeGoal, { role: "user" }),
       ];
 
       // ── THE INBOUND CHOKEPOINT (#8): the ONLY path from a tool result to a message.

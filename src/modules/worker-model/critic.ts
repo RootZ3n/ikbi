@@ -4,12 +4,18 @@
  * Scoped (pending 3-eyes): judge whether the builder's work satisfies the task
  * goal, producing a pass/fail verdict + feedback. READ-ONLY — critic reads the
  * goal and the builder's RoleResult from `priorResults`; it never touches the
- * workspace and never handles untrusted content (no `neutralizeUntrusted`).
+ * workspace.
+ *
+ * UNTRUSTED INPUT (C4): the goal (user-supplied) and the builder summary/detail
+ * (model-derived — a poisoned upstream role could embed instructions) are untrusted
+ * DATA. Each enters via `ctx.engine.neutralizeUntrusted` + `toUntrustedMessage`
+ * (untrusted:true), never raw-concatenated into the trusted SYSTEM verdict prompt.
  *
  * Every model call carries `identity: ctx.identity` (#10).
  */
 
-import type { ModelRequest } from "../../core/provider/contract.js";
+import { toUntrustedMessage } from "../../core/injection/index.js";
+import type { ModelMessage, ModelRequest } from "../../core/provider/contract.js";
 import type { RoleFn } from "./contract.js";
 
 const CRITIC_MODEL = "mimo-v2.5-pro"; // the critic/reviewer-tier logical roster id
@@ -47,6 +53,11 @@ export const critic: RoleFn = async (ctx) => {
   }
 
   try {
+    // C4: goal + builder summary/detail are untrusted DATA — neutralized + wrapped as
+    // isolated data-role messages (untrusted:true), never raw in the system prompt.
+    const untrusted = (raw: string, origin: string): ModelMessage =>
+      toUntrustedMessage(ctx.engine.neutralizeUntrusted(raw, { source: "external", identity: ctx.identity, origin }), { role: "user" });
+
     const request: ModelRequest = {
       model: CRITIC_MODEL,
       temperature: CRITIC_TEMPERATURE,
@@ -54,13 +65,9 @@ export const critic: RoleFn = async (ctx) => {
       identity: ctx.identity, // the spawned, ceiling-clamped role identity (#10)
       messages: [
         { role: "system", content: CRITIC_SYSTEM },
-        {
-          role: "user",
-          content:
-            `Goal (intent):\n${ctx.task.goal}\n\n` +
-            `Builder summary:\n${builderResult.summary ?? "(none)"}\n\n` +
-            `Builder detail:\n${JSON.stringify(builderResult.detail ?? {})}`,
-        },
+        untrusted(`Goal (intent):\n${ctx.task.goal}`, "critic_goal"),
+        untrusted(`Builder summary:\n${builderResult.summary ?? "(none)"}`, "critic_builder_summary"),
+        untrusted(`Builder detail:\n${JSON.stringify(builderResult.detail ?? {})}`, "critic_builder_detail"),
       ],
     };
 

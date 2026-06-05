@@ -178,14 +178,18 @@ export const builder: RoleFn = async (ctx) => {
     // orchestrator does NOT enforce a per-role timeout yet (noted for the 3rd eye).
     const startedAt = Date.now();
 
+    // C4: the goal (user-supplied) and the prior-role results (model-derived — a
+    // poisoned upstream summary could embed instructions) are untrusted DATA. Each
+    // enters via neutralize + toUntrustedMessage (untrusted:true), never raw-concatenated
+    // into the trusted system prompt. (Separate from the tool-result chokepoint below;
+    // these do NOT touch neutralizedCount, which tracks tool results.)
+    const untrusted = (raw: string, origin: string): ModelMessage =>
+      toUntrustedMessage(ctx.engine.neutralizeUntrusted(raw, { source: "external", identity: ctx.identity, origin }), { role: "user" });
+
     const messages: ModelMessage[] = [
       { role: "system", content: BUILDER_SYSTEM },
-      {
-        role: "user",
-        content:
-          `Goal:\n${ctx.task.goal}\n\n` +
-          `Prior role results:\n${JSON.stringify(ctx.priorResults.map((r) => ({ role: r.role, outcome: r.outcome, summary: r.summary })))}`,
-      },
+      untrusted(`Goal:\n${ctx.task.goal}`, "builder_goal"),
+      untrusted(`Prior role results:\n${JSON.stringify(ctx.priorResults.map((r) => ({ role: r.role, outcome: r.outcome, summary: r.summary })))}`, "builder_prior_results"),
     ];
 
     // --- the one tool: returns a raw result STRING; records side effects. It NEVER
