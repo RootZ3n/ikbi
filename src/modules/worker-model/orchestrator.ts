@@ -90,9 +90,10 @@ export interface OrchestratorDeps {
     diff?: (handle: WorkspaceHandle) => Promise<string>;
   };
   /**
-   * Governance evaluator (gate-wall). Optional: when absent, promote falls back to
-   * an explicit auditable advisory allow. When present, its PromoteGovernance verdict
-   * is passed into promote — the workspace manager is fail-closed on governance.
+   * Governance evaluator (gate-wall). Optional in the type, but a promote REQUIRES it:
+   * when absent, the promote is DENIED fail-closed (H5) — never advisory-allowed. When
+   * present, its PromoteGovernance verdict is passed into promote — the workspace manager
+   * is fail-closed on governance. The production orchestrator always wires it.
    */
   readonly gateWall?: {
     evaluate: (input: {
@@ -199,7 +200,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   const events = deps.events ?? coreEvents;
   const invokeModel = deps.invokeModel ?? lazyInvokeModel;
   const neutralizeUntrusted = deps.neutralizeUntrusted ?? coreNeutralize;
-  const gateWall = deps.gateWall; // optional — absent → explicit advisory allow at promote
+  const gateWall = deps.gateWall; // optional in the type — absent → promote DENIED fail-closed (H5)
   const judge = deps.judge ?? deterministicJudge; // competitive-mode scorer (pure, no model)
   // Cooperative kill checkpoint (read-only). Lazy default so worker-model load never
   // eagerly constructs the kill-switch; the loop OBEYS a kill, it never publishes one.
@@ -425,24 +426,32 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     let promoted = false;
     let reason: string | undefined;
     if (decision.promote) {
-      // GOVERNANCE (gate-wall): the workspace manager is fail-closed on governance.
-      // The governance subject is the run's parent tier grant (derived here — no
-      // per-run grant is in scope at the promote point). Absent a gate-wall dep, fall
-      // back to an EXPLICIT, auditable advisory allow (never a silent undefined).
-      const governanceGrant = autonomyForTier(asTier(parentIdentity.trustTier ?? TRUST_FLOOR, TRUST_FLOOR));
-      const governance: PromoteGovernance = gateWall
-        ? await gateWall.evaluate({ grant: governanceGrant, action: { kind: "promote", task, results }, identity: parentIdentity })
-        : { allow: true, reason: "gate-wall not wired (advisory mode)" };
-      const promote = await workspaces.promote(workspace, {
-        evaluation: decision.evaluation, // sourced from the integrator, NOT hardcoded
-        governance,
-        message: `worker-model: ${task.goal}${decision.rationale !== undefined ? ` — ${decision.rationale}` : ""}`,
-      });
-      promoted = promote.promoted;
-      if (!promoted) {
-        // Conflict: the workspace is reconcilable — downgrade to partial, do NOT discard.
-        overall = "partial";
-        reason = promote.reason ?? "promote did not land (conflict)";
+      if (gateWall === undefined) {
+        // H5 FAIL-CLOSED: a promote REQUIRES gate-wall authorization. An unwired
+        // gate-wall is a misconfiguration; the safe response to "can't verify
+        // authorization" is to DENY — never advisory-allow an irreversible promote.
+        // Discard the workspace, land nothing, reject (same discipline as the verifier's
+        // no-diff fail-closed).
+        await workspaces.discard(workspace);
+        overall = "rejected";
+        reason = "gate-wall not wired — promote denied (fail-closed)";
+      } else {
+        // GOVERNANCE (gate-wall): the workspace manager is fail-closed on governance.
+        // The governance subject is the run's parent tier grant (derived here — no
+        // per-run grant is in scope at the promote point).
+        const governanceGrant = autonomyForTier(asTier(parentIdentity.trustTier ?? TRUST_FLOOR, TRUST_FLOOR));
+        const governance: PromoteGovernance = await gateWall.evaluate({ grant: governanceGrant, action: { kind: "promote", task, results }, identity: parentIdentity });
+        const promote = await workspaces.promote(workspace, {
+          evaluation: decision.evaluation, // sourced from the integrator, NOT hardcoded
+          governance,
+          message: `worker-model: ${task.goal}${decision.rationale !== undefined ? ` — ${decision.rationale}` : ""}`,
+        });
+        promoted = promote.promoted;
+        if (!promoted) {
+          // Conflict: the workspace is reconcilable — downgrade to partial, do NOT discard.
+          overall = "partial";
+          reason = promote.reason ?? "promote did not land (conflict)";
+        }
       }
     } else {
       await workspaces.discard(workspace);
@@ -630,10 +639,20 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       // 5b. WINNER: promote it (gate-wall STILL governs), discard ALL losers.
       const winner = handles.find((h) => h.id === verdict.winner!.workspaceId)!;
       const winnerRoles = rolesByWs.get(winner.id) ?? [];
+
+      // H5 FAIL-CLOSED: a promote REQUIRES gate-wall authorization. No gate-wall ⇒ DENY
+      // (never advisory-allow an irreversible promote). Discard EVERY workspace, land
+      // nothing, reject.
+      if (gateWall === undefined) {
+        for (const ws of handles) await safeDiscard(workspaces, ws);
+        const reason = "gate-wall not wired — promote denied (fail-closed)";
+        events.publish(workerCompetitiveCompleted.create({ taskId: task.taskId, candidateCount: n, winnerWorkspaceId: winner.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
+        events.publish(workerFailed.create({ taskId: task.taskId, reason, workspaceId: winner.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
+        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: winnerRoles, workspaceId: winner.id, promoted: false, reason };
+      }
+
       const governanceGrant = autonomyForTier(asTier(parentIdentity.trustTier ?? TRUST_FLOOR, TRUST_FLOOR));
-      const governance: PromoteGovernance = gateWall
-        ? await gateWall.evaluate({ grant: governanceGrant, action: { kind: "promote", task, results: winnerRoles }, identity: parentIdentity })
-        : { allow: true, reason: "gate-wall not wired (advisory mode)" };
+      const governance: PromoteGovernance = await gateWall.evaluate({ grant: governanceGrant, action: { kind: "promote", task, results: winnerRoles }, identity: parentIdentity });
       const promote = await workspaces.promote(winner, {
         evaluation: { approved: true, score: verdict.winner.composite, evaluatorId: "deterministic-judge" },
         governance,

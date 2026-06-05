@@ -145,6 +145,16 @@ function capturingRoles(outcomeFor: (role: WorkerRole) => WorkerOutcome = () => 
 const ENABLED = { enabled: true, roleTimeoutMs: 1000, maxConcurrentRuns: 1 };
 const task: WorkerTask = { taskId: "t-1", targetRepo: "/repo", goal: "do the thing" };
 
+/** An ALLOWING gate-wall — the wired/governed path (production wires the real gate-wall). */
+const allowGate: NonNullable<OrchestratorDeps["gateWall"]> = { evaluate: async (): Promise<PromoteGovernance> => ({ allow: true, reason: "test gate allows" }) };
+
+/** Strip the wired gate-wall entirely — simulates the unwired/misconfig path (H5). */
+function omitGate(d: OrchestratorDeps): OrchestratorDeps {
+  const copy = { ...d };
+  delete (copy as { gateWall?: unknown }).gateWall;
+  return copy;
+}
+
 function baseDeps(extra: Partial<OrchestratorDeps>): OrchestratorDeps {
   const ws = fakeWorkspaces();
   const tr = fakeTrust();
@@ -156,6 +166,9 @@ function baseDeps(extra: Partial<OrchestratorDeps>): OrchestratorDeps {
     trust: tr.trust,
     receipts: rc.receipts,
     events: bus.bus,
+    // A promote REQUIRES gate-wall authorization (H5). Default to a wired ALLOWING gate so
+    // the happy-path promote tests exercise the GOVERNED path; H5 tests pass `gateWall: undefined`.
+    gateWall: allowGate,
     invokeModel: async () => {
       throw new Error("invokeModel not used in these tests");
     },
@@ -548,12 +561,17 @@ test("gate-wall wired: an ALLOWING gateWall → governance.allow=true reaches pr
   assert.equal(ws.captured()?.governance?.allow, true);
 });
 
-test("NO gate-wall dep → promote carries an EXPLICIT auditable advisory allow", async () => {
+test("H5: NO gate-wall dep → the promote is DENIED fail-closed (never advisory-allowed); workspace discarded, NOT promoted", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
   const ws = capturingWorkspaces();
-  const cap = capturingRoles();
-  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: cap.roles }));
-  await orch.run(task, parentCtx);
-  assert.equal(ws.captured()?.governance?.allow, true);
-  assert.match(ws.captured()?.governance?.reason ?? "", /advisory mode/);
+  const cap = capturingRoles(); // integrator returns a well-formed PROMOTE decision
+  // omitGate strips baseDeps' wired-allow default → the unwired/misconfig path.
+  const orch = createOrchestrator(omitGate(baseDeps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: cap.roles })));
+  const result = await orch.run(task, parentCtx);
+
+  assert.equal(result.promoted, false, "nothing promoted without gate-wall authorization");
+  assert.equal(result.outcome, "rejected", "an unwired gate-wall denies fail-closed");
+  assert.match(result.reason ?? "", /gate-wall not wired/);
+  assert.equal(ws.captured(), undefined, "promote() was NEVER called — the promote did not proceed");
+  assert.equal(ws.calls.discard, 1, "the workspace was discarded (nothing lands on the target branch)");
 });

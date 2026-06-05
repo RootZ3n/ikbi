@@ -62,8 +62,11 @@ const noopBus = () => ({ publish: <P>(i: P) => ({ ...(i as object), contractVers
 const ENABLED = { enabled: true, roleTimeoutMs: 1000, maxConcurrentRuns: 1 };
 const task: WorkerTask = { taskId: "t-1", targetRepo: "/repo", goal: "do the thing" };
 
+/** An ALLOWING gate-wall — a promote REQUIRES gate-wall authorization (H5). */
+const allowGate: NonNullable<OrchestratorDeps["gateWall"]> = { evaluate: async () => ({ allow: true, reason: "test gate allows" }) };
+
 function deps(killCheck: NonNullable<OrchestratorDeps["killCheck"]>, ws: ReturnType<typeof fakeWorkspaces>, cap: ReturnType<typeof capturingRoles>, ids: ReturnType<typeof makeIdentities>): OrchestratorDeps {
-  return { config: ENABLED, resolveIdentity: ids.resolveIdentity, roleClaim: ids.roleClaim, roles: cap.roles, workspaces: ws.workspaces, trust: fakeTrust(), receipts: fakeReceipts(), events: noopBus() as unknown as NonNullable<OrchestratorDeps["events"]>, invokeModel: async () => { throw new Error("unused"); }, killCheck };
+  return { config: ENABLED, resolveIdentity: ids.resolveIdentity, roleClaim: ids.roleClaim, roles: cap.roles, workspaces: ws.workspaces, trust: fakeTrust(), receipts: fakeReceipts(), events: noopBus() as unknown as NonNullable<OrchestratorDeps["events"]>, gateWall: allowGate, invokeModel: async () => { throw new Error("unused"); }, killCheck };
 }
 
 // ── PREVENT NEW WORK ─────────────────────────────────────────────────────────

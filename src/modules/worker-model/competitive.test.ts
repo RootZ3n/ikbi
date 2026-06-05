@@ -119,8 +119,18 @@ const COMP = { enabled: true, roleTimeoutMs: 1000, maxConcurrentRuns: 1, competi
 const SINGLE = { enabled: true, roleTimeoutMs: 1000, maxConcurrentRuns: 1 };
 const task: WorkerTask = { taskId: "t-1", targetRepo: "/repo", goal: "do the thing" };
 
+/** An ALLOWING gate-wall — the wired/governed path. A promote REQUIRES gate-wall (H5). */
+const allowGate: NonNullable<OrchestratorDeps["gateWall"]> = { evaluate: async (): Promise<PromoteGovernance> => ({ allow: true, reason: "test gate allows" }) };
+
+/** Strip the wired gate-wall entirely — simulates the unwired/misconfig path (H5). */
+function omitGate(d: OrchestratorDeps): OrchestratorDeps {
+  const copy = { ...d };
+  delete (copy as { gateWall?: unknown }).gateWall;
+  return copy;
+}
+
 function deps(extra: Partial<OrchestratorDeps>): OrchestratorDeps {
-  return { config: COMP, trust: fakeTrust(), receipts: fakeReceipts(), events: fakeBus().bus, invokeModel: async () => { throw new Error("unused"); }, ...extra };
+  return { config: COMP, trust: fakeTrust(), receipts: fakeReceipts(), events: fakeBus().bus, gateWall: allowGate, invokeModel: async () => { throw new Error("unused"); }, ...extra };
 }
 
 // ── OFF BY DEFAULT (regression guard) ────────────────────────────────────────
@@ -207,6 +217,21 @@ test("competitive: a denying gate-wall blocks the winner's promote ⇒ all disca
   assert.equal(r.promoted, false, "the gate blocked the promote");
   assert.ok(ws.promoted.includes("ws0"), "promote was attempted on the winner");
   assert.deepEqual([...ws.discarded].sort(), ["ws0", "ws1"], "winner + loser both discarded (fail-closed)");
+});
+
+test("H5 competitive: NO gate-wall → the winner promote is DENIED fail-closed; ALL discarded, nothing promoted", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = compWorkspaces();
+  const cap = compRoles((id) => (id === "ws0" ? { typecheck: 0, test: 0 } : { typecheck: 0, test: 1 })); // ws0 wins the judge
+  // omitGate strips the deps()' wired-allow default → the unwired/misconfig path.
+  const orch = createOrchestrator(omitGate(deps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: cap.roles })));
+
+  const r = await orch.run(task, parentCtx);
+  assert.equal(r.promoted, false, "nothing promoted without gate-wall authorization");
+  assert.equal(r.outcome, "rejected", "an unwired gate-wall denies the competitive promote fail-closed");
+  assert.match(r.reason ?? "", /gate-wall not wired/);
+  assert.equal(ws.promoted.length, 0, "workspaces.promote() was NEVER called — the promote did not proceed");
+  assert.deepEqual([...ws.discarded].sort(), ["ws0", "ws1"], "EVERY workspace discarded (nothing lands)");
 });
 
 // ── #10 CLAMP PRESERVED through the competitive path ─────────────────────────
