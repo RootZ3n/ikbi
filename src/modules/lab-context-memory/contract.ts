@@ -82,7 +82,7 @@ export interface MemoryQuery {
 }
 
 /** Failure kinds for the lab-memory writer. */
-export type LabMemoryErrorKind = "disabled" | "identity";
+export type LabMemoryErrorKind = "disabled" | "identity" | "too_large";
 
 /** A typed lab-memory failure (thrown only on a fail-closed write refusal). */
 export class LabMemoryError extends Error {

@@ -7,6 +7,10 @@
  * project / timestamp / seq from a receipt and NEVER its freeform metadata or
  * requestSummary (those would outlive the ≤30-day receipts they came from).
  *
+ * Direct `record()` keeps the open `value` shape, but because memory is DURABLE (no TTL),
+ * it SCRUBS secret-shaped content and CAPS the value size before persisting (H7) — the
+ * store never holds a raw secret, and the returned entry reflects the scrubbed value.
+ *
  * Durable via a substrate DocumentStore (concurrency-safe, keyed by entry id).
  */
 
@@ -20,6 +24,7 @@ import { receipts as coreReceipts } from "../../core/receipt/index.js";
 import type { Receipt, ReceiptQuery } from "../../core/receipt/contract.js";
 import { labContextMemoryConfig, type LabContextMemoryConfig } from "./config.js";
 import { labmemProjected, labmemQueried, labmemRecorded, type LabMemEventPayload } from "./events.js";
+import { scrubSecrets, valueByteSize } from "./redaction.js";
 import {
   LabMemoryError,
   type LabMemory,
@@ -125,8 +130,20 @@ export function createLabMemory(deps: LabMemoryDeps = {}): LabMemory {
   async function record(input: MemoryEntryInput, identity: ValidatedIdentity): Promise<MemoryEntry> {
     if (!config.enabled) throw new LabMemoryError("disabled", "lab-context-memory is disabled — refusing to record");
     if (!isValidatedIdentity(identity)) throw new LabMemoryError("identity", "record requires a validated identity");
+
+    // H7 SIZE CAP: durable shared memory holds SUMMARIES, not blobs. An over-cap value
+    // is REJECTED fail-closed (the caller must summarize) — never silently truncated/stored.
+    const size = valueByteSize(input.value);
+    if (size > config.maxValueBytes) {
+      throw new LabMemoryError("too_large", `record value is ${size} bytes — exceeds the ${config.maxValueBytes}-byte cap; summarize before persisting to durable shared memory`);
+    }
+    // H7 SECRET SCRUB: scrub secret-shaped content from value BEFORE persist, so the
+    // DURABLE store never holds a raw secret. The persisted AND returned entry carry the
+    // scrubbed value — a caller cannot read back the unscrubbed original.
+    const value = scrubSecrets(input.value);
+
     const agent = identity.identity.agentId;
-    const entry = await upsert({ project: input.project, agent, kind: input.kind, key: input.key, value: input.value, ...(input.sourceReceiptSeq !== undefined ? { sourceReceiptSeq: input.sourceReceiptSeq } : {}) });
+    const entry = await upsert({ project: input.project, agent, kind: input.kind, key: input.key, value, ...(input.sourceReceiptSeq !== undefined ? { sourceReceiptSeq: input.sourceReceiptSeq } : {}) });
     emit(labmemRecorded, { project: entry.project, agent: entry.agent, kind: entry.kind }, identity.identity);
     return entry;
   }
