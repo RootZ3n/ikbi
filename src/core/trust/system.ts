@@ -26,6 +26,8 @@ import { createHash } from "node:crypto";
 import type { Logger } from "pino";
 
 import type { TrustTier, TrustTierInput, TrustTierResolver } from "../identity/contract.js";
+import { isOperator } from "../identity/resolver.js";
+import type { ValidatedIdentity } from "../identity/resolver.js";
 import type { DocumentStore } from "../substrate/store.js";
 import {
   AGENT_CEILING,
@@ -33,8 +35,10 @@ import {
   type AutonomyGrant,
   autonomyForTier,
   clampTier,
+  MAX_TRANSITIONS,
   type OutcomeStatus,
   type RecordOutcomeInput,
+  tierRank,
   TRUST_FLOOR,
   type TrustDecision,
   TrustError,
@@ -268,6 +272,76 @@ export class TrustSystem implements TrustTierResolver {
     this.checked.add(input.agentId);
     this.failedClosed.delete(input.agentId);
     this.log.info({ event: "trust_operator_reset", agentId: input.agentId, tier: state.tier }, "operator cleared injection flag");
+    return state;
+  }
+
+  /**
+   * OPERATOR action: GRANT a worker an initial trust tier — the cold-start on-ramp.
+   *
+   * A fresh worker resolves to the untrusted FLOOR on a cold cache (deliberate
+   * fail-closed), and untrusted/probation require approval — so a never-seen worker
+   * is rejected on its first invocation with no path to work. This is a DELIBERATE,
+   * AUTHORIZED, durable override of that cold floor: the operator (the apex) sets a
+   * worker's tier directly, written MAC-protected through the existing trust store
+   * and logged as a transition (granted, NOT earned). It bypasses the earned-rules
+   * exactly as `operatorReset` bypasses them — that is the point of a grant.
+   *
+   * GATED: only an operator-tier identity may grant (a non-operator is rejected —
+   * an agent cannot grant itself trust). CEILING-CAPPED: the granted tier must be
+   * <= the agent ceiling (`trusted`) — an operator CANNOT grant the operator apex
+   * (trust does not manage the operator). The floor itself is unchanged: trust is
+   * still GRANTED by an authorized operator, never claimed by config or auto-assigned.
+   */
+  async grantTier(
+    input: { agentId: string; kind: "agent"; tier: TrustTier; defaultTrustTier: string },
+    granter: ValidatedIdentity,
+  ): Promise<TrustState> {
+    if (!isOperator(granter)) {
+      throw new TrustError("config", "only an operator-tier identity may grant trust");
+    }
+    // Ceiling cap: lower rank = MORE trust. A tier above the agent ceiling (i.e.
+    // `operator`, rank 0) is rejected — the operator apex is not grantable.
+    if (tierRank(input.tier) < tierRank(AGENT_CEILING)) {
+      throw new TrustError("config", `cannot grant tier "${input.tier}" — above the agent ceiling "${AGENT_CEILING}"`);
+    }
+    const now = this.now();
+    let newState: TrustState | undefined;
+    let transition: TrustTransition | undefined;
+    const persisted = await this.store.update(docKey(input.agentId), (cur) => {
+      const verified = cur === undefined ? undefined : verifyUnwrap(this.key, cur);
+      if (cur !== undefined && verified === undefined) {
+        // Refuse to grant on top of a forged/corrupt base (fail-closed).
+        throw new TrustError("state", `trust state for "${input.agentId}" failed integrity verification`);
+      }
+      const base = verified ?? freshState(input, now);
+      // A never-seen worker is effectively at the cold FLOOR before the grant — that
+      // is the honest `from` for the audit trail (the grant moves it off the floor).
+      const from = verified?.tier ?? TRUST_FLOOR;
+      const to = clampTier(input.tier, TRUST_FLOOR, AGENT_CEILING);
+      if (to !== from) {
+        transition = { at: now, direction: tierRank(to) < tierRank(from) ? "promote" : "demote", from, to, reason: "operator_grant" };
+      }
+      const next: TrustState = {
+        ...base,
+        tier: to,
+        ...(transition !== undefined
+          ? { transitions: [...base.transitions, transition].slice(-MAX_TRANSITIONS), lastTransition: transition }
+          : {}),
+        updatedAt: now,
+      };
+      newState = next;
+      return wrap(this.key, next);
+    });
+    const state = verifyUnwrap(this.key, persisted) ?? newState!;
+    // Live in-process AND persisted for the next run (preload reloads it).
+    this.cache.set(input.agentId, state);
+    this.checked.add(input.agentId);
+    this.failedClosed.delete(input.agentId);
+    this.log.info(
+      { event: "trust_operator_grant", agentId: input.agentId, granter: granter.identity.agentId, tier: state.tier },
+      `operator granted ${input.agentId} -> ${state.tier}`,
+    );
+    if (transition !== undefined) this.sink?.({ agentId: input.agentId, kind: input.kind, transition });
     return state;
   }
 

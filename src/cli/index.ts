@@ -19,6 +19,7 @@
 import "../modules/index.js";
 import { config } from "../core/config.js";
 import { registry } from "../core/provider/index.js";
+import { trust } from "../core/trust/index.js";
 import { commands } from "./registry.js";
 // The DEFAULT router: input that is not a known command is treated as a GOAL and
 // deliberated by cognition-layer (which decides the path + recommends the next
@@ -107,6 +108,19 @@ async function run(argv: readonly string[]): Promise<void> {
       printUsage();
       return;
     default: {
+      // STARTUP PRELOAD (the cold-start on-ramp's second half): warm the trust cache
+      // from durable state BEFORE any command resolves worker trust. Without this, a
+      // granted worker still resolves cold to the floor (system.ts cold path) and the
+      // grant is invisible. Skipped for the pure-info builtins above (no trust path).
+      // A rejected count (MAC failures) is surfaced, never silently dropped.
+      try {
+        const { rejected } = await trust.preload();
+        if (rejected > 0) {
+          process.stderr.write(`ikbi: trust preload rejected ${rejected} unreadable/forged state doc(s) (fail-closed)\n`);
+        }
+      } catch (err) {
+        process.stderr.write(`ikbi: trust preload failed: ${err instanceof Error ? err.message : String(err)}\n`);
+      }
       // Module commands compose via the command-registrar seam. Built-ins above
       // take precedence (a module cannot shadow a core command).
       const moduleCmd = commands.get(cmd);

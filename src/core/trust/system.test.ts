@@ -8,6 +8,9 @@ import { test } from "node:test";
 import { pino, type Logger } from "pino";
 
 import type { TrustTierInput } from "../identity/contract.js";
+import { AgentRegistry, hashToken } from "../identity/registry.js";
+import { IdentityResolver } from "../identity/resolver.js";
+import type { ValidatedIdentity } from "../identity/resolver.js";
 import { LockManager } from "../substrate/lock.js";
 import { DocumentStore } from "../substrate/store.js";
 import { autonomyForTier, type RecordOutcomeInput, TrustError } from "./contract.js";
@@ -250,4 +253,108 @@ test("the tier -> autonomy mapping returns correct grants per tier", () => {
   assert.deepEqual(autonomyForTier("verified"), { tier: "verified", sandboxed: false, gateLevel: "standard", requiresApproval: false, autoCommit: false });
   assert.deepEqual(autonomyForTier("trusted"), { tier: "trusted", sandboxed: false, gateLevel: "reduced", requiresApproval: false, autoCommit: true });
   assert.deepEqual(autonomyForTier("untrusted"), { tier: "untrusted", sandboxed: true, gateLevel: "all", requiresApproval: true, autoCommit: false });
+});
+
+// ── grantTier — the operator cold-start on-ramp (Blocker 1) ──────────────────
+
+/** A validated identity at a chosen tier (operator vs agent), for the grant gate. */
+function identity(agentId: string, tier: string): ValidatedIdentity {
+  const resolver = new IdentityResolver({
+    registry: new AgentRegistry({ agents: [{ agentId, kind: tier === "operator" ? "operator" : "agent", defaultTrustTier: tier, tokenHashes: [hashToken(`${agentId}-secret`)] }] }),
+    logger: silent,
+    now: () => 1000,
+  });
+  return resolver.resolve({ token: `${agentId}-secret` });
+}
+const operatorId = () => identity("operator", "operator");
+const agentId = () => identity("rogue", "trusted");
+
+test("grantTier: an OPERATOR grants a worker trusted — durable, MAC-protected, transition logged, survives restart", async () => {
+  const dir = await tmp();
+  try {
+    const { trust } = makeTrust(dir);
+    const state = await trust.grantTier({ agentId: "builder-3", kind: "agent", tier: "trusted", defaultTrustTier: "probation" }, operatorId());
+    assert.equal(state.tier, "trusted", "the worker's tier is now the granted tier");
+    // The grant is logged as a transition (granted, NOT earned) from the cold floor.
+    assert.equal(state.lastTransition?.reason, "operator_grant");
+    assert.equal(state.lastTransition?.from, "untrusted");
+    assert.equal(state.lastTransition?.to, "trusted");
+    // Live in-process immediately (cache + checked updated) — no restart needed.
+    assert.equal(trust.resolve(AGENT), "trusted", "the grant is live in this process");
+    // Survives restart: a fresh TrustSystem over the same store reads trusted.
+    const restarted = makeTrust(dir);
+    await restarted.trust.preload();
+    assert.equal(restarted.trust.resolve(AGENT), "trusted", "the granted state is durable across restart");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("grantTier: a NON-operator is REJECTED — no write, the worker stays at the floor", async () => {
+  const dir = await tmp();
+  try {
+    const { trust, store } = makeTrust(dir);
+    await assert.rejects(
+      trust.grantTier({ agentId: "builder-3", kind: "agent", tier: "trusted", defaultTrustTier: "probation" }, agentId()),
+      /only an operator/,
+    );
+    assert.equal((await store.list()).length, 0, "no durable state was written by the rejected grant");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("grantTier: CEILING CAP — granting the operator apex is REJECTED; granting the ceiling (trusted) is OK", async () => {
+  const dir = await tmp();
+  try {
+    const { trust } = makeTrust(dir);
+    await assert.rejects(
+      trust.grantTier({ agentId: "builder-3", kind: "agent", tier: "operator" as never, defaultTrustTier: "probation" }, operatorId()),
+      /above the agent ceiling/,
+    );
+    const ok = await trust.grantTier({ agentId: "builder-3", kind: "agent", tier: "trusted", defaultTrustTier: "probation" }, operatorId());
+    assert.equal(ok.tier, "trusted", "granting the ceiling tier is allowed");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("grantTier: MAC PROTECTION — a hand-edited granted doc fails verifyUnwrap (fail-closed)", async () => {
+  const dir = await tmp();
+  try {
+    const { trust, store } = makeTrust(dir);
+    await trust.grantTier({ agentId: "builder-3", kind: "agent", tier: "trusted", defaultTrustTier: "probation" }, operatorId());
+    // Tamper with the persisted (MAC-protected) doc — flip the tier without re-MACing.
+    const key = createHash("sha256").update("builder-3", "utf8").digest("hex");
+    const persisted = await store.get(key);
+    assert.ok(persisted !== undefined);
+    const forged = { ...persisted, tier: "operator" } as PersistedTrustState;
+    await store.put(key, forged);
+    // A fresh system fails the granted doc closed to the floor (not the forged tier).
+    const restarted = makeTrust(dir);
+    const { rejected } = await restarted.trust.preload();
+    assert.equal(rejected, 1, "the tampered grant doc is rejected at preload");
+    assert.equal(restarted.trust.resolve(AGENT), "untrusted", "fail-closed to the floor, not the forged operator tier");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("grantTier: COLD→WORKING — granted + preloaded, a fresh process resolves trusted (requiresApproval false)", async () => {
+  const dir = await tmp();
+  try {
+    // Operator grants on one process.
+    const first = makeTrust(dir);
+    await first.trust.grantTier({ agentId: "builder-3", kind: "agent", tier: "trusted", defaultTrustTier: "probation" }, operatorId());
+
+    // A FRESH process: cold cache. Preload loads the granted durable state.
+    const fresh = makeTrust(dir);
+    const { loaded } = await fresh.trust.preload();
+    assert.equal(loaded, 1);
+    // The cold→working path: resolve returns trusted (not the floor), so the gate-wall allows.
+    assert.equal(fresh.trust.resolve(AGENT), "trusted");
+    assert.equal(autonomyForTier("trusted").requiresApproval, false, "trusted does not require approval — the builder is not rejected at the trust gate");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
