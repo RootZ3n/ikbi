@@ -27,9 +27,12 @@ import type { ResolveContext, ValidatedIdentity } from "./resolver.js";
 
 const log = childLogger("identity");
 
-/** Build the default agents registry: operator bootstrap (protected) + registry file. */
-function buildDefaultRegistry(): AgentRegistry {
-  const ic = config.identity;
+/**
+ * Build the default agents registry: operator bootstrap (protected) + worker
+ * bootstrap (unlocked) + registry file. `ic` is injectable for tests; it defaults to
+ * the process config so the singleton below behaves as before.
+ */
+export function buildDefaultRegistry(ic: typeof config.identity = config.identity): AgentRegistry {
   const registry = new AgentRegistry();
 
   if (ic.tokenSaltIsDefault) {
@@ -52,6 +55,27 @@ function buildDefaultRegistry(): AgentRegistry {
       { locked: true }, // PROTECTED: a registry-file entry cannot overwrite the operator
     );
     log.info({ operatorAgentId: ic.operatorAgentId }, "bootstrapped protected operator identity from IKBI_OPERATOR_TOKEN");
+  }
+
+  if (ic.workerToken !== undefined) {
+    assertStrongToken(ic.workerToken); // same ≥32-char strength check as the operator
+    registry.upsertAgent({
+      agentId: ic.workerAgentId,
+      kind: "agent",
+      functionalRole: "worker",
+      defaultTrustTier: ic.workerTrustTier,
+      tokenHashes: [hashToken(ic.workerToken)],
+    });
+    // NOT locked — leaves room for the operator to add/refine per-role worker agents
+    // via agents.json (loaded below) without conflicting with this shared "worker".
+    //
+    // TIER IS A FLOOR, NOT A CEILING: whatever `defaultTrustTier` this agent is
+    // registered at, the worker-model orchestrator's spawnRole CLAMPS each spawned
+    // role's effective tier to ≤ the dispatching parent's tier (#10). So a mis-set
+    // IKBI_WORKER_TRUST_TIER — even "operator" — can NEVER grant a role more trust
+    // than the operator who dispatched the run. (Documenting the existing structural
+    // guarantee; no new enforcement here.)
+    log.info({ workerAgentId: ic.workerAgentId, workerTrustTier: ic.workerTrustTier }, "bootstrapped worker identity from IKBI_WORKER_TOKEN");
   }
 
   try {

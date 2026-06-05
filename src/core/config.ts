@@ -130,6 +130,22 @@ export interface IdentityConfig {
   /** Agent id assigned to the bootstrapped operator. `IKBI_OPERATOR_AGENT_ID`, default "operator". */
   readonly operatorAgentId: string;
   /**
+   * Bootstrap WORKER token (plaintext env, hashed at load — never stored raw). When
+   * set, registers a claimable worker agent so the worker-model orchestrator's
+   * roleClaim can resolve a real role identity. `IKBI_WORKER_TOKEN`. Undefined =
+   * no worker agent registered → roleClaim fails closed → no run.
+   */
+  readonly workerToken: string | undefined;
+  /** Agent id for the bootstrapped worker agent. `IKBI_WORKER_AGENT_ID`, default "worker". */
+  readonly workerAgentId: string;
+  /**
+   * The worker agent's `defaultTrustTier`. `IKBI_WORKER_TRUST_TIER`, default "trusted".
+   * A FLOOR, not a ceiling: the orchestrator's #10 clamp caps any spawned role at the
+   * dispatching parent's tier, so this cannot grant a role more trust than the operator
+   * who dispatched the run.
+   */
+  readonly workerTrustTier: string;
+  /**
    * Pepper (global salt) for the token-hash KDF. Kept SEPARATE from the registry
    * so a stolen registry file resists offline brute force. `IKBI_IDENTITY_TOKEN_SALT`.
    * A built-in dev default is used if unset (logged as insecure — set it in prod).
@@ -387,6 +403,9 @@ function loadIdentityConfig(env: NodeJS.ProcessEnv, stateRoot: string): Identity
     registryFile,
     operatorToken: optStr(env.IKBI_OPERATOR_TOKEN),
     operatorAgentId: optStr(env.IKBI_OPERATOR_AGENT_ID) ?? "operator",
+    workerToken: optStr(env.IKBI_WORKER_TOKEN),
+    workerAgentId: optStr(env.IKBI_WORKER_AGENT_ID) ?? "worker",
+    workerTrustTier: optStr(env.IKBI_WORKER_TRUST_TIER) ?? "trusted",
     tokenSalt: saltRaw ?? DEFAULT_TOKEN_SALT,
     tokenSaltIsDefault: saltRaw === undefined,
   };
