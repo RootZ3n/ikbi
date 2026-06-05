@@ -53,6 +53,13 @@ export interface OpenAICompatibleOptions {
   readonly fetchImpl?: FetchLike;
   /** Max length for sanitized provider error detail. */
   readonly maxErrorDetail?: number;
+  /**
+   * KEYLESS endpoint (e.g. a local Ollama that ignores auth): skip the API-key
+   * requirement and send NO Authorization header. DEFAULT false — every keyed provider
+   * is unchanged. An implementation option only; the frozen ModelProvider contract is
+   * untouched.
+   */
+  readonly keyless?: boolean;
 }
 
 const DEFAULT_MAX_ERROR_DETAIL = 300;
@@ -178,6 +185,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
   private readonly extraHeaders: Readonly<Record<string, string>>;
   private readonly fetchImpl: FetchLike;
   private readonly maxErrorDetail: number;
+  private readonly keyless: boolean;
 
   constructor(opts: OpenAICompatibleOptions) {
     this.id = opts.id;
@@ -185,6 +193,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
     this.apiKey = opts.apiKey;
     this.extraHeaders = opts.extraHeaders ?? {};
     this.maxErrorDetail = opts.maxErrorDetail ?? DEFAULT_MAX_ERROR_DETAIL;
+    this.keyless = opts.keyless ?? false;
     // Outbound HTTP is gated by the network-egress floor (the fetch-guard seam).
     // An explicit fetchImpl (tests) still wins; absent one, we resolve the
     // process-wide GUARDED fetch — FAIL-CLOSED: resolveFetchGuard() throws
@@ -195,7 +204,8 @@ export class OpenAICompatibleProvider implements ModelProvider {
   }
 
   async invoke(inv: ProviderInvocation): Promise<ProviderResult> {
-    if (this.apiKey === undefined || this.apiKey.length === 0) {
+    // A KEYLESS provider (local Ollama et al.) needs no key; a keyed one fails closed.
+    if (!this.keyless && (this.apiKey === undefined || this.apiKey.length === 0)) {
       throw new ProviderError(`Provider "${this.id}" has no API key configured`, {
         kind: "auth",
         provider: this.id,
@@ -222,7 +232,8 @@ export class OpenAICompatibleProvider implements ModelProvider {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          authorization: `Bearer ${this.apiKey}`,
+          // Keyless: send NO Authorization header (the endpoint ignores auth).
+          ...(this.keyless ? {} : { authorization: `Bearer ${this.apiKey}` }),
           ...this.extraHeaders,
         },
         body: JSON.stringify(body),

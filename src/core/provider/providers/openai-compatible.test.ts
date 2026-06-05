@@ -74,6 +74,30 @@ test("missing API key fails fast as a non-retriable auth error (no fetch)", asyn
   assert.equal(called, false);
 });
 
+test("KEYLESS: a keyless provider with NO api key invokes and sends NO Authorization header", async () => {
+  const { fetchImpl, captured } = jsonFetch(200, {
+    choices: [{ message: { content: "local-ollama" }, finish_reason: "stop" }],
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+  });
+  const p = new OpenAICompatibleProvider({ id: "ollama", baseUrl: "http://127.0.0.1:11434/v1", apiKey: undefined, keyless: true, fetchImpl });
+  const r = await p.invoke(invocation());
+
+  assert.equal(r.content, "local-ollama", "keyless invoke succeeded (no key requirement)");
+  assert.equal(captured.url, "http://127.0.0.1:11434/v1/chat/completions");
+  // NO Authorization header at all (not a dummy bearer).
+  assert.equal(captured.init?.headers.authorization, undefined, "no Authorization header on a keyless request");
+  assert.equal(captured.init?.headers["content-type"], "application/json", "other headers intact");
+});
+
+test("KEYLESS regression: keyless defaults false ⇒ a no-key keyed provider still throws (the floor unchanged)", async () => {
+  let called = false;
+  const fetchImpl: FetchLike = async () => { called = true; throw new Error("should not be called"); };
+  // keyless omitted ⇒ defaults false ⇒ the existing auth requirement holds.
+  const p = new OpenAICompatibleProvider({ id: "mimo", baseUrl: "https://x", apiKey: undefined, fetchImpl });
+  await assert.rejects(() => p.invoke(invocation()), (e: unknown) => e instanceof ProviderError && e.kind === "auth");
+  assert.equal(called, false, "no fetch on the non-keyless missing-key path");
+});
+
 test("HTTP error classification & retriability", async () => {
   const cases: Array<{ status: number; kind: string; retriable: boolean }> = [
     { status: 500, kind: "http", retriable: true },

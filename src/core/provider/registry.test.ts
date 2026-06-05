@@ -72,6 +72,17 @@ test("applyRoster upserts models and declares providers from data", () => {
   assert.equal(reg.getProvider("extra")?.id, "extra");
 });
 
+test("a KEYLESS roster entry (no apiKey) is accepted and declared (the keyless opt-in parses)", () => {
+  const reg = new ModelRegistry();
+  // A local Ollama: keyless, no apiKey — the parser must NOT reject it.
+  const applied = reg.applyRoster({
+    providers: [{ id: "ollama", kind: "openai-compatible", baseUrl: "http://127.0.0.1:11434/v1", keyless: true }],
+    models: [{ id: "llama", role: "scout", cost: { promptPerMTok: 0, completionPerMTok: 0 }, providers: [{ provider: "ollama", providerModelId: "llama3" }] }],
+  });
+  assert.deepEqual(applied, { models: 1, providers: 1 });
+  assert.equal(reg.getProvider("ollama")?.id, "ollama", "the keyless provider is declared");
+});
+
 test("applyRoster rejects malformed documents (fail loud)", () => {
   assert.throws(() => new ModelRegistry().applyRoster(42));
   assert.throws(() => new ModelRegistry().applyRoster({ models: "nope" }));

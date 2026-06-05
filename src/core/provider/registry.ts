@@ -228,10 +228,13 @@ function parseProviderEntry(v: unknown, source: string): ModelProvider {
     for (const [k, val] of Object.entries(hr)) extraHeaders[k] = String(val);
   }
   const apiKey = typeof r.apiKey === "string" ? r.apiKey : undefined;
+  // KEYLESS opt-in (e.g. a local Ollama): skip the key requirement, send no auth header.
+  const keyless = r.keyless === true;
   return new OpenAICompatibleProvider({
     id: asString(r.id, "provider.id", source),
     baseUrl: asString(r.baseUrl, "provider.baseUrl", source),
     apiKey,
     extraHeaders,
+    keyless,
   });
 }

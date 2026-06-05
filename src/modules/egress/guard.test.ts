@@ -5,7 +5,7 @@ import { ProviderError } from "../../core/provider/contract.js";
 import type { FetchLike } from "../../core/provider/providers/openai-compatible.js";
 import { events } from "../../core/events/index.js";
 import { createGuardedFetch } from "./guard.js";
-import { egressBlocked, type EgressBlockedPayload } from "./events.js";
+import { egressBlocked, type EgressBlockedPayload, type EgressLocalAllowedPayload } from "./events.js";
 
 const okResponse = {
   ok: true,
@@ -24,20 +24,24 @@ function recordingTransport(): { transport: FetchLike; calls: string[] } {
   return { transport, calls };
 }
 
-/** Build a guard with captured block events + a fixed DNS answer. */
+/** Build a guard with captured block + local-allowed events + a fixed DNS answer. */
 function harness(opts: {
   allowlist?: string[];
+  localEndpoints?: string[];
   resolve?: (host: string) => Promise<string[]>;
 }) {
   const blocked: EgressBlockedPayload[] = [];
+  const localAllowed: EgressLocalAllowedPayload[] = [];
   const { transport, calls } = recordingTransport();
   const guard = createGuardedFetch({
     allowlist: opts.allowlist ?? ["api.example.com"],
+    localEndpoints: opts.localEndpoints ?? [], // DEFAULT: no local access
     resolve: opts.resolve ?? (async () => ["93.184.216.34"]), // a public IP
     transport,
     publishBlocked: (p) => blocked.push(p),
+    publishLocalAllowed: (p) => localAllowed.push(p),
   });
-  return { guard, blocked, calls };
+  return { guard, blocked, localAllowed, calls };
 }
 
 const init = { method: "GET", headers: {}, body: "", signal: new AbortController().signal };
@@ -149,6 +153,7 @@ test("egress.blocked publishes a namespaced event on the real bus", async () => 
   // Use the DEFAULT publish path (real bus), only overriding allowlist/resolve/transport.
   const guard = createGuardedFetch({
     allowlist: ["api.example.com"],
+    localEndpoints: [],
     resolve: async () => ["169.254.169.254"],
     transport: async () => okResponse,
   });
@@ -160,4 +165,101 @@ test("egress.blocked publishes a namespaced event on the real bus", async () => 
   assert.equal(seen[0]?.reason, "internal_ip");
   assert.equal(seen[0]?.host, "api.example.com");
   assert.ok(egressBlocked.is({ type: "egress.blocked" } as never), "event type is namespaced egress.blocked");
+});
+
+// ── EXACT-MATCH LOCAL-ENDPOINT ALLOWLIST (3-eyes SSRF exception) ──────────────
+
+const LOCAL = "127.0.0.1";
+
+test("LOCAL ALLOWED (headline): an exact-match host:port internal endpoint is permitted + logged", async () => {
+  const { guard, blocked, localAllowed, calls } = harness({
+    allowlist: [LOCAL], // Layer 1: host allowlisted
+    localEndpoints: ["127.0.0.1:11434"], // Layer 2 exception: exact host:port
+    resolve: async () => [LOCAL], // resolves to a loopback IP (internal)
+  });
+  const res = await guard("http://127.0.0.1:11434/v1/chat/completions", init);
+  assert.equal(res.status, 200, "the local Ollama endpoint was reached");
+  assert.deepEqual(calls, ["http://127.0.0.1:11434/v1/chat/completions"], "transport reached exactly once");
+  assert.equal(blocked.length, 0, "NOT blocked");
+  // The positive audit event fired.
+  assert.equal(localAllowed.length, 1, "egress.local_allowed published");
+  assert.equal(localAllowed[0]?.host, "127.0.0.1");
+  assert.equal(localAllowed[0]?.port, 11434);
+  assert.match(localAllowed[0]?.reason ?? "", /loopback/);
+});
+
+test("EXACT MATCH ONLY: a near-miss port or host is STILL blocked (the exception is not broad)", async () => {
+  // Opted in: 127.0.0.1:11434 only.
+  const mk = (host: string) => harness({ allowlist: [host], localEndpoints: ["127.0.0.1:11434"], resolve: async () => [host] });
+
+  // Different PORT on the same host → blocked.
+  const p = mk("127.0.0.1");
+  await assert.rejects(() => p.guard("http://127.0.0.1:11435/x", init), (e: unknown) => e instanceof ProviderError);
+  assert.equal(p.blocked.at(-1)?.reason, "internal_ip", "127.0.0.1:11435 is NOT the opted-in port");
+  assert.equal(p.localAllowed.length, 0);
+  assert.equal(p.calls.length, 0);
+
+  // Different HOST (another loopback IP) on the same port → blocked.
+  const h = mk("127.0.0.2");
+  await assert.rejects(() => h.guard("http://127.0.0.2:11434/x", init), (e: unknown) => e instanceof ProviderError);
+  assert.equal(h.blocked.at(-1)?.reason, "internal_ip", "127.0.0.2:11434 is NOT the opted-in host");
+  assert.equal(h.localAllowed.length, 0);
+
+  // Same host:port, ANY path → allowed (exact match is host:port, path-independent).
+  const ok = mk("127.0.0.1");
+  const res = await ok.guard("http://127.0.0.1:11434/v1/models", init);
+  assert.equal(res.status, 200);
+  assert.equal(ok.localAllowed.length, 1);
+});
+
+test("DEFAULT DENY: with NO local opt-in, a loopback endpoint is blocked exactly as today", async () => {
+  const { guard, blocked, localAllowed, calls } = harness({
+    allowlist: [LOCAL],
+    localEndpoints: [], // default — no local access
+    resolve: async () => [LOCAL],
+  });
+  await assert.rejects(() => guard("http://127.0.0.1:11434/x", init), (e: unknown) => e instanceof ProviderError);
+  assert.equal(blocked.at(-1)?.reason, "internal_ip", "the floor is unchanged without an opt-in");
+  assert.equal(localAllowed.length, 0, "no allowance without IKBI_EGRESS_ALLOW_LOCAL");
+  assert.equal(calls.length, 0);
+});
+
+test("LAYER 1 STILL APPLIES: a local endpoint opted into ALLOW_LOCAL but NOT host-allowlisted is blocked at Layer 1", async () => {
+  const { guard, blocked, localAllowed, calls } = harness({
+    allowlist: [], // host NOT allowlisted
+    localEndpoints: ["127.0.0.1:11434"], // opted into the local exception only
+    resolve: async () => [LOCAL],
+  });
+  await assert.rejects(() => guard("http://127.0.0.1:11434/x", init), (e: unknown) => e instanceof ProviderError);
+  assert.equal(blocked.at(-1)?.reason, "not_allowlisted", "Layer 1 blocks before the IP layer — both gates required");
+  assert.equal(localAllowed.length, 0, "the local exception never reached (host gate failed first)");
+  assert.equal(calls.length, 0);
+});
+
+// ── SSRF FLOOR INTACT FOR EVERYTHING ELSE (critical regression) ──────────────
+
+test("SSRF floor intact: with a local opt-in active, OTHER internal destinations are STILL blocked", async () => {
+  // Operator opted in 127.0.0.1:11434, but an allowlisted PUBLIC host rebinds to internal.
+  const local = ["127.0.0.1:11434"];
+
+  // Cloud metadata via a rebinding public host → STILL blocked (not the opted-in endpoint).
+  const meta = harness({ allowlist: ["api.example.com"], localEndpoints: local, resolve: async () => ["169.254.169.254"] });
+  await assert.rejects(() => meta.guard("https://api.example.com/x", init), (e: unknown) => e instanceof ProviderError);
+  assert.equal(meta.blocked.at(-1)?.reason, "internal_ip", "cloud metadata is still blocked despite a local opt-in");
+  assert.equal(meta.localAllowed.length, 0);
+  assert.equal(meta.calls.length, 0);
+
+  // An RFC1918 address (different host:port than the opt-in) → STILL blocked.
+  const rfc = harness({ allowlist: ["api.example.com"], localEndpoints: local, resolve: async () => ["10.0.0.5"] });
+  await assert.rejects(() => rfc.guard("https://api.example.com/x", init), (e: unknown) => e instanceof ProviderError);
+  assert.equal(rfc.blocked.at(-1)?.reason, "internal_ip", "RFC1918 is still blocked");
+
+  // DNS-rebind: even the opted-in host:port, if it resolves to a DIFFERENT internal IP, is
+  // allowed ONLY because the operator named THIS host:port — but a public allowlisted host
+  // resolving to the metadata IP is NOT the opted-in endpoint and stays blocked (above).
+  // And the metadata IP itself, were it the host, is not opted in:
+  const direct = harness({ allowlist: ["169.254.169.254"], localEndpoints: local, resolve: async () => ["169.254.169.254"] });
+  await assert.rejects(() => direct.guard("http://169.254.169.254/latest/meta-data", init), (e: unknown) => e instanceof ProviderError);
+  assert.equal(direct.blocked.at(-1)?.reason, "internal_ip", "the metadata host:port is NOT in ALLOW_LOCAL → still blocked");
+  assert.equal(direct.localAllowed.length, 0);
 });

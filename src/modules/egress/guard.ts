@@ -34,19 +34,33 @@ import { ProviderError } from "../../core/provider/contract.js";
 import type { FetchLike } from "../../core/provider/providers/openai-compatible.js";
 import { events } from "../../core/events/index.js";
 import { egressConfig } from "./config.js";
-import { egressBlocked, type EgressBlockedPayload, type EgressBlockReason } from "./events.js";
+import { egressBlocked, egressLocalAllowed, type EgressBlockedPayload, type EgressBlockReason, type EgressLocalAllowedPayload } from "./events.js";
 import { classifyIp } from "./ip.js";
 
 /** Injectable dependencies (tests substitute DNS + transport + publish). */
 export interface GuardedFetchDeps {
   /** Permitted egress hosts, lowercased + exact-match. Empty = default-deny-all. */
   readonly allowlist: readonly string[];
+  /**
+   * Exact-match `host:port` local endpoints the operator opted in (lowercased). A NARROW
+   * exception at the internal-IP layer — an internal/loopback destination is permitted ONLY
+   * if its `host:port` is in this set AND its host already passed the allowlist (Layer 1).
+   * Empty = no local access (the floor is unchanged).
+   */
+  readonly localEndpoints: readonly string[];
   /** Resolve a host to its IP literals. Defaults to node DNS (`lookup`, all addresses). */
   readonly resolve?: (host: string) => Promise<string[]>;
   /** The underlying transport, invoked ONLY after all checks pass. Defaults to real fetch. */
   readonly transport?: FetchLike;
   /** Sink for `egress.blocked`. Defaults to the process event bus. */
   readonly publishBlocked?: (payload: EgressBlockedPayload) => void;
+  /** Sink for the positive `egress.local_allowed`. Defaults to the process event bus. */
+  readonly publishLocalAllowed?: (payload: EgressLocalAllowedPayload) => void;
+}
+
+/** The scheme default port (used to form the exact-match `host:port` key when absent). */
+function defaultPort(protocol: string): string {
+  return protocol === "https:" ? "443" : "80";
 }
 
 /** Default DNS resolver: every A/AAAA address for the host (IP literals pass through). */
@@ -65,12 +79,19 @@ const realTransport = globalThis.fetch as unknown as FetchLike;
 /** Build a guarded fetch from explicit dependencies (the testable core). */
 export function createGuardedFetch(deps: GuardedFetchDeps): FetchLike {
   const allowlist = new Set(deps.allowlist.map((h) => h.toLowerCase()));
+  // Exact-match `host:port` local endpoints (default-deny: empty ⇒ no local access).
+  const localAllowed = new Set(deps.localEndpoints.map((e) => e.toLowerCase()));
   const resolve = deps.resolve ?? defaultResolve;
   const transport = deps.transport ?? realTransport;
   const publishBlocked =
     deps.publishBlocked ??
     ((payload: EgressBlockedPayload): void => {
       events.publish(egressBlocked.create(payload, { source: "egress" }));
+    });
+  const publishLocalAllowed =
+    deps.publishLocalAllowed ??
+    ((payload: EgressLocalAllowedPayload): void => {
+      events.publish(egressLocalAllowed.create(payload, { source: "egress" }));
     });
 
   /** Publish the block event, then throw a network-kind ProviderError. Never returns. */
@@ -100,10 +121,17 @@ export function createGuardedFetch(deps: GuardedFetchDeps): FetchLike {
     }
 
     const host = url.hostname.toLowerCase();
-    // Default-DENY: an empty allowlist permits nothing.
+    // LAYER 1 — default-DENY host allowlist: an empty allowlist permits nothing. This
+    // applies to local endpoints TOO (the local-endpoint exception below is ADDITIONAL,
+    // not a replacement — a local host must still be allowlisted here).
     if (!allowlist.has(host)) {
       return block("not_allowlisted", host, `host "${host}" is not in IKBI_EGRESS_ALLOWLIST`);
     }
+
+    // The exact-match `host:port` key for the local-endpoint exception (explicit port, or
+    // the scheme default). Exact equality only — no ranges, globs, or subnets.
+    const port = url.port || defaultPort(url.protocol);
+    const localKey = `${host}:${port}`;
 
     let ips: string[];
     try {
@@ -115,10 +143,18 @@ export function createGuardedFetch(deps: GuardedFetchDeps): FetchLike {
       return block("dns_empty", host, `DNS returned no addresses for "${host}"`);
     }
 
-    // Reject if ANY resolved IP is internal — defeats rebinding-to-internal.
+    // LAYER 2 — reject if ANY resolved IP is internal (defeats rebinding-to-internal),
+    // EXCEPT an internal destination whose host:port EXACTLY matches an operator-opted
+    // local endpoint: that single named endpoint is allowed (logged), the floor otherwise
+    // intact for every other internal destination.
     for (const ip of ips) {
       const verdict = classifyIp(ip);
       if (verdict.internal) {
+        if (localAllowed.has(localKey)) {
+          // Operator opted EXACTLY this host:port in via IKBI_EGRESS_ALLOW_LOCAL.
+          publishLocalAllowed({ host, port: Number(port), reason: verdict.reason });
+          return transport(input, init);
+        }
         return block("internal_ip", host, `${host} -> ${ip} (${verdict.reason})`);
       }
     }
@@ -132,4 +168,4 @@ export function createGuardedFetch(deps: GuardedFetchDeps): FetchLike {
  * The process-wide guarded fetch the egress floor registers via the provider
  * fetch-guard seam. Built from the module's own config slice + real DNS/transport.
  */
-export const guardedFetch: FetchLike = createGuardedFetch({ allowlist: egressConfig.allowlist });
+export const guardedFetch: FetchLike = createGuardedFetch({ allowlist: egressConfig.allowlist, localEndpoints: egressConfig.localEndpoints });

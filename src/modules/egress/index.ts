@@ -30,5 +30,5 @@ register();
 
 export { guardedFetch, createGuardedFetch, type GuardedFetchDeps } from "./guard.js";
 export { classifyIp, type IpVerdict } from "./ip.js";
-export { egressBlocked, type EgressBlockedPayload, type EgressBlockReason } from "./events.js";
+export { egressBlocked, egressLocalAllowed, type EgressBlockedPayload, type EgressBlockReason, type EgressLocalAllowedPayload } from "./events.js";
 export { egressConfig, loadEgressConfig, type EgressConfig } from "./config.js";
