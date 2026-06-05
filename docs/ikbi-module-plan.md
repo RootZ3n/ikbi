@@ -109,7 +109,7 @@ content + spawns work).
 - `graceful-degradation/kill-switch` (cross-cutting; late — needs the modules it halts; consumes the S kill-switch seam) — 3-eyes
 
 **CUT / absorbed (placeholder slots whose function the built modules absorbed):**
-- `cognition-layer`: CUT — defined only by its dependency tuple (provider + lab-context-memory + worker-model), never by behavior — no spec, surface, I/O, or design decision. That tuple is the union of agent-router's deps (provider + memory) and batch-planner's deps (provider + workers), a subset of what those modules already do, so it could add nothing on top of them. Its candidate purposes are all covered: reason-over-memory by `agent-router.ask()`, worker-orchestration-via-model by `batch-planner`, self-improvement by the `drift-prevention` `DriftPolicy` seam. Absorbed like `closed-loop-builder` (absorbed by the worker orchestrator). Cut, not deferred.
+- `cognition-layer`: RESTORED with a defined behavior (the earlier "cut" was premature — the slot had a real purpose once specified). It is the non-executing PRE-ACTION DELIBERATION seam: given a goal + project + shared cross-agent lab memory + capability registry + optional drift signals, `deliberate()` returns a structured `CognitionDecision` (answer | plan | ask | route | warn | reject) with confidence, rationale, the memory it used, and a `recommendedNext` module — a RECOMMENDATION, never an invocation. Distinct from the others (agent-router answers, batch-planner decomposes, drift-prevention watches): cognition decides WHICH of them is appropriate. It imports NONE of the action modules (recommends, never invokes); goal + retrieved memory are neutralized before the model. 2-eyes.
 
 ---
 
@@ -159,6 +159,7 @@ With Step S done, these parallelize cleanly and concurrently (own dirs):
 | deterministic-judge (AMG) | events; PURE no-model scorer (overrides → weighted) — no provider/workspace/worker-model; consumed by the competitive build mode |
 | batch-planner | provider (decompose), injection (untrusted goal), identity, events, worker-model (runWorker) — ORCHESTRATION above worker-model: decompose→schedule→run governed runs; build-parallel/promote-serial; stop-and-report conflict policy; `ikbi batch` |
 | drift-prevention (AMG) | receipt (recent rate), events; lab-context-memory (pattern baseline, read-only) — success-rate drift detector; pure math; DETECT-AND-REPORT only (no trust/gate action); DriftPolicy intervention seam (default reportOnly) |
+| cognition-layer (AMG) | provider (deliberate), injection (untrusted goal+memory), identity, events; lab-context-memory + drift-prevention (read-only) — non-executing PRE-ACTION deliberation: goal+memory+capabilities+drift → CognitionDecision (answer\|plan\|ask\|route\|warn\|reject) + recommendedNext; RECOMMENDS, never invokes (imports no action module) |
 | peh-agent (built as generic `agent-router`) | provider, identity, injection (user/untrusted input), events, lab-context-memory (READ-ONLY — Q&A over lab state) |
 | dry-run/plan-only | identity (`OperationContext`), events; + the S dry-run seam |
 | graceful-degradation/kill-switch | events, substrate, trust (`revalidate`), workspace (`reclaim`); + the S kill seam |
