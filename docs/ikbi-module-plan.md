@@ -156,6 +156,7 @@ With Step S done, these parallelize cleanly and concurrently (own dirs):
 | cognition-layer | provider, lab-context-memory, worker-model |
 | drift-prevention | lab-context-memory, worker-model, receipts, events |
 | self-observation/monitoring | events (subscribe), receipts (read), substrate, identity (observed/own attribution agentId) |
+| deterministic-judge (AMG) | events; PURE no-model scorer (overrides → weighted) — no provider/workspace/worker-model; consumed by the competitive build mode |
 | peh-agent (built as generic `agent-router`) | provider, identity, injection (user/untrusted input), events, lab-context-memory (READ-ONLY — Q&A over lab state) |
 | dry-run/plan-only | identity (`OperationContext`), events; + the S dry-run seam |
 | graceful-degradation/kill-switch | events, substrate, trust (`revalidate`), workspace (`reclaim`); + the S kill seam |
