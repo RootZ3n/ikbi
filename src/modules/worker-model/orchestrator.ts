@@ -38,11 +38,13 @@ import type { ModelRequest, ModelResponse } from "../../core/provider/contract.j
 import { deterministicJudge } from "../deterministic-judge/index.js";
 import type { BuildCandidate, JudgeResult } from "../deterministic-judge/index.js";
 
+import type { GovernedExec } from "../governed-exec/index.js";
+
 import { builder, MAX_TOOL_ITERATIONS } from "./builder.js";
 import { critic } from "./critic.js";
 import { integrator } from "./integrator.js";
 import { scout } from "./scout.js";
-import { verifier } from "./verifier.js";
+import { createVerifier, verifier } from "./verifier.js";
 import {
   MAX_COMPETITIVE_N,
   MIN_COMPETITIVE_N,
@@ -115,6 +117,12 @@ export interface OrchestratorDeps {
    * (discard, no half-promote). NEVER publishes a kill — the loop only OBEYS.
    */
   readonly killCheck?: (target: { agentId?: string; runId?: string; requestId?: string }) => Promise<{ killed: boolean; signal?: { mode?: string; reason?: string } }>;
+  /**
+   * Governed executor the VERIFIER routes its checks through (C1). Default: the live
+   * governed-exec singleton (lazily imported inside the verifier). Injectable for tests.
+   * A non-allowlisted / gate-denied check fails the verifier CLOSED (never a silent pass).
+   */
+  readonly governedExec?: Pick<GovernedExec, "run">;
 }
 
 /** A role identity spawned under the parent ceiling (#10). */
@@ -204,6 +212,21 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   const roles: Record<WorkerRole, RoleFn> = { ...DEFAULT_ROLES, ...deps.roles };
 
   const engine: RoleEngine = { invokeModel, neutralizeUntrusted };
+
+  /**
+   * The verifier for THIS run (C1). Honors an injected `deps.roles.verifier` (tests),
+   * otherwise builds the governed + script-integrity-guarded verifier bound to the run's
+   * parent ctx (the validated identity governed-exec needs — the spawned role identity is
+   * not a minted ValidatedIdentity) and the workspace diff (LAYER-2 integrity source).
+   */
+  function verifierFor(parentCtx: OperationContext): RoleFn {
+    if (deps.roles?.verifier !== undefined) return deps.roles.verifier;
+    return createVerifier({
+      ...(deps.governedExec !== undefined ? { governedExec: deps.governedExec } : {}),
+      parentCtx,
+      ...(workspaces.diff !== undefined ? { diff: (ws: WorkspaceHandle) => workspaces.diff!(ws) } : {}),
+    });
+  }
 
   /**
    * Spawn a role identity under the parent's trust ceiling (#10). Resolve the role
@@ -341,7 +364,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           priorResults: [...results],
           engine,
         };
-        const result = await roles[role](ctx);
+        const roleFn = role === "verifier" ? verifierFor(parentCtx) : roles[role];
+        const result = await roleFn(ctx);
         results.push(result);
 
         events.publish(
@@ -461,7 +485,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   // ── COMPETITIVE BUILD MODE (AMG) ────────────────────────────────────────────
 
   /** Dispatch one role in one workspace (events + recordRole), returning its result. */
-  async function dispatchRole(role: WorkerRole, spawned: SpawnedRole, task: WorkerTask, workspace: WorkspaceHandle, priorResults: readonly RoleResult[]): Promise<RoleResult> {
+  async function dispatchRole(role: WorkerRole, spawned: SpawnedRole, task: WorkerTask, workspace: WorkspaceHandle, priorResults: readonly RoleResult[], parentCtx: OperationContext): Promise<RoleResult> {
     events.publish(
       workerRoleDispatched.create(
         { taskId: task.taskId, role, ...(spawned.identity.trustTier !== undefined ? { tier: spawned.identity.trustTier } : {}) },
@@ -469,7 +493,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       ),
     );
     const ctx: RoleContext = { task, role, identity: spawned.identity, autonomy: spawned.autonomy, workspace, priorResults: [...priorResults], engine };
-    const result = await roles[role](ctx);
+    // The verifier (C1) runs the governed + integrity-guarded path bound to the run ctx.
+    const roleFn = role === "verifier" ? verifierFor(parentCtx) : roles[role];
+    const result = await roleFn(ctx);
     events.publish(
       workerRoleCompleted.create(
         { taskId: task.taskId, role, outcome: result.outcome },
@@ -546,7 +572,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 
       // 2. scout ONCE (shared, read-only, in the first worktree's clean base state) —
       //    its findings seed every builder. (Per-workspace scout is a future option.)
-      const scoutResult = await dispatchRole("scout", spawnRole("scout", parentCtx), task, handles[0]!, []);
+      const scoutResult = await dispatchRole("scout", spawnRole("scout", parentCtx), task, handles[0]!, [], parentCtx);
 
       // 3. builder + verifier PER workspace (sequential in v1; parallelism is a future
       //    optimization). Each builder writes into ITS worktree; each verifier checks ITS
@@ -561,10 +587,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           events.publish(workerFailed.create({ taskId: task.taskId, reason: killReason, workspaceId: handles[0]?.id ?? ws.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
           return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: rolesByWs.get(handles[0]?.id ?? "") ?? [], ...(handles[0] !== undefined ? { workspaceId: handles[0].id } : {}), promoted: false, reason: killReason };
         }
-        const builderResult = await dispatchRole("builder", spawnRole("builder", parentCtx), task, ws, [scoutResult]);
+        const builderResult = await dispatchRole("builder", spawnRole("builder", parentCtx), task, ws, [scoutResult], parentCtx);
         let verifierResult: RoleResult | undefined;
         if (builderResult.outcome === "success") {
-          verifierResult = await dispatchRole("verifier", spawnRole("verifier", parentCtx), task, ws, [scoutResult, builderResult]);
+          verifierResult = await dispatchRole("verifier", spawnRole("verifier", parentCtx), task, ws, [scoutResult, builderResult], parentCtx);
         }
         rolesByWs.set(ws.id, [scoutResult, builderResult, ...(verifierResult !== undefined ? [verifierResult] : [])]);
         candidates.push(buildCandidate(ws, builderResult, verifierResult, await safeDiffLines(ws)));

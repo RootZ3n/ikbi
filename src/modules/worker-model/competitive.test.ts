@@ -13,6 +13,7 @@ import { TRUST_FLOOR } from "../../core/trust/index.js";
 import type { DiscardResult, PromoteGovernance, PromoteResult, WorkspaceHandle } from "../../core/workspace/contract.js";
 import type { BuildCandidate } from "../deterministic-judge/index.js";
 import { deterministicJudge } from "../deterministic-judge/index.js";
+import type { ExecRequest, ExecResult } from "../governed-exec/index.js";
 import { createOrchestrator, type OrchestratorDeps } from "./orchestrator.js";
 import { type RoleContext, type RoleFn, type WorkerRole, type WorkerTask } from "./contract.js";
 
@@ -246,6 +247,44 @@ test("competitive C6: a kill after the final candidate but before judge ⇒ all 
   assert.equal(r.promoted, false);
   assert.equal(r.outcome, "rejected");
   assert.match(r.reason ?? "", /kill-switch/);
+});
+
+// ── C1 LAYER 2 FEEDS THE JUDGE: a mutated-scripts candidate is disqualified ──
+
+test("C1: a candidate whose builder mutated package.json scripts → verifier UNTRUSTED → disqualified; the clean candidate wins", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  // ws0's diff shows the builder rewriting the "test" script (the attack); ws1 is clean.
+  const diffFor = (id: string): string =>
+    id === "ws0"
+      ? 'diff --git a/package.json b/package.json\n--- a/package.json\n+++ b/package.json\n-    "test": "node --test",\n+    "test": "echo pass && exit 0",'
+      : "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n-export const x = 1;\n+export const x = 2;";
+  const promoted: string[] = [];
+  const discarded: string[] = [];
+  let i = 0;
+  const workspaces: NonNullable<OrchestratorDeps["workspaces"]> = {
+    allocate: async () => baseHandle(`ws${i++}`),
+    promote: async (h): Promise<PromoteResult> => { promoted.push(h.id); return { promoted: true, workspaceId: h.id, targetBranch: h.baseBranch, beforeRef: "a", afterRef: "b" }; },
+    discard: async (h): Promise<DiscardResult> => { discarded.push(h.id); return { workspaceId: h.id, removed: true }; },
+    diff: async (h) => diffFor(h.id),
+  };
+  // The REAL governed + integrity-guarded verifier (no roles.verifier override). The
+  // governed exec passes the clean candidate's checks; the mutated one never reaches it.
+  const governedRuns: ExecRequest[] = [];
+  const governedExec = { run: async (req: ExecRequest): Promise<ExecResult> => { governedRuns.push(req); return { executed: true, exitCode: 0, stdoutTail: "ok" }; } };
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    scout: async () => ({ role: "scout", outcome: "success", summary: "s" }),
+    builder: async () => ({ role: "builder", outcome: "success", summary: "b", detail: { toolRounds: 2, filesWritten: ["a.ts"], rejectedToolCalls: [], stopReason: "stop" } }),
+    // NO verifier override — the orchestrator wires the real governed/integrity verifier.
+  };
+  const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces, roles, governedExec }));
+
+  const r = await orch.run(task, parentCtx);
+  assert.equal(r.promoted, true, "a winner was promoted");
+  assert.equal(r.workspaceId, "ws1", "the CLEAN candidate won (the mutated one is disqualified)");
+  assert.deepEqual(promoted, ["ws1"], "only the clean candidate is promoted");
+  assert.ok(discarded.includes("ws0"), "the mutated-scripts candidate is discarded, never promoted");
+  // ws0's mutated check was never executed: governed-exec only ran for the clean candidate.
+  for (const req of governedRuns) assert.notEqual(req.cwd, "/tmp/ws0", "the mutated candidate's check never executed");
 });
 
 // ── CANDIDATE MAPPING: verifier/builder/diff → BuildCandidate fields ─────────
