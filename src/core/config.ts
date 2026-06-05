@@ -210,6 +210,8 @@ export interface ProviderConfig {
   readonly mimo: ProviderEndpointConfig;
   /** OpenRouter backup endpoint. */
   readonly openrouter: OpenRouterEndpointConfig;
+  /** DeepSeek direct API endpoint (OpenAI-compatible). */
+  readonly deepseek: ProviderEndpointConfig;
   /** Default logical model ids for the standard roles (config-driven, not hardcoded downstream). */
   readonly defaultModels: { readonly driver: string; readonly critic: string };
 }
@@ -288,6 +290,11 @@ function loadProviderConfig(env: NodeJS.ProcessEnv, stateRoot: string): Provider
       apiKey: optStr(env.IKBI_OPENROUTER_API_KEY),
       referer: optStr(env.IKBI_OPENROUTER_REFERER),
       title: optStr(env.IKBI_OPENROUTER_TITLE),
+    },
+    deepseek: {
+      // DeepSeek's OpenAI-compatible endpoint. Override via IKBI_DEEPSEEK_BASE_URL.
+      baseUrl: optStr(env.IKBI_DEEPSEEK_BASE_URL) ?? "https://api.deepseek.com/v1",
+      apiKey: optStr(env.IKBI_DEEPSEEK_API_KEY),
     },
     defaultModels: {
       driver: optStr(env.IKBI_MODEL_DRIVER) ?? "mimo-v2.5",

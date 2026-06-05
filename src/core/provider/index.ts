@@ -12,8 +12,10 @@ import { cachedInvoke } from "../../modules/cache/index.js";
 import { ProviderInvoker } from "./invoke.js";
 import type { ModelRequest, ModelResponse } from "./contract.js";
 import {
+  createDeepseekProvider,
   createMimoProvider,
   createOpenRouterProvider,
+  DEEPSEEK_PROVIDER_ID,
   MIMO_PROVIDER_ID,
   OPENROUTER_PROVIDER_ID,
 } from "./providers/index.js";
@@ -46,11 +48,25 @@ function buildDefaultRegistry(): ModelRegistry {
         { provider: OPENROUTER_PROVIDER_ID, providerModelId: critic },
       ],
     },
+    // DeepSeek direct models — usable out of the box once IKBI_DEEPSEEK_API_KEY is set.
+    // Placeholder costs; override (and add OpenRouter fallback routes) via the roster file.
+    {
+      id: "deepseek-chat",
+      role: "driver",
+      cost: { promptPerMTok: 0.27, completionPerMTok: 1.1 },
+      providers: [{ provider: DEEPSEEK_PROVIDER_ID, providerModelId: "deepseek-chat" }],
+    },
+    {
+      id: "deepseek-reasoner",
+      role: "critic",
+      cost: { promptPerMTok: 0.55, completionPerMTok: 2.19 },
+      providers: [{ provider: DEEPSEEK_PROVIDER_ID, providerModelId: "deepseek-reasoner" }],
+    },
   ];
 
   const reg = new ModelRegistry({
     models: defaultModels,
-    providers: [createMimoProvider(pc.mimo), createOpenRouterProvider(pc.openrouter)],
+    providers: [createMimoProvider(pc.mimo), createOpenRouterProvider(pc.openrouter), createDeepseekProvider(pc.deepseek)],
   });
 
   try {

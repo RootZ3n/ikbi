@@ -8,7 +8,7 @@ import {
   resetFetchGuardForTests,
   resolveFetchGuard,
 } from "./fetch-guard.js";
-import { createMimoProvider, createOpenRouterProvider } from "./providers/index.js";
+import { createDeepseekProvider, createMimoProvider, createOpenRouterProvider } from "./providers/index.js";
 import { type FetchLike, OpenAICompatibleProvider } from "./providers/openai-compatible.js";
 import { ModelRegistry } from "./registry.js";
 
@@ -17,6 +17,7 @@ beforeEach(resetFetchGuardForTests);
 
 const mimoCfg = { baseUrl: "https://api.mimo.ai/v1", apiKey: "k" };
 const orCfg = { baseUrl: "https://openrouter.ai/api/v1", apiKey: "k", referer: undefined, title: undefined };
+const deepseekCfg = { baseUrl: "https://api.deepseek.com/v1", apiKey: "k" };
 const stubFetch: FetchLike = async () => {
   throw new Error("stub");
 };
@@ -32,6 +33,10 @@ test("construction site 1 — createMimoProvider fails closed with no guard", ()
 
 test("construction site 2 — createOpenRouterProvider fails closed with no guard", () => {
   assert.throws(() => createOpenRouterProvider(orCfg), EgressGuardMissingError);
+});
+
+test("construction site 2b — createDeepseekProvider fails closed with no guard", () => {
+  assert.throws(() => createDeepseekProvider(deepseekCfg), EgressGuardMissingError);
 });
 
 test("construction site 3 — roster provider entry (parseProviderEntry) fails closed with no guard", () => {
@@ -57,6 +62,14 @@ test("an explicit fetchImpl still wins — no guard needed (tests' path preserve
   assert.doesNotThrow(() => new OpenAICompatibleProvider({ id: "x", baseUrl: "https://x", apiKey: "k", fetchImpl: stubFetch }));
   assert.doesNotThrow(() => createMimoProvider(mimoCfg, stubFetch));
   assert.doesNotThrow(() => createOpenRouterProvider(orCfg, stubFetch));
+  assert.doesNotThrow(() => createDeepseekProvider(deepseekCfg, stubFetch));
+});
+
+test("the deepseek provider registers with id \"deepseek\" and is listed", () => {
+  registerFetchGuard(stubFetch);
+  const reg = new ModelRegistry({ providers: [createDeepseekProvider(deepseekCfg)] });
+  assert.equal(reg.getProvider("deepseek")?.id, "deepseek");
+  assert.ok(reg.listProviders().some((p) => p.id === "deepseek"));
 });
 
 test("once a guard is registered, construction resolves it (no throw)", () => {

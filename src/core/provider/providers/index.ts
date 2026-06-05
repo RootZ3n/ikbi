@@ -1,8 +1,9 @@
 /**
  * ikbi provider layer — concrete provider factories.
  *
- * mimo direct (primary) and OpenRouter (backup). Both are OpenAI-compatible, so
- * they share the hardened HTTP client and differ only in endpoint/auth/headers.
+ * mimo direct (primary), OpenRouter (backup), and DeepSeek direct. All are
+ * OpenAI-compatible, so they share the hardened HTTP client and differ only in
+ * endpoint/auth/headers.
  */
 
 import type { OpenRouterEndpointConfig, ProviderEndpointConfig } from "../../config.js";
@@ -11,11 +12,22 @@ import { type FetchLike, OpenAICompatibleProvider } from "./openai-compatible.js
 
 export const MIMO_PROVIDER_ID = "mimo";
 export const OPENROUTER_PROVIDER_ID = "openrouter";
+export const DEEPSEEK_PROVIDER_ID = "deepseek";
 
 /** Build the mimo direct-API provider (primary driver). */
 export function createMimoProvider(cfg: ProviderEndpointConfig, fetchImpl?: FetchLike): ModelProvider {
   return new OpenAICompatibleProvider({
     id: MIMO_PROVIDER_ID,
+    baseUrl: cfg.baseUrl,
+    apiKey: cfg.apiKey,
+    ...(fetchImpl ? { fetchImpl } : {}),
+  });
+}
+
+/** Build the DeepSeek direct-API provider (OpenAI-compatible, no special headers). */
+export function createDeepseekProvider(cfg: ProviderEndpointConfig, fetchImpl?: FetchLike): ModelProvider {
+  return new OpenAICompatibleProvider({
+    id: DEEPSEEK_PROVIDER_ID,
     baseUrl: cfg.baseUrl,
     apiKey: cfg.apiKey,
     ...(fetchImpl ? { fetchImpl } : {}),
