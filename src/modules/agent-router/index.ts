@@ -22,7 +22,12 @@ assertContractCompatible("injection", "1.0.0");
 assertContractCompatible("identity", "1.1.0");
 assertContractCompatible("events", "1.0.0");
 
+// Side-effect import: registers the `classify` / `ask` CLI commands at load time
+// (the modules barrel imports this module, so the commands are live once ikbi starts).
+import "./cli.js";
+
 export { createAgentRouter, agentRouter, type AgentRouterDeps, type LabMemoryReader, type NeutralizeFn, type ToUntrustedFn } from "./router.js";
+export { createRouterCli, parseProject, type RouterCliDeps } from "./cli.js";
 export {
   CONTRACT_VERSION,
   AgentRouterError,
