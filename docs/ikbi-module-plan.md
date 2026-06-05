@@ -56,10 +56,10 @@ step, because they are the real blockers to true parallelism.
    │  lab-context-memory (receipts read-seam + substrate durable + events)
    │        │
    │        ▼
-   │   ┌── cognition-layer ──┐   ┌── drift-prevention ──┐
-   │   │ (provider + memory  │   │ (memory + workers +  │
-   │   │  + workers)         │   │  receipts + events)  │
-   │   └─────────────────────┘   └──────────────────────┘
+   │   ┌── drift-prevention ──┐
+   │   │ (memory + workers +  │
+   │   │  receipts + events)  │
+   │   └──────────────────────┘
    ▼
  self-observation/monitoring (events subscribe + receipts read)      Peh agent (provider + identity + injection)
                                                                      dry-run/plan-only (cross-cutting; consumes S)
@@ -67,9 +67,9 @@ step, because they are the real blockers to true parallelism.
 ```
 
 Edges that matter:
-- **worker-model** is the hub: spawning, gate-wall (interacts), monitoring (observes), drift, cognition all sit downstream of it.
+- **worker-model** is the hub: spawning, gate-wall (interacts), monitoring (observes), drift all sit downstream of it.
 - **gate-wall** consumes `trust.autonomyForTier()` and PRODUCES the `PromoteGovernance` that `workspace.promote` requires — it is the enforcement seam workspace/sudo/dep-install call into.
-- **lab-context-memory** consumes the receipt read-seam and persists ITS OWN projections (receipts are ≤30-day ephemeral — recorded constraint). cognition + drift read memory, so memory precedes them.
+- **lab-context-memory** consumes the receipt read-seam and persists ITS OWN projections (receipts are ≤30-day ephemeral — recorded constraint). drift reads memory, so memory precedes it.
 - **network-egress** is the security floor every outbound-network module routes through (MCP servers, package fetch, governed curl, Peh web-fetch, and ideally the provider's own HTTP).
 
 ---
@@ -104,10 +104,12 @@ content + spawns work).
 - `self-observation/monitoring` — 2-eyes
 
 **Step P2 — depends on P1 (parallel).**
-- `cognition-layer` (needs memory) — 2-eyes
 - `drift-prevention` (needs memory + workers) — 2-eyes
 - `dry-run/plan-only` (cross-cutting; build once the S-seam exists + the side-effecting modules it gates) — 2-eyes
 - `graceful-degradation/kill-switch` (cross-cutting; late — needs the modules it halts; consumes the S kill-switch seam) — 3-eyes
+
+**CUT / absorbed (placeholder slots whose function the built modules absorbed):**
+- `cognition-layer`: CUT — defined only by its dependency tuple (provider + lab-context-memory + worker-model), never by behavior — no spec, surface, I/O, or design decision. That tuple is the union of agent-router's deps (provider + memory) and batch-planner's deps (provider + workers), a subset of what those modules already do, so it could add nothing on top of them. Its candidate purposes are all covered: reason-over-memory by `agent-router.ask()`, worker-orchestration-via-model by `batch-planner`, self-improvement by the `drift-prevention` `DriftPolicy` seam. Absorbed like `closed-loop-builder` (absorbed by the worker orchestrator). Cut, not deferred.
 
 ---
 
@@ -126,14 +128,13 @@ cross-cutting engine files, resolved by Step S:
 With Step S done, these parallelize cleanly and concurrently (own dirs):
 - Floors: `egress` ∥ `caching`.
 - P1: `gate-wall` ∥ `mcp` ∥ `dependency-install` ∥ `governed-exec` ∥ `spawning` ∥ `memory` ∥ `peh` ∥ `monitoring` (8-wide).
-- P2: `cognition` ∥ `drift` ∥ `dry-run` ∥ `kill-switch`.
+- P2: `drift` ∥ `dry-run` ∥ `kill-switch`.
 
 **Cannot freely parallelize (serialize or seam-first):**
 - `dry-run` and `kill-switch` are cross-cutting: they only avoid touching every
   module's files IF their seam (a flag in `OperationContext` / a kill event modules
   subscribe to) is defined in Step S. Otherwise they'd edit many modules → serialize.
-- `cognition` + `drift` both depend on `memory` → memory must land first (they then
-  parallelize).
+- `drift` depends on `memory` → memory must land first.
 - `gate-wall` must define its `PromoteGovernance`-producing surface before
   `dependency-install` / `governed-exec` / workspace-promote callers rely on it —
   build gate-wall early in P1 (others can stub against its contract).
@@ -153,7 +154,6 @@ With Step S done, these parallelize cleanly and concurrently (own dirs):
 | dependency-install | egress, gate-wall, workspace (install in sandbox), receipts, identity, events (install lifecycle) |
 | governed-sudo/curl | egress, gate-wall, receipts, identity, events |
 | lab-context-memory | receipts (read-seam, project-scoped), substrate (durable projections), events, identity (agent attribution) |
-| cognition-layer | provider, lab-context-memory, worker-model |
 | drift-prevention | lab-context-memory, worker-model, receipts, events |
 | self-observation/monitoring | events (subscribe), receipts (read), substrate, identity (observed/own attribution agentId) |
 | deterministic-judge (AMG) | events; PURE no-model scorer (overrides → weighted) — no provider/workspace/worker-model; consumed by the competitive build mode |
@@ -180,7 +180,7 @@ With Step S done, these parallelize cleanly and concurrently (own dirs):
 **TWO-EYES (lower-stakes — Hermes-only, mobile-friendly):**
 - `caching/cost` (cache correctness/cost; mild key-collision concern)
 - `lab-context-memory` (durability/projection correctness, not security boundary)
-- `cognition-layer`, `drift-prevention` (quality/behavior, not a boundary)
+- `drift-prevention` (quality/behavior, not a boundary)
 - `self-observation/monitoring` (read-only observation)
 - `peh-agent` router/intent/Q&A (teacher content deferred)
 - `dry-run/plan-only` (a safety *aid*; correctness matters but it gates, doesn't execute)
