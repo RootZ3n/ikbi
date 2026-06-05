@@ -100,9 +100,15 @@ export function isValidatedIdentity(o: unknown): o is ValidatedIdentity {
   return ValidatedIdentityImpl.brandPresent(o) && minted.has(o);
 }
 
-/** True if the validated identity is the human operator. */
+/**
+ * True if the value is a GENUINELY-MINTED operator identity. Requires provenance
+ * (`isValidatedIdentity` — the private-brand + WeakSet check) BEFORE the kind check,
+ * so a forged/cast plain object `{ kind: "operator" } as ValidatedIdentity` returns
+ * false. Safe-by-default: every operator gate that calls this is provenance-checked,
+ * never trusting a value's CLAIMED kind over its provenance.
+ */
 export function isOperator(v: ValidatedIdentity): boolean {
-  return v.kind === "operator";
+  return isValidatedIdentity(v) && v.kind === "operator";
 }
 
 // ---------------------------------------------------------------------------

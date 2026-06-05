@@ -62,6 +62,16 @@ test("the operator is distinguished from agents (highest tier, operator_token)",
   assert.equal(v.authMethod, "operator_token");
 });
 
+test("isOperator REQUIRES PROVENANCE — a forged {kind:'operator'} object is not an operator", () => {
+  const { resolver } = makeResolver();
+  // A genuinely-minted operator identity passes (provenance + kind).
+  const genuine = resolver.resolve({ token: "op-secret" });
+  assert.equal(isOperator(genuine), true, "a real resolved operator identity is operator");
+  // A structural look-alike that was NEVER minted fails the unforgeable brand+WeakSet check.
+  const forged = { kind: "operator", identity: { agentId: "forged-op", trustTier: "operator" }, authMethod: "operator_token", resolvedAt: 1 } as never;
+  assert.equal(isOperator(forged), false, "a forged structural object is NOT operator without genuine minting");
+});
+
 test("tailscale peer resolves ONLY from a boundary-verified source", () => {
   const { resolver } = makeResolver();
   const v = resolver.resolve({}, { verifiedPeer: { tailscale: { login: "alice@example.com" } } });

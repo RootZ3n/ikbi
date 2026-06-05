@@ -358,3 +358,23 @@ test("grantTier: COLD→WORKING — granted + preloaded, a fresh process resolve
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("grantTier: the CODEX FORGE is BLOCKED — a cast {kind:'operator'} object cannot grant (provenance, not claim)", async () => {
+  const dir = await tmp();
+  try {
+    const { trust, store } = makeTrust(dir);
+    // Codex's exact NO-SHIP repro: a forged plain object that STRUCTURALLY looks like
+    // an operator identity but was never minted by the resolver.
+    const forged = { kind: "operator", identity: { agentId: "forged-op" }, authMethod: "operator_token", resolvedAt: 1 } as unknown as ValidatedIdentity;
+    await assert.rejects(
+      trust.grantTier({ agentId: "victim", kind: "agent", tier: "trusted", defaultTrustTier: "probation" }, forged),
+      /validated identity/,
+      "a forged granter is rejected on provenance before the operator check",
+    );
+    assert.equal((await store.list()).length, 0, "no operator_grant was written by the forged caller");
+    assert.equal(trust.getState("victim"), undefined, "the target did not become trusted");
+    assert.equal(trust.resolve({ agentId: "victim", kind: "agent", defaultTrustTier: "probation" }), "untrusted", "the target still resolves to the cold floor");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

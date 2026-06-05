@@ -26,7 +26,7 @@ import { createHash } from "node:crypto";
 import type { Logger } from "pino";
 
 import type { TrustTier, TrustTierInput, TrustTierResolver } from "../identity/contract.js";
-import { isOperator } from "../identity/resolver.js";
+import { isOperator, isValidatedIdentity } from "../identity/resolver.js";
 import type { ValidatedIdentity } from "../identity/resolver.js";
 import type { DocumentStore } from "../substrate/store.js";
 import {
@@ -296,6 +296,14 @@ export class TrustSystem implements TrustTierResolver {
     input: { agentId: string; kind: "agent"; tier: TrustTier; defaultTrustTier: string },
     granter: ValidatedIdentity,
   ): Promise<TrustState> {
+    // PROVENANCE before AUTHORIZATION: verify the granter is a GENUINELY-MINTED
+    // ValidatedIdentity (the unforgeable private-brand + WeakSet check) BEFORE asking
+    // whether it is operator-tier. A forged/cast plain object `{ kind: "operator" }`
+    // fails this and is rejected before `isOperator` is ever consulted — closing the
+    // forged-operator escalation (trusting a value's CLAIM over its PROVENANCE).
+    if (!isValidatedIdentity(granter)) {
+      throw new TrustError("config", "grant requires a validated identity");
+    }
     if (!isOperator(granter)) {
       throw new TrustError("config", "only an operator-tier identity may grant trust");
     }
