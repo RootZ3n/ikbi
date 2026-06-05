@@ -10,12 +10,16 @@
  * barrel is what makes their commands available — no `cli/index.ts` edit.
  */
 
+// Side-effect import: load the modules barrel FIRST. egress's register() (fired on
+// barrel import) installs the SSRF fetch guard, and the provider singleton constructs
+// at module load via `resolveFetchGuard()` — so the barrel MUST precede the provider
+// import below, or the CLI throws EgressGuardMissingError at startup. This matches the
+// server entry's barrel-first ordering. (It also runs each module's command
+// registrations, composing the module subcommands.)
+import "../modules/index.js";
 import { config } from "../core/config.js";
 import { registry } from "../core/provider/index.js";
 import { commands } from "./registry.js";
-// Side-effect import: loading the modules barrel runs each module's route/command
-// registrations. Keep this AFTER the registry import so the registry exists first.
-import "../modules/index.js";
 
 /** Built-in command names — reserved, cannot be shadowed by a module command. */
 const BUILTINS = new Set(["version", "models", "providers", "help"]);
