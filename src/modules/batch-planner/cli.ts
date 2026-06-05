@@ -20,7 +20,8 @@ import { registerCommand } from "../../cli/registry.js";
 import { config } from "../../core/config.js";
 import { beginOperation, resolveIdentity as coreResolveIdentity } from "../../core/identity/index.js";
 import type { IdentityClaim, ValidatedIdentity } from "../../core/identity/index.js";
-import { batchPlanner as coreBatchPlanner } from "./planner.js";
+import { createProductionWorker } from "../worker-model/cli.js";
+import { createBatchPlanner } from "./planner.js";
 import type { BatchPlanner, BatchResult } from "./contract.js";
 
 function errMsg(e: unknown): string {
@@ -66,6 +67,7 @@ export interface BatchCliDeps {
   readonly planner?: BatchPlanner;
   readonly resolveIdentity?: (claim: IdentityClaim) => ValidatedIdentity;
   readonly operatorToken?: string | undefined;
+  readonly workerToken?: string | undefined;
   readonly stdout?: (s: string) => void;
   readonly stderr?: (s: string) => void;
   readonly setExit?: (code: number) => void;
@@ -73,11 +75,16 @@ export interface BatchCliDeps {
   readonly cwd?: () => string;
 }
 
-/** Build the `batch` command handler. Defaults wire the live planner + identity. */
+/** Build the `batch` command handler. Defaults wire the PRODUCTION governed worker + identity. */
 export function createBatchCli(deps: BatchCliDeps = {}) {
-  const planner = deps.planner ?? coreBatchPlanner;
   const resolveIdentity = deps.resolveIdentity ?? coreResolveIdentity;
   const operatorToken = "operatorToken" in deps ? deps.operatorToken : config.identity.operatorToken;
+  const workerToken = "workerToken" in deps ? deps.workerToken : config.identity.workerToken;
+  // C2: each subtask runs through the SAME governed worker `ikbi build` uses — the shared
+  // createProductionWorker (shared-worker roleClaim + REAL gate-wall), injected as the
+  // planner's runWorker. NOT the bare coreRunWorker default (which throws on the unwired
+  // worker). The gate-wall is wired INSIDE the helper, so batch-planner never imports it.
+  const planner = deps.planner ?? createBatchPlanner({ runWorker: createProductionWorker({ workerToken }).run });
   const out = deps.stdout ?? ((s: string) => void process.stdout.write(s));
   const err = deps.stderr ?? ((s: string) => void process.stderr.write(s));
   const setExit = deps.setExit ?? ((c: number) => void (process.exitCode = c));
@@ -94,6 +101,13 @@ export function createBatchCli(deps: BatchCliDeps = {}) {
     }
     if (operatorToken === undefined || operatorToken.length === 0) {
       err("ikbi: no operator identity — set IKBI_OPERATOR_TOKEN\n");
+      setExit(1);
+      return;
+    }
+    // C2: batch runs governed worker builds — the worker credential is required, same as
+    // `ikbi build`. Fail closed before any decomposition/run.
+    if (workerToken === undefined || workerToken.length === 0) {
+      err("ikbi: no worker credential — set IKBI_WORKER_TOKEN (see the worker-agent bootstrap)\n");
       setExit(1);
       return;
     }

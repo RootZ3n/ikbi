@@ -7,12 +7,19 @@ import { commands } from "../../cli/registry.js";
 import { beginOperation, IdentityResolver } from "../../core/identity/resolver.js";
 import { AgentRegistry, hashToken } from "../../core/identity/registry.js";
 import type { OperationContext } from "../../core/identity/resolver.js";
+import type { AgentIdentity } from "../../core/identity/contract.js";
 import type { ModelRequest, ModelResponse } from "../../core/provider/contract.js";
 import type { NeutralizedContent, UntrustedContext } from "../../core/injection/index.js";
+import { autonomyForTier, asTier, TRUST_FLOOR, type TrustDecision } from "../../core/trust/index.js";
+import type { DiscardResult, PromoteGovernance, PromoteResult, WorkspaceHandle } from "../../core/workspace/contract.js";
+import { createGateWall } from "../gate-wall/index.js";
+import { createOrchestrator, type OrchestratorDeps } from "../worker-model/orchestrator.js";
+import { createProductionWorker, productionRoleClaim } from "../worker-model/cli.js";
+import { WORKER_ROLES, type RoleContext, type RoleFn, type WorkerRole } from "../worker-model/contract.js";
 import type { WorkerResult, WorkerTask } from "../worker-model/index.js";
 import { createBatchPlanner, parsePlan, scheduleLevels, type ToUntrustedFn } from "./planner.js";
 import type { BatchPlannerConfig } from "./config.js";
-import type { ConflictPolicy, Subtask } from "./contract.js";
+import type { BatchPlanner, BatchResult, ConflictPolicy, Subtask } from "./contract.js";
 // Importing cli.js registers the `batch` command at module load.
 import { createBatchCli, parseBatchArgs } from "./cli.js";
 
@@ -300,4 +307,144 @@ test("the batch command fails closed (friendly) with no operator token", () => {
     assert.match(err, /no operator identity.*IKBI_OPERATOR_TOKEN/);
     assert.equal(out, "");
   });
+});
+
+// ── C2: the PRODUCTION governed worker is wired into `ikbi batch` ─────────────
+
+const OPERATOR_TOKEN = "operator-token-value";
+const WORKER_TOKEN = "worker-token-value";
+const ONE_SUBTASK = '[{"subtaskId":"a","goal":"do a","dependsOn":[]}]';
+
+/** A resolver over operator + worker agents at chosen tiers (the real identity path). */
+function cliResolver(operatorTier = "trusted", workerTier = "trusted") {
+  const resolver = new IdentityResolver({
+    registry: new AgentRegistry({
+      agents: [
+        { agentId: "lead", kind: "agent", functionalRole: "lead", defaultTrustTier: operatorTier, tokenHashes: [hashToken(OPERATOR_TOKEN)] },
+        { agentId: "worker", kind: "agent", functionalRole: "worker", defaultTrustTier: workerTier, tokenHashes: [hashToken(WORKER_TOKEN)] },
+      ],
+    }),
+    logger: silent(),
+    now: () => 1000,
+  });
+  return (claim: { token?: string }) => resolver.resolve(claim);
+}
+
+/** Capturing role set: records each spawned RoleContext; integrator returns a PROMOTE decision. */
+function capturingRoles() {
+  const seen: RoleContext[] = [];
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {};
+  for (const r of WORKER_ROLES) {
+    roles[r] = async (ctx) => {
+      seen.push(ctx);
+      if (r === "integrator") return { role: r, outcome: "success", summary: r, detail: { decision: "promote", rationale: "test", evaluation: { approved: true } } };
+      return { role: r, outcome: "success", summary: r };
+    };
+  }
+  return { seen, roles };
+}
+
+/** Workspaces fake that HONORS governance at promote + captures the verdict (no real git). */
+function governanceWorkspaces() {
+  let captured: PromoteGovernance | undefined;
+  const calls = { promote: 0, discard: 0 };
+  const handle: WorkspaceHandle = { id: "wsabcd", targetRepo: "/repo", baseBranch: "main", baseRef: "deadbeef", scratchBranch: "ikbi/ws/wsabcd", path: "/tmp/wsabcd", identity: { agentId: "lead" }, state: "allocated", createdAt: 1000 };
+  const workspaces: NonNullable<OrchestratorDeps["workspaces"]> = {
+    allocate: async () => handle,
+    promote: async (h, a): Promise<PromoteResult> => {
+      calls.promote += 1;
+      captured = a.governance;
+      return a.governance?.allow ? { promoted: true, workspaceId: h.id, targetBranch: h.baseBranch, beforeRef: "a", afterRef: "b" } : { promoted: false, workspaceId: h.id, targetBranch: h.baseBranch, beforeRef: "a", reason: "governance denied" };
+    },
+    discard: async (h): Promise<DiscardResult> => { calls.discard += 1; return { workspaceId: h.id, removed: true }; },
+  };
+  return { workspaces, governance: () => captured, calls };
+}
+
+const fakeTrustOrch = () => ({ recordOutcome: async (i: { agentId: string; operation: string; status: string; defaultTrustTier: string }): Promise<TrustDecision> => { const t = asTier(i.defaultTrustTier, TRUST_FLOOR); return { agentId: i.agentId, tier: t, previousTier: t, autonomy: autonomyForTier(t) }; } });
+const fakeReceiptsOrch = () => ({ append: async (_i: unknown, _id: AgentIdentity): Promise<unknown> => ({}) });
+const noopBusOrch = () => ({ publish: <P>(i: P) => ({ ...(i as object), contractVersion: "1.0.0", id: "e", seq: 1, timestamp: 0 }) as unknown, subscribe: () => ({ id: "s", unsubscribe: () => {}, stats: () => ({ delivered: 0, dropped: 0, failures: 0, queued: 0 }) }), flush: async () => {} });
+
+/**
+ * A PRODUCTION-wired governed worker (the SAME construction createProductionWorker does —
+ * productionRoleClaim + REAL gate-wall) but with test fakes injected so a subtask runs
+ * roles+gate+promote with no real git/model. `killCheck` lets a test kill the subtask.
+ */
+function governedWorker(resolveIdentity: (c: { token?: string }) => ReturnType<ReturnType<typeof cliResolver>>, over: Partial<OrchestratorDeps> = {}) {
+  const cap = capturingRoles();
+  const ws = governanceWorkspaces();
+  const gateWall = createGateWall({ receipts: fakeReceiptsOrch(), publish: () => {} }); // REAL evaluator
+  const orchestrator = createOrchestrator({
+    config: { enabled: true, roleTimeoutMs: 1000, maxConcurrentRuns: 1 },
+    resolveIdentity,
+    roleClaim: productionRoleClaim(WORKER_TOKEN), // the production shared-worker claim
+    roles: cap.roles,
+    workspaces: ws.workspaces,
+    gateWall,
+    trust: fakeTrustOrch(),
+    receipts: fakeReceiptsOrch(),
+    events: noopBusOrch() as unknown as NonNullable<OrchestratorDeps["events"]>,
+    invokeModel: async () => { throw new Error("invokeModel not used (capturing roles)"); },
+    ...over,
+  });
+  return { run: orchestrator.run, cap, ws };
+}
+
+function cliCapture() {
+  let out = "";
+  let err = "";
+  let exit: number | undefined;
+  return { stdout: (s: string) => void (out += s), stderr: (s: string) => void (err += s), setExit: (c: number) => void (exit = c), get out() { return out; }, get err() { return err; }, get exit() { return exit; } };
+}
+
+test("C2 headline: a batch subtask runs the SAME governed path as `ikbi build` — roles spawn, gate-wall is consulted, promote lands (NOT the bare-orchestrator throw)", async () => {
+  const resolveIdentity = cliResolver("trusted", "trusted");
+  const gov = governedWorker(resolveIdentity);
+  // The planner wires the governed worker as its runWorker — exactly what the CLI does by
+  // default via createProductionWorker (injected here so the decomposition uses fakes).
+  const plan = createBatchPlanner({ config: CFG, neutralizeUntrusted: neutralizeSpy().fn, toUntrustedMessage: toUntrusted, publish: () => {}, now: () => 1, invokeModel: async () => modelResponse(ONE_SUBTASK), runWorker: gov.run });
+  const cap2 = cliCapture();
+  const cli = createBatchCli({ planner: plan, resolveIdentity, operatorToken: OPERATOR_TOKEN, workerToken: WORKER_TOKEN, stdout: cap2.stdout, stderr: cap2.stderr, setExit: cap2.setExit, now: () => 1, cwd: () => "/repo" });
+
+  await cli.batch(["build", "the", "thing"]);
+
+  // The subtask reached the governed worker roles (NOT a "no credential configured" throw).
+  assert.deepEqual(gov.cap.seen.map((c) => c.role), ["scout", "builder", "critic", "verifier", "integrator"], "all five governed roles spawned for the subtask");
+  assert.ok(!cap2.err.includes("no credential configured for worker role"), "the bare-orchestrator throw is GONE");
+  // The gate-wall was consulted at promote, and the promote landed.
+  assert.equal(gov.cap.seen[0]?.identity.spawnedFrom, "lead", "roles spawned under the operator parent (#10)");
+  assert.ok(gov.ws.governance() !== undefined, "the REAL gate-wall produced a promote verdict");
+  assert.equal(gov.ws.calls.promote, 1, "the subtask workspace was promoted (governed)");
+  assert.notEqual(cap2.exit, 1, "a completed governed batch does not exit non-zero");
+  assert.match(cap2.out, /"status": "completed"/);
+});
+
+test("C2 worker-token fail-closed: operator token but NO worker token ⇒ friendly error, exit 1, nothing runs", async () => {
+  let ran = 0;
+  const plan: BatchPlanner = { planAndRun: async (): Promise<BatchResult> => { ran += 1; return { batchId: "b", status: "completed", outcomes: [], promotedCount: 0 }; } };
+  const cap2 = cliCapture();
+  const cli = createBatchCli({ planner: plan, resolveIdentity: cliResolver(), operatorToken: OPERATOR_TOKEN, workerToken: undefined, stdout: cap2.stdout, stderr: cap2.stderr, setExit: cap2.setExit, now: () => 1 });
+  await cli.batch(["do", "things"]);
+  assert.equal(cap2.exit, 1);
+  assert.match(cap2.err, /no worker credential.*IKBI_WORKER_TOKEN/);
+  assert.equal(ran, 0, "the planner never ran without a worker credential");
+});
+
+test("C2 shared helper: createProductionWorker constructs a runnable worker (the same wiring build uses)", () => {
+  const worker = createProductionWorker({ workerToken: WORKER_TOKEN });
+  assert.equal(typeof worker.run, "function", "exposes the run surface both build and batch consume");
+  // Construction is side-effect-free even with no token (the roleClaim only throws when CALLED).
+  assert.doesNotThrow(() => createProductionWorker({ workerToken: undefined }));
+});
+
+test("C2 kill composes: a kill at the worker layer rejects the subtask (the orchestrator's checkpoint), and the batch reports it", async () => {
+  const resolveIdentity = cliResolver("trusted", "trusted");
+  // The governed worker's own kill checkpoint fires (pre-start) → the subtask is rejected.
+  const gov = governedWorker(resolveIdentity, { killCheck: async () => ({ killed: true, signal: { mode: "hard" } }) });
+  const plan = createBatchPlanner({ config: CFG, neutralizeUntrusted: neutralizeSpy().fn, toUntrustedMessage: toUntrusted, publish: () => {}, now: () => 1, invokeModel: async () => modelResponse(ONE_SUBTASK), runWorker: gov.run, killCheck: async () => ({ killed: false }) });
+  const r = await plan.planAndRun(input(makeCtx()));
+
+  assert.equal(gov.ws.calls.promote, 0, "a killed subtask never promotes (worker-layer kill honored)");
+  assert.equal(r.outcomes.find((o) => o.subtaskId === "a")?.status, "failed", "the rejected subtask surfaces in the batch report");
+  assert.match(r.outcomes.find((o) => o.subtaskId === "a")?.reason ?? "", /kill-switch/, "the kill reason composes up to the batch outcome");
 });

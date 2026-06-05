@@ -49,6 +49,23 @@ export function productionRoleClaim(workerToken: string | undefined): (role: Wor
   };
 }
 
+/**
+ * THE shared production-worker construction (C2): a worker orchestrator wired with the
+ * shared-worker roleClaim (`productionRoleClaim`) + the REAL gate-wall at promote
+ * (deny-on-absent, H5). This is the governance-load-bearing wiring that BOTH `ikbi build`
+ * and `ikbi batch` run through — extracted ONCE so the two cannot drift apart (a future
+ * hardening of the production path can't fix build and silently miss batch's per-subtask
+ * runs). Construction is side-effect-free; `productionRoleClaim` only throws when CALLED
+ * with no worker token, and the CLI handlers fail closed before that. The gate-wall
+ * defaults to the live one so a caller that must NOT import gate-wall (the batch-planner
+ * module boundary) can wire the governed worker without reaching for it.
+ */
+export function createProductionWorker(
+  opts: { workerToken: string | undefined; gateWall?: GateWall },
+): { run: (task: WorkerTask, ctx: OperationContext) => Promise<WorkerResult> } {
+  return createOrchestrator({ roleClaim: productionRoleClaim(opts.workerToken), gateWall: opts.gateWall ?? coreGateWall });
+}
+
 /** Parse a `--repo <path>` / `--repo=<path>` flag out of argv; the rest is the goal prose. */
 export function parseBuildArgs(argv: readonly string[]): { repo?: string; rest: string[] } {
   const rest: string[] = [];
@@ -105,10 +122,11 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
   const operatorToken = "operatorToken" in deps ? deps.operatorToken : config.identity.operatorToken;
   const workerToken = "workerToken" in deps ? deps.workerToken : config.identity.workerToken;
   const gateWall = deps.gateWall ?? coreGateWall;
-  // The live orchestrator: production roleClaim (shared worker) + REAL gate-wall at
-  // promote. Construction is side-effect-free; roleClaim only throws when CALLED with
-  // no worker token (and the handler refuses before that).
-  const orchestrator = deps.orchestrator ?? createOrchestrator({ roleClaim: productionRoleClaim(workerToken), gateWall });
+  // The live orchestrator via the SHARED production-worker construction (the same wiring
+  // `ikbi batch` uses, so build + batch are governed identically). Construction is
+  // side-effect-free; roleClaim only throws when CALLED with no worker token (the handler
+  // refuses before that).
+  const orchestrator = deps.orchestrator ?? createProductionWorker({ workerToken, gateWall });
   const out = deps.stdout ?? ((s: string) => void process.stdout.write(s));
   const err = deps.stderr ?? ((s: string) => void process.stderr.write(s));
   const setExit = deps.setExit ?? ((c: number) => void (process.exitCode = c));
