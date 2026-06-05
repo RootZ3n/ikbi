@@ -1,0 +1,239 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+
+import { pino } from "pino";
+
+import { commands } from "../../cli/registry.js";
+import { IdentityResolver } from "../../core/identity/resolver.js";
+import { AgentRegistry, hashToken } from "../../core/identity/registry.js";
+import type { AgentIdentity } from "../../core/identity/contract.js";
+import { autonomyForTier, asTier, type TrustDecision } from "../../core/trust/index.js";
+import { TRUST_FLOOR } from "../../core/trust/index.js";
+import type { DiscardResult, PromoteGovernance, PromoteResult, WorkspaceHandle } from "../../core/workspace/contract.js";
+import { createGateWall } from "../gate-wall/index.js";
+import { createOrchestrator, type OrchestratorDeps } from "./orchestrator.js";
+import { WORKER_ROLES, WorkerError, type RoleContext, type RoleFn, type WorkerResult, type WorkerRole, type WorkerTask } from "./contract.js";
+// Importing cli.js registers the `build` command at module load.
+import { createWorkerCli, parseBuildArgs, productionRoleClaim } from "./cli.js";
+
+const silent = () => pino({ level: "silent" });
+const OPERATOR_TOKEN = "operator-token-value";
+const WORKER_TOKEN = "worker-token-value";
+
+/** A resolver over operator + worker agents at chosen tiers (the real identity path). */
+function makeResolver(operatorTier: string, workerTier: string) {
+  const resolver = new IdentityResolver({
+    registry: new AgentRegistry({
+      agents: [
+        { agentId: "lead", kind: "agent", functionalRole: "lead", defaultTrustTier: operatorTier, tokenHashes: [hashToken(OPERATOR_TOKEN)] },
+        { agentId: "worker", kind: "agent", functionalRole: "worker", defaultTrustTier: workerTier, tokenHashes: [hashToken(WORKER_TOKEN)] },
+      ],
+    }),
+    logger: silent(),
+    now: () => 1000,
+  });
+  return (claim: { token?: string }) => resolver.resolve(claim);
+}
+
+/** Capturing role set: records each RoleContext; integrator returns a PROMOTE decision. */
+function capturingRoles() {
+  const seen: RoleContext[] = [];
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {};
+  for (const r of WORKER_ROLES) {
+    roles[r] = async (ctx) => {
+      seen.push(ctx);
+      if (r === "integrator") return { role: r, outcome: "success", summary: r, detail: { decision: "promote", rationale: "test", evaluation: { approved: true } } };
+      return { role: r, outcome: "success", summary: r };
+    };
+  }
+  return { seen, roles };
+}
+
+function fakeWorkspaceHandle(): WorkspaceHandle {
+  return { id: "wsabcd", targetRepo: "/repo", baseBranch: "main", baseRef: "deadbeef", scratchBranch: "ikbi/ws/wsabcd", path: "/tmp/wsabcd", identity: { agentId: "lead" }, state: "allocated", createdAt: 1000 };
+}
+
+/** Workspaces fake that HONORS governance at promote + captures the verdict. No real git. */
+function governanceWorkspaces() {
+  let captured: PromoteGovernance | undefined;
+  const calls = { promote: 0, discard: 0 };
+  const handle = fakeWorkspaceHandle();
+  const workspaces: NonNullable<OrchestratorDeps["workspaces"]> = {
+    allocate: async () => handle,
+    promote: async (h, a): Promise<PromoteResult> => {
+      calls.promote += 1;
+      captured = a.governance;
+      return a.governance?.allow
+        ? { promoted: true, workspaceId: h.id, targetBranch: h.baseBranch, beforeRef: "a", afterRef: "b" }
+        : { promoted: false, workspaceId: h.id, targetBranch: h.baseBranch, beforeRef: "a", reason: "governance denied" };
+    },
+    discard: async (h): Promise<DiscardResult> => {
+      calls.discard += 1;
+      return { workspaceId: h.id, removed: true };
+    },
+  };
+  return { workspaces, governance: () => captured, calls };
+}
+
+const fakeTrust = () => ({
+  recordOutcome: async (i: { agentId: string; operation: string; status: string; defaultTrustTier: string }): Promise<TrustDecision> => {
+    const tier = asTier(i.defaultTrustTier, TRUST_FLOOR);
+    return { agentId: i.agentId, tier, previousTier: tier, autonomy: autonomyForTier(tier) };
+  },
+});
+const fakeReceipts = () => ({ append: async (_i: unknown, _id: AgentIdentity): Promise<unknown> => ({}) });
+const noopBus = () => ({
+  publish: <P>(input: P) => ({ ...(input as object), contractVersion: "1.0.0", id: "e", seq: 1, timestamp: 0 }) as unknown,
+  subscribe: () => ({ id: "s", unsubscribe: () => {}, stats: () => ({ delivered: 0, dropped: 0, failures: 0, queued: 0 }) }),
+  flush: async () => {},
+});
+
+const ENABLED = { enabled: true, roleTimeoutMs: 1000, maxConcurrentRuns: 1 };
+
+/** Build a REAL orchestrator wired with the production roleClaim + REAL gate-wall + fakes. */
+function realOrchestrator(operatorTier: string, workerTier: string) {
+  const resolveIdentity = makeResolver(operatorTier, workerTier);
+  const cap = capturingRoles();
+  const ws = governanceWorkspaces();
+  const gateWall = createGateWall({ receipts: fakeReceipts(), publish: () => {} }); // REAL evaluator
+  const orchestrator = createOrchestrator({
+    config: ENABLED,
+    resolveIdentity,
+    roleClaim: productionRoleClaim(WORKER_TOKEN), // PRODUCTION shared-worker claim
+    roles: cap.roles,
+    workspaces: ws.workspaces,
+    gateWall,
+    trust: fakeTrust(),
+    receipts: fakeReceipts(),
+    events: noopBus() as unknown as NonNullable<OrchestratorDeps["events"]>,
+    invokeModel: async () => {
+      throw new Error("invokeModel not used (capturing roles)");
+    },
+  });
+  return { orchestrator, resolveIdentity, cap, ws };
+}
+
+function capture() {
+  let out = "";
+  let err = "";
+  let exit: number | undefined;
+  return { stdout: (s: string) => void (out += s), stderr: (s: string) => void (err += s), setExit: (c: number) => void (exit = c), get out() { return out; }, get err() { return err; }, get exit() { return exit; } };
+}
+
+// ── registration ─────────────────────────────────────────────────────────────
+
+test("build is registered as a CLI command (no built-in collision)", () => {
+  assert.ok(commands.has("build"));
+  for (const b of ["version", "models", "providers", "help"]) assert.notEqual(b, "build");
+});
+
+test("productionRoleClaim returns the worker token for ALL roles; throws fail-closed when unset", () => {
+  const claim = productionRoleClaim(WORKER_TOKEN);
+  for (const r of WORKER_ROLES) assert.deepEqual(claim(r), { token: WORKER_TOKEN });
+  assert.throws(() => productionRoleClaim(undefined)("scout"), (e: unknown) => e instanceof WorkerError && e.kind === "config");
+});
+
+test("parseBuildArgs extracts --repo and leaves the goal", () => {
+  assert.deepEqual(parseBuildArgs(["fix", "the", "bug", "--repo", "/r"]), { repo: "/r", rest: ["fix", "the", "bug"] });
+  assert.deepEqual(parseBuildArgs(["g", "--repo=/x"]), { repo: "/x", rest: ["g"] });
+  assert.deepEqual(parseBuildArgs(["just", "a", "goal"]), { rest: ["just", "a", "goal"] });
+});
+
+// ── THE CHAIN PROOF (injected model via capturing roles + real gate-wall) ────
+
+test("build runs the full 5-role pipeline through the orchestrator with the real gate-wall", () => {
+  const { orchestrator, resolveIdentity, cap, ws } = realOrchestrator("trusted", "trusted");
+  const cap2 = capture();
+  const cli = createWorkerCli({ orchestrator, resolveIdentity, operatorToken: OPERATOR_TOKEN, workerToken: WORKER_TOKEN, stdout: cap2.stdout, stderr: cap2.stderr, setExit: cap2.setExit, now: () => 1, cwd: () => "/repo" });
+
+  return cli.build(["fix", "the", "bug", "--repo", "/repo"]).then(() => {
+    assert.equal(cap2.exit, undefined, "clean run");
+    assert.deepEqual(cap.seen.map((c) => c.role), ["scout", "builder", "critic", "verifier", "integrator"], "all five roles ran");
+    for (const c of cap.seen) assert.equal(c.identity.spawnedFrom, "lead", "each role spawned under the dispatching parent");
+    assert.equal(ws.governance()?.allow, true, "the REAL gate-wall evaluated the promote (trusted ⇒ allow)");
+    const summary = JSON.parse(cap2.out);
+    assert.equal(summary.outcome, "success");
+    assert.equal(summary.promoted, true);
+    assert.equal(summary.roles.length, 5);
+  });
+});
+
+// ── #10 CLAMP through the command path (credential wiring cannot escalate) ───
+
+test("a worker credential registered ABOVE the parent is clamped to the parent tier (#10)", () => {
+  // Parent "verified" (rank 2); worker "trusted" (rank 1 — MORE trusted). Roles must
+  // clamp to the PARENT's "verified", never the worker's nominal "trusted".
+  const { orchestrator, resolveIdentity, cap } = realOrchestrator("verified", "trusted");
+  const cap2 = capture();
+  const cli = createWorkerCli({ orchestrator, resolveIdentity, operatorToken: OPERATOR_TOKEN, workerToken: WORKER_TOKEN, stdout: cap2.stdout, stderr: cap2.stderr, setExit: cap2.setExit, now: () => 1, cwd: () => "/repo" });
+
+  return cli.build(["do", "the", "thing"]).then(() => {
+    assert.equal(cap.seen.length, 5);
+    for (const c of cap.seen) {
+      assert.equal(c.identity.trustTier, "verified", `role ${c.role} clamped to the parent tier, NOT the worker's "trusted"`);
+    }
+  });
+});
+
+// ── gate denial at promote is a CLEAN outcome (not a crash) ──────────────────
+
+test("a gate-denied promote (probation parent) surfaces a discarded/partial outcome, not a crash", () => {
+  const { orchestrator, resolveIdentity, ws } = realOrchestrator("probation", "trusted");
+  const cap2 = capture();
+  const cli = createWorkerCli({ orchestrator, resolveIdentity, operatorToken: OPERATOR_TOKEN, workerToken: WORKER_TOKEN, stdout: cap2.stdout, stderr: cap2.stderr, setExit: cap2.setExit, now: () => 1, cwd: () => "/repo" });
+
+  return cli.build(["ship", "it"]).then(() => {
+    assert.equal(cap2.exit, undefined, "a gate denial is NOT a crash");
+    assert.equal(cap2.err, "", "nothing on stderr");
+    assert.equal(ws.governance()?.allow, false, "the real gate-wall DENIED the probation promote");
+    const summary = JSON.parse(cap2.out);
+    assert.equal(summary.promoted, false, "not promoted");
+    assert.notEqual(summary.outcome, "success");
+  });
+});
+
+// ── fail-closed credential checks (no run) ───────────────────────────────────
+
+function countingOrchestrator() {
+  const calls: WorkerTask[] = [];
+  const orchestrator = {
+    run: async (task: WorkerTask): Promise<WorkerResult> => {
+      calls.push(task);
+      return { contractVersion: "1.0.0", taskId: task.taskId, outcome: "success", roles: [], workspaceId: "w", promoted: true };
+    },
+  };
+  return { orchestrator, calls };
+}
+
+test("no operator token ⇒ friendly error, no orchestrator run", () => {
+  const oc = countingOrchestrator();
+  const cap2 = capture();
+  const cli = createWorkerCli({ orchestrator: oc.orchestrator, resolveIdentity: makeResolver("trusted", "trusted"), operatorToken: undefined, workerToken: WORKER_TOKEN, stdout: cap2.stdout, stderr: cap2.stderr, setExit: cap2.setExit, now: () => 1 });
+  return cli.build(["x"]).then(() => {
+    assert.equal(cap2.exit, 1);
+    assert.match(cap2.err, /no operator identity.*IKBI_OPERATOR_TOKEN/);
+    assert.equal(oc.calls.length, 0);
+  });
+});
+
+test("no worker token ⇒ friendly error, no orchestrator run", () => {
+  const oc = countingOrchestrator();
+  const cap2 = capture();
+  const cli = createWorkerCli({ orchestrator: oc.orchestrator, resolveIdentity: makeResolver("trusted", "trusted"), operatorToken: OPERATOR_TOKEN, workerToken: undefined, stdout: cap2.stdout, stderr: cap2.stderr, setExit: cap2.setExit, now: () => 1 });
+  return cli.build(["x"]).then(() => {
+    assert.equal(cap2.exit, 1);
+    assert.match(cap2.err, /no worker credential.*IKBI_WORKER_TOKEN/);
+    assert.equal(oc.calls.length, 0);
+  });
+});
+
+test("an empty goal ⇒ usage hint, no run", () => {
+  const oc = countingOrchestrator();
+  const cap2 = capture();
+  const cli = createWorkerCli({ orchestrator: oc.orchestrator, resolveIdentity: makeResolver("trusted", "trusted"), operatorToken: OPERATOR_TOKEN, workerToken: WORKER_TOKEN, stdout: cap2.stdout, stderr: cap2.stderr, setExit: cap2.setExit, now: () => 1 });
+  return cli.build([]).then(() => {
+    assert.equal(cap2.exit, 1);
+    assert.match(cap2.err, /needs a goal/);
+    assert.equal(oc.calls.length, 0);
+  });
+});

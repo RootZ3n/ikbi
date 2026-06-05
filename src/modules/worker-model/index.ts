@@ -23,7 +23,12 @@ assertContractCompatible("events", "1.0.0");
 assertContractCompatible("receipt", "1.0.0");
 assertContractCompatible("substrate", "1.0.0");
 
+// Side-effect import: registers the `build` CLI command at load time (the modules
+// barrel imports worker-model, so the command is live once ikbi starts).
+import "./cli.js";
+
 // --- public surface ---
+export { createWorkerCli, productionRoleClaim, parseBuildArgs, type WorkerCliDeps } from "./cli.js";
 export {
   CONTRACT_VERSION,
   WORKER_ROLES,
