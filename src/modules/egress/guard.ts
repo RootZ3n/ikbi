@@ -128,10 +128,8 @@ export function createGuardedFetch(deps: GuardedFetchDeps): FetchLike {
       return block("not_allowlisted", host, `host "${host}" is not in IKBI_EGRESS_ALLOWLIST`);
     }
 
-    // The exact-match `host:port` key for the local-endpoint exception (explicit port, or
-    // the scheme default). Exact equality only — no ranges, globs, or subnets.
+    // The port for the local-endpoint key (explicit, or the scheme default).
     const port = url.port || defaultPort(url.protocol);
-    const localKey = `${host}:${port}`;
 
     let ips: string[];
     try {
@@ -143,22 +141,28 @@ export function createGuardedFetch(deps: GuardedFetchDeps): FetchLike {
       return block("dns_empty", host, `DNS returned no addresses for "${host}"`);
     }
 
-    // LAYER 2 — reject if ANY resolved IP is internal (defeats rebinding-to-internal),
-    // EXCEPT an internal destination whose host:port EXACTLY matches an operator-opted
-    // local endpoint: that single named endpoint is allowed (logged), the floor otherwise
-    // intact for every other internal destination.
+    // LAYER 2 — every resolved IP must be PUBLIC or the EXACT operator-opted internal
+    // IP:port. The exception keys on the RESOLVED IP `classifyIp` actually saw, NEVER the
+    // hostname (a name can resolve to any internal IP, including cloud metadata). Block on
+    // the FIRST internal IP that is not the opted-in endpoint — so a multi-IP rebind where
+    // ANY answer is an un-opted internal address (e.g. [127.0.0.1, 169.254.169.254])
+    // blocks the WHOLE request; one allowed IP can never bless the others.
+    let matchedLocal: { ip: string; reason: string } | undefined;
     for (const ip of ips) {
       const verdict = classifyIp(ip);
-      if (verdict.internal) {
-        if (localAllowed.has(localKey)) {
-          // Operator opted EXACTLY this host:port in via IKBI_EGRESS_ALLOW_LOCAL.
-          publishLocalAllowed({ host, port: Number(port), reason: verdict.reason });
-          return transport(input, init);
-        }
-        return block("internal_ip", host, `${host} -> ${ip} (${verdict.reason})`);
+      if (!verdict.internal) continue;
+      if (localAllowed.has(`${ip}:${port}`)) {
+        matchedLocal = { ip, reason: verdict.reason };
+        continue; // this internal IP is the opted-in endpoint — keep validating the rest
       }
+      return block("internal_ip", host, `${host} -> ${ip} (${verdict.reason})`);
     }
 
+    // No internal-and-not-opted-in IP among the answers. If an opted-in local endpoint was
+    // matched, log the positive allow (carrying the resolved IP the decision keyed on).
+    if (matchedLocal !== undefined) {
+      publishLocalAllowed({ host, resolvedIp: matchedLocal.ip, port: Number(port), reason: matchedLocal.reason });
+    }
     // All checks passed — hand off to the real transport. (See TOCTOU note above.)
     return transport(input, init);
   };

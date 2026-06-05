@@ -9,14 +9,20 @@
  *                          case-insensitive). DEFAULT-DENY: empty/unset = nothing
  *                          is allowed, so every outbound call is blocked until the
  *                          operator opts specific hosts in.
- *   IKBI_EGRESS_ALLOW_LOCAL  comma-separated `host:port` LOCAL endpoints (exact match,
- *                          case-insensitive), e.g. "127.0.0.1:11434" for a local Ollama.
+ *   IKBI_EGRESS_ALLOW_LOCAL  comma-separated `ip:port` LOCAL endpoints (exact match),
+ *                          e.g. "127.0.0.1:11434" for a local Ollama. The host part MUST
+ *                          be an IP LITERAL (IPv4, or bracketed IPv6 "[::1]:11434") — a
+ *                          HOSTNAME is REJECTED at load, BY DESIGN: the exception matches
+ *                          on the RESOLVED IP, and a name can resolve to ANY internal IP
+ *                          (including cloud metadata), which would re-open the SSRF gap.
  *                          DEFAULT EMPTY — no internal/loopback destination is reachable
- *                          unless the operator opts in EXACTLY this host:port. This is a
- *                          NARROW exception at the internal-IP rejection point; it does
- *                          NOT replace the host allowlist (Layer 1 STILL applies) and it
- *                          is exact-match only (no ranges, globs, or subnets).
+ *                          unless the operator opts in EXACTLY this ip:port. A NARROW
+ *                          exception at the internal-IP rejection point; it does NOT
+ *                          replace the host allowlist (Layer 1 STILL applies) and it is
+ *                          exact-match only (no ranges, globs, or subnets).
  */
+
+import { isIP } from "node:net";
 
 import { moduleEnv } from "../../core/module-config.js";
 
@@ -26,18 +32,53 @@ export interface EgressConfig {
   /** Permitted egress hosts (lowercased, exact match). Empty = default-deny-all. */
   readonly allowlist: readonly string[];
   /**
-   * Exact-match `host:port` local endpoints the operator has explicitly opted in
-   * (lowercased). Empty = no local access. An ADDITIONAL gate at the internal-IP layer,
-   * NOT a replacement for `allowlist` — a local endpoint must ALSO be host-allowlisted.
+   * Exact-match `ip:port` local endpoints the operator has explicitly opted in (canonical,
+   * lowercased; the host part is always an IP LITERAL). Empty = no local access. An
+   * ADDITIONAL gate at the internal-IP layer matched against the RESOLVED IP, NOT a
+   * replacement for `allowlist` — a local endpoint must ALSO be host-allowlisted.
    */
   readonly localEndpoints: readonly string[];
+}
+
+/**
+ * Parse + validate one ALLOW_LOCAL entry into a canonical `ip:port` key. THROWS on a
+ * non-IP-literal host: ALLOW_LOCAL takes IP-literals ONLY because the guard matches on the
+ * resolved IP — a hostname could resolve to any internal IP and re-open the SSRF gap. A
+ * misconfiguration here fails LOUD at load rather than silently widening the floor.
+ */
+export function parseLocalEndpoint(entry: string): string {
+  const raw = entry.trim().toLowerCase();
+  let host: string;
+  let portStr: string;
+  const bracketed = /^\[([0-9a-f:]+)\]:(\d{1,5})$/.exec(raw); // [::1]:11434
+  if (bracketed !== null) {
+    host = bracketed[1]!;
+    portStr = bracketed[2]!;
+  } else {
+    const idx = raw.lastIndexOf(":");
+    if (idx <= 0 || idx === raw.length - 1) {
+      throw new Error(`IKBI_EGRESS_ALLOW_LOCAL entry "${entry}" is not "ip:port"`);
+    }
+    host = raw.slice(0, idx);
+    portStr = raw.slice(idx + 1);
+  }
+  const port = Number(portStr);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`IKBI_EGRESS_ALLOW_LOCAL entry "${entry}" has an invalid port "${portStr}"`);
+  }
+  if (isIP(host) === 0) {
+    throw new Error(
+      `IKBI_EGRESS_ALLOW_LOCAL entry "${entry}" host "${host}" is not an IP literal — ALLOW_LOCAL takes IP-literals only (a hostname can resolve to any internal IP, which would re-open the SSRF gap)`,
+    );
+  }
+  return `${host}:${port}`;
 }
 
 /** Load the egress config slice from `IKBI_EGRESS_*`. */
 export function loadEgressConfig(reader = env): EgressConfig {
   return Object.freeze({
     allowlist: reader.list("ALLOWLIST").map((h) => h.toLowerCase()),
-    localEndpoints: reader.list("ALLOW_LOCAL").map((e) => e.toLowerCase()),
+    localEndpoints: reader.list("ALLOW_LOCAL").map(parseLocalEndpoint),
   });
 }
 

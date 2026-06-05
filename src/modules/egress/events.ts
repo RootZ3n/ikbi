@@ -37,8 +37,10 @@ export const egressBlocked = defineEvent<EgressBlockedPayload>("egress.blocked")
 
 /** Payload for `egress.local_allowed` — a logged ALLOW of an exact-match local endpoint. */
 export interface EgressLocalAllowedPayload {
-  /** The local host that was allowed (e.g. "127.0.0.1"). */
+  /** The request host (from the URL — may be a name; the ALLOW decision is on resolvedIp). */
   readonly host: string;
+  /** The RESOLVED internal IP that matched the opt-in (what classifyIp saw + the gate keys on). */
+  readonly resolvedIp: string;
   /** The exact port the operator opted in. */
   readonly port: number;
   /** The internal-classification reason that WOULD have blocked it (e.g. "ipv4_loopback"). */

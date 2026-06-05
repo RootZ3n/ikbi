@@ -5,6 +5,7 @@ import { ProviderError } from "../../core/provider/contract.js";
 import type { FetchLike } from "../../core/provider/providers/openai-compatible.js";
 import { events } from "../../core/events/index.js";
 import { createGuardedFetch } from "./guard.js";
+import { loadEgressConfig, parseLocalEndpoint } from "./config.js";
 import { egressBlocked, type EgressBlockedPayload, type EgressLocalAllowedPayload } from "./events.js";
 
 const okResponse = {
@@ -181,9 +182,10 @@ test("LOCAL ALLOWED (headline): an exact-match host:port internal endpoint is pe
   assert.equal(res.status, 200, "the local Ollama endpoint was reached");
   assert.deepEqual(calls, ["http://127.0.0.1:11434/v1/chat/completions"], "transport reached exactly once");
   assert.equal(blocked.length, 0, "NOT blocked");
-  // The positive audit event fired.
+  // The positive audit event fired, carrying the RESOLVED IP the gate keyed on.
   assert.equal(localAllowed.length, 1, "egress.local_allowed published");
   assert.equal(localAllowed[0]?.host, "127.0.0.1");
+  assert.equal(localAllowed[0]?.resolvedIp, "127.0.0.1", "the allow decision is on the resolved IP");
   assert.equal(localAllowed[0]?.port, 11434);
   assert.match(localAllowed[0]?.reason ?? "", /loopback/);
 });
@@ -262,4 +264,78 @@ test("SSRF floor intact: with a local opt-in active, OTHER internal destinations
   await assert.rejects(() => direct.guard("http://169.254.169.254/latest/meta-data", init), (e: unknown) => e instanceof ProviderError);
   assert.equal(direct.blocked.at(-1)?.reason, "internal_ip", "the metadata host:port is NOT in ALLOW_LOCAL → still blocked");
   assert.equal(direct.localAllowed.length, 0);
+});
+
+// ── RESOLVED-IP MATCHING (Codex NO-SHIP fix — the hostname-resolution gap) ────
+
+test("CODEX BYPASS now BLOCKED: an opted-in IP, but a HOST that resolves to cloud metadata → blocked", async () => {
+  // The exact crafted bypass: ALLOW_LOCAL=127.0.0.1:11434, host "ollama.local" → metadata IP.
+  const { guard, blocked, localAllowed, calls } = harness({
+    allowlist: ["ollama.local"], // Layer 1 passes (host is allowlisted)
+    localEndpoints: ["127.0.0.1:11434"], // opt-in is the loopback IP, NOT the name
+    resolve: async () => ["169.254.169.254"], // the name resolves to cloud metadata
+  });
+  await assert.rejects(() => guard("http://ollama.local:11434/latest/meta-data", init), (e: unknown) => e instanceof ProviderError);
+  assert.equal(blocked.at(-1)?.reason, "internal_ip", "the RESOLVED metadata IP is not the opted-in IP → blocked");
+  assert.match(blocked.at(-1)?.detail ?? "", /169\.254\.169\.254/, "the block names the resolved IP, not the hostname");
+  assert.equal(localAllowed.length, 0, "no allowance — the name does not bless the metadata IP");
+  assert.equal(calls.length, 0, "transport never reached");
+});
+
+test("RESOLVED-IP MATCH (legit): an IP-literal host that resolves to itself is allowed, logged with the resolved IP", async () => {
+  const { guard, localAllowed, calls } = harness({
+    allowlist: ["127.0.0.1"],
+    localEndpoints: ["127.0.0.1:11434"],
+    resolve: async () => ["127.0.0.1"], // a literal IP resolves to itself
+  });
+  const res = await guard("http://127.0.0.1:11434/v1/models", init);
+  assert.equal(res.status, 200, "the legit local Ollama path still works");
+  assert.equal(calls.length, 1);
+  assert.equal(localAllowed[0]?.resolvedIp, "127.0.0.1");
+});
+
+test("HOSTNAME resolving to a DIFFERENT internal IP → blocked (the resolved IP decides, not the name)", async () => {
+  const { guard, blocked, localAllowed } = harness({
+    allowlist: ["ollama.local"],
+    localEndpoints: ["127.0.0.1:11434"], // opted in 127.0.0.1 only
+    resolve: async () => ["10.0.0.5"], // resolves to an RFC1918 host, not the opt-in
+  });
+  await assert.rejects(() => guard("http://ollama.local:11434/x", init), (e: unknown) => e instanceof ProviderError);
+  assert.equal(blocked.at(-1)?.reason, "internal_ip", "10.0.0.5:11434 ≠ 127.0.0.1:11434");
+  assert.equal(localAllowed.length, 0);
+});
+
+test("MULTI-IP REBIND blocked: a host resolving to [opted-in IP, metadata IP] blocks the WHOLE request", async () => {
+  const { guard, blocked, localAllowed, calls } = harness({
+    allowlist: ["ollama.local"],
+    localEndpoints: ["127.0.0.1:11434"],
+    // One answer IS the opted-in IP, the other is cloud metadata — must NOT allow.
+    resolve: async () => ["127.0.0.1", "169.254.169.254"],
+  });
+  await assert.rejects(() => guard("http://ollama.local:11434/x", init), (e: unknown) => e instanceof ProviderError);
+  assert.equal(blocked.at(-1)?.reason, "internal_ip", "the un-opted metadata IP blocks even though 127.0.0.1 matched");
+  assert.match(blocked.at(-1)?.detail ?? "", /169\.254\.169\.254/);
+  assert.equal(localAllowed.length, 0, "one allowed IP never blesses the rebind");
+  assert.equal(calls.length, 0);
+});
+
+// ── CONFIG: ALLOW_LOCAL takes IP-LITERALS only (a hostname is rejected at load) ──
+
+test("ALLOW_LOCAL config REJECTS a hostname entry (it could resolve anywhere — the gap)", () => {
+  // A hostname is invalid for ALLOW_LOCAL — reject LOUD at load.
+  assert.throws(() => parseLocalEndpoint("ollama.local:11434"), /not an IP literal/);
+  // An IP-literal is accepted and canonicalized to ip:port.
+  assert.equal(parseLocalEndpoint("127.0.0.1:11434"), "127.0.0.1:11434");
+  assert.equal(parseLocalEndpoint("[::1]:11434"), "::1:11434", "bracketed IPv6 is accepted");
+  // Malformed entries (no port / bad port) are rejected too.
+  assert.throws(() => parseLocalEndpoint("127.0.0.1"), /not "ip:port"/);
+  assert.throws(() => parseLocalEndpoint("127.0.0.1:99999"), /invalid port/);
+
+  // loadEgressConfig surfaces the rejection from a reader supplying a hostname entry.
+  const reader = { list: (k: string) => (k === "ALLOW_LOCAL" ? ["ollama.local:11434"] : []) } as unknown as Parameters<typeof loadEgressConfig>[0];
+  assert.throws(() => loadEgressConfig(reader), /not an IP literal/);
+
+  // A reader supplying an IP-literal loads cleanly.
+  const okReader = { list: (k: string) => (k === "ALLOW_LOCAL" ? ["127.0.0.1:11434"] : k === "ALLOWLIST" ? ["127.0.0.1"] : []) } as unknown as Parameters<typeof loadEgressConfig>[0];
+  assert.deepEqual(loadEgressConfig(okReader).localEndpoints, ["127.0.0.1:11434"]);
 });
