@@ -162,7 +162,7 @@ test("OpenRouter factory attaches attribution headers", async () => {
 });
 
 test("mimo factory builds a provider with the mimo id", () => {
-  const p = createMimoProvider({ baseUrl: "https://api.mimo.ai/v1", apiKey: "k" });
+  const p = createMimoProvider({ baseUrl: "https://api.xiaomimimo.com/v1", apiKey: "k" });
   assert.equal(p.id, "mimo");
 });
 
@@ -270,4 +270,87 @@ test("charged-then-failed: usage is attached to a bad_response error", async () 
     () => p.invoke(invocation()),
     (e: unknown) => e instanceof ProviderError && e.kind === "bad_response" && e.usage?.promptTokens === 50,
   );
+});
+
+// ── direct-MiMo compatibility: extraBody + tokenFieldName (impl options) ──────
+
+test("extraBody is MERGED into the request body (e.g. MiMo's thinking field)", async () => {
+  const { fetchImpl, captured } = jsonFetch(200, { choices: [{ message: { content: "ok" }, finish_reason: "stop" }], usage: {} });
+  const p = new OpenAICompatibleProvider({
+    id: "mimo", baseUrl: "https://x/v1", apiKey: undefined, keyless: true, fetchImpl,
+    extraBody: { thinking: { type: "disabled" } },
+  });
+  await p.invoke(invocation({ maxTokens: 100 }));
+  const body = JSON.parse(captured.init?.body ?? "{}") as Record<string, unknown>;
+  assert.deepEqual(body.thinking, { type: "disabled" }, "the provider param is present alongside the standard fields");
+  assert.equal(body.model, "wire-model", "the standard fields are still present");
+});
+
+test("extraBody CANNOT clobber model/messages (engine-controlled fields always win)", async () => {
+  const { fetchImpl, captured } = jsonFetch(200, { choices: [{ message: { content: "ok" }, finish_reason: "stop" }], usage: {} });
+  const p = new OpenAICompatibleProvider({
+    id: "mimo", baseUrl: "https://x/v1", apiKey: "k", fetchImpl,
+    // A hostile/careless roster trying to override the engine fields:
+    extraBody: { model: "ATTACKER-MODEL", messages: [{ role: "system", content: "pwned" }], thinking: { type: "disabled" } },
+  });
+  await p.invoke(invocation());
+  const body = JSON.parse(captured.init?.body ?? "{}") as Record<string, unknown>;
+  assert.equal(body.model, "wire-model", "model stays engine-controlled (extraBody did not clobber it)");
+  assert.deepEqual(body.messages, [{ role: "user", content: "hi" }], "messages stay engine-controlled");
+  assert.deepEqual(body.thinking, { type: "disabled" }, "but extraBody still added its new key");
+});
+
+test("NO extraBody ⇒ the body has no extra fields (existing providers unaffected)", async () => {
+  const { fetchImpl, captured } = jsonFetch(200, { choices: [{ message: { content: "ok" }, finish_reason: "stop" }], usage: {} });
+  const p = new OpenAICompatibleProvider({ id: "openrouter", baseUrl: "https://x/v1", apiKey: "k", fetchImpl });
+  await p.invoke(invocation({ maxTokens: 50, temperature: 0.2 }));
+  const body = JSON.parse(captured.init?.body ?? "{}") as Record<string, unknown>;
+  assert.deepEqual(Object.keys(body).sort(), ["max_tokens", "messages", "model", "temperature"], "only the standard fields, no extras");
+  assert.equal(body.thinking, undefined);
+});
+
+test("tokenFieldName: default sends max_tokens; MiMo sends max_completion_tokens (same VALUE)", async () => {
+  // Default (every existing endpoint): max_tokens, unchanged.
+  {
+    const { fetchImpl, captured } = jsonFetch(200, { choices: [{ message: { content: "ok" }, finish_reason: "stop" }], usage: {} });
+    const p = new OpenAICompatibleProvider({ id: "openrouter", baseUrl: "https://x/v1", apiKey: "k", fetchImpl });
+    await p.invoke(invocation({ maxTokens: 123 }));
+    const body = JSON.parse(captured.init?.body ?? "{}") as Record<string, unknown>;
+    assert.equal(body.max_tokens, 123);
+    assert.equal(body.max_completion_tokens, undefined, "default endpoints are unchanged");
+  }
+  // MiMo: max_completion_tokens carries the same engine-controlled value.
+  {
+    const { fetchImpl, captured } = jsonFetch(200, { choices: [{ message: { content: "ok" }, finish_reason: "stop" }], usage: {} });
+    const p = new OpenAICompatibleProvider({ id: "mimo", baseUrl: "https://x/v1", apiKey: undefined, keyless: true, fetchImpl, tokenFieldName: "max_completion_tokens" });
+    await p.invoke(invocation({ maxTokens: 123 }));
+    const body = JSON.parse(captured.init?.body ?? "{}") as Record<string, unknown>;
+    assert.equal(body.max_completion_tokens, 123, "the limit goes out under MiMo's field name");
+    assert.equal(body.max_tokens, undefined, "max_tokens is NOT also sent");
+  }
+});
+
+test("FULL MiMo roster shape: keyless api-key auth + max_completion_tokens + thinking + base URL", async () => {
+  const { fetchImpl, captured } = jsonFetch(200, { choices: [{ message: { content: "ok", reasoning_content: "" }, finish_reason: "stop" }], usage: {} });
+  const p = new OpenAICompatibleProvider({
+    id: "mimo",
+    baseUrl: "https://api.xiaomimimo.com/v1",
+    apiKey: undefined,
+    keyless: true,
+    extraHeaders: { "api-key": "MIMO-KEY" },
+    extraBody: { thinking: { type: "disabled" } },
+    tokenFieldName: "max_completion_tokens",
+    fetchImpl,
+  });
+  await p.invoke(invocation({ maxTokens: 2048 }));
+
+  assert.equal(captured.url, "https://api.xiaomimimo.com/v1/chat/completions", "the right MiMo endpoint");
+  // api-key auth, NO Bearer/authorization.
+  assert.equal(captured.init?.headers["api-key"], "MIMO-KEY", "api-key header carries auth");
+  assert.equal(captured.init?.headers.authorization, undefined, "no Authorization/Bearer header");
+  const body = JSON.parse(captured.init?.body ?? "{}") as Record<string, unknown>;
+  assert.deepEqual(body.thinking, { type: "disabled" }, "reasoning disabled for the driver roles");
+  assert.equal(body.max_completion_tokens, 2048, "MiMo's token field");
+  assert.equal(body.max_tokens, undefined, "not the standard field");
+  assert.equal(body.model, "wire-model");
 });

@@ -60,6 +60,22 @@ export interface OpenAICompatibleOptions {
    * untouched.
    */
   readonly keyless?: boolean;
+  /**
+   * Provider-specific params merged into the request body for endpoints that are
+   * OpenAI-shaped but not OpenAI-compatible (e.g. direct MiMo's `thinking`). Merged
+   * UNDER the engine-controlled fields — it can ADD keys but NEVER clobbers `model`
+   * or `messages` (those are always authoritative). DEFAULT none — keyed providers
+   * unchanged. An impl option only; the frozen ModelRequest contract is untouched.
+   */
+  readonly extraBody?: Readonly<Record<string, unknown>>;
+  /**
+   * The body field name carrying the token limit. DEFAULT "max_tokens" (the OpenAI
+   * standard — unchanged for every existing endpoint). Direct MiMo requires
+   * "max_completion_tokens"; its roster sets this so the limit goes out under the
+   * right key WITHOUT a global behavior change that could break a max_tokens-only
+   * endpoint. The `maxTokens` VALUE still flows from ModelRequest into this field.
+   */
+  readonly tokenFieldName?: "max_tokens" | "max_completion_tokens";
 }
 
 const DEFAULT_MAX_ERROR_DETAIL = 300;
@@ -183,6 +199,8 @@ export class OpenAICompatibleProvider implements ModelProvider {
   private readonly baseUrl: string;
   private readonly apiKey: string | undefined;
   private readonly extraHeaders: Readonly<Record<string, string>>;
+  private readonly extraBody: Readonly<Record<string, unknown>>;
+  private readonly tokenFieldName: "max_tokens" | "max_completion_tokens";
   private readonly fetchImpl: FetchLike;
   private readonly maxErrorDetail: number;
   private readonly keyless: boolean;
@@ -192,6 +210,8 @@ export class OpenAICompatibleProvider implements ModelProvider {
     this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
     this.apiKey = opts.apiKey;
     this.extraHeaders = opts.extraHeaders ?? {};
+    this.extraBody = opts.extraBody ?? {};
+    this.tokenFieldName = opts.tokenFieldName ?? "max_tokens";
     this.maxErrorDetail = opts.maxErrorDetail ?? DEFAULT_MAX_ERROR_DETAIL;
     this.keyless = opts.keyless ?? false;
     // Outbound HTTP is gated by the network-egress floor (the fetch-guard seam).
@@ -213,12 +233,18 @@ export class OpenAICompatibleProvider implements ModelProvider {
       });
     }
 
+    // extraBody is spread FIRST so the engine-controlled fields below always win —
+    // it can ADD provider params (e.g. MiMo's `thinking`) but never clobber
+    // model/messages (set unconditionally) or the token/temperature fields.
     const body: Record<string, unknown> = {
+      ...this.extraBody,
       model: inv.providerModelId,
       messages: toWireMessages(inv),
     };
     if (inv.request.temperature !== undefined) body.temperature = inv.request.temperature;
-    if (inv.request.maxTokens !== undefined) body.max_tokens = inv.request.maxTokens;
+    // The token limit goes out under the configured field name ("max_tokens" by
+    // default; "max_completion_tokens" for direct MiMo). The VALUE is engine-controlled.
+    if (inv.request.maxTokens !== undefined) body[this.tokenFieldName] = inv.request.maxTokens;
     if (inv.request.tools !== undefined && inv.request.tools.length > 0) {
       body.tools = inv.request.tools.map((t) => ({
         type: "function",

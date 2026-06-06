@@ -279,10 +279,11 @@ function loadProviderConfig(env: NodeJS.ProcessEnv, stateRoot: string): Provider
     },
     rosterFile,
     mimo: {
-      // NOTE: placeholder default — confirm mimo's real direct-API base URL and
-      // override via IKBI_MIMO_BASE_URL. The provider speaks an OpenAI-compatible
-      // /chat/completions shape; adjust the provider impl if mimo differs.
-      baseUrl: optStr(env.IKBI_MIMO_BASE_URL) ?? "https://api.mimo.ai/v1",
+      // Direct MiMo's real endpoint. OpenAI-SHAPED but not OpenAI-compatible: api-key
+      // auth (keyless + an api-key extra-header, not Bearer), max_completion_tokens
+      // (tokenFieldName), and a non-standard thinking field (extraBody) — all set at the
+      // roster level. Override the base URL via IKBI_MIMO_BASE_URL.
+      baseUrl: optStr(env.IKBI_MIMO_BASE_URL) ?? "https://api.xiaomimimo.com/v1",
       apiKey: optStr(env.IKBI_MIMO_API_KEY),
     },
     openrouter: {

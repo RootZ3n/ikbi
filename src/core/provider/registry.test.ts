@@ -83,6 +83,36 @@ test("a KEYLESS roster entry (no apiKey) is accepted and declared (the keyless o
   assert.equal(reg.getProvider("ollama")?.id, "ollama", "the keyless provider is declared");
 });
 
+test("a FULL direct-MiMo roster entry (keyless api-key, extraBody, tokenFieldName) parses and is declared", () => {
+  const reg = new ModelRegistry();
+  const applied = reg.applyRoster({
+    providers: [
+      {
+        id: "mimo",
+        kind: "openai-compatible",
+        baseUrl: "https://api.xiaomimimo.com/v1",
+        keyless: true,
+        headers: { "api-key": "MIMO-KEY" },
+        extraBody: { thinking: { type: "disabled" } },
+        tokenFieldName: "max_completion_tokens",
+      },
+    ],
+    models: [{ id: "mimo-v2.5", role: "scout", cost: { promptPerMTok: 0, completionPerMTok: 0 }, providers: [{ provider: "mimo", providerModelId: "mimo-v2.5" }] }],
+  });
+  assert.deepEqual(applied, { models: 1, providers: 1 });
+  assert.equal(reg.getProvider("mimo")?.id, "mimo", "the MiMo provider is declared from the full roster entry");
+});
+
+test("an invalid tokenFieldName is REJECTED (a typo would silently drop the token limit)", () => {
+  assert.throws(
+    () =>
+      new ModelRegistry().applyRoster({
+        providers: [{ id: "mimo", kind: "openai-compatible", baseUrl: "https://x/v1", tokenFieldName: "max_toks" }],
+      }),
+    /tokenFieldName must be/,
+  );
+});
+
 test("applyRoster rejects malformed documents (fail loud)", () => {
   assert.throws(() => new ModelRegistry().applyRoster(42));
   assert.throws(() => new ModelRegistry().applyRoster({ models: "nope" }));

@@ -230,11 +230,27 @@ function parseProviderEntry(v: unknown, source: string): ModelProvider {
   const apiKey = typeof r.apiKey === "string" ? r.apiKey : undefined;
   // KEYLESS opt-in (e.g. a local Ollama): skip the key requirement, send no auth header.
   const keyless = r.keyless === true;
+  // Provider-specific body params (e.g. direct MiMo's thinking:{type:"disabled"}).
+  const extraBody =
+    typeof r.extraBody === "object" && r.extraBody !== null && !Array.isArray(r.extraBody)
+      ? (r.extraBody as Record<string, unknown>)
+      : undefined;
+  // The token-limit field name. Default "max_tokens"; direct MiMo needs
+  // "max_completion_tokens". Reject any other value (a typo would silently drop the limit).
+  let tokenFieldName: "max_tokens" | "max_completion_tokens" | undefined;
+  if (r.tokenFieldName !== undefined) {
+    if (r.tokenFieldName !== "max_tokens" && r.tokenFieldName !== "max_completion_tokens") {
+      throw new Error(`Provider roster ${source}: provider.tokenFieldName must be "max_tokens" or "max_completion_tokens", got "${String(r.tokenFieldName)}"`);
+    }
+    tokenFieldName = r.tokenFieldName;
+  }
   return new OpenAICompatibleProvider({
     id: asString(r.id, "provider.id", source),
     baseUrl: asString(r.baseUrl, "provider.baseUrl", source),
     apiKey,
     extraHeaders,
     keyless,
+    ...(extraBody !== undefined ? { extraBody } : {}),
+    ...(tokenFieldName !== undefined ? { tokenFieldName } : {}),
   });
 }

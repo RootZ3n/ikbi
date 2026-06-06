@@ -15,7 +15,7 @@ import { ModelRegistry } from "./registry.js";
 // Every test starts with NO guard registered (the fail-closed precondition).
 beforeEach(resetFetchGuardForTests);
 
-const mimoCfg = { baseUrl: "https://api.mimo.ai/v1", apiKey: "k" };
+const mimoCfg = { baseUrl: "https://api.xiaomimimo.com/v1", apiKey: "k" };
 const orCfg = { baseUrl: "https://openrouter.ai/api/v1", apiKey: "k", referer: undefined, title: undefined };
 const deepseekCfg = { baseUrl: "https://api.deepseek.com/v1", apiKey: "k" };
 const stubFetch: FetchLike = async () => {

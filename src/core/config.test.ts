@@ -11,6 +11,11 @@ test("defaults: loopback bind on default port", () => {
   assert.ok(cfg.stateRoot.endsWith("state"));
 });
 
+test("mimo base URL defaults to the real direct-API endpoint (api.xiaomimimo.com), overridable", () => {
+  assert.equal(loadConfig({}).provider.mimo.baseUrl, "https://api.xiaomimimo.com/v1");
+  assert.equal(loadConfig({ IKBI_MIMO_BASE_URL: "https://custom/v1" }).provider.mimo.baseUrl, "https://custom/v1");
+});
+
 test("IKBI_PORT is parsed and validated", () => {
   assert.equal(loadConfig({ IKBI_PORT: "3000" }).port, 3000);
   assert.throws(() => loadConfig({ IKBI_PORT: "not-a-port" }));
