@@ -37,25 +37,16 @@
 
 import type { OperationContext } from "../../core/identity/index.js";
 import type { WorkspaceHandle } from "../../core/workspace/contract.js";
-import type { ExecResult, GovernedExec } from "../governed-exec/index.js";
+import type { GovernedExec } from "../governed-exec/index.js";
 
+// The check SET is the single shared definition (worker-model/checks.ts) — the SAME
+// constant the builder's in-loop run_checks imports, so the builder previews the
+// verifier's EXACT checks. Behavior here is unchanged; the constant just relocated.
+import { type CheckResult, mapExec, VERIFIER_CHECKS } from "./checks.js";
 import type { RoleFn, RoleResult } from "./contract.js";
 
-/** A fixed check. The command list is a named constant — never model-chosen. */
-interface Check {
-  readonly name: string;
-  readonly command: string;
-  readonly args: readonly string[];
-}
-
-/** THE fixed, read-only check set. */
-const VERIFIER_CHECKS: readonly Check[] = [
-  { name: "typecheck", command: "pnpm", args: ["tsc", "--noEmit"] },
-  { name: "test", command: "pnpm", args: ["test"] },
-];
-
-/** Captured output tail length retained in the result. */
-const MAX_OUTPUT_TAIL = 2_000;
+/** Re-exported for consumers (and tests) that import it from the verifier. */
+export type { CheckResult } from "./checks.js";
 
 /**
  * The package.json script keys the verifier's checks depend on: `pnpm test` runs the
@@ -69,14 +60,6 @@ const GUARDED_SCRIPT_KEYS: readonly string[] = [
   "build", "prebuild", "postbuild",
   "tsc", "pretsc", "posttsc",
 ];
-
-/** One check's outcome. Lives in the open `detail` bag — NOT a contract type. */
-export interface CheckResult {
-  readonly name: string;
-  readonly command: string;
-  readonly exitCode: number;
-  readonly outputTail: string;
-}
 
 /** Injectable dependencies. Defaults wire the live governed-exec singleton (lazily). */
 export interface VerifierDeps {
@@ -93,10 +76,6 @@ export interface VerifierDeps {
    * WITHOUT it fails closed at run time (untrusted) — it cannot prove script integrity.
    */
   readonly diff?: (workspace: WorkspaceHandle) => Promise<string>;
-}
-
-function tail(s: string, max: number): string {
-  return s.length <= max ? s : s.slice(s.length - max);
 }
 
 /** Lazy live governed-exec — importing it eagerly would force the gate-wall/egress wiring order. */
@@ -144,22 +123,6 @@ export function detectScriptMutation(diff: string): { mutated: boolean; reason?:
     }
   }
   return { mutated: false };
-}
-
-/** Map one governed ExecResult onto a CheckResult (fail-closed on deny). */
-function mapExec(name: string, command: string, res: ExecResult): { check: CheckResult; dryRun: boolean } {
-  if (res.executed) {
-    const output = `${res.stdoutTail ?? ""}${res.stderrTail ?? ""}`;
-    return { check: { name, command, exitCode: res.exitCode ?? 1, outputTail: tail(output, MAX_OUTPUT_TAIL) }, dryRun: false };
-  }
-  if (res.denied === true) {
-    // FAIL CLOSED: a denied / non-allowlisted check is a non-zero check, NEVER a pass.
-    const note = `governed-exec DENIED: ${res.reason ?? "denied"} — add "${command.split(" ")[0]}" to IKBI_GOVERNED_EXEC_ALLOWLIST for real verification`;
-    return { check: { name, command, exitCode: res.exitCode ?? 1, outputTail: tail(note, MAX_OUTPUT_TAIL) }, dryRun: false };
-  }
-  // executed:false, not denied ⇒ DRY-RUN (governed-exec reported intent, ran nothing).
-  const note = `governed-exec dry-run: ${res.reason ?? "intent only — not executed"}`;
-  return { check: { name, command, exitCode: 1, outputTail: tail(note, MAX_OUTPUT_TAIL) }, dryRun: true };
 }
 
 /** Build a verifier. Tests inject fakes; the default wires the live governed-exec. */

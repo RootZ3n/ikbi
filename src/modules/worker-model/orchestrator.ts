@@ -40,7 +40,7 @@ import type { BuildCandidate, JudgeResult } from "../deterministic-judge/index.j
 
 import type { GovernedExec } from "../governed-exec/index.js";
 
-import { builder, MAX_TOOL_ITERATIONS } from "./builder.js";
+import { builder, createBuilder, MAX_TOOL_ITERATIONS } from "./builder.js";
 import { critic } from "./critic.js";
 import { integrator } from "./integrator.js";
 import { scout } from "./scout.js";
@@ -232,6 +232,20 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   }
 
   /**
+   * The builder for THIS run. Honors an injected `deps.roles.builder` (tests); otherwise
+   * builds it with governedExec + the run's parent ctx — the SAME module-internal injection
+   * the verifier uses — so its in-loop `run_checks` runs the verifier's EXACT checks through
+   * the same governed path. NO contract change: governedExec/parentCtx are not RoleContext fields.
+   */
+  function builderFor(parentCtx: OperationContext): RoleFn {
+    if (deps.roles?.builder !== undefined) return deps.roles.builder;
+    return createBuilder({
+      ...(deps.governedExec !== undefined ? { governedExec: deps.governedExec } : {}),
+      parentCtx,
+    });
+  }
+
+  /**
    * Spawn a role identity under the parent's trust ceiling (#10). Resolve the role
    * credential (with `spawnedFrom = parent`), then CLAMP its tier so it can NEVER
    * exceed the parent — the single most important guard in this module.
@@ -372,7 +386,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           priorResults: [...results],
           engine,
         };
-        const roleFn = role === "verifier" ? verifierFor(parentCtx) : roles[role];
+        const roleFn = role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderFor(parentCtx) : roles[role];
         const result = await roleFn(ctx);
         results.push(result);
 
@@ -509,8 +523,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       ),
     );
     const ctx: RoleContext = { task, role, identity: spawned.identity, autonomy: spawned.autonomy, workspace, priorResults: [...priorResults], engine };
-    // The verifier (C1) runs the governed + integrity-guarded path bound to the run ctx.
-    const roleFn = role === "verifier" ? verifierFor(parentCtx) : roles[role];
+    // The verifier (C1) and the builder (its in-loop run_checks) run the governed path
+    // bound to the run ctx (parentCtx is the minted ValidatedIdentity governed-exec needs).
+    const roleFn = role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderFor(parentCtx) : roles[role];
     const result = await roleFn(ctx);
     events.publish(
       workerRoleCompleted.create(

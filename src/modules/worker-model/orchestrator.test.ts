@@ -369,19 +369,33 @@ function okModelResponse(): ModelResponse {
   };
 }
 
-/** The real builder now REQUIRES a `done` self-check to finish (a bare stop is incomplete). */
+/** The real builder now REQUIRES a green run_checks then a `done` self-check to finish. */
 function doneModelResponse(): ModelResponse {
   return {
     ...okModelResponse(),
     content: "",
     finishReason: "tool_calls",
-    toolCalls: [{ id: "done1", name: "done", arguments: JSON.stringify({ successCondition: "do the thing", filesReadBack: ["a.ts"], selfCheck: "re-read a.ts; the goal is met", satisfied: true }) }],
+    toolCalls: [{ id: "done1", name: "done", arguments: JSON.stringify({ successCondition: "do the thing", filesReadBack: ["a.ts"], selfCheck: "re-read a.ts and ran checks green; the goal is met", satisfied: true }) }],
   };
 }
+function runChecksModelResponse(): ModelResponse {
+  return { ...okModelResponse(), content: "", finishReason: "tool_calls", toolCalls: [{ id: "rc1", name: "run_checks", arguments: "{}" }] };
+}
 
-/** Builder offers a `done` tool and must call it; scout/critic offer no tools → plain stop. */
-const builderAwareModel = async (req: ModelRequest): Promise<ModelResponse> =>
-  (req.tools ?? []).some((t) => t.name === "done") ? doneModelResponse() : okModelResponse();
+/**
+ * Builder offers a `done` tool; scout/critic offer no tools → plain stop. The builder
+ * must run_checks (green) BEFORE done, so its first turn is run_checks, its second is done.
+ */
+function makeBuilderAwareModel(): (req: ModelRequest) => Promise<ModelResponse> {
+  let builderTurn = 0;
+  return async (req) => {
+    if (!(req.tools ?? []).some((t) => t.name === "done")) return okModelResponse(); // scout/critic
+    builderTurn += 1;
+    return builderTurn === 1 ? runChecksModelResponse() : doneModelResponse();
+  };
+}
+/** A GREEN governed exec so the builder's in-loop run_checks passes (the verifier is stubbed here). */
+const greenGovernedExec = { run: async () => ({ executed: true as const, exitCode: 0, stdoutTail: "ok", stderrTail: "" }) };
 
 test("real scout/builder/critic + stubbed verifier/integrator → coherent success → promote", async () => {
   // scout, builder, critic are now REAL roles. Give them a real workspace dir + a
@@ -416,7 +430,7 @@ test("real scout/builder/critic + stubbed verifier/integrator → coherent succe
   };
 
   const orch = createOrchestrator(
-    baseDeps({ resolveIdentity, roleClaim, workspaces, roles, invokeModel: builderAwareModel }),
+    baseDeps({ resolveIdentity, roleClaim, workspaces, roles, invokeModel: makeBuilderAwareModel(), governedExec: greenGovernedExec }),
   );
   const result = await orch.run({ taskId: "t-1", targetRepo: dir, goal: "do the thing" }, parentCtx);
 
@@ -426,9 +440,12 @@ test("real scout/builder/critic + stubbed verifier/integrator → coherent succe
   assert.equal(calls.discard, 0);
   assert.deepEqual(result.roles.map((r) => r.role), ["scout", "builder", "critic", "verifier", "integrator"]);
   for (const r of result.roles) assert.equal(r.outcome, "success", `${r.role} succeeded`);
-  // Builder really ran its (real) loop — its detail carries the chokepoint counter.
-  const builderDetail = result.roles[1]?.detail as { neutralizedCount: number } | undefined;
-  assert.equal(builderDetail?.neutralizedCount, 0, "real builder ran (no tools this run)");
+  // Builder really ran its (real) loop — it ran its in-loop run_checks (the verifier's
+  // shared checks) green before done. The run_checks output is one neutralized tool result.
+  const builderDetail = result.roles[1]?.detail as { neutralizedCount: number; checksRuns: number; doneClaim?: { checksPassed: boolean } } | undefined;
+  assert.equal(builderDetail?.checksRuns, 1, "the builder ran run_checks in-loop");
+  assert.equal(builderDetail?.neutralizedCount, 1, "the run_checks output was neutralized (the chokepoint)");
+  assert.equal(builderDetail?.doneClaim?.checksPassed, true, "the builder claims green checks; the verifier still ran independently");
 });
 
 // ── Pass C: integrator decision wiring ─────────────────────────────────────
