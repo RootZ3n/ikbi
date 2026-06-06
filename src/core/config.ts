@@ -212,8 +212,18 @@ export interface ProviderConfig {
   readonly openrouter: OpenRouterEndpointConfig;
   /** DeepSeek direct API endpoint (OpenAI-compatible). */
   readonly deepseek: ProviderEndpointConfig;
-  /** Default logical model ids for the standard roles (config-driven, not hardcoded downstream). */
-  readonly defaultModels: { readonly driver: string; readonly critic: string };
+  /**
+   * Default logical model ids for the standard roles (config-driven, not hardcoded
+   * downstream). `builder` has its OWN id (IKBI_MODEL_BUILDER) that falls through to the
+   * driver when unset. `competitiveModels` (IKBI_COMPETITIVE_MODELS) is the optional
+   * head-to-head list — competitive mode races one candidate per listed model.
+   */
+  readonly defaultModels: {
+    readonly driver: string;
+    readonly builder: string;
+    readonly critic: string;
+    readonly competitiveModels?: readonly string[];
+  };
 }
 
 const DEFAULT_PORT = 18796;
@@ -299,7 +309,14 @@ function loadProviderConfig(env: NodeJS.ProcessEnv, stateRoot: string): Provider
     },
     defaultModels: {
       driver: optStr(env.IKBI_MODEL_DRIVER) ?? "mimo-v2.5",
+      // The builder's own model — falls through to the driver when unset (default unchanged).
+      builder: optStr(env.IKBI_MODEL_BUILDER) ?? optStr(env.IKBI_MODEL_DRIVER) ?? "mimo-v2.5",
       critic: optStr(env.IKBI_MODEL_CRITIC) ?? "mimo-v2.5-pro",
+      // Optional head-to-head list (comma-separated). Empty/unset ⇒ undefined.
+      ...(() => {
+        const list = optStr(env.IKBI_COMPETITIVE_MODELS)?.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+        return list !== undefined && list.length > 0 ? { competitiveModels: list } : {};
+      })(),
     },
   };
 }

@@ -72,21 +72,27 @@ export function runDoctor(inp: DoctorInputs = {}): DoctorResult {
   // env-key built-ins. Read-only: getModel/getProvider, no network, no invoke.
   const reg = inp.registry ?? defaultRegistry;
   const driverId = cfg.provider.defaultModels.driver;
+  const builderId = cfg.provider.defaultModels.builder;
   const criticId = cfg.provider.defaultModels.critic;
+  const competitive = cfg.provider.defaultModels.competitiveModels;
   const resolves = (spec: ModelSpec | undefined): boolean =>
     spec !== undefined && spec.providers.some((route) => reg.getProvider(route.provider) !== undefined);
-  const driverOk = resolves(reg.getModel(driverId));
-  const criticOk = resolves(reg.getModel(criticId));
-  const providerEntry = driverOk && criticOk
-    ? { ok: true, label: `provider — driver '${driverId}' and critic '${criticId}' resolve to registered providers`, fix: "" }
+  // ALL configured models must resolve: scout(driver) + builder + critic + every
+  // competitive-list model (the shootout — the operator needs to know if a racer isn't wired).
+  const modelChecks: Array<{ label: string; id: string; ok: boolean }> = [
+    { label: "driver model", id: driverId, ok: resolves(reg.getModel(driverId)) },
+    { label: "builder model", id: builderId, ok: resolves(reg.getModel(builderId)) },
+    { label: "critic model", id: criticId, ok: resolves(reg.getModel(criticId)) },
+    ...(competitive ?? []).map((id) => ({ label: "competitive model", id, ok: resolves(reg.getModel(id)) })),
+  ];
+  const broken = modelChecks.filter((m) => !m.ok);
+  const providerEntry = broken.length === 0
+    ? { ok: true, label: `provider — all role models resolve (driver '${driverId}', builder '${builderId}', critic '${criticId}'${competitive ? `, competitive ${competitive.map((m) => `'${m}'`).join(", ")}` : ""})`, fix: "" }
     : (() => {
-        const broken = [!driverOk ? `driver model '${driverId}'` : undefined, !criticOk ? `critic model '${criticId}'` : undefined].filter(
-          (x): x is string => x !== undefined,
-        );
         const verb = broken.length > 1 ? "don't" : "doesn't";
         return {
           ok: false,
-          label: `the ${broken.join(" and ")} ${verb} resolve to a registered provider`,
+          label: `the ${broken.map((m) => `${m.label} '${m.id}'`).join(" and ")} ${verb} resolve to a registered provider`,
           fix: "add a provider entry in the roster (providers.json) for it, or set a provider API key",
         };
       })();
@@ -134,8 +140,12 @@ export function runDoctor(inp: DoctorInputs = {}): DoctorResult {
   // --- MODEL CONFIG (the ids the roles will request) -----------------------
   push("");
   push("MODEL CONFIG (resolved role models)");
-  push(`  ${OK} IKBI_MODEL_DRIVER  = ${cfg.provider.defaultModels.driver}   (scout, builder)`);
-  push(`  ${OK} IKBI_MODEL_CRITIC  = ${cfg.provider.defaultModels.critic}   (critic)`);
+  push(`  ${OK} IKBI_MODEL_DRIVER  = ${driverId}   (scout)`);
+  push(`  ${OK} IKBI_MODEL_BUILDER = ${builderId}   (builder)`);
+  push(`  ${OK} IKBI_MODEL_CRITIC  = ${criticId}   (critic)`);
+  if (competitive !== undefined && competitive.length > 0) {
+    push(`  ${OK} IKBI_COMPETITIVE_MODELS = ${competitive.join(", ")}   (head-to-head shootout)`);
+  }
 
   // --- STATE ---------------------------------------------------------------
   push("");

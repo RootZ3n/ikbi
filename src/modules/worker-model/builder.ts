@@ -43,7 +43,7 @@ import type { GovernedExec } from "../governed-exec/index.js";
 import { type CheckResult, mapExec, VERIFIER_CHECKS } from "./checks.js";
 import { workerModelConfig } from "./config.js";
 import type { RoleFn, WorkerOutcome } from "./contract.js";
-import { driverModel } from "./role-models.js";
+import { builderModel } from "./role-models.js";
 
 // --- named constants (no magic values inline) ------------------------------
 // The model id is DRIVER-tier and config-driven (see role-models.ts) — resolved at
@@ -160,6 +160,13 @@ export interface BuilderDeps {
   readonly governedExec?: Pick<GovernedExec, "run">;
   /** The run's validated OperationContext (#10). Absent ⇒ run_checks cannot run (fail-closed). */
   readonly parentCtx?: OperationContext;
+  /**
+   * Per-candidate model id (the head-to-head shootout). When set, THIS builder requests
+   * this model instead of `builderModel()` — so competitive candidates can race DIFFERENT
+   * models, each in its own shadow workspace. Module-internal; the model id is a plain
+   * string on the unchanged ModelRequest.
+   */
+  readonly modelOverride?: string;
 }
 
 /** The last run_checks outcome — gates `done` (RAIL: no done while red). */
@@ -516,7 +523,8 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       }
 
       const response = await ctx.engine.invokeModel({
-        model: driverModel(),
+        // Per-candidate model (the shootout) when injected; otherwise the builder's own model.
+        model: deps.modelOverride ?? builderModel(),
         temperature: BUILDER_TEMPERATURE,
         maxTokens: BUILDER_MAX_TOKENS,
         identity: ctx.identity, // clamped spawned identity (#10), by reference, EVERY round

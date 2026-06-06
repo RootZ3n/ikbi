@@ -541,3 +541,20 @@ test("SAME GOVERNED PATH: a DENIED run_checks (e.g. pnpm not allowlisted) is a r
   const detail = result.detail as { lastChecks?: { allPass: boolean } };
   assert.equal(detail.lastChecks?.allPass, false, "a governed deny is NOT a pass");
 });
+
+// ── per-candidate model override (the shootout) ──────────────────────────────
+
+test("modelOverride: a builder constructed with modelOverride requests THAT model (not builderModel())", async () => {
+  const dir = tmp();
+  const { engine, requests } = mockEngine([runChecksResp(), doneResp(["x"])]);
+  const ctx = makeCtx(dir, "verified", engine);
+  await createBuilder({ governedExec: greenExec(), parentCtx: PARENT_CTX, modelOverride: "deepseek-v4-pro" })(ctx);
+  assert.equal(requests[0]?.model, "deepseek-v4-pro", "the per-candidate model overrides the default");
+});
+
+test("no modelOverride: the builder requests the default builderModel() (== driver by default)", async () => {
+  const dir = tmp();
+  const { engine, requests } = mockEngine([runChecksResp(), doneResp(["x"])]);
+  await run(makeCtx(dir, "verified", engine)); // run() injects no modelOverride
+  assert.equal(requests[0]?.model, driverModel(), "default builder model == the driver (IKBI_MODEL_BUILDER unset)");
+});

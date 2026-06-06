@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import { pino } from "pino";
@@ -16,6 +19,7 @@ import { deterministicJudge } from "../deterministic-judge/index.js";
 import type { ExecRequest, ExecResult } from "../governed-exec/index.js";
 import { createOrchestrator, type OrchestratorDeps } from "./orchestrator.js";
 import { type RoleContext, type RoleFn, type WorkerRole, type WorkerTask } from "./contract.js";
+import { driverModel } from "./role-models.js";
 
 const silent = () => pino({ level: "silent" });
 
@@ -333,4 +337,113 @@ test("competitive: the judge receives correctly-mapped BuildCandidates", async (
   assert.equal(c0.rejectedToolCalls, 0);
   assert.equal(c0.stopReason, "stop");
   assert.equal(c0.diffLines, 3, "diff line count from workspaces.diff");
+});
+
+
+// ── HEAD-TO-HEAD MODEL SHOOTOUT (per-candidate models) ───────────────────────
+
+/** Workspaces with REAL temp dirs (the real builder realpath's + checks-cwd's its worktree). */
+function realCompWorkspaces() {
+  const allocated: string[] = [];
+  const promoted: string[] = [];
+  const discarded: string[] = [];
+  let i = 0;
+  const workspaces: NonNullable<OrchestratorDeps["workspaces"]> = {
+    allocate: async () => {
+      const id = `ws${i++}`;
+      const path = mkdtempSync(join(tmpdir(), `ikbi-comp-${id}-`));
+      allocated.push(id);
+      return { id, targetRepo: "/repo", baseBranch: "main", baseRef: "deadbeef", scratchBranch: `ikbi/ws/${id}`, path, identity: { agentId: "parent-1" }, state: "allocated", createdAt: 1000 };
+    },
+    promote: async (h): Promise<PromoteResult> => { promoted.push(h.id); return { promoted: true, workspaceId: h.id, targetBranch: h.baseBranch, beforeRef: "a", afterRef: "b" }; },
+    discard: async (h): Promise<DiscardResult> => { discarded.push(h.id); return { workspaceId: h.id, removed: true }; },
+    diff: async () => "line1\nline2",
+  };
+  return { workspaces, allocated, promoted, discarded };
+}
+
+/** A model response: run_checks on a model's first turn, done on its second. */
+function builderDriver() {
+  const capturedModels: string[] = [];
+  const turnByModel = new Map<string, number>();
+  const invokeModel: NonNullable<OrchestratorDeps["invokeModel"]> = async (req) => {
+    const m = req.model;
+    capturedModels.push(m);
+    const t = (turnByModel.get(m) ?? 0) + 1;
+    turnByModel.set(m, t);
+    const toolCalls = t === 1
+      ? [{ id: "rc1", name: "run_checks", arguments: "{}" }]
+      : [{ id: "d1", name: "done", arguments: JSON.stringify({ successCondition: "x", filesReadBack: ["a.ts"], selfCheck: "ran checks green", satisfied: true }) }];
+    return { contractVersion: "1.1.0", model: m, provider: "p", providerModelId: m, content: "", finishReason: "tool_calls" as const, toolCalls, usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 }, cost: { usd: 0, promptUsd: 0, cachedUsd: 0, completionUsd: 0, rate: { promptPerMTok: 0, completionPerMTok: 0 } }, latencyMs: 1, fellBack: false, attempts: [] };
+  };
+  return { invokeModel, capturedModels };
+}
+/** Stub every role EXCEPT the builder (the REAL builder must run to pick up its per-candidate model). */
+function nonBuilderRoles(verifierFor: (wsId: string) => { typecheck: number; test: number }): Partial<Record<WorkerRole, RoleFn>> {
+  return {
+    scout: async () => ({ role: "scout", outcome: "success", summary: "s" }),
+    critic: async () => ({ role: "critic", outcome: "success", summary: "c" }),
+    verifier: async (ctx: RoleContext) => { const o = verifierFor(ctx.workspace.id); return { role: "verifier", outcome: "success", summary: "v", detail: { verdict: o.typecheck === 0 && o.test === 0 ? "pass" : "fail", checks: checks(o.typecheck, o.test) } }; },
+    integrator: async () => ({ role: "integrator", outcome: "success", summary: "i", detail: { decision: "promote", evaluation: { approved: true } } }),
+  };
+}
+
+test("HEAD-TO-HEAD: competitive + a model list races DIFFERENT models per candidate, each in its own worktree", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = realCompWorkspaces();
+  const drv = builderDriver();
+  const governedRuns: ExecRequest[] = [];
+  const governedExec = { run: async (req: ExecRequest): Promise<ExecResult> => { governedRuns.push(req); return { executed: true, exitCode: 0, stdoutTail: "ok", stderrTail: "" }; } };
+  const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: nonBuilderRoles(() => ({ typecheck: 0, test: 0 })), invokeModel: drv.invokeModel, governedExec, competitiveModels: ["model-a", "model-b"] }));
+
+  await orch.run(task, parentCtx);
+
+  assert.equal(ws.allocated.length, 2, "N = the list length (2 models → 2 candidates)");
+  assert.equal(drv.capturedModels[0], "model-a", "candidate 0 raced model-a");
+  assert.ok(drv.capturedModels.includes("model-b"), "candidate 1 raced model-b");
+  assert.equal(new Set(drv.capturedModels).size, 2, "the candidates raced DIFFERENT models (not the same model twice)");
+  // EACH CANDIDATE GETS run_checks (governed path): 2 candidates × 2 shared checks = 4 governed runs.
+  assert.equal(governedRuns.length, 4, "each candidate ran the governed run_checks (typecheck + test)");
+  assert.equal(new Set(governedRuns.map((r) => r.cwd)).size, 2, "each candidate's checks ran in its OWN worktree");
+});
+
+test("HEAD-TO-HEAD: the judge picks the winner by the REAL checks, regardless of model", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = realCompWorkspaces();
+  const drv = builderDriver();
+  const governedExec = { run: async (): Promise<ExecResult> => ({ executed: true, exitCode: 0, stdoutTail: "ok", stderrTail: "" }) };
+  // model-a's candidate (ws0) passes typecheck; model-b's (ws1) FAILS → judge disqualifies ws1.
+  const roles = nonBuilderRoles((id) => (id === "ws0" ? { typecheck: 0, test: 0 } : { typecheck: 1, test: 0 }));
+  const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles, invokeModel: drv.invokeModel, governedExec, competitiveModels: ["model-a", "model-b"] }));
+
+  const r = await orch.run(task, parentCtx);
+  assert.equal(r.promoted, true, "a winner was promoted");
+  assert.equal(r.workspaceId, "ws0", "the judge picked model-a's candidate — the one that passed the real checks");
+  assert.deepEqual(ws.discarded, ["ws1"], "model-b's candidate (failed typecheck) was discarded — by checks, not by model");
+});
+
+test("competitive WITHOUT a model list ⇒ competitiveN candidates all on the single builder model (old behavior)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = realCompWorkspaces();
+  const drv = builderDriver();
+  const governedExec = { run: async (): Promise<ExecResult> => ({ executed: true, exitCode: 0, stdoutTail: "ok", stderrTail: "" }) };
+  // No competitiveModels → COMP config (competitiveN 2) → 2 candidates, all on builderModel().
+  const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: nonBuilderRoles(() => ({ typecheck: 0, test: 0 })), invokeModel: drv.invokeModel, governedExec }));
+
+  await orch.run(task, parentCtx);
+  assert.equal(ws.allocated.length, 2, "competitiveN candidates (workspace-isolation mode)");
+  assert.equal(new Set(drv.capturedModels).size, 1, "all candidates use the SAME model");
+  assert.equal(drv.capturedModels[0], driverModel(), "the single builder model == the driver by default");
+});
+
+test("N = LIST LENGTH (capped at MAX_COMPETITIVE_N): a 3-model list ⇒ 3 candidates", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = realCompWorkspaces();
+  const drv = builderDriver();
+  const governedExec = { run: async (): Promise<ExecResult> => ({ executed: true, exitCode: 0, stdoutTail: "ok", stderrTail: "" }) };
+  const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: nonBuilderRoles(() => ({ typecheck: 0, test: 0 })), invokeModel: drv.invokeModel, governedExec, competitiveModels: ["m1", "m2", "m3"] }));
+
+  await orch.run(task, parentCtx);
+  assert.equal(ws.allocated.length, 3, "one candidate per listed model (within MAX_COMPETITIVE_N=4)");
+  assert.deepEqual([...new Set(drv.capturedModels)].sort(), ["m1", "m2", "m3"], "each listed model raced once");
 });

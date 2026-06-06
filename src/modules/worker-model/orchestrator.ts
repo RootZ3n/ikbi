@@ -41,6 +41,7 @@ import type { BuildCandidate, JudgeResult } from "../deterministic-judge/index.j
 import type { GovernedExec } from "../governed-exec/index.js";
 
 import { builder, createBuilder, MAX_TOOL_ITERATIONS } from "./builder.js";
+import { builderModel, competitiveBuilderModels } from "./role-models.js";
 import { critic } from "./critic.js";
 import { integrator } from "./integrator.js";
 import { scout } from "./scout.js";
@@ -124,6 +125,10 @@ export interface OrchestratorDeps {
    * A non-allowlisted / gate-denied check fails the verifier CLOSED (never a silent pass).
    */
   readonly governedExec?: Pick<GovernedExec, "run">;
+  /** The single builder model (per-candidate fallback). Default: config (IKBI_MODEL_BUILDER). */
+  readonly builderModel?: string;
+  /** The head-to-head competitive model list. Default: config (IKBI_COMPETITIVE_MODELS). */
+  readonly competitiveModels?: readonly string[];
 }
 
 /** A role identity spawned under the parent ceiling (#10). */
@@ -214,6 +219,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     });
   const roles: Record<WorkerRole, RoleFn> = { ...DEFAULT_ROLES, ...deps.roles };
 
+  // Per-candidate builder models (the head-to-head shootout). Default to config; injectable
+  // for tests. When `competitiveModelList` is set, competitive mode races one candidate per
+  // listed model; otherwise every candidate uses the single builder model (old behavior).
+  const singleBuilderModel = deps.builderModel ?? builderModel();
+  const competitiveModelList = deps.competitiveModels ?? competitiveBuilderModels();
+
   const engine: RoleEngine = { invokeModel, neutralizeUntrusted };
 
   /**
@@ -238,10 +249,16 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
    * the same governed path. NO contract change: governedExec/parentCtx are not RoleContext fields.
    */
   function builderFor(parentCtx: OperationContext): RoleFn {
+    return builderForModel(parentCtx);
+  }
+
+  /** Like `builderFor`, but for a specific per-candidate model (the head-to-head shootout). */
+  function builderForModel(parentCtx: OperationContext, modelOverride?: string): RoleFn {
     if (deps.roles?.builder !== undefined) return deps.roles.builder;
     return createBuilder({
       ...(deps.governedExec !== undefined ? { governedExec: deps.governedExec } : {}),
       parentCtx,
+      ...(modelOverride !== undefined ? { modelOverride } : {}),
     });
   }
 
@@ -336,7 +353,13 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // COMPETITIVE BUILD MODE (default OFF). When on, take the N-workspace path and
     // return; otherwise fall through to the single-workspace path below — BYTE-UNCHANGED.
     if (config.competitive === true) {
-      const n = Math.max(MIN_COMPETITIVE_N, Math.min(MAX_COMPETITIVE_N, config.competitiveN ?? MIN_COMPETITIVE_N));
+      // N reconciliation: a competitive MODEL LIST means race exactly the listed models —
+      // one candidate per model, capped at MAX_COMPETITIVE_N. No list ⇒ competitiveN
+      // candidates all on the single builder model (the old workspace-isolation behavior).
+      const n =
+        competitiveModelList !== undefined && competitiveModelList.length > 0
+          ? Math.min(MAX_COMPETITIVE_N, competitiveModelList.length)
+          : Math.max(MIN_COMPETITIVE_N, Math.min(MAX_COMPETITIVE_N, config.competitiveN ?? MIN_COMPETITIVE_N));
       return runCompetitive(task, parentCtx, parentIdentity, n);
     }
 
@@ -514,8 +537,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 
   // ── COMPETITIVE BUILD MODE (AMG) ────────────────────────────────────────────
 
-  /** Dispatch one role in one workspace (events + recordRole), returning its result. */
-  async function dispatchRole(role: WorkerRole, spawned: SpawnedRole, task: WorkerTask, workspace: WorkspaceHandle, priorResults: readonly RoleResult[], parentCtx: OperationContext): Promise<RoleResult> {
+  /** Dispatch one role in one workspace (events + recordRole), returning its result.
+   *  `roleFnOverride` lets the competitive loop inject a per-candidate builder (its own model). */
+  async function dispatchRole(role: WorkerRole, spawned: SpawnedRole, task: WorkerTask, workspace: WorkspaceHandle, priorResults: readonly RoleResult[], parentCtx: OperationContext, roleFnOverride?: RoleFn): Promise<RoleResult> {
     events.publish(
       workerRoleDispatched.create(
         { taskId: task.taskId, role, ...(spawned.identity.trustTier !== undefined ? { tier: spawned.identity.trustTier } : {}) },
@@ -525,7 +549,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     const ctx: RoleContext = { task, role, identity: spawned.identity, autonomy: spawned.autonomy, workspace, priorResults: [...priorResults], engine };
     // The verifier (C1) and the builder (its in-loop run_checks) run the governed path
     // bound to the run ctx (parentCtx is the minted ValidatedIdentity governed-exec needs).
-    const roleFn = role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderFor(parentCtx) : roles[role];
+    const roleFn = roleFnOverride ?? (role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderFor(parentCtx) : roles[role]);
     const result = await roleFn(ctx);
     events.publish(
       workerRoleCompleted.create(
@@ -609,7 +633,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       //    optimization). Each builder writes into ITS worktree; each verifier checks ITS
       //    worktree. The per-workspace builder is spawned through the SAME #10 clamp.
       const candidates: BuildCandidate[] = [];
-      for (const ws of handles) {
+      for (let ci = 0; ci < handles.length; ci += 1) {
+        const ws = handles[ci]!;
         // COOPERATIVE KILL CHECKPOINT (between candidates): stop cleanly, discard EVERY
         // workspace (no half-promote), surface the kill.
         const killReason = await killHalt(task, parentIdentity, parentCtx);
@@ -618,7 +643,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           events.publish(workerFailed.create({ taskId: task.taskId, reason: killReason, workspaceId: handles[0]?.id ?? ws.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
           return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: rolesByWs.get(handles[0]?.id ?? "") ?? [], ...(handles[0] !== undefined ? { workspaceId: handles[0].id } : {}), promoted: false, reason: killReason };
         }
-        const builderResult = await dispatchRole("builder", spawnRole("builder", parentCtx), task, ws, [scoutResult], parentCtx);
+        // HEAD-TO-HEAD: candidate ci races its OWN model (the Nth listed model, or the single
+        // builder model as fallback) in its OWN worktree — each with the full run_checks rail.
+        const candidateModel = competitiveModelList?.[ci] ?? singleBuilderModel;
+        const candidateBuilder = builderForModel(parentCtx, candidateModel);
+        const builderResult = await dispatchRole("builder", spawnRole("builder", parentCtx), task, ws, [scoutResult], parentCtx, candidateBuilder);
         let verifierResult: RoleResult | undefined;
         if (builderResult.outcome === "success") {
           verifierResult = await dispatchRole("verifier", spawnRole("verifier", parentCtx), task, ws, [scoutResult, builderResult], parentCtx);

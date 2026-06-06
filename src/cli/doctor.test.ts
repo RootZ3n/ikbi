@@ -64,7 +64,7 @@ test("doctor REPORTS MISSING required settings and ends NOT ready (cold start)",
   assert.match(text, /✗ IKBI_WORKER_TOKEN/);
   assert.match(text, /✗ IKBI_WORKER_MODEL_ENABLED/);
   assert.match(text, /✗ IKBI_GOVERNED_EXEC_ALLOWLIST/);
-  assert.match(text, /✗ the driver model 'mimo-v2.5' and critic model 'mimo-v2.5-pro' don't resolve to a registered provider/);
+  assert.match(text, /✗ the driver model 'mimo-v2.5' and builder model 'mimo-v2.5' and critic model 'mimo-v2.5-pro' don't resolve to a registered provider/);
   assert.match(text, /NOT ready — 5 required settings missing/);
 });
 
@@ -78,13 +78,13 @@ test("ROSTER PROVIDER SEEN: role models resolving via a roster provider (no env 
     }),
   );
   const text = r.lines.join("\n");
-  assert.match(text, /✓ provider — driver 'mimo-v2.5' and critic 'mimo-v2.5-pro' resolve to registered providers/);
+  assert.match(text, /✓ provider — all role models resolve \(driver 'mimo-v2.5', builder 'mimo-v2.5', critic 'mimo-v2.5-pro'\)/);
   assert.equal(r.ready, true, "a roster setup that just ran a build is correctly reported ready");
 });
 
 test("BUILT-IN KEY STILL WORKS: models resolving via a built-in keyed provider ⇒ ✓ (regression)", () => {
   const r = runDoctor(readyInputs({ registry: fakeRegistry({ "mimo-v2.5": ["mimo"], "mimo-v2.5-pro": ["openrouter"] }, ["mimo", "openrouter"]) }));
-  assert.match(r.lines.join("\n"), /✓ provider — driver 'mimo-v2.5' and critic 'mimo-v2.5-pro' resolve/);
+  assert.match(r.lines.join("\n"), /✓ provider — all role models resolve/);
   assert.equal(r.ready, true);
 });
 
@@ -96,7 +96,7 @@ test("UNRESOLVABLE MODEL FLAGGED: a driver model with no registered provider ⇒
     }),
   );
   const text = r.lines.join("\n");
-  assert.match(text, /✗ the driver model 'mimo-v2.5' doesn't resolve to a registered provider — add a provider entry/);
+  assert.match(text, /✗ the driver model 'mimo-v2.5' and builder model 'mimo-v2.5' don't resolve to a registered provider — add a provider entry/);
   assert.equal(r.ready, false);
   assert.match(text, /NOT ready — 1 required setting missing/);
 });
@@ -161,14 +161,31 @@ test("doctor PRINTS NO SECRET VALUES — only set/unset status", () => {
   assert.match(text, /✓ IKBI_WORKER_TOKEN/);
 });
 
-test("doctor SHOWS the resolved role models (so the operator sees which models will be used)", () => {
+test("doctor SHOWS the resolved role models — driver, builder, critic (so the operator sees which models will be used)", () => {
   const r = runDoctor({
-    config: loadConfig({ IKBI_MODEL_DRIVER: "qwen3:4b", IKBI_MODEL_CRITIC: "qwen3:14b" }),
-    registry: fakeRegistry({ "qwen3:4b": ["x"], "qwen3:14b": ["x"] }, ["x"]),
+    config: loadConfig({ IKBI_MODEL_DRIVER: "qwen3:4b", IKBI_MODEL_BUILDER: "deepseek-v4-pro", IKBI_MODEL_CRITIC: "qwen3:14b" }),
+    registry: fakeRegistry({ "qwen3:4b": ["x"], "deepseek-v4-pro": ["x"], "qwen3:14b": ["x"] }, ["x"]),
   });
   const text = r.lines.join("\n");
   assert.match(text, /IKBI_MODEL_DRIVER\s+= qwen3:4b/);
+  assert.match(text, /IKBI_MODEL_BUILDER = deepseek-v4-pro/);
   assert.match(text, /IKBI_MODEL_CRITIC\s+= qwen3:14b/);
+});
+
+test("doctor SHOWS the competitive shootout list and resolution-CHECKS each racer by name", () => {
+  // A competitive model that does NOT resolve to a provider is flagged BY NAME (critical
+  // for the shootout — the operator must know if deepseek-v4-pro isn't wired).
+  const r = runDoctor(
+    readyInputs({
+      config: loadConfig({ IKBI_OPERATOR_TOKEN: "op-strong-value-here", IKBI_WORKER_TOKEN: "worker-strong-value-here", IKBI_TRUST_HMAC_KEY: "h", IKBI_IDENTITY_TOKEN_SALT: "s", IKBI_COMPETITIVE_MODELS: "mimo-v2.5, deepseek-v4-pro" }),
+      // mimo-v2.5 resolves; deepseek-v4-pro is NOT registered → flagged.
+      registry: fakeRegistry({ "mimo-v2.5": ["mimo"], "mimo-v2.5-pro": ["mimo"] }, ["mimo"]),
+    }),
+  );
+  const text = r.lines.join("\n");
+  assert.match(text, /IKBI_COMPETITIVE_MODELS = mimo-v2\.5, deepseek-v4-pro/, "the shootout list is shown");
+  assert.match(text, /✗ the competitive model 'deepseek-v4-pro' doesn't resolve to a registered provider/, "the unwired racer is flagged by name");
+  assert.equal(r.ready, false, "an unresolvable competitive racer blocks readiness");
 });
 
 test("`ikbi help` lists the doctor command, and doctor is a reserved builtin", async () => {
