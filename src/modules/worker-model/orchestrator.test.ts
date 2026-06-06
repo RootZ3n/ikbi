@@ -6,7 +6,7 @@ import { test } from "node:test";
 
 import { pino } from "pino";
 
-import type { ModelResponse } from "../../core/provider/contract.js";
+import type { ModelRequest, ModelResponse } from "../../core/provider/contract.js";
 
 import type { EventBusSurface, EventInput, IkbiEvent } from "../../core/events/index.js";
 import { beginOperation, IdentityResolver, isValidatedIdentity } from "../../core/identity/resolver.js";
@@ -369,6 +369,20 @@ function okModelResponse(): ModelResponse {
   };
 }
 
+/** The real builder now REQUIRES a `done` self-check to finish (a bare stop is incomplete). */
+function doneModelResponse(): ModelResponse {
+  return {
+    ...okModelResponse(),
+    content: "",
+    finishReason: "tool_calls",
+    toolCalls: [{ id: "done1", name: "done", arguments: JSON.stringify({ successCondition: "do the thing", filesReadBack: ["a.ts"], selfCheck: "re-read a.ts; the goal is met", satisfied: true }) }],
+  };
+}
+
+/** Builder offers a `done` tool and must call it; scout/critic offer no tools → plain stop. */
+const builderAwareModel = async (req: ModelRequest): Promise<ModelResponse> =>
+  (req.tools ?? []).some((t) => t.name === "done") ? doneModelResponse() : okModelResponse();
+
 test("real scout/builder/critic + stubbed verifier/integrator → coherent success → promote", async () => {
   // scout, builder, critic are now REAL roles. Give them a real workspace dir + a
   // working model. verifier/integrator are overridden here ONLY so the real verifier
@@ -402,7 +416,7 @@ test("real scout/builder/critic + stubbed verifier/integrator → coherent succe
   };
 
   const orch = createOrchestrator(
-    baseDeps({ resolveIdentity, roleClaim, workspaces, roles, invokeModel: async () => okModelResponse() }),
+    baseDeps({ resolveIdentity, roleClaim, workspaces, roles, invokeModel: builderAwareModel }),
   );
   const result = await orch.run({ taskId: "t-1", targetRepo: dir, goal: "do the thing" }, parentCtx);
 
