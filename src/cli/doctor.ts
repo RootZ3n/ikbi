@@ -13,9 +13,18 @@
  */
 
 import { config, type IkbiConfig } from "../core/config.js";
+import type { ModelProvider } from "../core/provider/contract.js";
+import { registry as defaultRegistry } from "../core/provider/index.js";
+import type { ModelSpec } from "../core/provider/registry.js";
 import { egressConfig } from "../modules/egress/config.js";
 import { governedExecConfig } from "../modules/governed-exec/config.js";
 import { workerModelConfig } from "../modules/worker-model/config.js";
+
+/** The read-only registry surface doctor needs to check role-model resolution. */
+export interface DoctorRegistry {
+  getModel: (id: string) => ModelSpec | undefined;
+  getProvider: (id: string) => ModelProvider | undefined;
+}
 
 /** The inputs doctor reads — all default to the process-wide singletons; injectable for tests. */
 export interface DoctorInputs {
@@ -24,6 +33,8 @@ export interface DoctorInputs {
   readonly governedExecAllowlist?: readonly string[];
   readonly egressAllowlist?: readonly string[];
   readonly egressLocalEndpoints?: readonly string[];
+  /** The model registry (read-only) — to verify the role models resolve to a provider. */
+  readonly registry?: DoctorRegistry;
 }
 
 export interface DoctorResult {
@@ -54,18 +65,38 @@ export function runDoctor(inp: DoctorInputs = {}): DoctorResult {
   const operatorSet = cfg.identity.operatorToken !== undefined && cfg.identity.operatorToken.length > 0;
   const workerSet = cfg.identity.workerToken !== undefined && cfg.identity.workerToken.length > 0;
   const execHasPnpm = execAllow.includes(REQUIRED_EXEC);
-  const providerConfigured =
-    cfg.provider.mimo.apiKey !== undefined ||
-    cfg.provider.openrouter.apiKey !== undefined ||
-    cfg.provider.deepseek.apiKey !== undefined ||
-    egressLocal.length > 0; // a keyless local model (e.g. Ollama) reached via an allowed local endpoint
+
+  // PROVIDER readiness is the REAL question: do the role models the roles will request
+  // actually RESOLVE to a registered provider? This sees roster-declared providers (the
+  // MiMo keyless+api-key case), built-in keyed providers, and mixed setups — not just the
+  // env-key built-ins. Read-only: getModel/getProvider, no network, no invoke.
+  const reg = inp.registry ?? defaultRegistry;
+  const driverId = cfg.provider.defaultModels.driver;
+  const criticId = cfg.provider.defaultModels.critic;
+  const resolves = (spec: ModelSpec | undefined): boolean =>
+    spec !== undefined && spec.providers.some((route) => reg.getProvider(route.provider) !== undefined);
+  const driverOk = resolves(reg.getModel(driverId));
+  const criticOk = resolves(reg.getModel(criticId));
+  const providerEntry = driverOk && criticOk
+    ? { ok: true, label: `provider — driver '${driverId}' and critic '${criticId}' resolve to registered providers`, fix: "" }
+    : (() => {
+        const broken = [!driverOk ? `driver model '${driverId}'` : undefined, !criticOk ? `critic model '${criticId}'` : undefined].filter(
+          (x): x is string => x !== undefined,
+        );
+        const verb = broken.length > 1 ? "don't" : "doesn't";
+        return {
+          ok: false,
+          label: `the ${broken.join(" and ")} ${verb} resolve to a registered provider`,
+          fix: "add a provider entry in the roster (providers.json) for it, or set a provider API key",
+        };
+      })();
 
   const required: Array<{ ok: boolean; label: string; fix: string }> = [
     { ok: operatorSet, label: "IKBI_OPERATOR_TOKEN", fix: "set it — the operator identity that grants trust / runs operator commands" },
     { ok: workerSet, label: "IKBI_WORKER_TOKEN", fix: "set it — the worker identity that builds run under" },
     { ok: workerEnabled, label: "IKBI_WORKER_MODEL_ENABLED", fix: "set true — builds are DISABLED until the worker-model substrate is enabled" },
     { ok: execHasPnpm, label: `IKBI_GOVERNED_EXEC_ALLOWLIST (has ${REQUIRED_EXEC})`, fix: `add "${REQUIRED_EXEC}" — the verifier needs it to run tsc/tests` },
-    { ok: providerConfigured, label: "a model provider configured", fix: "set a provider API key (IKBI_MIMO_API_KEY / OpenRouter / DeepSeek) OR allow a local endpoint (IKBI_EGRESS_ALLOW_LOCAL) for a keyless local model" },
+    providerEntry,
   ];
 
   push("REQUIRED FOR A BUILD");

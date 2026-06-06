@@ -3,8 +3,32 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
+// Side-effect FIRST (mirrors the CLI's barrel-first boot): egress registers the fetch
+// guard, so importing doctor.js — which imports the provider registry singleton, whose
+// construction resolves that guard — does not fail closed at module load.
+import "../modules/egress/index.js";
+
 import { loadConfig } from "../core/config.js";
-import { runDoctor, type DoctorInputs } from "./doctor.js";
+import type { ModelProvider } from "../core/provider/contract.js";
+import { runDoctor, type DoctorInputs, type DoctorRegistry } from "./doctor.js";
+
+/**
+ * A fake read-only registry. `models` maps a model id → its provider-route chain;
+ * `registered` is the set of provider ids that are actually declared. A model
+ * "resolves" iff it exists AND some route's provider is registered.
+ */
+function fakeRegistry(models: Record<string, string[]>, registered: string[]): DoctorRegistry {
+  const provs = new Set(registered);
+  return {
+    getModel: (id) => (models[id] ? { id, providers: models[id].map((p) => ({ provider: p, providerModelId: id })) } : undefined),
+    getProvider: (id) => (provs.has(id) ? ({ id } as unknown as ModelProvider) : undefined),
+  };
+}
+
+/** The default role models (loadConfig defaults) both resolve to a roster-declared provider. */
+const resolvingRegistry = (): DoctorRegistry => fakeRegistry({ "mimo-v2.5": ["mimo"], "mimo-v2.5-pro": ["mimo"] }, ["mimo"]);
+/** Nothing resolves (no models / no registered providers). */
+const emptyRegistry = (): DoctorRegistry => fakeRegistry({}, []);
 
 /** A config + module-config set with EVERYTHING required satisfied (the ready case). */
 function readyInputs(over: Partial<DoctorInputs> = {}): DoctorInputs {
@@ -14,12 +38,12 @@ function readyInputs(over: Partial<DoctorInputs> = {}): DoctorInputs {
       IKBI_WORKER_TOKEN: "worker-secret-strong-value",
       IKBI_TRUST_HMAC_KEY: "a-real-hmac-key",
       IKBI_IDENTITY_TOKEN_SALT: "a-real-salt",
-      IKBI_MIMO_API_KEY: "k",
     }),
     workerModelEnabled: true,
     governedExecAllowlist: ["git", "pnpm"],
     egressAllowlist: ["api.mimo.example"],
     egressLocalEndpoints: [],
+    registry: resolvingRegistry(),
     ...over,
   };
 }
@@ -31,6 +55,7 @@ test("doctor REPORTS MISSING required settings and ends NOT ready (cold start)",
     governedExecAllowlist: ["git", "ls"], // no pnpm
     egressAllowlist: [],
     egressLocalEndpoints: [],
+    registry: emptyRegistry(), // no role model resolves
   });
   assert.equal(r.ready, false);
   assert.equal(r.missingRequired, 5, "all five required-for-build settings are missing");
@@ -39,34 +64,76 @@ test("doctor REPORTS MISSING required settings and ends NOT ready (cold start)",
   assert.match(text, /✗ IKBI_WORKER_TOKEN/);
   assert.match(text, /✗ IKBI_WORKER_MODEL_ENABLED/);
   assert.match(text, /✗ IKBI_GOVERNED_EXEC_ALLOWLIST/);
-  assert.match(text, /✗ a model provider configured/);
+  assert.match(text, /✗ the driver model 'mimo-v2.5' and critic model 'mimo-v2.5-pro' don't resolve to a registered provider/);
   assert.match(text, /NOT ready — 5 required settings missing/);
 });
 
-test("doctor REPORTS READY when every required setting is satisfied", () => {
-  const r = runDoctor(readyInputs());
-  assert.equal(r.missingRequired, 0);
-  assert.equal(r.ready, true);
-  assert.match(r.lines.join("\n"), /ready to build/);
-});
-
-test("doctor counts a keyless LOCAL endpoint as a configured provider", () => {
-  // No API key, but a local endpoint allowed (e.g. Ollama) → provider requirement satisfied.
+test("ROSTER PROVIDER SEEN: role models resolving via a roster provider (no env key) ⇒ ✓ provider, ready (the MiMo smoke case)", () => {
+  // The EXACT bug: no IKBI_MIMO_API_KEY env, but mimo-v2.5 / mimo-v2.5-pro resolve to a
+  // roster-DECLARED keyless+api-key provider. The old env-key check falsely failed this.
   const r = runDoctor(
     readyInputs({
-      config: loadConfig({ IKBI_OPERATOR_TOKEN: "o", IKBI_WORKER_TOKEN: "w" }),
-      egressLocalEndpoints: ["127.0.0.1:11434"],
+      config: loadConfig({ IKBI_OPERATOR_TOKEN: "op-strong-value-here", IKBI_WORKER_TOKEN: "worker-strong-value-here", IKBI_TRUST_HMAC_KEY: "h", IKBI_IDENTITY_TOKEN_SALT: "s" }),
+      registry: fakeRegistry({ "mimo-v2.5": ["mimo"], "mimo-v2.5-pro": ["mimo"] }, ["mimo"]),
     }),
   );
-  assert.match(r.lines.join("\n"), /✓ a model provider configured/);
+  const text = r.lines.join("\n");
+  assert.match(text, /✓ provider — driver 'mimo-v2.5' and critic 'mimo-v2.5-pro' resolve to registered providers/);
+  assert.equal(r.ready, true, "a roster setup that just ran a build is correctly reported ready");
+});
+
+test("BUILT-IN KEY STILL WORKS: models resolving via a built-in keyed provider ⇒ ✓ (regression)", () => {
+  const r = runDoctor(readyInputs({ registry: fakeRegistry({ "mimo-v2.5": ["mimo"], "mimo-v2.5-pro": ["openrouter"] }, ["mimo", "openrouter"]) }));
+  assert.match(r.lines.join("\n"), /✓ provider — driver 'mimo-v2.5' and critic 'mimo-v2.5-pro' resolve/);
+  assert.equal(r.ready, true);
+});
+
+test("UNRESOLVABLE MODEL FLAGGED: a driver model with no registered provider ⇒ ✗ + actionable message, NOT ready", () => {
+  const r = runDoctor(
+    readyInputs({
+      // driver model declared but its provider isn't registered; critic resolves.
+      registry: fakeRegistry({ "mimo-v2.5": ["ghost"], "mimo-v2.5-pro": ["mimo"] }, ["mimo"]),
+    }),
+  );
+  const text = r.lines.join("\n");
+  assert.match(text, /✗ the driver model 'mimo-v2.5' doesn't resolve to a registered provider — add a provider entry/);
+  assert.equal(r.ready, false);
+  assert.match(text, /NOT ready — 1 required setting missing/);
+});
+
+test("WHICH MODEL FLAGGED: driver resolves but critic doesn't ⇒ the CRITIC model is named specifically", () => {
+  const r = runDoctor(
+    readyInputs({
+      registry: fakeRegistry({ "mimo-v2.5": ["mimo"] /* critic absent entirely */ }, ["mimo"]),
+    }),
+  );
+  const text = r.lines.join("\n");
+  assert.match(text, /✗ the critic model 'mimo-v2.5-pro' doesn't resolve to a registered provider/);
+  assert.doesNotMatch(text, /driver model 'mimo-v2.5' (?:and|doesn't)/, "the resolving driver is NOT flagged");
+  assert.equal(r.ready, false);
+});
+
+test("INJECTABLE REGISTRY: doctor uses the fake registry passed in (not the real singleton)", () => {
+  // A registry that resolves a NONSENSE model id only — proving doctor consulted THIS registry.
+  let getModelCalls = 0;
+  const spy: DoctorRegistry = {
+    getModel: (id) => {
+      getModelCalls += 1;
+      return id === "mimo-v2.5" || id === "mimo-v2.5-pro" ? { id, providers: [{ provider: "p", providerModelId: id }] } : undefined;
+    },
+    getProvider: (id) => (id === "p" ? ({ id } as unknown as ModelProvider) : undefined),
+  };
+  const r = runDoctor(readyInputs({ registry: spy }));
+  assert.ok(getModelCalls >= 2, "doctor queried the injected registry for the driver + critic models");
   assert.equal(r.ready, true);
 });
 
 test("doctor FLAGS insecure security defaults (⚠), not as build-blockers", () => {
   const r = runDoctor({
-    config: loadConfig({ IKBI_OPERATOR_TOKEN: "o", IKBI_WORKER_TOKEN: "w", IKBI_MIMO_API_KEY: "k" }),
+    config: loadConfig({ IKBI_OPERATOR_TOKEN: "op-strong-value-here", IKBI_WORKER_TOKEN: "worker-strong-value-here" }),
     workerModelEnabled: true,
     governedExecAllowlist: ["pnpm"],
+    registry: resolvingRegistry(),
   });
   const text = r.lines.join("\n");
   assert.match(text, /⚠ IKBI_TRUST_HMAC_KEY/, "insecure trust key flagged");
@@ -90,13 +157,15 @@ test("doctor PRINTS NO SECRET VALUES — only set/unset status", () => {
   for (const secret of ["SUPER-SECRET-OP", "SUPER-SECRET-WORKER", "SUPER-SECRET-HMAC", "SUPER-SECRET-SALT", "SUPER-SECRET-APIKEY"]) {
     assert.equal(text.includes(secret), false, `doctor output must not contain the secret value "${secret}"`);
   }
-  // It still reports the tokens as set.
   assert.match(text, /✓ IKBI_OPERATOR_TOKEN/);
   assert.match(text, /✓ IKBI_WORKER_TOKEN/);
 });
 
 test("doctor SHOWS the resolved role models (so the operator sees which models will be used)", () => {
-  const r = runDoctor({ config: loadConfig({ IKBI_MODEL_DRIVER: "qwen3:4b", IKBI_MODEL_CRITIC: "qwen3:14b" }) });
+  const r = runDoctor({
+    config: loadConfig({ IKBI_MODEL_DRIVER: "qwen3:4b", IKBI_MODEL_CRITIC: "qwen3:14b" }),
+    registry: fakeRegistry({ "qwen3:4b": ["x"], "qwen3:14b": ["x"] }, ["x"]),
+  });
   const text = r.lines.join("\n");
   assert.match(text, /IKBI_MODEL_DRIVER\s+= qwen3:4b/);
   assert.match(text, /IKBI_MODEL_CRITIC\s+= qwen3:14b/);
