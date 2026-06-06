@@ -441,10 +441,11 @@ test("real scout/builder/critic + stubbed verifier/integrator → coherent succe
   assert.deepEqual(result.roles.map((r) => r.role), ["scout", "builder", "critic", "verifier", "integrator"]);
   for (const r of result.roles) assert.equal(r.outcome, "success", `${r.role} succeeded`);
   // Builder really ran its (real) loop — it ran its in-loop run_checks (the verifier's
-  // shared checks) green before done. The run_checks output is one neutralized tool result.
+  // shared checks) green before done. run_checks output is ACTIONABLE feedback (not
+  // inert-neutralized), so it does NOT count as a neutralized tool result.
   const builderDetail = result.roles[1]?.detail as { neutralizedCount: number; checksRuns: number; doneClaim?: { checksPassed: boolean } } | undefined;
   assert.equal(builderDetail?.checksRuns, 1, "the builder ran run_checks in-loop");
-  assert.equal(builderDetail?.neutralizedCount, 1, "the run_checks output was neutralized (the chokepoint)");
+  assert.equal(builderDetail?.neutralizedCount, 0, "run_checks output is actionable feedback, not inert-neutralized; no untrusted repo content this run");
   assert.equal(builderDetail?.doneClaim?.checksPassed, true, "the builder claims green checks; the verifier still ran independently");
 });
 
