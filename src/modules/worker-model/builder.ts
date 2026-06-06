@@ -40,9 +40,11 @@ import { toUntrustedMessage } from "../../core/injection/index.js";
 import type { ModelMessage, ModelTool, ToolCall } from "../../core/provider/contract.js";
 import { workerModelConfig } from "./config.js";
 import type { RoleFn, WorkerOutcome } from "./contract.js";
+import { driverModel } from "./role-models.js";
 
 // --- named constants (no magic values inline) ------------------------------
-const BUILDER_MODEL = "mimo-v2.5"; // driver-tier logical roster id
+// The model id is DRIVER-tier and config-driven (see role-models.ts) — resolved at
+// request time so an operator's IKBI_MODEL_DRIVER takes effect without a roster alias.
 const BUILDER_TEMPERATURE = 0.1;
 const BUILDER_MAX_TOKENS = 2048;
 /** Hard cap on tool-call rounds — the loop can never run forever. */
@@ -278,7 +280,7 @@ export const builder: RoleFn = async (ctx) => {
       }
 
       const response = await ctx.engine.invokeModel({
-        model: BUILDER_MODEL,
+        model: driverModel(),
         temperature: BUILDER_TEMPERATURE,
         maxTokens: BUILDER_MAX_TOKENS,
         identity: ctx.identity, // clamped spawned identity (#10), by reference, EVERY round

@@ -8,6 +8,7 @@ import type { ModelRequest, ModelResponse } from "../../core/provider/contract.j
 import { autonomyForTier } from "../../core/trust/index.js";
 import type { WorkspaceHandle } from "../../core/workspace/contract.js";
 import { critic } from "./critic.js";
+import { criticModel } from "./role-models.js";
 import type { RoleContext, RoleResult } from "./contract.js";
 
 const IDENTITY: AgentIdentity = { agentId: "worker-1", functionalRole: "critic", trustTier: "verified", spawnedFrom: "parent-1" };
@@ -61,6 +62,7 @@ test("critic reads builder output and produces a PASS verdict (outcome success)"
   assert.equal(detail.pass, true);
   assert.match(detail.feedback, /looks good/);
   assert.equal(calls[0]?.identity, ctx.identity, "ctx.identity rides the request");
+  assert.equal(calls[0]?.model, criticModel(), "the model id is CONFIG-DRIVEN (critic tier), not a constant");
 });
 
 test("pass=false is still outcome:success (a successful critique that found problems)", async () => {

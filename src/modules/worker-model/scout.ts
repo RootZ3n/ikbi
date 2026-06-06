@@ -23,6 +23,7 @@ import { extname, join, relative } from "node:path";
 import { toUntrustedMessage } from "../../core/injection/index.js";
 import type { ModelMessage, ModelRequest } from "../../core/provider/contract.js";
 import type { RoleFn } from "./contract.js";
+import { driverModel } from "./role-models.js";
 
 /** A single thing scout learned. Lives in the open `detail` bag — NOT a contract type. */
 export interface ScoutFinding {
@@ -32,7 +33,8 @@ export interface ScoutFinding {
 }
 
 // --- named constants (no magic values inline) ------------------------------
-const SCOUT_MODEL = "mimo-v2.5"; // the driver-tier logical roster id
+// The model id is DRIVER-tier and config-driven (see role-models.ts) — resolved at
+// request time so an operator's IKBI_MODEL_DRIVER takes effect without a roster alias.
 const SCOUT_TEMPERATURE = 0.2;
 const SCOUT_MAX_TOKENS = 1024;
 /** Hard cap on files visited — scout never walks the whole tree. */
@@ -122,7 +124,7 @@ export const scout: RoleFn = async (ctx) => {
       toUntrustedMessage(ctx.engine.neutralizeUntrusted(raw, { source: "external", identity: ctx.identity, origin }), { role: "user" });
 
     const request: ModelRequest = {
-      model: SCOUT_MODEL,
+      model: driverModel(),
       temperature: SCOUT_TEMPERATURE,
       maxTokens: SCOUT_MAX_TOKENS,
       identity: ctx.identity, // the spawned, ceiling-clamped role identity (#10)

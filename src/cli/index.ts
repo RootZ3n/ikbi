@@ -21,13 +21,14 @@ import { config } from "../core/config.js";
 import { registry } from "../core/provider/index.js";
 import { trust } from "../core/trust/index.js";
 import { commands } from "./registry.js";
+import { runDoctor } from "./doctor.js";
 // The DEFAULT router: input that is not a known command is treated as a GOAL and
 // deliberated by cognition-layer (which decides the path + recommends the next
 // command). Imported AFTER the barrel so the egress guard is already registered.
 import { cognitionRouter } from "../modules/cognition-layer/index.js";
 
 /** Built-in command names — reserved, cannot be shadowed by a module command. */
-const BUILTINS = new Set(["version", "models", "providers", "help"]);
+const BUILTINS = new Set(["version", "models", "providers", "doctor", "help"]);
 
 function printUsage(): void {
   const moduleCmds = commands.all().filter((c) => !BUILTINS.has(c.name));
@@ -43,6 +44,7 @@ function printUsage(): void {
     "  version            Print the ikbi version",
     "  models [list]      List the model roster (id, role, cost, provider chain)",
     "  providers [list]   List the registered providers",
+    "  doctor             Report bootstrap config: what's set, what's missing for a build",
   ];
   if (moduleCmds.length > 0) {
     lines.push("", "Module commands:");
@@ -100,6 +102,9 @@ async function run(argv: readonly string[]): Promise<void> {
       return;
     case "providers":
       listProviders();
+      return;
+    case "doctor":
+      process.stdout.write(`${runDoctor().lines.join("\n")}\n`);
       return;
     case undefined:
     case "help":

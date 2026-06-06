@@ -12,6 +12,7 @@ import type { ModelRequest, ModelResponse, ToolCall } from "../../core/provider/
 import { autonomyForTier } from "../../core/trust/index.js";
 import type { WorkspaceHandle } from "../../core/workspace/contract.js";
 import { builder, MAX_TOOL_ITERATIONS, type ToolCallError } from "./builder.js";
+import { driverModel } from "./role-models.js";
 import type { RoleContext, RoleEngine, RoleResult } from "./contract.js";
 
 // --- model-response builders ----------------------------------------------
@@ -118,6 +119,7 @@ test("C4: the goal and prior-role results enter as UNTRUSTED (source external), 
   const untrusted = msgs.filter((m) => m.untrusted === true);
   assert.equal(untrusted.length, 2, "goal + prior-results are the two untrusted blocks");
   for (const m of untrusted) assert.equal(m.role, "user", "untrusted content occupies a data role");
+  assert.equal(requests[0]?.model, driverModel(), "the builder's model id is CONFIG-DRIVEN (driver tier), not a constant");
 });
 
 test("C4 POISONED-UPSTREAM: a prior scout summary with embedded instructions is WRAPPED untrusted, not raw", async () => {

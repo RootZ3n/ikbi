@@ -12,6 +12,7 @@ import { autonomyForTier } from "../../core/trust/index.js";
 import type { WorkspaceHandle } from "../../core/workspace/contract.js";
 import { scout, type ScoutFinding } from "./scout.js";
 import type { RoleContext } from "./contract.js";
+import { driverModel } from "./role-models.js";
 
 const IDENTITY: AgentIdentity = { agentId: "worker-1", functionalRole: "scout", trustTier: "probation", spawnedFrom: "parent-1" };
 
@@ -82,6 +83,14 @@ test("scout passes ctx.identity on the model request", async () => {
   const { ctx, calls } = makeCtx(dir, async () => modelResponse("- f"));
   await scout(ctx);
   assert.equal(calls[0]?.identity, ctx.identity, "the spawned role identity rides the request (same reference)");
+});
+
+test("scout's request.model is CONFIG-DRIVEN (driver tier), not a constant", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-scout-"));
+  writeFileSync(join(dir, "a.ts"), "x");
+  const { ctx, calls } = makeCtx(dir, async () => modelResponse("- f"));
+  await scout(ctx);
+  assert.equal(calls[0]?.model, driverModel(), "the model id comes from config.provider.defaultModels.driver");
 });
 
 test("scout bounds its scan — it does NOT read the whole tree", async () => {

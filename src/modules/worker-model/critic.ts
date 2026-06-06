@@ -17,8 +17,10 @@
 import { toUntrustedMessage } from "../../core/injection/index.js";
 import type { ModelMessage, ModelRequest } from "../../core/provider/contract.js";
 import type { RoleFn } from "./contract.js";
+import { criticModel } from "./role-models.js";
 
-const CRITIC_MODEL = "mimo-v2.5-pro"; // the critic/reviewer-tier logical roster id
+// The model id is CRITIC-tier and config-driven (see role-models.ts) — resolved at
+// request time so an operator's IKBI_MODEL_CRITIC takes effect without a roster alias.
 const CRITIC_TEMPERATURE = 0.0; // deterministic judgment
 const CRITIC_MAX_TOKENS = 768;
 
@@ -59,7 +61,7 @@ export const critic: RoleFn = async (ctx) => {
       toUntrustedMessage(ctx.engine.neutralizeUntrusted(raw, { source: "external", identity: ctx.identity, origin }), { role: "user" });
 
     const request: ModelRequest = {
-      model: CRITIC_MODEL,
+      model: criticModel(),
       temperature: CRITIC_TEMPERATURE,
       maxTokens: CRITIC_MAX_TOKENS,
       identity: ctx.identity, // the spawned, ceiling-clamped role identity (#10)
