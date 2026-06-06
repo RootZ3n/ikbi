@@ -167,16 +167,18 @@ export function isPromotableOperation(operation: string): boolean {
 export type OutcomeStatus = "success" | "failure" | "partial" | "rejected";
 
 /**
- * Engine-internal, VALIDATED input to record a behavior signal. This is derived
- * from a completed, attributed operation receipt (see `recordFromReceipt`) — NOT a
- * free-form caller — so a model/content-influenced path cannot report a fake
- * success or omit an injection flag. The shape is narrow + validated.
+ * Engine-internal input to record a behavior signal. `recordOutcome` requires a
+ * genuine ValidatedIdentity SUBJECT alongside this input: the authoritative agentId
+ * and kind are derived from that subject (the `agentId` here must MATCH it), and the
+ * never-seen-agent starting tier is sourced from the registry — so `defaultTrustTier`
+ * here is NO LONGER the tier source (retained for the frozen shape; ignored for the
+ * starting tier). A model/content-influenced path cannot forge a subject or mint a tier.
  */
 export interface RecordOutcomeInput {
-  /** The ATTRIBUTED agent id (from the runtime-unforgeable validated identity). */
+  /** The ATTRIBUTED agent id. MUST match the ValidatedIdentity subject passed to recordOutcome. */
   readonly agentId: string;
   readonly kind: IdentityKind;
-  /** The agent's registry-assigned default/starting tier. */
+  /** @deprecated IGNORED for the starting tier — the registry is authoritative. Retained for the frozen shape. */
   readonly defaultTrustTier: string;
   readonly operation: string;
   readonly status: OutcomeStatus;
@@ -185,10 +187,11 @@ export interface RecordOutcomeInput {
 }
 
 /**
- * The VALIDATED source of a trust signal: a completed, attributed operation
- * receipt (the Phase-5 receipt shape, narrowed to what trust reads). Trust signals
- * come from here — never from arbitrary caller input. The injection flag is read
- * from the receipt metadata the engine set from the injection chokepoint verdict.
+ * @deprecated UNUSED — retained only to avoid a frozen-contract removal. The
+ * receipt-shaped intake (`recordFromReceipt`) was removed: it carried a plain
+ * `{ agentId }` with NO identity binding, so it could not be made provenance-safe.
+ * The PRIMARY trust-write path (`recordOutcome`) now requires a genuine
+ * ValidatedIdentity subject. Do not reintroduce a receipt-string intake.
  */
 export interface TrustSignalReceipt {
   readonly identity: { readonly agentId: string };
@@ -197,7 +200,7 @@ export interface TrustSignalReceipt {
   readonly metadata?: Readonly<Record<string, unknown>>;
 }
 
-/** Context the engine supplies alongside a receipt (the agent's kind + registry default). */
+/** @deprecated UNUSED — see {@link TrustSignalReceipt}. */
 export interface TrustSignalContext {
   readonly kind: IdentityKind;
   readonly defaultTrustTier: string;

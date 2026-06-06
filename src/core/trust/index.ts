@@ -42,6 +42,11 @@ function buildDefaultTrust(): TrustSystem {
     demoteStreak: tc.demoteStreak,
     minDistinctOps: tc.promoteMinDistinctOps,
     hmacKey: tc.hmacKey,
+    // NOTE: the AUTHORITATIVE starting-tier registry is wired post-construction by
+    // identity/index via `attachRegistry` — NOT here. identity/index already imports
+    // this trust singleton (for the resolver's trustResolver); importing it back would
+    // create a load-time cycle (identity accessing `trust` in its TDZ). One-way wiring
+    // from identity avoids that. Until attached, a never-seen agent fails closed to the floor.
     // The Phase-5 read-seam for window-scoped recent signals (diagnostics).
     receiptReader: { summarizeAgent: (agentId) => receipts.summarizeAgent(agentId) },
     // A transition is receipt-worthy: record it as a governance receipt.

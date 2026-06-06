@@ -9,7 +9,8 @@ import { pino } from "pino";
 import type { ModelResponse } from "../../core/provider/contract.js";
 
 import type { EventBusSurface, EventInput, IkbiEvent } from "../../core/events/index.js";
-import { beginOperation, IdentityResolver } from "../../core/identity/resolver.js";
+import { beginOperation, IdentityResolver, isValidatedIdentity } from "../../core/identity/resolver.js";
+import type { ValidatedIdentity } from "../../core/identity/resolver.js";
 import { AgentRegistry, hashToken } from "../../core/identity/registry.js";
 import type { AgentRecord } from "../../core/identity/registry.js";
 import type { AgentIdentity } from "../../core/identity/contract.js";
@@ -87,10 +88,13 @@ function fakeWorkspaces(promoteOk = true) {
 }
 
 function fakeTrust() {
-  const calls: Array<{ agentId: string; operation: string; status: string }> = [];
+  const calls: Array<{ agentId: string; operation: string; status: string; subject: ValidatedIdentity }> = [];
   const trust = {
-    recordOutcome: async (input: { agentId: string; operation: string; status: string; defaultTrustTier: string }): Promise<TrustDecision> => {
-      calls.push({ agentId: input.agentId, operation: input.operation, status: input.status });
+    recordOutcome: async (
+      input: { agentId: string; operation: string; status: string; defaultTrustTier: string },
+      subject: ValidatedIdentity,
+    ): Promise<TrustDecision> => {
+      calls.push({ agentId: input.agentId, operation: input.operation, status: input.status, subject });
       const tier = asTier(input.defaultTrustTier, TRUST_FLOOR);
       return { agentId: input.agentId, tier, previousTier: tier, autonomy: autonomyForTier(tier) };
     },
@@ -312,6 +316,12 @@ test("each role's outcome is recorded to receipts + trust under the ROLE identit
   }
   assert.deepEqual(tr.calls.map((c) => c.operation), WORKER_ROLES.map((r) => `worker.role.${r}`));
   for (const c of tr.calls) assert.equal(c.status, "success");
+  // The orchestrator THREADS the genuine ValidatedIdentity as the recordOutcome subject
+  // (provenance): every call carries a real minted identity matching the recorded agent.
+  for (const c of tr.calls) {
+    assert.ok(isValidatedIdentity(c.subject), "a genuine ValidatedIdentity subject is threaded to recordOutcome");
+    assert.equal(c.subject.identity.agentId, c.agentId, "the subject identity matches the recorded agentId");
+  }
 });
 
 // ── events: source + identity attribution ──────────────────────────────────

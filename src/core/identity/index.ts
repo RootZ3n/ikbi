@@ -98,6 +98,12 @@ export function buildDefaultRegistry(ic: typeof config.identity = config.identit
 /** The process-wide agents registry (read/update path for who-can-call). */
 export const registry: AgentRegistry = buildDefaultRegistry();
 
+// Wire the registry into the trust system as the AUTHORITATIVE starting-tier source
+// for a never-seen agent (recordOutcome no longer trusts a caller-supplied tier). This
+// is done HERE (one-way) rather than in trust/index because identity already imports the
+// trust singleton — wiring it back there would form a load-time cycle.
+trust.attachRegistry(registry);
+
 /**
  * The process-wide identity resolver, wired to the trust system via the Phase-3
  * `TrustTierResolver` seam: resolution returns each agent's EARNED tier (from

@@ -81,7 +81,7 @@ export interface OrchestratorDeps {
   readonly resolveIdentity?: (claim: IdentityClaim, ctx?: ResolveContext) => ValidatedIdentity;
   /** Produce the credential claim for a role. Default: fail-closed (must be configured). */
   readonly roleClaim?: (role: WorkerRole) => IdentityClaim;
-  readonly trust?: { recordOutcome: (input: RecordOutcomeInput) => Promise<TrustDecision> };
+  readonly trust?: { recordOutcome: (input: RecordOutcomeInput, subject: ValidatedIdentity) => Promise<TrustDecision> };
   readonly workspaces?: {
     allocate: (opts: { targetRepo: string; identity: AgentIdentity; baseBranch?: string; label?: string }) => Promise<WorkspaceHandle>;
     promote: (handle: WorkspaceHandle, approval: { evaluation: WorkspaceEvaluation; governance?: PromoteGovernance; message?: string }) => Promise<PromoteResult>;
@@ -131,6 +131,8 @@ interface SpawnedRole {
   readonly identity: AgentIdentity;
   readonly kind: IdentityKind;
   readonly autonomy: AutonomyGrant;
+  /** The GENUINE ValidatedIdentity (provenance), threaded to trust.recordOutcome as the subject. */
+  readonly validated: ValidatedIdentity;
 }
 
 const DEFAULT_ROLES: Record<WorkerRole, RoleFn> = { scout, builder, critic, verifier, integrator };
@@ -265,7 +267,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       spawnedFrom: parent.agentId,
       ...(parent.sessionId !== undefined ? { sessionId: parent.sessionId } : {}),
     });
-    return { identity, kind: resolved.kind, autonomy: autonomyForTier(effectiveTier) };
+    return { identity, kind: resolved.kind, autonomy: autonomyForTier(effectiveTier), validated: resolved };
   }
 
   /** Record a role's outcome to receipts + trust under the role's attributed identity. */
@@ -287,13 +289,18 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       },
       spawned.identity,
     );
-    await trust.recordOutcome({
-      agentId: spawned.identity.agentId,
-      kind: spawned.kind,
-      defaultTrustTier: spawned.identity.trustTier ?? TRUST_FLOOR,
-      operation,
-      status,
-    });
+    // Thread the GENUINE ValidatedIdentity as the subject (provenance) — recordOutcome
+    // derives agentId/kind from it and sources the starting tier from the registry.
+    await trust.recordOutcome(
+      {
+        agentId: spawned.identity.agentId,
+        kind: spawned.kind,
+        defaultTrustTier: spawned.identity.trustTier ?? TRUST_FLOOR,
+        operation,
+        status,
+      },
+      spawned.validated,
+    );
   }
 
   /** Cooperative kill checkpoint: does an active kill target THIS run? (read-only; never publishes). */

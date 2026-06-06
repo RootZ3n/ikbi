@@ -18,8 +18,9 @@
  *
  * STARTUP: call `preload()` once before serving so the cache is warm.
  *
- * Signal intake is NARROW + VALIDATED: `recordFromReceipt` derives the signal from
- * a completed, attributed operation receipt — not free-form caller input.
+ * Signal intake is NARROW + PROVENANCE-GATED: `recordOutcome` requires a genuine
+ * ValidatedIdentity subject (agentId/kind derived from it, starting tier from the
+ * registry) — not free-form caller input.
  */
 
 import { createHash } from "node:crypto";
@@ -36,15 +37,12 @@ import {
   autonomyForTier,
   clampTier,
   MAX_TRANSITIONS,
-  type OutcomeStatus,
   type RecordOutcomeInput,
   tierRank,
   TRUST_FLOOR,
   type TrustDecision,
   TrustError,
   type TrustReceiptReader,
-  type TrustSignalContext,
-  type TrustSignalReceipt,
   type TrustState,
   type TrustTransition,
   type TrustTransitionSink,
@@ -54,6 +52,16 @@ import { applyOutcome, clearInjectionFlag, freshState } from "./rules.js";
 
 const VALID_STATUS: ReadonlySet<string> = new Set(["success", "failure", "partial", "rejected"]);
 
+/**
+ * Minimal read-seam into the agent registry — the AUTHORITATIVE source of a
+ * never-seen agent's STARTING trust tier. The caller of `recordOutcome` does NOT
+ * supply the starting tier (that was the tier-mint hole); it comes from here. An
+ * agent absent from the registry starts at the FLOOR (fail-closed).
+ */
+export interface TrustAgentRegistry {
+  getAgent(agentId: string): { readonly defaultTrustTier: string } | undefined;
+}
+
 export interface TrustSystemDeps {
   readonly store: DocumentStore<PersistedTrustState>;
   readonly logger: Logger;
@@ -62,6 +70,8 @@ export interface TrustSystemDeps {
   readonly minDistinctOps: number;
   /** MAC key for trust-state integrity (kept separate from the trust dir). */
   readonly hmacKey: string;
+  /** Authoritative source of a never-seen agent's starting tier (NOT the caller). */
+  readonly registry?: TrustAgentRegistry;
   readonly sink?: TrustTransitionSink;
   readonly receiptReader?: TrustReceiptReader;
   readonly now?: () => number;
@@ -78,6 +88,9 @@ export class TrustSystem implements TrustTierResolver {
   private readonly demoteStreak: number;
   private readonly minDistinctOps: number;
   private readonly key: string;
+  /** Authoritative starting-tier source. Set in the constructor OR wired post-construction
+   *  via `attachRegistry` (the singleton path, to avoid a trust↔identity load cycle). */
+  private registry?: TrustAgentRegistry;
   private readonly sink?: TrustTransitionSink;
   private readonly receiptReader?: TrustReceiptReader;
   private readonly now: () => number;
@@ -96,9 +109,20 @@ export class TrustSystem implements TrustTierResolver {
     this.demoteStreak = deps.demoteStreak;
     this.minDistinctOps = deps.minDistinctOps;
     this.key = deps.hmacKey;
+    if (deps.registry) this.registry = deps.registry;
     if (deps.sink) this.sink = deps.sink;
     if (deps.receiptReader) this.receiptReader = deps.receiptReader;
     this.now = deps.now ?? Date.now;
+  }
+
+  /**
+   * Wire the authoritative agent registry AFTER construction. Used by the singleton
+   * wiring (identity/index) because identity already imports this trust singleton, so
+   * a constructor-time back-import would form a load cycle. Idempotent — the first
+   * registry wins; a later call is ignored (the registry is set once at startup).
+   */
+  attachRegistry(registry: TrustAgentRegistry): void {
+    if (this.registry === undefined) this.registry = registry;
   }
 
   // ---- Phase-3 TrustTierResolver seam (synchronous, fail-closed) ----
@@ -157,76 +181,76 @@ export class TrustSystem implements TrustTierResolver {
   // ---- VALIDATED signal intake ----
 
   /**
-   * Record a behavior signal derived from a completed, attributed operation
-   * RECEIPT (the sanctioned, validated source). Validates the receipt shape, then
-   * applies the deterministic rules. This is how trust signals enter the system.
+   * Record a validated outcome and apply the deterministic transitions, persisting
+   * MAC-protected state. This is the PRIMARY trust-write path (earned trust).
+   *
+   * PROVENANCE-GATED: the `subject` MUST be a GENUINELY-MINTED ValidatedIdentity —
+   * the agentId/kind are derived from it (NOT from caller-supplied strings), so a
+   * direct caller cannot record an outcome for an identity it does not hold. A
+   * forged/cast object fails `isValidatedIdentity` and is rejected. The caller's
+   * `input.agentId` must MATCH the subject (reject-on-mismatch, defense-in-depth).
+   *
+   * REGISTRY-SOURCED STARTING TIER: for a never-seen agent, the fresh-state starting
+   * tier comes from the authoritative AgentRegistry, NOT `input.defaultTrustTier`
+   * (which is ignored for the tier) — so a caller cannot mint a starting tier by
+   * passing `defaultTrustTier: "trusted"`. An unregistered agent starts at the FLOOR.
    */
-  async recordFromReceipt(receipt: TrustSignalReceipt, ctx: TrustSignalContext): Promise<TrustDecision> {
-    const agentId = receipt.identity?.agentId;
-    const operation = receipt.operation;
-    const status = receipt.outcome?.status;
-    if (typeof agentId !== "string" || agentId.length === 0) {
-      throw new TrustError("invalid_agent", "receipt has no attributed agentId");
+  async recordOutcome(input: RecordOutcomeInput, subject: ValidatedIdentity): Promise<TrustDecision> {
+    if (!isValidatedIdentity(subject)) {
+      throw new TrustError("config", "recordOutcome requires a validated subject identity");
     }
-    if (typeof operation !== "string" || operation.length === 0 || typeof status !== "string" || !VALID_STATUS.has(status)) {
-      throw new TrustError("state", "receipt has an invalid operation/status");
-    }
-    const injection = receipt.metadata?.injectionDetected === true || receipt.metadata?.injection === true;
-    return this.recordOutcome({
-      agentId,
-      kind: ctx.kind,
-      defaultTrustTier: ctx.defaultTrustTier,
-      operation,
-      status: status as OutcomeStatus,
-      ...(injection ? { signals: { injection: true } } : {}),
-    });
-  }
-
-  /**
-   * Engine-internal: record a validated outcome and apply transitions. Prefer
-   * `recordFromReceipt` (the validated source). Persists MAC-protected state.
-   */
-  async recordOutcome(input: RecordOutcomeInput): Promise<TrustDecision> {
+    // Derive the authoritative identity from the genuine subject (not caller strings).
+    const agentId = subject.identity.agentId;
+    const kind = subject.kind;
     if (typeof input.agentId !== "string" || input.agentId.length === 0) {
       throw new TrustError("invalid_agent", "recordOutcome requires a non-empty agentId");
+    }
+    if (input.agentId !== agentId) {
+      throw new TrustError("invalid_agent", `recordOutcome agentId "${input.agentId}" does not match the subject identity "${agentId}"`);
     }
     if (!VALID_STATUS.has(input.status) || typeof input.operation !== "string" || input.operation.length === 0) {
       throw new TrustError("state", "recordOutcome requires a valid operation + status");
     }
-    if (input.kind === "operator") {
-      return { agentId: input.agentId, tier: "operator", previousTier: "operator", autonomy: autonomyForTier("operator") };
+    if (kind === "operator") {
+      return { agentId, tier: "operator", previousTier: "operator", autonomy: autonomyForTier("operator") };
     }
 
+    // The starting tier for a never-seen agent is the REGISTRY's authoritative value
+    // (fail-closed to the floor for an unregistered agent) — NEVER the caller's field.
+    const startingTier = asTier(this.registry?.getAgent(agentId)?.defaultTrustTier ?? TRUST_FLOOR, TRUST_FLOOR);
+    // The input applyOutcome sees uses the registry-sourced tier + subject identity.
+    const effectiveInput: RecordOutcomeInput = { ...input, agentId, kind, defaultTrustTier: startingTier };
+
     const opts = { promoteStreak: this.promoteStreak, demoteStreak: this.demoteStreak, minDistinctOps: this.minDistinctOps, now: this.now() };
-    let previousTier: TrustTier = clampTier(asTier(input.defaultTrustTier, "probation"), TRUST_FLOOR, AGENT_CEILING);
+    let previousTier: TrustTier = clampTier(startingTier, TRUST_FLOOR, AGENT_CEILING);
     let transition: TrustTransition | undefined;
     let newState: TrustState | undefined;
 
     let persisted: PersistedTrustState;
     try {
-      persisted = await this.store.update(docKey(input.agentId), (curPersisted) => {
+      persisted = await this.store.update(docKey(agentId), (curPersisted) => {
         const cur = curPersisted === undefined ? undefined : verifyUnwrap(this.key, curPersisted);
         if (curPersisted !== undefined && cur === undefined) {
           // The existing doc failed integrity — refuse to build trust on a forged base.
-          throw new TrustError("state", `trust state for "${input.agentId}" failed integrity verification`);
+          throw new TrustError("state", `trust state for "${agentId}" failed integrity verification`);
         }
         previousTier = cur?.tier ?? previousTier;
-        const result = applyOutcome(cur, input, opts);
+        const result = applyOutcome(cur, effectiveInput, opts);
         transition = result.transition;
         newState = result.state;
         return wrap(this.key, result.state);
       });
     } catch (err) {
-      this.failedClosed.add(input.agentId);
-      this.log.error({ event: "trust_state_rejected", agentId: input.agentId, err }, "trust state failed integrity (fail-closed)");
+      this.failedClosed.add(agentId);
+      this.log.error({ event: "trust_state_rejected", agentId, err }, "trust state failed integrity (fail-closed)");
       throw err;
     }
 
     const state = verifyUnwrap(this.key, persisted) ?? newState;
     if (state !== undefined) {
-      this.cache.set(input.agentId, state);
-      this.checked.add(input.agentId);
-      this.failedClosed.delete(input.agentId);
+      this.cache.set(agentId, state);
+      this.checked.add(agentId);
+      this.failedClosed.delete(agentId);
     }
     const finalState = state ?? newState;
     const tier = finalState?.tier ?? TRUST_FLOOR;
@@ -235,8 +259,8 @@ export class TrustSystem implements TrustTierResolver {
       this.log.info(
         {
           event: "trust_transition",
-          agentId: input.agentId,
-          kind: input.kind,
+          agentId,
+          kind,
           direction: transition.direction,
           from: transition.from,
           to: transition.to,
@@ -245,11 +269,11 @@ export class TrustSystem implements TrustTierResolver {
         },
         `trust ${transition.direction}: ${transition.from} -> ${transition.to} (${transition.reason})`,
       );
-      this.sink?.({ agentId: input.agentId, kind: input.kind, transition });
+      this.sink?.({ agentId, kind, transition });
     }
 
     return {
-      agentId: input.agentId,
+      agentId,
       tier,
       previousTier,
       ...(transition !== undefined ? { transition } : {}),
