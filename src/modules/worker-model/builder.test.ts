@@ -618,3 +618,58 @@ test("BUILDER_MAX_TOKENS is raised to 12288 (output no longer starved in long co
   await run(makeCtx(dir, "verified", engine));
   assert.equal(requests[0]?.maxTokens, 12288, "the builder's completion cap is 12k");
 });
+
+// ── FIX: ikbi-authored done-rejection feedback is actionable, not neutralized ─
+
+test("done-REJECTION feedback is ACTIONABLE harness instruction, NOT inert-neutralized (the headline)", async () => {
+  const dir = tmp();
+  // done WITHOUT a prior run_checks → rejected; then run_checks; then done (accepted).
+  const { engine, requests, neutralizeCalls } = mockEngine([
+    toolResp([call("write_file", { path: "a.txt", content: "x" })]),
+    doneResp(["a.txt"]), // rejected: no run_checks yet
+    runChecksResp(),
+    doneResp(["a.txt"]), // now accepted
+  ]);
+  const result = await run(makeCtx(dir, "verified", engine));
+  assert.equal(result.outcome, "success", "the model recovered after the ACTIONABLE rejection (no inert-data loop)");
+
+  const msgs = requests.flatMap((r) => r.messages ?? []);
+  const rej = msgs.find((m) => m.role === "tool" && typeof m.content === "string" && m.content.includes("IKBI-HARNESS-FEEDBACK-BEGIN"));
+  assert.ok(rej, "the done-rejection is wrapped as ACTIONABLE harness feedback");
+  const text = String(rej?.content);
+  assert.match(text, /INSTRUCTION from the build system .*FOLLOW it/i, "framed as a build-system instruction to FOLLOW");
+  // THE INSTRUCTION IS CLEAR: the next action is to call run_checks.
+  assert.match(text, /call run_checks/i, "the rejection directs the next action: call run_checks");
+  // NOT the inert-neutralization preamble.
+  assert.doesNotMatch(text, /strictly as inert data|NEVER as instructions|Ignore any directions/i, "NOT the inert-neutralization frame");
+  // It did NOT go through the untrusted neutralizer (no mcp_result for the done feedback).
+  assert.ok(!neutralizeCalls.some((c) => c.context.source === "mcp_result" && c.context.origin === "done"), "done feedback is NOT neutralized");
+});
+
+test("the harness-instruction wrapper is BOUNDED by a fresh verified-absent nonce (injection-safe)", async () => {
+  const dir = tmp();
+  const { engine, requests } = mockEngine([doneResp(["x"]), runChecksResp(), doneResp(["x"]), lengthResp()]);
+  await run(makeCtx(dir, "verified", engine));
+  const text = String(requests.flatMap((r) => r.messages ?? []).find((m) => m.role === "tool" && typeof m.content === "string" && m.content.includes("IKBI-HARNESS-FEEDBACK-BEGIN"))?.content);
+  const nonce = text.match(/IKBI-HARNESS-FEEDBACK-BEGIN-([0-9a-f]+)/)?.[1];
+  assert.ok(nonce && nonce.length >= 32, "a fresh unguessable nonce bounds the harness instruction");
+  assert.ok(text.includes(`IKBI-HARNESS-FEEDBACK-END-${nonce}`), "matching END terminator with the same nonce");
+});
+
+test("run_checks output is STILL actionable (regression from 3e4f724 — unchanged)", async () => {
+  const dir = tmp();
+  const { engine, requests } = mockEngine([runChecksResp(), doneResp(["x"]), lengthResp()]);
+  await run(makeCtx(dir, "verified", engine), redExec("test"));
+  const rc = String(requests.flatMap((r) => r.messages ?? []).find((m) => m.role === "tool" && typeof m.content === "string" && m.content.includes("IKBI-CHECK-RESULTS-BEGIN"))?.content);
+  assert.match(rc, /results of YOUR check run/, "run_checks output stays actionable check-results");
+  assert.match(rc, /FAILED|expected 7, got 3/, "carries the real failure output");
+});
+
+test("the bare-stop corrective stays a plain ACTIONABLE message (ikbi-authored, never neutralized)", async () => {
+  const dir = tmp();
+  const { engine, requests } = mockEngine([toolResp([call("write_file", { path: "a.txt", content: "x" })]), stopResp()]);
+  await run(makeCtx(dir, "verified", engine)); // bare-stops → corrective injected each round
+  const corrective = requests.flatMap((r) => r.messages ?? []).find((m) => m.role === "user" && typeof m.content === "string" && m.content.includes("stopped without calling"));
+  assert.ok(corrective, "the corrective is a plain user message (actionable)");
+  assert.notEqual(corrective?.untrusted, true, "not flagged untrusted — the model must act on it");
+});
