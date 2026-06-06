@@ -27,6 +27,7 @@ import { config } from "../../core/config.js";
 import { beginOperation, resolveIdentity as coreResolveIdentity } from "../../core/identity/index.js";
 import type { IdentityClaim, OperationContext, ValidatedIdentity } from "../../core/identity/index.js";
 import { gateWall as coreGateWall, type GateWall } from "../gate-wall/index.js";
+import type { ExecRequest, ExecResult } from "../governed-exec/index.js";
 import { createOrchestrator } from "./orchestrator.js";
 import { WorkerError, type WorkerResult, type WorkerRole, type WorkerTask } from "./contract.js";
 
@@ -63,7 +64,12 @@ export function productionRoleClaim(workerToken: string | undefined): (role: Wor
 export function createProductionWorker(
   opts: { workerToken: string | undefined; gateWall?: GateWall },
 ): { run: (task: WorkerTask, ctx: OperationContext) => Promise<WorkerResult> } {
-  return createOrchestrator({ roleClaim: productionRoleClaim(opts.workerToken), gateWall: opts.gateWall ?? coreGateWall });
+  // Explicitly thread the governed executor to BOTH roles (builder run_checks + verifier) via
+  // the orchestrator. LAZY wrapper (not an eager import): importing the governed-exec singleton
+  // at module scope would force the gate-wall/egress wiring order — the same reason the verifier
+  // imports it lazily. (The builder also has the lazy fallback as defense-in-depth.)
+  const governedExec = { run: async (req: ExecRequest): Promise<ExecResult> => (await import("../governed-exec/index.js")).governedExec.run(req) };
+  return createOrchestrator({ roleClaim: productionRoleClaim(opts.workerToken), gateWall: opts.gateWall ?? coreGateWall, governedExec });
 }
 
 /** Parse a `--repo <path>` / `--repo=<path>` flag out of argv; the rest is the goal prose. */

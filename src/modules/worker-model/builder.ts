@@ -260,6 +260,18 @@ function wrapActionableFeedback(raw: string, kind: "check_results" | "harness_in
   return [...preamble, begin, raw, end].join("\n");
 }
 
+/**
+ * Lazy live governed-exec — the SAME pattern (and the SAME singleton) the verifier uses
+ * (verifier.ts). Importing it eagerly would force the gate-wall/egress wiring order, so it
+ * is resolved at run_checks-call time. Because it is the identical governed-exec singleton
+ * the verifier runs its checks through (same gate-wall, allowlist, receipts, egress guard),
+ * the builder's in-loop run_checks runs the EXACT governed path the verifier does — so the
+ * shared-check guarantee (builder-green ⇒ verifier-green) holds.
+ */
+function lazyGovernedExec(): Pick<GovernedExec, "run"> {
+  return { run: async (req) => (await import("../governed-exec/index.js")).governedExec.run(req) };
+}
+
 /** A tool call that was rejected (bad path / bad args / unknown tool). Lives in detail. */
 export interface ToolCallError {
   readonly tool: string;
@@ -334,6 +346,12 @@ function deriveSuccessCondition(goal: string, priorResults: ReadonlyArray<{ role
  * closed (no governed path), so `done` (gated on green checks) can never be reached.
  */
 export function createBuilder(deps: BuilderDeps = {}): RoleFn {
+  // Resolve the governed executor with the verifier's lazy fallback: an injected one wins
+  // (production wires it via createProductionWorker), else the live governed-exec singleton.
+  // This is the load-bearing fix — without it the production builder (no explicit injection)
+  // hit "no governed executor wired" on every run_checks. The identity (parentCtx) is still
+  // required separately (gate-wall authorization needs it); the fallback supplies ONLY the executor.
+  const governedExec = deps.governedExec ?? lazyGovernedExec();
   return async (ctx) => {
   // AUTONOMY — advisory this pass; STRUCTURAL enforcement lands with gate-wall (P1).
   // GATE-WALL SEAM ↓ : the gate-wall module will plug in here to grant/deny based on
@@ -542,15 +560,18 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
     // the worktree. The result (real output tails) is the builder's factual in-loop signal. ---
     const runChecks = async (): Promise<string> => {
       checksRuns += 1;
-      if (deps.governedExec === undefined || deps.parentCtx === undefined) {
-        // No governed path wired ⇒ checks cannot run ⇒ fail closed (done stays gated red).
+      // governedExec is ALWAYS resolvable (injected or the lazy singleton fallback). The
+      // remaining requirement is the parent IDENTITY: gate-wall authorization of the exec
+      // needs a minted ValidatedIdentity, which the orchestrator always threads. No identity
+      // ⇒ fail closed (done stays gated red).
+      if (deps.parentCtx === undefined) {
         lastChecks = { allPass: false, checks: [] };
-        return "ERROR: checks are unavailable (no governed executor wired) — cannot verify; done is blocked.";
+        return "ERROR: checks are unavailable (no parent identity wired to authorize the checks) — cannot verify; done is blocked.";
       }
       const results: CheckResult[] = [];
       let dry = false;
       for (const c of VERIFIER_CHECKS) {
-        const res = await deps.governedExec.run({
+        const res = await governedExec.run({
           parentCtx: deps.parentCtx,
           command: c.command,
           args: [...c.args],

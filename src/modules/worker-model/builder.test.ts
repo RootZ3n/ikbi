@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { pino } from "pino";
 
@@ -733,4 +735,54 @@ test("EXTERNAL content (read_file) is STILL neutralized + role:'tool' + untruste
   // Still a tool-role, untrusted message (unchanged).
   const readMsg = requests.flatMap((r) => r.messages ?? []).find((m) => m.role === "tool" && m.untrusted === true);
   assert.ok(readMsg, "repo content stays a tool-role untrusted message");
+});
+
+// ── FIX: governedExec lazy fallback (production wiring) ──────────────────────
+
+test("builder run_checks WORKS WITHOUT explicit governedExec injection (lazy fallback, mirrors verifier)", async () => {
+  const dir = tmp();
+  // Construct the builder the OLD production way: parentCtx but NO governedExec.
+  const { engine } = mockEngine([runChecksResp(), doneResp(["x"]), lengthResp()]);
+  const result = await createBuilder({ parentCtx: PARENT_CTX })(makeCtx(dir, "verified", engine));
+  const lc = (result.detail as { lastChecks?: { checks: unknown[] } }).lastChecks;
+  // run_checks RESOLVED the executor via the lazy fallback and RAN the shared checks
+  // (here the real governed-exec DENIES pnpm — not allowlisted in tests — so they're red,
+  // but they RAN: 2 checks, NOT the empty "no governed executor wired" fail-closed).
+  assert.ok(lc !== undefined && lc.checks.length === VERIFIER_CHECKS.length, "run_checks ran the checks via the lazy fallback (not the unavailable branch)");
+});
+
+test("parentCtx is STILL required: no identity ⇒ run_checks fails closed (the executor isn't the identity)", async () => {
+  const dir = tmp();
+  const { engine } = mockEngine([runChecksResp(), doneResp(["x"]), lengthResp()]);
+  // governedExec resolvable via fallback, but NO parentCtx → gate-wall can't authorize.
+  const result = await createBuilder({})(makeCtx(dir, "verified", engine));
+  const lc = (result.detail as { lastChecks?: { checks: unknown[] } }).lastChecks;
+  assert.ok(lc !== undefined && lc.checks.length === 0, "fail-closed: no checks ran without a parent identity");
+  // And done stays blocked (never green) → not success.
+  assert.notEqual(result.outcome, "success");
+});
+
+test("INJECTED governedExec is PREFERRED over the lazy fallback", async () => {
+  const dir = tmp();
+  let injectedCalls = 0;
+  const spyExec = { run: async (_req: ExecRequest): Promise<ExecResult> => { injectedCalls += 1; return { executed: true, exitCode: 0, stdoutTail: "ok", stderrTail: "" }; } };
+  const { engine } = mockEngine([runChecksResp(), doneResp(["x"])]);
+  const result = await createBuilder({ governedExec: spyExec, parentCtx: PARENT_CTX })(makeCtx(dir, "verified", engine));
+  assert.equal(injectedCalls, VERIFIER_CHECKS.length, "the INJECTED executor ran the checks (not the lazy singleton fallback)");
+  assert.equal(result.outcome, "success", "green via the injected executor");
+});
+
+test("the builder's lazy fallback imports the SAME governed-exec singleton as the verifier (shared-check guarantee)", async () => {
+  const builderSrc = await readFile(fileURLToPath(new URL("./builder.ts", import.meta.url)), "utf8");
+  const verifierSrc = await readFile(fileURLToPath(new URL("./verifier.ts", import.meta.url)), "utf8");
+  const lazyLine = /import\("\.\.\/governed-exec\/index\.js"\)\)\.governedExec\.run\(req\)/;
+  assert.match(builderSrc, lazyLine, "builder lazily imports the governed-exec singleton");
+  assert.match(verifierSrc, lazyLine, "verifier lazily imports the SAME governed-exec singleton");
+});
+
+test("createProductionWorker EXPLICITLY threads governedExec to the orchestrator (FIX B)", async () => {
+  const cliSrc = await readFile(fileURLToPath(new URL("./cli.ts", import.meta.url)), "utf8");
+  // createProductionWorker passes governedExec into createOrchestrator (lazy wrapper, wiring-order-safe).
+  assert.match(cliSrc, /createOrchestrator\(\{[^}]*governedExec/, "createOrchestrator is called with governedExec");
+  assert.match(cliSrc, /import\("\.\.\/governed-exec\/index\.js"\)\)\.governedExec\.run/, "the CLI wires it lazily (no eager import — wiring-order-safe)");
 });
