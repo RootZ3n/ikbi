@@ -89,6 +89,13 @@ export interface OrchestratorDeps {
     discard: (handle: WorkspaceHandle) => Promise<DiscardResult>;
     /** Unified diff of the workspace vs its base (competitive mode reads it for the diff signal). Optional. */
     diff?: (handle: WorkspaceHandle) => Promise<string>;
+    /**
+     * Commit the workspace's working tree onto its scratch branch (git add -A + commit; returns
+     * false when there is nothing to commit). The orchestrator calls this AFTER the verifier
+     * succeeds (gated on autoCommit), so the scratch branch advances and promote sees a non-empty
+     * diff. The workspace manager already provides it; this is the orchestrator's local view of it.
+     */
+    commit?: (handle: WorkspaceHandle, message: string) => Promise<boolean>;
   };
   /**
    * Governance evaluator (gate-wall). Optional in the type, but a promote REQUIRES it:
@@ -427,6 +434,15 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           break; // short-circuit on the first non-success
         }
 
+        // COMMIT the VERIFIED-good working tree, gated on autoCommit. The builder's edits live
+        // in the working tree (what run_checks + the verifier both check); without committing,
+        // the scratch branch HEAD == base HEAD and promote sees an empty diff. After the verifier
+        // SUCCEEDS, capture that verified state so the integrator (next role) promotes a real diff.
+        // Gated on the worker's autonomy: trusted/operator (autoCommit) commit; lower tiers do not.
+        if (role === "verifier" && spawned.autonomy.autoCommit && workspaces.commit !== undefined) {
+          await workspaces.commit(workspace, `ikbi: ${task.goal}`);
+        }
+
         // COOPERATIVE KILL CHECKPOINT (role boundary): obey a kill before the NEXT role.
         // "hard"/"soft" both stop here at role granularity (true mid-role abort deferred).
         killedReason = await killHalt(task, parentIdentity, parentCtx);
@@ -649,8 +665,15 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         const candidateBuilder = builderForModel(parentCtx, candidateModel);
         const builderResult = await dispatchRole("builder", spawnRole("builder", parentCtx), task, ws, [scoutResult], parentCtx, candidateBuilder);
         let verifierResult: RoleResult | undefined;
+        const verifierSpawn = spawnRole("verifier", parentCtx);
         if (builderResult.outcome === "success") {
-          verifierResult = await dispatchRole("verifier", spawnRole("verifier", parentCtx), task, ws, [scoutResult, builderResult], parentCtx);
+          verifierResult = await dispatchRole("verifier", verifierSpawn, task, ws, [scoutResult, builderResult], parentCtx);
+        }
+        // COMMIT this candidate's VERIFIED-good work (gated on autoCommit) BEFORE the judge —
+        // safeDiffLines + buildCandidate read the committed diff, and the winner is promoted, so
+        // the candidate's scratch branch must advance first or its diff is empty.
+        if (verifierResult?.outcome === "success" && verifierSpawn.autonomy.autoCommit && workspaces.commit !== undefined) {
+          await workspaces.commit(ws, `ikbi: ${task.goal}`);
         }
         rolesByWs.set(ws.id, [scoutResult, builderResult, ...(verifierResult !== undefined ? [verifierResult] : [])]);
         candidates.push(buildCandidate(ws, builderResult, verifierResult, await safeDiffLines(ws)));

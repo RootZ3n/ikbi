@@ -66,7 +66,7 @@ function fakeWorkspaceHandle(): WorkspaceHandle {
 }
 
 function fakeWorkspaces(promoteOk = true) {
-  const calls = { allocate: [] as unknown[], promote: 0, discard: 0 };
+  const calls = { allocate: [] as unknown[], promote: 0, discard: 0, commit: [] as Array<{ id: string; message: string }> };
   const handle = fakeWorkspaceHandle();
   const workspaces: NonNullable<OrchestratorDeps["workspaces"]> = {
     allocate: async (opts) => {
@@ -82,6 +82,10 @@ function fakeWorkspaces(promoteOk = true) {
     discard: async (h): Promise<DiscardResult> => {
       calls.discard += 1;
       return { workspaceId: h.id, removed: true };
+    },
+    commit: async (h, message): Promise<boolean> => {
+      calls.commit.push({ id: h.id, message });
+      return true; // the working tree had changes → committed
     },
   };
   return { workspaces, calls, handle };
@@ -271,6 +275,50 @@ test("success path: workspace allocated then PROMOTED (not discarded)", async ()
   assert.equal(result.outcome, "success");
   assert.equal(result.promoted, true);
   assert.equal(result.workspaceId, "wsabcd");
+  // The VERIFIED work was committed (autoCommit, trusted) so promote sees a non-empty diff.
+  assert.equal(ws.calls.commit.length, 1, "committed once (the verified-good state)");
+});
+
+test("COMMIT after verifier on a trusted (autoCommit) success — captured AFTER verifier, BEFORE the integrator", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const seq: string[] = [];
+  const cap = capturingRoles();
+  const roles = {
+    ...cap.roles,
+    verifier: async (ctx: RoleContext) => { seq.push("verifier"); return cap.roles.verifier!(ctx); },
+    integrator: async (ctx: RoleContext) => { seq.push("integrator"); return cap.roles.integrator!(ctx); },
+  };
+  const wrapped = { ...ws.workspaces, commit: async (h: WorkspaceHandle, m: string): Promise<boolean> => { seq.push("commit"); ws.calls.commit.push({ id: h.id, message: m }); return true; } };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: wrapped }));
+  await orch.run(task, parentCtx);
+
+  assert.equal(ws.calls.commit.length, 1, "committed exactly once");
+  assert.equal(ws.calls.commit[0]?.id, "wsabcd", "the run's workspace");
+  assert.match(ws.calls.commit[0]?.message ?? "", /do the thing/, "commit message carries the goal prose");
+  assert.deepEqual(seq, ["verifier", "commit", "integrator"], "commit lands AFTER the verifier and BEFORE the integrator promotes");
+});
+
+test("NO COMMIT for a non-autoCommit tier (verified) — the autonomy model is respected", async () => {
+  // worker at 'verified' → autoCommit:false (and requiresApproval:false, so it proceeds).
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("verified", "verified");
+  const ws = fakeWorkspaces(true);
+  const cap = capturingRoles();
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, workspaces: ws.workspaces }));
+  await orch.run(task, parentCtx);
+  assert.equal(ws.calls.commit.length, 0, "a non-autoCommit tier is NOT auto-committed");
+});
+
+test("NO COMMIT when a role fails (verified fails) — failed work is never committed", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  // The verifier FAILS → short-circuit before any commit.
+  const cap = capturingRoles((r) => (r === "verifier" ? "failure" : "success"));
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, workspaces: ws.workspaces }));
+  const result = await orch.run(task, parentCtx);
+  assert.notEqual(result.outcome, "success");
+  assert.equal(ws.calls.commit.length, 0, "no commit on a verifier failure");
+  assert.equal(ws.calls.discard, 1, "the failed work is discarded, not promoted");
 });
 
 test("failure path: a role failure short-circuits, workspace DISCARDED (not promoted)", async () => {

@@ -237,3 +237,19 @@ test("an empty goal ⇒ usage hint, no run", () => {
     assert.equal(oc.calls.length, 0);
   });
 });
+
+// ── FIX: createProductionWorker wires commit (the workspace manager has it) ───
+
+test("createProductionWorker wires the workspace manager (commit) + governedExec into the orchestrator", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const { fileURLToPath } = await import("node:url");
+  const src = await readFile(fileURLToPath(new URL("./cli.ts", import.meta.url)), "utf8");
+  // createProductionWorker passes workspaces (coreWorkspaces, which provides commit) explicitly.
+  assert.match(src, /createOrchestrator\(\{[^}]*workspaces: coreWorkspaces/, "the production worker threads the workspace manager (with commit)");
+  assert.match(src, /import \{ workspaces as coreWorkspaces \} from "\.\.\/\.\.\/core\/workspace\/index\.js"/, "imports the workspace manager singleton");
+});
+
+test("the workspace manager singleton actually provides a commit method (production path has commit)", async () => {
+  const { workspaces } = await import("../../core/workspace/index.js");
+  assert.equal(typeof workspaces.commit, "function", "coreWorkspaces.commit exists — the orchestrator can commit verified work");
+});

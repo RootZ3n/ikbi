@@ -26,6 +26,7 @@ import { registerCommand } from "../../cli/registry.js";
 import { config } from "../../core/config.js";
 import { beginOperation, resolveIdentity as coreResolveIdentity } from "../../core/identity/index.js";
 import type { IdentityClaim, OperationContext, ValidatedIdentity } from "../../core/identity/index.js";
+import { workspaces as coreWorkspaces } from "../../core/workspace/index.js";
 import { gateWall as coreGateWall, type GateWall } from "../gate-wall/index.js";
 import type { ExecRequest, ExecResult } from "../governed-exec/index.js";
 import { createOrchestrator } from "./orchestrator.js";
@@ -69,7 +70,11 @@ export function createProductionWorker(
   // at module scope would force the gate-wall/egress wiring order — the same reason the verifier
   // imports it lazily. (The builder also has the lazy fallback as defense-in-depth.)
   const governedExec = { run: async (req: ExecRequest): Promise<ExecResult> => (await import("../governed-exec/index.js")).governedExec.run(req) };
-  return createOrchestrator({ roleClaim: productionRoleClaim(opts.workerToken), gateWall: opts.gateWall ?? coreGateWall, governedExec });
+  // Explicitly thread the workspace manager (which provides commit) so the orchestrator can
+  // COMMIT the verified-good work — without it the scratch branch never advances and promote
+  // sees an empty diff ("no changes to promote"). coreWorkspaces is the same manager the
+  // orchestrator would default to; passing it makes the commit dependency explicit.
+  return createOrchestrator({ roleClaim: productionRoleClaim(opts.workerToken), gateWall: opts.gateWall ?? coreGateWall, governedExec, workspaces: coreWorkspaces });
 }
 
 /** Parse a `--repo <path>` / `--repo=<path>` flag out of argv; the rest is the goal prose. */

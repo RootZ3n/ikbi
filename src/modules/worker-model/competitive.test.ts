@@ -47,6 +47,8 @@ function compWorkspaces(opts: { conflict?: boolean; failAllocateAt?: number } = 
   const allocated: string[] = [];
   const promoted: string[] = [];
   const discarded: string[] = [];
+  const committed: string[] = [];
+  const events: string[] = []; // ordered trace: "commit:wsN" / "diff:wsN"
   let i = 0;
   const workspaces: NonNullable<OrchestratorDeps["workspaces"]> = {
     allocate: async () => {
@@ -65,9 +67,10 @@ function compWorkspaces(opts: { conflict?: boolean; failAllocateAt?: number } = 
       discarded.push(h.id);
       return { workspaceId: h.id, removed: true };
     },
-    diff: async () => "line1\nline2\nline3",
+    diff: async (h) => { events.push(`diff:${h.id}`); return "line1\nline2\nline3"; },
+    commit: async (h): Promise<boolean> => { committed.push(h.id); events.push(`commit:${h.id}`); return true; },
   };
-  return { workspaces, allocated, promoted, discarded };
+  return { workspaces, allocated, promoted, discarded, committed, events };
 }
 
 const fakeTrust = () => ({
@@ -172,6 +175,40 @@ test("competitive: the better candidate wins — winner promoted, loser discarde
   assert.deepEqual(ws.discarded, ["ws1"], "the loser is discarded");
   // every allocated workspace is promoted XOR discarded — no leak.
   for (const id of ws.allocated) assert.ok(ws.promoted.includes(id) || ws.discarded.includes(id), `${id} not leaked`);
+});
+
+test("competitive: each candidate's verified work is COMMITTED before the judge reads its diff (autoCommit)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = compWorkspaces();
+  // Both candidates pass (verifier success) → both get committed (trusted → autoCommit).
+  const cap = compRoles(() => ({ typecheck: 0, test: 0 }));
+  const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: cap.roles }));
+  await orch.run(task, parentCtx);
+
+  // Each candidate whose verifier succeeded was committed (one per workspace).
+  assert.deepEqual([...ws.committed].sort(), ["ws0", "ws1"], "both verified candidates committed");
+  // And each commit precedes that candidate's diff read (safeDiffLines → judge scoring).
+  assert.ok(ws.events.indexOf("commit:ws0") < ws.events.indexOf("diff:ws0"), "ws0 committed before its diff is read");
+  assert.ok(ws.events.indexOf("commit:ws1") < ws.events.indexOf("diff:ws1"), "ws1 committed before its diff is read");
+});
+
+test("competitive: a candidate that never reaches a successful verifier is NOT committed (only verified work)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = compWorkspaces();
+  // ws0 builder+verifier succeed; ws1's BUILDER fails → no verifier → ws1 not committed.
+  const cap = compRoles((id) => (id === "ws0" ? { typecheck: 0, test: 0 } : { builderOk: false }));
+  const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: cap.roles }));
+  await orch.run(task, parentCtx);
+  assert.deepEqual(ws.committed, ["ws0"], "only the candidate whose verifier succeeded is committed");
+});
+
+test("competitive: a non-autoCommit tier (verified) commits NO candidate (autonomy respected)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("verified", "verified");
+  const ws = compWorkspaces();
+  const cap = compRoles(() => ({ typecheck: 0, test: 0 }));
+  const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: cap.roles }));
+  await orch.run(task, parentCtx);
+  assert.equal(ws.committed.length, 0, "verified tier → autoCommit false → no candidate committed");
 });
 
 // ── NO-PASS: every candidate disqualified ⇒ all discarded, nothing promoted ──
