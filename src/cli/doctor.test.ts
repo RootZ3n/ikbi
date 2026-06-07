@@ -128,17 +128,37 @@ test("INJECTABLE REGISTRY: doctor uses the fake registry passed in (not the real
   assert.equal(r.ready, true);
 });
 
-test("doctor FLAGS insecure security defaults (⚠), not as build-blockers", () => {
+test("doctor WARNS on insecure default keys when the dev opt-in IS set (⚠), still ready", () => {
   const r = runDoctor({
-    config: loadConfig({ IKBI_OPERATOR_TOKEN: "op-strong-value-here", IKBI_WORKER_TOKEN: "worker-strong-value-here" }),
+    // default keys, but explicitly opted into dev keys → warning, not a blocker.
+    config: loadConfig({ IKBI_OPERATOR_TOKEN: "op-strong-value-here", IKBI_WORKER_TOKEN: "worker-strong-value-here", IKBI_ALLOW_INSECURE_DEV_KEYS: "true" }),
     workerModelEnabled: true,
     governedExecAllowlist: ["pnpm"],
     registry: resolvingRegistry(),
   });
   const text = r.lines.join("\n");
-  assert.match(text, /⚠ IKBI_TRUST_HMAC_KEY/, "insecure trust key flagged");
-  assert.match(text, /⚠ IKBI_IDENTITY_TOKEN_SALT/, "insecure token salt flagged");
-  assert.equal(r.ready, true, "insecure defaults are warnings, not build-blockers");
+  assert.match(text, /⚠ IKBI_TRUST_HMAC_KEY .* explicitly allowed via IKBI_ALLOW_INSECURE_DEV_KEYS/, "insecure trust key flagged as an allowed dev warning");
+  assert.match(text, /⚠ IKBI_IDENTITY_TOKEN_SALT .* explicitly allowed via IKBI_ALLOW_INSECURE_DEV_KEYS/, "insecure token salt flagged as an allowed dev warning");
+  assert.equal(r.ready, true, "explicitly-allowed dev keys are a warning, not a build-blocker");
+});
+
+test("doctor BLOCKS (✗) on insecure default keys when the dev opt-in is NOT set, NOT ready", () => {
+  // The startup gate fires first in a LIVE process; here we construct the unopted-in
+  // default-keys config doctor would inspect (loadConfig past the gate via the dev flag,
+  // then drop the flag) to prove doctor reports it as the refuse-to-start blocker it is.
+  const base = loadConfig({ IKBI_OPERATOR_TOKEN: "op-strong-value-here", IKBI_WORKER_TOKEN: "worker-strong-value-here", IKBI_ALLOW_INSECURE_DEV_KEYS: "true" });
+  const cfg = { ...base, allowInsecureDevKeys: false };
+  const r = runDoctor({
+    config: cfg,
+    workerModelEnabled: true,
+    governedExecAllowlist: ["pnpm"],
+    registry: resolvingRegistry(),
+  });
+  const text = r.lines.join("\n");
+  assert.match(text, /✗ IKBI_TRUST_HMAC_KEY .* refuse to start/, "insecure trust key is a refuse-to-start blocker");
+  assert.match(text, /✗ IKBI_IDENTITY_TOKEN_SALT .* refuse to start/, "insecure token salt is a refuse-to-start blocker");
+  assert.match(text, /NOT ready — .*insecure default key/, "the summary names the security blocker");
+  assert.equal(r.ready, false, "default keys with no dev opt-in is a build blocker");
 });
 
 test("doctor PRINTS NO SECRET VALUES — only set/unset status", () => {

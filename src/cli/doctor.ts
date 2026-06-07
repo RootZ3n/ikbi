@@ -116,19 +116,26 @@ export function runDoctor(inp: DoctorInputs = {}): DoctorResult {
     }
   }
 
-  // --- SECURITY (insecure-default warnings) --------------------------------
+  // --- SECURITY (trust-key gate: three states) -----------------------------
+  // Each key is one of: SET (✓), DEFAULTED-but-explicitly-allowed (⚠, dev), or
+  // DEFAULTED-and-blocking (✗). The blocking state cannot occur in a LIVE process —
+  // the startup gate in loadConfig refuses to start there first — but doctor reports
+  // config state, so an unopted-in default-keys config is surfaced as the blocker it is.
   push("");
   push("SECURITY");
-  if (cfg.trust.hmacKeyIsDefault) {
-    push(`  ${WARN} IKBI_TRUST_HMAC_KEY — unset; trust-state MAC uses an INSECURE built-in key. Set it in production.`);
-  } else {
-    push(`  ${OK} IKBI_TRUST_HMAC_KEY (set)`);
-  }
-  if (cfg.identity.tokenSaltIsDefault) {
-    push(`  ${WARN} IKBI_IDENTITY_TOKEN_SALT — unset; token hashing uses an INSECURE built-in pepper. Set it in production.`);
-  } else {
-    push(`  ${OK} IKBI_IDENTITY_TOKEN_SALT (set)`);
-  }
+  let securityBlockers = 0;
+  const keyState = (isDefault: boolean, name: string, builtinDesc: string): void => {
+    if (!isDefault) {
+      push(`  ${OK} ${name} (set)`);
+    } else if (cfg.allowInsecureDevKeys) {
+      push(`  ${WARN} ${name} — running with insecure dev keys (${builtinDesc}); explicitly allowed via IKBI_ALLOW_INSECURE_DEV_KEYS.`);
+    } else {
+      securityBlockers += 1;
+      push(`  ${BAD} ${name} — INSECURE default (${builtinDesc}); ikbi will refuse to start. Set ${name} or IKBI_ALLOW_INSECURE_DEV_KEYS=true.`);
+    }
+  };
+  keyState(cfg.trust.hmacKeyIsDefault, "IKBI_TRUST_HMAC_KEY", "trust-state MAC uses a built-in key");
+  keyState(cfg.identity.tokenSaltIsDefault, "IKBI_IDENTITY_TOKEN_SALT", "token hashing uses a built-in pepper");
 
   // --- EGRESS --------------------------------------------------------------
   push("");
@@ -155,9 +162,18 @@ export function runDoctor(inp: DoctorInputs = {}): DoctorResult {
   push(`  ${OK} roster file        = ${cfg.provider.rosterFile}`);
 
   // --- SUMMARY -------------------------------------------------------------
-  const ready = missingRequired === 0;
+  // A security blocker (insecure default key, no dev opt-in) is fatal to readiness
+  // even when every required-for-build setting is present — ikbi would refuse to start.
+  const ready = missingRequired === 0 && securityBlockers === 0;
   push("");
-  push(ready ? "ready to build" : `NOT ready — ${missingRequired} required setting${missingRequired === 1 ? "" : "s"} missing (see ${BAD} above)`);
+  if (ready) {
+    push("ready to build");
+  } else {
+    const parts: string[] = [];
+    if (missingRequired > 0) parts.push(`${missingRequired} required setting${missingRequired === 1 ? "" : "s"} missing`);
+    if (securityBlockers > 0) parts.push(`${securityBlockers} insecure default key${securityBlockers === 1 ? "" : "s"} (refuse-to-start)`);
+    push(`NOT ready — ${parts.join(" + ")} (see ${BAD} above)`);
+  }
 
   return { lines, ready, missingRequired };
 }

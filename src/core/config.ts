@@ -23,6 +23,12 @@ export interface IkbiConfig {
   readonly bindHost: string;
   /** Allow binding a non-loopback (public) interface. `IKBI_ALLOW_PUBLIC_BIND`, default false. */
   readonly allowPublicBind: boolean;
+  /**
+   * Allow starting on the insecure built-in trust HMAC key / token salt (dev only).
+   * `IKBI_ALLOW_INSECURE_DEV_KEYS`, default false. When false and either key is
+   * defaulted, `loadConfig` refuses to start (see the gate in `loadConfig`).
+   */
+  readonly allowInsecureDevKeys: boolean;
   /** Root directory for runtime state. `IKBI_STATE_ROOT`, default `<cwd>/state`. */
   readonly stateRoot: string;
   /** Log level. `IKBI_LOG_LEVEL`, default "info". */
@@ -341,6 +347,28 @@ function loadConfig(env: NodeJS.ProcessEnv = process.env): IkbiConfig {
     );
   }
 
+  // Safety seam (mirrors the public-bind gate): refuse to start the process on the
+  // insecure built-in trust MAC key or token-hash pepper. A governance core whose
+  // own integrity keys are guessable would violate ikbi's fail-closed posture, so
+  // the refusal fires HERE — at config load, before the trust and identity modules
+  // construct from these values — leaving no window in which the system runs on
+  // default keys. The dev opt-in is read from the ambient process env as a fallback
+  // so a single harness-level `IKBI_ALLOW_INSECURE_DEV_KEYS=true` also covers
+  // `loadConfig({...})` calls that pass an explicit partial env (tests); in
+  // production `env` IS `process.env`, so the fallback is a no-op.
+  const allowInsecureDevKeys = parseBool(
+    env.IKBI_ALLOW_INSECURE_DEV_KEYS ?? process.env.IKBI_ALLOW_INSECURE_DEV_KEYS,
+    false,
+  );
+  const hmacKeyIsDefault = optStr(env.IKBI_TRUST_HMAC_KEY) === undefined;
+  const tokenSaltIsDefault = optStr(env.IKBI_IDENTITY_TOKEN_SALT) === undefined;
+  if ((hmacKeyIsDefault || tokenSaltIsDefault) && !allowInsecureDevKeys) {
+    throw new Error(
+      `Refusing to start with insecure default trust keys without IKBI_ALLOW_INSECURE_DEV_KEYS=true. ` +
+        `Set IKBI_TRUST_HMAC_KEY and IKBI_IDENTITY_TOKEN_SALT, or opt in explicitly for development.`,
+    );
+  }
+
   const stateRootRaw = env.IKBI_STATE_ROOT?.trim();
   const stateRoot =
     stateRootRaw && stateRootRaw.length > 0
@@ -357,6 +385,7 @@ function loadConfig(env: NodeJS.ProcessEnv = process.env): IkbiConfig {
     port,
     bindHost,
     allowPublicBind,
+    allowInsecureDevKeys,
     stateRoot,
     logLevel,
     env: runtimeEnv,
