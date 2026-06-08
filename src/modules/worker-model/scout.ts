@@ -30,6 +30,17 @@ export interface ScoutFinding {
   readonly title: string;
   readonly detail: string;
   readonly files?: readonly string[];
+  /** PROGRESSIVE DISCLOSURE: the primary file this finding references, if one was named. */
+  readonly path?: string;
+  /** The line range within `path` the finding points at, as [start, end] (1-based), if given. */
+  readonly lines?: readonly [number, number];
+}
+
+/** One entry in the scout's STRUCTURE index — a scanned file with its size. The brief is built from these. */
+export interface ScoutFileEntry {
+  readonly path: string;
+  readonly lines: number;
+  readonly bytes: number;
 }
 
 // --- named constants (no magic values inline) ------------------------------
@@ -50,7 +61,11 @@ const SCOUT_SYSTEM =
   "You are the SCOUT in a build pipeline. Investigate the provided repository " +
   "excerpts against the stated goal and list concise, concrete findings (one per " +
   "line, starting with '- '): what exists, what's relevant, and what the builder " +
-  "should know. Read-only — do not propose edits.";
+  "should know. When a finding is about a specific file, START the line with its " +
+  "path and (if you can) a line number, like `- src/foo.ts:42 — does X`, so the " +
+  "builder can drill straight to it. Read-only — do not propose edits.";
+/** Max files listed in the deterministic structure brief (keeps the brief cheap-model sized). */
+const MAX_BRIEF_FILES = 15;
 
 /** Bounded, read-only directory walk. Stops at MAX_FILES_SCANNED; skips heavy dirs. */
 function gatherFiles(root: string): string[] {
@@ -77,9 +92,11 @@ function gatherFiles(root: string): string[] {
   return out;
 }
 
-/** Read a bounded slice of each file into a single context string. Read-only. */
-function buildContext(files: readonly string[], root: string): { text: string; used: number } {
+/** Read a bounded slice of each file into a single context string. Read-only. Also
+ *  returns the STRUCTURE index (each scanned file's path + line/byte size). */
+function buildContext(files: readonly string[], root: string): { text: string; used: number; structure: ScoutFileEntry[] } {
   const parts: string[] = [];
+  const structure: ScoutFileEntry[] = [];
   let total = 0;
   let used = 0;
   for (const f of files) {
@@ -91,14 +108,51 @@ function buildContext(files: readonly string[], root: string): { text: string; u
       continue;
     }
     const slice = content.slice(0, MAX_FILE_BYTES);
-    parts.push(`--- ${relative(root, f)} ---\n${slice}`);
+    const rel = relative(root, f);
+    parts.push(`--- ${rel} ---\n${slice}`);
+    structure.push({ path: rel, lines: content.split("\n").length, bytes: Buffer.byteLength(content, "utf8") });
     total += Buffer.byteLength(slice, "utf8");
     used += 1;
   }
-  return { text: parts.join("\n\n"), used };
+  return { text: parts.join("\n\n"), used, structure };
 }
 
-/** Parse the model's bullet output into findings; fall back to one finding. */
+/**
+ * PROGRESSIVE DISCLOSURE: a compact, DETERMINISTIC structure brief the builder sees
+ * FIRST — top-level directories + the largest scanned files with line counts — so a
+ * cheap model gets the lay of the land without the whole codebase dumped on it. It
+ * drills into specifics on demand via the builder's `scout_detail` tool.
+ */
+function buildBrief(structure: readonly ScoutFileEntry[]): string {
+  if (structure.length === 0) return "No files were scanned.";
+  const dirs = new Set<string>();
+  for (const e of structure) {
+    const slash = e.path.indexOf("/");
+    dirs.add(slash === -1 ? "(root)" : e.path.slice(0, slash) + "/");
+  }
+  const top = [...structure].sort((a, b) => b.bytes - a.bytes).slice(0, MAX_BRIEF_FILES);
+  const lines = [
+    `Repository structure (${structure.length} file(s) scanned).`,
+    `Top-level: ${[...dirs].sort().join(", ")}`,
+    "Key files (largest first):",
+    ...top.map((e) => `  - ${e.path} (${e.lines} lines)`),
+  ];
+  return lines.join("\n");
+}
+
+/** Extract a leading `path[:line[-line]]` reference from a finding line, if present. */
+function extractPathRef(text: string): { path?: string; lines?: [number, number] } {
+  // A path-like token: contains a slash or a dotted extension, optionally `:line` or `:line-line`.
+  const m = text.match(/(?:^|\s)([\w./-]+\.[A-Za-z0-9]+)(?::(\d+)(?:-(\d+))?)?/);
+  if (m === null || m[1] === undefined) return {};
+  const path = m[1];
+  if (m[2] === undefined) return { path };
+  const start = Number.parseInt(m[2], 10);
+  const end = m[3] !== undefined ? Number.parseInt(m[3], 10) : start;
+  return { path, lines: [start, end] };
+}
+
+/** Parse the model's bullet output into structured findings; fall back to one finding. */
 function parseFindings(content: string): ScoutFinding[] {
   const lines = content
     .split("\n")
@@ -106,7 +160,16 @@ function parseFindings(content: string): ScoutFinding[] {
     .filter((l) => l.length > 0);
   const bullets = lines.filter((l) => /^[-*]\s+/.test(l) || /^\d+[.)]\s+/.test(l));
   if (bullets.length > 0) {
-    return bullets.map((l, i) => ({ title: `finding-${i + 1}`, detail: l.replace(/^([-*]|\d+[.)])\s+/, "") }));
+    return bullets.map((l, i) => {
+      const detail = l.replace(/^([-*]|\d+[.)])\s+/, "");
+      const ref = extractPathRef(detail);
+      return {
+        title: `finding-${i + 1}`,
+        detail,
+        ...(ref.path !== undefined ? { path: ref.path } : {}),
+        ...(ref.lines !== undefined ? { lines: ref.lines } : {}),
+      };
+    });
   }
   const detail = content.trim();
   return [{ title: "investigation", detail: detail.length > 0 ? detail : "(no analysis returned)" }];
@@ -116,7 +179,7 @@ export const scout: RoleFn = async (ctx) => {
   try {
     const root = ctx.workspace.path;
     const files = gatherFiles(root); // bounded, read-only
-    const { text, used } = buildContext(files, root);
+    const { text, used, structure } = buildContext(files, root);
 
     // C4: each untrusted block is neutralized + wrapped as an isolated data-role
     // message (untrusted:true) — never raw-concatenated into the trusted system prompt.
@@ -138,11 +201,14 @@ export const scout: RoleFn = async (ctx) => {
 
     const response = await ctx.engine.invokeModel(request);
     const findings = parseFindings(response.content);
+    const brief = buildBrief(structure);
     return {
       role: "scout",
       outcome: "success",
       summary: `scouted ${used} file(s); produced ${findings.length} finding(s)`,
-      detail: { findings, filesScanned: used },
+      // `brief` + `structure` drive PROGRESSIVE DISCLOSURE downstream: the builder shows the
+      // brief first and pulls a finding's full `detail` only on demand (scout_detail tool).
+      detail: { findings, filesScanned: used, brief, structure },
     };
   } catch (err) {
     // IO / model failure: report at the role boundary, do not throw past it.
