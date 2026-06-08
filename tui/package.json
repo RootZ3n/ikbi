@@ -1,0 +1,26 @@
+{
+  "name": "ikbi-tui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "ikbi TUI — the build engine's terminal interface (Ink/React).",
+  "scripts": {
+    "dev": "tsx --watch src/entry.tsx",
+    "start": "tsx src/entry.tsx",
+    "harness": "tsx src/harness.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "ink": "^6.0.0",
+    "ink-text-input": "^6.0.0",
+    "react": "^19.0.0",
+    "js-yaml": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.13.1",
+    "@types/react": "^19.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3"
+  }
+}

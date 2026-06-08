@@ -1,0 +1,123 @@
+# ikbi TUI Skin — The Build Engine
+# Amber and gold. Construction, engineering, the disciplined builder.
+# Geometric and architectural — no cute mascot art.
+
+name: ikbi
+description: "ikbi — the build/repair engine. Amber and gold. Methodical. Evidence-based."
+
+# ── Branding ──────────────────────────────────────────────────────────
+branding:
+  agent_name: "ikbi"
+  welcome: "ikbi online. State the goal — I'll read the ground truth, make the smallest correct change, and prove it green."
+  goodbye: "Build halted. Foundation intact. Until the next blueprint."
+  prompt_symbol: "▸"
+  response_label: " ▣ ikbi "
+  help_header: "▣ ikbi — build commands"
+
+# ── Colors (amber / gold / bronze) ────────────────────────────────────
+colors:
+  banner_border: "#8D6E63"
+  banner_title: "#FFB300"
+  banner_accent: "#FFD54F"
+  ui_accent: "#FFB300"
+  ui_ok: "#9CCC65"
+  ui_error: "#EF5350"
+  ui_warn: "#FFA726"
+  response_border: "#A1887F"
+  status_bg: "#1a1408"
+  status_fg: "#FFE082"
+  status_good: "#9CCC65"
+  status_warn: "#FFA726"
+  status_bad: "#EF5350"
+  text: "#ECE0C8"
+  muted: "#A1887F"
+  prompt: "#FFB300"
+  selection_bg: "#3a2c10"
+  completion_bg: "#1a1408"
+  completion_current_bg: "#3a2c10"
+
+# ── Banner Art (geometric / architectural) ────────────────────────────
+banner_logo: |
+  [bold #FFB300]
+     ██╗██╗  ██╗██████╗ ██╗
+     ██║██║ ██╔╝██╔══██╗██║
+     ██║█████╔╝ ██████╔╝██║
+     ██║██╔═██╗ ██╔══██╗██║
+     ██║██║  ██╗██████╔╝██║
+     ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝
+     [dim #A1887F]B U I L D   E N G I N E[/]
+  [/]
+
+banner_hero: |
+  [bold #FFB300]
+     ┌─────────────────────────────┐
+     │  [dim]Choctaw: "to build"[/]        │
+     │                             │
+     │     ▣  i k b i  ▣           │
+     │                             │
+     │  [dim]┌──┬──┐  foundation[/]        │
+     │  [dim]├──┼──┤  scaffolding[/]       │
+     │  [dim]└──┴──┘  load-bearing[/]      │
+     │                             │
+     │  [italic #FFD54F]"Read the blueprint,[/]      │
+     │  [italic #FFD54F] then lift the hammer."[/]   │
+     │                             │
+     │  [dim]Green checks or it isn't built.[/] │
+     └─────────────────────────────┘
+  [/]
+
+# ── Spinner / Thinking ───────────────────────────────────────────────
+spinner:
+  waiting_faces: ["▸", "▹", "▪", "▫", "▣"]
+  thinking_faces: ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+  thinking_verbs:
+    - "reading the blueprint"
+    - "pouring the foundation"
+    - "raising scaffolding"
+    - "measuring twice"
+    - "checking the load path"
+    - "squaring the corners"
+    - "running the checks"
+    - "inspecting the work"
+    - "tightening the joints"
+    - "verifying it's plumb"
+  wings: [["▸", "◂"], ["▹", "◃"]]
+
+# ── Tool prefix ───────────────────────────────────────────────────────
+tool_prefix: "▣"
+
+# ── Tool emojis (geometric markers, not cute) ─────────────────────────
+tool_emojis:
+  terminal: "▶"
+  search_files: "⌕"
+  read_file: "▤"
+  write_file: "▥"
+  patch: "✎"
+  run_checks: "✓"
+  done: "▣"
+
+# ── Theme colors (TUI Ink layer) ─────────────────────────────────────
+theme:
+  primary: "#FFB300"
+  accent: "#FFD54F"
+  border: "#8D6E63"
+  text: "#ECE0C8"
+  muted: "#A1887F"
+  ok: "#9CCC65"
+  error: "#EF5350"
+  warn: "#FFA726"
+  prompt: "#FFB300"
+  session_label: "#8D6E63"
+  session_border: "#A1887F"
+  status_bg: "#1a1408"
+  status_fg: "#FFE082"
+  status_good: "#9CCC65"
+  status_warn: "#FFA726"
+  status_bad: "#EF5350"
+  status_critical: "#ff1744"
+  selection_bg: "#3a2c10"
+  diff_added: "#9CCC65"
+  diff_removed: "#EF5350"
+  diff_added_word: "#558B2F"
+  diff_removed_word: "#c62828"
+  shell_dollar: "#FFB300"
