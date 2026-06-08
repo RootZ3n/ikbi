@@ -57,6 +57,8 @@ import {
   workerCompetitiveCompleted,
   workerCompetitiveJudged,
   workerCompetitiveStarted,
+  workerApprovalRequested,
+  workerApprovalResolved,
   workerBuilderActivity,
   workerCompleted,
   workerFailed,
@@ -141,6 +143,13 @@ export interface OrchestratorDeps {
    * check output live, not just the buffered tail at the end. The CLI wires it to stdout.
    */
   readonly onExecOutput?: (chunk: string, stream: "stdout" | "stderr") => void;
+  /**
+   * HUMAN-APPROVAL GATE (SG-10, opt-in). When set, after a build VERIFIES and the integrator
+   * decides to promote, the orchestrator pauses and calls this for the operator's decision —
+   * `false` DISCARDS instead of promoting. Absent ⇒ no gate (backward compatible). The CLI
+   * wires a stdin y/N prompt when IKBI_REQUIRE_APPROVAL is set.
+   */
+  readonly requestApproval?: (req: { taskId: string; workspaceId: string; goal: string }) => Promise<boolean>;
   /** The single builder model (per-candidate fallback). Default: config (IKBI_MODEL_BUILDER). */
   readonly builderModel?: string;
   /** The head-to-head competitive model list. Default: config (IKBI_COMPETITIVE_MODELS). */
@@ -235,6 +244,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   const gateWall = deps.gateWall; // optional in the type — absent → promote DENIED fail-closed (H5)
   const judge = deps.judge ?? deterministicJudge; // competitive-mode scorer (pure, no model)
   const enforceProjectRoot = deps.enforceProjectRoot ?? false; // Fix 1/2 guard — production-only (off in tests)
+  const requestApproval = deps.requestApproval; // SG-10 human-approval gate (undefined ⇒ no gate)
   // SG-1: when a live-output sink is wired, wrap the injected governed executor so EVERY check
   // it runs streams its output to the sink. No sink (the common/test case) ⇒ the base executor
   // unchanged. (Only wraps an explicitly-injected governedExec — the verifier/builder lazy
@@ -540,7 +550,25 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     const decision = readIntegratorDecision(results.find((r) => r.role === "integrator"));
     let promoted = false;
     let reason: string | undefined;
-    if (decision.promote) {
+    // SG-10 HUMAN-APPROVAL GATE (opt-in): the build is VERIFIED and the integrator approved —
+    // pause for the operator before the irreversible promote. A rejection DISCARDS the work.
+    let approvalRejected = false;
+    if (decision.promote && requestApproval !== undefined) {
+      events.publish(
+        workerApprovalRequested.create({ taskId: task.taskId, workspaceId: workspace.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } }),
+      );
+      const approved = await requestApproval({ taskId: task.taskId, workspaceId: workspace.id, goal: task.goal });
+      events.publish(
+        workerApprovalResolved.create({ taskId: task.taskId, workspaceId: workspace.id, approved }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } }),
+      );
+      if (!approved) {
+        await workspaces.discard(workspace);
+        overall = "rejected";
+        reason = "promotion rejected by operator (approval gate)";
+        approvalRejected = true;
+      }
+    }
+    if (decision.promote && !approvalRejected) {
       if (gateWall === undefined) {
         // H5 FAIL-CLOSED: a promote REQUIRES gate-wall authorization. An unwired
         // gate-wall is a misconfiguration; the safe response to "can't verify
@@ -568,7 +596,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           reason = promote.reason ?? "promote did not land (conflict)";
         }
       }
-    } else {
+    } else if (!approvalRejected) {
+      // The integrator did not approve promote (and it was not an approval-gate rejection,
+      // which already discarded above). Fail-closed discard.
       await workspaces.discard(workspace);
       reason =
         decision.rationale ??

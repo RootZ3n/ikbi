@@ -22,6 +22,8 @@
  *   and the workspace is promoted or discarded. Without tokens/key/repo it fails closed.
  */
 
+import { createInterface } from "node:readline";
+
 import { registerCommand } from "../../cli/registry.js";
 import { config } from "../../core/config.js";
 import { beginOperation, resolveIdentity as coreResolveIdentity } from "../../core/identity/index.js";
@@ -153,8 +155,30 @@ export function productionRoleClaim(workerToken: string | undefined): (role: Wor
  * defaults to the live one so a caller that must NOT import gate-wall (the batch-planner
  * module boundary) can wire the governed worker without reaching for it.
  */
+/** True iff a y/N answer is affirmative (only an explicit yes approves — default is No). */
+export function isAffirmative(answer: string): boolean {
+  const a = answer.trim().toLowerCase();
+  return a === "y" || a === "yes";
+}
+
+/** SG-10: a stdin y/N prompt asking the operator to approve a verified build's promotion. */
+function stdinApprovalPrompt(req: { taskId: string; workspaceId: string; goal: string }): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(`\nBuild ${req.taskId} verified. Approve promotion? [y/N] `, (ans) => {
+      rl.close();
+      resolve(isAffirmative(ans));
+    });
+  });
+}
+
+/** True iff IKBI_REQUIRE_APPROVAL opts into the human-approval gate. */
+function approvalRequiredFromEnv(env: NodeJS.ProcessEnv = process.env): boolean {
+  return /^(1|true|yes|on)$/i.test(env.IKBI_REQUIRE_APPROVAL ?? "");
+}
+
 export function createProductionWorker(
-  opts: { workerToken: string | undefined; gateWall?: GateWall; onExecOutput?: (chunk: string, stream: "stdout" | "stderr") => void },
+  opts: { workerToken: string | undefined; gateWall?: GateWall; onExecOutput?: (chunk: string, stream: "stdout" | "stderr") => void; requestApproval?: (req: { taskId: string; workspaceId: string; goal: string }) => Promise<boolean> },
 ): { run: (task: WorkerTask, ctx: OperationContext) => Promise<WorkerResult> } {
   // Explicitly thread the governed executor to BOTH roles (builder run_checks + verifier) via
   // the orchestrator. LAZY wrapper (not an eager import): importing the governed-exec singleton
@@ -165,7 +189,7 @@ export function createProductionWorker(
   // COMMIT the verified-good work — without it the scratch branch never advances and promote
   // sees an empty diff ("no changes to promote"). coreWorkspaces is the same manager the
   // orchestrator would default to; passing it makes the commit dependency explicit.
-  return createOrchestrator({ roleClaim: productionRoleClaim(opts.workerToken), gateWall: opts.gateWall ?? coreGateWall, governedExec, workspaces: coreWorkspaces, enforceProjectRoot: true, ...(opts.onExecOutput !== undefined ? { onExecOutput: opts.onExecOutput } : {}) });
+  return createOrchestrator({ roleClaim: productionRoleClaim(opts.workerToken), gateWall: opts.gateWall ?? coreGateWall, governedExec, workspaces: coreWorkspaces, enforceProjectRoot: true, ...(opts.onExecOutput !== undefined ? { onExecOutput: opts.onExecOutput } : {}), ...(opts.requestApproval !== undefined ? { requestApproval: opts.requestApproval } : {}) });
 }
 
 /** Parse `--repo <path>` / `--repo=<path>` and `--verbose`/`-v`; the rest is the goal prose. */
@@ -246,6 +270,11 @@ export interface WorkerCliDeps {
   readonly workspaces?: DiffWorkspaceSurface;
   /** Event bus the `--verbose` progress stream subscribes to (SG-5). Default: the live bus. */
   readonly events?: EventBusSurface;
+  /**
+   * Human-approval prompt (SG-10). When provided OR when IKBI_REQUIRE_APPROVAL is set, a
+   * verified build pauses for this decision before promoting. Default: a stdin y/N prompt.
+   */
+  readonly approvalPrompt?: (req: { taskId: string; workspaceId: string; goal: string }) => Promise<boolean>;
 }
 
 /** Build the `build` command handler. Defaults wire the live singletons + REAL gate-wall. */
@@ -265,7 +294,9 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
   // `ikbi batch` uses, so build + batch are governed identically). Construction is
   // side-effect-free; roleClaim only throws when CALLED with no worker token (the handler
   // refuses before that). SG-1: stream the governed check output live to the operator's stdout.
-  const orchestrator = deps.orchestrator ?? createProductionWorker({ workerToken, gateWall, onExecOutput: (chunk) => out(chunk) });
+  // SG-10: wire the human-approval gate when explicitly provided or when IKBI_REQUIRE_APPROVAL is set.
+  const requestApproval = deps.approvalPrompt ?? (approvalRequiredFromEnv() ? stdinApprovalPrompt : undefined);
+  const orchestrator = deps.orchestrator ?? createProductionWorker({ workerToken, gateWall, onExecOutput: (chunk) => out(chunk), ...(requestApproval !== undefined ? { requestApproval } : {}) });
 
   async function build(argv: readonly string[]): Promise<void> {
     const { repo, verbose, rest } = parseBuildArgs(argv);

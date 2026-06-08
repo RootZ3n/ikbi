@@ -32,6 +32,12 @@ export const workerVerification = defineEvent<{ taskId: string; verdict: string;
   "worker.verification",
 );
 
+/** A verified build is PAUSED awaiting operator approval before promote (SG-10). (Attribution: parent.) */
+export const workerApprovalRequested = defineEvent<{ taskId: string; workspaceId: string }>("worker.approval.requested");
+
+/** The operator's approval decision resolved (SG-10). (Attribution: parent.) */
+export const workerApprovalResolved = defineEvent<{ taskId: string; workspaceId: string; approved: boolean }>("worker.approval.resolved");
+
 /** A run completed (success / partial). (Attribution: parent.) */
 export const workerCompleted = defineEvent<{
   taskId: string;
