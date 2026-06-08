@@ -21,7 +21,7 @@ assertContractCompatible("identity", "1.1.0");
 assertContractCompatible("events", "1.0.0");
 
 export { createCognitionLayer, cognitionLayer, parseDecision, type CognitionLayerDeps, type DriftReader, type LabMemoryReader, type NeutralizeFn, type ToUntrustedFn } from "./cognition.js";
-export { createCognitionRouter, cognitionRouter, parseRouterArgs, suggestedCommand, type CognitionRouterDeps } from "./cli.js";
+export { createCognitionRouter, cognitionRouter, dispatchableArgv, parseRouterArgs, suggestedCommand, type CognitionRouterDeps } from "./cli.js";
 export {
   CONTRACT_VERSION,
   CognitionError,

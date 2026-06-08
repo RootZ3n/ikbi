@@ -5,7 +5,7 @@ import { pino } from "pino";
 
 import { IdentityResolver } from "../../core/identity/resolver.js";
 import { AgentRegistry, hashToken } from "../../core/identity/registry.js";
-import { createCognitionRouter, parseRouterArgs, suggestedCommand } from "./cli.js";
+import { createCognitionRouter, dispatchableArgv, parseRouterArgs, suggestedCommand } from "./cli.js";
 import type { CognitionDecision, CognitionInput, CognitionLayer } from "./contract.js";
 
 const silent = () => pino({ level: "silent" });
@@ -63,6 +63,62 @@ test("the default router deliberates and REPORTS the decision + suggested comman
     assert.match(cap.out, /rationale: needs decomposition/);
     assert.match(cap.out, /memory used: 2 entries/);
     assert.match(cap.out, /next: ikbi batch "add a feature and tests"/, "recommends the command — does not run it");
+  });
+});
+
+// ── auto-dispatch (--run, the default) ───────────────────────────────────────
+
+test("dispatchableArgv maps the recommendation to a concrete [command, goal]", () => {
+  assert.deepEqual(dispatchableArgv(decision({ recommendedNext: { module: "worker-model", action: "build", payload: {} } }), "fix it"), ["build", "fix it"]);
+  assert.deepEqual(dispatchableArgv(decision({ recommendedNext: { module: "batch-planner", action: "planAndRun", payload: {} } }), "g"), ["batch", "g"]);
+  assert.deepEqual(dispatchableArgv(decision({ recommendedNext: { module: "agent-router", action: "classify", payload: {} } }), "g"), ["classify", "g"]);
+  assert.deepEqual(dispatchableArgv(decision({ recommendedNext: { module: "agent-router", action: "ask", payload: {} } }), "g"), ["ask", "g"]);
+  assert.equal(dispatchableArgv(decision({ recommendedNext: { module: "drift-prevention", action: "check", payload: {} } }), "g"), undefined, "no concrete command");
+  assert.equal(dispatchableArgv(decision({}), "g"), undefined, "no recommendation ⇒ nothing to dispatch");
+});
+
+test("with a dispatcher wired, the router AUTO-RUNS the recommended command (the default)", () => {
+  const fc = fakeCognition(decision({ decision: "plan", recommendedNext: { module: "worker-model", action: "build", payload: {} } }));
+  const cap = capture();
+  const dispatched: string[][] = [];
+  const router = createCognitionRouter({ cognition: fc.cognition, resolveIdentity: operatorResolver(), operatorToken: OPERATOR_TOKEN, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit, now: () => 1, dispatch: async (argv) => void dispatched.push([...argv]) });
+  return router.route(["fix", "the", "auth", "bug"]).then(() => {
+    assert.deepEqual(dispatched, [["build", "fix the auth bug"]], "auto-routed to `ikbi build <goal>`");
+    assert.match(cap.out, /running: ikbi build "fix the auth bug"/);
+    assert.equal(cap.exit, undefined);
+  });
+});
+
+test("--no-run reports but does NOT auto-run", () => {
+  const fc = fakeCognition(decision({ decision: "plan", recommendedNext: { module: "worker-model", action: "build", payload: {} } }));
+  const cap = capture();
+  const dispatched: string[][] = [];
+  const router = createCognitionRouter({ cognition: fc.cognition, resolveIdentity: operatorResolver(), operatorToken: OPERATOR_TOKEN, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit, now: () => 1, dispatch: async (argv) => void dispatched.push([...argv]) });
+  return router.route(["fix", "the", "bug", "--no-run"]).then(() => {
+    assert.equal(dispatched.length, 0, "no dispatch under --no-run");
+    assert.match(cap.out, /next: ikbi build "fix the bug"/, "still reports the suggestion");
+    assert.doesNotMatch(cap.out, /running:/);
+  });
+});
+
+test("an 'ask' decision is never auto-run (the goal is underspecified)", () => {
+  const fc = fakeCognition(decision({ decision: "ask", missingInfo: ["which repo?"], recommendedNext: { module: "worker-model", action: "build", payload: {} } }));
+  const cap = capture();
+  const dispatched: string[][] = [];
+  const router = createCognitionRouter({ cognition: fc.cognition, resolveIdentity: operatorResolver(), operatorToken: OPERATOR_TOKEN, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit, now: () => 1, dispatch: async (argv) => void dispatched.push([...argv]) });
+  return router.route(["do", "the", "thing"]).then(() => {
+    assert.equal(dispatched.length, 0, "ask ⇒ clarify, never auto-run");
+  });
+});
+
+test("a failing auto-run is reported cleanly and sets a non-zero exit", () => {
+  const fc = fakeCognition(decision({ decision: "plan", recommendedNext: { module: "worker-model", action: "build", payload: {} } }));
+  const cap = capture();
+  const router = createCognitionRouter({ cognition: fc.cognition, resolveIdentity: operatorResolver(), operatorToken: OPERATOR_TOKEN, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit, now: () => 1, dispatch: async () => { throw new Error("build blew up"); } });
+  return router.route(["fix", "it"]).then(() => {
+    assert.equal(cap.exit, 1);
+    assert.match(cap.err, /auto-run of "ikbi build" failed: build blew up/);
+    assert.match(cap.err, /--no-run/);
   });
 });
 

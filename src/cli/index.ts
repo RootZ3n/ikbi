@@ -25,10 +25,30 @@ import { runDoctor } from "./doctor.js";
 // The DEFAULT router: input that is not a known command is treated as a GOAL and
 // deliberated by cognition-layer (which decides the path + recommends the next
 // command). Imported AFTER the barrel so the egress guard is already registered.
-import { cognitionRouter } from "../modules/cognition-layer/index.js";
+import { createCognitionRouter } from "../modules/cognition-layer/index.js";
 
 /** Built-in command names — reserved, cannot be shadowed by a module command. */
 const BUILTINS = new Set(["version", "models", "providers", "doctor", "help"]);
+
+/**
+ * Auto-run dispatcher for the cognition router: act on a recommendation by re-entering
+ * the CLI's own command lookup (`commands.get`). Only KNOWN module commands are ever
+ * dispatched — the recommendation maps to build/batch/classify/ask — so this can never
+ * loop back into the cognition fallback. This is the seam that turns "recommend" into
+ * "do it" while keeping the cognition LAYER itself non-executing.
+ */
+async function dispatchCommand(argv: readonly string[]): Promise<void> {
+  const name = argv[0];
+  const sub = name !== undefined ? commands.get(name) : undefined;
+  if (sub === undefined) {
+    process.stderr.write(`ikbi: cannot auto-run unrecognized command "${name ?? ""}"\n`);
+    return;
+  }
+  await sub.run(argv.slice(1));
+}
+
+/** The default router, with auto-dispatch wired (cli owns the command registry). */
+const cognitionRouter = createCognitionRouter({ dispatch: dispatchCommand });
 
 function printUsage(): void {
   const moduleCmds = commands.all().filter((c) => !BUILTINS.has(c.name));
@@ -134,8 +154,9 @@ async function run(argv: readonly string[]): Promise<void> {
         return;
       }
       // DEFAULT ROUTER: not a known command ⇒ treat the WHOLE input as a goal and let
-      // cognition-layer deliberate which path is appropriate (it reports + recommends
-      // the next command; it does not auto-execute).
+      // cognition-layer deliberate which path is appropriate. It reports the decision
+      // and then AUTO-DISPATCHES the recommended command (via dispatchCommand) unless
+      // --no-run was passed. The deliberation IS the routing.
       await cognitionRouter.route(argv);
     }
   }
