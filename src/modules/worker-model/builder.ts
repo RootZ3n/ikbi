@@ -381,7 +381,7 @@ function buildPriorResultsBlock(priorResults: readonly RoleResult[], scout: Scou
 }
 
 /** scout_detail tool body: return the FULL detail of one finding (by 1-based index or path). */
-function scoutDetail(findings: readonly ScoutFinding[], args: Record<string, unknown>): string {
+export function scoutDetail(findings: readonly ScoutFinding[], args: Record<string, unknown>): string {
   if (findings.length === 0) return "No scout findings are available for this task.";
   let found: ScoutFinding | undefined;
   if (typeof args.index === "number" && Number.isFinite(args.index)) {

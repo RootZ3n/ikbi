@@ -158,14 +158,55 @@ test("chat advertises the full builder tool suite to the model", async () => {
   await s.send("hello");
   const firstReq = requests[0] as { tools: Array<{ name: string }> };
   const names = firstReq.tools.map((t) => t.name);
-  // The expanded suite — same tools the builder has — must all be offered to the chat model.
-  for (const t of [
+  // FULL PARITY — all SIXTEEN builder tools must be offered to the chat model.
+  const ALL_SIXTEEN = [
     "read_file", "write_file", "list_dir", "search_files", "patch", "terminal",
     "git_status", "git_diff", "git_log", "web_search", "web_extract", "delegate_task",
-    "vision_analyze",
-  ]) {
+    "vision_analyze", "scout_detail", "run_checks", "done",
+  ];
+  for (const t of ALL_SIXTEEN) {
     assert.ok(names.includes(t), `chat advertises ${t}`);
   }
+  assert.equal(new Set(names).size, ALL_SIXTEEN.length, "chat advertises exactly the 16 builder tools");
+});
+
+test("send: scout_detail reports no findings (chat runs no scout phase)", async () => {
+  const { invoke } = scripted([
+    toolResp([call("scout_detail", { index: 1 })]),
+    stop("No scouting was run for this chat."),
+  ]);
+  const s = new ChatSession("s-scout", { invoke, worktree: tmp() });
+  const { tools } = await s.send("show finding 1");
+  assert.equal(tools[0]?.name, "scout_detail");
+  assert.equal(tools[0]?.ok, true);
+});
+
+test("send: done records a non-terminating session checkpoint", async () => {
+  const { invoke, requests } = scripted([
+    toolResp([call("done", { successCondition: "answered the question", filesReadBack: ["a.ts"], selfCheck: "reviewed", satisfied: true })]),
+    stop("Checkpoint noted; standing by."),
+  ]);
+  const s = new ChatSession("s-done", { invoke, worktree: tmp() });
+  const { response, tools } = await s.send("wrap up");
+  assert.equal(tools[0]?.name, "done");
+  assert.equal(tools[0]?.summary, "session checkpoint");
+  // The checkpoint result re-entered the loop (UNTRUSTED) and the model answered AFTER it —
+  // proving `done` did NOT terminate the chat turn.
+  assert.match(response, /standing by/);
+  const afterDone = requests[1] as { messages: Array<{ role: string; content: string; untrusted?: boolean }> };
+  assert.ok(afterDone.messages.some((m) => m.role === "tool" && /Session checkpoint recorded/.test(m.content)), "checkpoint fed back as a tool result");
+});
+
+test("send: run_checks fails closed when no parent identity is wired", async () => {
+  // The test session resolves no operator/worker token ⇒ parentCtx is undefined ⇒ checks fail closed.
+  const { invoke } = scripted([
+    toolResp([call("run_checks", {})]),
+    stop("Checks could not run without authorization."),
+  ]);
+  const s = new ChatSession("s-checks", { invoke, worktree: tmp() });
+  const { tools } = await s.send("run the checks");
+  assert.equal(tools[0]?.name, "run_checks");
+  assert.equal(tools[0]?.ok, false, "no identity ⇒ checks are not ALL PASS (fail closed)");
 });
 
 test("send: operator-pasted images attach to the user turn as multimodal parts", async () => {
