@@ -32,8 +32,25 @@
 import type { AgentIdentity, ModelMessage, ModelRequest, ModelResponse } from "../../core/provider/contract.js";
 import type { ModelCapabilities } from "../../core/provider/capabilities.js";
 
-/** Compress once the estimate crosses this fraction of the context window. */
+/**
+ * Default compression threshold (fraction of the window) for LARGE-context models. Small
+ * windows compress EARLIER — see `compressThreshold`. Kept as the ≥8192 / else value.
+ */
 export const COMPRESS_THRESHOLD = 0.7;
+
+/**
+ * The fraction-of-window at which to compress, scaled to the model's context size. A
+ * small-context model must compact EARLIER: at 0.7 of a 4k window there is too little
+ * headroom left for the next turn + the summary, so a tighter budget leaves room to work.
+ *   context_window ≤ 4096  → 0.5
+ *   context_window ≤ 8192  → 0.6
+ *   otherwise              → 0.7  (COMPRESS_THRESHOLD)
+ */
+export function compressThreshold(contextWindow: number): number {
+  if (contextWindow <= 4096) return 0.5;
+  if (contextWindow <= 8192) return 0.6;
+  return COMPRESS_THRESHOLD;
+}
 /** Rough chars-per-token for the estimate (provider-agnostic heuristic). */
 const CHARS_PER_TOKEN = 4;
 /** Default count of leading messages treated as the un-compressible header. */
@@ -125,7 +142,8 @@ export async function maybeCompress(
   deps: CompressDeps,
 ): Promise<CompressResult> {
   const before = estimateTokens(messages);
-  const budget = Math.floor(caps.context_window * COMPRESS_THRESHOLD);
+  // Threshold scales to the window: small-context models compress earlier (more headroom).
+  const budget = Math.floor(caps.context_window * compressThreshold(caps.context_window));
   if (before < budget) return { compressed: false };
 
   const headerLen = deps.headerLen ?? DEFAULT_HEADER_LEN;

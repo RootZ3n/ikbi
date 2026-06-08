@@ -18,7 +18,7 @@ import type { WorkspaceHandle } from "../../core/workspace/contract.js";
 import type { ExecRequest, ExecResult } from "../governed-exec/index.js";
 import { createBuilder } from "./builder.js";
 import type { RoleContext, RoleEngine } from "./contract.js";
-import { estimateTokens, maybeCompress } from "./context-manager.js";
+import { compressThreshold, COMPRESS_THRESHOLD, estimateTokens, maybeCompress } from "./context-manager.js";
 
 const IDENTITY: AgentIdentity = { agentId: "w", functionalRole: "builder", trustTier: "verified", spawnedFrom: "p" };
 const TINY: ModelCapabilities = { context_window: 100, supports_tools: true, reasoning_level: "low", speed_class: "fast" };
@@ -56,6 +56,37 @@ test("estimateTokens grows roughly with content length", () => {
   const big = estimateTokens([msg("user", "x".repeat(800))]);
   assert.ok(big > small);
   assert.ok(big >= 200, "≈ 800/4 tokens");
+});
+
+// ── compressThreshold (dynamic, scaled to context size) ─────────────────────
+
+test("compressThreshold is lower for small-context models", () => {
+  assert.equal(compressThreshold(2048), 0.5, "tiny window ⇒ compress at 50%");
+  assert.equal(compressThreshold(4096), 0.5, "≤4096 ⇒ 0.5");
+  assert.equal(compressThreshold(8192), 0.6, "≤8192 ⇒ 0.6");
+  assert.equal(compressThreshold(32_768), COMPRESS_THRESHOLD, "large window ⇒ default 0.7");
+  assert.equal(compressThreshold(200_000), 0.7);
+  // Monotonic: a smaller window never has a HIGHER threshold than a larger one.
+  assert.ok(compressThreshold(4096) <= compressThreshold(8192));
+  assert.ok(compressThreshold(8192) <= compressThreshold(32_768));
+});
+
+test("a small-context model compresses at a fill that a large-context model would not", async () => {
+  // ~10 middle msgs of ~1000 chars ≈ 2540 estimated tokens (+ header/tail) ≈ 2590 total.
+  // Against a 4096 window: budget = 0.5*4096 = 2048 ⇒ OVER ⇒ compresses.
+  // Against an 8192 window: budget = 0.6*8192 = 4915 ⇒ UNDER ⇒ no-op.
+  const header = [msg("system", "S"), msg("user", "G"), msg("user", "C"), msg("user", "P")];
+  const middle = Array.from({ length: 10 }, (_, i) => msg("assistant", `m${i} ${"q".repeat(1000)}`));
+  const tail = Array.from({ length: 6 }, (_, i) => msg("user", `t${i}`));
+  const build = () => [...header, ...middle, ...tail];
+
+  const SMALL: ModelCapabilities = { context_window: 4096, supports_tools: true, reasoning_level: "low", speed_class: "fast" };
+  const MID: ModelCapabilities = { context_window: 8192, supports_tools: true, reasoning_level: "low", speed_class: "fast" };
+
+  const small = await maybeCompress(build(), SMALL, deps(summarizer().invoke));
+  const mid = await maybeCompress(build(), MID, deps(summarizer().invoke));
+  assert.equal(small.compressed, true, "small-context model compacts at this fill (0.5 threshold)");
+  assert.equal(mid.compressed, false, "larger-context model does not yet (0.6 threshold)");
 });
 
 // ── maybeCompress ─────────────────────────────────────────────────────────────
