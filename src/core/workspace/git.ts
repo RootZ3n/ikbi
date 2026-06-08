@@ -168,3 +168,28 @@ export async function commitTree(repo: string, tree: string, parents: readonly s
 export async function updateRefCas(repo: string, ref: string, newSha: string, oldSha: string): Promise<void> {
   await runGit(repo, ["update-ref", ref, newSha, oldSha]);
 }
+
+/**
+ * The path of the worktree currently checked out on `branch` (the main working tree
+ * counts), or undefined if no worktree has that branch checked out (e.g. detached HEAD).
+ * Used by promote to detect a working tree that the ref CAS would desync.
+ */
+export async function worktreeForBranch(repo: string, branch: string): Promise<string | undefined> {
+  const match = (await listWorktrees(repo)).find((w) => w.branch === branch);
+  return match?.path;
+}
+
+/** True iff the worktree at `worktreePath` has a clean working tree + index (porcelain empty). */
+export async function isWorktreeClean(worktreePath: string): Promise<boolean> {
+  const r = await runGit(worktreePath, ["status", "--porcelain"]);
+  return r.stdout.trim().length === 0;
+}
+
+/**
+ * Hard-sync a worktree's index + working tree to `ref`. Called by promote AFTER the ref CAS,
+ * only when that worktree was verified clean beforehand — so it brings the tree FORWARD to the
+ * new HEAD (no user work to clobber) and `git status` is clean again (no phantom revert).
+ */
+export async function syncWorktreeToRef(worktreePath: string, ref: string): Promise<void> {
+  await runGit(worktreePath, ["reset", "--hard", "--quiet", ref]);
+}

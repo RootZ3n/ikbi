@@ -55,12 +55,15 @@ import {
   diffRange,
   isAncestor,
   isGitRepo,
+  isWorktreeClean,
   listBranches,
   listWorktrees,
   pruneWorktrees,
   removeWorktree,
   revParse,
+  syncWorktreeToRef,
   updateRefCas,
+  worktreeForBranch,
 } from "./git.js";
 
 export const WorkspaceEvents = {
@@ -243,6 +246,22 @@ export class WorkspaceManager {
           return { promoted: false, workspaceId: handle.id, targetBranch: handle.baseBranch, beforeRef: targetHead, strategy: "noop", reason: "no changes to promote" } satisfies PromoteResult;
         }
 
+        // The target branch is typically checked out in the repo's MAIN working tree. Moving its
+        // ref (the CAS below) would leave HEAD ahead of that tree — a phantom revert in
+        // `git status`. Resolve that worktree NOW: if it has uncommitted work, REFUSE (never
+        // clobber it, never leave HEAD/tree silently disagreeing); if clean, we sync it after the CAS.
+        const checkedOutPath = await worktreeForBranch(repo, handle.baseBranch);
+        if (checkedOutPath !== undefined && !(await isWorktreeClean(checkedOutPath))) {
+          return {
+            promoted: false,
+            workspaceId: handle.id,
+            targetBranch: handle.baseBranch,
+            beforeRef: targetHead,
+            strategy: "noop",
+            reason: `target branch "${handle.baseBranch}" is checked out at ${checkedOutPath} with uncommitted changes — refusing to promote (commit or stash there first, then retry)`,
+          } satisfies PromoteResult;
+        }
+
         let afterRef: string;
         let mergeCommit: string | undefined;
         let strategy: "fast_forward" | "merge";
@@ -270,6 +289,13 @@ export class WorkspaceManager {
         this.live.set(handle.id, promoting);
 
         await updateRefCas(repo, ref, afterRef, targetHead); // the single atomic target mutation
+
+        // The branch ref moved. If it is checked out (and clean — we refused otherwise above),
+        // bring that working tree FORWARD to the new HEAD so HEAD and the tree agree and
+        // `git status` is clean (no phantom revert). Never silently leaves them disagreeing.
+        if (checkedOutPath !== undefined) {
+          await syncWorktreeToRef(checkedOutPath, afterRef);
+        }
 
         // Landed: record it durably FIRST (the registry is the landing proof), then receipt/event.
         const promoted: WorkspaceRecord = { ...promoting, state: "promoted", promotedTo: afterRef, updatedAt: this.now() };
