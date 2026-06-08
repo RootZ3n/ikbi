@@ -20,6 +20,8 @@ assertContractCompatible("identity", "1.1.0");
 
 // Side-effect: register the POST /chat route on import.
 import "./routes.js";
+// Side-effect: register the `ikbi repl` interactive-session command (HB-5).
+import "./cli.js";
 
 export { CONTRACT_VERSION, type ChatRequest, type ChatResponse, type ChatToolActivity } from "./contract.js";
 export { ChatSession, sessionStore } from "./session.js";
