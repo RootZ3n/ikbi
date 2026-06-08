@@ -13,6 +13,12 @@
 /**
  * Semantic version of the request/response contract.
  *
+ * 1.2.0 — additive: multimodal (vision) message content. `ModelMessage` gains an
+ *         OPTIONAL `parts?: ContentPart[]` (text + image_url parts). `content`
+ *         (string) is UNCHANGED and remains the canonical text — `parts`, when
+ *         present, is what the provider serializes to the wire (OpenAI multimodal
+ *         format), with `content` left as the flattened-text fallback. New OPTIONAL
+ *         field → MINOR bump; modules that never set `parts` are unaffected.
  * 1.1.0 — additive: provider fetch-guard seam (registerFetchGuard/resolveFetchGuard,
  *         fail-closed). The network-egress floor (Step F) registers a guarded fetch;
  *         absent a guard, construction fails closed rather than using raw
@@ -20,7 +26,7 @@
  *         provider@1.0.x stay compatible.
  * 1.0.0 — frozen-core provider contract.
  */
-export const CONTRACT_VERSION = "1.1.0";
+export const CONTRACT_VERSION = "1.2.0";
 
 // ---------------------------------------------------------------------------
 // Request
@@ -29,10 +35,30 @@ export const CONTRACT_VERSION = "1.1.0";
 /** Role of a message in a model conversation. */
 export type MessageRole = "system" | "user" | "assistant" | "tool";
 
+/**
+ * A single piece of multimodal message content (the OpenAI wire shape). A `text`
+ * part carries prose; an `image_url` part carries an image as either a remote
+ * https URL or a `data:<mime>;base64,<...>` data-URL. Used in `ModelMessage.parts`
+ * to send a vision request; never required for text-only calls.
+ */
+export type ContentPart =
+  | { readonly type: "text"; readonly text: string }
+  | { readonly type: "image_url"; readonly image_url: { readonly url: string } };
+
 /** A single conversation message. */
 export interface ModelMessage {
   readonly role: MessageRole;
   readonly content: string;
+  /**
+   * ADDITIVE (1.2.0, backward-compatible): MULTIMODAL content. When present and
+   * non-empty, the provider serializes THIS array to the wire (OpenAI multimodal
+   * `content: [...]` format) INSTEAD of the `content` string; `content` then serves
+   * as the flattened-text fallback (for logging, neutralization, and providers that
+   * cannot accept images). Text-only callers leave it unset and nothing changes.
+   * The injection chokepoint still neutralizes the `content` string — images carried
+   * here are not free-text instruction channels.
+   */
+  readonly parts?: readonly ContentPart[];
   /**
    * For `role: "assistant"`, tool calls the model previously emitted. Carrying
    * them lets the full tool loop round-trip: assistant(tool_calls) -> tool

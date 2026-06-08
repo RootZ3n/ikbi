@@ -23,10 +23,10 @@ test("the registry lists all 8 frozen contracts with versions", () => {
   );
   // Frozen-core contracts at their additive-bumped versions:
   //  - identity 1.1.0 — the `OperationContext.dryRun` seam (Step S).
-  //  - provider 1.1.0 — the fetch-guard seam (Step F).
-  // Both are additive-MINOR per the codified rule; the rest remain 1.0.0.
+  //  - provider 1.2.0 — the fetch-guard seam (1.1.0) + multimodal `parts` (1.2.0).
+  // All additive-MINOR per the codified rule; the rest remain 1.0.0.
   const expected: Record<string, string> = {
-    provider: "1.1.0",
+    provider: "1.2.0",
     injection: "1.0.0",
     identity: "1.1.0",
     substrate: "1.0.0",

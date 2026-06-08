@@ -13,7 +13,8 @@
 
 import { assertContractCompatible } from "../../core/contracts/index.js";
 
-assertContractCompatible("provider", "1.1.0");
+// provider@1.2.0: chat exposes vision_analyze, which sets ModelMessage.parts (multimodal).
+assertContractCompatible("provider", "1.2.0");
 assertContractCompatible("injection", "1.0.0");
 assertContractCompatible("identity", "1.1.0");
 

@@ -18,7 +18,8 @@
 import { assertContractCompatible } from "../../core/contracts/index.js";
 
 // Pin the eight frozen contracts the worker-model orchestrator builds against.
-assertContractCompatible("provider", "1.1.0");
+// provider@1.2.0: the builder's vision_analyze tool sets ModelMessage.parts (multimodal).
+assertContractCompatible("provider", "1.2.0");
 assertContractCompatible("injection", "1.0.0");
 assertContractCompatible("identity", "1.1.0");
 assertContractCompatible("trust", "1.0.0");
