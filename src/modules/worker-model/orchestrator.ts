@@ -57,11 +57,13 @@ import {
   workerCompetitiveCompleted,
   workerCompetitiveJudged,
   workerCompetitiveStarted,
+  workerBuilderActivity,
   workerCompleted,
   workerFailed,
   workerRoleCompleted,
   workerRoleDispatched,
   workerStarted,
+  workerVerification,
 } from "./events.js";
 import { CONTRACT_VERSION, toOutcomeStatus, WorkerError, WORKER_ROLES } from "./contract.js";
 import type {
@@ -460,6 +462,27 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         );
 
         await recordRole(task, workspace, spawned, result);
+
+        // SG-5 PROGRESS: structured per-role detail beyond start/end — builder tool activity
+        // and the verifier's verdict — so `--verbose` can show what each phase actually did.
+        if (role === "builder") {
+          const bd = (result.detail ?? {}) as Record<string, unknown>;
+          events.publish(
+            workerBuilderActivity.create(
+              { taskId: task.taskId, toolRounds: typeof bd.toolRounds === "number" ? bd.toolRounds : 0, filesWritten: Array.isArray(bd.filesWritten) ? bd.filesWritten.length : 0 },
+              { source: EVENT_SOURCE, attribution: { identity: spawned.identity, operation: "worker.role.builder", runId: task.taskId } },
+            ),
+          );
+        } else if (role === "verifier") {
+          const v = readVerifier(result);
+          const verdict = (result.detail as Record<string, unknown> | undefined)?.verdict;
+          events.publish(
+            workerVerification.create(
+              { taskId: task.taskId, verdict: typeof verdict === "string" ? verdict : result.outcome === "success" ? "pass" : "fail", typecheckPassed: v.typecheckPass, testsPassed: v.testsPass },
+              { source: EVENT_SOURCE, attribution: { identity: spawned.identity, operation: "worker.role.verifier", runId: task.taskId } },
+            ),
+          );
+        }
 
         if (result.outcome !== "success") {
           overall = result.outcome;

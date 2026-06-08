@@ -28,6 +28,8 @@ import { beginOperation, resolveIdentity as coreResolveIdentity } from "../../co
 import type { IdentityClaim, OperationContext, ValidatedIdentity } from "../../core/identity/index.js";
 import { workspaces as coreWorkspaces } from "../../core/workspace/index.js";
 import type { WorkspaceHandle, WorkspaceRecord } from "../../core/workspace/contract.js";
+import { events as coreEvents } from "../../core/events/index.js";
+import type { EventBusSurface } from "../../core/events/index.js";
 import { gateWall as coreGateWall, type GateWall } from "../gate-wall/index.js";
 import type { ExecRequest, ExecResult } from "../governed-exec/index.js";
 import { createOrchestrator } from "./orchestrator.js";
@@ -166,10 +168,11 @@ export function createProductionWorker(
   return createOrchestrator({ roleClaim: productionRoleClaim(opts.workerToken), gateWall: opts.gateWall ?? coreGateWall, governedExec, workspaces: coreWorkspaces, enforceProjectRoot: true, ...(opts.onExecOutput !== undefined ? { onExecOutput: opts.onExecOutput } : {}) });
 }
 
-/** Parse a `--repo <path>` / `--repo=<path>` flag out of argv; the rest is the goal prose. */
-export function parseBuildArgs(argv: readonly string[]): { repo?: string; rest: string[] } {
+/** Parse `--repo <path>` / `--repo=<path>` and `--verbose`/`-v`; the rest is the goal prose. */
+export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbose?: boolean; rest: string[] } {
   const rest: string[] = [];
   let repo: string | undefined;
+  let verbose = false;
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i] as string;
     if (a === "--repo") {
@@ -177,11 +180,36 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; rest: 
       i += 1;
     } else if (a.startsWith("--repo=")) {
       repo = a.slice("--repo=".length);
+    } else if (a === "--verbose" || a === "-v") {
+      verbose = true;
     } else {
       rest.push(a);
     }
   }
-  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), rest };
+  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), ...(verbose ? { verbose } : {}), rest };
+}
+
+/** Render a worker `worker.*` progress event into a concise human line (for `--verbose`). PURE. */
+export function formatProgressEvent(e: { type: string; payload?: unknown }): string {
+  const p = (e.payload ?? {}) as Record<string, unknown>;
+  switch (e.type) {
+    case "worker.started":
+      return `  → run started (workspace ${String(p.workspaceId ?? "?")})\n`;
+    case "worker.role.dispatched":
+      return `  → ${String(p.role ?? "?")} …\n`;
+    case "worker.role.completed":
+      return `  ${p.outcome === "success" ? "✓" : "✗"} ${String(p.role ?? "?")}: ${String(p.outcome ?? "?")}\n`;
+    case "worker.builder.activity":
+      return `    builder: ${String(p.toolRounds ?? 0)} tool round(s), ${String(p.filesWritten ?? 0)} file(s) written\n`;
+    case "worker.verification":
+      return `    verify: ${String(p.verdict ?? "?")} (typecheck ${p.typecheckPassed ? "✓" : "✗"}, tests ${p.testsPassed ? "✓" : "✗"})\n`;
+    case "worker.completed":
+      return `  ✓ run complete (promoted=${String(p.promoted ?? false)})\n`;
+    case "worker.failed":
+      return `  ✗ run failed: ${String(p.reason ?? "unknown")}\n`;
+    default:
+      return ""; // other worker.* events (competitive) — not surfaced in the verbose line stream
+  }
 }
 
 /** A concise, non-leaky result summary for the operator. */
@@ -216,6 +244,8 @@ export interface WorkerCliDeps {
   readonly cwd?: () => string;
   /** Workspace surface for the post-build diff summary (SG-2). Default: the live manager. */
   readonly workspaces?: DiffWorkspaceSurface;
+  /** Event bus the `--verbose` progress stream subscribes to (SG-5). Default: the live bus. */
+  readonly events?: EventBusSurface;
 }
 
 /** Build the `build` command handler. Defaults wire the live singletons + REAL gate-wall. */
@@ -230,6 +260,7 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
   const now = deps.now ?? Date.now;
   const cwd = deps.cwd ?? (() => process.cwd());
   const summaryWorkspaces: DiffWorkspaceSurface = deps.workspaces ?? coreWorkspaces;
+  const eventBus: EventBusSurface = deps.events ?? coreEvents;
   // The live orchestrator via the SHARED production-worker construction (the same wiring
   // `ikbi batch` uses, so build + batch are governed identically). Construction is
   // side-effect-free; roleClaim only throws when CALLED with no worker token (the handler
@@ -237,7 +268,7 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
   const orchestrator = deps.orchestrator ?? createProductionWorker({ workerToken, gateWall, onExecOutput: (chunk) => out(chunk) });
 
   async function build(argv: readonly string[]): Promise<void> {
-    const { repo, rest } = parseBuildArgs(argv);
+    const { repo, verbose, rest } = parseBuildArgs(argv);
     const goal = rest.join(" ").trim();
     if (goal.length === 0) {
       err("ikbi: build needs a goal — usage: ikbi build <goal...> [--repo <path>]\n");
@@ -269,8 +300,12 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
     const ctx = beginOperation(who, { requestId: id });
     const task: WorkerTask = { taskId: id, targetRepo: repo ?? cwd(), goal };
 
+    // SG-5: with --verbose, stream the build's structured progress events (per-role start/end,
+    // builder tool activity, verification status) live as they fire.
+    const sub = verbose === true ? eventBus.subscribe({ typePrefix: "worker." }, (e) => out(formatProgressEvent(e))) : undefined;
     try {
       const result = await orchestrator.run(task, ctx);
+      if (sub !== undefined) await eventBus.flush(); // drain the progress lines before the summary
       // A gate denial / non-promote is a CLEAN outcome (printed), not an error.
       out(summarize(result));
       // SG-2: after the run, show a one-line diff summary of what changed (best-effort).
@@ -278,6 +313,8 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
     } catch (e) {
       err(`ikbi: build failed: ${errMsg(e)}\n`);
       setExit(1);
+    } finally {
+      sub?.unsubscribe();
     }
   }
 
@@ -302,7 +339,7 @@ const live = createWorkerCli();
 registerCommand({
   name: "build",
   summary: "Run a worker build pipeline toward a goal",
-  usage: "ikbi build <goal...> [--repo <path>]",
+  usage: "ikbi build <goal...> [--repo <path>] [--verbose]",
   run: (argv) => live.build(argv),
 });
 

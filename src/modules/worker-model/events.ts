@@ -22,6 +22,16 @@ export const workerRoleCompleted = defineEvent<{ taskId: string; role: WorkerRol
   "worker.role.completed",
 );
 
+/** BUILDER tool activity at the role boundary — round count + files written. (Attribution: role.) */
+export const workerBuilderActivity = defineEvent<{ taskId: string; toolRounds: number; filesWritten: number }>(
+  "worker.builder.activity",
+);
+
+/** VERIFICATION status — the verifier's verdict + which checks passed. (Attribution: role.) */
+export const workerVerification = defineEvent<{ taskId: string; verdict: string; typecheckPassed: boolean; testsPassed: boolean }>(
+  "worker.verification",
+);
+
 /** A run completed (success / partial). (Attribution: parent.) */
 export const workerCompleted = defineEvent<{
   taskId: string;
