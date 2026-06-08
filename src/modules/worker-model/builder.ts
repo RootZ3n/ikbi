@@ -47,6 +47,7 @@ import { gitDiffTool, gitLogTool, gitStatusTool, GIT_TOOL_NAMES, runGitTool } fr
 import { patchTool, runPatch } from "./builder-tools/patch.js";
 import { runSearchFiles, searchFilesTool } from "./builder-tools/search-files.js";
 import { runTerminal, terminalTool } from "./builder-tools/terminal.js";
+import { runWebExtract, runWebSearch, webExtractTool, webSearchTool, WEB_TOOL_NAMES } from "./builder-tools/web-tools.js";
 import { type CheckResult, mapExec, VERIFIER_CHECKS } from "./checks.js";
 import { workerModelConfig } from "./config.js";
 import { maybeCompress } from "./context-manager.js";
@@ -96,7 +97,8 @@ const BUILDER_SYSTEM =
   "A `done` whose read-back omits a file you changed is REJECTED.\n\n" +
   "Tools: read_file, write_file, list_dir, search_files (ripgrep over the worktree), patch (surgical " +
   "find-and-replace), terminal (governed shell — allowlisted binaries only), git_status/git_diff/git_log " +
-  "(read-only inspection of your own changes) — all confined to the worktree — plus run_checks and done.\n" +
+  "(read-only inspection of your own changes), web_search/web_extract (research docs & Stack Overflow — " +
+  "through the egress guard) — all confined to the worktree — plus run_checks and done.\n" +
   "Prefer `patch` for small, targeted edits (it preserves the rest of the file); use write_file only when " +
   "creating a file or rewriting it wholesale. Use search_files to LOCATE code before changing it.\n" +
   "The SCOUT BRIEF (in the prior-results) shows the repo structure and finding TITLES only — call `scout_detail` " +
@@ -147,6 +149,9 @@ const TOOLS: readonly ModelTool[] = [
   gitStatusTool,
   gitDiffTool,
   gitLogTool,
+  // Web research (through the egress SSRF guard; fail-closed unless the host is allowlisted).
+  webSearchTool,
+  webExtractTool,
   {
     // PROGRESSIVE DISCLOSURE: the scout brief shows finding TITLES only; this pulls the
     // full detail of ONE finding on demand, so a cheap model isn't handed everything at once.
@@ -607,6 +612,26 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       return runGitTool({ governedExec, ...(deps.parentCtx !== undefined ? { parentCtx: deps.parentCtx } : {}) }, ctx.workspace.path, call.name, args);
     };
 
+    // --- web research (web_search / web_extract): async, routed through the EGRESS SSRF guard
+    // (resolveFetchGuard) — fail-closed unless the host is allowlisted. Output is arbitrary
+    // INTERNET content → UNTRUSTED, neutralized by the chokepoint like every other result. ---
+    const runWebCall = async (call: ToolCall): Promise<string> => {
+      let args: Record<string, unknown>;
+      try {
+        args = JSON.parse(call.arguments && call.arguments.length > 0 ? call.arguments : "{}") as Record<string, unknown>;
+      } catch {
+        rejectedToolCalls.push({ tool: call.name, error: "malformed tool arguments (not JSON)" });
+        return `ERROR: malformed arguments for ${call.name} (not valid JSON)`;
+      }
+      let guardedFetch;
+      try {
+        guardedFetch = (await import("../../core/provider/fetch-guard.js")).resolveFetchGuard();
+      } catch {
+        return "ERROR: web tools are unavailable (the egress guard is not loaded).";
+      }
+      return call.name === "web_search" ? runWebSearch({ guardedFetch }, args) : runWebExtract({ guardedFetch }, args);
+    };
+
     // --- THE CHOKEPOINT (#8): the ONLY path from a tool result to a message. Always
     // neutralizes (source mcp_result) and re-enters via toUntrustedMessage(untrusted). ---
     const appendToolResult = (raw: string, call: ToolCall): void => {
@@ -802,6 +827,11 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
           } else if (GIT_TOOL_NAMES.has(call.name)) {
             // Read-only governed git inspection — async; output neutralized like terminal.
             const raw = await runGitCall(call);
+            appendToolResult(raw, call);
+          } else if (WEB_TOOL_NAMES.has(call.name)) {
+            // Web research through the egress SSRF guard — async; output is UNTRUSTED internet
+            // content, neutralized by the chokepoint.
+            const raw = await runWebCall(call);
             appendToolResult(raw, call);
           } else {
             const raw = runTool(call); // pure: produces a result string (schema-gated inside)
