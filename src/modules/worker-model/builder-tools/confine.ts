@@ -51,6 +51,9 @@ export function confinePath(worktreeReal: string, arg: unknown): Confined {
   const resolved = resolve(worktreeReal, arg);
   if (!isUnder(worktreeReal, resolved)) return { ok: false, error: `path "${arg}" escapes the worktree` };
   // Symlink escape: the realpath of the deepest existing ancestor must stay inside.
+  // NOTE: Known TOCTOU window between realpath check and file operation.
+  // Exploitation requires attacker write access to worktree + microsecond timing.
+  // Node.js lacks atomic path resolution; this is an accepted risk.
   if (!isUnder(worktreeReal, realExistingAncestor(resolved))) {
     return { ok: false, error: `path "${arg}" escapes the worktree via symlink` };
   }
