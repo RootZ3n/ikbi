@@ -27,6 +27,7 @@ import { config } from "../../core/config.js";
 import { beginOperation, resolveIdentity as coreResolveIdentity } from "../../core/identity/index.js";
 import type { IdentityClaim, OperationContext, ValidatedIdentity } from "../../core/identity/index.js";
 import { workspaces as coreWorkspaces } from "../../core/workspace/index.js";
+import type { WorkspaceHandle, WorkspaceRecord } from "../../core/workspace/contract.js";
 import { gateWall as coreGateWall, type GateWall } from "../gate-wall/index.js";
 import type { ExecRequest, ExecResult } from "../governed-exec/index.js";
 import { createOrchestrator } from "./orchestrator.js";
@@ -34,6 +35,94 @@ import { WorkerError, type WorkerResult, type WorkerRole, type WorkerTask } from
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+// ── SG-2: diff surfacing ──────────────────────────────────────────────────────
+
+/** A one-line change summary parsed from a unified diff (file count + +/- line counts). */
+export interface DiffSummary {
+  readonly files: number;
+  readonly insertions: number;
+  readonly deletions: number;
+}
+
+/** Parse a unified `git diff` into a change summary (PURE — for the post-build one-liner). */
+export function summarizeDiff(diffText: string): DiffSummary {
+  let files = 0;
+  let insertions = 0;
+  let deletions = 0;
+  for (const line of diffText.split("\n")) {
+    if (line.startsWith("diff --git ")) files += 1;
+    else if (line.startsWith("+++") || line.startsWith("---")) continue; // file headers, not content
+    else if (line.startsWith("+")) insertions += 1;
+    else if (line.startsWith("-")) deletions += 1;
+  }
+  return { files, insertions, deletions };
+}
+
+/** Format a DiffSummary as a single human line. */
+export function formatDiffSummary(s: DiffSummary): string {
+  return `Δ ${s.files} file${s.files === 1 ? "" : "s"} changed, +${s.insertions}/-${s.deletions}`;
+}
+
+/** The minimal workspace surface the diff command + post-build summary read (get + diff). */
+export interface DiffWorkspaceSurface {
+  get(id: string): Promise<WorkspaceRecord | undefined>;
+  diff(handle: WorkspaceHandle): Promise<string>;
+}
+
+/** Injectable surfaces for the `ikbi diff` command (tests inject a fake workspace surface). */
+export interface DiffCliDeps {
+  readonly workspaces?: DiffWorkspaceSurface;
+  readonly stdout?: (s: string) => void;
+  readonly stderr?: (s: string) => void;
+  readonly setExit?: (code: number) => void;
+}
+
+/** Build the `ikbi diff <workspace-id>` handler — prints the workspace diff + a change summary. */
+export function createDiffCli(deps: DiffCliDeps = {}) {
+  const workspaces: DiffWorkspaceSurface = deps.workspaces ?? coreWorkspaces;
+  const out = deps.stdout ?? ((s: string) => void process.stdout.write(s));
+  const err = deps.stderr ?? ((s: string) => void process.stderr.write(s));
+  const setExit = deps.setExit ?? ((c: number) => void (process.exitCode = c));
+
+  async function diff(argv: readonly string[]): Promise<void> {
+    const id = argv[0];
+    if (id === undefined || id.length === 0) {
+      err("ikbi diff: a workspace id is required — usage: ikbi diff <workspace-id>\n");
+      setExit(1);
+      return;
+    }
+    let rec: WorkspaceRecord | undefined;
+    try {
+      rec = await workspaces.get(id);
+    } catch (e) {
+      err(`ikbi diff: could not read workspace "${id}": ${errMsg(e)}\n`);
+      setExit(1);
+      return;
+    }
+    if (rec === undefined) {
+      err(`ikbi diff: no workspace "${id}" found\n`);
+      setExit(1);
+      return;
+    }
+    let text: string;
+    try {
+      text = await workspaces.diff(rec);
+    } catch (e) {
+      err(`ikbi diff: could not compute the diff for "${id}": ${errMsg(e)}\n`);
+      setExit(1);
+      return;
+    }
+    if (text.trim().length === 0) {
+      out(`workspace ${id}: no changes\n`);
+      return;
+    }
+    out(text.endsWith("\n") ? text : `${text}\n`);
+    out(`\n${formatDiffSummary(summarizeDiff(text))}\n`);
+  }
+
+  return { diff };
 }
 
 /**
@@ -125,6 +214,8 @@ export interface WorkerCliDeps {
   readonly setExit?: (code: number) => void;
   readonly now?: () => number;
   readonly cwd?: () => string;
+  /** Workspace surface for the post-build diff summary (SG-2). Default: the live manager. */
+  readonly workspaces?: DiffWorkspaceSurface;
 }
 
 /** Build the `build` command handler. Defaults wire the live singletons + REAL gate-wall. */
@@ -138,6 +229,7 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
   const setExit = deps.setExit ?? ((c: number) => void (process.exitCode = c));
   const now = deps.now ?? Date.now;
   const cwd = deps.cwd ?? (() => process.cwd());
+  const summaryWorkspaces: DiffWorkspaceSurface = deps.workspaces ?? coreWorkspaces;
   // The live orchestrator via the SHARED production-worker construction (the same wiring
   // `ikbi batch` uses, so build + batch are governed identically). Construction is
   // side-effect-free; roleClaim only throws when CALLED with no worker token (the handler
@@ -181,9 +273,24 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       const result = await orchestrator.run(task, ctx);
       // A gate denial / non-promote is a CLEAN outcome (printed), not an error.
       out(summarize(result));
+      // SG-2: after the run, show a one-line diff summary of what changed (best-effort).
+      if (result.workspaceId !== undefined) await printDiffSummary(result.workspaceId);
     } catch (e) {
       err(`ikbi: build failed: ${errMsg(e)}\n`);
       setExit(1);
+    }
+  }
+
+  /** Print a one-line diff summary for the run's workspace. Best-effort — never fails the build. */
+  async function printDiffSummary(workspaceId: string): Promise<void> {
+    try {
+      const rec = await summaryWorkspaces.get(workspaceId);
+      if (rec === undefined) return;
+      const d = await summaryWorkspaces.diff(rec);
+      if (d.trim().length === 0) return;
+      out(`${formatDiffSummary(summarizeDiff(d))}\n`);
+    } catch {
+      /* a missing/cleaned workspace or git error is not a build failure — skip the summary */
     }
   }
 
@@ -197,4 +304,13 @@ registerCommand({
   summary: "Run a worker build pipeline toward a goal",
   usage: "ikbi build <goal...> [--repo <path>]",
   run: (argv) => live.build(argv),
+});
+
+// SG-2: `ikbi diff <workspace-id>` prints a workspace's git diff + a one-line change summary.
+const liveDiff = createDiffCli();
+registerCommand({
+  name: "diff",
+  summary: "Print a workspace's git diff (base..scratch) + a change summary",
+  usage: "ikbi diff <workspace-id>",
+  run: (argv) => liveDiff.diff(argv),
 });

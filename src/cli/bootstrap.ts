@@ -63,6 +63,7 @@ export const INFO_COMMANDS: ReadonlySet<string> = new Set([
   "models",
   "providers",
   "capabilities",
+  "diff", // read-only: prints a workspace's git diff; performs no trust operations
 ]);
 
 /**
