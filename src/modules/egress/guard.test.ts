@@ -4,8 +4,9 @@ import { test } from "node:test";
 import { ProviderError } from "../../core/provider/contract.js";
 import type { FetchLike } from "../../core/provider/providers/openai-compatible.js";
 import { events } from "../../core/events/index.js";
+import { moduleEnv } from "../../core/module-config.js";
 import { createGuardedFetch } from "./guard.js";
-import { loadEgressConfig, parseLocalEndpoint } from "./config.js";
+import { DEFAULT_EGRESS_HOSTS, loadEgressConfig, parseLocalEndpoint } from "./config.js";
 import { egressBlocked, type EgressBlockedPayload, type EgressLocalAllowedPayload } from "./events.js";
 
 const okResponse = {
@@ -338,4 +339,16 @@ test("ALLOW_LOCAL config REJECTS a hostname entry (it could resolve anywhere —
   // A reader supplying an IP-literal loads cleanly.
   const okReader = { list: (k: string) => (k === "ALLOW_LOCAL" ? ["127.0.0.1:11434"] : k === "ALLOWLIST" ? ["127.0.0.1"] : []) } as unknown as Parameters<typeof loadEgressConfig>[0];
   assert.deepEqual(loadEgressConfig(okReader).localEndpoints, ["127.0.0.1:11434"]);
+});
+
+test("ALLOWLIST default: unset ⇒ the default host set; set ⇒ the operator list replaces it", () => {
+  // UNSET (empty env): the default allowlist applies so the web tools work out of the box.
+  const def = loadEgressConfig(moduleEnv("egress", {}));
+  assert.deepEqual(def.allowlist, [...DEFAULT_EGRESS_HOSTS], "unset ⇒ default hosts");
+  assert.ok(def.allowlist.includes("html.duckduckgo.com"), "web-search host is default-allowed");
+  assert.ok(def.allowlist.includes("stackoverflow.com"), "doc host is default-allowed");
+
+  // SET: the operator's list REPLACES the default entirely (lowercased, exact match).
+  const restricted = loadEgressConfig(moduleEnv("egress", { IKBI_EGRESS_ALLOWLIST: "Internal.Corp" }));
+  assert.deepEqual(restricted.allowlist, ["internal.corp"], "set ⇒ operator list replaces default");
 });
