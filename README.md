@@ -35,7 +35,7 @@ trust and capability are granted, never assumed.
 - **Cheap-model harness** — the `worker-model` orchestrator that drives small,
   inexpensive models through the governed roles to land verified fixes cold → working
   for a fraction of a cent.
-- **716 tests** covering the core, the modules, and the CLI.
+- **908 tests** covering the core, the modules, and the CLI.
 
 ## Requirements
 
@@ -76,7 +76,9 @@ Stop it with `Ctrl-C` (SIGINT) or `kill -TERM <pid>` — it drains and exits 0.
 
 All configuration is read in exactly one place — [`src/core/config.ts`](src/core/config.ts).
 Nothing else touches `process.env`; modules read their own `IKBI_*` slice through the
-config seam. All knobs are `IKBI_*` prefixed. The most important ones:
+config seam. All knobs are `IKBI_*` prefixed. The CLI autoloads a project `.env` at
+startup (a real environment variable always wins over a `.env` entry), so you can keep
+your `IKBI_*` tokens in `.env`. The most important ones:
 
 | Env var                       | Default       | Meaning                                                              |
 | ----------------------------- | ------------- | ------------------------------------------------------------------- |
@@ -114,8 +116,8 @@ src/
              workspace primitive, events
   modules/   engine modules: worker-model orchestrator, deterministic-judge,
              governed-exec, egress guard, gate-wall, and more
-  server/    Fastify HTTP service (health + lifecycle)
-  cli/       operator CLI (incl. `doctor`)
+  server/    Fastify HTTP service (health/lifecycle, agent discovery, chat)
+  cli/       operator CLI (`doctor`, `capabilities`, `build`, `diff`, …)
   index.ts   entry point: start server, handle SIGTERM/SIGINT
 deploy/
   ikbi.service   sample systemd unit (documented, not installed)
@@ -123,10 +125,13 @@ deploy/
 
 ## Endpoints
 
-| Method | Path      | Purpose                                         |
-| ------ | --------- | ----------------------------------------------- |
-| `GET`  | `/health` | Liveness — `{ status: "ok", version }`          |
-| `GET`  | `/ready`  | Readiness — 200 when ready, 503 while starting  |
+| Method | Path            | Purpose                                                        |
+| ------ | --------------- | -------------------------------------------------------------- |
+| `GET`  | `/health`       | Liveness — `{ status: "ok", version }`                         |
+| `GET`  | `/ready`        | Readiness — 200 when ready, 503 while starting                 |
+| `GET`  | `/agent`        | Agent identity/discovery — id, role, model, tool count, status |
+| `GET`  | `/capabilities` | Tool inventory (16) + feature flags, for inter-agent discovery |
+| `POST` | `/chat`         | Persistent conversational session (bounded tool-calling loop)  |
 
 ## Running under systemd
 

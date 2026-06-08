@@ -4,6 +4,10 @@ Date: 2026-06-08
 
 Scope: `src/` was treated as source of truth. `dist/` is generated output and was not used for behavioral conclusions. I checked entrypoints, module barrels, CLI/HTTP registration, worker builder/chat tool loops, MCP transport, cognition/drift call paths, and import reachability.
 
+> **Note (post-audit):** several findings below have since been fixed. Most relevant to the
+> numbers in this summary: `/chat` now exposes **all 16** builder tools (parity 16/16) — see the
+> resolution note under finding #4. Findings are kept as the original snapshot for the record.
+
 ## Executive Summary
 
 The codebase is mostly wired through the `src/modules/index.ts` activation barrel, but "import-reachable" does not always mean "operationally invoked." The builder's 16-tool loop is fully declared and dispatched. The `/chat` loop is wired, but it intentionally or accidentally exposes only 13 of those tools: it does not have `scout_detail`, `run_checks`, or `done`, so it does not have "ALL the same tools as the builder." The context compressor is actually invoked in the builder loop before each model call.
@@ -114,6 +118,8 @@ Missing compared with builder:
 This is visible by comparing `src/modules/worker-model/builder.ts:127-200` with `src/modules/chat/session.ts:134-148`.
 
 Conclusion: `/chat` does not have all the same tools as the builder. It has 13 of 16. If parity is intended, chat is missing three tools. If conversational chat is intentionally not supposed to have builder-only terminator/check/scout tools, the comments saying "SAME builder tools" should be narrowed.
+
+> **STATUS (resolved):** `/chat` now exposes **all 16** builder tools — `scout_detail`, `run_checks`, and `done` were added (adapted to the chat surface), so builder/chat tool parity is **16/16** (`ikbi capabilities` reports `inSync: true`). The summary above reflects the original audit snapshot.
 
 ### 5. MCP stdio transport is real but not user-facing by default
 
