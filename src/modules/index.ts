@@ -36,6 +36,8 @@ import "./dependency-install/index.js";
 import "./lab-context-memory/index.js";
 import "./agent-router/index.js";
 import "./self-observation/index.js";
+// Chat — registers the POST /chat conversational endpoint (persistent sessions + tool loop).
+import "./chat/index.js";
 // Orchestration layer above worker-model (registers the `batch` command on import).
 import "./batch-planner/index.js";
 // Capability-recovery diagnostic (registers the `recover` operator command on import).
