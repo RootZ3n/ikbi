@@ -189,6 +189,55 @@ test("assistant tool calls and tool results round-trip onto the wire", async () 
   assert.equal(body.messages[2]?.role, "tool");
 });
 
+test("MULTIMODAL: a message with `parts` serializes the content array onto the wire", async () => {
+  const { fetchImpl, captured } = jsonFetch(200, {
+    choices: [{ message: { content: "a red square" }, finish_reason: "stop" }],
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+  });
+  const p = new OpenAICompatibleProvider({ id: "mimo", baseUrl: "https://x", apiKey: "k", fetchImpl });
+  await p.invoke(
+    invocation({
+      messages: [
+        {
+          role: "user",
+          content: "What is in this image?", // the flattened-text fallback
+          parts: [
+            { type: "text", text: "What is in this image?" },
+            { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+          ],
+        },
+      ],
+    }),
+  );
+  const body = JSON.parse(captured.init?.body ?? "{}") as { messages: Array<Record<string, unknown>> };
+  // `parts` present ⇒ wire content is the OpenAI multimodal ARRAY, not the string.
+  assert.deepEqual(body.messages[0]?.content, [
+    { type: "text", text: "What is in this image?" },
+    { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+  ]);
+});
+
+test("MULTIMODAL: a text-only message (no parts) still sends the plain string content", async () => {
+  const { fetchImpl, captured } = jsonFetch(200, {
+    choices: [{ message: { content: "ok" }, finish_reason: "stop" }],
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+  });
+  const p = new OpenAICompatibleProvider({ id: "mimo", baseUrl: "https://x", apiKey: "k", fetchImpl });
+  await p.invoke(invocation({ messages: [{ role: "user", content: "plain text" }] }));
+  const body = JSON.parse(captured.init?.body ?? "{}") as { messages: Array<Record<string, unknown>> };
+  assert.equal(body.messages[0]?.content, "plain text", "string content unchanged for non-multimodal");
+});
+
+test("MULTIMODAL: an array-form response content is accepted and flattened to text", async () => {
+  const { fetchImpl } = jsonFetch(200, {
+    choices: [{ message: { content: [{ type: "text", text: "part one " }, { type: "text", text: "part two" }] }, finish_reason: "stop" }],
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+  });
+  const p = new OpenAICompatibleProvider({ id: "mimo", baseUrl: "https://x", apiKey: "k", fetchImpl });
+  const r = await p.invoke(invocation());
+  assert.equal(r.content, "part one part two", "array response flattened to its text parts");
+});
+
 test("captures reasoning_content separately from content", async () => {
   const { fetchImpl } = jsonFetch(200, {
     choices: [{ message: { content: "the answer", reasoning_content: "step-by-step why" }, finish_reason: "stop" }],

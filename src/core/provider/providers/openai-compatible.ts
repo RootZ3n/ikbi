@@ -15,6 +15,7 @@
  */
 
 import type {
+  ContentPart,
   FinishReason,
   ModelMessage,
   ModelProvider,
@@ -105,12 +106,23 @@ function mapFinishReason(raw: unknown): FinishReason {
   }
 }
 
+/** Map ContentPart[] to plain wire objects (the OpenAI multimodal content array). */
+function toWireParts(parts: readonly ContentPart[]): Array<Record<string, unknown>> {
+  return parts.map((p) =>
+    p.type === "text" ? { type: "text", text: p.text } : { type: "image_url", image_url: { url: p.image_url.url } },
+  );
+}
+
 function toWireMessages(inv: ProviderInvocation): Array<Record<string, unknown>> {
   const req = inv.request;
   const messages: readonly ModelMessage[] =
     req.messages ?? (req.prompt !== undefined ? [{ role: "user", content: req.prompt }] : []);
   return messages.map((m) => {
-    const wire: Record<string, unknown> = { role: m.role, content: m.content };
+    // MULTIMODAL: when `parts` is present and non-empty, the OpenAI wire format wants the
+    // ARRAY as `content` ([{type:"text"...},{type:"image_url"...}]). Otherwise the plain
+    // string (current behavior). `content` (string) remains the flattened-text fallback.
+    const partsWire = m.parts !== undefined && m.parts.length > 0 ? toWireParts(m.parts) : undefined;
+    const wire: Record<string, unknown> = { role: m.role, content: partsWire ?? m.content };
     if (m.name !== undefined) wire.name = m.name;
     if (m.toolCallId !== undefined) wire.tool_call_id = m.toolCallId;
     // Assistant messages can carry prior tool calls so the tool loop round-trips.
@@ -138,6 +150,14 @@ function badResponse(provider: string, why: string, usage?: TokenUsage): Provide
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null;
+}
+
+/** Flatten an array-form response content into its text: concat the `text` of text parts. */
+function flattenContentParts(parts: readonly unknown[]): string {
+  return parts
+    .map((p) => (isRecord(p) && p.type === "text" && typeof p.text === "string" ? p.text : ""))
+    .filter((t) => t.length > 0)
+    .join("");
 }
 
 /** A token count must be a finite, non-negative, safe integer (or absent). */
@@ -318,9 +338,19 @@ export class OpenAICompatibleProvider implements ModelProvider {
     const message = choice.message;
     if (!isRecord(message)) throw badResponse(this.id, "choices[0].message is missing", usage);
 
+    // A response message's content is normally a string. Some multimodal-capable
+    // providers may echo an ARRAY of content parts; accept that too and flatten its
+    // text parts into the canonical string. Anything else is still a bad response.
     const content = message.content;
-    if (content !== undefined && content !== null && typeof content !== "string") {
-      throw badResponse(this.id, "message.content is not a string", usage);
+    let contentText: string;
+    if (content === undefined || content === null) {
+      contentText = "";
+    } else if (typeof content === "string") {
+      contentText = content;
+    } else if (Array.isArray(content)) {
+      contentText = flattenContentParts(content);
+    } else {
+      throw badResponse(this.id, "message.content is not a string or content array", usage);
     }
     const reasoningRaw = message.reasoning_content;
     if (reasoningRaw !== undefined && reasoningRaw !== null && typeof reasoningRaw !== "string") {
@@ -330,7 +360,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
     const toolCalls = parseToolCalls(message.tool_calls, this.id);
 
     const result: ProviderResult = {
-      content: typeof content === "string" ? content : "",
+      content: contentText,
       finishReason: mapFinishReason(choice.finish_reason),
       usage,
       ...(typeof reasoningRaw === "string" && reasoningRaw.length > 0 ? { reasoning: reasoningRaw } : {}),
