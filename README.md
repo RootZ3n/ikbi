@@ -35,7 +35,7 @@ trust and capability are granted, never assumed.
 - **Cheap-model harness** — the `worker-model` orchestrator that drives small,
   inexpensive models through the governed roles to land verified fixes cold → working
   for a fraction of a cent.
-- **908 tests** covering the core, the modules, and the CLI.
+- **940 tests** covering the core, the modules, the CLI, and end-to-end acceptance.
 
 ## Requirements
 
