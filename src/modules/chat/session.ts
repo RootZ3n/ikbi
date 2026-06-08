@@ -169,7 +169,7 @@ const DONE_TOOL: ModelTool = {
 };
 
 /** The full chat tool set — the builder's expanded suite, wired into the chat loop. */
-const CHAT_TOOLS: readonly ModelTool[] = [
+export const CHAT_TOOLS: readonly ModelTool[] = [
   READ_FILE_TOOL,
   WRITE_FILE_TOOL,
   LIST_DIR_TOOL,

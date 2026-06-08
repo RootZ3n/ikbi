@@ -124,7 +124,7 @@ const BUILDER_SYSTEM =
   "selfCheck: 're-read the file and ran the checks green; the export is now hello', satisfied: true })";
 
 /** The FIXED tool set declared to the model. No shell, no network, no MCP this pass. */
-const TOOLS: readonly ModelTool[] = [
+export const TOOLS: readonly ModelTool[] = [
   {
     name: "read_file",
     description: "Read a UTF-8 text file under the worktree.",
