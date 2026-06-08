@@ -43,6 +43,7 @@ import { adaptMaxTokens, getCapabilities } from "../../core/provider/capabilitie
 import type { ModelMessage, ModelTool, ToolCall } from "../../core/provider/contract.js";
 import type { GovernedExec } from "../governed-exec/index.js";
 import { confinePath, type ToolCallError } from "./builder-tools/confine.js";
+import { gitDiffTool, gitLogTool, gitStatusTool, GIT_TOOL_NAMES, runGitTool } from "./builder-tools/git-tools.js";
 import { patchTool, runPatch } from "./builder-tools/patch.js";
 import { runSearchFiles, searchFilesTool } from "./builder-tools/search-files.js";
 import { runTerminal, terminalTool } from "./builder-tools/terminal.js";
@@ -94,8 +95,8 @@ const BUILDER_SYSTEM =
   "by just stopping — a bare stop is treated as INCOMPLETE — and you CANNOT call done while any check is red. " +
   "A `done` whose read-back omits a file you changed is REJECTED.\n\n" +
   "Tools: read_file, write_file, list_dir, search_files (ripgrep over the worktree), patch (surgical " +
-  "find-and-replace), terminal (governed shell — allowlisted binaries only) — all confined to the worktree — " +
-  "plus run_checks and done.\n" +
+  "find-and-replace), terminal (governed shell — allowlisted binaries only), git_status/git_diff/git_log " +
+  "(read-only inspection of your own changes) — all confined to the worktree — plus run_checks and done.\n" +
   "Prefer `patch` for small, targeted edits (it preserves the rest of the file); use write_file only when " +
   "creating a file or rewriting it wholesale. Use search_files to LOCATE code before changing it.\n" +
   "The SCOUT BRIEF (in the prior-results) shows the repo structure and finding TITLES only — call `scout_detail` " +
@@ -142,6 +143,10 @@ const TOOLS: readonly ModelTool[] = [
   searchFilesTool,
   patchTool,
   terminalTool,
+  // Read-only git inspection (governed): see what changed and the history.
+  gitStatusTool,
+  gitDiffTool,
+  gitLogTool,
   {
     // PROGRESSIVE DISCLOSURE: the scout brief shows finding TITLES only; this pulls the
     // full detail of ONE finding on demand, so a cheap model isn't handed everything at once.
@@ -589,6 +594,19 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       return runTerminal({ governedExec, ...(deps.parentCtx !== undefined ? { parentCtx: deps.parentCtx } : {}) }, ctx.workspace.path, args);
     };
 
+    // --- git inspection (git_status / git_diff / git_log): read-only, GOVERNED, async. Same
+    // discipline as terminal; output is UNTRUSTED command output for the chokepoint. ---
+    const runGitCall = async (call: ToolCall): Promise<string> => {
+      let args: Record<string, unknown>;
+      try {
+        args = JSON.parse(call.arguments && call.arguments.length > 0 ? call.arguments : "{}") as Record<string, unknown>;
+      } catch {
+        rejectedToolCalls.push({ tool: call.name, error: "malformed tool arguments (not JSON)" });
+        return `ERROR: malformed arguments for ${call.name} (not valid JSON)`;
+      }
+      return runGitTool({ governedExec, ...(deps.parentCtx !== undefined ? { parentCtx: deps.parentCtx } : {}) }, ctx.workspace.path, call.name, args);
+    };
+
     // --- THE CHOKEPOINT (#8): the ONLY path from a tool result to a message. Always
     // neutralizes (source mcp_result) and re-enters via toUntrustedMessage(untrusted). ---
     const appendToolResult = (raw: string, call: ToolCall): void => {
@@ -780,6 +798,10 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
             // Governed shell — async. Its output is UNTRUSTED command output, so it goes
             // through the SAME neutralization chokepoint as read_file / search_files.
             const raw = await runTerminalCall(call);
+            appendToolResult(raw, call);
+          } else if (GIT_TOOL_NAMES.has(call.name)) {
+            // Read-only governed git inspection — async; output neutralized like terminal.
+            const raw = await runGitCall(call);
             appendToolResult(raw, call);
           } else {
             const raw = runTool(call); // pure: produces a result string (schema-gated inside)
