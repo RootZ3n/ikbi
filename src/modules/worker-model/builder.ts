@@ -39,6 +39,7 @@ import { dirname } from "node:path";
 
 import type { OperationContext } from "../../core/identity/index.js";
 import { toUntrustedMessage } from "../../core/injection/index.js";
+import { adaptMaxTokens, getCapabilities } from "../../core/provider/capabilities.js";
 import type { ModelMessage, ModelTool, ToolCall } from "../../core/provider/contract.js";
 import type { GovernedExec } from "../governed-exec/index.js";
 import { confinePath, type ToolCallError } from "./builder-tools/confine.js";
@@ -167,6 +168,17 @@ const TOOLS: readonly ModelTool[] = [
 
 /** Tool lookup for argument-schema validation (RAIL 4). */
 const TOOL_BY_NAME: ReadonlyMap<string, ModelTool> = new Map(TOOLS.map((t) => [t.name, t]));
+
+/**
+ * Simplify the tool schemas for a model whose capability profile says it does NOT
+ * support native tool-calling. Such models do worst when handed verbose schemas;
+ * we strip descriptions down to the tool name so the (best-effort) tool surface is
+ * as small as possible. The tool SET and parameter shapes are unchanged — only the
+ * prose is trimmed — so a model that nonetheless emits a valid tool call still works.
+ */
+function simplifyTools(tools: readonly ModelTool[]): readonly ModelTool[] {
+  return tools.map((t) => ({ name: t.name, description: t.name, parameters: t.parameters }));
+}
 
 /** The builder's CLAIM of completion (NOT the verdict — the verifier still decides). */
 export interface DoneClaim {
@@ -594,6 +606,16 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       return `Checks ${allPass ? "ALL PASS" : "FAILED"}:\n${lines.join("\n---\n")}`;
     };
 
+    // CAPABILITY ADAPTATION: read the (config/roster-driven) model's profile ONCE and
+    // adapt the request to it — a small-context cheap model gets a completion budget that
+    // fits its window (so the prompt isn't crowded out), and a model that does not support
+    // tool-calling gets stripped-down tool schemas. Resolved from the bare model id via the
+    // pure capabilities leaf (no provider-registry import on the builder's hot path).
+    const builderModelId = deps.modelOverride ?? builderModel();
+    const caps = getCapabilities(builderModelId);
+    const effectiveMaxTokens = adaptMaxTokens(BUILDER_MAX_TOKENS, caps);
+    const effectiveTools = caps.supports_tools ? TOOLS : simplifyTools(TOOLS);
+
     // --- the bounded loop. The cap bounds TOTAL model rounds (tool rounds + corrective
     // turns), so a model that keeps bare-stopping can never spin forever. ---
     for (;;) {
@@ -609,12 +631,12 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
 
       const response = await ctx.engine.invokeModel({
         // Per-candidate model (the shootout) when injected; otherwise the builder's own model.
-        model: deps.modelOverride ?? builderModel(),
+        model: builderModelId,
         temperature: BUILDER_TEMPERATURE,
-        maxTokens: BUILDER_MAX_TOKENS,
+        maxTokens: effectiveMaxTokens, // adapted to the model's context window (capability profile)
         identity: ctx.identity, // clamped spawned identity (#10), by reference, EVERY round
         messages,
-        tools: TOOLS,
+        tools: effectiveTools, // simplified schemas when the model lacks native tool-calling
       });
 
       // Round-trip the assistant turn (with any tool calls it emitted).

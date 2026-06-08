@@ -10,6 +10,7 @@
 
 import { readFileSync } from "node:fs";
 
+import type { ModelCapabilities, ReasoningLevel, SpeedClass } from "./capabilities.js";
 import type { CostRate, ModelProvider } from "./contract.js";
 import { OpenAICompatibleProvider } from "./providers/openai-compatible.js";
 
@@ -36,6 +37,14 @@ export interface ModelSpec {
   readonly cost?: CostRate;
   /** Ordered provider routes — the deterministic fallback chain for this model. */
   readonly providers: readonly ProviderRoute[];
+  /**
+   * OPTIONAL capability profile override (context window, tool support, reasoning
+   * level, speed class). Additive: any subset may be declared; unspecified fields
+   * fall back to the model's known/family/default profile via `getCapabilities`.
+   * This does NOT touch the frozen request/response contract — it is roster DATA
+   * the engine adapts to (e.g. the builder's completion budget).
+   */
+  readonly capabilities?: Partial<ModelCapabilities>;
 }
 
 /** Resolve the effective cost rate for a served route (route rate beats model default). */
@@ -64,6 +73,10 @@ export class ModelRegistry {
   }
   listModels(): ModelSpec[] {
     return [...this.models.values()];
+  }
+  /** The roster's OPTIONAL capability override for a model (undefined if none declared). */
+  capabilitiesFor(id: string): Partial<ModelCapabilities> | undefined {
+    return this.models.get(id)?.capabilities;
   }
 
   // --- models (update) ---
@@ -170,6 +183,34 @@ function asNumber(v: unknown, what: string, source: string): number {
   return v;
 }
 
+const REASONING_LEVELS: ReadonlySet<string> = new Set(["low", "medium", "high"]);
+const SPEED_CLASSES: ReadonlySet<string> = new Set(["fast", "medium", "slow"]);
+
+/** Parse the OPTIONAL per-model capability override. Every field is optional; invalid types throw (fail loud). */
+function parseCapabilitiesMaybe(v: unknown, source: string): Partial<ModelCapabilities> | undefined {
+  if (v === undefined) return undefined;
+  const r = asRecord(v, "capabilities", source);
+  const caps: { -readonly [K in keyof ModelCapabilities]?: ModelCapabilities[K] } = {};
+  if (r.context_window !== undefined) caps.context_window = asNumber(r.context_window, "capabilities.context_window", source);
+  if (r.supports_tools !== undefined) {
+    if (typeof r.supports_tools !== "boolean") throw new Error(`Provider roster ${source}: capabilities.supports_tools must be a boolean`);
+    caps.supports_tools = r.supports_tools;
+  }
+  if (r.reasoning_level !== undefined) {
+    if (typeof r.reasoning_level !== "string" || !REASONING_LEVELS.has(r.reasoning_level)) {
+      throw new Error(`Provider roster ${source}: capabilities.reasoning_level must be one of low|medium|high`);
+    }
+    caps.reasoning_level = r.reasoning_level as ReasoningLevel;
+  }
+  if (r.speed_class !== undefined) {
+    if (typeof r.speed_class !== "string" || !SPEED_CLASSES.has(r.speed_class)) {
+      throw new Error(`Provider roster ${source}: capabilities.speed_class must be one of fast|medium|slow`);
+    }
+    caps.speed_class = r.speed_class as SpeedClass;
+  }
+  return Object.keys(caps).length > 0 ? caps : undefined;
+}
+
 function parseCostRateMaybe(v: unknown, source: string): CostRate | undefined {
   if (v === undefined) return undefined;
   const r = asRecord(v, "cost", source);
@@ -207,11 +248,13 @@ function parseModelSpec(v: unknown, source: string): ModelSpec {
     };
   });
   const role = r.role;
+  const capabilities = parseCapabilitiesMaybe(r.capabilities, source);
   return {
     id,
     ...(typeof role === "string" ? { role } : {}),
     ...(modelCost !== undefined ? { cost: modelCost } : {}),
     providers,
+    ...(capabilities !== undefined ? { capabilities } : {}),
   };
 }
 

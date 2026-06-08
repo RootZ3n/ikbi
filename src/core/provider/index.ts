@@ -10,6 +10,7 @@ import { config } from "../config.js";
 import { childLogger } from "../log.js";
 import { cachedInvoke } from "../../modules/cache/index.js";
 import { ProviderInvoker } from "./invoke.js";
+import { getCapabilities, type ModelCapabilities } from "./capabilities.js";
 import type { ModelRequest, ModelResponse } from "./contract.js";
 import {
   createDeepseekProvider,
@@ -105,12 +106,24 @@ export function invokeModel(request: ModelRequest): Promise<ModelResponse> {
   return cachedInvoke(request, () => invoker.invokeModel(request));
 }
 
+/**
+ * Resolve a model's capabilities WITH the roster override layered on top of the
+ * known/family/default profile. Callers that already hold a bare model id and do
+ * not want the registry can import `getCapabilities` from ./capabilities directly;
+ * this variant additionally honors a roster `ModelSpec.capabilities` declaration.
+ */
+export function resolveCapabilities(modelId: string): ModelCapabilities {
+  return getCapabilities(modelId, registry.capabilitiesFor(modelId));
+}
+
 // --- re-export the frozen contract + building blocks ---
 export * from "./contract.js";
 export { ProviderInvoker, computeCost } from "./invoke.js";
 export type { InvokerDeps } from "./invoke.js";
 export { ModelRegistry, resolveRate } from "./registry.js";
 export type { ModelSpec, ProviderRoute, RegistryInit } from "./registry.js";
+export { getCapabilities, adaptMaxTokens, FALLBACK_CAPABILITIES } from "./capabilities.js";
+export type { ModelCapabilities, ReasoningLevel, SpeedClass } from "./capabilities.js";
 export { CircuitBreaker } from "./circuit-breaker.js";
 export type { Clock, CircuitState, CircuitSnapshot } from "./circuit-breaker.js";
 export {
