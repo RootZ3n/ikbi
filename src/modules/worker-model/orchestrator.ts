@@ -41,6 +41,7 @@ import type { BuildCandidate, JudgeResult } from "../deterministic-judge/index.j
 import type { GovernedExec } from "../governed-exec/index.js";
 
 import { builder, createBuilder, MAX_TOOL_ITERATIONS } from "./builder.js";
+import { resolveChecks } from "./checks.js";
 import { builderModel, competitiveBuilderModels } from "./role-models.js";
 import { critic } from "./critic.js";
 import { integrator } from "./integrator.js";
@@ -136,6 +137,15 @@ export interface OrchestratorDeps {
   readonly builderModel?: string;
   /** The head-to-head competitive model list. Default: config (IKBI_COMPETITIVE_MODELS). */
   readonly competitiveModels?: readonly string[];
+  /**
+   * Enforce the fail-closed PROJECT-ROOT GUARD (Fix 1) + per-target check set (Fix 2) on the
+   * REAL verifier/builder this run constructs: when true, both are wired with the live
+   * `resolveChecks`, so a worktree with no project of its own (or whose nearest manifest is an
+   * ANCESTOR — e.g. ikbi's own workspace) fails closed RED instead of vacuously passing. DEFAULT
+   * OFF so unit/competitive tests that drive the real verifier/builder against synthetic paths
+   * are unchanged; PRODUCTION wiring (`createProductionWorker`) turns it ON.
+   */
+  readonly enforceProjectRoot?: boolean;
 }
 
 /** A role identity spawned under the parent ceiling (#10). */
@@ -216,6 +226,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   const neutralizeUntrusted = deps.neutralizeUntrusted ?? coreNeutralize;
   const gateWall = deps.gateWall; // optional in the type — absent → promote DENIED fail-closed (H5)
   const judge = deps.judge ?? deterministicJudge; // competitive-mode scorer (pure, no model)
+  const enforceProjectRoot = deps.enforceProjectRoot ?? false; // Fix 1/2 guard — production-only (off in tests)
   // Cooperative kill checkpoint (read-only). Lazy default so worker-model load never
   // eagerly constructs the kill-switch; the loop OBEYS a kill, it never publishes one.
   const killCheck =
@@ -246,6 +257,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       ...(deps.governedExec !== undefined ? { governedExec: deps.governedExec } : {}),
       parentCtx,
       ...(workspaces.diff !== undefined ? { diff: (ws: WorkspaceHandle) => workspaces.diff!(ws) } : {}),
+      // PROJECT-ROOT GUARD + per-target check set (Fix 1/2): wired ONLY in production
+      // (enforceProjectRoot), so a no-manifest / wrong-repo worktree fails closed RED.
+      ...(enforceProjectRoot ? { resolveChecks: (ws: string) => resolveChecks(ws) } : {}),
     });
   }
 
@@ -266,6 +280,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       ...(deps.governedExec !== undefined ? { governedExec: deps.governedExec } : {}),
       parentCtx,
       ...(modelOverride !== undefined ? { modelOverride } : {}),
+      // Same resolved set the verifier uses (Fix 1/2), wired ONLY in production (enforceProjectRoot).
+      ...(enforceProjectRoot ? { resolveChecks: (ws: string) => resolveChecks(ws) } : {}),
     });
   }
 

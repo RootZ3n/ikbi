@@ -11,6 +11,9 @@
  * Read-only: the checks (`tsc --noEmit`, `test`) do not mutate the workspace.
  */
 
+import { existsSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+
 import type { ExecResult } from "../governed-exec/index.js";
 
 /** A fixed check. The command list is a named constant — never model-chosen. */
@@ -20,11 +23,68 @@ export interface Check {
   readonly args: readonly string[];
 }
 
-/** THE fixed, read-only check set (the verifier's checks; the builder previews the same). */
+/** THE default, read-only check set (pnpm — ikbi's own checks; the builder previews the same). */
 export const VERIFIER_CHECKS: readonly Check[] = [
   { name: "typecheck", command: "pnpm", args: ["tsc", "--noEmit"] },
   { name: "test", command: "pnpm", args: ["test"] },
 ];
+
+/**
+ * Project manifests that mark a repository ROOT. The presence of one at a directory means
+ * "this is a project root" for check resolution. Used to detect the "validates the wrong
+ * repo" bug: checks must run against the worktree's OWN project, never an ancestor's.
+ */
+export const PROJECT_MANIFESTS: readonly string[] = [
+  "package.json",
+  "pnpm-workspace.yaml",
+  "Cargo.toml",
+  "go.mod",
+  "pyproject.toml",
+  "deno.json",
+  "deno.jsonc",
+];
+
+/** Walk up from `start` to the nearest directory holding a project manifest; undefined if none. */
+export function resolveProjectRoot(start: string): string | undefined {
+  let dir = resolve(start);
+  for (;;) {
+    for (const m of PROJECT_MANIFESTS) {
+      if (existsSync(join(dir, m))) return dir;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) return undefined; // reached the filesystem root
+    dir = parent;
+  }
+}
+
+/** The resolved check set, or a fail-closed RED reason when the target has no valid project root. */
+export type ChecksResolution =
+  | { readonly ok: true; readonly checks: readonly Check[]; readonly source: "default" | "env" }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * Resolve the check set to run against a worktree WITH a fail-closed PROJECT-ROOT GUARD.
+ *
+ * THE BUG this closes: worktrees can live INSIDE ikbi's own pnpm workspace, so `pnpm tsc` /
+ * `pnpm test` with cwd=worktree walk UP and run IKBI's suite — a target with no manifest
+ * would then "pass" vacuously. The guard asserts the project root resolved from the worktree
+ * EQUALS the worktree root; if the nearest manifest is an ANCESTOR (wrong repo) or there is
+ * NONE (no recognizable project), it returns RED (ok:false) — never a vacuous pass.
+ *
+ * The command set is configured by the operator/target repo (NEVER model-chosen) — the env
+ * override is layered in by a later fix; for now the default is pnpm (VERIFIER_CHECKS).
+ */
+export function resolveChecks(worktreeReal: string): ChecksResolution {
+  const wt = resolve(worktreeReal);
+  const root = resolveProjectRoot(wt);
+  if (root === undefined) {
+    return { ok: false, reason: `no recognizable project manifest at or above the worktree (${wt}) — cannot verify (RED, never a vacuous pass)` };
+  }
+  if (root !== wt) {
+    return { ok: false, reason: `the resolved project root (${root}) is an ANCESTOR of the worktree (${wt}) — checks would validate the WRONG repo (RED)` };
+  }
+  return { ok: true, checks: VERIFIER_CHECKS, source: "default" };
+}
 
 /** Captured output tail length retained in a check result. */
 export const MAX_OUTPUT_TAIL = 2_000;

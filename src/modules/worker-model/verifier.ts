@@ -42,7 +42,7 @@ import type { GovernedExec } from "../governed-exec/index.js";
 // The check SET is the single shared definition (worker-model/checks.ts) — the SAME
 // constant the builder's in-loop run_checks imports, so the builder previews the
 // verifier's EXACT checks. Behavior here is unchanged; the constant just relocated.
-import { type CheckResult, mapExec, VERIFIER_CHECKS } from "./checks.js";
+import { type CheckResult, type ChecksResolution, mapExec, VERIFIER_CHECKS } from "./checks.js";
 import type { RoleFn, RoleResult } from "./contract.js";
 
 /** Re-exported for consumers (and tests) that import it from the verifier. */
@@ -76,6 +76,13 @@ export interface VerifierDeps {
    * WITHOUT it fails closed at run time (untrusted) — it cannot prove script integrity.
    */
   readonly diff?: (workspace: WorkspaceHandle) => Promise<string>;
+  /**
+   * Resolve the per-target check set, with the fail-closed PROJECT-ROOT GUARD (Fix 1) and
+   * the operator/repo-configured command set (Fix 2). The orchestrator wires the live
+   * `resolveChecks` here. DEFAULT (tests / direct construction): the pnpm VERIFIER_CHECKS
+   * with NO guard — so existing direct-construction callers are byte-unchanged.
+   */
+  readonly resolveChecks?: (worktreeReal: string) => ChecksResolution;
 }
 
 /** Lazy live governed-exec — importing it eagerly would force the gate-wall/egress wiring order. */
@@ -86,6 +93,11 @@ function lazyGovernedExec(): Pick<GovernedExec, "run"> {
 /** The UNTRUSTED verdict — a mutated/unprovable build fails verification, fail-closed. */
 function untrusted(reason: string): RoleResult {
   return { role: "verifier", outcome: "failure", summary: reason, detail: { verdict: "untrusted", reason, checks: [] } };
+}
+
+/** A RED verdict — no valid project to check (wrong repo / no manifest). Fail-closed, never a vacuous pass. */
+function red(reason: string): RoleResult {
+  return { role: "verifier", outcome: "failure", summary: reason, detail: { verdict: "fail", reason, checks: [] } };
 }
 
 /**
@@ -159,9 +171,18 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
     }
     const parentCtx = deps.parentCtx;
 
+    // PROJECT-ROOT GUARD + per-target check set (Fix 1/2). Default (direct construction):
+    // pnpm VERIFIER_CHECKS, no guard. The orchestrator wires the live resolver, which fails
+    // closed RED when the worktree has no project of its own (so a no-manifest target can
+    // NEVER pass vacuously by walking up into ikbi's workspace).
+    const resolveChecks = deps.resolveChecks ?? ((): ChecksResolution => ({ ok: true, checks: VERIFIER_CHECKS, source: "default" }));
+    const resolved = resolveChecks(ctx.workspace.path);
+    if (!resolved.ok) return red(`verification RED: ${resolved.reason}`);
+    const checkSet = resolved.checks;
+
     const checks: CheckResult[] = [];
     let sawDryRun = false;
-    for (const c of VERIFIER_CHECKS) {
+    for (const c of checkSet) {
       const res = await governedExec.run({
         parentCtx,
         command: c.command,

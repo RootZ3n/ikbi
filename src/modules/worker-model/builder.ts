@@ -51,7 +51,7 @@ import { runSearchFiles, searchFilesTool } from "./builder-tools/search-files.js
 import { runTerminal, terminalTool } from "./builder-tools/terminal.js";
 import { runVisionAnalyze, visionAnalyzeTool } from "./builder-tools/vision-tool.js";
 import { runWebExtract, runWebSearch, webExtractTool, webSearchTool, WEB_TOOL_NAMES } from "./builder-tools/web-tools.js";
-import { type CheckResult, mapExec, VERIFIER_CHECKS } from "./checks.js";
+import { type CheckResult, type ChecksResolution, mapExec, VERIFIER_CHECKS } from "./checks.js";
 import { workerModelConfig } from "./config.js";
 import { maybeCompress } from "./context-manager.js";
 import type { RoleFn, RoleResult, WorkerOutcome } from "./contract.js";
@@ -242,6 +242,12 @@ export interface BuilderDeps {
    * string on the unchanged ModelRequest.
    */
   readonly modelOverride?: string;
+  /**
+   * Resolve the per-target check set + PROJECT-ROOT GUARD (Fix 1/2), so the builder's in-loop
+   * run_checks runs the SAME resolved set the verifier will. The orchestrator wires the live
+   * resolver. DEFAULT (tests / direct construction): pnpm VERIFIER_CHECKS, no guard — unchanged.
+   */
+  readonly resolveChecks?: (worktreeReal: string) => ChecksResolution;
 }
 
 /** The last run_checks outcome — gates `done` (RAIL: no done while red). */
@@ -767,9 +773,18 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         lastChecks = { allPass: false, checks: [] };
         return "ERROR: checks are unavailable (no parent identity wired to authorize the checks) — cannot verify; done is blocked.";
       }
+      // SAME resolved set the verifier uses (Fix 1/2): the project-root guard fails closed
+      // RED if the worktree has no project of its own (so the builder cannot believe a
+      // vacuous ancestor-suite pass), and the command set is operator/repo-configured.
+      const resolveChecks = deps.resolveChecks ?? ((): ChecksResolution => ({ ok: true, checks: VERIFIER_CHECKS, source: "default" }));
+      const resolved = resolveChecks(ctx.workspace.path);
+      if (!resolved.ok) {
+        lastChecks = { allPass: false, checks: [] };
+        return `ERROR: ${resolved.reason} — checks cannot run; done is blocked.`;
+      }
       const results: CheckResult[] = [];
       let dry = false;
-      for (const c of VERIFIER_CHECKS) {
+      for (const c of resolved.checks) {
         const res = await governedExec.run({
           parentCtx: deps.parentCtx,
           command: c.command,

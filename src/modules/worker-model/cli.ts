@@ -74,7 +74,7 @@ export function createProductionWorker(
   // COMMIT the verified-good work — without it the scratch branch never advances and promote
   // sees an empty diff ("no changes to promote"). coreWorkspaces is the same manager the
   // orchestrator would default to; passing it makes the commit dependency explicit.
-  return createOrchestrator({ roleClaim: productionRoleClaim(opts.workerToken), gateWall: opts.gateWall ?? coreGateWall, governedExec, workspaces: coreWorkspaces });
+  return createOrchestrator({ roleClaim: productionRoleClaim(opts.workerToken), gateWall: opts.gateWall ?? coreGateWall, governedExec, workspaces: coreWorkspaces, enforceProjectRoot: true });
 }
 
 /** Parse a `--repo <path>` / `--repo=<path>` flag out of argv; the rest is the goal prose. */
