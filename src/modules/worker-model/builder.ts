@@ -43,6 +43,7 @@ import { adaptMaxTokens, getCapabilities } from "../../core/provider/capabilitie
 import type { ModelMessage, ModelTool, ToolCall } from "../../core/provider/contract.js";
 import type { GovernedExec } from "../governed-exec/index.js";
 import { confinePath, type ToolCallError } from "./builder-tools/confine.js";
+import { delegateTaskTool, runDelegateTask } from "./builder-tools/delegate.js";
 import { gitDiffTool, gitLogTool, gitStatusTool, GIT_TOOL_NAMES, runGitTool } from "./builder-tools/git-tools.js";
 import { patchTool, runPatch } from "./builder-tools/patch.js";
 import { runSearchFiles, searchFilesTool } from "./builder-tools/search-files.js";
@@ -98,7 +99,8 @@ const BUILDER_SYSTEM =
   "Tools: read_file, write_file, list_dir, search_files (ripgrep over the worktree), patch (surgical " +
   "find-and-replace), terminal (governed shell — allowlisted binaries only), git_status/git_diff/git_log " +
   "(read-only inspection of your own changes), web_search/web_extract (research docs & Stack Overflow — " +
-  "through the egress guard) — all confined to the worktree — plus run_checks and done.\n" +
+  "through the egress guard), delegate_task (hand an independent subtask to a focused sub-agent) — " +
+  "all confined to the worktree — plus run_checks and done.\n" +
   "Prefer `patch` for small, targeted edits (it preserves the rest of the file); use write_file only when " +
   "creating a file or rewriting it wholesale. Use search_files to LOCATE code before changing it.\n" +
   "The SCOUT BRIEF (in the prior-results) shows the repo structure and finding TITLES only — call `scout_detail` " +
@@ -152,6 +154,8 @@ const TOOLS: readonly ModelTool[] = [
   // Web research (through the egress SSRF guard; fail-closed unless the host is allowlisted).
   webSearchTool,
   webExtractTool,
+  // Delegation: hand an independent subtask to a focused sub-agent (simplified tool set).
+  delegateTaskTool,
   {
     // PROGRESSIVE DISCLOSURE: the scout brief shows finding TITLES only; this pulls the
     // full detail of ONE finding on demand, so a cheap model isn't handed everything at once.
@@ -632,6 +636,30 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       return call.name === "web_search" ? runWebSearch({ guardedFetch }, args) : runWebExtract({ guardedFetch }, args);
     };
 
+    // --- delegate_task: run a focused sub-agent (its own loop + simplified governed tool set,
+    // same worktree). Async. The sub-agent's RESULT is UNTRUSTED to the parent → chokepoint. ---
+    const runDelegateCall = async (call: ToolCall): Promise<string> => {
+      let args: Record<string, unknown>;
+      try {
+        args = JSON.parse(call.arguments && call.arguments.length > 0 ? call.arguments : "{}") as Record<string, unknown>;
+      } catch {
+        rejectedToolCalls.push({ tool: "delegate_task", error: "malformed tool arguments (not JSON)" });
+        return "ERROR: malformed arguments for delegate_task (not valid JSON)";
+      }
+      return runDelegateTask(
+        {
+          invokeModel: ctx.engine.invokeModel,
+          neutralizeUntrusted: ctx.engine.neutralizeUntrusted,
+          governedExec,
+          ...(deps.parentCtx !== undefined ? { parentCtx: deps.parentCtx } : {}),
+          identity: ctx.identity,
+          model: builderModelId,
+          worktreeReal,
+        },
+        args,
+      );
+    };
+
     // --- THE CHOKEPOINT (#8): the ONLY path from a tool result to a message. Always
     // neutralizes (source mcp_result) and re-enters via toUntrustedMessage(untrusted). ---
     const appendToolResult = (raw: string, call: ToolCall): void => {
@@ -832,6 +860,10 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
             // Web research through the egress SSRF guard — async; output is UNTRUSTED internet
             // content, neutralized by the chokepoint.
             const raw = await runWebCall(call);
+            appendToolResult(raw, call);
+          } else if (call.name === "delegate_task") {
+            // Sub-agent delegation — async; its result is UNTRUSTED to the parent → chokepoint.
+            const raw = await runDelegateCall(call);
             appendToolResult(raw, call);
           } else {
             const raw = runTool(call); // pure: produces a result string (schema-gated inside)
