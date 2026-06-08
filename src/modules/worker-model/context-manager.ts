@@ -78,6 +78,12 @@ export interface CompressDeps {
   readonly identity: AgentIdentity;
   /** Build the message that carries the summary (the builder wraps it through its chokepoint). */
   readonly wrapSummary: (text: string) => ModelMessage;
+  /**
+   * Optional sink for compaction WARNINGS. Compaction still never fails the build — this
+   * only adds VISIBILITY so a silently-failing summarizer is observable. Defaults to
+   * `console.error`. Pass a real logger (e.g. the builder's pino child) for structured logs.
+   */
+  readonly logger?: { warn(msg: string): void };
   readonly headerLen?: number;
   readonly keepRecent?: number;
   readonly maxSummaryTokens?: number;
@@ -149,8 +155,12 @@ export async function maybeCompress(
       ],
     });
     summaryText = res.content.trim();
-  } catch {
-    return { compressed: false }; // compaction must never fail the build
+  } catch (e) {
+    // Compaction must NEVER fail the build — but it must not fail SILENTLY either. Log the
+    // error (warn level) for visibility, then proceed with the conversation untouched.
+    const msg = e instanceof Error ? e.message : String(e);
+    (deps.logger?.warn.bind(deps.logger) ?? ((m: string) => console.error(m)))(`[compress] summarization failed: ${msg}`);
+    return { compressed: false };
   }
   if (summaryText.length === 0) return { compressed: false };
 

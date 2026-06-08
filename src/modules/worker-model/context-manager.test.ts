@@ -116,6 +116,21 @@ test("maybeCompress never fails the build — a summarizer error leaves messages
   assert.equal(messages.length, before, "untouched on summarizer failure");
 });
 
+test("maybeCompress LOGS the summarizer error at warn level (visibility, not silence)", async () => {
+  const header = [msg("system", "S"), msg("user", "G"), msg("user", "C"), msg("user", "P")];
+  const middle = Array.from({ length: 10 }, (_, i) => msg("assistant", `m${i} ${"z".repeat(20)}`));
+  const tail = Array.from({ length: 6 }, (_, i) => msg("user", `t${i}`));
+  const messages = [...header, ...middle, ...tail];
+
+  const warned: string[] = [];
+  const throwing = (async () => { throw new Error("provider exploded"); }) as unknown as Parameters<typeof maybeCompress>[2]["invoke"];
+  const r = await maybeCompress(messages, TINY, { ...deps(throwing), logger: { warn: (m: string) => void warned.push(m) } });
+
+  assert.equal(r.compressed, false, "still returns compressed:false (behavior unchanged)");
+  assert.equal(warned.length, 1, "the failure was logged exactly once");
+  assert.match(warned[0] ?? "", /\[compress\] summarization failed: provider exploded/);
+});
+
 // ── builder integration: compaction triggers with a small-window model ───────
 
 const PARENT_CTX: OperationContext = (() => {

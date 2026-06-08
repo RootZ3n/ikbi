@@ -39,6 +39,7 @@ import { dirname } from "node:path";
 
 import type { OperationContext } from "../../core/identity/index.js";
 import { toUntrustedMessage } from "../../core/injection/index.js";
+import { childLogger } from "../../core/log.js";
 import { adaptMaxTokens, getCapabilities } from "../../core/provider/capabilities.js";
 import type { ModelMessage, ModelTool, ToolCall } from "../../core/provider/contract.js";
 import type { GovernedExec } from "../governed-exec/index.js";
@@ -60,6 +61,9 @@ import type { ScoutFinding } from "./scout.js";
 // ToolCallError now lives in builder-tools/confine.ts (shared by every builder tool);
 // re-exported here so existing importers (and tests) keep `import { ToolCallError } from "./builder.js"`.
 export type { ToolCallError } from "./builder-tools/confine.js";
+
+/** Builder-scoped logger (used for non-fatal visibility, e.g. context-compaction warnings). */
+const log = childLogger("worker-model");
 
 // --- named constants (no magic values inline) ------------------------------
 // The model id is DRIVER-tier and config-driven (see role-models.ts) — resolved at
@@ -819,6 +823,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
             ctx.engine.neutralizeUntrusted(text, { source: "mcp_result", identity: ctx.identity, origin: "context_summary" }),
             { role: "user" },
           ),
+        logger: { warn: (msg: string) => log.warn(msg) },
       });
       if (comp.compressed) compressions += 1;
 
