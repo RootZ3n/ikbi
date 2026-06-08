@@ -22,3 +22,4 @@ import "./routes.js";
 
 export { CONTRACT_VERSION, type ChatRequest, type ChatResponse, type ChatToolActivity } from "./contract.js";
 export { ChatSession, sessionStore } from "./session.js";
+export { SessionMemory, type MemorySnapshot, type TestResultFact } from "./memory.js";

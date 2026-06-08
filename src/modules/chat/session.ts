@@ -39,6 +39,7 @@ import { patchTool, runPatch } from "../worker-model/builder-tools/patch.js";
 import { runSearchFiles, searchFilesTool } from "../worker-model/builder-tools/search-files.js";
 import { runTerminal, terminalTool } from "../worker-model/builder-tools/terminal.js";
 import type { ChatToolActivity } from "./contract.js";
+import { SessionMemory } from "./memory.js";
 
 const log = childLogger("chat");
 
@@ -145,6 +146,8 @@ export interface ChatSessionDeps {
 export class ChatSession {
   readonly id: string;
   readonly worktree: string;
+  /** Key-fact memory across turns (files modified, command/test results, conclusions). */
+  readonly memory: SessionMemory;
   private readonly messages: ModelMessage[];
   private readonly identity: AgentIdentity;
   private readonly parentCtx: OperationContext | undefined;
@@ -158,6 +161,8 @@ export class ChatSession {
     this.identity = { agentId: "ikbi-chat", functionalRole: "assistant", trustTier: "trusted", sessionId: id };
     this.parentCtx = resolveParentCtx(id);
     this.invoke = deps.invoke ?? invokeModel;
+    this.memory = new SessionMemory();
+    // messages[0] is the system prompt; it is REWRITTEN each turn to fold in the memory summary.
     this.messages = [{ role: "system", content: CHAT_SYSTEM }];
     this.lastUsedAt = Date.now();
   }
@@ -232,6 +237,11 @@ export class ChatSession {
   /** Send a user message; run the bounded tool loop; return the assistant reply + tool activity. */
   async send(userMessage: string): Promise<{ response: string; tools: ChatToolActivity[] }> {
     this.lastUsedAt = Date.now();
+    // CONVERSATION MEMORY: refresh the system prompt with a brief summary of prior-turn
+    // facts (files modified, command/test results, conclusions). Rewriting messages[0]
+    // keeps it a SINGLE system message that stays current — never duplicated per turn.
+    const memSummary = this.memory.summary();
+    this.messages[0] = { role: "system", content: memSummary.length > 0 ? `${CHAT_SYSTEM}\n\n${memSummary}` : CHAT_SYSTEM };
     this.messages.push({ role: "user", content: userMessage });
     const tools: ChatToolActivity[] = [];
 
@@ -239,6 +249,7 @@ export class ChatSession {
     for (;;) {
       iterations += 1;
       if (iterations > MAX_TOOL_ITERATIONS) {
+        this.memory.recordToolActivity(tools);
         return { response: "[ikbi: reached the tool-iteration limit for this turn — try narrowing the request.]", tools };
       }
 
@@ -253,6 +264,7 @@ export class ChatSession {
           tools: CHAT_TOOLS,
         });
       } catch (e) {
+        this.memory.recordToolActivity(tools);
         return { response: `[ikbi: model call failed: ${errMsg(e)}]`, tools };
       }
 
@@ -272,6 +284,10 @@ export class ChatSession {
       }
 
       // A normal completion (stop / length / anything non-tool) ends the turn.
+      // Fold this turn's facts into memory: files/commands from tool activity, and the
+      // assistant's reply as the turn's CONCLUSION (skipping synthetic ikbi error replies).
+      this.memory.recordToolActivity(tools);
+      if (!response.content.startsWith("[ikbi:")) this.memory.recordDecision(response.content);
       return { response: response.content, tools };
     }
   }
