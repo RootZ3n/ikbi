@@ -48,6 +48,7 @@ import { runSearchFiles, searchFilesTool } from "./builder-tools/search-files.js
 import { runTerminal, terminalTool } from "./builder-tools/terminal.js";
 import { type CheckResult, mapExec, VERIFIER_CHECKS } from "./checks.js";
 import { workerModelConfig } from "./config.js";
+import { maybeCompress } from "./context-manager.js";
 import type { RoleFn, RoleResult, WorkerOutcome } from "./contract.js";
 import { builderModel } from "./role-models.js";
 import type { ScoutFinding } from "./scout.js";
@@ -447,6 +448,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
   let doneClaim: DoneClaim | undefined; // the builder's CLAIM (verifier still decides truth)
   let lastChecks: ChecksOutcome | undefined; // last run_checks outcome — gates `done`
   let checksRuns = 0; // how many times the builder ran the checks in-loop
+  let compressions = 0; // how many times the context was compacted (window management)
   let stopReason = "max_iterations"; // not "stop": only a validated `done` is success now
 
   try {
@@ -714,6 +716,22 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         break;
       }
 
+      // CONTEXT WINDOW MANAGEMENT: before each model call, compact the conversation if it
+      // has grown past 70% of this model's window (capability profile). Older middle turns
+      // are summarized BY THE MODEL into one message wrapped through the neutralization
+      // chokepoint (the header + recent turns are preserved). Never fails the build.
+      const comp = await maybeCompress(messages, caps, {
+        invoke: (req) => ctx.engine.invokeModel(req),
+        model: builderModelId,
+        identity: ctx.identity,
+        wrapSummary: (text) =>
+          toUntrustedMessage(
+            ctx.engine.neutralizeUntrusted(text, { source: "mcp_result", identity: ctx.identity, origin: "context_summary" }),
+            { role: "user" },
+          ),
+      });
+      if (comp.compressed) compressions += 1;
+
       const response = await ctx.engine.invokeModel({
         // Per-candidate model (the shootout) when injected; otherwise the builder's own model.
         model: builderModelId,
@@ -806,6 +824,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         toolRounds,
         bareStops,
         checksRuns,
+        compressions,
         ...(lastChecks !== undefined ? { lastChecks } : {}),
         stopReason,
         neutralizedCount,
