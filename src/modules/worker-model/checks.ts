@@ -63,6 +63,35 @@ export type ChecksResolution =
   | { readonly ok: false; readonly reason: string };
 
 /**
+ * Parse the per-target check set from `IKBI_CHECKS` — a JSON array of {name, command, args},
+ * e.g. `[{"name":"test","command":"npm","args":["test"]}]`. This is OPERATOR-configured (an
+ * env var, never read from the worktree, never model-chosen). Returns `undefined` when unset,
+ * the parsed checks when valid, or `"malformed"` (→ fail-closed RED) on bad JSON / shape.
+ */
+export function parseChecksEnv(raw: string | undefined): readonly Check[] | "malformed" | undefined {
+  if (raw === undefined) return undefined;
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return "malformed";
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0) return "malformed";
+  const checks: Check[] = [];
+  for (const item of parsed) {
+    if (typeof item !== "object" || item === null) return "malformed";
+    const o = item as Record<string, unknown>;
+    if (typeof o.name !== "string" || o.name.length === 0) return "malformed";
+    if (typeof o.command !== "string" || o.command.length === 0) return "malformed";
+    if (!Array.isArray(o.args) || !o.args.every((a) => typeof a === "string")) return "malformed";
+    checks.push({ name: o.name, command: o.command, args: [...(o.args as string[])] });
+  }
+  return checks;
+}
+
+/**
  * Resolve the check set to run against a worktree WITH a fail-closed PROJECT-ROOT GUARD.
  *
  * THE BUG this closes: worktrees can live INSIDE ikbi's own pnpm workspace, so `pnpm tsc` /
@@ -71,10 +100,11 @@ export type ChecksResolution =
  * EQUALS the worktree root; if the nearest manifest is an ANCESTOR (wrong repo) or there is
  * NONE (no recognizable project), it returns RED (ok:false) — never a vacuous pass.
  *
- * The command set is configured by the operator/target repo (NEVER model-chosen) — the env
- * override is layered in by a later fix; for now the default is pnpm (VERIFIER_CHECKS).
+ * The command set is configured by the operator (the `IKBI_CHECKS` env, NEVER model-chosen);
+ * the default is pnpm (VERIFIER_CHECKS). A malformed IKBI_CHECKS fails closed (RED) rather
+ * than silently falling back, so a typo can never mask an unverified build.
  */
-export function resolveChecks(worktreeReal: string): ChecksResolution {
+export function resolveChecks(worktreeReal: string, env: NodeJS.ProcessEnv = process.env): ChecksResolution {
   const wt = resolve(worktreeReal);
   const root = resolveProjectRoot(wt);
   if (root === undefined) {
@@ -83,6 +113,12 @@ export function resolveChecks(worktreeReal: string): ChecksResolution {
   if (root !== wt) {
     return { ok: false, reason: `the resolved project root (${root}) is an ANCESTOR of the worktree (${wt}) — checks would validate the WRONG repo (RED)` };
   }
+  // Fix 2: operator-configured, NEVER model-chosen. IKBI_CHECKS wins; default is pnpm.
+  const fromEnv = parseChecksEnv(env.IKBI_CHECKS);
+  if (fromEnv === "malformed") {
+    return { ok: false, reason: "IKBI_CHECKS is malformed (expected a non-empty JSON array of {name,command,args}) — cannot verify (RED)" };
+  }
+  if (fromEnv !== undefined) return { ok: true, checks: fromEnv, source: "env" };
   return { ok: true, checks: VERIFIER_CHECKS, source: "default" };
 }
 
