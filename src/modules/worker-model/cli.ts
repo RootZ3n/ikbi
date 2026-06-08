@@ -63,7 +63,7 @@ export function productionRoleClaim(workerToken: string | undefined): (role: Wor
  * module boundary) can wire the governed worker without reaching for it.
  */
 export function createProductionWorker(
-  opts: { workerToken: string | undefined; gateWall?: GateWall },
+  opts: { workerToken: string | undefined; gateWall?: GateWall; onExecOutput?: (chunk: string, stream: "stdout" | "stderr") => void },
 ): { run: (task: WorkerTask, ctx: OperationContext) => Promise<WorkerResult> } {
   // Explicitly thread the governed executor to BOTH roles (builder run_checks + verifier) via
   // the orchestrator. LAZY wrapper (not an eager import): importing the governed-exec singleton
@@ -74,7 +74,7 @@ export function createProductionWorker(
   // COMMIT the verified-good work — without it the scratch branch never advances and promote
   // sees an empty diff ("no changes to promote"). coreWorkspaces is the same manager the
   // orchestrator would default to; passing it makes the commit dependency explicit.
-  return createOrchestrator({ roleClaim: productionRoleClaim(opts.workerToken), gateWall: opts.gateWall ?? coreGateWall, governedExec, workspaces: coreWorkspaces, enforceProjectRoot: true });
+  return createOrchestrator({ roleClaim: productionRoleClaim(opts.workerToken), gateWall: opts.gateWall ?? coreGateWall, governedExec, workspaces: coreWorkspaces, enforceProjectRoot: true, ...(opts.onExecOutput !== undefined ? { onExecOutput: opts.onExecOutput } : {}) });
 }
 
 /** Parse a `--repo <path>` / `--repo=<path>` flag out of argv; the rest is the goal prose. */
@@ -133,16 +133,16 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
   const operatorToken = "operatorToken" in deps ? deps.operatorToken : config.identity.operatorToken;
   const workerToken = "workerToken" in deps ? deps.workerToken : config.identity.workerToken;
   const gateWall = deps.gateWall ?? coreGateWall;
-  // The live orchestrator via the SHARED production-worker construction (the same wiring
-  // `ikbi batch` uses, so build + batch are governed identically). Construction is
-  // side-effect-free; roleClaim only throws when CALLED with no worker token (the handler
-  // refuses before that).
-  const orchestrator = deps.orchestrator ?? createProductionWorker({ workerToken, gateWall });
   const out = deps.stdout ?? ((s: string) => void process.stdout.write(s));
   const err = deps.stderr ?? ((s: string) => void process.stderr.write(s));
   const setExit = deps.setExit ?? ((c: number) => void (process.exitCode = c));
   const now = deps.now ?? Date.now;
   const cwd = deps.cwd ?? (() => process.cwd());
+  // The live orchestrator via the SHARED production-worker construction (the same wiring
+  // `ikbi batch` uses, so build + batch are governed identically). Construction is
+  // side-effect-free; roleClaim only throws when CALLED with no worker token (the handler
+  // refuses before that). SG-1: stream the governed check output live to the operator's stdout.
+  const orchestrator = deps.orchestrator ?? createProductionWorker({ workerToken, gateWall, onExecOutput: (chunk) => out(chunk) });
 
   async function build(argv: readonly string[]): Promise<void> {
     const { repo, rest } = parseBuildArgs(argv);

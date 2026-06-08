@@ -38,7 +38,7 @@ import type { ModelRequest, ModelResponse } from "../../core/provider/contract.j
 import { deterministicJudge } from "../deterministic-judge/index.js";
 import type { BuildCandidate, JudgeResult } from "../deterministic-judge/index.js";
 
-import type { GovernedExec } from "../governed-exec/index.js";
+import type { ExecRequest, GovernedExec } from "../governed-exec/index.js";
 
 import { builder, createBuilder, MAX_TOOL_ITERATIONS } from "./builder.js";
 import { resolveChecks } from "./checks.js";
@@ -133,6 +133,12 @@ export interface OrchestratorDeps {
    * A non-allowlisted / gate-denied check fails the verifier CLOSED (never a silent pass).
    */
   readonly governedExec?: Pick<GovernedExec, "run">;
+  /**
+   * LIVE OUTPUT SINK (SG-1): when set, every governed check (verifier + builder run_checks)
+   * STREAMS its stdout/stderr here chunk-by-chunk as it runs — so the operator sees long
+   * check output live, not just the buffered tail at the end. The CLI wires it to stdout.
+   */
+  readonly onExecOutput?: (chunk: string, stream: "stdout" | "stderr") => void;
   /** The single builder model (per-candidate fallback). Default: config (IKBI_MODEL_BUILDER). */
   readonly builderModel?: string;
   /** The head-to-head competitive model list. Default: config (IKBI_COMPETITIVE_MODELS). */
@@ -227,6 +233,16 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   const gateWall = deps.gateWall; // optional in the type — absent → promote DENIED fail-closed (H5)
   const judge = deps.judge ?? deterministicJudge; // competitive-mode scorer (pure, no model)
   const enforceProjectRoot = deps.enforceProjectRoot ?? false; // Fix 1/2 guard — production-only (off in tests)
+  // SG-1: when a live-output sink is wired, wrap the injected governed executor so EVERY check
+  // it runs streams its output to the sink. No sink (the common/test case) ⇒ the base executor
+  // unchanged. (Only wraps an explicitly-injected governedExec — the verifier/builder lazy
+  // fallback is used otherwise, and streaming requires the explicit production wiring anyway.)
+  const baseGovExec = deps.governedExec;
+  const execSink = deps.onExecOutput;
+  const govExecForRoles: Pick<GovernedExec, "run"> | undefined =
+    baseGovExec !== undefined && execSink !== undefined
+      ? { run: (req: ExecRequest) => baseGovExec.run({ ...req, onOutput: execSink }) }
+      : baseGovExec;
   // Cooperative kill checkpoint (read-only). Lazy default so worker-model load never
   // eagerly constructs the kill-switch; the loop OBEYS a kill, it never publishes one.
   const killCheck =
@@ -254,7 +270,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   function verifierFor(parentCtx: OperationContext): RoleFn {
     if (deps.roles?.verifier !== undefined) return deps.roles.verifier;
     return createVerifier({
-      ...(deps.governedExec !== undefined ? { governedExec: deps.governedExec } : {}),
+      ...(govExecForRoles !== undefined ? { governedExec: govExecForRoles } : {}),
       parentCtx,
       ...(workspaces.diff !== undefined ? { diff: (ws: WorkspaceHandle) => workspaces.diff!(ws) } : {}),
       // PROJECT-ROOT GUARD + per-target check set (Fix 1/2): wired ONLY in production
@@ -277,7 +293,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   function builderForModel(parentCtx: OperationContext, modelOverride?: string): RoleFn {
     if (deps.roles?.builder !== undefined) return deps.roles.builder;
     return createBuilder({
-      ...(deps.governedExec !== undefined ? { governedExec: deps.governedExec } : {}),
+      ...(govExecForRoles !== undefined ? { governedExec: govExecForRoles } : {}),
       parentCtx,
       ...(modelOverride !== undefined ? { modelOverride } : {}),
       // Same resolved set the verifier uses (Fix 1/2), wired ONLY in production (enforceProjectRoot).

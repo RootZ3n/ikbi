@@ -36,6 +36,14 @@ export interface ExecRequest {
   readonly purpose?: string;
   /** Working directory for the command. */
   readonly cwd?: string;
+  /**
+   * Optional LIVE OUTPUT SINK (SG-1): when provided, the command's stdout/stderr are STREAMED
+   * to this callback chunk-by-chunk as they arrive (so a user sees long check output live),
+   * instead of only the buffered tail at the end. The returned `ExecResult` still carries the
+   * bounded `stdoutTail`/`stderrTail` for logging/receipts — the truncation is for the record,
+   * not the live view. Absent ⇒ the buffered path (unchanged).
+   */
+  readonly onOutput?: (chunk: string, stream: "stdout" | "stderr") => void;
 }
 
 /**

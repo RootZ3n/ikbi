@@ -22,7 +22,7 @@
  * arg COUNT + sudo + host/method + outcome only.
  */
 
-import { execFile as nodeExecFile } from "node:child_process";
+import { execFile as nodeExecFile, spawn as nodeSpawn } from "node:child_process";
 import { promisify } from "node:util";
 
 import { events as coreEvents } from "../../core/events/index.js";
@@ -60,6 +60,49 @@ const promisifiedExecFile = promisify(nodeExecFile);
 const defaultExecFile: ExecFileFn = (binary, args, opts) =>
   promisifiedExecFile(binary, args as string[], opts);
 
+/**
+ * The STREAMING exec primitive (SG-1): spawns the command and forwards each stdout/stderr
+ * chunk to `onOutput` as it arrives, while accumulating bounded output for the tail. Resolves
+ * with the captured output + exit code (it does NOT throw on a non-zero exit — the caller maps
+ * the code). Tests substitute this.
+ */
+export type ExecFileStreamFn = (
+  binary: string,
+  args: readonly string[],
+  opts: { cwd?: string; timeout: number; maxBuffer: number },
+  onOutput: (chunk: string, stream: "stdout" | "stderr") => void,
+) => Promise<{ stdout: string; stderr: string; code: number }>;
+
+/** Default streaming impl over node `spawn` (array args, no shell). Bounds capture at maxBuffer. */
+const defaultExecFileStream: ExecFileStreamFn = (binary, args, opts, onOutput) =>
+  new Promise((resolveP) => {
+    const child = nodeSpawn(binary, args as string[], opts.cwd !== undefined ? { cwd: opts.cwd } : {});
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, opts.timeout);
+    const onData = (which: "stdout" | "stderr") => (d: Buffer | string) => {
+      const s = typeof d === "string" ? d : d.toString("utf8");
+      onOutput(s, which); // LIVE — every chunk, untruncated, as it arrives
+      if (which === "stdout") {
+        if (stdout.length < opts.maxBuffer) stdout += s;
+      } else if (stderr.length < opts.maxBuffer) stderr += s;
+    };
+    child.stdout?.on("data", onData("stdout"));
+    child.stderr?.on("data", onData("stderr"));
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      resolveP({ stdout, stderr: `${stderr}${e instanceof Error ? e.message : String(e)}`, code: 1 });
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolveP({ stdout, stderr, code: timedOut ? 124 : code ?? 1 });
+    });
+  });
+
 /** Injectable dependencies (tests substitute gateWall / guardedFetch / receipts / execFile / clock). */
 export interface GovernedExecDeps {
   readonly config?: GovernedExecConfig;
@@ -71,6 +114,8 @@ export interface GovernedExecDeps {
   readonly publish?: (input: EventInput<GovExecEventPayload>) => void;
   /** The exec primitive. Default: promisified node execFile (array args, no shell). */
   readonly execFile?: ExecFileFn;
+  /** The STREAMING exec primitive (used when a request sets `onOutput`). Default: node spawn. */
+  readonly execFileStream?: ExecFileStreamFn;
 }
 
 /** Last `OUTPUT_TAIL_CHARS` of a captured stream (bounded; never the full body). */
@@ -94,6 +139,7 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
   const receipts = deps.receipts ?? coreReceipts;
   const publish = deps.publish ?? ((input: EventInput<GovExecEventPayload>) => void coreEvents.publish(input));
   const execFile = deps.execFile ?? defaultExecFile;
+  const execFileStream = deps.execFileStream ?? defaultExecFileStream;
   const allowlist = new Set(config.allowlist);
   // Lazy: resolving the egress guard at construction would throw if egress is not yet
   // registered. Resolve per-call so importing this module never forces that ordering.
@@ -191,6 +237,26 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
     }
 
     // (7) EXECUTE — array args, NO shell. (8) receipt the outcome.
+    // STREAMING path (SG-1): when the caller wants live output, spawn and forward each chunk.
+    // The receipt/result still carry only the BOUNDED tail — truncation is for the record, not
+    // the live view. A non-zero exit is reported, never thrown.
+    if (request.onOutput !== undefined) {
+      const { stdout, stderr, code } = await execFileStream(
+        command,
+        args,
+        { ...(cwd !== undefined ? { cwd } : {}), timeout: config.execTimeoutMs, maxBuffer: config.maxBuffer },
+        request.onOutput,
+      );
+      if (code === 0) {
+        emit(govexecExecuted, { ...base, allow: true, exitCode: 0 }, identity, EXEC_OPERATION, requestId);
+        await receipt(EXEC_OPERATION, identity, { status: "success", detail: `exec ${command} ok` }, { action: "exec", command, argCount, sudo, allow: true, exitCode: 0 }, requestId, cwd);
+        return { executed: true, exitCode: 0, stdoutTail: tail(stdout), stderrTail: tail(stderr) };
+      }
+      const reason = `command exited ${code}`;
+      emit(govexecFailed, { ...base, allow: true, exitCode: code, reason }, identity, EXEC_OPERATION, requestId);
+      await receipt(EXEC_OPERATION, identity, { status: "failure", error: reason, code: String(code) }, { action: "exec", command, argCount, sudo, allow: true, exitCode: code }, requestId, cwd);
+      return { executed: true, exitCode: code, reason, stdoutTail: tail(stdout), stderrTail: tail(stderr) };
+    }
     try {
       const { stdout, stderr } = await execFile(command, args, {
         ...(cwd !== undefined ? { cwd } : {}),
