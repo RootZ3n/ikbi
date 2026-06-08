@@ -11,11 +11,29 @@
  *   IKBI_DRIFT_PREVENTION_MIN_SAMPLE_SIZE  minimum recent outcomes before flagging —
  *                                          never cry drift on noise. Default 5.
  *   IKBI_DRIFT_PREVENTION_RECENT_WINDOW    how many recent outcomes = "recent". Default 20.
+ *   IKBI_DRIFT_PREVENTION_POLICY           intervention on detected drift: "reportOnly"
+ *                                          (default — log/emit only), "warn" (console.warn
+ *                                          and continue), or "block" (check() throws a
+ *                                          DriftBlockedError). Invalid value ⇒ load throws.
  */
 
 import { moduleEnv } from "../../core/module-config.js";
 
 const env = moduleEnv("drift-prevention");
+
+/** The intervention a detected drift triggers in check(). */
+export type DriftPolicyName = "reportOnly" | "warn" | "block";
+
+/** The default intervention: detect-and-report only (acts on nothing). */
+export const DEFAULT_DRIFT_POLICY: DriftPolicyName = "reportOnly";
+
+/** Parse + validate the policy name (fail-loud on an unrecognized value). */
+export function parseDriftPolicy(raw: string | undefined): DriftPolicyName {
+  if (raw === undefined) return DEFAULT_DRIFT_POLICY;
+  const v = raw.trim();
+  if (v === "reportOnly" || v === "warn" || v === "block") return v;
+  throw new Error(`invalid IKBI_DRIFT_PREVENTION_POLICY "${raw}" (expected reportOnly | warn | block)`);
+}
 
 /** Minimum drop (baseline rate − recent rate) to flag drift. */
 export const DEFAULT_DRIFT_THRESHOLD = 0.2;
@@ -33,6 +51,11 @@ export interface DriftPreventionConfig {
   readonly minSampleSize: number;
   /** Recent-window size. */
   readonly recentWindow: number;
+  /**
+   * Intervention on detected drift. Optional — when absent, the detector defaults to
+   * `reportOnly` (the v1 posture). Set via IKBI_DRIFT_PREVENTION_POLICY.
+   */
+  readonly policy?: DriftPolicyName;
 }
 
 /** Load the drift-prevention config slice from `IKBI_DRIFT_PREVENTION_*`. */
@@ -42,6 +65,7 @@ export function loadDriftPreventionConfig(reader = env): DriftPreventionConfig {
     driftThreshold: reader.number("DRIFT_THRESHOLD", DEFAULT_DRIFT_THRESHOLD, { min: 0, max: 1 }),
     minSampleSize: reader.int("MIN_SAMPLE_SIZE", DEFAULT_MIN_SAMPLE_SIZE, { min: 1 }),
     recentWindow: reader.int("RECENT_WINDOW", DEFAULT_RECENT_WINDOW, { min: 1 }),
+    policy: parseDriftPolicy(reader.str("POLICY")),
   });
 }
 

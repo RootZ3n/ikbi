@@ -1,11 +1,15 @@
 /**
- * ikbi drift-prevention — the success-rate drift detector (detect-and-report only).
+ * ikbi drift-prevention — the success-rate drift detector WITH a graduated intervention.
  *
  * READS the durable baseline (lab-context-memory "pattern" entries) + the recent rate
  * (a receipts window) and computes drift with PURE math — no model call, deterministic.
- * It WRITES nothing and ACTS on nothing: no trust demotion, no agent pause, no gate.
- * Intervention is the `DriftPolicy` seam (default `reportOnly` — advisory, acts on
- * nothing in v1).
+ * It still WRITES nothing (no trust demotion, no agent pause, no gate). What it now DOES
+ * on a detected drift is governed by the `DriftPolicy` seam, selected by config:
+ *   - reportOnly (DEFAULT) — emit the event + return the report; take no action ("none").
+ *   - warn                 — additionally `console.warn` the drift, then continue ("warned").
+ *   - block                — throw a DriftBlockedError carrying the drifted reports ("blocked").
+ * The default is reportOnly, so existing read-only callers are unaffected; warn/block are
+ * the operator's deliberate opt-in via IKBI_DRIFT_PREVENTION_POLICY.
  */
 
 import { events as coreEvents } from "../../core/events/index.js";
@@ -14,14 +18,32 @@ import { receipts as coreReceipts } from "../../core/receipt/index.js";
 import type { Receipt, ReceiptQuery } from "../../core/receipt/contract.js";
 import { labMemory as coreLabMemory } from "../lab-context-memory/index.js";
 import type { MemoryEntry, MemoryKind } from "../lab-context-memory/index.js";
-import { driftPreventionConfig, type DriftPreventionConfig } from "./config.js";
+import { driftPreventionConfig, type DriftPolicyName, type DriftPreventionConfig } from "./config.js";
 import { driftChecked, driftDetected } from "./events.js";
-import type { DriftCheckOptions, DriftPolicy, DriftPrevention, DriftReport, DriftSeverity } from "./contract.js";
+import { DriftBlockedError, type DriftActionTaken, type DriftCheckOptions, type DriftPolicy, type DriftPrevention, type DriftReport, type DriftSeverity } from "./contract.js";
 
 const EVENT_SOURCE = "drift-prevention";
 
-/** The v1 default policy: report only — never act. The seam's no-op upgrade point. */
+/** The default policy: report only — never act (emit + return; action "none"). */
 export const reportOnly: DriftPolicy = () => ({ act: false });
+
+/** WARN policy: log a warning and continue (action "warned"). */
+export const warnPolicy: DriftPolicy = (report) => ({ act: true, kind: "warn", note: `drift on ${report.agent}/${report.operation}` });
+
+/** BLOCK policy: signal that check() must throw a DriftBlockedError (action "blocked"). */
+export const blockPolicy: DriftPolicy = (report) => ({ act: true, kind: "block", note: `drift on ${report.agent}/${report.operation}` });
+
+/** Resolve the built-in policy function for a config policy name (default reportOnly). */
+export function policyForName(name: DriftPolicyName | undefined): DriftPolicy {
+  switch (name) {
+    case "warn":
+      return warnPolicy;
+    case "block":
+      return blockPolicy;
+    default:
+      return reportOnly;
+  }
+}
 
 function num(v: unknown): number {
   return typeof v === "number" && Number.isFinite(v) ? v : 0;
@@ -79,7 +101,9 @@ export function createDriftPrevention(deps: DriftPreventionDeps = {}): DriftPrev
   const config = deps.config ?? driftPreventionConfig;
   const labMemory: LabMemoryReader = deps.labMemory ?? coreLabMemory;
   const receipts: ReceiptReader = deps.receipts ?? (coreReceipts as ReceiptReader);
-  const policy = deps.policy ?? reportOnly;
+  // An explicitly injected policy wins (the test/advanced seam); otherwise the policy is
+  // selected by the config name (default reportOnly).
+  const policy = deps.policy ?? policyForName(config.policy);
   const publish = deps.publish ?? ((input: EventInput<unknown>) => void coreEvents.publish(input));
 
   function emit<P>(event: { create: (p: P, o?: { source?: string }) => EventInput<P> }, payload: P): void {
@@ -92,6 +116,7 @@ export function createDriftPrevention(deps: DriftPreventionDeps = {}): DriftPrev
     // BASELINE: the agent's durable "pattern" entries (success/failure per operation).
     const patterns = await labMemory.byAgent(opts.agent, { kind: "pattern", ...(opts.project !== undefined ? { project: opts.project } : {}) });
     const reports: DriftReport[] = [];
+    const blocked: DriftReport[] = []; // drifted reports the "block" policy wants to halt on
 
     for (const entry of patterns) {
       const v = entry.value as Record<string, unknown>;
@@ -108,8 +133,8 @@ export function createDriftPrevention(deps: DriftPreventionDeps = {}): DriftPrev
       const recentSuccesses = windowed.filter((r) => r.outcome.status === "success").length;
 
       const report = computeDrift(config, opts.agent, operation, opts.project, baselineRate, recentSuccesses, recentTotal);
-      reports.push(report);
 
+      let action: DriftActionTaken = "none";
       if (report.drifted) {
         emit(driftDetected, {
           agent: report.agent,
@@ -121,13 +146,29 @@ export function createDriftPrevention(deps: DriftPreventionDeps = {}): DriftPrev
           sampleSize: report.sampleSize,
           severity: report.severity ?? "minor",
         });
-        // INTERVENTION SEAM (v1 reportOnly → act:false). Consulted, but drift-prevention
-        // has NO action surface — even act:true triggers nothing until a future layer wires it.
-        policy(report);
+        // INTERVENTION SEAM: ask the policy what to do, then ACT on its decision.
+        //  - act:false (reportOnly)         → "none" (advisory).
+        //  - act:true, kind "warn"          → log a warning, continue → "warned".
+        //  - act:true, kind "block"         → mark for the post-loop throw → "blocked".
+        //  - act:true, no kind (legacy)     → advisory only ("none"); never writes/throws.
+        const decision = policy(report);
+        if (decision.act && decision.kind === "warn") {
+          console.warn(`[drift] ${report.agent}/${report.operation}: ${report.reason}${decision.note !== undefined ? ` (${decision.note})` : ""}`);
+          action = "warned";
+        } else if (decision.act && decision.kind === "block") {
+          action = "blocked";
+        }
       }
+
+      const finalReport: DriftReport = { ...report, action };
+      reports.push(finalReport);
+      if (action === "blocked") blocked.push(finalReport);
     }
 
     emit(driftChecked, { agent: opts.agent, operationCount: reports.length });
+    // BLOCK intervention: a detected drift under the "block" policy HALTS the caller with a
+    // typed error carrying the offending reports (after the event is emitted, so it is audited).
+    if (blocked.length > 0) throw new DriftBlockedError(blocked);
     return reports;
   }
 

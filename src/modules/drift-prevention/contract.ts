@@ -20,12 +20,21 @@
  * No frozen-core change.
  *
  * CONTRACT_VERSION changelog (newest on top):
+ *   1.1.0 — additive INTERVENTION: the policy seam can now actually act. DriftAction
+ *           gains an optional `kind` ("warn" | "block"); DriftReport gains an optional
+ *           `action` recording what check() did ("none" | "warned" | "blocked"); and a
+ *           DriftBlockedError is thrown by check() under the "block" policy. Default
+ *           stays reportOnly (act:false ⇒ action "none"), so existing callers are
+ *           unaffected — all fields are additive/optional.
  *   1.0.0 — initial drift-prevention contract: DriftReport (baseline vs recent pass
  *           rate, drop, severity) + the report-only DriftPolicy seam. Detect-and-report.
  */
 
 /** Semantic version of the drift-prevention contract. Bump on breaking change. */
-export const CONTRACT_VERSION = "1.0.0";
+export const CONTRACT_VERSION = "1.1.0";
+
+/** What check() actually DID about a report (the intervention taken). */
+export type DriftActionTaken = "none" | "warned" | "blocked";
 
 /** Drift severity bands (by the size of the drop). */
 export type DriftSeverity = "minor" | "major";
@@ -49,13 +58,37 @@ export interface DriftReport {
   readonly severity?: DriftSeverity;
   /** Human/audit reason. */
   readonly reason: string;
+  /**
+   * ADDITIVE (1.1.0): what the intervention policy made check() DO about this report.
+   * "none" = report-only / advisory (the v1 posture), "warned" = a warning was logged,
+   * "blocked" = check() threw a DriftBlockedError. Absent on raw `computeDrift` output
+   * (pure math, no policy) — check() stamps it on every report it returns.
+   */
+  readonly action?: DriftActionTaken;
 }
 
-/** What an intervention policy decides for a drifted report. v1 acts on nothing. */
+/** What an intervention policy decides for a drifted report. */
 export interface DriftAction {
-  /** Whether a (future) intervention layer should act. v1 reportOnly ⇒ false. */
+  /** Whether to act on this drift. reportOnly ⇒ false. */
   readonly act: boolean;
+  /**
+   * ADDITIVE (1.1.0): HOW to act when `act` is true. "warn" ⇒ check() logs a warning and
+   * continues; "block" ⇒ check() throws a DriftBlockedError. Absent (with act:true) is the
+   * legacy advisory posture — consulted, but check() takes no warn/throw action.
+   */
+  readonly kind?: "warn" | "block";
   readonly note?: string;
+}
+
+/** Thrown by check() under the "block" policy when drift is detected. Carries the blocked reports. */
+export class DriftBlockedError extends Error {
+  readonly reports: readonly DriftReport[];
+  constructor(reports: readonly DriftReport[]) {
+    const ops = reports.map((r) => `${r.agent}/${r.operation}`).join(", ");
+    super(`drift blocked: ${reports.length} drifted operation(s) [${ops}] under the "block" policy`);
+    this.name = "DriftBlockedError";
+    this.reports = reports;
+  }
 }
 
 /**

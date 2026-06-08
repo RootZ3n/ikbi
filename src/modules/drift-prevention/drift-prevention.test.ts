@@ -4,9 +4,9 @@ import { test } from "node:test";
 import type { EventInput } from "../../core/events/index.js";
 import type { Receipt, ReceiptQuery } from "../../core/receipt/contract.js";
 import type { MemoryEntry } from "../lab-context-memory/index.js";
-import { createDriftPrevention, computeDrift, reportOnly } from "./drift.js";
-import type { DriftPreventionConfig } from "./config.js";
-import type { DriftPolicy, DriftReport } from "./contract.js";
+import { createDriftPrevention, computeDrift, reportOnly, warnPolicy, blockPolicy, policyForName } from "./drift.js";
+import { parseDriftPolicy, type DriftPreventionConfig } from "./config.js";
+import { DriftBlockedError, type DriftPolicy, type DriftReport } from "./contract.js";
 
 const CFG: DriftPreventionConfig = { enabled: true, driftThreshold: 0.2, minSampleSize: 5, recentWindow: 20 };
 
@@ -164,6 +164,78 @@ test("drift.* events carry rates/counts only — no raw receipt content or secre
   assert.ok(!serialized.includes("RECEIPT-SECRET"), "no receipt metadata in events");
   assert.ok(!serialized.includes("REQ-SECRET"), "no request summary in events");
   for (const e of ev.sent) assert.equal((e as { source: string }).source, "drift-prevention");
+});
+
+// ── INTERVENTION POLICIES (1.1.0) ────────────────────────────────────────────
+
+const drifted = (over: Partial<DriftReport> = {}): DriftReport =>
+  ({ agent: "a", operation: "op.x", baselineRate: 0.9, recentRate: 0.1, drop: 0.8, sampleSize: 10, drifted: true, severity: "major", reason: "x", ...over });
+
+test("policy functions: reportOnly=no act, warn=act+kind warn, block=act+kind block", () => {
+  assert.deepEqual(reportOnly(drifted()), { act: false });
+  const w = warnPolicy(drifted());
+  assert.equal(w.act, true);
+  assert.equal(w.kind, "warn");
+  const b = blockPolicy(drifted());
+  assert.equal(b.act, true);
+  assert.equal(b.kind, "block");
+});
+
+test("policyForName maps config names to policies (default reportOnly)", () => {
+  assert.equal(policyForName("warn"), warnPolicy);
+  assert.equal(policyForName("block"), blockPolicy);
+  assert.equal(policyForName("reportOnly"), reportOnly);
+  assert.equal(policyForName(undefined), reportOnly);
+});
+
+test("parseDriftPolicy validates the env value (fail-loud on garbage)", () => {
+  assert.equal(parseDriftPolicy(undefined), "reportOnly");
+  assert.equal(parseDriftPolicy("block"), "block");
+  assert.throws(() => parseDriftPolicy("halt-everything"), /invalid IKBI_DRIFT_PREVENTION_POLICY/);
+});
+
+test("reportOnly: a drifted report is stamped action 'none' (advisory, no throw)", async () => {
+  const f = fakes([pattern("a", "op.x", 18, 20)], receiptsFor("a", "op.x", 2, 10));
+  const reports = await mk({ labMemory: f.labMemory, receipts: f.receipts, config: { ...CFG, policy: "reportOnly" } }).check({ agent: "a" });
+  assert.equal(reports[0]?.drifted, true);
+  assert.equal(reports[0]?.action, "none");
+});
+
+test("warn policy: a drifted report is stamped action 'warned' and check() still returns", async () => {
+  const warned: string[] = [];
+  const orig = console.warn;
+  console.warn = (...a: unknown[]) => void warned.push(a.join(" "));
+  try {
+    const f = fakes([pattern("a", "op.x", 18, 20)], receiptsFor("a", "op.x", 2, 10));
+    const reports = await mk({ labMemory: f.labMemory, receipts: f.receipts, config: { ...CFG, policy: "warn" } }).check({ agent: "a" });
+    assert.equal(reports[0]?.action, "warned");
+    assert.equal(warned.length, 1, "a warning was logged");
+    assert.match(warned[0] ?? "", /\[drift\] a\/op\.x/);
+  } finally {
+    console.warn = orig;
+  }
+});
+
+test("block policy: a detected drift THROWS DriftBlockedError carrying the reports", async () => {
+  const f = fakes([pattern("a", "op.x", 18, 20)], receiptsFor("a", "op.x", 2, 10));
+  const d = mk({ labMemory: f.labMemory, receipts: f.receipts, config: { ...CFG, policy: "block" } });
+  await assert.rejects(
+    () => d.check({ agent: "a" }),
+    (e: unknown) => {
+      assert.ok(e instanceof DriftBlockedError, "throws the typed error");
+      assert.equal(e.reports.length, 1);
+      assert.equal(e.reports[0]?.action, "blocked");
+      assert.match(e.message, /drift blocked/);
+      return true;
+    },
+  );
+});
+
+test("block policy: NO drift ⇒ no throw (a stable agent passes through)", async () => {
+  const f = fakes([pattern("a", "op.x", 90, 100)], receiptsFor("a", "op.x", 17, 20));
+  const reports = await mk({ labMemory: f.labMemory, receipts: f.receipts, config: { ...CFG, policy: "block" } }).check({ agent: "a" });
+  assert.equal(reports[0]?.drifted, false);
+  assert.equal(reports[0]?.action, "none", "no drift ⇒ no intervention");
 });
 
 // ── disabled ─────────────────────────────────────────────────────────────────

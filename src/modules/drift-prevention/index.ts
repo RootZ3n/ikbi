@@ -19,10 +19,23 @@ import { assertContractCompatible } from "../../core/contracts/index.js";
 assertContractCompatible("receipt", "1.0.0");
 assertContractCompatible("events", "1.0.0");
 
-export { createDriftPrevention, driftPrevention, computeDrift, reportOnly, type DriftPreventionDeps, type LabMemoryReader, type ReceiptReader } from "./drift.js";
+export {
+  createDriftPrevention,
+  driftPrevention,
+  computeDrift,
+  reportOnly,
+  warnPolicy,
+  blockPolicy,
+  policyForName,
+  type DriftPreventionDeps,
+  type LabMemoryReader,
+  type ReceiptReader,
+} from "./drift.js";
 export {
   CONTRACT_VERSION,
+  DriftBlockedError,
   type DriftAction,
+  type DriftActionTaken,
   type DriftCheckOptions,
   type DriftPolicy,
   type DriftPrevention,
@@ -32,9 +45,12 @@ export {
 export {
   driftPreventionConfig,
   loadDriftPreventionConfig,
+  parseDriftPolicy,
   DEFAULT_DRIFT_THRESHOLD,
   DEFAULT_MIN_SAMPLE_SIZE,
   DEFAULT_RECENT_WINDOW,
+  DEFAULT_DRIFT_POLICY,
   type DriftPreventionConfig,
+  type DriftPolicyName,
 } from "./config.js";
 export { driftChecked, driftDetected } from "./events.js";
