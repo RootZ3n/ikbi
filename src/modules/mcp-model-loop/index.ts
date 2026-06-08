@@ -2,15 +2,19 @@
  * ikbi mcp-model-loop — module entrypoint.
  *
  * Pins the FROZEN-CORE contracts this module builds against (exact targets) so a
- * drift throws a clear ContractVersionError at load. Like gate-wall / governed-exec /
- * subagent-spawning, it registers NO guard / side-effect — it is a pure consumer. The
- * operator wires the loop into an entrypoint (route/CLI) in the later barrel-wiring
- * pass; this file does NOT touch `src/modules/index.ts`.
+ * drift throws a clear ContractVersionError at load.
  *
  * NOTE: `gate-wall` (outbound tool-call gating) and `egress` (the SSRF guard real
  * HTTP transports route through) are MODULE dependencies, not frozen-core contracts
  * in `CONTRACT_VERSIONS`, so they cannot be pinned here — only the frozen deps
  * (provider, injection, events, identity).
+ *
+ * @status partially-wired
+ * The REAL stdio transport is now operator-reachable via the `ikbi mcp` CLI command
+ * (registered below through `./cli.js`) — connect to a stdio MCP server and run the
+ * governed loop. The DEFAULT process-wide `mcpModelLoop` singleton still uses the
+ * in-process MOCK transport (a library surface for in-process consumers); a default HTTP
+ * transport remains future work. So: stdio = live (CLI), mock singleton = library.
  */
 
 import { assertContractCompatible } from "../../core/contracts/index.js";

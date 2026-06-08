@@ -12,6 +12,13 @@
  * NOTE: `identity` is pinned for the agentId carried on observed events + the
  * observer's own lifecycle attribution — beyond the plan's original dep row for this
  * module; recorded as a minor additive visibility note (like lab-context-memory).
+ *
+ * @status dormant (library-only)
+ * DORMANT: the `selfObservation` singleton is constructed at load, but NOTHING in
+ * production calls `start()` or `snapshot()` and no HTTP route exposes it yet. It is a
+ * passive LIBRARY surface (a redacted event-ring for introspection) awaiting a status
+ * route / consumer. Until then it is inert — it neither subscribes nor reads unless a
+ * caller starts it. See MODULE_CENSUS.md.
  */
 
 import { assertContractCompatible } from "../../core/contracts/index.js";

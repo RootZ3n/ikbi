@@ -12,6 +12,13 @@
  * not frozen-core contracts in `CONTRACT_VERSIONS`, so they are not pinned here.
  * `events` is pinned too: it is BEYOND the plan's original dep list for this module —
  * added for install lifecycle visibility (a minor, non-security dependency).
+ *
+ * @status dormant (library-only)
+ * DORMANT: a complete, tested LIBRARY surface (`dependencyInstall.run(...)`) with NO live
+ * operator path yet — no CLI command and no HTTP route invokes it. capability-recovery may
+ * RECOMMEND a dependency install as data, but never dispatches it. Wiring an entrypoint is
+ * deliberate future work; until then the module only initializes (pins + config) and does
+ * no work unless a consumer calls it directly. See MODULE_CENSUS.md.
  */
 
 import { assertContractCompatible } from "../../core/contracts/index.js";

@@ -2,9 +2,12 @@
  * ikbi cognition-layer — module entrypoint.
  *
  * Pins the FROZEN-CORE contracts this module builds against (exact targets) so a
- * drift throws a clear ContractVersionError at load. It registers NO guard / side-
- * effect and runs ON DEMAND (`deliberate()`); no CLI command, no load-time
- * subscription, so it needs no modules-barrel entry.
+ * drift throws a clear ContractVersionError at load. It registers no named CLI command
+ * and no load-time subscription. It IS, however, wired into the operator path: the CLI
+ * imports `createCognitionRouter` directly (`src/cli/index.ts`) and uses it as the
+ * bare-goal DEFAULT router — `ikbi <goal>` deliberates here, then auto-dispatches the
+ * recommended command. So although it has no registration side-effect of its own, it is
+ * a live entrypoint, not dormant.
  *
  * RECOMMENDS, NEVER INVOKES: it imports provider (invokeModel), injection, identity,
  * events (frozen core, pinned below), and the READ-ONLY module deps lab-context-memory

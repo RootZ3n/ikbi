@@ -16,10 +16,14 @@
  * never at import, so egress-first is sufficient.)
  *
  * These are SIDE-EFFECT imports (no bindings pulled in) — loading is the point.
- * Modules register routes/commands in the later barrel-wiring step; none do so yet,
- * so importing here only initializes them. Nothing below performs active work at
- * import (no server bind, no network, no exec, no disk write) — registration and
- * in-memory singleton construction only.
+ * Importing a module fires its registrations: worker-model (`build`), batch-planner
+ * (`batch`), agent-router (`classify`/`ask`), capability-recovery (`recover`),
+ * mcp-model-loop (`mcp`), trust (`trust`), and kill-switch (`kill`/`unkill`/
+ * `kill-status`) register CLI commands; chat registers the `POST /chat` HTTP route.
+ * (cognition-layer is the CLI's bare-goal default router, wired directly in
+ * `src/cli/index.ts` rather than as a named command.) Nothing below performs active
+ * work at import (no server bind, no network, no exec, no disk write) — command/route
+ * registration and in-memory singleton construction only.
  */
 
 // EGRESS FIRST — registers the fetch guard before any model-invocation path.

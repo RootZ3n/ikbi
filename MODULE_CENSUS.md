@@ -27,6 +27,7 @@ Resolves the M8 (server is health-only) and M9 (barrel/orphan) honesty findings.
 | agent-router | `ikbi classify`, `ikbi ask` | Intent classification + cross-agent Q&A over lab memory. |
 | kill-switch | `ikbi kill`, `ikbi unkill`, `ikbi kill-status` | Operator emergency halt; reads the durable latch at startup. |
 | capability-recovery | `ikbi recover <capability> [--project]` | **NEW (M9).** Operator DIAGNOSTIC: prints a `CapabilityRecoveryPlan` (what broke, the likely cause class, which module should repair it). **Non-executing** — it recommends, never dispatches the repair. |
+| mcp-model-loop | `ikbi mcp --server "<command>" <goal>` | Runs the governed MCP model+tool loop against an operator-configured **stdio** MCP server (every tool call gate-walled, every result neutralized). The default process-wide loop singleton still uses the in-process mock; `ikbi mcp` is the real, opt-in stdio entrypoint. |
 
 ## Reachable transitively / as a library
 
@@ -37,13 +38,15 @@ Resolves the M8 (server is health-only) and M9 (barrel/orphan) honesty findings.
 | gate-wall | worker-model (promote governance) + governed-exec (exec governance) | Transitive |
 | governed-exec | worker-model (verifier routes its checks through it) | Transitive |
 | lab-context-memory | agent-router, cognition-layer, capability-recovery (read cross-agent memory) | Transitive (read) |
-| dependency-install | a future repair caller (capability-recovery RECOMMENDS it as data; never invokes) | Library |
-| mcp-model-loop | a standalone governed MCP tool loop for its consumers | Library |
-| subagent-spawning | the spawn surface consumers use to derive child identities | Library |
-| self-observation | the redacted event-ring consumers read for introspection | Library |
+| dependency-install | a future repair caller (capability-recovery RECOMMENDS it as data; never invokes) | Library (dormant) |
+| subagent-spawning | the spawn surface consumers use to derive child identities | Library (dormant) |
+| self-observation | the redacted event-ring consumers read for introspection | Library (dormant) |
 
-The **Library** modules are intentional: each is a typed surface called by its consumer
-or designed for a future caller. No CLI command is a design choice, not an orphan.
+The **Library (dormant)** modules are intentional typed surfaces with no live operator
+path yet — each is annotated `@status dormant` / `@status library-only` in its `index.ts`
+so the dormancy is explicit, not assumed. mcp-model-loop is **no longer** in this group:
+its stdio path is now reachable via `ikbi mcp` (above), though its default singleton
+remains a library/mock surface.
 
 ### capability-recovery — dual role (recorded so it is not re-flagged as orphaned)
 
@@ -61,20 +64,22 @@ or designed for a future caller. No CLI command is a design choice, not an orpha
 | egress | Installs the SSRF fetch guard (`registerFetchGuard`). Imported **first** in the barrel — any model-invocation path resolves this guard at call time and throws if it is absent. |
 | cache | Constructs the provider response cache singleton. |
 
-## Server (M8) — Phase 0 health-only
+## Server (M8) — health + chat
 
-The HTTP server (`src/server/`) is a **Phase 0 health-check skeleton**. It exposes
-**only** `/health` and `/ready` — no engine routes. The route registry
-(`src/server/registry.ts`) is a parallel-build **seam**: a module may register its routes
-from its own file at import time, but **none do yet** — the registry is intentionally
-empty. The **CLI is the real entrypoint today**; HTTP engine routes (status, Peh Q&A,
-dry-run toggle, kill-switch control) are future work. The server is **not** an orphan — it
-is a documented Phase 0 skeleton, deliberately without speculative routes.
+The HTTP server (`src/server/`) exposes `/health` and `/ready` plus the engine's first
+real module route: **`POST /chat`**, registered by the chat module
+(`src/modules/chat/routes.ts`) through the route registry seam
+(`src/server/registry.ts`). The registry is no longer empty — the seam is exercised: a
+module registers its routes from its own file at import time, and chat does so. The CLI
+remains the primary entrypoint for the build/governance commands; other HTTP engine routes
+(status, Peh Q&A, dry-run toggle, kill-switch control) are still future work.
 
 ## Barrel
 
-`src/modules/index.ts` side-effect-imports every module so its import-time initialization
-(contract pins, config slices, event definitions, singletons, **command registration**)
-fires when ikbi starts. capability-recovery is now barrel-imported (it registers the
-`recover` command). The CLI (`src/cli/index.ts`) and the service entry import the barrel
-before they start, so every CLI command above is registered at startup.
+`src/modules/index.ts` side-effect-imports all **19** module directories under
+`src/modules/` so each module's import-time initialization (contract pins, config slices,
+event definitions, singletons, **command registration**) fires when ikbi starts. The CLI
+(`src/cli/index.ts`) and the service entry import the barrel before they start, so every
+CLI command above — `build`, `batch`, `classify`, `ask`, `recover`, `mcp`, `trust`,
+`kill`/`unkill`/`kill-status` — is registered at startup, and chat's `POST /chat` route is
+mounted. (cognition-layer is wired directly in the CLI as the bare-goal default router.)

@@ -10,6 +10,13 @@
  * NOTE: `worker-model` is the module's primary dependency but is a MODULE contract,
  * not one of the frozen-core contracts in `CONTRACT_VERSIONS`, so it cannot be
  * pinned here — only the frozen deps it transits (workspace, identity, events) are.
+ *
+ * @status dormant (library-only)
+ * DORMANT: a tested LIBRARY surface (`subagentSpawner`) for deriving child identities,
+ * with NO live caller yet. It is INTENTIONALLY SEPARATE from the builder's `delegate_task`
+ * tool, which runs its own in-builder sub-loop (`worker-model/builder-tools/delegate.ts`)
+ * and does NOT use this module — the two are deliberately not merged. This module awaits a
+ * future orchestrator/runtime consumer. See MODULE_CENSUS.md.
  */
 
 import { assertContractCompatible } from "../../core/contracts/index.js";
