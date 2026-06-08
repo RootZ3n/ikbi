@@ -78,9 +78,9 @@ const call = (name: string, args: unknown, id = "c1"): ToolCall => ({ id, name, 
 
 /** A scripted invoker that records every request it saw. */
 function scripted(responses: ModelResponse[]) {
-  const requests: Array<{ messages: Array<{ role: string; content: string }> }> = [];
+  const requests: Array<{ messages: Array<{ role: string; content: string; untrusted?: boolean }> }> = [];
   let i = 0;
-  const invoke = (async (req: { messages: Array<{ role: string; content: string }> }) => {
+  const invoke = (async (req: { messages: Array<{ role: string; content: string; untrusted?: boolean }> }) => {
     requests.push(req);
     const r = responses[Math.min(i, responses.length - 1)] ?? stop("");
     i += 1;
@@ -91,9 +91,9 @@ function scripted(responses: ModelResponse[]) {
 
 const tmp = (): string => mkdtempSync(join(tmpdir(), "ikbi-mem-"));
 
-test("session: facts from turn 1 are injected into the system prompt on turn 2", async () => {
+test("session: facts from turn 1 ride turn 2 as ISOLATED UNTRUSTED data (not in the system prompt)", async () => {
   const dir = tmp();
-  // Turn 1: write a file, then conclude. Turn 2: a plain answer — we inspect its system prompt.
+  // Turn 1: write a file, then conclude. Turn 2: a plain answer — we inspect how memory is carried.
   const { invoke, requests } = scripted([
     toolResp([call("write_file", { path: "g.ts", content: "export const x = 1;\n" })]),
     stop("Created g.ts with the export."),
@@ -106,20 +106,24 @@ test("session: facts from turn 1 are injected into the system prompt on turn 2",
   assert.deepEqual(s.memory.snapshot().filesModified, ["g.ts"]);
 
   await s.send("is g.ts still there?");
-  // The LAST request's system message must carry the memory summary.
   const lastReq = requests[requests.length - 1]!;
+  // The memory summary rides as an UNTRUSTED data-role message — NEVER in the trusted system prompt.
   const sys = lastReq.messages.find((m) => m.role === "system")!;
-  assert.match(sys.content, /CONVERSATION MEMORY/);
-  assert.match(sys.content, /Files modified so far: g\.ts/);
+  assert.doesNotMatch(sys.content, /CONVERSATION MEMORY/, "memory is NOT in the trusted system prompt");
+  const memCarrier = lastReq.messages.find((m) => m.untrusted === true && /CONVERSATION MEMORY/.test(m.content));
+  assert.ok(memCarrier, "memory summary is carried as an untrusted (neutralized) message");
+  assert.equal(memCarrier?.role, "user", "untrusted memory occupies a data role");
+  assert.match(memCarrier!.content, /Files modified so far: g\.ts/);
 });
 
-test("session: turn 1's system prompt has NO memory (nothing recorded yet)", async () => {
+test("session: turn 1 carries NO memory at all (nothing recorded yet)", async () => {
   const dir = tmp();
   const { invoke, requests } = scripted([stop("hello")]);
   const s = new ChatSession("mem-2", { invoke, worktree: dir });
   await s.send("hi");
-  const sys = requests[0]!.messages.find((m) => m.role === "system")!;
-  assert.doesNotMatch(sys.content, /CONVERSATION MEMORY/, "first turn has clean system prompt");
+  const msgs = requests[0]!.messages;
+  assert.doesNotMatch(msgs.find((m) => m.role === "system")!.content, /CONVERSATION MEMORY/, "first turn has clean system prompt");
+  assert.ok(!msgs.some((m) => /CONVERSATION MEMORY/.test(m.content)), "no memory carrier on the first turn");
 });
 
 test("session: a terminal result is remembered as a command/test outcome", async () => {

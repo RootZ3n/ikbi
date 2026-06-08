@@ -234,14 +234,26 @@ export class ChatSession {
     this.messages.push(toUntrustedMessage(safe, { role: "tool", toolCallId: call.id }));
   }
 
+  /** Build the per-invoke message view: the (clean, trusted) system prompt, then the memory
+   *  carrier as isolated UNTRUSTED data, then the live conversation. The memory message is NOT
+   *  persisted into `this.messages` — it is recomputed per turn and slotted in right after system. */
+  private viewWithMemory(memMsg: ModelMessage | undefined): ModelMessage[] {
+    if (memMsg === undefined) return this.messages;
+    return [this.messages[0] as ModelMessage, memMsg, ...this.messages.slice(1)];
+  }
+
   /** Send a user message; run the bounded tool loop; return the assistant reply + tool activity. */
   async send(userMessage: string): Promise<{ response: string; tools: ChatToolActivity[] }> {
     this.lastUsedAt = Date.now();
-    // CONVERSATION MEMORY: refresh the system prompt with a brief summary of prior-turn
-    // facts (files modified, command/test results, conclusions). Rewriting messages[0]
-    // keeps it a SINGLE system message that stays current — never duplicated per turn.
+    // CONVERSATION MEMORY: a brief summary of prior-turn facts (files modified, command/test
+    // results, conclusions). The facts are model-authored, but a recorded conclusion could echo
+    // text from a malicious file the model read — so the summary rides as ISOLATED UNTRUSTED DATA
+    // (neutralized, data-role), NEVER concatenated into the trusted system prompt. The clean
+    // system prompt (messages[0]) is left untouched.
     const memSummary = this.memory.summary();
-    this.messages[0] = { role: "system", content: memSummary.length > 0 ? `${CHAT_SYSTEM}\n\n${memSummary}` : CHAT_SYSTEM };
+    const memMsg = memSummary.length > 0
+      ? toUntrustedMessage(neutralizeUntrusted(memSummary, { source: "external", identity: this.identity, origin: "chat_memory" }), { role: "user" })
+      : undefined;
     this.messages.push({ role: "user", content: userMessage });
     const tools: ChatToolActivity[] = [];
 
@@ -260,7 +272,7 @@ export class ChatSession {
           temperature: TEMPERATURE,
           maxTokens: MAX_TOKENS,
           identity: this.identity,
-          messages: this.messages,
+          messages: this.viewWithMemory(memMsg),
           tools: CHAT_TOOLS,
         });
       } catch (e) {
