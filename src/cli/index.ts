@@ -10,12 +10,15 @@
  * barrel is what makes their commands available — no `cli/index.ts` edit.
  */
 
-// Side-effect import: load the modules barrel FIRST. egress's register() (fired on
-// barrel import) installs the SSRF fetch guard, and the provider singleton constructs
-// at module load via `resolveFetchGuard()` — so the barrel MUST precede the provider
-// import below, or the CLI throws EgressGuardMissingError at startup. This matches the
-// server entry's barrel-first ordering. (It also runs each module's command
-// registrations, composing the module subcommands.)
+// BOOTSTRAP FIRST (before ANY config-loading import): autoload `.env`, and let read-only
+// info commands (doctor/help/…) load even on a fresh shell. Imports only node builtins, so
+// it cannot transitively pull in core/config — its side effects must land first.
+import "./bootstrap.js";
+// Side-effect import: load the modules barrel. egress's register() (fired on barrel import)
+// installs the SSRF fetch guard, and the provider singleton constructs at module load via
+// `resolveFetchGuard()` — so the barrel MUST precede the provider import below, or the CLI
+// throws EgressGuardMissingError at startup. This matches the server entry's barrel-first
+// ordering. (It also runs each module's command registrations, composing the subcommands.)
 import "../modules/index.js";
 import { config } from "../core/config.js";
 import { registry } from "../core/provider/index.js";
@@ -113,6 +116,21 @@ function listProviders(): void {
   for (const p of providers) process.stdout.write(`${p.id}\n`);
 }
 
+/**
+ * Run a read-only info command, turning any failure into a friendly ONE-LINE config error
+ * (never a raw stack). The bootstrap already lets these commands load on a fresh shell; this
+ * is the belt-and-suspenders for any other config-shaped error during their execution.
+ */
+function runInfo(name: string, fn: () => void): void {
+  try {
+    fn();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    process.stderr.write(`ikbi ${name}: configuration error — ${msg}\n  (set the required IKBI_* env vars or add them to a .env file; see README.md / SECURITY.md)\n`);
+    process.exitCode = 1;
+  }
+}
+
 async function run(argv: readonly string[]): Promise<void> {
   const cmd = argv[0];
   switch (cmd) {
@@ -126,16 +144,16 @@ async function run(argv: readonly string[]): Promise<void> {
       listProviders();
       return;
     case "doctor":
-      process.stdout.write(`${runDoctor().lines.join("\n")}\n`);
+      runInfo("doctor", () => process.stdout.write(`${runDoctor().lines.join("\n")}\n`));
       return;
     case "capabilities":
-      process.stdout.write(`${runCapabilities().lines.join("\n")}\n`);
+      runInfo("capabilities", () => process.stdout.write(`${runCapabilities().lines.join("\n")}\n`));
       return;
     case undefined:
     case "help":
     case "--help":
     case "-h":
-      printUsage();
+      runInfo("help", printUsage);
       return;
     default: {
       // STARTUP PRELOAD (the cold-start on-ramp's second half): warm the trust cache
