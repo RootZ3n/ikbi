@@ -22,7 +22,7 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { mkdir } from "node:fs/promises";
+import { access, mkdir } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import type { Logger } from "pino";
 
@@ -308,6 +308,14 @@ export class WorkspaceManager {
           WorkspaceEvents.promoted.create({ workspaceId: handle.id, targetBranch: handle.baseBranch, strategy, beforeRef: targetHead, afterRef }, { source: "workspace", attribution: { identity: handle.identity } }),
         );
         this.log.info({ event: "workspace_promoted", workspaceId: handle.id, strategy, beforeRef: targetHead, afterRef, targetBranch: handle.baseBranch }, "workspace promoted");
+
+        // SG-7: the source worktree DIRECTORY is no longer needed once promoted — free the disk
+        // (best-effort; never undoes the landed promote). The scratch BRANCH is intentionally
+        // KEPT so a post-build `ikbi diff <id>` can still compute base..scratch; `ikbi clean` /
+        // reclaim removes the now-orphan branch later. The promoted record stays terminal.
+        await this.removeWorktreeDir(promoted).catch((e) =>
+          this.log.warn({ err: e instanceof Error ? e.message : String(e), workspaceId: handle.id }, "post-promote worktree cleanup failed (non-fatal)"),
+        );
         return result;
       });
     });
@@ -393,7 +401,65 @@ export class WorkspaceManager {
     return this.store.get(id);
   }
 
+  // ---- clean (SG-7): reclaim orphaned worktree DIRECTORIES of terminal records ----
+
+  /**
+   * Sweep TERMINAL workspaces (promoted / discarded / failed) whose worktree directory still
+   * exists on disk and remove it (+ its scratch branch), marking the record `cleanedAt`. This
+   * collects the leftover dirs under the workspace root that `promote`/`discard` didn't already
+   * remove (e.g. a crash between landing and cleanup). Active workspaces are skipped (their
+   * per-ws lock is held); a held lock is treated as "active" and left alone. Idempotent.
+   */
+  async cleanOrphans(): Promise<{ removed: number; checked: number }> {
+    await this.preload();
+    let removed = 0;
+    let checked = 0;
+    for (const id of await this.store.list()) {
+      const rec = await this.store.get(id).catch(() => undefined);
+      if (rec === undefined) continue;
+      const terminal = rec.state === "promoted" || rec.state === "discarded" || rec.state === "failed";
+      if (!terminal) continue;
+      checked += 1;
+      if (!(await this.pathExists(rec.path))) continue; // dir already gone — nothing to reclaim
+      try {
+        await this.locks.withLock(
+          this.wsKey(id),
+          async () => {
+            await removeWorktree(rec.targetRepo, rec.path).catch(() => undefined);
+            await pruneWorktrees(rec.targetRepo).catch(() => undefined);
+            await deleteBranch(rec.targetRepo, rec.scratchBranch).catch(() => undefined);
+            await this.store.put(id, { ...rec, cleanedAt: this.now() });
+          },
+          { timeoutMs: RECLAIM_WS_TIMEOUT_MS },
+        );
+        removed += 1;
+      } catch (err) {
+        if (err instanceof SubstrateError && err.kind === "lock_timeout") continue; // active — skip
+        throw err;
+      }
+    }
+    this.log.info({ event: "workspace_cleaned", removed, checked }, "reclaimed orphaned worktrees");
+    return { removed, checked };
+  }
+
   // ---- internals ----
+
+  /** Remove the worktree DIRECTORY (+ admin entry) of a record, KEEPING the scratch branch. */
+  private async removeWorktreeDir(rec: WorkspaceRecord): Promise<void> {
+    await removeWorktree(rec.targetRepo, rec.path);
+    await pruneWorktrees(rec.targetRepo);
+    await this.store.put(rec.id, { ...rec, cleanedAt: this.now() });
+  }
+
+  /** True iff `p` exists on disk (a directory probe; never throws). */
+  private async pathExists(p: string): Promise<boolean> {
+    try {
+      await access(p);
+      return true;
+    } catch {
+      return false;
+    }
+  }
 
   private wsKey(id: string): string {
     return `workspace:ws:${id}`;

@@ -30,6 +30,7 @@ import { runCapabilities } from "./capabilities.js";
 // workspace manager). Imported here so registerCommand fires before dispatch.
 import "./receipts.js";
 import "./undo.js";
+import "./clean.js";
 // The DEFAULT router: input that is not a known command is treated as a GOAL and
 // deliberated by cognition-layer (which decides the path + recommends the next
 // command). Imported AFTER the barrel so the egress guard is already registered.

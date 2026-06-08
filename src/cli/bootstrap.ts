@@ -66,6 +66,7 @@ export const INFO_COMMANDS: ReadonlySet<string> = new Set([
   "diff", // read-only: prints a workspace's git diff; performs no trust operations
   "receipts", // read-only: prints the operational log; performs no trust operations
   "undo", // reverts a promote via git + receipts; performs no trust operations
+  "clean", // reclaims orphaned worktrees; performs no trust operations
 ]);
 
 /**

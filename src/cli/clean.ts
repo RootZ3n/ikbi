@@ -1,0 +1,49 @@
+/**
+ * ikbi `clean` — reclaim orphaned worktrees (SG-7).
+ *
+ * Sweeps terminal workspaces (promoted / discarded / failed) whose worktree directory still
+ * lingers under the workspace root and removes it (+ its scratch branch). Normal promote/
+ * discard already clean up; this collects leftovers from crashes or interrupted runs.
+ */
+
+import { registerCommand } from "./registry.js";
+import { workspaces as coreWorkspaces } from "../core/workspace/index.js";
+
+/** The cleanup surface the command drives (injectable for tests). */
+export interface CleanWorkspaces {
+  cleanOrphans(): Promise<{ removed: number; checked: number }>;
+}
+
+export interface CleanCliDeps {
+  readonly workspaces?: CleanWorkspaces;
+  readonly stdout?: (s: string) => void;
+  readonly stderr?: (s: string) => void;
+  readonly setExit?: (code: number) => void;
+}
+
+/** Build the `clean` handler. Default reclaims via the live workspace manager. */
+export function createCleanCli(deps: CleanCliDeps = {}) {
+  const workspaces: CleanWorkspaces = deps.workspaces ?? coreWorkspaces;
+  const out = deps.stdout ?? ((s: string) => void process.stdout.write(s));
+  const err = deps.stderr ?? ((s: string) => void process.stderr.write(s));
+  const setExit = deps.setExit ?? ((c: number) => void (process.exitCode = c));
+
+  async function clean(): Promise<void> {
+    try {
+      const r = await workspaces.cleanOrphans();
+      out(`clean: reclaimed ${r.removed} orphaned worktree(s) (checked ${r.checked} terminal workspace${r.checked === 1 ? "" : "s"}).\n`);
+    } catch (e) {
+      err(`ikbi clean: failed: ${e instanceof Error ? e.message : String(e)}\n`);
+      setExit(1);
+    }
+  }
+
+  return { clean };
+}
+
+registerCommand({
+  name: "clean",
+  summary: "Reclaim orphaned worktrees from terminal (promoted/discarded) workspaces",
+  usage: "ikbi clean",
+  run: () => createCleanCli().clean(),
+});
