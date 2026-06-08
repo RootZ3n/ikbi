@@ -47,6 +47,50 @@ export function buildServer() {
     return { status: "ready", ready: true };
   });
 
+  // Agent identity — for Ittunaha health probes and inter-agent discovery.
+  app.get("/agent", async () => {
+    const { runCapabilities } = await import("../cli/capabilities.js");
+    const caps = runCapabilities();
+    return {
+      id: "ikbi",
+      name: "ikbi",
+      role: "build orchestration, central nervous system",
+      model: config.provider.defaultModels.builder ?? config.provider.defaultModels.driver ?? "unknown",
+      tools: caps.builder.length,
+      status: ready ? "active" : "starting",
+      uptime: process.uptime(),
+    };
+  });
+
+  // Capabilities — tool inventory and feature flags for Ittunaha/agents.
+  app.get("/capabilities", async () => {
+    const { runCapabilities } = await import("../cli/capabilities.js");
+    const caps = runCapabilities();
+    return {
+      agent: "ikbi",
+      tools: caps.builder,
+      endpoints: ["/health", "/ready", "/agent", "/capabilities", "/chat"],
+      model: config.provider.defaultModels.builder ?? config.provider.defaultModels.driver ?? "unknown",
+      features: [
+        "tool_calling",
+        "governed_execution",
+        "injection_defense",
+        "trust_model",
+        "circuit_breaker",
+        "drift_prevention",
+        "context_compression",
+        "vision_support",
+        "mcp_stdio",
+        "sub_agent_delegation",
+      ],
+      toolParity: {
+        builder: caps.builder.length,
+        chat: caps.chat.length,
+        inSync: caps.builderOnly.length === 0 && caps.chatOnly.length === 0,
+      },
+    };
+  });
+
   // Compose every module's routes via the route-registrar SEAM. Modules register
   // from their own files (see server/registry.ts) — this file never names them,
   // so endpoint-exposing modules are added WITHOUT editing server/index.ts. Each
