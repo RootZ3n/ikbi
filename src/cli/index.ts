@@ -26,6 +26,9 @@ import { trust } from "../core/trust/index.js";
 import { commands } from "./registry.js";
 import { runDoctor } from "./doctor.js";
 import { runCapabilities } from "./capabilities.js";
+// Core-facing operator commands registered from their own files (read the receipt store /
+// workspace manager). Imported here so registerCommand fires before dispatch.
+import "./receipts.js";
 // The DEFAULT router: input that is not a known command is treated as a GOAL and
 // deliberated by cognition-layer (which decides the path + recommends the next
 // command). Imported AFTER the barrel so the egress guard is already registered.
