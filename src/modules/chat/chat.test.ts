@@ -63,6 +63,19 @@ test("POST /chat rejects a body without a message (schema validation, no model c
   }
 });
 
+test("POST /chat enforces the images cap (maxItems, schema validation, no model call)", async () => {
+  const { buildServer } = await import("../../server/index.js");
+  const app = buildServer();
+  await app.ready();
+  try {
+    const tooMany = Array.from({ length: 9 }, (_v, i) => `data:image/png;base64,A${i}`);
+    const res = await app.inject({ method: "POST", url: "/chat", payload: { message: "hi", images: tooMany } });
+    assert.equal(res.statusCode, 400, "more than 8 images is rejected before the handler");
+  } finally {
+    await app.close();
+  }
+});
+
 // ── session store ───────────────────────────────────────────────────────────
 
 test("sessionStore mints a new id when none is given and reuses an existing one", () => {
@@ -149,9 +162,35 @@ test("chat advertises the full builder tool suite to the model", async () => {
   for (const t of [
     "read_file", "write_file", "list_dir", "search_files", "patch", "terminal",
     "git_status", "git_diff", "git_log", "web_search", "web_extract", "delegate_task",
+    "vision_analyze",
   ]) {
     assert.ok(names.includes(t), `chat advertises ${t}`);
   }
+});
+
+test("send: operator-pasted images attach to the user turn as multimodal parts", async () => {
+  const { invoke, requests } = scripted([stop("I see a red pixel.")]);
+  const s = new ChatSession("s-vision", { invoke, worktree: tmp() });
+  const dataUrl = "data:image/png;base64,AAAA";
+  const { response } = await s.send("what is in this image?", [dataUrl, "https://example.com/x.png", "not-an-image"]);
+  assert.match(response, /red pixel/);
+  const sent = (requests[0] as { messages: Array<{ role: string; content: string; parts?: Array<{ type: string; image_url?: { url: string } }> }> }).messages;
+  const userMsg = sent.find((m) => m.role === "user" && m.parts !== undefined);
+  assert.ok(userMsg, "the user turn carries multimodal parts");
+  assert.equal(userMsg!.content, "what is in this image?", "content keeps the text fallback");
+  // text part + the two VALID image urls (the bogus 'not-an-image' is dropped).
+  assert.equal(userMsg!.parts!.length, 3);
+  assert.deepEqual(userMsg!.parts!.map((p) => p.type), ["text", "image_url", "image_url"]);
+  assert.equal(userMsg!.parts![1]?.image_url?.url, dataUrl);
+});
+
+test("send: a text-only turn carries NO parts (unchanged behavior)", async () => {
+  const { invoke, requests } = scripted([stop("ok")]);
+  const s = new ChatSession("s-novision", { invoke, worktree: tmp() });
+  await s.send("just text");
+  const sent = (requests[0] as { messages: Array<{ role: string; parts?: unknown }> }).messages;
+  const userMsg = sent.find((m) => m.role === "user");
+  assert.equal(userMsg?.parts, undefined, "no parts on a text-only turn");
 });
 
 test("send: delegate_task runs a focused sub-agent and feeds its result back (chokepoint)", async () => {

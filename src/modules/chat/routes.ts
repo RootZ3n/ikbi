@@ -13,7 +13,7 @@ import { registerRoutes } from "../../server/registry.js";
 import type { ChatRequest, ChatResponse } from "./contract.js";
 import { sessionStore } from "./session.js";
 
-/** JSON body schema for POST /chat — message required, session_id optional. */
+/** JSON body schema for POST /chat — message required; session_id + images optional. */
 const chatBodySchema = {
   type: "object",
   required: ["message"],
@@ -21,6 +21,8 @@ const chatBodySchema = {
   properties: {
     message: { type: "string", minLength: 1 },
     session_id: { type: "string" },
+    // Operator-pasted images (data-URLs or http(s) URLs); attached to the turn as multimodal parts.
+    images: { type: "array", items: { type: "string", minLength: 1 }, maxItems: 8 },
   },
 } as const;
 
@@ -29,9 +31,9 @@ registerRoutes("chat", (app: FastifyInstance) => {
     "/chat",
     { schema: { body: chatBodySchema } },
     async (request, reply) => {
-      const { message, session_id } = request.body;
+      const { message, session_id, images } = request.body;
       const session = sessionStore.getOrCreate(session_id);
-      const { response, tools } = await session.send(message);
+      const { response, tools } = await session.send(message, images);
       reply.code(200);
       return { response, session_id: session.id, ...(tools.length > 0 ? { tools } : {}) };
     },

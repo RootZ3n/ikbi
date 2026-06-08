@@ -48,6 +48,7 @@ import { gitDiffTool, gitLogTool, gitStatusTool, GIT_TOOL_NAMES, runGitTool } fr
 import { patchTool, runPatch } from "./builder-tools/patch.js";
 import { runSearchFiles, searchFilesTool } from "./builder-tools/search-files.js";
 import { runTerminal, terminalTool } from "./builder-tools/terminal.js";
+import { runVisionAnalyze, visionAnalyzeTool } from "./builder-tools/vision-tool.js";
 import { runWebExtract, runWebSearch, webExtractTool, webSearchTool, WEB_TOOL_NAMES } from "./builder-tools/web-tools.js";
 import { type CheckResult, mapExec, VERIFIER_CHECKS } from "./checks.js";
 import { workerModelConfig } from "./config.js";
@@ -156,6 +157,8 @@ const TOOLS: readonly ModelTool[] = [
   webExtractTool,
   // Delegation: hand an independent subtask to a focused sub-agent (simplified tool set).
   delegateTaskTool,
+  // Vision: analyze an image (screenshot/diagram/chart) via a multimodal message.
+  visionAnalyzeTool,
   {
     // PROGRESSIVE DISCLOSURE: the scout brief shows finding TITLES only; this pulls the
     // full detail of ONE finding on demand, so a cheap model isn't handed everything at once.
@@ -660,6 +663,22 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       );
     };
 
+    // --- vision_analyze: send ONE multimodal message (question + image) to the model and
+    // return its analysis. Async. The result is UNTRUSTED to the parent → chokepoint. ---
+    const runVisionCall = async (call: ToolCall): Promise<string> => {
+      let args: Record<string, unknown>;
+      try {
+        args = JSON.parse(call.arguments && call.arguments.length > 0 ? call.arguments : "{}") as Record<string, unknown>;
+      } catch {
+        rejectedToolCalls.push({ tool: "vision_analyze", error: "malformed tool arguments (not JSON)" });
+        return "ERROR: malformed arguments for vision_analyze (not valid JSON)";
+      }
+      return runVisionAnalyze(
+        { invokeModel: ctx.engine.invokeModel, identity: ctx.identity, model: builderModelId, worktreeReal },
+        args,
+      );
+    };
+
     // --- THE CHOKEPOINT (#8): the ONLY path from a tool result to a message. Always
     // neutralizes (source mcp_result) and re-enters via toUntrustedMessage(untrusted). ---
     const appendToolResult = (raw: string, call: ToolCall): void => {
@@ -864,6 +883,10 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
           } else if (call.name === "delegate_task") {
             // Sub-agent delegation — async; its result is UNTRUSTED to the parent → chokepoint.
             const raw = await runDelegateCall(call);
+            appendToolResult(raw, call);
+          } else if (call.name === "vision_analyze") {
+            // Multimodal image analysis — async; the analysis is UNTRUSTED → chokepoint.
+            const raw = await runVisionCall(call);
             appendToolResult(raw, call);
           } else {
             const raw = runTool(call); // pure: produces a result string (schema-gated inside)
