@@ -5,6 +5,13 @@
  * The handler is a thin shell over the session store + tool loop in session.ts:
  * it validates the body, resolves/creates the session, runs one turn, and returns
  * { response, session_id, tools? }.
+ *
+ * GOVERNANCE BOUNDARY (SG-8): this endpoint is the SINGLE governed boundary external
+ * clients (notably the standalone `tui/` package) cross. They never execute tools or
+ * import ikbi internals — they POST here, and the tool loop runs SERVER-SIDE inside the
+ * governed ChatSession (identity-resolved parent context → governed-exec/gate-wall for
+ * `terminal`, the neutralization chokepoint for every result, worktree-confined files).
+ * So a TUI tool call is governed identically to a CLI/worker tool call. See SECURITY.md.
  */
 
 import type { FastifyInstance } from "fastify";

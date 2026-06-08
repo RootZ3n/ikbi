@@ -44,6 +44,31 @@ IP is the strongest mitigation available within the current surface; the residua
 is the re-resolution race, and IP pinning is the follow-up once the transport allows
 it.
 
+## TUI / external clients are governed via `/chat` (SG-8)
+
+**Status:** governed by construction — documented so it is not assumed.
+
+The terminal UI (the standalone `tui/` package) does **not** execute tools itself and
+does **not** import ikbi's internals. Its tool-calling path
+(`tui/src/lib/agent-chat.ts`) is a thin HTTP client to ikbi's `POST /chat` endpoint;
+the actual model+tool loop runs **server-side** inside ikbi's `ChatSession`
+(`src/modules/chat/session.ts`), which is governed by the **same** trust/identity
+machinery as the CLI:
+
+- a **governed parent context** is resolved from the operator/worker token
+  (`resolveParentCtx`); absent one, the `terminal` / `run_checks` tools **fail closed**;
+- the `terminal` tool routes through **governed-exec** (allowlist + gate-wall + receipts),
+  exactly as in the worker builder;
+- every tool RESULT re-enters the conversation only through the **neutralization
+  chokepoint** (`neutralizeUntrusted` + `toUntrustedMessage`);
+- all file/search tools are **worktree-confined** (`confinePath`).
+
+So a TUI tool call is governed identically to a CLI tool call — because it *is* an ikbi
+server-side tool call. The TUI's other path (`tui/src/lib/chat.ts`) is a direct, **tool-less**
+conversation with the model provider: it has no execution surface to govern. There is no
+ungoverned "bridge tools" surface in this repo; the `/chat` route is the single governed
+boundary every external client crosses.
+
 ## Single trust domain per process
 
 **Status:** intentional architectural assumption — not a limitation to be fixed.
