@@ -83,8 +83,25 @@ test("recordIgnoredFailure releases a half-open probe without tripping", () => {
   assert.equal(cb.canAttempt(), true); // probe reserved
   cb.recordIgnoredFailure(); // permanent error -> release the slot, don't reopen or count
   assert.equal(cb.snapshot().state, "half_open", "stays half-open, not reopened");
-  assert.equal(cb.snapshot().consecutiveFailures, 1, "failure count unchanged by ignored failure");
+  // The half_open transition resets the counter to 0 (fresh trial window); an ignored
+  // failure doesn't change it, so it stays 0.
+  assert.equal(cb.snapshot().consecutiveFailures, 0, "counter reset on half-open; ignored failure leaves it 0");
   assert.equal(cb.canAttempt(), true, "released slot lets another probe proceed");
+});
+
+test("open -> cooldown -> half_open resets consecutiveFailures to 0", () => {
+  const clock = fakeClock();
+  const cb = new CircuitBreaker({ failureThreshold: 3, cooldownMs: 1000, halfOpenMaxTrials: 1, now: clock.now });
+  cb.recordFailure();
+  cb.recordFailure();
+  cb.recordFailure(); // open after 3
+  assert.equal(cb.snapshot().state, "open");
+  assert.equal(cb.snapshot().consecutiveFailures, 3, "accumulated while open");
+
+  clock.advance(1000); // cooldown elapses
+  assert.equal(cb.canAttempt(), true, "transitions to half-open");
+  assert.equal(cb.snapshot().state, "half_open");
+  assert.equal(cb.snapshot().consecutiveFailures, 0, "the open count is reset on entry to half-open");
 });
 
 test("half-open trial failure re-opens for another cooldown", () => {

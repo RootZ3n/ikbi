@@ -126,6 +126,10 @@ export class CircuitBreaker {
     if (this.now() - openedAt >= this.cooldownMs) {
       this.state = "half_open";
       this.halfOpenInFlight = 0;
+      // Reset the failure counter on entry to half_open: this is a FRESH trial window, so
+      // the snapshot reflects "testing clean" (the prior open's count is spent). A trial
+      // failure (recordFailure in half_open) re-opens immediately regardless of the count.
+      this.consecutiveFailures = 0;
     }
   }
 
