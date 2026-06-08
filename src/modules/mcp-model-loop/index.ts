@@ -21,6 +21,9 @@ assertContractCompatible("events", "1.0.0");
 assertContractCompatible("identity", "1.1.0");
 
 export { createMcpModelLoop, createMockTransport, mcpModelLoop, type McpModelLoopDeps, type NeutralizeFn, type ToUntrustedFn } from "./loop.js";
+// OPT-IN real transport: stdio (spawn a child MCP server, JSON-RPC over stdin/stdout).
+// The mock transport remains the default; wire this via createMcpModelLoop({ transport }).
+export { createStdioTransport, type StdioTransportOptions, type SpawnLike, type SpawnedChild } from "./transports/stdio.js";
 export {
   CONTRACT_VERSION,
   type McpLoopRequest,
