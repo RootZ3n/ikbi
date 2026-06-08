@@ -136,3 +136,40 @@ test("send: the loop is bounded — a model that always calls tools cannot spin 
   const { response } = await s.send("loop forever");
   assert.match(response, /iteration limit/);
 });
+
+// ── the FULL builder tool suite is wired into chat ───────────────────────────
+
+test("chat advertises the full builder tool suite to the model", async () => {
+  const { invoke, requests } = scripted([stop("ready")]);
+  const s = new ChatSession("s-toolset", { invoke, worktree: tmp() });
+  await s.send("hello");
+  const firstReq = requests[0] as { tools: Array<{ name: string }> };
+  const names = firstReq.tools.map((t) => t.name);
+  // The expanded suite — same tools the builder has — must all be offered to the chat model.
+  for (const t of [
+    "read_file", "write_file", "list_dir", "search_files", "patch", "terminal",
+    "git_status", "git_diff", "git_log", "web_search", "web_extract", "delegate_task",
+  ]) {
+    assert.ok(names.includes(t), `chat advertises ${t}`);
+  }
+});
+
+test("send: delegate_task runs a focused sub-agent and feeds its result back (chokepoint)", async () => {
+  const dir = tmp();
+  const { invoke, requests } = scripted([
+    toolResp([call("delegate_task", { task: "tidy the build" })]), // [0] chat asks to delegate
+    stop("Subtask complete: nothing to change."),                  // [1] the SUB-AGENT's own loop ends
+    stop("Delegated and verified — the foundation holds."),        // [2] chat answers from the result
+  ]);
+  const s = new ChatSession("s-delegate", { invoke, worktree: dir });
+  const { response, tools } = await s.send("delegate the tidy-up");
+  assert.equal(tools[0]?.name, "delegate_task");
+  assert.equal(tools[0]?.ok, true);
+  assert.match(response, /foundation holds/);
+  // The sub-agent's RESULT must re-enter the chat as an UNTRUSTED tool-role message (the chokepoint).
+  const afterDelegate = requests[2] as { messages: Array<{ role: string; untrusted?: boolean }> };
+  assert.ok(
+    afterDelegate.messages.some((m) => m.role === "tool" && m.untrusted === true),
+    "delegate_task result re-entered as untrusted",
+  );
+});
