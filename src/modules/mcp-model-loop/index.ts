@@ -20,7 +20,13 @@ assertContractCompatible("injection", "1.0.0");
 assertContractCompatible("events", "1.0.0");
 assertContractCompatible("identity", "1.1.0");
 
+// Side-effect import: registers the `ikbi mcp` CLI command (opt-in stdio transport) at
+// load time. The modules barrel imports this index, so the command is live once ikbi starts.
+import "./cli.js";
+
 export { createMcpModelLoop, createMockTransport, mcpModelLoop, type McpModelLoopDeps, type NeutralizeFn, type ToUntrustedFn } from "./loop.js";
+// The `ikbi mcp` CLI command surface (testable factory + arg parsers).
+export { createMcpCli, parseMcpArgs, splitServerCommand, type McpCliDeps } from "./cli.js";
 // OPT-IN real transport: stdio (spawn a child MCP server, JSON-RPC over stdin/stdout).
 // The mock transport remains the default; wire this via createMcpModelLoop({ transport }).
 export { createStdioTransport, type StdioTransportOptions, type SpawnLike, type SpawnedChild } from "./transports/stdio.js";
