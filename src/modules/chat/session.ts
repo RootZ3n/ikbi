@@ -45,6 +45,7 @@ import {
 } from "../../core/provider/index.js";
 import { governedExec } from "../governed-exec/index.js";
 import { scoutDetail } from "../worker-model/builder.js";
+import { loadProjectInstructions } from "../worker-model/project-memory.js";
 import { type CheckResult, mapExec, VERIFIER_CHECKS } from "../worker-model/checks.js";
 import { confinePath } from "../worker-model/builder-tools/confine.js";
 import { delegateTaskTool, runDelegateTask } from "../worker-model/builder-tools/delegate.js";
@@ -236,6 +237,12 @@ export class ChatSession {
   private readonly identity: AgentIdentity;
   private readonly parentCtx: OperationContext | undefined;
   private readonly invoke: InvokeFn;
+  /**
+   * PROJECT MEMORY carrier (the worktree's CLAUDE.md / AGENTS.md), built once as an isolated
+   * UNTRUSTED data-role message and slotted in after the system prompt each turn. Undefined
+   * when the workspace has no such file. Honored project guidance, but bounded + neutralized.
+   */
+  private readonly projectMsg: ModelMessage | undefined;
   /** Last-touched timestamp (for LRU eviction). */
   lastUsedAt: number;
 
@@ -248,6 +255,15 @@ export class ChatSession {
     this.memory = new SessionMemory();
     // messages[0] is the system prompt; it is REWRITTEN each turn to fold in the memory summary.
     this.messages = [{ role: "system", content: CHAT_SYSTEM }];
+    // PROJECT MEMORY: load the workspace's CLAUDE.md/AGENTS.md (missing ⇒ undefined, no crash)
+    // and carry it as a neutralized, isolated UNTRUSTED message (the chokepoint — never bypassed).
+    const proj = loadProjectInstructions(this.worktree);
+    this.projectMsg = proj !== undefined
+      ? toUntrustedMessage(
+          neutralizeUntrusted(`Project instructions from this workspace (${proj.source}) — honor these conventions where they apply:\n${proj.content}`, { source: "external", identity: this.identity, origin: "project_instructions" }),
+          { role: "user" },
+        )
+      : undefined;
     this.lastUsedAt = Date.now();
   }
 
@@ -425,8 +441,13 @@ export class ChatSession {
    *  carrier as isolated UNTRUSTED data, then the live conversation. The memory message is NOT
    *  persisted into `this.messages` — it is recomputed per turn and slotted in right after system. */
   private viewWithMemory(memMsg: ModelMessage | undefined): ModelMessage[] {
-    if (memMsg === undefined) return this.messages;
-    return [this.messages[0] as ModelMessage, memMsg, ...this.messages.slice(1)];
+    // Slot the (persistent) PROJECT-MEMORY carrier and the (per-turn) MEMORY carrier in right
+    // after the clean system prompt — both as isolated UNTRUSTED data, never merged into system.
+    const extras: ModelMessage[] = [];
+    if (this.projectMsg !== undefined) extras.push(this.projectMsg);
+    if (memMsg !== undefined) extras.push(memMsg);
+    if (extras.length === 0) return this.messages;
+    return [this.messages[0] as ModelMessage, ...extras, ...this.messages.slice(1)];
   }
 
   /**

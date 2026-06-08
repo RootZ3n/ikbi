@@ -55,6 +55,7 @@ import { type CheckResult, type ChecksResolution, mapExec, VERIFIER_CHECKS } fro
 import { workerModelConfig } from "./config.js";
 import { maybeCompress } from "./context-manager.js";
 import type { RoleFn, RoleResult, WorkerOutcome } from "./contract.js";
+import { loadProjectInstructions } from "./project-memory.js";
 import { builderModel } from "./role-models.js";
 import type { ScoutFinding } from "./scout.js";
 
@@ -500,8 +501,15 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
     // leads with the BRIEF (structure + titles); full per-finding detail is pulled on demand
     // by the scout_detail tool (below). Still exactly ONE untrusted block: builder_prior_results.
     const scoutInfo = extractScout(ctx.priorResults);
+    // PROJECT MEMORY (CLAUDE.md / AGENTS.md): caller-supplied, else loaded from the worktree
+    // root. Rides as an isolated UNTRUSTED message (neutralized) — honored project guidance,
+    // but bounded; never raw-concatenated into the trusted system prompt. Missing ⇒ omitted.
+    const projectInstructions = ctx.task.projectInstructions ?? loadProjectInstructions(worktreeReal)?.content;
     const messages: ModelMessage[] = [
       { role: "system", content: BUILDER_SYSTEM },
+      ...(projectInstructions !== undefined
+        ? [untrusted(`Project instructions from the target repo (CLAUDE.md/AGENTS.md) — honor these conventions where they apply:\n${projectInstructions}`, "project_instructions")]
+        : []),
       untrusted(`Goal:\n${ctx.task.goal}`, "builder_goal"),
       untrusted(successCondition, "builder_success_condition"),
       untrusted(buildPriorResultsBlock(ctx.priorResults, scoutInfo), "builder_prior_results"),

@@ -79,6 +79,13 @@ export interface WorkerTask {
   readonly goal: string;
   /** Branch to base + promote into (defaults to the repo's current branch). */
   readonly baseBranch?: string;
+  /**
+   * OPTIONAL project instructions (the target repo's CLAUDE.md / AGENTS.md), supplied by the
+   * caller. When absent, the builder loads it from the worktree root itself. ADDITIVE — it
+   * rides into the prompt through the neutralization chokepoint (honored project guidance,
+   * but bounded + isolated), never as trusted system text.
+   */
+  readonly projectInstructions?: string;
   /** Free-form correlation metadata (never secrets). */
   readonly metadata?: Readonly<Record<string, unknown>>;
 }
