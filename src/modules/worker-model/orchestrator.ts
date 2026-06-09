@@ -387,15 +387,39 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     const status = toOutcomeStatus(result.outcome);
     const operation = `worker.role.${result.role}`;
 
-    // ISSUE 1 — separate PERFORMANCE failures from trust demotion. A wall-clock timeout or a
-    // non-converging `max_iterations` stop is not, by itself, evidence of unreliability; counting
-    // it as a trust failure silently demotes the worker (→ autoCommit off → later GOOD builds can't
-    // promote). Unless policy opts in (penalizeTimeouts), such a failure does NOT feed the trust
-    // signal. REAL failures — failed verification, bad output, safety/policy violations — always do.
-    const stopReason = (result.detail as Record<string, unknown> | undefined)?.stopReason;
+    // ISSUE 1 (+ R1) — separate PERFORMANCE failures from trust demotion, WITHOUT letting a
+    // flailing/bad-output worker hide behind non-convergence. A wall-clock `timeout` is a pure
+    // performance signal (suppressible by default). A `max_iterations` stop is suppressible ONLY
+    // when there is no evidence of bad output — `detail.rejectedToolCalls` captures malformed JSON,
+    // schema-validation failures, and repeated invalid actions; if any are present, the run was
+    // flailing, so it is counted against trust as a real failure. Policy (penalizeTimeouts) forces
+    // ALL performance-class failures to count. REAL failures (failed verification, safety/policy)
+    // were never in this class and always count.
+    const detailRec = (result.detail as Record<string, unknown> | undefined) ?? {};
+    const stopReason = detailRec.stopReason;
+    const rejectedToolCalls = Array.isArray(detailRec.rejectedToolCalls) ? detailRec.rejectedToolCalls : [];
+    const badOutputEvidence = rejectedToolCalls.length > 0;
     const isPerformanceFailure =
       result.outcome === "failure" && (stopReason === "timeout" || stopReason === "max_iterations");
-    const suppressTrustSignal = isPerformanceFailure && config.penalizeTimeouts !== true;
+    // timeout: always suppressible. max_iterations: suppressible only WITHOUT bad-output evidence.
+    const suppressEligible = stopReason === "timeout" || (stopReason === "max_iterations" && !badOutputEvidence);
+    const suppressTrustSignal = isPerformanceFailure && suppressEligible && config.penalizeTimeouts !== true;
+
+    // R1: an explicit, auditable record of the trust decision for EVERY performance-class failure —
+    // whether it was suppressed or penalized, and why.
+    let perfTrust: { decision: "suppressed" | "penalized"; reason: string } | undefined;
+    if (isPerformanceFailure) {
+      if (suppressTrustSignal) {
+        const why = stopReason === "timeout" ? "wall-clock timeout (performance)" : "max_iterations with no bad-output evidence";
+        perfTrust = { decision: "suppressed", reason: `${why} — trust signal suppressed (not counted)` };
+      } else {
+        const why =
+          config.penalizeTimeouts === true
+            ? "IKBI_WORKER_MODEL_PENALIZE_TIMEOUTS policy is on"
+            : `max_iterations with ${rejectedToolCalls.length} rejected tool call(s) (bad-output evidence)`;
+        perfTrust = { decision: "penalized", reason: `${String(stopReason)}: ${why} — counted against trust` };
+      }
+    }
 
     // ISSUE 3: a repair run's narrative (root cause + fix rationale, from the builder's `done`
     // claim) is persisted into the role receipt's metadata so the trail records WHY the change
@@ -415,8 +439,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           taskId: task.taskId,
           workspaceId: workspace.id,
           outcome: result.outcome,
-          ...(suppressTrustSignal
-            ? { trustSignalSuppressed: true, trustSuppressReason: `performance failure (${String(stopReason)}) — not counted against trust` }
+          ...(perfTrust !== undefined
+            ? { performanceFailure: true, trustDecision: perfTrust.decision, trustDecisionReason: perfTrust.reason }
             : {}),
           ...(doneClaim?.rootCause !== undefined ? { rootCause: doneClaim.rootCause } : {}),
           ...(doneClaim?.fixRationale !== undefined ? { fixRationale: doneClaim.fixRationale } : {}),
@@ -436,10 +460,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           operation: "worker.trust.signal_suppressed",
           outcome: {
             status: "success",
-            detail: `role ${result.role} ended in a performance failure (${String(stopReason)}); trust signal suppressed (not a trust violation — set IKBI_WORKER_MODEL_PENALIZE_TIMEOUTS=true to count timeouts).`,
+            detail: `role ${result.role}: ${perfTrust?.reason ?? "performance failure — trust signal suppressed"} (set IKBI_WORKER_MODEL_PENALIZE_TIMEOUTS=true to count performance failures).`,
           },
           requestId: task.taskId,
-          metadata: { role: result.role, taskId: task.taskId, agentId: spawned.identity.agentId, stopReason: String(stopReason), penalizeTimeouts: false },
+          metadata: { role: result.role, taskId: task.taskId, agentId: spawned.identity.agentId, stopReason: String(stopReason), rejectedToolCalls: rejectedToolCalls.length, penalizeTimeouts: false },
           project: task.targetRepo,
         },
         spawned.identity,
@@ -645,12 +669,18 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // model is intact; it only replaces a confusing empty-diff outcome with a clear one.)
     if (autoCommitSkippedTier !== undefined && overall === "success") {
       const agent = autoCommitSkippedAgent ?? "worker";
+      // R2: the disposition note must match what ACTUALLY happens. Retention only occurs when the
+      // policy is on AND the workspace manager can retain (safeRetain falls back to discard when it
+      // cannot). Decide first, then describe — never claim a retained workspace that was discarded.
+      const retained = retainFailedWorkspaces && workspaces.retain !== undefined;
+      const disposition = retained
+        ? `Its verified changes were left uncommitted, but the workspace (${workspace.id}) was RETAINED — no work was lost; inspect or reclaim it with \`ikbi clean\`.`
+        : "Its verified changes were left uncommitted and the workspace was DISCARDED — no retained workspace is available.";
       const reason =
         "verification PASSED, but promotion was BLOCKED. " +
-        `Reason: the worker tier "${autoCommitSkippedTier}" lacks autoCommit autonomy, so its verified ` +
-        `changes were deliberately left uncommitted (workspace ${workspace.id} retained — no work was lost). ` +
-        `To land it, run: \`ikbi trust grant ${agent} trusted\` then re-run the build (or promote via a higher-tier run).`;
-      if (retainFailedWorkspaces) await safeRetain(workspaces, workspace, reason);
+        `Reason: the worker tier "${autoCommitSkippedTier}" lacks autoCommit autonomy. ${disposition} ` +
+        `To land this work, run: \`ikbi trust grant ${agent} trusted\` then re-run the build (or promote via a higher-tier run).`;
+      if (retained) await safeRetain(workspaces, workspace, reason);
       else await workspaces.discard(workspace);
       events.publish(
         workerCompleted.create(

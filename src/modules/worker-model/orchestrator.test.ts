@@ -395,6 +395,91 @@ test("ISSUE 1: a REAL failure (failed verification) still feeds the trust signal
   );
 });
 
+// ── R1: max_iterations is only suppressible WITHOUT bad-output evidence ───────────
+test("R1: max_iterations with NO bad-output evidence is suppressed (treated as performance)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    scout: async () => ({ role: "scout", outcome: "success", summary: "s" }),
+    builder: async () => ({ role: "builder", outcome: "failure", summary: "no convergence", detail: { stopReason: "max_iterations", rejectedToolCalls: [] } }),
+  };
+  const tr = capturingTrust();
+  const rc = fakeReceipts();
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, trust: tr.trust, receipts: rc.receipts }));
+  await orch.run(task, parentCtx);
+  assert.equal(tr.calls.filter((c) => c.operation === "worker.role.builder").length, 0, "clean max_iterations did NOT feed a trust signal");
+  assert.ok(rc.calls.some((c) => c.operation === "worker.trust.signal_suppressed"), "suppression receipt written");
+});
+
+test("R1: max_iterations WITH rejectedToolCalls (bad output) IS penalized + metadata explains why", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    scout: async () => ({ role: "scout", outcome: "success", summary: "s" }),
+    builder: async () => ({
+      role: "builder",
+      outcome: "failure",
+      summary: "flailing",
+      detail: { stopReason: "max_iterations", rejectedToolCalls: [{ tool: "write_file", error: "malformed tool arguments (not JSON)" }, { tool: "done", error: "checks not green" }] },
+    }),
+  };
+  const tr = capturingTrust();
+  const appended: Array<{ operation: string; metadata: Record<string, unknown> }> = [];
+  const receipts = { append: async (input: unknown): Promise<unknown> => { const i = input as { operation: string; metadata?: Record<string, unknown> }; appended.push({ operation: i.operation, metadata: i.metadata ?? {} }); return {}; } };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, trust: tr.trust, receipts }));
+  await orch.run(task, parentCtx);
+
+  assert.equal(tr.calls.filter((c) => c.operation === "worker.role.builder" && c.status === "failure").length, 1, "bad-output max_iterations IS a trust failure signal");
+  assert.ok(!appended.some((a) => a.operation === "worker.trust.signal_suppressed"), "no suppression receipt — it was penalized");
+  const builderReceipt = appended.find((a) => a.operation === "worker.role.builder");
+  assert.equal(builderReceipt?.metadata.performanceFailure, true, "metadata flags the performance-class failure");
+  assert.equal(builderReceipt?.metadata.trustDecision, "penalized", "metadata records the penalize decision");
+  assert.match(String(builderReceipt?.metadata.trustDecisionReason ?? ""), /rejected tool call/, "metadata explains WHY (bad-output evidence)");
+});
+
+test("R1: PENALIZE_TIMEOUTS policy penalizes BOTH timeout and a clean max_iterations", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  for (const stop of ["timeout", "max_iterations"] as const) {
+    const roles: Partial<Record<WorkerRole, RoleFn>> = {
+      scout: async () => ({ role: "scout", outcome: "success", summary: "s" }),
+      builder: async () => ({ role: "builder", outcome: "failure", summary: stop, detail: { stopReason: stop, rejectedToolCalls: [] } }),
+    };
+    const tr = capturingTrust();
+    const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, trust: tr.trust, config: { ...ENABLED, penalizeTimeouts: true } }));
+    await orch.run(task, parentCtx);
+    assert.equal(tr.calls.filter((c) => c.operation === "worker.role.builder" && c.status === "failure").length, 1, `policy on → ${stop} IS a trust failure`);
+  }
+});
+
+// ── R2: blocked-promotion message must match the ACTUAL workspace disposition ─────
+test("R2: blocked-promotion message says RETAINED when the workspace is actually retained", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("verified", "verified");
+  const cap = capturingRoles();
+  const ws = fakeWorkspaces(true);
+  const retainCalls: string[] = [];
+  const wrapped = { ...ws.workspaces, retain: async (h: WorkspaceHandle): Promise<DiscardResult> => { retainCalls.push(h.id); return { workspaceId: h.id, removed: false }; } };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, workspaces: wrapped }));
+  const result = await orch.run(task, parentCtx);
+
+  assert.equal(result.outcome, "partial");
+  assert.equal(retainCalls.length, 1, "retain was actually called");
+  assert.equal(ws.calls.discard, 0, "not discarded");
+  assert.match(result.reason ?? "", /RETAINED/, "message says retained");
+  assert.doesNotMatch(result.reason ?? "", /DISCARDED/, "does not falsely claim discard");
+});
+
+test("R2: blocked-promotion message says DISCARDED when retention did not happen", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("verified", "verified");
+  const cap = capturingRoles();
+  const ws = fakeWorkspaces(true); // no `retain` method → cannot retain
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, workspaces: ws.workspaces, config: { ...ENABLED, retainFailedWorkspaces: false } }));
+  const result = await orch.run(task, parentCtx);
+
+  assert.equal(result.outcome, "partial");
+  assert.equal(ws.calls.discard, 1, "the workspace was discarded");
+  assert.match(result.reason ?? "", /DISCARDED/, "message says discarded");
+  assert.doesNotMatch(result.reason ?? "", /RETAINED/, "does not falsely claim retention");
+  assert.match(result.reason ?? "", /no retained workspace/i, "tells the operator no workspace is available");
+});
+
 // ── ISSUE 3: a repair run persists root cause + fix rationale into the receipt ───
 test("ISSUE 3: the builder's root cause + fix rationale land in the role receipt metadata", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
