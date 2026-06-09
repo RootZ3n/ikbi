@@ -247,3 +247,53 @@ test("P0/T1: detectScriptMutation guards the extended script keys (lint/check/e2
     assert.equal(detectScriptMutation(diff).mutated, true, `${key} script change flagged`);
   }
 });
+
+// ── P0 Fix 1: the script-integrity guard inspects the WORKING-TREE diff, not the empty committed range
+import { execFileSync as _execFileSync } from "node:child_process";
+import { mkdtempSync as _mkdtempSync, mkdirSync as _mkdirSync, writeFileSync as _writeFileSync, rmSync as _rmSync } from "node:fs";
+import { tmpdir as _tmpdir } from "node:os";
+import { join as _join } from "node:path";
+import { workingTreePackageJsonDiff } from "./checks.js";
+
+test("P0/Fix1: working-tree diff catches an UNCOMMITTED package.json rewrite (root + subpackage); committed range is empty", async () => {
+  const repo = _mkdtempSync(_join(_tmpdir(), "ikbi-si-"));
+  try {
+    const git = (args: string[]): string => _execFileSync("git", ["-C", repo, ...args], { stdio: ["ignore", "pipe", "ignore"], encoding: "utf8" });
+    try {
+      git(["init", "-q"]);
+      git(["config", "user.email", "t@example.com"]);
+      git(["config", "user.name", "t"]);
+      _writeFileSync(_join(repo, "package.json"), `${JSON.stringify({ name: "r", scripts: { test: "vitest run" } }, null, 2)}\n`);
+      _mkdirSync(_join(repo, "packages", "a"), { recursive: true });
+      _writeFileSync(_join(repo, "packages", "a", "package.json"), `${JSON.stringify({ name: "a", scripts: { test: "vitest run" } }, null, 2)}\n`);
+      git(["add", "-A"]);
+      git(["commit", "-qm", "base"]);
+    } catch {
+      return; // git unavailable → skip (the unit detectScriptMutation tests still cover the parser)
+    }
+    const base = git(["rev-parse", "HEAD"]).trim();
+    // builder rewrites BOTH test scripts in the WORKING TREE, uncommitted (root → stub; subpackage → narrowed)
+    _writeFileSync(_join(repo, "package.json"), `${JSON.stringify({ name: "r", scripts: { test: "echo pass" } }, null, 2)}\n`);
+    _writeFileSync(_join(repo, "packages", "a", "package.json"), `${JSON.stringify({ name: "a", scripts: { test: "vitest run only-passing.test.ts" } }, null, 2)}\n`);
+
+    // the OLD source (committed base..scratch range) is EMPTY at verify time
+    assert.equal(git(["diff", `${base}..HEAD`]).trim(), "", "committed range is empty before the build commit (the old bug)");
+    // the FIX: the working-tree diff sees the uncommitted rewrites
+    const wt = await workingTreePackageJsonDiff(async (args) => git([...args]), repo, base);
+    assert.ok(/echo pass/.test(wt), "root rewrite visible");
+    assert.ok(/only-passing/.test(wt), "subpackage rewrite visible");
+    assert.equal(detectScriptMutation(wt).mutated, true, "→ script-integrity fails closed at verify time");
+  } finally {
+    _rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("P0/Fix1: a non-stub NARROWED test script is caught by detectScriptMutation", () => {
+  const diff = 'diff --git a/package.json b/package.json\n-    "test": "vitest run",\n+    "test": "vitest run only-passing.test.ts",';
+  assert.equal(detectScriptMutation(diff).mutated, true, "narrowing a real test command is a guarded-script change");
+});
+
+test("P0/Fix1: a package.json change OUTSIDE guarded scripts does NOT false-trip", () => {
+  const diff = 'diff --git a/package.json b/package.json\n-    "lodash": "^4.17.20",\n+    "lodash": "^4.17.21",';
+  assert.equal(detectScriptMutation(diff).mutated, false, "a dependency bump is not a script mutation");
+});

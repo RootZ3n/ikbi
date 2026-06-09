@@ -33,12 +33,19 @@ function packageOf(relPath: string, rootsDescByLen: readonly string[]): string |
  * `echo …`, `true`, `:`, `exit 0`. These are NOT meaningful verification; they must never count as
  * green unless the operator explicitly trusts trivial scripts.
  */
+/** Strip a trailing shell comment (`… # comment`) — `#` at start or after whitespace. */
+function stripShellComment(s: string): string {
+  return s.replace(/(^|\s)#.*$/, "$1").trim();
+}
+
 export function isStubScript(body: string): boolean {
-  const s = body.trim();
+  const s = stripShellComment(body);
   if (s.length === 0) return true;
+  // F3: a "pass with no tests" flag lets a runner exit 0 with ZERO tests → trivially green → stub.
+  if (/--pass-?with-?no-?(tests|empty-?test-?files)\b/i.test(s)) return true;
   const segments = s
     .split(/\s*(?:&&|\|\||;)\s*/)
-    .map((x) => x.trim())
+    .map((x) => stripShellComment(x))
     .filter((x) => x.length > 0);
   if (segments.length === 0) return true;
   return segments.every((seg) => /^exit\s+0$/.test(seg) || seg === "true" || seg === ":" || /^echo(\s|$)/.test(seg));
@@ -85,9 +92,10 @@ export function createVerificationLadder(cfg: VerificationLadderConfig = verific
     if (data.packages.length === 0) escalationReasons.push("the index has no packages — impact cannot be scoped");
     if (changed.length === 0) escalationReasons.push("no changed files supplied — impact cannot be scoped");
     if (data.truncated) escalationReasons.push("the project-index is truncated (incomplete) — impact may be wrong");
-    // F2/A4: an incomplete import graph (unresolved path aliases) means impact can't be trusted.
-    if (data.aliases?.present === true && data.aliases.unresolved > 0) {
-      escalationReasons.push(`${data.aliases.unresolved} unresolved path-alias import(s) — import graph has holes, impact cannot be trusted`);
+    // F2/A4: an incomplete import graph (ANY unresolved alias-shaped import — incl. extends/
+    // per-package configs we couldn't fully load) means impact can't be trusted → escalate.
+    if ((data.aliases?.unresolved ?? 0) > 0) {
+      escalationReasons.push(`${data.aliases?.unresolved} unresolved path-alias import(s) — import graph has holes, impact cannot be trusted`);
     }
     if (opts.alwaysFull) escalationReasons.push("opts.alwaysFull is set");
 

@@ -122,6 +122,23 @@ export function resolveChecks(worktreeReal: string, env: NodeJS.ProcessEnv = pro
   return { ok: true, checks: VERIFIER_CHECKS, source: "default" };
 }
 
+/**
+ * The WORKING-TREE diff of package.json files vs base — what the script-integrity guard MUST
+ * inspect. The verifier runs BEFORE the build is committed, so `git diff <baseRef>` (base vs the
+ * current working tree) captures the builder's UNCOMMITTED edits to tracked package.json files,
+ * whereas the committed `base..scratch` range is empty at that point. Scoped to `*package.json`
+ * (git pathspec `*` crosses directories) so it covers root + every subpackage and stays small.
+ * A brand-new (untracked) package.json does not appear — that is greenfield-legitimate, and its
+ * no-op scripts are caught separately by the verification-ladder stub detector.
+ */
+export async function workingTreePackageJsonDiff(
+  runGit: (args: readonly string[]) => Promise<string>,
+  worktreePath: string,
+  baseRef: string,
+): Promise<string> {
+  return runGit(["-C", worktreePath, "diff", baseRef, "--", "*package.json"]);
+}
+
 /** Captured output tail length retained in a check result. */
 export const MAX_OUTPUT_TAIL = 2_000;
 

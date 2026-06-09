@@ -180,3 +180,12 @@ test("P0/F2: unresolved path aliases force full verification (graph holes)", () 
   assert.ok(pl.escalationReasons.some((r) => /alias/.test(r)), "escalation cites unresolved aliases");
   assert.equal(pl.scope, "full");
 });
+
+test("P0/Fix3: comment-disguised no-ops and no-test passes are detected as stubs", () => {
+  for (const body of ["exit 0 # but actually", "true # noop", ": # nothing", "echo pass # done", "jest --passWithNoTests", "vitest run --passWithNoTests"]) {
+    assert.equal(isStubScript(body), true, `stub: "${body}"`);
+  }
+  for (const body of ["vitest run", "tsc --noEmit", "node test.js # run tests"]) {
+    assert.equal(isStubScript(body), false, `real: "${body}"`);
+  }
+});

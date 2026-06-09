@@ -559,10 +559,61 @@ function edgesForFile(
   return edges;
 }
 
-/** Count alias-shaped imports that did not resolve — these are graph holes. */
-function countUnresolvedAliases(imports: readonly ImportEdge[], aliasRules: readonly AliasRule[]): number {
-  if (aliasRules.length === 0) return 0;
-  return imports.filter((e) => e.kind === "unresolved" && isAliasShaped(e.specifier, aliasRules)).length;
+/** True if a tsconfig/jsconfig at the repo root OR any package root declares `paths` or `extends`
+ *  — i.e. alias config exists that we may not have fully loaded (extends chains / per-package). */
+export function detectAliasConfigPresence(repoAbs: string, packageRoots: readonly string[]): boolean {
+  const dirs = ["", ...packageRoots.filter((r) => r !== "")];
+  for (const d of dirs) {
+    for (const fname of ["tsconfig.json", "jsconfig.json"]) {
+      const p = d === "" ? `${repoAbs}${sep}${fname}` : `${repoAbs}${sep}${d.split("/").join(sep)}${sep}${fname}`;
+      if (!existsSync(p)) continue;
+      try {
+        const txt = readFileSync(p, "utf8");
+        if (/"paths"\s*:/.test(txt) || /"extends"\s*:/.test(txt)) return true;
+      } catch {
+        /* unreadable — ignore */
+      }
+    }
+  }
+  return false;
+}
+
+/** A specifier that is UNAMBIGUOUSLY an alias/subpath (never a published npm package). */
+function isDefiniteAliasShape(s: string): boolean {
+  return /^@\//.test(s) || /^~\//.test(s) || /^#/.test(s);
+}
+/** A specifier that LOOKS like a scoped name (@scope/name) — alias OR npm; only suspicious when alias config exists. */
+function isScopedShape(s: string): boolean {
+  return /^@[^/]+\//.test(s);
+}
+
+/**
+ * Count alias-shaped imports that did NOT resolve to a file — graph holes that make impact
+ * analysis untrustworthy. Counts: (a) imports matching a loaded alias rule but unresolved;
+ * (b) UNAMBIGUOUS alias shapes (`@/…`, `~/…`, `#…`) that didn't resolve — always; (c) scoped
+ * shapes (`@scope/name`) that didn't resolve, ONLY when alias config is present (extends/
+ * per-package paths we couldn't fully load) → conservative escalation rather than a false green.
+ */
+function countUnresolvedAliases(imports: readonly ImportEdge[], aliasRules: readonly AliasRule[], aliasConfigPresent: boolean): number {
+  let n = 0;
+  for (const e of imports) {
+    if (e.to !== undefined) continue; // resolved (relative/alias/package) → not a hole
+    if (e.kind === "relative") continue; // an unresolved relative path is not an alias
+    const s = e.specifier;
+    if (isAliasShaped(s, aliasRules) || isDefiniteAliasShape(s) || (aliasConfigPresent && isScopedShape(s))) n += 1;
+  }
+  return n;
+}
+
+/** The persisted alias summary: present (config exists anywhere) + count of unresolved alias holes. */
+function aliasSummary(
+  repoAbs: string,
+  packages: readonly PackageEntry[],
+  aliasInfo: { rules: AliasRule[]; present: boolean },
+  imports: readonly ImportEdge[],
+): { present: boolean; unresolved: number } {
+  const configPresent = aliasInfo.present || detectAliasConfigPresence(repoAbs, packages.map((p) => p.root));
+  return { present: configPresent, unresolved: countUnresolvedAliases(imports, aliasInfo.rules, configPresent) };
 }
 
 /** source file → colocated tests (same package, matching stem). Deterministic, sorted. */
@@ -689,7 +740,7 @@ export function createProjectIndex(deps: ProjectIndexDeps = {}): ProjectIndexApi
       imports: sortEdges(imports),
       fileToTests: buildFileToTests(files),
       truncated,
-      aliases: { present: aliasInfo.present, unresolved: countUnresolvedAliases(imports, aliasInfo.rules) },
+      aliases: aliasSummary(repoAbs, packages, aliasInfo, imports),
     };
   }
 
@@ -810,7 +861,7 @@ export function createProjectIndex(deps: ProjectIndexDeps = {}): ProjectIndexApi
         imports,
         fileToTests: buildFileToTests(files),
         truncated,
-        aliases: { present: aliasInfo.present, unresolved: countUnresolvedAliases(imports, aliasInfo.rules) },
+        aliases: aliasSummary(repoAbs, packages, aliasInfo, imports),
       },
       git,
     );

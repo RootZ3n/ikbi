@@ -350,8 +350,13 @@ test("C1: a candidate whose builder mutated package.json scripts → verifier UN
   assert.equal(r.workspaceId, "ws1", "the CLEAN candidate won (the mutated one is disqualified)");
   assert.deepEqual(promoted, ["ws1"], "only the clean candidate is promoted");
   assert.ok(discarded.includes("ws0"), "the mutated-scripts candidate is discarded, never promoted");
-  // ws0's mutated check was never executed: governed-exec only ran for the clean candidate.
-  for (const req of governedRuns) assert.notEqual(req.cwd, "/tmp/ws0", "the mutated candidate's check never executed");
+  // ws0's mutated CHECK was never executed: governed-exec ran no test/build for the mutated
+  // candidate. (The script-integrity guard's read-only `git diff` PROBE does run in ws0 — that is
+  // HOW the mutation is detected — so it is excluded here.)
+  for (const req of governedRuns) {
+    if (req.command === "git") continue; // the working-tree script-integrity probe is expected
+    assert.notEqual(req.cwd, "/tmp/ws0", "the mutated candidate's check never executed");
+  }
 });
 
 // ── CANDIDATE MAPPING: verifier/builder/diff → BuildCandidate fields ─────────

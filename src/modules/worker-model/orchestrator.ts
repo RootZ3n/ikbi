@@ -41,7 +41,7 @@ import type { BuildCandidate, JudgeResult } from "../deterministic-judge/index.j
 import type { ExecRequest, GovernedExec } from "../governed-exec/index.js";
 
 import { builder, createBuilder, MAX_TOOL_ITERATIONS } from "./builder.js";
-import { resolveChecks } from "./checks.js";
+import { resolveChecks, workingTreePackageJsonDiff } from "./checks.js";
 import { builderModel, competitiveBuilderModels } from "./role-models.js";
 import { critic } from "./critic.js";
 import { integrator } from "./integrator.js";
@@ -306,10 +306,32 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
    */
   function verifierFor(parentCtx: OperationContext): RoleFn {
     if (deps.roles?.verifier !== undefined) return deps.roles.verifier;
+    // FIX 1 (script integrity): the guard must see the UNION of (a) the committed base..scratch
+    // diff — non-empty for competitive candidates that commit before judging — and (b) the
+    // WORKING-TREE package.json changes — the normal single-run flow does NOT commit before the
+    // verifier, so the committed range is empty there. (b) is a governed (read-only, allowlisted)
+    // `git diff <baseRef> -- *package.json`, best-effort (errors → ""); (a) is NOT swallowed, so a
+    // genuinely-unreadable diff still fails the verifier CLOSED.
+    const hasCommitted = workspaces.diff !== undefined;
+    const scriptIntegrityDiff: ((ws: WorkspaceHandle) => Promise<string>) | undefined =
+      hasCommitted || govExecForRoles !== undefined
+        ? (ws: WorkspaceHandle): Promise<string> => {
+            const committedP = hasCommitted ? workspaces.diff!(ws) : Promise.resolve("");
+            const workingP =
+              govExecForRoles !== undefined
+                ? workingTreePackageJsonDiff(
+                    async (args) => (await govExecForRoles.run({ parentCtx, command: "git", args: [...args], cwd: ws.path, purpose: "verifier: script-integrity working-tree diff" })).stdoutTail ?? "",
+                    ws.path,
+                    ws.baseRef,
+                  ).catch(() => "")
+                : Promise.resolve("");
+            return Promise.all([committedP, workingP]).then(([c, w]) => `${c}\n${w}`);
+          }
+        : undefined;
     return createVerifier({
       ...(govExecForRoles !== undefined ? { governedExec: govExecForRoles } : {}),
       parentCtx,
-      ...(workspaces.diff !== undefined ? { diff: (ws: WorkspaceHandle) => workspaces.diff!(ws) } : {}),
+      ...(scriptIntegrityDiff !== undefined ? { diff: scriptIntegrityDiff } : {}),
       // PROJECT-ROOT GUARD + per-target check set (Fix 1/2): wired ONLY in production
       // (enforceProjectRoot), so a no-manifest / wrong-repo worktree fails closed RED.
       ...(enforceProjectRoot ? { resolveChecks: (ws: string) => resolveChecks(ws) } : {}),
