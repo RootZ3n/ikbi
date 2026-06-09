@@ -44,6 +44,19 @@ export interface BuildCandidate {
   readonly testsPass: boolean;
   /** Parsed test tallies, when the verifier output yielded them. */
   readonly testCount?: { readonly passed: number; readonly total: number };
+  /**
+   * Test-execution EVIDENCE — distinguishes a real executed suite from a passing command that
+   * proved nothing, so a zero-test / custom-check success cannot be scored like a real suite:
+   *   "executed"   — a test runner ran and a count>0 was parsed (real evidence).
+   *   "zero"       — a test runner ran but executed ZERO tests (parsed count 0).
+   *   "unverified" — the test check passed but no count could be parsed (e.g. `echo done`).
+   *   "absent"     — no "test" check ran at all (only custom checks such as `ci`).
+   * Optional/back-compat: when ABSENT the tests-family score keeps its prior behavior
+   * (testCount-driven, full marks for an un-counted survivor). When PRESENT it gates the score
+   * so non-executed signals rank strictly below a real suite. Set by the orchestrator's
+   * `readVerifier`; existing direct-construction callers omit it and are byte-unchanged.
+   */
+  readonly testEvidence?: "executed" | "zero" | "unverified" | "absent";
   /** Builder tool-call rounds used. */
   readonly toolRounds: number;
   /** The configured tool-round ceiling (to normalize efficiency). */

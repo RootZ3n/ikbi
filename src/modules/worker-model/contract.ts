@@ -115,6 +115,17 @@ export interface WorkerResult {
   /** Human reason on a non-success / partial terminal. */
   readonly reason?: string;
   /**
+   * Which verification path actually ran this run: "ladder" (HARDENED — stub detection,
+   * no-vacuous-green, scope-stamped) or "legacy". Surfaced so an operator never has to inspect
+   * env/source to know which path produced the verdict. Absent on pre-dispatch terminals (kill).
+   */
+  readonly verificationMode?: string;
+  /**
+   * Which retrieval path actually ran this run: "index" (HARDENED), "legacy", or "index-fallback"
+   * (index requested but it failed and fell back to the legacy scan). Surfaced for the same reason.
+   */
+  readonly retrievalMode?: string;
+  /**
    * Total USD cost of EVERY model invocation this run made (summed from each
    * ModelResponse's `cost.usd`, across all roles + competitive candidates). Absent on
    * paths that never invoke a model (e.g. a pre-allocation kill). Surfaced for cost visibility.

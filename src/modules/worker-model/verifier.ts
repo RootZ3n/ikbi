@@ -51,6 +51,7 @@ import type { RoleFn, RoleResult } from "./contract.js";
 import { projectIndex, type ProjectIndexData } from "../project-index/index.js";
 import { verificationLadder, type VerificationPlan } from "../verification-ladder/index.js";
 import { parseCheckOutput, type CheckTriage } from "../check-triage/index.js";
+import { resolveVerificationMode, type VerificationMode } from "./modes.js";
 
 /** Default per-check wall-clock budget (ms) for ladder verification — SEPARATE from the model
  *  role timeout, and larger than governed-exec's read-only-tool default so real suites don't get
@@ -127,6 +128,14 @@ export interface VerifierDeps {
   readonly resolveChecks?: (worktreeReal: string) => ChecksResolution;
   /** Env source for IKBI_VERIFY / IKBI_CHECK_TIMEOUT_MS (tests inject). Default: process.env. */
   readonly env?: NodeJS.ProcessEnv;
+  /**
+   * Explicit verification mode, set by the PRODUCTION wiring (`createProductionWorker` →
+   * orchestrator) so production defaults to the HARDENED ladder. When set it WINS over env;
+   * when omitted, the mode is env-derived with legacy as the bare-construction default
+   * (so direct `createVerifier()` callers / existing tests are byte-unchanged). An explicit
+   * `IKBI_VERIFY=legacy` is honored by the production resolver BEFORE this is computed.
+   */
+  readonly mode?: VerificationMode;
   /** Project-index for ladder mode. Default: the live `projectIndex` (built/refreshed per run). */
   readonly index?: { refresh: (repo: string) => Promise<{ data: ProjectIndexData }> };
   /** Verification planner for ladder mode. Default: the live `verificationLadder`. */
@@ -225,7 +234,10 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
     // Package/impact-aware verification. The script-integrity guard (above) has ALREADY run, so a
     // build that touched any package.json scripts is rejected before we read package scripts here.
     const env = deps.env ?? process.env;
-    if ((env.IKBI_VERIFY ?? "").trim().toLowerCase() === "ladder") {
+    // Mode precedence: an explicit production `mode` wins; otherwise env-derived with legacy
+    // as the bare-construction default (resolveVerificationMode(..., { production: false })).
+    const verificationMode: VerificationMode = deps.mode ?? resolveVerificationMode(env, { production: false });
+    if (verificationMode === "ladder") {
       return await runLadder(ctx, parentCtx, diffText, env);
     }
 
@@ -260,7 +272,7 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
         role: "verifier",
         outcome: "stub",
         summary: "dry-run: governed checks reported intent, executed nothing",
-        detail: { verdict: "dry-run", checks },
+        detail: { verdict: "dry-run", verificationMode, checks },
       };
     }
 
@@ -270,7 +282,7 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
       role: "verifier",
       outcome: allPass ? "success" : "failure",
       summary: allPass ? "all checks passed" : `checks failed: ${failed.join(", ")}`,
-      detail: { verdict: allPass ? "pass" : "fail", checks },
+      detail: { verdict: allPass ? "pass" : "fail", verificationMode, checks },
     };
 
     // ── LADDER MODE implementation (hoisted; reached only when IKBI_VERIFY=ladder) ──────────
@@ -355,7 +367,7 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
               role: "verifier", outcome: "failure",
               summary: `verification FAILED (scope ${plan.scope}) at ${stage.stage}/${task.name}: ${tr.errorSummary}`,
               detail: {
-                verdict: "fail", verificationScope: plan.scope, checks, triage: triages, stagesRun,
+                verdict: "fail", verificationMode, verificationScope: plan.scope, checks, triage: triages, stagesRun,
                 neutralPackages: plan.neutralPackages, failedAt: { stage: stage.stage, task: task.name },
                 receipts: [...baseReceipts, `ran stages: ${stagesRun.join(" → ")}`, `FAILED at ${stage.stage}/${task.name}: ${tr.errorSummary}`, ...neutralNote, ...tr.failures.slice(0, 10)],
               },
@@ -384,7 +396,7 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
         role: "verifier", outcome: "success",
         summary: `verification PASSED for scope "${plan.scope}" — ran ${checks.length} check(s) across [${stagesRun.join(" → ")}]${plan.neutralPackages.length > 0 ? `; ${plan.neutralPackages.length} neutral package(s) recorded (not counted green)` : ""}`,
         detail: {
-          verdict: "pass", verificationScope: plan.scope, checks, triage: triages, stagesRun,
+          verdict: "pass", verificationMode, verificationScope: plan.scope, checks, triage: triages, stagesRun,
           neutralPackages: plan.neutralPackages,
           receipts: [...baseReceipts, `ran stages: ${stagesRun.join(" → ")}`, ...neutralNote, `GREEN for scope: ${plan.scope}`],
         },

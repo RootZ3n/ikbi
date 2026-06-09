@@ -32,10 +32,30 @@ const EVENT_SOURCE = "deterministic-judge";
 
 const clamp01 = (x: number): number => Math.max(0, Math.min(1, x));
 
+/**
+ * Tests-family confidence for a NON-executed test signal (Finding D). A survivor that did not
+ * run a real test suite still survives the gate (it didn't FAIL), but it must NOT earn the same
+ * tests-confidence as a real executed suite. Distinct, deterministic, strictly below 1.0:
+ *   unverified (passed, no count — e.g. `echo done`)  > absent (no test check, only custom checks)
+ *   > zero (a runner that executed zero tests). All below a real "executed" suite's count ratio.
+ */
+const TEST_EVIDENCE_SCORE: Readonly<Record<"zero" | "unverified" | "absent", number>> = Object.freeze({
+  unverified: 0.5,
+  absent: 0.35,
+  zero: 0.1,
+});
+
 /** The tests-family score (also the primary tie-breaker). Survivors already passed the gate. */
 function testsScore(c: BuildCandidate): number {
+  // Finding D: when execution evidence is present, it decides confidence — a real executed suite
+  // (count ratio) ranks strictly above zero-test / unparseable / no-test-check signals.
+  if (c.testEvidence !== undefined && c.testEvidence !== "executed") {
+    return TEST_EVIDENCE_SCORE[c.testEvidence];
+  }
   if (c.testCount !== undefined && c.testCount.total > 0) return clamp01(c.testCount.passed / c.testCount.total);
-  return 1.0; // a survivor passed the tests-gate; no parsed count ⇒ full marks
+  // Back-compat: no evidence + no parsed count ⇒ full marks (a survivor passed the tests-gate).
+  // With evidence "executed" but no count this also yields 1.0 (a runner that ran but we trust the pass).
+  return 1.0;
 }
 
 /**

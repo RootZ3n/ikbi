@@ -45,8 +45,10 @@ import { resolveChecks, workingTreePackageJsonDiff, workingTreePlanningDiff } fr
 import { builderModel, competitiveBuilderModels } from "./role-models.js";
 import { critic } from "./critic.js";
 import { integrator } from "./integrator.js";
-import { scout } from "./scout.js";
+import { createScout, scout } from "./scout.js";
 import { createVerifier, verifier } from "./verifier.js";
+import { resolveRetrievalMode, resolveVerificationMode } from "./modes.js";
+import type { ProjectRetrievalApi } from "../project-retrieval/index.js";
 import {
   MAX_COMPETITIVE_N,
   MIN_COMPETITIVE_N,
@@ -170,6 +172,18 @@ export interface OrchestratorDeps {
    * are unchanged; PRODUCTION wiring (`createProductionWorker`) turns it ON.
    */
   readonly enforceProjectRoot?: boolean;
+  /**
+   * Env source for production mode resolution (verification + retrieval). Default: process.env.
+   * Injectable so wiring tests can prove "production ⇒ ladder/index" and the explicit
+   * `IKBI_VERIFY=legacy` / `IKBI_RETRIEVAL=legacy` overrides deterministically.
+   */
+  readonly env?: NodeJS.ProcessEnv;
+  /**
+   * Project-retrieval API the PRODUCTION scout uses under index retrieval. Default: the live
+   * singleton (lazily imported inside the scout). Injectable so a wiring test can prove the
+   * production scout takes the index path without touching the filesystem.
+   */
+  readonly retrieval?: ProjectRetrievalApi;
 }
 
 /** A role identity spawned under the parent ceiling (#10). */
@@ -251,6 +265,13 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   const gateWall = deps.gateWall; // optional in the type — absent → promote DENIED fail-closed (H5)
   const judge = deps.judge ?? deterministicJudge; // competitive-mode scorer (pure, no model)
   const enforceProjectRoot = deps.enforceProjectRoot ?? false; // Fix 1/2 guard — production-only (off in tests)
+  // HARDENED-BY-DEFAULT (production): the verification + retrieval modes this run wires. The
+  // production wiring (`createProductionWorker` ⇒ enforceProjectRoot) defaults to ladder + index;
+  // a bare/test orchestrator stays legacy unless env opts in; an explicit IKBI_VERIFY/RETRIEVAL=legacy
+  // opts back out. These are the modes surfaced for observability (startup event + result + receipts).
+  const modeEnv = deps.env ?? process.env;
+  const verificationMode = resolveVerificationMode(modeEnv, { production: enforceProjectRoot });
+  const retrievalMode = resolveRetrievalMode(modeEnv, { production: enforceProjectRoot });
   // Bug 2: retain (don't discard) a FAILED build's workspace so its work survives for inspection.
   const retainFailedWorkspaces = config.retainFailedWorkspaces ?? true;
   const requestApproval = deps.requestApproval; // SG-10 human-approval gate (undefined ⇒ no gate)
@@ -273,6 +294,14 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       return mod.killSwitch.isKilled(target);
     });
   const roles: Record<WorkerRole, RoleFn> = { ...DEFAULT_ROLES, ...deps.roles };
+  // SCOUT retrieval mode (B): wire the resolved mode into the scout so production defaults to
+  // index retrieval. An injected `deps.roles.scout` (tests) always wins; otherwise we rebuild
+  // the default scout bound to the resolved mode + env. Behavior is byte-unchanged for a
+  // non-production orchestrator (resolveRetrievalMode(..., { production:false }) == legacy
+  // unless env opts in, which is exactly the bare scout's own env read).
+  if (deps.roles?.scout === undefined) {
+    roles.scout = createScout({ mode: retrievalMode, env: modeEnv, ...(deps.retrieval !== undefined ? { retrieval: deps.retrieval } : {}) });
+  }
 
   // Per-candidate builder models (the head-to-head shootout). Default to config; injectable
   // for tests. When `competitiveModelList` is set, competitive mode races one candidate per
@@ -353,6 +382,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       // PROJECT-ROOT GUARD + per-target check set (Fix 1/2): wired ONLY in production
       // (enforceProjectRoot), so a no-manifest / wrong-repo worktree fails closed RED.
       ...(enforceProjectRoot ? { resolveChecks: (ws: string) => resolveChecks(ws) } : {}),
+      // VERIFICATION MODE (A): production defaults to the HARDENED ladder (stub detection,
+      // no-vacuous-green, alias/impact escalation, neutral-package handling, scope stamp).
+      // The resolved mode honors an explicit IKBI_VERIFY=legacy opt-out + env IKBI_VERIFY=ladder.
+      mode: verificationMode,
+      env: modeEnv,
     });
   }
 
@@ -571,7 +605,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 
     events.publish(
       workerStarted.create(
-        { taskId: task.taskId, workspaceId: workspace.id },
+        { taskId: task.taskId, workspaceId: workspace.id, verificationMode, retrievalMode },
         { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } },
       ),
     );
@@ -590,6 +624,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // The verification scope the verifier stamped ("impact" | "full"), surfaced into the
     // verification event, the completed event, and the promote message for auditability.
     let verificationScope: "impact" | "full" | undefined;
+    // OBSERVABILITY (E): the ACTUAL modes the roles reported (verifier detail.verificationMode,
+    // scout detail.retrievalMode). They fall back to the resolved wiring decision below — so the
+    // run result + completion event always carry which path actually ran.
+    let actualVerificationMode: string | undefined;
+    let actualRetrievalMode: string | undefined;
 
     try {
       for (const role of WORKER_ROLES) {
@@ -626,7 +665,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 
         // SG-5 PROGRESS: structured per-role detail beyond start/end — builder tool activity
         // and the verifier's verdict — so `--verbose` can show what each phase actually did.
-        if (role === "builder") {
+        if (role === "scout") {
+          const sd = (result.detail ?? {}) as Record<string, unknown>;
+          if (typeof sd.retrievalMode === "string") actualRetrievalMode = sd.retrievalMode;
+        } else if (role === "builder") {
           const bd = (result.detail ?? {}) as Record<string, unknown>;
           events.publish(
             workerBuilderActivity.create(
@@ -640,6 +682,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           const verdict = vd.verdict;
           const scope = vd.verificationScope === "impact" || vd.verificationScope === "full" ? vd.verificationScope : undefined;
           verificationScope = scope; // carried to the completed event + promote message (auditability)
+          if (typeof vd.verificationMode === "string") actualVerificationMode = vd.verificationMode;
           events.publish(
             workerVerification.create(
               {
@@ -826,6 +869,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       if (overall === "success") overall = "rejected";
     }
 
+    // OBSERVABILITY (E): which paths ACTUALLY ran — the role's own report when present, else the
+    // wired decision. Always present on the result so the CLI summary + receipts can show them.
+    const ranVerificationMode = actualVerificationMode ?? verificationMode;
+    const ranRetrievalMode = actualRetrievalMode ?? retrievalMode;
     const result: WorkerResult = {
       contractVersion: CONTRACT_VERSION,
       taskId: task.taskId,
@@ -834,13 +881,15 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       workspaceId: workspace.id,
       promoted,
       ...(reason !== undefined ? { reason } : {}),
+      verificationMode: ranVerificationMode,
+      retrievalMode: ranRetrievalMode,
       costUsd: runCost(),
     };
 
     if (overall === "success" || overall === "partial") {
       events.publish(
         workerCompleted.create(
-          { taskId: task.taskId, outcome: overall, promoted, workspaceId: workspace.id, ...(verificationScope !== undefined ? { verificationScope } : {}) },
+          { taskId: task.taskId, outcome: overall, promoted, workspaceId: workspace.id, verificationMode: ranVerificationMode, retrievalMode: ranRetrievalMode, ...(verificationScope !== undefined ? { verificationScope } : {}) },
           { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } },
         ),
       );
@@ -905,6 +954,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       typecheckPass: v.typecheckPass,
       testsPass: v.testsPass,
       ...(v.testCount !== undefined ? { testCount: v.testCount } : {}),
+      testEvidence: v.testEvidence,
       toolRounds,
       maxToolRounds: MAX_TOOL_ITERATIONS,
       rejectedToolCalls,
@@ -1081,9 +1131,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 }
 
 /** Parse the verifier's check results into the candidate's pass flags + (best-effort) test count. */
-function readVerifier(verifierResult: RoleResult | undefined): { typecheckPass: boolean; testsPass: boolean; testCount?: { passed: number; total: number }; checks: ReadonlyArray<{ name: string; passed: boolean }> } {
+function readVerifier(verifierResult: RoleResult | undefined): { typecheckPass: boolean; testsPass: boolean; testCount?: { passed: number; total: number }; testEvidence: "executed" | "zero" | "unverified" | "absent"; checks: ReadonlyArray<{ name: string; passed: boolean }> } {
   // Builder failed (no verify ran) ⇒ both gates fail.
-  if (verifierResult === undefined) return { typecheckPass: false, testsPass: false, checks: [] };
+  if (verifierResult === undefined) return { typecheckPass: false, testsPass: false, testEvidence: "absent", checks: [] };
   const detail = (verifierResult.detail ?? {}) as Record<string, unknown>;
   const checks = Array.isArray(detail.checks) ? (detail.checks as Array<Record<string, unknown>>) : [];
   const find = (name: string) => checks.find((c) => c.name === name);
@@ -1094,10 +1144,23 @@ function readVerifier(verifierResult: RoleResult | undefined): { typecheckPass: 
   const typecheckPass = typecheck !== undefined ? typecheck.exitCode === 0 : authoritativePass;
   const testsPass = test !== undefined ? test.exitCode === 0 : authoritativePass;
   const testCount = test !== undefined && typeof test.outputTail === "string" ? parseTestCount(test.outputTail) : undefined;
+  // Finding D — TEST-EXECUTION EVIDENCE: distinguish a REAL executed suite from a passing command
+  // that proved nothing, so the judge cannot score them identically. A passing "test" check with a
+  // parsed count>0 is "executed"; a parsed count of 0 is "zero" (a runner that ran nothing); a pass
+  // with no parseable count is "unverified" (e.g. `echo done` — exit 0 but no test tally); NO "test"
+  // check at all (only custom checks like `ci`) is "absent". This is an objective, deterministic fact.
+  let testEvidence: "executed" | "zero" | "unverified" | "absent";
+  if (test === undefined) {
+    testEvidence = "absent";
+  } else if (testCount !== undefined) {
+    testEvidence = testCount.total > 0 ? "executed" : "zero";
+  } else {
+    testEvidence = "unverified";
+  }
   // ISSUE 4: carry the ACTUAL per-check results (by their real names) so the UI shows custom
   // IKBI_CHECKS correctly instead of forcing every run onto the typecheck/tests axes.
   const checkList = checks.map((c) => ({ name: String(c.name), passed: c.exitCode === 0 }));
-  return { typecheckPass, testsPass, ...(testCount !== undefined ? { testCount } : {}), checks: checkList };
+  return { typecheckPass, testsPass, ...(testCount !== undefined ? { testCount } : {}), testEvidence, checks: checkList };
 }
 
 /** Parse the node:test summary tail ("# tests N" / "# pass N") into a count, when present. */

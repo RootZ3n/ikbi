@@ -249,8 +249,11 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
 export function formatProgressEvent(e: { type: string; payload?: unknown }): string {
   const p = (e.payload ?? {}) as Record<string, unknown>;
   switch (e.type) {
-    case "worker.started":
-      return `  → run started (workspace ${String(p.workspaceId ?? "?")})\n`;
+    case "worker.started": {
+      // Surface the resolved hardened/legacy paths up-front so the operator sees what will run.
+      const modes = p.verificationMode !== undefined || p.retrievalMode !== undefined ? ` [verify: ${String(p.verificationMode ?? "?")}, retrieval: ${String(p.retrievalMode ?? "?")}]` : "";
+      return `  → run started (workspace ${String(p.workspaceId ?? "?")})${modes}\n`;
+    }
     case "worker.role.dispatched":
       return `  → ${String(p.role ?? "?")} …\n`;
     case "worker.role.completed":
@@ -291,6 +294,10 @@ function summarize(r: WorkerResult): string {
       promoted: r.promoted,
       ...(r.workspaceId !== undefined ? { workspaceId: r.workspaceId } : {}),
       roles: r.roles.map((x) => ({ role: x.role, outcome: x.outcome })),
+      // Observability (E): which hardened/legacy paths actually ran, so the operator never has
+      // to inspect env/source to know the safety posture of THIS run.
+      ...(r.verificationMode !== undefined ? { verification: r.verificationMode } : {}),
+      ...(r.retrievalMode !== undefined ? { retrieval: r.retrievalMode } : {}),
       // Cost visibility: sum of every model invocation this run made.
       cost_usd: r.costUsd ?? 0,
       ...(r.reason !== undefined ? { reason: r.reason } : {}),

@@ -9,8 +9,9 @@
 import { defineEvent } from "../../core/events/index.js";
 import type { WorkerOutcome, WorkerRole } from "./contract.js";
 
-/** A run started — workspace allocated, about to dispatch roles. (Attribution: parent.) */
-export const workerStarted = defineEvent<{ taskId: string; workspaceId: string }>("worker.started");
+/** A run started — workspace allocated, about to dispatch roles. (Attribution: parent.)
+ *  Carries the resolved verification + retrieval modes so the operator sees which path will run. */
+export const workerStarted = defineEvent<{ taskId: string; workspaceId: string; verificationMode?: string; retrievalMode?: string }>("worker.started");
 
 /** A role is about to run, under its spawned identity. (Attribution: role identity.) */
 export const workerRoleDispatched = defineEvent<{ taskId: string; role: WorkerRole; tier?: string }>(
@@ -46,6 +47,10 @@ export const workerCompleted = defineEvent<{
   workspaceId: string;
   /** The verification scope a promote/judge relied on ("impact" | "full"), for auditability. */
   verificationScope?: "impact" | "full";
+  /** Which verification path actually ran ("ladder" | "legacy"), for auditability. */
+  verificationMode?: string;
+  /** Which retrieval path actually ran ("index" | "legacy" | "index-fallback"), for auditability. */
+  retrievalMode?: string;
 }>("worker.completed");
 
 /** A run failed (a role failed/rejected/stub, or an infrastructure error). (Attribution: parent.) */

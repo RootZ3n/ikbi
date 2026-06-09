@@ -208,6 +208,44 @@ test("doctor SHOWS the competitive shootout list and resolution-CHECKS each race
   assert.equal(r.ready, false, "an unresolvable competitive racer blocks readiness");
 });
 
+// ── SAFETY POSTURE: verification + retrieval mode reporting (the hardening patch) ────────────
+
+test("F3/F4: doctor REPORTS the verification + retrieval modes (HARDENED by default, no env)", () => {
+  const r = runDoctor(readyInputs({ env: {} }));
+  const text = r.lines.join("\n");
+  assert.match(text, /SAFETY POSTURE/);
+  assert.match(text, /✓ Verification: ladder \(HARDENED/, "F3: verification mode reported as the hardened ladder default");
+  assert.match(text, /✓ Retrieval: index \(HARDENED/, "F4: retrieval mode reported as the hardened index default");
+  assert.match(text, /✓ Posture: HARDENED/, "the combined posture is HARDENED");
+  assert.equal(r.ready, true, "a hardened default config is still ready");
+});
+
+test("F5: doctor WARNS when verification is legacy (hardened protections disabled)", () => {
+  const r = runDoctor(readyInputs({ env: { IKBI_VERIFY: "legacy" } }));
+  const text = r.lines.join("\n");
+  assert.match(text, /⚠ Verification: legacy/, "the legacy verification path is flagged with a warning glyph");
+  assert.match(text, /verification is LEGACY — hardened ladder protections are DISABLED \(IKBI_VERIFY=legacy set\)/);
+  assert.match(text, /⚠ Posture: MIXED/, "one legacy + one hardened ⇒ MIXED posture");
+  assert.match(text, /opted OUT of a hardened path/, "an explicit legacy default is surfaced as an opt-out");
+});
+
+test("F5: doctor WARNS when retrieval is legacy, and reports LEGACY posture when BOTH are legacy", () => {
+  const mixed = runDoctor(readyInputs({ env: { IKBI_RETRIEVAL: "legacy" } }));
+  assert.match(mixed.lines.join("\n"), /⚠ Retrieval: legacy/);
+  assert.match(mixed.lines.join("\n"), /retrieval is LEGACY — index retrieval is DISABLED \(IKBI_RETRIEVAL=legacy set\)/);
+
+  const both = runDoctor(readyInputs({ env: { IKBI_VERIFY: "legacy", IKBI_RETRIEVAL: "legacy" } }));
+  const text = both.lines.join("\n");
+  assert.match(text, /⚠ Posture: LEGACY/, "both legacy ⇒ LEGACY posture");
+  assert.match(text, /⚠ Verification: legacy/);
+  assert.match(text, /⚠ Retrieval: legacy/);
+});
+
+test("doctor SAFETY POSTURE honors an explicit hardened opt-in (IKBI_VERIFY=ladder, IKBI_RETRIEVAL=index)", () => {
+  const r = runDoctor(readyInputs({ env: { IKBI_VERIFY: "ladder", IKBI_RETRIEVAL: "index" } }));
+  assert.match(r.lines.join("\n"), /✓ Posture: HARDENED/);
+});
+
 test("`ikbi help` lists the doctor command, and doctor is a reserved builtin", async () => {
   // run()/printUsage self-invoke on import (they read process.argv), so assert the
   // wiring at the source level: doctor is in the help listing AND the builtin set.

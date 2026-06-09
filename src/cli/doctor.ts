@@ -19,6 +19,13 @@ import type { ModelSpec } from "../core/provider/registry.js";
 import { egressConfig } from "../modules/egress/config.js";
 import { governedExecConfig } from "../modules/governed-exec/config.js";
 import { workerModelConfig } from "../modules/worker-model/config.js";
+import {
+  isExplicitLegacyRetrieval,
+  isExplicitLegacyVerify,
+  resolveRetrievalMode,
+  resolveVerificationMode,
+  safetyPosture,
+} from "../modules/worker-model/modes.js";
 
 /** The read-only registry surface doctor needs to check role-model resolution. */
 export interface DoctorRegistry {
@@ -35,6 +42,8 @@ export interface DoctorInputs {
   readonly egressLocalEndpoints?: readonly string[];
   /** The model registry (read-only) — to verify the role models resolve to a provider. */
   readonly registry?: DoctorRegistry;
+  /** Env source for verification/retrieval mode reporting (tests inject). Default: process.env. */
+  readonly env?: NodeJS.ProcessEnv;
 }
 
 export interface DoctorResult {
@@ -57,6 +66,7 @@ export function runDoctor(inp: DoctorInputs = {}): DoctorResult {
   const execAllow = inp.governedExecAllowlist ?? governedExecConfig.allowlist;
   const egressAllow = inp.egressAllowlist ?? egressConfig.allowlist;
   const egressLocal = inp.egressLocalEndpoints ?? egressConfig.localEndpoints;
+  const env = inp.env ?? process.env;
 
   const lines: string[] = [];
   const push = (s: string) => lines.push(s);
@@ -136,6 +146,27 @@ export function runDoctor(inp: DoctorInputs = {}): DoctorResult {
   };
   keyState(cfg.trust.hmacKeyIsDefault, "IKBI_TRUST_HMAC_KEY", "trust-state MAC uses a built-in key");
   keyState(cfg.identity.tokenSaltIsDefault, "IKBI_IDENTITY_TOKEN_SALT", "token hashing uses a built-in pepper");
+
+  // --- SAFETY POSTURE (verification + retrieval paths) ---------------------
+  // `ikbi build` runs through the PRODUCTION wiring (createProductionWorker ⇒ enforceProjectRoot),
+  // so the modes an operator actually gets are the production-resolved ones. Report them
+  // EXPLICITLY (no operator should have to read source/env to know which path runs) and WARN
+  // on any legacy / un-hardened path so the real safety posture is visible from doctor alone.
+  const verificationMode = resolveVerificationMode(env, { production: true });
+  const retrievalMode = resolveRetrievalMode(env, { production: true });
+  const posture = safetyPosture(verificationMode, retrievalMode);
+  push("");
+  push("SAFETY POSTURE");
+  const vHardened = verificationMode === "ladder";
+  const rHardened = retrievalMode === "index";
+  push(`  ${vHardened ? OK : WARN} Verification: ${verificationMode}${vHardened ? " (HARDENED — stub detection, no-vacuous-green, scope-stamped)" : " — legacy checks (no stub/vacuous-green protection)"}`);
+  push(`  ${rHardened ? OK : WARN} Retrieval: ${retrievalMode}${rHardened ? " (HARDENED — index-backed, goal-relevant)" : " — legacy 40-file scan (≈first 40 files only)"}`);
+  push(`  ${posture === "HARDENED" ? OK : WARN} Posture: ${posture}`);
+  if (!vHardened) push(`  ${WARN} verification is LEGACY — hardened ladder protections are DISABLED${isExplicitLegacyVerify(env) ? " (IKBI_VERIFY=legacy set)" : ""}; unset IKBI_VERIFY (or set =ladder) for the hardened default.`);
+  if (!rHardened) push(`  ${WARN} retrieval is LEGACY — index retrieval is DISABLED${isExplicitLegacyRetrieval(env) ? " (IKBI_RETRIEVAL=legacy set)" : ""}; unset IKBI_RETRIEVAL (or set =index) for the hardened default.`);
+  if (isExplicitLegacyVerify(env) || isExplicitLegacyRetrieval(env)) {
+    push(`  ${WARN} a fallback/legacy mode is configured as the DEFAULT via env — the operator has explicitly opted OUT of a hardened path.`);
+  }
 
   // --- EGRESS --------------------------------------------------------------
   push("");

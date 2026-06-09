@@ -25,6 +25,7 @@ import type { ModelMessage, ModelRequest } from "../../core/provider/contract.js
 import type { RoleFn } from "./contract.js";
 import { driverModel } from "./role-models.js";
 import type { ProjectRetrievalApi } from "../project-retrieval/index.js";
+import { resolveRetrievalMode, type RetrievalMode } from "./modes.js";
 
 /** A single thing scout learned. Lives in the open `detail` bag — NOT a contract type. */
 export interface ScoutFinding {
@@ -182,6 +183,14 @@ export interface ScoutDeps {
   readonly retrieval?: ProjectRetrievalApi;
   /** Env source for the IKBI_RETRIEVAL flag (tests inject). Default: process.env. */
   readonly env?: NodeJS.ProcessEnv;
+  /**
+   * Explicit retrieval mode, set by the PRODUCTION wiring (orchestrator) so production
+   * defaults to the HARDENED index retrieval. When set it WINS over env; when omitted, the
+   * mode is env-derived with legacy as the bare-construction default (so direct
+   * `createScout()` callers / existing tests are byte-unchanged). The index path remains
+   * FAIL-SAFE: any retrieval failure/empty selection still falls back to the legacy scan.
+   */
+  readonly mode?: RetrievalMode;
 }
 
 /**
@@ -199,7 +208,9 @@ export function createScout(deps: ScoutDeps = {}): RoleFn {
     try {
       const root = ctx.workspace.path;
       const env = deps.env ?? process.env;
-      const wantIndex = (env.IKBI_RETRIEVAL ?? "").trim().toLowerCase() === "index";
+      // Mode precedence: an explicit production `mode` wins; otherwise env-derived with legacy
+      // as the bare-construction default (resolveRetrievalMode(..., { production: false })).
+      const wantIndex = (deps.mode ?? resolveRetrievalMode(env, { production: false })) === "index";
 
       let files: string[];
       // "legacy" = flag off (the unchanged default). "index" = retrieval used. "index-fallback" =
