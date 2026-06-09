@@ -21,9 +21,12 @@ const env = moduleEnv("governed-exec");
  * (`node`, `npm`, `pnpm`) the builder needs to run Node scripts, install deps, and run
  * the project's checks. OPERATOR CHOICE (operational tuning): runners are dual-use — they
  * can run arbitrary code (`node -e`) — so this trades some default-deny strictness for a
- * builder that can actually drive a JS project out of the box. Shells are still excluded,
- * and the operator can tighten this with the `IKBI_GOVERNED_EXEC_ALLOWLIST` env override
- * (which REPLACES this default wholesale).
+ * builder that can actually drive a JS project out of the box. Shells are still excluded.
+ *
+ * The `IKBI_GOVERNED_EXEC_ALLOWLIST` env override is ADDITIVE (see `loadGovernedExecConfig`):
+ * it ADDS to these defaults rather than replacing them, so an operator who allows extra
+ * binaries (e.g. `python3,mkdir`) does NOT lose `git`/`ls`/`cat`/`echo` that the builder
+ * relies on for version control and exploration.
  */
 export const DEFAULT_ALLOWLIST: readonly string[] = Object.freeze(["git", "ls", "cat", "echo", "node", "npm", "pnpm"]);
 
@@ -46,11 +49,23 @@ export interface GovernedExecConfig {
   readonly networkTimeoutMs: number;
 }
 
+/**
+ * Merge the env allowlist override with the defaults (deduped, order-stable: defaults first,
+ * then any new operator-added binaries). ADDITIVE — the env list EXTENDS the defaults instead
+ * of replacing them, so essential builder binaries (git/ls/cat/echo/...) survive an override
+ * like `IKBI_GOVERNED_EXEC_ALLOWLIST=python3,mkdir`. An empty/absent override leaves exactly
+ * the defaults.
+ */
+function mergeAllowlist(overrides: readonly string[]): readonly string[] {
+  return Object.freeze([...new Set([...DEFAULT_ALLOWLIST, ...overrides])]);
+}
+
 /** Load the governed-exec config slice from `IKBI_GOVERNED_EXEC_*`. */
 export function loadGovernedExecConfig(reader = env): GovernedExecConfig {
   return Object.freeze({
     enabled: reader.bool("ENABLED", true),
-    allowlist: reader.list("ALLOWLIST", DEFAULT_ALLOWLIST),
+    // ADDITIVE override (NOT a replace): merge the env list onto the defaults, deduped.
+    allowlist: mergeAllowlist(reader.list("ALLOWLIST")),
     execTimeoutMs: reader.int("EXEC_TIMEOUT_MS", DEFAULT_EXEC_TIMEOUT_MS, { min: 1 }),
     maxBuffer: reader.int("MAX_BUFFER", DEFAULT_MAX_BUFFER, { min: 1 }),
     networkTimeoutMs: reader.int("NETWORK_TIMEOUT_MS", DEFAULT_NETWORK_TIMEOUT_MS, { min: 1 }),
