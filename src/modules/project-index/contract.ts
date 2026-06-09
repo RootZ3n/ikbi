@@ -68,6 +68,18 @@ export interface ImportEdge {
   readonly kind: ImportKind;
 }
 
+/** Git provenance for the indexed working tree (present only when repoPath IS a git root). */
+export interface GitProvenance {
+  /** Current HEAD commit (full sha). */
+  readonly head: string;
+  /** Current branch name, or undefined when detached. */
+  readonly branch?: string;
+  /** Whether the working tree has uncommitted changes (undefined when not cheaply determinable). */
+  readonly dirty?: boolean;
+  /** Count of changed entries from `git status --porcelain` (when `dirty` is known). */
+  readonly changedFiles?: number;
+}
+
 /** The full persisted index for one repo. Arrays are sorted for deterministic output. */
 export interface ProjectIndexData {
   readonly version: number;
@@ -82,6 +94,14 @@ export interface ProjectIndexData {
   readonly fileToTests: Readonly<Record<string, readonly string[]>>;
   /** True when the walk hit the configured maxFiles cap (index is incomplete). */
   readonly truncated: boolean;
+  /** Git provenance (HEAD/branch/dirty) when the repo is a git root; undefined otherwise. */
+  readonly git?: GitProvenance;
+  /**
+   * Wall-clock (ms epoch) the index was last written — the reference for racy-clean refresh
+   * (a file whose mtime is within the racy window of this stamp is re-hashed even when its
+   * size+mtime appear unchanged). METADATA, not part of the deterministic structural content.
+   */
+  readonly builtAtMs?: number;
 }
 
 /** Result of an incremental refresh. */
@@ -93,6 +113,10 @@ export interface RefreshResult {
   /** Count of files present and unchanged. */
   readonly unchanged: number;
   readonly data: ProjectIndexData;
+  /** True when git HEAD changed since the last index → a safe FULL rebuild was performed. */
+  readonly rebuilt: boolean;
+  /** True when the detected HEAD differs from the persisted index's HEAD. */
+  readonly headChanged: boolean;
 }
 
 /** Why a file was selected by `query`. */

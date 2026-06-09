@@ -15,6 +15,10 @@ const env = moduleEnv("project-index");
 export const DEFAULT_MAX_FILE_BYTES = 4_000_000;
 export const DEFAULT_MAX_PARSE_BYTES = 1_000_000;
 export const DEFAULT_MAX_FILES = 200_000;
+/** Racy-clean window (ms): a probe-"unchanged" file whose mtime is within this of the last index
+ *  write is re-hashed (catches same-size, same-mtime in-place edits). Bounds the extra hashing to
+ *  recently-touched files; older untouched files stay on the cheap mtime+size path. */
+export const DEFAULT_RACY_WINDOW_MS = 2_000;
 
 /** Directory names never descended into (independent of .gitignore). */
 export const DEFAULT_SKIP_DIRS: readonly string[] = Object.freeze([
@@ -35,6 +39,7 @@ export interface ProjectIndexConfig {
   readonly maxParseBytes: number;
   readonly maxFiles: number;
   readonly skipDirs: readonly string[];
+  readonly racyWindowMs: number;
 }
 
 /** Load the project-index config slice from `IKBI_PROJECT_INDEX_*`. */
@@ -44,6 +49,7 @@ export function loadProjectIndexConfig(reader = env): ProjectIndexConfig {
     maxParseBytes: reader.int("MAX_PARSE_BYTES", DEFAULT_MAX_PARSE_BYTES, { min: 1 }),
     maxFiles: reader.int("MAX_FILES", DEFAULT_MAX_FILES, { min: 1 }),
     skipDirs: Object.freeze([...new Set([...DEFAULT_SKIP_DIRS, ...reader.list("SKIP_DIRS")])]),
+    racyWindowMs: reader.int("RACY_WINDOW_MS", DEFAULT_RACY_WINDOW_MS, { min: 0 }),
   });
 }
 

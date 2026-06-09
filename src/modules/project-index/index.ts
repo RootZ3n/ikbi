@@ -13,6 +13,7 @@
 export {
   PROJECT_INDEX_VERSION,
   type FileEntry,
+  type GitProvenance,
   type ImportEdge,
   type ImportKind,
   type Language,
@@ -43,5 +44,7 @@ export {
   isTestPath,
   parseGitignore,
   projectIndex,
+  readGitProvenanceReal,
+  type GitProvenanceReader,
   type ProjectIndexDeps,
 } from "./implementation.js";

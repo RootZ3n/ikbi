@@ -11,6 +11,7 @@
  * type/semantic claims.
  */
 
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { posix, relative, resolve, sep } from "node:path";
@@ -20,6 +21,7 @@ import { projectIndexConfig, type ProjectIndexConfig } from "./config.js";
 import {
   PROJECT_INDEX_VERSION,
   type FileEntry,
+  type GitProvenance,
   type ImportEdge,
   type Language,
   type PackageEntry,
@@ -31,6 +33,51 @@ import {
   type ReasonTag,
   type RefreshResult,
 } from "./contract.js";
+
+// ── git provenance (R-A) ─────────────────────────────────────────────────────────
+
+/** A git-provenance reader: HEAD/branch/dirty for a repo root, or undefined when not a git root. */
+export type GitProvenanceReader = (repoAbs: string) => GitProvenance | undefined;
+
+/**
+ * The default reader: shells `git` (deterministic given repo state, no model calls). Fully guarded —
+ * any failure (no git binary, not a repo, timeout, output overflow) yields undefined or a partial
+ * record. It only stamps provenance when `repoAbs` is the git TOP-LEVEL, so a tmp dir that merely
+ * sits under some ancestor repo never leaks that ancestor's HEAD.
+ */
+export function readGitProvenanceReal(repoAbs: string): GitProvenance | undefined {
+  const run = (args: readonly string[]): string =>
+    execFileSync("git", ["-C", repoAbs, ...args], { encoding: "utf8", timeout: 5_000, maxBuffer: 8_000_000, stdio: ["ignore", "pipe", "ignore"] }).trim();
+  try {
+    if (resolve(run(["rev-parse", "--show-toplevel"])) !== resolve(repoAbs)) return undefined; // repoAbs is not its OWN repo root
+    const head = run(["rev-parse", "HEAD"]);
+    if (head.length === 0) return undefined;
+    let branch: string | undefined;
+    try {
+      const b = run(["rev-parse", "--abbrev-ref", "HEAD"]);
+      if (b.length > 0 && b !== "HEAD") branch = b;
+    } catch {
+      /* detached / unborn — leave branch undefined */
+    }
+    let dirty: boolean | undefined;
+    let changedFiles: number | undefined;
+    try {
+      const porcelain = run(["status", "--porcelain"]);
+      const lines = porcelain.length === 0 ? [] : porcelain.split("\n").filter((l) => l.length > 0);
+      dirty = lines.length > 0;
+      changedFiles = lines.length;
+    } catch {
+      /* status too large / slow — leave dirty unknown */
+    }
+    return {
+      head,
+      ...(branch !== undefined ? { branch } : {}),
+      ...(dirty !== undefined ? { dirty, ...(changedFiles !== undefined ? { changedFiles } : {}) } : {}),
+    };
+  } catch {
+    return undefined; // not a git repo (or git unavailable)
+  }
+}
 
 // ── path helpers ───────────────────────────────────────────────────────────────
 
@@ -482,11 +529,24 @@ export interface ProjectIndexDeps {
   /** Persistence root. Default `<coreConfig.stateRoot>`; index lives under `<stateRoot>/index/`. */
   readonly stateRoot?: string;
   readonly config?: ProjectIndexConfig;
+  /** Git-provenance reader (R-A). Default: the real `git`-shelling reader. Tests inject a stub. */
+  readonly git?: GitProvenanceReader;
+  /** Clock for the `builtAtMs` racy-clean reference. Default `Date.now`. */
+  readonly now?: () => number;
 }
 
 export function createProjectIndex(deps: ProjectIndexDeps = {}): ProjectIndexApi {
   const stateRoot = deps.stateRoot ?? coreConfig.stateRoot;
   const cfg = deps.config ?? projectIndexConfig;
+  const gitReader = deps.git ?? readGitProvenanceReal;
+  const nowMs = deps.now ?? Date.now;
+
+  /** Attach git provenance + the racy-clean reference stamp. */
+  const stampMeta = (data: ProjectIndexData, git: GitProvenance | undefined): ProjectIndexData => ({
+    ...data,
+    ...(git !== undefined ? { git } : {}),
+    builtAtMs: nowMs(),
+  });
 
   const indexDirFor = (repoPath: string): string => `${stateRoot}${sep}index${sep}${repoHashOf(repoPath)}`;
   const indexFileFor = (repoPath: string): string => `${indexDirFor(repoPath)}${sep}index.json`;
@@ -543,7 +603,7 @@ export function createProjectIndex(deps: ProjectIndexDeps = {}): ProjectIndexApi
   async function build(repoPath: string): Promise<ProjectIndexData> {
     const repoAbs = resolve(repoPath);
     const { files: raws, truncated } = walk(repoAbs, cfg);
-    const data = assemble(repoAbs, raws, truncated);
+    const data = stampMeta(assemble(repoAbs, raws, truncated), gitReader(repoAbs));
     persist(repoPath, data);
     return data;
   }
@@ -553,7 +613,29 @@ export function createProjectIndex(deps: ProjectIndexDeps = {}): ProjectIndexApi
     const old = await load(repoPath);
     if (old === undefined) {
       const data = await build(repoPath);
-      return { added: data.files.map((f) => f.path), reparsed: data.files.map((f) => f.path), removed: [], unchanged: 0, data };
+      const all = data.files.map((f) => f.path);
+      return { added: all, reparsed: all, removed: [], unchanged: 0, data, rebuilt: false, headChanged: false };
+    }
+
+    // R-A: a HEAD change is the one case the cheap incremental path cannot safely reconcile
+    // (renamed targets, deleted files, mass content moves, stale cross-file edges). Take the
+    // SAFE-AND-SIMPLE option: a full rebuild. Bounded — this only triggers on an actual HEAD
+    // change, never on ordinary working-tree edits (those go through the incremental probe).
+    const git = gitReader(repoAbs);
+    const headChanged = (old.git?.head ?? undefined) !== (git?.head ?? undefined);
+    if (headChanged) {
+      const data = await build(repoPath);
+      const newPaths = new Set(data.files.map((f) => f.path));
+      const oldPaths = old.files.map((f) => f.path);
+      return {
+        added: data.files.map((f) => f.path).filter((p) => !oldPaths.includes(p)).sort(),
+        reparsed: data.files.map((f) => f.path),
+        removed: oldPaths.filter((p) => !newPaths.has(p)).sort(),
+        unchanged: 0,
+        data,
+        rebuilt: true,
+        headChanged: true,
+      };
     }
 
     const { files: raws, truncated } = walk(repoAbs, cfg);
@@ -564,6 +646,12 @@ export function createProjectIndex(deps: ProjectIndexDeps = {}): ProjectIndexApi
     const fileSet = currentPaths;
     const packages = finalizePackages(rawPkgs, fileSet);
     const pkgByName = new Map(packages.map((p) => [p.name, { root: p.root, ...(p.entry !== undefined ? { entry: p.entry } : {}) }]));
+
+    // R-B: racy-clean reference. A file whose mtime sits within the racy window of the LAST index
+    // write could have been edited in-place (same size, same mtime tick), so we re-hash it even
+    // when the cheap probe says "unchanged". Files modified well before the last index are trusted
+    // on size+mtime alone — so this is NOT a full re-hash every time, only for recently-touched files.
+    const racyFloor = (old.builtAtMs ?? 0) - cfg.racyWindowMs;
 
     const added: string[] = [];
     const reparsed: string[] = [];
@@ -576,16 +664,29 @@ export function createProjectIndex(deps: ProjectIndexDeps = {}): ProjectIndexApi
 
     for (const raw of raws) {
       const prev = oldByPath.get(raw.rel);
-      const changedProbe = prev === undefined || prev.size !== raw.size || prev.mtimeMs !== raw.mtimeMs;
-      if (!changedProbe && prev !== undefined) {
-        // cheap probe says unchanged → reuse the stored entry + its edges, but refresh the package
-        // assignment in case package roots moved.
-        const pkg = assignPackage(raw.rel, pkgRootsDescByLen);
-        files.push({ ...prev, ...(pkg !== undefined ? { package: pkg } : {}) });
-        unchanged += 1;
+      const probeUnchanged = prev !== undefined && prev.size === raw.size && prev.mtimeMs === raw.mtimeMs;
+      if (probeUnchanged) {
+        const racy = raw.mtimeMs >= racyFloor;
+        if (!racy) {
+          // confidently unchanged → reuse stored entry + edges (refresh pkg assignment only).
+          const pkg = assignPackage(raw.rel, pkgRootsDescByLen);
+          files.push({ ...prev, ...(pkg !== undefined ? { package: pkg } : {}) });
+          unchanged += 1;
+          continue;
+        }
+        // racy → re-hash to be sure (catches same-size/same-mtime in-place edits).
+        const { entry, content } = buildFileEntry(raw, pkgRootsDescByLen);
+        if (entry.hash === prev.hash) {
+          files.push({ ...prev, ...(entry.package !== undefined ? { package: entry.package } : {}) });
+          unchanged += 1;
+        } else {
+          files.push(entry);
+          reparsed.push(raw.rel);
+          if (content !== null) newEdges.push(...edgesForFile(raw.rel, content, cfg, fileSet, pkgByName));
+        }
         continue;
       }
-      // probe says maybe-changed → read + hash to confirm.
+      // probe says maybe-changed (size/mtime differ) or new → read + hash to confirm.
       const { entry, content } = buildFileEntry(raw, pkgRootsDescByLen);
       const contentChanged = prev === undefined || prev.hash !== entry.hash;
       files.push(entry);
@@ -605,18 +706,21 @@ export function createProjectIndex(deps: ProjectIndexDeps = {}): ProjectIndexApi
     const imports = sortEdges([...keptEdges, ...newEdges]);
     files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
 
-    const data: ProjectIndexData = {
-      version: PROJECT_INDEX_VERSION,
-      repoPath: repoAbs,
-      repoHash: repoHashOf(repoAbs),
-      files,
-      packages,
-      imports,
-      fileToTests: buildFileToTests(files),
-      truncated,
-    };
+    const data = stampMeta(
+      {
+        version: PROJECT_INDEX_VERSION,
+        repoPath: repoAbs,
+        repoHash: repoHashOf(repoAbs),
+        files,
+        packages,
+        imports,
+        fileToTests: buildFileToTests(files),
+        truncated,
+      },
+      git,
+    );
     persist(repoPath, data);
-    return { added: added.sort(), reparsed: reparsed.sort(), removed: removed.sort(), unchanged, data };
+    return { added: added.sort(), reparsed: reparsed.sort(), removed: removed.sort(), unchanged, data, rebuilt: false, headChanged: false };
   }
 
   async function query(repoPath: string, spec: QuerySpec): Promise<readonly QueryResultItem[]> {

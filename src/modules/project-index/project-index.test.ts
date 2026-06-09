@@ -8,12 +8,13 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, appendFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 
-import { createProjectIndex } from "./index.js";
+import { createProjectIndex, projectIndexConfig } from "./index.js";
 
 function write(root: string, rel: string, content: string): void {
   const abs = join(root, rel);
@@ -122,6 +123,141 @@ test("project-index: query callers returns the importing file with reason import
     assert.ok(importer?.reasons.includes("imported-by-seed"), "tagged with reason imported-by-seed");
     // a seed never returns itself
     assert.ok(!callers.some((r) => r.path === "packages/b/src/index.ts"), "seed excluded from its own results");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
+  }
+});
+
+// ── R-A: git HEAD / provenance ────────────────────────────────────────────────────
+test("R-A: a HEAD change triggers a safe full rebuild; same HEAD stays incremental", async () => {
+  const { repo, stateRoot } = makeFixture();
+  try {
+    let head = "1111111111111111111111111111111111111111";
+    const idx = createProjectIndex({ stateRoot, git: () => ({ head, branch: "main" }) });
+    const built = await idx.build(repo);
+    assert.equal(built.git?.head, head, "HEAD recorded in the index");
+    assert.equal(built.git?.branch, "main", "branch recorded");
+
+    const same = await idx.refresh(repo);
+    assert.equal(same.headChanged, false, "same HEAD → no change");
+    assert.equal(same.rebuilt, false, "same HEAD → incremental, no rebuild");
+
+    head = "2222222222222222222222222222222222222222";
+    const changed = await idx.refresh(repo);
+    assert.equal(changed.headChanged, true, "HEAD change detected");
+    assert.equal(changed.rebuilt, true, "a safe full rebuild was performed");
+    assert.equal(changed.data.git?.head, head, "the new HEAD is persisted");
+    assert.ok(changed.reparsed.length >= 5, "rebuild reparsed the whole tree");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
+  }
+});
+
+test("R-A: the real reader records HEAD + branch for an actual git repo", async () => {
+  const { repo, stateRoot } = makeFixture();
+  try {
+    try {
+      const g = (args: string[]): void => void execFileSync("git", ["-C", repo, ...args], { stdio: ["ignore", "pipe", "ignore"] });
+      g(["init", "-q", "-b", "trunk"]);
+      g(["config", "user.email", "t@example.com"]);
+      g(["config", "user.name", "t"]);
+      g(["add", "-A"]);
+      g(["commit", "-qm", "init"]);
+    } catch {
+      return; // git unavailable / too old → skip (the injected-stub test covers behavior)
+    }
+    const data = await createProjectIndex({ stateRoot }).build(repo); // default real reader
+    assert.ok(data.git, "provenance captured for a git repo");
+    assert.match(data.git?.head ?? "", /^[0-9a-f]{40}$/, "HEAD is a full sha");
+    assert.equal(data.git?.branch, "trunk", "branch recorded");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
+  }
+});
+
+// ── R-B: racy-clean refresh (same-size, same-mtime in-place edit) ───────────────────
+test("R-B: refresh catches a same-size, same-mtime in-place edit", async () => {
+  const { repo, stateRoot } = makeFixture();
+  try {
+    const idx = createProjectIndex({ stateRoot });
+    const target = "packages/b/src/index.ts";
+    const abs = join(repo, target);
+    await idx.build(repo);
+
+    const st = statSync(abs);
+    const before = readFileSync(abs, "utf8");
+    const after = before.replace("export const b = 1;", "export const b = 9;"); // same byte length
+    assert.equal(after.length, before.length, "edit preserves byte size");
+    writeFileSync(abs, after);
+    utimesSync(abs, st.atime, st.mtime); // restore the original mtime → defeats the cheap probe
+
+    const r = await idx.refresh(repo);
+    assert.deepEqual(r.reparsed, [target], "the in-place edit was caught and reparsed (exactly one file)");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
+  }
+});
+
+// ── R-F: relative import with omitted extension ─────────────────────────────────────
+test("R-F: a relative import with an omitted extension resolves to the .ts file", async () => {
+  const { repo, stateRoot } = makeFixture();
+  try {
+    const data = await createProjectIndex({ stateRoot }).build(repo);
+    const e = data.imports.find((x) => x.from === "packages/a/src/index.ts" && x.specifier === "./util");
+    assert.ok(e, "the ./util import is recorded");
+    assert.equal(e?.kind, "relative", "classified relative");
+    assert.equal(e?.to, "packages/a/src/util.ts", "resolved ./util → util.ts (extension inferred)");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
+  }
+});
+
+// ── R-E: .gitignore matcher (anchored / **glob / nested / negation) + maxFiles ──────
+function makeIgnoreFixture(): { repo: string; stateRoot: string } {
+  const repo = mkdtempSync(join(tmpdir(), "ikbi-pi-ign-"));
+  const stateRoot = mkdtempSync(join(tmpdir(), "ikbi-pi-ign-state-"));
+  write(repo, ".gitignore", "/ignored-root.ts\n**/*.log\ngen/\n");
+  write(repo, "src/.gitignore", "*.draft.ts\n!keep.draft.ts\n");
+  write(repo, "ignored-root.ts", "export const x = 1;\n"); // anchored at root → ignored
+  write(repo, "src/ignored-root.ts", "export const x = 1;\n"); // anchor only at root → INCLUDED
+  write(repo, "a.log", "log\n"); // **/*.log → ignored
+  write(repo, "deep/inner/b.log", "log\n"); // **/*.log (nested) → ignored
+  write(repo, "gen/x.ts", "export const g = 1;\n"); // gen/ dir → ignored
+  write(repo, "src/note.draft.ts", "export const n = 1;\n"); // nested *.draft.ts → ignored
+  write(repo, "src/keep.draft.ts", "export const k = 1;\n"); // negation !keep.draft.ts → INCLUDED
+  write(repo, "src/main.ts", "export const m = 1;\n"); // included
+  return { repo, stateRoot };
+}
+
+test("R-E: .gitignore honors anchored, **/*.glob, nested file rules, and negation", async () => {
+  const { repo, stateRoot } = makeIgnoreFixture();
+  try {
+    const data = await createProjectIndex({ stateRoot }).build(repo);
+    const paths = new Set(data.files.map((f) => f.path));
+    for (const p of ["ignored-root.ts", "a.log", "deep/inner/b.log", "gen/x.ts", "src/note.draft.ts"]) {
+      assert.ok(!paths.has(p), `excluded: ${p}`);
+    }
+    for (const p of ["src/ignored-root.ts", "src/keep.draft.ts", "src/main.ts"]) {
+      assert.ok(paths.has(p), `included: ${p}`);
+    }
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
+  }
+});
+
+test("R-E/safety: maxFiles cap sets truncated and bounds the file list", async () => {
+  const { repo, stateRoot } = makeFixture();
+  try {
+    const idx = createProjectIndex({ stateRoot, config: { ...projectIndexConfig, maxFiles: 2 } });
+    const data = await idx.build(repo);
+    assert.equal(data.truncated, true, "hit the maxFiles cap");
+    assert.ok(data.files.length <= 2, "file list bounded by maxFiles");
   } finally {
     rmSync(repo, { recursive: true, force: true });
     rmSync(stateRoot, { recursive: true, force: true });
