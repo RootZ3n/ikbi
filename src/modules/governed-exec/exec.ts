@@ -237,6 +237,9 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
     }
 
     // (7) EXECUTE — array args, NO shell. (8) receipt the outcome.
+    // Per-call timeout override (verification checks pass a larger IKBI_CHECK_TIMEOUT_MS); absent /
+    // non-positive ⇒ the module default (unchanged).
+    const effectiveTimeout = typeof request.timeoutMs === "number" && request.timeoutMs > 0 ? request.timeoutMs : config.execTimeoutMs;
     // STREAMING path (SG-1): when the caller wants live output, spawn and forward each chunk.
     // The receipt/result still carry only the BOUNDED tail — truncation is for the record, not
     // the live view. A non-zero exit is reported, never thrown.
@@ -244,7 +247,7 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
       const { stdout, stderr, code } = await execFileStream(
         command,
         args,
-        { ...(cwd !== undefined ? { cwd } : {}), timeout: config.execTimeoutMs, maxBuffer: config.maxBuffer },
+        { ...(cwd !== undefined ? { cwd } : {}), timeout: effectiveTimeout, maxBuffer: config.maxBuffer },
         request.onOutput,
       );
       if (code === 0) {
@@ -260,7 +263,7 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
     try {
       const { stdout, stderr } = await execFile(command, args, {
         ...(cwd !== undefined ? { cwd } : {}),
-        timeout: config.execTimeoutMs,
+        timeout: effectiveTimeout,
         maxBuffer: config.maxBuffer,
       });
       emit(govexecExecuted, { ...base, allow: true, exitCode: 0 }, identity, EXEC_OPERATION, requestId);

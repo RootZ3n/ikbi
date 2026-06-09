@@ -44,6 +44,13 @@ export interface ExecRequest {
    * not the live view. Absent ⇒ the buffered path (unchanged).
    */
   readonly onOutput?: (chunk: string, stream: "stdout" | "stderr") => void;
+  /**
+   * Optional per-call wall-clock timeout (ms) for THIS command, overriding the module default
+   * (`IKBI_GOVERNED_EXEC_EXEC_TIMEOUT_MS`). Long verification checks (full test suites) pass a
+   * larger budget here (IKBI_CHECK_TIMEOUT_MS) so the 30s read-only-tool default doesn't SIGKILL
+   * them. Absent / non-positive ⇒ the module default applies (unchanged).
+   */
+  readonly timeoutMs?: number;
 }
 
 /**

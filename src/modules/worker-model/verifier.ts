@@ -35,6 +35,8 @@
  * Commands run with `cwd: ctx.workspace.path`.
  */
 
+import { join } from "node:path";
+
 import type { OperationContext } from "../../core/identity/index.js";
 import type { WorkspaceHandle } from "../../core/workspace/contract.js";
 import type { GovernedExec } from "../governed-exec/index.js";
@@ -44,6 +46,34 @@ import type { GovernedExec } from "../governed-exec/index.js";
 // verifier's EXACT checks. Behavior here is unchanged; the constant just relocated.
 import { type CheckResult, type ChecksResolution, mapExec, VERIFIER_CHECKS } from "./checks.js";
 import type { RoleFn, RoleResult } from "./contract.js";
+// LADDER MODE (opt-in, IKBI_VERIFY=ladder): package/impact-aware verification. These are
+// library-only consumers — no side effects at import; the default (legacy) path never calls them.
+import { projectIndex, type ProjectIndexData } from "../project-index/index.js";
+import { verificationLadder, type VerificationPlan } from "../verification-ladder/index.js";
+import { parseCheckOutput, type CheckTriage } from "../check-triage/index.js";
+
+/** Default per-check wall-clock budget (ms) for ladder verification — SEPARATE from the model
+ *  role timeout, and larger than governed-exec's read-only-tool default so real suites don't get
+ *  SIGKILL'd. Overridable via IKBI_CHECK_TIMEOUT_MS. */
+export const DEFAULT_CHECK_TIMEOUT_MS = 600_000;
+
+/** Extract changed file paths (repo-relative POSIX) from a unified `git diff`. */
+export function parseChangedFiles(diff: string): string[] {
+  const out = new Set<string>();
+  for (const line of diff.split("\n")) {
+    const g = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
+    if (g) {
+      if (g[1] !== undefined && g[1] !== "/dev/null") out.add(g[1]);
+      if (g[2] !== undefined && g[2] !== "/dev/null") out.add(g[2]);
+      continue;
+    }
+    const p = /^\+\+\+ b\/(.+)$/.exec(line);
+    if (p && p[1] !== undefined && p[1] !== "/dev/null") out.add(p[1]);
+    const m = /^--- a\/(.+)$/.exec(line);
+    if (m && m[1] !== undefined && m[1] !== "/dev/null") out.add(m[1]);
+  }
+  return [...out].sort();
+}
 
 /** Re-exported for consumers (and tests) that import it from the verifier. */
 export type { CheckResult } from "./checks.js";
@@ -83,6 +113,14 @@ export interface VerifierDeps {
    * with NO guard — so existing direct-construction callers are byte-unchanged.
    */
   readonly resolveChecks?: (worktreeReal: string) => ChecksResolution;
+  /** Env source for IKBI_VERIFY / IKBI_CHECK_TIMEOUT_MS (tests inject). Default: process.env. */
+  readonly env?: NodeJS.ProcessEnv;
+  /** Project-index for ladder mode. Default: the live `projectIndex` (built/refreshed per run). */
+  readonly index?: { refresh: (repo: string) => Promise<{ data: ProjectIndexData }> };
+  /** Verification planner for ladder mode. Default: the live `verificationLadder`. */
+  readonly plan?: (req: { data: ProjectIndexData; changedFiles: string[] }) => VerificationPlan;
+  /** Check-output triage for ladder mode. Default: the live `parseCheckOutput`. */
+  readonly triage?: typeof parseCheckOutput;
 }
 
 /** Lazy live governed-exec — importing it eagerly would force the gate-wall/egress wiring order. */
@@ -171,6 +209,14 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
     }
     const parentCtx = deps.parentCtx;
 
+    // ── LADDER MODE (opt-in: IKBI_VERIFY=ladder) ──────────────────────────────
+    // Package/impact-aware verification. The script-integrity guard (above) has ALREADY run, so a
+    // build that touched any package.json scripts is rejected before we read package scripts here.
+    const env = deps.env ?? process.env;
+    if ((env.IKBI_VERIFY ?? "").trim().toLowerCase() === "ladder") {
+      return await runLadder(ctx, parentCtx, diffText, env);
+    }
+
     // PROJECT-ROOT GUARD + per-target check set (Fix 1/2). Default (direct construction):
     // pnpm VERIFIER_CHECKS, no guard. The orchestrator wires the live resolver, which fails
     // closed RED when the worktree has no project of its own (so a no-manifest target can
@@ -214,6 +260,99 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
       summary: allPass ? "all checks passed" : `checks failed: ${failed.join(", ")}`,
       detail: { verdict: allPass ? "pass" : "fail", checks },
     };
+
+    // ── LADDER MODE implementation (hoisted; reached only when IKBI_VERIFY=ladder) ──────────
+    async function runLadder(rctx: typeof ctx, pctx: OperationContext, diff: string, runEnv: NodeJS.ProcessEnv): Promise<RoleResult> {
+      const worktree = rctx.workspace.path;
+      const indexApi = deps.index ?? projectIndex;
+      const planFn = deps.plan ?? ((r) => verificationLadder.planVerification(r));
+      const triageFn = deps.triage ?? parseCheckOutput;
+      const raw = (runEnv.IKBI_CHECK_TIMEOUT_MS ?? "").trim();
+      const parsedTimeout = Number.parseInt(raw, 10);
+      const checkTimeoutMs = Number.isFinite(parsedTimeout) && parsedTimeout > 0 ? parsedTimeout : DEFAULT_CHECK_TIMEOUT_MS;
+
+      let data: ProjectIndexData;
+      try {
+        data = (await indexApi.refresh(worktree)).data;
+      } catch (e) {
+        // Fail closed: without an index we cannot scope impact — RED, never a vacuous pass.
+        return red(`verification RED (ladder): project-index unavailable — ${e instanceof Error ? e.message : String(e)}`);
+      }
+
+      const changedFiles = parseChangedFiles(diff);
+      const plan = planFn({ data, changedFiles });
+      const baseReceipts = [...plan.receipts];
+
+      if (plan.blocked) {
+        return {
+          role: "verifier", outcome: "failure",
+          summary: `verification BLOCKED (scope ${plan.scope}): ${plan.blockReasons.join("; ")}`,
+          detail: { verdict: "fail", verificationScope: plan.scope, blocked: true, blockReasons: plan.blockReasons, checks: [], stagesRun: [], neutralPackages: plan.neutralPackages, receipts: baseReceipts },
+        };
+      }
+
+      const checks: CheckResult[] = [];
+      const triages: Array<{ stage: string; name: string; package: string; passed: boolean; failures: readonly string[]; errorSummary: string; detectedFrameworks: readonly string[] }> = [];
+      const stagesRun: string[] = [];
+      const neutralNote = plan.neutralPackages.length > 0 ? [`neutral packages (no runnable check — NOT counted green): ${plan.neutralPackages.join(", ")}`] : [];
+
+      for (const stage of plan.stages) {
+        stagesRun.push(stage.stage);
+        for (const task of stage.tasks) {
+          if (task.blocking || task.command === "") {
+            // Defensive: a blocking marker must never be run or passed. (Blocked plans return above.)
+            return {
+              role: "verifier", outcome: "failure",
+              summary: `verification BLOCKED (scope ${plan.scope}): ${task.reason}`,
+              detail: { verdict: "fail", verificationScope: plan.scope, blocked: true, blockReasons: [task.reason], checks, stagesRun, neutralPackages: plan.neutralPackages, receipts: [...baseReceipts, `BLOCKED at ${stage.stage}: ${task.reason}`] },
+            };
+          }
+          const cmdStr = `${task.command} ${task.args.join(" ")}`;
+          const res = await governedExec.run({
+            parentCtx: pctx,
+            command: task.command,
+            args: [...task.args],
+            cwd: task.cwd === "" ? worktree : join(worktree, task.cwd),
+            purpose: `verifier[ladder:${task.scope}] ${task.name} (${task.package || "(root)"})`,
+            timeoutMs: checkTimeoutMs,
+          });
+          const { check, dryRun } = mapExec(task.name, cmdStr, res);
+          checks.push(check);
+          if (dryRun) {
+            return {
+              role: "verifier", outcome: "stub",
+              summary: "dry-run: governed checks reported intent, executed nothing",
+              detail: { verdict: "dry-run", verificationScope: plan.scope, checks, stagesRun, neutralPackages: plan.neutralPackages, receipts: baseReceipts },
+            };
+          }
+          const tr: CheckTriage = triageFn({ name: task.name, command: cmdStr, exitCode: check.exitCode, stdout: res.stdoutTail ?? "", stderr: res.stderrTail ?? "" });
+          triages.push({ stage: stage.stage, name: task.name, package: task.package, passed: tr.passed, failures: tr.failures, errorSummary: tr.errorSummary, detectedFrameworks: tr.detectedFrameworks });
+          if (!tr.passed) {
+            // FAIL FAST — stop before any later stage/task.
+            return {
+              role: "verifier", outcome: "failure",
+              summary: `verification FAILED (scope ${plan.scope}) at ${stage.stage}/${task.name}: ${tr.errorSummary}`,
+              detail: {
+                verdict: "fail", verificationScope: plan.scope, checks, triage: triages, stagesRun,
+                neutralPackages: plan.neutralPackages, failedAt: { stage: stage.stage, task: task.name },
+                receipts: [...baseReceipts, `ran stages: ${stagesRun.join(" → ")}`, `FAILED at ${stage.stage}/${task.name}: ${tr.errorSummary}`, ...neutralNote, ...tr.failures.slice(0, 10)],
+              },
+            };
+          }
+        }
+      }
+
+      // ALL runnable tasks passed — SCOPE-STAMPED green (never a plain "all checks passed").
+      return {
+        role: "verifier", outcome: "success",
+        summary: `verification PASSED for scope "${plan.scope}" — ran ${checks.length} check(s) across [${stagesRun.join(" → ")}]${plan.neutralPackages.length > 0 ? `; ${plan.neutralPackages.length} neutral package(s) recorded (not counted green)` : ""}`,
+        detail: {
+          verdict: "pass", verificationScope: plan.scope, checks, triage: triages, stagesRun,
+          neutralPackages: plan.neutralPackages,
+          receipts: [...baseReceipts, `ran stages: ${stagesRun.join(" → ")}`, ...neutralNote, `GREEN for scope: ${plan.scope}`],
+        },
+      };
+    }
   };
 }
 
