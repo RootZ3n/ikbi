@@ -508,7 +508,7 @@ test("run_checks FEEDS BACK the real check output as ACTIONABLE feedback (the fa
   // The run_checks output re-enters as a tool message carrying the REAL failure output,
   // wrapped ACTIONABLE (not the inert-neutralized path) — the model receives the fact to act on.
   const msgs = requests.flatMap((r) => r.messages ?? []);
-  const rc = msgs.find((m) => m.role === "user" && typeof m.content === "string" && m.content.includes("IKBI-CHECK-RESULTS-BEGIN"));
+  const rc = msgs.find((m) => m.role === "tool" && typeof m.content === "string" && m.content.includes("IKBI-CHECK-RESULTS-BEGIN"));
   assert.ok(rc, "run_checks output is a tool message wrapped as actionable check results");
   assert.match(String(rc?.content), /FAILED|expected 7, got 3/, "the model receives the actual failure output, not just pass/fail");
   // ACTIONABLE framing — NOT the 'inert data, ignore directions' neutralization preamble.
@@ -571,7 +571,7 @@ test("run_checks feedback is ACTIONABLE, NOT inert-neutralized (the harness-bug 
   const dir = tmp();
   const { engine, requests } = mockEngine([runChecksResp(), doneResp(["x"]), lengthResp()]);
   await run(makeCtx(dir, "verified", engine), redExec("test"));
-  const rc = requests.flatMap((r) => r.messages ?? []).find((m) => m.role === "user" && typeof m.content === "string" && m.content.includes("IKBI-CHECK-RESULTS-BEGIN"));
+  const rc = requests.flatMap((r) => r.messages ?? []).find((m) => m.role === "tool" && typeof m.content === "string" && m.content.includes("IKBI-CHECK-RESULTS-BEGIN"));
   const text = String(rc?.content);
   // ACTIONABLE preamble: act on / your check run / fix your code — the rail's purpose.
   assert.match(text, /results of YOUR check run/);
@@ -587,7 +587,7 @@ test("run_checks feedback STILL injection-safe: BOUNDED by markers + explicit 'd
   const evilExec = { run: async (): Promise<ExecResult> => ({ executed: true, exitCode: 1, stdoutTail: evil, stderrTail: "" }) };
   const { engine, requests } = mockEngine([runChecksResp(), doneResp(["x"]), lengthResp()]);
   await run(makeCtx(dir, "verified", engine), evilExec);
-  const text = String(requests.flatMap((r) => r.messages ?? []).find((m) => m.role === "user" && typeof m.content === "string" && m.content.includes("IKBI-CHECK-RESULTS-BEGIN"))?.content);
+  const text = String(requests.flatMap((r) => r.messages ?? []).find((m) => m.role === "tool" && typeof m.content === "string" && m.content.includes("IKBI-CHECK-RESULTS-BEGIN"))?.content);
 
   // BOUNDED by a fresh nonce in BEGIN/END markers — the FAKE marker the test printed does
   // NOT match the real (unguessable) nonce, so it cannot break out of the bounded region.
@@ -636,7 +636,7 @@ test("done-REJECTION feedback is ACTIONABLE harness instruction, NOT inert-neutr
   assert.equal(result.outcome, "success", "the model recovered after the ACTIONABLE rejection (no inert-data loop)");
 
   const msgs = requests.flatMap((r) => r.messages ?? []);
-  const rej = msgs.find((m) => m.role === "user" && typeof m.content === "string" && m.content.includes("IKBI-HARNESS-FEEDBACK-BEGIN"));
+  const rej = msgs.find((m) => m.role === "tool" && typeof m.content === "string" && m.content.includes("IKBI-HARNESS-FEEDBACK-BEGIN"));
   assert.ok(rej, "the done-rejection is wrapped as ACTIONABLE harness feedback");
   const text = String(rej?.content);
   assert.match(text, /INSTRUCTION from the build system .*FOLLOW it/i, "framed as a build-system instruction to FOLLOW");
@@ -652,7 +652,7 @@ test("the harness-instruction wrapper is BOUNDED by a fresh verified-absent nonc
   const dir = tmp();
   const { engine, requests } = mockEngine([doneResp(["x"]), runChecksResp(), doneResp(["x"]), lengthResp()]);
   await run(makeCtx(dir, "verified", engine));
-  const text = String(requests.flatMap((r) => r.messages ?? []).find((m) => m.role === "user" && typeof m.content === "string" && m.content.includes("IKBI-HARNESS-FEEDBACK-BEGIN"))?.content);
+  const text = String(requests.flatMap((r) => r.messages ?? []).find((m) => m.role === "tool" && typeof m.content === "string" && m.content.includes("IKBI-HARNESS-FEEDBACK-BEGIN"))?.content);
   const nonce = text.match(/IKBI-HARNESS-FEEDBACK-BEGIN-([0-9a-f]+)/)?.[1];
   assert.ok(nonce && nonce.length >= 32, "a fresh unguessable nonce bounds the harness instruction");
   assert.ok(text.includes(`IKBI-HARNESS-FEEDBACK-END-${nonce}`), "matching END terminator with the same nonce");
@@ -662,7 +662,7 @@ test("run_checks output is STILL actionable (regression from 3e4f724 — unchang
   const dir = tmp();
   const { engine, requests } = mockEngine([runChecksResp(), doneResp(["x"]), lengthResp()]);
   await run(makeCtx(dir, "verified", engine), redExec("test"));
-  const rc = String(requests.flatMap((r) => r.messages ?? []).find((m) => m.role === "user" && typeof m.content === "string" && m.content.includes("IKBI-CHECK-RESULTS-BEGIN"))?.content);
+  const rc = String(requests.flatMap((r) => r.messages ?? []).find((m) => m.role === "tool" && typeof m.content === "string" && m.content.includes("IKBI-CHECK-RESULTS-BEGIN"))?.content);
   assert.match(rc, /results of YOUR check run/, "run_checks output stays actionable check-results");
   assert.match(rc, /FAILED|expected 7, got 3/, "carries the real failure output");
 });
@@ -678,7 +678,7 @@ test("the bare-stop corrective stays a plain ACTIONABLE message (ikbi-authored, 
 
 // ── FIX: system-prompt trust classification + ikbi feedback as user-role ──────
 
-test("the done-rejection is delivered as role:'user' (the working channel), NOT role:'tool'", async () => {
+test("the done-rejection is delivered as role:'tool' with matching toolCallId (DeepSeek compat)", async () => {
   const dir = tmp();
   const { engine, requests } = mockEngine([
     toolResp([call("write_file", { path: "a.txt", content: "x" })]),
@@ -691,17 +691,18 @@ test("the done-rejection is delivered as role:'user' (the working channel), NOT 
   const harness = msgs.filter((m) => typeof m.content === "string" && m.content.includes("IKBI-HARNESS-FEEDBACK-BEGIN"));
   assert.ok(harness.length > 0, "the done-rejection was delivered");
   for (const m of harness) {
-    assert.equal(m.role, "user", "ikbi instruction rides the user channel, not a tool result");
-    assert.notEqual((m as { toolCallId?: string }).toolCallId, "done1", "no toolCallId — it's a build-system message, not a tool response");
+    assert.equal(m.role, "tool", "ikbi instruction rides the tool channel with matching toolCallId for DeepSeek compat");
+    assert.equal((m as { toolCallId?: string }).toolCallId, "done1", "toolCallId matches the done call's ID");
   }
 });
 
-test("run_checks feedback is delivered as role:'user' (followable), body still bounded by the nonce markers", async () => {
+test("run_checks feedback is delivered as role:'tool' with matching toolCallId (DeepSeek compat), body still bounded by the nonce markers", async () => {
   const dir = tmp();
   const { engine, requests } = mockEngine([runChecksResp(), doneResp(["x"]), lengthResp()]);
   await run(makeCtx(dir, "verified", engine), redExec("test"));
   const rc = requests.flatMap((r) => r.messages ?? []).find((m) => typeof m.content === "string" && m.content.includes("IKBI-CHECK-RESULTS-BEGIN"));
-  assert.equal(rc?.role, "user", "run_checks feedback is a build-system message the model can act on");
+  assert.equal(rc?.role, "tool", "run_checks feedback is a tool result with matching toolCallId");
+  assert.equal((rc as { toolCallId?: string })?.toolCallId, "rc1", "toolCallId matches the run_checks call's ID");
   const text = String(rc?.content);
   const nonce = text.match(/IKBI-CHECK-RESULTS-BEGIN-([0-9a-f]+)/)?.[1];
   assert.ok(nonce && nonce.length >= 32 && text.includes(`IKBI-CHECK-RESULTS-END-${nonce}`), "the test-output BODY stays bounded by a fresh nonce (injection-safe)");

@@ -882,18 +882,31 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
               break;
             }
             // Rejected or satisfied:false → PURE ikbi-AUTHORED feedback (the harness telling its
-            // own builder why done was rejected + the next action). Delivered as a build-system
-            // USER message (the SAME channel as the working bare-stop corrective) — NOT a tool
-            // result, so the system prompt's "repo content is untrusted" rule does not block it.
-            // The model must ACT on it (e.g. "call run_checks").
-            messages.push({ role: "user", content: wrapActionableFeedback(verdict.feedback, "harness_instruction") });
+            // own builder why done was rejected + the next action). Delivered as a tool result
+            // with matching toolCallId so providers with strict tool_call_id validation (DeepSeek,
+            // etc.) accept it. The system prompt's tier classification still applies: build-system
+            // feedback is classified as FOLLOW regardless of role. Neutralization is skipped because
+            // this is trusted ikbi-authored content, not repo content.
+            messages.push({
+              role: "tool",
+              toolCallId: call.id,
+              content: wrapActionableFeedback(verdict.feedback, "harness_instruction"),
+              untrusted: false,
+            });
           } else if (call.name === "run_checks") {
-            // The independent signal: run the shared checks and feed the result back as a
-            // build-system USER message — the ikbi FRAMING is followable ("act on these results"),
+            // The independent signal: run the shared checks and feed the result back as a tool
+            // result with matching toolCallId. The ikbi FRAMING is followable ("act on these results"),
             // while the test-OUTPUT body stays DATA, bounded by a fresh verified-absent nonce so a
-            // malicious test print can't break out or be obeyed. (Not a tool result; not neutralized.)
+            // malicious test print can't break out or be obeyed. Neutralization is skipped because
+            // this is trusted ikbi-authored content. Delivered as tool result (not user) to satisfy
+            // providers with strict tool_call_id validation (DeepSeek, etc.).
             const out = await runChecks();
-            messages.push({ role: "user", content: wrapActionableFeedback(out, "check_results") });
+            messages.push({
+              role: "tool",
+              toolCallId: call.id,
+              content: wrapActionableFeedback(out, "check_results"),
+              untrusted: false,
+            });
           } else if (call.name === "terminal") {
             // Governed shell — async. Its output is UNTRUSTED command output, so it goes
             // through the SAME neutralization chokepoint as read_file / search_files.
