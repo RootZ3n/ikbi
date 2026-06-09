@@ -93,6 +93,8 @@ const GUARDED_SCRIPT_KEYS: readonly string[] = [
   "test", "pretest", "posttest",
   "build", "prebuild", "postbuild",
   "tsc", "pretsc", "posttsc",
+  // T1: also guard the other scripts an operator may trust as verification signals.
+  "typecheck", "lint", "check", "validate", "ci", "e2e", "integration", "coverage",
 ];
 
 /** Injectable dependencies. Defaults wire the live governed-exec singleton (lazily). */

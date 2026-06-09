@@ -12,8 +12,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 
-import { createProjectIndex } from "../project-index/index.js";
-import { createProjectRetrieval } from "./index.js";
+import { createProjectIndex, projectIndexConfig } from "../project-index/index.js";
+import { createProjectRetrieval, projectRetrievalConfig } from "./index.js";
 
 function write(root: string, rel: string, content: string): void {
   const abs = join(root, rel);
@@ -189,6 +189,40 @@ test("F3: under budget pressure only as many rules as fit are kept; the dropped 
     assert.ok(!paths.includes("packages/f/AGENTS.md"), "the second rules file is dropped for budget (not force-included)");
     assert.ok(res.receipts.some((r) => /AGENTS\.md.*dropped/.test(r)), "the dropped rules file is recorded in the receipts");
     assert.ok(res.truncatedByBudget, "marked truncated");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
+  }
+});
+
+// ── P0/A3: relevance seed ranking (no alphabetical drop of critical seeds) ──────────
+test("P0/A3: the seed cap keeps the high-relevance seed, not the alphabetically-first trivial one", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "ikbi-pr-rank-"));
+  const stateRoot = mkdtempSync(join(tmpdir(), "ikbi-pr-rank-state-"));
+  try {
+    write(repo, "package.json", JSON.stringify({ name: "r" }));
+    write(repo, "src/constants.ts", "export const c = 1;\n"); // alphabetically-early, trivial (name-match, weight 12)
+    write(repo, "src/z-critical-auth.ts", "export const a = 1;\n"); // critical (path-match, weight 20)
+    const retrieval = createProjectRetrieval({ index: createProjectIndex({ stateRoot }), config: { ...projectRetrievalConfig, maxSeeds: 1 } });
+    const res = await retrieval.retrieve({ repoPath: repo, goal: "fix z-critical-auth.ts; also update constants" });
+    assert.ok(res.seeds.includes("src/z-critical-auth.ts"), "the critical (higher-relevance) seed survives the cap");
+    assert.ok(!res.seeds.includes("src/constants.ts"), "the alphabetically-earlier trivial seed was dropped, not the critical one");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
+  }
+});
+
+// ── P0/F6: low-confidence on an incomplete (truncated) index ────────────────────────
+test("P0/F6: a truncated index → retrieval flags LOW CONFIDENCE (does not proceed as if enough)", async () => {
+  const { repo, stateRoot } = makeBigFixture(); // 60+ files
+  try {
+    // force the index to truncate (incomplete view) — the retrieval must NOT present this as enough.
+    const retrieval = createProjectRetrieval({ index: createProjectIndex({ stateRoot, config: { ...projectIndexConfig, maxFiles: 1 } }) });
+    const res = await retrieval.retrieve({ repoPath: repo, goal: "fix the widget bug" });
+    assert.equal(res.lowConfidence, true, "low confidence is flagged");
+    assert.match(res.lowConfidenceReason ?? "", /truncated|covers/, "reason names the incomplete view");
+    assert.ok(res.receipts.some((r) => /LOW CONFIDENCE/.test(r)), "low confidence is surfaced loudly in receipts");
   } finally {
     rmSync(repo, { recursive: true, force: true });
     rmSync(stateRoot, { recursive: true, force: true });

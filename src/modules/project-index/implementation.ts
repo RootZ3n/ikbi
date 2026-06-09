@@ -103,11 +103,14 @@ function isJsLike(lang: Language): boolean {
   return lang === "ts" || lang === "tsx" || lang === "js" || lang === "jsx";
 }
 
-/** Test-file detection by convention (name suffix or a `__tests__/` segment). */
+/** A path segment that marks a test directory (tests/, test/, spec/, specs/, e2e/, __tests__/). */
+const TEST_DIR_RE = /(^|\/)(tests?|specs?|e2e|__tests__)\//;
+
+/** Test-file detection by convention: a `.test`/`.spec`/`.e2e` suffix, OR living under a test dir. */
 export function isTestPath(relPath: string): boolean {
-  if (/(^|\/)__tests__\//.test(relPath)) return true;
+  if (TEST_DIR_RE.test(relPath)) return true;
   const base = posix.basename(relPath);
-  return /\.(test|spec)\.[cm]?[jt]sx?$/.test(base);
+  return /\.(test|spec|e2e)\.[cm]?[jt]sx?$/.test(base);
 }
 
 /** Stem of a source basename (drop the final extension): "foo.ts" → "foo". */
@@ -116,10 +119,11 @@ function sourceStem(relPath: string): string {
   return base.replace(/\.[^.]+$/, "");
 }
 
-/** Stem of a test basename (drop `.test`/`.spec` + ext): "foo.test.ts" → "foo". */
+/** Stem of a test basename — drop the final ext, then a trailing `.test`/`.spec`/`.e2e`.
+ *  "foo.test.ts" → "foo"; "foo.e2e.ts" → "foo"; "foo.ts" (under tests/) → "foo". */
 function testStem(relPath: string): string {
   const base = posix.basename(relPath);
-  return base.replace(/\.(test|spec)\.[cm]?[jt]sx?$/, "");
+  return base.replace(/\.[cm]?[jt]sx?$/, "").replace(/\.(test|spec|e2e)$/, "");
 }
 
 // ── .gitignore matching (pragmatic, deterministic subset) ───────────────────────
@@ -415,11 +419,85 @@ function packageEntryFile(pkg: RawPackage, fileSet: ReadonlySet<string>): string
   return undefined;
 }
 
+// ── tsconfig/jsconfig path aliases (A4 / F2) ─────────────────────────────────────
+export interface AliasRule {
+  readonly prefix: string; // glob: text before "*" (e.g. "@lib/"); exact: the whole key
+  readonly suffix: string; // glob: text after "*" (often ""); exact: ""
+  readonly glob: boolean;
+  readonly targets: readonly string[]; // baseUrl-joined target templates (may contain "*")
+}
+
+/** Tolerant JSONC parse (strip block/line comments + trailing commas). Throws on hard failure. */
+function parseJsonc(text: string): unknown {
+  const noBlock = text.replace(/\/\*[\s\S]*?\*\//g, "");
+  const noLine = noBlock.replace(/(^|[^:"'])\/\/.*$/gm, "$1");
+  const noTrailing = noLine.replace(/,(\s*[}\]])/g, "$1");
+  return JSON.parse(noTrailing);
+}
+
+/** Read tsconfig/jsconfig `compilerOptions.paths` (+ baseUrl) at the repo root. Fail-soft. */
+export function readAliasRules(repoAbs: string): { rules: AliasRule[]; present: boolean } {
+  for (const fname of ["tsconfig.json", "jsconfig.json"]) {
+    const p = `${repoAbs}${sep}${fname}`;
+    if (!existsSync(p)) continue;
+    let json: { compilerOptions?: { baseUrl?: unknown; paths?: unknown } };
+    try {
+      json = parseJsonc(readFileSync(p, "utf8")) as typeof json;
+    } catch {
+      continue;
+    }
+    const co = json.compilerOptions ?? {};
+    const baseUrl = typeof co.baseUrl === "string" ? co.baseUrl : ".";
+    const base = baseUrl === "." || baseUrl === "./" ? "" : baseUrl.replace(/^\.\//, "");
+    const paths = co.paths !== undefined && typeof co.paths === "object" ? (co.paths as Record<string, unknown>) : undefined;
+    if (paths === undefined) return { rules: [], present: false };
+    const rules: AliasRule[] = [];
+    for (const key of Object.keys(paths)) {
+      const raw = paths[key];
+      const targets = (Array.isArray(raw) ? raw : []).filter((t): t is string => typeof t === "string").map((t) => (base === "" ? t : posix.join(base, t)));
+      if (targets.length === 0) continue;
+      const star = key.indexOf("*");
+      if (star >= 0) rules.push({ prefix: key.slice(0, star), suffix: key.slice(star + 1), glob: true, targets });
+      else rules.push({ prefix: key, suffix: "", glob: false, targets });
+    }
+    return { rules, present: rules.length > 0 };
+  }
+  return { rules: [], present: false };
+}
+
+/** Does the specifier match any alias rule (alias-shaped, resolved or not)? */
+export function isAliasShaped(specifier: string, rules: readonly AliasRule[]): boolean {
+  return rules.some((r) =>
+    r.glob ? specifier.startsWith(r.prefix) && specifier.endsWith(r.suffix) && specifier.length >= r.prefix.length + r.suffix.length : specifier === r.prefix,
+  );
+}
+
+/** Resolve an alias specifier to a known file, or undefined when no target resolves. */
+function resolveAlias(specifier: string, rules: readonly AliasRule[], fileSet: ReadonlySet<string>): string | undefined {
+  for (const r of rules) {
+    let mid: string | undefined;
+    if (r.glob) {
+      if (!(specifier.startsWith(r.prefix) && specifier.endsWith(r.suffix) && specifier.length >= r.prefix.length + r.suffix.length)) continue;
+      mid = specifier.slice(r.prefix.length, specifier.length - r.suffix.length);
+    } else if (specifier === r.prefix) {
+      mid = "";
+    } else {
+      continue;
+    }
+    for (const t of r.targets) {
+      const hit = resolveModuleFile(posix.normalize(t.includes("*") ? t.replace("*", mid) : t), fileSet);
+      if (hit !== undefined) return hit;
+    }
+  }
+  return undefined;
+}
+
 function resolveSpecifier(
   fromRel: string,
   specifier: string,
   fileSet: ReadonlySet<string>,
   pkgByName: ReadonlyMap<string, { root: string; entry?: string }>,
+  aliasRules: readonly AliasRule[],
 ): { kind: ImportEdge["kind"]; to?: string } {
   if (specifier.startsWith(".")) {
     const target = posix.normalize(posix.join(posix.dirname(fromRel), specifier));
@@ -427,6 +505,12 @@ function resolveSpecifier(
     return r ? { kind: "relative", to: r } : { kind: "unresolved" };
   }
   if (specifier.startsWith("/")) return { kind: "unresolved" };
+  // PATH ALIAS (tsconfig paths) — checked BEFORE bare-package so "@lib/auth" resolves to source.
+  // An alias-shaped specifier that does NOT resolve is a GRAPH HOLE → kind "unresolved" (counted).
+  if (isAliasShaped(specifier, aliasRules)) {
+    const hit = resolveAlias(specifier, aliasRules, fileSet);
+    return hit !== undefined ? { kind: "alias", to: hit } : { kind: "unresolved" };
+  }
   const pkgName = specifier.startsWith("@") ? specifier.split("/").slice(0, 2).join("/") : (specifier.split("/")[0] as string);
   const pkg = pkgByName.get(pkgName);
   if (pkg === undefined) return { kind: "external" };
@@ -464,14 +548,21 @@ function edgesForFile(
   cfg: ProjectIndexConfig,
   fileSet: ReadonlySet<string>,
   pkgByName: ReadonlyMap<string, { root: string; entry?: string }>,
+  aliasRules: readonly AliasRule[],
 ): ImportEdge[] {
   const text = content.length > cfg.maxParseBytes ? content.slice(0, cfg.maxParseBytes) : content;
   const edges: ImportEdge[] = [];
   for (const specifier of extractImportSpecifiers(text)) {
-    const r = resolveSpecifier(fromRel, specifier, fileSet, pkgByName);
+    const r = resolveSpecifier(fromRel, specifier, fileSet, pkgByName, aliasRules);
     edges.push({ from: fromRel, specifier, kind: r.kind, ...(r.to !== undefined ? { to: r.to } : {}) });
   }
   return edges;
+}
+
+/** Count alias-shaped imports that did not resolve — these are graph holes. */
+function countUnresolvedAliases(imports: readonly ImportEdge[], aliasRules: readonly AliasRule[]): number {
+  if (aliasRules.length === 0) return 0;
+  return imports.filter((e) => e.kind === "unresolved" && isAliasShaped(e.specifier, aliasRules)).length;
 }
 
 /** source file → colocated tests (same package, matching stem). Deterministic, sorted. */
@@ -581,11 +672,12 @@ export function createProjectIndex(deps: ProjectIndexDeps = {}): ProjectIndexApi
     }
     const packages = finalizePackages(rawPkgs, fileSet);
     const pkgByName = new Map(packages.map((p) => [p.name, { root: p.root, ...(p.entry !== undefined ? { entry: p.entry } : {}) }]));
+    const aliasInfo = readAliasRules(repoAbs);
 
     const imports: ImportEdge[] = [];
     for (const f of files) {
       const content = contentByRel.get(f.path);
-      if (content !== undefined) imports.push(...edgesForFile(f.path, content, cfg, fileSet, pkgByName));
+      if (content !== undefined) imports.push(...edgesForFile(f.path, content, cfg, fileSet, pkgByName, aliasInfo.rules));
     }
 
     return {
@@ -597,6 +689,7 @@ export function createProjectIndex(deps: ProjectIndexDeps = {}): ProjectIndexApi
       imports: sortEdges(imports),
       fileToTests: buildFileToTests(files),
       truncated,
+      aliases: { present: aliasInfo.present, unresolved: countUnresolvedAliases(imports, aliasInfo.rules) },
     };
   }
 
@@ -646,6 +739,7 @@ export function createProjectIndex(deps: ProjectIndexDeps = {}): ProjectIndexApi
     const fileSet = currentPaths;
     const packages = finalizePackages(rawPkgs, fileSet);
     const pkgByName = new Map(packages.map((p) => [p.name, { root: p.root, ...(p.entry !== undefined ? { entry: p.entry } : {}) }]));
+    const aliasInfo = readAliasRules(repoAbs);
 
     // R-B: racy-clean reference. A file whose mtime sits within the racy window of the LAST index
     // write could have been edited in-place (same size, same mtime tick), so we re-hash it even
@@ -682,7 +776,7 @@ export function createProjectIndex(deps: ProjectIndexDeps = {}): ProjectIndexApi
         } else {
           files.push(entry);
           reparsed.push(raw.rel);
-          if (content !== null) newEdges.push(...edgesForFile(raw.rel, content, cfg, fileSet, pkgByName));
+          if (content !== null) newEdges.push(...edgesForFile(raw.rel, content, cfg, fileSet, pkgByName, aliasInfo.rules));
         }
         continue;
       }
@@ -693,7 +787,7 @@ export function createProjectIndex(deps: ProjectIndexDeps = {}): ProjectIndexApi
       if (prev === undefined) added.push(raw.rel);
       if (contentChanged) {
         reparsed.push(raw.rel);
-        if (content !== null) newEdges.push(...edgesForFile(raw.rel, content, cfg, fileSet, pkgByName));
+        if (content !== null) newEdges.push(...edgesForFile(raw.rel, content, cfg, fileSet, pkgByName, aliasInfo.rules));
       } else {
         // mtime moved but content identical → not a reparse; reuse stored edges for this file.
         unchanged += 1;
@@ -716,6 +810,7 @@ export function createProjectIndex(deps: ProjectIndexDeps = {}): ProjectIndexApi
         imports,
         fileToTests: buildFileToTests(files),
         truncated,
+        aliases: { present: aliasInfo.present, unresolved: countUnresolvedAliases(imports, aliasInfo.rules) },
       },
       git,
     );

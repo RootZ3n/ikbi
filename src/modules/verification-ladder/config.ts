@@ -31,6 +31,9 @@ export interface VerificationLadderConfig {
   readonly maxImpactHops: number;
   readonly maxImpactFiles: number;
   readonly maxCrossPackage: number;
+  /** When true, no-op/stub scripts (echo/true/exit 0/…) are trusted as real checks. DEFAULT false
+   *  (suspicious): a trivial script is NOT meaningful verification unless the operator opts in. */
+  readonly trustTrivialScripts: boolean;
 }
 
 export function loadVerificationLadderConfig(reader = env): VerificationLadderConfig {
@@ -38,6 +41,7 @@ export function loadVerificationLadderConfig(reader = env): VerificationLadderCo
     maxImpactHops: reader.int("MAX_IMPACT_HOPS", DEFAULT_MAX_IMPACT_HOPS, { min: 0 }),
     maxImpactFiles: reader.int("MAX_IMPACT_FILES", DEFAULT_MAX_IMPACT_FILES, { min: 1 }),
     maxCrossPackage: reader.int("MAX_CROSS_PACKAGE", DEFAULT_MAX_CROSS_PACKAGE, { min: 0 }),
+    trustTrivialScripts: reader.bool("TRUST_TRIVIAL_SCRIPTS", false),
   });
 }
 

@@ -28,12 +28,38 @@ function packageOf(relPath: string, rootsDescByLen: readonly string[]): string |
   return undefined;
 }
 
-/** The runnable checks a package offers, in priority order (empty ⇒ the package is neutral). */
-function packageTasks(pkg: PackageEntry, scope: CheckTask["scope"], reason: string): CheckTask[] {
+/**
+ * A no-op / STUB verification script: empty, or a composition (via && ; ||) of only no-ops —
+ * `echo …`, `true`, `:`, `exit 0`. These are NOT meaningful verification; they must never count as
+ * green unless the operator explicitly trusts trivial scripts.
+ */
+export function isStubScript(body: string): boolean {
+  const s = body.trim();
+  if (s.length === 0) return true;
+  const segments = s
+    .split(/\s*(?:&&|\|\||;)\s*/)
+    .map((x) => x.trim())
+    .filter((x) => x.length > 0);
+  if (segments.length === 0) return true;
+  return segments.every((seg) => /^exit\s+0$/.test(seg) || seg === "true" || seg === ":" || /^echo(\s|$)/.test(seg));
+}
+
+/** Runnable script keys whose body is a stub (skipped unless trivial scripts are operator-trusted). */
+function stubScriptKeys(pkg: PackageEntry): string[] {
+  return RUNNABLE_SCRIPT_KEYS.filter((k) => {
+    const s = pkg.scripts[k];
+    return typeof s === "string" && s.length > 0 && isStubScript(s);
+  });
+}
+
+/** The runnable checks a package offers, in priority order (empty ⇒ the package is neutral).
+ *  A stub script is NOT runnable unless `trustTrivial` (operator opt-in) — a no-op is not evidence. */
+function packageTasks(pkg: PackageEntry, scope: CheckTask["scope"], reason: string, trustTrivial: boolean): CheckTask[] {
   const tasks: CheckTask[] = [];
   for (const key of RUNNABLE_SCRIPT_KEYS) {
     const script = pkg.scripts[key];
     if (typeof script !== "string" || script.length === 0) continue;
+    if (!trustTrivial && isStubScript(script)) continue; // suspicious: a no-op check is not verification
     const { command, args } = toCommand(pkg.manager, key);
     tasks.push({ package: pkg.root, cwd: pkg.root, name: key, command, args, scope, reason });
   }
@@ -44,6 +70,7 @@ export function createVerificationLadder(cfg: VerificationLadderConfig = verific
   function planVerification(req: PlanRequest): VerificationPlan {
     const data: ProjectIndexData = req.data;
     const opts = req.opts ?? {};
+    const trustTrivial = cfg.trustTrivialScripts === true;
     const receipts: string[] = [];
     const escalationReasons: string[] = [];
 
@@ -58,6 +85,10 @@ export function createVerificationLadder(cfg: VerificationLadderConfig = verific
     if (data.packages.length === 0) escalationReasons.push("the index has no packages — impact cannot be scoped");
     if (changed.length === 0) escalationReasons.push("no changed files supplied — impact cannot be scoped");
     if (data.truncated) escalationReasons.push("the project-index is truncated (incomplete) — impact may be wrong");
+    // F2/A4: an incomplete import graph (unresolved path aliases) means impact can't be trusted.
+    if (data.aliases?.present === true && data.aliases.unresolved > 0) {
+      escalationReasons.push(`${data.aliases.unresolved} unresolved path-alias import(s) — import graph has holes, impact cannot be trusted`);
+    }
     if (opts.alwaysFull) escalationReasons.push("opts.alwaysFull is set");
 
     for (const f of changed) {
@@ -110,6 +141,11 @@ export function createVerificationLadder(cfg: VerificationLadderConfig = verific
       frontier = next;
       if (frontier.length === 0) break;
     }
+    // A7: if the reverse-dependent BFS truncated (hop or file cap with more to explore), the blast
+    // radius is unbounded → cannot trust an impact-scoped pass → escalate to full.
+    if (frontier.length > 0 || dependents.size >= cfg.maxImpactFiles) {
+      escalationReasons.push("impact graph truncated (hop/file cap reached) — blast radius cannot be bounded");
+    }
 
     const affectedTests = new Set<string>();
     for (const f of dependents) {
@@ -121,21 +157,28 @@ export function createVerificationLadder(cfg: VerificationLadderConfig = verific
     const affectedPkgList = [...affectedPackages].sort();
     const neutralPackages: string[] = [];
     const runnablePkgs: PackageEntry[] = [];
+    const stubScripts: string[] = [];
     for (const root of affectedPkgList) {
       const pkg = packagesByRoot.get(root);
       if (pkg === undefined) continue;
-      if (packageTasks(pkg, "package", "").length === 0) neutralPackages.push(root);
+      for (const k of stubScriptKeys(pkg)) stubScripts.push(`${root || "(root)"}:${k}`);
+      if (packageTasks(pkg, "package", "", trustTrivial).length === 0) neutralPackages.push(root);
       else runnablePkgs.push(pkg);
+    }
+    // F1: a stub verification script is not meaningful evidence (recorded; never counted green).
+    if (!trustTrivial && stubScripts.length > 0) {
+      escalationReasons.push(`stub/no-op verification script(s) detected (${stubScripts.join(", ")}) — not meaningful verification`);
     }
     // all affected packages neutral (no runnable checks) ⇒ a local pass would be vacuous ⇒ escalate
     if (affectedPkgList.length > 0 && runnablePkgs.length === 0) {
       escalationReasons.push("no affected package has a runnable check (test/typecheck/build) — a scoped pass would be vacuous");
     }
 
-    // nearest-tests: per package that has a test script AND affected tests within it
+    // nearest-tests: per package that has a NON-STUB test script AND affected tests within it
     const nearest: CheckTask[] = [];
     for (const pkg of runnablePkgs) {
       if (typeof pkg.scripts.test !== "string" || pkg.scripts.test.length === 0) continue;
+      if (!trustTrivial && isStubScript(pkg.scripts.test)) continue;
       const testsInPkg = [...affectedTests].filter((t) => packageOf(t, rootsDescByLen) === pkg.root).sort();
       if (testsInPkg.length === 0) continue;
       const { command, args } = toCommand(pkg.manager, "test");
@@ -143,7 +186,7 @@ export function createVerificationLadder(cfg: VerificationLadderConfig = verific
     }
 
     // package-checks: every runnable affected package's checks
-    const packageChecks = runnablePkgs.flatMap((pkg) => packageTasks(pkg, "package", `package checks for ${pkg.root || "(root)"}`));
+    const packageChecks = runnablePkgs.flatMap((pkg) => packageTasks(pkg, "package", `package checks for ${pkg.root || "(root)"}`, trustTrivial));
 
     const escalateToFull = escalationReasons.length > 0;
 
@@ -153,7 +196,7 @@ export function createVerificationLadder(cfg: VerificationLadderConfig = verific
       fullTasks = opts.fullChecks.map((c) => ({ package: "", cwd: "", name: c.name, command: c.command, args: [...c.args], scope: "full" as const, reason: "operator-configured full check" }));
     } else {
       const rootPkg = packagesByRoot.get("");
-      if (rootPkg !== undefined) fullTasks = packageTasks(rootPkg, "full", "full-repo verification (root package)");
+      if (rootPkg !== undefined) fullTasks = packageTasks(rootPkg, "full", "full-repo verification (root package)", trustTrivial);
     }
 
     // ── assemble (fail-closed on required-but-underivable full) ───────────────────
@@ -172,7 +215,8 @@ export function createVerificationLadder(cfg: VerificationLadderConfig = verific
         // HARD INVARIANT: full is required but no runnable full check exists. Do NOT emit an empty
         // (vacuously-green) full stage. Emit a non-runnable BLOCKING marker and block the plan.
         blocked = true;
-        const why = `full verification is REQUIRED (${escalationReasons.join("; ")}) but no runnable full-repo checks could be derived (no operator fullChecks and the root package has no test/typecheck/build script)`;
+        const stubNote = stubScripts.length > 0 ? ` (stub/no-op script(s) not counted: ${stubScripts.join(", ")})` : "";
+        const why = `full verification is REQUIRED (${escalationReasons.join("; ")}) but no runnable full-repo checks could be derived (no operator fullChecks and the root package has no real test/typecheck/build script)${stubNote}`;
         blockReasons.push(why);
         stages.push({
           stage: "full",
@@ -186,6 +230,7 @@ export function createVerificationLadder(cfg: VerificationLadderConfig = verific
     receipts.push(`changed files: ${changed.length}`);
     receipts.push(`affected packages: ${affectedPkgList.length > 0 ? affectedPkgList.join(", ") : "(none)"}`);
     if (neutralPackages.length > 0) receipts.push(`neutral packages (no runnable check, never counted green): ${neutralPackages.join(", ")}`);
+    if (stubScripts.length > 0) receipts.push(`stub/no-op scripts (NOT counted as verification): ${stubScripts.join(", ")}`);
     receipts.push(`affected tests: ${affectedTests.size}`);
     receipts.push(escalateToFull ? `escalated to FULL: ${escalationReasons.join("; ")}` : "scope is IMPACT (local change, no escalation signal)");
     receipts.push(`scope: ${scope}; status: ${blocked ? "blocked" : "ok"}`);
@@ -200,6 +245,7 @@ export function createVerificationLadder(cfg: VerificationLadderConfig = verific
       affectedPackages: affectedPkgList,
       affectedTests: [...affectedTests].sort(),
       neutralPackages: neutralPackages.sort(),
+      stubScripts: stubScripts.sort(),
       stages,
       receipts,
     };

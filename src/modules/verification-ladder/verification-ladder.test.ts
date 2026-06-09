@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { FileEntry, ImportEdge, PackageEntry, ProjectIndexData } from "../project-index/index.js";
-import { createVerificationLadder } from "./index.js";
+import { createVerificationLadder, isStubScript, verificationLadderConfig } from "./index.js";
 
 const plan = createVerificationLadder().planVerification;
 
@@ -142,4 +142,41 @@ test("deterministic: identical inputs → identical plan", () => {
   const a = plan({ data, changedFiles: ["packages/a/src/foo.ts"] });
   const b = plan({ data, changedFiles: ["packages/a/src/foo.ts"] });
   assert.deepEqual(a, b);
+});
+
+// ── P0/F1: stub/no-op verification scripts never produce green ──────────────────────
+test("P0/F1: a root test script that is a STUB ('echo pass') does NOT produce green — it blocks", () => {
+  const data = mkData({ packages: [pkg("", { test: "echo pass" })], files: [file("src/foo.ts")] });
+  const pl = plan({ data, changedFiles: ["src/foo.ts"] });
+  assert.ok(pl.stubScripts.includes("(root):test"), "the stub script is recorded");
+  assert.equal(pl.status, "blocked", "a no-op check is not meaningful verification → blocked");
+  assert.equal(pl.blocked, true);
+  assert.ok(pl.escalationReasons.some((r) => /stub|no-op/.test(r)), "escalation cites the stub");
+});
+
+test("P0/F1: stub variants (true / exit 0 / : / empty / echo … && exit 0) are all detected", () => {
+  for (const body of ["echo pass", "true", "exit 0", ":", "", "echo all good && exit 0"]) {
+    assert.equal(isStubScript(body), true, `stub: "${body}"`);
+  }
+  for (const body of ["vitest run", "tsc --noEmit", "node test.js", "echo start && vitest run"]) {
+    assert.equal(isStubScript(body), false, `real: "${body}"`);
+  }
+});
+
+test("P0/F1: operator opt-in (trustTrivialScripts) lets a trivial script count", () => {
+  const trusting = createVerificationLadder({ ...verificationLadderConfig, trustTrivialScripts: true }).planVerification;
+  const data = mkData({ packages: [pkg("", { test: "echo pass" })], files: [file("src/foo.ts")] });
+  const pl = trusting({ data, changedFiles: ["src/foo.ts"] });
+  assert.equal(pl.blocked, false, "operator explicitly trusts trivial scripts");
+  assert.ok(pl.stages.some((s) => s.tasks.length > 0), "a runnable task exists under the opt-in");
+});
+
+// ── P0/F2: unresolved path aliases force full verification ──────────────────────────
+test("P0/F2: unresolved path aliases force full verification (graph holes)", () => {
+  const base = mkData({ packages: [pkg("", { test: "pnpm -r test" }), pkg("packages/a", { test: "vitest" })], files: [file("packages/a/src/foo.ts")] });
+  const data = { ...base, aliases: { present: true, unresolved: 2 } };
+  const pl = plan({ data, changedFiles: ["packages/a/src/foo.ts"] });
+  assert.equal(pl.escalateToFull, true);
+  assert.ok(pl.escalationReasons.some((r) => /alias/.test(r)), "escalation cites unresolved aliases");
+  assert.equal(pl.scope, "full");
 });

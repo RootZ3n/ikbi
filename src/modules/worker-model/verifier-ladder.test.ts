@@ -143,7 +143,7 @@ test("ladder (Fix 2): a non-blocked plan that runs ZERO checks fails closed — 
   const emptyPlan = {
     status: "ok" as const, blocked: false, blockReasons: [], scope: "impact" as const,
     escalateToFull: false, escalationReasons: [], affectedPackages: [], affectedTests: [],
-    neutralPackages: [], stages: [], receipts: ["fake: empty non-blocked plan"],
+    neutralPackages: [], stubScripts: [], stages: [], receipts: ["fake: empty non-blocked plan"],
   };
   const v = createVerifier({ governedExec: ge.exec, parentCtx: PCTX, diff: async () => diffOf(["src/x.ts"]), env: { IKBI_VERIFY: "ladder" }, index: { refresh: async () => ({ data: mkData({}) }) }, plan: () => emptyPlan });
   const r = await v(makeCtx("/wt"));

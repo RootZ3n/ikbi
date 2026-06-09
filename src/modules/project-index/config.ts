@@ -49,7 +49,9 @@ export function loadProjectIndexConfig(reader = env): ProjectIndexConfig {
     maxParseBytes: reader.int("MAX_PARSE_BYTES", DEFAULT_MAX_PARSE_BYTES, { min: 1 }),
     maxFiles: reader.int("MAX_FILES", DEFAULT_MAX_FILES, { min: 1 }),
     skipDirs: Object.freeze([...new Set([...DEFAULT_SKIP_DIRS, ...reader.list("SKIP_DIRS")])]),
-    racyWindowMs: reader.int("RACY_WINDOW_MS", DEFAULT_RACY_WINDOW_MS, { min: 0 }),
+    // A8: never allow a sub-1s window — a 0/tiny window lets a same-size, same-mtime-second in-place
+    // edit be marked "confidently unchanged", leaving a STALE hash → wrong impact → false green.
+    racyWindowMs: Math.max(1000, reader.int("RACY_WINDOW_MS", DEFAULT_RACY_WINDOW_MS, { min: 0 })),
   });
 }
 

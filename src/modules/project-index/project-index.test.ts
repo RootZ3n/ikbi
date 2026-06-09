@@ -263,3 +263,68 @@ test("R-E/safety: maxFiles cap sets truncated and bounds the file list", async (
     rmSync(stateRoot, { recursive: true, force: true });
   }
 });
+
+// ── P0: tsconfig path-alias resolution (F2/A4) ─────────────────────────────────────
+test("P0/F2: a tsconfig path alias resolves into the import graph + reverse dependents are found", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "ikbi-pi-alias-"));
+  const stateRoot = mkdtempSync(join(tmpdir(), "ikbi-pi-alias-state-"));
+  try {
+    write(repo, "package.json", JSON.stringify({ name: "aliased", scripts: { test: "vitest run" } }));
+    write(repo, "tsconfig.json", JSON.stringify({ compilerOptions: { baseUrl: ".", paths: { "@lib/*": ["src/lib/*"] } } }));
+    write(repo, "src/lib/auth.ts", "export const auth = 1;\n");
+    write(repo, "src/app.ts", 'import { auth } from "@lib/auth";\nexport const app = auth;\n');
+    const idx = createProjectIndex({ stateRoot });
+    const data = await idx.build(repo);
+
+    const edge = data.imports.find((e) => e.from === "src/app.ts" && e.specifier === "@lib/auth");
+    assert.ok(edge, "the alias import edge exists");
+    assert.equal(edge?.kind, "alias", "tagged as an alias edge");
+    assert.equal(edge?.to, "src/lib/auth.ts", "alias @lib/auth resolved to src/lib/auth.ts");
+    assert.equal(data.aliases?.present, true);
+    assert.equal(data.aliases?.unresolved, 0);
+
+    const callers = await idx.query(repo, { seeds: ["src/lib/auth.ts"], want: "callers" });
+    assert.ok(callers.some((r) => r.path === "src/app.ts"), "reverse dependent (importer via alias) is found");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
+  }
+});
+
+test("P0/F2: an alias-shaped import that does not resolve is counted as unresolved (graph hole)", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "ikbi-pi-alias2-"));
+  const stateRoot = mkdtempSync(join(tmpdir(), "ikbi-pi-alias2-state-"));
+  try {
+    write(repo, "package.json", JSON.stringify({ name: "aliased" }));
+    write(repo, "tsconfig.json", JSON.stringify({ compilerOptions: { baseUrl: ".", paths: { "@lib/*": ["src/lib/*"] } } }));
+    write(repo, "src/app.ts", 'import { gone } from "@lib/missing";\nexport const app = gone;\n');
+    const data = await createProjectIndex({ stateRoot }).build(repo);
+    assert.equal(data.aliases?.present, true);
+    assert.equal(data.aliases?.unresolved, 1, "the unresolvable alias import is counted");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
+  }
+});
+
+// ── P0: test directory mapping (tests/, e2e/, __tests__, *.spec) ────────────────────
+test("P0: tests/, e2e/, and *.spec files are mapped to their source", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "ikbi-pi-tdir-"));
+  const stateRoot = mkdtempSync(join(tmpdir(), "ikbi-pi-tdir-state-"));
+  try {
+    write(repo, "package.json", JSON.stringify({ name: "tdir", scripts: { test: "vitest run" } }));
+    write(repo, "src/auth.ts", "export const auth = 1;\n");
+    write(repo, "tests/auth.test.ts", 'import "../src/auth";\n');
+    write(repo, "e2e/auth.e2e.ts", 'import "../src/auth";\n');
+    write(repo, "src/widget.ts", "export const w = 1;\n");
+    write(repo, "src/widget.spec.ts", 'import "./widget";\n');
+    const data = await createProjectIndex({ stateRoot }).build(repo);
+
+    assert.ok((data.fileToTests["src/auth.ts"] ?? []).includes("tests/auth.test.ts"), "tests/ dir test mapped");
+    assert.ok((data.fileToTests["src/auth.ts"] ?? []).includes("e2e/auth.e2e.ts"), "e2e/ dir test mapped");
+    assert.ok((data.fileToTests["src/widget.ts"] ?? []).includes("src/widget.spec.ts"), "*.spec mapped");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
+  }
+});

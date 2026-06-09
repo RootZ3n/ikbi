@@ -39,11 +39,14 @@ export {
 } from "./config.js";
 
 export {
+  type AliasRule,
   createProjectIndex,
   extractImportSpecifiers,
+  isAliasShaped,
   isTestPath,
   parseGitignore,
   projectIndex,
+  readAliasRules,
   readGitProvenanceReal,
   type GitProvenanceReader,
   type ProjectIndexDeps,

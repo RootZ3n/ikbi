@@ -35,6 +35,10 @@ export interface ProjectRetrievalConfig {
   readonly maxPerTerm: number;
   /** Hard cap on goal-mined seeds (bounds expansion fan-out + query cost). */
   readonly maxSeeds: number;
+  /** Repo size (file count) at/above which low-coverage / no-seed retrieval is flagged low-confidence. */
+  readonly lowConfidenceMinFiles: number;
+  /** Fraction of repo files below which (on a large repo) the selection is flagged low-confidence. */
+  readonly lowCoverageFraction: number;
 }
 
 export function loadProjectRetrievalConfig(reader = env): ProjectRetrievalConfig {
@@ -44,6 +48,8 @@ export function loadProjectRetrievalConfig(reader = env): ProjectRetrievalConfig
     maxFiles: reader.int("MAX_FILES", DEFAULT_MAX_FILES, { min: 1 }),
     maxPerTerm: reader.int("MAX_PER_TERM", DEFAULT_MAX_PER_TERM, { min: 1 }),
     maxSeeds: reader.int("MAX_SEEDS", DEFAULT_MAX_SEEDS, { min: 1 }),
+    lowConfidenceMinFiles: reader.int("LOW_CONFIDENCE_MIN_FILES", 200, { min: 1 }),
+    lowCoverageFraction: reader.int("LOW_COVERAGE_PCT", 5, { min: 0, max: 100 }) / 100,
   });
 }
 

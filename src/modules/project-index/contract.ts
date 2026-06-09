@@ -55,7 +55,7 @@ export interface PackageEntry {
 }
 
 /** How an import specifier was resolved. */
-export type ImportKind = "relative" | "package" | "external" | "unresolved";
+export type ImportKind = "relative" | "package" | "external" | "unresolved" | "alias";
 
 /** One directed import edge (from → to/specifier). */
 export interface ImportEdge {
@@ -94,6 +94,13 @@ export interface ProjectIndexData {
   readonly fileToTests: Readonly<Record<string, readonly string[]>>;
   /** True when the walk hit the configured maxFiles cap (index is incomplete). */
   readonly truncated: boolean;
+  /**
+   * tsconfig/jsconfig path-alias status. `present` = the repo declares `compilerOptions.paths`;
+   * `unresolved` = count of alias-shaped imports that could NOT be resolved to a known file. A
+   * positive `unresolved` means the import graph has holes → consumers (the verification ladder)
+   * must escalate to full rather than trust an impact-scoped result.
+   */
+  readonly aliases?: { readonly present: boolean; readonly unresolved: number };
   /** Git provenance (HEAD/branch/dirty) when the repo is a git root; undefined otherwise. */
   readonly git?: GitProvenance;
   /**

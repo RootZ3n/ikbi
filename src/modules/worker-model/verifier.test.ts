@@ -227,3 +227,23 @@ test("verifier never invokes the model (asserted via the engine spy)", async () 
   await createVerifier({ governedExec: exec.governedExec, parentCtx: makeParentCtx(), diff: cleanDiff })(ctx);
   assert.equal(invokeCalls(), 0);
 });
+
+test("P0/A6: detectScriptMutation flags a SUBPACKAGE package.json test-script change (not just root)", () => {
+  const diff = [
+    "diff --git a/packages/a/package.json b/packages/a/package.json",
+    "--- a/packages/a/package.json",
+    "+++ b/packages/a/package.json",
+    "@@ -3,3 +3,3 @@",
+    '-    "test": "vitest run",',
+    '+    "test": "echo pass",',
+  ].join("\n");
+  const r = detectScriptMutation(diff);
+  assert.equal(r.mutated, true, "a subpackage test-script change is caught → verification fails closed");
+});
+
+test("P0/T1: detectScriptMutation guards the extended script keys (lint/check/e2e/coverage)", () => {
+  for (const key of ["lint", "check", "e2e", "coverage", "typecheck"]) {
+    const diff = `diff --git a/package.json b/package.json\n-    "${key}": "real",\n+    "${key}": "echo pass",`;
+    assert.equal(detectScriptMutation(diff).mutated, true, `${key} script change flagged`);
+  }
+});

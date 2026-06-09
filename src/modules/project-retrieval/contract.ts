@@ -57,6 +57,11 @@ export interface RetrievalResult {
   readonly totalBytes: number;
   /** True when files were dropped to stay within budget / maxFiles. */
   readonly truncatedByBudget: boolean;
+  /** True when the retrieved context is NOT trustworthy as exhaustive (incomplete index, no seeds
+   *  on a large repo, or tiny coverage) — the caller must require full verification, not assume enough. */
+  readonly lowConfidence: boolean;
+  /** Why confidence is low (present only when lowConfidence). */
+  readonly lowConfidenceReason?: string;
   /** Decision trail (overall "why"): seeds found, expansion, rules, budget outcome. */
   readonly receipts: readonly string[];
 }

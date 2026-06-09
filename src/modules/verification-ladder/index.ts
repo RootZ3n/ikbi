@@ -29,4 +29,4 @@ export {
   type VerificationLadderConfig,
 } from "./config.js";
 
-export { createVerificationLadder, verificationLadder } from "./implementation.js";
+export { createVerificationLadder, isStubScript, verificationLadder } from "./implementation.js";

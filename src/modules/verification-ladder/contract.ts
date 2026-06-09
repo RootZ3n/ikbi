@@ -63,6 +63,9 @@ export interface VerificationPlan {
   readonly affectedTests: readonly string[];
   /** Affected packages with NO runnable check (no test/typecheck/build script) — never counted green. */
   readonly neutralPackages: readonly string[];
+  /** Stub/no-op verification scripts found ("<pkg>:<key>", e.g. a `test` that is `echo pass`) —
+   *  recorded and NEVER counted as green unless trivial scripts are operator-trusted. */
+  readonly stubScripts: readonly string[];
   /** Ordered stages: nearest-tests → package-checks → full. */
   readonly stages: readonly CheckStage[];
   /** Decision trail. */

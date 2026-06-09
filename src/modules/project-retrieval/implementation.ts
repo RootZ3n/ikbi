@@ -141,8 +141,16 @@ export function createProjectRetrieval(deps: ProjectRetrievalDeps = {}): Project
     }
     // F1: overall seed cap — never let goal mining explode into a huge seed set (bounds the
     // expansion fan-out and the O(seeds × files) query cost on large repos).
+    // A3/F3: rank by RELEVANCE (summed reason weight: exact path-match > name-match), NEVER
+    // alphabetically — a critical `z-critical-auth.ts` must not be dropped for an earlier weak
+    // `a-constants.ts`. Path asc only breaks exact-score ties.
     if (seedFiles.size > cfg.maxSeeds) {
-      const kept = new Set([...seedFiles].sort().slice(0, cfg.maxSeeds));
+      const seedScore = (p: string): number => [...(reasons.get(p) ?? [])].reduce((s, r) => s + (WEIGHT[r] ?? 0), 0);
+      const ranked = [...seedFiles].sort((a, b) => {
+        const d = seedScore(b) - seedScore(a);
+        return d !== 0 ? d : a < b ? -1 : a > b ? 1 : 0;
+      });
+      const kept = new Set(ranked.slice(0, cfg.maxSeeds));
       let dropped = 0;
       for (const p of [...seedFiles]) {
         if (!kept.has(p)) {
@@ -151,7 +159,7 @@ export function createProjectRetrieval(deps: ProjectRetrievalDeps = {}): Project
           dropped += 1;
         }
       }
-      receipts.push(`seed cap ${cfg.maxSeeds} reached — dropped ${dropped} lower-priority seed(s)`);
+      receipts.push(`seed cap ${cfg.maxSeeds} reached — kept the ${cfg.maxSeeds} highest-relevance seed(s) by match specificity, dropped ${dropped} lower-relevance`);
     }
     receipts.push(seedFiles.size > 0 ? `seeds: ${[...seedFiles].sort().join(", ")}` : "no goal seeds matched — falling back to a project-structure baseline");
 
@@ -231,7 +239,20 @@ export function createProjectRetrieval(deps: ProjectRetrievalDeps = {}): Project
     }
     receipts.push(`budget ${budget}B: selected ${files.length} file(s), ${totalBytes}B, truncated=${truncatedByBudget}`);
 
-    return { mode: "index", files, seeds: [...seedFiles].sort(), totalBytes, truncatedByBudget, receipts };
+    // F6/A1: LOUD low-confidence — never let the caller assume a microscopic view was "enough".
+    // Low confidence when the index is incomplete (truncated), or when a large repo yielded NO goal
+    // seeds (only a structural baseline), or when the selection covers a tiny fraction of a big repo.
+    const totalFiles = data.files.length;
+    const lowReasons: string[] = [];
+    if (data.truncated) lowReasons.push("the project-index is truncated (incomplete)");
+    if (seedFiles.size === 0 && totalFiles >= cfg.lowConfidenceMinFiles) lowReasons.push(`no goal seeds matched in a ${totalFiles}-file repo (structure baseline only)`);
+    if (totalFiles >= cfg.lowConfidenceMinFiles && files.length / totalFiles < cfg.lowCoverageFraction) {
+      lowReasons.push(`selection covers ${((files.length / totalFiles) * 100).toFixed(2)}% of ${totalFiles} files`);
+    }
+    const lowConfidence = lowReasons.length > 0;
+    if (lowConfidence) receipts.push(`LOW CONFIDENCE: ${lowReasons.join("; ")} — do NOT treat this context as exhaustive; full verification required`);
+
+    return { mode: "index", files, seeds: [...seedFiles].sort(), totalBytes, truncatedByBudget, lowConfidence, ...(lowConfidence ? { lowConfidenceReason: lowReasons.join("; ") } : {}), receipts };
   }
 
   return { retrieve };
