@@ -4,7 +4,7 @@
  * gate, and terminal output flows through the neutralization chokepoint.
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -121,6 +121,32 @@ test("builder: terminal output passes through the neutralization chokepoint (sou
   assert.equal(result.outcome, "success");
   // The terminal result was neutralized as a tool result (source mcp_result, origin terminal).
   assert.ok(neutralized.some((n) => n.source === "mcp_result" && n.origin === "terminal"));
+});
+
+test("builder: terminal runs in the WORKTREE (cwd = realpath'd workspace, not the CLI cwd)", async () => {
+  // Bug 1 regression: the terminal tool MUST execute governed commands in the builder's
+  // worktree — the same canonical (realpath'd) root read_file/write_file confine against —
+  // so the builder can verify its own work. A regression here makes `ls` see the CLI's
+  // process.cwd() instead of the files the builder just wrote.
+  const dir = tmp();
+  writeFileSync(join(dir, "g.ts"), "export const hello = 1;\n");
+  const { engine } = mockEngine([
+    toolResp([call("terminal", { command: "ls" })]),
+    toolResp([call("read_file", { path: "g.ts" })]),
+    toolResp([call("run_checks", {})]),
+    toolResp([call("done", { successCondition: "x", filesReadBack: ["g.ts"], selfCheck: "y", satisfied: true })]),
+  ]);
+  // Capture the cwd governed-exec is asked to run the terminal command in.
+  let terminalCwd: string | undefined;
+  const exec = {
+    run: async (req: ExecRequest): Promise<ExecResult> => {
+      if (req.purpose?.includes("terminal")) terminalCwd = req.cwd;
+      return { executed: true, exitCode: 0, stdoutTail: "g.ts", stderrTail: "" };
+    },
+  };
+  const result = await createBuilder({ governedExec: exec, parentCtx: PARENT_CTX })(makeCtx(dir, "verified", engine));
+  assert.equal(result.outcome, "success");
+  assert.equal(terminalCwd, realpathSync(dir), "terminal must run in the realpath'd worktree, not the process cwd");
 });
 
 test("builder: search_files output is neutralized as untrusted repo content", async () => {

@@ -639,7 +639,12 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         rejectedToolCalls.push({ tool: "terminal", error: verr });
         return `ERROR: ${verr}`;
       }
-      return runTerminal({ governedExec, ...(deps.parentCtx !== undefined ? { parentCtx: deps.parentCtx } : {}) }, ctx.workspace.path, args);
+      // CWD = the REALPATH'd worktree (worktreeReal), the SAME canonical root read_file/
+      // write_file confine against — never the raw ctx.workspace.path, which can diverge from
+      // where the builder's writes actually land if any path component is a symlink. Pinning
+      // the realpath guarantees `terminal` runs WHERE the builder built (so `ls` sees the files
+      // it wrote), not in the CLI's process.cwd().
+      return runTerminal({ governedExec, ...(deps.parentCtx !== undefined ? { parentCtx: deps.parentCtx } : {}) }, worktreeReal, args);
     };
 
     // --- git inspection (git_status / git_diff / git_log): read-only, GOVERNED, async. Same
@@ -652,7 +657,9 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         rejectedToolCalls.push({ tool: call.name, error: "malformed tool arguments (not JSON)" });
         return `ERROR: malformed arguments for ${call.name} (not valid JSON)`;
       }
-      return runGitTool({ governedExec, ...(deps.parentCtx !== undefined ? { parentCtx: deps.parentCtx } : {}) }, ctx.workspace.path, call.name, args);
+      // CWD = the REALPATH'd worktree (same as terminal / read_file / write_file) so git
+      // inspects the builder's actual worktree, not the CLI's process.cwd().
+      return runGitTool({ governedExec, ...(deps.parentCtx !== undefined ? { parentCtx: deps.parentCtx } : {}) }, worktreeReal, call.name, args);
     };
 
     // --- web research (web_search / web_extract): async, routed through the EGRESS SSRF guard
