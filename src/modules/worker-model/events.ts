@@ -28,7 +28,7 @@ export const workerBuilderActivity = defineEvent<{ taskId: string; toolRounds: n
 );
 
 /** VERIFICATION status — the verifier's verdict + which checks passed. (Attribution: role.) */
-export const workerVerification = defineEvent<{ taskId: string; verdict: string; typecheckPassed: boolean; testsPassed: boolean; checks?: ReadonlyArray<{ name: string; passed: boolean }> }>(
+export const workerVerification = defineEvent<{ taskId: string; verdict: string; typecheckPassed: boolean; testsPassed: boolean; checks?: ReadonlyArray<{ name: string; passed: boolean }>; verificationScope?: "impact" | "full" }>(
   "worker.verification",
 );
 
@@ -44,6 +44,8 @@ export const workerCompleted = defineEvent<{
   outcome: WorkerOutcome;
   promoted: boolean;
   workspaceId: string;
+  /** The verification scope a promote/judge relied on ("impact" | "full"), for auditability. */
+  verificationScope?: "impact" | "full";
 }>("worker.completed");
 
 /** A run failed (a role failed/rejected/stub, or an infrastructure error). (Attribution: parent.) */

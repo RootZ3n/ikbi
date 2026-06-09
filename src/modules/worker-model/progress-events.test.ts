@@ -190,3 +190,31 @@ test("ISSUE 3: formatRepairNarrative is empty for a non-repair build (no narrati
   } as unknown as WorkerResult;
   assert.equal(formatRepairNarrative(result), "", "no narrative → empty (safe to print unconditionally)");
 });
+
+// ── verification scope propagation (ladder auditability) ──────────────────────
+test("scope reaches the verification + completed events (operators/judges see impact vs full)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = ids();
+  const sent: Array<{ type: string; payload: Record<string, unknown> }> = [];
+  const bus: EventBusSurface = {
+    publish: <P>(i: EventInput<P>): IkbiEvent<P> => { sent.push(i as unknown as { type: string; payload: Record<string, unknown> }); return { ...i, contractVersion: "1.0.0", id: `e${sent.length}`, seq: sent.length, timestamp: 0 } as IkbiEvent<P>; },
+    subscribe: () => ({ id: "s", unsubscribe: () => {}, stats: () => ({ delivered: 0, dropped: 0, failures: 0, queued: 0 }) }),
+    flush: async () => {},
+  };
+  const roles = progressRoles();
+  roles.verifier = async () => ({ role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", verificationScope: "impact", checks: [{ name: "test", exitCode: 0 }] } });
+  const orch = createOrchestrator({
+    config: { enabled: true, roleTimeoutMs: 1000, maxConcurrentRuns: 1 },
+    resolveIdentity, roleClaim, roles, workspaces: fakeWs(), trust: fakeTrust, receipts: fakeReceipts, events: bus, gateWall: allowGate,
+    invokeModel: async () => { throw new Error("unused"); },
+  });
+  await orch.run({ taskId: "t-1", targetRepo: "/repo", goal: "g" }, parentCtx);
+
+  assert.equal(sent.find((e) => e.type === "worker.verification")?.payload.verificationScope, "impact", "verification event carries scope");
+  assert.equal(sent.find((e) => e.type === "worker.completed")?.payload.verificationScope, "impact", "completed event carries scope (promotion auditability)");
+});
+
+test("the --verbose verify line is scope-stamped in ladder mode (and unchanged in legacy)", () => {
+  assert.match(formatProgressEvent({ type: "worker.verification", payload: { verdict: "pass", verificationScope: "impact", checks: [{ name: "test", passed: true }] } }), /verify: pass \[impact\] \(test ✓\)/);
+  assert.match(formatProgressEvent({ type: "worker.verification", payload: { verdict: "pass", verificationScope: "full", typecheckPassed: true, testsPassed: true } }), /verify: pass \[full\] \(/);
+  assert.doesNotMatch(formatProgressEvent({ type: "worker.verification", payload: { verdict: "pass", typecheckPassed: true, testsPassed: true } }), /\[/);
+});

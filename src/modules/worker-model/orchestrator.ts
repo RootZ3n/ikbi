@@ -547,6 +547,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // step report an explicit, actionable reason instead of a misleading "no changes to promote".
     let autoCommitSkippedTier: string | undefined;
     let autoCommitSkippedAgent: string | undefined;
+    // The verification scope the verifier stamped ("impact" | "full"), surfaced into the
+    // verification event, the completed event, and the promote message for auditability.
+    let verificationScope: "impact" | "full" | undefined;
 
     try {
       for (const role of WORKER_ROLES) {
@@ -593,10 +596,20 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           );
         } else if (role === "verifier") {
           const v = readVerifier(result);
-          const verdict = (result.detail as Record<string, unknown> | undefined)?.verdict;
+          const vd = (result.detail as Record<string, unknown> | undefined) ?? {};
+          const verdict = vd.verdict;
+          const scope = vd.verificationScope === "impact" || vd.verificationScope === "full" ? vd.verificationScope : undefined;
+          verificationScope = scope; // carried to the completed event + promote message (auditability)
           events.publish(
             workerVerification.create(
-              { taskId: task.taskId, verdict: typeof verdict === "string" ? verdict : result.outcome === "success" ? "pass" : "fail", typecheckPassed: v.typecheckPass, testsPassed: v.testsPass, checks: v.checks },
+              {
+                taskId: task.taskId,
+                verdict: typeof verdict === "string" ? verdict : result.outcome === "success" ? "pass" : "fail",
+                typecheckPassed: v.typecheckPass,
+                testsPassed: v.testsPass,
+                checks: v.checks,
+                ...(scope !== undefined ? { verificationScope: scope } : {}),
+              },
               { source: EVENT_SOURCE, attribution: { identity: spawned.identity, operation: "worker.role.verifier", runId: task.taskId } },
             ),
           );
@@ -736,7 +749,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         const promote = await workspaces.promote(workspace, {
           evaluation: decision.evaluation, // sourced from the integrator, NOT hardcoded
           governance,
-          message: `worker-model: ${task.goal}${decision.rationale !== undefined ? ` — ${decision.rationale}` : ""}`,
+          // Auditability: record the verification scope the promote relied on in the commit message.
+          message: `worker-model: ${task.goal}${decision.rationale !== undefined ? ` — ${decision.rationale}` : ""}${verificationScope !== undefined ? ` [verification: ${verificationScope}]` : ""}`,
         });
         promoted = promote.promoted;
         if (!promoted) {
@@ -780,7 +794,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     if (overall === "success" || overall === "partial") {
       events.publish(
         workerCompleted.create(
-          { taskId: task.taskId, outcome: overall, promoted, workspaceId: workspace.id },
+          { taskId: task.taskId, outcome: overall, promoted, workspaceId: workspace.id, ...(verificationScope !== undefined ? { verificationScope } : {}) },
           { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } },
         ),
       );

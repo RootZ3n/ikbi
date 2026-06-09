@@ -57,6 +57,10 @@ import { parseCheckOutput, type CheckTriage } from "../check-triage/index.js";
  *  SIGKILL'd. Overridable via IKBI_CHECK_TIMEOUT_MS. */
 export const DEFAULT_CHECK_TIMEOUT_MS = 600_000;
 
+/** Upper clamp for IKBI_CHECK_TIMEOUT_MS — Node's setTimeout overflows past 2^31-1 ms (fires ~at
+ *  once), which would SIGKILL every check instantly. Clamp to the max safe 32-bit delay. */
+export const MAX_CHECK_TIMEOUT_MS = 2_147_483_647;
+
 /** Extract changed file paths (repo-relative POSIX) from a unified `git diff`. */
 export function parseChangedFiles(diff: string): string[] {
   const out = new Set<string>();
@@ -269,7 +273,9 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
       const triageFn = deps.triage ?? parseCheckOutput;
       const raw = (runEnv.IKBI_CHECK_TIMEOUT_MS ?? "").trim();
       const parsedTimeout = Number.parseInt(raw, 10);
-      const checkTimeoutMs = Number.isFinite(parsedTimeout) && parsedTimeout > 0 ? parsedTimeout : DEFAULT_CHECK_TIMEOUT_MS;
+      // Invalid / non-positive ⇒ default; valid ⇒ CLAMP to MAX_CHECK_TIMEOUT_MS (above which Node's
+      // setTimeout overflows and fires ~immediately → every check SIGKILL'd → false RED).
+      const checkTimeoutMs = Number.isFinite(parsedTimeout) && parsedTimeout > 0 ? Math.min(parsedTimeout, MAX_CHECK_TIMEOUT_MS) : DEFAULT_CHECK_TIMEOUT_MS;
 
       let data: ProjectIndexData;
       try {
@@ -281,7 +287,7 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
 
       const changedFiles = parseChangedFiles(diff);
       const plan = planFn({ data, changedFiles });
-      const baseReceipts = [...plan.receipts];
+      const baseReceipts = [...plan.receipts, `check timeout: ${checkTimeoutMs}ms (per check, separate from the model role budget)`];
 
       if (plan.blocked) {
         return {
@@ -340,6 +346,21 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
             };
           }
         }
+      }
+
+      // DEFENSE-IN-DEPTH (no vacuous green): a non-blocked plan that executed ZERO checks must NOT
+      // pass. The planner guarantees ≥1 runnable task for a non-blocked plan, but the verifier does
+      // not trust that cross-module invariant — fail closed if nothing actually ran.
+      if (checks.length === 0) {
+        return {
+          role: "verifier", outcome: "failure",
+          summary: `verification FAILED (scope ${plan.scope}): no verification checks ran — refusing a vacuous green`,
+          detail: {
+            verdict: "fail", verificationScope: plan.scope, checks: [], triage: triages, stagesRun,
+            neutralPackages: plan.neutralPackages,
+            receipts: [...baseReceipts, "FAILED: no runnable verification checks executed (refusing a vacuous green)", ...neutralNote],
+          },
+        };
       }
 
       // ALL runnable tasks passed — SCOPE-STAMPED green (never a plain "all checks passed").

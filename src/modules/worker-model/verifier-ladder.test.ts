@@ -10,7 +10,7 @@ import { test } from "node:test";
 import type { OperationContext } from "../../core/identity/index.js";
 import type { ExecRequest, ExecResult } from "../governed-exec/index.js";
 import type { FileEntry, PackageEntry, ProjectIndexData } from "../project-index/index.js";
-import { createVerifier, parseChangedFiles, DEFAULT_CHECK_TIMEOUT_MS } from "./verifier.js";
+import { createVerifier, parseChangedFiles, DEFAULT_CHECK_TIMEOUT_MS, MAX_CHECK_TIMEOUT_MS } from "./verifier.js";
 import type { RoleContext } from "./contract.js";
 
 const PCTX = {} as unknown as OperationContext;
@@ -135,4 +135,35 @@ test("ladder: a neutral package does not create a vacuous green — it forces fu
   assert.ok((detail(r).neutralPackages as string[]).includes("packages/a"));
   assert.ok((detail(r).stagesRun as string[]).includes("full"), "a full check actually ran");
   assert.ok(ge.calls.length >= 1, "the full check executed");
+});
+
+test("ladder (Fix 2): a non-blocked plan that runs ZERO checks fails closed — no vacuous green", async () => {
+  const ge = fakeGovernedExec();
+  // injected planner result: not blocked, but empty stages (planner-invariant violation simulated)
+  const emptyPlan = {
+    status: "ok" as const, blocked: false, blockReasons: [], scope: "impact" as const,
+    escalateToFull: false, escalationReasons: [], affectedPackages: [], affectedTests: [],
+    neutralPackages: [], stages: [], receipts: ["fake: empty non-blocked plan"],
+  };
+  const v = createVerifier({ governedExec: ge.exec, parentCtx: PCTX, diff: async () => diffOf(["src/x.ts"]), env: { IKBI_VERIFY: "ladder" }, index: { refresh: async () => ({ data: mkData({}) }) }, plan: () => emptyPlan });
+  const r = await v(makeCtx("/wt"));
+  assert.equal(r.outcome, "failure");
+  assert.match(r.summary ?? "", /no verification checks ran/);
+  assert.equal(ge.calls.length, 0, "nothing executed");
+});
+
+test("ladder (Fix 4): IKBI_CHECK_TIMEOUT_MS is clamped below the setTimeout overflow", async () => {
+  const data = mkData({ packages: [pkg("packages/a", { test: "vitest" })], files: [file("packages/a/src/foo.ts"), file("packages/a/src/foo.test.ts", { isTest: true })], fileToTests: { "packages/a/src/foo.ts": ["packages/a/src/foo.test.ts"] } });
+  const ge = fakeGovernedExec();
+  const v = createVerifier({ governedExec: ge.exec, parentCtx: PCTX, diff: async () => diffOf(["packages/a/src/foo.ts"]), env: { IKBI_VERIFY: "ladder", IKBI_CHECK_TIMEOUT_MS: "999999999999999" }, index: { refresh: async () => ({ data }) } });
+  await v(makeCtx("/wt"));
+  assert.equal(ge.calls[0]?.timeoutMs, MAX_CHECK_TIMEOUT_MS, "huge value clamped to the safe max");
+});
+
+test("ladder (Fix 4): an invalid IKBI_CHECK_TIMEOUT_MS falls back to the default", async () => {
+  const data = mkData({ packages: [pkg("packages/a", { test: "vitest" })], files: [file("packages/a/src/foo.ts"), file("packages/a/src/foo.test.ts", { isTest: true })], fileToTests: { "packages/a/src/foo.ts": ["packages/a/src/foo.test.ts"] } });
+  const ge = fakeGovernedExec();
+  const v = createVerifier({ governedExec: ge.exec, parentCtx: PCTX, diff: async () => diffOf(["packages/a/src/foo.ts"]), env: { IKBI_VERIFY: "ladder", IKBI_CHECK_TIMEOUT_MS: "nonsense" }, index: { refresh: async () => ({ data }) } });
+  await v(makeCtx("/wt"));
+  assert.equal(ge.calls[0]?.timeoutMs, DEFAULT_CHECK_TIMEOUT_MS, "invalid value → default");
 });

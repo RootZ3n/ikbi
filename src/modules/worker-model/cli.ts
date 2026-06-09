@@ -268,7 +268,9 @@ export function formatProgressEvent(e: { type: string; payload?: unknown }): str
         checks !== undefined && checks.length > 0
           ? checks.map((c) => `${String(c.name)} ${c.passed ? "✓" : "✗"}`).join(", ")
           : `typecheck ${p.typecheckPassed ? "✓" : "✗"}, tests ${p.testsPassed ? "✓" : "✗"}`;
-      return `    verify: ${String(p.verdict ?? "?")} (${detail})\n`;
+      // Scope-stamp the verify line in ladder mode so operators see impact vs full at a glance.
+      const scope = p.verificationScope === "impact" || p.verificationScope === "full" ? ` [${p.verificationScope}]` : "";
+      return `    verify: ${String(p.verdict ?? "?")}${scope} (${detail})\n`;
     }
     case "worker.completed":
       return `  ✓ run complete (promoted=${String(p.promoted ?? false)})\n`;
