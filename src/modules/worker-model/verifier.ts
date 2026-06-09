@@ -113,6 +113,12 @@ export interface VerifierDeps {
    */
   readonly diff?: (workspace: WorkspaceHandle) => Promise<string>;
   /**
+   * Diff used by ladder impact planning. When omitted, ladder falls back to `diff`; production
+   * wires this to the full verifier-time working-tree diff while keeping `diff` scoped to the
+   * package.json script-integrity surface.
+   */
+  readonly planningDiff?: (workspace: WorkspaceHandle) => Promise<string>;
+  /**
    * Resolve the per-target check set, with the fail-closed PROJECT-ROOT GUARD (Fix 1) and
    * the operator/repo-configured command set (Fix 2). The orchestrator wires the live
    * `resolveChecks` here. DEFAULT (tests / direct construction): the pnpm VERIFIER_CHECKS
@@ -287,7 +293,15 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
         return red(`verification RED (ladder): project-index unavailable — ${e instanceof Error ? e.message : String(e)}`);
       }
 
-      const changedFiles = parseChangedFiles(diff);
+      let planningDiff = diff;
+      if (deps.planningDiff !== undefined) {
+        try {
+          planningDiff = await deps.planningDiff(rctx.workspace);
+        } catch (e) {
+          return red(`verification RED (ladder): planning diff unavailable — ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+      const changedFiles = parseChangedFiles(planningDiff);
       const plan = planFn({ data, changedFiles });
       const baseReceipts = [...plan.receipts, `check timeout: ${checkTimeoutMs}ms (per check, separate from the model role budget)`];
 

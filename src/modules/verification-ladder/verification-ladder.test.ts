@@ -28,6 +28,7 @@ function mkData(p: Partial<ProjectIndexData>): ProjectIndexData {
     version: 1, repoPath: "/r", repoHash: "abc",
     files: p.files ?? [], packages: p.packages ?? [], imports: p.imports ?? [],
     fileToTests: p.fileToTests ?? {}, truncated: p.truncated ?? false,
+    ...(p.graphHoles !== undefined ? { graphHoles: p.graphHoles } : {}),
   };
 }
 const stageOf = (pl: ReturnType<typeof plan>, name: string) => pl.stages.find((s) => s.stage === name);
@@ -62,6 +63,19 @@ test("cross-package import → escalate to full", () => {
   assert.equal(pl.scope, "full");
   assert.equal(pl.status, "ok");
   assert.ok(stageOf(pl, "full"), "full stage present (root has a test script)");
+});
+
+test("unresolved asset graph hole → escalates to full, never unsafe impact-green", () => {
+  const data = mkData({
+    packages: [pkg("", { test: "pnpm -r test" }), pkg("packages/theme", { test: "vitest" })],
+    files: [file("packages/theme/styles.css")],
+    graphHoles: { unresolved: 1 },
+  });
+  const pl = plan({ data, changedFiles: ["packages/theme/styles.css"] });
+  assert.equal(pl.scope, "full");
+  assert.equal(pl.escalateToFull, true);
+  assert.ok(pl.escalationReasons.some((r) => /graph hole/.test(r)), "asset graph uncertainty is explicit");
+  assert.ok(stageOf(pl, "full"), "full stage present");
 });
 
 test("shared/root file (tsconfig) → escalate to full", () => {

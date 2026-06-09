@@ -257,7 +257,7 @@ test("competitive: a denying gate-wall blocks the winner's promote ⇒ all disca
   // The judge DID pick a winner (ws0 survived) — proving select vs authorize are separate.
   assert.equal(captured[0]?.length, 2, "the judge scored both candidates");
   assert.equal(r.promoted, false, "the gate blocked the promote");
-  assert.ok(ws.promoted.includes("ws0"), "promote was attempted on the winner");
+  assert.equal(ws.promoted.length, 0, "promote was not called after gate denial");
   assert.deepEqual([...ws.discarded].sort(), ["ws0", "ws1"], "winner + loser both discarded (fail-closed)");
 });
 
@@ -380,6 +380,26 @@ test("competitive: the judge receives correctly-mapped BuildCandidates", async (
   assert.equal(c0.rejectedToolCalls, 0);
   assert.equal(c0.stopReason, "stop");
   assert.equal(c0.diffLines, 3, "diff line count from workspaces.diff");
+});
+
+test("competitive: verifier verdict pass with custom check name is authoritative", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = compWorkspaces();
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    scout: async () => ({ role: "scout", outcome: "success", summary: "s" }),
+    builder: async () => ({ role: "builder", outcome: "success", summary: "b", detail: { toolRounds: 1, filesWritten: ["a.ts"], rejectedToolCalls: [], stopReason: "stop" } }),
+    verifier: async () => ({ role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", verificationScope: "full", checks: [{ name: "ci", command: "pnpm run ci", exitCode: 0, outputTail: "" }] } }),
+  };
+  let seen: readonly BuildCandidate[] = [];
+  const judge = { judge: (c: readonly BuildCandidate[]) => { seen = c; return deterministicJudge.judge(c); } };
+  const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles, judge }));
+  const r = await orch.run(task, parentCtx);
+  assert.equal(r.outcome, "success");
+  assert.equal(r.promoted, true);
+  for (const c of seen) {
+    assert.equal(c.typecheckPass, true, "custom-check verifier pass maps to typecheck gate pass");
+    assert.equal(c.testsPass, true, "custom-check verifier pass maps to tests gate pass");
+  }
 });
 
 

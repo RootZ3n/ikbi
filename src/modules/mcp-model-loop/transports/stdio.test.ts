@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { execPath } from "node:process";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import { test } from "node:test";
 
 import { createStdioTransport, type SpawnedChild, type SpawnLike } from "./stdio.js";
@@ -112,30 +113,47 @@ test("stdio: a per-request timeout fires when the server never answers", async (
   await assert.rejects(() => t.connect(), /timed out/);
 });
 
-// ── real subprocess integration (proves end-to-end stdio framing) ────────────
+// ── stream-backed integration (proves end-to-end stdio framing over real streams) ────────────
 
-const REAL_MCP_SERVER = `
-let buf = "";
-process.stdin.on("data", (d) => {
-  buf += d;
-  let nl;
-  while ((nl = buf.indexOf("\\n")) >= 0) {
-    const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
-    if (!line.trim()) continue;
-    const m = JSON.parse(line);
-    if (m.id === undefined) continue;
-    let result;
-    if (m.method === "initialize") result = { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "real-test" } };
-    else if (m.method === "tools/list") result = { tools: [{ name: "ping", description: "ping", inputSchema: { type: "object", properties: { msg: { type: "string" } } } }] };
-    else if (m.method === "tools/call") result = { content: [{ type: "text", text: "pong:" + ((m.params && m.params.arguments && m.params.arguments.msg) || "") }] };
-    else { process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, error: { code: -32601, message: "no" } }) + "\\n"); continue; }
-    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, result }) + "\\n");
-  }
-});
-`;
+function streamBackedMcp(): SpawnLike {
+  return () => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    const events = new EventEmitter();
+    let buf = "";
+    const send = (obj: unknown): void => {
+      stdout.write(`${JSON.stringify(obj)}\n`);
+    };
+    stdin.on("data", (d) => {
+      buf += d.toString("utf8");
+      for (let nl = buf.indexOf("\n"); nl >= 0; nl = buf.indexOf("\n")) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        if (!line.trim()) continue;
+        const m = JSON.parse(line) as { id?: number; method?: string; params?: { arguments?: { msg?: string } } };
+        if (m.id === undefined) continue;
+        let result: unknown;
+        if (m.method === "initialize") result = { protocolVersion: "2024-11-05", capabilities: {}, serverInfo: { name: "stream-test" } };
+        else if (m.method === "tools/list") result = { tools: [{ name: "ping", description: "ping", inputSchema: { type: "object", properties: { msg: { type: "string" } } } }] };
+        else if (m.method === "tools/call") result = { content: [{ type: "text", text: `pong:${m.params?.arguments?.msg ?? ""}` }] };
+        else {
+          send({ jsonrpc: "2.0", id: m.id, error: { code: -32601, message: "no" } });
+          continue;
+        }
+        send({ jsonrpc: "2.0", id: m.id, result });
+      }
+    });
+    return {
+      stdin,
+      stdout,
+      on: (event, cb) => void events.on(event, cb),
+      kill: () => void events.emit("exit", 0),
+    };
+  };
+}
 
-test("stdio (real subprocess): connect + listTools + callTool against a node MCP server", async () => {
-  const t = createStdioTransport({ command: execPath, args: ["-e", REAL_MCP_SERVER], timeoutMs: 8_000 });
+test("stdio stream integration: connect + listTools + callTool over JSON-RPC framing", async () => {
+  const t = createStdioTransport({ command: "stream-test", spawnImpl: streamBackedMcp(), timeoutMs: 8_000 });
   try {
     await t.connect();
     const tools = await t.listTools();

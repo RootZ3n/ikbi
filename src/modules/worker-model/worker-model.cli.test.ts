@@ -95,7 +95,14 @@ function realOrchestrator(operatorTier: string, workerTier: string) {
   const resolveIdentity = makeResolver(operatorTier, workerTier);
   const cap = capturingRoles();
   const ws = governanceWorkspaces();
-  const gateWall = createGateWall({ receipts: fakeReceipts(), publish: () => {} }); // REAL evaluator
+  const realGateWall = createGateWall({ receipts: fakeReceipts(), publish: () => {} }); // REAL evaluator
+  let gateDecision: PromoteGovernance | undefined;
+  const gateWall = {
+    evaluate: async (...args: Parameters<typeof realGateWall.evaluate>): Promise<PromoteGovernance> => {
+      gateDecision = await realGateWall.evaluate(...args);
+      return gateDecision;
+    },
+  };
   const orchestrator = createOrchestrator({
     config: ENABLED,
     resolveIdentity,
@@ -110,7 +117,7 @@ function realOrchestrator(operatorTier: string, workerTier: string) {
       throw new Error("invokeModel not used (capturing roles)");
     },
   });
-  return { orchestrator, resolveIdentity, cap, ws };
+  return { orchestrator, resolveIdentity, cap, ws, gateDecision: () => gateDecision };
 }
 
 function capture() {
@@ -142,7 +149,7 @@ test("parseBuildArgs extracts --repo and leaves the goal", () => {
 // ── THE CHAIN PROOF (injected model via capturing roles + real gate-wall) ────
 
 test("build runs the full 5-role pipeline through the orchestrator with the real gate-wall", () => {
-  const { orchestrator, resolveIdentity, cap, ws } = realOrchestrator("trusted", "trusted");
+  const { orchestrator, resolveIdentity, cap, gateDecision } = realOrchestrator("trusted", "trusted");
   const cap2 = capture();
   const cli = createWorkerCli({ orchestrator, resolveIdentity, operatorToken: OPERATOR_TOKEN, workerToken: WORKER_TOKEN, stdout: cap2.stdout, stderr: cap2.stderr, setExit: cap2.setExit, now: () => 1, cwd: () => "/repo" });
 
@@ -150,7 +157,7 @@ test("build runs the full 5-role pipeline through the orchestrator with the real
     assert.equal(cap2.exit, undefined, "clean run");
     assert.deepEqual(cap.seen.map((c) => c.role), ["scout", "builder", "critic", "verifier", "integrator"], "all five roles ran");
     for (const c of cap.seen) assert.equal(c.identity.spawnedFrom, "lead", "each role spawned under the dispatching parent");
-    assert.equal(ws.governance()?.allow, true, "the REAL gate-wall evaluated the promote (trusted ⇒ allow)");
+    assert.equal(gateDecision()?.allow, true, "the REAL gate-wall evaluated the promote (trusted ⇒ allow)");
     const summary = JSON.parse(cap2.out);
     assert.equal(summary.outcome, "success");
     assert.equal(summary.promoted, true);
@@ -178,14 +185,14 @@ test("a worker credential registered ABOVE the parent is clamped to the parent t
 // ── gate denial at promote is a CLEAN outcome (not a crash) ──────────────────
 
 test("a gate-denied promote (probation parent) surfaces a discarded/partial outcome, not a crash", () => {
-  const { orchestrator, resolveIdentity, ws } = realOrchestrator("probation", "trusted");
+  const { orchestrator, resolveIdentity, gateDecision } = realOrchestrator("probation", "trusted");
   const cap2 = capture();
   const cli = createWorkerCli({ orchestrator, resolveIdentity, operatorToken: OPERATOR_TOKEN, workerToken: WORKER_TOKEN, stdout: cap2.stdout, stderr: cap2.stderr, setExit: cap2.setExit, now: () => 1, cwd: () => "/repo" });
 
   return cli.build(["ship", "it"]).then(() => {
     assert.equal(cap2.exit, undefined, "a gate denial is NOT a crash");
     assert.equal(cap2.err, "", "nothing on stderr");
-    assert.equal(ws.governance()?.allow, false, "the real gate-wall DENIED the probation promote");
+    assert.equal(gateDecision()?.allow, false, "the real gate-wall DENIED the probation promote");
     const summary = JSON.parse(cap2.out);
     assert.equal(summary.promoted, false, "not promoted");
     assert.notEqual(summary.outcome, "success");

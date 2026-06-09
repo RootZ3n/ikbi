@@ -8,6 +8,7 @@
 
 import { registerCommand } from "./registry.js";
 import { workspaces as coreWorkspaces } from "../core/workspace/index.js";
+import { writeStderr, writeStdout } from "./io.js";
 
 /** The cleanup surface the command drives (injectable for tests). */
 export interface CleanWorkspaces {
@@ -24,8 +25,8 @@ export interface CleanCliDeps {
 /** Build the `clean` handler. Default reclaims via the live workspace manager. */
 export function createCleanCli(deps: CleanCliDeps = {}) {
   const workspaces: CleanWorkspaces = deps.workspaces ?? coreWorkspaces;
-  const out = deps.stdout ?? ((s: string) => void process.stdout.write(s));
-  const err = deps.stderr ?? ((s: string) => void process.stderr.write(s));
+  const out = deps.stdout ?? writeStdout;
+  const err = deps.stderr ?? writeStderr;
   const setExit = deps.setExit ?? ((c: number) => void (process.exitCode = c));
 
   async function clean(): Promise<void> {

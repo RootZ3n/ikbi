@@ -111,6 +111,32 @@ test("project-index: incremental refresh after ONE edit reparses exactly one fil
   }
 });
 
+test("project-index: refresh re-resolves unchanged bare-package import when a package entry appears", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "ikbi-pi-entry-"));
+  const stateRoot = mkdtempSync(join(tmpdir(), "ikbi-pi-entry-state-"));
+  try {
+    write(repo, "package.json", JSON.stringify({ name: "root", private: true }));
+    write(repo, "pnpm-workspace.yaml", "packages:\n  - 'packages/*'\n");
+    write(repo, "packages/a/package.json", JSON.stringify({ name: "@fix/a", version: "1.0.0" }));
+    write(repo, "packages/b/package.json", JSON.stringify({ name: "@fix/b", version: "1.0.0" }));
+    write(repo, "packages/b/src/use-a.ts", 'import { a } from "@fix/a";\nexport const b = a;\n');
+    const idx = createProjectIndex({ stateRoot });
+    const initial = await idx.build(repo);
+    const before = initial.imports.find((e) => e.from === "packages/b/src/use-a.ts" && e.specifier === "@fix/a");
+    assert.ok(before, "initial bare-package edge exists");
+    assert.equal(before?.to, undefined, "package A initially has no resolvable entry");
+
+    write(repo, "packages/a/src/index.ts", "export const a = 1;\n");
+    const refreshed = await idx.refresh(repo);
+    const after = refreshed.data.imports.find((e) => e.from === "packages/b/src/use-a.ts" && e.specifier === "@fix/a");
+    assert.equal(after?.to, "packages/a/src/index.ts", "unchanged importer was re-resolved to the new package entry");
+    assert.ok(refreshed.reparsed.includes("packages/b/src/use-a.ts"), "unchanged JS importer was reparsed because package resolution changed");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
+  }
+});
+
 test("project-index: query callers returns the importing file with reason imported-by-seed", async () => {
   const { repo, stateRoot } = makeFixture();
   try {
@@ -285,6 +311,29 @@ test("P0/F2: a tsconfig path alias resolves into the import graph + reverse depe
 
     const callers = await idx.query(repo, { seeds: ["src/lib/auth.ts"], want: "callers" });
     assert.ok(callers.some((r) => r.path === "src/app.ts"), "reverse dependent (importer via alias) is found");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
+  }
+});
+
+test("project-index: common asset imports resolve when the target file exists", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "ikbi-pi-css-"));
+  const stateRoot = mkdtempSync(join(tmpdir(), "ikbi-pi-css-state-"));
+  try {
+    write(repo, "package.json", JSON.stringify({ name: "css-root" }));
+    write(repo, "tsconfig.json", JSON.stringify({ compilerOptions: { baseUrl: ".", paths: { "@theme/*": ["packages/theme/*"] } } }));
+    write(repo, "packages/app/package.json", JSON.stringify({ name: "@m/app" }));
+    write(repo, "packages/app/src/main.ts", 'import "@theme/styles.css";\nexport const app = 1;\n');
+    write(repo, "packages/theme/package.json", JSON.stringify({ name: "@m/theme" }));
+    write(repo, "packages/theme/styles.css", "body { color: red; }\n");
+    const idx = createProjectIndex({ stateRoot });
+    const data = await idx.build(repo);
+    const edge = data.imports.find((e) => e.from === "packages/app/src/main.ts" && e.specifier === "@theme/styles.css");
+    assert.equal(edge?.to, "packages/theme/styles.css", "CSS alias import resolved to the asset file");
+    assert.equal(data.graphHoles?.unresolved, 0, "resolved asset import is not a graph hole");
+    const callers = await idx.query(repo, { seeds: ["packages/theme/styles.css"], want: "callers" });
+    assert.ok(callers.some((r) => r.path === "packages/app/src/main.ts"), "asset reverse dependent is queryable");
   } finally {
     rmSync(repo, { recursive: true, force: true });
     rmSync(stateRoot, { recursive: true, force: true });

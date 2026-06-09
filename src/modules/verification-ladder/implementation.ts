@@ -97,6 +97,9 @@ export function createVerificationLadder(cfg: VerificationLadderConfig = verific
     if ((data.aliases?.unresolved ?? 0) > 0) {
       escalationReasons.push(`${data.aliases?.unresolved} unresolved path-alias import(s) — import graph has holes, impact cannot be trusted`);
     }
+    if ((data.graphHoles?.unresolved ?? 0) > 0) {
+      escalationReasons.push(`${data.graphHoles?.unresolved} unresolved non-code import graph hole(s) — impact cannot be trusted`);
+    }
     if (opts.alwaysFull) escalationReasons.push("opts.alwaysFull is set");
 
     for (const f of changed) {

@@ -87,6 +87,7 @@ function toRel(repoAbs: string, abs: string): string {
 }
 
 const JS_EXTS = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json"] as const;
+const ASSET_EXTS = [".css", ".scss", ".sass", ".less", ".html", ".vue", ".svelte", ".md", ".mdx", ".yaml", ".yml"] as const;
 
 function detectLang(relPath: string): Language {
   const lower = relPath.toLowerCase();
@@ -393,8 +394,8 @@ export function extractImportSpecifiers(content: string): string[] {
 /** Resolve a target path (no extension assumed) against the known file set: try ext + /index. */
 function resolveModuleFile(targetRel: string, fileSet: ReadonlySet<string>): string | undefined {
   if (fileSet.has(targetRel)) return targetRel;
-  for (const ext of JS_EXTS) if (fileSet.has(targetRel + ext)) return targetRel + ext;
-  for (const ext of JS_EXTS) if (fileSet.has(`${targetRel}/index${ext}`)) return `${targetRel}/index${ext}`;
+  for (const ext of [...JS_EXTS, ...ASSET_EXTS]) if (fileSet.has(targetRel + ext)) return targetRel + ext;
+  for (const ext of [...JS_EXTS, ...ASSET_EXTS]) if (fileSet.has(`${targetRel}/index${ext}`)) return `${targetRel}/index${ext}`;
   return undefined;
 }
 
@@ -616,6 +617,27 @@ function aliasSummary(
   return { present: configPresent, unresolved: countUnresolvedAliases(imports, aliasInfo.rules, configPresent) };
 }
 
+function hasKnownAssetExtension(specifier: string): boolean {
+  return ASSET_EXTS.some((ext) => specifier.toLowerCase().endsWith(ext));
+}
+
+function graphHoleSummary(imports: readonly ImportEdge[]): { unresolved: number } {
+  let unresolved = 0;
+  for (const e of imports) {
+    if (e.to !== undefined) continue;
+    if ((e.kind === "relative" || e.kind === "package" || e.kind === "unresolved") && hasKnownAssetExtension(e.specifier)) unresolved += 1;
+  }
+  return { unresolved };
+}
+
+function packageResolutionSignature(packages: readonly PackageEntry[]): string {
+  return JSON.stringify(
+    packages
+      .map((p) => ({ root: p.root, name: p.name, entry: p.entry ?? null }))
+      .sort((a, b) => (a.root < b.root ? -1 : a.root > b.root ? 1 : 0)),
+  );
+}
+
 /** source file → colocated tests (same package, matching stem). Deterministic, sorted. */
 function buildFileToTests(files: readonly FileEntry[]): Record<string, string[]> {
   const tests = files.filter((f) => f.isTest);
@@ -741,6 +763,7 @@ export function createProjectIndex(deps: ProjectIndexDeps = {}): ProjectIndexApi
       fileToTests: buildFileToTests(files),
       truncated,
       aliases: aliasSummary(repoAbs, packages, aliasInfo, imports),
+      graphHoles: graphHoleSummary(imports),
     };
   }
 
@@ -791,6 +814,7 @@ export function createProjectIndex(deps: ProjectIndexDeps = {}): ProjectIndexApi
     const packages = finalizePackages(rawPkgs, fileSet);
     const pkgByName = new Map(packages.map((p) => [p.name, { root: p.root, ...(p.entry !== undefined ? { entry: p.entry } : {}) }]));
     const aliasInfo = readAliasRules(repoAbs);
+    const packageResolutionChanged = packageResolutionSignature(old.packages) !== packageResolutionSignature(packages);
 
     // R-B: racy-clean reference. A file whose mtime sits within the racy window of the LAST index
     // write could have been edited in-place (same size, same mtime tick), so we re-hash it even
@@ -813,17 +837,31 @@ export function createProjectIndex(deps: ProjectIndexDeps = {}): ProjectIndexApi
       if (probeUnchanged) {
         const racy = raw.mtimeMs >= racyFloor;
         if (!racy) {
-          // confidently unchanged → reuse stored entry + edges (refresh pkg assignment only).
+          // confidently unchanged → reuse stored entry + edges unless package entry resolution
+          // changed, in which case bare-package imports in unchanged files must be re-resolved.
           const pkg = assignPackage(raw.rel, pkgRootsDescByLen);
-          files.push({ ...prev, ...(pkg !== undefined ? { package: pkg } : {}) });
-          unchanged += 1;
+          if (packageResolutionChanged && isJsLike(prev.lang)) {
+            const { entry, content } = buildFileEntry(raw, pkgRootsDescByLen);
+            files.push(entry);
+            reparsed.push(raw.rel);
+            if (content !== null) newEdges.push(...edgesForFile(raw.rel, content, cfg, fileSet, pkgByName, aliasInfo.rules));
+          } else {
+            files.push({ ...prev, ...(pkg !== undefined ? { package: pkg } : {}) });
+            unchanged += 1;
+          }
           continue;
         }
         // racy → re-hash to be sure (catches same-size/same-mtime in-place edits).
         const { entry, content } = buildFileEntry(raw, pkgRootsDescByLen);
         if (entry.hash === prev.hash) {
-          files.push({ ...prev, ...(entry.package !== undefined ? { package: entry.package } : {}) });
-          unchanged += 1;
+          if (packageResolutionChanged && isJsLike(prev.lang)) {
+            files.push(entry);
+            reparsed.push(raw.rel);
+            if (content !== null) newEdges.push(...edgesForFile(raw.rel, content, cfg, fileSet, pkgByName, aliasInfo.rules));
+          } else {
+            files.push({ ...prev, ...(entry.package !== undefined ? { package: entry.package } : {}) });
+            unchanged += 1;
+          }
         } else {
           files.push(entry);
           reparsed.push(raw.rel);
@@ -840,8 +878,13 @@ export function createProjectIndex(deps: ProjectIndexDeps = {}): ProjectIndexApi
         reparsed.push(raw.rel);
         if (content !== null) newEdges.push(...edgesForFile(raw.rel, content, cfg, fileSet, pkgByName, aliasInfo.rules));
       } else {
-        // mtime moved but content identical → not a reparse; reuse stored edges for this file.
-        unchanged += 1;
+        if (packageResolutionChanged && isJsLike(prev.lang)) {
+          reparsed.push(raw.rel);
+          if (content !== null) newEdges.push(...edgesForFile(raw.rel, content, cfg, fileSet, pkgByName, aliasInfo.rules));
+        } else {
+          // mtime moved but content identical → not a reparse; reuse stored edges for this file.
+          unchanged += 1;
+        }
       }
     }
 
@@ -862,6 +905,7 @@ export function createProjectIndex(deps: ProjectIndexDeps = {}): ProjectIndexApi
         fileToTests: buildFileToTests(files),
         truncated,
         aliases: aliasSummary(repoAbs, packages, aliasInfo, imports),
+        graphHoles: graphHoleSummary(imports),
       },
       git,
     );

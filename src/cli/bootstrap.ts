@@ -86,6 +86,20 @@ export function enableDevKeysForInfoCommand(argv: readonly string[], env: NodeJS
   return true;
 }
 
+/**
+ * Short-lived CLI commands often exit immediately after printing. In some Node/pino
+ * combinations, ordinary `process.stdout.write` output can be lost when stdout is a pipe
+ * even though logger output has already flushed. Put stdio in blocking mode at the CLI
+ * entrypoint so clean-env smoke tests and shell pipelines see the command body reliably.
+ */
+export function forceBlockingStdIoForCli(): void {
+  type BlockingStream = NodeJS.WriteStream & { _handle?: { setBlocking?: (blocking: boolean) => void } };
+  for (const stream of [process.stdout, process.stderr] as BlockingStream[]) {
+    stream._handle?.setBlocking?.(true);
+  }
+}
+
 // ── side effects (run at import, BEFORE core/config is evaluated) ────────────
+forceBlockingStdIoForCli();
 loadDotenv(resolve(process.cwd(), ".env"));
 enableDevKeysForInfoCommand(process.argv.slice(2));

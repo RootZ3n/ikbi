@@ -25,6 +25,7 @@
 import { createInterface } from "node:readline";
 
 import { registerCommand } from "../../cli/registry.js";
+import { writeStderr, writeStdout } from "../../cli/io.js";
 import { config } from "../../core/config.js";
 import { beginOperation, resolveIdentity as coreResolveIdentity } from "../../core/identity/index.js";
 import type { IdentityClaim, OperationContext, ValidatedIdentity } from "../../core/identity/index.js";
@@ -110,8 +111,8 @@ export interface DiffCliDeps {
 /** Build the `ikbi diff <workspace-id>` handler — prints the workspace diff + a change summary. */
 export function createDiffCli(deps: DiffCliDeps = {}) {
   const workspaces: DiffWorkspaceSurface = deps.workspaces ?? coreWorkspaces;
-  const out = deps.stdout ?? ((s: string) => void process.stdout.write(s));
-  const err = deps.stderr ?? ((s: string) => void process.stderr.write(s));
+  const out = deps.stdout ?? writeStdout;
+  const err = deps.stderr ?? writeStderr;
   const setExit = deps.setExit ?? ((c: number) => void (process.exitCode = c));
   // Only colorize for an interactive terminal — piped/redirected output stays clean ANSI-free.
   const colorize = deps.colorize ?? (process.stdout.isTTY === true);
@@ -360,8 +361,8 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
   const operatorToken = "operatorToken" in deps ? deps.operatorToken : config.identity.operatorToken;
   const workerToken = "workerToken" in deps ? deps.workerToken : config.identity.workerToken;
   const gateWall = deps.gateWall ?? coreGateWall;
-  const out = deps.stdout ?? ((s: string) => void process.stdout.write(s));
-  const err = deps.stderr ?? ((s: string) => void process.stderr.write(s));
+  const out = deps.stdout ?? writeStdout;
+  const err = deps.stderr ?? writeStderr;
   const setExit = deps.setExit ?? ((c: number) => void (process.exitCode = c));
   const now = deps.now ?? Date.now;
   const cwd = deps.cwd ?? (() => process.cwd());

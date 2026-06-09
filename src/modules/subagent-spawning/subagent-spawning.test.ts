@@ -180,7 +180,14 @@ test("ENFORCEMENT LIVE: a probation parent ⇒ child probation ⇒ gate-wall DEN
   const { parentCtx, resolveIdentity, childClaim, roleClaim } = makeCast({ parentTier: "probation", childTier: "probation", workerTier: "probation" });
   const ws = governanceHonoringWorkspaces();
   // Real gate-wall (enabled by default), with fake receipts/publish so the test does no I/O.
-  const gateWall = createGateWall({ receipts: fakeReceipts(), publish: () => {} });
+  const realGateWall = createGateWall({ receipts: fakeReceipts(), publish: () => {} });
+  let gateDecision: PromoteGovernance | undefined;
+  const gateWall = {
+    evaluate: async (...args: Parameters<typeof realGateWall.evaluate>): Promise<PromoteGovernance> => {
+      gateDecision = await realGateWall.evaluate(...args);
+      return gateDecision;
+    },
+  };
 
   const orchestrator = createOrchestrator({
     gateWall,
@@ -200,9 +207,10 @@ test("ENFORCEMENT LIVE: a probation parent ⇒ child probation ⇒ gate-wall DEN
   const spawner = createSubagentSpawner({ resolveIdentity, childClaim, gateWall, orchestrator, publish: () => {} });
   const result = await spawner.spawn({ parentCtx, task });
 
-  // Governance reached promote and DENIED — enforcement is live (not advisory-allow).
-  assert.equal(ws.calls.promote, 1, "the run reached the promote/governance path");
-  assert.equal(ws.governance()?.allow, false, "gate-wall DENIED the probation parent's promote");
+  // Governance reached the promote gate and DENIED — enforcement is live (not advisory-allow).
+  assert.equal(gateDecision?.allow, false, "gate-wall DENIED the probation parent's promote");
+  assert.equal(ws.calls.promote, 0, "promote is not called after gate denial");
+  assert.equal(ws.calls.discard, 1, "workspace is discarded after gate denial");
   // ...and the run did not promote end-to-end.
   assert.equal(result.spawned, true);
   assert.equal(result.workerResult?.promoted, false, "a probation spawn does not promote");

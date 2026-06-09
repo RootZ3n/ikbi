@@ -172,7 +172,10 @@ export function createStdioTransport(options: StdioTransportOptions): McpTranspo
       child.stderr?.on("data", (chunk) => {
         stderrTail = (stderrTail + (typeof chunk === "string" ? chunk : chunk.toString("utf8"))).slice(-MAX_STDERR);
       });
-      child.on("exit", () => { closed = true; rejectAll("MCP server process exited"); });
+      child.on("exit", () => {
+        closed = true;
+        rejectAll(`MCP server process exited${stderrTail.length > 0 ? ` (stderr: ${stderrTail.slice(-200)})` : ""}`);
+      });
       child.on("error", (err) => { closed = true; rejectAll(`MCP server process error: ${err instanceof Error ? err.message : String(err)}`); });
 
       // JSON-RPC handshake: initialize → initialized notification.

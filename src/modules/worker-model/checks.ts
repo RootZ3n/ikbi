@@ -139,6 +139,56 @@ export async function workingTreePackageJsonDiff(
   return runGit(["-C", worktreePath, "diff", baseRef, "--", "*package.json"]);
 }
 
+const RELEVANT_WORKTREE_EXTS: readonly string[] = [
+  ".ts",
+  ".tsx",
+  ".js",
+  ".jsx",
+  ".mjs",
+  ".cjs",
+  ".json",
+  ".css",
+  ".scss",
+  ".sass",
+  ".less",
+  ".html",
+  ".vue",
+  ".svelte",
+  ".md",
+  ".mdx",
+  ".yaml",
+  ".yml",
+];
+
+function syntheticAddedDiff(path: string): string {
+  return [`diff --git a/${path} b/${path}`, "--- /dev/null", `+++ b/${path}`, "@@ -0,0 +1 @@", "+untracked"].join("\n");
+}
+
+function isRelevantWorktreePath(path: string): boolean {
+  const lower = path.toLowerCase();
+  return RELEVANT_WORKTREE_EXTS.some((ext) => lower.endsWith(ext));
+}
+
+/**
+ * Verifier-time planning diff: tracked working-tree changes against `baseRef` plus untracked
+ * relevant files. The synthetic untracked headers make `parseChangedFiles` see greenfield work
+ * rather than treating an empty tracked diff as an impact-scoped green.
+ */
+export async function workingTreePlanningDiff(
+  runGit: (args: readonly string[]) => Promise<string>,
+  worktreePath: string,
+  baseRef: string,
+): Promise<string> {
+  const trackedRaw = await runGit(["-C", worktreePath, "diff", "--name-only", baseRef, "--", "."]);
+  const untrackedRaw = await runGit(["-C", worktreePath, "ls-files", "--others", "--exclude-standard", "--", "."]);
+  const paths = [...trackedRaw.split(/\r?\n/), ...untrackedRaw.split(/\r?\n/)]
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0 && isRelevantWorktreePath(s))
+    .sort();
+  const unique = [...new Set(paths)];
+  return unique.map(syntheticAddedDiff).join("\n");
+}
+
 /** Captured output tail length retained in a check result. */
 export const MAX_OUTPUT_TAIL = 2_000;
 

@@ -11,6 +11,7 @@ import type { OperationContext } from "../../core/identity/index.js";
 import type { ExecRequest, ExecResult } from "../governed-exec/index.js";
 import type { FileEntry, PackageEntry, ProjectIndexData } from "../project-index/index.js";
 import { createVerifier, parseChangedFiles, DEFAULT_CHECK_TIMEOUT_MS, MAX_CHECK_TIMEOUT_MS } from "./verifier.js";
+import { workingTreePlanningDiff } from "./checks.js";
 import type { RoleContext } from "./contract.js";
 
 const PCTX = {} as unknown as OperationContext;
@@ -46,6 +47,19 @@ test("parseChangedFiles extracts paths from a unified diff", () => {
   assert.deepEqual(parseChangedFiles(diffOf(["packages/a/src/foo.ts", "tsconfig.json"])), ["packages/a/src/foo.ts", "tsconfig.json"]);
 });
 
+test("workingTreePlanningDiff includes relevant untracked files with synthetic diff headers", async () => {
+  const d = await workingTreePlanningDiff(
+    async (args) => {
+      if (args.includes("diff")) return "";
+      if (args.includes("ls-files")) return "packages/a/src/new.ts\n";
+      return "";
+    },
+    "/wt",
+    "base",
+  );
+  assert.deepEqual(parseChangedFiles(d), ["packages/a/src/new.ts"]);
+});
+
 test("default (no IKBI_VERIFY) → legacy verification UNCHANGED (no scope stamp)", async () => {
   const ge = fakeGovernedExec();
   const v = createVerifier({ governedExec: ge.exec, parentCtx: PCTX, diff: async () => diffOf(["src/x.ts"]), env: {} });
@@ -72,6 +86,44 @@ test("ladder: local change runs nearest + package, NOT full; scope=impact", asyn
   assert.ok(stages.includes("nearest-tests") && stages.includes("package-checks"));
   assert.ok(!stages.includes("full"), "no full stage for a local change");
   assert.match(r.summary ?? "", /scope "impact"/);
+});
+
+test("ladder: uncommitted source edit from planningDiff reaches planVerification", async () => {
+  const data = mkData({
+    packages: [pkg("packages/a", { test: "vitest run" })],
+    files: [file("packages/a/src/foo.ts"), file("packages/a/src/foo.test.ts", { isTest: true })],
+    fileToTests: { "packages/a/src/foo.ts": ["packages/a/src/foo.test.ts"] },
+  });
+  const ge = fakeGovernedExec();
+  let seenChanged: readonly string[] = [];
+  const v = createVerifier({
+    governedExec: ge.exec,
+    parentCtx: PCTX,
+    diff: async () => "", // script-integrity package.json subset can be empty
+    planningDiff: async () => diffOf(["packages/a/src/foo.ts"]),
+    env: { IKBI_VERIFY: "ladder" },
+    index: { refresh: async () => ({ data }) },
+    plan: (req) => {
+      seenChanged = req.changedFiles;
+      return {
+        status: "ok" as const,
+        blocked: false,
+        blockReasons: [],
+        scope: "impact" as const,
+        escalateToFull: false,
+        escalationReasons: [],
+        affectedPackages: ["packages/a"],
+        affectedTests: [],
+        neutralPackages: [],
+        stubScripts: [],
+        stages: [{ stage: "package-checks", tasks: [{ package: "packages/a", cwd: "packages/a", name: "test", command: "pnpm", args: ["test"], scope: "package", reason: "test" }] }],
+        receipts: [],
+      };
+    },
+  });
+  const r = await v(makeCtx("/wt"));
+  assert.equal(r.outcome, "success");
+  assert.deepEqual(seenChanged, ["packages/a/src/foo.ts"]);
 });
 
 test("ladder: shared config change (tsconfig) escalates to full", async () => {

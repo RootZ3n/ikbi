@@ -41,7 +41,7 @@ import type { BuildCandidate, JudgeResult } from "../deterministic-judge/index.j
 import type { ExecRequest, GovernedExec } from "../governed-exec/index.js";
 
 import { builder, createBuilder, MAX_TOOL_ITERATIONS } from "./builder.js";
-import { resolveChecks, workingTreePackageJsonDiff } from "./checks.js";
+import { resolveChecks, workingTreePackageJsonDiff, workingTreePlanningDiff } from "./checks.js";
 import { builderModel, competitiveBuilderModels } from "./role-models.js";
 import { critic } from "./critic.js";
 import { integrator } from "./integrator.js";
@@ -328,10 +328,28 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             return Promise.all([committedP, workingP]).then(([c, w]) => `${c}\n${w}`);
           }
         : undefined;
+    const runGitForDiff = async (args: readonly string[], ws: WorkspaceHandle, purpose: string): Promise<string> => {
+      if (govExecForRoles === undefined) throw new Error("governed-exec unavailable for verifier planning diff");
+      const res = await govExecForRoles.run({ parentCtx, command: "git", args: [...args], cwd: ws.path, purpose });
+      if (!res.executed || res.exitCode !== 0) throw new Error(res.reason ?? `git exited ${res.exitCode ?? "unknown"}`);
+      return res.stdoutTail ?? "";
+    };
+    const planningDiff: ((ws: WorkspaceHandle) => Promise<string>) | undefined =
+      hasCommitted || govExecForRoles !== undefined
+        ? (ws: WorkspaceHandle): Promise<string> => {
+            const committedP = hasCommitted ? workspaces.diff!(ws) : Promise.resolve("");
+            const workingP =
+              govExecForRoles !== undefined
+                ? workingTreePlanningDiff((args) => runGitForDiff(args, ws, "verifier: ladder planning working-tree diff"), ws.path, ws.baseRef)
+                : Promise.resolve("");
+            return Promise.all([committedP, workingP]).then(([c, w]) => `${c}\n${w}`);
+          }
+        : undefined;
     return createVerifier({
       ...(govExecForRoles !== undefined ? { governedExec: govExecForRoles } : {}),
       parentCtx,
       ...(scriptIntegrityDiff !== undefined ? { diff: scriptIntegrityDiff } : {}),
+      ...(planningDiff !== undefined ? { planningDiff } : {}),
       // PROJECT-ROOT GUARD + per-target check set (Fix 1/2): wired ONLY in production
       // (enforceProjectRoot), so a no-manifest / wrong-repo worktree fails closed RED.
       ...(enforceProjectRoot ? { resolveChecks: (ws: string) => resolveChecks(ws) } : {}),
@@ -768,17 +786,23 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         // per-run grant is in scope at the promote point).
         const governanceGrant = autonomyForTier(asTier(parentIdentity.trustTier ?? TRUST_FLOOR, TRUST_FLOOR));
         const governance: PromoteGovernance = await gateWall.evaluate({ grant: governanceGrant, action: { kind: "promote", task, results }, identity: parentIdentity });
-        const promote = await workspaces.promote(workspace, {
-          evaluation: decision.evaluation, // sourced from the integrator, NOT hardcoded
-          governance,
-          // Auditability: record the verification scope the promote relied on in the commit message.
-          message: `worker-model: ${task.goal}${decision.rationale !== undefined ? ` — ${decision.rationale}` : ""}${verificationScope !== undefined ? ` [verification: ${verificationScope}]` : ""}`,
-        });
-        promoted = promote.promoted;
-        if (!promoted) {
-          // Conflict: the workspace is reconcilable — downgrade to partial, do NOT discard.
-          overall = "partial";
-          reason = promote.reason ?? "promote did not land (conflict)";
+        if (!governance.allow) {
+          await workspaces.discard(workspace);
+          overall = "rejected";
+          reason = governance.reason ?? "gate-wall denied promotion";
+        } else {
+          const promote = await workspaces.promote(workspace, {
+            evaluation: decision.evaluation, // sourced from the integrator, NOT hardcoded
+            governance,
+            // Auditability: record the verification scope the promote relied on in the commit message.
+            message: `worker-model: ${task.goal}${decision.rationale !== undefined ? ` — ${decision.rationale}` : ""}${verificationScope !== undefined ? ` [verification: ${verificationScope}]` : ""}`,
+          });
+          promoted = promote.promoted;
+          if (!promoted) {
+            // Conflict: the workspace is reconcilable — downgrade to partial, do NOT discard.
+            overall = "partial";
+            reason = promote.reason ?? "promote did not land (conflict)";
+          }
         }
       }
     } else if (!approvalRejected) {
@@ -1010,6 +1034,13 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 
       const governanceGrant = autonomyForTier(asTier(parentIdentity.trustTier ?? TRUST_FLOOR, TRUST_FLOOR));
       const governance: PromoteGovernance = await gateWall.evaluate({ grant: governanceGrant, action: { kind: "promote", task, results: winnerRoles }, identity: parentIdentity });
+      if (!governance.allow) {
+        for (const ws of handles) await safeDiscard(workspaces, ws);
+        const reason = governance.reason ?? "gate-wall denied promotion";
+        events.publish(workerCompetitiveCompleted.create({ taskId: task.taskId, candidateCount: n, winnerWorkspaceId: winner.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
+        events.publish(workerFailed.create({ taskId: task.taskId, reason, workspaceId: winner.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
+        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: winnerRoles, workspaceId: winner.id, promoted: false, reason, costUsd: runCost() };
+      }
       const promote = await workspaces.promote(winner, {
         evaluation: { approved: true, score: verdict.winner.composite, evaluatorId: "deterministic-judge" },
         governance,
@@ -1058,8 +1089,10 @@ function readVerifier(verifierResult: RoleResult | undefined): { typecheckPass: 
   const find = (name: string) => checks.find((c) => c.name === name);
   const typecheck = find("typecheck");
   const test = find("test");
-  const typecheckPass = typecheck !== undefined && typecheck.exitCode === 0;
-  const testsPass = test !== undefined && test.exitCode === 0;
+  const verdict = detail.verdict;
+  const authoritativePass = verdict === "pass" && verifierResult.outcome === "success";
+  const typecheckPass = typecheck !== undefined ? typecheck.exitCode === 0 : authoritativePass;
+  const testsPass = test !== undefined ? test.exitCode === 0 : authoritativePass;
   const testCount = test !== undefined && typeof test.outputTail === "string" ? parseTestCount(test.outputTail) : undefined;
   // ISSUE 4: carry the ACTUAL per-check results (by their real names) so the UI shows custom
   // IKBI_CHECKS correctly instead of forcing every run onto the typecheck/tests axes.

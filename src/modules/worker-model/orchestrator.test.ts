@@ -880,15 +880,18 @@ function capturingWorkspaces() {
   return { workspaces, captured: () => approval, calls };
 }
 
-test("gate-wall wired: a DENYING gateWall → governance.allow=false reaches promote", async () => {
+test("gate-wall wired: a DENYING gateWall → stable rejection, workspace discarded, promote not called", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
   const ws = capturingWorkspaces();
   const gateWall = { evaluate: async (): Promise<PromoteGovernance> => ({ allow: false, reason: "denied by policy", gateId: "g1" }) };
   const cap = capturingRoles();
   const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, gateWall, roles: cap.roles }));
-  await orch.run(task, parentCtx);
-  assert.equal(ws.captured()?.governance?.allow, false, "the deny verdict is passed into promote");
-  assert.match(ws.captured()?.governance?.reason ?? "", /denied by policy/);
+  const result = await orch.run(task, parentCtx);
+  assert.equal(result.promoted, false);
+  assert.equal(result.outcome, "rejected");
+  assert.match(result.reason ?? "", /denied by policy/);
+  assert.equal(ws.captured(), undefined, "promote() was never called on gate denial");
+  assert.equal(ws.calls.discard, 1, "workspace discarded; no allocated leak");
 });
 
 test("gate-wall wired: an ALLOWING gateWall → governance.allow=true reaches promote", async () => {

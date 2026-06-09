@@ -101,6 +101,9 @@ export interface ProjectIndexData {
    * must escalate to full rather than trust an impact-scoped result.
    */
   readonly aliases?: { readonly present: boolean; readonly unresolved: number };
+  /** Other unresolved import graph holes that affect impact confidence, such as JS/TS imports of
+   *  assets/templates that could not be resolved to an indexed file. */
+  readonly graphHoles?: { readonly unresolved: number };
   /** Git provenance (HEAD/branch/dirty) when the repo is a git root; undefined otherwise. */
   readonly git?: GitProvenance;
   /**

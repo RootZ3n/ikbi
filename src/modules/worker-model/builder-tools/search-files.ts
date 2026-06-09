@@ -17,6 +17,8 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { join, relative, sep } from "node:path";
 
 import type { ModelTool } from "../../../core/provider/contract.js";
 import { confinePath, type BuilderToolResult } from "./confine.js";
@@ -44,6 +46,68 @@ export const searchFilesTool: ModelTool = {
     required: ["pattern"],
   },
 };
+
+function globToRegExp(glob: string): RegExp {
+  let out = "";
+  for (const ch of glob) {
+    if (ch === "*") out += ".*";
+    else if (ch === "?") out += ".";
+    else out += ch.replace(/[\\^$+?.()|[\]{}]/g, "\\$&");
+  }
+  return new RegExp(`^${out}$`);
+}
+
+function fallbackSearch(worktreeReal: string, root: string, pattern: string, fileGlob: string | undefined, maxResults: number): string {
+  let re: RegExp;
+  try {
+    re = new RegExp(pattern);
+  } catch (e) {
+    return `ERROR: search failed: invalid regex (${e instanceof Error ? e.message : String(e)})`;
+  }
+  const glob = fileGlob !== undefined && fileGlob.length > 0 ? globToRegExp(fileGlob) : undefined;
+  const matches: string[] = [];
+  const visit = (dir: string): void => {
+    if (matches.length >= maxResults) return;
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      if (matches.length >= maxResults) return;
+      if (entry.name === ".git" || entry.name === "node_modules") continue;
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        visit(full);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      if (glob !== undefined && !glob.test(entry.name)) continue;
+      let st;
+      try {
+        st = statSync(full);
+      } catch {
+        continue;
+      }
+      if (st.size > 1_000_000) continue;
+      let text;
+      try {
+        text = readFileSync(full, "utf8");
+      } catch {
+        continue;
+      }
+      const rel = relative(worktreeReal, full).split(sep).join("/");
+      const lines = text.split(/\r?\n/);
+      for (let i = 0; i < lines.length && matches.length < maxResults; i += 1) {
+        if (re.test(lines[i] ?? "")) matches.push(`${rel}:${i + 1}:${lines[i] ?? ""}`);
+      }
+    }
+  };
+  visit(root);
+  return matches.length === 0 ? `No matches for "${pattern}"` : matches.join("\n").slice(0, MAX_OUTPUT_BYTES);
+}
 
 /**
  * Run a ripgrep search confined to the worktree. Pure: produces a result string
@@ -85,6 +149,10 @@ export function runSearchFiles(worktreeReal: string, args: Record<string, unknow
     const status = (e as { status?: number }).status;
     if (status === 1) {
       return { output: `No matches for "${pattern}"` };
+    }
+    const code = (e as { code?: unknown }).code;
+    if (code === "EPERM" || code === "ENOENT") {
+      return { output: fallbackSearch(worktreeReal, c.full, pattern, typeof args.file_glob === "string" ? args.file_glob : undefined, maxResults) };
     }
     const msg = e instanceof Error ? e.message : String(e);
     return { output: `ERROR: search failed: ${msg}` };

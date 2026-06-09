@@ -26,6 +26,7 @@ import { trust } from "../core/trust/index.js";
 import { commands } from "./registry.js";
 import { runDoctor } from "./doctor.js";
 import { runCapabilities } from "./capabilities.js";
+import { writeStderr, writeStdout } from "./io.js";
 // Core-facing operator commands registered from their own files (read the receipt store /
 // workspace manager). Imported here so registerCommand fires before dispatch.
 import "./receipts.js";
@@ -50,7 +51,7 @@ async function dispatchCommand(argv: readonly string[]): Promise<void> {
   const name = argv[0];
   const sub = name !== undefined ? commands.get(name) : undefined;
   if (sub === undefined) {
-    process.stderr.write(`ikbi: cannot auto-run unrecognized command "${name ?? ""}"\n`);
+    writeStderr(`ikbi: cannot auto-run unrecognized command "${name ?? ""}"\n`);
     return;
   }
   await sub.run(argv.slice(1));
@@ -90,13 +91,13 @@ function printUsage(): void {
     "(Edit that JSON file to add/remove models & providers — no code change.)",
     "",
   );
-  process.stdout.write(lines.join("\n"));
+  writeStdout(lines.join("\n"));
 }
 
 function listModels(): void {
   const models = registry.listModels();
   if (models.length === 0) {
-    process.stdout.write("(no models in roster)\n");
+    writeStdout("(no models in roster)\n");
     return;
   }
   for (const m of models) {
@@ -108,17 +109,17 @@ function listModels(): void {
       })
       .join(" -> ");
     const role = m.role ? ` [${m.role}]` : "";
-    process.stdout.write(`${m.id}${role}  chain=${chain}\n`);
+    writeStdout(`${m.id}${role}  chain=${chain}\n`);
   }
 }
 
 function listProviders(): void {
   const providers = registry.listProviders();
   if (providers.length === 0) {
-    process.stdout.write("(no providers registered)\n");
+    writeStdout("(no providers registered)\n");
     return;
   }
-  for (const p of providers) process.stdout.write(`${p.id}\n`);
+  for (const p of providers) writeStdout(`${p.id}\n`);
 }
 
 /**
@@ -131,7 +132,7 @@ function runInfo(name: string, fn: () => void): void {
     fn();
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    process.stderr.write(`ikbi ${name}: configuration error — ${msg}\n  (set the required IKBI_* env vars or add them to a .env file; see README.md / SECURITY.md)\n`);
+    writeStderr(`ikbi ${name}: configuration error — ${msg}\n  (set the required IKBI_* env vars or add them to a .env file; see README.md / SECURITY.md)\n`);
     process.exitCode = 1;
   }
 }
@@ -140,7 +141,7 @@ async function run(argv: readonly string[]): Promise<void> {
   const cmd = argv[0];
   switch (cmd) {
     case "version":
-      process.stdout.write(`${config.version}\n`);
+      writeStdout(`${config.version}\n`);
       return;
     case "models":
       listModels();
@@ -149,10 +150,10 @@ async function run(argv: readonly string[]): Promise<void> {
       listProviders();
       return;
     case "doctor":
-      runInfo("doctor", () => process.stdout.write(`${runDoctor().lines.join("\n")}\n`));
+      runInfo("doctor", () => writeStdout(`${runDoctor().lines.join("\n")}\n`));
       return;
     case "capabilities":
-      runInfo("capabilities", () => process.stdout.write(`${runCapabilities().lines.join("\n")}\n`));
+      runInfo("capabilities", () => writeStdout(`${runCapabilities().lines.join("\n")}\n`));
       return;
     case undefined:
     case "help":
@@ -169,10 +170,10 @@ async function run(argv: readonly string[]): Promise<void> {
       try {
         const { rejected } = await trust.preload();
         if (rejected > 0) {
-          process.stderr.write(`ikbi: trust preload rejected ${rejected} unreadable/forged state doc(s) (fail-closed)\n`);
+          writeStderr(`ikbi: trust preload rejected ${rejected} unreadable/forged state doc(s) (fail-closed)\n`);
         }
       } catch (err) {
-        process.stderr.write(`ikbi: trust preload failed: ${err instanceof Error ? err.message : String(err)}\n`);
+        writeStderr(`ikbi: trust preload failed: ${err instanceof Error ? err.message : String(err)}\n`);
       }
       // Module commands compose via the command-registrar seam. Built-ins above
       // take precedence (a module cannot shadow a core command).
@@ -191,6 +192,6 @@ async function run(argv: readonly string[]): Promise<void> {
 }
 
 run(process.argv.slice(2)).catch((err: unknown) => {
-  process.stderr.write(`ikbi: ${err instanceof Error ? err.message : String(err)}\n`);
+  writeStderr(`ikbi: ${err instanceof Error ? err.message : String(err)}\n`);
   process.exitCode = 1;
 });
