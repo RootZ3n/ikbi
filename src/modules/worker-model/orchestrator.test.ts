@@ -335,6 +335,50 @@ test("failure path: a role failure short-circuits, workspace DISCARDED (not prom
   assert.equal(result.promoted, false);
 });
 
+test("Bug 2: a role failure RETAINS the workspace (not discarded) when the manager supports retain", async () => {
+  // The builder may have written real files before failing; retention keeps the worktree on
+  // disk for inspection. The orchestrator calls retain (not discard) when overall is a failure.
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  let retained = 0;
+  let retainReason = "";
+  const wrapped: NonNullable<OrchestratorDeps["workspaces"]> = {
+    ...ws.workspaces,
+    retain: async (h, reason): Promise<DiscardResult> => {
+      retained += 1;
+      retainReason = reason;
+      return { workspaceId: h.id, removed: false };
+    },
+  };
+  const cap = capturingRoles((r) => (r === "builder" ? "failure" : "success"));
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, workspaces: wrapped }));
+  const result = await orch.run(task, parentCtx);
+
+  assert.equal(ws.calls.promote, 0, "not promoted");
+  assert.equal(ws.calls.discard, 0, "a FAILED build is NOT discarded — its work is retained");
+  assert.equal(retained, 1, "the failed build's workspace is retained for inspection");
+  assert.match(retainReason, /failure/, "the retain reason reflects the failed outcome");
+  assert.equal(result.outcome, "failure");
+  assert.equal(result.promoted, false);
+});
+
+test("Bug 2: retention OFF restores eager discard on a failed build", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  let retained = 0;
+  const wrapped: NonNullable<OrchestratorDeps["workspaces"]> = {
+    ...ws.workspaces,
+    retain: async (h): Promise<DiscardResult> => { retained += 1; return { workspaceId: h.id, removed: false }; },
+  };
+  const cap = capturingRoles((r) => (r === "builder" ? "failure" : "success"));
+  const orch = createOrchestrator(
+    baseDeps({ config: { ...ENABLED, retainFailedWorkspaces: false }, resolveIdentity, roleClaim, roles: cap.roles, workspaces: wrapped }),
+  );
+  await orch.run(task, parentCtx);
+  assert.equal(retained, 0, "retention off ⇒ retain not called");
+  assert.equal(ws.calls.discard, 1, "retention off ⇒ the failed build is discarded as before");
+});
+
 test("promote conflict downgrades the run to partial (not promoted)", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
   const ws = fakeWorkspaces(false); // promote returns promoted:false (conflict)

@@ -15,6 +15,12 @@
  *                                    `run` is byte-identical to single-workspace behavior.
  *   IKBI_WORKER_MODEL_COMPETITIVE_N    candidate count when competitive. Default 2, bounded
  *                                    [MIN_COMPETITIVE_N, MAX_COMPETITIVE_N].
+ *   IKBI_WORKER_MODEL_RETAIN_FAILED_WORKSPACES  on/off. DEFAULT ON — when a build FAILS
+ *                                    (timeout, tool rejection, non-converging loop), the
+ *                                    workspace is RETAINED (worktree kept on disk) instead of
+ *                                    discarded, so the operator can inspect what was built.
+ *                                    `ikbi clean` reclaims retained workspaces. Set OFF to
+ *                                    restore the old eager-discard behavior.
  */
 
 import { moduleEnv } from "../../core/module-config.js";
@@ -45,6 +51,12 @@ export interface WorkerModelConfig {
   readonly competitive?: boolean;
   /** Candidate count when competitive (bounded [MIN,MAX]). */
   readonly competitiveN?: number;
+  /**
+   * Retain (don't discard) a workspace when the build FAILS, keeping its worktree on disk for
+   * inspection. DEFAULT ON. Optional in the type so pre-existing config literals stay valid;
+   * the loader always sets it.
+   */
+  readonly retainFailedWorkspaces?: boolean;
 }
 
 /** Load the worker-model config slice from `IKBI_WORKER_MODEL_*`. */
@@ -55,6 +67,7 @@ export function loadWorkerModelConfig(reader = env): WorkerModelConfig {
     maxConcurrentRuns: reader.int("MAX_CONCURRENT_RUNS", DEFAULT_MAX_CONCURRENT_RUNS, { min: 1 }),
     competitive: reader.bool("COMPETITIVE", false),
     competitiveN: reader.int("COMPETITIVE_N", DEFAULT_COMPETITIVE_N, { min: MIN_COMPETITIVE_N, max: MAX_COMPETITIVE_N }),
+    retainFailedWorkspaces: reader.bool("RETAIN_FAILED_WORKSPACES", true),
   });
 }
 

@@ -69,6 +69,54 @@ test("promote removes the source worktree DIRECTORY but keeps the scratch branch
   }
 });
 
+test("retain KEEPS the worktree (files survive) but marks the record failed, and clean reclaims it later", async () => {
+  // Bug 2: a FAILED build must not lose its work. retain keeps the worktree directory on disk
+  // (so the operator can inspect what was built), marks the record terminal-failed, and frees
+  // the live slot — then a later `ikbi clean` (cleanOrphans) reclaims the lingering dir.
+  const repo = await makeRepo();
+  const { mgr, root } = makeManager();
+  try {
+    const ws = await mgr.allocate({ targetRepo: repo, identity: ID });
+    await writeFile(join(ws.path, "index.html"), "<html>built before the timeout</html>\n");
+
+    const r = await mgr.retain(ws, "build timed out");
+    assert.equal(r.removed, false, "retain does not remove the worktree");
+    // THE POINT: the work the build wrote survives on disk.
+    assert.ok(await exists(ws.path), "the worktree directory is KEPT for inspection");
+    assert.ok(await exists(join(ws.path, "index.html")), "the file the build wrote survives retain");
+    // The scratch branch is kept too (a post-mortem `ikbi diff <id>` still works).
+    assert.ok((await listBranches(repo, SCRATCH_BRANCH_PREFIX)).includes(ws.scratchBranch), "scratch branch kept");
+    const rec = await mgr.get(ws.id);
+    assert.equal(rec?.state, "failed", "the record is marked terminal-failed");
+    assert.match(rec?.note ?? "", /retained: build timed out/);
+    assert.equal(mgr.liveCount(), 0, "the allocation slot is freed (does not hold the live bound)");
+
+    // `ikbi clean` reclaims the retained worktree afterwards (the manual/eventual cleanup).
+    const cleaned = await mgr.cleanOrphans();
+    assert.ok(cleaned.removed >= 1, "clean reclaims the retained worktree");
+    assert.equal(await exists(ws.path), false, "the retained worktree dir is removed by clean");
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
+test("retain never downgrades a promoted record", async () => {
+  const repo = await makeRepo();
+  const { mgr, root } = makeManager();
+  try {
+    const ws = await mgr.allocate({ targetRepo: repo, identity: ID });
+    await writeFile(join(ws.path, "feature.txt"), "feature\n");
+    await mgr.commit(ws, "add feature");
+    await mgr.promote(ws, APPROVE);
+
+    const r = await mgr.retain(ws, "should be a no-op");
+    assert.equal(r.removed, false);
+    assert.equal((await mgr.get(ws.id))?.state, "promoted", "a promoted record stays promoted");
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
 test("cleanOrphans reclaims a terminal workspace whose worktree dir lingered", async () => {
   const repo = await makeRepo();
   const { mgr, root, store } = makeManager();

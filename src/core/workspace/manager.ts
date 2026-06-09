@@ -343,6 +343,39 @@ export class WorkspaceManager {
     });
   }
 
+  // ---- retain (failed build: KEEP the worktree on disk for inspection) ----
+
+  /**
+   * Retain a workspace whose build FAILED instead of discarding it: mark the record terminal
+   * (`failed`) and free its allocation slot (so the live bound is not held), but DELIBERATELY
+   * KEEP the worktree directory + scratch branch on disk so the operator can inspect what was
+   * built (e.g. a 13KB index.html the build wrote before timing out). Because the record is
+   * terminal-`failed` with its path still present, a later `ikbi clean` (cleanOrphans) reclaims
+   * the leftover directory — the manual/eventual cleanup the discard used to do eagerly.
+   *
+   * A `promoted` record is NEVER downgraded (its landed mutation stands). Idempotent for an
+   * already-terminal record (no-op beyond a note refresh).
+   */
+  async retain(handle: WorkspaceHandle, reason: string): Promise<DiscardResult> {
+    return this.locks.withLock(this.wsKey(handle.id), async () => {
+      const rec = await this.store.get(handle.id);
+      if (rec === undefined) {
+        this.live.delete(handle.id);
+        return { workspaceId: handle.id, removed: false };
+      }
+      if (rec.state === "promoted") {
+        // Terminal-promoted: never downgrade; nothing to retain (the worktree dir is already freed).
+        return { workspaceId: handle.id, removed: false };
+      }
+      // Mark failed (terminal) but KEEP the worktree dir + branch — no removeWorktree/deleteBranch.
+      await this.store.put(handle.id, { ...rec, state: "failed", updatedAt: this.now(), note: `retained: ${reason}` });
+      this.live.delete(handle.id);
+      this.events?.publish(WorkspaceEvents.failed.create({ workspaceId: handle.id, reason }, { source: "workspace", attribution: { identity: handle.identity } }));
+      this.log.info({ event: "workspace_retained", workspaceId: handle.id, reason, path: handle.path }, "workspace retained for inspection (worktree kept; reclaim later with `ikbi clean`)");
+      return { workspaceId: handle.id, removed: false };
+    });
+  }
+
   // ---- reclaim (respects the per-workspace lock; skips active) ----
 
   async reclaim(targetRepo: string): Promise<ReclaimResult> {

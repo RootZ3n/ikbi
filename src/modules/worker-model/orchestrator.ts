@@ -92,6 +92,13 @@ export interface OrchestratorDeps {
     allocate: (opts: { targetRepo: string; identity: AgentIdentity; baseBranch?: string; label?: string }) => Promise<WorkspaceHandle>;
     promote: (handle: WorkspaceHandle, approval: { evaluation: WorkspaceEvaluation; governance?: PromoteGovernance; message?: string }) => Promise<PromoteResult>;
     discard: (handle: WorkspaceHandle) => Promise<DiscardResult>;
+    /**
+     * Retain a FAILED build's workspace (mark it terminal-failed but KEEP the worktree on disk
+     * for inspection) instead of discarding it. Optional: when absent (older injected doubles)
+     * the orchestrator falls back to discard, so behavior is unchanged. The real manager provides
+     * it; `ikbi clean` reclaims retained workspaces later. (Bug 2 fix.)
+     */
+    retain?: (handle: WorkspaceHandle, reason: string) => Promise<DiscardResult>;
     /** Unified diff of the workspace vs its base (competitive mode reads it for the diff signal). Optional. */
     diff?: (handle: WorkspaceHandle) => Promise<string>;
     /**
@@ -244,6 +251,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   const gateWall = deps.gateWall; // optional in the type — absent → promote DENIED fail-closed (H5)
   const judge = deps.judge ?? deterministicJudge; // competitive-mode scorer (pure, no model)
   const enforceProjectRoot = deps.enforceProjectRoot ?? false; // Fix 1/2 guard — production-only (off in tests)
+  // Bug 2: retain (don't discard) a FAILED build's workspace so its work survives for inspection.
+  const retainFailedWorkspaces = config.retainFailedWorkspaces ?? true;
   const requestApproval = deps.requestApproval; // SG-10 human-approval gate (undefined ⇒ no gate)
   // SG-1: when a live-output sink is wired, wrap the injected governed executor so EVERY check
   // it runs streams its output to the sink. No sink (the common/test case) ⇒ the base executor
@@ -536,9 +545,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         }
       }
     } catch (err) {
-      // Infrastructure failure mid-run (e.g. escalation guard): discard + fail.
-      await safeDiscard(workspaces, workspace);
+      // Infrastructure failure mid-run (e.g. escalation guard): RETAIN the work for inspection
+      // (Bug 2) instead of discarding it — the worktree may hold real progress. `ikbi clean`
+      // reclaims it later. Falls back to discard when retention is off / unavailable.
       const reason = err instanceof Error ? err.message : String(err);
+      if (retainFailedWorkspaces) await safeRetain(workspaces, workspace, `infrastructure failure: ${reason}`);
+      else await safeDiscard(workspaces, workspace);
       events.publish(
         workerFailed.create(
           { taskId: task.taskId, reason, workspaceId: workspace.id },
@@ -617,11 +629,20 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       }
     } else if (!approvalRejected) {
       // The integrator did not approve promote (and it was not an approval-gate rejection,
-      // which already discarded above). Fail-closed discard.
-      await workspaces.discard(workspace);
+      // which already discarded above). Fail-closed: nothing lands.
       reason =
         decision.rationale ??
         (overall !== "success" ? `run ended with role outcome "${overall}"` : "integrator did not approve promote");
+      // Bug 2: when the build actually FAILED (a role did not converge — overall is not
+      // "success"), RETAIN the workspace so its work survives for inspection instead of
+      // discarding it (the builder may have written real files before the failure). A build
+      // that ran GREEN but the integrator declined to promote is a deliberate "not promotable"
+      // verdict → discard as before. Retention is gated (default on); off ⇒ old eager discard.
+      if (retainFailedWorkspaces && overall !== "success") {
+        await safeRetain(workspaces, workspace, reason);
+      } else {
+        await workspaces.discard(workspace);
+      }
       // Roles ran to completion but the work was judged not promotable → not a
       // misleading "success".
       if (overall === "success") overall = "rejected";
@@ -906,6 +927,24 @@ async function safeDiscard(
     await workspaces.discard(workspace);
   } catch {
     // swallow — the caller is already failing; discard is best-effort cleanup.
+  }
+}
+
+/**
+ * Best-effort RETAIN (Bug 2) for a failed build: keep the worktree on disk for inspection
+ * instead of discarding it. Falls back to discard when the manager has no `retain` (older
+ * injected doubles) so behavior degrades safely. Never masks the original error.
+ */
+async function safeRetain(
+  workspaces: NonNullable<OrchestratorDeps["workspaces"]>,
+  workspace: WorkspaceHandle,
+  reason: string,
+): Promise<void> {
+  try {
+    if (workspaces.retain !== undefined) await workspaces.retain(workspace, reason);
+    else await workspaces.discard(workspace);
+  } catch {
+    // swallow — the caller is already failing; retain is best-effort.
   }
 }
 
