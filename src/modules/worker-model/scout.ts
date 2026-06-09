@@ -24,6 +24,7 @@ import { toUntrustedMessage } from "../../core/injection/index.js";
 import type { ModelMessage, ModelRequest } from "../../core/provider/contract.js";
 import type { RoleFn } from "./contract.js";
 import { driverModel } from "./role-models.js";
+import type { ProjectRetrievalApi } from "../project-retrieval/index.js";
 
 /** A single thing scout learned. Lives in the open `detail` bag — NOT a contract type. */
 export interface ScoutFinding {
@@ -175,47 +176,97 @@ function parseFindings(content: string): ScoutFinding[] {
   return [{ title: "investigation", detail: detail.length > 0 ? detail : "(no analysis returned)" }];
 }
 
-export const scout: RoleFn = async (ctx) => {
-  try {
-    const root = ctx.workspace.path;
-    const files = gatherFiles(root); // bounded, read-only
-    const { text, used, structure } = buildContext(files, root);
+/** Injectable scout dependencies. Defaults preserve the legacy behavior exactly. */
+export interface ScoutDeps {
+  /** Index-backed retrieval, used ONLY when IKBI_RETRIEVAL=index. Default: the lazy singleton. */
+  readonly retrieval?: ProjectRetrievalApi;
+  /** Env source for the IKBI_RETRIEVAL flag (tests inject). Default: process.env. */
+  readonly env?: NodeJS.ProcessEnv;
+}
 
-    // C4: each untrusted block is neutralized + wrapped as an isolated data-role
-    // message (untrusted:true) — never raw-concatenated into the trusted system prompt.
-    const untrusted = (raw: string, origin: string): ModelMessage =>
-      toUntrustedMessage(ctx.engine.neutralizeUntrusted(raw, { source: "external", identity: ctx.identity, origin }), { role: "user" });
+/**
+ * Build the scout role.
+ *
+ * DEFAULT BEHAVIOR IS UNCHANGED: a bounded legacy traversal sample (`gatherFiles`). When
+ * `IKBI_RETRIEVAL=index`, file selection is delegated to the deterministic, index-backed
+ * project-retrieval — which finds goal-relevant files anywhere in the tree instead of the first 40
+ * traversal files. ANY index/retrieval failure (or an empty selection) falls back to the legacy
+ * scan, so the flag can never make scout worse than before. The result records which path ran
+ * (`detail.retrievalMode` + the summary that the orchestrator writes into the role receipt).
+ */
+export function createScout(deps: ScoutDeps = {}): RoleFn {
+  return async (ctx) => {
+    try {
+      const root = ctx.workspace.path;
+      const env = deps.env ?? process.env;
+      const wantIndex = (env.IKBI_RETRIEVAL ?? "").trim().toLowerCase() === "index";
 
-    const request: ModelRequest = {
-      model: driverModel(),
-      temperature: SCOUT_TEMPERATURE,
-      maxTokens: SCOUT_MAX_TOKENS,
-      identity: ctx.identity, // the spawned, ceiling-clamped role identity (#10)
-      messages: [
-        { role: "system", content: SCOUT_SYSTEM },
-        untrusted(`Goal:\n${ctx.task.goal}`, "scout_goal"),
-        untrusted(`Task metadata: ${JSON.stringify(ctx.task.metadata ?? {})}`, "scout_metadata"),
-        untrusted(`Repository excerpts (${used} file(s)):\n${text}`, "scout_repo_excerpts"),
-      ],
-    };
+      let files: string[];
+      let retrievalMode: "index" | "legacy" = "legacy";
+      let modeNote = "via legacy scan";
+      let retrievalDetail: { selected: Array<{ path: string; reasons: readonly string[]; why: string }>; receipts: readonly string[] } | undefined;
 
-    const response = await ctx.engine.invokeModel(request);
-    const findings = parseFindings(response.content);
-    const brief = buildBrief(structure);
-    return {
-      role: "scout",
-      outcome: "success",
-      summary: `scouted ${used} file(s); produced ${findings.length} finding(s)`,
-      // `brief` + `structure` drive PROGRESSIVE DISCLOSURE downstream: the builder shows the
-      // brief first and pulls a finding's full `detail` only on demand (scout_detail tool).
-      detail: { findings, filesScanned: used, brief, structure },
-    };
-  } catch (err) {
-    // IO / model failure: report at the role boundary, do not throw past it.
-    return {
-      role: "scout",
-      outcome: "failure",
-      summary: `scout failed: ${err instanceof Error ? err.message : String(err)}`,
-    };
-  }
-};
+      if (wantIndex) {
+        try {
+          const retrieval = deps.retrieval ?? (await import("../project-retrieval/index.js")).projectRetrieval;
+          const res = await retrieval.retrieve({ repoPath: root, goal: ctx.task.goal, budgetBytes: MAX_TOTAL_BYTES, perFileCapBytes: MAX_FILE_BYTES, maxFiles: MAX_FILES_SCANNED });
+          if (res.files.length === 0) throw new Error("retrieval selected no files");
+          files = res.files.map((f) => join(root, f.path));
+          retrievalMode = "index";
+          modeNote = "via index retrieval";
+          retrievalDetail = { selected: res.files.map((f) => ({ path: f.path, reasons: f.reasons, why: f.why })), receipts: res.receipts };
+        } catch (e) {
+          // FAIL-SAFE: never let the index path make scout worse — fall back to the legacy scan.
+          files = gatherFiles(root);
+          retrievalMode = "legacy";
+          modeNote = `index retrieval unavailable (${e instanceof Error ? e.message : String(e)}); fell back to legacy scan`;
+        }
+      } else {
+        files = gatherFiles(root); // bounded, read-only — the unchanged default
+      }
+
+      const { text, used, structure } = buildContext(files, root);
+
+      // C4: each untrusted block is neutralized + wrapped as an isolated data-role
+      // message (untrusted:true) — never raw-concatenated into the trusted system prompt.
+      const untrusted = (raw: string, origin: string): ModelMessage =>
+        toUntrustedMessage(ctx.engine.neutralizeUntrusted(raw, { source: "external", identity: ctx.identity, origin }), { role: "user" });
+
+      const request: ModelRequest = {
+        model: driverModel(),
+        temperature: SCOUT_TEMPERATURE,
+        maxTokens: SCOUT_MAX_TOKENS,
+        identity: ctx.identity, // the spawned, ceiling-clamped role identity (#10)
+        messages: [
+          { role: "system", content: SCOUT_SYSTEM },
+          untrusted(`Goal:\n${ctx.task.goal}`, "scout_goal"),
+          untrusted(`Task metadata: ${JSON.stringify(ctx.task.metadata ?? {})}`, "scout_metadata"),
+          untrusted(`Repository excerpts (${used} file(s)):\n${text}`, "scout_repo_excerpts"),
+        ],
+      };
+
+      const response = await ctx.engine.invokeModel(request);
+      const findings = parseFindings(response.content);
+      const brief = buildBrief(structure);
+      return {
+        role: "scout",
+        outcome: "success",
+        summary: `scouted ${used} file(s) ${modeNote}; produced ${findings.length} finding(s)`,
+        // `brief` + `structure` drive PROGRESSIVE DISCLOSURE downstream: the builder shows the
+        // brief first and pulls a finding's full `detail` only on demand (scout_detail tool).
+        // `retrievalMode` (+ `retrieval` when index-backed) records HOW context was selected.
+        detail: { findings, filesScanned: used, brief, structure, retrievalMode, ...(retrievalDetail !== undefined ? { retrieval: retrievalDetail } : {}) },
+      };
+    } catch (err) {
+      // IO / model failure: report at the role boundary, do not throw past it.
+      return {
+        role: "scout",
+        outcome: "failure",
+        summary: `scout failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+  };
+}
+
+/** The default scout (legacy by default; index-backed only under IKBI_RETRIEVAL=index). */
+export const scout: RoleFn = createScout();
