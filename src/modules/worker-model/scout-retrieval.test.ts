@@ -75,7 +75,8 @@ function makeCtx(dir: string, goal: string): RoleContext {
 }
 
 interface ScoutDetail {
-  retrievalMode: "index" | "legacy";
+  retrievalMode: "index" | "legacy" | "index-fallback";
+  retrievalFallbackReason?: string;
   filesScanned: number;
   structure: Array<{ path: string }>;
   retrieval?: { selected: Array<{ path: string; reasons: string[] }> };
@@ -120,15 +121,18 @@ test("scout wiring: IKBI_RETRIEVAL=index finds the out-of-sample target + its re
   }
 });
 
-test("scout wiring: a retrieval failure falls back safely to the legacy scan", async () => {
+test("scout wiring (F4): a retrieval failure falls back LOUDLY — index-fallback mode + reason", async () => {
   const { repo, stateRoot } = makeBigFixture();
   try {
     const failing: ProjectRetrievalApi = { retrieve: async () => { throw new Error("index boom"); } };
     const result = await createScout({ env: { IKBI_RETRIEVAL: "index" }, retrieval: failing })(makeCtx(repo, "Fix the widget bug"));
     const d = result.detail as unknown as ScoutDetail;
     assert.equal(result.outcome, "success", "scout still succeeds via fallback");
-    assert.equal(d.retrievalMode, "legacy", "fell back to legacy");
+    assert.equal(d.retrievalMode, "index-fallback", "distinct fallback mode (not plain legacy)");
+    assert.match(d.retrievalFallbackReason ?? "", /index boom/, "distinct fallback reason field");
     assert.match(result.summary ?? "", /fell back to legacy scan/, "summary records the fallback");
+    assert.match(result.summary ?? "", /index boom/, "summary clearly includes the fallback reason");
+    assert.ok(!d.structure.some((s) => s.path.includes("widget")), "actually ran the legacy scan");
   } finally {
     rmSync(repo, { recursive: true, force: true });
     rmSync(stateRoot, { recursive: true, force: true });

@@ -99,8 +99,26 @@ export function createProjectRetrieval(deps: ProjectRetrievalDeps = {}): Project
     }
     for (const pt of [...pathTokens]) {
       const norm = pt.replace(/^\.?\//, "");
-      const base = posix.basename(norm);
-      const hits = data.files.filter((f) => f.path === norm || f.path.endsWith(`/${norm}`) || posix.basename(f.path) === base);
+      // F1: prefer the MOST SPECIFIC match. An exact repo-relative path is unambiguous → always seed.
+      const exact = data.files.filter((f) => f.path === norm);
+      if (exact.length > 0) {
+        for (const f of exact) {
+          addReason(f.path, "goal-path-match");
+          seedFiles.add(f.path);
+        }
+        continue;
+      }
+      // Otherwise a slashed fragment matches by path suffix; a BARE basename (e.g. "index.ts",
+      // "types.ts", "package.json") is treated like a generic term — seeded only when NOT too
+      // generic (≤ maxPerTerm matches), so a common filename can never seed the whole repo.
+      const hits = norm.includes("/")
+        ? data.files.filter((f) => f.path.endsWith(`/${norm}`))
+        : data.files.filter((f) => posix.basename(f.path) === posix.basename(norm));
+      if (hits.length === 0) continue;
+      if (hits.length > cfg.maxPerTerm) {
+        receipts.push(`path token "${pt}" matched ${hits.length} files — too generic, skipped as a seed`);
+        continue;
+      }
       for (const f of hits) {
         addReason(f.path, "goal-path-match");
         seedFiles.add(f.path);
@@ -120,6 +138,20 @@ export function createProjectRetrieval(deps: ProjectRetrievalDeps = {}): Project
         addReason(p, "goal-name-match");
         seedFiles.add(p);
       }
+    }
+    // F1: overall seed cap — never let goal mining explode into a huge seed set (bounds the
+    // expansion fan-out and the O(seeds × files) query cost on large repos).
+    if (seedFiles.size > cfg.maxSeeds) {
+      const kept = new Set([...seedFiles].sort().slice(0, cfg.maxSeeds));
+      let dropped = 0;
+      for (const p of [...seedFiles]) {
+        if (!kept.has(p)) {
+          seedFiles.delete(p);
+          reasons.delete(p); // drop its goal reasons; it may still return via graph expansion
+          dropped += 1;
+        }
+      }
+      receipts.push(`seed cap ${cfg.maxSeeds} reached — dropped ${dropped} lower-priority seed(s)`);
     }
     receipts.push(seedFiles.size > 0 ? `seeds: ${[...seedFiles].sort().join(", ")}` : "no goal seeds matched — falling back to a project-structure baseline");
 
@@ -142,7 +174,7 @@ export function createProjectRetrieval(deps: ProjectRetrievalDeps = {}): Project
         rulesCount += 1;
       }
     }
-    if (rulesCount > 0) receipts.push(`project rules: ${rulesCount} file(s) (CLAUDE.md/AGENTS.md) included`);
+    if (rulesCount > 0) receipts.push(`project rules: ${rulesCount} file(s) (CLAUDE.md/AGENTS.md) found — included subject to budget`);
 
     // ── 4. package manifests for packages of selected files ───────────────────────
     const selectedPkgs = new Set<string>();
@@ -162,7 +194,6 @@ export function createProjectRetrieval(deps: ProjectRetrievalDeps = {}): Project
     const rest = scored
       .filter((x) => !isRule(x))
       .sort((a, b) => (b.score !== a.score ? b.score - a.score : a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
-    const ordered = [...rulesFirst, ...rest];
 
     const budget = req.budgetBytes ?? cfg.budgetBytes;
     const cap = req.perFileCapBytes ?? cfg.perFileCapBytes;
@@ -170,19 +201,33 @@ export function createProjectRetrieval(deps: ProjectRetrievalDeps = {}): Project
     const files: SelectedFile[] = [];
     let totalBytes = 0;
     let truncatedByBudget = false;
-    for (const o of ordered) {
+    const costOf = (path: string): number => Math.min(byPath.get(path)?.size ?? 0, cap);
+    const admit = (o: { path: string; reasons: RetrievalReason[]; score: number }): void => {
+      totalBytes += costOf(o.path);
+      files.push({ path: o.path, bytes: byPath.get(o.path)?.size ?? 0, score: o.score, reasons: o.reasons, why: o.reasons.map((r) => PHRASE[r]).join("; ") });
+    };
+
+    // F3: rules respect the budget (NO unconditional first-file admission). Include as MANY rules as
+    // fit; record which rules file was dropped for budget.
+    for (const o of rulesFirst) {
       if (files.length >= maxFiles) {
         truncatedByBudget = true;
         break;
       }
-      const size = byPath.get(o.path)?.size ?? 0;
-      const cost = Math.min(size, cap);
-      if (files.length > 0 && totalBytes + cost > budget) {
+      if (totalBytes + costOf(o.path) <= budget) admit(o);
+      else {
         truncatedByBudget = true;
-        continue; // skip this one; a smaller later file may still fit
+        receipts.push(`project-rules file "${o.path}" dropped — exceeds the ${budget}B budget`);
       }
-      totalBytes += cost;
-      files.push({ path: o.path, bytes: size, score: o.score, reasons: o.reasons, why: o.reasons.map((r) => PHRASE[r]).join("; ") });
+    }
+    // F2: non-rules are score-ordered; STOP at the first that does not fit. A strictly-lower-scored
+    // file must never jump ahead of a higher-scored one that was dropped for budget.
+    for (const o of rest) {
+      if (files.length >= maxFiles || totalBytes + costOf(o.path) > budget) {
+        truncatedByBudget = true;
+        break;
+      }
+      admit(o);
     }
     receipts.push(`budget ${budget}B: selected ${files.length} file(s), ${totalBytes}B, truncated=${truncatedByBudget}`);
 

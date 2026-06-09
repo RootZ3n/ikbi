@@ -42,8 +42,11 @@ export function makeBigFixture(): { repo: string; stateRoot: string } {
   write(repo, "packages/feature/src/widget.test.ts", 'import { renderWidget } from "./widget";\nimport { it } from "node:test";\nit("w", () => renderWidget());\n');
   write(repo, "packages/feature/src/index.ts", 'import { renderWidget } from "./widget";\nexport const ui = renderWidget();\n');
 
-  // 10 files sharing the stem "common" (across dirs) — a term matching all of them is too generic.
-  for (let i = 0; i < 10; i += 1) write(repo, `mod${i}/common.ts`, `export const c${i} = ${i};\n`);
+  // 10 dirs each with common.ts + index.ts — generic stems/filenames that must NOT explode seeds.
+  for (let i = 0; i < 10; i += 1) {
+    write(repo, `mod${i}/common.ts`, `export const c${i} = ${i};\n`);
+    write(repo, `mod${i}/index.ts`, `export const i${i} = ${i};\n`);
+  }
 
   return { repo, stateRoot };
 }
@@ -102,6 +105,90 @@ test("project-retrieval: a generic term that matches everything is dropped as a 
     const res = await retrieval.retrieve({ repoPath: repo, goal: "fix the common helpers" });
     assert.ok(res.receipts.some((r) => /too generic/.test(r)), "generic term reported as dropped");
     assert.ok(!res.seeds.some((s) => s.includes("common")), "no common-stem file became a seed");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
+  }
+});
+
+// ── F1: generic path tokens must not seed the whole repo ────────────────────────────
+test("F1: a generic path token (index.ts) does NOT seed every index.ts in the repo", async () => {
+  const { repo, stateRoot } = makeBigFixture(); // has 12+ index.ts files
+  try {
+    const retrieval = createProjectRetrieval({ index: createProjectIndex({ stateRoot }) });
+    const res = await retrieval.retrieve({ repoPath: repo, goal: "update the index.ts entry files" });
+    assert.ok(res.receipts.some((r) => /index\.ts.*too generic/.test(r)), "the generic path token is reported as dropped");
+    assert.equal(res.seeds.length, 0, "no seeds mined from the generic token");
+    assert.ok(res.files.every((f) => !f.reasons.includes("goal-path-match")), "nothing tagged goal-path-match");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
+  }
+});
+
+test("F1: an EXACT path token still seeds precisely that one file", async () => {
+  const { repo, stateRoot } = makeBigFixture();
+  try {
+    const retrieval = createProjectRetrieval({ index: createProjectIndex({ stateRoot }) });
+    const res = await retrieval.retrieve({ repoPath: repo, goal: "fix packages/feature/src/index.ts" });
+    assert.deepEqual(res.seeds, ["packages/feature/src/index.ts"], "exactly the named file is seeded");
+    assert.ok(res.files.find((f) => f.path === "packages/feature/src/index.ts")?.reasons.includes("goal-path-match"), "tagged goal-path-match");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
+  }
+});
+
+// ── F2: tight budget keeps the top-scored target over a smaller manifest ─────────────
+function makeBudgetFixture(): { repo: string; stateRoot: string } {
+  const repo = mkdtempSync(join(tmpdir(), "ikbi-pr-bud-"));
+  const stateRoot = mkdtempSync(join(tmpdir(), "ikbi-pr-bud-state-"));
+  write(repo, "CLAUDE.md", "# rules\n");
+  write(repo, "packages/f/package.json", JSON.stringify({ name: "@b/f" }));
+  write(repo, "packages/f/src/widget.ts", "export const w = 1;\n");
+  write(repo, "packages/f/src/widget.test.ts", 'import "./widget";\n');
+  write(repo, "packages/f/src/index.ts", 'import "./widget";\n');
+  return { repo, stateRoot };
+}
+
+test("F2: under a tight budget, the highest-scored target is kept and a smaller manifest never jumps ahead", async () => {
+  const { repo, stateRoot } = makeBudgetFixture();
+  try {
+    const retrieval = createProjectRetrieval({ index: createProjectIndex({ stateRoot }) });
+    // perFileCap 10, budget 20 → rules(10) + exactly ONE non-rules(10); the rest is dropped.
+    const res = await retrieval.retrieve({ repoPath: repo, goal: "fix the widget", budgetBytes: 20, perFileCapBytes: 10 });
+    const paths = res.files.map((f) => f.path);
+    assert.ok(paths.includes("packages/f/src/widget.ts"), "the top-scored target is kept");
+    assert.ok(!paths.includes("packages/f/package.json"), "the lower-scored manifest did NOT jump ahead of dropped higher items");
+    assert.ok(res.truncatedByBudget, "marked truncated");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
+  }
+});
+
+// ── F3: rules respect budget; the dropped rule is recorded ───────────────────────────
+function makeRulesFixture(): { repo: string; stateRoot: string } {
+  const repo = mkdtempSync(join(tmpdir(), "ikbi-pr-rules-"));
+  const stateRoot = mkdtempSync(join(tmpdir(), "ikbi-pr-rules-state-"));
+  write(repo, "CLAUDE.md", "# root rules\n");
+  write(repo, "packages/f/AGENTS.md", "# nested rules\n");
+  write(repo, "packages/f/package.json", JSON.stringify({ name: "@b/f" }));
+  write(repo, "packages/f/src/a.ts", "export const a = 1;\n");
+  return { repo, stateRoot };
+}
+
+test("F3: under budget pressure only as many rules as fit are kept; the dropped rule is recorded", async () => {
+  const { repo, stateRoot } = makeRulesFixture();
+  try {
+    const retrieval = createProjectRetrieval({ index: createProjectIndex({ stateRoot }) });
+    // budget fits exactly ONE rules file (perFileCap 10, budget 10).
+    const res = await retrieval.retrieve({ repoPath: repo, goal: "anything", budgetBytes: 10, perFileCapBytes: 10 });
+    const paths = res.files.map((f) => f.path);
+    assert.ok(paths.includes("CLAUDE.md"), "the first rules file is kept");
+    assert.ok(!paths.includes("packages/f/AGENTS.md"), "the second rules file is dropped for budget (not force-included)");
+    assert.ok(res.receipts.some((r) => /AGENTS\.md.*dropped/.test(r)), "the dropped rules file is recorded in the receipts");
+    assert.ok(res.truncatedByBudget, "marked truncated");
   } finally {
     rmSync(repo, { recursive: true, force: true });
     rmSync(stateRoot, { recursive: true, force: true });

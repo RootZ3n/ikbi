@@ -17,6 +17,7 @@ export {
   DEFAULT_BUDGET_BYTES,
   DEFAULT_MAX_FILES,
   DEFAULT_MAX_PER_TERM,
+  DEFAULT_MAX_SEEDS,
   DEFAULT_PER_FILE_CAP_BYTES,
   loadProjectRetrievalConfig,
   projectRetrievalConfig,

@@ -202,7 +202,10 @@ export function createScout(deps: ScoutDeps = {}): RoleFn {
       const wantIndex = (env.IKBI_RETRIEVAL ?? "").trim().toLowerCase() === "index";
 
       let files: string[];
-      let retrievalMode: "index" | "legacy" = "legacy";
+      // "legacy" = flag off (the unchanged default). "index" = retrieval used. "index-fallback" =
+      // flag ON but retrieval failed/empty and we fell back to legacy (F4: surfaced loudly).
+      let retrievalMode: "index" | "legacy" | "index-fallback" = "legacy";
+      let retrievalFallbackReason: string | undefined;
       let modeNote = "via legacy scan";
       let retrievalDetail: { selected: Array<{ path: string; reasons: readonly string[]; why: string }>; receipts: readonly string[] } | undefined;
 
@@ -216,10 +219,12 @@ export function createScout(deps: ScoutDeps = {}): RoleFn {
           modeNote = "via index retrieval";
           retrievalDetail = { selected: res.files.map((f) => ({ path: f.path, reasons: f.reasons, why: f.why })), receipts: res.receipts };
         } catch (e) {
-          // FAIL-SAFE: never let the index path make scout worse — fall back to the legacy scan.
+          // FAIL-SAFE + LOUD (F4): never let the index path make scout worse — fall back to the legacy
+          // scan, but record a DISTINCT mode + reason so a persistently-broken index isn't silent.
           files = gatherFiles(root);
-          retrievalMode = "legacy";
-          modeNote = `index retrieval unavailable (${e instanceof Error ? e.message : String(e)}); fell back to legacy scan`;
+          retrievalMode = "index-fallback";
+          retrievalFallbackReason = e instanceof Error ? e.message : String(e);
+          modeNote = `IKBI_RETRIEVAL=index but index retrieval FAILED — fell back to legacy scan (reason: ${retrievalFallbackReason})`;
         }
       } else {
         files = gatherFiles(root); // bounded, read-only — the unchanged default
@@ -255,7 +260,7 @@ export function createScout(deps: ScoutDeps = {}): RoleFn {
         // `brief` + `structure` drive PROGRESSIVE DISCLOSURE downstream: the builder shows the
         // brief first and pulls a finding's full `detail` only on demand (scout_detail tool).
         // `retrievalMode` (+ `retrieval` when index-backed) records HOW context was selected.
-        detail: { findings, filesScanned: used, brief, structure, retrievalMode, ...(retrievalDetail !== undefined ? { retrieval: retrievalDetail } : {}) },
+        detail: { findings, filesScanned: used, brief, structure, retrievalMode, ...(retrievalFallbackReason !== undefined ? { retrievalFallbackReason } : {}), ...(retrievalDetail !== undefined ? { retrieval: retrievalDetail } : {}) },
       };
     } catch (err) {
       // IO / model failure: report at the role boundary, do not throw past it.
