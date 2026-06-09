@@ -114,6 +114,12 @@ export interface WorkerResult {
   readonly promoted: boolean;
   /** Human reason on a non-success / partial terminal. */
   readonly reason?: string;
+  /**
+   * Total USD cost of EVERY model invocation this run made (summed from each
+   * ModelResponse's `cost.usd`, across all roles + competitive candidates). Absent on
+   * paths that never invoke a model (e.g. a pre-allocation kill). Surfaced for cost visibility.
+   */
+  readonly costUsd?: number;
 }
 
 /**

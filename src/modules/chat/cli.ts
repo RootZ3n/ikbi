@@ -13,7 +13,7 @@
 import { createInterface } from "node:readline";
 
 import { registerCommand } from "../../cli/registry.js";
-import type { ChatToolActivity } from "./contract.js";
+import type { ChatMode, ChatToolActivity } from "./contract.js";
 import { ChatSession, sessionStore } from "./session.js";
 
 function errMsg(e: unknown): string {
@@ -22,7 +22,7 @@ function errMsg(e: unknown): string {
 
 /** The minimal session surface the repl drives (one turn = one send). */
 export interface ReplSession {
-  send(userMessage: string): Promise<{ response: string; tools: ChatToolActivity[] }>;
+  send(userMessage: string, images?: readonly string[], mode?: ChatMode): Promise<{ response: string; tools: ChatToolActivity[] }>;
 }
 
 /** Injectable surfaces so the loop is testable without a terminal. */
@@ -45,7 +45,9 @@ function toolLine(tools: readonly ChatToolActivity[]): string {
  */
 export async function runRepl(deps: ReplDeps): Promise<void> {
   const prompt = deps.prompt ?? "ikbi› ";
-  deps.out("ikbi repl — a conversational coding session. Type /exit (or Ctrl-C) to quit.\n");
+  // Current turn mode — `/plan` switches to read-only analysis, `/agent` resumes execution.
+  let mode: ChatMode = "agent";
+  deps.out("ikbi repl — a conversational coding session. Type /plan for read-only planning, /exit (or Ctrl-C) to quit.\n");
   for (;;) {
     deps.out(prompt);
     const line = await deps.readLine();
@@ -53,9 +55,19 @@ export async function runRepl(deps: ReplDeps): Promise<void> {
     const msg = line.trim();
     if (msg.length === 0) continue;
     if (msg === "/exit" || msg === "/quit") break;
+    if (msg === "/plan") {
+      mode = "plan";
+      deps.out("[plan mode: read-only analysis only — I will produce a plan, not make changes. Type /agent to resume execution.]\n");
+      continue;
+    }
+    if (msg === "/agent") {
+      mode = "agent";
+      deps.out("[agent mode: full tool suite — changes will be applied.]\n");
+      continue;
+    }
     let res: { response: string; tools: ChatToolActivity[] };
     try {
-      res = await deps.session.send(msg);
+      res = await deps.session.send(msg, undefined, mode);
     } catch (e) {
       deps.out(`[error: ${errMsg(e)}]\n`);
       continue;

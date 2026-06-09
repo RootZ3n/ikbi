@@ -7,6 +7,10 @@
  * injection, and identity contracts; it adds NO frozen-core change.
  *
  * CONTRACT_VERSION changelog (newest on top):
+ *   1.2.0 — additive: cost + context visibility and PLAN MODE. The request gains an OPTIONAL
+ *           `mode?: "agent" | "plan"` ("plan" restricts the loop to read-only tools and returns a
+ *           structured plan without making changes). The response gains OPTIONAL `cost` (USD for the
+ *           turn) and `context_percent` (0-100 window pressure). All backward-compatible.
  *   1.1.0 — additive: multimodal input. The request gains an OPTIONAL `images?: string[]`
  *           (data-URLs or http(s) URLs) so the operator can PASTE images; they attach to
  *           the turn as multimodal parts. Backward-compatible — omitting it is the old
@@ -17,7 +21,10 @@
  */
 
 /** Semantic version of the chat module contract. Bump on breaking change. */
-export const CONTRACT_VERSION = "1.1.0";
+export const CONTRACT_VERSION = "1.2.0";
+
+/** Chat mode: `agent` (default — full tool suite) or `plan` (read-only analysis → structured plan). */
+export type ChatMode = "agent" | "plan";
 
 /** The POST /chat request body. */
 export interface ChatRequest {
@@ -31,6 +38,11 @@ export interface ChatRequest {
    * parts so a vision-capable model sees them inline. Omit for a text-only turn.
    */
   readonly images?: readonly string[];
+  /**
+   * OPTIONAL turn mode. `"plan"` runs the loop with READ-ONLY tools only and asks the model
+   * for a structured plan WITHOUT making changes; `"agent"` (default) runs the full tool suite.
+   */
+  readonly mode?: ChatMode;
 }
 
 /** A tool the loop invoked while answering (surfaced for display/audit). */
@@ -48,4 +60,8 @@ export interface ChatResponse {
   readonly session_id: string;
   /** Tools invoked during this turn, in order, if any. */
   readonly tools?: readonly ChatToolActivity[];
+  /** USD cost of every model invocation this turn made (cost visibility). */
+  readonly cost?: number;
+  /** Context-window pressure for the session after this turn, 0-100 (context visibility). */
+  readonly context_percent?: number;
 }

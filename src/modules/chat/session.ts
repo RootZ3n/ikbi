@@ -43,8 +43,10 @@ import {
   type ModelTool,
   type ToolCall,
 } from "../../core/provider/index.js";
+import { getCapabilities } from "../../core/provider/capabilities.js";
 import { governedExec } from "../governed-exec/index.js";
 import { scoutDetail } from "../worker-model/builder.js";
+import { estimateTokens } from "../worker-model/context-manager.js";
 import { loadProjectInstructions } from "../worker-model/project-memory.js";
 import { type CheckResult, mapExec, VERIFIER_CHECKS } from "../worker-model/checks.js";
 import { confinePath } from "../worker-model/builder-tools/confine.js";
@@ -190,6 +192,29 @@ export const CHAT_TOOLS: readonly ModelTool[] = [
   DONE_TOOL,
 ];
 
+/** Chat mode: `agent` (the default — full tool suite) or `plan` (read-only analysis). */
+export type ChatMode = "agent" | "plan";
+
+/** The READ-ONLY tool subset available in plan mode — inspect only, never mutate. */
+const READ_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([
+  "read_file",
+  "list_dir",
+  "search_files",
+  "git_status",
+  "git_diff",
+  "git_log",
+]);
+
+/** Plan mode's tools: CHAT_TOOLS filtered to the read-only subset (no write/patch/terminal/delegate). */
+export const PLAN_TOOLS: readonly ModelTool[] = CHAT_TOOLS.filter((t) => READ_ONLY_TOOL_NAMES.has(t.name));
+
+/** System-prompt extension folded in for plan mode (the model analyzes, it does NOT change anything). */
+const PLAN_SYSTEM_EXTENSION =
+  "\n\nYOU ARE IN PLAN MODE. Analyze the codebase using the READ-ONLY tools (read_file, list_dir, " +
+  "search_files, git_status, git_diff, git_log) and produce a clear, structured, step-by-step PLAN to " +
+  "accomplish the request. Do NOT make any changes: write_file, patch, terminal, and delegate_task are " +
+  "unavailable in this mode. Output the plan as your reply — the operator will switch to agent mode to execute it.";
+
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
@@ -268,7 +293,12 @@ export class ChatSession {
   }
 
   /** Run one tool call; returns the raw result string + display activity (NOT yet neutralized). */
-  private async runTool(call: ToolCall): Promise<{ output: string; activity: ChatToolActivity }> {
+  private async runTool(call: ToolCall, mode: ChatMode = "agent"): Promise<{ output: string; activity: ChatToolActivity }> {
+    // PLAN MODE: defense-in-depth — even though plan mode only OFFERS read-only tools, reject any
+    // mutating/effecting call the model might still emit (write_file, patch, terminal, delegate, …).
+    if (mode === "plan" && !READ_ONLY_TOOL_NAMES.has(call.name)) {
+      return { output: `ERROR: ${call.name} is unavailable in plan mode (read-only tools only).`, activity: { name: call.name, ok: false, summary: "blocked in plan mode" } };
+    }
     let args: Record<string, unknown>;
     try {
       args = JSON.parse(call.arguments && call.arguments.length > 0 ? call.arguments : "{}") as Record<string, unknown>;
@@ -440,14 +470,24 @@ export class ChatSession {
   /** Build the per-invoke message view: the (clean, trusted) system prompt, then the memory
    *  carrier as isolated UNTRUSTED data, then the live conversation. The memory message is NOT
    *  persisted into `this.messages` — it is recomputed per turn and slotted in right after system. */
-  private viewWithMemory(memMsg: ModelMessage | undefined): ModelMessage[] {
+  private viewWithMemory(memMsg: ModelMessage | undefined, mode: ChatMode = "agent"): ModelMessage[] {
+    // PLAN MODE: fold the plan-mode directive into a fresh system message for THIS turn only
+    // (never mutate the persisted clean system prompt). Agent mode uses the clean prompt as-is.
+    const sys0 = this.messages[0] as ModelMessage;
+    const sys: ModelMessage = mode === "plan" ? { role: "system", content: sys0.content + PLAN_SYSTEM_EXTENSION } : sys0;
     // Slot the (persistent) PROJECT-MEMORY carrier and the (per-turn) MEMORY carrier in right
     // after the clean system prompt — both as isolated UNTRUSTED data, never merged into system.
     const extras: ModelMessage[] = [];
     if (this.projectMsg !== undefined) extras.push(this.projectMsg);
     if (memMsg !== undefined) extras.push(memMsg);
-    if (extras.length === 0) return this.messages;
-    return [this.messages[0] as ModelMessage, ...extras, ...this.messages.slice(1)];
+    if (extras.length === 0 && mode !== "plan") return this.messages;
+    return [sys, ...extras, ...this.messages.slice(1)];
+  }
+
+  /** Estimate the conversation's context-window pressure as a 0-100 percent of the model's window. */
+  private contextPercent(contextWindow: number): number {
+    if (contextWindow <= 0) return 0;
+    return Math.min(100, Math.round((estimateTokens(this.messages) / contextWindow) * 100));
   }
 
   /**
@@ -455,8 +495,18 @@ export class ChatSession {
    * `images` (optional) are operator-pasted images (data-URLs or http(s) URLs) attached to THIS
    * turn as multimodal `parts` so a vision-capable model sees them inline.
    */
-  async send(userMessage: string, images?: readonly string[]): Promise<{ response: string; tools: ChatToolActivity[] }> {
+  async send(
+    userMessage: string,
+    images?: readonly string[],
+    mode: ChatMode = "agent",
+  ): Promise<{ response: string; tools: ChatToolActivity[]; cost: number; contextPercent: number }> {
     this.lastUsedAt = Date.now();
+    // Cost visibility: accumulate every model invocation's cost this turn.
+    let turnCost = 0;
+    // Context pressure: this model's window, so the conversation size can be reported as a percent.
+    const contextWindow = getCapabilities(config.provider.defaultModels.driver).context_window;
+    // Plan mode runs the READ-ONLY tool subset; agent mode runs the full suite.
+    const activeTools = mode === "plan" ? PLAN_TOOLS : CHAT_TOOLS;
     // CONVERSATION MEMORY: a brief summary of prior-turn facts (files modified, command/test
     // results, conclusions). The facts are model-authored, but a recorded conclusion could echo
     // text from a malicious file the model read — so the summary rides as ISOLATED UNTRUSTED DATA
@@ -477,7 +527,7 @@ export class ChatSession {
       iterations += 1;
       if (iterations > MAX_TOOL_ITERATIONS) {
         this.memory.recordToolActivity(tools);
-        return { response: "[ikbi: reached the tool-iteration limit for this turn — try narrowing the request.]", tools };
+        return { response: "[ikbi: reached the tool-iteration limit for this turn — try narrowing the request.]", tools, cost: turnCost, contextPercent: this.contextPercent(contextWindow) };
       }
 
       let response: ModelResponse;
@@ -487,13 +537,14 @@ export class ChatSession {
           temperature: TEMPERATURE,
           maxTokens: MAX_TOKENS,
           identity: this.identity,
-          messages: this.viewWithMemory(memMsg),
-          tools: CHAT_TOOLS,
+          messages: this.viewWithMemory(memMsg, mode),
+          tools: activeTools,
         });
       } catch (e) {
         this.memory.recordToolActivity(tools);
-        return { response: `[ikbi: model call failed: ${errMsg(e)}]`, tools };
+        return { response: `[ikbi: model call failed: ${errMsg(e)}]`, tools, cost: turnCost, contextPercent: this.contextPercent(contextWindow) };
       }
+      turnCost += response.cost?.usd ?? 0;
 
       this.messages.push({
         role: "assistant",
@@ -503,7 +554,7 @@ export class ChatSession {
 
       if (response.finishReason === "tool_calls" && response.toolCalls !== undefined && response.toolCalls.length > 0) {
         for (const call of response.toolCalls) {
-          const { output, activity } = await this.runTool(call);
+          const { output, activity } = await this.runTool(call, mode);
           tools.push(activity);
           this.appendToolResult(output, call); // chokepoint: neutralize + append
         }
@@ -515,7 +566,10 @@ export class ChatSession {
       // assistant's reply as the turn's CONCLUSION (skipping synthetic ikbi error replies).
       this.memory.recordToolActivity(tools);
       if (!response.content.startsWith("[ikbi:")) this.memory.recordDecision(response.content);
-      return { response: response.content, tools };
+      const contextPercent = this.contextPercent(contextWindow);
+      // Context pressure VISIBILITY: warn when the conversation crosses 70% of the window.
+      if (contextPercent > 70) log.warn({ sessionId: this.id, contextPercent }, "chat: context window pressure above 70%");
+      return { response: response.content, tools, cost: turnCost, contextPercent };
     }
   }
 }

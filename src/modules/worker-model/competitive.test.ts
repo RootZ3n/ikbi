@@ -17,6 +17,7 @@ import type { DiscardResult, PromoteGovernance, PromoteResult, WorkspaceHandle }
 import type { BuildCandidate } from "../deterministic-judge/index.js";
 import { deterministicJudge } from "../deterministic-judge/index.js";
 import type { ExecRequest, ExecResult } from "../governed-exec/index.js";
+import { MAX_TOOL_ITERATIONS } from "./builder.js";
 import { createOrchestrator, type OrchestratorDeps } from "./orchestrator.js";
 import { type RoleContext, type RoleFn, type WorkerRole, type WorkerTask } from "./contract.js";
 import { builderModel } from "./role-models.js";
@@ -369,7 +370,7 @@ test("competitive: the judge receives correctly-mapped BuildCandidates", async (
   assert.equal(c0.testsPass, true, "test exit 0 ⇒ pass");
   assert.deepEqual(c0.testCount, { passed: 9, total: 10 }, "test count parsed from the verifier output");
   assert.equal(c0.toolRounds, 4, "toolRounds from the builder detail");
-  assert.equal(c0.maxToolRounds, 20, "the builder ceiling");
+  assert.equal(c0.maxToolRounds, MAX_TOOL_ITERATIONS, "the builder ceiling");
   assert.equal(c0.filesWritten, 1);
   assert.equal(c0.rejectedToolCalls, 0);
   assert.equal(c0.stopReason, "stop");

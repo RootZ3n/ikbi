@@ -22,8 +22,8 @@ export const workerRoleCompleted = defineEvent<{ taskId: string; role: WorkerRol
   "worker.role.completed",
 );
 
-/** BUILDER tool activity at the role boundary — round count + files written. (Attribution: role.) */
-export const workerBuilderActivity = defineEvent<{ taskId: string; toolRounds: number; filesWritten: number }>(
+/** BUILDER tool activity at the role boundary — round count + files written + context pressure. (Attribution: role.) */
+export const workerBuilderActivity = defineEvent<{ taskId: string; toolRounds: number; filesWritten: number; contextPercent?: number }>(
   "worker.builder.activity",
 );
 

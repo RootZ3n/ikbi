@@ -271,7 +271,23 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   const singleBuilderModel = deps.builderModel ?? builderModel();
   const competitiveModelList = deps.competitiveModels ?? competitiveBuilderModels();
 
-  const engine: RoleEngine = { invokeModel, neutralizeUntrusted };
+  /**
+   * A per-run COSTING engine: wraps `invokeModel` so every call across all roles (and
+   * competitive candidates) accumulates `response.cost.usd` into one running total. The
+   * neutralization seam is passed through untouched. `cost()` reads the accumulated total.
+   */
+  function makeCostingEngine(): { engine: RoleEngine; cost: () => number } {
+    let total = 0;
+    const costingEngine: RoleEngine = {
+      invokeModel: async (request: ModelRequest): Promise<ModelResponse> => {
+        const r = await invokeModel(request);
+        total += r.cost?.usd ?? 0;
+        return r;
+      },
+      neutralizeUntrusted,
+    };
+    return { engine: costingEngine, cost: () => total };
+  }
 
   /**
    * The verifier for THIS run (C1). Honors an injected `deps.roles.verifier` (tests),
@@ -436,6 +452,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       ),
     );
 
+    // Per-run costing engine: accumulates every model invocation's cost across all roles.
+    const { engine: runEngine, cost: runCost } = makeCostingEngine();
+
     const results: RoleResult[] = [];
     let overall: WorkerResult["outcome"] = "success";
     let killedReason: string | undefined;
@@ -458,7 +477,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           autonomy: spawned.autonomy,
           workspace,
           priorResults: [...results],
-          engine,
+          engine: runEngine,
         };
         const roleFn = role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderFor(parentCtx) : roles[role];
         const result = await roleFn(ctx);
@@ -479,7 +498,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           const bd = (result.detail ?? {}) as Record<string, unknown>;
           events.publish(
             workerBuilderActivity.create(
-              { taskId: task.taskId, toolRounds: typeof bd.toolRounds === "number" ? bd.toolRounds : 0, filesWritten: Array.isArray(bd.filesWritten) ? bd.filesWritten.length : 0 },
+              { taskId: task.taskId, toolRounds: typeof bd.toolRounds === "number" ? bd.toolRounds : 0, filesWritten: Array.isArray(bd.filesWritten) ? bd.filesWritten.length : 0, ...(typeof bd.contextPercent === "number" ? { contextPercent: bd.contextPercent } : {}) },
               { source: EVENT_SOURCE, attribution: { identity: spawned.identity, operation: "worker.role.builder", runId: task.taskId } },
             ),
           );
@@ -616,6 +635,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       workspaceId: workspace.id,
       promoted,
       ...(reason !== undefined ? { reason } : {}),
+      costUsd: runCost(),
     };
 
     if (overall === "success" || overall === "partial") {
@@ -640,7 +660,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 
   /** Dispatch one role in one workspace (events + recordRole), returning its result.
    *  `roleFnOverride` lets the competitive loop inject a per-candidate builder (its own model). */
-  async function dispatchRole(role: WorkerRole, spawned: SpawnedRole, task: WorkerTask, workspace: WorkspaceHandle, priorResults: readonly RoleResult[], parentCtx: OperationContext, roleFnOverride?: RoleFn): Promise<RoleResult> {
+  async function dispatchRole(role: WorkerRole, spawned: SpawnedRole, task: WorkerTask, workspace: WorkspaceHandle, priorResults: readonly RoleResult[], parentCtx: OperationContext, engine: RoleEngine, roleFnOverride?: RoleFn): Promise<RoleResult> {
     events.publish(
       workerRoleDispatched.create(
         { taskId: task.taskId, role, ...(spawned.identity.trustTier !== undefined ? { tier: spawned.identity.trustTier } : {}) },
@@ -711,6 +731,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason: preKill };
     }
 
+    // Per-run costing engine: accumulates model cost across the shared scout + every candidate.
+    const { engine: runEngine, cost: runCost } = makeCostingEngine();
+
     const handles: WorkspaceHandle[] = [];
     const rolesByWs = new Map<string, RoleResult[]>();
     try {
@@ -728,7 +751,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 
       // 2. scout ONCE (shared, read-only, in the first worktree's clean base state) —
       //    its findings seed every builder. (Per-workspace scout is a future option.)
-      const scoutResult = await dispatchRole("scout", spawnRole("scout", parentCtx), task, handles[0]!, [], parentCtx);
+      const scoutResult = await dispatchRole("scout", spawnRole("scout", parentCtx), task, handles[0]!, [], parentCtx, runEngine);
 
       // 3. builder + verifier PER workspace (sequential in v1; parallelism is a future
       //    optimization). Each builder writes into ITS worktree; each verifier checks ITS
@@ -748,11 +771,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         // builder model as fallback) in its OWN worktree — each with the full run_checks rail.
         const candidateModel = competitiveModelList?.[ci] ?? singleBuilderModel;
         const candidateBuilder = builderForModel(parentCtx, candidateModel);
-        const builderResult = await dispatchRole("builder", spawnRole("builder", parentCtx), task, ws, [scoutResult], parentCtx, candidateBuilder);
+        const builderResult = await dispatchRole("builder", spawnRole("builder", parentCtx), task, ws, [scoutResult], parentCtx, runEngine, candidateBuilder);
         let verifierResult: RoleResult | undefined;
         const verifierSpawn = spawnRole("verifier", parentCtx);
         if (builderResult.outcome === "success") {
-          verifierResult = await dispatchRole("verifier", verifierSpawn, task, ws, [scoutResult, builderResult], parentCtx);
+          verifierResult = await dispatchRole("verifier", verifierSpawn, task, ws, [scoutResult, builderResult], parentCtx, runEngine);
         }
         // COMMIT this candidate's VERIFIED-good work (gated on autoCommit) BEFORE the judge —
         // safeDiffLines + buildCandidate read the committed diff, and the winner is promoted, so
@@ -837,7 +860,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       } else {
         events.publish(workerFailed.create({ taskId: task.taskId, reason: reason ?? outcome, workspaceId: winner.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
       }
-      return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome, roles: winnerRoles, workspaceId: winner.id, promoted, ...(reason !== undefined ? { reason } : {}) };
+      return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome, roles: winnerRoles, workspaceId: winner.id, promoted, ...(reason !== undefined ? { reason } : {}), costUsd: runCost() };
     } catch (err) {
       // Mid-run failure (allocation / role / judge): discard EVERY allocated workspace —
       // no leaked worktree — then fail.

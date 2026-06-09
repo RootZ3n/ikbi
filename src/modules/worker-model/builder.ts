@@ -37,6 +37,7 @@ import { randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
+import { configEnv } from "../../core/config.js";
 import type { OperationContext } from "../../core/identity/index.js";
 import { toUntrustedMessage } from "../../core/injection/index.js";
 import { childLogger } from "../../core/log.js";
@@ -53,7 +54,7 @@ import { runVisionAnalyze, visionAnalyzeTool } from "./builder-tools/vision-tool
 import { runWebExtract, runWebSearch, webExtractTool, webSearchTool, WEB_TOOL_NAMES } from "./builder-tools/web-tools.js";
 import { type CheckResult, type ChecksResolution, mapExec, VERIFIER_CHECKS } from "./checks.js";
 import { workerModelConfig } from "./config.js";
-import { maybeCompress } from "./context-manager.js";
+import { estimateTokens, maybeCompress } from "./context-manager.js";
 import type { RoleFn, RoleResult, WorkerOutcome } from "./contract.js";
 import { loadProjectInstructions } from "./project-memory.js";
 import { builderModel } from "./role-models.js";
@@ -75,8 +76,23 @@ const BUILDER_TEMPERATURE = 0.0;
 // past ~11k tokens by the late rounds, and 2048 truncated the model mid-fix — starving its
 // room to emit a complete change. 12k leaves headroom to generate the fix deep in the loop.
 const BUILDER_MAX_TOKENS = 12288;
-/** Hard cap on model rounds (tool rounds + corrective turns) — the loop can never run forever. */
-export const MAX_TOOL_ITERATIONS = 20;
+/**
+ * Default hard cap on model rounds (tool rounds + corrective turns) — the loop can never
+ * run forever. 40 (up from 20): a complex multi-file task needs more than 20 rounds to
+ * read, edit, run_checks, fix, and re-verify. Operators tune it via IKBI_MAX_TOOL_ITERATIONS.
+ */
+const DEFAULT_MAX_TOOL_ITERATIONS = 40;
+
+/** Resolve the iteration cap from IKBI_MAX_TOOL_ITERATIONS (env seam), falling back to the default. */
+function resolveMaxToolIterations(): number {
+  const raw = configEnv.IKBI_MAX_TOOL_ITERATIONS?.trim();
+  if (raw === undefined || raw.length === 0) return DEFAULT_MAX_TOOL_ITERATIONS;
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : DEFAULT_MAX_TOOL_ITERATIONS;
+}
+
+/** Hard cap on model rounds — IKBI_MAX_TOOL_ITERATIONS overrides the default (40). */
+export const MAX_TOOL_ITERATIONS = resolveMaxToolIterations();
 /** Max bytes returned by read_file (untrusted content is bounded before the model). */
 const MAX_READ_BYTES = 32_000;
 /** Max entries returned by list_dir. */
@@ -477,6 +493,8 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
   let lastChecks: ChecksOutcome | undefined; // last run_checks outcome — gates `done`
   let checksRuns = 0; // how many times the builder ran the checks in-loop
   let compressions = 0; // how many times the context was compacted (window management)
+  let contextPercent = 0; // SG: latest context-window pressure (0-100), surfaced for visibility
+  let warnedHighContext = false; // warn-once when pressure crosses 70%
   let stopReason = "max_iterations"; // not "stop": only a validated `done` is success now
 
   try {
@@ -850,6 +868,15 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       });
       if (comp.compressed) compressions += 1;
 
+      // CONTEXT PRESSURE VISIBILITY: estimate how full the model's window is AFTER any
+      // compaction, as a 0-100 percent. Surfaced on the builder result (→ progress events).
+      // Warn ONCE when it crosses 70% so a silently-compressing run is observable.
+      contextPercent = Math.min(100, Math.round((estimateTokens(messages) / caps.context_window) * 100));
+      if (contextPercent > 70 && !warnedHighContext) {
+        warnedHighContext = true;
+        log.warn(`[context] window pressure at ${contextPercent}% of ${caps.context_window} tokens — compaction active`);
+      }
+
       const response = await ctx.engine.invokeModel({
         // Per-candidate model (the shootout) when injected; otherwise the builder's own model.
         model: builderModelId,
@@ -973,6 +1000,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         bareStops,
         checksRuns,
         compressions,
+        contextPercent,
         ...(lastChecks !== undefined ? { lastChecks } : {}),
         stopReason,
         neutralizedCount,

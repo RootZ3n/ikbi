@@ -17,11 +17,15 @@ import { moduleEnv } from "../../core/module-config.js";
 const env = moduleEnv("governed-exec");
 
 /**
- * The default allowlist: a minimal, read-only-ish set. Deliberately EXCLUDES code
- * runners (node/python/pnpm) and shells — those would defeat default-deny (e.g.
- * `node -e`). The operator opts additional binaries in via the env override.
+ * The default allowlist: a minimal, read-only-ish set PLUS the JS toolchain runners
+ * (`node`, `npm`, `pnpm`) the builder needs to run Node scripts, install deps, and run
+ * the project's checks. OPERATOR CHOICE (operational tuning): runners are dual-use — they
+ * can run arbitrary code (`node -e`) — so this trades some default-deny strictness for a
+ * builder that can actually drive a JS project out of the box. Shells are still excluded,
+ * and the operator can tighten this with the `IKBI_GOVERNED_EXEC_ALLOWLIST` env override
+ * (which REPLACES this default wholesale).
  */
-export const DEFAULT_ALLOWLIST: readonly string[] = Object.freeze(["git", "ls", "cat", "echo"]);
+export const DEFAULT_ALLOWLIST: readonly string[] = Object.freeze(["git", "ls", "cat", "echo", "node", "npm", "pnpm"]);
 
 /** Per-command wall-clock cap. */
 export const DEFAULT_EXEC_TIMEOUT_MS = 30_000;

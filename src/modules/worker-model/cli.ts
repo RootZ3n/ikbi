@@ -69,6 +69,28 @@ export function formatDiffSummary(s: DiffSummary): string {
   return `Δ ${s.files} file${s.files === 1 ? "" : "s"} changed, +${s.insertions}/-${s.deletions}`;
 }
 
+// ── colored diff display (HUMAN-facing only) ──────────────────────────────────
+// Raw ANSI (no chalk dependency in the CLI context). Models never see this — the diff
+// TEXT handed to a model is unchanged; only the terminal display is colorized.
+const ANSI = { green: "\x1b[32m", red: "\x1b[31m", dim: "\x1b[2m", reset: "\x1b[0m" } as const;
+
+/**
+ * Colorize a unified diff for terminal display: green for added (`+`) lines, red for
+ * removed (`-`) lines, dim for `@@` hunk headers. File headers (`+++`/`---`) and context
+ * lines are left plain. PURE — the input diff text is never mutated for the model. */
+export function colorizeDiff(text: string): string {
+  return text
+    .split("\n")
+    .map((line) => {
+      if (line.startsWith("+++") || line.startsWith("---")) return line; // file headers — plain
+      if (line.startsWith("@@")) return `${ANSI.dim}${line}${ANSI.reset}`;
+      if (line.startsWith("+")) return `${ANSI.green}${line}${ANSI.reset}`;
+      if (line.startsWith("-")) return `${ANSI.red}${line}${ANSI.reset}`;
+      return line;
+    })
+    .join("\n");
+}
+
 /** The minimal workspace surface the diff command + post-build summary read (get + diff). */
 export interface DiffWorkspaceSurface {
   get(id: string): Promise<WorkspaceRecord | undefined>;
@@ -81,6 +103,8 @@ export interface DiffCliDeps {
   readonly stdout?: (s: string) => void;
   readonly stderr?: (s: string) => void;
   readonly setExit?: (code: number) => void;
+  /** Colorize the diff for display. Default: on only when stdout is a TTY (never pollutes a pipe). */
+  readonly colorize?: boolean;
 }
 
 /** Build the `ikbi diff <workspace-id>` handler — prints the workspace diff + a change summary. */
@@ -89,6 +113,8 @@ export function createDiffCli(deps: DiffCliDeps = {}) {
   const out = deps.stdout ?? ((s: string) => void process.stdout.write(s));
   const err = deps.stderr ?? ((s: string) => void process.stderr.write(s));
   const setExit = deps.setExit ?? ((c: number) => void (process.exitCode = c));
+  // Only colorize for an interactive terminal — piped/redirected output stays clean ANSI-free.
+  const colorize = deps.colorize ?? (process.stdout.isTTY === true);
 
   async function diff(argv: readonly string[]): Promise<void> {
     const id = argv[0];
@@ -122,7 +148,9 @@ export function createDiffCli(deps: DiffCliDeps = {}) {
       out(`workspace ${id}: no changes\n`);
       return;
     }
-    out(text.endsWith("\n") ? text : `${text}\n`);
+    // Colorize for terminal display only; summarizeDiff still parses the RAW text.
+    const display = colorize ? colorizeDiff(text) : text;
+    out(display.endsWith("\n") ? display : `${display}\n`);
     out(`\n${formatDiffSummary(summarizeDiff(text))}\n`);
   }
 
@@ -192,11 +220,12 @@ export function createProductionWorker(
   return createOrchestrator({ roleClaim: productionRoleClaim(opts.workerToken), gateWall: opts.gateWall ?? coreGateWall, governedExec, workspaces: coreWorkspaces, enforceProjectRoot: true, ...(opts.onExecOutput !== undefined ? { onExecOutput: opts.onExecOutput } : {}), ...(opts.requestApproval !== undefined ? { requestApproval: opts.requestApproval } : {}) });
 }
 
-/** Parse `--repo <path>` / `--repo=<path>` and `--verbose`/`-v`; the rest is the goal prose. */
-export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbose?: boolean; rest: string[] } {
+/** Parse `--repo <path>` / `--repo=<path>`, `--verbose`/`-v`, and `--cost`; the rest is the goal prose. */
+export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbose?: boolean; cost?: boolean; rest: string[] } {
   const rest: string[] = [];
   let repo: string | undefined;
   let verbose = false;
+  let cost = false;
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i] as string;
     if (a === "--repo") {
@@ -206,11 +235,13 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
       repo = a.slice("--repo=".length);
     } else if (a === "--verbose" || a === "-v") {
       verbose = true;
+    } else if (a === "--cost") {
+      cost = true;
     } else {
       rest.push(a);
     }
   }
-  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), ...(verbose ? { verbose } : {}), rest };
+  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), ...(verbose ? { verbose } : {}), ...(cost ? { cost } : {}), rest };
 }
 
 /** Render a worker `worker.*` progress event into a concise human line (for `--verbose`). PURE. */
@@ -223,8 +254,11 @@ export function formatProgressEvent(e: { type: string; payload?: unknown }): str
       return `  → ${String(p.role ?? "?")} …\n`;
     case "worker.role.completed":
       return `  ${p.outcome === "success" ? "✓" : "✗"} ${String(p.role ?? "?")}: ${String(p.outcome ?? "?")}\n`;
-    case "worker.builder.activity":
-      return `    builder: ${String(p.toolRounds ?? 0)} tool round(s), ${String(p.filesWritten ?? 0)} file(s) written\n`;
+    case "worker.builder.activity": {
+      // SG: surface context-window pressure alongside the tool-activity line when present.
+      const ctxNote = typeof p.contextPercent === "number" ? `, context ${String(p.contextPercent)}%` : "";
+      return `    builder: ${String(p.toolRounds ?? 0)} tool round(s), ${String(p.filesWritten ?? 0)} file(s) written${ctxNote}\n`;
+    }
     case "worker.verification":
       return `    verify: ${String(p.verdict ?? "?")} (typecheck ${p.typecheckPassed ? "✓" : "✗"}, tests ${p.testsPassed ? "✓" : "✗"})\n`;
     case "worker.completed":
@@ -236,7 +270,7 @@ export function formatProgressEvent(e: { type: string; payload?: unknown }): str
   }
 }
 
-/** A concise, non-leaky result summary for the operator. */
+/** A concise, non-leaky result summary for the operator. Includes the run's total cost (USD). */
 function summarize(r: WorkerResult): string {
   return `${JSON.stringify(
     {
@@ -245,11 +279,18 @@ function summarize(r: WorkerResult): string {
       promoted: r.promoted,
       ...(r.workspaceId !== undefined ? { workspaceId: r.workspaceId } : {}),
       roles: r.roles.map((x) => ({ role: x.role, outcome: x.outcome })),
+      // Cost visibility: sum of every model invocation this run made.
+      cost_usd: r.costUsd ?? 0,
       ...(r.reason !== undefined ? { reason: r.reason } : {}),
     },
     null,
     2,
   )}\n`;
+}
+
+/** Format a run's total cost as a human one-line ($USD, 4 decimals). */
+export function formatCost(costUsd: number | undefined): string {
+  return `Cost: $${(costUsd ?? 0).toFixed(4)}`;
 }
 
 /** Injectable surfaces so the construction + roleClaim + spawn/clamp + gate chain is testable. */
@@ -299,7 +340,7 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
   const orchestrator = deps.orchestrator ?? createProductionWorker({ workerToken, gateWall, onExecOutput: (chunk) => out(chunk), ...(requestApproval !== undefined ? { requestApproval } : {}) });
 
   async function build(argv: readonly string[]): Promise<void> {
-    const { repo, verbose, rest } = parseBuildArgs(argv);
+    const { repo, verbose, cost, rest } = parseBuildArgs(argv);
     const goal = rest.join(" ").trim();
     if (goal.length === 0) {
       err("ikbi: build needs a goal — usage: ikbi build <goal...> [--repo <path>]\n");
@@ -339,6 +380,8 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       if (sub !== undefined) await eventBus.flush(); // drain the progress lines before the summary
       // A gate denial / non-promote is a CLEAN outcome (printed), not an error.
       out(summarize(result));
+      // --cost: print the run's total model cost as a human one-liner after the build.
+      if (cost === true) out(`${formatCost(result.costUsd)}\n`);
       // SG-2: after the run, show a one-line diff summary of what changed (best-effort).
       if (result.workspaceId !== undefined) await printDiffSummary(result.workspaceId);
     } catch (e) {
