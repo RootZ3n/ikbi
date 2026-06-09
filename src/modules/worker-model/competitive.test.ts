@@ -19,7 +19,7 @@ import { deterministicJudge } from "../deterministic-judge/index.js";
 import type { ExecRequest, ExecResult } from "../governed-exec/index.js";
 import { createOrchestrator, type OrchestratorDeps } from "./orchestrator.js";
 import { type RoleContext, type RoleFn, type WorkerRole, type WorkerTask } from "./contract.js";
-import { driverModel } from "./role-models.js";
+import { builderModel } from "./role-models.js";
 
 const silent = () => pino({ level: "silent" });
 
@@ -470,7 +470,7 @@ test("competitive WITHOUT a model list ⇒ competitiveN candidates all on the si
   await orch.run(task, parentCtx);
   assert.equal(ws.allocated.length, 2, "competitiveN candidates (workspace-isolation mode)");
   assert.equal(new Set(drv.capturedModels).size, 1, "all candidates use the SAME model");
-  assert.equal(drv.capturedModels[0], driverModel(), "the single builder model == the driver by default");
+  assert.equal(drv.capturedModels[0], builderModel(), "the single builder model == builderModel() (config-driven, robust to IKBI_MODEL_BUILDER)");
 });
 
 test("N = LIST LENGTH (capped at MAX_COMPETITIVE_N): a 3-model list ⇒ 3 candidates", async () => {

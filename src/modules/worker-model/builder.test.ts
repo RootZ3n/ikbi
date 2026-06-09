@@ -21,7 +21,7 @@ import type { WorkspaceHandle } from "../../core/workspace/contract.js";
 import type { ExecRequest, ExecResult } from "../governed-exec/index.js";
 import { createBuilder, MAX_TOOL_ITERATIONS, type ToolCallError } from "./builder.js";
 import { VERIFIER_CHECKS } from "./checks.js";
-import { driverModel } from "./role-models.js";
+import { builderModel } from "./role-models.js";
 import type { RoleContext, RoleEngine, RoleResult } from "./contract.js";
 
 // --- governed-exec wiring (mirrors verifier.test): run_checks runs through this ---
@@ -159,7 +159,7 @@ test("C4: the goal and prior-role results enter as UNTRUSTED (source external), 
   const untrusted = msgs.filter((m) => m.untrusted === true);
   assert.equal(untrusted.length, 3, "goal + success-condition + prior-results are the three untrusted blocks");
   for (const m of untrusted) assert.equal(m.role, "user", "untrusted content occupies a data role");
-  assert.equal(requests[0]?.model, driverModel(), "the builder's model id is CONFIG-DRIVEN (driver tier), not a constant");
+  assert.equal(requests[0]?.model, builderModel(), "the builder's model id is CONFIG-DRIVEN (builder tier), not a constant — robust to IKBI_MODEL_BUILDER");
 });
 
 test("C4 POISONED-UPSTREAM: a prior scout summary with embedded instructions is WRAPPED untrusted, not raw", async () => {
@@ -562,7 +562,7 @@ test("no modelOverride: the builder requests the default builderModel() (== driv
   const dir = tmp();
   const { engine, requests } = mockEngine([runChecksResp(), doneResp(["x"])]);
   await run(makeCtx(dir, "verified", engine)); // run() injects no modelOverride
-  assert.equal(requests[0]?.model, driverModel(), "default builder model == the driver (IKBI_MODEL_BUILDER unset)");
+  assert.equal(requests[0]?.model, builderModel(), "default builder model == builderModel() (config-driven, robust to IKBI_MODEL_BUILDER)");
 });
 
 // ── FIX: run_checks actionable feedback + raised output cap ───────────────────
