@@ -206,7 +206,7 @@ export const TOOLS: readonly ModelTool[] = [
     // call done with a self-check, validated for SUBSTANCE (not a rubber stamp).
     name: "done",
     description:
-      "Declare the work complete. You MUST call this to finish — stopping without it means the work is INCOMPLETE. Provide the self-check.",
+      "Declare the work complete. You MUST call this to finish — stopping without it means the work is INCOMPLETE. Provide the self-check. When you FIXED a bug, also provide rootCause (what was actually wrong, the underlying cause) and fixRationale (why your change corrects it).",
     parameters: {
       type: "object",
       properties: {
@@ -214,6 +214,8 @@ export const TOOLS: readonly ModelTool[] = [
         filesReadBack: { type: "array", items: { type: "string" } },
         selfCheck: { type: "string" },
         satisfied: { type: "boolean" },
+        rootCause: { type: "string" },
+        fixRationale: { type: "string" },
       },
       required: ["successCondition", "filesReadBack", "selfCheck", "satisfied"],
     },
@@ -242,6 +244,10 @@ export interface DoneClaim {
   readonly satisfied: boolean;
   /** The builder ran the (shared) checks green before claiming done. The verifier confirms. */
   readonly checksPassed: boolean;
+  /** Suspected ROOT CAUSE of a bug this run fixed (the underlying cause, not the symptom). */
+  readonly rootCause?: string;
+  /** WHY the change fixes it — the builder's repair rationale. */
+  readonly fixRationale?: string;
 }
 
 /** Module-internal injection (mirrors VerifierDeps) — threaded by the orchestrator's
@@ -790,7 +796,15 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       return {
         accept: true,
         feedback: "",
-        claim: { successCondition: String(args.successCondition), filesReadBack, selfCheck: String(args.selfCheck), satisfied: true, checksPassed: true },
+        claim: {
+          successCondition: String(args.successCondition),
+          filesReadBack,
+          selfCheck: String(args.selfCheck),
+          satisfied: true,
+          checksPassed: true,
+          ...(typeof args.rootCause === "string" && args.rootCause.trim().length > 0 ? { rootCause: args.rootCause.trim() } : {}),
+          ...(typeof args.fixRationale === "string" && args.fixRationale.trim().length > 0 ? { fixRationale: args.fixRationale.trim() } : {}),
+        },
       };
     };
 
@@ -993,13 +1007,18 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
     }
 
     const outcome = classifyOutcome(stopReason);
+    let summary =
+      `builder ${outcome} after ${toolRounds} tool round(s) (stop: ${stopReason}); ` +
+      `wrote ${filesWritten.length}, read ${filesRead.length}, ${rejectedToolCalls.length} rejected` +
+      (bareStops > 0 ? `, ${bareStops} bare-stop(s) corrected` : "");
+    // ISSUE 3: fold the repair narrative into the role summary so the receipt trail records the
+    // suspected root cause + fix rationale (the CLI also surfaces it in the final report).
+    if (doneClaim?.rootCause !== undefined) summary += `; root cause: ${doneClaim.rootCause}`;
+    if (doneClaim?.fixRationale !== undefined) summary += `; fix: ${doneClaim.fixRationale}`;
     return {
       role: "builder",
       outcome,
-      summary:
-        `builder ${outcome} after ${toolRounds} tool round(s) (stop: ${stopReason}); ` +
-        `wrote ${filesWritten.length}, read ${filesRead.length}, ${rejectedToolCalls.length} rejected` +
-        (bareStops > 0 ? `, ${bareStops} bare-stop(s) corrected` : ""),
+      summary,
       detail: {
         filesWritten,
         filesRead,

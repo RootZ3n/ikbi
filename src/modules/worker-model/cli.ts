@@ -259,8 +259,17 @@ export function formatProgressEvent(e: { type: string; payload?: unknown }): str
       const ctxNote = typeof p.contextPercent === "number" ? `, context ${String(p.contextPercent)}%` : "";
       return `    builder: ${String(p.toolRounds ?? 0)} tool round(s), ${String(p.filesWritten ?? 0)} file(s) written${ctxNote}\n`;
     }
-    case "worker.verification":
-      return `    verify: ${String(p.verdict ?? "?")} (typecheck ${p.typecheckPassed ? "✓" : "✗"}, tests ${p.testsPassed ? "✓" : "✗"})\n`;
+    case "worker.verification": {
+      // ISSUE 4: show the ACTUAL per-check results (correct for custom IKBI_CHECKS — no phantom
+      // "typecheck ✗" when only `test`/`build` ran). Fall back to the legacy typecheck/tests axes
+      // only when the per-check list isn't present (older event shape).
+      const checks = Array.isArray(p.checks) ? (p.checks as Array<{ name?: unknown; passed?: unknown }>) : undefined;
+      const detail =
+        checks !== undefined && checks.length > 0
+          ? checks.map((c) => `${String(c.name)} ${c.passed ? "✓" : "✗"}`).join(", ")
+          : `typecheck ${p.typecheckPassed ? "✓" : "✗"}, tests ${p.testsPassed ? "✓" : "✗"}`;
+      return `    verify: ${String(p.verdict ?? "?")} (${detail})\n`;
+    }
     case "worker.completed":
       return `  ✓ run complete (promoted=${String(p.promoted ?? false)})\n`;
     case "worker.failed":
@@ -286,6 +295,31 @@ function summarize(r: WorkerResult): string {
     null,
     2,
   )}\n`;
+}
+
+/**
+ * ISSUE 3: a human-facing REPAIR REPORT — suspected root cause, files changed, why the change
+ * fixes it, and the tests run — sourced from the builder role's `done` claim + the verifier's
+ * checks. Returns "" when the run carries no narrative (a non-repair build, or a model that
+ * supplied none), so callers can print it unconditionally.
+ */
+export function formatRepairNarrative(r: WorkerResult): string {
+  const builder = r.roles.find((x) => x.role === "builder");
+  const bd = (builder?.detail ?? {}) as Record<string, unknown>;
+  const claim = (bd.doneClaim ?? {}) as { rootCause?: string; fixRationale?: string };
+  if (claim.rootCause === undefined && claim.fixRationale === undefined) return "";
+
+  const files = Array.isArray(bd.filesWritten) ? (bd.filesWritten as unknown[]).map(String) : [];
+  const verifier = r.roles.find((x) => x.role === "verifier");
+  const vd = (verifier?.detail ?? {}) as Record<string, unknown>;
+  const checks = Array.isArray(vd.checks) ? (vd.checks as Array<{ name?: unknown; exitCode?: unknown }>) : [];
+
+  const lines: string[] = ["", "Repair report:"];
+  if (claim.rootCause !== undefined) lines.push(`  • Root cause: ${claim.rootCause}`);
+  if (files.length > 0) lines.push(`  • Files changed: ${files.join(", ")}`);
+  if (claim.fixRationale !== undefined) lines.push(`  • Why this fixes it: ${claim.fixRationale}`);
+  if (checks.length > 0) lines.push(`  • Tests run: ${checks.map((c) => `${String(c.name)} ${c.exitCode === 0 ? "✓" : "✗"}`).join(", ")}`);
+  return `${lines.join("\n")}\n`;
 }
 
 /** Format a run's total cost as a human one-line ($USD, 4 decimals). */
@@ -380,6 +414,8 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       if (sub !== undefined) await eventBus.flush(); // drain the progress lines before the summary
       // A gate denial / non-promote is a CLEAN outcome (printed), not an error.
       out(summarize(result));
+      // ISSUE 3: surface the repair report (root cause / files / rationale / tests) when present.
+      out(formatRepairNarrative(result));
       // --cost: print the run's total model cost as a human one-liner after the build.
       if (cost === true) out(`${formatCost(result.costUsd)}\n`);
       // SG-2: after the run, show a one-line diff summary of what changed (best-effort).

@@ -309,6 +309,127 @@ test("NO COMMIT for a non-autoCommit tier (verified) — the autonomy model is r
   assert.equal(ws.calls.commit.length, 0, "a non-autoCommit tier is NOT auto-committed");
 });
 
+test("verified-good but non-autoCommit tier: RETAIN + actionable reason, never a silent 'no changes to promote'", async () => {
+  // A build that passes EVERY role but whose tier lacks autoCommit must not vanish behind a
+  // misleading empty-diff promote. The autonomy model is still respected (no commit), but the
+  // operator gets a clear, actionable outcome instead of "no changes to promote".
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("verified", "verified");
+  const ws = fakeWorkspaces(true);
+  const cap = capturingRoles(); // every role succeeds
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, workspaces: ws.workspaces }));
+  const result = await orch.run(task, parentCtx);
+
+  assert.equal(ws.calls.commit.length, 0, "autonomy respected: still no auto-commit");
+  assert.equal(ws.calls.promote, 0, "no misleading empty-diff promote attempt");
+  assert.equal(result.promoted, false, "nothing landed");
+  assert.equal(result.outcome, "partial", "surfaced as partial, not a silent failure/success");
+  // ISSUE 2: the blocked-promotion message states all four facts explicitly.
+  assert.match(result.reason ?? "", /verification PASSED/i, "says verification passed");
+  assert.match(result.reason ?? "", /BLOCKED/i, "says promotion was blocked");
+  assert.match(result.reason ?? "", /autoCommit/, "gives the exact reason (no autoCommit autonomy)");
+  assert.match(result.reason ?? "", /ikbi trust grant .+ trusted/, "gives the exact operator command");
+});
+
+// ── ISSUE 1: performance failures (timeouts) are separated from trust demotion ───
+function capturingTrust() {
+  const calls: Array<{ operation: string; status: string }> = [];
+  const trust = {
+    recordOutcome: async (i: { agentId: string; defaultTrustTier: string; operation: string; status: string }): Promise<TrustDecision> => {
+      calls.push({ operation: i.operation, status: i.status });
+      const t = asTier(i.defaultTrustTier, TRUST_FLOOR);
+      return { agentId: i.agentId, tier: t, previousTier: t, autonomy: autonomyForTier(t) };
+    },
+  };
+  return { trust, calls };
+}
+
+test("ISSUE 1: a builder TIMEOUT does NOT feed the trust signal (no demotion) and writes an explicit suppression receipt", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    scout: async () => ({ role: "scout", outcome: "success", summary: "s" }),
+    // a wall-clock timeout: classifyOutcome → failure, detail.stopReason === "timeout"
+    builder: async () => ({ role: "builder", outcome: "failure", summary: "timed out", detail: { stopReason: "timeout" } }),
+  };
+  const tr = capturingTrust();
+  const rc = fakeReceipts();
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, trust: tr.trust, receipts: rc.receipts }));
+  await orch.run(task, parentCtx);
+
+  assert.equal(tr.calls.filter((c) => c.operation === "worker.role.builder").length, 0, "the builder timeout did NOT feed a trust signal");
+  assert.ok(rc.calls.some((c) => c.operation === "worker.trust.signal_suppressed"), "an explicit suppression receipt was written");
+});
+
+test("ISSUE 1: with PENALIZE_TIMEOUTS policy on, a timeout IS counted as a trust failure", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    scout: async () => ({ role: "scout", outcome: "success", summary: "s" }),
+    builder: async () => ({ role: "builder", outcome: "failure", summary: "timed out", detail: { stopReason: "timeout" } }),
+  };
+  const tr = capturingTrust();
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, trust: tr.trust, config: { ...ENABLED, penalizeTimeouts: true } }));
+  await orch.run(task, parentCtx);
+
+  assert.equal(
+    tr.calls.filter((c) => c.operation === "worker.role.builder" && c.status === "failure").length,
+    1,
+    "policy on → the timeout IS a trust failure signal",
+  );
+});
+
+test("ISSUE 1: a REAL failure (failed verification) still feeds the trust signal regardless of policy", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  // scout+builder+critic succeed; the verifier (failed checks) is the real failure — no timeout.
+  const cap = capturingRoles();
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    verifier: async () => ({ role: "verifier", outcome: "failure", summary: "checks failed", detail: { verdict: "fail", checks: [{ name: "test", exitCode: 1 }] } }),
+  };
+  const tr = capturingTrust();
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, trust: tr.trust }));
+  await orch.run(task, parentCtx);
+
+  assert.equal(
+    tr.calls.filter((c) => c.operation === "worker.role.verifier" && c.status === "failure").length,
+    1,
+    "a failed verification is a real failure → always a trust signal",
+  );
+});
+
+// ── ISSUE 3: a repair run persists root cause + fix rationale into the receipt ───
+test("ISSUE 3: the builder's root cause + fix rationale land in the role receipt metadata", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const cap = capturingRoles();
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    builder: async () => ({
+      role: "builder",
+      outcome: "success",
+      summary: "fixed",
+      detail: {
+        filesWritten: ["src/lib/calculations.ts"],
+        doneClaim: { rootCause: "totalTokens omitted completionTokens", fixRationale: "added completionTokens back to the sum", checksPassed: true },
+      },
+    }),
+  };
+  // a receipts fake that captures full metadata (the shared one only records operation+agentId).
+  const appended: Array<{ operation: string; metadata: Record<string, unknown> }> = [];
+  const receipts = {
+    append: async (input: unknown): Promise<unknown> => {
+      const i = input as { operation: string; metadata?: Record<string, unknown> };
+      appended.push({ operation: i.operation, metadata: i.metadata ?? {} });
+      return {};
+    },
+  };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, receipts }));
+  await orch.run(task, parentCtx);
+
+  const builderReceipt = appended.find((a) => a.operation === "worker.role.builder");
+  assert.ok(builderReceipt, "a builder role receipt was appended");
+  assert.equal(builderReceipt?.metadata.rootCause, "totalTokens omitted completionTokens", "root cause persisted");
+  assert.equal(builderReceipt?.metadata.fixRationale, "added completionTokens back to the sum", "fix rationale persisted");
+  assert.deepEqual(builderReceipt?.metadata.filesChanged, ["src/lib/calculations.ts"], "files changed persisted");
+});
+
 test("NO COMMIT when a role fails (verified fails) — failed work is never committed", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
   const ws = fakeWorkspaces(true);

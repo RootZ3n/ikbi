@@ -57,6 +57,15 @@ export interface WorkerModelConfig {
    * the loader always sets it.
    */
   readonly retainFailedWorkspaces?: boolean;
+  /**
+   * POLICY: count a role's PERFORMANCE failure (a wall-clock timeout or a non-converging
+   * max-iterations stop) as a trust-penalizing signal. DEFAULT OFF — a slow/timed-out run is
+   * not, by itself, evidence of unreliability, so it must not silently demote the worker (which
+   * would disable autoCommit and block later GOOD builds). Real failures (failed verification,
+   * bad output, safety/policy violations) ALWAYS count regardless of this flag. Set
+   * IKBI_WORKER_MODEL_PENALIZE_TIMEOUTS=true to make timeouts trust-relevant by policy.
+   */
+  readonly penalizeTimeouts?: boolean;
 }
 
 /** Load the worker-model config slice from `IKBI_WORKER_MODEL_*`. */
@@ -68,6 +77,7 @@ export function loadWorkerModelConfig(reader = env): WorkerModelConfig {
     competitive: reader.bool("COMPETITIVE", false),
     competitiveN: reader.int("COMPETITIVE_N", DEFAULT_COMPETITIVE_N, { min: MIN_COMPETITIVE_N, max: MAX_COMPETITIVE_N }),
     retainFailedWorkspaces: reader.bool("RETAIN_FAILED_WORKSPACES", true),
+    penalizeTimeouts: reader.bool("PENALIZE_TIMEOUTS", false),
   });
 }
 

@@ -386,16 +386,67 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   ): Promise<void> {
     const status = toOutcomeStatus(result.outcome);
     const operation = `worker.role.${result.role}`;
+
+    // ISSUE 1 — separate PERFORMANCE failures from trust demotion. A wall-clock timeout or a
+    // non-converging `max_iterations` stop is not, by itself, evidence of unreliability; counting
+    // it as a trust failure silently demotes the worker (→ autoCommit off → later GOOD builds can't
+    // promote). Unless policy opts in (penalizeTimeouts), such a failure does NOT feed the trust
+    // signal. REAL failures — failed verification, bad output, safety/policy violations — always do.
+    const stopReason = (result.detail as Record<string, unknown> | undefined)?.stopReason;
+    const isPerformanceFailure =
+      result.outcome === "failure" && (stopReason === "timeout" || stopReason === "max_iterations");
+    const suppressTrustSignal = isPerformanceFailure && config.penalizeTimeouts !== true;
+
+    // ISSUE 3: a repair run's narrative (root cause + fix rationale, from the builder's `done`
+    // claim) is persisted into the role receipt's metadata so the trail records WHY the change
+    // was made — not just that files moved.
+    const doneClaim = (result.detail as Record<string, unknown> | undefined)?.doneClaim as
+      | { rootCause?: string; fixRationale?: string }
+      | undefined;
+    const filesWritten = (result.detail as Record<string, unknown> | undefined)?.filesWritten;
+
     await receipts.append(
       {
         operation,
         outcome: { status, ...(result.summary !== undefined ? { detail: result.summary } : {}) },
         requestId: task.taskId,
-        metadata: { role: result.role, taskId: task.taskId, workspaceId: workspace.id, outcome: result.outcome },
+        metadata: {
+          role: result.role,
+          taskId: task.taskId,
+          workspaceId: workspace.id,
+          outcome: result.outcome,
+          ...(suppressTrustSignal
+            ? { trustSignalSuppressed: true, trustSuppressReason: `performance failure (${String(stopReason)}) — not counted against trust` }
+            : {}),
+          ...(doneClaim?.rootCause !== undefined ? { rootCause: doneClaim.rootCause } : {}),
+          ...(doneClaim?.fixRationale !== undefined ? { fixRationale: doneClaim.fixRationale } : {}),
+          ...(Array.isArray(filesWritten) ? { filesChanged: filesWritten } : {}),
+        },
         project: task.targetRepo,
       },
       spawned.identity,
     );
+
+    if (suppressTrustSignal) {
+      // EXPLICIT, auditable receipt for the autonomy decision: trust is deliberately left
+      // unchanged for this performance failure (so there is a clear trail for "why trust did
+      // not move"). No trust.recordOutcome call → no demotion, no transition event.
+      await receipts.append(
+        {
+          operation: "worker.trust.signal_suppressed",
+          outcome: {
+            status: "success",
+            detail: `role ${result.role} ended in a performance failure (${String(stopReason)}); trust signal suppressed (not a trust violation — set IKBI_WORKER_MODEL_PENALIZE_TIMEOUTS=true to count timeouts).`,
+          },
+          requestId: task.taskId,
+          metadata: { role: result.role, taskId: task.taskId, agentId: spawned.identity.agentId, stopReason: String(stopReason), penalizeTimeouts: false },
+          project: task.targetRepo,
+        },
+        spawned.identity,
+      );
+      return;
+    }
+
     // Thread the GENUINE ValidatedIdentity as the subject (provenance) — recordOutcome
     // derives agentId/kind from it and sources the starting tier from the registry.
     await trust.recordOutcome(
@@ -467,6 +518,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     const results: RoleResult[] = [];
     let overall: WorkerResult["outcome"] = "success";
     let killedReason: string | undefined;
+    // Set when a build runs GREEN but its worker tier lacks autoCommit autonomy, so the
+    // verified work is deliberately left uncommitted. Carrying the tier + agent lets the terminal
+    // step report an explicit, actionable reason instead of a misleading "no changes to promote".
+    let autoCommitSkippedTier: string | undefined;
+    let autoCommitSkippedAgent: string | undefined;
 
     try {
       for (const role of WORKER_ROLES) {
@@ -516,7 +572,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           const verdict = (result.detail as Record<string, unknown> | undefined)?.verdict;
           events.publish(
             workerVerification.create(
-              { taskId: task.taskId, verdict: typeof verdict === "string" ? verdict : result.outcome === "success" ? "pass" : "fail", typecheckPassed: v.typecheckPass, testsPassed: v.testsPass },
+              { taskId: task.taskId, verdict: typeof verdict === "string" ? verdict : result.outcome === "success" ? "pass" : "fail", typecheckPassed: v.typecheckPass, testsPassed: v.testsPass, checks: v.checks },
               { source: EVENT_SOURCE, attribution: { identity: spawned.identity, operation: "worker.role.verifier", runId: task.taskId } },
             ),
           );
@@ -532,8 +588,16 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         // the scratch branch HEAD == base HEAD and promote sees an empty diff. After the verifier
         // SUCCEEDS, capture that verified state so the integrator (next role) promotes a real diff.
         // Gated on the worker's autonomy: trusted/operator (autoCommit) commit; lower tiers do not.
-        if (role === "verifier" && spawned.autonomy.autoCommit && workspaces.commit !== undefined) {
-          await workspaces.commit(workspace, `ikbi: ${task.goal}`);
+        if (role === "verifier" && workspaces.commit !== undefined) {
+          if (spawned.autonomy.autoCommit) {
+            await workspaces.commit(workspace, `ikbi: ${task.goal}`);
+          } else {
+            // Verified-good, but this tier lacks autoCommit autonomy → its work is intentionally
+            // NOT committed (the autonomy model; an existing test pins commit-count == 0 here).
+            // Record WHY so the terminal step surfaces it instead of silently dropping a green build.
+            autoCommitSkippedTier = spawned.autonomy.tier;
+            autoCommitSkippedAgent = spawned.identity.agentId;
+          }
         }
 
         // COOPERATIVE KILL CHECKPOINT (role boundary): obey a kill before the NEXT role.
@@ -571,6 +635,30 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         ),
       );
       return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: results, workspaceId: workspace.id, promoted: false, reason: killedReason };
+    }
+
+    // Terminal: a GREEN build whose worker tier lacks autoCommit autonomy left its verified
+    // work uncommitted by policy (see the verifier-commit gate). A promote here would find an
+    // empty diff and report a misleading "no changes to promote". Instead, RETAIN the verified
+    // work and return a precise, actionable reason — a green build is never silently dropped,
+    // and the operator is told exactly how to land it. (This does NOT auto-commit: the autonomy
+    // model is intact; it only replaces a confusing empty-diff outcome with a clear one.)
+    if (autoCommitSkippedTier !== undefined && overall === "success") {
+      const agent = autoCommitSkippedAgent ?? "worker";
+      const reason =
+        "verification PASSED, but promotion was BLOCKED. " +
+        `Reason: the worker tier "${autoCommitSkippedTier}" lacks autoCommit autonomy, so its verified ` +
+        `changes were deliberately left uncommitted (workspace ${workspace.id} retained — no work was lost). ` +
+        `To land it, run: \`ikbi trust grant ${agent} trusted\` then re-run the build (or promote via a higher-tier run).`;
+      if (retainFailedWorkspaces) await safeRetain(workspaces, workspace, reason);
+      else await workspaces.discard(workspace);
+      events.publish(
+        workerCompleted.create(
+          { taskId: task.taskId, outcome: "partial", promoted: false, workspaceId: workspace.id },
+          { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } },
+        ),
+      );
+      return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "partial", roles: results, workspaceId: workspace.id, promoted: false, reason, costUsd: runCost() };
     }
 
     // Terminal: ENACT the integrator's promote/discard DECISION (the integrator
@@ -896,9 +984,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 }
 
 /** Parse the verifier's check results into the candidate's pass flags + (best-effort) test count. */
-function readVerifier(verifierResult: RoleResult | undefined): { typecheckPass: boolean; testsPass: boolean; testCount?: { passed: number; total: number } } {
+function readVerifier(verifierResult: RoleResult | undefined): { typecheckPass: boolean; testsPass: boolean; testCount?: { passed: number; total: number }; checks: ReadonlyArray<{ name: string; passed: boolean }> } {
   // Builder failed (no verify ran) ⇒ both gates fail.
-  if (verifierResult === undefined) return { typecheckPass: false, testsPass: false };
+  if (verifierResult === undefined) return { typecheckPass: false, testsPass: false, checks: [] };
   const detail = (verifierResult.detail ?? {}) as Record<string, unknown>;
   const checks = Array.isArray(detail.checks) ? (detail.checks as Array<Record<string, unknown>>) : [];
   const find = (name: string) => checks.find((c) => c.name === name);
@@ -907,7 +995,10 @@ function readVerifier(verifierResult: RoleResult | undefined): { typecheckPass: 
   const typecheckPass = typecheck !== undefined && typecheck.exitCode === 0;
   const testsPass = test !== undefined && test.exitCode === 0;
   const testCount = test !== undefined && typeof test.outputTail === "string" ? parseTestCount(test.outputTail) : undefined;
-  return { typecheckPass, testsPass, ...(testCount !== undefined ? { testCount } : {}) };
+  // ISSUE 4: carry the ACTUAL per-check results (by their real names) so the UI shows custom
+  // IKBI_CHECKS correctly instead of forcing every run onto the typecheck/tests axes.
+  const checkList = checks.map((c) => ({ name: String(c.name), passed: c.exitCode === 0 }));
+  return { typecheckPass, testsPass, ...(testCount !== undefined ? { testCount } : {}), checks: checkList };
 }
 
 /** Parse the node:test summary tail ("# tests N" / "# pass N") into a count, when present. */

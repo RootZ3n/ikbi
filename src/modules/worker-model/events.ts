@@ -28,7 +28,7 @@ export const workerBuilderActivity = defineEvent<{ taskId: string; toolRounds: n
 );
 
 /** VERIFICATION status — the verifier's verdict + which checks passed. (Attribution: role.) */
-export const workerVerification = defineEvent<{ taskId: string; verdict: string; typecheckPassed: boolean; testsPassed: boolean }>(
+export const workerVerification = defineEvent<{ taskId: string; verdict: string; typecheckPassed: boolean; testsPassed: boolean; checks?: ReadonlyArray<{ name: string; passed: boolean }> }>(
   "worker.verification",
 );
 

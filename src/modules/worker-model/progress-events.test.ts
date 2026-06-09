@@ -16,9 +16,9 @@ import type { ValidatedIdentity } from "../../core/identity/resolver.js";
 import { asTier, autonomyForTier, TRUST_FLOOR, type TrustDecision } from "../../core/trust/index.js";
 import type { DiscardResult, PromoteGovernance, PromoteResult, WorkspaceHandle } from "../../core/workspace/contract.js";
 import { createOrchestrator, type OrchestratorDeps } from "./orchestrator.js";
-import { createWorkerCli, formatProgressEvent } from "./cli.js";
+import { createWorkerCli, formatProgressEvent, formatRepairNarrative } from "./cli.js";
 import { workerRoleDispatched, workerVerification } from "./events.js";
-import { WORKER_ROLES, type RoleFn, type WorkerRole, type WorkerTask } from "./contract.js";
+import { WORKER_ROLES, type RoleFn, type WorkerRole, type WorkerResult, type WorkerTask } from "./contract.js";
 
 const silent = () => pino({ level: "silent" });
 
@@ -149,4 +149,44 @@ test("without --verbose, no progress lines are streamed", async () => {
   const cli = createWorkerCli({ orchestrator, resolveIdentity: (c: { token?: string }): ValidatedIdentity => opResolver.resolve(c), operatorToken: "op-secret", workerToken: "worker-secret", events: bus, stdout: (s) => { out += s; }, stderr: () => {}, setExit: () => {}, now: () => 1 });
   await cli.build(["fix", "the", "thing"]);
   assert.doesNotMatch(out, /→ builder …/, "no progress lines without --verbose");
+});
+
+// ── ISSUE 4: custom IKBI_CHECKS display correctly (no false "typecheck ✗") ───────
+test("ISSUE 4: the verify line renders ACTUAL custom check names, not the typecheck/tests axes", () => {
+  const line = formatProgressEvent({
+    type: "worker.verification",
+    payload: { verdict: "pass", typecheckPassed: false, testsPassed: true, checks: [{ name: "test", passed: true }, { name: "build", passed: true }] },
+  });
+  assert.match(line, /verify: pass \(test ✓, build ✓\)/, "shows the real check names + results");
+  assert.doesNotMatch(line, /typecheck/, "no phantom typecheck axis when custom checks ran");
+});
+
+test("ISSUE 4: the verify line falls back to typecheck/tests when no per-check list is present", () => {
+  // backward-compatible with older events that carry only the two axes.
+  const line = formatProgressEvent({ type: "worker.verification", payload: { verdict: "pass", typecheckPassed: true, testsPassed: true } });
+  assert.match(line, /verify: pass \(typecheck ✓, tests ✓\)/);
+});
+
+// ── ISSUE 3: the repair narrative renders in the final report ────────────────────
+test("ISSUE 3: formatRepairNarrative surfaces root cause, files changed, rationale, and tests run", () => {
+  const result = {
+    contractVersion: "1.0.0", taskId: "t", outcome: "success", promoted: true,
+    roles: [
+      { role: "builder", outcome: "success", detail: { filesWritten: ["src/lib/calculations.ts"], doneClaim: { rootCause: "totalTokens omitted completionTokens", fixRationale: "re-added completionTokens to the sum", checksPassed: true } } },
+      { role: "verifier", outcome: "success", detail: { verdict: "pass", checks: [{ name: "test", exitCode: 0 }, { name: "build", exitCode: 0 }] } },
+    ],
+  } as unknown as WorkerResult;
+  const out = formatRepairNarrative(result);
+  assert.match(out, /Root cause: totalTokens omitted completionTokens/);
+  assert.match(out, /Files changed: src\/lib\/calculations\.ts/);
+  assert.match(out, /Why this fixes it: re-added completionTokens to the sum/);
+  assert.match(out, /Tests run: test ✓, build ✓/);
+});
+
+test("ISSUE 3: formatRepairNarrative is empty for a non-repair build (no narrative supplied)", () => {
+  const result = {
+    contractVersion: "1.0.0", taskId: "t", outcome: "success", promoted: true,
+    roles: [{ role: "builder", outcome: "success", detail: { filesWritten: ["a.ts"] } }],
+  } as unknown as WorkerResult;
+  assert.equal(formatRepairNarrative(result), "", "no narrative → empty (safe to print unconditionally)");
 });
