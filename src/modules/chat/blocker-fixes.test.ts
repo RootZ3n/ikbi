@@ -7,13 +7,15 @@
  *   BLOCKER-2  the session store takes a per-session write lock — a write blocked by a LIVE holder
  *              fails loudly (SessionLockedError) instead of silently clobbering, and a stale lock is
  *              reclaimed so the write succeeds after cleanup.
+ *   BLOCKER-3  the session store is bounded: list() caps at MAX_SESSIONS and prunes the oldest files,
+ *              and the cap is configurable.
  *
  * Driven through a SCRIPTED invoker (no network, no real model), same harness style as the other
  * chat tests.
  */
 
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -22,7 +24,7 @@ import { test } from "node:test";
 import "../egress/index.js";
 
 import type { ModelResponse, ToolCall } from "../../core/provider/contract.js";
-import { ChatSession } from "./session.js";
+import { ChatSession, type PersistedSession } from "./session.js";
 import { PersistentSessionStore, SessionLockedError } from "./session-store.js";
 
 function base(): Omit<ModelResponse, "content" | "finishReason" | "toolCalls"> {
@@ -130,4 +132,80 @@ test("BLOCKER-2: a STALE lock (dead pid) is reclaimed automatically; --force bre
   assert.throws(() => store.save(persistable), SessionLockedError, "live lock refused without force");
   store.save(persistable, { force: true }); // force breaks it
   assert.equal(store.load("stale")?.id, "stale", "force-unlock allowed the write");
+});
+
+// ── BLOCKER-3: bounded session store with pruning ──────────────────────────────────
+
+function seedSessions(dir: string, count: number): void {
+  mkdirSync(dir, { recursive: true });
+  for (let i = 0; i < count; i += 1) {
+    const persisted: PersistedSession = {
+      id: `sess-${i}`,
+      worktree: dir,
+      model: "mimo-v2.5",
+      // lastUsedAt increases with i ⇒ higher i = newer. The OLDEST are the low-i sessions.
+      messages: [{ role: "system", content: "x" }],
+      memory: { facts: [], decisions: [], openQuestions: [] } as unknown as PersistedSession["memory"],
+      createdAt: 1000 + i,
+      lastUsedAt: 1000 + i,
+      tokensIn: 0, tokensOut: 0, costUsd: 0, cachedTokens: 0, cacheSavedUsd: 0,
+    };
+    writeFileSync(join(dir, `sess-${i}.json`), JSON.stringify(persisted), "utf8");
+  }
+}
+
+test("BLOCKER-3: list() caps at MAX_SESSIONS and prunes the oldest files", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-prune-"));
+  const store = new PersistentSessionStore(dir, 100);
+  // 160 > 100 * 1.5 (=150) ⇒ list() trips the lazy auto-prune (which fires only when the count
+  // EXCEEDS 1.5× the cap, so the store doesn't prune on every single list).
+  seedSessions(dir, 160);
+
+  const metas = store.list();
+  assert.equal(metas.length, 100, "list() returns at most MAX_SESSIONS");
+
+  // The newest 100 (ids sess-60 .. sess-159) survive; the oldest 60 (sess-0 .. sess-59) are gone.
+  const onDisk = readdirSync(dir).filter((f) => f.endsWith(".json"));
+  assert.equal(onDisk.length, 100, "the directory itself was pruned to the cap");
+  assert.ok(!existsSync(join(dir, "sess-0.json")), "the oldest session file was deleted");
+  assert.ok(!existsSync(join(dir, "sess-59.json")), "the 60th-oldest session file was deleted");
+  assert.ok(existsSync(join(dir, "sess-159.json")), "the newest session file survived");
+  assert.equal(metas[0]!.id, "sess-159", "newest sorts first");
+  assert.ok(!metas.some((m) => m.id === "sess-0"), "the pruned oldest is absent from the listing");
+});
+
+test("BLOCKER-3: the max-sessions cap is configurable (constructor / IKBI_MAX_SESSIONS)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-prune2-"));
+  seedSessions(dir, 40);
+
+  // Constructor override: cap of 10 ⇒ list() returns 10 and prunes (40 > 10 * 1.5).
+  const store = new PersistentSessionStore(dir, 10);
+  assert.equal(store.list().length, 10, "constructor override caps the listing");
+  assert.equal(readdirSync(dir).filter((f) => f.endsWith(".json")).length, 10, "and prunes to that cap");
+
+  // Env override picked up by a default-cap store on a fresh dir.
+  const dir2 = mkdtempSync(join(tmpdir(), "ikbi-prune3-"));
+  seedSessions(dir2, 20);
+  const prev = process.env.IKBI_MAX_SESSIONS;
+  process.env.IKBI_MAX_SESSIONS = "5";
+  try {
+    const envStore = new PersistentSessionStore(dir2);
+    assert.equal(envStore.list().length, 5, "IKBI_MAX_SESSIONS caps the listing");
+  } finally {
+    if (prev === undefined) delete process.env.IKBI_MAX_SESSIONS;
+    else process.env.IKBI_MAX_SESSIONS = prev;
+  }
+});
+
+test("BLOCKER-3: prune() also removes a pruned session's leftover lock dir", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-prune4-"));
+  const store = new PersistentSessionStore(dir, 5);
+  seedSessions(dir, 8); // 8 > 5 ⇒ prune deletes the 3 oldest
+  // Leave a stray lock dir behind for the oldest session.
+  mkdirSync(join(dir, "sess-0.lock"), { recursive: true });
+
+  const pruned = store.prune();
+  assert.equal(pruned, 3, "the three oldest sessions were pruned");
+  assert.ok(!existsSync(join(dir, "sess-0.json")), "oldest session JSON removed");
+  assert.ok(!existsSync(join(dir, "sess-0.lock")), "its leftover lock dir was removed too");
 });

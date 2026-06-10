@@ -13,11 +13,14 @@
  * The store is the production `autosave` sink: ChatSession calls `save(this)` after every
  * turn (wired in cli.ts / routes.ts), so persistence needs no clean exit.
  *
- * BLOCKER-2 (concurrency): `save()` takes a per-session file lock (atomic `mkdir`) so two REPLs
- * on the same session can't silently clobber each other's writes.
+ * Two operational guards (senior-engineer audit):
+ *   BLOCKER-2 — concurrency: `save()` takes a per-session file lock (atomic `mkdir`) so two REPLs
+ *               on the same session can't silently clobber each other's writes.
+ *   BLOCKER-3 — growth: `list()` is capped to MAX_SESSIONS and lazily `prune()`s the oldest files
+ *               once the directory grows past 1.5× the cap, so it never has to scan 500 files.
  */
 
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -25,6 +28,20 @@ import { childLogger } from "../../core/log.js";
 import { ChatSession, type ChatSessionDeps, type PersistedSession } from "./session.js";
 
 const log = childLogger("chat-store");
+
+/** Default cap on how many sessions `list()` returns / the store retains (BLOCKER-3). */
+export const DEFAULT_MAX_SESSIONS = 100;
+
+/** Resolve the session cap: explicit override → `IKBI_MAX_SESSIONS` env → default. */
+function resolveMaxSessions(override?: number): number {
+  if (override !== undefined && Number.isFinite(override) && override > 0) return Math.floor(override);
+  const env = process.env.IKBI_MAX_SESSIONS;
+  if (env !== undefined) {
+    const n = Number.parseInt(env.trim(), 10);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return DEFAULT_MAX_SESSIONS;
+}
 
 /** The sessions directory (IKBI_SESSIONS_DIR overrides the `~/.ikbi/sessions` default). */
 export function sessionsDir(): string {
@@ -101,9 +118,11 @@ function isPidAlive(pid: number): boolean {
 /** A disk-backed session store: save/load/list/delete/latest under the sessions directory. */
 export class PersistentSessionStore {
   private readonly dir: string;
+  private readonly maxSessions: number;
 
-  constructor(dir: string = sessionsDir()) {
+  constructor(dir: string = sessionsDir(), maxSessions?: number) {
     this.dir = dir;
+    this.maxSessions = resolveMaxSessions(maxSessions);
   }
 
   private ensureDir(): void {
@@ -206,16 +225,24 @@ export class PersistentSessionStore {
     return new ChatSession(state.id, { ...deps, restore: state });
   }
 
-  /** All persisted sessions' metadata, most-recently-used first. */
-  list(): SessionMeta[] {
-    let files: string[];
+  /** The `.json` session filenames currently in the directory ([] when the dir is absent). */
+  private jsonFiles(): string[] {
     try {
-      files = readdirSync(this.dir).filter((f) => f.endsWith(".json"));
+      return readdirSync(this.dir).filter((f) => f.endsWith(".json"));
     } catch {
       return []; // dir doesn't exist yet ⇒ nothing persisted
     }
+  }
+
+  /**
+   * All persisted sessions' metadata, most-recently-used first, CAPPED at `maxSessions` (BLOCKER-3).
+   * Lazily `prune()`s first when the directory has grown past 1.5× the cap, so a long-lived store
+   * never has to parse hundreds of stale files on every list.
+   */
+  list(): SessionMeta[] {
+    if (this.jsonFiles().length > this.maxSessions * 1.5) this.prune();
     const metas: SessionMeta[] = [];
-    for (const f of files) {
+    for (const f of this.jsonFiles()) {
       try {
         const s = JSON.parse(readFileSync(join(this.dir, f), "utf8")) as PersistedSession;
         if (typeof s.id !== "string" || !Array.isArray(s.messages)) continue;
@@ -231,7 +258,52 @@ export class PersistentSessionStore {
         continue; // skip a corrupt file rather than failing the whole listing
       }
     }
-    return metas.sort((a, b) => b.lastUsedAt - a.lastUsedAt);
+    metas.sort((a, b) => b.lastUsedAt - a.lastUsedAt);
+    return metas.slice(0, this.maxSessions);
+  }
+
+  /**
+   * Bound the store to `maxSessions` (BLOCKER-3): keep the newest sessions, delete the rest (each
+   * session's JSON + any leftover `.lock`). "Newest" is by the persisted `lastUsedAt` when readable,
+   * falling back to file mtime (so a corrupt/unparseable file still gets ordered and pruned). Never
+   * throws. Returns the number of sessions pruned.
+   */
+  prune(): number {
+    const files = this.jsonFiles();
+    if (files.length <= this.maxSessions) return 0;
+    const ranked = files
+      .map((f) => ({ f, key: this.recencyKey(join(this.dir, f)) }))
+      .sort((a, b) => b.key - a.key);
+    const doomed = ranked.slice(this.maxSessions);
+    let pruned = 0;
+    for (const { f } of doomed) {
+      try {
+        rmSync(join(this.dir, f), { force: true });
+        // Also drop the matching lock dir (stem.lock) if one was left behind.
+        const lockDir = join(this.dir, `${f.slice(0, -".json".length)}.lock`);
+        rmSync(lockDir, { recursive: true, force: true });
+        pruned += 1;
+      } catch (e) {
+        log.warn({ err: e instanceof Error ? e.message : String(e), file: f }, "chat-store: prune failed for file");
+      }
+    }
+    if (pruned > 0) log.info({ pruned, kept: this.maxSessions, dir: this.dir }, "chat-store: pruned oldest sessions");
+    return pruned;
+  }
+
+  /** Recency key for ordering during prune: persisted `lastUsedAt`, else file mtime, else 0. */
+  private recencyKey(path: string): number {
+    try {
+      const s = JSON.parse(readFileSync(path, "utf8")) as PersistedSession;
+      if (typeof s.lastUsedAt === "number" && Number.isFinite(s.lastUsedAt)) return s.lastUsedAt;
+    } catch {
+      // fall through to mtime
+    }
+    try {
+      return statSync(path).mtimeMs;
+    } catch {
+      return 0;
+    }
   }
 
   /** Delete a persisted session. Returns true if a file was removed. */

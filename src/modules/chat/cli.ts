@@ -25,7 +25,7 @@ import { colorizeDiff } from "../worker-model/cli.js";
 import type { ChatMode, ChatToolActivity } from "./contract.js";
 import { discoverProject, formatOverview } from "./project-discovery.js";
 import { ChatSession, type PermissionMode, type PersistedSession, type RollbackResult, type TurnOptions } from "./session.js";
-import { persistentStore, type PersistentSessionStore } from "./session-store.js";
+import { persistentStore, PersistentSessionStore, sessionsDir } from "./session-store.js";
 import { defaultBinDir, installLauncher, launcherExists, setupInstructions } from "./shell-integration.js";
 import { addInstruction, clearInstructions, editInstructions, instructionsPath, readInstructions } from "./user-memory.js";
 
@@ -502,7 +502,10 @@ function readlineSource(): { readLine: () => Promise<string | null>; close: () =
  */
 export async function liveRepl(argv: readonly string[] = []): Promise<void> {
   const out = (s: string): void => void process.stdout.write(s);
-  const store = persistentStore;
+  // `--max-sessions <n>` overrides the prune cap (BLOCKER-3); else the store uses IKBI_MAX_SESSIONS / default.
+  const maxIdx = argv.indexOf("--max-sessions");
+  const maxArg = maxIdx >= 0 ? Number.parseInt(argv[maxIdx + 1] ?? "", 10) : Number.NaN;
+  const store = Number.isFinite(maxArg) && maxArg > 0 ? new PersistentSessionStore(sessionsDir(), maxArg) : persistentStore;
   // `--force` breaks a stale/foreign session lock on save (BLOCKER-2).
   const force = argv.includes("--force");
   const autosave = (s: ChatSession): void => store.save(s, { force });
