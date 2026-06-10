@@ -123,12 +123,17 @@ function renderToolDiffs(tools: readonly ChatToolActivity[], out: (s: string) =>
   }
 }
 
-/** Persist the current session through the store (no-op when the store/session can't be persisted). */
+/** Persist the current session through the store (no-op when the store/session can't be persisted).
+ *  A session-lock conflict (BLOCKER-2) is reported to the operator rather than crashing the REPL. */
 function persist(ctx: ReplContext): void {
   if (ctx.store === undefined) return;
   const s = ctx.session;
   if (typeof s.id === "string" && typeof s.toPersisted === "function") {
-    ctx.store.save({ id: s.id, toPersisted: s.toPersisted.bind(s) });
+    try {
+      ctx.store.save({ id: s.id, toPersisted: s.toPersisted.bind(s) });
+    } catch (e) {
+      ctx.out(`[save blocked] ${e instanceof Error ? e.message : String(e)}\n`);
+    }
   }
 }
 
@@ -498,7 +503,9 @@ function readlineSource(): { readLine: () => Promise<string | null>; close: () =
 export async function liveRepl(argv: readonly string[] = []): Promise<void> {
   const out = (s: string): void => void process.stdout.write(s);
   const store = persistentStore;
-  const autosave = (s: ChatSession): void => store.save(s);
+  // `--force` breaks a stale/foreign session lock on save (BLOCKER-2).
+  const force = argv.includes("--force");
+  const autosave = (s: ChatSession): void => store.save(s, { force });
   const newSession = (): ChatSession => new ChatSession(randomUUID(), { autosave });
 
   let session: ChatSession;

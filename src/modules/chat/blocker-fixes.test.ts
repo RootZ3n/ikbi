@@ -4,13 +4,16 @@
  *
  *   BLOCKER-1  /rollback injects a stale-context notice into the conversation so the model re-reads
  *              the reverted file instead of operating on its now-stale tool results.
+ *   BLOCKER-2  the session store takes a per-session write lock — a write blocked by a LIVE holder
+ *              fails loudly (SessionLockedError) instead of silently clobbering, and a stale lock is
+ *              reclaimed so the write succeeds after cleanup.
  *
  * Driven through a SCRIPTED invoker (no network, no real model), same harness style as the other
  * chat tests.
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -20,6 +23,7 @@ import "../egress/index.js";
 
 import type { ModelResponse, ToolCall } from "../../core/provider/contract.js";
 import { ChatSession } from "./session.js";
+import { PersistentSessionStore, SessionLockedError } from "./session-store.js";
 
 function base(): Omit<ModelResponse, "content" | "finishReason" | "toolCalls"> {
   return {
@@ -72,4 +76,58 @@ test("BLOCKER-1: a failed/empty rollback injects no notice", () => {
   const rolled = s.rollback(1); // nothing in the file history
   assert.equal(rolled.length, 0, "nothing to roll back");
   assert.equal(s.toPersisted().messages.length, before, "no spurious notification when nothing reverted");
+});
+
+// ── BLOCKER-2: session store write lock ────────────────────────────────────────────
+
+test("BLOCKER-2: save() refuses when a LIVE process holds the lock, then succeeds after cleanup", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-lock-"));
+  const store = new PersistentSessionStore(dir);
+  const sess = new ChatSession("locked", { invoke: queued([stop("ok")]), worktree: dir });
+  const persistable = { id: sess.id, toPersisted: () => sess.toPersisted() };
+
+  // (1) plant a lock owned by a LIVE pid (this very process — guaranteed alive).
+  const lockDir = join(dir, "locked.lock");
+  mkdirSync(lockDir, { recursive: true });
+  writeFileSync(join(lockDir, "owner.json"), JSON.stringify({ pid: process.pid, startedAt: Date.now() }), "utf8");
+
+  // (2)+(3) the write is refused with a clear, actionable error.
+  assert.throws(
+    () => store.save(persistable),
+    (e: unknown) => {
+      assert.ok(e instanceof SessionLockedError, "a SessionLockedError is thrown");
+      assert.equal((e as SessionLockedError).sessionId, "locked");
+      assert.equal((e as SessionLockedError).holderPid, process.pid);
+      assert.match((e as Error).message, /locked by PID/i, "the message names the holding PID");
+      assert.match((e as Error).message, /--force/, "the message points at the --force escape hatch");
+      return true;
+    },
+  );
+  assert.ok(!existsSync(join(dir, "locked.json")), "no session file was written while locked");
+
+  // (4) clean up the lock, (5) the write now succeeds.
+  rmSync(lockDir, { recursive: true, force: true });
+  store.save(persistable);
+  assert.equal(store.load("locked")?.id, "locked", "write succeeds once the lock is gone");
+});
+
+test("BLOCKER-2: a STALE lock (dead pid) is reclaimed automatically; --force breaks a live lock", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-lock2-"));
+  const store = new PersistentSessionStore(dir);
+  const sess = new ChatSession("stale", { invoke: queued([stop("ok")]), worktree: dir });
+  const persistable = { id: sess.id, toPersisted: () => sess.toPersisted() };
+
+  // A lock owned by a pid that cannot be alive (a huge pid is reliably dead).
+  const lockDir = join(dir, "stale.lock");
+  mkdirSync(lockDir, { recursive: true });
+  writeFileSync(join(lockDir, "owner.json"), JSON.stringify({ pid: 2147483646, startedAt: Date.now() }), "utf8");
+  store.save(persistable); // must NOT throw — the stale lock is reclaimed
+  assert.equal(store.load("stale")?.id, "stale", "stale lock reclaimed and write succeeded");
+
+  // A LIVE lock is normally refused, but --force breaks it.
+  mkdirSync(lockDir, { recursive: true });
+  writeFileSync(join(lockDir, "owner.json"), JSON.stringify({ pid: process.pid, startedAt: Date.now() }), "utf8");
+  assert.throws(() => store.save(persistable), SessionLockedError, "live lock refused without force");
+  store.save(persistable, { force: true }); // force breaks it
+  assert.equal(store.load("stale")?.id, "stale", "force-unlock allowed the write");
 });
