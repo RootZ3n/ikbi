@@ -207,6 +207,12 @@ function observeEscalation(
           attribution,
         ),
       );
+      // CRITICAL FIX (C1): recordEscalation MUST be called after evaluate returns
+      // escalate:true — otherwise the per-task cap never advances and the engine
+      // recommends escalation indefinitely. The engine's two-phase API (evaluate is
+      // idempotent; recordEscalation commits the transition) is correct by design,
+      // but the orchestrator must maintain the coupling.
+      escalationEngine.recordEscalation(task.taskId, decision.currentTier, decision.targetTier);
     } else if (decision.declineReason !== undefined) {
       events.publish(
         escalationDeclined.create(
