@@ -25,7 +25,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname } from "node:path";
 
@@ -220,6 +220,109 @@ function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+/** Per-session permission level for mutating tools (REPL FIX 5). */
+export type PermissionMode = "auto" | "confirm" | "readonly";
+
+/** Tools that MUTATE the worktree (or run effecting work) — gated by permission mode. */
+const MUTATING_TOOL_NAMES: ReadonlySet<string> = new Set(["write_file", "patch", "terminal", "delegate_task"]);
+
+/** Per-turn options threaded from the REPL into the tool loop (progress + permissions). */
+export interface TurnOptions {
+  /** Called as the loop changes phase ("Thinking…", "Running terminal: …") for a spinner (FIX 4). */
+  readonly onProgress?: (phase: string) => void;
+  /** The session's permission level for THIS turn (FIX 5). Defaults to "auto". */
+  readonly permissionMode?: PermissionMode;
+  /** In "confirm" mode, asked before each mutating tool; resolve false to BLOCK it (FIX 5). */
+  readonly confirm?: (tool: string, target: string) => Promise<boolean>;
+}
+
+/** One recorded file mutation (for `/rollback`, REPL FIX 1). */
+export interface FileMutation {
+  /** Worktree-relative path. */
+  readonly path: string;
+  /** Absolute path (for the rollback write/delete). */
+  readonly full: string;
+  /** File content BEFORE the mutation; null when the file did not previously exist. */
+  readonly beforeContent: string | null;
+  /** File content AFTER the mutation. */
+  readonly afterContent: string;
+  /** Which tool made it. */
+  readonly tool: "write_file" | "patch";
+  readonly timestamp: number;
+}
+
+/** What a single rollback step did (for the REPL to report). */
+export interface RollbackResult {
+  readonly tool: string;
+  readonly path: string;
+  readonly action: string;
+}
+
+/**
+ * A bounded, unified-style line diff between two file versions (REPL FIX 3). Uses a common
+ * prefix/suffix collapse so a small edit yields a small diff (the typical patch case) without
+ * an O(n·m) LCS. Removed lines are `-`-prefixed, added lines `+`-prefixed — exactly what the
+ * shared `colorizeDiff` colorizes. Returns "" when the two versions are identical.
+ */
+export function computeLineDiff(before: string, after: string): string {
+  if (before === after) return "";
+  const a = before.length === 0 ? [] : before.split("\n");
+  const b = after.length === 0 ? [] : after.split("\n");
+  let start = 0;
+  while (start < a.length && start < b.length && a[start] === b[start]) start += 1;
+  let endA = a.length;
+  let endB = b.length;
+  while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) {
+    endA -= 1;
+    endB -= 1;
+  }
+  const lines: string[] = [];
+  for (let i = start; i < endA; i += 1) lines.push(`-${a[i]}`);
+  for (let i = start; i < endB; i += 1) lines.push(`+${b[i]}`);
+  return lines.join("\n");
+}
+
+/** Bound a diff to ~50 lines: keep the first 25 + last 25 with a collapse marker between. */
+export function boundDiff(diff: string): string {
+  if (diff.length === 0) return diff;
+  const lines = diff.split("\n");
+  if (lines.length <= 50) return diff;
+  const omitted = lines.length - 50;
+  return [...lines.slice(0, 25), `... (${omitted} more line${omitted === 1 ? "" : "s"}) ...`, ...lines.slice(-25)].join("\n");
+}
+
+/**
+ * Map a failed tool's output to ONE short, actionable hint (REPL FIX 9), or undefined when no
+ * known pattern matches. The hint is APPENDED to the tool output (never replaces it).
+ */
+export function errorRecoveryHint(output: string): string | undefined {
+  if (/ENOENT/.test(output)) return "File not found. Did you mean a different path?";
+  if (/EACCES/.test(output)) return "Permission denied. Check file permissions.";
+  if (/MODULE_NOT_FOUND/.test(output)) return "Missing dependency. Run npm install?";
+  if (/TS2345/.test(output)) return "Type error. Check the function signature.";
+  if (/\bexit (?:code )?1\b/.test(output) && /ERROR|DENIED|FAIL/i.test(output)) return "Command failed. Check the output above.";
+  return undefined;
+}
+
+/** Append an error-recovery hint to a tool output when one applies; otherwise return it unchanged. */
+function withErrorHint(output: string): string {
+  const hint = errorRecoveryHint(output);
+  return hint !== undefined ? `${output}\n[hint: ${hint}]` : output;
+}
+
+/** Build a spinner phase line for a tool call ("Running terminal: pnpm test"), best-effort. */
+function progressPhase(call: ToolCall): string {
+  let target = "";
+  try {
+    const a = JSON.parse(call.arguments && call.arguments.length > 0 ? call.arguments : "{}") as Record<string, unknown>;
+    const raw = typeof a.command === "string" ? a.command : typeof a.path === "string" ? a.path : typeof a.query === "string" ? a.query : typeof a.task === "string" ? a.task : "";
+    target = raw.length > 60 ? `${raw.slice(0, 60)}…` : raw;
+  } catch {
+    target = "";
+  }
+  return target.length > 0 ? `Running ${call.name}: ${target}` : `Running ${call.name}`;
+}
+
 /** Resolve a governed parent identity from configured tokens; undefined ⇒ terminal fails closed. */
 function resolveParentCtx(sessionId: string): OperationContext | undefined {
   const token = config.identity.operatorToken ?? config.identity.workerToken;
@@ -263,6 +366,9 @@ export interface PersistedSession {
   readonly tokensIn?: number;
   readonly tokensOut?: number;
   readonly costUsd?: number;
+  /** Cumulative prompt-cache counters (for cache-hit visibility after a resume). */
+  readonly cachedTokens?: number;
+  readonly cacheSavedUsd?: number;
 }
 
 /** Per-session injectable dependencies (production defaults: real invokeModel, configured workdir). */
@@ -314,6 +420,11 @@ export class ChatSession {
   private tokensIn = 0;
   private tokensOut = 0;
   private costTotal = 0;
+  /** Cumulative prompt-cache counters (FIX 7): cached prompt tokens + estimated USD saved. */
+  private cachedTokens = 0;
+  private cacheSavedUsd = 0;
+  /** Ordered log of file mutations this session made, for `/rollback` (FIX 1). In-memory only. */
+  private readonly fileHistory: FileMutation[] = [];
 
   constructor(id: string, deps: ChatSessionDeps = {}) {
     const restore = deps.restore;
@@ -336,6 +447,8 @@ export class ChatSession {
     this.tokensIn = restore?.tokensIn ?? 0;
     this.tokensOut = restore?.tokensOut ?? 0;
     this.costTotal = restore?.costUsd ?? 0;
+    this.cachedTokens = restore?.cachedTokens ?? 0;
+    this.cacheSavedUsd = restore?.cacheSavedUsd ?? 0;
     // PROJECT MEMORY: load the workspace's CLAUDE.md/AGENTS.md (missing ⇒ undefined, no crash)
     // and carry it as a neutralized, isolated UNTRUSTED message (the chokepoint — never bypassed).
     const proj = loadProjectInstructions(this.worktree);
@@ -357,7 +470,7 @@ export class ChatSession {
   }
 
   /** Run one tool call; returns the raw result string + display activity (NOT yet neutralized). */
-  private async runTool(call: ToolCall, mode: ChatMode = "agent"): Promise<{ output: string; activity: ChatToolActivity }> {
+  private async runTool(call: ToolCall, mode: ChatMode = "agent", opts: TurnOptions = {}): Promise<{ output: string; activity: ChatToolActivity }> {
     // PLAN MODE: defense-in-depth — even though plan mode only OFFERS read-only tools, reject any
     // mutating/effecting call the model might still emit (write_file, patch, terminal, delegate, …).
     if (mode === "plan" && !READ_ONLY_TOOL_NAMES.has(call.name)) {
@@ -368,6 +481,23 @@ export class ChatSession {
       args = JSON.parse(call.arguments && call.arguments.length > 0 ? call.arguments : "{}") as Record<string, unknown>;
     } catch {
       return { output: `ERROR: malformed arguments for ${call.name} (not valid JSON)`, activity: { name: call.name, ok: false, summary: "bad arguments" } };
+    }
+    // PERMISSION GATE (FIX 5): in "readonly" mode block every mutating tool; in "confirm" mode ask
+    // the operator first and BLOCK on a decline. "auto" (the default) lets everything through.
+    const permissionMode = opts.permissionMode ?? "auto";
+    if (permissionMode !== "auto" && MUTATING_TOOL_NAMES.has(call.name)) {
+      const target =
+        typeof args.path === "string" ? args.path
+        : typeof args.command === "string" ? args.command
+        : typeof args.task === "string" ? args.task
+        : "";
+      if (permissionMode === "readonly") {
+        return { output: `ERROR: ${call.name} is blocked (permission mode: readonly).`, activity: { name: call.name, ok: false, summary: "blocked (readonly)" } };
+      }
+      const allowed = opts.confirm !== undefined ? await opts.confirm(call.name, target) : true;
+      if (!allowed) {
+        return { output: `ERROR: ${call.name} was DENIED by the operator (permission mode: confirm).`, activity: { name: call.name, ok: false, summary: "denied" } };
+      }
     }
     switch (call.name) {
       case "read_file": {
@@ -384,10 +514,19 @@ export class ChatSession {
         const c = confinePath(this.worktree, args.path);
         if (!c.ok) return { output: `ERROR: ${c.error}`, activity: { name: "write_file", ok: false, summary: c.error } };
         const content = typeof args.content === "string" ? args.content : "";
+        // Capture BEFORE content for rollback + diff (null ⇒ a brand-new file).
+        let before: string | null = null;
+        try {
+          before = readFileSync(c.full, "utf8");
+        } catch {
+          before = null;
+        }
         try {
           mkdirSync(dirname(c.full), { recursive: true });
           writeFileSync(c.full, content, "utf8");
-          return { output: `wrote ${Buffer.byteLength(content, "utf8")} bytes to ${c.rel}`, activity: { name: "write_file", ok: true, summary: c.rel } };
+          this.recordMutation({ path: c.rel, full: c.full, beforeContent: before, afterContent: content, tool: "write_file", timestamp: Date.now() });
+          const diff = boundDiff(computeLineDiff(before ?? "", content));
+          return { output: `wrote ${Buffer.byteLength(content, "utf8")} bytes to ${c.rel}`, activity: { name: "write_file", ok: true, summary: c.rel, ...(diff.length > 0 ? { diff } : {}) } };
         } catch (e) {
           return { output: `ERROR: write failed: ${errMsg(e)}`, activity: { name: "write_file", ok: false, summary: c.rel } };
         }
@@ -409,8 +548,31 @@ export class ChatSession {
         return { output: res.output, activity: { name: "search_files", ok: res.rejection === undefined, ...(typeof args.pattern === "string" ? { summary: args.pattern } : {}) } };
       }
       case "patch": {
+        // Capture BEFORE content (for rollback + diff) before the in-place edit. Confine here too so
+        // we have the absolute path; runPatch re-confines internally (cheap, and keeps it self-contained).
+        const c = confinePath(this.worktree, args.path);
+        let before: string | null = null;
+        if (c.ok) {
+          try {
+            before = readFileSync(c.full, "utf8");
+          } catch {
+            before = null;
+          }
+        }
         const res = runPatch(this.worktree, args);
-        return { output: res.output, activity: { name: "patch", ok: res.rejection === undefined, ...(res.wrote !== undefined ? { summary: res.wrote } : {}) } };
+        const ok = res.rejection === undefined;
+        let diff = "";
+        if (ok && c.ok) {
+          let after = "";
+          try {
+            after = readFileSync(c.full, "utf8");
+          } catch {
+            after = "";
+          }
+          this.recordMutation({ path: c.rel, full: c.full, beforeContent: before, afterContent: after, tool: "patch", timestamp: Date.now() });
+          diff = boundDiff(computeLineDiff(before ?? "", after));
+        }
+        return { output: res.output, activity: { name: "patch", ok, ...(res.wrote !== undefined ? { summary: res.wrote } : {}), ...(diff.length > 0 ? { diff } : {}) } };
       }
       case "terminal": {
         const out = await runTerminal({ governedExec, ...(this.parentCtx !== undefined ? { parentCtx: this.parentCtx } : {}) }, this.worktree, args);
@@ -572,9 +734,46 @@ export class ChatSession {
     this.model = model;
   }
 
-  /** Cumulative token + cost usage across the session (for `/cost`). */
-  usage(): { tokensIn: number; tokensOut: number; costUsd: number } {
-    return { tokensIn: this.tokensIn, tokensOut: this.tokensOut, costUsd: this.costTotal };
+  /** Record a file mutation for `/rollback` (FIX 1). Internal — called from the write/patch tools. */
+  private recordMutation(m: FileMutation): void {
+    this.fileHistory.push(m);
+  }
+
+  /**
+   * Undo the last `n` file mutations this session made (FIX 1), most-recent first. A write/patch
+   * to a previously-existing file is restored to its prior content; a mutation that CREATED the
+   * file is undone by deleting it. Returns one result per step (newest first). Never throws.
+   */
+  rollback(n = 1): RollbackResult[] {
+    const count = Math.max(0, Math.min(Math.floor(n), this.fileHistory.length));
+    const results: RollbackResult[] = [];
+    for (let i = 0; i < count; i += 1) {
+      const m = this.fileHistory.pop();
+      if (m === undefined) break;
+      try {
+        if (m.beforeContent === null) {
+          rmSync(m.full, { force: true });
+          results.push({ tool: m.tool, path: m.path, action: "deleted (was newly created)" });
+        } else {
+          writeFileSync(m.full, m.beforeContent, "utf8");
+          results.push({ tool: m.tool, path: m.path, action: "restored to previous content" });
+        }
+      } catch (e) {
+        results.push({ tool: m.tool, path: m.path, action: `rollback FAILED: ${errMsg(e)}` });
+      }
+    }
+    return results;
+  }
+
+  /** Cumulative token + cost usage across the session (for `/cost`), incl. prompt-cache counters. */
+  usage(): { tokensIn: number; tokensOut: number; costUsd: number; cachedTokens: number; cacheSavedUsd: number } {
+    return { tokensIn: this.tokensIn, tokensOut: this.tokensOut, costUsd: this.costTotal, cachedTokens: this.cachedTokens, cacheSavedUsd: this.cacheSavedUsd };
+  }
+
+  /** Prompt-cache hit rate as a 0-100 percent of cumulative prompt tokens (FIX 7); 0 when none. */
+  cacheHitPercent(): number {
+    if (this.tokensIn <= 0) return 0;
+    return Math.min(100, Math.round((this.cachedTokens / this.tokensIn) * 100));
   }
 
   /** Serialize this session to its on-disk shape (the inverse of the `restore` dep). */
@@ -591,6 +790,8 @@ export class ChatSession {
       tokensIn: this.tokensIn,
       tokensOut: this.tokensOut,
       costUsd: this.costTotal,
+      cachedTokens: this.cachedTokens,
+      cacheSavedUsd: this.cacheSavedUsd,
     };
   }
 
@@ -649,8 +850,9 @@ export class ChatSession {
     userMessage: string,
     images?: readonly string[],
     mode: ChatMode = "agent",
+    opts: TurnOptions = {},
   ): Promise<{ response: string; tools: ChatToolActivity[]; cost: number; contextPercent: number }> {
-    const result = await this.runTurn(userMessage, images, mode);
+    const result = await this.runTurn(userMessage, images, mode, opts);
     // AUTO-SAVE: persist the (now-mutated) session after every turn, so a crash/quit never
     // loses work. The hook is injected (the persistent store in production; absent in unit tests).
     if (this.autosave !== undefined) {
@@ -667,6 +869,7 @@ export class ChatSession {
     userMessage: string,
     images?: readonly string[],
     mode: ChatMode = "agent",
+    opts: TurnOptions = {},
   ): Promise<{ response: string; tools: ChatToolActivity[]; cost: number; contextPercent: number }> {
     this.lastUsedAt = Date.now();
     // Cost visibility: accumulate every model invocation's cost this turn.
@@ -696,6 +899,8 @@ export class ChatSession {
         return { response: "[ikbi: reached the tool-iteration limit for this turn — try narrowing the request.]", tools, cost: turnCost, contextPercent: this.contextPercent() };
       }
 
+      // PROGRESS (FIX 4): signal the "thinking" phase before the (possibly slow) model call.
+      opts.onProgress?.("Thinking…");
       let response: ModelResponse;
       try {
         response = await this.invoke({
@@ -715,6 +920,17 @@ export class ChatSession {
       this.tokensIn += response.usage?.promptTokens ?? 0;
       this.tokensOut += response.usage?.completionTokens ?? 0;
       this.costTotal += response.cost?.usd ?? 0;
+      // PROMPT-CACHE VISIBILITY (FIX 7): accumulate cached prompt tokens + the estimated USD saved
+      // (the gap between the full prompt rate and the cheaper cached rate on those tokens).
+      const cached = response.usage?.cachedTokens ?? 0;
+      if (cached > 0) {
+        this.cachedTokens += cached;
+        const rate = response.cost?.rate;
+        if (rate !== undefined) {
+          const cachedRate = rate.cachedPromptPerMTok ?? rate.promptPerMTok;
+          this.cacheSavedUsd += (cached / 1_000_000) * Math.max(0, rate.promptPerMTok - cachedRate);
+        }
+      }
 
       this.messages.push({
         role: "assistant",
@@ -724,9 +940,12 @@ export class ChatSession {
 
       if (response.finishReason === "tool_calls" && response.toolCalls !== undefined && response.toolCalls.length > 0) {
         for (const call of response.toolCalls) {
-          const { output, activity } = await this.runTool(call, mode);
+          // PROGRESS (FIX 4): name the tool (and a short target) as the spinner phase.
+          opts.onProgress?.(progressPhase(call));
+          const { output, activity } = await this.runTool(call, mode, opts);
           tools.push(activity);
-          this.appendToolResult(output, call); // chokepoint: neutralize + append
+          // ERROR HINTS (FIX 9): append a one-line recovery hint to a failed tool's output.
+          this.appendToolResult(withErrorHint(output), call); // chokepoint: neutralize + append
         }
         continue; // let the model read the (neutralized) results and continue
       }

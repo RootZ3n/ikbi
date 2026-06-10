@@ -50,6 +50,11 @@ export interface ChatToolActivity {
   readonly name: string;
   readonly ok: boolean;
   readonly summary?: string;
+  /**
+   * OPTIONAL unified-diff text of a file mutation this tool made (write_file / patch only,
+   * on success). DISPLAY-only — bounded, not fed back to the model. The REPL colorizes it.
+   */
+  readonly diff?: string;
 }
 
 /** The POST /chat response body. */

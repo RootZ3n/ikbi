@@ -21,9 +21,12 @@ import { createInterface } from "node:readline";
 
 import { registerCommand } from "../../cli/registry.js";
 import { config } from "../../core/config.js";
+import { colorizeDiff } from "../worker-model/cli.js";
 import type { ChatMode, ChatToolActivity } from "./contract.js";
-import { ChatSession, type PersistedSession } from "./session.js";
+import { discoverProject, formatOverview } from "./project-discovery.js";
+import { ChatSession, type PermissionMode, type PersistedSession, type RollbackResult, type TurnOptions } from "./session.js";
 import { persistentStore, type PersistentSessionStore } from "./session-store.js";
+import { defaultBinDir, installLauncher, launcherExists, setupInstructions } from "./shell-integration.js";
 import { addInstruction, clearInstructions, editInstructions, instructionsPath, readInstructions } from "./user-memory.js";
 
 function errMsg(e: unknown): string {
@@ -33,7 +36,7 @@ function errMsg(e: unknown): string {
 /** The session surface the repl drives. `send` is the only hard requirement; the rest are
  *  optional so a lightweight fake (just `send`) still satisfies it for tests. */
 export interface ReplSession {
-  send(userMessage: string, images?: readonly string[], mode?: ChatMode): Promise<{ response: string; tools: ChatToolActivity[]; cost?: number; contextPercent?: number }>;
+  send(userMessage: string, images?: readonly string[], mode?: ChatMode, opts?: TurnOptions): Promise<{ response: string; tools: ChatToolActivity[]; cost?: number; contextPercent?: number }>;
   readonly id?: string;
   readonly worktree?: string;
   label?: string | undefined;
@@ -41,7 +44,9 @@ export interface ReplSession {
   messageCount?(): number;
   currentModel?(): string;
   setModel?(model: string): void;
-  usage?(): { tokensIn: number; tokensOut: number; costUsd: number };
+  usage?(): { tokensIn: number; tokensOut: number; costUsd: number; cachedTokens?: number; cacheSavedUsd?: number };
+  cacheHitPercent?(): number;
+  rollback?(n: number): RollbackResult[];
   compact?(): Promise<{ before: number; after: number; compressed: boolean }>;
   toPersisted?(): PersistedSession;
 }
@@ -63,12 +68,16 @@ export interface ReplDeps {
 interface ReplContext {
   session: ReplSession;
   mode: ChatMode;
+  /** Per-session permission level for mutating tools (FIX 5). */
+  permissionMode: PermissionMode;
   exit: boolean;
   readonly out: (s: string) => void;
   readonly store: PersistentSessionStore | undefined;
   readonly newSession: (() => ReplSession) | undefined;
   /** Read ONE line and resolve true on an affirmative (y/yes) — used by `/reset`. */
   readonly confirm: () => Promise<boolean>;
+  /** Read ONE line as a permission decision; default-YES ([Y/n]) — used by `/permissions confirm`. */
+  readonly confirmTool: (tool: string, target: string) => Promise<boolean>;
 }
 
 /** A registered slash command. */
@@ -89,12 +98,29 @@ const YELLOW = "\x1b[33m";
 const RED = "\x1b[31m";
 const RESET = "\x1b[0m";
 
-/** The context-usage bar shown after a turn, escalating its warning as the window fills. */
-function contextBar(pct: number | undefined): string {
+/** A spinner clears its line with `\r` + erase-to-end before the next write. */
+const SPINNER_CLEAR = "\r\x1b[K";
+
+/**
+ * The context-usage bar shown after a turn, escalating its warning as the window fills. When
+ * prompt caching is active (cachePct defined and > 0), a `cache: N%` segment is appended (FIX 7).
+ */
+function contextBar(pct: number | undefined, cachePct?: number): string {
   if (pct === undefined) return "";
-  if (pct > 85) return `${RED}[ctx: ${pct}% — /compact recommended]${RESET}\n`;
-  if (pct > 70) return `${YELLOW}[ctx: ${pct}% — consider /compact]${RESET}\n`;
-  return `${DIM}[ctx: ${pct}%]${RESET}\n`;
+  const cacheSeg = cachePct !== undefined && cachePct > 0 ? ` | cache: ${cachePct}%` : "";
+  if (pct > 85) return `${RED}[ctx: ${pct}%${cacheSeg} — /compact recommended]${RESET}\n`;
+  if (pct > 70) return `${YELLOW}[ctx: ${pct}%${cacheSeg} — consider /compact]${RESET}\n`;
+  return `${DIM}[ctx: ${pct}%${cacheSeg}]${RESET}\n`;
+}
+
+/** Render any inline diffs carried on a turn's tool activity, colorized for the terminal (FIX 3). */
+function renderToolDiffs(tools: readonly ChatToolActivity[], out: (s: string) => void): void {
+  for (const t of tools) {
+    if (t.diff !== undefined && t.diff.length > 0) {
+      out(`${DIM}── ${t.name} ${t.summary ?? ""}${RESET}\n`);
+      out(`${colorizeDiff(t.diff)}\n`);
+    }
+  }
 }
 
 /** Persist the current session through the store (no-op when the store/session can't be persisted). */
@@ -160,6 +186,12 @@ const COMMAND_LIST: readonly ReplCommand[] = [
       }
       ctx.out(`tokens — in: ${u.tokensIn}, out: ${u.tokensOut}, total: ${u.tokensIn + u.tokensOut}\n`);
       ctx.out(`estimated cost: $${u.costUsd.toFixed(4)}\n`);
+      // Prompt-cache visibility (FIX 7): hit rate + estimated savings, when caching was active.
+      const cached = u.cachedTokens ?? 0;
+      if (cached > 0 && u.tokensIn > 0) {
+        const rate = Math.round((cached / u.tokensIn) * 100);
+        ctx.out(`Cache hit rate: ${rate}% (saved ~$${(u.cacheSavedUsd ?? 0).toFixed(2)})\n`);
+      }
     },
   },
   {
@@ -168,18 +200,23 @@ const COMMAND_LIST: readonly ReplCommand[] = [
     usage: "[name]",
     handler: (ctx, args) => {
       const name = args.trim();
+      const dm = config.provider.defaultModels;
       if (name.length === 0) {
         ctx.out(`current model: ${ctx.session.currentModel !== undefined ? ctx.session.currentModel() : "?"}\n`);
-        const dm = config.provider.defaultModels;
         ctx.out(`configured defaults: driver=${dm.driver}, builder=${dm.builder}, critic=${dm.critic}\n`);
+        // Available models to switch to (FIX 8): the configured defaults + any competitive list.
+        const available = [...new Set([dm.driver, dm.builder, dm.critic, ...(dm.competitiveModels ?? [])])];
+        ctx.out(`available: ${available.join(", ")}\n`);
         return;
       }
       if (ctx.session.setModel === undefined) {
         ctx.out("[model switching unavailable for this session]\n");
         return;
       }
+      // Hot-swap (FIX 8): the message log is untouched, so context is preserved across the switch.
+      const prev = ctx.session.currentModel !== undefined ? ctx.session.currentModel() : "?";
       ctx.session.setModel(name);
-      ctx.out(`model switched to ${name}\n`);
+      ctx.out(`model switched to ${name} — context preserved (${prev} → ${name})\n`);
       persist(ctx);
     },
   },
@@ -300,6 +337,45 @@ const COMMAND_LIST: readonly ReplCommand[] = [
       ctx.out(`[unknown /memory subcommand: ${sub} — use show | add <text> | edit | clear]\n`);
     },
   },
+  {
+    name: "rollback",
+    description: "Undo the last N file changes made this session (default 1)",
+    usage: "[N]",
+    handler: (ctx, args) => {
+      if (ctx.session.rollback === undefined) {
+        ctx.out("[rollback unavailable for this session]\n");
+        return;
+      }
+      const parsed = Number.parseInt(args.trim(), 10);
+      const n = Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+      const results = ctx.session.rollback(n);
+      if (results.length === 0) {
+        ctx.out("[nothing to roll back]\n");
+        return;
+      }
+      for (const r of results) ctx.out(`Rolled back: ${r.tool} ${r.path} (${r.action})\n`);
+      persist(ctx);
+    },
+  },
+  {
+    name: "permissions",
+    description: "Show or set the tool permission mode (auto | confirm | readonly)",
+    usage: "[auto|confirm|readonly]",
+    handler: (ctx, args) => {
+      const m = args.trim();
+      if (m.length === 0) {
+        ctx.out(`permission mode: ${ctx.permissionMode}\n`);
+        ctx.out("  auto     — approve all tool calls (default)\n  confirm  — ask before write_file / patch / terminal / delegate_task\n  readonly — block all mutating tools\n");
+        return;
+      }
+      if (m !== "auto" && m !== "confirm" && m !== "readonly") {
+        ctx.out("[usage: /permissions auto|confirm|readonly]\n");
+        return;
+      }
+      ctx.permissionMode = m;
+      ctx.out(`permission mode set to ${m}\n`);
+    },
+  },
 ];
 
 /** Name → command lookup, plus the `quit` alias for `exit` (both handled inline in the loop). */
@@ -317,14 +393,23 @@ export async function runRepl(deps: ReplDeps): Promise<void> {
     if (line === null) return false;
     return /^\s*y(es)?\s*$/i.test(line);
   };
+  // Permission prompt (FIX 5): "[Y/n]" defaults to YES — only an explicit no/n declines.
+  const confirmTool = async (tool: string, target: string): Promise<boolean> => {
+    deps.out(`Allow ${tool}${target.length > 0 ? ` ${target}` : ""}? [Y/n] `);
+    const line = await deps.readLine();
+    if (line === null) return false;
+    return !/^\s*n(o)?\s*$/i.test(line);
+  };
   const ctx: ReplContext = {
     session: deps.session,
     mode: "agent",
+    permissionMode: "auto",
     exit: false,
     out: deps.out,
     store: deps.store,
     newSession: deps.newSession,
     confirm,
+    confirmTool,
   };
   deps.out("ikbi repl — a conversational coding session. Type /help for commands, /plan for read-only planning, /exit (or Ctrl-C) to quit.\n");
   for (;;) {
@@ -351,15 +436,23 @@ export async function runRepl(deps: ReplDeps): Promise<void> {
       continue;
     }
     let res: { response: string; tools: ChatToolActivity[]; contextPercent?: number };
+    // PROGRESS (FIX 4): a `\r`-overwriting spinner line while the (async) turn runs.
+    const onProgress = (phase: string): void => deps.out(`${SPINNER_CLEAR}${DIM}⟳ ${phase}${RESET}`);
+    const turnOpts: TurnOptions = { onProgress, permissionMode: ctx.permissionMode, confirm: ctx.confirmTool };
     try {
-      res = await ctx.session.send(msg, undefined, ctx.mode);
+      res = await ctx.session.send(msg, undefined, ctx.mode, turnOpts);
     } catch (e) {
-      deps.out(`[error: ${errMsg(e)}]\n`);
+      deps.out(`${SPINNER_CLEAR}[error: ${errMsg(e)}]\n`);
       continue;
     }
+    deps.out(SPINNER_CLEAR); // clear the spinner line before printing the result
     if (res.tools.length > 0) deps.out(toolLine(res.tools));
+    renderToolDiffs(res.tools, deps.out); // FIX 3: colorized inline diffs for file mutations
     deps.out(`${res.response}\n`);
-    deps.out(contextBar(res.contextPercent));
+    // Cache-hit segment for the context bar (FIX 7), when caching is active this session.
+    const u = ctx.session.usage?.();
+    const cachePct = ctx.session.cacheHitPercent?.() ?? (u !== undefined && (u.cachedTokens ?? 0) > 0 && u.tokensIn > 0 ? Math.round(((u.cachedTokens ?? 0) / u.tokensIn) * 100) : undefined);
+    deps.out(contextBar(res.contextPercent, cachePct));
   }
   deps.out("\nsession ended.\n");
 }
@@ -430,6 +523,13 @@ export async function liveRepl(argv: readonly string[] = []): Promise<void> {
     session = newSession();
   }
 
+  // PROJECT AUTO-DISCOVERY (FIX 2): a one-line overview of the worktree at startup.
+  try {
+    out(formatOverview(discoverProject(session.worktree)));
+  } catch {
+    // Discovery is best-effort cosmetics — never let it block the session.
+  }
+
   const src = readlineSource();
   try {
     await runRepl({ session, store, newSession, readLine: src.readLine, out });
@@ -443,4 +543,25 @@ registerCommand({
   summary: "Start an interactive conversational session (multi-turn, tool-calling)",
   usage: "ikbi repl [--continue | --resume <id>]",
   run: (argv) => liveRepl(argv),
+});
+
+/**
+ * `ikbi setup` (FIX 6) — install a global `ikbi` launcher so the CLI runs from any directory.
+ * Writes an executable wrapper to ~/.local/bin/ikbi (the SHELL INTEGRATION seam) and prints
+ * whatever PATH step (if any) remains. Idempotent — re-running just refreshes the launcher.
+ */
+registerCommand({
+  name: "setup",
+  summary: "Install a global `ikbi` launcher (shell integration) so `ikbi` works from anywhere",
+  usage: "ikbi setup",
+  run: () => {
+    const out = (s: string): void => void process.stdout.write(s);
+    if (launcherExists()) out(`(refreshing existing launcher in ${defaultBinDir()})\n`);
+    try {
+      const install = installLauncher();
+      out(setupInstructions(install));
+    } catch (e) {
+      out(`[setup failed: ${errMsg(e)}]\nManually create an executable ~/.local/bin/ikbi that execs this repo's CLI.\n`);
+    }
+  },
 });
