@@ -81,6 +81,17 @@ export class SessionMemory {
     return { filesModified: [...this.files], testResults: [...this.tests], decisions: [...this.decisions] };
   }
 
+  /** Rebuild a memory from a persisted snapshot (the inverse of `snapshot()`, used by the
+   *  persistent session store on resume). Trims to the same caps so a tampered file can't bloat. */
+  static fromSnapshot(snap: MemorySnapshot): SessionMemory {
+    const m = new SessionMemory();
+    m.files = [...snap.filesModified];
+    for (const t of snap.testResults) m.tests.push({ command: t.command, ok: t.ok });
+    for (const d of snap.decisions) m.decisions.push(d);
+    m.trim();
+    return m;
+  }
+
   /**
    * The BRIEF memory summary injected into the system prompt each turn. Byte-bounded
    * (< ~500 tokens) and framed as context, not instructions. Empty string when there

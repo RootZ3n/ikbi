@@ -46,7 +46,7 @@ import {
 import { getCapabilities } from "../../core/provider/capabilities.js";
 import { governedExec } from "../governed-exec/index.js";
 import { scoutDetail } from "../worker-model/builder.js";
-import { estimateTokens } from "../worker-model/context-manager.js";
+import { estimateTokens, maybeCompress } from "../worker-model/context-manager.js";
 import { loadProjectInstructions } from "../worker-model/project-memory.js";
 import { type CheckResult, mapExec, VERIFIER_CHECKS } from "../worker-model/checks.js";
 import { confinePath } from "../worker-model/builder-tools/confine.js";
@@ -58,7 +58,8 @@ import { runTerminal, terminalTool } from "../worker-model/builder-tools/termina
 import { runVisionAnalyze, visionAnalyzeTool } from "../worker-model/builder-tools/vision-tool.js";
 import { runWebExtract, runWebSearch, webExtractTool, webSearchTool } from "../worker-model/builder-tools/web-tools.js";
 import type { ChatToolActivity } from "./contract.js";
-import { SessionMemory } from "./memory.js";
+import { SessionMemory, type MemorySnapshot } from "./memory.js";
+import { loadUserInstructions } from "./user-memory.js";
 
 const log = childLogger("chat");
 
@@ -244,12 +245,38 @@ function resolveWorkdir(): string {
 /** The model-invocation function shape — injectable so the tool loop is testable without network. */
 export type InvokeFn = typeof invokeModel;
 
+/**
+ * A session serialized to disk (the persistent-store shape). Holds everything needed to
+ * reconstruct a live ChatSession: identity/worktree, the full message log, the key-fact
+ * memory snapshot, lifecycle timestamps, and an optional human label. JSON-friendly.
+ */
+export interface PersistedSession {
+  readonly id: string;
+  readonly worktree: string;
+  readonly model: string;
+  readonly messages: readonly ModelMessage[];
+  readonly memory: MemorySnapshot;
+  readonly createdAt: number;
+  readonly lastUsedAt: number;
+  readonly label?: string;
+  /** Cumulative token/cost counters (for `/cost` after a resume). */
+  readonly tokensIn?: number;
+  readonly tokensOut?: number;
+  readonly costUsd?: number;
+}
+
 /** Per-session injectable dependencies (production defaults: real invokeModel, configured workdir). */
 export interface ChatSessionDeps {
   /** Override the model invoker (tests script responses); defaults to the real provider. */
   readonly invoke?: InvokeFn;
   /** Override the worktree (tests pin a known dir); defaults to IKBI_CHAT_WORKDIR or a tmp sandbox. */
   readonly worktree?: string;
+  /** Override the driver model id; defaults to the configured driver. Switchable later via setModel. */
+  readonly model?: string;
+  /** Restore a persisted session (messages + memory + lifecycle) instead of starting fresh. */
+  readonly restore?: PersistedSession;
+  /** Called at the END of every `send()` (after state is mutated) so the caller can auto-persist. */
+  readonly autosave?: (session: ChatSession) => void;
 }
 
 /** One persistent conversation. Holds the message log, worktree, and governed identity. */
@@ -258,28 +285,57 @@ export class ChatSession {
   readonly worktree: string;
   /** Key-fact memory across turns (files modified, command/test results, conclusions). */
   readonly memory: SessionMemory;
-  private readonly messages: ModelMessage[];
+  private messages: ModelMessage[];
   private readonly identity: AgentIdentity;
   private readonly parentCtx: OperationContext | undefined;
   private readonly invoke: InvokeFn;
+  private readonly autosave: ((session: ChatSession) => void) | undefined;
   /**
    * PROJECT MEMORY carrier (the worktree's CLAUDE.md / AGENTS.md), built once as an isolated
    * UNTRUSTED data-role message and slotted in after the system prompt each turn. Undefined
    * when the workspace has no such file. Honored project guidance, but bounded + neutralized.
    */
   private readonly projectMsg: ModelMessage | undefined;
+  /**
+   * USER MEMORY carrier (the operator's ~/.ikbi/instructions.md standing instructions), built
+   * once and slotted in after project memory. Same isolated/neutralized treatment. Undefined
+   * when there are no user instructions.
+   */
+  private readonly userMsg: ModelMessage | undefined;
+  /** The driver model id for this session — switchable at runtime via setModel (`/model`). */
+  private model: string;
+  /** When the session was first created (carried across resume, for `/status`). */
+  readonly createdAt: number;
   /** Last-touched timestamp (for LRU eviction). */
   lastUsedAt: number;
+  /** Optional human-friendly label (`/label`), persisted with the session. */
+  label: string | undefined;
+  /** Cumulative token + cost counters across the whole session (for `/cost`). */
+  private tokensIn = 0;
+  private tokensOut = 0;
+  private costTotal = 0;
 
   constructor(id: string, deps: ChatSessionDeps = {}) {
+    const restore = deps.restore;
     this.id = id;
-    this.worktree = deps.worktree ?? resolveWorkdir();
+    this.worktree = deps.worktree ?? restore?.worktree ?? resolveWorkdir();
     this.identity = { agentId: "ikbi-chat", functionalRole: "assistant", trustTier: "trusted", sessionId: id };
     this.parentCtx = resolveParentCtx(id);
     this.invoke = deps.invoke ?? invokeModel;
-    this.memory = new SessionMemory();
-    // messages[0] is the system prompt; it is REWRITTEN each turn to fold in the memory summary.
-    this.messages = [{ role: "system", content: CHAT_SYSTEM }];
+    this.autosave = deps.autosave;
+    this.model = deps.model ?? restore?.model ?? config.provider.defaultModels.driver;
+    // messages[0] is ALWAYS the clean, trusted system prompt — even on resume we force a fresh
+    // one (never trust a persisted/poisoned system slot), then graft the restored conversation.
+    this.messages = restore !== undefined
+      ? [{ role: "system", content: CHAT_SYSTEM }, ...restore.messages.slice(1)]
+      : [{ role: "system", content: CHAT_SYSTEM }];
+    this.memory = restore !== undefined ? SessionMemory.fromSnapshot(restore.memory) : new SessionMemory();
+    this.createdAt = restore?.createdAt ?? Date.now();
+    this.lastUsedAt = restore?.lastUsedAt ?? Date.now();
+    this.label = restore?.label;
+    this.tokensIn = restore?.tokensIn ?? 0;
+    this.tokensOut = restore?.tokensOut ?? 0;
+    this.costTotal = restore?.costUsd ?? 0;
     // PROJECT MEMORY: load the workspace's CLAUDE.md/AGENTS.md (missing ⇒ undefined, no crash)
     // and carry it as a neutralized, isolated UNTRUSTED message (the chokepoint — never bypassed).
     const proj = loadProjectInstructions(this.worktree);
@@ -289,7 +345,15 @@ export class ChatSession {
           { role: "user" },
         )
       : undefined;
-    this.lastUsedAt = Date.now();
+    // USER MEMORY: the operator's standing instructions (~/.ikbi/instructions.md). Same isolated,
+    // neutralized treatment as project memory — honored as guidance, never trusted as a raw system slot.
+    const userInstr = loadUserInstructions();
+    this.userMsg = userInstr !== undefined
+      ? toUntrustedMessage(
+          neutralizeUntrusted(`Operator standing instructions (~/.ikbi/instructions.md) — honor these across this and every session:\n${userInstr.content}`, { source: "external", identity: this.identity, origin: "user_instructions" }),
+          { role: "user" },
+        )
+      : undefined;
   }
 
   /** Run one tool call; returns the raw result string + display activity (NOT yet neutralized). */
@@ -385,7 +449,7 @@ export class ChatSession {
             governedExec,
             ...(this.parentCtx !== undefined ? { parentCtx: this.parentCtx } : {}),
             identity: this.identity,
-            model: config.provider.defaultModels.driver,
+            model: this.model,
             worktreeReal: this.worktree,
           },
           args,
@@ -396,7 +460,7 @@ export class ChatSession {
       case "vision_analyze": {
         // Multimodal image analysis — one shot to the model; result is UNTRUSTED → chokepoint.
         const out = await runVisionAnalyze(
-          { invokeModel: this.invoke, identity: this.identity, model: config.provider.defaultModels.driver, worktreeReal: this.worktree },
+          { invokeModel: this.invoke, identity: this.identity, model: this.model, worktreeReal: this.worktree },
           args,
         );
         const ok = !out.startsWith("ERROR");
@@ -475,19 +539,105 @@ export class ChatSession {
     // (never mutate the persisted clean system prompt). Agent mode uses the clean prompt as-is.
     const sys0 = this.messages[0] as ModelMessage;
     const sys: ModelMessage = mode === "plan" ? { role: "system", content: sys0.content + PLAN_SYSTEM_EXTENSION } : sys0;
-    // Slot the (persistent) PROJECT-MEMORY carrier and the (per-turn) MEMORY carrier in right
-    // after the clean system prompt — both as isolated UNTRUSTED data, never merged into system.
+    // Slot the (persistent) PROJECT-MEMORY + USER-MEMORY carriers and the (per-turn) MEMORY carrier
+    // in right after the clean system prompt — all as isolated UNTRUSTED data, never merged into system.
     const extras: ModelMessage[] = [];
     if (this.projectMsg !== undefined) extras.push(this.projectMsg);
+    if (this.userMsg !== undefined) extras.push(this.userMsg);
     if (memMsg !== undefined) extras.push(memMsg);
     if (extras.length === 0 && mode !== "plan") return this.messages;
     return [sys, ...extras, ...this.messages.slice(1)];
   }
 
-  /** Estimate the conversation's context-window pressure as a 0-100 percent of the model's window. */
-  private contextPercent(contextWindow: number): number {
+  /** Estimate the conversation's context-window pressure as a 0-100 percent of the current
+   *  model's window. Public so the REPL can render a context bar after each turn. */
+  contextPercent(): number {
+    const contextWindow = getCapabilities(this.model).context_window;
     if (contextWindow <= 0) return 0;
     return Math.min(100, Math.round((estimateTokens(this.messages) / contextWindow) * 100));
+  }
+
+  /** Number of conversation messages (excludes the per-turn memory/project carriers). */
+  messageCount(): number {
+    return this.messages.length;
+  }
+
+  /** The session's current driver model id. */
+  currentModel(): string {
+    return this.model;
+  }
+
+  /** Switch the driver model for subsequent turns (`/model <name>`). */
+  setModel(model: string): void {
+    this.model = model;
+  }
+
+  /** Cumulative token + cost usage across the session (for `/cost`). */
+  usage(): { tokensIn: number; tokensOut: number; costUsd: number } {
+    return { tokensIn: this.tokensIn, tokensOut: this.tokensOut, costUsd: this.costTotal };
+  }
+
+  /** Serialize this session to its on-disk shape (the inverse of the `restore` dep). */
+  toPersisted(): PersistedSession {
+    return {
+      id: this.id,
+      worktree: this.worktree,
+      model: this.model,
+      messages: [...this.messages],
+      memory: this.memory.snapshot(),
+      createdAt: this.createdAt,
+      lastUsedAt: this.lastUsedAt,
+      ...(this.label !== undefined ? { label: this.label } : {}),
+      tokensIn: this.tokensIn,
+      tokensOut: this.tokensOut,
+      costUsd: this.costTotal,
+    };
+  }
+
+  /**
+   * Compact the conversation to relieve context pressure (`/compact`). First tries the shared
+   * model-driven compressor (summarize the middle); if the conversation is below its threshold to
+   * compress, falls back to a STRUCTURAL collapse — keep the system prompt + a short placeholder +
+   * the most-recent messages — so `/compact` always makes headroom when there is a middle to shed.
+   * Returns the before/after message counts. Never throws.
+   */
+  async compact(): Promise<{ before: number; after: number; compressed: boolean }> {
+    const before = this.messages.length;
+    const caps = getCapabilities(this.model);
+    const wrapSummary = (text: string): ModelMessage =>
+      toUntrustedMessage(neutralizeUntrusted(text, { source: "mcp_result", identity: this.identity, origin: "compaction" }), { role: "user" });
+    let compressed = false;
+    try {
+      const res = await maybeCompress(this.messages, caps, {
+        invoke: this.invoke,
+        model: this.model,
+        identity: this.identity,
+        wrapSummary,
+        logger: { warn: (m) => log.warn(m) },
+      });
+      compressed = res.compressed;
+    } catch {
+      compressed = false;
+    }
+    if (!compressed) {
+      // STRUCTURAL FALLBACK: keep messages[0] (system) + the last KEEP, collapse the middle into a
+      // single placeholder. Advance past any leading tool message so the kept tail is never orphaned.
+      const HEADER = 1;
+      const KEEP = 6;
+      let tailStart = this.messages.length - KEEP;
+      while (tailStart < this.messages.length && this.messages[tailStart]?.role === "tool") tailStart += 1;
+      const collapsed = tailStart - HEADER;
+      if (collapsed >= 2) {
+        this.messages.splice(HEADER, collapsed, wrapSummary(`[compacted ${collapsed} earlier message(s) to relieve context pressure]`));
+        compressed = true;
+      }
+    }
+    return { before, after: this.messages.length, compressed };
+  }
+
+  /** Replace the whole conversation with a fresh start (a hard `/reset` of in-place history). */
+  clearHistory(): void {
+    this.messages = [{ role: "system", content: CHAT_SYSTEM }];
   }
 
   /**
@@ -500,11 +650,27 @@ export class ChatSession {
     images?: readonly string[],
     mode: ChatMode = "agent",
   ): Promise<{ response: string; tools: ChatToolActivity[]; cost: number; contextPercent: number }> {
+    const result = await this.runTurn(userMessage, images, mode);
+    // AUTO-SAVE: persist the (now-mutated) session after every turn, so a crash/quit never
+    // loses work. The hook is injected (the persistent store in production; absent in unit tests).
+    if (this.autosave !== undefined) {
+      try {
+        this.autosave(this);
+      } catch (e) {
+        log.warn({ err: errMsg(e), sessionId: this.id }, "chat: autosave failed");
+      }
+    }
+    return result;
+  }
+
+  private async runTurn(
+    userMessage: string,
+    images?: readonly string[],
+    mode: ChatMode = "agent",
+  ): Promise<{ response: string; tools: ChatToolActivity[]; cost: number; contextPercent: number }> {
     this.lastUsedAt = Date.now();
     // Cost visibility: accumulate every model invocation's cost this turn.
     let turnCost = 0;
-    // Context pressure: this model's window, so the conversation size can be reported as a percent.
-    const contextWindow = getCapabilities(config.provider.defaultModels.driver).context_window;
     // Plan mode runs the READ-ONLY tool subset; agent mode runs the full suite.
     const activeTools = mode === "plan" ? PLAN_TOOLS : CHAT_TOOLS;
     // CONVERSATION MEMORY: a brief summary of prior-turn facts (files modified, command/test
@@ -527,13 +693,13 @@ export class ChatSession {
       iterations += 1;
       if (iterations > MAX_TOOL_ITERATIONS) {
         this.memory.recordToolActivity(tools);
-        return { response: "[ikbi: reached the tool-iteration limit for this turn — try narrowing the request.]", tools, cost: turnCost, contextPercent: this.contextPercent(contextWindow) };
+        return { response: "[ikbi: reached the tool-iteration limit for this turn — try narrowing the request.]", tools, cost: turnCost, contextPercent: this.contextPercent() };
       }
 
       let response: ModelResponse;
       try {
         response = await this.invoke({
-          model: config.provider.defaultModels.driver,
+          model: this.model,
           temperature: TEMPERATURE,
           maxTokens: MAX_TOKENS,
           identity: this.identity,
@@ -542,9 +708,13 @@ export class ChatSession {
         });
       } catch (e) {
         this.memory.recordToolActivity(tools);
-        return { response: `[ikbi: model call failed: ${errMsg(e)}]`, tools, cost: turnCost, contextPercent: this.contextPercent(contextWindow) };
+        return { response: `[ikbi: model call failed: ${errMsg(e)}]`, tools, cost: turnCost, contextPercent: this.contextPercent() };
       }
       turnCost += response.cost?.usd ?? 0;
+      // Cumulative usage for `/cost` — accumulate tokens + cost across the whole session.
+      this.tokensIn += response.usage?.promptTokens ?? 0;
+      this.tokensOut += response.usage?.completionTokens ?? 0;
+      this.costTotal += response.cost?.usd ?? 0;
 
       this.messages.push({
         role: "assistant",
@@ -566,7 +736,7 @@ export class ChatSession {
       // assistant's reply as the turn's CONCLUSION (skipping synthetic ikbi error replies).
       this.memory.recordToolActivity(tools);
       if (!response.content.startsWith("[ikbi:")) this.memory.recordDecision(response.content);
-      const contextPercent = this.contextPercent(contextWindow);
+      const contextPercent = this.contextPercent();
       // Context pressure VISIBILITY: warn when the conversation crosses 70% of the window.
       if (contextPercent > 70) log.warn({ sessionId: this.id, contextPercent }, "chat: context window pressure above 70%");
       return { response: response.content, tools, cost: turnCost, contextPercent };
