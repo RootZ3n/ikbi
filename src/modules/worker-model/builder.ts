@@ -43,6 +43,7 @@ import { toUntrustedMessage } from "../../core/injection/index.js";
 import { childLogger } from "../../core/log.js";
 import { adaptMaxTokens, getCapabilities } from "../../core/provider/capabilities.js";
 import type { ModelMessage, ModelTool, ToolCall } from "../../core/provider/contract.js";
+import { parseCheckOutput } from "../check-triage/index.js";
 import type { GovernedExec } from "../governed-exec/index.js";
 import { confinePath, type ToolCallError } from "./builder-tools/confine.js";
 import { delegateTaskTool, runDelegateTask } from "./builder-tools/delegate.js";
@@ -848,9 +849,13 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         results.push(check);
         dry = dry || dryRun;
       }
-      const allPass = !dry && results.every((r) => r.exitCode === 0);
+      // FALSE-GREEN HARDENING (M6): exit 0 is a FLOOR, not a ceiling. Route each check's output
+      // through the deterministic triage parser so an exit-swallowed failure (`vitest || true`) or
+      // a zero-tests run cannot read as a pass and let `done` go green on an unverified build.
+      const triaged = results.map((r) => ({ result: r, triage: parseCheckOutput({ name: r.name, command: r.command, exitCode: r.exitCode, stdout: r.outputTail }) }));
+      const allPass = !dry && triaged.every((t) => t.triage.passed);
       lastChecks = { allPass, checks: results };
-      const lines = results.map((r) => `${r.name}: ${r.exitCode === 0 ? "PASS" : `FAILED (exit ${r.exitCode})`}\n${r.outputTail}`);
+      const lines = triaged.map(({ result: r, triage }) => `${r.name}: ${triage.passed ? "PASS" : `FAILED — ${triage.errorSummary}`}\n${r.outputTail}`);
       return `Checks ${allPass ? "ALL PASS" : "FAILED"}:\n${lines.join("\n---\n")}`;
     };
 

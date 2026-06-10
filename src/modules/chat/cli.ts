@@ -354,6 +354,9 @@ const COMMAND_LIST: readonly ReplCommand[] = [
         return;
       }
       for (const r of results) ctx.out(`Rolled back: ${r.tool} ${r.path} (${r.action})\n`);
+      // M4: rollback only tracks write_file/patch edits. Files touched by `terminal` (e.g. a shell
+      // redirect) or by a `delegate_task` sub-agent are NOT recorded, so they are NOT undone here.
+      ctx.out("[note: terminal and sub-agent mutations are not tracked and were not rolled back]\n");
       persist(ctx);
     },
   },

@@ -44,11 +44,12 @@ import {
   type ToolCall,
 } from "../../core/provider/index.js";
 import { getCapabilities } from "../../core/provider/capabilities.js";
+import { parseCheckOutput } from "../check-triage/index.js";
 import { governedExec } from "../governed-exec/index.js";
 import { scoutDetail } from "../worker-model/builder.js";
 import { estimateTokens, maybeCompress } from "../worker-model/context-manager.js";
 import { loadProjectInstructions } from "../worker-model/project-memory.js";
-import { type CheckResult, mapExec, VERIFIER_CHECKS } from "../worker-model/checks.js";
+import { type CheckResult, mapExec, resolveCheckTimeoutMs, resolveChecks } from "../worker-model/checks.js";
 import { confinePath } from "../worker-model/builder-tools/confine.js";
 import { delegateTaskTool, runDelegateTask } from "../worker-model/builder-tools/delegate.js";
 import { gitDiffTool, gitLogTool, gitStatusTool, runGitTool } from "../worker-model/builder-tools/git-tools.js";
@@ -220,11 +221,43 @@ function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+/**
+ * SANITIZE a restored conversation (M2 trust boundary). A persisted session file is UNTRUSTED
+ * input: a tampered file could smuggle a `{role:"system"}` message past index 0 (re-entering as a
+ * trusted instruction) or flip a tool/data result's `untrusted` flag off (re-admitting repo/command
+ * output as if it were a trusted turn). On restore we:
+ *   - DROP every `role === "system"` message (index 0 is always rebuilt from the clean CHAT_SYSTEM,
+ *     so no legitimate system message ever lives in the restored tail);
+ *   - FORCE `untrusted: true` on every data-role message (tool results, and any message already
+ *     flagged untrusted) so neutralized data can never be promoted to a trusted slot via the file.
+ * Assistant turns and genuine operator `user` turns keep their roles (the conversation must round-trip),
+ * but their `content` is plain text the model re-reads — never an instruction channel it must obey.
+ */
+function sanitizeRestoredMessages(messages: readonly ModelMessage[]): ModelMessage[] {
+  return messages
+    .filter((m) => m.role !== "system")
+    .map((m) => (m.role === "tool" || m.untrusted === true ? { ...m, untrusted: true } : m));
+}
+
 /** Per-session permission level for mutating tools (REPL FIX 5). */
 export type PermissionMode = "auto" | "confirm" | "readonly";
 
-/** Tools that MUTATE the worktree (or run effecting work) — gated by permission mode. */
-const MUTATING_TOOL_NAMES: ReadonlySet<string> = new Set(["write_file", "patch", "terminal", "delegate_task"]);
+/**
+ * Tools that MUTATE the worktree OR run effecting/arbitrary work — gated by permission mode.
+ * Beyond the obvious writers (write_file / patch) this includes: `terminal` and `delegate_task`
+ * (arbitrary execution), `run_checks` (M3 — runs the project's test suite, i.e. arbitrary code),
+ * and `web_search` / `web_extract` (M3 — outbound network I/O). In "readonly" all are blocked; in
+ * "confirm" they require operator approval (delegate_task is blocked outright — see runTool).
+ */
+const MUTATING_TOOL_NAMES: ReadonlySet<string> = new Set([
+  "write_file",
+  "patch",
+  "terminal",
+  "delegate_task",
+  "run_checks",
+  "web_search",
+  "web_extract",
+]);
 
 /** Per-turn options threaded from the REPL into the tool loop (progress + permissions). */
 export interface TurnOptions {
@@ -436,9 +469,11 @@ export class ChatSession {
     this.autosave = deps.autosave;
     this.model = deps.model ?? restore?.model ?? config.provider.defaultModels.driver;
     // messages[0] is ALWAYS the clean, trusted system prompt — even on resume we force a fresh
-    // one (never trust a persisted/poisoned system slot), then graft the restored conversation.
+    // one (never trust a persisted/poisoned system slot), then graft the restored conversation
+    // AFTER sanitizing it (M2): drop any smuggled system messages and re-mark restored data as
+    // untrusted, so a tampered session file cannot re-admit a trusted instruction.
     this.messages = restore !== undefined
-      ? [{ role: "system", content: CHAT_SYSTEM }, ...restore.messages.slice(1)]
+      ? [{ role: "system", content: CHAT_SYSTEM }, ...sanitizeRestoredMessages(restore.messages.slice(1))]
       : [{ role: "system", content: CHAT_SYSTEM }];
     this.memory = restore !== undefined ? SessionMemory.fromSnapshot(restore.memory) : new SessionMemory();
     this.createdAt = restore?.createdAt ?? Date.now();
@@ -493,6 +528,12 @@ export class ChatSession {
         : "";
       if (permissionMode === "readonly") {
         return { output: `ERROR: ${call.name} is blocked (permission mode: readonly).`, activity: { name: call.name, ok: false, summary: "blocked (readonly)" } };
+      }
+      // CONFIRM MODE + DELEGATE (M5): a single parent approval cannot govern a sub-agent's own
+      // unconfirmed tool loop (it runs with full write access and no confirm callback). So in
+      // "confirm" mode delegate_task is unavailable outright — switch to "auto" to delegate.
+      if (call.name === "delegate_task") {
+        return { output: `ERROR: delegate_task is unavailable in confirm mode (a sub-agent runs its own tool loop that this confirmation cannot govern). Switch to auto mode to delegate.`, activity: { name: "delegate_task", ok: false, summary: "blocked (confirm)" } };
       }
       const allowed = opts.confirm !== undefined ? await opts.confirm(call.name, target) : true;
       if (!allowed) {
@@ -668,22 +709,36 @@ export class ChatSession {
     if (this.parentCtx === undefined) {
       return "ERROR: checks are unavailable (no parent identity wired to authorize the governed checks).";
     }
+    // PROJECT-ROOT GUARD (L11): resolve the check set against the worktree the SAME way the
+    // builder/verifier do. This fails closed (RED) if the worktree has no project manifest of its
+    // own (or only an ANCESTOR's) — so a chat session can never run the wrong repo's suite and
+    // believe a vacuous ancestor-suite pass. Also honors operator-configured IKBI_CHECKS.
+    const resolved = resolveChecks(this.worktree);
+    if (!resolved.ok) {
+      return `ERROR: ${resolved.reason} — checks cannot run.`;
+    }
+    const checkTimeoutMs = resolveCheckTimeoutMs();
     const results: CheckResult[] = [];
     let dry = false;
-    for (const c of VERIFIER_CHECKS) {
+    for (const c of resolved.checks) {
       const res = await governedExec.run({
         parentCtx: this.parentCtx,
         command: c.command,
         args: [...c.args],
         cwd: this.worktree,
         purpose: `chat check: ${c.name}`,
+        timeoutMs: checkTimeoutMs,
       });
       const { check, dryRun } = mapExec(c.name, `${c.command} ${c.args.join(" ")}`, res);
       results.push(check);
       dry = dry || dryRun;
     }
-    const allPass = !dry && results.every((r) => r.exitCode === 0);
-    const lines = results.map((r) => `${r.name}: ${r.exitCode === 0 ? "PASS" : `FAILED (exit ${r.exitCode})`}\n${r.outputTail}`);
+    // FALSE-GREEN HARDENING (M6): exit 0 is a FLOOR, not a ceiling. Route each check's output
+    // through the deterministic triage parser so an exit-swallowed failure (`vitest || true`) or a
+    // zero-tests run can never read as a pass here — the SAME guard the verifier ladder applies.
+    const triaged = results.map((r) => ({ result: r, triage: parseCheckOutput({ name: r.name, command: r.command, exitCode: r.exitCode, stdout: r.outputTail }) }));
+    const allPass = !dry && triaged.every((t) => t.triage.passed);
+    const lines = triaged.map(({ result: r, triage }) => `${r.name}: ${triage.passed ? "PASS" : `FAILED — ${triage.errorSummary}`}\n${r.outputTail}`);
     return `Checks ${allPass ? "ALL PASS" : "FAILED"}:\n${lines.join("\n---\n")}`;
   }
 

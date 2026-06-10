@@ -206,12 +206,13 @@ export function createCheckTriage(cfg: CheckTriageConfig = checkTriageConfig): C
       try {
         return parse(input, cfg);
       } catch (err) {
-        // NEVER throw: degrade to a safe generic summary.
-        const exitCode = typeof input?.exitCode === "number" ? input.exitCode : 1;
+        // NEVER throw: degrade to a safe generic summary. FAIL CLOSED (L9) — a parser crash means
+        // we could not verify the output, so we must NOT report a pass on the bare exit code (an
+        // exit-swallowed or zero-tests false green would slip through). Unverifiable ⇒ not passed.
         return {
-          passed: exitCode === 0,
+          passed: false,
           failures: [],
-          errorSummary: `${input?.name ?? "check"}: triage parser error (${err instanceof Error ? err.message : String(err)})`,
+          errorSummary: `${input?.name ?? "check"}: triage parser error — failing closed (could not verify): ${err instanceof Error ? err.message : String(err)}`,
           head: "",
           tail: "",
           truncated: false,

@@ -47,8 +47,11 @@ export interface SessionMeta {
 
 /** Map an arbitrary session id to a safe, collision-resistant file stem. */
 function fileStem(id: string): string {
-  // Keep readable ids readable; escape anything filesystem-unsafe deterministically.
-  return id.replace(/[^A-Za-z0-9_-]/g, (c) => `_${c.charCodeAt(0).toString(16)}`);
+  // Keep readable ids readable; escape anything filesystem-unsafe deterministically. The escape
+  // char is `_`, so we MUST escape literal `_` first (L8) — otherwise the raw id "a_2f" and the
+  // id "a/" (which escapes to "a_2f") would collide on the same file. Escaping `_`→`_5f` makes the
+  // mapping injective.
+  return id.replace(/[^A-Za-z0-9-]/g, (c) => `_${c.charCodeAt(0).toString(16)}`);
 }
 
 /** A disk-backed session store: save/load/list/delete/latest under the sessions directory. */
@@ -60,7 +63,9 @@ export class PersistentSessionStore {
   }
 
   private ensureDir(): void {
-    mkdirSync(this.dir, { recursive: true });
+    // M7: session files hold the full conversation (and any secrets it discussed). Lock the
+    // directory to the owner (0700) so other local users can't enumerate or read sessions.
+    mkdirSync(this.dir, { recursive: true, mode: 0o700 });
   }
 
   private fileFor(id: string): string {
@@ -72,7 +77,8 @@ export class PersistentSessionStore {
     try {
       this.ensureDir();
       const data: PersistedSession = session.toPersisted();
-      writeFileSync(this.fileFor(session.id), JSON.stringify(data, null, 2), "utf8");
+      // M7: owner-only (0600) — the file is a transcript, not world-readable data.
+      writeFileSync(this.fileFor(session.id), JSON.stringify(data, null, 2), { encoding: "utf8", mode: 0o600 });
     } catch (e) {
       log.warn({ err: e instanceof Error ? e.message : String(e), sessionId: session.id }, "chat-store: save failed");
     }
