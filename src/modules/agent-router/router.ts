@@ -83,12 +83,31 @@ async function lazyInvokeModel(request: ModelRequest): Promise<ModelResponse> {
   return mod.invokeModel(request);
 }
 
+/**
+ * Extract the first complete JSON object from a model response. The greedy
+ * `/\\{[\\s\\S]*\\}/` regex fails when trailing text follows the JSON (it captures
+ * from the FIRST `{` to the LAST `}`, swallowing non-JSON tail). This extractor
+ * counts braces to find the first BALANCED pair, which correctly handles nested
+ * objects and trailing prose.
+ */
+function extractFirstJsonObject(text: string): string | undefined {
+  const start = text.indexOf("{");
+  if (start === -1) return undefined;
+  let depth = 0;
+  for (let i = start; i < text.length; i++) {
+    if (text[i] === "{") depth++;
+    else if (text[i] === "}") depth--;
+    if (depth === 0) return text.slice(start, i + 1);
+  }
+  return undefined; // unclosed brace — no complete JSON object
+}
+
 /** Lenient parse of the classifier's JSON-ish reply into a structured intent. */
-function parseIntent(content: string): IntentResult {
-  const m = content.match(/\{[\s\S]*\}/);
-  if (m !== null) {
+export function parseIntent(content: string): IntentResult {
+  const extracted = extractFirstJsonObject(content);
+  if (extracted !== undefined) {
     try {
-      const o = JSON.parse(m[0]) as Record<string, unknown>;
+      const o = JSON.parse(extracted) as Record<string, unknown>;
       return {
         intent: typeof o.intent === "string" && o.intent.length > 0 ? o.intent : "unknown",
         ...(typeof o.target === "string" && o.target.length > 0 ? { target: o.target } : {}),

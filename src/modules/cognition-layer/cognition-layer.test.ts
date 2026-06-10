@@ -95,6 +95,35 @@ test("each of the six decisions parses; an unknown decision fails closed to reje
   assert.match(parseDecision('{"decision":"explode"}', []).rationale, /unknown decision/);
 });
 
+// ── H1 fix: parseDecision handles trailing text ────────────────────────────
+
+test("parseDecision extracts JSON when trailing text follows (H1 greedy-regex fix)", () => {
+  const trailing = '{"decision":"plan","confidence":0.8,"rationale":"needs sub-tasks"}\nAdditional notes: the project uses TypeScript.';
+  const d = parseDecision(trailing, []);
+  assert.equal(d.decision, "plan");
+  assert.equal(d.confidence, 0.8);
+});
+
+test("parseDecision handles nested JSON objects with trailing text", () => {
+  const nested = '{"decision":"route","confidence":0.9,"rationale":"ok","recommendedNext":{"module":"worker-model","action":"build","payload":{}}}\nExtra text.';
+  const d = parseDecision(nested, []);
+  assert.equal(d.decision, "route");
+  assert.equal(d.recommendedNext?.module, "worker-model");
+});
+
+test("parseDecision handles prefix text before JSON", () => {
+  const prefixed = 'Thinking step by step:\n{"decision":"ask","confidence":0.6,"rationale":"missing info"}\nDone.';
+  const d = parseDecision(prefixed, []);
+  assert.equal(d.decision, "ask");
+  assert.equal(d.confidence, 0.6);
+});
+
+test("parseDecision rejects unclosed JSON (no closing brace)", () => {
+  const unclosed = '{"decision":"plan","confidence":0.8';
+  const d = parseDecision(unclosed, []);
+  assert.equal(d.decision, "reject", "unclosed brace ⇒ fail-closed reject");
+});
+
 // ── CROSS-AGENT MEMORY FEEDS DELIBERATION (first-class) ──────────────────────
 
 test("deliberation reasons over CROSS-AGENT memory (multiple agents' entries feed the model)", async () => {

@@ -95,14 +95,33 @@ function parseRecommended(v: unknown): RecommendedNext | undefined {
   return { module: o.module as RecommendableModule, action, payload };
 }
 
+/**
+ * Extract the first complete JSON object from a model response. The greedy
+ * `/\\{[\\s\\S]*\\}/` regex fails when trailing text follows the JSON (it captures
+ * from the FIRST `{` to the LAST `}`, swallowing non-JSON tail). This extractor
+ * counts braces to find the first BALANCED pair, which correctly handles nested
+ * objects and trailing prose.
+ */
+function extractFirstJsonObject(text: string): string | undefined {
+  const start = text.indexOf("{");
+  if (start === -1) return undefined;
+  let depth = 0;
+  for (let i = start; i < text.length; i++) {
+    if (text[i] === "{") depth++;
+    else if (text[i] === "}") depth--;
+    if (depth === 0) return text.slice(start, i + 1);
+  }
+  return undefined; // unclosed brace — no complete JSON object
+}
+
 /** Parse + validate the model's reply into a CognitionDecision. Invalid ⇒ fail-closed "reject". */
 export function parseDecision(content: string, memoryUsed: readonly string[]): CognitionDecision {
   const reject = (rationale: string): CognitionDecision => ({ decision: "reject", confidence: 0, rationale, memoryUsed: [...memoryUsed] });
-  const m = content.match(/\{[\s\S]*\}/);
-  if (m === null) return reject("deliberation produced no JSON decision");
+  const extracted = extractFirstJsonObject(content);
+  if (extracted === undefined) return reject("deliberation produced no JSON decision");
   let o: Record<string, unknown>;
   try {
-    o = JSON.parse(m[0]) as Record<string, unknown>;
+    o = JSON.parse(extracted) as Record<string, unknown>;
   } catch {
     return reject("deliberation output was not valid JSON");
   }

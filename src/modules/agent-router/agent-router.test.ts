@@ -10,7 +10,7 @@ import type { OperationContext } from "../../core/identity/resolver.js";
 import type { ModelMessage, ModelRequest, ModelResponse } from "../../core/provider/contract.js";
 import type { NeutralizedContent, UntrustedContext } from "../../core/injection/index.js";
 import type { MemoryEntry } from "../lab-context-memory/index.js";
-import { createAgentRouter, type LabMemoryReader } from "./router.js";
+import { createAgentRouter, parseIntent, type LabMemoryReader } from "./router.js";
 import { AgentRouterError } from "./contract.js";
 import type { AgentRouterConfig } from "./config.js";
 import type { RouterEventPayload } from "./events.js";
@@ -238,4 +238,32 @@ test("router.* events emit without leaking the message, answer, or memory values
   for (const secret of ["MESSAGE-SECRET", "ANSWER-SECRET", "MEMORY-SECRET"]) {
     assert.ok(!serialized.includes(secret), `"${secret}" must NOT be in events`);
   }
+});
+
+// ── H1 fix: parseIntent handles trailing text ───────────────────────────────
+
+test("parseIntent extracts JSON when trailing text follows (H1 greedy-regex fix)", () => {
+  // Model returns JSON followed by prose — the old greedy regex would swallow it all
+  const trailing = '{"intent":"build","confidence":0.9}\nAdditional notes: the project uses TypeScript.';
+  const r = parseIntent(trailing);
+  assert.equal(r.intent, "build");
+  assert.equal(r.confidence, 0.9);
+});
+
+test("parseIntent handles nested JSON objects with trailing text", () => {
+  const nested = '{"intent":"build","target":{"repo":"foo","branch":"main"}}\nSome extra text here.';
+  const r = parseIntent(nested);
+  assert.equal(r.intent, "build");
+});
+
+test("parseIntent returns unknown for unparseable content", () => {
+  const r = parseIntent("no json here at all");
+  assert.equal(r.intent, "unknown");
+});
+
+test("parseIntent handles prefix text before JSON", () => {
+  const prefixed = 'Here is my analysis:\n{"intent":"question","confidence":0.7}\nEnd of analysis.';
+  const r = parseIntent(prefixed);
+  assert.equal(r.intent, "question");
+  assert.equal(r.confidence, 0.7);
 });

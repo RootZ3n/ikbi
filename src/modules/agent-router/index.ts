@@ -26,7 +26,7 @@ assertContractCompatible("events", "1.0.0");
 // (the modules barrel imports this module, so the commands are live once ikbi starts).
 import "./cli.js";
 
-export { createAgentRouter, agentRouter, type AgentRouterDeps, type LabMemoryReader, type NeutralizeFn, type ToUntrustedFn } from "./router.js";
+export { createAgentRouter, agentRouter, parseIntent, type AgentRouterDeps, type LabMemoryReader, type NeutralizeFn, type ToUntrustedFn } from "./router.js";
 export { createRouterCli, parseProject, type RouterCliDeps } from "./cli.js";
 export {
   CONTRACT_VERSION,
