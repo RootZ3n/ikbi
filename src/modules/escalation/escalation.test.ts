@@ -338,7 +338,7 @@ test("config — defaults match the three-tier spec", () => {
   assert.equal(escalationConfig.workerToMidThreshold, 50);
   assert.equal(escalationConfig.midToFrontierThreshold, 70);
   assert.equal(escalationConfig.maxEscalations, 2);
-  assert.deepEqual([...escalationConfig.tierModels.worker], ["deepseek-v4-flash", "mimo-v2.5", "minimax-m2.7"]);
+  assert.deepEqual([...escalationConfig.tierModels.worker], ["deepseek-v4-flash", "mimo-v2.5", "minimax-m3"]);
   assert.deepEqual([...escalationConfig.tierModels.mid], ["deepseek-v4-pro", "mimo-v2.5-pro"]);
   assert.deepEqual([...escalationConfig.tierModels.frontier], ["gpt-5.5", "opus-4.8"]);
 });

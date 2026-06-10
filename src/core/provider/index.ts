@@ -83,13 +83,13 @@ function buildDefaultRegistry(): ModelRegistry {
       cost: { promptPerMTok: 0.14, completionPerMTok: 0.55 },
       providers: [{ provider: DEEPSEEK_PROVIDER_ID, providerModelId: "deepseek-v4-flash" }],
     },
-    // minimax-m2.7 / gpt-5.5 / opus-4.8: no API endpoint wired yet — stub entries so the
+    // minimax-m3 / gpt-5.5 / opus-4.8: no API endpoint wired yet — stub entries so the
     // escalation roster resolves; real calls fail gracefully (no "stub" provider registered).
     {
-      id: "minimax-m2.7",
+      id: "minimax-m3",
       role: "driver",
       cost: { promptPerMTok: 0, completionPerMTok: 0 },
-      providers: [{ provider: STUB_PROVIDER_ID, providerModelId: "minimax-m2.7" }],
+      providers: [{ provider: STUB_PROVIDER_ID, providerModelId: "minimax-m3" }],
     },
     {
       id: "gpt-5.5",

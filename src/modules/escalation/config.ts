@@ -11,7 +11,7 @@
  *     CRITIC_REJECTED 20 · VERIFICATION_FAILED 25 · REJECTED_TOOL_CALLS 10 · BENCHMARK_PASS_RATE 5
  *
  *   Tier rosters (comma-separated; the retry picks the FIRST entry):
- *     IKBI_ESCALATION_WORKER_MODELS    Default deepseek-v4-flash,mimo-v2.5,minimax-m2.7
+ *     IKBI_ESCALATION_WORKER_MODELS    Default deepseek-v4-flash,mimo-v2.5,minimax-m3
  *     IKBI_ESCALATION_MID_MODELS       Default deepseek-v4-pro,mimo-v2.5-pro
  *     IKBI_ESCALATION_FRONTIER_MODELS  Default gpt-5.5,opus-4.8
  */
@@ -36,7 +36,7 @@ export const DEFAULT_WEIGHTS: EscalationWeights = Object.freeze({
   benchmarkPassRate: 5,
 });
 
-export const DEFAULT_WORKER_MODELS = ["deepseek-v4-flash", "mimo-v2.5", "minimax-m2.7"] as const;
+export const DEFAULT_WORKER_MODELS = ["deepseek-v4-flash", "mimo-v2.5", "minimax-m3"] as const;
 export const DEFAULT_MID_MODELS = ["deepseek-v4-pro", "mimo-v2.5-pro"] as const;
 export const DEFAULT_FRONTIER_MODELS = ["gpt-5.5", "opus-4.8"] as const;
 
