@@ -40,10 +40,15 @@ const env = moduleEnv("egress");
  * stays default-deny — nothing outside the resolved allowlist is reachable.
  */
 export const DEFAULT_EGRESS_HOSTS: readonly string[] = Object.freeze([
+  // Web-search + common documentation hosts (web tools work out of the box).
   "html.duckduckgo.com",
   "docs.python.org",
   "developer.mozilla.org",
   "stackoverflow.com",
+  // LLM provider API hosts — so model calls succeed by default (fail-closed otherwise).
+  "api.xiaomimimo.com", // MiMo (mimo-v2.5 / mimo-v2.5-pro)
+  "api.deepseek.com", // DeepSeek (deepseek-v4-pro / deepseek-v4-flash / deepseek-chat / deepseek-reasoner)
+  "openrouter.ai", // OpenRouter (backup routes)
 ]);
 
 export interface EgressConfig {
