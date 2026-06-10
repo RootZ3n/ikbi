@@ -38,6 +38,19 @@ import type { ModelRequest, ModelResponse } from "../../core/provider/contract.j
 import { deterministicJudge } from "../deterministic-judge/index.js";
 import type { BuildCandidate, JudgeResult } from "../deterministic-judge/index.js";
 
+// Escalation (ADDITIVE, hook-only): the orchestrator folds hard signals across the
+// scoring roles and asks the escalation engine whether a higher tier is warranted,
+// emitting `escalation.*` events. It NEVER alters dispatch/promote/discard — the
+// actual model swap + retry is a separately-reviewed follow-up. See observeEscalation.
+import {
+  escalationConfig,
+  escalationEngine,
+  escalationEvaluated,
+  escalationTriggered,
+  escalationDeclined,
+} from "../escalation/index.js";
+import type { EscalationSignals } from "../escalation/index.js";
+
 import type { ExecRequest, GovernedExec } from "../governed-exec/index.js";
 
 import { builder, createBuilder, MAX_TOOL_ITERATIONS } from "./builder.js";
@@ -81,6 +94,131 @@ import type {
 } from "./contract.js";
 
 const EVENT_SOURCE = "worker-model";
+
+/** A mutable signal accumulator folded across roles within one run (see observeEscalation). */
+interface MutableEscalationSignals {
+  schemaFailures: number;
+  retryCount: number;
+  scoutScore?: number;
+  contextPressure: number;
+  criticRejected: boolean;
+  verificationFailed: boolean;
+  stopReason?: string;
+  rejectedToolCalls: number;
+}
+
+/** Handoff-only context captured from roles (not scored). */
+interface EscalationHandoffFields {
+  scoutFindings?: string;
+  criticFeedback?: string;
+  verificationDetails?: string;
+}
+
+/** Coerce an unknown detail field to a finite number, else undefined. */
+function asNumber(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}
+
+/**
+ * Fold one role's hard signals into the run-level accumulator. Reads the role's
+ * open `detail` shape DEFENSIVELY (every field optional) so a shape change never
+ * throws into the run. Pure bookkeeping — no events, no decision.
+ */
+function foldRoleSignals(
+  role: WorkerRole,
+  result: RoleResult,
+  acc: MutableEscalationSignals,
+  handoff: EscalationHandoffFields,
+): void {
+  const detail = (result.detail ?? {}) as Record<string, unknown>;
+  if (role === "scout") {
+    const s = asNumber(detail.score);
+    if (s !== undefined) acc.scoutScore = s;
+    if (typeof detail.brief === "string") handoff.scoutFindings = detail.brief;
+  } else if (role === "builder") {
+    const rejected = Array.isArray(detail.rejectedToolCalls) ? detail.rejectedToolCalls.length : 0;
+    // schemaFailures and rejectedToolCalls both derive from the rejected-tool-call set
+    // (a rejected call is a schema/validation failure) — per the escalation signal map.
+    acc.schemaFailures += rejected;
+    acc.rejectedToolCalls += rejected;
+    const retries = asNumber(detail.retryCount) ?? asNumber(detail.bareStops);
+    if (retries !== undefined) acc.retryCount += retries;
+    const pct = asNumber(detail.contextPercent);
+    if (pct !== undefined) acc.contextPressure = Math.min(1, Math.max(0, pct / 100));
+    if (typeof detail.stopReason === "string") acc.stopReason = detail.stopReason;
+  } else if (role === "critic") {
+    if (result.outcome === "failure" || result.outcome === "rejected") acc.criticRejected = true;
+    if (typeof result.summary === "string") handoff.criticFeedback = result.summary;
+  } else if (role === "verifier") {
+    if (result.outcome !== "success") acc.verificationFailed = true;
+    const reason = typeof detail.reason === "string" ? detail.reason : result.summary;
+    if (typeof reason === "string") handoff.verificationDetails = reason;
+  }
+}
+
+/**
+ * ADDITIVE escalation hook (chosen integration depth: observe-only). After a scoring
+ * role completes, fold its signals and — for the builder/critic/verifier roles — ask
+ * the escalation engine whether a higher tier is warranted, emitting `escalation.*`
+ * events with the full score breakdown. The run's worker roles execute at the cheap
+ * (`worker`) tier, so evaluation runs against that tier. This NEVER mutates the run:
+ * no model swap, no retry, no change to promote/discard. Best-effort — it must never
+ * throw into the dispatch loop, so the whole body is guarded.
+ */
+function observeEscalation(
+  events: EventBusSurface,
+  task: WorkerTask,
+  role: WorkerRole,
+  result: RoleResult,
+  acc: MutableEscalationSignals,
+  handoff: EscalationHandoffFields,
+  identity: AgentIdentity,
+): void {
+  try {
+    foldRoleSignals(role, result, acc, handoff);
+    if (!escalationConfig.enabled) return;
+    // Only the roles that carry escalation-relevant signal trigger an evaluation.
+    if (role !== "builder" && role !== "critic" && role !== "verifier") return;
+
+    const signals: EscalationSignals = { ...acc };
+    const decision = escalationEngine.evaluate({
+      taskId: task.taskId,
+      currentTier: "worker",
+      goal: task.goal,
+      signals,
+      ...(handoff.scoutFindings !== undefined ? { scoutFindings: handoff.scoutFindings } : {}),
+      ...(handoff.criticFeedback !== undefined ? { criticFeedback: handoff.criticFeedback } : {}),
+      ...(handoff.verificationDetails !== undefined ? { verificationDetails: handoff.verificationDetails } : {}),
+    });
+
+    // Emitted BY the worker-model orchestrator, so the source is worker-model; the
+    // escalation.* event TYPE namespaces them. (#identity attribution: the parent.)
+    const attribution = { source: EVENT_SOURCE, attribution: { identity, operation: "escalation.evaluate", runId: task.taskId } };
+    events.publish(
+      escalationEvaluated.create(
+        { taskId: task.taskId, currentTier: decision.currentTier, total: decision.score.total, shouldEscalate: decision.score.shouldEscalate, escalate: decision.escalate },
+        attribution,
+      ),
+    );
+    if (decision.escalate && decision.targetTier !== undefined) {
+      events.publish(
+        escalationTriggered.create(
+          { taskId: task.taskId, from: decision.currentTier, to: decision.targetTier, total: decision.score.total, requiresApproval: decision.requiresApproval, ...(decision.targetModel !== undefined ? { targetModel: decision.targetModel } : {}) },
+          attribution,
+        ),
+      );
+    } else if (decision.declineReason !== undefined) {
+      events.publish(
+        escalationDeclined.create(
+          { taskId: task.taskId, currentTier: decision.currentTier, total: decision.score.total, reason: decision.declineReason },
+          attribution,
+        ),
+      );
+    }
+  } catch {
+    // Escalation observability is ADVISORY — a fold/eval/publish failure never breaks the run.
+  }
+}
 
 /** Minimal injected surfaces (each a Pick of the real singleton's relevant method). */
 export interface OrchestratorDeps {
@@ -614,6 +752,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     const { engine: runEngine, cost: runCost } = makeCostingEngine();
 
     const results: RoleResult[] = [];
+    // Run-level escalation accumulator (ADDITIVE observability; never alters dispatch).
+    const escSignals: MutableEscalationSignals = { schemaFailures: 0, retryCount: 0, contextPressure: 0, criticRejected: false, verificationFailed: false, rejectedToolCalls: 0 };
+    const escHandoff: EscalationHandoffFields = {};
     let overall: WorkerResult["outcome"] = "success";
     let killedReason: string | undefined;
     // Set when a build runs GREEN but its worker tier lacks autoCommit autonomy, so the
@@ -697,6 +838,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             ),
           );
         }
+
+        // ADDITIVE escalation observability — fold signals + emit escalation.* events.
+        // Runs before the short-circuit so a failing role's signals are still scored.
+        observeEscalation(events, task, role, result, escSignals, escHandoff, parentIdentity);
 
         if (result.outcome !== "success") {
           overall = result.outcome;

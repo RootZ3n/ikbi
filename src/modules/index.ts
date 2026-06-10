@@ -32,6 +32,9 @@ import "./egress/index.js";
 // The remaining built modules (order otherwise non-significant — each is independent).
 import "./cache/index.js";
 import "./worker-model/index.js";
+// Escalation — deterministic model-tier escalation engine; the worker-model
+// orchestrator hooks it (additively) to score attempts and emit escalation.* events.
+import "./escalation/index.js";
 import "./gate-wall/index.js";
 import "./subagent-spawning/index.js";
 import "./governed-exec/index.js";
