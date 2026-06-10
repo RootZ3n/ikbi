@@ -53,6 +53,7 @@ import {
   currentBranch,
   deleteBranch,
   diffRange,
+  workingTreeDiff,
   isAncestor,
   isGitRepo,
   isWorktreeClean,
@@ -216,7 +217,16 @@ export class WorkspaceManager {
   }
 
   async diff(handle: WorkspaceHandle): Promise<string> {
-    return diffRange(handle.targetRepo, handle.baseRef, handle.scratchBranch);
+    const committed = await diffRange(handle.targetRepo, handle.baseRef, handle.scratchBranch);
+    if (committed.trim().length > 0) return committed;
+    // FALLBACK: RETAINED/failed work is UNCOMMITTED, so the committed base..scratch range is empty.
+    // If the worktree dir still exists, compute the working-tree diff from it so `ikbi diff <id>`
+    // shows the real changes left behind (never a misleading "no changes"). A cleaned/promoted
+    // workspace has no worktree dir → returns the (empty) committed diff unchanged.
+    if (await this.pathExists(handle.path)) {
+      return workingTreeDiff(handle.path, handle.baseRef).catch(() => committed);
+    }
+    return committed;
   }
 
   // ---- promote (governed-closed, atomic CAS, crash-durable) ----
@@ -376,6 +386,28 @@ export class WorkspaceManager {
     });
   }
 
+  /**
+   * GRACEFUL SHUTDOWN (SIGINT): RETAIN every still-live ALLOCATED/ALLOCATING workspace — keep its
+   * worktree, mark it terminal-`failed` (note `retained: …`), and free the slot — so an interrupt
+   * never leaves an "allocated" record leaking the bound and silently abandoning on-disk work. The
+   * retained records are then inspectable (`ikbi workspace ls` / `ikbi diff <id>`) and only removed
+   * deliberately (`ikbi workspace discard` / `ikbi clean --force`). PROMOTING records are left for
+   * crash-reconcile (a landed CAS must still reconcile to `promoted`). Best-effort; returns the count.
+   */
+  async retainAllLive(reason: string): Promise<number> {
+    let retained = 0;
+    for (const rec of [...this.live.values()]) {
+      if (rec.state !== "allocating" && rec.state !== "allocated") continue;
+      try {
+        await this.retain(rec, reason);
+        retained += 1;
+      } catch {
+        // best-effort — a shutdown must not throw.
+      }
+    }
+    return retained;
+  }
+
   // ---- reclaim (respects the per-workspace lock; skips active) ----
 
   async reclaim(targetRepo: string): Promise<ReclaimResult> {
@@ -434,6 +466,23 @@ export class WorkspaceManager {
     return this.store.get(id);
   }
 
+  /** All persisted workspace records (for `ikbi workspace ls`). Unreadable docs are skipped. */
+  async list(): Promise<WorkspaceRecord[]> {
+    const out: WorkspaceRecord[] = [];
+    for (const id of await this.store.list()) {
+      const rec = await this.store.get(id).catch(() => undefined);
+      if (rec !== undefined) out.push(rec);
+    }
+    return out;
+  }
+
+  /** A record is RETAINED iff a failed build deliberately kept its worktree (the only copy of its
+   *  uncommitted work) — `retain()` stamps the note `retained: …`. Reclaim-abandoned `failed`
+   *  records carry `reclaimed: …` instead and are NOT retained (safe to clean without --force). */
+  private isRetained(rec: WorkspaceRecord): boolean {
+    return rec.state === "failed" && (rec.note ?? "").startsWith("retained:");
+  }
+
   // ---- clean (SG-7): reclaim orphaned worktree DIRECTORIES of terminal records ----
 
   /**
@@ -442,11 +491,41 @@ export class WorkspaceManager {
    * collects the leftover dirs under the workspace root that `promote`/`discard` didn't already
    * remove (e.g. a crash between landing and cleanup). Active workspaces are skipped (their
    * per-ws lock is held); a held lock is treated as "active" and left alone. Idempotent.
+   *
+   * RECLAIM WIRING: first runs `reclaim` per distinct repo (its only production caller) to
+   * reconcile crash-leaked ACTIVE records and prune orphan worktrees/branches before the sweep.
+   *
+   * RETAINED-WORK SAFETY: a RETAINED failed build's worktree is the ONLY copy of its uncommitted
+   * work. When `force` is false the sweep SKIPS those (reporting them in `skipped`/`skippedIds`)
+   * so it can never destroy work the failure message told the operator to inspect. The CLI
+   * `ikbi clean` passes `force:false`; `ikbi clean --force` opts into removing them. The default
+   * here is `force:true` so direct/programmatic callers keep the pre-existing sweep-everything
+   * behavior (the destructive-by-default footgun lives only behind the explicit flag at the CLI).
    */
-  async cleanOrphans(): Promise<{ removed: number; checked: number }> {
+  async cleanOrphans(opts: { force?: boolean } = {}): Promise<{ removed: number; checked: number; skipped: number; reclaimed: number; skippedIds: string[] }> {
     await this.preload();
+    const force = opts.force ?? true;
+
+    // Wire reclaim (previously zero production callers): reconcile crash-leaked active records +
+    // prune orphan worktrees/branches per distinct repo, BEFORE sweeping terminal dirs.
+    let reclaimed = 0;
+    const repos = new Set<string>();
+    for (const id of await this.store.list()) {
+      const rec = await this.store.get(id).catch(() => undefined);
+      if (rec !== undefined) repos.add(rec.targetRepo);
+    }
+    for (const repo of repos) {
+      try {
+        reclaimed += (await this.reclaim(repo)).recordsReconciled;
+      } catch (err) {
+        this.log.warn({ err: err instanceof Error ? err.message : String(err), repo }, "reclaim during clean failed (non-fatal)");
+      }
+    }
+
     let removed = 0;
     let checked = 0;
+    let skipped = 0;
+    const skippedIds: string[] = [];
     for (const id of await this.store.list()) {
       const rec = await this.store.get(id).catch(() => undefined);
       if (rec === undefined) continue;
@@ -454,6 +533,12 @@ export class WorkspaceManager {
       if (!terminal) continue;
       checked += 1;
       if (!(await this.pathExists(rec.path))) continue; // dir already gone — nothing to reclaim
+      // SAFETY: never destroy retained (the only copy of failed-build work) without --force.
+      if (!force && this.isRetained(rec)) {
+        skipped += 1;
+        skippedIds.push(id);
+        continue;
+      }
       try {
         await this.locks.withLock(
           this.wsKey(id),
@@ -471,8 +556,8 @@ export class WorkspaceManager {
         throw err;
       }
     }
-    this.log.info({ event: "workspace_cleaned", removed, checked }, "reclaimed orphaned worktrees");
-    return { removed, checked };
+    this.log.info({ event: "workspace_cleaned", removed, checked, skipped, reclaimed, force }, "reclaimed orphaned worktrees");
+    return { removed, checked, skipped, reclaimed, skippedIds };
   }
 
   // ---- internals ----

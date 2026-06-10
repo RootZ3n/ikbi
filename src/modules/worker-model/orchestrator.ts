@@ -770,7 +770,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       // cannot). Decide first, then describe — never claim a retained workspace that was discarded.
       const retained = retainFailedWorkspaces && workspaces.retain !== undefined;
       const disposition = retained
-        ? `Its verified changes were left uncommitted, but the workspace (${workspace.id}) was RETAINED — no work was lost; inspect or reclaim it with \`ikbi clean\`.`
+        ? `Its verified changes were left uncommitted, but the workspace (${workspace.id}) was RETAINED at ${workspace.path} — no work was lost. Inspect it with \`ikbi diff ${workspace.id}\` (or open ${workspace.path}); when done, remove it deliberately with \`ikbi workspace discard ${workspace.id}\` (\`ikbi clean\` preserves retained work — use \`ikbi clean --force\` to sweep it).`
         : "Its verified changes were left uncommitted and the workspace was DISCARDED — no retained workspace is available.";
       const reason =
         "verification PASSED, but promotion was BLOCKED. " +

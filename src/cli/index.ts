@@ -32,6 +32,8 @@ import { writeStderr, writeStdout } from "./io.js";
 import "./receipts.js";
 import "./undo.js";
 import "./clean.js";
+import "./workspace.js";
+import { workspaces as coreWorkspaces } from "../core/workspace/index.js";
 // The DEFAULT router: input that is not a known command is treated as a GOAL and
 // deliberated by cognition-layer (which decides the path + recommends the next
 // command). Imported AFTER the barrel so the egress guard is already registered.
@@ -190,6 +192,25 @@ async function run(argv: readonly string[]): Promise<void> {
     }
   }
 }
+
+// SIGINT (Ctrl-C): RETAIN cleanly. An interrupt mid-build would otherwise leave the allocated
+// workspace leaking the bound and silently abandon whatever the builder had written. On the first
+// Ctrl-C we mark every still-live ALLOCATED workspace as retained-failed (keeping its worktree) so
+// the work survives and is inspectable (`ikbi workspace ls` / `ikbi diff <id>`); a second Ctrl-C
+// force-exits immediately. (PROMOTING workspaces are left for crash-reconcile.)
+let interrupting = false;
+process.on("SIGINT", () => {
+  if (interrupting) process.exit(130); // second Ctrl-C — force quit
+  interrupting = true;
+  writeStderr("\nikbi: interrupted — retaining in-progress workspaces (Ctrl-C again to force quit)…\n");
+  void coreWorkspaces
+    .retainAllLive("interrupted by SIGINT")
+    .then((n) => {
+      if (n > 0) writeStderr(`ikbi: retained ${n} in-progress workspace(s) — inspect with \`ikbi workspace ls\`.\n`);
+      process.exit(130);
+    })
+    .catch(() => process.exit(130));
+});
 
 run(process.argv.slice(2)).catch((err: unknown) => {
   writeStderr(`ikbi: ${err instanceof Error ? err.message : String(err)}\n`);

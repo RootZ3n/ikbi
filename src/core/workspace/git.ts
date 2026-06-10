@@ -123,6 +123,30 @@ export async function diffRange(repo: string, base: string, scratch: string): Pr
   return r.stdout;
 }
 
+/**
+ * The UNCOMMITTED working-tree diff of a worktree vs `baseRef`: tracked changes PLUS untracked
+ * (non-ignored) files rendered as add-diffs. RETAINED failed work is uncommitted, so the committed
+ * `base..scratch` range is empty for it — this surfaces what the build actually left on disk
+ * (e.g. a file the builder wrote before timing out) so `ikbi diff <id>` is not a misleading
+ * "no changes". Run with `cwd` = the worktree directory.
+ */
+export async function workingTreeDiff(worktreePath: string, baseRef: string): Promise<string> {
+  const parts: string[] = [];
+  const tracked = (await runGit(worktreePath, ["diff", baseRef])).stdout;
+  if (tracked.trim().length > 0) parts.push(tracked.replace(/\n+$/, ""));
+  const untracked = (await runGit(worktreePath, ["ls-files", "--others", "--exclude-standard"])).stdout
+    .split("\n")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  for (const rel of untracked) {
+    // `git diff --no-index` exits 1 when the files differ (always, vs /dev/null) — that is the
+    // success case here, so 1 is an ok code.
+    const r = await runGit(worktreePath, ["diff", "--no-index", "--", "/dev/null", rel], { okCodes: [1] });
+    if (r.stdout.trim().length > 0) parts.push(r.stdout.replace(/\n+$/, ""));
+  }
+  return parts.length > 0 ? `${parts.join("\n")}\n` : "";
+}
+
 export interface MergeComputation {
   readonly clean: boolean;
   /** The merged tree OID (when clean). */
