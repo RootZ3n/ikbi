@@ -13,8 +13,8 @@ import { moduleEnv } from "../../core/module-config.js";
 
 const env = moduleEnv("agent-router");
 
-/** Logical roster model id the router drives (classifier + answerer). */
-export const ROUTER_MODEL = "mimo-v2.5";
+/** Logical roster model id the router drives (classifier + answerer). Overridable via IKBI_AGENT_ROUTER_MODEL. */
+export const ROUTER_MODEL = env.str("MODEL", "mimo-v2.5");
 /** Sampling temperature (low — classification/answering should be steady). */
 export const ROUTER_TEMPERATURE = 0.1;
 /** Max completion tokens per call. */

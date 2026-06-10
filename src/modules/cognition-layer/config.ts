@@ -13,8 +13,8 @@ import { moduleEnv } from "../../core/module-config.js";
 
 const env = moduleEnv("cognition-layer");
 
-/** Model that performs the deliberation. */
-export const COGNITION_MODEL = "mimo-v2.5";
+/** Model that performs the deliberation. Overridable via IKBI_COGNITION_LAYER_MODEL. */
+export const COGNITION_MODEL = env.str("MODEL", "mimo-v2.5");
 /** Sampling temperature (low — steady judgment). */
 export const COGNITION_TEMPERATURE = 0.2;
 /** Max completion tokens for the decision reply. */
