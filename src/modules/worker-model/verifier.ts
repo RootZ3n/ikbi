@@ -44,7 +44,7 @@ import type { GovernedExec } from "../governed-exec/index.js";
 // The check SET is the single shared definition (worker-model/checks.ts) — the SAME
 // constant the builder's in-loop run_checks imports, so the builder previews the
 // verifier's EXACT checks. Behavior here is unchanged; the constant just relocated.
-import { type CheckResult, type ChecksResolution, mapExec, VERIFIER_CHECKS } from "./checks.js";
+import { type CheckResult, type ChecksResolution, mapExec, resolveCheckTimeoutMs, VERIFIER_CHECKS } from "./checks.js";
 import type { RoleFn, RoleResult } from "./contract.js";
 // LADDER MODE (opt-in, IKBI_VERIFY=ladder): package/impact-aware verification. These are
 // library-only consumers — no side effects at import; the default (legacy) path never calls them.
@@ -53,14 +53,10 @@ import { verificationLadder, type VerificationPlan } from "../verification-ladde
 import { parseCheckOutput, type CheckTriage } from "../check-triage/index.js";
 import { resolveVerificationMode, type VerificationMode } from "./modes.js";
 
-/** Default per-check wall-clock budget (ms) for ladder verification — SEPARATE from the model
- *  role timeout, and larger than governed-exec's read-only-tool default so real suites don't get
- *  SIGKILL'd. Overridable via IKBI_CHECK_TIMEOUT_MS. */
-export const DEFAULT_CHECK_TIMEOUT_MS = 600_000;
-
-/** Upper clamp for IKBI_CHECK_TIMEOUT_MS — Node's setTimeout overflows past 2^31-1 ms (fires ~at
- *  once), which would SIGKILL every check instantly. Clamp to the max safe 32-bit delay. */
-export const MAX_CHECK_TIMEOUT_MS = 2_147_483_647;
+// The check-timeout constants + resolver now live in the SHARED check definition (checks.ts) so the
+// verifier and the builder's in-loop run_checks resolve the SAME per-check budget. Re-exported here
+// so existing importers (and tests) keep `import { ... } from "./verifier.js"`.
+export { DEFAULT_CHECK_TIMEOUT_MS, MAX_CHECK_TIMEOUT_MS } from "./checks.js";
 
 /** Extract changed file paths (repo-relative POSIX) from a unified `git diff`. */
 export function parseChangedFiles(diff: string): string[] {
@@ -250,6 +246,9 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
     if (!resolved.ok) return red(`verification RED: ${resolved.reason}`);
     const checkSet = resolved.checks;
 
+    // SAME per-check budget as the ladder path and the builder's run_checks — without it the
+    // legacy loop would inherit governed-exec's 30s read-only-tool default and SIGKILL real suites.
+    const legacyCheckTimeoutMs = resolveCheckTimeoutMs(env);
     const checks: CheckResult[] = [];
     let sawDryRun = false;
     for (const c of checkSet) {
@@ -259,6 +258,7 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
         args: [...c.args],
         cwd: ctx.workspace.path,
         purpose: `verifier check: ${c.name}`,
+        timeoutMs: legacyCheckTimeoutMs,
       });
       const { check, dryRun } = mapExec(c.name, `${c.command} ${c.args.join(" ")}`, res);
       checks.push(check);
@@ -291,11 +291,9 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
       const indexApi = deps.index ?? projectIndex;
       const planFn = deps.plan ?? ((r) => verificationLadder.planVerification(r));
       const triageFn = deps.triage ?? parseCheckOutput;
-      const raw = (runEnv.IKBI_CHECK_TIMEOUT_MS ?? "").trim();
-      const parsedTimeout = Number.parseInt(raw, 10);
-      // Invalid / non-positive ⇒ default; valid ⇒ CLAMP to MAX_CHECK_TIMEOUT_MS (above which Node's
-      // setTimeout overflows and fires ~immediately → every check SIGKILL'd → false RED).
-      const checkTimeoutMs = Number.isFinite(parsedTimeout) && parsedTimeout > 0 ? Math.min(parsedTimeout, MAX_CHECK_TIMEOUT_MS) : DEFAULT_CHECK_TIMEOUT_MS;
+      // Invalid / non-positive ⇒ default; valid ⇒ CLAMPED (above MAX Node's setTimeout overflows
+      // and fires ~immediately → every check SIGKILL'd → false RED). Shared with the builder.
+      const checkTimeoutMs = resolveCheckTimeoutMs(runEnv);
 
       let data: ProjectIndexData;
       try {

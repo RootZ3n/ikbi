@@ -52,7 +52,7 @@ import { runSearchFiles, searchFilesTool } from "./builder-tools/search-files.js
 import { runTerminal, terminalTool } from "./builder-tools/terminal.js";
 import { runVisionAnalyze, visionAnalyzeTool } from "./builder-tools/vision-tool.js";
 import { runWebExtract, runWebSearch, webExtractTool, webSearchTool, WEB_TOOL_NAMES } from "./builder-tools/web-tools.js";
-import { type CheckResult, type ChecksResolution, mapExec, VERIFIER_CHECKS } from "./checks.js";
+import { type CheckResult, type ChecksResolution, mapExec, resolveCheckTimeoutMs, VERIFIER_CHECKS } from "./checks.js";
 import { workerModelConfig } from "./config.js";
 import { estimateTokens, maybeCompress } from "./context-manager.js";
 import type { RoleFn, RoleResult, WorkerOutcome } from "./contract.js";
@@ -829,6 +829,10 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         lastChecks = { allPass: false, checks: [] };
         return `ERROR: ${resolved.reason} — checks cannot run; done is blocked.`;
       }
+      // SAME per-check budget the verifier uses (resolveCheckTimeoutMs ← IKBI_CHECK_TIMEOUT_MS):
+      // without it run_checks inherits governed-exec's 30s read-only default and SIGKILLs any suite
+      // that takes longer — burning the builder's iterations on work the verifier would have passed.
+      const checkTimeoutMs = resolveCheckTimeoutMs();
       const results: CheckResult[] = [];
       let dry = false;
       for (const c of resolved.checks) {
@@ -838,6 +842,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
           args: [...c.args],
           cwd: ctx.workspace.path,
           purpose: `builder check: ${c.name}`,
+          timeoutMs: checkTimeoutMs,
         });
         const { check, dryRun } = mapExec(c.name, `${c.command} ${c.args.join(" ")}`, res);
         results.push(check);

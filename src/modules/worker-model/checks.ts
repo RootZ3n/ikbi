@@ -189,6 +189,29 @@ export async function workingTreePlanningDiff(
   return unique.map(syntheticAddedDiff).join("\n");
 }
 
+/** Default per-check wall-clock budget (ms) — SEPARATE from the model role timeout, and far
+ *  larger than governed-exec's 30s read-only-tool default so real suites don't get SIGKILL'd.
+ *  Overridable via IKBI_CHECK_TIMEOUT_MS. The verifier AND the builder's in-loop run_checks
+ *  both resolve their per-check timeout through this single source so the builder previews the
+ *  verifier's EXACT budget (a build whose tests take >30s is no longer killed mid-loop). */
+export const DEFAULT_CHECK_TIMEOUT_MS = 600_000;
+
+/** Upper clamp for IKBI_CHECK_TIMEOUT_MS — Node's setTimeout overflows past 2^31-1 ms (fires ~at
+ *  once), which would SIGKILL every check instantly. Clamp to the max safe 32-bit delay. */
+export const MAX_CHECK_TIMEOUT_MS = 2_147_483_647;
+
+/**
+ * Resolve the per-check wall-clock timeout (ms) from IKBI_CHECK_TIMEOUT_MS. Invalid / non-positive
+ * ⇒ the default; valid ⇒ CLAMPED to MAX_CHECK_TIMEOUT_MS (above which Node's setTimeout overflows
+ * and fires ~immediately → every check SIGKILL'd → false RED). One resolver, shared by the verifier
+ * (ladder + legacy loops) and the builder's run_checks, so they always agree on the budget.
+ */
+export function resolveCheckTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = (env.IKBI_CHECK_TIMEOUT_MS ?? "").trim();
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, MAX_CHECK_TIMEOUT_MS) : DEFAULT_CHECK_TIMEOUT_MS;
+}
+
 /** Captured output tail length retained in a check result. */
 export const MAX_OUTPUT_TAIL = 2_000;
 
