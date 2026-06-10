@@ -41,6 +41,10 @@ import "./governed-exec/index.js";
 import "./mcp-model-loop/index.js";
 import "./dependency-install/index.js";
 import "./lab-context-memory/index.js";
+// Capability-client — read-only HTTP client for the lab Capability Ledger; the
+// agent-router consults it for capability-driven model selection (graceful fallback
+// to static config when the ledger is down). Loaded before agent-router (its consumer).
+import "./capability-client/index.js";
 import "./agent-router/index.js";
 import "./self-observation/index.js";
 // Chat — registers the POST /chat conversational endpoint (persistent sessions + tool loop).
