@@ -24,6 +24,13 @@ import { ModelRegistry, type ModelSpec } from "./registry.js";
 
 const log = childLogger("provider");
 
+/**
+ * Provider id used by STUB model entries (escalation tier models with no wired endpoint).
+ * It is deliberately NOT registered — the model resolves in `listModels()` so escalation
+ * can look it up, but `invokeModel` finds no provider and fails gracefully.
+ */
+const STUB_PROVIDER_ID = "stub";
+
 /** Build the default registry: built-in roster + configured providers, then the roster file. */
 function buildDefaultRegistry(): ModelRegistry {
   const pc = config.provider;
@@ -62,6 +69,39 @@ function buildDefaultRegistry(): ModelRegistry {
       role: "critic",
       cost: { promptPerMTok: 0.55, completionPerMTok: 2.19 },
       providers: [{ provider: DEEPSEEK_PROVIDER_ID, providerModelId: "deepseek-reasoner" }],
+    },
+    // --- Escalation tier roster models (see src/modules/escalation/config.ts) ---
+    // Every model id named in escalationConfig.tierModels MUST resolve in the registry
+    // so the escalation retry can look it up. Models with a real endpoint route there;
+    // the rest are STUB entries (route points at the unregistered "stub" provider) so the
+    // registry lookup succeeds but invokeModel fails gracefully until a provider is wired.
+    //
+    // deepseek-v4-flash: real DeepSeek route (same base URL / provider as deepseek-v4-pro).
+    {
+      id: "deepseek-v4-flash",
+      role: "driver",
+      cost: { promptPerMTok: 0.14, completionPerMTok: 0.55 },
+      providers: [{ provider: DEEPSEEK_PROVIDER_ID, providerModelId: "deepseek-v4-flash" }],
+    },
+    // minimax-m2.7 / gpt-5.5 / opus-4.8: no API endpoint wired yet — stub entries so the
+    // escalation roster resolves; real calls fail gracefully (no "stub" provider registered).
+    {
+      id: "minimax-m2.7",
+      role: "driver",
+      cost: { promptPerMTok: 0, completionPerMTok: 0 },
+      providers: [{ provider: STUB_PROVIDER_ID, providerModelId: "minimax-m2.7" }],
+    },
+    {
+      id: "gpt-5.5",
+      role: "critic",
+      cost: { promptPerMTok: 0, completionPerMTok: 0 },
+      providers: [{ provider: STUB_PROVIDER_ID, providerModelId: "gpt-5.5" }],
+    },
+    {
+      id: "opus-4.8",
+      role: "critic",
+      cost: { promptPerMTok: 0, completionPerMTok: 0 },
+      providers: [{ provider: STUB_PROVIDER_ID, providerModelId: "opus-4.8" }],
     },
   ];
 
