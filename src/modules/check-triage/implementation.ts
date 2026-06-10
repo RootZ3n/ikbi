@@ -34,10 +34,51 @@ function frameworkHintsFromCommand(cmdLower: string, add: (f: string) => void): 
   if (/(^|\s)node\b[^\n]*--test\b/.test(cmdLower) || /(^|\s)--test\b/.test(cmdLower)) add("node:test");
 }
 
+/** The test frameworks (a tsc typecheck legitimately runs zero "tests" and is NOT subject to the
+ *  zero-test floor — only checks that are supposed to RUN tests are). */
+const TEST_FRAMEWORKS: readonly string[] = ["vitest/jest", "pytest", "go-test", "node:test"];
+
+/**
+ * Is this check supposed to RUN tests? (name like "test"/"e2e"/"integration", a test-runner in the
+ * command, or a detected test framework). A `tsc`/typecheck/build/lint check is NOT — it never runs
+ * tests, so "zero tests" is not a false-green for it.
+ */
+function isTestCheck(name: string, cmdLower: string, detectedFrameworks: readonly string[]): boolean {
+  if (/\b(test|tests|e2e|integration|spec|specs)\b/i.test(name)) return true;
+  if (detectedFrameworks.some((f) => TEST_FRAMEWORKS.includes(f))) return true;
+  if (/\b(vitest|jest|pytest|mocha|ava)\b/.test(cmdLower)) return true;
+  if (/\bgo\b[^\n]*\btest\b/.test(cmdLower)) return true;
+  if (/--test\b/.test(cmdLower)) return true;
+  return false;
+}
+
+/**
+ * VECTOR A detector: did a test runner execute ZERO tests? Exit 0 with no tests (a fresh package
+ * with `go test ./...`, `node --test`, `jest --passWithNoTests`, or a no-collect pytest) is a FALSE
+ * GREEN — it proves nothing. Per-framework zero-test markers:
+ *   - go test        `?   pkg   [no test files]`
+ *   - vitest         `No test files found`
+ *   - node:test TAP  `# tests 0`
+ *   - jest summary   `Tests:       0 total`
+ *   - pytest         `collected 0 items` / `no tests ran`
+ */
+function ranZeroTests(combined: string): boolean {
+  for (const raw of combined.split("\n")) {
+    const t = raw.trim();
+    if (t.length === 0) continue;
+    if (/\[no test files\]/i.test(t)) return true;
+    if (/no test files found/i.test(t)) return true;
+    if (/^#?\s*tests\s+0\b/.test(t)) return true; // node:test TAP: `# tests 0`
+    if (/^Tests:\s+0\s+total\b/.test(t)) return true; // jest: `Tests: 0 total`
+    if (/\bcollected 0 items\b/i.test(t)) return true; // pytest: `collected 0 items`
+    if (/\bno tests ran\b/i.test(t)) return true; // pytest: `no tests ran`
+  }
+  return false;
+}
+
 /** Internal worker — wrapped by parseCheckOutput so the public API never throws. */
 function parse(input: CheckInput, cfg: CheckTriageConfig): CheckTriage {
   const exitCode = typeof input.exitCode === "number" && Number.isFinite(input.exitCode) ? input.exitCode : 1;
-  const passed = exitCode === 0;
 
   const stdout = stripAnsi(typeof input.stdout === "string" ? input.stdout : "");
   const stderr = stripAnsi(typeof input.stderr === "string" ? input.stderr : "");
@@ -121,10 +162,26 @@ function parse(input: CheckInput, cfg: CheckTriageConfig): CheckTriage {
 
   const detectedFrameworks = [...frameworks].sort();
 
+  // ── PASS/FAIL: the exit code is a FLOOR, not a ceiling. ───────────────────────────────────
+  // VECTOR B (exit-swallowing): `vitest run; echo done` / `jest || true` exit 0 but the real
+  //   failure lines are still in the output and parsed into failures[] — fail closed.
+  // VECTOR A (zero tests): a test-named check that exit-0'd having run ZERO tests is a false green.
+  // exit 0 is necessary but NOT sufficient — both vectors override it to fail.
+  const cmdLower = (input.command ?? "").toLowerCase();
+  const zeroTests = isTestCheck(input.name, cmdLower, detectedFrameworks) && ranZeroTests(combined);
+  const passed = exitCode === 0 && failures.length === 0 && !zeroTests;
+
   // errorSummary — always non-empty, bounded
   let errorSummary: string;
   if (passed) {
     errorSummary = `${input.name}: passed (exit 0)`;
+  } else if (zeroTests) {
+    const fw = detectedFrameworks.length > 0 ? detectedFrameworks.join("/") : "unknown format";
+    errorSummary = `${input.name}: FAILED — a test check ran ZERO tests (exit ${exitCode}, ${fw}); exit 0 with no tests executed is not a pass`;
+  } else if (exitCode === 0 && failures.length > 0) {
+    const fw = detectedFrameworks.length > 0 ? detectedFrameworks.join("/") : "unknown format";
+    const shown = failures.slice(0, 3).join("; ");
+    errorSummary = `${input.name}: FAILED — exit 0 but ${failures.length} failure(s) parsed (exit-swallowing script; exit code is a floor, not a ceiling, ${fw}): ${shown}${failures.length > 3 ? ", …" : ""}`;
   } else {
     const fw = detectedFrameworks.length > 0 ? detectedFrameworks.join("/") : "unknown format";
     if (failures.length > 0) {

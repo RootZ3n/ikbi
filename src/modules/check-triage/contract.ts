@@ -25,7 +25,11 @@ export interface CheckInput {
 
 /** Structured triage for one check. */
 export interface CheckTriage {
-  /** True iff exitCode === 0 (the process is the source of truth for pass/fail). */
+  /**
+   * True only when the check genuinely passed. exit 0 is a FLOOR, not a ceiling: a pass requires
+   * exitCode === 0 AND no parsed failures (exit-swallowing scripts like `jest || true`) AND, for a
+   * test-named check, that it did not run ZERO tests (a no-test exit-0 is a false green).
+   */
   readonly passed: boolean;
   /** Failing test / error identifiers (deduped, bounded, each length-capped). */
   readonly failures: readonly string[];

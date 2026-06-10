@@ -74,6 +74,46 @@ test("passed (exit 0) → passed true, positive summary", () => {
   assert.ok(/passed/.test(r.errorSummary));
 });
 
+// ── BLOCKER 2 — exit 0 is a FLOOR, not a ceiling ─────────────────────────────
+
+test("VECTOR A — go test with no test files (exit 0) is NOT a pass", () => {
+  const r = parseCheckOutput({ name: "test", command: "go test ./...", exitCode: 0, stdout: "?   example/pkg   [no test files]\n" });
+  assert.equal(r.passed, false, "zero tests executed → not a pass");
+  assert.ok(/ZERO tests/.test(r.errorSummary));
+});
+
+test("VECTOR A — node --test with zero tests (TAP `# tests 0`, exit 0) is NOT a pass", () => {
+  const r = parseCheckOutput({ name: "test", command: "node --test", exitCode: 0, stdout: "TAP version 13\n1..0\n# tests 0\n# pass 0\n# fail 0\n" });
+  assert.equal(r.passed, false, "node:test ran zero tests → not a pass");
+});
+
+test("VECTOR A — jest --passWithNoTests (`Tests: 0 total`, exit 0) is NOT a pass", () => {
+  const r = parseCheckOutput({ name: "test", command: "jest --passWithNoTests", exitCode: 0, stdout: "Tests:       0 total\nSnapshots:   0 total\n" });
+  assert.equal(r.passed, false, "jest with no tests → not a pass");
+});
+
+test("VECTOR A — pytest no-collect (`collected 0 items`, exit 0) is NOT a pass", () => {
+  const r = parseCheckOutput({ name: "test", command: "pytest -q", exitCode: 0, stdout: "collected 0 items\n\nno tests ran in 0.01s\n" });
+  assert.equal(r.passed, false, "pytest collected nothing → not a pass");
+});
+
+test("VECTOR A scope — a typecheck legitimately runs zero tests and STILL passes", () => {
+  const r = parseCheckOutput({ name: "typecheck", command: "tsc --noEmit", exitCode: 0, stdout: "" });
+  assert.equal(r.passed, true, "tsc is not a test check — zero-test floor does not apply");
+});
+
+test("VECTOR B — exit 0 but parsed failures (exit-swallowing script) is NOT a pass", () => {
+  const r = parseCheckOutput({ name: "test", command: "vitest run; echo done", exitCode: 0, stdout: "RUN  v1.0\nFAIL  src/math.test.ts > adds\n ✗ adds 3ms\ndone\n" });
+  assert.equal(r.passed, false, "exit 0 with real failures parsed → fail closed");
+  assert.ok(/exit 0 but/.test(r.errorSummary));
+  assert.ok(r.failures.length > 0, "the swallowed failures are still surfaced");
+});
+
+test("a real passing test run (exit 0, tests ran, no failures) still passes", () => {
+  const r = parseCheckOutput({ name: "test", command: "node --test", exitCode: 0, stdout: "TAP version 13\nok 1 - adds\n1..1\n# tests 1\n# pass 1\n# fail 0\n" });
+  assert.equal(r.passed, true, "tests actually ran and passed");
+});
+
 test("deterministic: identical input → identical output", () => {
   const input = { name: "test", command: "go test ./...", exitCode: 1, stdout: "--- FAIL: TestA\n--- FAIL: TestB\n" };
   assert.deepEqual(parseCheckOutput(input), parseCheckOutput(input));
