@@ -817,7 +817,33 @@ export class ChatSession {
         results.push({ tool: m.tool, path: m.path, action: `rollback FAILED: ${errMsg(e)}` });
       }
     }
+    // BLOCKER-1: the file is back to its prior state on disk, but the conversation still holds the
+    // OLD read_file/write_file/patch tool results for it. Left unflagged, the model keeps reasoning
+    // (and editing) against content that no longer exists. Inject a notice into the conversation —
+    // for the paths that ACTUALLY reverted (skip "rollback FAILED" entries) — so the model knows its
+    // earlier tool results for these files are stale and must re-read before operating on them.
+    const reverted = results.filter((r) => !r.action.startsWith("rollback FAILED"));
+    if (reverted.length > 0) this.notifyRollback(reverted);
     return results;
+  }
+
+  /** Push a stale-context notice into the conversation after a successful rollback (BLOCKER-1).
+   *  Carried as isolated, neutralized UNTRUSTED data (role "user") so it survives restore — the
+   *  `system` slot is rebuilt on resume (M2) — yet can never be promoted to a trusted instruction. */
+  private notifyRollback(reverted: readonly RollbackResult[]): void {
+    const paths = [...new Set(reverted.map((r) => r.path))];
+    const list = paths.join(", ");
+    const text =
+      `ROLLBACK NOTICE: the operator reverted the following file(s) via /rollback: ${list}. ` +
+      `Each was restored to the content it had BEFORE this session's edits. ` +
+      `Any earlier tool results (read_file / write_file / patch output) you have for these files are now STALE ` +
+      `and do NOT reflect the current on-disk content. Re-read each of these files with read_file before reasoning about or editing it.`;
+    this.messages.push(
+      toUntrustedMessage(
+        neutralizeUntrusted(text, { source: "external", identity: this.identity, origin: "rollback" }),
+        { role: "user" },
+      ),
+    );
   }
 
   /** Cumulative token + cost usage across the session (for `/cost`), incl. prompt-cache counters. */
