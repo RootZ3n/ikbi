@@ -46,13 +46,24 @@ function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-/** Prompt the user for input via stdin. Returns the trimmed answer. */
+/**
+ * Prompt the user for input via stdin. Returns the trimmed answer.
+ *
+ * EOF-safe: if stdin is closed (piped `/dev/null`, EOF, a non-interactive runner)
+ * the `question` callback never fires, so we also resolve on `close` with an empty
+ * answer rather than hanging the process forever.
+ */
 function promptUser(prompt: string): Promise<string> {
   return new Promise<string>((resolve) => {
     const rl = createInterface({ input: process.stdin, output: process.stdout });
+    let answered = false;
     rl.question(prompt, (ans) => {
+      answered = true;
       rl.close();
       resolve(ans.trim());
+    });
+    rl.on("close", () => {
+      if (!answered) resolve("");
     });
   });
 }
@@ -236,12 +247,17 @@ export function createProductionWorker(
   return createOrchestrator({ roleClaim: productionRoleClaim(opts.workerToken), gateWall: opts.gateWall ?? coreGateWall, governedExec, workspaces: coreWorkspaces, enforceProjectRoot: true, ...(opts.onExecOutput !== undefined ? { onExecOutput: opts.onExecOutput } : {}), ...(opts.requestApproval !== undefined ? { requestApproval: opts.requestApproval } : {}) });
 }
 
-/** Parse `--repo <path>` / `--repo=<path>`, `--verbose`/`-v`, and `--cost`; the rest is the goal prose. */
-export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbose?: boolean; cost?: boolean; rest: string[] } {
+/**
+ * Parse `--repo <path>` / `--repo=<path>`, `--verbose`/`-v`, `--cost`, and `--yes`/`-y`;
+ * the rest is the goal prose. `--yes` skips the interactive Socratic interview prompt and
+ * proceeds with the original goal (the cognition layer still runs — it is non-blocking).
+ */
+export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbose?: boolean; cost?: boolean; yes?: boolean; rest: string[] } {
   const rest: string[] = [];
   let repo: string | undefined;
   let verbose = false;
   let cost = false;
+  let yes = false;
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i] as string;
     if (a === "--repo") {
@@ -253,11 +269,13 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
       verbose = true;
     } else if (a === "--cost") {
       cost = true;
+    } else if (a === "--yes" || a === "-y") {
+      yes = true;
     } else {
       rest.push(a);
     }
   }
-  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), ...(verbose ? { verbose } : {}), ...(cost ? { cost } : {}), rest };
+  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), ...(verbose ? { verbose } : {}), ...(cost ? { cost } : {}), ...(yes ? { yes } : {}), rest };
 }
 
 /** Render a worker `worker.*` progress event into a concise human line (for `--verbose`). PURE. */
@@ -375,6 +393,14 @@ export interface WorkerCliDeps {
    * verified build pauses for this decision before promoting. Default: a stdin y/N prompt.
    */
   readonly approvalPrompt?: (req: { taskId: string; workspaceId: string; goal: string }) => Promise<boolean>;
+  /** The Socratic-interview stdin prompt. Default: a readline question (EOF-safe). Injectable for tests. */
+  readonly prompt?: (question: string) => Promise<string>;
+  /**
+   * Whether the session is interactive (a human is at the keyboard). When false, the
+   * interactive Socratic-interview prompt is skipped (proceed with the original goal) —
+   * the same effect as `--yes`. Default: `process.stdin.isTTY === true`.
+   */
+  readonly interactive?: boolean;
 }
 
 /** Resolve a repo name or path through the repo registry. Returns undefined if not provided. */
@@ -404,9 +430,13 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
   // SG-10: wire the human-approval gate when explicitly provided or when IKBI_REQUIRE_APPROVAL is set.
   const requestApproval = deps.approvalPrompt ?? (approvalRequiredFromEnv() ? stdinApprovalPrompt : undefined);
   const orchestrator = deps.orchestrator ?? createProductionWorker({ workerToken, gateWall, onExecOutput: (chunk) => out(chunk), ...(requestApproval !== undefined ? { requestApproval } : {}) });
+  const prompt = deps.prompt ?? promptUser;
+  // Default to interactive ONLY when stdin is a real terminal — a piped/redirected/CI stdin
+  // never blocks the build waiting for an answer that can't come.
+  const interactive = deps.interactive ?? (process.stdin.isTTY === true);
 
   async function build(argv: readonly string[]): Promise<void> {
-    const { repo, verbose, cost, rest } = parseBuildArgs(argv);
+    const { repo, verbose, cost, yes, rest } = parseBuildArgs(argv);
     const goal = rest.join(" ").trim();
     if (goal.length === 0) {
       err("ikbi: build needs a goal — usage: ikbi build <goal...> [--repo <path>]\n");
@@ -450,10 +480,15 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
     }
 
     const refinement = preBuildRefinement(goal, cognitionResult);
-    if (!refinement.proceed && refinement.interview !== undefined) {
+    // `--yes` (or a non-interactive session) skips the BLOCKING interview prompt entirely and
+    // proceeds with the original goal. The cognition layer above still ran (non-blocking).
+    const skipInterview = yes === true || !interactive;
+    if (skipInterview) {
+      // Nothing interactive to do — proceed silently with the original goal.
+    } else if (!refinement.proceed && refinement.interview !== undefined) {
       out(formatInterview(refinement.interview));
       // Wait for user input — they can refine the goal or press Enter to skip
-      const answer = await promptUser("\n  Your answer (or press Enter to skip): ");
+      const answer = await prompt("\n  Your answer (or press Enter to skip): ");
       if (answer.trim().length > 0) {
         finalGoal = `${goal} — ${answer.trim()}`;
         out(`\n  Refined goal: "${finalGoal}"\n\n`);
@@ -510,7 +545,7 @@ const live = createWorkerCli();
 registerCommand({
   name: "build",
   summary: "Run a worker build pipeline toward a goal",
-  usage: "ikbi build <goal...> [--repo <path>] [--verbose]",
+  usage: "ikbi build <goal...> [--repo <path>] [--verbose] [--cost] [--yes]",
   run: (argv) => live.build(argv),
 });
 

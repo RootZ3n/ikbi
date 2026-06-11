@@ -146,6 +146,69 @@ test("parseBuildArgs extracts --repo and leaves the goal", () => {
   assert.deepEqual(parseBuildArgs(["just", "a", "goal"]), { rest: ["just", "a", "goal"] });
 });
 
+test("parseBuildArgs parses --yes / -y (skip the Socratic interview)", () => {
+  assert.deepEqual(parseBuildArgs(["fix", "it", "--yes"]), { yes: true, rest: ["fix", "it"] });
+  assert.deepEqual(parseBuildArgs(["fix", "it", "-y"]), { yes: true, rest: ["fix", "it"] });
+  // absent ⇒ no `yes` key (so callers see undefined, the interview default)
+  assert.deepEqual(parseBuildArgs(["fix", "it"]), { rest: ["fix", "it"] });
+  // composes with the other flags
+  assert.deepEqual(parseBuildArgs(["g", "--repo=/x", "-y", "--cost"]), { repo: "/x", cost: true, yes: true, rest: ["g"] });
+});
+
+// ── --yes SKIPS the blocking Socratic interview (Fix 1) ──────────────────────
+
+test("--yes skips the interactive interview prompt even for an ambiguous goal", () => {
+  // "fix it" is maximally ambiguous (vague verb + pronoun + no target) ⇒ would normally
+  // trigger the interview. With --yes (and even with interactive:true) the prompt must NOT fire.
+  const { orchestrator, resolveIdentity } = realOrchestrator("trusted", "trusted");
+  const cap2 = capture();
+  let promptCalls = 0;
+  const cli = createWorkerCli({
+    orchestrator, resolveIdentity, operatorToken: OPERATOR_TOKEN, workerToken: WORKER_TOKEN,
+    stdout: cap2.stdout, stderr: cap2.stderr, setExit: cap2.setExit, now: () => 1, cwd: () => "/repo",
+    interactive: true, // a TTY would normally prompt …
+    prompt: async () => { promptCalls += 1; return ""; },
+  });
+  return cli.build(["fix", "it", "--yes"]).then(() => {
+    assert.equal(promptCalls, 0, "the interview prompt was NOT shown under --yes");
+    assert.equal(cap2.exit, undefined, "clean run");
+    const summary = JSON.parse(cap2.out); // out is ONLY the summary — no interview text leaked
+    assert.equal(summary.outcome, "success");
+  });
+});
+
+test("without --yes, an interactive session DOES prompt the interview for an ambiguous goal", () => {
+  const { orchestrator, resolveIdentity } = realOrchestrator("trusted", "trusted");
+  const cap2 = capture();
+  let promptCalls = 0;
+  const cli = createWorkerCli({
+    orchestrator, resolveIdentity, operatorToken: OPERATOR_TOKEN, workerToken: WORKER_TOKEN,
+    stdout: cap2.stdout, stderr: cap2.stderr, setExit: cap2.setExit, now: () => 1, cwd: () => "/repo",
+    interactive: true,
+    prompt: async () => { promptCalls += 1; return ""; }, // user presses Enter ⇒ proceed with original goal
+  });
+  return cli.build(["fix", "it"]).then(() => {
+    assert.equal(promptCalls, 1, "the interview prompt fired once for the ambiguous goal");
+    assert.equal(cap2.exit, undefined, "pressing Enter proceeds — clean run");
+  });
+});
+
+test("a non-interactive session skips the interview without --yes (no hang on piped stdin)", () => {
+  const { orchestrator, resolveIdentity } = realOrchestrator("trusted", "trusted");
+  const cap2 = capture();
+  let promptCalls = 0;
+  const cli = createWorkerCli({
+    orchestrator, resolveIdentity, operatorToken: OPERATOR_TOKEN, workerToken: WORKER_TOKEN,
+    stdout: cap2.stdout, stderr: cap2.stderr, setExit: cap2.setExit, now: () => 1, cwd: () => "/repo",
+    interactive: false, // piped / redirected / CI stdin
+    prompt: async () => { promptCalls += 1; return ""; },
+  });
+  return cli.build(["fix", "it"]).then(() => {
+    assert.equal(promptCalls, 0, "no blocking prompt when stdin is not a TTY");
+    assert.equal(cap2.exit, undefined, "clean run");
+  });
+});
+
 // ── THE CHAIN PROOF (injected model via capturing roles + real gate-wall) ────
 
 test("build runs the full 5-role pipeline through the orchestrator with the real gate-wall", () => {
