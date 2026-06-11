@@ -29,6 +29,23 @@ export const VERIFIER_CHECKS: readonly Check[] = [
   { name: "test", command: "pnpm", args: ["test"] },
 ];
 
+/** npm-equivalent checks for repos that use package-lock.json instead of pnpm-lock.yaml. */
+const NPM_CHECKS: readonly Check[] = [
+  { name: "typecheck", command: "npx", args: ["tsc", "--noEmit"] },
+  { name: "test", command: "npm", args: ["test"] },
+];
+
+/**
+ * Detect the package manager from lockfiles in the project root and return
+ * the matching check set. Defaults to pnpm when ambiguous.
+ */
+function detectChecksForProject(projectRoot: string): readonly Check[] {
+  const hasPnpmLock = existsSync(join(projectRoot, "pnpm-lock.yaml"));
+  const hasNpmLock = existsSync(join(projectRoot, "package-lock.json"));
+  if (hasNpmLock && !hasPnpmLock) return NPM_CHECKS;
+  return VERIFIER_CHECKS;
+}
+
 /**
  * Project manifests that mark a repository ROOT. The presence of one at a directory means
  * "this is a project root" for check resolution. Used to detect the "validates the wrong
@@ -119,7 +136,7 @@ export function resolveChecks(worktreeReal: string, env: NodeJS.ProcessEnv = pro
     return { ok: false, reason: "IKBI_CHECKS is malformed (expected a non-empty JSON array of {name,command,args}) — cannot verify (RED)" };
   }
   if (fromEnv !== undefined) return { ok: true, checks: fromEnv, source: "env" };
-  return { ok: true, checks: VERIFIER_CHECKS, source: "default" };
+  return { ok: true, checks: detectChecksForProject(wt), source: "default" };
 }
 
 /**

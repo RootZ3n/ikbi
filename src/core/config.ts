@@ -324,7 +324,7 @@ function loadProviderConfig(env: NodeJS.ProcessEnv, stateRoot: string): Provider
       driver: optStr(env.IKBI_MODEL_DRIVER) ?? "mimo-v2.5",
       // The builder's own model — falls through to the driver when unset (default unchanged).
       builder: optStr(env.IKBI_MODEL_BUILDER) ?? optStr(env.IKBI_MODEL_DRIVER) ?? "mimo-v2.5",
-      critic: optStr(env.IKBI_MODEL_CRITIC) ?? "minimax-m3",
+      critic: optStr(env.IKBI_MODEL_CRITIC) ?? "deepseek-v4-pro",
       // Optional head-to-head list (comma-separated). Empty/unset ⇒ undefined.
       ...(() => {
         const list = optStr(env.IKBI_COMPETITIVE_MODELS)?.split(",").map((s) => s.trim()).filter((s) => s.length > 0);

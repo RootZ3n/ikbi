@@ -31,12 +31,15 @@ test("ALLOWLIST override is ADDITIVE — defaults are preserved, new binaries ap
   assert.equal(cfg.allowlist.filter((b) => b === "pnpm").length, 1);
   assert.equal(cfg.allowlist.filter((b) => b === "node").length, 1);
   // Order-stable: defaults first, then the genuinely-new binaries in operator order.
-  assert.deepEqual([...cfg.allowlist], [...DEFAULT_ALLOWLIST, "pnpm", "node", "npm", "python3", "mkdir", "cp"]);
+  // pnpm and npm are now defaults so they get deduped from the override.
+  assert.deepEqual([...cfg.allowlist], [...DEFAULT_ALLOWLIST, "node", "python3", "mkdir", "cp"]);
 });
 
 test("dangerous interpreters and file dumpers are not default-allowed", () => {
   const cfg = loadGovernedExecConfig(reader({}));
-  for (const denied of ["node", "npm", "pnpm", "cat"]) {
+  // node and cat remain operator opt-in — node can eval arbitrary code, cat dumps secrets.
+  // npm/npx/pnpm are now default-allowed because the verifier NEEDS them to run checks.
+  for (const denied of ["node", "cat"]) {
     assert.equal(cfg.allowlist.includes(denied), false, `${denied} must be operator opt-in only`);
   }
 });

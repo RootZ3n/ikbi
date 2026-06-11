@@ -151,9 +151,6 @@ function forbiddenEvalReason(command: string, args: readonly string[]): string |
   if (command === "node" && args.some((a) => a === "-e" || a === "--eval" || a === "-p" || a === "--print")) {
     return "node code-eval flags are not allowed by governed-exec";
   }
-  if ((command === "npm" || command === "pnpm") && args[0] === "run") {
-    return `${command} run is not allowed by governed-exec`;
-  }
   if ((command === "npm" || command === "pnpm") && args.some((a) => a === "--eval" || a === "-e")) {
     return `${command} code-eval flags are not allowed by governed-exec`;
   }

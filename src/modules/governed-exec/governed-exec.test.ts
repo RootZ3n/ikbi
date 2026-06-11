@@ -227,8 +227,6 @@ test("operator-allowed interpreters still reject direct code-eval flags", async 
   for (const [command, args] of [
     ["node", ["-e", "process.env"]],
     ["node", ["-p", "1+1"]],
-    ["npm", ["run", "postinstall"]],
-    ["pnpm", ["run", "test"]],
   ] as const) {
     const r = await ge.run({ parentCtx: makeCtx("verified"), command, args });
     assert.equal(r.denied, true, `${command} ${args.join(" ")} should be denied`);

@@ -26,7 +26,18 @@ const env = moduleEnv("governed-exec");
  * binaries (e.g. `python3,mkdir`) does NOT lose the safe defaults the builder relies on
  * for version control and light exploration.
  */
-export const DEFAULT_ALLOWLIST: readonly string[] = Object.freeze(["git", "ls", "echo"]);
+export const DEFAULT_ALLOWLIST: readonly string[] = Object.freeze([
+  // version control
+  "git",
+  // read-only exploration (safe for doc/audit/analysis tasks)
+  // NOTE: cat is intentionally excluded — the builder uses read_file MCP tool instead.
+  //       cat can dump .env / secrets and must remain operator opt-in.
+  "ls", "head", "tail", "wc", "find", "grep", "echo",
+  // package manager + typecheck (required for verifier checks and run_checks)
+  // npm/npx can execute arbitrary code, but the verifier NEEDS them to run tests.
+  // The governed-exec wall-clock timeout + the pipeline's writeScope guard limit blast radius.
+  "npm", "npx", "pnpm",
+]);
 
 /** Per-command wall-clock cap. */
 export const DEFAULT_EXEC_TIMEOUT_MS = 30_000;

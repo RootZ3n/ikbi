@@ -25,15 +25,15 @@ Each task must create something tangible that another part of the lab immediatel
 ## Level 2 — Repository Understanding
 
 **Tasks:**
-- Audit a small repo
-- Generate architecture docs
-- Find dead code
-- Detect drift
-- Create fix plans
+- Audit a small repo ✅
+- Generate architecture docs ✅
+- Find dead code ✅
+- Detect drift ✅
+- Create fix plans ✅
 
 **Goal:** Can ikbi understand existing systems?
 
-**Status:** Not started.
+**Status:** PROVEN. Scout reads repos, builder creates actionable deliverables, full 5-role pipeline green on both pnpm and npm repos. writeScope enforcement working. $0.07-0.62/run. See L2-PROVING-NOTES.md.
 
 ---
 

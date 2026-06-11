@@ -28,7 +28,7 @@ import { moduleEnv } from "../../core/module-config.js";
 const env = moduleEnv("worker-model");
 
 /** Default per-role wall-clock budget (ms) — a named constant, not a magic number. */
-export const DEFAULT_ROLE_TIMEOUT_MS = 120_000; // 2 minutes
+export const DEFAULT_ROLE_TIMEOUT_MS = 300_000; // 5 minutes
 /** Default concurrent-run cap (concurrency feature deferred; safe default 1). */
 export const DEFAULT_MAX_CONCURRENT_RUNS = 1;
 /** Competitive candidate count: default + bounds (≥2 to be a competition; small cap on cost/disk). */
