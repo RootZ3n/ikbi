@@ -55,6 +55,7 @@ const KNOWN_CAPABILITIES: Readonly<Record<string, ModelCapabilities>> = Object.f
   "mimo-v2.5-pro": { context_window: 65_536, supports_tools: true, reasoning_level: "high", speed_class: "medium" },
   "deepseek-chat": { context_window: 65_536, supports_tools: true, reasoning_level: "medium", speed_class: "medium" },
   "deepseek-reasoner": { context_window: 65_536, supports_tools: false, reasoning_level: "high", speed_class: "slow" },
+  "MiniMax-M1": { context_window: 131_072, supports_tools: true, reasoning_level: "high", speed_class: "medium" },
 });
 
 /** Family-pattern fallbacks (id substring → profile) for models not in the exact table. */
@@ -65,6 +66,7 @@ const FAMILY_PATTERNS: ReadonlyArray<{ readonly match: RegExp; readonly caps: Mo
   { match: /deepseek/i, caps: { context_window: 65_536, supports_tools: true, reasoning_level: "medium", speed_class: "medium" } },
   { match: /gpt-4o|gpt-4\.1|o[134]/i, caps: { context_window: 128_000, supports_tools: true, reasoning_level: "high", speed_class: "medium" } },
   { match: /claude/i, caps: { context_window: 200_000, supports_tools: true, reasoning_level: "high", speed_class: "medium" } },
+  { match: /minimax/i, caps: { context_window: 131_072, supports_tools: true, reasoning_level: "high", speed_class: "medium" } },
   { match: /qwen/i, caps: { context_window: 32_768, supports_tools: true, reasoning_level: "medium", speed_class: "fast" } },
   { match: /(llama|gemma|phi|mistral|mixtral)/i, caps: { context_window: 8_192, supports_tools: true, reasoning_level: "low", speed_class: "fast" } },
 ];

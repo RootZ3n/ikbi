@@ -14,9 +14,11 @@ import { getCapabilities, type ModelCapabilities } from "./capabilities.js";
 import type { ModelRequest, ModelResponse } from "./contract.js";
 import {
   createDeepseekProvider,
+  createMinimaxProvider,
   createMimoProvider,
   createOpenRouterProvider,
   DEEPSEEK_PROVIDER_ID,
+  MINIMAX_PROVIDER_ID,
   MIMO_PROVIDER_ID,
   OPENROUTER_PROVIDER_ID,
 } from "./providers/index.js";
@@ -50,10 +52,9 @@ function buildDefaultRegistry(): ModelRegistry {
     {
       id: critic,
       role: "critic",
-      cost: { promptPerMTok: 0.6, completionPerMTok: 1.8 },
+      cost: { promptPerMTok: 0.5, completionPerMTok: 1.5 },
       providers: [
-        { provider: MIMO_PROVIDER_ID, providerModelId: critic },
-        { provider: OPENROUTER_PROVIDER_ID, providerModelId: critic },
+        { provider: MINIMAX_PROVIDER_ID, providerModelId: "MiniMax-M1" },
       ],
     },
     // DeepSeek direct models — usable out of the box once IKBI_DEEPSEEK_API_KEY is set.
@@ -96,7 +97,7 @@ function buildDefaultRegistry(): ModelRegistry {
 
   const reg = new ModelRegistry({
     models: defaultModels,
-    providers: [createMimoProvider(pc.mimo), createOpenRouterProvider(pc.openrouter), createDeepseekProvider(pc.deepseek)],
+    providers: [createMimoProvider(pc.mimo), createOpenRouterProvider(pc.openrouter), createDeepseekProvider(pc.deepseek), createMinimaxProvider(pc.minimax)],
   });
 
   try {

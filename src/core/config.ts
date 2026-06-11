@@ -218,6 +218,8 @@ export interface ProviderConfig {
   readonly openrouter: OpenRouterEndpointConfig;
   /** DeepSeek direct API endpoint (OpenAI-compatible). */
   readonly deepseek: ProviderEndpointConfig;
+  /** MiniMax direct API endpoint (OpenAI-compatible). */
+  readonly minimax: ProviderEndpointConfig;
   /**
    * Default logical model ids for the standard roles (config-driven, not hardcoded
    * downstream). `builder` has its OWN id (IKBI_MODEL_BUILDER) that falls through to the
@@ -313,11 +315,16 @@ function loadProviderConfig(env: NodeJS.ProcessEnv, stateRoot: string): Provider
       baseUrl: optStr(env.IKBI_DEEPSEEK_BASE_URL) ?? "https://api.deepseek.com/v1",
       apiKey: optStr(env.IKBI_DEEPSEEK_API_KEY),
     },
+    minimax: {
+      // MiniMax's OpenAI-compatible endpoint. Override via IKBI_MINIMAX_BASE_URL.
+      baseUrl: optStr(env.IKBI_MINIMAX_BASE_URL) ?? "https://api.minimax.chat/v1",
+      apiKey: optStr(env.IKBI_MINIMAX_API_KEY),
+    },
     defaultModels: {
       driver: optStr(env.IKBI_MODEL_DRIVER) ?? "mimo-v2.5",
       // The builder's own model — falls through to the driver when unset (default unchanged).
       builder: optStr(env.IKBI_MODEL_BUILDER) ?? optStr(env.IKBI_MODEL_DRIVER) ?? "mimo-v2.5",
-      critic: optStr(env.IKBI_MODEL_CRITIC) ?? "mimo-v2.5-pro",
+      critic: optStr(env.IKBI_MODEL_CRITIC) ?? "minimax-m3",
       // Optional head-to-head list (comma-separated). Empty/unset ⇒ undefined.
       ...(() => {
         const list = optStr(env.IKBI_COMPETITIVE_MODELS)?.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
