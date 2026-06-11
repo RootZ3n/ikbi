@@ -174,7 +174,17 @@ export class EventBus implements EventBusSurface {
   private kickDrain(sub: Sub): void {
     if (sub.draining || sub.closed) return;
     sub.draining = true;
-    sub.drainPromise = this.drain(sub);
+    // H4: drain() is a FLOATING promise (deliberately not awaited — publish must not block on
+    // delivery). The handler is already isolated inside drain(), but if drain()'s OWN machinery
+    // throws (e.g. the failure-logging path itself), an unhandled rejection would surface on a bus
+    // 20+ modules share. Attach a terminal catch that contains it: reset the flag and log.
+    sub.drainPromise = this.drain(sub).catch((err: unknown) => {
+      sub.draining = false;
+      this.log.error(
+        { event: "bus_drain_failed", subId: sub.id, label: sub.opts.label, err },
+        "event bus drain machinery threw (contained — never an unhandledRejection)",
+      );
+    });
   }
 
   private async drain(sub: Sub): Promise<void> {

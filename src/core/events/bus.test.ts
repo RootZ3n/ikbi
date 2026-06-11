@@ -200,3 +200,24 @@ test("flush resolves once all subscribers have drained", async () => {
   await bus.flush();
   assert.deepEqual(got, [1, 2]);
 });
+
+test("H4: a throw in the drain machinery is contained (no unhandledRejection), logged as bus_drain_failed", async () => {
+  // A logger whose .warn throws — so when a throwing handler triggers the failure-logging path
+  // INSIDE drain(), drain()'s own machinery throws. Without kickDrain's terminal .catch this would
+  // surface as an unhandledRejection on the shared bus. The .error path records the containment.
+  const errorObjs: Array<Record<string, unknown>> = [];
+  const throwingLogger = {
+    debug: () => {},
+    info: () => {},
+    warn: () => { throw new Error("logger.warn boom"); },
+    error: (obj: Record<string, unknown>) => void errorObjs.push(obj),
+  } as unknown as Logger;
+  const bus = new EventBus({ logger: throwingLogger, defaultMaxQueue: 1000 });
+
+  bus.subscribe({}, () => { throw new Error("handler boom"); }); // triggers the (throwing) warn path
+  bus.publish({ type: "t", payload: 1 });
+  await bus.flush(); // resolves (does NOT reject) — the rejection was contained
+
+  const drainFail = errorObjs.find((o) => o.event === "bus_drain_failed");
+  assert.ok(drainFail, "the drain-machinery throw was caught and logged as bus_drain_failed");
+});
