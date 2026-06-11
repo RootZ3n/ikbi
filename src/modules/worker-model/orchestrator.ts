@@ -57,7 +57,7 @@ import type { DependencyInstall } from "../dependency-install/contract.js";
 import { builder, createBuilder, MAX_TOOL_ITERATIONS } from "./builder.js";
 import { resolveChecks, workingTreePackageJsonDiff, workingTreePlanningDiff } from "./checks.js";
 import { builderModel, competitiveBuilderModels } from "./role-models.js";
-import { critic } from "./critic.js";
+import { createCritic, critic } from "./critic.js";
 import { integrator } from "./integrator.js";
 import { createScout, scout } from "./scout.js";
 import { createVerifier, verifier } from "./verifier.js";
@@ -608,6 +608,14 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     });
   }
 
+  /** The critic for THIS run. Honors injected tests, otherwise gives the critic workspace diff access. */
+  function criticFor(): RoleFn {
+    if (deps.roles?.critic !== undefined) return deps.roles.critic;
+    return createCritic({
+      ...(workspaces.diff !== undefined ? { diff: (ws: WorkspaceHandle) => workspaces.diff!(ws) } : {}),
+    });
+  }
+
   /**
    * The builder for THIS run. Honors an injected `deps.roles.builder` (tests); otherwise
    * builds it with governedExec + the run's parent ctx — the SAME module-internal injection
@@ -877,7 +885,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           priorResults: [...results],
           engine: runEngine,
         };
-        const roleFn = role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderFor(parentCtx) : roles[role];
+        const roleFn = role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderFor(parentCtx) : role === "critic" ? criticFor() : roles[role];
         const result = await runRoleFn(role, roleFn, ctx);
         results.push(result);
 
