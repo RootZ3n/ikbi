@@ -15,6 +15,7 @@
  */
 
 import type { RoleResult } from "./contract.js";
+import { formatDebugFixGoal } from "./debug-assistant.js";
 
 /** Default max fix iterations (override via IKBI_MAX_FIX_ITERATIONS). */
 export const DEFAULT_MAX_FIX_ITERATIONS = 3;
@@ -129,7 +130,7 @@ export async function runIterativeLoop(
 
 /** Format a fix goal from the verifier's error output. */
 function formatFixGoal(errors: string): string {
-  return `The verifier found errors in your code. Fix them:\n\n${errors}`;
+  return formatDebugFixGoal(errors);
 }
 
 /**
