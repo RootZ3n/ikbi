@@ -678,6 +678,15 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         rejectedToolCalls.push({ tool: "terminal", error: verr });
         return `ERROR: ${verr}`;
       }
+      // WRITE SCOPE: block terminal commands that write files when scope is restricted
+      if (writeScope === "none" || writeScope === "new_only") {
+        const cmd = String(args.command ?? "");
+        const writePatterns = />\s*[^&|;]+|>>\s*[^&|;]+|\btee\b|\bcp\b.*[^|]\s|\bmv\b|\brm\b|\bsed\s+-i\b|\bnode\b.*writeFile|\bpython.*open\(.*['\"]w['\"]|\becho\b.*>/;
+        if (writePatterns.test(cmd)) {
+          rejectedToolCalls.push({ tool: "terminal", path: cmd.slice(0, 100), error: `write_scope is '${writeScope}' — terminal write commands are forbidden` });
+          return `ERROR: WRITE SCOPE VIOLATION — write scope is '${writeScope}'. Terminal command that writes files is forbidden: ${cmd.slice(0, 100)}`;
+        }
+      }
       // CWD = the REALPATH'd worktree (worktreeReal), the SAME canonical root read_file/
       // write_file confine against — never the raw ctx.workspace.path, which can diverge from
       // where the builder's writes actually land if any path component is a symlink. Pinning
