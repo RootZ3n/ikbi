@@ -13,10 +13,19 @@ import type { PackageEntry, PackageManager, ProjectIndexData } from "../project-
 import { RUNNABLE_SCRIPT_KEYS, SHARED_FILE_PATTERNS, verificationLadderConfig, type VerificationLadderConfig } from "./config.js";
 import type { CheckStage, CheckTask, PlanRequest, VerificationLadderApi, VerificationPlan } from "./contract.js";
 
-/** `<manager> test` / `<manager> run <script>` (unknown manager → npm). */
+/** Managers where `<mgr> <script>` forwards to run-script WITHOUT the `run` keyword. pnpm and
+ *  yarn (classic) both do this; npm does NOT (a non-lifecycle script needs `npm run <script>`).
+ *  governed-exec BANS `<mgr> run …` (exec.ts:154), so emitting the shorthand for these managers is
+ *  what lets a real `pnpm typecheck` / `pnpm build` pass the executor instead of being denied → RED. */
+const SHORTHAND_RUN_MANAGERS = new Set<PackageManager>(["pnpm", "yarn"]);
+
+/** `<manager> test` / `<manager> <script>` (shorthand for pnpm/yarn to avoid the banned `run`
+ *  keyword; npm/unknown fall back to `<manager> run <script>`). */
 function toCommand(manager: PackageManager, key: string): { command: string; args: string[] } {
   const m = manager === "unknown" ? "npm" : manager;
-  return key === "test" ? { command: m, args: ["test"] } : { command: m, args: ["run", key] };
+  if (key === "test") return { command: m, args: ["test"] };
+  if (SHORTHAND_RUN_MANAGERS.has(manager)) return { command: m, args: [key] };
+  return { command: m, args: ["run", key] };
 }
 
 /** The nearest enclosing package root for a file (longest match; "" matches all, lowest priority). */

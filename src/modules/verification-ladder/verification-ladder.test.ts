@@ -203,3 +203,27 @@ test("P0/Fix3: comment-disguised no-ops and no-test passes are detected as stubs
     assert.equal(isStubScript(body), false, `real: "${body}"`);
   }
 });
+
+// ── C1: ladder emits the `run`-less shorthand for pnpm/yarn so governed-exec (which bans
+//        `<mgr> run <script>`) lets a real typecheck/build pass instead of denying it → RED ──────
+test("C1: non-test scripts use shorthand for pnpm/yarn, `run` only for npm", () => {
+  const taskArgs = (manager: PackageEntry["manager"], key: string) => {
+    const data = mkData({
+      packages: [pkg("packages/a", { [key]: key === "typecheck" ? "tsc --noEmit" : "tsc -p ." }, manager)],
+      files: [file("packages/a/src/foo.ts")],
+    });
+    const pl = plan({ data, changedFiles: ["packages/a/src/foo.ts"] });
+    const task = stageOf(pl, "package-checks")?.tasks.find((t) => t.name === key);
+    return { command: task?.command, args: task?.args };
+  };
+  // pnpm/yarn: `<mgr> typecheck` — NO `run` keyword (governed-exec bans `<mgr> run`).
+  assert.deepEqual(taskArgs("pnpm", "typecheck"), { command: "pnpm", args: ["typecheck"] });
+  assert.deepEqual(taskArgs("pnpm", "build"), { command: "pnpm", args: ["build"] });
+  assert.deepEqual(taskArgs("yarn", "build"), { command: "yarn", args: ["build"] });
+  // npm/unknown: `npm run <script>` shorthand is not valid → keep `run` (npm is not the ban target).
+  assert.deepEqual(taskArgs("npm", "build"), { command: "npm", args: ["run", "build"] });
+  assert.deepEqual(taskArgs("unknown", "build"), { command: "npm", args: ["run", "build"] });
+  // `test` is always the bare `<mgr> test` for every manager.
+  assert.deepEqual(taskArgs("pnpm", "test"), { command: "pnpm", args: ["test"] });
+  assert.deepEqual(taskArgs("npm", "test"), { command: "npm", args: ["test"] });
+});
