@@ -608,6 +608,14 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
             rejectedToolCalls.push({ tool: "write_file", path: c.rel, error: "write_scope is 'new_only' — cannot modify existing file" });
             return `ERROR: WRITE SCOPE VIOLATION — you may only CREATE new files, not modify existing ones. ${c.rel} already exists. Use read_file to inspect it.`;
           }
+          // DEPENDENCY GUARD: never allow writes into node_modules, .git, dist, or similar
+          const BLOCKED_PATHS = ["node_modules/", ".git/", "dist/", ".next/", ".cache/"];
+          const relPath = c.rel.replace(/\\/g, "/");
+          if (BLOCKED_PATHS.some((bp) => relPath.startsWith(bp) || relPath.includes(`/${bp}`))) {
+            log.warn({ path: c.rel }, "DEPENDENCY GUARD BLOCKED write to dependency/build directory");
+            rejectedToolCalls.push({ tool: "write_file", path: c.rel, error: `cannot write to dependency directory: ${c.rel}` });
+            return `ERROR: Cannot write to ${c.rel} — dependency/build directories are off-limits. Create files in src/, scripts/, docs/, or other project directories instead.`;
+          }
           log.info({ path: c.rel, writeScope, exists: existsSync(c.full) }, "write_file ALLOWED");
           const content = typeof args.content === "string" ? args.content : "";
           try {
