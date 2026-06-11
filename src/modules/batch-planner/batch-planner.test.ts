@@ -448,3 +448,18 @@ test("C2 kill composes: a kill at the worker layer rejects the subtask (the orch
   assert.equal(r.outcomes.find((o) => o.subtaskId === "a")?.status, "failed", "the rejected subtask surfaces in the batch report");
   assert.match(r.outcomes.find((o) => o.subtaskId === "a")?.reason ?? "", /kill-switch/, "the kill reason composes up to the batch outcome");
 });
+
+// ── M2: bracket-balanced extraction (greedy regex would swallow trailing prose) ───────────────
+test("M2: trailing prose with brackets after the array does not corrupt the parse", () => {
+  // The old greedy /\[[\s\S]*\]/ would match through the final `]` in `[the docs]` → invalid JSON.
+  const subs = parsePlan(`${PLAN}\n\nNote: see [the docs] and section [4] for details.`, 12);
+  assert.equal(subs.length, 4, "stopped at the array's balanced close, ignoring later brackets");
+  assert.deepEqual(subs.find((s) => s.subtaskId === "c")?.dependsOn, ["a", "b"]);
+});
+
+test("M2: a string containing a `]` inside the array does not end the span early", () => {
+  const plan = '[{"subtaskId":"a","goal":"handle the [edge] case","dependsOn":[]}]';
+  const subs = parsePlan(`Here:\n${plan}\nthanks`, 12);
+  assert.equal(subs.length, 1);
+  assert.equal(subs[0]?.goal, "handle the [edge] case", "bracket inside a JSON string is preserved");
+});

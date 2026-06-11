@@ -65,13 +65,44 @@ export const stopAndReport: ConflictPolicy = (result) => {
 /** A decomposition/validation problem (caught → a rejected BatchResult, never thrown out). */
 class PlanError extends Error {}
 
+/**
+ * Extract the first BALANCED top-level `[...]` span from a model reply. Counts bracket depth and
+ * ignores brackets inside JSON strings, so it stops at the array's real close instead of the last
+ * `]` in the message. Replaces a greedy `/\[[\s\S]*\]/` that swallowed trailing prose/brackets
+ * (e.g. `[...]\n\nNote: see [docs]`) and corrupted the parse. Returns undefined when no complete
+ * balanced array exists.
+ */
+export function extractJsonArray(content: string): string | undefined {
+  const start = content.indexOf("[");
+  if (start === -1) return undefined;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < content.length; i += 1) {
+    const ch = content[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === "[") depth += 1;
+    else if (ch === "]") {
+      depth -= 1;
+      if (depth === 0) return content.slice(start, i + 1);
+    }
+  }
+  return undefined; // unbalanced — no complete array
+}
+
 /** Lenient parse of the decomposer's JSON-array reply into validated Subtasks. */
 export function parsePlan(content: string, maxSubtasks: number): Subtask[] {
-  const m = content.match(/\[[\s\S]*\]/);
-  if (m === null) throw new PlanError("decomposition produced no JSON subtask array");
+  const span = extractJsonArray(content);
+  if (span === undefined) throw new PlanError("decomposition produced no JSON subtask array");
   let raw: unknown;
   try {
-    raw = JSON.parse(m[0]);
+    raw = JSON.parse(span);
   } catch {
     throw new PlanError("decomposition output was not valid JSON");
   }
