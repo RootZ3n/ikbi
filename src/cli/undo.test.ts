@@ -10,11 +10,13 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import type { AgentIdentity } from "../core/identity/contract.js";
+import type { ValidatedIdentity } from "../core/identity/index.js";
 import type { Receipt, ReceiptInput, ReceiptQuery } from "../core/receipt/index.js";
 import { runGit } from "../core/workspace/git.js";
 import { createUndoCli, type UndoGit } from "./undo.js";
 
 const ID: AgentIdentity = { agentId: "operator", trustTier: "operator" };
+const VALIDATED = { identity: ID } as ValidatedIdentity;
 
 /** An in-memory receipt store (controls what undo reads; captures what it appends). */
 function memReceipts(initial: Receipt[]) {
@@ -69,7 +71,7 @@ test("undo reverts a promotion: branch ref AND working tree return to the prior 
 
     const mem = memReceipts([promoteReceipt(repo, "main", beforeRef, afterRef)]);
     const cap = capture();
-    await createUndoCli({ receipts: mem.store, identity: ID, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit }).undo(["promo-1"]);
+    await createUndoCli({ receipts: mem.store, operatorToken: "op-token", resolveIdentity: () => VALIDATED, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit }).undo(["promo-1"]);
 
     assert.equal(cap.exit, undefined, "undo succeeded");
     assert.equal((await runGit(repo, ["rev-parse", "main"])).stdout.trim(), beforeRef, "branch ref reset to before");
@@ -107,7 +109,7 @@ test("undo CAS-resets after→before and syncs the worktree (with fakes)", async
   const mem = memReceipts(REC());
   const g = fakeGit();
   const cap = capture();
-  await createUndoCli({ receipts: mem.store, git: g.git, identity: ID, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit }).undo(["promo-1"]);
+  await createUndoCli({ receipts: mem.store, git: g.git, operatorToken: "op-token", resolveIdentity: () => VALIDATED, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit }).undo(["promo-1"]);
   assert.deepEqual(g.cas, [{ ref: "refs/heads/main", newSha: "BEFORE", oldSha: "AFTER" }], "atomic after→before reset");
   assert.deepEqual(g.synced, ["/wt/main"], "the checked-out tree was synced");
   assert.equal(cap.exit, undefined);
@@ -117,7 +119,7 @@ test("undo refuses when the branch has moved on (no clobber)", async () => {
   const mem = memReceipts(REC());
   const g = fakeGit({ revParse: async () => "MOVED" });
   const cap = capture();
-  await createUndoCli({ receipts: mem.store, git: g.git, identity: ID, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit }).undo(["promo-1"]);
+  await createUndoCli({ receipts: mem.store, git: g.git, operatorToken: "op-token", resolveIdentity: () => VALIDATED, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit }).undo(["promo-1"]);
   assert.equal(cap.exit, 1);
   assert.match(cap.err, /moved on|not the promoted/);
   assert.equal(g.cas.length, 0, "the ref was NOT reset");
@@ -128,13 +130,42 @@ test("undo refuses a dirty checked-out tree, and errors on an unknown id", async
   const dirty = memReceipts(REC());
   const g = fakeGit({ isWorktreeClean: async () => false });
   const c1 = capture();
-  await createUndoCli({ receipts: dirty.store, git: g.git, identity: ID, stdout: c1.stdout, stderr: c1.stderr, setExit: c1.setExit }).undo(["promo-1"]);
+  await createUndoCli({ receipts: dirty.store, git: g.git, operatorToken: "op-token", resolveIdentity: () => VALIDATED, stdout: c1.stdout, stderr: c1.stderr, setExit: c1.setExit }).undo(["promo-1"]);
   assert.equal(c1.exit, 1);
   assert.match(c1.err, /uncommitted changes/);
   assert.equal(g.cas.length, 0);
 
   const c2 = capture();
-  await createUndoCli({ receipts: memReceipts(REC()).store, git: fakeGit().git, identity: ID, stdout: c2.stdout, stderr: c2.stderr, setExit: c2.setExit }).undo(["does-not-exist"]);
+  await createUndoCli({ receipts: memReceipts(REC()).store, git: fakeGit().git, operatorToken: "op-token", resolveIdentity: () => VALIDATED, stdout: c2.stdout, stderr: c2.stderr, setExit: c2.setExit }).undo(["does-not-exist"]);
   assert.equal(c2.exit, 1);
   assert.match(c2.err, /no revertible promote/);
+});
+
+test("undo requires a resolved operator identity before reading or reverting", async () => {
+  let queried = false;
+  const cap = capture();
+  await createUndoCli({
+    receipts: { query: async () => { queried = true; return REC(); }, append: async () => { throw new Error("not reached"); } },
+    git: fakeGit().git,
+    operatorToken: undefined,
+    stdout: cap.stdout,
+    stderr: cap.stderr,
+    setExit: cap.setExit,
+  }).undo(["promo-1"]);
+  assert.equal(cap.exit, 1);
+  assert.match(cap.err, /no operator identity/);
+  assert.equal(queried, false, "undo does not touch receipts before auth");
+
+  const denied = capture();
+  await createUndoCli({
+    receipts: { query: async () => { queried = true; return REC(); }, append: async () => { throw new Error("not reached"); } },
+    git: fakeGit().git,
+    operatorToken: "bad-token",
+    resolveIdentity: () => { throw new Error("bad credentials"); },
+    stdout: denied.stdout,
+    stderr: denied.stderr,
+    setExit: denied.setExit,
+  }).undo(["promo-1"]);
+  assert.equal(denied.exit, 1);
+  assert.match(denied.err, /operator identity resolution failed: bad credentials/);
 });

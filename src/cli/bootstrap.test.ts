@@ -57,7 +57,7 @@ test("info commands with no trust keys get the dev-keys opt-in (so config can lo
 });
 
 test("a real build/batch is NOT auto-opted-in (production guard stays)", () => {
-  for (const cmd of ["build", "batch", "mcp"]) {
+  for (const cmd of ["build", "batch", "mcp", "undo"]) {
     const env: NodeJS.ProcessEnv = {};
     assert.equal(enableDevKeysForInfoCommand([cmd], env), false, `${cmd} is not auto-opted-in`);
     assert.equal(env.IKBI_ALLOW_INSECURE_DEV_KEYS, undefined);

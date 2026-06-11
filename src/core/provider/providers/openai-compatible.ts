@@ -139,6 +139,16 @@ function toWireMessages(inv: ProviderInvocation): Array<Record<string, unknown>>
   });
 }
 
+function safeExtraHeaders(headers: Readonly<Record<string, string>>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [name, value] of Object.entries(headers)) {
+    const lower = name.toLowerCase();
+    if (lower === "authorization" || lower === "content-type") continue;
+    out[name] = value;
+  }
+  return out;
+}
+
 // --- response validation -------------------------------------------------
 
 function badResponse(provider: string, why: string, usage?: TokenUsage): ProviderError {
@@ -231,7 +241,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
     this.id = opts.id;
     this.baseUrl = opts.baseUrl.replace(/\/+$/, "");
     this.apiKey = opts.apiKey;
-    this.extraHeaders = opts.extraHeaders ?? {};
+    this.extraHeaders = safeExtraHeaders(opts.extraHeaders ?? {});
     this.extraBody = opts.extraBody ?? {};
     this.tokenFieldName = opts.tokenFieldName ?? "max_tokens";
     this.maxErrorDetail = opts.maxErrorDetail ?? DEFAULT_MAX_ERROR_DETAIL;

@@ -213,7 +213,16 @@ export class DocumentStore<T> {
     }
     return entries
       .filter((n) => n.endsWith(DOC_EXT) && !isTempFile(n) && !n.includes(".corrupt."))
-      .map((n) => n.slice(0, -DOC_EXT.length));
+      .map((n) => n.slice(0, -DOC_EXT.length))
+      .filter((id) => {
+        try {
+          this.pathFor(id);
+          return true;
+        } catch (err) {
+          if (err instanceof SubstrateError && err.kind === "invalid_key") return false;
+          throw err;
+        }
+      });
   }
 
   private acquireOpts(path: string): { timeoutMs?: number; file?: string } {

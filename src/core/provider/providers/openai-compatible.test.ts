@@ -89,6 +89,30 @@ test("KEYLESS: a keyless provider with NO api key invokes and sends NO Authoriza
   assert.equal(captured.init?.headers["content-type"], "application/json", "other headers intact");
 });
 
+test("extraHeaders cannot override engine-controlled auth or content-type headers", async () => {
+  const { fetchImpl, captured } = jsonFetch(200, {
+    choices: [{ message: { content: "ok" }, finish_reason: "stop" }],
+    usage: {},
+  });
+  const p = new OpenAICompatibleProvider({
+    id: "mimo",
+    baseUrl: "https://x",
+    apiKey: "real-key",
+    fetchImpl,
+    extraHeaders: {
+      authorization: "Bearer attacker",
+      "Authorization": "Bearer attacker2",
+      "content-type": "text/plain",
+      "Content-Type": "text/plain",
+      "x-extra": "ok",
+    },
+  });
+  await p.invoke(invocation());
+  assert.equal(captured.init?.headers.authorization, "Bearer real-key");
+  assert.equal(captured.init?.headers["content-type"], "application/json");
+  assert.equal(captured.init?.headers["x-extra"], "ok");
+});
+
 test("KEYLESS regression: keyless defaults false ⇒ a no-key keyed provider still throws (the floor unchanged)", async () => {
   let called = false;
   const fetchImpl: FetchLike = async () => { called = true; throw new Error("should not be called"); };

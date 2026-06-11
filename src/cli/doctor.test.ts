@@ -25,6 +25,8 @@ function fakeRegistry(models: Record<string, string[]>, registered: string[]): D
   };
 }
 
+const DEV_ENV = { IKBI_ALLOW_INSECURE_DEV_KEYS: "true" } as const;
+
 /** The default role models (loadConfig defaults) both resolve to a roster-declared provider. */
 const resolvingRegistry = (): DoctorRegistry => fakeRegistry({ "mimo-v2.5": ["mimo"], "mimo-v2.5-pro": ["mimo"] }, ["mimo"]);
 /** Nothing resolves (no models / no registered providers). */
@@ -50,7 +52,7 @@ function readyInputs(over: Partial<DoctorInputs> = {}): DoctorInputs {
 
 test("doctor REPORTS MISSING required settings and ends NOT ready (cold start)", () => {
   const r = runDoctor({
-    config: loadConfig({}), // nothing set
+    config: loadConfig(DEV_ENV), // no build credentials set; dev key opt-in only lets config load
     workerModelEnabled: false,
     governedExecAllowlist: ["git", "ls"], // no pnpm
     egressAllowlist: [],
@@ -183,7 +185,7 @@ test("doctor PRINTS NO SECRET VALUES — only set/unset status", () => {
 
 test("doctor SHOWS the resolved role models — driver, builder, critic (so the operator sees which models will be used)", () => {
   const r = runDoctor({
-    config: loadConfig({ IKBI_MODEL_DRIVER: "qwen3:4b", IKBI_MODEL_BUILDER: "deepseek-v4-pro", IKBI_MODEL_CRITIC: "qwen3:14b" }),
+    config: loadConfig({ ...DEV_ENV, IKBI_MODEL_DRIVER: "qwen3:4b", IKBI_MODEL_BUILDER: "deepseek-v4-pro", IKBI_MODEL_CRITIC: "qwen3:14b" }),
     registry: fakeRegistry({ "qwen3:4b": ["x"], "deepseek-v4-pro": ["x"], "qwen3:14b": ["x"] }, ["x"]),
   });
   const text = r.lines.join("\n");

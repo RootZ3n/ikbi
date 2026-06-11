@@ -24,6 +24,7 @@ import { createHash } from "node:crypto";
 import { events as defaultBus } from "../../core/events/index.js";
 import type { EventInput } from "../../core/events/index.js";
 import type { ModelRequest, ModelResponse } from "../../core/provider/contract.js";
+import { registerModelInvokeWrapper } from "../../core/provider/invoke-wrapper.js";
 import { cacheConfig, type CacheConfig } from "./config.js";
 import { cacheHit, cacheMiss, cacheStore, type CacheEventPayload } from "./events.js";
 
@@ -154,6 +155,8 @@ export const modelCache = createModelCache();
 export function cachedInvoke(request: ModelRequest, next: InvokeNext): Promise<ModelResponse> {
   return modelCache.wrap(request, next);
 }
+
+registerModelInvokeWrapper(cachedInvoke);
 
 export { cacheConfig, loadCacheConfig, DEFAULT_TTL_MS, type CacheConfig } from "./config.js";
 export { cacheHit, cacheMiss, cacheStore, type CacheEventPayload } from "./events.js";

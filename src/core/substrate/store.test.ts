@@ -189,3 +189,17 @@ test("DocumentStore.list ignores temp and corrupt sidecar files", async () => {
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("DocumentStore.list filters ids through the same path guard as get/put", async () => {
+  const dir = await tmp();
+  try {
+    const s = store<Counter>(dir);
+    await s.put("real", { n: 1 });
+    await writeFile(join(dir, "../escape.json"), "{}");
+    await writeFile(join(dir, "bad/slash.json"), "{}").catch(() => undefined);
+    await writeFile(join(dir, "x".repeat(220) + ".json"), "{}");
+    assert.deepEqual(await s.list(), ["real"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

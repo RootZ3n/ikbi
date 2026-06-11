@@ -352,14 +352,9 @@ function loadConfig(env: NodeJS.ProcessEnv = process.env): IkbiConfig {
   // own integrity keys are guessable would violate ikbi's fail-closed posture, so
   // the refusal fires HERE — at config load, before the trust and identity modules
   // construct from these values — leaving no window in which the system runs on
-  // default keys. The dev opt-in is read from the ambient process env as a fallback
-  // so a single harness-level `IKBI_ALLOW_INSECURE_DEV_KEYS=true` also covers
-  // `loadConfig({...})` calls that pass an explicit partial env (tests); in
-  // production `env` IS `process.env`, so the fallback is a no-op.
-  const allowInsecureDevKeys = parseBool(
-    env.IKBI_ALLOW_INSECURE_DEV_KEYS ?? process.env.IKBI_ALLOW_INSECURE_DEV_KEYS,
-    false,
-  );
+  // default keys. Explicit env objects are authoritative; callers that pass one
+  // must include IKBI_ALLOW_INSECURE_DEV_KEYS=true or real keys themselves.
+  const allowInsecureDevKeys = parseBool(env.IKBI_ALLOW_INSECURE_DEV_KEYS, false);
   const hmacKeyIsDefault = optStr(env.IKBI_TRUST_HMAC_KEY) === undefined;
   const tokenSaltIsDefault = optStr(env.IKBI_IDENTITY_TOKEN_SALT) === undefined;
   if ((hmacKeyIsDefault || tokenSaltIsDefault) && !allowInsecureDevKeys) {

@@ -100,3 +100,14 @@ test("entries with empty path are skipped", () => {
     teardown();
   }
 });
+
+test("relative repo paths are rejected at load time", () => {
+  const dir = setupState({ repos: { bad: { path: "../relative", description: "unsafe" } } });
+  try {
+    const reg = loadRepoRegistry(dir);
+    assert.equal(reg.list().length, 0);
+    assert.equal(reg.resolve("bad"), undefined);
+  } finally {
+    teardown();
+  }
+});

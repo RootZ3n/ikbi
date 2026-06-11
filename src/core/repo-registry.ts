@@ -56,6 +56,9 @@ export function loadRepoRegistry(stateRoot?: string): RepoRegistry {
 
     for (const [name, entry] of Object.entries(data.repos ?? {})) {
       if (typeof entry?.path === "string" && entry.path.length > 0) {
+        if (!isAbsolute(entry.path)) {
+          throw new Error(`repo "${name}" path must be absolute`);
+        }
         entries.set(name.toLowerCase(), { ...entry, path: entry.path });
       }
     }

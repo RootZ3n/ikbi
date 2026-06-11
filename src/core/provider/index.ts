@@ -8,7 +8,7 @@
 
 import { config } from "../config.js";
 import { childLogger } from "../log.js";
-import { cachedInvoke } from "../../modules/cache/index.js";
+import { wrapModelInvocation } from "./invoke-wrapper.js";
 import { ProviderInvoker } from "./invoke.js";
 import { getCapabilities, type ModelCapabilities } from "./capabilities.js";
 import type { ModelRequest, ModelResponse } from "./contract.js";
@@ -132,7 +132,7 @@ export const invoker = new ProviderInvoker({
  * disabled this is an exact passthrough to `invoker.invokeModel`.
  */
 export function invokeModel(request: ModelRequest): Promise<ModelResponse> {
-  return cachedInvoke(request, () => invoker.invokeModel(request));
+  return wrapModelInvocation(request, () => invoker.invokeModel(request));
 }
 
 /**
@@ -149,6 +149,8 @@ export function resolveCapabilities(modelId: string): ModelCapabilities {
 export * from "./contract.js";
 export { ProviderInvoker, computeCost } from "./invoke.js";
 export type { InvokerDeps } from "./invoke.js";
+export { registerModelInvokeWrapper } from "./invoke-wrapper.js";
+export type { InvokeNext, ModelInvokeWrapper } from "./invoke-wrapper.js";
 export { ModelRegistry, resolveRate } from "./registry.js";
 export type { ModelSpec, ProviderRoute, RegistryInit } from "./registry.js";
 export { getCapabilities, adaptMaxTokens, FALLBACK_CAPABILITIES } from "./capabilities.js";

@@ -46,7 +46,9 @@ const MAX_TEXT = 4096; // outcome detail/error/code
 const MAX_TARGET = 1024;
 const MAX_CHANGES = 10_000;
 const MAX_SUMMARY_BYTES = 64 * 1024; // requestSummary + metadata serialized cap
+const MAX_CHANGE_FIELD_BYTES = 64 * 1024;
 const VALID_STATUSES: ReadonlySet<string> = new Set(["success", "failure", "partial", "rejected"]);
+const VALID_CHANGE_KINDS: ReadonlySet<string> = new Set(["file", "state", "exec", "network", "config", "other"]);
 const ONE_YEAR_MS = 365 * 24 * 60 * 60 * 1000;
 const MAX_RETENTION_MS = 100 * ONE_YEAR_MS;
 
@@ -296,6 +298,60 @@ function boundedRecord(v: unknown, field: string): Readonly<Record<string, unkno
   return v as Record<string, unknown>;
 }
 
+function serializedBytes(v: unknown, field: string, max: number): number {
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(v);
+  } catch (cause) {
+    throw new ReceiptError("invalid_input", `${field} is not JSON-serializable`, { cause });
+  }
+  const bytes = Buffer.byteLength(serialized, "utf8");
+  if (bytes > max) throw new ReceiptError("invalid_input", `${field} exceeds ${max} bytes`);
+  return bytes;
+}
+
+function boundedOptionalRecord(v: unknown, field: string, max = MAX_CHANGE_FIELD_BYTES): Readonly<Record<string, unknown>> | undefined {
+  if (v === undefined) return undefined;
+  if (typeof v !== "object" || v === null || Array.isArray(v)) {
+    throw new ReceiptError("invalid_input", `${field} must be an object`);
+  }
+  serializedBytes(v, field, max);
+  return v as Record<string, unknown>;
+}
+
+function boundedBoolean(v: unknown, field: string): boolean {
+  if (typeof v !== "boolean") throw new ReceiptError("invalid_input", `${field} must be a boolean`);
+  return v;
+}
+
+function boundedNonNegativeInt(v: unknown, field: string): number {
+  if (typeof v !== "number" || !Number.isSafeInteger(v) || v < 0) {
+    throw new ReceiptError("invalid_input", `${field} must be a non-negative safe integer`);
+  }
+  return v;
+}
+
+function validateStateRef(v: unknown, field: string): NonNullable<ReceiptChange["before"]> {
+  const r = boundedOptionalRecord(v, field);
+  if (r === undefined) throw new ReceiptError("invalid_input", `${field} must be an object`);
+  return {
+    ...(r.existed !== undefined ? { existed: boundedBoolean(r.existed, `${field}.existed`) } : {}),
+    ...(r.hash !== undefined ? { hash: boundedString(r.hash, `${field}.hash`, MAX_FIELD) } : {}),
+    ...(r.ref !== undefined ? { ref: boundedString(r.ref, `${field}.ref`, MAX_FIELD) } : {}),
+    ...(r.bytes !== undefined ? { bytes: boundedNonNegativeInt(r.bytes, `${field}.bytes`) } : {}),
+  };
+}
+
+function validateInverse(v: unknown, field: string): NonNullable<ReceiptChange["inverse"]> {
+  const r = boundedOptionalRecord(v, field);
+  if (r === undefined) throw new ReceiptError("invalid_input", `${field} must be an object`);
+  const args = r.args !== undefined ? boundedOptionalRecord(r.args, `${field}.args`) : undefined;
+  return {
+    operation: reqString(r.operation, `${field}.operation`, MAX_FIELD),
+    ...(args !== undefined ? { args } : {}),
+  };
+}
+
 function validateIdentity(identity: AgentIdentity): AgentIdentity {
   if (typeof identity !== "object" || identity === null) {
     throw new ReceiptError("invalid_input", "identity must be an AgentIdentity object");
@@ -347,13 +403,28 @@ function validateChanges(v: unknown): readonly ReceiptChange[] {
   if (v === undefined) return [];
   if (!Array.isArray(v)) throw new ReceiptError("invalid_input", "changes must be an array");
   if (v.length > MAX_CHANGES) throw new ReceiptError("invalid_input", `changes exceeds ${MAX_CHANGES} entries`);
-  for (const c of v) {
+  const out: ReceiptChange[] = [];
+  for (let i = 0; i < v.length; i += 1) {
+    const c = v[i];
     if (typeof c !== "object" || c === null) throw new ReceiptError("invalid_input", "each change must be an object");
     const ch = c as Record<string, unknown>;
-    reqString(ch.kind, "change.kind", MAX_FIELD);
-    reqString(ch.target, "change.target", MAX_TARGET);
+    const kind = reqString(ch.kind, `changes[${i}].kind`, MAX_FIELD);
+    if (!VALID_CHANGE_KINDS.has(kind)) {
+      throw new ReceiptError("invalid_input", `changes[${i}].kind must be one of ${[...VALID_CHANGE_KINDS].join("/")}`);
+    }
+    const clean: ReceiptChange = {
+      kind: kind as ReceiptChange["kind"],
+      target: reqString(ch.target, `changes[${i}].target`, MAX_TARGET),
+      ...(ch.before !== undefined ? { before: validateStateRef(ch.before, `changes[${i}].before`) } : {}),
+      ...(ch.after !== undefined ? { after: validateStateRef(ch.after, `changes[${i}].after`) } : {}),
+      ...(ch.inverse !== undefined ? { inverse: validateInverse(ch.inverse, `changes[${i}].inverse`) } : {}),
+      ...(ch.summary !== undefined ? { summary: boundedString(ch.summary, `changes[${i}].summary`, MAX_TEXT) } : {}),
+    };
+    serializedBytes(clean, `changes[${i}]`, MAX_CHANGE_FIELD_BYTES);
+    out.push(clean);
   }
-  return v as readonly ReceiptChange[];
+  serializedBytes(out, "changes", MAX_CHANGE_FIELD_BYTES);
+  return out;
 }
 
 function validateInput(input: ReceiptInput): CleanInput {

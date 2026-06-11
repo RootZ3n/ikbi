@@ -125,11 +125,13 @@ export class AgentRegistry {
 
   removeAgent(id: string): boolean {
     if (!this.agents.has(id)) return false;
+    if (this.locked.has(id)) {
+      throw new IdentityError("registry", `agent "${id}" is protected and cannot be deleted`);
+    }
     const next = new Map(this.agents);
     next.delete(id);
     this.agents = next;
     this.indexes = computeIndexes(next.values());
-    this.locked.delete(id);
     return true;
   }
 

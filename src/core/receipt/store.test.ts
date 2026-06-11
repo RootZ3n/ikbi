@@ -166,6 +166,51 @@ test("append-only: the store exposes NO mutate/update API (retention prune is th
   assert.equal(typeof proto.pruneOlderThan, "function");
 });
 
+test("append rejects oversized nested receipt change fields", async () => {
+  const dir = await tmp();
+  try {
+    const { store } = makeStore(dir);
+    await assert.rejects(
+      () =>
+        store.append(
+          {
+            operation: "file.write",
+            outcome: { status: "success" },
+            changes: [{ kind: "file", target: "x", before: { hash: "x".repeat(70 * 1024) } }],
+          },
+          IDENTITY,
+        ),
+      (e: unknown) => e instanceof ReceiptError && e.kind === "invalid_input" && /before exceeds/.test(e.message),
+    );
+    await assert.rejects(
+      () =>
+        store.append(
+          {
+            operation: "file.write",
+            outcome: { status: "success" },
+            changes: [{ kind: "file", target: "x", summary: "x".repeat(5000) }],
+          },
+          IDENTITY,
+        ),
+      (e: unknown) => e instanceof ReceiptError && e.kind === "invalid_input" && /summary exceeds/.test(e.message),
+    );
+    await assert.rejects(
+      () =>
+        store.append(
+          {
+            operation: "file.write",
+            outcome: { status: "success" },
+            changes: [{ kind: "file", target: "x", inverse: { operation: "x", args: { payload: "x".repeat(70 * 1024) } } }],
+          },
+          IDENTITY,
+        ),
+      (e: unknown) => e instanceof ReceiptError && e.kind === "invalid_input" && /inverse(?:\.args)? exceeds/.test(e.message),
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("retention hard-deletes aged receipts; fresh receipts survive; survivors keep monotonic seq", async () => {
   const dir = await tmp();
   try {

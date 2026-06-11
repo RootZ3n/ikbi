@@ -13,6 +13,8 @@
 
 import { registerCommand } from "./registry.js";
 import { config } from "../core/config.js";
+import { resolveIdentity as coreResolveIdentity } from "../core/identity/index.js";
+import type { IdentityClaim, ValidatedIdentity } from "../core/identity/index.js";
 import { receipts as coreReceipts } from "../core/receipt/index.js";
 import type { Receipt, ReceiptInput, ReceiptQuery } from "../core/receipt/index.js";
 import type { AgentIdentity } from "../core/identity/contract.js";
@@ -30,7 +32,8 @@ export interface UndoGit {
 export interface UndoCliDeps {
   readonly receipts?: { query(filter?: ReceiptQuery): Promise<Receipt[]>; append(input: ReceiptInput, identity: AgentIdentity): Promise<Receipt> };
   readonly git?: UndoGit;
-  readonly identity?: AgentIdentity;
+  readonly resolveIdentity?: (claim: IdentityClaim) => ValidatedIdentity;
+  readonly operatorToken?: string | undefined;
   readonly stdout?: (s: string) => void;
   readonly stderr?: (s: string) => void;
   readonly setExit?: (code: number) => void;
@@ -55,10 +58,26 @@ const short = (sha: string): string => sha.slice(0, 8);
 export function createUndoCli(deps: UndoCliDeps = {}) {
   const receipts = deps.receipts ?? coreReceipts;
   const git = deps.git ?? defaultGit;
-  const identity = deps.identity ?? { agentId: config.identity.operatorAgentId, trustTier: "operator" };
+  const resolveIdentity = deps.resolveIdentity ?? coreResolveIdentity;
+  const operatorToken = "operatorToken" in deps ? deps.operatorToken : config.identity.operatorToken;
   const out = deps.stdout ?? ((s: string) => void process.stdout.write(s));
   const err = deps.stderr ?? ((s: string) => void process.stderr.write(s));
   const setExit = deps.setExit ?? ((c: number) => void (process.exitCode = c));
+
+  function operator(): AgentIdentity | undefined {
+    if (operatorToken === undefined || operatorToken.length === 0) {
+      err("ikbi undo: no operator identity — set IKBI_OPERATOR_TOKEN\n");
+      setExit(1);
+      return undefined;
+    }
+    try {
+      return resolveIdentity({ token: operatorToken }).identity;
+    } catch (e) {
+      err(`ikbi undo: operator identity resolution failed: ${e instanceof Error ? e.message : String(e)}\n`);
+      setExit(1);
+      return undefined;
+    }
+  }
 
   async function undo(argv: readonly string[]): Promise<void> {
     const idArg = argv[0];
@@ -67,6 +86,8 @@ export function createUndoCli(deps: UndoCliDeps = {}) {
       setExit(1);
       return;
     }
+    const identity = operator();
+    if (identity === undefined) return;
     let all: Receipt[];
     try {
       all = await receipts.query();

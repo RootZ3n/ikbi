@@ -498,13 +498,12 @@ export class WorkspaceManager {
    * RETAINED-WORK SAFETY: a RETAINED failed build's worktree is the ONLY copy of its uncommitted
    * work. When `force` is false the sweep SKIPS those (reporting them in `skipped`/`skippedIds`)
    * so it can never destroy work the failure message told the operator to inspect. The CLI
-   * `ikbi clean` passes `force:false`; `ikbi clean --force` opts into removing them. The default
-   * here is `force:true` so direct/programmatic callers keep the pre-existing sweep-everything
-   * behavior (the destructive-by-default footgun lives only behind the explicit flag at the CLI).
+   * `ikbi clean` passes `force:false`; `ikbi clean --force` opts into removing them. The core
+   * default is also `force:false` so direct/programmatic callers are safe by default.
    */
   async cleanOrphans(opts: { force?: boolean } = {}): Promise<{ removed: number; checked: number; skipped: number; reclaimed: number; skippedIds: string[] }> {
     await this.preload();
-    const force = opts.force ?? true;
+    const force = opts.force ?? false;
 
     // Wire reclaim (previously zero production callers): reconcile crash-leaked active records +
     // prune orphan worktrees/branches per distinct repo, BEFORE sweeping terminal dirs.

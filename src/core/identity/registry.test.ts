@@ -36,6 +36,14 @@ test("update path: upsert / remove re-index credentials", () => {
   assert.equal(reg.removeAgent("builder-3"), false);
 });
 
+test("locked agents cannot be removed", () => {
+  const reg = new AgentRegistry();
+  reg.upsertAgent(agent, { locked: true });
+  assert.throws(() => reg.removeAgent("builder-3"), IdentityError);
+  assert.equal(reg.getAgent("builder-3")?.agentId, "builder-3");
+  assert.ok(reg.findByTokenHash(hashToken("builder-secret")), "locked agent remains indexed");
+});
+
 test("tailscale lookup by login (case-insensitive), nodeId, addr", () => {
   const reg = new AgentRegistry({
     agents: [

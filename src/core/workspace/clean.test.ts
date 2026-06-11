@@ -91,10 +91,15 @@ test("retain KEEPS the worktree (files survive) but marks the record failed, and
     assert.match(rec?.note ?? "", /retained: build timed out/);
     assert.equal(mgr.liveCount(), 0, "the allocation slot is freed (does not hold the live bound)");
 
-    // `ikbi clean` reclaims the retained worktree afterwards (the manual/eventual cleanup).
+    // The core default is safe: retained work is preserved unless force is explicit.
     const cleaned = await mgr.cleanOrphans();
-    assert.ok(cleaned.removed >= 1, "clean reclaims the retained worktree");
-    assert.equal(await exists(ws.path), false, "the retained worktree dir is removed by clean");
+    assert.equal(cleaned.removed, 0, "clean does not reclaim retained work by default");
+    assert.ok(cleaned.skipped >= 1, "the retained workspace is reported as skipped");
+    assert.equal(await exists(ws.path), true, "the retained worktree dir is preserved by default");
+
+    const forced = await mgr.cleanOrphans({ force: true });
+    assert.ok(forced.removed >= 1, "explicit force reclaims the retained worktree");
+    assert.equal(await exists(ws.path), false, "the retained worktree dir is removed by force");
   } finally {
     await cleanup(repo, root);
   }
