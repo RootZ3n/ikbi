@@ -56,6 +56,7 @@ import { runWebExtract, runWebSearch, webExtractTool, webSearchTool, WEB_TOOL_NA
 import { type CheckResult, type ChecksResolution, mapExec, resolveCheckTimeoutMs, VERIFIER_CHECKS } from "./checks.js";
 import { workerModelConfig } from "./config.js";
 import { estimateTokens, maybeCompress } from "./context-manager.js";
+import { ContextLayer } from "./context-layer.js";
 import type { RoleFn, RoleResult, WorkerOutcome } from "./contract.js";
 import { loadProjectInstructions } from "./project-memory.js";
 import { builderModel } from "./role-models.js";
@@ -921,6 +922,16 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
     const effectiveMaxTokens = adaptMaxTokens(BUILDER_MAX_TOKENS, caps);
     const effectiveTools = caps.supports_tools ? TOOLS : simplifyTools(TOOLS);
 
+    // CONTEXT LAYER: deterministic, model-agnostic compression. Runs BEFORE the
+    // model-based maybeCompress — compresses old tool results into one-line summaries
+    // using pattern matching (no extra model call). The existing maybeCompress handles
+    // any remaining overflow with model-generated summaries.
+    const contextLayer = new ContextLayer({
+      tokenBudget: Math.floor(caps.context_window * 0.6),
+      recencyWindow: 5,
+      headerLen: 4,
+    });
+
     // --- the bounded loop. The cap bounds TOTAL model rounds (tool rounds + corrective
     // turns), so a model that keeps bare-stopping can never spin forever. ---
     for (;;) {
@@ -932,6 +943,19 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       if (Date.now() - startedAt > timeoutMs) {
         stopReason = "timeout";
         break;
+      }
+
+      // CONTEXT LAYER — deterministic compression: compress old tool results into
+      // lightweight summaries using pattern matching (no model call). This runs FIRST
+      // to cheaply reduce context pressure; the model-based maybeCompress below
+      // handles any remaining overflow.
+      const ctxLayerResult = contextLayer.compress(messages);
+      if (ctxLayerResult.compressed) {
+        compressions += 1;
+        log.info(
+          { before: ctxLayerResult.before, after: ctxLayerResult.after, msgs: ctxLayerResult.messagesCompressed },
+          "[context-layer] deterministic compression applied",
+        );
       }
 
       // CONTEXT WINDOW MANAGEMENT: before each model call, compact the conversation if it
