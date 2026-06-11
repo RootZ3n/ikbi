@@ -64,3 +64,22 @@ test("the registry tracks module names and registration order", () => {
     ["one", "two"],
   );
 });
+
+test("server error handler returns a generic 500 body", async () => {
+  registerRoutes("boom", async (app) => {
+    app.get("/boom", async () => {
+      throw new Error("secret stack detail");
+    });
+  });
+
+  const app = buildServer();
+  await app.ready();
+  try {
+    const res = await app.inject({ method: "GET", url: "/boom" });
+    assert.equal(res.statusCode, 500);
+    assert.deepEqual(res.json(), { error: "internal server error" });
+    assert.equal(res.body.includes("secret stack detail"), false);
+  } finally {
+    await app.close();
+  }
+});

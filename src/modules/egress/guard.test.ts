@@ -17,10 +17,10 @@ const okResponse = {
 };
 
 /** A transport that records whether it was reached, and the URL it saw. */
-function recordingTransport(): { transport: FetchLike; calls: string[] } {
-  const calls: string[] = [];
-  const transport: FetchLike = async (input) => {
-    calls.push(input);
+function recordingTransport(): { transport: FetchLike; calls: Array<{ input: string; redirect?: string }> } {
+  const calls: Array<{ input: string; redirect?: string }> = [];
+  const transport: FetchLike = async (input, init) => {
+    calls.push({ input, ...(init.redirect !== undefined ? { redirect: init.redirect } : {}) });
     return okResponse;
   };
   return { transport, calls };
@@ -52,7 +52,8 @@ test("a permitted host resolving to a public IP passes through to the transport"
   const { guard, blocked, calls } = harness({ allowlist: ["api.example.com"] });
   const res = await guard("https://api.example.com/v1/chat", init);
   assert.equal(res.status, 200);
-  assert.deepEqual(calls, ["https://api.example.com/v1/chat"], "transport reached exactly once");
+  assert.deepEqual(calls.map((c) => c.input), ["https://api.example.com/v1/chat"], "transport reached exactly once");
+  assert.equal(calls[0]?.redirect, "manual", "guard disables automatic redirect following");
   assert.equal(blocked.length, 0);
 });
 
@@ -181,7 +182,7 @@ test("LOCAL ALLOWED (headline): an exact-match host:port internal endpoint is pe
   });
   const res = await guard("http://127.0.0.1:11434/v1/chat/completions", init);
   assert.equal(res.status, 200, "the local Ollama endpoint was reached");
-  assert.deepEqual(calls, ["http://127.0.0.1:11434/v1/chat/completions"], "transport reached exactly once");
+  assert.deepEqual(calls.map((c) => c.input), ["http://127.0.0.1:11434/v1/chat/completions"], "transport reached exactly once");
   assert.equal(blocked.length, 0, "NOT blocked");
   // The positive audit event fired, carrying the RESOLVED IP the gate keyed on.
   assert.equal(localAllowed.length, 1, "egress.local_allowed published");
@@ -318,6 +319,31 @@ test("MULTI-IP REBIND blocked: a host resolving to [opted-in IP, metadata IP] bl
   assert.match(blocked.at(-1)?.detail ?? "", /169\.254\.169\.254/);
   assert.equal(localAllowed.length, 0, "one allowed IP never blesses the rebind");
   assert.equal(calls.length, 0);
+});
+
+test("redirect Location is re-validated and blocked when it targets an internal IP", async () => {
+  const blocked: EgressBlockedPayload[] = [];
+  const calls: string[] = [];
+  const guard = createGuardedFetch({
+    allowlist: ["api.example.com", "169.254.169.254"],
+    localEndpoints: [],
+    resolve: async (host) => (host === "api.example.com" ? ["93.184.216.34"] : ["169.254.169.254"]),
+    transport: async (input, init) => {
+      calls.push(`${input} redirect=${init.redirect}`);
+      return {
+        ok: false,
+        status: 302,
+        headers: { get: (name: string) => (name.toLowerCase() === "location" ? "http://169.254.169.254/latest/meta-data" : null) },
+        json: async () => ({}),
+        text: async () => "",
+      };
+    },
+    publishBlocked: (p) => blocked.push(p),
+    publishLocalAllowed: () => {},
+  });
+  await assert.rejects(() => guard("https://api.example.com/start", init), (e: unknown) => e instanceof ProviderError);
+  assert.deepEqual(calls, ["https://api.example.com/start redirect=manual"], "only the first hop reaches transport");
+  assert.equal(blocked.at(-1)?.reason, "internal_ip");
 });
 
 // ── CONFIG: ALLOW_LOCAL takes IP-LITERALS only (a hostname is rejected at load) ──

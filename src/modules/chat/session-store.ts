@@ -103,6 +103,24 @@ function fileStem(id: string): string {
   return id.replace(/[^A-Za-z0-9-]/g, (c) => `_${c.charCodeAt(0).toString(16)}`);
 }
 
+function isPersistedSession(value: unknown): value is PersistedSession {
+  if (typeof value !== "object" || value === null) return false;
+  const s = value as Record<string, unknown>;
+  return (
+    typeof s.id === "string" &&
+    typeof s.worktree === "string" &&
+    typeof s.model === "string" &&
+    Array.isArray(s.messages) &&
+    typeof s.memory === "object" &&
+    s.memory !== null &&
+    typeof s.createdAt === "number" &&
+    Number.isFinite(s.createdAt) &&
+    typeof s.lastUsedAt === "number" &&
+    Number.isFinite(s.lastUsedAt) &&
+    (s.label === undefined || typeof s.label === "string")
+  );
+}
+
 /** Is `pid` a live process? `kill(pid, 0)` probes existence without signalling. EPERM ⇒ alive
  *  (exists but not ours); ESRCH ⇒ gone. Used to distinguish a held lock from a stale one. */
 function isPidAlive(pid: number): boolean {
@@ -210,7 +228,12 @@ export class PersistentSessionStore {
     const file = this.fileFor(id);
     if (!existsSync(file)) return undefined;
     try {
-      return JSON.parse(readFileSync(file, "utf8")) as PersistedSession;
+      const parsed = JSON.parse(readFileSync(file, "utf8")) as unknown;
+      if (!isPersistedSession(parsed)) {
+        log.warn({ sessionId: id }, "chat-store: load failed (invalid session shape)");
+        return undefined;
+      }
+      return parsed;
     } catch (e) {
       log.warn({ err: e instanceof Error ? e.message : String(e), sessionId: id }, "chat-store: load failed (corrupt file?)");
       return undefined;
@@ -244,8 +267,8 @@ export class PersistentSessionStore {
     const metas: SessionMeta[] = [];
     for (const f of this.jsonFiles()) {
       try {
-        const s = JSON.parse(readFileSync(join(this.dir, f), "utf8")) as PersistedSession;
-        if (typeof s.id !== "string" || !Array.isArray(s.messages)) continue;
+        const s = JSON.parse(readFileSync(join(this.dir, f), "utf8")) as unknown;
+        if (!isPersistedSession(s)) continue;
         metas.push({
           id: s.id,
           ...(s.label !== undefined ? { label: s.label } : {}),

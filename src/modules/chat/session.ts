@@ -378,6 +378,17 @@ function resolveWorkdir(): string {
   return realpathSync(mkdtempSync(`${tmpdir()}/ikbi-chat-`));
 }
 
+function resolveProvidedWorkdir(input: unknown, createIfMissing: boolean): string | undefined {
+  if (typeof input !== "string" || input.trim().length === 0) return undefined;
+  try {
+    if (createIfMissing) mkdirSync(input, { recursive: true });
+    return realpathSync(input);
+  } catch (e) {
+    log.warn({ err: errMsg(e) }, "chat: ignoring invalid restored/configured worktree");
+    return undefined;
+  }
+}
+
 /** The model-invocation function shape — injectable so the tool loop is testable without network. */
 export type InvokeFn = typeof invokeModel;
 
@@ -458,11 +469,15 @@ export class ChatSession {
   private cacheSavedUsd = 0;
   /** Ordered log of file mutations this session made, for `/rollback` (FIX 1). In-memory only. */
   private readonly fileHistory: FileMutation[] = [];
+  private turnQueue: Promise<unknown> = Promise.resolve();
 
   constructor(id: string, deps: ChatSessionDeps = {}) {
     const restore = deps.restore;
     this.id = id;
-    this.worktree = deps.worktree ?? restore?.worktree ?? resolveWorkdir();
+    const suppliedWorktree = deps.worktree ?? restore?.worktree;
+    this.worktree = suppliedWorktree !== undefined
+      ? (resolveProvidedWorkdir(suppliedWorktree, deps.worktree !== undefined) ?? resolveWorkdir())
+      : resolveWorkdir();
     this.identity = { agentId: "ikbi-chat", functionalRole: "assistant", trustTier: "trusted", sessionId: id };
     this.parentCtx = resolveParentCtx(id);
     this.invoke = deps.invoke ?? invokeModel;
@@ -678,7 +693,12 @@ export class ChatSession {
       case "run_checks": {
         // The project's checks against the session workspace — the SAME VERIFIER_CHECKS the builder
         // and verifier run, through the SAME governed path. Output is UNTRUSTED command output.
-        const out = await this.runWorkspaceChecks();
+        let out: string;
+        try {
+          out = await this.runWorkspaceChecks();
+        } catch (e) {
+          out = `ERROR: run_checks failed: ${errMsg(e)}`;
+        }
         const ok = out.startsWith("Checks ALL PASS");
         return { output: out, activity: { name: "run_checks", ok } };
       }
@@ -928,6 +948,20 @@ export class ChatSession {
    * turn as multimodal `parts` so a vision-capable model sees them inline.
    */
   async send(
+    userMessage: string,
+    images?: readonly string[],
+    mode: ChatMode = "agent",
+    opts: TurnOptions = {},
+  ): Promise<{ response: string; tools: ChatToolActivity[]; cost: number; contextPercent: number }> {
+    const next = this.turnQueue.then(
+      () => this.sendUnlocked(userMessage, images, mode, opts),
+      () => this.sendUnlocked(userMessage, images, mode, opts),
+    );
+    this.turnQueue = next.catch(() => undefined);
+    return next;
+  }
+
+  private async sendUnlocked(
     userMessage: string,
     images?: readonly string[],
     mode: ChatMode = "agent",

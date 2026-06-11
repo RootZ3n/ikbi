@@ -37,6 +37,8 @@ import { egressConfig } from "./config.js";
 import { egressBlocked, egressLocalAllowed, type EgressBlockedPayload, type EgressBlockReason, type EgressLocalAllowedPayload } from "./events.js";
 import { classifyIp } from "./ip.js";
 
+const MAX_REDIRECT_HOPS = 5;
+
 /** Injectable dependencies (tests substitute DNS + transport + publish). */
 export interface GuardedFetchDeps {
   /** Permitted egress hosts, lowercased + exact-match. Empty = default-deny-all. */
@@ -108,12 +110,12 @@ export function createGuardedFetch(deps: GuardedFetchDeps): FetchLike {
     });
   };
 
-  return async (input, init) => {
+  async function validate(urlText: string): Promise<{ url: URL; host: string; port: string }> {
     let url: URL;
     try {
-      url = new URL(input);
+      url = new URL(urlText);
     } catch {
-      return block("invalid_url", input, `not a valid URL: ${input}`);
+      return block("invalid_url", urlText, `not a valid URL: ${urlText}`);
     }
 
     if (url.protocol !== "http:" && url.protocol !== "https:") {
@@ -163,8 +165,30 @@ export function createGuardedFetch(deps: GuardedFetchDeps): FetchLike {
     if (matchedLocal !== undefined) {
       publishLocalAllowed({ host, resolvedIp: matchedLocal.ip, port: Number(port), reason: matchedLocal.reason });
     }
-    // All checks passed — hand off to the real transport. (See TOCTOU note above.)
-    return transport(input, init);
+    return { url, host, port };
+  }
+
+  return async (input, init) => {
+    let current = input;
+    for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop += 1) {
+      await validate(current);
+      const res = await transport(current, { ...init, redirect: "manual" });
+      if (res.status < 300 || res.status >= 400) return res;
+      const location = res.headers?.get("location");
+      if (location === null || location === undefined || location.trim().length === 0) return res;
+      if (hop === MAX_REDIRECT_HOPS) {
+        const host = (() => {
+          try {
+            return new URL(current).hostname.toLowerCase();
+          } catch {
+            return current;
+          }
+        })();
+        return block("invalid_url", host, `redirect limit exceeded after ${MAX_REDIRECT_HOPS} hops`);
+      }
+      current = new URL(location, current).toString();
+    }
+    return block("invalid_url", input, "redirect limit exceeded");
   };
 }
 

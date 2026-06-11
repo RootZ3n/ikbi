@@ -187,7 +187,8 @@ export async function acquireFileLock(
         throw new SubstrateError("io", `failed to acquire file lock ${lockPath}`, { path: lockPath, cause: err });
       }
       // Held by someone — reclaim ONLY if provably safe (never steal a live holder).
-      if ((await isStealAuthorized(lockPath, deps.staleMs, now)) && (await tryStealLock(lockPath, nonce, deps.logger))) {
+      const authorizedBody = await stealAuthorizedBody(lockPath, deps.staleMs, now);
+      if (authorizedBody !== undefined && (await tryStealLock(lockPath, nonce, deps.logger, authorizedBody))) {
         continue; // try to create immediately
       }
       if (now() >= deadline) {
@@ -204,12 +205,12 @@ export async function acquireFileLock(
  * unverifiable) holder is NEVER stealable. Only a dead same-host PID, or an
  * empty/corrupt lock file that has been broken longer than `staleMs`, qualifies.
  */
-async function isStealAuthorized(lockPath: string, staleMs: number, now: Clock): Promise<boolean> {
+async function stealAuthorizedBody(lockPath: string, staleMs: number, now: Clock): Promise<string | undefined> {
   let raw: string;
   try {
     raw = await readFile(lockPath, "utf8");
   } catch {
-    return false; // vanished/unreadable right now — just retry the create, don't steal
+    return undefined; // vanished/unreadable right now — just retry the create, don't steal
   }
 
   let body: LockFileBody | undefined;
@@ -224,23 +225,37 @@ async function isStealAuthorized(lockPath: string, staleMs: number, now: Clock):
     // Empty/corrupt: only steal if it has been broken for a while (not mid-creation).
     try {
       const st = await stat(lockPath);
-      return now() - st.mtimeMs > staleMs;
+      return now() - st.mtimeMs > staleMs ? raw : undefined;
     } catch {
-      return false;
+      return undefined;
     }
   }
 
   // Parseable: ONLY a dead PID on THIS host is reclaimable. Live or cross-host => never.
-  return body.host === hostname() && !isProcessAlive(body.pid);
+  return body.host === hostname() && !isProcessAlive(body.pid) ? raw : undefined;
 }
 
 /** Atomically steal a stale lock: rename it aside (only one winner) then remove it. */
-async function tryStealLock(lockPath: string, nonce: string, logger: Logger): Promise<boolean> {
+async function tryStealLock(lockPath: string, nonce: string, logger: Logger, authorizedBody: string): Promise<boolean> {
   const aside = `${lockPath}.stale.${nonce}`;
   try {
     await rename(lockPath, aside);
   } catch {
     return false; // someone else already moved/removed it
+  }
+  let movedBody: string;
+  try {
+    movedBody = await readFile(aside, "utf8");
+  } catch {
+    return false;
+  }
+  if (movedBody !== authorizedBody) {
+    try {
+      await rename(aside, lockPath);
+    } catch {
+      logger.warn({ event: "stale_lock_recheck_failed", lockPath }, "stale lock changed during steal and could not be restored");
+    }
+    return false;
   }
   await unlink(aside).catch(() => undefined);
   logger.warn({ event: "stale_lock_recovered", lockPath }, "recovered a stale cross-process lock");

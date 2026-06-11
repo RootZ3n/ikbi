@@ -199,6 +199,43 @@ test("args reach execFile as a LITERAL array (no shell, no metacharacter interpr
   assert.ok(!("shell" in (ex.calls[0]?.opts ?? {})), "execFile is invoked with NO shell option");
 });
 
+test("exec children receive a scrubbed env allowlist only", async () => {
+  const oldPath = process.env.PATH;
+  const oldHome = process.env.HOME;
+  const oldLang = process.env.LANG;
+  const oldSecret = process.env.IKBI_SECRET_TEST_VALUE;
+  process.env.PATH = "/usr/bin";
+  process.env.HOME = "/home/test";
+  process.env.LANG = "C.UTF-8";
+  process.env.IKBI_SECRET_TEST_VALUE = "do-not-leak";
+  try {
+    const ex = fakeExecFile();
+    const ge = createGovernedExec({ config: cfg(["echo"]), gateWall: capturingGate().gateWall, execFile: ex.fn, receipts: fakeReceipts().receipts, publish: () => {} });
+    await ge.run({ parentCtx: makeCtx("verified"), command: "echo", args: ["hi"] });
+    assert.deepEqual(ex.calls[0]?.opts.env, { PATH: "/usr/bin", HOME: "/home/test", LANG: "C.UTF-8" });
+  } finally {
+    if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
+    if (oldHome === undefined) delete process.env.HOME; else process.env.HOME = oldHome;
+    if (oldLang === undefined) delete process.env.LANG; else process.env.LANG = oldLang;
+    if (oldSecret === undefined) delete process.env.IKBI_SECRET_TEST_VALUE; else process.env.IKBI_SECRET_TEST_VALUE = oldSecret;
+  }
+});
+
+test("operator-allowed interpreters still reject direct code-eval flags", async () => {
+  const ex = fakeExecFile();
+  const ge = createGovernedExec({ config: cfg(["node", "npm", "pnpm"]), gateWall: capturingGate().gateWall, execFile: ex.fn, receipts: fakeReceipts().receipts, publish: () => {} });
+  for (const [command, args] of [
+    ["node", ["-e", "process.env"]],
+    ["node", ["-p", "1+1"]],
+    ["npm", ["run", "postinstall"]],
+    ["pnpm", ["run", "test"]],
+  ] as const) {
+    const r = await ge.run({ parentCtx: makeCtx("verified"), command, args });
+    assert.equal(r.denied, true, `${command} ${args.join(" ")} should be denied`);
+  }
+  assert.equal(ex.calls.length, 0);
+});
+
 // ── curl / HTTP through the egress guard ─────────────────────────────────────
 
 test("fetch routes through the guarded fetch (egress), NOT the curl binary", async () => {

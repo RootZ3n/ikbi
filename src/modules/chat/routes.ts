@@ -27,6 +27,10 @@ import type { ChatRequest, ChatResponse } from "./contract.js";
 // The two stores are deliberately NOT unified.
 import { sessionStore, type PermissionMode } from "./session.js";
 
+const CHAT_RATE_WINDOW_MS = 60_000;
+const CHAT_RATE_LIMIT = 60;
+const rateBuckets = new Map<string, { count: number; resetAt: number }>();
+
 /**
  * The shared chat auth token (IKBI_CHAT_TOKEN), read PER REQUEST so the env can be set/cleared
  * by the operator (and by tests) without a process restart. Trimmed; empty ⇒ "no token configured".
@@ -59,11 +63,15 @@ function bearerOf(header: string | undefined): string | undefined {
  * reach "auto" permissions.
  *
  *  - IKBI_CHAT_TOKEN set: require `Authorization: Bearer <token>`; reject 401 on missing/mismatch.
- *  - IKBI_CHAT_TOKEN unset: the request is allowed but DOWNGRADED to readonly (see resolvePermissionMode).
+ *  - IKBI_CHAT_TOKEN unset: refuse open. /chat runs model+tools and must never be anonymously exposed.
  */
 async function chatAuth(request: FastifyRequest, reply: FastifyReply): Promise<void> {
   const token = chatToken();
-  if (token === undefined) return; // no token configured ⇒ allowed, but forced readonly downstream
+  if (token === undefined) {
+    reply.code(503);
+    await reply.send({ error: "chat unavailable: IKBI_CHAT_TOKEN is required" });
+    return;
+  }
   const presented = bearerOf(request.headers.authorization);
   if (presented === undefined || !tokenMatches(presented, token)) {
     reply.code(401);
@@ -71,13 +79,28 @@ async function chatAuth(request: FastifyRequest, reply: FastifyReply): Promise<v
   }
 }
 
+async function chatRateLimit(request: FastifyRequest, reply: FastifyReply): Promise<void> {
+  const now = Date.now();
+  const key = request.ip;
+  const bucket = rateBuckets.get(key);
+  if (bucket === undefined || now >= bucket.resetAt) {
+    rateBuckets.set(key, { count: 1, resetAt: now + CHAT_RATE_WINDOW_MS });
+    return;
+  }
+  bucket.count += 1;
+  if (bucket.count > CHAT_RATE_LIMIT) {
+    reply.code(429);
+    reply.header("retry-after", String(Math.ceil((bucket.resetAt - now) / 1000)));
+    await reply.send({ error: "rate limit exceeded" });
+  }
+}
+
 /**
- * The permission mode a network-originated /chat turn runs at: an authenticated request (token
- * configured AND verified by chatAuth) gets full "auto"; with NO token configured, the endpoint
- * is open but every session is forced to "readonly" so no mutating tool executes (H1).
+ * The permission mode a network-originated /chat turn runs at. chatAuth refuses open when no
+ * token is configured, so reaching the handler means the request is authenticated.
  */
 function resolvePermissionMode(): PermissionMode {
-  return chatToken() !== undefined ? "auto" : "readonly";
+  return "auto";
 }
 
 /** JSON body schema for POST /chat — message required; session_id + images + mode optional. */
@@ -98,7 +121,7 @@ const chatBodySchema = {
 registerRoutes("chat", (app: FastifyInstance) => {
   app.post<{ Body: ChatRequest; Reply: ChatResponse }>(
     "/chat",
-    { schema: { body: chatBodySchema }, preHandler: chatAuth },
+    { schema: { body: chatBodySchema }, preHandler: [chatRateLimit, chatAuth] },
     async (request, reply) => {
       const { message, session_id, images, mode } = request.body;
       const session = sessionStore.getOrCreate(session_id);

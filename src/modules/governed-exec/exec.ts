@@ -53,7 +53,7 @@ const FETCH_OPERATION = "govexec.fetch";
 export type ExecFileFn = (
   binary: string,
   args: readonly string[],
-  opts: { cwd?: string; timeout: number; maxBuffer: number },
+  opts: { cwd?: string; timeout: number; maxBuffer: number; env: NodeJS.ProcessEnv },
 ) => Promise<{ stdout: string; stderr: string }>;
 
 const promisifiedExecFile = promisify(nodeExecFile);
@@ -69,14 +69,14 @@ const defaultExecFile: ExecFileFn = (binary, args, opts) =>
 export type ExecFileStreamFn = (
   binary: string,
   args: readonly string[],
-  opts: { cwd?: string; timeout: number; maxBuffer: number },
+  opts: { cwd?: string; timeout: number; maxBuffer: number; env: NodeJS.ProcessEnv },
   onOutput: (chunk: string, stream: "stdout" | "stderr") => void,
 ) => Promise<{ stdout: string; stderr: string; code: number }>;
 
 /** Default streaming impl over node `spawn` (array args, no shell). Bounds capture at maxBuffer. */
 const defaultExecFileStream: ExecFileStreamFn = (binary, args, opts, onOutput) =>
   new Promise((resolveP) => {
-    const child = nodeSpawn(binary, args as string[], opts.cwd !== undefined ? { cwd: opts.cwd } : {});
+    const child = nodeSpawn(binary, args as string[], { ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}), env: opts.env });
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -130,6 +130,34 @@ function safeHost(url: string): string {
   } catch {
     return "invalid-url";
   }
+}
+
+function scrubbedEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const key of ["PATH", "HOME", "LANG"] as const) {
+    if (process.env[key] !== undefined) env[key] = process.env[key];
+  }
+  const extra = process.env.IKBI_GOVERNED_EXEC_ENV_ALLOWLIST;
+  if (extra !== undefined) {
+    for (const raw of extra.split(",")) {
+      const key = raw.trim();
+      if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) && process.env[key] !== undefined) env[key] = process.env[key];
+    }
+  }
+  return env;
+}
+
+function forbiddenEvalReason(command: string, args: readonly string[]): string | undefined {
+  if (command === "node" && args.some((a) => a === "-e" || a === "--eval" || a === "-p" || a === "--print")) {
+    return "node code-eval flags are not allowed by governed-exec";
+  }
+  if ((command === "npm" || command === "pnpm") && args[0] === "run") {
+    return `${command} run is not allowed by governed-exec`;
+  }
+  if ((command === "npm" || command === "pnpm") && args.some((a) => a === "--eval" || a === "-e")) {
+    return `${command} code-eval flags are not allowed by governed-exec`;
+  }
+  return undefined;
 }
 
 /** Build a governed executor. The default deps wire the live frozen singletons + gate-wall + egress. */
@@ -211,6 +239,8 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
     if (identity === undefined) return deny("parent identity is not a validated identity");
     // (3) DEFAULT-DENY ALLOWLIST: an un-allowlisted binary never runs (no gate call).
     if (!allowlist.has(command)) return deny(`binary "${command}" is not on the allowlist`);
+    const evalDeny = forbiddenEvalReason(command, args);
+    if (evalDeny !== undefined) return deny(evalDeny);
 
     // (4) the caller's grant. (5) GATE-WALL — sudo is part of the gated action.
     const grant = autonomyForTier(asTier(identity.trustTier ?? TRUST_FLOOR, TRUST_FLOOR));
@@ -247,7 +277,7 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
       const { stdout, stderr, code } = await execFileStream(
         command,
         args,
-        { ...(cwd !== undefined ? { cwd } : {}), timeout: effectiveTimeout, maxBuffer: config.maxBuffer },
+        { ...(cwd !== undefined ? { cwd } : {}), timeout: effectiveTimeout, maxBuffer: config.maxBuffer, env: scrubbedEnv() },
         request.onOutput,
       );
       if (code === 0) {
@@ -265,6 +295,7 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
         ...(cwd !== undefined ? { cwd } : {}),
         timeout: effectiveTimeout,
         maxBuffer: config.maxBuffer,
+        env: scrubbedEnv(),
       });
       emit(govexecExecuted, { ...base, allow: true, exitCode: 0 }, identity, EXEC_OPERATION, requestId);
       await receipt(

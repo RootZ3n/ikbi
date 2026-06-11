@@ -76,6 +76,22 @@ test("POST /chat enforces the images cap (maxItems, schema validation, no model 
   }
 });
 
+test("POST /chat refuses open when IKBI_CHAT_TOKEN is not configured", async () => {
+  const old = process.env.IKBI_CHAT_TOKEN;
+  delete process.env.IKBI_CHAT_TOKEN;
+  const { buildServer } = await import("../../server/index.js");
+  const app = buildServer();
+  await app.ready();
+  try {
+    const res = await app.inject({ method: "POST", url: "/chat", payload: { message: "hi" } });
+    assert.equal(res.statusCode, 503);
+    assert.match(res.body, /IKBI_CHAT_TOKEN/);
+  } finally {
+    await app.close();
+    if (old === undefined) delete process.env.IKBI_CHAT_TOKEN; else process.env.IKBI_CHAT_TOKEN = old;
+  }
+});
+
 // ── session store ───────────────────────────────────────────────────────────
 
 test("sessionStore mints a new id when none is given and reuses an existing one", () => {
@@ -95,6 +111,25 @@ test("send: a plain answer (no tools) returns the model content", async () => {
   const { response, tools } = await s.send("status?");
   assert.equal(response, "Foundation is solid. The build is green.");
   assert.equal(tools.length, 0);
+});
+
+test("send: concurrent turns on one session are serialized", async () => {
+  let releaseFirst!: () => void;
+  let calls = 0;
+  const invoke = (async () => {
+    calls += 1;
+    if (calls === 1) await new Promise<void>((resolve) => { releaseFirst = resolve; });
+    return stop(`reply ${calls}`);
+  }) as unknown as ConstructorParameters<typeof ChatSession>[1] extends { invoke?: infer F } ? F : never;
+  const s = new ChatSession("s-queue", { invoke, worktree: tmp() });
+  const first = s.send("one");
+  const second = s.send("two");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(calls, 1, "second turn has not entered invoke while first is in flight");
+  releaseFirst();
+  const [a, b] = await Promise.all([first, second]);
+  assert.equal(a.response, "reply 1");
+  assert.equal(b.response, "reply 2");
 });
 
 test("send: drives the builder tools — write_file then patch — and reports activity", async () => {

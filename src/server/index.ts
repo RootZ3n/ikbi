@@ -33,6 +33,17 @@ export function buildServer() {
     disableRequestLogging: false,
   });
 
+  app.setErrorHandler((err: unknown, request, reply) => {
+    const maybe = err as { statusCode?: unknown; message?: unknown };
+    const status = typeof maybe.statusCode === "number" && maybe.statusCode >= 400 && maybe.statusCode < 500 ? maybe.statusCode : 500;
+    if (status >= 500) {
+      request.log.error({ err }, "request failed");
+      void reply.code(500).send({ error: "internal server error" });
+      return;
+    }
+    void reply.code(status).send({ error: typeof maybe.message === "string" ? maybe.message : "bad request" });
+  });
+
   // Liveness — the process is up and answering.
   app.get("/health", async () => {
     return { status: "ok", service: "ikbi", version: config.version };

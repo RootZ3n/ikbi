@@ -17,18 +17,16 @@ import { moduleEnv } from "../../core/module-config.js";
 const env = moduleEnv("governed-exec");
 
 /**
- * The default allowlist: a minimal, read-only-ish set PLUS the JS toolchain runners
- * (`node`, `npm`, `pnpm`) the builder needs to run Node scripts, install deps, and run
- * the project's checks. OPERATOR CHOICE (operational tuning): runners are dual-use — they
- * can run arbitrary code (`node -e`) — so this trades some default-deny strictness for a
- * builder that can actually drive a JS project out of the box. Shells are still excluded.
+ * The default allowlist: a minimal read-only-ish set. Interpreters, package managers, and
+ * file dumpers (`node`, `npm`, `pnpm`, `cat`) are intentionally NOT default-allowed: they
+ * are dual-use execution/exfiltration primitives and must be explicitly operator-enabled.
  *
  * The `IKBI_GOVERNED_EXEC_ALLOWLIST` env override is ADDITIVE (see `loadGovernedExecConfig`):
  * it ADDS to these defaults rather than replacing them, so an operator who allows extra
- * binaries (e.g. `python3,mkdir`) does NOT lose `git`/`ls`/`cat`/`echo` that the builder
- * relies on for version control and exploration.
+ * binaries (e.g. `python3,mkdir`) does NOT lose the safe defaults the builder relies on
+ * for version control and light exploration.
  */
-export const DEFAULT_ALLOWLIST: readonly string[] = Object.freeze(["git", "ls", "cat", "echo", "node", "npm", "pnpm"]);
+export const DEFAULT_ALLOWLIST: readonly string[] = Object.freeze(["git", "ls", "echo"]);
 
 /** Per-command wall-clock cap. */
 export const DEFAULT_EXEC_TIMEOUT_MS = 30_000;

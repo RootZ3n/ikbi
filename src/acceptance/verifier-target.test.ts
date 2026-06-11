@@ -38,12 +38,12 @@ test("HB-1: a valid target with a passing check ⇒ verifier GREEN, PROMOTED (le
   const savedChecks = process.env.IKBI_CHECKS;
   const savedVerify = process.env.IKBI_VERIFY;
   // A trivial, real, passing check (operator-configured, never model-chosen) run via real governed-exec.
-  process.env.IKBI_CHECKS = JSON.stringify([{ name: "check", command: "node", args: ["-e", "process.exit(0)"] }]);
+  process.env.IKBI_CHECKS = JSON.stringify([{ name: "check", command: "git", args: ["--version"] }]);
   process.env.IKBI_VERIFY = "legacy"; // explicit opt-out of the hardened ladder default → legacy resolveChecks
   try {
     const { parentCtx, resolveIdentity, roleClaim } = makeIdentities();
     const orch = realOrchestrator({
-      targetRepo: repo, manager, governedExec: realGovernedExec(["node"]), resolveIdentity, roleClaim,
+      targetRepo: repo, manager, governedExec: realGovernedExec(["git"]), resolveIdentity, roleClaim,
       roles: stubRoles({ write: { path: "feature.txt", content: "the fix\n" } }),
     });
     const result = await orch.run({ taskId: "t-green", targetRepo: repo, goal: "add feature" }, parentCtx);

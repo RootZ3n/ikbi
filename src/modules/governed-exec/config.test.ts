@@ -1,8 +1,8 @@
 /**
  * governed-exec config loader — the IKBI_GOVERNED_EXEC_ALLOWLIST override is ADDITIVE:
- * it EXTENDS the default allowlist (git/ls/cat/echo/node/npm/pnpm) rather than replacing
+ * it EXTENDS the default allowlist (git/ls/echo) rather than replacing
  * it, so an operator who allows extra binaries does not silently lose the essentials the
- * builder relies on (git for version control, ls/cat for exploration).
+ * builder relies on (git for version control, ls/echo for exploration).
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -30,8 +30,15 @@ test("ALLOWLIST override is ADDITIVE — defaults are preserved, new binaries ap
   // Deduped: defaults that also appear in the override are not duplicated.
   assert.equal(cfg.allowlist.filter((b) => b === "pnpm").length, 1);
   assert.equal(cfg.allowlist.filter((b) => b === "node").length, 1);
-  // Order-stable: defaults first, then the genuinely-new binaries.
-  assert.deepEqual([...cfg.allowlist], [...DEFAULT_ALLOWLIST, "python3", "mkdir", "cp"]);
+  // Order-stable: defaults first, then the genuinely-new binaries in operator order.
+  assert.deepEqual([...cfg.allowlist], [...DEFAULT_ALLOWLIST, "pnpm", "node", "npm", "python3", "mkdir", "cp"]);
+});
+
+test("dangerous interpreters and file dumpers are not default-allowed", () => {
+  const cfg = loadGovernedExecConfig(reader({}));
+  for (const denied of ["node", "npm", "pnpm", "cat"]) {
+    assert.equal(cfg.allowlist.includes(denied), false, `${denied} must be operator opt-in only`);
+  }
 });
 
 test("a blank ALLOWLIST override leaves the defaults intact", () => {
