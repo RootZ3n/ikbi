@@ -39,6 +39,7 @@ import { createOrchestrator } from "./orchestrator.js";
 import { WorkerError, type WorkerResult, type WorkerRole, type WorkerTask } from "./contract.js";
 import { preBuildRefinement, formatInterview } from "../../core/goal-refinement.js";
 import { createCognitionLayer } from "../cognition-layer/cognition.js";
+import { loadRepoRegistry } from "../../core/repo-registry.js";
 import type { CognitionDecision } from "../cognition-layer/contract.js";
 
 function errMsg(e: unknown): string {
@@ -376,6 +377,13 @@ export interface WorkerCliDeps {
   readonly approvalPrompt?: (req: { taskId: string; workspaceId: string; goal: string }) => Promise<boolean>;
 }
 
+/** Resolve a repo name or path through the repo registry. Returns undefined if not provided. */
+function resolveRepo(repo: string | undefined): string | undefined {
+  if (repo === undefined || repo.length === 0) return undefined;
+  const registry = loadRepoRegistry();
+  return registry.resolve(repo);
+}
+
 /** Build the `build` command handler. Defaults wire the live singletons + REAL gate-wall. */
 export function createWorkerCli(deps: WorkerCliDeps = {}) {
   const resolveIdentity = deps.resolveIdentity ?? coreResolveIdentity;
@@ -457,7 +465,7 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       out(`\n  ⚠ ${refinement.interview.summary}\n\n`);
     }
 
-    const task: WorkerTask = { taskId: id, targetRepo: repo ?? cwd(), goal: finalGoal };
+    const task: WorkerTask = { taskId: id, targetRepo: resolveRepo(repo) ?? cwd(), goal: finalGoal };
 
     // SG-5: with --verbose, stream the build's structured progress events (per-role start/end,
     // builder tool activity, verification status) live as they fire.
@@ -513,4 +521,30 @@ registerCommand({
   summary: "Print a workspace's git diff (base..scratch) + a change summary",
   usage: "ikbi diff <workspace-id>",
   run: (argv) => liveDiff.diff(argv),
+});
+
+
+// `ikbi repos` lists all registered repos from the repo registry.
+registerCommand({
+  name: "repos",
+  summary: "List registered Pehverse repos (from state/repos.json)",
+  usage: "ikbi repos",
+  run: () => {
+    const registry = loadRepoRegistry();
+    const repos = registry.list();
+    if (repos.length === 0) {
+      writeStdout("No repos registered. Add entries to state/repos.json.\n");
+      return;
+    }
+    const maxName = Math.max(...repos.map((r) => r.name.length));
+    for (const r of repos) {
+      const pad = " ".repeat(maxName - r.name.length);
+      const port = r.port !== undefined ? ` (port ${r.port})` : "";
+      writeStdout(`  ${r.name}${pad}  ${r.path}${port}\n`);
+      if (r.description.length > 0) {
+        const indent = " ".repeat(maxName + 4);
+        writeStdout(`${indent}${r.description}\n`);
+      }
+    }
+  },
 });
