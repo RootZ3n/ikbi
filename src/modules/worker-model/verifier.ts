@@ -46,6 +46,7 @@ import type { GovernedExec } from "../governed-exec/index.js";
 // verifier's EXACT checks. Behavior here is unchanged; the constant just relocated.
 import { type CheckResult, type ChecksResolution, mapExec, resolveCheckTimeoutMs, VERIFIER_CHECKS } from "./checks.js";
 import type { RoleFn, RoleResult } from "./contract.js";
+import { runQualityChecks, type QualityResult } from "./quality-checks.js";
 // LADDER MODE (opt-in, IKBI_VERIFY=ladder): package/impact-aware verification. These are
 // library-only consumers — no side effects at import; the default (legacy) path never calls them.
 import { projectIndex, type ProjectIndexData } from "../project-index/index.js";
@@ -143,6 +144,24 @@ export interface VerifierDeps {
 /** Lazy live governed-exec — importing it eagerly would force the gate-wall/egress wiring order. */
 function lazyGovernedExec(): Pick<GovernedExec, "run"> {
   return { run: async (req) => (await import("../governed-exec/index.js")).governedExec.run(req) };
+}
+
+/**
+ * Extract written files from the builder's prior result and run quality checks.
+ * Returns undefined when no builder result is available or no files were written
+ * (quality checks are skipped — not a failure).
+ */
+function runQualityCheckFromPrior(
+  priorResults: readonly RoleResult[],
+  workspacePath: string,
+): { result: QualityResult } | undefined {
+  if (priorResults === undefined || priorResults.length === 0) return undefined;
+  const builderResult = priorResults.find((r) => r.role === "builder");
+  if (builderResult === undefined) return undefined;
+  const detail = builderResult.detail as { filesWritten?: string[] } | undefined;
+  const filesWritten = detail?.filesWritten;
+  if (filesWritten === undefined || filesWritten.length === 0) return undefined;
+  return { result: runQualityChecks(workspacePath, filesWritten) };
 }
 
 /** The UNTRUSTED verdict — a mutated/unprovable build fails verification, fail-closed. */
@@ -278,11 +297,26 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
 
     const allPass = checks.every((c) => c.exitCode === 0);
     const failed = checks.filter((c) => c.exitCode !== 0).map((c) => c.name);
+
+    // QUALITY CHECKS: run AFTER typecheck + tests pass. Deterministic, fast, no model calls.
+    // Extract written files from the builder's prior result (if available).
+    if (allPass) {
+      const quality = runQualityCheckFromPrior(ctx.priorResults, ctx.workspace.path);
+      if (quality !== undefined && !quality.result.pass) {
+        return {
+          role: "verifier",
+          outcome: "failure",
+          summary: `quality checks failed: ${quality.result.issues.map((i) => i.kind).join(", ")}`,
+          detail: { verdict: "fail", verificationMode, checks, qualityIssues: quality.result.issues },
+        };
+      }
+    }
+
     return {
       role: "verifier",
       outcome: allPass ? "success" : "failure",
       summary: allPass ? "all checks passed" : `checks failed: ${failed.join(", ")}`,
-      detail: { verdict: allPass ? "pass" : "fail", verificationMode, checks },
+      detail: { verdict: allPass ? "pass" : "fail", verificationMode, checks, ...(allPass ? { qualityPassed: true } : {}) },
     };
 
     // ── LADDER MODE implementation (hoisted; reached only when IKBI_VERIFY=ladder) ──────────
@@ -390,6 +424,20 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
       }
 
       // ALL runnable tasks passed — SCOPE-STAMPED green (never a plain "all checks passed").
+      // QUALITY CHECKS: run AFTER typecheck + tests pass. Deterministic, fast, no model calls.
+      const qualityLadder = runQualityCheckFromPrior(rctx.priorResults, worktree);
+      if (qualityLadder !== undefined && !qualityLadder.result.pass) {
+        return {
+          role: "verifier", outcome: "failure",
+          summary: `quality checks failed (scope ${plan.scope}): ${qualityLadder.result.issues.map((i) => i.kind).join(", ")}`,
+          detail: {
+            verdict: "fail", verificationMode, verificationScope: plan.scope, checks, triage: triages, stagesRun,
+            neutralPackages: plan.neutralPackages, qualityIssues: qualityLadder.result.issues,
+            receipts: [...baseReceipts, `ran stages: ${stagesRun.join(" → ")}`, `QUALITY FAILED: ${qualityLadder.result.issues.length} issue(s)`, ...qualityLadder.result.issues.map((i) => `  ${i.kind}: ${i.detail}`)],
+          },
+        };
+      }
+
       return {
         role: "verifier", outcome: "success",
         summary: `verification PASSED for scope "${plan.scope}" — ran ${checks.length} check(s) across [${stagesRun.join(" → ")}]${plan.neutralPackages.length > 0 ? `; ${plan.neutralPackages.length} neutral package(s) recorded (not counted green)` : ""}`,
