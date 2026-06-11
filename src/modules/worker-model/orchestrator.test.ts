@@ -25,6 +25,7 @@ import {
   WorkerError,
   type RoleContext,
   type RoleFn,
+  type RoleResult,
   type WorkerOutcome,
   type WorkerRole,
   type WorkerTask,
@@ -931,7 +932,7 @@ test("H2: a fresh worktree installs via the injected dependency-install module (
   const handle = { ...ws.handle, path: dir };
   const workspaces = { ...ws.workspaces, allocate: async () => handle };
 
-  const installCalls: Array<{ path: string; pm?: string }> = [];
+  const installCalls: Array<{ path: string; pm: string | undefined }> = [];
   const dependencyInstall = {
     run: async (req: { workspace: { path: string }; packageManager?: string }) => {
       installCalls.push({ path: req.workspace.path, pm: req.packageManager });
@@ -946,4 +947,28 @@ test("H2: a fresh worktree installs via the injected dependency-install module (
   assert.equal(installCalls.length, 1, "the hardened installer ran exactly once for the fresh worktree");
   assert.equal(installCalls[0]?.path, dir, "installed into the run's worktree");
   assert.equal(installCalls[0]?.pm, "pnpm", "a pnpm lockfile selects the pnpm frozen install");
+});
+
+// ── H3: a hung role is bounded by the per-role wall-clock timeout ──────────────────────────────
+test("H3: a hung role is bounded by the per-role wall-clock timeout and fails the run", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const cap = capturingRoles();
+  // the scout hangs (a gated promise) — only the wall-clock timeout can end the role. We release
+  // the gate AFTER the run so node:test sees no dangling pending promise (the orchestrator has
+  // already abandoned it — JS cannot cancel, so we settle it ourselves for a clean test).
+  let releaseScout: () => void = () => {};
+  const scoutGate = new Promise<RoleResult>((resolve) => {
+    releaseScout = () => resolve({ role: "scout", outcome: "success", summary: "late (ignored)" });
+  });
+  const roles = { ...cap.roles, scout: (): Promise<RoleResult> => scoutGate };
+  const orch = createOrchestrator(baseDeps({ config: { ...ENABLED, roleTimeoutMs: 50 }, resolveIdentity, roleClaim, roles, workspaces: ws.workspaces }));
+
+  const result = await orch.run(task, parentCtx);
+  assert.notEqual(result.outcome, "success", "a hung role never promotes");
+  const scoutRole = result.roles.find((r) => r.role === "scout");
+  assert.equal(scoutRole?.outcome, "failure", "the hung scout was failed by the wall-clock timeout");
+  assert.match(scoutRole?.summary ?? "", /timeout/i, "the failure summary names the timeout");
+  releaseScout();
+  await scoutGate;
 });

@@ -471,6 +471,28 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   // Bug 2: retain (don't discard) a FAILED build's workspace so its work survives for inspection.
   const retainFailedWorkspaces = config.retainFailedWorkspaces ?? true;
   const requestApproval = deps.requestApproval; // SG-10 human-approval gate (undefined ⇒ no gate)
+
+  // H3: enforce a per-role WALL-CLOCK timeout. Only the builder self-checks between model calls;
+  // a hung scout/critic/verifier/integrator (a stuck model stream, a wedged subprocess) would
+  // otherwise run unbounded. On timeout the role FAILS — a non-success outcome short-circuits the
+  // run through the normal failure path (discard/retain). The abandoned promise is left to settle
+  // and is ignored (JS cannot cancel it). `roleTimeoutMs <= 0` disables the guard.
+  const roleTimeoutMs = config.roleTimeoutMs;
+  async function runRoleFn(role: WorkerRole, roleFn: RoleFn, ctx: RoleContext): Promise<RoleResult> {
+    if (!(roleTimeoutMs > 0)) return roleFn(ctx);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<RoleResult>((resolve) => {
+      timer = setTimeout(
+        () => resolve({ role, outcome: "failure", summary: `role "${role}" exceeded its ${roleTimeoutMs}ms wall-clock timeout`, detail: { timedOut: true, timeoutMs: roleTimeoutMs } }),
+        roleTimeoutMs,
+      );
+    });
+    try {
+      return await Promise.race([Promise.resolve(roleFn(ctx)), timeout]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
   // SG-1: when a live-output sink is wired, wrap the injected governed executor so EVERY check
   // it runs streams its output to the sink. No sink (the common/test case) ⇒ the base executor
   // unchanged. (Only wraps an explicitly-injected governedExec — the verifier/builder lazy
@@ -856,7 +878,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           engine: runEngine,
         };
         const roleFn = role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderFor(parentCtx) : roles[role];
-        const result = await roleFn(ctx);
+        const result = await runRoleFn(role, roleFn, ctx);
         results.push(result);
 
         events.publish(
@@ -1128,7 +1150,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // The verifier (C1) and the builder (its in-loop run_checks) run the governed path
     // bound to the run ctx (parentCtx is the minted ValidatedIdentity governed-exec needs).
     const roleFn = roleFnOverride ?? (role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderFor(parentCtx) : roles[role]);
-    const result = await roleFn(ctx);
+    const result = await runRoleFn(role, roleFn, ctx);
     events.publish(
       workerRoleCompleted.create(
         { taskId: task.taskId, role, outcome: result.outcome },
