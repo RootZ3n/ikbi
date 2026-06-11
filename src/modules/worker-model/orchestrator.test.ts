@@ -918,3 +918,32 @@ test("H5: NO gate-wall dep → the promote is DENIED fail-closed (never advisory
   assert.equal(ws.captured(), undefined, "promote() was NEVER called — the promote did not proceed");
   assert.equal(ws.calls.discard, 1, "the workspace was discarded (nothing lands on the target branch)");
 });
+
+// ── H2: the orchestrator installs deps through the HARDENED dependency-install module ──────────
+test("H2: a fresh worktree installs via the injected dependency-install module (not an inline pnpm)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  // a REAL worktree with package.json + a pnpm lockfile and NO node_modules → triggers install
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-h2-"));
+  writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "t", version: "1.0.0" }));
+  writeFileSync(join(dir, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+
+  const ws = fakeWorkspaces(true);
+  const handle = { ...ws.handle, path: dir };
+  const workspaces = { ...ws.workspaces, allocate: async () => handle };
+
+  const installCalls: Array<{ path: string; pm?: string }> = [];
+  const dependencyInstall = {
+    run: async (req: { workspace: { path: string }; packageManager?: string }) => {
+      installCalls.push({ path: req.workspace.path, pm: req.packageManager });
+      return { installed: true, exitCode: 0 };
+    },
+  } as unknown as NonNullable<OrchestratorDeps["dependencyInstall"]>;
+
+  const cap = capturingRoles();
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, workspaces, dependencyInstall }));
+  await orch.run(task, parentCtx);
+
+  assert.equal(installCalls.length, 1, "the hardened installer ran exactly once for the fresh worktree");
+  assert.equal(installCalls[0]?.path, dir, "installed into the run's worktree");
+  assert.equal(installCalls[0]?.pm, "pnpm", "a pnpm lockfile selects the pnpm frozen install");
+});

@@ -51,7 +51,8 @@ import {
 } from "../escalation/index.js";
 import type { EscalationSignals } from "../escalation/index.js";
 
-import type { ExecRequest, ExecResult, GovernedExec } from "../governed-exec/index.js";
+import type { ExecRequest, GovernedExec } from "../governed-exec/index.js";
+import type { DependencyInstall } from "../dependency-install/contract.js";
 
 import { builder, createBuilder, MAX_TOOL_ITERATIONS } from "./builder.js";
 import { resolveChecks, workingTreePackageJsonDiff, workingTreePlanningDiff } from "./checks.js";
@@ -122,35 +123,33 @@ import { join } from "node:path";
 
 /**
  * Install dependencies in the worktree if node_modules is missing.
- * Checks for package.json + absence of node_modules, then runs the appropriate
- * package manager install. Non-fatal — if install fails, the builder will see
- * the error in run_checks and can try to fix it.
+ *
+ * H2: delegates to the HARDENED `dependency-install` module — gate-walled, lockfile-only
+ * (frozen), registry-allowlisted, and receipted — instead of running `pnpm install
+ * --no-frozen-lockfile` inline (which bypassed every one of those controls). A lazy import
+ * keeps the module-load graph acyclic and lets tests inject a double. Non-fatal: if the
+ * install is denied or fails, the builder will see the error in run_checks and can react.
  */
 async function installWorkspaceDeps(
-  worktreePath: string,
-  governedExec: { run: (req: ExecRequest) => Promise<ExecResult> },
+  workspace: WorkspaceHandle,
   parentCtx: OperationContext,
+  installer?: DependencyInstall,
 ): Promise<void> {
+  const worktreePath = workspace.path;
   const pkgJson = join(worktreePath, "package.json");
   const nodeModules = join(worktreePath, "node_modules");
 
   if (!existsSync(pkgJson) || existsSync(nodeModules)) return; // nothing to install
 
-  // Detect package manager from lockfile
+  // Detect package manager from lockfile (the hardened installer is frozen-lockfile-only;
+  // an npm-locked repo uses `npm ci`, otherwise default to pnpm's frozen install).
   const hasPnpmLock = existsSync(join(worktreePath, "pnpm-lock.yaml"));
   const hasNpmLock = existsSync(join(worktreePath, "package-lock.json"));
-
-  const pm = hasPnpmLock ? "pnpm" : hasNpmLock ? "npm" : "pnpm"; // default to pnpm
-  const args = pm === "pnpm" ? ["install", "--no-frozen-lockfile"] : ["install"];
+  const pm: "pnpm" | "npm" = hasNpmLock && !hasPnpmLock ? "npm" : "pnpm";
 
   try {
-    await governedExec.run({
-      parentCtx,
-      command: pm,
-      args,
-      cwd: worktreePath,
-      timeoutMs: 120_000,
-    });
+    const di = installer ?? (await import("../dependency-install/index.js")).dependencyInstall;
+    await di.run({ parentCtx, workspace, packageManager: pm });
   } catch {
     // Non-fatal: the builder will see missing deps in run_checks
   }
@@ -337,6 +336,12 @@ export interface OrchestratorDeps {
    * A non-allowlisted / gate-denied check fails the verifier CLOSED (never a silent pass).
    */
   readonly governedExec?: Pick<GovernedExec, "run">;
+  /**
+   * Dependency installer (H2). Default: the live hardened `dependency-install` singleton
+   * (lazily imported). The orchestrator calls it once per run to populate node_modules in a
+   * fresh worktree, through the gate-walled / lockfile-only / receipted path. Injectable for tests.
+   */
+  readonly dependencyInstall?: DependencyInstall;
   /**
    * LIVE OUTPUT SINK (SG-1): when set, every governed check (verifier + builder run_checks)
    * STREAMS its stdout/stderr here chunk-by-chunk as it runs — so the operator sees long
@@ -829,9 +834,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       // If the worktree has a package.json but no node_modules, install dependencies
       // so run_checks (typecheck + tests) can actually succeed. This is the fix for
       // the "vitest: command not found" / "Cannot find module" failures.
-      if (govExecForRoles !== undefined) {
-        await installWorkspaceDeps(workspace.path, govExecForRoles, parentCtx);
-      }
+      await installWorkspaceDeps(workspace, parentCtx, deps.dependencyInstall);
 
       for (const role of WORKER_ROLES) {
         const spawned = spawnRole(role, parentCtx);
