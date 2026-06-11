@@ -248,6 +248,36 @@ export function createProductionWorker(
 }
 
 /**
+ * Detect the write scope from the goal text. Doc/audit/analysis tasks should be
+ * "new_only" to prevent the builder from over-writing existing files.
+ * This is a heuristic — the goal text is the only signal available at dispatch time.
+ */
+function detectWriteScope(goal: string): "all" | "new_only" | "none" {
+  const lower = goal.toLowerCase();
+  // Pure read/audit/analysis patterns → new_only (create docs/reports, don't modify code)
+  const docPatterns = [
+    /\baudit\b/, /\breview\b/, /\banalyze\b/, /\bfind\s+dead\s+code\b/,
+    /\bdetect\s+drift\b/, /\bgenerate\s+(?:architecture|docs?|documentation)\b/,
+    /\bcreate\s+(?:a\s+)?(?:report|documentation|docs?|architecture)\b/,
+    /\bwrite\s+(?:a\s+)?(?:report|documentation|docs?)\b/,
+    /\bdo\s+not\s+modify\b/, /\bdon'?t\s+modify\b/,
+    /\bread[- ]only\b/, /\breport\b.*\bonly\b/,
+  ];
+  // If the goal is explicitly about creating something new (not docs), allow all writes
+  const createPatterns = [
+    /\bfix\b/, /\badd\b/, /\bimplement\b/, /\brefactor\b/, /\bupdate\b/,
+    /\brebuild\b/, /\bcreate\s+(?:a\s+)?(?:skill|module|feature|utility|endpoint|component)\b/,
+  ];
+  // If explicitly told not to modify, honor it
+  if (/\bdo\s+not\s+modify\b/i.test(goal) || /\bdon'?t\s+modify\b/i.test(goal)) return "new_only";
+  // If it's clearly a create/fix task, allow all
+  if (createPatterns.some((p) => p.test(lower))) return "all";
+  // If it matches doc/audit patterns, restrict to new files only
+  if (docPatterns.some((p) => p.test(lower))) return "new_only";
+  return "all";
+}
+
+/**
  * Parse `--repo <path>` / `--repo=<path>`, `--verbose`/`-v`, `--cost`, and `--yes`/`-y`;
  * the rest is the goal prose. `--yes` skips the interactive Socratic interview prompt and
  * proceeds with the original goal (the cognition layer still runs — it is non-blocking).
@@ -528,7 +558,7 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       out(`\n  ⚠ ${refinement.interview.summary}\n\n`);
     }
 
-    const task: WorkerTask = { taskId: id, targetRepo, goal: finalGoal };
+    const task: WorkerTask = { taskId: id, targetRepo, goal: finalGoal, writeScope: detectWriteScope(finalGoal) };
 
     // SG-5: with --verbose, stream the build's structured progress events (per-role start/end,
     // builder tool activity, verification status) live as they fire.

@@ -88,6 +88,16 @@ export interface WorkerTask {
   readonly projectInstructions?: string;
   /** Free-form correlation metadata (never secrets). */
   readonly metadata?: Readonly<Record<string, unknown>>;
+  /**
+   * Write scope constraint for the builder. Controls which files the builder can modify.
+   * - "all" (default): builder can create and modify any file in the worktree
+   * - "new_only": builder can only CREATE new files; modifying existing files is rejected
+   * - "none": builder cannot write any files (read-only audit mode)
+   *
+   * The cognition layer auto-detects doc/audit/analysis tasks and sets this to "new_only"
+   * to prevent the builder from over-writing existing files when the goal is documentation.
+   */
+  readonly writeScope?: "all" | "new_only" | "none";
 }
 
 /** The result a single role produces. */

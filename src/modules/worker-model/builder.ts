@@ -34,7 +34,7 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 import { configEnv } from "../../core/config.js";
@@ -536,6 +536,9 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
     // RAIL 1: the derived success condition restates the (untrusted) goal, so it rides
     // as an untrusted message too — never raw-concatenated into the trusted system prompt.
     const successCondition = deriveSuccessCondition(ctx.task.goal, ctx.priorResults);
+    // WRITE SCOPE: enforce file boundary discipline. "new_only" prevents the builder
+    // from modifying existing files — only creating new ones. "none" blocks all writes.
+    const writeScope = ctx.task.writeScope ?? "all";
     // PROGRESSIVE DISCLOSURE: capture the scout's findings once. The prior-results block now
     // leads with the BRIEF (structure + titles); full per-finding detail is pulled on demand
     // by the scout_detail tool (below). Still exactly ONE untrusted block: builder_prior_results.
@@ -545,7 +548,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
     // but bounded; never raw-concatenated into the trusted system prompt. Missing ⇒ omitted.
     const projectInstructions = ctx.task.projectInstructions ?? loadProjectInstructions(worktreeReal)?.content;
     const messages: ModelMessage[] = [
-      { role: "system", content: BUILDER_SYSTEM },
+      { role: "system", content: writeScope === "all" ? BUILDER_SYSTEM : BUILDER_SYSTEM + "\n\nWRITE SCOPE: " + (writeScope === "new_only" ? "You may ONLY create NEW files. Do NOT modify any existing file — read_file to inspect, but write_file/patch on an existing file is FORBIDDEN and will be rejected." : "You are in READ-ONLY mode. Do NOT write or patch any file.") },
       ...(projectInstructions !== undefined
         ? [untrusted(`Project instructions from the target repo (CLAUDE.md/AGENTS.md) — honor these conventions where they apply:\n${projectInstructions}`, "project_instructions")]
         : []),
@@ -594,6 +597,15 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
             rejectedToolCalls.push({ tool: "write_file", path: String(args.path ?? ""), error: c.error });
             return `ERROR: ${c.error}`;
           }
+          // WRITE SCOPE: reject writes to existing files when scope is "new_only" or "none"
+          if (writeScope === "none") {
+            rejectedToolCalls.push({ tool: "write_file", path: c.rel, error: "write_scope is 'none' — read-only mode" });
+            return `ERROR: WRITE SCOPE VIOLATION — you are in read-only mode. Cannot write to ${c.rel}.`;
+          }
+          if (writeScope === "new_only" && existsSync(c.full)) {
+            rejectedToolCalls.push({ tool: "write_file", path: c.rel, error: "write_scope is 'new_only' — cannot modify existing file" });
+            return `ERROR: WRITE SCOPE VIOLATION — you may only CREATE new files, not modify existing ones. ${c.rel} already exists. Use read_file to inspect it.`;
+          }
           const content = typeof args.content === "string" ? args.content : "";
           try {
             mkdirSync(dirname(c.full), { recursive: true });
@@ -625,6 +637,12 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
           return res.output;
         }
         case "patch": {
+          // WRITE SCOPE: patch modifies existing files — reject if scope is "new_only" or "none"
+          if (writeScope === "none" || writeScope === "new_only") {
+            const targetPath = String(args.path ?? "");
+            rejectedToolCalls.push({ tool: "patch", path: targetPath, error: `write_scope is '${writeScope}' — cannot modify existing files` });
+            return `ERROR: WRITE SCOPE VIOLATION — write scope is '${writeScope}'. Patch on ${targetPath} is forbidden. You may only create new files.`;
+          }
           const res = runPatch(worktreeReal, args);
           if (res.rejection !== undefined) rejectedToolCalls.push(res.rejection);
           // A successful patch MODIFIES a file — record it so the `done` read-back gate
