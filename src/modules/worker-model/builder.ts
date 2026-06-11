@@ -539,6 +539,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
     // WRITE SCOPE: enforce file boundary discipline. "new_only" prevents the builder
     // from modifying existing files — only creating new ones. "none" blocks all writes.
     const writeScope = ctx.task.writeScope ?? "all";
+    log.info({ writeScope, goal: ctx.task.goal.slice(0, 100) }, "builder writeScope resolved");
     // PROGRESSIVE DISCLOSURE: capture the scout's findings once. The prior-results block now
     // leads with the BRIEF (structure + titles); full per-finding detail is pulled on demand
     // by the scout_detail tool (below). Still exactly ONE untrusted block: builder_prior_results.
@@ -603,9 +604,11 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
             return `ERROR: WRITE SCOPE VIOLATION — you are in read-only mode. Cannot write to ${c.rel}.`;
           }
           if (writeScope === "new_only" && existsSync(c.full)) {
+            log.info({ path: c.rel, writeScope, full: c.full }, "WRITE SCOPE BLOCKED write_file on existing file");
             rejectedToolCalls.push({ tool: "write_file", path: c.rel, error: "write_scope is 'new_only' — cannot modify existing file" });
             return `ERROR: WRITE SCOPE VIOLATION — you may only CREATE new files, not modify existing ones. ${c.rel} already exists. Use read_file to inspect it.`;
           }
+          log.info({ path: c.rel, writeScope, exists: existsSync(c.full) }, "write_file ALLOWED");
           const content = typeof args.content === "string" ? args.content : "";
           try {
             mkdirSync(dirname(c.full), { recursive: true });
