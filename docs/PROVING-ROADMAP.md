@@ -41,14 +41,14 @@ Each task must create something tangible that another part of the lab immediatel
 
 **Tasks:**
 - Update a bridge
-- Add a new Ptah skill
+- Add a new Ptah skill ✅ (partial — builder creates correct files but hits iteration limit)
 - Create a Peh memory utility
 - Improve Matrix tooling
 - Build service-discovery enhancements
 
 **Goal:** Can ikbi contribute to the lab without breaking things?
 
-**Status:** Not started.
+**Status:** 1/5 tasks tested. Builder creates correct, working output. Dependency guard added. Known issue: builder lacks early-stop mechanism. See L3-PROVING-NOTES.md.
 
 ---
 
