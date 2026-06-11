@@ -130,13 +130,6 @@ export function createKillSwitch(deps: KillSwitchDeps = {}): KillSwitch {
     await store.put(LATCH_ID, { signals: [...signals], updatedAt: now() });
   }
 
-  /** Add to the in-memory latch (dedup by key). Returns true if newly added. */
-  function latch(signal: KillSignal): boolean {
-    const key = signalKey(signal);
-    if (signals.some((s) => signalKey(s) === key)) return false;
-    signals.push(signal);
-    return true;
-  }
 
   function emit<P>(event: { create: (p: P, o?: { source?: string }) => EventInput<P> }, payload: P): void {
     publish(event.create(payload, { source: EVENT_SOURCE }));
@@ -164,8 +157,18 @@ export function createKillSwitch(deps: KillSwitchDeps = {}): KillSwitch {
       return { engaged: false, reason: "a work-halting kill requires an operator-tier identity" };
     }
     await ensureLoaded();
-    latch(signal);
-    await persist();
+    // L4: PERSIST before mutating the in-memory latch. The durable store is the source of
+    // truth honored on boot; if persist() throws AFTER an in-memory push we would hold a
+    // phantom kill that the next restart silently loses (memory says halted, disk does not).
+    // Persisting the candidate set first means a write failure leaves memory == disk (no kill
+    // recorded) and surfaces the error to the caller, instead of a divergent latch.
+    const key = signalKey(signal);
+    const newlyLatched = !signals.some((s) => signalKey(s) === key);
+    if (newlyLatched) {
+      const next = [...signals, signal];
+      await store.put(LATCH_ID, { signals: next, updatedAt: now() });
+      signals = next;
+    }
     doPublishKill(signal, { source: EVENT_SOURCE }); // the seam event (now a real halt)
     emit(killswitchEngaged, { reason: signal.reason, mode: signal.mode, scope: signal.scope, ...(signal.target !== undefined ? { target: signal.target } : {}), ...(signal.note !== undefined ? { note: signal.note } : {}) });
     return { engaged: true };

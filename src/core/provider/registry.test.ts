@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import type { ModelProvider, ProviderInvocation, ProviderResult } from "./contract.js";
@@ -155,4 +158,13 @@ test("loadRosterFile is a no-op when the file is absent", () => {
   const reg = new ModelRegistry();
   const applied = reg.loadRosterFile("/nonexistent/ikbi-roster-does-not-exist.json");
   assert.deepEqual(applied, { models: 0, providers: 0 });
+});
+
+// M6: only ENOENT (absent file) is a benign no-op. A roster that EXISTS but is unreadable
+// (e.g. it is a directory, or a permission error) must throw — not silently load zero models.
+test("loadRosterFile THROWS on a non-ENOENT read error (a directory), not a silent zero-load", () => {
+  const reg = new ModelRegistry();
+  // A directory at the roster path yields EISDIR on read — a real read failure, not "absent".
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-roster-dir-"));
+  assert.throws(() => reg.loadRosterFile(dir), /Unable to read provider roster file/);
 });

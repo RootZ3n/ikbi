@@ -22,7 +22,10 @@
 
 import { spawn as nodeSpawn } from "node:child_process";
 
+import { childLogger } from "../../../core/log.js";
 import type { McpToolDef, McpTransport } from "../contract.js";
+
+const log = childLogger("mcp-stdio");
 
 /** The minimal child-process surface this transport depends on (a subset of ChildProcess). */
 export interface SpawnedChild {
@@ -208,7 +211,15 @@ export function createStdioTransport(options: StdioTransportOptions): McpTranspo
       let args: unknown = {};
       try {
         args = argsJson && argsJson.length > 0 ? JSON.parse(argsJson) : {};
-      } catch {
+      } catch (e) {
+        // L3: a tool call whose arguments are not valid JSON falls back to `{}` so the call
+        // still proceeds, but that silently DROPS the model's intended arguments. Warn so the
+        // dropped payload is observable (e.g. a truncated/garbled arg string from a cheap model)
+        // rather than masquerading as a deliberate no-arg call.
+        log.warn(
+          { tool: name, argLen: argsJson?.length ?? 0, err: e instanceof Error ? e.message : String(e) },
+          "mcp callTool: tool arguments were not valid JSON — falling back to empty arguments {}",
+        );
         args = {};
       }
       const result = (await request("tools/call", { name, arguments: args })) as { content?: unknown };

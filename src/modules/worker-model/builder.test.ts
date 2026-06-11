@@ -19,7 +19,7 @@ import type { ModelRequest, ModelResponse, ToolCall } from "../../core/provider/
 import { autonomyForTier } from "../../core/trust/index.js";
 import type { WorkspaceHandle } from "../../core/workspace/contract.js";
 import type { ExecRequest, ExecResult } from "../governed-exec/index.js";
-import { createBuilder, MAX_TOOL_ITERATIONS, type ToolCallError } from "./builder.js";
+import { createBuilder, MAX_TOOL_ITERATIONS, simplifyTools, TOOLS, type ToolCallError } from "./builder.js";
 import { VERIFIER_CHECKS } from "./checks.js";
 import { builderModel } from "./role-models.js";
 import type { RoleContext, RoleEngine, RoleResult } from "./contract.js";
@@ -786,4 +786,33 @@ test("createProductionWorker EXPLICITLY threads governedExec to the orchestrator
   // createProductionWorker passes governedExec into createOrchestrator (lazy wrapper, wiring-order-safe).
   assert.match(cliSrc, /createOrchestrator\(\{[^}]*governedExec/, "createOrchestrator is called with governedExec");
   assert.match(cliSrc, /import\("\.\.\/governed-exec\/index\.js"\)\)\.governedExec\.run/, "the CLI wires it lazily (no eager import — wiring-order-safe)");
+});
+
+// ── M8: simplifyTools preserves the run_checks→done gating contract ───────────
+
+test("M8: simplifyTools strips prose to the name for ordinary tools but KEEPS a gating hint for run_checks/done", () => {
+  const simplified = simplifyTools(TOOLS);
+  const byName = new Map(simplified.map((t) => [t.name, t]));
+
+  // The gating tools retain a one-line description that still encodes the rule.
+  const runChecks = byName.get("run_checks");
+  const done = byName.get("done");
+  assert.ok(runChecks, "run_checks survives simplification");
+  assert.ok(done, "done survives simplification");
+  assert.notEqual(runChecks!.description, "run_checks", "run_checks keeps a real description, not just its name");
+  assert.match(runChecks!.description ?? "", /pass before calling done/i, "the run_checks→done gating rule is preserved");
+  assert.notEqual(done!.description, "done", "done keeps a real description, not just its name");
+  assert.match(done!.description ?? "", /run_checks/i, "done's description still references the run_checks gate");
+
+  // Every NON-gating tool still collapses to just its name (the cheap-model simplification holds).
+  for (const t of simplified) {
+    if (t.name === "run_checks" || t.name === "done") continue;
+    assert.equal(t.description, t.name, `non-gating tool ${t.name} is stripped to its name`);
+  }
+
+  // The tool SET and parameter shapes are unchanged — only prose differs.
+  assert.equal(simplified.length, TOOLS.length, "no tools added or dropped");
+  for (const original of TOOLS) {
+    assert.deepEqual(byName.get(original.name)!.parameters, original.parameters, `${original.name} parameter shape unchanged`);
+  }
 });

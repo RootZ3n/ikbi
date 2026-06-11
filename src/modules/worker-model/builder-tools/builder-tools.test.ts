@@ -81,6 +81,16 @@ test("search_files: an empty pattern is rejected", () => {
   assert.notEqual(res.rejection, undefined);
 });
 
+// L2: a malformed regex must yield ACTIONABLE guidance, not an opaque "search failed".
+test("search_files: a malformed regex returns actionable 'Invalid regex pattern' guidance", () => {
+  const dir = tmp();
+  writeFileSync(join(dir, "a.ts"), "some content\n");
+  // Unbalanced group — invalid in both rg and JS RegExp, so the message holds with or without rg.
+  const res = runSearchFiles(dir, { pattern: "foo(" });
+  assert.match(res.output, /Invalid regex pattern/i, "names the failure clearly");
+  assert.match(res.output, /escape special characters/i, "tells the model how to fix it");
+});
+
 // ── patch ──────────────────────────────────────────────────────────────────
 
 test("patch: replaces a unique occurrence and records the written file", () => {

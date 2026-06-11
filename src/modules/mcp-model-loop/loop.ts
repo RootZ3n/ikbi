@@ -172,8 +172,12 @@ export function createMcpModelLoop(deps: McpModelLoopDeps = {}): McpModelLoop {
     try {
       // (d) connect + discover tools (map to provider ModelTool[]) — only after the
       // session gate ALLOWED.
-      await transport.connect();
+      // M3: mark `connected` BEFORE connect() returns. connect() may spawn a child
+      // process and THEN throw (e.g. handshake/timeout failure) — if we only set the
+      // flag on success, finally would skip close() and leak that child. Setting it
+      // first guarantees the finally-close() runs on a connect() throw too.
       connected = true;
+      await transport.connect();
       const toolDefs = await transport.listTools();
       const tools: ModelTool[] = toolDefs.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters }));
 

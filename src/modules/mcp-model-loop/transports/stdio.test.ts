@@ -164,3 +164,22 @@ test("stdio stream integration: connect + listTools + callTool over JSON-RPC fra
     await t.close();
   }
 });
+
+// L3: malformed tool-arg JSON must NOT crash the call — it falls back to empty arguments
+// (and logs a warning so the dropped payload is observable, not silent).
+test("L3: callTool with malformed argument JSON falls back to empty arguments and still calls the tool", async () => {
+  const fake = fakeMcp();
+  const t = createStdioTransport({ command: "fake-mcp", spawnImpl: fake.spawn });
+  try {
+    await t.connect();
+    // A truncated/garbled arg string (e.g. from a cheap model) — not valid JSON.
+    const out = await t.callTool("echo", "{ text: 'oops not json");
+    // The call proceeds with `{}`; the fake echoes the (absent) text as empty.
+    assert.equal(out, "echo:", "the call proceeded with empty arguments rather than throwing");
+    // The garbled payload was NOT forwarded as the tool arguments.
+    const callWrite = fake.writes.find((w) => w.includes('"method":"tools/call"')) ?? "";
+    assert.ok(callWrite.includes('"arguments":{}'), "arguments fell back to {} (the bad JSON was dropped)");
+  } finally {
+    await t.close();
+  }
+});

@@ -335,3 +335,44 @@ test("the workspace manager singleton actually provides a commit method (product
   const { workspaces } = await import("../../core/workspace/index.js");
   assert.equal(typeof workspaces.commit, "function", "coreWorkspaces.commit exists — the orchestrator can commit verified work");
 });
+
+// ── M4: a cognition `reject` is surfaced (not silently discarded) under --yes ──
+
+test("M4: under --yes, a cognition `reject` is warned to STDERR (advisory, build proceeds)", () => {
+  const { orchestrator, resolveIdentity } = realOrchestrator("trusted", "trusted");
+  const cap2 = capture();
+  let promptCalls = 0;
+  const cli = createWorkerCli({
+    orchestrator, resolveIdentity, operatorToken: OPERATOR_TOKEN, workerToken: WORKER_TOKEN,
+    stdout: cap2.stdout, stderr: cap2.stderr, setExit: cap2.setExit, now: () => 1, cwd: () => "/repo",
+    interactive: true,
+    prompt: async () => { promptCalls += 1; return ""; },
+    // Force deliberation to REJECT — the historically-discarded signal.
+    cognition: { deliberate: async () => ({ decision: "reject", confidence: 0.9, rationale: "goal conflicts with policy", memoryUsed: [] }) },
+  });
+  return cli.build(["delete", "everything", "--yes"]).then(() => {
+    assert.equal(promptCalls, 0, "--yes never prompts");
+    // The rejection is surfaced on STDERR (not stdout — stdout stays machine-readable).
+    assert.match(cap2.err, /REJECTED/, "the reject was warned, not silently discarded");
+    assert.match(cap2.err, /goal conflicts with policy/, "the rationale is included in the warning");
+    assert.equal(cap2.out.includes("REJECTED"), false, "the warning did NOT leak onto stdout");
+    // Advisory: the build still ran to a clean outcome.
+    const summary = JSON.parse(cap2.out);
+    assert.equal(summary.outcome, "success", "--yes proceeds past the advisory reject");
+  });
+});
+
+test("M4: under --yes, a non-reject cognition decision emits NO reject warning", () => {
+  const { orchestrator, resolveIdentity } = realOrchestrator("trusted", "trusted");
+  const cap2 = capture();
+  const cli = createWorkerCli({
+    orchestrator, resolveIdentity, operatorToken: OPERATOR_TOKEN, workerToken: WORKER_TOKEN,
+    stdout: cap2.stdout, stderr: cap2.stderr, setExit: cap2.setExit, now: () => 1, cwd: () => "/repo",
+    interactive: true,
+    prompt: async () => "",
+    cognition: { deliberate: async () => ({ decision: "answer", confidence: 0.9, rationale: "clear", memoryUsed: [] }) },
+  });
+  return cli.build(["add a readme", "--yes"]).then(() => {
+    assert.equal(cap2.err.includes("REJECTED"), false, "no reject warning when deliberation did not reject");
+  });
+});

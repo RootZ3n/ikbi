@@ -62,7 +62,8 @@ function fallbackSearch(worktreeReal: string, root: string, pattern: string, fil
   try {
     re = new RegExp(pattern);
   } catch (e) {
-    return `ERROR: search failed: invalid regex (${e instanceof Error ? e.message : String(e)})`;
+    // L2: actionable guidance — the pattern is a regex; tell the caller how to fix it.
+    return `ERROR: Invalid regex pattern: "${pattern}" — ${e instanceof Error ? e.message : String(e)}. search_files treats the pattern as a regular expression; escape special characters (e.g. \\( \\[ \\.) to match them literally.`;
   }
   const glob = fileGlob !== undefined && fileGlob.length > 0 ? globToRegExp(fileGlob) : undefined;
   const matches: string[] = [];
@@ -153,6 +154,14 @@ export function runSearchFiles(worktreeReal: string, args: Record<string, unknow
     const code = (e as { code?: unknown }).code;
     if (code === "EPERM" || code === "ENOENT") {
       return { output: fallbackSearch(worktreeReal, c.full, pattern, typeof args.file_glob === "string" ? args.file_glob : undefined, maxResults) };
+    }
+    // L2: rg exits status 2 on an error — overwhelmingly a malformed regex. Surface
+    // ACTIONABLE guidance with rg's own parse message instead of an opaque
+    // "search failed", so a model can correct the pattern (e.g. escape `(`/`[`).
+    const stderr = String((e as { stderr?: unknown }).stderr ?? "").trim();
+    if (status === 2 && (stderr.length === 0 || /regex|parse|repetition|unclosed|character class/i.test(stderr))) {
+      const detail = stderr.length > 0 ? stderr : "rg could not parse the pattern";
+      return { output: `ERROR: Invalid regex pattern: "${pattern}" — ${detail}. search_files treats the pattern as a regular expression; escape special characters (e.g. \\( \\[ \\.) to match them literally.` };
     }
     const msg = e instanceof Error ? e.message : String(e);
     return { output: `ERROR: search failed: ${msg}` };

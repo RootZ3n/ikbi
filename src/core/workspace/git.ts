@@ -213,7 +213,24 @@ export async function isWorktreeClean(worktreePath: string): Promise<boolean> {
  * Hard-sync a worktree's index + working tree to `ref`. Called by promote AFTER the ref CAS,
  * only when that worktree was verified clean beforehand — so it brings the tree FORWARD to the
  * new HEAD (no user work to clobber) and `git status` is clean again (no phantom revert).
+ *
+ * M7 (TOCTOU): promote's earlier isWorktreeClean() gate and this destructive reset are NOT
+ * atomic — a user can write new uncommitted work into the tree in the window between them, and
+ * `reset --hard` would clobber it irrecoverably. So we re-check cleanliness immediately before
+ * the reset and, if anything appeared, STASH it first (including untracked files). The stash is
+ * preserved in the worktree's stash list — the late work is never lost, only set aside — and the
+ * reset then proceeds against a clean tree. The operator recovers it with `git stash pop`.
  */
 export async function syncWorktreeToRef(worktreePath: string, ref: string): Promise<void> {
+  if (!(await isWorktreeClean(worktreePath))) {
+    await runGit(worktreePath, [
+      "stash",
+      "push",
+      "--include-untracked",
+      "--quiet",
+      "-m",
+      `ikbi: auto-stashed late uncommitted work before promote-sync to ${ref}`,
+    ]);
+  }
   await runGit(worktreePath, ["reset", "--hard", "--quiet", ref]);
 }

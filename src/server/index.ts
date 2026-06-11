@@ -11,6 +11,7 @@ import Fastify from "fastify";
 
 import { config } from "../core/config.js";
 import { log } from "../core/log.js";
+import { trust } from "../core/trust/index.js";
 import { routes } from "./registry.js";
 
 /**
@@ -114,6 +115,12 @@ export function buildServer() {
 /** Build, start, and bind the server. Returns the running instance. */
 export async function startServer() {
   const app = buildServer();
+  // M5: warm the trust tier cache BEFORE accepting connections. Without this the resolver
+  // fails closed (every agent reads as the trust floor / requires-approval) until the
+  // background load finishes — a race where early requests get the wrong, downgraded tier.
+  // Awaiting here guarantees the first served request sees earned tiers. Fail-loud: a
+  // broken roster surfaces at boot rather than silently degrading every request.
+  await trust.preload();
   await app.listen({ host: config.bindHost, port: config.port });
   setReady(true);
   log.info(

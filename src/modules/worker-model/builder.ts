@@ -227,14 +227,28 @@ export const TOOLS: readonly ModelTool[] = [
 const TOOL_BY_NAME: ReadonlyMap<string, ModelTool> = new Map(TOOLS.map((t) => [t.name, t]));
 
 /**
+ * M8: gating tools whose CONTRACT (not just their existence) the model must understand.
+ * `simplifyTools` strips prose down to the bare name for cheap models, but for these two the
+ * gating rule itself — "run_checks must be green before done" — lives in the description. Erase
+ * it and a cheap model calls `done` on a red tree, defeating the RAIL. So we preserve a terse
+ * one-line description for exactly these, while every other tool still collapses to its name.
+ */
+const GATING_TOOL_HINTS: ReadonlyMap<string, string> = new Map([
+  ["run_checks", "Run the project's checks. You MUST see all checks pass before calling done."],
+  ["done", "Declare the work complete. Only call after run_checks is fully green."],
+]);
+
+/**
  * Simplify the tool schemas for a model whose capability profile says it does NOT
  * support native tool-calling. Such models do worst when handed verbose schemas;
  * we strip descriptions down to the tool name so the (best-effort) tool surface is
  * as small as possible. The tool SET and parameter shapes are unchanged — only the
  * prose is trimmed — so a model that nonetheless emits a valid tool call still works.
+ * EXCEPTION (M8): the gating tools keep a one-line description so the run_checks→done
+ * contract survives the simplification.
  */
-function simplifyTools(tools: readonly ModelTool[]): readonly ModelTool[] {
-  return tools.map((t) => ({ name: t.name, description: t.name, parameters: t.parameters }));
+export function simplifyTools(tools: readonly ModelTool[]): readonly ModelTool[] {
+  return tools.map((t) => ({ name: t.name, description: GATING_TOOL_HINTS.get(t.name) ?? t.name, parameters: t.parameters }));
 }
 
 /** The builder's CLAIM of completion (NOT the verdict — the verifier still decides). */

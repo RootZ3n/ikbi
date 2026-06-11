@@ -112,8 +112,15 @@ export class ModelRegistry {
     let raw: string;
     try {
       raw = readFileSync(path, "utf8");
-    } catch {
-      return { models: 0, providers: 0 }; // absent file is fine
+    } catch (cause) {
+      // M6: ONLY an absent file is a benign no-op. A bare catch also swallowed permission
+      // errors, I/O errors, "is a directory", etc. — silently loading ZERO models from a
+      // roster that exists but is unreadable. The roster is operationally critical, so any
+      // non-ENOENT read failure is fatal (fail loud) rather than a phantom empty load.
+      if ((cause as NodeJS.ErrnoException)?.code === "ENOENT") {
+        return { models: 0, providers: 0 }; // absent file is fine
+      }
+      throw new Error(`Unable to read provider roster file ${path}: ${String(cause)}`);
     }
 
     let doc: unknown;

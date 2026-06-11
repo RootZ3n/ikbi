@@ -40,7 +40,7 @@ import { WorkerError, type WorkerResult, type WorkerRole, type WorkerTask } from
 import { preBuildRefinement, formatInterview } from "../../core/goal-refinement.js";
 import { createCognitionLayer } from "../cognition-layer/cognition.js";
 import { loadRepoRegistry } from "../../core/repo-registry.js";
-import type { CognitionDecision } from "../cognition-layer/contract.js";
+import type { CognitionDecision, CognitionLayer } from "../cognition-layer/contract.js";
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -401,6 +401,8 @@ export interface WorkerCliDeps {
    * the same effect as `--yes`. Default: `process.stdin.isTTY === true`.
    */
   readonly interactive?: boolean;
+  /** Pre-build deliberation surface. Default: a fresh `createCognitionLayer()`. Injectable for tests. */
+  readonly cognition?: Pick<CognitionLayer, "deliberate">;
 }
 
 /** Resolve a repo name or path through the repo registry. Returns undefined if not provided. */
@@ -491,7 +493,7 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
     let finalGoal = goal;
     let cognitionResult: CognitionDecision | undefined;
     try {
-      const cognition = createCognitionLayer();
+      const cognition = deps.cognition ?? createCognitionLayer();
       cognitionResult = await cognition.deliberate({ parentCtx: ctx, goal, ...(repo !== undefined ? { project: repo } : {}) });
     } catch {
       // Cognition failure is non-fatal — proceed with the original goal
@@ -502,7 +504,15 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
     // proceeds with the original goal. The cognition layer above still ran (non-blocking).
     const skipInterview = yes === true || !interactive;
     if (skipInterview) {
-      // Nothing interactive to do — proceed silently with the original goal.
+      // M4: a cognition `reject` is ADVISORY at this layer — `--yes` (or a non-interactive
+      // session) deliberately proceeds rather than aborting. Design choice: `--yes` means
+      // "don't prompt me", and deliberation can be wrong, so we warn-and-proceed instead of
+      // blocking. But silently discarding a reject hides a real signal, so surface it on
+      // STDERR (not stdout — it must not pollute machine-readable output) before proceeding.
+      if (cognitionResult?.decision === "reject") {
+        err(`ikbi: warning: deliberation REJECTED this goal but --yes/non-interactive proceeds anyway: ${cognitionResult.rationale ?? "(no rationale)"}\n`);
+      }
+      // Nothing interactive to do — proceed with the original goal.
     } else if (!refinement.proceed && refinement.interview !== undefined) {
       out(formatInterview(refinement.interview));
       // Wait for user input — they can refine the goal or press Enter to skip

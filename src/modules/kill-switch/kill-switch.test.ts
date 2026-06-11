@@ -232,3 +232,26 @@ test("killswitch.* events carry reason/mode/scope/target — no identity tokens"
   assert.equal((engaged?.payload as { scope: string }).scope, "agent");
   assert.equal((engaged?.payload as { target: string }).target, "worker-7");
 });
+
+// ── L4: PERSIST before mutating the in-memory latch ──────────────────────────
+
+test("L4: when persist FAILS, the in-memory latch is NOT mutated (no phantom kill; error surfaces)", async () => {
+  // A store whose put() always throws — simulates a durable-write failure.
+  const failing: LatchStore = {
+    get: async () => undefined,
+    put: async () => {
+      throw new Error("disk full");
+    },
+  };
+  const pk = publishKillSpy();
+  const ev = captureEvents();
+  const ks = mk({ store: failing, publishKill: pk.publishKill, publish: ev.publish });
+
+  // The persist failure surfaces to the caller (fail loud), not swallowed.
+  await assert.rejects(() => ks.kill(engineKill, OPERATOR()), /disk full/);
+
+  // CRITICAL: in-memory state was NOT mutated — the engine is not phantom-killed. A kill that
+  // could not be made durable must not appear engaged (it would vanish on restart otherwise).
+  assert.equal((await ks.isKilled({})).killed, false, "no in-memory latch after a failed persist");
+  assert.equal(pk.calls.length, 0, "the seam halt was NOT published — persist must land first");
+});

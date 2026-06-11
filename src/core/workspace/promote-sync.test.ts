@@ -17,7 +17,7 @@ import type { AgentIdentity } from "../provider/contract.js";
 import { LockManager } from "../substrate/lock.js";
 import { DocumentStore } from "../substrate/store.js";
 import type { WorkspaceRecord } from "./contract.js";
-import { runGit } from "./git.js";
+import { runGit, syncWorktreeToRef } from "./git.js";
 import { WorkspaceManager } from "./manager.js";
 
 const silent: Logger = pino({ level: "silent" });
@@ -121,5 +121,58 @@ test("promote REFUSES when the target branch is checked out with uncommitted cha
     assert.equal(await readFile(join(repo, "wip.txt"), "utf8"), "uncommitted work\n");
   } finally {
     await cleanup(repo, root);
+  }
+});
+
+// M7 (TOCTOU): syncWorktreeToRef runs AFTER the promote clean-check. If a user writes new
+// uncommitted work into the tree in the window between the check and the destructive reset,
+// `reset --hard` would clobber it. The fix stashes any late work FIRST (preserved, recoverable)
+// and only then resets — never silent data loss.
+test("M7: syncWorktreeToRef STASHES late uncommitted work before the reset (no clobber)", async () => {
+  const repo = await makeRepo();
+  try {
+    const base = (await runGit(repo, ["rev-parse", "HEAD"])).stdout.trim();
+    // Advance the ref we will sync the tree forward TO.
+    await writeFile(join(repo, "advanced.txt"), "advanced\n");
+    await runGit(repo, ["add", "-A"]);
+    await runGit(repo, ["commit", "--quiet", "-m", "advance"]);
+    const advanced = (await runGit(repo, ["rev-parse", "HEAD"])).stdout.trim();
+    // Move the worktree back to base (so a sync-forward is a real change), then dirty it —
+    // this simulates work that appeared AFTER promote's clean-check but BEFORE the reset.
+    await runGit(repo, ["reset", "--hard", "--quiet", base]);
+    await writeFile(join(repo, "late-work.txt"), "PRECIOUS uncommitted work\n");
+
+    await syncWorktreeToRef(repo, advanced);
+
+    // The tree is now AT the target ref and `git status` is clean (the reset happened).
+    assert.equal((await runGit(repo, ["rev-parse", "HEAD"])).stdout.trim(), advanced, "tree synced to the target ref");
+    assert.equal(await porcelain(repo), "", "git status is clean after sync");
+    // The late work was NOT clobbered — it is preserved in the stash list and recoverable.
+    const stashList = (await runGit(repo, ["stash", "list"])).stdout.trim();
+    assert.match(stashList, /auto-stashed late uncommitted work/, "late work was stashed, not destroyed");
+    await runGit(repo, ["stash", "pop", "--quiet"]);
+    const { readFile } = await import("node:fs/promises");
+    assert.equal(await readFile(join(repo, "late-work.txt"), "utf8"), "PRECIOUS uncommitted work\n", "the stashed work is fully recoverable");
+  } finally {
+    await rm(repo, { recursive: true, force: true }).catch(() => undefined);
+  }
+});
+
+test("M7: syncWorktreeToRef on an already-clean tree resets with NO stash (unchanged fast path)", async () => {
+  const repo = await makeRepo();
+  try {
+    const base = (await runGit(repo, ["rev-parse", "HEAD"])).stdout.trim();
+    await writeFile(join(repo, "next.txt"), "next\n");
+    await runGit(repo, ["add", "-A"]);
+    await runGit(repo, ["commit", "--quiet", "-m", "next"]);
+    const next = (await runGit(repo, ["rev-parse", "HEAD"])).stdout.trim();
+    await runGit(repo, ["reset", "--hard", "--quiet", base]); // clean tree at base
+
+    await syncWorktreeToRef(repo, next);
+
+    assert.equal((await runGit(repo, ["rev-parse", "HEAD"])).stdout.trim(), next, "tree synced forward");
+    assert.equal((await runGit(repo, ["stash", "list"])).stdout.trim(), "", "no stash created for a clean tree");
+  } finally {
+    await rm(repo, { recursive: true, force: true }).catch(() => undefined);
   }
 });

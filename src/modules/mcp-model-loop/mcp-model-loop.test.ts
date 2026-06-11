@@ -387,3 +387,35 @@ test("events never carry full tool args or raw results", async () => {
   assert.ok(!serialized.includes("ARG-SECRET-8"), "full tool args are NOT in events");
   assert.ok(!serialized.includes("RAW-RESULT-SECRET-9"), "raw tool results are NOT in events");
 });
+
+// ── M3: NO LEAKED CHILD ON CONNECT FAILURE ───────────────────────────────────
+
+test("M3: when transport.connect() throws, close() is still called (no leaked child process)", async () => {
+  const order: string[] = [];
+  const transport: McpTransport = {
+    connect: async () => {
+      order.push("connect");
+      // connect() may spawn a child process and THEN fail (handshake/timeout) — the child
+      // is live but connect rejected. The loop must still tear it down.
+      throw new Error("handshake failed after spawn");
+    },
+    listTools: async () => {
+      order.push("listTools");
+      return [];
+    },
+    callTool: async () => {
+      order.push("callTool");
+      return "";
+    },
+    close: async () => void order.push("close"),
+  };
+  const sm = scriptedModel([]);
+  const gate = capturingGate();
+  const { deps } = baseDeps({ transport, invokeModel: sm.invokeModel, gateWall: gate.gateWall });
+  const loop = createMcpModelLoop(deps);
+
+  const r = await loop.run({ parentCtx: makeCtx("verified"), goal: "find it" });
+  assert.equal(r.stopReason, "error", "the connect failure surfaces as an error outcome");
+  assert.ok(order.includes("close"), "close() ran despite connect() throwing — the child is not leaked");
+  assert.deepEqual(order, ["connect", "close"], "connect threw, then close cleaned up — no discovery/model calls");
+});

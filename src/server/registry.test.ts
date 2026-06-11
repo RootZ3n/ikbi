@@ -1,10 +1,30 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 
+import { trust } from "../core/trust/index.js";
 import { registerRoutes, routes } from "./registry.js";
-import { buildServer } from "./index.js";
+import { buildServer, startServer } from "./index.js";
 
 afterEach(() => routes.reset());
+
+// M5: startServer must warm the trust tier cache BEFORE accepting connections, or early
+// requests fail closed (downgraded to the trust floor) until the background load finishes.
+// We make preload throw a sentinel: if startServer REJECTS with it and never binds a port,
+// then preload was both CALLED and AWAITED before app.listen — exactly the ordering we want.
+test("M5: startServer awaits trust.preload() before binding the port", async () => {
+  const orig = trust.preload;
+  const order: string[] = [];
+  (trust as { preload: () => Promise<unknown> }).preload = async () => {
+    order.push("preload");
+    throw new Error("PRELOAD_SENTINEL");
+  };
+  try {
+    await assert.rejects(() => startServer(), /PRELOAD_SENTINEL/, "the preload rejection propagated — it was awaited before listen");
+    assert.deepEqual(order, ["preload"], "preload ran (and, having thrown, the server never bound a port)");
+  } finally {
+    (trust as { preload: typeof orig }).preload = orig;
+  }
+});
 
 test("a module registers a route and the server serves it WITHOUT editing server/index.ts", async () => {
   // This is the sample module — it touches only the registrar seam.
