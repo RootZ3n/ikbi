@@ -66,6 +66,12 @@ export interface WorkerModelConfig {
    * IKBI_WORKER_MODEL_PENALIZE_TIMEOUTS=true to make timeouts trust-relevant by policy.
    */
   readonly penalizeTimeouts?: boolean;
+  /**
+   * Iterative fix loop: after the builder succeeds, run the verifier and feed
+   * test failures back to the builder for automatic fixing. DEFAULT OFF (opt-in).
+   * Set IKBI_WORKER_MODEL_FIX_LOOP=true to enable.
+   */
+  readonly fixLoop?: boolean;
 }
 
 /** Load the worker-model config slice from `IKBI_WORKER_MODEL_*`. */
@@ -78,6 +84,7 @@ export function loadWorkerModelConfig(reader = env): WorkerModelConfig {
     competitiveN: reader.int("COMPETITIVE_N", DEFAULT_COMPETITIVE_N, { min: MIN_COMPETITIVE_N, max: MAX_COMPETITIVE_N }),
     retainFailedWorkspaces: reader.bool("RETAIN_FAILED_WORKSPACES", true),
     penalizeTimeouts: reader.bool("PENALIZE_TIMEOUTS", false),
+    fixLoop: reader.bool("FIX_LOOP", false),
   });
 }
 

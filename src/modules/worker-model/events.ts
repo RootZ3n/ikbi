@@ -70,3 +70,8 @@ export const workerCompetitiveJudged = defineEvent<{ taskId: string; candidateCo
 export const workerCompetitiveCompleted = defineEvent<{ taskId: string; candidateCount: number; winnerWorkspaceId: string | null }>(
   "worker.competitive.completed",
 );
+
+/** The iterative fix loop completed — how many fix iterations ran and whether it succeeded. (Attribution: parent.) */
+export const workerFixLoopCompleted = defineEvent<{ taskId: string; fixIterations: number; success: boolean; lastErrors?: string }>(
+  "worker.fix_loop.completed",
+);

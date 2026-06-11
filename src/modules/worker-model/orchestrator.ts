@@ -82,8 +82,10 @@ import {
   workerRoleDispatched,
   workerStarted,
   workerVerification,
+  workerFixLoopCompleted,
 } from "./events.js";
 import { CONTRACT_VERSION, toOutcomeStatus, WorkerError, WORKER_ROLES } from "./contract.js";
+import { runIterativeLoop, DEFAULT_MAX_FIX_ITERATIONS, extractVerifierCheckResult } from "./iterative-loop.js";
 import type {
   RoleContext,
   RoleEngine,
@@ -886,7 +888,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           engine: runEngine,
         };
         const roleFn = role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderFor(parentCtx) : role === "critic" ? criticFor() : roles[role];
-        const result = await runRoleFn(role, roleFn, ctx);
+        let result = await runRoleFn(role, roleFn, ctx);
         results.push(result);
 
         events.publish(
@@ -931,6 +933,82 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               { source: EVENT_SOURCE, attribution: { identity: spawned.identity, operation: "worker.role.verifier", runId: task.taskId } },
             ),
           );
+        }
+
+        // ── ITERATIVE FIX LOOP: verify → auto-fix → re-verify ──────────────────
+        // After the builder succeeds, run a quick verifier check. If verification
+        // fails, feed the errors back to the builder as a fix goal and retry.
+        // Up to MAX_FIX_ITERATIONS attempts. This is WRAPPER logic — the builder
+        // and verifier internals are unchanged.
+        // OPT-IN: requires IKBI_WORKER_MODEL_FIX_LOOP=true (default off).
+        if (role === "builder" && result.outcome === "success" && config.fixLoop) {
+          const fixLoopOutcome = await runIterativeLoop(result, {
+            maxFixIterations: DEFAULT_MAX_FIX_ITERATIONS,
+            verifier: async () => {
+              const verifyFn = verifierFor(parentCtx);
+              const verifyCtx: RoleContext = {
+                task, role: "verifier",
+                identity: spawned.identity,
+                autonomy: spawned.autonomy,
+                workspace,
+                priorResults: [...results],
+                engine: runEngine,
+              };
+              const vResult = await runRoleFn("verifier", verifyFn, verifyCtx);
+              return extractVerifierCheckResult(vResult);
+            },
+            builder: async (fixGoal: string) => {
+              const fixBuilderFn = builderFor(parentCtx);
+              const fixCtx: RoleContext = {
+                task: { ...task, goal: fixGoal },
+                role: "builder",
+                identity: spawned.identity,
+                autonomy: spawned.autonomy,
+                workspace,
+                priorResults: [...results],
+                engine: runEngine,
+              };
+              return runRoleFn("builder", fixBuilderFn, fixCtx);
+            },
+          });
+
+          if (fixLoopOutcome.fixIterations > 0) {
+            // The fix loop ran — update the builder result and emit an event.
+            const prevDetail = (result.detail ?? {}) as Record<string, unknown>;
+            const loopDetail = (fixLoopOutcome.buildResult.detail ?? {}) as Record<string, unknown>;
+            result = {
+              ...fixLoopOutcome.buildResult,
+              detail: { ...prevDetail, ...loopDetail, fixIterations: fixLoopOutcome.fixIterations },
+            };
+            results[results.length - 1] = result;
+            events.publish(
+              workerFixLoopCompleted.create(
+                {
+                  taskId: task.taskId,
+                  fixIterations: fixLoopOutcome.fixIterations,
+                  success: fixLoopOutcome.buildResult.outcome === "success",
+                  ...(fixLoopOutcome.lastVerifierResult !== undefined ? { lastErrors: fixLoopOutcome.lastVerifierResult.errors.slice(0, 500) } : {}),
+                },
+                { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.fix_loop", runId: task.taskId } },
+              ),
+            );
+            // Record a receipt for the fix loop so the trail shows how many iterations ran.
+            await receipts.append(
+              {
+                operation: "worker.fix_loop",
+                outcome: { status: fixLoopOutcome.buildResult.outcome === "success" ? "success" : "failure" },
+                requestId: task.taskId,
+                metadata: {
+                  taskId: task.taskId,
+                  workspaceId: workspace.id,
+                  fixIterations: fixLoopOutcome.fixIterations,
+                  success: fixLoopOutcome.buildResult.outcome === "success",
+                },
+                project: task.targetRepo,
+              },
+              parentIdentity,
+            );
+          }
         }
 
         // ADDITIVE escalation observability — fold signals + emit escalation.* events.
