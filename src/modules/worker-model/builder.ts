@@ -518,6 +518,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
   let contextPercent = 0; // SG: latest context-window pressure (0-100), surfaced for visibility
   let warnedHighContext = false; // warn-once when pressure crosses 70%
   let stopReason = "max_iterations"; // not "stop": only a validated `done` is success now
+  const filesWrittenPerRound: number[] = []; // EARLY STOP: tracks new files written each tool-round iteration
 
   try {
     // Canonical worktree root for confinement (realpath’d once).
@@ -945,6 +946,9 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         break;
       }
 
+      // EARLY STOP: snapshot filesWritten count so we can detect no-progress after tool rounds
+      const filesWrittenBeforeRound = filesWritten.length;
+
       // CONTEXT LAYER — deterministic compression: compress old tool results into
       // lightweight summaries using pattern matching (no model call). This runs FIRST
       // to cheaply reduce context pressure; the model-based maybeCompress below
@@ -1069,7 +1073,38 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
           }
         }
         if (terminated) break;
+        // EARLY STOP: track files written in this tool-round iteration
+        const newFilesThisRound = filesWritten.length - filesWrittenBeforeRound;
+        filesWrittenPerRound.push(newFilesThisRound);
+        // EARLY STOP: stuck detection — if last 3 tool calls were all rejected, builder is stuck
+        const recentRejections = rejectedToolCalls.slice(-3);
+        if (recentRejections.length >= 3) {
+          stopReason = "stuck_detected";
+          break;
+        }
+        // EARLY STOP: no-progress detection — if the builder wrote files before but the last 5
+        // rounds produced no new writes, it may be stuck. Only fires when the builder has
+        // previously demonstrated write activity (excludes pure-read exploration rounds).
+        const totalFilesWritten = filesWrittenPerRound.reduce((a, b) => a + b, 0);
+        const recentFileWrites = filesWrittenPerRound.slice(-5);
+        if (totalFilesWritten > 0 && recentFileWrites.length >= 5 && recentFileWrites.every((n) => n === 0)) {
+          stopReason = "no_progress";
+          break;
+        }
         continue; // keep looping while the model wants tools / has not validly done
+      }
+
+      // EARLY STOP: detect when the builder signals completion in its text (no tool calls).
+      // The model said "goal achieved" / "task complete" in plain text — stop.
+      // NOTE: "done" alone is NOT matched here because it's too common in corrective turns
+      // ("call done with your self-check"). The model has a dedicated `done` TOOL for signaling.
+      const lastAssistantText = typeof response.content === "string" ? response.content.toLowerCase() : "";
+      if (
+        response.finishReason === "stop" &&
+        (lastAssistantText.includes("goal achieved") || lastAssistantText.includes("task complete"))
+      ) {
+        stopReason = "builder_done";
+        break;
       }
 
       // RAIL 3: a BARE STOP (no done) is INCOMPLETE — inject a corrective turn and loop
