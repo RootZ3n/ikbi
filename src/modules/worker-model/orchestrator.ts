@@ -51,7 +51,7 @@ import {
 } from "../escalation/index.js";
 import type { EscalationSignals } from "../escalation/index.js";
 
-import type { ExecRequest, GovernedExec } from "../governed-exec/index.js";
+import type { ExecRequest, ExecResult, GovernedExec } from "../governed-exec/index.js";
 
 import { builder, createBuilder, MAX_TOOL_ITERATIONS } from "./builder.js";
 import { resolveChecks, workingTreePackageJsonDiff, workingTreePlanningDiff } from "./checks.js";
@@ -110,8 +110,50 @@ interface MutableEscalationSignals {
 /** Handoff-only context captured from roles (not scored). */
 interface EscalationHandoffFields {
   scoutFindings?: string;
+  goalAlignment?: { status: string; summary: string; missingFiles: readonly string[] };
   criticFeedback?: string;
   verificationDetails?: string;
+}
+
+// ── DEPENDENCY INSTALL: ensure worktree has node_modules ──────────────────────
+
+import { existsSync } from "node:fs";
+import { join } from "node:path";
+
+/**
+ * Install dependencies in the worktree if node_modules is missing.
+ * Checks for package.json + absence of node_modules, then runs the appropriate
+ * package manager install. Non-fatal — if install fails, the builder will see
+ * the error in run_checks and can try to fix it.
+ */
+async function installWorkspaceDeps(
+  worktreePath: string,
+  governedExec: { run: (req: ExecRequest) => Promise<ExecResult> },
+  parentCtx: OperationContext,
+): Promise<void> {
+  const pkgJson = join(worktreePath, "package.json");
+  const nodeModules = join(worktreePath, "node_modules");
+
+  if (!existsSync(pkgJson) || existsSync(nodeModules)) return; // nothing to install
+
+  // Detect package manager from lockfile
+  const hasPnpmLock = existsSync(join(worktreePath, "pnpm-lock.yaml"));
+  const hasNpmLock = existsSync(join(worktreePath, "package-lock.json"));
+
+  const pm = hasPnpmLock ? "pnpm" : hasNpmLock ? "npm" : "pnpm"; // default to pnpm
+  const args = pm === "pnpm" ? ["install", "--no-frozen-lockfile"] : ["install"];
+
+  try {
+    await governedExec.run({
+      parentCtx,
+      command: pm,
+      args,
+      cwd: worktreePath,
+      timeoutMs: 120_000,
+    });
+  } catch {
+    // Non-fatal: the builder will see missing deps in run_checks
+  }
 }
 
 /** Coerce an unknown detail field to a finite number, else undefined. */
@@ -135,6 +177,11 @@ function foldRoleSignals(
     const s = asNumber(detail.score);
     if (s !== undefined) acc.scoutScore = s;
     if (typeof detail.brief === "string") handoff.scoutFindings = detail.brief;
+    // Layer 2: capture goal-file alignment from the scout
+    const ga = detail.goalAlignment as { status?: string; summary?: string; missingFiles?: readonly string[] } | undefined;
+    if (ga !== undefined && typeof ga.status === "string") {
+      handoff.goalAlignment = { status: ga.status, summary: ga.summary ?? "", missingFiles: ga.missingFiles ?? [] };
+    }
   } else if (role === "builder") {
     const rejected = Array.isArray(detail.rejectedToolCalls) ? detail.rejectedToolCalls.length : 0;
     // schemaFailures and rejectedToolCalls both derive from the rejected-tool-call set
@@ -778,6 +825,14 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     let actualRetrievalMode: string | undefined;
 
     try {
+      // ── DEPENDENCY INSTALL: ensure node_modules exists before running checks ──
+      // If the worktree has a package.json but no node_modules, install dependencies
+      // so run_checks (typecheck + tests) can actually succeed. This is the fix for
+      // the "vitest: command not found" / "Cannot find module" failures.
+      if (govExecForRoles !== undefined) {
+        await installWorkspaceDeps(workspace.path, govExecForRoles, parentCtx);
+      }
+
       for (const role of WORKER_ROLES) {
         const spawned = spawnRole(role, parentCtx);
 

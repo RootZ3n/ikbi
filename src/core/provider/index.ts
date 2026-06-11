@@ -84,13 +84,8 @@ function buildDefaultRegistry(): ModelRegistry {
       providers: [{ provider: DEEPSEEK_PROVIDER_ID, providerModelId: "deepseek-v4-flash" }],
     },
     // minimax-m3: real provider now wired via providers.json
-    // gpt-5.5 / opus-4.8: stub entries so the escalation roster resolves; real calls fail gracefully.
-    {
-      id: "gpt-5.5",
-      role: "critic",
-      cost: { promptPerMTok: 0, completionPerMTok: 0 },
-      providers: [{ provider: STUB_PROVIDER_ID, providerModelId: "gpt-5.5" }],
-    },
+    // gpt-5.5: real provider now wired via providers.json (OpenAI)
+    // opus-4.8: stub entry so the escalation roster resolves; real calls fail gracefully.
     {
       id: "opus-4.8",
       role: "critic",

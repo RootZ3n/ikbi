@@ -37,9 +37,23 @@ import { gateWall as coreGateWall, type GateWall } from "../gate-wall/index.js";
 import type { ExecRequest, ExecResult } from "../governed-exec/index.js";
 import { createOrchestrator } from "./orchestrator.js";
 import { WorkerError, type WorkerResult, type WorkerRole, type WorkerTask } from "./contract.js";
+import { preBuildRefinement, formatInterview } from "../../core/goal-refinement.js";
+import { createCognitionLayer } from "../cognition-layer/cognition.js";
+import type { CognitionDecision } from "../cognition-layer/contract.js";
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+/** Prompt the user for input via stdin. Returns the trimmed answer. */
+function promptUser(prompt: string): Promise<string> {
+  return new Promise<string>((resolve) => {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(prompt, (ans) => {
+      rl.close();
+      resolve(ans.trim());
+    });
+  });
 }
 
 // ── SG-2: diff surfacing ──────────────────────────────────────────────────────
@@ -414,7 +428,36 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
 
     const id = `build-${now()}`;
     const ctx = beginOperation(who, { requestId: id });
-    const task: WorkerTask = { taskId: id, targetRepo: repo ?? cwd(), goal };
+
+    // ── LAYER 1: Pre-build deliberation ─────────────────────────────────────
+    // Run the cognition layer on the goal BEFORE creating the task. If the goal
+    // is ambiguous, print the Socratic interview and wait for user input.
+    let finalGoal = goal;
+    let cognitionResult: CognitionDecision | undefined;
+    try {
+      const cognition = createCognitionLayer();
+      cognitionResult = await cognition.deliberate({ parentCtx: ctx, goal, ...(repo !== undefined ? { project: repo } : {}) });
+    } catch {
+      // Cognition failure is non-fatal — proceed with the original goal
+    }
+
+    const refinement = preBuildRefinement(goal, cognitionResult);
+    if (!refinement.proceed && refinement.interview !== undefined) {
+      out(formatInterview(refinement.interview));
+      // Wait for user input — they can refine the goal or press Enter to skip
+      const answer = await promptUser("\n  Your answer (or press Enter to skip): ");
+      if (answer.trim().length > 0) {
+        finalGoal = `${goal} — ${answer.trim()}`;
+        out(`\n  Refined goal: "${finalGoal}"\n\n`);
+      } else {
+        out("\n  Proceeding with original goal.\n\n");
+      }
+    } else if (refinement.interview !== undefined && refinement.interview.summary.startsWith("Warning:")) {
+      // Surface warnings but proceed
+      out(`\n  ⚠ ${refinement.interview.summary}\n\n`);
+    }
+
+    const task: WorkerTask = { taskId: id, targetRepo: repo ?? cwd(), goal: finalGoal };
 
     // SG-5: with --verbose, stream the build's structured progress events (per-role start/end,
     // builder tool activity, verification status) live as they fire.

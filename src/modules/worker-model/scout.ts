@@ -177,6 +177,64 @@ function parseFindings(content: string): ScoutFinding[] {
   return [{ title: "investigation", detail: detail.length > 0 ? detail : "(no analysis returned)" }];
 }
 
+// ── LAYER 2: Scout-level goal-file alignment ────────────────────────────────────
+
+/** Assessment of whether the goal maps to specific files in the repo. */
+export interface GoalFileAlignment {
+  /** Files explicitly mentioned in the goal that were found in the repo. */
+  readonly matchedFiles: readonly string[];
+  /** Files explicitly mentioned in the goal that were NOT found in the repo. */
+  readonly missingFiles: readonly string[];
+  /** Overall alignment: "aligned" (goal maps to found files), "broad" (no specific files mentioned), or "misaligned" (goal mentions files not found). */
+  readonly status: "aligned" | "broad" | "misaligned";
+  /** Human-readable summary of the alignment. */
+  readonly summary: string;
+}
+
+/**
+ * Assess whether the goal mentions specific files that the scout found (or didn't find).
+ * PURE — no model calls. Extracts file-like references from the goal and checks against
+ * the scout's structure index.
+ */
+export function assessGoalFileAlignment(goal: string, structure: readonly ScoutFileEntry[]): GoalFileAlignment {
+  const repoFiles = structure.map((f) => f.path.toLowerCase());
+
+  // Extract file-like references from the goal (paths, filenames with extensions)
+  const filePattern = /[\w\-./]+\.\w{1,10}/g;
+  const mentioned = goal.match(filePattern) ?? [];
+
+  const matchedFiles: string[] = [];
+  const missingFiles: string[] = [];
+
+  for (const ref of mentioned) {
+    const refLower = ref.toLowerCase();
+    // Check if the file exists in the repo (exact match or suffix match)
+    const found = repoFiles.some((f) => f === refLower || f.endsWith(`/${refLower}`) || refLower.endsWith(`/${f}`) || f.includes(refLower));
+    if (found) {
+      matchedFiles.push(ref);
+    } else {
+      missingFiles.push(ref);
+    }
+  }
+
+  // Determine status
+  let status: "aligned" | "broad" | "misaligned";
+  let summary: string;
+
+  if (mentioned.length === 0) {
+    status = "broad";
+    summary = "Goal does not reference specific files — builder will need to determine targets from context";
+  } else if (missingFiles.length > 0) {
+    status = "misaligned";
+    summary = `Goal references ${missingFiles.join(", ")} but ${missingFiles.length === 1 ? "this file was" : "these files were"} not found in the repository`;
+  } else {
+    status = "aligned";
+    summary = `Goal maps to ${matchedFiles.join(", ")} — found in repository`;
+  }
+
+  return { matchedFiles, missingFiles, status, summary };
+}
+
 /** Injectable scout dependencies. Defaults preserve the legacy behavior exactly. */
 export interface ScoutDeps {
   /** Index-backed retrieval, used ONLY when IKBI_RETRIEVAL=index. Default: the lazy singleton. */
@@ -264,14 +322,19 @@ export function createScout(deps: ScoutDeps = {}): RoleFn {
       const response = await ctx.engine.invokeModel(request);
       const findings = parseFindings(response.content);
       const brief = buildBrief(structure);
+
+      // ── LAYER 2: Scout-level ambiguity detection ───────────────────────────
+      // Check if the goal mentions specific files that the scout found (or didn't find).
+      const goalAlignment = assessGoalFileAlignment(ctx.task.goal, structure);
+
       return {
         role: "scout",
         outcome: "success",
-        summary: `scouted ${used} file(s) ${modeNote}; produced ${findings.length} finding(s)`,
+        summary: `scouted ${used} file(s) ${modeNote}; produced ${findings.length} finding(s); goal alignment: ${goalAlignment.summary}`,
         // `brief` + `structure` drive PROGRESSIVE DISCLOSURE downstream: the builder shows the
         // brief first and pulls a finding's full `detail` only on demand (scout_detail tool).
         // `retrievalMode` (+ `retrieval` when index-backed) records HOW context was selected.
-        detail: { findings, filesScanned: used, brief, structure, retrievalMode, ...(retrievalFallbackReason !== undefined ? { retrievalFallbackReason } : {}), ...(retrievalDetail !== undefined ? { retrieval: retrievalDetail } : {}) },
+        detail: { findings, filesScanned: used, brief, structure, retrievalMode, goalAlignment, ...(retrievalFallbackReason !== undefined ? { retrievalFallbackReason } : {}), ...(retrievalDetail !== undefined ? { retrieval: retrievalDetail } : {}) },
       };
     } catch (err) {
       // IO / model failure: report at the role boundary, do not throw past it.
