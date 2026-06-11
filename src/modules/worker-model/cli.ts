@@ -455,6 +455,24 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       return;
     }
 
+    // H1: resolve the target repo BEFORE any work. Only fall back to cwd when --repo was NOT given.
+    // An explicit --repo that does not resolve (a typo'd alias) must FAIL LOUDLY — never silently
+    // run the build against the wrong directory (cwd).
+    let targetRepo: string;
+    if (repo === undefined || repo.length === 0) {
+      targetRepo = cwd();
+    } else {
+      const resolved = resolveRepo(repo);
+      if (resolved === undefined) {
+        const known = loadRepoRegistry().list().map((r) => r.name);
+        const hint = known.length > 0 ? `known repos: ${known.join(", ")}` : "no repos registered in state/repos.json";
+        err(`ikbi: --repo "${repo}" did not resolve to a known repo or absolute path (${hint})\n`);
+        setExit(1);
+        return;
+      }
+      targetRepo = resolved;
+    }
+
     let who: ValidatedIdentity;
     try {
       who = resolveIdentity({ token: operatorToken });
@@ -500,7 +518,7 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       out(`\n  ⚠ ${refinement.interview.summary}\n\n`);
     }
 
-    const task: WorkerTask = { taskId: id, targetRepo: resolveRepo(repo) ?? cwd(), goal: finalGoal };
+    const task: WorkerTask = { taskId: id, targetRepo, goal: finalGoal };
 
     // SG-5: with --verbose, stream the build's structured progress events (per-role start/end,
     // builder tool activity, verification status) live as they fire.

@@ -77,7 +77,10 @@ export function loadRepoRegistry(stateRoot?: string): RepoRegistry {
         return entries.has(name.toLowerCase());
       },
     };
-  } catch {
+  } catch (e) {
+    // L1: a malformed repos.json silently loaded zero repos — surface it so a typo'd registry
+    // is diagnosable instead of looking like "no repos registered".
+    process.stderr.write(`ikbi: failed to parse repo registry at ${filePath}: ${e instanceof Error ? e.message : String(e)} — loading empty registry\n`);
     cached = emptyRegistry();
   }
 

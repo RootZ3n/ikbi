@@ -297,6 +297,18 @@ test("no worker token ⇒ friendly error, no orchestrator run", () => {
   });
 });
 
+test("H1: an explicit --repo that does not resolve ⇒ loud error, no run (never silent cwd fallback)", () => {
+  const oc = countingOrchestrator();
+  const cap2 = capture();
+  const cli = createWorkerCli({ orchestrator: oc.orchestrator, resolveIdentity: makeResolver("trusted", "trusted"), operatorToken: OPERATOR_TOKEN, workerToken: WORKER_TOKEN, stdout: cap2.stdout, stderr: cap2.stderr, setExit: cap2.setExit, now: () => 1, cwd: () => "/repo" });
+  // a typo'd alias (non-absolute, not registered) must NOT fall back to cwd
+  return cli.build(["fix", "it", "--repo", "zzz-not-a-real-repo-alias"]).then(() => {
+    assert.equal(cap2.exit, 1);
+    assert.match(cap2.err, /--repo "zzz-not-a-real-repo-alias" did not resolve/);
+    assert.equal(oc.calls.length, 0, "no build ran against the wrong directory");
+  });
+});
+
 test("an empty goal ⇒ usage hint, no run", () => {
   const oc = countingOrchestrator();
   const cap2 = capture();
