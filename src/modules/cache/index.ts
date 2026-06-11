@@ -60,6 +60,13 @@ function normalizeMessages(request: ModelRequest): Array<Record<string, unknown>
     ...(m.toolCalls !== undefined
       ? { toolCalls: m.toolCalls.map((tc) => ({ id: tc.id, name: tc.name, arguments: tc.arguments })) }
       : {}),
+    // M1: vision turns carry images in `parts`, NOT in `content` (the flattened-text fallback).
+    // Two turns with identical text but DIFFERENT images would otherwise collide on `content`
+    // alone — the second served the first image's answer. Fold a hash of `parts` into the key
+    // whenever they carry non-text (image) content so distinct images key distinctly.
+    ...(m.parts !== undefined && m.parts.some((p) => p.type !== "text")
+      ? { partsHash: createHash("sha256").update(JSON.stringify(m.parts)).digest("hex") }
+      : {}),
   }));
 }
 

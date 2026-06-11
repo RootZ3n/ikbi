@@ -166,3 +166,20 @@ test("hit / miss / store publish namespaced cache.* events", async () => {
   await cache.wrap(req(), countingNext().next); // hit
   assert.deepEqual(seen, ["cache.miss", "cache.store", "cache.hit"]);
 });
+
+// --- M1: vision content keys distinctly even when the flattened text is identical ----------
+test("M1: two vision turns with identical text but different images key distinctly (no collision)", () => {
+  const textOnly = cacheKey(req({ messages: [{ role: "user", content: "describe this" }] }));
+  const withImgA = cacheKey(req({ messages: [{ role: "user", content: "describe this", parts: [{ type: "text", text: "describe this" }, { type: "image_url", image_url: { url: "https://x/a.png" } }] }] }));
+  const withImgB = cacheKey(req({ messages: [{ role: "user", content: "describe this", parts: [{ type: "text", text: "describe this" }, { type: "image_url", image_url: { url: "https://x/b.png" } }] }] }));
+  // different images ⇒ different keys (the bug: B would otherwise be served A's answer)
+  assert.notEqual(withImgA, withImgB, "distinct images key distinctly");
+  // an image turn never collides with the text-only turn that shares its flattened text
+  assert.notEqual(textOnly, withImgA, "image turn differs from the bare-text turn");
+});
+
+test("M1: a text-only `parts` array does not change the key (equivalent to plain content)", () => {
+  const plain = cacheKey(req({ messages: [{ role: "user", content: "hi" }] }));
+  const textParts = cacheKey(req({ messages: [{ role: "user", content: "hi", parts: [{ type: "text", text: "hi" }] }] }));
+  assert.equal(plain, textParts, "text-only parts carry no image content → no key change");
+});
