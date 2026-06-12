@@ -297,3 +297,61 @@ test("P0/Fix1: a package.json change OUTSIDE guarded scripts does NOT false-trip
   const diff = 'diff --git a/package.json b/package.json\n-    "lodash": "^4.17.20",\n+    "lodash": "^4.17.21",';
   assert.equal(detectScriptMutation(diff).mutated, false, "a dependency bump is not a script mutation");
 });
+
+// ── L4: greenfield tsconfig.json ──────────────────────────────────────────────
+
+test("L4: greenfield tsconfig.json with 'new file mode' is NOT flagged for weakening keys", () => {
+  const diff = [
+    "diff --git a/tsconfig.json b/tsconfig.json",
+    "new file mode 100644",
+    "index 0000000..abc1234",
+    "--- /dev/null",
+    "+++ b/tsconfig.json",
+    '+  "compilerOptions": {',
+    '+    "strict": true,',
+    '+    "skipLibCheck": true,',
+    '+    "target": "ES2022"',
+    "+  }",
+  ].join("\n");
+  const r = detectScriptMutation(diff);
+  assert.equal(r.mutated, false, "new file tsconfig with skipLibCheck should NOT be flagged — can't weaken what didn't exist");
+});
+
+test("L4: greenfield tsconfig.json with '--- /dev/null' (untracked) is NOT flagged for weakening keys", () => {
+  const diff = [
+    "diff --git a/tsconfig.json b/tsconfig.json",
+    "--- /dev/null",
+    "+++ b/tsconfig.json",
+    '+  "compilerOptions": {',
+    '+    "skipLibCheck": true',
+    "+  }",
+  ].join("\n");
+  const r = detectScriptMutation(diff);
+  assert.equal(r.mutated, false, "untracked new tsconfig with skipLibCheck should NOT be flagged");
+});
+
+test("L4: MODIFIED tsconfig.json with weakening key IS still flagged", () => {
+  const diff = [
+    "diff --git a/tsconfig.json b/tsconfig.json",
+    "--- a/tsconfig.json",
+    "+++ b/tsconfig.json",
+    '-  "skipLibCheck": false,',
+    '+  "skipLibCheck": true,',
+  ].join("\n");
+  const r = detectScriptMutation(diff);
+  assert.equal(r.mutated, true, "changing skipLibCheck on an existing tsconfig IS a mutation");
+});
+
+test("L4: 'new file mode' detection sets isNewFile for guarded config files too", () => {
+  // A new vitest.config.ts should NOT be flagged (can't weaken what didn't exist)
+  const diff = [
+    "diff --git a/vitest.config.ts b/vitest.config.ts",
+    "new file mode 100644",
+    "index 0000000..abc1234",
+    "--- /dev/null",
+    "+++ b/vitest.config.ts",
+    "+export default { test: { include: ['**/*.test.ts'] } }",
+  ].join("\n");
+  const r = detectScriptMutation(diff);
+  assert.equal(r.mutated, false, "new vitest.config.ts should NOT be flagged");
+});

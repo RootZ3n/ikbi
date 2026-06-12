@@ -230,6 +230,7 @@ export function detectScriptMutation(diff: string): { mutated: boolean; reason?:
       }
       continue;
     }
+    if (line.startsWith("new file mode")) { isNewFile = true; continue; } // committed diff new-file marker (belt-and-suspenders with --- /dev/null)
     if (line.startsWith("--- /dev/null")) {
       isNewFile = true; // next +++ is a new file
       continue;
@@ -244,7 +245,8 @@ export function detectScriptMutation(diff: string): { mutated: boolean; reason?:
       }
     }
     // tsconfig: only flag changes to verification-WEAKENING keys.
-    if (inTsconfig) {
+    // But NOT for new files — a new tsconfig can't weaken an existing one.
+    if (inTsconfig && !isNewFile) {
       const changed = line.startsWith("+") || line.startsWith("-");
       if (changed) {
         const body = line.slice(1);
