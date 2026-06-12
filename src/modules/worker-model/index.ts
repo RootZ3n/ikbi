@@ -91,3 +91,15 @@ export {
 export { critic } from "./critic.js";
 export { verifier } from "./verifier.js";
 export { integrator } from "./integrator.js";
+
+// Candidate tournament (#tournament)
+export {
+  runTournament,
+  type CandidateSpec,
+  type CandidateRun,
+  type ShadowVerification,
+  type TournamentEngine,
+  type TournamentEvent,
+  type TournamentReceipt,
+  type TournamentReceiptCandidate,
+} from "./tournament.js";

@@ -71,6 +71,21 @@ export const workerCompetitiveCompleted = defineEvent<{ taskId: string; candidat
   "worker.competitive.completed",
 );
 
+// ── candidate tournament mode (#tournament) — counts + winner/shadow ids, no candidate detail ──
+
+/** A tournament started — N candidate workspaces about to race independently. (Attribution: parent.) */
+export const workerTournamentStarted = defineEvent<{ taskId: string; candidateCount: number }>("worker.tournament.started");
+
+/** The deterministic judge picked a winner (or null = fail-closed). (Attribution: parent.) */
+export const workerTournamentJudged = defineEvent<{ taskId: string; candidateCount: number; winnerWorkspaceId: string | null }>(
+  "worker.tournament.judged",
+);
+
+/** A tournament finished — winner replayed into the shadow, verified, and promoted/discarded. (Attribution: parent.) */
+export const workerTournamentCompleted = defineEvent<{ taskId: string; winnerWorkspaceId: string | null; shadowWorkspaceId?: string; promoted: boolean }>(
+  "worker.tournament.completed",
+);
+
 /** The iterative fix loop completed — how many fix iterations ran and whether it succeeded. (Attribution: parent.) */
 export const workerFixLoopCompleted = defineEvent<{ taskId: string; fixIterations: number; success: boolean; lastErrors?: string }>(
   "worker.fix_loop.completed",

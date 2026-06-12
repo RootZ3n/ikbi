@@ -107,6 +107,16 @@ export interface WorkerTask {
    *   routed here. When absent, the orchestrator resolves the lane from IKBI_BUILDER_MODE.
    */
   readonly builderMode?: "agent" | "patch";
+  /**
+   * TOURNAMENT candidate models (the candidate-tournament decision #tournament). When present and
+   * non-empty, the orchestrator runs a CANDIDATE TOURNAMENT instead of the single-workspace path:
+   * each listed model independently attempts this task in its OWN isolated workspace, ikbi verifies
+   * + scores ALL of them deterministically (no model judge), and the WINNER's diff is replayed into
+   * a CLEAN shadow workspace and re-verified before the EXISTING promote path runs. Models propose;
+   * ikbi verifies + scores; one winner; no model-to-model communication; no merging. When absent,
+   * the orchestrator resolves the candidate list from IKBI_CANDIDATE_MODELS (empty ⇒ no tournament).
+   */
+  readonly candidates?: readonly string[];
 }
 
 /** The result a single role produces. */

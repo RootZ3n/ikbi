@@ -56,6 +56,8 @@ import type { DependencyInstall } from "../dependency-install/contract.js";
 
 import { builder, createBuilder, MAX_TOOL_ITERATIONS } from "./builder.js";
 import { createPatchsmith } from "./patchsmith.js";
+import { runTournament } from "./tournament.js";
+import type { CandidateRun, CandidateSpec, ShadowVerification, TournamentEngine, TournamentEvent } from "./tournament.js";
 import { resolveChecks, resolveCheckTimeoutMs, workingTreePackageJsonDiff, workingTreePlanningDiff } from "./checks.js";
 import { builderModel, competitiveBuilderModels } from "./role-models.js";
 import { createCritic, critic } from "./critic.js";
@@ -66,6 +68,7 @@ import { resolveRetrievalMode, resolveVerificationMode } from "./modes.js";
 import type { ProjectRetrievalApi } from "../project-retrieval/index.js";
 import {
   type BuilderMode,
+  MAX_CANDIDATE_MODELS,
   MAX_COMPETITIVE_N,
   MIN_COMPETITIVE_N,
   workerModelConfig,
@@ -75,6 +78,9 @@ import {
   workerCompetitiveCompleted,
   workerCompetitiveJudged,
   workerCompetitiveStarted,
+  workerTournamentStarted,
+  workerTournamentJudged,
+  workerTournamentCompleted,
   workerApprovalRequested,
   workerApprovalResolved,
   workerBuilderActivity,
@@ -363,6 +369,18 @@ export interface OrchestratorDeps {
   /** The head-to-head competitive model list. Default: config (IKBI_COMPETITIVE_MODELS). */
   readonly competitiveModels?: readonly string[];
   /**
+   * The TOURNAMENT candidate model list. Default: the task's own `candidates`, else config
+   * (IKBI_CANDIDATE_MODELS). A non-empty list takes the candidate-tournament path (#tournament).
+   */
+  readonly candidateModels?: readonly string[];
+  /**
+   * Apply a unified diff into a CLEAN workspace and commit it (the tournament's SHADOW REPLAY).
+   * Default: a governed `git apply` + commit (see `defaultApplyDiff`). Injectable for tests so the
+   * tournament's shadow-replay can be driven without a real worktree. Returns whether the diff both
+   * applied AND produced a committed change (an empty/failed apply ⇒ `applied: false`).
+   */
+  readonly applyDiff?: (workspace: WorkspaceHandle, diff: string) => Promise<{ applied: boolean; reason?: string }>;
+  /**
    * Enforce the fail-closed PROJECT-ROOT GUARD (Fix 1) + per-target check set (Fix 2) on the
    * REAL verifier/builder this run constructs: when true, both are wired with the live
    * `resolveChecks`, so a worktree with no project of its own (or whose nearest manifest is an
@@ -530,6 +548,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   // listed model; otherwise every candidate uses the single builder model (old behavior).
   const singleBuilderModel = deps.builderModel ?? builderModel();
   const competitiveModelList = deps.competitiveModels ?? competitiveBuilderModels();
+  // TOURNAMENT candidate models (deps → config). A task's own `candidates` overrides both at run().
+  const candidateModelList = deps.candidateModels ?? config.candidateModels ?? [];
 
   /**
    * A per-run COSTING engine: wraps `invokeModel` so every call across all roles (and
@@ -816,6 +836,17 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       throw new WorkerError("identity", "run requires an OperationContext carrying a validated identity");
     }
     const parentIdentity = parentCtx.identity.identity;
+
+    // CANDIDATE TOURNAMENT MODE (#tournament, default OFF). When the task (or config) names
+    // candidate models, race them independently, verify + score all, replay the WINNER's diff into
+    // a clean shadow workspace, re-verify, then take the existing promote path. Takes precedence
+    // over competitive. Byte-unchanged when no candidate models are configured.
+    const taskCandidates = task.candidates !== undefined && task.candidates.length > 0 ? task.candidates : candidateModelList;
+    if (taskCandidates.length > 0) {
+      const mode = resolveBuilderMode(task);
+      const specs: CandidateSpec[] = taskCandidates.slice(0, MAX_CANDIDATE_MODELS).map((model) => ({ model, mode }));
+      return runTournament(task, parentCtx, specs, makeTournamentEngine(task, parentCtx, parentIdentity));
+    }
 
     // COMPETITIVE BUILD MODE (default OFF). When on, take the N-workspace path and
     // return; otherwise fall through to the single-workspace path below — BYTE-UNCHANGED.
@@ -1482,6 +1513,165 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       events.publish(workerFailed.create({ taskId: task.taskId, reason: retained.reason, ...(retained.retained !== undefined ? { workspaceId: retained.retained.id } : handles[0] !== undefined ? { workspaceId: handles[0].id } : {}) }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
       throw err;
     }
+  }
+
+  // ── CANDIDATE TOURNAMENT MODE (#tournament) ─────────────────────────────────
+
+  /** Map a tournament lifecycle event onto the event bus (parent attribution). */
+  function emitTournamentEvent(task: WorkerTask, parentIdentity: AgentIdentity, ev: TournamentEvent): void {
+    const attribution = { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.tournament", runId: task.taskId } };
+    switch (ev.kind) {
+      case "started":
+        events.publish(workerTournamentStarted.create({ taskId: task.taskId, candidateCount: ev.candidateCount }, attribution));
+        break;
+      case "judged":
+        events.publish(workerTournamentJudged.create({ taskId: task.taskId, candidateCount: ev.candidateCount, winnerWorkspaceId: ev.winnerWorkspaceId }, attribution));
+        break;
+      case "completed":
+        events.publish(workerTournamentCompleted.create({ taskId: task.taskId, winnerWorkspaceId: ev.winnerWorkspaceId, ...(ev.shadowWorkspaceId !== undefined ? { shadowWorkspaceId: ev.shadowWorkspaceId } : {}), promoted: ev.promoted }, attribution));
+        if (ev.shadowWorkspaceId !== undefined) {
+          events.publish(workerCompleted.create({ taskId: task.taskId, outcome: ev.promoted ? "success" : "partial", promoted: ev.promoted, workspaceId: ev.shadowWorkspaceId, ...(verificationMode !== undefined ? { verificationMode } : {}) }, attribution));
+        }
+        break;
+      case "failed":
+        events.publish(workerFailed.create({ taskId: task.taskId, reason: ev.reason, ...(ev.workspaceId !== undefined ? { workspaceId: ev.workspaceId } : {}) }, attribution));
+        break;
+    }
+  }
+
+  /**
+   * DEFAULT shadow-replay applier: apply the winner's unified diff into a clean workspace via a
+   * GOVERNED `git apply` (the same governed-exec the verifier routes its checks through — defense in
+   * depth, auditable), then COMMIT it so the shadow's scratch branch advances and the existing
+   * promote path sees the change. An empty diff, a failed apply, or a no-op commit ⇒ `applied: false`
+   * (the tournament then fails closed). Git-mutation governance still applies: `git apply` is
+   * allowlisted but cannot redirect the worktree (the `-C`/`--work-tree` flags are denied upstream).
+   */
+  async function defaultApplyDiff(parentCtx: OperationContext, workspace: WorkspaceHandle, diff: string, goal: string): Promise<{ applied: boolean; reason?: string }> {
+    if (diff.trim().length === 0) return { applied: false, reason: "winner produced an empty diff" };
+    const gov = govExecForRoles ?? (await import("../governed-exec/index.js")).governedExec;
+    const os = await import("node:os");
+    const fs = await import("node:fs/promises");
+    const path = await import("node:path");
+    const patchPath = path.join(os.tmpdir(), `ikbi-tournament-${workspace.id}.patch`);
+    await fs.writeFile(patchPath, diff.endsWith("\n") ? diff : `${diff}\n`, "utf8");
+    try {
+      const res = await gov.run({ parentCtx, command: "git", args: ["apply", "--whitespace=nowarn", patchPath], cwd: workspace.path, purpose: "tournament: shadow replay (git apply)" });
+      if (!res.executed || res.exitCode !== 0) {
+        const detail = res.reason ?? res.stderrTail ?? `git apply exited ${res.exitCode ?? "unknown"}`;
+        return { applied: false, reason: detail };
+      }
+      const committed = workspaces.commit !== undefined ? await workspaces.commit(workspace, `ikbi: ${goal}`) : false;
+      if (!committed) return { applied: false, reason: "diff applied but produced no committed change" };
+      return { applied: true };
+    } catch (err) {
+      return { applied: false, reason: err instanceof Error ? err.message : String(err) };
+    } finally {
+      await fs.rm(patchPath, { force: true }).catch(() => {});
+    }
+  }
+
+  /**
+   * Build the TournamentEngine for ONE run, bound to its task + identity. Reuses the SAME dispatch /
+   * spawn / verifier / judge / promote closures the other modes use, so the tournament inherits the
+   * #10 trust clamp, the governed verifier, and the H5 fail-closed promote unchanged. One costing
+   * engine is shared across every candidate + the shadow.
+   */
+  function makeTournamentEngine(task: WorkerTask, parentCtx: OperationContext, parentIdentity: AgentIdentity): TournamentEngine {
+    const { engine: runEngine, cost: runCost } = makeCostingEngine();
+
+    const allocate = async (label: string): Promise<WorkspaceHandle | null> => {
+      try {
+        return await workspaces.allocate({
+          targetRepo: task.targetRepo,
+          identity: parentIdentity,
+          ...(task.baseBranch !== undefined ? { baseBranch: task.baseBranch } : {}),
+          label,
+        });
+      } catch {
+        return null; // a candidate whose allocation fails is skipped (the others continue).
+      }
+    };
+
+    const runCandidate = async (t: WorkerTask, ws: WorkspaceHandle, spec: CandidateSpec): Promise<CandidateRun> => {
+      // Each candidate scouts + builds + verifies in ITS OWN worktree — fully isolated, never seeing
+      // another candidate's workspace or output (no model-to-model communication).
+      const scoutResult = await dispatchRole("scout", spawnRole("scout", parentCtx), t, ws, [], parentCtx, runEngine);
+      const candidateBuilder = builderForModel(parentCtx, spec.model, spec.mode);
+      const builderResult = await dispatchRole("builder", spawnRole("builder", parentCtx), t, ws, [scoutResult], parentCtx, runEngine, candidateBuilder);
+      let verifierResult: RoleResult | undefined;
+      const verifierSpawn = spawnRole("verifier", parentCtx);
+      if (builderResult.outcome === "success") {
+        verifierResult = await dispatchRole("verifier", verifierSpawn, t, ws, [scoutResult, builderResult], parentCtx, runEngine);
+      }
+      // COMMIT verified work so the candidate's diff is the clean committed range — that range is
+      // both what the judge scores (diffLines) and what gets replayed into the shadow if it wins.
+      if (verifierResult?.outcome === "success" && verifierSpawn.autonomy.autoCommit && workspaces.commit !== undefined) {
+        await workspaces.commit(ws, `ikbi: ${t.goal}`);
+      }
+      const diffText = workspaces.diff !== undefined ? await workspaces.diff(ws).catch(() => "") : "";
+      const candidate = buildCandidate(ws, builderResult, verifierResult, await safeDiffLines(ws));
+      const roles = [scoutResult, builderResult, ...(verifierResult !== undefined ? [verifierResult] : [])];
+      return { spec, workspace: ws, roles, candidate, diff: diffText };
+    };
+
+    const verifyShadow = async (t: WorkerTask, ws: WorkspaceHandle): Promise<ShadowVerification> => {
+      const verifierResult = await dispatchRole("verifier", spawnRole("verifier", parentCtx), t, ws, [], parentCtx, runEngine);
+      const verdict = (verifierResult.detail as { verdict?: unknown } | undefined)?.verdict;
+      const pass = verifierResult.outcome === "success" && verdict === "pass";
+      return { pass, roles: [verifierResult], ...(pass ? {} : { reason: verifierResult.summary ?? "shadow verifier did not pass" }) };
+    };
+
+    const promote = async (t: WorkerTask, ws: WorkspaceHandle, roleResults: readonly RoleResult[], composite: number): Promise<{ promoted: boolean; reason?: string; conflicts?: readonly string[] }> => {
+      // H5 FAIL-CLOSED: a promote REQUIRES gate-wall authorization — no gate-wall ⇒ DENY.
+      if (gateWall === undefined) return { promoted: false, reason: "gate-wall not wired — promote denied (fail-closed)" };
+      const governanceGrant = autonomyForTier(asTier(parentIdentity.trustTier ?? TRUST_FLOOR, TRUST_FLOOR));
+      const governance: PromoteGovernance = await gateWall.evaluate({ grant: governanceGrant, action: { kind: "promote", task: t, results: [...roleResults] }, identity: parentIdentity });
+      if (!governance.allow) return { promoted: false, reason: governance.reason ?? "gate-wall denied promotion" };
+      const result = await workspaces.promote(ws, {
+        evaluation: { approved: true, score: composite, evaluatorId: "deterministic-judge" },
+        governance,
+        message: `worker-model (tournament): ${t.goal}`,
+      });
+      return {
+        promoted: result.promoted,
+        ...(result.reason !== undefined ? { reason: result.reason } : {}),
+        ...(result.conflicts !== undefined ? { conflicts: result.conflicts } : {}),
+      };
+    };
+
+    return {
+      ...(verificationMode !== undefined ? { verificationMode } : {}),
+      allocate,
+      runCandidate,
+      judge: (candidates) => judge.judge(candidates),
+      applyDiff: async (ws, diff) => (deps.applyDiff !== undefined ? deps.applyDiff(ws, diff) : defaultApplyDiff(parentCtx, ws, diff, task.goal)),
+      verifyShadow,
+      promote,
+      discard: async (ws) => safeDiscard(workspaces, ws),
+      retain: async (ws, reason) => (retainFailedWorkspaces && workspaces.retain !== undefined ? safeRetain(workspaces, ws, reason) : safeDiscard(workspaces, ws)),
+      recordReceipt: async (receipt) => {
+        await receipts.append(
+          {
+            operation: "worker.tournament",
+            outcome: { status: receipt.promoted ? "success" : "failure", ...(receipt.reason !== undefined ? { detail: receipt.reason } : {}) },
+            requestId: task.taskId,
+            metadata: {
+              taskId: task.taskId,
+              candidates: receipt.candidates,
+              winner: receipt.winner,
+              shadow: receipt.shadow,
+              promoted: receipt.promoted,
+            },
+            project: task.targetRepo,
+          },
+          parentIdentity,
+        );
+      },
+      cost: runCost,
+      killed: async () => killHalt(task, parentIdentity, parentCtx),
+      emit: (ev) => emitTournamentEvent(task, parentIdentity, ev),
+    };
   }
 
   return { run, spawnRole };

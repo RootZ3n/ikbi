@@ -44,6 +44,25 @@ export function loadBuilderMode(env: NodeJS.ProcessEnv = configEnv): BuilderMode
   return raw === "patch" ? "patch" : raw === "agent" ? "agent" : DEFAULT_BUILDER_MODE;
 }
 
+/**
+ * Resolve the TOURNAMENT candidate model list from `IKBI_CANDIDATE_MODELS` (bare, comma-separated).
+ * Read at the un-prefixed env name because, like IKBI_BUILDER_MODE / IKBI_COMPETITIVE_MODELS, it is
+ * an operator-facing switch, not a worker-model sub-knob. A non-empty list ENABLES the candidate
+ * tournament: each listed model races independently, ikbi verifies + scores all of them, and the
+ * winner's diff is replayed into a clean shadow workspace (re-verified) before the existing promote
+ * path. Empty/absent ⇒ no tournament (the single-workspace / competitive paths are byte-unchanged).
+ * Capped at MAX_CANDIDATE_MODELS to bound cost + disk (one isolated worktree per candidate + shadow).
+ */
+export function loadCandidateModels(env: NodeJS.ProcessEnv = configEnv): readonly string[] {
+  const raw = (env.IKBI_CANDIDATE_MODELS ?? "").trim();
+  if (raw.length === 0) return [];
+  const list = raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  return Object.freeze(list.slice(0, MAX_CANDIDATE_MODELS));
+}
+
 /** Default per-role wall-clock budget (ms) — a named constant, not a magic number. */
 export const DEFAULT_ROLE_TIMEOUT_MS = 300_000; // 5 minutes
 /** Default concurrent-run cap (concurrency feature deferred; safe default 1). */
@@ -52,6 +71,8 @@ export const DEFAULT_MAX_CONCURRENT_RUNS = 1;
 export const DEFAULT_COMPETITIVE_N = 2;
 export const MIN_COMPETITIVE_N = 2;
 export const MAX_COMPETITIVE_N = 4;
+/** Tournament candidate cap — one isolated worktree per candidate (+ one shadow), so bound it. */
+export const MAX_CANDIDATE_MODELS = 6;
 
 export interface WorkerModelConfig {
   /** When false, `run` throws WorkerError("disabled") (opt-in substrate). */
@@ -95,6 +116,15 @@ export interface WorkerModelConfig {
    * Optional in the type so pre-existing config literals stay valid; the loader always sets it.
    */
   readonly builderMode?: BuilderMode;
+  /**
+   * The TOURNAMENT candidate model list (IKBI_CANDIDATE_MODELS). A non-empty list enables the
+   * candidate tournament path: N models race independently, ikbi verifies + scores all of them
+   * deterministically, and the winner's diff is REPLAYED into a clean shadow workspace and
+   * re-verified before the existing promote path runs. Empty/absent ⇒ no tournament (the
+   * single-workspace / competitive paths are byte-unchanged). Optional in the type so pre-existing
+   * config literals stay valid; the loader always sets it (to [] when unset).
+   */
+  readonly candidateModels?: readonly string[];
 }
 
 /** Load the worker-model config slice from `IKBI_WORKER_MODEL_*`. */
@@ -109,6 +139,7 @@ export function loadWorkerModelConfig(reader = env): WorkerModelConfig {
     penalizeTimeouts: reader.bool("PENALIZE_TIMEOUTS", false),
     fixLoop: reader.bool("FIX_LOOP", false),
     builderMode: loadBuilderMode(),
+    candidateModels: loadCandidateModels(),
   });
 }
 
