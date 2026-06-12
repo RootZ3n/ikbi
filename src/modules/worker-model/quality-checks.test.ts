@@ -200,4 +200,13 @@ describe("quality-checks", () => {
     assert.equal(result.issues.length, 1, "only one issue (bad_location), not empty_file too");
     assert.equal(result.issues[0]!.kind, "bad_location");
   });
+
+  // ── .d.ts exclusion ───────────────────────────────────────────────────────
+
+  test("L4: .d.ts files with only triple-slash directives are NOT flagged as stubs", () => {
+    writeFile("src/vite-env.d.ts", '/// <reference types="vite/client" />\n');
+    const result = runQualityChecks(TEST_WS, ["src/vite-env.d.ts"]);
+    assert.equal(result.pass, true, "vite-env.d.ts should pass — it's a type declaration, not a stub");
+    assert.equal(result.issues.length, 0);
+  });
 });

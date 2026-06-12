@@ -55,7 +55,11 @@ const BLOCKED_DIRS: readonly string[] = [
  *  - Only empty exports (export {}; or export default {};)
  *  - Content that is exclusively TODO/FIXME/HACK/XXX placeholder text
  */
-function isStubContent(content: string): boolean {
+function isStubContent(content: string, filePath?: string): boolean {
+  // .d.ts files are type declarations — triple-slash directives and ambient types are
+  // legitimate content, not stubs. Skip stub detection for declaration files.
+  if (filePath !== undefined && filePath.endsWith(".d.ts")) return false;
+
   // Strip: block comments, line comments, shebang, empty lines, whitespace
   const stripped = content
     .replace(/\/\*[\s\S]*?\*\//g, "") // block comments
@@ -159,7 +163,7 @@ export function runQualityChecks(
       const textExts = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".md", ".yaml", ".yml", ".css", ".scss", ".html", ".vue", ".svelte"];
       if (textExts.includes(ext)) {
         const content = readFileSync(fullPath, "utf8");
-        if (content.trim().length > 0 && isStubContent(content)) {
+        if (content.trim().length > 0 && isStubContent(content, relPath)) {
           issues.push({
             kind: "stub_file",
             file: relPath,
