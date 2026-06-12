@@ -732,12 +732,14 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
           // WRITE SCOPE: reject writes to existing files when scope is "new_only" or "none"
           if (writeScope === "none") {
             rejectedToolCalls.push({ tool: "write_file", path: c.rel, error: "write_scope is 'none' — read-only mode" });
-            return `ERROR: WRITE SCOPE VIOLATION — you are in read-only mode. Cannot write to ${c.rel}.`;
+            // ACTIONABLE (Principle 3): one clear next move, not an explanation of why.
+            return `ERROR: This task is read-only — do not write files. Inspect with read_file, then call done.`;
           }
           if (writeScope === "new_only" && existsSync(c.full)) {
             log.info({ path: c.rel, writeScope, full: c.full }, "WRITE SCOPE BLOCKED write_file on existing file");
             rejectedToolCalls.push({ tool: "write_file", path: c.rel, error: "write_scope is 'new_only' — cannot modify existing file" });
-            return `ERROR: WRITE SCOPE VIOLATION — you may only CREATE new files, not modify existing ones. ${c.rel} already exists. Use read_file to inspect it.`;
+            // ACTIONABLE: tell it what TO do (create a new file), not just what it did wrong.
+            return `ERROR: ${c.rel} already exists and this task only allows NEW files. Pick a new path and call write_file again.`;
           }
           // DEPENDENCY GUARD: never allow writes into node_modules, .git, dist, or similar
           const BLOCKED_PATHS = ["node_modules/", ".git/", "dist/", ".next/", ".cache/"];
@@ -745,7 +747,8 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
           if (BLOCKED_PATHS.some((bp) => relPath.startsWith(bp) || relPath.includes(`/${bp}`))) {
             log.warn({ path: c.rel }, "DEPENDENCY GUARD BLOCKED write to dependency/build directory");
             rejectedToolCalls.push({ tool: "write_file", path: c.rel, error: `cannot write to dependency directory: ${c.rel}` });
-            return `ERROR: Cannot write to ${c.rel} — dependency/build directories are off-limits. Create files in src/, scripts/, docs/, or other project directories instead.`;
+            // ACTIONABLE: name the directory to use instead, first.
+            return `ERROR: Write to src/ (or scripts/, docs/) instead — ${c.rel} is a build/dependency directory and is off-limits.`;
           }
           // PRINCIPLE 1: READ-BEFORE-WRITE. Overwriting an EXISTING file the builder has never read
           // (and never wrote this run) is the #1 cheap-model failure — it hallucinates the file's
@@ -756,7 +759,10 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
           if (existsSync(c.full) && !filesRead.includes(c.rel) && !filesWritten.includes(c.rel)) {
             log.info({ path: c.rel }, "READ-BEFORE-WRITE BLOCKED write_file on an unread existing file");
             rejectedToolCalls.push({ tool: "write_file", path: c.rel, error: "write before read — existing file not read this session" });
-            return `ERROR: READ-BEFORE-WRITE — ${c.rel} already exists but you have not read it this session. Call read_file('${c.rel}') FIRST so you do not clobber its contents, then write_file with the full corrected content (for a small change, prefer the patch tool).`;
+            // ACTIONABLE (Principle 3): lead with the exact next call, not the rationale. A cheap
+            // model that hit this guard, got a paragraph, and gave up is the #1 "reads but never
+            // writes" failure — a one-line "do X next" lets it recover and proceed to the write.
+            return `ERROR: First call read_file('${c.rel}'), then call write_file('${c.rel}', ...) again. (${c.rel} exists — read it first so you don't overwrite it blindly. For a small change, use patch instead.)`;
           }
           log.info({ path: c.rel, writeScope, exists: existsSync(c.full) }, "write_file ALLOWED");
           const content = typeof args.content === "string" ? args.content : "";
@@ -795,7 +801,8 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
           if (writeScope === "none" || writeScope === "new_only") {
             const targetPath = String(args.path ?? "");
             rejectedToolCalls.push({ tool: "patch", path: targetPath, error: `write_scope is '${writeScope}' — cannot modify existing files` });
-            return `ERROR: WRITE SCOPE VIOLATION — write scope is '${writeScope}'. Patch on ${targetPath} is forbidden. You may only create new files.`;
+            // ACTIONABLE: point at the allowed move (a new file), not the violation.
+            return `ERROR: Create a NEW file with write_file instead — this task does not allow editing existing files like ${targetPath}.`;
           }
           const res = runPatch(worktreeReal, args);
           if (res.rejection !== undefined) rejectedToolCalls.push(res.rejection);
@@ -841,13 +848,15 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       const cmd = String(args.command ?? "");
       if (writeScope === "none") {
         rejectedToolCalls.push({ tool: "terminal", path: cmd.slice(0, 100), error: "write_scope is 'none' — terminal is forbidden in read-only mode" });
-        return `ERROR: WRITE SCOPE VIOLATION — you are in read-only mode. Terminal is forbidden. Use read_file and search_files for inspection.`;
+        // ACTIONABLE: name the tools to use instead.
+        return `ERROR: Use read_file and search_files instead — this task is read-only, so terminal is off.`;
       }
       if (writeScope === "new_only") {
         const writePatterns = />\s*[^&|;]+|>>\s*[^&|;]+|\btee\b|\bcp\b.*[^|]\s|\bmv\b|\brm\b|\bsed\s+-i\b|\bnode\b.*writeFile|\bpython.*open\(.*['"]w['"]|\becho\b.*>|\binstall\b|\bdd\b|\btruncate\b|\bln\b|\bgit\s+apply\b|\bpatch\s+</;
         if (writePatterns.test(cmd)) {
           rejectedToolCalls.push({ tool: "terminal", path: cmd.slice(0, 100), error: `write_scope is '${writeScope}' — terminal write commands are forbidden` });
-          return `ERROR: WRITE SCOPE VIOLATION — write scope is '${writeScope}'. Terminal command that writes files is forbidden: ${cmd.slice(0, 100)}`;
+          // ACTIONABLE: redirect to the allowed write path (write_file for new files).
+          return `ERROR: Use write_file to create new files instead — terminal commands that modify files are off for this task.`;
         }
       }
       const tokens = tokenizeCommand(cmd);
@@ -981,7 +990,8 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       // SUBSTANCE check 1: you cannot claim done without reading anything back.
       if (filesReadBack.length === 0) {
         rejectedToolCalls.push({ tool: "done", error: "self-check filesReadBack is empty" });
-        return { accept: false, feedback: "ERROR: your done self-check must read back the file(s) you changed before claiming done — filesReadBack is empty." };
+        // ACTIONABLE (Principle 3): one next move.
+        return { accept: false, feedback: "Do this next: read_file each file you changed, then call done again with those paths in filesReadBack." };
       }
       // SUBSTANCE check 2: the read-back must include every file you actually WROTE.
       const missing = filesWritten.filter((f) => !filesReadBack.includes(f));
@@ -989,27 +999,27 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         rejectedToolCalls.push({ tool: "done", error: `self-check did not read back written files: ${missing.join(", ")}` });
         return {
           accept: false,
-          feedback: `ERROR: your self-check must read back the files you changed: [${filesWritten.join(", ")}]; you reported reading back: [${filesReadBack.join(", ")}]. Re-read the missing file(s) and call done again.`,
+          feedback: `Do this next: read_file these file(s) — ${missing.join(", ")} — then call done again with them in filesReadBack.`,
         };
       }
       // THE INDEPENDENT-SIGNAL GATE: done requires a GREEN run_checks (the verifier's exact
       // checks). A confident-wrong self-judgment cannot finish against a red check.
       if (lastChecks === undefined) {
         rejectedToolCalls.push({ tool: "done", error: "done before run_checks" });
-        return { accept: false, feedback: "You must call run_checks before done. Call run_checks now to verify your changes, then call done only after the checks all pass." };
+        return { accept: false, feedback: "Do this next: call run_checks. After every check passes, call done." };
       }
       // PRINCIPLE 4(b): run_checks must POST-DATE your last edit. A write/patch after the last
       // run_checks makes that green STALE — the checks no longer reflect the file on disk. Re-run.
       if (checksStale) {
         rejectedToolCalls.push({ tool: "done", error: "checks stale — wrote files after the last run_checks" });
-        return { accept: false, feedback: "ERROR: you changed files AFTER your last run_checks, so the result is stale and no longer reflects the code on disk. Call run_checks again to verify the current state, then call done." };
+        return { accept: false, feedback: "Do this next: call run_checks again (you edited files after the last check), then call done." };
       }
       if (!lastChecks.allPass) {
         const failed = lastChecks.checks.filter((c) => c.exitCode !== 0).map((c) => c.name);
         rejectedToolCalls.push({ tool: "done", error: `checks not green (failed: ${failed.join(", ") || "none ran"})` });
         return {
           accept: false,
-          feedback: `ERROR: the checks are not passing (failed: ${failed.join(", ") || "checks did not run"}). Fix the cause and run_checks again until all pass, then call done.`,
+          feedback: `Do this next: fix the failing check(s) — ${failed.join(", ") || "checks did not run"} — then call run_checks until all pass, then call done.`,
         };
       }
       return {
