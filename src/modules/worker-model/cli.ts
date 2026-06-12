@@ -560,11 +560,43 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
 
     const task: WorkerTask = { taskId: id, targetRepo, goal: finalGoal, writeScope: detectWriteScope(finalGoal) };
 
+    // STEP-PLANNER: decompose complex goals into atomic steps for cheap models.
+    const { decompose } = await import("../step-planner/index.js");
+    const stepPlan = decompose(finalGoal);
+
     // SG-5: with --verbose, stream the build's structured progress events (per-role start/end,
     // builder tool activity, verification status) live as they fire.
     const sub = verbose === true ? eventBus.subscribe({ typePrefix: "worker." }, (e) => out(formatProgressEvent(e))) : undefined;
     try {
-      const result = await orchestrator.run(task, ctx);
+      let result: WorkerResult;
+
+      if (stepPlan.decomposed && stepPlan.steps.length > 1) {
+        // MULTI-STEP: run each step sequentially through the orchestrator.
+        // Changes accumulate in the same workspace across steps.
+        out(`  ↳ decomposed into ${stepPlan.steps.length} steps\n`);
+        let lastResult: WorkerResult | undefined;
+        for (const step of stepPlan.steps) {
+          out(`  → step ${step.index}/${stepPlan.steps.length}: ${step.goal}\n`);
+          const stepTask: WorkerTask = {
+            taskId: `${id}:step${step.index}`,
+            targetRepo,
+            goal: step.goal,
+            writeScope: detectWriteScope(step.goal),
+          };
+          lastResult = await orchestrator.run(stepTask, ctx);
+          if (lastResult.outcome !== "success") {
+            out(`  ✗ step ${step.index} failed: ${lastResult.reason ?? lastResult.outcome}\n`);
+            result = lastResult;
+            break;
+          }
+          out(`  ✓ step ${step.index} passed\n`);
+        }
+        // If all steps passed, use the last result.
+        result = lastResult!;
+      } else {
+        // SINGLE-STEP: run directly.
+        result = await orchestrator.run(task, ctx);
+      }
       if (sub !== undefined) await eventBus.flush(); // drain the progress lines before the summary
       // A gate denial / non-promote is a CLEAN outcome (printed), not an error.
       out(summarize(result));
