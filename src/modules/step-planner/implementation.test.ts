@@ -118,6 +118,27 @@ describe("step-planner", () => {
       assert.equal(plan.steps[0]?.goal, goal, "the original goal is preserved unchanged");
     });
 
+    it("does NOT decompose a LONG (40+ word) single-task goal with multiple 'and's but no sentence boundaries", () => {
+      // The Codex Issue-2 case: a verbose SINGLE task that is well OVER MIN_MULTITASK_WORDS.
+      // A pure word-count gate would have split it; the fix requires ≥2 action-led clauses when
+      // there is no semicolon / numbered list / sequencer word. Only the first clause is
+      // action-led ("Refactor ..."); the rest are continuations ("checks ...", "handles ...",
+      // "returns ..."), so it must stay a single step despite its length.
+      const goal =
+        "Refactor the authentication middleware so that it validates the incoming bearer token " +
+        "and checks the expiry timestamp against the server clock " +
+        "and gracefully handles malformed authorization headers " +
+        "and returns a clear and descriptive error message to the calling client " +
+        "while preserving the existing request logging behavior across every protected route";
+      const wordCount = goal.trim().split(/\s+/).filter(Boolean).length;
+      assert.ok(wordCount >= 40, `the goal is genuinely long (${wordCount} words), defeating a pure word-count gate`);
+      assert.ok(complexityScore(goal) >= 1, "the loose 'and...and' indicator still matches");
+      const plan = decompose(goal);
+      assert.equal(plan.decomposed, false, "length alone does not authorize a split without a sentence boundary");
+      assert.equal(plan.steps.length, 1, "stays a single step");
+      assert.equal(plan.steps[0]?.goal, goal, "the original goal is preserved unchanged");
+    });
+
     it("STILL decomposes a genuine multi-task goal where each clause is an action-led task", () => {
       // Positive control: short, but each "and" clause opens with an imperative action verb —
       // genuinely independent tasks. The guard must let this through.

@@ -50,15 +50,36 @@ function hasStrongSeparator(goal: string): boolean {
 }
 
 /**
+ * SENTENCE BOUNDARY — a softer ordering signal than `hasStrongSeparator`: explicit sequencer
+ * words (first / then / finally / next / lastly / afterwards) that mark genuinely SEPARATE,
+ * ordered sub-tasks. (Semicolons and numbered lists are STRONG separators handled by
+ * `hasStrongSeparator`; this catches the "first do X then do Y" shape that lacks punctuation.)
+ * Without any such boundary, a long run of "and"s is most likely ONE verbose sentence.
+ */
+function hasSentenceBoundary(goal: string): boolean {
+  return /\b(?:first|then|finally|next|lastly|afterwards)\b/i.test(goal);
+}
+
+/**
  * OVER-TRIGGER GUARD (Issue 2). `splitGoal` will happily fragment a verbose SINGLE task whose
- * description merely contains "and" twice. Only treat a split as a genuine decomposition when
- * there is real evidence of multiple INDEPENDENT tasks: a strong structural separator, OR ≥2
- * clauses that each open with an imperative action verb, OR a long goal (≥ MIN_MULTITASK_WORDS,
- * where the conjunction signal alone is allowed). A short goal with weak evidence stays one step.
+ * description merely contains "and" twice — and verbose single tasks are often LONG, so a pure
+ * word-count gate does not save them. Only treat a split as a genuine decomposition when there is
+ * real evidence of multiple INDEPENDENT tasks:
+ *   1. a STRONG structural separator (numbered list / semicolons / comma+sequencer), OR
+ *   2. ≥2 clauses that each open with an imperative action verb (genuine independent tasks), OR
+ *   3. a clear SENTENCE BOUNDARY (sequencer words) *and* the goal clears the word-count FLOOR.
+ *
+ * The word count is a FLOOR (a necessary minimum), never the sole gate: a goal with NO semicolons,
+ * NO numbered list, and NO sequencer words requires ≥2 action-led clauses to split, no matter how
+ * long it is. This is the core of the Codex fix — length alone no longer authorizes a split.
  */
 function looksMultiTask(goal: string, parts: readonly string[]): boolean {
   if (hasStrongSeparator(goal)) return true;
   if (actionLedClauseCount(parts) >= 2) return true;
+  // Only weak conjunction evidence ("and …and") remains. Splitting on it is allowed ONLY when the
+  // goal has a clear sentence boundary AND is long enough — never on length alone, and never when
+  // there is no sentence boundary (those need ≥2 action-led clauses, already handled above).
+  if (!hasSentenceBoundary(goal)) return false;
   const wordCount = goal.trim().split(/\s+/).filter(Boolean).length;
   return wordCount >= MIN_MULTITASK_WORDS;
 }
