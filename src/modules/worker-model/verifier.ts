@@ -209,6 +209,8 @@ export function detectScriptMutation(diff: string): { mutated: boolean; reason?:
   for (const line of diff.split("\n")) {
     // A new file section. `git diff` emits `diff --git a/<p> b/<p>` naming the file.
     if (line.startsWith("diff --git ")) {
+      // Skip node_modules — builder-installed deps are not builder-authored code.
+      if (line.includes("node_modules/")) { inPackageJson = false; inGuardedConfig = false; inTsconfig = false; continue; }
       inPackageJson = /(?:^|\/)package\.json(?:\s|$)/.test(line);
       inGuardedConfig = GUARDED_CONFIG_PATTERNS.some((p) => p.test(line));
       inTsconfig = GUARD_TSCONFIG.test(line);
