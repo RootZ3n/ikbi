@@ -47,6 +47,11 @@ import "./lab-context-memory/index.js";
 import "./capability-client/index.js";
 import "./agent-router/index.js";
 import "./self-observation/index.js";
+// Context-packets + model-evaluation — library-only primitives (byte-budgeted task
+// packets; deterministic benchmark verifiers). No import-time registration; loaded for
+// completeness so the tournament/patchsmith/capability-harness consumers can resolve them.
+import "./context-packets/index.js";
+import "./model-evaluation/index.js";
 // Chat — registers the POST /chat conversational endpoint (persistent sessions + tool loop).
 import "./chat/index.js";
 // Orchestration layer above worker-model (registers the `batch` command on import).
