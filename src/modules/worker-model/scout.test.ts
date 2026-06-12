@@ -10,7 +10,7 @@ import type { UntrustedContext } from "../../core/injection/contract.js";
 import type { ModelRequest, ModelResponse } from "../../core/provider/contract.js";
 import { autonomyForTier } from "../../core/trust/index.js";
 import type { WorkspaceHandle } from "../../core/workspace/contract.js";
-import { createScout, scout, type ScoutFinding } from "./scout.js";
+import { assessGoalFileAlignment, createScout, scout, type ScoutFileEntry, type ScoutFinding } from "./scout.js";
 import type { RoleContext } from "./contract.js";
 import { driverModel } from "./role-models.js";
 import type { ProjectRetrievalApi, RetrievalResult, SelectedFile } from "../project-retrieval/index.js";
@@ -232,4 +232,62 @@ test("FIX#3: legacy selection is goal-aware — goal-relevant files lead the sca
   // widget.ts is the only file matching a goal token ("widget") — it must sort to the front,
   // ahead of the zero-relevance files, regardless of filesystem walk order.
   assert.equal(detail.structure[0]?.path, "widget.ts", "goal-relevant file leads the scanned batch");
+});
+
+// ── FIX#4: CONTEXT-QUALITY tests (the existing suite only proves safety/behavior) ────────
+
+test("FIX#4 quality: the brief contains the target file when the goal names it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-scout-"));
+  writeFileSync(join(dir, "target.ts"), "export const t = 1;");
+  writeFileSync(join(dir, "other.ts"), "export const o = 1;");
+  const { ctx } = makeCtx(dir, async () => modelResponse("- f"), "investigate target.ts");
+
+  const result = await scout(ctx);
+  assert.equal(result.outcome, "success");
+  const detail = result.detail as { brief: string };
+  assert.match(detail.brief, /target\.ts/, "the goal-named target file is present in the brief the builder sees first");
+});
+
+test("FIX#4 quality: assessGoalFileAlignment returns aligned / broad / misaligned correctly", () => {
+  const structure: ScoutFileEntry[] = [
+    { path: "src/auth/login.ts", lines: 20, bytes: 200 },
+    { path: "src/util.ts", lines: 8, bytes: 80 },
+  ];
+
+  const aligned = assessGoalFileAlignment("fix the bug in src/auth/login.ts", structure);
+  assert.equal(aligned.status, "aligned");
+  assert.deepEqual(aligned.matchedFiles, ["src/auth/login.ts"]);
+  assert.deepEqual(aligned.missingFiles, []);
+
+  const broad = assessGoalFileAlignment("make the login flow faster", structure);
+  assert.equal(broad.status, "broad");
+  assert.deepEqual(broad.matchedFiles, []);
+  assert.deepEqual(broad.missingFiles, []);
+
+  const misaligned = assessGoalFileAlignment("edit config.yaml to add a flag", structure);
+  assert.equal(misaligned.status, "misaligned");
+  assert.deepEqual(misaligned.missingFiles, ["config.yaml"]);
+});
+
+test("FIX#4 quality: buildBrief ordering — index mode is relevance-ranked, legacy mode is size-ranked", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-scout-"));
+  writeFileSync(join(dir, "huge.ts"), `// ${"y".repeat(4000)}\nexport const h = 1;`);
+  writeFileSync(join(dir, "tiny.ts"), "export const t = 1;");
+
+  // Legacy mode: Key files ordered by SIZE — huge.ts leads, header says "largest first".
+  const legacy = await scout(makeCtx(dir, async () => modelResponse("- f"), "look around").ctx);
+  const legacyBrief = (legacy.detail as { brief: string }).brief;
+  assert.match(legacyBrief, /Key files \(largest first\)/);
+  assert.ok(legacyBrief.indexOf("huge.ts") < legacyBrief.indexOf("tiny.ts"), "legacy: largest file leads");
+
+  // Index mode: project-retrieval scores tiny.ts above huge.ts — relevance ordering must flip them.
+  const selected: SelectedFile[] = [
+    { path: "huge.ts", bytes: 4000, score: 2, reasons: ["name-match"], why: "weak" },
+    { path: "tiny.ts", bytes: 24, score: 50, reasons: ["goal-path-match"], why: "named in goal" },
+  ];
+  const indexScout = createScout({ retrieval: fakeRetrieval(selected), mode: "index" });
+  const indexed = await indexScout(makeCtx(dir, async () => modelResponse("- f"), "look around").ctx);
+  const indexBrief = (indexed.detail as { brief: string }).brief;
+  assert.match(indexBrief, /Key files \(most relevant first\)/);
+  assert.ok(indexBrief.indexOf("tiny.ts") < indexBrief.indexOf("huge.ts"), "index: most-relevant file leads despite smaller size");
 });
