@@ -138,3 +138,21 @@ test("scout wiring (F4): a retrieval failure falls back LOUDLY — index-fallbac
     rmSync(stateRoot, { recursive: true, force: true });
   }
 });
+
+test("scout wiring: large repo + retrieval failure refuses silent legacy fallback", async () => {
+  const { repo, stateRoot } = makeBigFixture();
+  try {
+    const failing: ProjectRetrievalApi = { retrieve: async () => { throw new Error("index boom"); } };
+    const result = await createScout({
+      env: { IKBI_RETRIEVAL: "index", IKBI_RETRIEVAL_FALLBACK_BLOCK_MIN_FILES: "10" },
+      retrieval: failing,
+    })(makeCtx(repo, "Fix the widget bug"));
+    assert.equal(result.outcome, "failure");
+    assert.match(result.summary ?? "", /large repo/);
+    assert.match(result.summary ?? "", /refusing silent legacy fallback/);
+    assert.match(result.summary ?? "", /index boom/);
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
+  }
+});

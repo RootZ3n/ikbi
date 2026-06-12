@@ -26,6 +26,7 @@ import { trust } from "../core/trust/index.js";
 import { commands } from "./registry.js";
 import { runDoctor } from "./doctor.js";
 import { runCapabilities } from "./capabilities.js";
+import { postureLines } from "./posture.js";
 import { writeStderr, writeStdout } from "./io.js";
 // Core-facing operator commands registered from their own files (read the receipt store /
 // workspace manager). Imported here so registerCommand fires before dispatch.
@@ -156,7 +157,9 @@ async function run(argv: readonly string[]): Promise<void> {
       runInfo("doctor", () => writeStdout(`${runDoctor().lines.join("\n")}\n`));
       return;
     case "capabilities":
-      runInfo("capabilities", () => writeStdout(`${runCapabilities().lines.join("\n")}\n`));
+      // Tool inventory + the shared product posture: which surfaces are core/experimental/dormant,
+      // and which lifecycle guarantees each editing surface actually provides (no overstatement).
+      runInfo("capabilities", () => writeStdout(`${runCapabilities().lines.join("\n")}\n\n${postureLines().join("\n")}\n`));
       return;
     case undefined:
     case "help":

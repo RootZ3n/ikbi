@@ -26,6 +26,7 @@ import {
   resolveVerificationMode,
   safetyPosture,
 } from "../modules/worker-model/modes.js";
+import { postureLines, productPosture } from "./posture.js";
 
 /** The read-only registry surface doctor needs to check role-model resolution. */
 export interface DoctorRegistry {
@@ -110,7 +111,7 @@ export function runDoctor(inp: DoctorInputs = {}): DoctorResult {
   const required: Array<{ ok: boolean; label: string; fix: string }> = [
     { ok: operatorSet, label: "IKBI_OPERATOR_TOKEN", fix: "set it — the operator identity that grants trust / runs operator commands" },
     { ok: workerSet, label: "IKBI_WORKER_TOKEN", fix: "set it — the worker identity that builds run under" },
-    { ok: workerEnabled, label: "IKBI_WORKER_MODEL_ENABLED", fix: "set true — builds are DISABLED until the worker-model substrate is enabled" },
+    { ok: workerEnabled, label: "IKBI_WORKER_MODEL_ENABLED", fix: "set true — builds are DISABLED until the worker-model substrate is enabled (e.g. export IKBI_WORKER_MODEL_ENABLED=true or add IKBI_WORKER_MODEL_ENABLED=true to your service env file)" },
     { ok: execHasPnpm, label: `IKBI_GOVERNED_EXEC_ALLOWLIST (has ${REQUIRED_EXEC})`, fix: `add "${REQUIRED_EXEC}" — the verifier needs it to run tsc/tests` },
     providerEntry,
   ];
@@ -167,6 +168,14 @@ export function runDoctor(inp: DoctorInputs = {}): DoctorResult {
   if (isExplicitLegacyVerify(env) || isExplicitLegacyRetrieval(env)) {
     push(`  ${WARN} a fallback/legacy mode is configured as the DEFAULT via env — the operator has explicitly opted OUT of a hardened path.`);
   }
+
+  // --- PRODUCT SURFACES (classification + lifecycle truth) -----------------
+  // The shared posture object (same one /capabilities, /status, and the HTTP /capabilities
+  // endpoint read) so doctor discloses which surfaces are core vs experimental/dormant and which
+  // lifecycle guarantees each editing surface actually provides — no surface overstates the spine.
+  push("");
+  push("PRODUCT SURFACES");
+  for (const l of postureLines(productPosture({ env }))) push(l);
 
   // --- EGRESS --------------------------------------------------------------
   push("");

@@ -5,6 +5,7 @@
  */
 
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -93,8 +94,33 @@ test("FIX5: /permissions confirm + a 'n' answer blocks the write", async () => {
   const s = new ChatSession("permrepl-2", { invoke, worktree: dir });
   let out = "";
   await runRepl({ session: s, store: store(), readLine: lines(["/permissions confirm", "make an edit", "n", "/exit"]), out: (o) => { out += o; } });
-  assert.match(out, /Allow write_file ask\.ts\? \[Y\/n\]/, "the operator was prompted");
+  assert.match(out, /Allow write_file ask\.ts\? \[y\/N\]/, "the operator was prompted with default-no");
   assert.ok(!existsSync(join(dir, "ask.ts")), "the declined write never happened");
+});
+
+test("FIX5: confirm mode defaults to NO when the operator presses Enter", async () => {
+  const dir = wt();
+  const invoke = queued([toolTurn(call("write_file", { path: "enter.ts", content: "x\n" })), stop("ok")]);
+  const s = new ChatSession("permrepl-enter", { invoke, worktree: dir, permissionMode: "confirm" });
+  let out = "";
+  await runRepl({ session: s, store: store(), readLine: lines(["make an edit", "", "/exit"]), out: (o) => { out += o; } });
+  assert.match(out, /Allow write_file enter\.ts\? \[y\/N\]/);
+  assert.ok(!existsSync(join(dir, "enter.ts")), "blank confirmation denies the mutating tool");
+});
+
+test("BLOCKER2: /diff shows pending git changes and /discard rolls back tracked chat edits", async () => {
+  const dir = wt();
+  execFileSync("git", ["init"], { cwd: dir, stdio: "ignore" });
+  writeFileSync(join(dir, "d.ts"), "old\n");
+  execFileSync("git", ["add", "d.ts"], { cwd: dir, stdio: "ignore" });
+  const invoke = queued([toolTurn(call("write_file", { path: "d.ts", content: "new\n" })), stop("done")]);
+  const s = new ChatSession("diff-discard", { invoke, worktree: dir });
+  let out = "";
+  await runRepl({ session: s, store: store(), readLine: lines(["edit", "/diff", "/discard", "/exit"]), out: (o) => { out += o; } });
+  assert.ok(out.includes("-old"), "diff shows the removed line");
+  assert.ok(out.includes("+new"), "diff shows the added line");
+  assert.match(out, /Discarded: write_file d\.ts/);
+  assert.equal(readFileSync(join(dir, "d.ts"), "utf8"), "old\n");
 });
 
 test("FIX7: /cost surfaces the cache hit rate after a cached turn", async () => {
@@ -112,6 +138,16 @@ test("FIX8: /model hot-swap reports context preserved and switches the model", a
   await runRepl({ session: s, store: store(), readLine: lines(["/model deepseek-chat", "after swap", "/exit"]), out: (o) => { out += o; } });
   assert.match(out, /model switched to deepseek-chat — context preserved \(mimo-v2\.5 → deepseek-chat\)/);
   assert.equal(requests.at(-1)!.model, "deepseek-chat", "the next turn used the swapped model");
+});
+
+test("HIGH3: /model rejects nonexistent models and keeps the current model", async () => {
+  const requests: Array<{ model: string }> = [];
+  const invoke = (async (req: unknown) => { requests.push(req as { model: string }); return stop("ok"); }) as unknown as Invoke;
+  const s = new ChatSession("modelrepl-fake", { invoke, worktree: wt(), model: "mimo-v2.5" });
+  let out = "";
+  await runRepl({ session: s, store: store(), readLine: lines(["/model fake-model-does-not-exist", "after failed swap", "/exit"]), out: (o) => { out += o; } });
+  assert.match(out, /model unavailable: fake-model-does-not-exist/);
+  assert.equal(requests.at(-1)!.model, "mimo-v2.5", "the failed switch did not change the active model");
 });
 
 test("FIX4/5: /help now lists /rollback and /permissions", async () => {

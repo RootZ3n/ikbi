@@ -77,7 +77,9 @@ export function buildServer() {
   // Capabilities — tool inventory and feature flags for Ittunaha/agents.
   app.get("/capabilities", async () => {
     const { runCapabilities } = await import("../cli/capabilities.js");
+    const { productPosture } = await import("../cli/posture.js");
     const caps = runCapabilities();
+    const posture = productPosture({ capabilities: caps });
     return {
       agent: "ikbi",
       tools: caps.builder,
@@ -100,6 +102,14 @@ export function buildServer() {
         chat: caps.chat.length,
         inSync: caps.builderOnly.length === 0 && caps.chatOnly.length === 0,
       },
+      chatSessions: posture.chatSessions,
+      // SEMANTIC LIFECYCLE TRUTH: the guarantees the HTTP /chat coding loop actually provides.
+      // Every flag is false EXCEPT what the path genuinely delivers — a remote agent must not infer
+      // managed-workspace / verification / promote semantics from the tool inventory above.
+      lifecycle: posture.lifecycle.httpChat,
+      // Where each operator-facing surface sits relative to the golden build path.
+      surfaces: posture.classifications,
+      safetyPosture: posture.safety,
     };
   });
 

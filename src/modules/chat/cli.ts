@@ -21,10 +21,12 @@ import { createInterface } from "node:readline";
 
 import { registerCommand } from "../../cli/registry.js";
 import { config } from "../../core/config.js";
+import { registry } from "../../core/provider/index.js";
 import { colorizeDiff } from "../worker-model/cli.js";
 import type { ChatMode, ChatToolActivity } from "./contract.js";
 import { discoverProject, formatOverview } from "./project-discovery.js";
-import { ChatSession, type PermissionMode, type PersistedSession, type RollbackResult, type TurnOptions } from "./session.js";
+import { ChatSession, type ApplyResult, type DiscardOutcome, type PermissionMode, type PersistedSession, type RollbackResult, type TurnOptions, type WorkdirKind } from "./session.js";
+import { allocateSessionWorkspace, reconnectSessionWorkspace, resolveRepoTarget } from "./repl-workspace.js";
 import { persistentStore, PersistentSessionStore, sessionsDir } from "./session-store.js";
 import { defaultBinDir, installLauncher, launcherExists, setupInstructions } from "./shell-integration.js";
 import { addInstruction, clearInstructions, editInstructions, instructionsPath, readInstructions } from "./user-memory.js";
@@ -39,11 +41,26 @@ export interface ReplSession {
   send(userMessage: string, images?: readonly string[], mode?: ChatMode, opts?: TurnOptions): Promise<{ response: string; tools: ChatToolActivity[]; cost?: number; contextPercent?: number }>;
   readonly id?: string;
   readonly worktree?: string;
+  readonly workdirKind?: WorkdirKind;
+  readonly workdirWarning?: string | undefined;
   label?: string | undefined;
   contextPercent?(): number;
   messageCount?(): number;
   currentModel?(): string;
   setModel?(model: string): void;
+  currentPermissionMode?(): PermissionMode;
+  setPermissionMode?(mode: PermissionMode): void;
+  pendingDiff?(): string;
+  // Managed-workspace lifecycle (Phase 2). Optional so a lightweight fake still satisfies ReplSession.
+  isManaged?(): boolean;
+  pendingChangeCount?(): number;
+  getDiff?(): Promise<string>;
+  apply?(message?: string): Promise<ApplyResult>;
+  discardWorkspace?(): Promise<DiscardOutcome>;
+  readonly workspaceId?: string | undefined;
+  readonly targetRepo?: string | undefined;
+  readonly baseBranch?: string | undefined;
+  readonly baseRef?: string | undefined;
   usage?(): { tokensIn: number; tokensOut: number; costUsd: number; cachedTokens?: number; cacheSavedUsd?: number };
   cacheHitPercent?(): number;
   rollback?(n: number): RollbackResult[];
@@ -60,8 +77,8 @@ export interface ReplDeps {
   readonly prompt?: string;
   /** Persistent store for `/sessions` / `/label` / `/delete` (and resume). Optional in tests. */
   readonly store?: PersistentSessionStore;
-  /** Factory for a fresh session (`/reset`). Optional — when absent, `/reset` is unavailable. */
-  readonly newSession?: () => ReplSession;
+  /** Factory for a fresh session (`/reset`). May be async (managed-workspace allocation). Optional. */
+  readonly newSession?: () => ReplSession | Promise<ReplSession>;
 }
 
 /** The mutable per-run state shared with every command handler. */
@@ -73,10 +90,10 @@ interface ReplContext {
   exit: boolean;
   readonly out: (s: string) => void;
   readonly store: PersistentSessionStore | undefined;
-  readonly newSession: (() => ReplSession) | undefined;
+  readonly newSession: (() => ReplSession | Promise<ReplSession>) | undefined;
   /** Read ONE line and resolve true on an affirmative (y/yes) — used by `/reset`. */
   readonly confirm: () => Promise<boolean>;
-  /** Read ONE line as a permission decision; default-YES ([Y/n]) — used by `/permissions confirm`. */
+  /** Read ONE line as a permission decision; default-NO ([y/N]) — used by `/permissions confirm`. */
   readonly confirmTool: (tool: string, target: string) => Promise<boolean>;
 }
 
@@ -91,6 +108,22 @@ interface ReplCommand {
 /** Render a turn's tool activity as a compact one-liner (✗ marks a failed tool). */
 function toolLine(tools: readonly ChatToolActivity[]): string {
   return `  · ${tools.map((t) => `${t.name}${t.ok ? "" : "✗"}`).join(", ")}\n`;
+}
+
+/**
+ * Render a verified `/apply` result (req 3): the verification mode + scope, the checks that ran,
+ * and the failure/triage summary when it did not pass — followed by the apply headline.
+ */
+function renderApply(ctx: ReplContext, r: ApplyResult): void {
+  const v = r.verification;
+  if (v !== undefined) {
+    ctx.out(`verification: ${v.ok ? "PASS" : v.blocked ? "BLOCKED" : v.outcome === "unavailable" ? "UNAVAILABLE" : "FAIL"} — mode=${v.mode}${v.scope !== undefined ? `, scope=${v.scope}` : ""}\n`);
+    if (v.checks.length > 0) ctx.out(`  checks: ${v.checks.map((c) => `${c.name} ${c.ok ? "✓" : "✗"}`).join(", ")}\n`);
+    if (!v.ok && v.blocked && v.blockReasons !== undefined && v.blockReasons.length > 0) ctx.out(`  blocked: ${v.blockReasons.join("; ")}\n`);
+    if (!v.ok && v.triageSummary !== undefined) ctx.out(`  failure: ${v.triageSummary}\n`);
+  }
+  ctx.out(`${r.applied ? "✓ " : ""}${r.summary}\n`);
+  persist(ctx);
 }
 
 const DIM = "\x1b[2m";
@@ -137,6 +170,17 @@ function persist(ctx: ReplContext): void {
   }
 }
 
+function availableModels(): string[] {
+  const configured = config.provider.defaultModels;
+  return [...new Set([configured.driver, configured.builder, configured.critic, ...(configured.competitiveModels ?? []), ...registry.listModels().map((m) => m.id)])].sort();
+}
+
+function isUsableModel(id: string): boolean {
+  const model = registry.getModel(id);
+  if (model === undefined) return false;
+  return model.providers.some((route) => registry.getProvider(route.provider) !== undefined);
+}
+
 // ── the slash-command registry ────────────────────────────────────────────────
 
 const COMMAND_LIST: readonly ReplCommand[] = [
@@ -168,16 +212,36 @@ const COMMAND_LIST: readonly ReplCommand[] = [
   },
   {
     name: "status",
-    description: "Show session info (id, worktree, messages, context, model, mode)",
+    description: "Show session info (id, target repo, workspace, base ref, pending changes, lifecycle)",
     handler: (ctx) => {
       const s = ctx.session;
-      ctx.out(`id:       ${s.id ?? "(in-memory)"}\n`);
-      ctx.out(`worktree: ${s.worktree ?? "(n/a)"}\n`);
-      if (s.label !== undefined && s.label.length > 0) ctx.out(`label:    ${s.label}\n`);
-      ctx.out(`messages: ${s.messageCount !== undefined ? s.messageCount() : "?"}\n`);
-      ctx.out(`context:  ${s.contextPercent !== undefined ? `${s.contextPercent()}%` : "?"}\n`);
-      ctx.out(`model:    ${s.currentModel !== undefined ? s.currentModel() : "?"}\n`);
-      ctx.out(`mode:     ${ctx.mode}\n`);
+      const managed = s.isManaged?.() === true || s.workdirKind === "managed";
+      ctx.out(`id:           ${s.id ?? "(in-memory)"}\n`);
+      // Lifecycle mode FIRST — the most important truth about what editing this session does.
+      const modeLabel =
+        s.workdirKind === "managed" ? (managed ? "managed-workspace (promotable via /apply)" : "managed-workspace (UNAVAILABLE — workspace gone)")
+        : s.workdirKind === "scratch" ? "scratch (NON-PROMOTABLE — copy out manually)"
+        : s.workdirKind === "explicit" ? "explicit (live-direct edits to IKBI_CHAT_WORKDIR)"
+        : "repo (live-direct edits)";
+      ctx.out(`lifecycle:    ${modeLabel}\n`);
+      ctx.out(`target repo:  ${s.targetRepo ?? "(none — not a managed session)"}\n`);
+      ctx.out(`workspace:    ${s.worktree ?? "(n/a)"}\n`);
+      ctx.out(`base ref:     ${s.baseRef !== undefined ? `${s.baseRef.slice(0, 12)} (${s.baseBranch ?? "?"})` : "(n/a)"}\n`);
+      ctx.out(`pending:      ${s.pendingChangeCount !== undefined ? `${s.pendingChangeCount()} file(s) changed` : "?"}\n`);
+      if (s.workdirWarning !== undefined) ctx.out(`warning:      ${s.workdirWarning}\n`);
+      if (s.label !== undefined && s.label.length > 0) ctx.out(`label:        ${s.label}\n`);
+      ctx.out(`messages:     ${s.messageCount !== undefined ? s.messageCount() : "?"}\n`);
+      ctx.out(`context:      ${s.contextPercent !== undefined ? `${s.contextPercent()}%` : "?"}\n`);
+      ctx.out(`model:        ${s.currentModel !== undefined ? s.currentModel() : "?"}\n`);
+      ctx.out(`mode:         ${ctx.mode}\n`);
+      ctx.out(`permissions:  ${ctx.permissionMode}\n`);
+      // Verification truth (Phase 3): managed /apply runs ladder verification BEFORE the governed
+      // promote; scratch/live-direct cannot apply at all.
+      ctx.out(
+        managed
+          ? "note:         managed edits are isolated; /apply runs ladder verification, then promotes ONLY on a pass.\n"
+          : "note:         rollback covers tracked file edits only (not terminal/sub-agent side effects).\n",
+      );
     },
   },
   {
@@ -210,12 +274,17 @@ const COMMAND_LIST: readonly ReplCommand[] = [
         ctx.out(`current model: ${ctx.session.currentModel !== undefined ? ctx.session.currentModel() : "?"}\n`);
         ctx.out(`configured defaults: driver=${dm.driver}, builder=${dm.builder}, critic=${dm.critic}\n`);
         // Available models to switch to (FIX 8): the configured defaults + any competitive list.
-        const available = [...new Set([dm.driver, dm.builder, dm.critic, ...(dm.competitiveModels ?? [])])];
+        const available = availableModels();
         ctx.out(`available: ${available.join(", ")}\n`);
         return;
       }
       if (ctx.session.setModel === undefined) {
         ctx.out("[model switching unavailable for this session]\n");
+        return;
+      }
+      if (!isUsableModel(name)) {
+        ctx.out(`[model unavailable: ${name}]\n`);
+        ctx.out(`available: ${availableModels().join(", ")}\n`);
         return;
       }
       // Hot-swap (FIX 8): the message log is untouched, so context is preserved across the switch.
@@ -251,7 +320,7 @@ const COMMAND_LIST: readonly ReplCommand[] = [
         ctx.out("[reset cancelled]\n");
         return;
       }
-      ctx.session = ctx.newSession();
+      ctx.session = await ctx.newSession();
       ctx.mode = "agent";
       ctx.out(`[new session started: ${ctx.session.id ?? "(in-memory)"}]\n`);
     },
@@ -306,6 +375,60 @@ const COMMAND_LIST: readonly ReplCommand[] = [
         return;
       }
       ctx.out(ctx.store.delete(id) ? `[deleted session ${id}]\n` : `[no session found: ${id}]\n`);
+    },
+  },
+  {
+    name: "diff",
+    description: "Show pending changes (managed: workspace vs target base; else git diff of the workdir)",
+    handler: async (ctx) => {
+      const diff = ctx.session.getDiff !== undefined ? await ctx.session.getDiff() : ctx.session.pendingDiff?.();
+      ctx.out(diff !== undefined && diff.trim().length > 0 ? `${colorizeDiff(diff)}\n` : "[no pending changes]\n");
+    },
+  },
+  {
+    name: "apply",
+    description: "Verify (ladder) then apply this session's changes to the target repo (managed only)",
+    usage: "[commit message]",
+    handler: async (ctx, args) => {
+      if (ctx.session.apply === undefined) {
+        ctx.out("[apply unavailable for this session]\n");
+        return;
+      }
+      renderApply(ctx, await ctx.session.apply(args.trim().length > 0 ? args.trim() : undefined));
+    },
+  },
+  {
+    name: "promote",
+    description: "Alias for /apply",
+    handler: async (ctx, args) => {
+      if (ctx.session.apply === undefined) {
+        ctx.out("[apply unavailable for this session]\n");
+        return;
+      }
+      renderApply(ctx, await ctx.session.apply(args.trim().length > 0 ? args.trim() : undefined));
+    },
+  },
+  {
+    name: "discard",
+    description: "Managed: remove the workspace (target untouched). Else: roll back tracked file edits.",
+    handler: async (ctx) => {
+      if (ctx.session.discardWorkspace === undefined) {
+        ctx.out("[discard unavailable for this session]\n");
+        return;
+      }
+      const r = await ctx.session.discardWorkspace();
+      if (r.mode === "rollback") {
+        const reverted = r.reverted ?? [];
+        if (reverted.length === 0) {
+          ctx.out("[nothing to discard]\n");
+          return;
+        }
+        for (const m of reverted) ctx.out(`Discarded: ${m.tool} ${m.path} (${m.action})\n`);
+        ctx.out("[note: terminal and sub-agent mutations require explicit approval and are not tracked by discard]\n");
+      } else {
+        ctx.out(`${r.summary}\n`);
+      }
+      persist(ctx);
     },
   },
   {
@@ -373,7 +496,7 @@ const COMMAND_LIST: readonly ReplCommand[] = [
       const m = args.trim();
       if (m.length === 0) {
         ctx.out(`permission mode: ${ctx.permissionMode}\n`);
-        ctx.out("  auto     — approve all tool calls (default)\n  confirm  — ask before write_file / patch / terminal / delegate_task\n  readonly — block all mutating tools\n");
+        ctx.out("  confirm  — ask before write_file / patch / terminal / delegate_task (default)\n  auto     — approve file/check/web tools; terminal/delegate still ask\n  readonly — block all mutating tools\n");
         return;
       }
       if (m !== "auto" && m !== "confirm" && m !== "readonly") {
@@ -381,6 +504,8 @@ const COMMAND_LIST: readonly ReplCommand[] = [
         return;
       }
       ctx.permissionMode = m;
+      ctx.session.setPermissionMode?.(m);
+      persist(ctx);
       ctx.out(`permission mode set to ${m}\n`);
     },
   },
@@ -401,17 +526,17 @@ export async function runRepl(deps: ReplDeps): Promise<void> {
     if (line === null) return false;
     return /^\s*y(es)?\s*$/i.test(line);
   };
-  // Permission prompt (FIX 5): "[Y/n]" defaults to YES — only an explicit no/n declines.
+  // Permission prompt: "[y/N]" defaults to NO — only an explicit yes/y allows.
   const confirmTool = async (tool: string, target: string): Promise<boolean> => {
-    deps.out(`Allow ${tool}${target.length > 0 ? ` ${target}` : ""}? [Y/n] `);
+    deps.out(`Allow ${tool}${target.length > 0 ? ` ${target}` : ""}? [y/N] `);
     const line = await deps.readLine();
     if (line === null) return false;
-    return !/^\s*n(o)?\s*$/i.test(line);
+    return /^\s*y(es)?\s*$/i.test(line);
   };
   const ctx: ReplContext = {
     session: deps.session,
     mode: "agent",
-    permissionMode: "auto",
+    permissionMode: deps.session.currentPermissionMode?.() ?? "confirm",
     exit: false,
     out: deps.out,
     store: deps.store,
@@ -420,6 +545,15 @@ export async function runRepl(deps: ReplDeps): Promise<void> {
     confirmTool,
   };
   deps.out("ikbi repl — a conversational coding session. Type /help for commands, /plan for read-only planning, /exit (or Ctrl-C) to quit.\n");
+  if (deps.session.workdirWarning !== undefined) deps.out(`[workdir warning] ${deps.session.workdirWarning}\n`);
+  if (deps.session.workdirKind !== undefined && deps.session.worktree !== undefined) {
+    const kind = deps.session.workdirKind;
+    const descr =
+      kind === "managed" ? `managed workspace off ${deps.session.targetRepo ?? "the repo"} — edits are isolated; /apply to promote, /discard to drop`
+      : kind === "scratch" ? "scratch (non-promotable)"
+      : "live-direct edits";
+    deps.out(`[workdir: ${deps.session.worktree} — ${descr}]\n`);
+  }
   for (;;) {
     deps.out(prompt);
     const line = await deps.readLine();
@@ -509,14 +643,55 @@ export async function liveRepl(argv: readonly string[] = []): Promise<void> {
   // `--force` breaks a stale/foreign session lock on save (BLOCKER-2).
   const force = argv.includes("--force");
   const autosave = (s: ChatSession): void => store.save(s, { force });
-  const newSession = (): ChatSession => new ChatSession(randomUUID(), { autosave });
+  const scratch = argv.includes("--scratch");
+
+  /**
+   * Mint a fresh session. DEFAULT (cwd is a git repo, no `--scratch`): allocate a MANAGED workspace
+   * — an isolated worktree off the repo — so edits never touch the target until an explicit `/apply`.
+   * `--scratch`, or a cwd that is not a repo (allocation failure), falls back to a labelled scratch
+   * workspace. This is the only place the REPL decides repo-vs-scratch; there is no live-direct path.
+   */
+  const newSession = async (): Promise<ChatSession> => {
+    const id = randomUUID();
+    // EXPLICIT OPERATOR OVERRIDE: IKBI_CHAT_WORKDIR pins a specific dir (live-direct, clearly labeled
+    // "explicit" in /status). It is an opt-in, not the default, so it is honored as-is — the managed
+    // default applies only when the operator has NOT pinned a workdir.
+    const explicitWorkdir = process.env.IKBI_CHAT_WORKDIR;
+    if (!scratch && explicitWorkdir !== undefined && explicitWorkdir.trim().length > 0) {
+      return new ChatSession(id, { autosave, cwd: process.cwd(), permissionMode: "confirm" });
+    }
+    if (!scratch) {
+      const target = resolveRepoTarget(process.cwd());
+      if (target !== undefined) {
+        try {
+          const ws = await allocateSessionWorkspace({ targetRepo: target, sessionId: id });
+          return new ChatSession(id, { workspace: ws, autosave, permissionMode: "confirm" });
+        } catch (e) {
+          out(`[managed workspace allocation failed (${errMsg(e)}) — falling back to a scratch session]\n`);
+        }
+      }
+    }
+    return new ChatSession(id, { autosave, cwd: process.cwd(), scratch: true, permissionMode: "confirm" });
+  };
+
+  /** Resume a persisted session, reconnecting its managed workspace when one was recorded. */
+  const resume = async (id: string): Promise<ChatSession | undefined> => {
+    const state = store.loadState(id);
+    if (state === undefined) return undefined;
+    let workspace;
+    if (state.workdirKind === "managed" && state.workspaceId !== undefined) {
+      workspace = await reconnectSessionWorkspace(state.workspaceId, { sessionId: state.id });
+      if (workspace === undefined) out(`[managed workspace ${state.workspaceId} is no longer available — /diff, /apply, /discard are disabled this session]\n`);
+    }
+    return new ChatSession(state.id, { restore: state, autosave, ...(workspace !== undefined ? { workspace } : {}) });
+  };
 
   let session: ChatSession;
   const resumeIdx = argv.indexOf("--resume");
   const wantContinue = argv.includes("--continue") || argv.includes("-c");
   if (resumeIdx >= 0) {
     const id = argv[resumeIdx + 1];
-    const loaded = id !== undefined ? store.load(id, { autosave }) : undefined;
+    const loaded = id !== undefined ? await resume(id) : undefined;
     if (loaded === undefined) {
       out(`[no session found for --resume ${id ?? "(missing id)"}]\n`);
       return;
@@ -524,16 +699,17 @@ export async function liveRepl(argv: readonly string[] = []): Promise<void> {
     session = loaded;
     out(`Resumed session ${session.id} (${session.messageCount()} messages, worktree: ${session.worktree})\n`);
   } else if (wantContinue) {
-    const latest = store.latest({ autosave });
+    const top = store.list()[0];
+    const latest = top !== undefined ? await resume(top.id) : undefined;
     if (latest === undefined) {
       out("[no prior session to continue — starting fresh]\n");
-      session = newSession();
+      session = await newSession();
     } else {
       session = latest;
       out(`Resumed session ${session.id} (${session.messageCount()} messages, worktree: ${session.worktree})\n`);
     }
   } else {
-    session = newSession();
+    session = await newSession();
   }
 
   // PROJECT AUTO-DISCOVERY (FIX 2): a one-line overview of the worktree at startup.

@@ -7,6 +7,7 @@
  * injection, and identity contracts; it adds NO frozen-core change.
  *
  * CONTRACT_VERSION changelog (newest on top):
+ *   1.2.1 — additive: HTTP sessions explicitly disclose that they are ephemeral/non-resumable.
  *   1.2.0 — additive: cost + context visibility and PLAN MODE. The request gains an OPTIONAL
  *           `mode?: "agent" | "plan"` ("plan" restricts the loop to read-only tools and returns a
  *           structured plan without making changes). The response gains OPTIONAL `cost` (USD for the
@@ -21,7 +22,7 @@
  */
 
 /** Semantic version of the chat module contract. Bump on breaking change. */
-export const CONTRACT_VERSION = "1.2.0";
+export const CONTRACT_VERSION = "1.2.1";
 
 /** Chat mode: `agent` (default — full tool suite) or `plan` (read-only analysis → structured plan). */
 export type ChatMode = "agent" | "plan";
@@ -69,4 +70,8 @@ export interface ChatResponse {
   readonly cost?: number;
   /** Context-window pressure for the session after this turn, 0-100 (context visibility). */
   readonly context_percent?: number;
+  /** HTTP /chat session persistence disclosure. REPL sessions use the disk store; HTTP sessions do not. */
+  readonly session_persistence?: "ephemeral";
+  readonly resumable?: false;
+  readonly warning?: string;
 }

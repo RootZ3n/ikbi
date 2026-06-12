@@ -17,6 +17,32 @@ Resolves the M8 (server is health-only) and M9 (barrel/orphan) honesty findings.
 - **Side-effect** — initializes at barrel import (installs a guard / constructs a
   singleton); never "called" directly.
 
+## Product-Spine Classification
+
+Reachability (the rest of this doc) answers *"is it wired?"*. It does **not** answer *"does this
+surface carry the golden-path guarantees?"* — and several wired surfaces do not. The classification
+below is lifted from [`docs/PRODUCT-SPINE.md`](docs/PRODUCT-SPINE.md) and is the SAME classification
+the runtime reports through the shared posture object (`src/cli/posture.ts`) on `ikbi doctor`, `ikbi
+capabilities`, REPL `/status`, and HTTP `GET /capabilities`.
+
+Vocabulary (the user-facing four): **core** (on the golden build/promote loop), **adapter**
+(CLI/HTTP/TUI glue with the same semantics), **experimental** (a *dangerous parallel path* — an
+alternate edit/exec/route loop with **weaker** guarantees than the golden path), **dormant** (a typed
+surface that is imported/tested but has no default operator path).
+
+| Surface | Classification | Why |
+| --- | --- | --- |
+| `ikbi build` (worker-model) | **core** | The golden path: managed worktrees, ladder verification, governed promote/undo. |
+| chat (REPL + `POST /chat`) | **experimental** | REPL repo mode shares the build path's **managed-workspace** lifecycle (isolated worktree, safe `/discard`) and **verified `/apply`**: `/apply` runs the same ladder verification as `ikbi build` and promotes only on a pass (fail-closed otherwise). `ikbi repl --scratch` is non-promotable. HTTP `/chat` remains ephemeral (in-memory) + non-managed (deferred). Still experimental: operator-driven single loop (no scout/critic/integrator). |
+| mcp-model-loop (`ikbi mcp`) | **experimental** | Separate stdio model/tool loop; not the golden build path. |
+| batch-planner (`ikbi batch`) | **experimental** | Multi-run orchestration that can diverge from single-build behavior. |
+| subagent-spawning | **dormant** | Typed spawn surface; no default operator path exercises it. |
+| cognition-layer (bare-goal `ikbi <goal>`) | **experimental** | Bare-goal deliberation/auto-dispatch can route before operator clarity. |
+
+These six are exactly the surfaces an operator can reach to edit, execute, or route work outside the
+golden path; naming them here keeps any of them from implying golden-path semantics by being merely
+"reachable" in the tables that follow.
+
 ## Reachable via CLI
 
 | Module | Command(s) | Notes |

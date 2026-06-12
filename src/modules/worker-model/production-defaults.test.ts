@@ -123,7 +123,7 @@ test("F2 (wiring): a scout built with mode:'index' delegates to project-retrieva
 
 test("F2 (fail-safe): index retrieval that throws falls back to the legacy scan, reported as index-fallback", async () => {
   const retrieval: ProjectRetrievalApi = { retrieve: async () => { throw new Error("index down"); } } as never;
-  const s = createScout({ mode: "index", retrieval });
+  const s = createScout({ mode: "index", retrieval, env: { IKBI_RETRIEVAL_FALLBACK_BLOCK_MIN_FILES: "1000000" } });
   const r = await s(scoutCtx(process.cwd()));
   assert.equal(r.outcome, "success", "the flag NEVER makes scout worse — it falls back");
   assert.equal((r.detail as { retrievalMode?: string }).retrievalMode, "index-fallback");

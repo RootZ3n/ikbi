@@ -92,6 +92,35 @@ test("POST /chat refuses open when IKBI_CHAT_TOKEN is not configured", async () 
   }
 });
 
+test("/capabilities discloses that HTTP chat sessions are ephemeral/non-resumable", async () => {
+  const { buildServer } = await import("../../server/index.js");
+  const app = buildServer();
+  await app.ready();
+  try {
+    const res = await app.inject({ method: "GET", url: "/capabilities" });
+    assert.equal(res.statusCode, 200);
+    const body = JSON.parse(res.body) as { chatSessions?: { persistence?: string; resumable?: boolean; warning?: string } };
+    assert.equal(body.chatSessions?.persistence, "ephemeral");
+    assert.equal(body.chatSessions?.resumable, false);
+    assert.match(body.chatSessions?.warning ?? "", /do not survive server restart/);
+  } finally {
+    await app.close();
+  }
+});
+
+test("HTTP sessions (SessionStore.getOrCreate) are scratch / non-managed and CANNOT promote or apply", async () => {
+  // The HTTP /chat route resolves every session through `sessionStore.getOrCreate`. It must hand back
+  // a scratch (ephemeral, non-managed) session so a network turn never edits a real repo or promotes.
+  const s = sessionStore.getOrCreate("http-scratch-1");
+  assert.equal(s.workdirKind, "scratch", "HTTP /chat sessions use a scratch workspace");
+  assert.equal(s.isManaged(), false, "HTTP sessions are never managed");
+  assert.equal(s.targetRepo, undefined, "HTTP sessions have no target repo to promote into");
+  const r = await s.apply();
+  assert.equal(r.applied, false, "an HTTP session cannot apply/promote");
+  assert.match(r.summary, /NON-PROMOTABLE/i);
+  assert.equal(r.verification, undefined, "a scratch session never runs verification");
+});
+
 // ── session store ───────────────────────────────────────────────────────────
 
 test("sessionStore mints a new id when none is given and reuses an existing one", () => {

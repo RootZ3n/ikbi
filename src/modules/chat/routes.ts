@@ -136,6 +136,9 @@ registerRoutes("chat", (app: FastifyInstance) => {
         ...(tools.length > 0 ? { tools } : {}),
         cost,
         context_percent: contextPercent,
+        session_persistence: "ephemeral",
+        resumable: false,
+        warning: "HTTP /chat sessions are in-memory only and do not survive server restart; use `ikbi repl --continue` for durable sessions.",
       };
     },
   );

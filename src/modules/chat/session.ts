@@ -25,9 +25,10 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
+import { execFileSync } from "node:child_process";
 
 import { config } from "../../core/config.js";
 import { resolveIdentity } from "../../core/identity/index.js";
@@ -43,6 +44,7 @@ import {
   type ModelTool,
   type ToolCall,
 } from "../../core/provider/index.js";
+import type { DiscardResult, PromoteResult } from "../../core/workspace/index.js";
 import { getCapabilities } from "../../core/provider/capabilities.js";
 import { parseCheckOutput } from "../check-triage/index.js";
 import { governedExec } from "../governed-exec/index.js";
@@ -241,6 +243,101 @@ function sanitizeRestoredMessages(messages: readonly ModelMessage[]): ModelMessa
 
 /** Per-session permission level for mutating tools (REPL FIX 5). */
 export type PermissionMode = "auto" | "confirm" | "readonly";
+/**
+ * How the session's workdir relates to the operator's repo:
+ *  - managed   — an isolated git worktree allocated off the target repo (the build-spine lifecycle);
+ *                edits never touch the target until an explicit `/apply` promote. PROMOTABLE.
+ *  - scratch   — a throwaway tmp dir with no target repo. NON-PROMOTABLE (copy out manually).
+ *  - explicit  — IKBI_CHAT_WORKDIR: the operator pinned a specific dir; edits are live-direct there.
+ *  - repo      — legacy live-direct edit of a project cwd (no longer the REPL default; kept for
+ *                direct ChatSession construction).
+ */
+export type WorkdirKind = "managed" | "repo" | "scratch" | "explicit";
+
+/**
+ * A managed workspace the chat session edits inside (Phase 2). Implemented by repl-workspace.ts as a
+ * thin wrapper over the frozen-core `workspaces` manager + a `WorkspaceHandle`, so the session owns
+ * NO git/worktree logic of its own — it drives the SAME isolated-worktree → commit → governed-promote
+ * lifecycle `ikbi build` uses. Injected (not constructed here) so it stays test-doubleable.
+ */
+export interface SessionWorkspace {
+  /** Workspace id (durable; persisted so a resume can reconnect to the same worktree). */
+  readonly id: string;
+  /** Absolute path to the isolated worktree (this becomes the session's `worktree`). */
+  readonly path: string;
+  /** Absolute path to the TARGET repo the workspace isolates from (where `/apply` lands). */
+  readonly targetRepo: string;
+  /** Branch the result promotes into. */
+  readonly baseBranch: string;
+  /** The commit the workspace started from (the isolation base — `/diff` is computed against this). */
+  readonly baseRef: string;
+  /** Pending changes in the worktree vs the base (committed range, else working-tree fallback). */
+  diff(): Promise<string>;
+  /** Commit the current worktree state onto the scratch branch (advances it for promote). */
+  commit(message: string): Promise<boolean>;
+  /** Promote the committed work into the target repo — operator-authorized, governed, receipt-backed. */
+  promote(message: string): Promise<PromoteResult>;
+  /** Tear the workspace down (remove worktree + scratch branch). The target repo is untouched. */
+  discard(): Promise<DiscardResult>;
+  /**
+   * Phase 3: run the SAME ladder verification `ikbi build` uses against the workspace's pending
+   * (working-tree) changes, BEFORE any promote. Reuses the worker-model verifier; never mutates.
+   */
+  verify(opts: { parentCtx?: OperationContext; env?: NodeJS.ProcessEnv }): Promise<ApplyVerification>;
+}
+
+/**
+ * The structured result of pre-apply verification (Phase 3). Carries exactly what `/apply` must
+ * surface (req 3): the mode, scope, checks run, and a failure/triage summary — plus the receipts
+ * the verifier emitted (recorded into the session transcript). `ok` is the ONLY gate to promote.
+ */
+export interface ApplyVerification {
+  /** Did verification execute a verdict at all? false ⇒ couldn't run (fail closed — never promote). */
+  readonly ran: boolean;
+  /** Passed: the workspace is safe to promote. The SOLE precondition for landing changes. */
+  readonly ok: boolean;
+  /** The plan was BLOCKED (scope/impact undeterminable, blocking marker) — must not promote (req 2). */
+  readonly blocked: boolean;
+  /** Verifier outcome, plus "unavailable" when verification could not run (no ctx / no diff). */
+  readonly outcome: "success" | "failure" | "stub" | "unavailable";
+  /** Verification mode that ran: "ladder" (hardened) or "legacy". */
+  readonly mode: string;
+  /** Verification scope ("impact" | "full" | "legacy" | …) when the ladder produced one. */
+  readonly scope?: string;
+  /** Each check that ran, with its pass/fail. */
+  readonly checks: readonly { readonly name: string; readonly ok: boolean }[];
+  /** Where the ladder failed (stage/task), when applicable. */
+  readonly failedAt?: { readonly stage: string; readonly task: string };
+  /** Why the plan was blocked, when applicable. */
+  readonly blockReasons?: readonly string[];
+  /** A one-line failure/triage summary for display when not ok. */
+  readonly triageSummary?: string;
+  /** Human-readable headline. */
+  readonly summary: string;
+  /** Verifier receipts (recorded into the session transcript — req 8). */
+  readonly receipts: readonly string[];
+}
+
+/** Result of `/apply` (verify → commit → promote) in a managed session. */
+export interface ApplyResult {
+  readonly applied: boolean;
+  /** Set in managed mode — the underlying governed promote result. */
+  readonly promote?: PromoteResult;
+  /** Phase 3: the pre-apply verification result (present whenever verification ran). */
+  readonly verification?: ApplyVerification;
+  /** Human-readable explanation (always present). */
+  readonly summary: string;
+}
+
+/** Result of `/discard`. Managed → workspace torn down; scratch/explicit → tracked file edits reverted. */
+export interface DiscardOutcome {
+  readonly mode: "managed" | "rollback";
+  /** Managed: the workspace was removed. */
+  readonly removed?: boolean;
+  /** Rollback: the reverted file mutations. */
+  readonly reverted?: readonly RollbackResult[];
+  readonly summary: string;
+}
 
 /**
  * Tools that MUTATE the worktree OR run effecting/arbitrary work — gated by permission mode.
@@ -267,6 +364,12 @@ export interface TurnOptions {
   readonly permissionMode?: PermissionMode;
   /** In "confirm" mode, asked before each mutating tool; resolve false to BLOCK it (FIX 5). */
   readonly confirm?: (tool: string, target: string) => Promise<boolean>;
+}
+
+export interface ResolvedWorkdir {
+  readonly path: string;
+  readonly kind: WorkdirKind;
+  readonly warning?: string;
 }
 
 /** One recorded file mutation (for `/rollback`, REPL FIX 1). */
@@ -368,14 +471,54 @@ function resolveParentCtx(sessionId: string): OperationContext | undefined {
   }
 }
 
-/** Resolve the session worktree: IKBI_CHAT_WORKDIR if set, else a per-session tmp sandbox. */
-function resolveWorkdir(): string {
+const PROJECT_MARKERS = [
+  ".git",
+  "package.json",
+  "pnpm-workspace.yaml",
+  "Cargo.toml",
+  "go.mod",
+  "pyproject.toml",
+  "deno.json",
+  "deno.jsonc",
+  "requirements.txt",
+  "Makefile",
+] as const;
+
+function isProjectLike(dir: string): boolean {
+  try {
+    const start = realpathSync(dir);
+    if (PROJECT_MARKERS.filter((m) => m !== ".git").some((m) => existsSync(join(start, m)))) return true;
+    const out = execFileSync("git", ["-C", start, "rev-parse", "--is-inside-work-tree"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    return out === "true";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolve the session worktree for a DIRECTLY-CONSTRUCTED session (no managed workspace supplied).
+ *
+ * LIVE-DIRECT IS OPT-IN ONLY (audit hardening): a bare session NEVER edits the cwd in place. The only
+ * live-direct paths are intentional ones — an explicit `IKBI_CHAT_WORKDIR` (here → "explicit") or an
+ * explicit `deps.worktree` (handled by the constructor → "explicit"). Otherwise we default to a
+ * NON-PROMOTABLE scratch sandbox, so a directly-constructed `ChatSession` can't silently mutate a real
+ * repo. (Managed, promotable repo-mode sessions are allocated by `ikbi repl`, not here.)
+ */
+function resolveWorkdir(cwd = process.cwd(), scratch = false): ResolvedWorkdir {
   const configured = process.env.IKBI_CHAT_WORKDIR;
   if (configured !== undefined && configured.length > 0) {
     mkdirSync(configured, { recursive: true });
-    return realpathSync(configured);
+    return { path: realpathSync(configured), kind: "explicit" };
   }
-  return realpathSync(mkdtempSync(`${tmpdir()}/ikbi-chat-`));
+  const path = realpathSync(mkdtempSync(`${tmpdir()}/ikbi-chat-`));
+  // Warn only when the operator might have expected to be editing the cwd: a project-like cwd defaults
+  // to scratch (live-direct is opt-in); a non-project cwd was never editable anyway.
+  const warning = scratch
+    ? undefined
+    : isProjectLike(cwd)
+      ? `defaulting to a NON-PROMOTABLE scratch workspace (${path}); live-direct editing is opt-in. Start a managed repo-mode session (\`ikbi repl\`) or set IKBI_CHAT_WORKDIR to target a workdir.`
+      : `cwd is not a git/project directory; using scratch workspace ${path}. Run from a repo or set IKBI_CHAT_WORKDIR to target a workdir.`;
+  return { path, kind: "scratch", ...(warning !== undefined ? { warning } : {}) };
 }
 
 function resolveProvidedWorkdir(input: unknown, createIfMissing: boolean): string | undefined {
@@ -413,6 +556,15 @@ export interface PersistedSession {
   /** Cumulative prompt-cache counters (for cache-hit visibility after a resume). */
   readonly cachedTokens?: number;
   readonly cacheSavedUsd?: number;
+  readonly fileHistory?: readonly FileMutation[];
+  readonly permissionMode?: PermissionMode;
+  readonly workdirKind?: WorkdirKind;
+  readonly workdirWarning?: string;
+  /** Managed-workspace lifecycle (Phase 2): persisted so `--resume` reconnects to the same worktree. */
+  readonly workspaceId?: string;
+  readonly targetRepo?: string;
+  readonly baseBranch?: string;
+  readonly baseRef?: string;
 }
 
 /** Per-session injectable dependencies (production defaults: real invokeModel, configured workdir). */
@@ -421,10 +573,23 @@ export interface ChatSessionDeps {
   readonly invoke?: InvokeFn;
   /** Override the worktree (tests pin a known dir); defaults to IKBI_CHAT_WORKDIR or a tmp sandbox. */
   readonly worktree?: string;
+  /** Current shell cwd for auto workdir selection; defaults to process.cwd(). */
+  readonly cwd?: string;
+  /** Force an explicit temp scratch workspace instead of using a project cwd. */
+  readonly scratch?: boolean;
+  /**
+   * A managed workspace to edit inside (Phase 2). When provided, the session runs in "managed" mode:
+   * `worktree` becomes the workspace's isolated path, all mutating tools operate there, and
+   * `/diff`/`/apply`/`/discard` drive the governed workspace lifecycle. Takes precedence over
+   * `worktree`/`cwd`/`scratch`. The REPL allocates this for repo-mode sessions; tests inject a double.
+   */
+  readonly workspace?: SessionWorkspace;
   /** Override the driver model id; defaults to the configured driver. Switchable later via setModel. */
   readonly model?: string;
   /** Restore a persisted session (messages + memory + lifecycle) instead of starting fresh. */
   readonly restore?: PersistedSession;
+  /** Initial permission mode for callers that own an interactive session. */
+  readonly permissionMode?: PermissionMode;
   /** Called at the END of every `send()` (after state is mutated) so the caller can auto-persist. */
   readonly autosave?: (session: ChatSession) => void;
 }
@@ -433,6 +598,17 @@ export interface ChatSessionDeps {
 export class ChatSession {
   readonly id: string;
   readonly worktree: string;
+  readonly workdirKind: WorkdirKind;
+  readonly workdirWarning: string | undefined;
+  /** The managed workspace this session edits inside (managed mode only; undefined otherwise). */
+  private readonly workspace: SessionWorkspace | undefined;
+  /** Managed-workspace metadata (also carried for a resumed managed session whose workspace is gone). */
+  readonly workspaceId: string | undefined;
+  readonly targetRepo: string | undefined;
+  readonly baseBranch: string | undefined;
+  readonly baseRef: string | undefined;
+  /** Set once a managed workspace has been discarded — further lifecycle ops report it's gone. */
+  private workspaceDiscarded = false;
   /** Key-fact memory across turns (files modified, command/test results, conclusions). */
   readonly memory: SessionMemory;
   private messages: ModelMessage[];
@@ -467,17 +643,58 @@ export class ChatSession {
   /** Cumulative prompt-cache counters (FIX 7): cached prompt tokens + estimated USD saved. */
   private cachedTokens = 0;
   private cacheSavedUsd = 0;
-  /** Ordered log of file mutations this session made, for `/rollback` (FIX 1). In-memory only. */
+  /** Ordered log of file mutations this session made, for `/rollback` (persisted across resume). */
   private readonly fileHistory: FileMutation[] = [];
+  private permissionMode: PermissionMode = "auto";
   private turnQueue: Promise<unknown> = Promise.resolve();
 
   constructor(id: string, deps: ChatSessionDeps = {}) {
     const restore = deps.restore;
     this.id = id;
     const suppliedWorktree = deps.worktree ?? restore?.worktree;
-    this.worktree = suppliedWorktree !== undefined
-      ? (resolveProvidedWorkdir(suppliedWorktree, deps.worktree !== undefined) ?? resolveWorkdir())
-      : resolveWorkdir();
+    if (deps.workspace !== undefined) {
+      // MANAGED MODE (Phase 2): edit inside the allocated isolated worktree. The target repo is
+      // never touched until an explicit `/apply` promote. This is the build-spine lifecycle.
+      this.workspace = deps.workspace;
+      this.worktree = deps.workspace.path;
+      this.workdirKind = "managed";
+      this.workdirWarning = undefined;
+      this.workspaceId = deps.workspace.id;
+      this.targetRepo = deps.workspace.targetRepo;
+      this.baseBranch = deps.workspace.baseBranch;
+      this.baseRef = deps.workspace.baseRef;
+    } else if (restore?.workdirKind === "managed") {
+      // A managed session resumed WITHOUT a live workspace (the worktree was discarded/cleaned, or
+      // reconnect failed). Preserve the managed identity for honest /status, but disclose that the
+      // lifecycle ops are unavailable — never silently downgrade to live-direct editing.
+      this.workspace = undefined;
+      this.worktree = restore.worktree;
+      this.workdirKind = "managed";
+      this.workdirWarning = `managed workspace ${restore.workspaceId ?? "(unknown)"} is no longer available — /diff, /apply, and /discard are unavailable until you start a new session`;
+      this.workspaceId = restore.workspaceId;
+      this.targetRepo = restore.targetRepo;
+      this.baseBranch = restore.baseBranch;
+      this.baseRef = restore.baseRef;
+    } else if (suppliedWorktree !== undefined) {
+      this.worktree = resolveProvidedWorkdir(suppliedWorktree, deps.worktree !== undefined) ?? resolveWorkdir(deps.cwd, deps.scratch === true).path;
+      this.workdirKind = restore?.workdirKind ?? (deps.worktree !== undefined ? "explicit" : "repo");
+      this.workdirWarning = restore?.workdirWarning;
+      this.workspace = undefined;
+      this.workspaceId = undefined;
+      this.targetRepo = undefined;
+      this.baseBranch = undefined;
+      this.baseRef = undefined;
+    } else {
+      const resolved = resolveWorkdir(deps.cwd, deps.scratch === true);
+      this.worktree = resolved.path;
+      this.workdirKind = resolved.kind;
+      this.workdirWarning = resolved.warning;
+      this.workspace = undefined;
+      this.workspaceId = undefined;
+      this.targetRepo = undefined;
+      this.baseBranch = undefined;
+      this.baseRef = undefined;
+    }
     this.identity = { agentId: "ikbi-chat", functionalRole: "assistant", trustTier: "trusted", sessionId: id };
     this.parentCtx = resolveParentCtx(id);
     this.invoke = deps.invoke ?? invokeModel;
@@ -499,6 +716,8 @@ export class ChatSession {
     this.costTotal = restore?.costUsd ?? 0;
     this.cachedTokens = restore?.cachedTokens ?? 0;
     this.cacheSavedUsd = restore?.cacheSavedUsd ?? 0;
+    this.permissionMode = restore?.permissionMode ?? deps.permissionMode ?? "auto";
+    this.fileHistory.push(...(restore?.fileHistory ?? []));
     // PROJECT MEMORY: load the workspace's CLAUDE.md/AGENTS.md (missing ⇒ undefined, no crash)
     // and carry it as a neutralized, isolated UNTRUSTED message (the chokepoint — never bypassed).
     const proj = loadProjectInstructions(this.worktree);
@@ -534,7 +753,15 @@ export class ChatSession {
     }
     // PERMISSION GATE (FIX 5): in "readonly" mode block every mutating tool; in "confirm" mode ask
     // the operator first and BLOCK on a decline. "auto" (the default) lets everything through.
-    const permissionMode = opts.permissionMode ?? "auto";
+    const permissionMode = opts.permissionMode ?? this.permissionMode;
+    const sideEffectConfirmed = (call.name === "terminal" || call.name === "delegate_task") && opts.confirm !== undefined;
+    if (sideEffectConfirmed) {
+      const target = typeof args.command === "string" ? args.command : typeof args.task === "string" ? args.task : "";
+      const allowed = await opts.confirm(call.name, `${target}${target.length > 0 ? " " : ""}(rollback cannot cover terminal/sub-agent side effects)`);
+      if (!allowed) {
+        return { output: `ERROR: ${call.name} was DENIED by the operator. Rollback cannot cover terminal/sub-agent side effects.`, activity: { name: call.name, ok: false, summary: "denied" } };
+      }
+    }
     if (permissionMode !== "auto" && MUTATING_TOOL_NAMES.has(call.name)) {
       const target =
         typeof args.path === "string" ? args.path
@@ -547,10 +774,10 @@ export class ChatSession {
       // CONFIRM MODE + DELEGATE (M5): a single parent approval cannot govern a sub-agent's own
       // unconfirmed tool loop (it runs with full write access and no confirm callback). So in
       // "confirm" mode delegate_task is unavailable outright — switch to "auto" to delegate.
-      if (call.name === "delegate_task") {
-        return { output: `ERROR: delegate_task is unavailable in confirm mode (a sub-agent runs its own tool loop that this confirmation cannot govern). Switch to auto mode to delegate.`, activity: { name: "delegate_task", ok: false, summary: "blocked (confirm)" } };
+      if ((call.name === "delegate_task" || call.name === "terminal") && !sideEffectConfirmed) {
+        return { output: `ERROR: ${call.name} requires an interactive confirmation because rollback cannot cover its side effects.`, activity: { name: call.name, ok: false, summary: "confirmation required" } };
       }
-      const allowed = opts.confirm !== undefined ? await opts.confirm(call.name, target) : true;
+      const allowed = sideEffectConfirmed ? true : opts.confirm !== undefined ? await opts.confirm(call.name, target) : false;
       if (!allowed) {
         return { output: `ERROR: ${call.name} was DENIED by the operator (permission mode: confirm).`, activity: { name: call.name, ok: false, summary: "denied" } };
       }
@@ -809,6 +1036,138 @@ export class ChatSession {
     this.model = model;
   }
 
+  currentPermissionMode(): PermissionMode {
+    return this.permissionMode;
+  }
+
+  setPermissionMode(mode: PermissionMode): void {
+    this.permissionMode = mode;
+  }
+
+  /** True when this session edits inside a managed, promotable workspace (Phase 2). */
+  isManaged(): boolean {
+    return this.workspace !== undefined;
+  }
+
+  /** Number of files with pending changes in the workdir (for `/status`). 0 on any error. */
+  pendingChangeCount(): number {
+    try {
+      const out = execFileSync("git", ["-C", this.worktree, "status", "--porcelain"], { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 });
+      return out.split("\n").filter((l) => l.trim().length > 0).length;
+    } catch {
+      return 0;
+    }
+  }
+
+  pendingDiff(): string {
+    try {
+      return execFileSync("git", ["-C", this.worktree, "diff", "--"], { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 });
+    } catch {
+      return "[diff unavailable: workdir is not a git repository or git failed]\n";
+    }
+  }
+
+  /**
+   * `/diff` — pending changes. MANAGED: the workspace diff vs the isolation base (committed range,
+   * else working-tree fallback). Otherwise a plain `git diff` of the active workdir.
+   */
+  async getDiff(): Promise<string> {
+    if (this.workspace !== undefined) return this.workspace.diff();
+    return this.pendingDiff();
+  }
+
+  /**
+   * `/apply` (a.k.a. `/promote`) — land this session's work in the TARGET repo. MANAGED only, and
+   * VERIFIED-FIRST (Phase 3): run the SAME ladder verification `ikbi build` uses against the pending
+   * working-tree changes, and PROMOTE ONLY ON A PASS. A failed, blocked, or undeterminable
+   * verification fails closed — no commit, no promote (reqs 1, 2, 9). The operator explicitly typed
+   * `/apply` (req 4); verification gates that intent, it does not replace it. Scratch/explicit
+   * sessions are NOT promotable and say so (reqs 5, 6). Never throws.
+   */
+  async apply(message?: string): Promise<ApplyResult> {
+    if (this.workspace === undefined) {
+      if (this.workdirKind === "scratch") {
+        return { applied: false, summary: `scratch workspace is NON-PROMOTABLE (no verification/apply). Inspect ${this.worktree} and copy changes out manually, or start a repo-mode session to /apply.` };
+      }
+      if (this.workdirKind === "managed") {
+        return { applied: false, summary: this.workdirWarning ?? "managed workspace is no longer available; start a new session to /apply." };
+      }
+      return { applied: false, summary: "live-direct session: verification/apply is UNAVAILABLE here (edits are already in the active workdir; commit with git directly). Start a default repo-mode session for a verified /apply." };
+    }
+    if (this.workspaceDiscarded) {
+      return { applied: false, summary: "this session's workspace was discarded; start a new session to make and apply changes." };
+    }
+    const msg = message !== undefined && message.trim().length > 0 ? message.trim() : `ikbi repl: apply session ${this.id}`;
+
+    // ── VERIFICATION GATE (before ANY mutation of the target) ────────────────
+    let verification: ApplyVerification;
+    try {
+      verification = await this.workspace.verify({ ...(this.parentCtx !== undefined ? { parentCtx: this.parentCtx } : {}), env: process.env });
+    } catch (e) {
+      // Verification could not run ⇒ fail closed (req 9): no commit, no promote.
+      const v: ApplyVerification = { ran: false, ok: false, blocked: true, outcome: "unavailable", mode: "unknown", checks: [], summary: `verification could not run: ${errMsg(e)}`, receipts: [] };
+      this.recordApplyVerification(v, false);
+      return { applied: false, verification: v, summary: `NOT applied — ${v.summary}` };
+    }
+    if (!verification.ok) {
+      // Fail-closed on failure / blocked / dry-run / unavailable (reqs 2, 9).
+      this.recordApplyVerification(verification, false);
+      const why = verification.blocked
+        ? `verification BLOCKED (${(verification.blockReasons ?? ["scope/checks undeterminable"]).join("; ")})`
+        : `verification FAILED${verification.triageSummary !== undefined ? `: ${verification.triageSummary}` : ""}`;
+      return { applied: false, verification, summary: `NOT applied — ${why}. Fix the issues, review /diff, and /apply again.` };
+    }
+
+    // ── PASS ⇒ commit + governed promote ─────────────────────────────────────
+    try {
+      await this.workspace.commit(msg);
+      const promote = await this.workspace.promote(msg);
+      if (promote.promoted) {
+        this.recordApplyVerification(verification, true, promote);
+        return { applied: true, promote, verification, summary: `verified (${verification.mode}${verification.scope !== undefined ? `, scope ${verification.scope}` : ""}) and applied to ${promote.targetBranch} (${promote.strategy}) ${promote.beforeRef.slice(0, 8)} → ${(promote.afterRef ?? "").slice(0, 8)}. Undo with: ikbi undo` };
+      }
+      this.recordApplyVerification(verification, false, promote);
+      const reason = promote.reason ?? (promote.conflicts !== undefined ? `merge conflicts in ${promote.conflicts.join(", ")}` : "nothing to apply");
+      return { applied: false, promote, verification, summary: `verification passed but NOT applied: ${reason}` };
+    } catch (e) {
+      return { applied: false, verification, summary: `verification passed but apply failed: ${errMsg(e)}` };
+    }
+  }
+
+  /** Record the apply verification outcome into the durable session memory/transcript (req 8). */
+  private recordApplyVerification(v: ApplyVerification, promoted: boolean, promote?: PromoteResult): void {
+    const checkLine = v.checks.length > 0 ? ` checks=[${v.checks.map((c) => `${c.name}:${c.ok ? "ok" : "FAIL"}`).join(", ")}]` : "";
+    const land = promoted ? ` → promoted ${promote?.beforeRef?.slice(0, 8) ?? "?"}→${promote?.afterRef?.slice(0, 8) ?? "?"}` : " → NOT promoted";
+    this.memory.recordDecision(
+      `/apply verification: ${v.ok ? "PASS" : v.blocked ? "BLOCKED" : "FAIL"} (mode=${v.mode}${v.scope !== undefined ? `, scope=${v.scope}` : ""})${checkLine}${v.triageSummary !== undefined && !v.ok ? `; ${v.triageSummary}` : ""}${land}`,
+    );
+  }
+
+  /**
+   * `/discard` — MANAGED: tear the workspace down (remove worktree + scratch branch); the target
+   * repo is untouched. Otherwise: roll back every tracked file edit this session made. Never throws.
+   */
+  async discardWorkspace(): Promise<DiscardOutcome> {
+    if (this.workspace !== undefined) {
+      if (this.workspaceDiscarded) {
+        return { mode: "managed", removed: false, summary: "workspace already discarded." };
+      }
+      try {
+        const r = await this.workspace.discard();
+        this.workspaceDiscarded = true;
+        return { mode: "managed", removed: r.removed, summary: `managed workspace ${r.workspaceId} discarded — the target repo (${this.targetRepo ?? "?"}) was not modified.` };
+      } catch (e) {
+        return { mode: "managed", removed: false, summary: `discard failed: ${errMsg(e)}` };
+      }
+    }
+    const reverted = this.rollback(this.fileHistory.length);
+    return {
+      mode: "rollback",
+      reverted,
+      summary: reverted.length === 0 ? "nothing to discard." : `reverted ${reverted.length} tracked file edit(s). Note: terminal/sub-agent side effects are not tracked by rollback.`,
+    };
+  }
+
   /** Record a file mutation for `/rollback` (FIX 1). Internal — called from the write/patch tools. */
   private recordMutation(m: FileMutation): void {
     this.fileHistory.push(m);
@@ -893,6 +1252,14 @@ export class ChatSession {
       costUsd: this.costTotal,
       cachedTokens: this.cachedTokens,
       cacheSavedUsd: this.cacheSavedUsd,
+      fileHistory: [...this.fileHistory],
+      permissionMode: this.permissionMode,
+      workdirKind: this.workdirKind,
+      ...(this.workdirWarning !== undefined ? { workdirWarning: this.workdirWarning } : {}),
+      ...(this.workspaceId !== undefined ? { workspaceId: this.workspaceId } : {}),
+      ...(this.targetRepo !== undefined ? { targetRepo: this.targetRepo } : {}),
+      ...(this.baseBranch !== undefined ? { baseBranch: this.baseBranch } : {}),
+      ...(this.baseRef !== undefined ? { baseRef: this.baseRef } : {}),
     };
   }
 
@@ -1090,7 +1457,10 @@ class SessionStore {
       return existing;
     }
     const id = sessionId !== undefined && sessionId.length > 0 ? sessionId : randomUUID();
-    const session = new ChatSession(id);
+    // HTTP /chat sessions are EXPLICITLY ephemeral + non-managed (Phase 2 req 9): force a scratch
+    // workspace so a network turn never edits the server's cwd live-direct and never allocates a
+    // managed worktree. Upgrading HTTP to managed sessions is deliberately deferred.
+    const session = new ChatSession(id, { scratch: true });
     this.sessions.set(id, session);
     this.evictIfNeeded();
     return session;

@@ -56,6 +56,7 @@ const MAX_FILES_SCANNED = 40;
 const MAX_FILE_BYTES = 4_000;
 /** Total byte cap of gathered context. */
 const MAX_TOTAL_BYTES = 60_000;
+const DEFAULT_INDEX_FALLBACK_BLOCK_MIN_FILES = 500;
 const SCAN_EXTENSIONS: ReadonlySet<string> = new Set([".ts", ".tsx", ".js", ".jsx", ".json", ".md"]);
 const SKIP_DIRS: ReadonlySet<string> = new Set(["node_modules", ".git", "dist", "build", "coverage", ".next", "out"]);
 
@@ -92,6 +93,37 @@ function gatherFiles(root: string): string[] {
     }
   }
   return out;
+}
+
+function fallbackBlockThreshold(env: NodeJS.ProcessEnv): number {
+  const raw = env.IKBI_RETRIEVAL_FALLBACK_BLOCK_MIN_FILES;
+  if (raw === undefined || raw.trim().length === 0) return DEFAULT_INDEX_FALLBACK_BLOCK_MIN_FILES;
+  const n = Number.parseInt(raw.trim(), 10);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_INDEX_FALLBACK_BLOCK_MIN_FILES;
+}
+
+function reachesFileThreshold(root: string, threshold: number): boolean {
+  let count = 0;
+  const stack: string[] = [root];
+  while (stack.length > 0) {
+    const dir = stack.pop() as string;
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      const full = join(dir, e.name);
+      if (e.isDirectory()) {
+        if (!SKIP_DIRS.has(e.name)) stack.push(full);
+      } else if (e.isFile() && SCAN_EXTENSIONS.has(extname(e.name))) {
+        count += 1;
+        if (count >= threshold) return true;
+      }
+    }
+  }
+  return false;
 }
 
 /** Read a bounded slice of each file into a single context string. Read-only. Also
@@ -290,9 +322,14 @@ export function createScout(deps: ScoutDeps = {}): RoleFn {
         } catch (e) {
           // FAIL-SAFE + LOUD (F4): never let the index path make scout worse — fall back to the legacy
           // scan, but record a DISTINCT mode + reason so a persistently-broken index isn't silent.
+          const reason = e instanceof Error ? e.message : String(e);
+          const threshold = fallbackBlockThreshold(env);
+          if (reachesFileThreshold(root, threshold)) {
+            throw new Error(`index retrieval failed on a large repo (>=${threshold} scanned source files); refusing silent legacy fallback. Reason: ${reason}`);
+          }
           files = gatherFiles(root);
           retrievalMode = "index-fallback";
-          retrievalFallbackReason = e instanceof Error ? e.message : String(e);
+          retrievalFallbackReason = reason;
           modeNote = `IKBI_RETRIEVAL=index but index retrieval FAILED — fell back to legacy scan (reason: ${retrievalFallbackReason})`;
         }
       } else {

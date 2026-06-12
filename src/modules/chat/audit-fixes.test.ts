@@ -107,20 +107,21 @@ test("M3: run_checks is blocked under readonly permission mode", async () => {
   assert.match(rc!.summary ?? "", /readonly/);
 });
 
-// ── M5: delegate_task unavailable in confirm mode ─────────────────────────────────
+// ── M5: delegate_task requires explicit confirmation in confirm mode ──────────────
 
-test("M5: delegate_task is blocked outright in confirm mode (confirm never consulted)", async () => {
+test("M5: delegate_task requires explicit confirmation with rollback-limit warning", async () => {
   const invoke = queued([toolTurn(call("delegate_task", { task: "do something" })), stop("done")]);
   const s = new ChatSession("m5", { invoke, worktree: wt() });
   let asked = false;
+  let target = "";
   const res = await s.send("delegate it", undefined, "agent", {
     permissionMode: "confirm",
-    confirm: async () => { asked = true; return true; },
+    confirm: async (_tool, t) => { asked = true; target = t; return true; },
   });
   const d = res.tools.find((t) => t.name === "delegate_task");
-  assert.equal(d?.ok, false, "delegate_task is blocked in confirm mode");
-  assert.match(d!.summary ?? "", /confirm/);
-  assert.equal(asked, false, "the operator confirm callback is never consulted for delegate_task");
+  assert.equal(d?.ok, true, "delegate_task can run only after explicit confirmation");
+  assert.equal(asked, true, "the operator confirm callback is consulted for delegate_task");
+  assert.match(target, /rollback cannot cover/, "confirmation discloses rollback cannot cover sub-agent side effects");
 });
 
 // ── L8: fileStem is injective (no collision) ──────────────────────────────────────

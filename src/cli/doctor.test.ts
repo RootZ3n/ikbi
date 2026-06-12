@@ -65,6 +65,7 @@ test("doctor REPORTS MISSING required settings and ends NOT ready (cold start)",
   assert.match(text, /✗ IKBI_OPERATOR_TOKEN/);
   assert.match(text, /✗ IKBI_WORKER_TOKEN/);
   assert.match(text, /✗ IKBI_WORKER_MODEL_ENABLED/);
+  assert.match(text, /export IKBI_WORKER_MODEL_ENABLED=true/);
   assert.match(text, /✗ IKBI_GOVERNED_EXEC_ALLOWLIST/);
   assert.match(text, /✗ the driver model 'mimo-v2.5' and builder model 'mimo-v2.5' and critic model 'deepseek-v4-pro' don't resolve to a registered provider/);
   assert.match(text, /NOT ready — 5 required settings missing/);

@@ -15,7 +15,7 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -78,6 +78,70 @@ test("BLOCKER-1: a failed/empty rollback injects no notice", () => {
   const rolled = s.rollback(1); // nothing in the file history
   assert.equal(rolled.length, 0, "nothing to roll back");
   assert.equal(s.toPersisted().messages.length, before, "no spurious notification when nothing reverted");
+});
+
+test("HARDENING: a bare session in a project cwd defaults to scratch (live-direct is opt-in), never edits the cwd", () => {
+  const old = process.env.IKBI_CHAT_WORKDIR;
+  delete process.env.IKBI_CHAT_WORKDIR;
+  const dir = wt();
+  try {
+    writeFileSync(join(dir, "package.json"), "{}");
+    const s = new ChatSession("cwd-project", { invoke: queued([stop("ok")]), cwd: dir });
+    // The session must NOT silently live-direct edit the project cwd — it gets a non-promotable scratch sandbox.
+    assert.notEqual(s.worktree, dir, "a directly-constructed session does not adopt the cwd as its worktree");
+    assert.equal(s.workdirKind, "scratch");
+    assert.equal(s.isManaged(), false);
+    assert.match(s.workdirWarning ?? "", /opt-in|scratch/i, "the operator is told live-direct editing was avoided");
+  } finally {
+    if (old === undefined) delete process.env.IKBI_CHAT_WORKDIR; else process.env.IKBI_CHAT_WORKDIR = old;
+  }
+});
+
+test("BLOCKER-1: non-project cwd falls back to explicit scratch with a visible warning", () => {
+  const old = process.env.IKBI_CHAT_WORKDIR;
+  delete process.env.IKBI_CHAT_WORKDIR;
+  const dir = wt();
+  try {
+    const s = new ChatSession("cwd-scratch", { invoke: queued([stop("ok")]), cwd: dir });
+    assert.match(s.worktree, /ikbi-chat-/);
+    assert.equal(s.workdirKind, "scratch");
+    assert.match(s.workdirWarning ?? "", /cwd is not a git\/project directory/);
+  } finally {
+    if (old === undefined) delete process.env.IKBI_CHAT_WORKDIR; else process.env.IKBI_CHAT_WORKDIR = old;
+  }
+});
+
+test("BLOCKER-1: explicit scratch mode still uses a scratch workspace even inside a repo", () => {
+  const old = process.env.IKBI_CHAT_WORKDIR;
+  delete process.env.IKBI_CHAT_WORKDIR;
+  const dir = wt();
+  try {
+    writeFileSync(join(dir, "package.json"), "{}");
+    const s = new ChatSession("cwd-explicit-scratch", { invoke: queued([stop("ok")]), cwd: dir, scratch: true });
+    assert.notEqual(s.worktree, dir);
+    assert.equal(s.workdirKind, "scratch");
+  } finally {
+    if (old === undefined) delete process.env.IKBI_CHAT_WORKDIR; else process.env.IKBI_CHAT_WORKDIR = old;
+  }
+});
+
+test("BLOCKER-3: rollback history survives session resume", async () => {
+  const dir = wt();
+  writeFileSync(join(dir, "durable.ts"), "before\n");
+  const store = new PersistentSessionStore(mkdtempSync(join(tmpdir(), "ikbi-rb-store-")));
+  const s = new ChatSession("durable-rb", {
+    invoke: queued([toolTurn(call("write_file", { path: "durable.ts", content: "after\n" })), stop("done")]),
+    worktree: dir,
+    autosave: (x) => store.save(x),
+  });
+  await s.send("edit durable");
+  assert.equal(readFileSync(join(dir, "durable.ts"), "utf8"), "after\n");
+  const loaded = store.load("durable-rb", { invoke: queued([stop("ok")]) });
+  assert.ok(loaded, "session was persisted");
+  const rolled = loaded.rollback(1);
+  assert.equal(rolled.length, 1);
+  assert.equal(readFileSync(join(dir, "durable.ts"), "utf8"), "before\n");
+  assert.match(loaded.toPersisted().messages.at(-1)?.content ?? "", /ROLLBACK NOTICE/);
 });
 
 // ── BLOCKER-2: session store write lock ────────────────────────────────────────────

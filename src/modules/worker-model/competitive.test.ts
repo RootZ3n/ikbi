@@ -48,6 +48,7 @@ function compWorkspaces(opts: { conflict?: boolean; failAllocateAt?: number } = 
   const allocated: string[] = [];
   const promoted: string[] = [];
   const discarded: string[] = [];
+  const retained: string[] = [];
   const committed: string[] = [];
   const events: string[] = []; // ordered trace: "commit:wsN" / "diff:wsN"
   let i = 0;
@@ -68,10 +69,14 @@ function compWorkspaces(opts: { conflict?: boolean; failAllocateAt?: number } = 
       discarded.push(h.id);
       return { workspaceId: h.id, removed: true };
     },
+    retain: async (h): Promise<DiscardResult> => {
+      retained.push(h.id);
+      return { workspaceId: h.id, removed: false };
+    },
     diff: async (h) => { events.push(`diff:${h.id}`); return "line1\nline2\nline3"; },
     commit: async (h): Promise<boolean> => { committed.push(h.id); events.push(`commit:${h.id}`); return true; },
   };
-  return { workspaces, allocated, promoted, discarded, committed, events };
+  return { workspaces, allocated, promoted, discarded, retained, committed, events };
 }
 
 const fakeTrust = () => ({
@@ -214,7 +219,7 @@ test("competitive: a non-autoCommit tier (verified) commits NO candidate (autono
 
 // ── NO-PASS: every candidate disqualified ⇒ all discarded, nothing promoted ──
 
-test("competitive no-pass: all candidates disqualified ⇒ all discarded, nothing promoted, fail-closed", async () => {
+test("competitive no-pass: all candidates disqualified ⇒ retains one candidate, discards losers, nothing promoted", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
   const ws = compWorkspaces();
   const cap = compRoles(() => ({ typecheck: 1, test: 0 })); // BOTH fail typecheck
@@ -224,13 +229,15 @@ test("competitive no-pass: all candidates disqualified ⇒ all discarded, nothin
   assert.equal(r.promoted, false);
   assert.notEqual(r.outcome, "success");
   assert.ok(r.reason, "a fail-closed reason");
+  assert.match(r.reason ?? "", /retained candidate workspace/);
   assert.equal(ws.promoted.length, 0, "nothing promoted");
-  assert.deepEqual([...ws.discarded].sort(), ["ws0", "ws1"], "every workspace discarded");
+  assert.deepEqual(ws.retained, ["ws0"], "best/representative failed candidate retained");
+  assert.deepEqual(ws.discarded, ["ws1"], "non-retained candidate discarded");
 });
 
 // ── CLEANUP ON ERROR: no leaked worktree ─────────────────────────────────────
 
-test("competitive: an allocation failure discards everything already allocated (no leak)", async () => {
+test("competitive: an allocation failure retains the already allocated workspace when supported", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
   const ws = compWorkspaces({ failAllocateAt: 1 }); // ws0 allocates, ws1 throws
   const cap = compRoles(() => ({}));
@@ -238,7 +245,8 @@ test("competitive: an allocation failure discards everything already allocated (
 
   await assert.rejects(() => orch.run(task, parentCtx));
   assert.deepEqual(ws.allocated, ["ws0"], "only ws0 was allocated before the failure");
-  assert.deepEqual(ws.discarded, ["ws0"], "the allocated workspace was discarded (no leak)");
+  assert.deepEqual(ws.retained, ["ws0"], "the allocated workspace was retained for inspection");
+  assert.deepEqual(ws.discarded, [], "no retained workspace is also discarded");
   assert.equal(ws.promoted.length, 0);
 });
 
@@ -258,7 +266,8 @@ test("competitive: a denying gate-wall blocks the winner's promote ⇒ all disca
   assert.equal(captured[0]?.length, 2, "the judge scored both candidates");
   assert.equal(r.promoted, false, "the gate blocked the promote");
   assert.equal(ws.promoted.length, 0, "promote was not called after gate denial");
-  assert.deepEqual([...ws.discarded].sort(), ["ws0", "ws1"], "winner + loser both discarded (fail-closed)");
+  assert.deepEqual(ws.retained, ["ws0"], "denied winner retained");
+  assert.deepEqual(ws.discarded, ["ws1"], "loser discarded");
 });
 
 test("H5 competitive: NO gate-wall → the winner promote is DENIED fail-closed; ALL discarded, nothing promoted", async () => {
@@ -273,7 +282,8 @@ test("H5 competitive: NO gate-wall → the winner promote is DENIED fail-closed;
   assert.equal(r.outcome, "rejected", "an unwired gate-wall denies the competitive promote fail-closed");
   assert.match(r.reason ?? "", /gate-wall not wired/);
   assert.equal(ws.promoted.length, 0, "workspaces.promote() was NEVER called — the promote did not proceed");
-  assert.deepEqual([...ws.discarded].sort(), ["ws0", "ws1"], "EVERY workspace discarded (nothing lands)");
+  assert.deepEqual(ws.retained, ["ws0"], "winner retained for inspection");
+  assert.deepEqual(ws.discarded, ["ws1"], "loser discarded");
 });
 
 // ── #10 CLAMP PRESERVED through the competitive path ─────────────────────────

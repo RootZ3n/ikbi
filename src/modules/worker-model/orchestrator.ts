@@ -1302,6 +1302,25 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 
     const handles: WorkspaceHandle[] = [];
     const rolesByWs = new Map<string, RoleResult[]>();
+    const retainCompetitiveFailure = async (reason: string, preferredWorkspaceId?: string): Promise<{ retained?: WorkspaceHandle; reason: string }> => {
+      const preferred = preferredWorkspaceId !== undefined ? handles.find((h) => h.id === preferredWorkspaceId) : undefined;
+      const withEdits = [...handles].reverse().find((h) => {
+        const builder = rolesByWs.get(h.id)?.find((r) => r.role === "builder");
+        const detail = (builder?.detail ?? {}) as { filesWritten?: unknown };
+        return Array.isArray(detail.filesWritten) && detail.filesWritten.length > 0;
+      });
+      const keep = preferred ?? withEdits ?? handles.at(-1);
+      if (keep === undefined || !retainFailedWorkspaces || workspaces.retain === undefined) {
+        for (const h of handles) await safeDiscard(workspaces, h);
+        return { reason };
+      }
+      await safeRetain(workspaces, keep, reason);
+      for (const h of handles) if (h.id !== keep.id) await safeDiscard(workspaces, h);
+      return {
+        retained: keep,
+        reason: `${reason}; retained candidate workspace ${keep.id} at ${keep.path}. Inspect with \`ikbi diff ${keep.id}\`; discard with \`ikbi workspace discard ${keep.id}\`.`,
+      };
+    };
     try {
       // 1. allocate N isolated worktrees (the workspace layer is already concurrent-capable).
       for (let i = 0; i < n; i += 1) {
@@ -1376,12 +1395,13 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 
       // 5a. NO-PASS (fail-closed): the judge rejected all → discard EVERY workspace, promote nothing.
       if (verdict.winner === null) {
-        for (const ws of handles) await safeDiscard(workspaces, ws);
         const reason = verdict.reason ?? "no candidate passed the judge";
         const repId = verdict.ranking[0]?.workspaceId ?? handles[0]?.id;
+        const retained = await retainCompetitiveFailure(reason, repId);
         events.publish(workerCompetitiveCompleted.create({ taskId: task.taskId, candidateCount: n, winnerWorkspaceId: null }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
-        events.publish(workerFailed.create({ taskId: task.taskId, reason, ...(repId !== undefined ? { workspaceId: repId } : {}) }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
-        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: repId !== undefined ? rolesByWs.get(repId) ?? [] : [], ...(repId !== undefined ? { workspaceId: repId } : {}), promoted: false, reason };
+        events.publish(workerFailed.create({ taskId: task.taskId, reason: retained.reason, ...(retained.retained !== undefined ? { workspaceId: retained.retained.id } : repId !== undefined ? { workspaceId: repId } : {}) }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
+        const resultId = retained.retained?.id ?? repId;
+        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: resultId !== undefined ? rolesByWs.get(resultId) ?? [] : [], ...(resultId !== undefined ? { workspaceId: resultId } : {}), promoted: false, reason: retained.reason };
       }
 
       // 5b. WINNER: promote it (gate-wall STILL governs), discard ALL losers.
@@ -1392,21 +1412,21 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       // (never advisory-allow an irreversible promote). Discard EVERY workspace, land
       // nothing, reject.
       if (gateWall === undefined) {
-        for (const ws of handles) await safeDiscard(workspaces, ws);
         const reason = "gate-wall not wired — promote denied (fail-closed)";
+        const retained = await retainCompetitiveFailure(reason, winner.id);
         events.publish(workerCompetitiveCompleted.create({ taskId: task.taskId, candidateCount: n, winnerWorkspaceId: winner.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
-        events.publish(workerFailed.create({ taskId: task.taskId, reason, workspaceId: winner.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
-        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: winnerRoles, workspaceId: winner.id, promoted: false, reason };
+        events.publish(workerFailed.create({ taskId: task.taskId, reason: retained.reason, workspaceId: retained.retained?.id ?? winner.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
+        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: winnerRoles, workspaceId: retained.retained?.id ?? winner.id, promoted: false, reason: retained.reason };
       }
 
       const governanceGrant = autonomyForTier(asTier(parentIdentity.trustTier ?? TRUST_FLOOR, TRUST_FLOOR));
       const governance: PromoteGovernance = await gateWall.evaluate({ grant: governanceGrant, action: { kind: "promote", task, results: winnerRoles }, identity: parentIdentity });
       if (!governance.allow) {
-        for (const ws of handles) await safeDiscard(workspaces, ws);
         const reason = governance.reason ?? "gate-wall denied promotion";
+        const retained = await retainCompetitiveFailure(reason, winner.id);
         events.publish(workerCompetitiveCompleted.create({ taskId: task.taskId, candidateCount: n, winnerWorkspaceId: winner.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
-        events.publish(workerFailed.create({ taskId: task.taskId, reason, workspaceId: winner.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
-        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: winnerRoles, workspaceId: winner.id, promoted: false, reason, costUsd: runCost() };
+        events.publish(workerFailed.create({ taskId: task.taskId, reason: retained.reason, workspaceId: retained.retained?.id ?? winner.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
+        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: winnerRoles, workspaceId: retained.retained?.id ?? winner.id, promoted: false, reason: retained.reason, costUsd: runCost() };
       }
       const promote = await workspaces.promote(winner, {
         evaluation: { approved: true, score: verdict.winner.composite, evaluatorId: "deterministic-judge" },
@@ -1420,11 +1440,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       let reason: string | undefined;
       if (!promoted) {
         // The winner did not land — gate denial or conflict. Fail-closed: discard the
-        // winner too (so EVERY workspace is now discarded). A conflict is reconcilable
+        // winner too unless failed-workspace retention is enabled. A conflict is reconcilable
         // (partial); a governance deny is a rejection.
-        await safeDiscard(workspaces, winner);
         outcome = promote.conflicts !== undefined && promote.conflicts.length > 0 ? "partial" : "rejected";
         reason = promote.reason ?? "winner not promoted (gate denied or conflict)";
+        const retained = await retainCompetitiveFailure(reason, winner.id);
+        reason = retained.reason;
       }
 
       events.publish(workerCompetitiveCompleted.create({ taskId: task.taskId, candidateCount: n, winnerWorkspaceId: winner.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
@@ -1435,11 +1456,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       }
       return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome, roles: winnerRoles, workspaceId: winner.id, promoted, ...(reason !== undefined ? { reason } : {}), costUsd: runCost() };
     } catch (err) {
-      // Mid-run failure (allocation / role / judge): discard EVERY allocated workspace —
-      // no leaked worktree — then fail.
-      for (const ws of handles) await safeDiscard(workspaces, ws);
+      // Mid-run failure (allocation / role / judge): retain one useful failed candidate when
+      // supported, discard the rest, then fail.
       const reason = err instanceof Error ? err.message : String(err);
-      events.publish(workerFailed.create({ taskId: task.taskId, reason, ...(handles[0] !== undefined ? { workspaceId: handles[0].id } : {}) }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
+      const retained = await retainCompetitiveFailure(reason);
+      events.publish(workerFailed.create({ taskId: task.taskId, reason: retained.reason, ...(retained.retained !== undefined ? { workspaceId: retained.retained.id } : handles[0] !== undefined ? { workspaceId: handles[0].id } : {}) }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
       throw err;
     }
   }

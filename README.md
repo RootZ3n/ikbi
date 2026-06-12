@@ -35,7 +35,7 @@ trust and capability are granted, never assumed.
 - **Cheap-model harness** — the `worker-model` orchestrator that drives small,
   inexpensive models through the governed roles to land verified fixes cold → working
   for a fraction of a cent.
-- **940 tests** covering the core, the modules, the CLI, and end-to-end acceptance.
+- **1438 tests** covering the core, the modules, the CLI, and end-to-end acceptance.
 
 ## Requirements
 
@@ -74,9 +74,14 @@ Stop it with `Ctrl-C` (SIGINT) or `kill -TERM <pid>` — it drains and exits 0.
 
 ## Configuration
 
-All configuration is read in exactly one place — [`src/core/config.ts`](src/core/config.ts).
-Nothing else touches `process.env`; modules read their own `IKBI_*` slice through the
-config seam. All knobs are `IKBI_*` prefixed. The CLI autoloads a project `.env` at
+The bootstrap configuration is parsed in one place — [`src/core/config.ts`](src/core/config.ts) —
+which is the **primary** config seam; most modules read their own `IKBI_*` slice through it.
+A small number of paths read `process.env` **directly** by design, for per-request secrets and
+runtime mode toggles that must be settable without a process restart: the `POST /chat` bearer token
+(`IKBI_CHAT_TOKEN`), the chat workdir (`IKBI_CHAT_WORKDIR`), the verification/retrieval mode
+overrides (`IKBI_VERIFY` / `IKBI_RETRIEVAL`), governed-exec, and a few worker-model/CLI seams. These
+are the documented exceptions the architecture invariants allow — not a single-reader guarantee. All
+knobs are `IKBI_*` prefixed. The CLI autoloads a project `.env` at
 startup (a real environment variable always wins over a `.env` entry), so you can keep
 your `IKBI_*` tokens in `.env`. The most important ones:
 
@@ -130,8 +135,31 @@ deploy/
 | `GET`  | `/health`       | Liveness — `{ status: "ok", version }`                         |
 | `GET`  | `/ready`        | Readiness — 200 when ready, 503 while starting                 |
 | `GET`  | `/agent`        | Agent identity/discovery — id, role, model, tool count, status |
-| `GET`  | `/capabilities` | Tool inventory (16) + feature flags, for inter-agent discovery |
-| `POST` | `/chat`         | Persistent conversational session (bounded tool-calling loop)  |
+| `GET`  | `/capabilities` | Tool inventory (16) + feature flags + product posture (surface classification & lifecycle truth) |
+| `POST` | `/chat`         | Conversational coding session (bounded tool-calling loop). **Ephemeral** — sessions are in-memory only and do not survive a server restart; use `ikbi repl --continue` for durable sessions |
+
+## Product surfaces
+
+Not every surface carries the same guarantees. The **CLI build path** (`ikbi build`/`diff`/
+`workspace`/`undo`) is the golden path: it edits isolated, promotable git worktrees, gates success on
+ladder verification, and gives explicit governed promote/undo.
+
+The **interactive REPL** (`ikbi repl`) now shares the build path's *managed-workspace* lifecycle: a
+repo-mode session allocates an isolated git worktree off your repo and edits **there**, never the
+target directly. Review pending changes with `/diff`, then land them with an explicit `/apply` — which
+runs the **same ladder verification `ikbi build` uses** (governed checks, script-integrity guard,
+impact-scoped) and promotes **only on a pass**; a failed, blocked, or undeterminable verification
+fails closed (no commit, no promote). The promote is governed and receipt-backed — undo later with
+`ikbi undo` — and the verification verdict is recorded in the session. `/discard` drops the workspace
+safely. `ikbi repl --scratch` keeps the old throwaway behavior and is clearly labelled
+**non-promotable** (it cannot verify or apply).
+
+The **HTTP `/chat`**, **batch**, **mcp**, **sub-agent**, and **bare-goal cognition** paths are
+*experimental* (or *dormant*): HTTP chat sessions are ephemeral, in-memory, and non-managed (a
+deliberate deferral). Each surface's honest classification and lifecycle truth is reported by `ikbi
+doctor`, `ikbi capabilities`, the REPL `/status` command, and the HTTP `GET /capabilities` endpoint,
+and is specified in [`docs/PRODUCT-SPINE.md`](docs/PRODUCT-SPINE.md) and
+[`docs/ARCHITECTURE-INVARIANTS.md`](docs/ARCHITECTURE-INVARIANTS.md).
 
 ## Running under systemd
 
