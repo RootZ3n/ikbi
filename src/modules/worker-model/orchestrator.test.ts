@@ -975,3 +975,86 @@ test("H3: a hung role is bounded by the per-role wall-clock timeout and fails th
   releaseScout();
   await scoutGate;
 });
+
+// ── STEP-PLANNER: reuseWorkspace + skipPromote ─────────────────────────────────────────────
+
+test("reuseWorkspace: orchestrator reuses the provided workspace instead of allocating", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const cap = capturingRoles();
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, workspaces: ws.workspaces }));
+  const existing = fakeWorkspaceHandle();
+  const taskWithReuse: WorkerTask = { ...task, reuseWorkspace: existing };
+  const result = await orch.run(taskWithReuse, parentCtx);
+
+  assert.equal(ws.calls.allocate.length, 0, "did NOT allocate a new workspace");
+  assert.equal(ws.calls.promote, 1, "still promoted (skipPromote not set)");
+  assert.equal(result.workspaceId, existing.id, "used the existing workspace id");
+  assert.equal(result.outcome, "success");
+});
+
+test("skipPromote: orchestrator runs all roles but skips promote/discard", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const cap = capturingRoles();
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, workspaces: ws.workspaces }));
+  const taskSkip: WorkerTask = { ...task, skipPromote: true };
+  const result = await orch.run(taskSkip, parentCtx);
+
+  assert.equal(ws.calls.allocate.length, 1, "allocated a workspace");
+  assert.equal(ws.calls.promote, 0, "did NOT promote");
+  assert.equal(ws.calls.discard, 0, "did NOT discard");
+  assert.equal(result.outcome, "success", "roles still report success");
+  assert.equal(result.promoted, false, "not promoted");
+  // All 5 roles still ran.
+  assert.equal(cap.seen.length, 5, "all five roles dispatched");
+});
+
+test("reuseWorkspace + skipPromote: shared workspace across steps, no lifecycle", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const cap = capturingRoles();
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, workspaces: ws.workspaces }));
+  const existing = fakeWorkspaceHandle();
+  // Step 1: reuse + skip promote
+  const step1: WorkerTask = { taskId: "t-step1", targetRepo: "/repo", goal: "step 1", reuseWorkspace: existing, skipPromote: true };
+  const r1 = await orch.run(step1, parentCtx);
+  assert.equal(ws.calls.allocate.length, 0, "step 1 did not allocate");
+  assert.equal(ws.calls.promote, 0, "step 1 did not promote");
+  assert.equal(r1.workspaceId, existing.id, "step 1 used shared workspace");
+
+  // Step 2: reuse + skip promote (same workspace)
+  const step2: WorkerTask = { taskId: "t-step2", targetRepo: "/repo", goal: "step 2", reuseWorkspace: existing, skipPromote: true };
+  const r2 = await orch.run(step2, parentCtx);
+  assert.equal(ws.calls.allocate.length, 0, "step 2 did not allocate");
+  assert.equal(ws.calls.promote, 0, "step 2 did not promote");
+  assert.equal(r2.workspaceId, existing.id, "step 2 used same workspace");
+
+  // Final: reuse + promote (no skipPromote)
+  const final: WorkerTask = { taskId: "t-final", targetRepo: "/repo", goal: "verify all", reuseWorkspace: existing };
+  const rFinal = await orch.run(final, parentCtx);
+  assert.equal(ws.calls.allocate.length, 0, "final did not allocate");
+  assert.equal(ws.calls.promote, 1, "final promoted");
+  assert.equal(rFinal.workspaceId, existing.id, "final used same workspace");
+  assert.equal(rFinal.promoted, true, "final promoted flag set");
+
+  // Total: 3 runs, 0 allocations, 1 promote, 0 discards.
+  assert.equal(ws.calls.allocate.length, 0);
+  assert.equal(ws.calls.promote, 1);
+  assert.equal(ws.calls.discard, 0);
+});
+
+test("skipPromote: a failed step still reports failure without discarding", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const cap = capturingRoles((role) => role === "builder" ? "failure" : "success");
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, workspaces: ws.workspaces }));
+  const existing = fakeWorkspaceHandle();
+  const stepFail: WorkerTask = { ...task, reuseWorkspace: existing, skipPromote: true };
+  const result = await orch.run(stepFail, parentCtx);
+
+  assert.equal(result.outcome, "failure", "builder failure propagates");
+  assert.equal(result.promoted, false, "not promoted");
+  assert.equal(ws.calls.promote, 0, "did NOT promote");
+  assert.equal(ws.calls.discard, 0, "did NOT discard — workspace stays alive for step planner");
+});

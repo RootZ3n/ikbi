@@ -117,6 +117,20 @@ export interface WorkerTask {
    * the orchestrator resolves the candidate list from IKBI_CANDIDATE_MODELS (empty ⇒ no tournament).
    */
   readonly candidates?: readonly string[];
+  /**
+   * STEP-PLANNER: reuse an existing workspace instead of allocating a new one.
+   * When set, the orchestrator skips workspace allocation and runs in the
+   * provided handle. Used by the step planner to share a single workspace
+   * across multiple sequential steps so changes accumulate.
+   */
+  readonly reuseWorkspace?: import("../../core/workspace/contract.js").WorkspaceHandle;
+  /**
+   * STEP-PLANNER: run the full role pipeline (scout → builder → critic → verifier)
+   * but SKIP the promote/discard lifecycle at the end. The workspace stays alive
+   * on disk so the next step (or a final verification pass) can continue.
+   * When false (default), the orchestrator promotes or discards as usual.
+   */
+  readonly skipPromote?: boolean;
 }
 
 /** The result a single role produces. */

@@ -571,9 +571,15 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       let result: WorkerResult;
 
       if (stepPlan.decomposed && stepPlan.steps.length > 1) {
-        // MULTI-STEP: run each step sequentially through the orchestrator.
-        // Changes accumulate in the same workspace across steps.
+        // MULTI-STEP: allocate ONE workspace, run all steps in it, final verify + promote.
+        // This is the shared-workspace step planner — changes accumulate across steps.
         out(`  ↳ decomposed into ${stepPlan.steps.length} steps\n`);
+        const sharedWorkspace = await coreWorkspaces.allocate({
+          targetRepo,
+          identity: who.identity,
+          label: `worker:${id}:steps`,
+        });
+        let stepsOk = true;
         let lastResult: WorkerResult | undefined;
         for (const step of stepPlan.steps) {
           out(`  → step ${step.index}/${stepPlan.steps.length}: ${step.goal}\n`);
@@ -582,17 +588,31 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
             targetRepo,
             goal: step.goal,
             writeScope: detectWriteScope(step.goal),
+            reuseWorkspace: sharedWorkspace,
+            skipPromote: true,
           };
           lastResult = await orchestrator.run(stepTask, ctx);
           if (lastResult.outcome !== "success") {
             out(`  ✗ step ${step.index} failed: ${lastResult.reason ?? lastResult.outcome}\n`);
+            stepsOk = false;
             result = lastResult;
             break;
           }
           out(`  ✓ step ${step.index} passed\n`);
         }
-        // If all steps passed, use the last result.
-        result = lastResult!;
+        if (stepsOk) {
+          // All steps passed — run full verification + promote on the accumulated workspace.
+          out(`  → final verification + promote\n`);
+          const finalTask: WorkerTask = {
+            taskId: `${id}:verify`,
+            targetRepo,
+            goal: `Verify all changes from the multi-step plan: ${finalGoal}`,
+            reuseWorkspace: sharedWorkspace,
+          };
+          result = await orchestrator.run(finalTask, ctx);
+        } else {
+          result = lastResult!;
+        }
       } else {
         // SINGLE-STEP: run directly.
         result = await orchestrator.run(task, ctx);

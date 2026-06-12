@@ -862,14 +862,19 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     }
 
     // COOPERATIVE KILL CHECKPOINT (prevent NEW work): if a kill targets this run, do
-    // not allocate or start anything.
-    const preKill = await killHalt(task, parentIdentity, parentCtx);
-    if (preKill !== undefined) {
-      events.publish(workerFailed.create({ taskId: task.taskId, reason: preKill }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } }));
-      return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason: preKill };
+    // not allocate or start anything. Skip the kill check when reusing a workspace —
+    // the step planner already checked on the first step.
+    if (task.reuseWorkspace === undefined) {
+      const preKill = await killHalt(task, parentIdentity, parentCtx);
+      if (preKill !== undefined) {
+        events.publish(workerFailed.create({ taskId: task.taskId, reason: preKill }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } }));
+        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason: preKill };
+      }
     }
 
-    const workspace = await workspaces.allocate({
+    // STEP-PLANNER: reuse an existing workspace (changes accumulate across steps)
+    // or allocate a fresh one (default single-step behavior).
+    const workspace = task.reuseWorkspace ?? await workspaces.allocate({
       targetRepo: task.targetRepo,
       identity: parentIdentity,
       ...(task.baseBranch !== undefined ? { baseBranch: task.baseBranch } : {}),
@@ -1150,6 +1155,19 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         ),
       );
       return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "partial", roles: results, workspaceId: workspace.id, promoted: false, reason, costUsd: runCost() };
+    }
+
+    // STEP-PLANNER: when skipPromote is set, run the role pipeline but leave the
+    // workspace alive on disk. No promote, no discard — the step planner will
+    // either run more steps or do a final verification pass.
+    if (task.skipPromote === true) {
+      events.publish(
+        workerCompleted.create(
+          { taskId: task.taskId, outcome: overall, promoted: false, workspaceId: workspace.id, ...(verificationScope !== undefined ? { verificationScope } : {}) },
+          { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } },
+        ),
+      );
+      return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: overall, roles: results, workspaceId: workspace.id, promoted: false, ...(overall !== "success" ? { reason: `step completed with outcome "${overall}"` } : {}), costUsd: runCost() };
     }
 
     // Terminal: ENACT the integrator's promote/discard DECISION (the integrator
