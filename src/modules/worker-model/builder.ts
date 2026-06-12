@@ -196,20 +196,17 @@ export const TOOLS: readonly ModelTool[] = [
     // call done with a self-check, validated for SUBSTANCE (not a rubber stamp).
     name: "done",
     description:
-      "Declare the work complete. You MUST call this to finish — stopping without it means the work is INCOMPLETE. " +
-      "Only call it AFTER run_checks is fully green (and re-run after your last edit). When you FIXED a bug, also " +
-      "provide rootCause and fixRationale. " +
-      'Example: {"successCondition": "src/routes.ts links the stylesheet", "filesReadBack": ["src/routes.ts"], ' +
-      '"selfCheck": "re-read src/routes.ts; the <link> is present and run_checks is green", "satisfied": true}',
+      "Declare the work complete. Only call after run_checks passes. " +
+      'Example: {"satisfied": true, "filesReadBack": ["src/file.ts"], "selfCheck": "verified"}',
     parameters: {
       type: "object",
       properties: {
-        successCondition: { type: "string", description: "The single checkable outcome that means 'done'." },
-        filesReadBack: { type: "array", items: { type: "string" }, description: "Every file you changed, re-read to verify. Must include all files you wrote." },
-        selfCheck: { type: "string", description: "How you verified: what you re-read and that run_checks is green." },
-        satisfied: { type: "boolean", description: "true only when the success condition is met and run_checks is green." },
-        rootCause: { type: "string", description: "(bug fixes) The underlying cause that was actually wrong." },
-        fixRationale: { type: "string", description: "(bug fixes) Why your change corrects the root cause." },
+        satisfied: { type: "boolean", description: "true when the work is done and checks pass." },
+        filesReadBack: { type: "array", items: { type: "string" }, description: "Files you changed and re-read." },
+        selfCheck: { type: "string", description: "How you verified." },
+        successCondition: { type: "string", description: "What 'done' means." },
+        rootCause: { type: "string", description: "(bug fixes) What was wrong." },
+        fixRationale: { type: "string", description: "(bug fixes) Why your change fixes it." },
       },
       required: ["successCondition", "filesReadBack", "selfCheck", "satisfied"],
     },
@@ -958,8 +955,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       // SUBSTANCE check 1: you cannot claim done without reading anything back.
       if (filesReadBack.length === 0) {
         rejectedToolCalls.push({ tool: "done", error: "self-check filesReadBack is empty" });
-        // ACTIONABLE (Principle 3): one next move.
-        return { accept: false, feedback: "Do this next: read_file each file you changed, then call done again with those paths in filesReadBack." };
+        return { accept: false, feedback: "Do this next: read_file the file you changed, then call done again with filesReadBack." };
       }
       // SUBSTANCE check 2: the read-back must include every file you actually WROTE.
       const missing = filesWritten.filter((f) => !filesReadBack.includes(f));

@@ -260,6 +260,6 @@ test("P6: the core tool schemas carry concrete examples", () => {
   const byName = new Map(TOOLS.map((t) => [t.name, t]));
   assert.match(byName.get("read_file")?.description ?? "", /Example: \{"path"/);
   assert.match(byName.get("write_file")?.description ?? "", /Example: \{"path".*"content"/);
-  assert.match(byName.get("done")?.description ?? "", /Example: \{"successCondition"/);
+  assert.match(byName.get("done")?.description ?? "", /Example: \{"satisfied"/);
   assert.match(byName.get("run_checks")?.description ?? "", /Example: \{\}/);
 });
