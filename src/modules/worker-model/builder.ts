@@ -1311,6 +1311,32 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       break;
     }
 
+    // AUTO-ACCEPT ON GREEN-CHECKS TERMINATION. The loop can terminate for a PROTOCOL reason
+    // (max_iterations, timeout, stuck_detected, no_progress) without the model ever emitting a
+    // schema-valid `done`. But the INDEPENDENT signal — run_checks runs the verifier's EXACT
+    // shared checks against the worktree — may already be GREEN over real work on disk. Discarding
+    // green, current, non-empty work because of a missing `done` formality throws away correct
+    // output the verifier would have promoted. So before classifying as failure, consult the
+    // objective state: checks last ran GREEN, that green is NOT stale (no write since), and files
+    // were actually written. When all hold, synthesize the done claim and classify SUCCESS — the
+    // verifier downstream still re-runs the real checks, so this cannot promote unverified work.
+    if (
+      doneClaim === undefined &&
+      stopReason !== "done" &&
+      lastChecks?.allPass === true &&
+      !checksStale &&
+      filesWritten.length > 0
+    ) {
+      doneClaim = {
+        successCondition,
+        filesReadBack: [...new Set(filesWritten)],
+        selfCheck: "auto: checks green at termination",
+        satisfied: true,
+        checksPassed: true,
+      };
+      stopReason = "done";
+    }
+
     const policyViolations = rejectedToolCalls.filter(isPolicyViolation);
     const toolFormatErrors = rejectedToolCalls.filter((e) => !isPolicyViolation(e));
     const outcome = classifyOutcome(stopReason);

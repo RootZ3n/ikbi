@@ -823,3 +823,58 @@ test("M8: simplifyTools strips prose to the name for ordinary tools but KEEPS a 
     assert.deepEqual(byName.get(original.name)!.parameters, original.parameters, `${original.name} parameter shape unchanged`);
   }
 });
+
+// ── AUTO-ACCEPT on green-checks termination (correct work is not discarded on a `done` formality) ──
+
+test("AUTO-ACCEPT: green run_checks + writes, then the model never calls done (loops to termination) → SUCCESS, not failure", async () => {
+  const dir = tmp();
+  // Write a file, run_checks GREEN, then list_dir forever (never a valid done). The loop
+  // terminates on no_progress/stuck — but the verifier's exact checks are GREEN over real work.
+  const { engine } = mockEngine([
+    writeResp("x.ts", "export const x = 1;\n"),
+    runChecksResp(), // green (default exec)
+    toolResp([call("list_dir", { path: "." })]), // repeats → no done, no new writes
+  ]);
+  const result = await run(makeCtx(dir, "verified", engine), greenExec());
+  assert.equal(result.outcome, "success", "green, current, non-empty work is accepted despite no `done`");
+  const detail = result.detail as { stopReason: string; doneClaim?: { satisfied: boolean; checksPassed: boolean; selfCheck: string; filesReadBack: string[] } };
+  assert.equal(detail.stopReason, "done", "the synthesized claim reclassifies termination as done");
+  assert.equal(detail.doneClaim?.satisfied, true);
+  assert.equal(detail.doneClaim?.checksPassed, true);
+  assert.match(detail.doneClaim?.selfCheck ?? "", /auto: checks green at termination/);
+  assert.deepEqual(detail.doneClaim?.filesReadBack, ["x.ts"], "read-back is the files actually written");
+});
+
+test("AUTO-ACCEPT: green run_checks + writes, then a MALFORMED done (rejected) → SUCCESS via auto-accept", async () => {
+  const dir = tmp();
+  // Write, run_checks GREEN, then a malformed `done` (not valid JSON) repeated → rejected every
+  // round → stuck_detected. The schema-invalid done is a protocol formality; the work is green.
+  const { engine } = mockEngine([
+    writeResp("x.ts", "export const x = 1;\n"),
+    runChecksResp(), // green
+    toolResp([call("done", "{ not valid json")]), // malformed → rejected, repeats
+  ]);
+  const result = await run(makeCtx(dir, "verified", engine), greenExec());
+  assert.equal(result.outcome, "success", "a malformed done does not discard green, verified work");
+  const detail = result.detail as { stopReason: string; doneClaim?: { checksPassed: boolean }; rejectedToolCalls: ToolCallError[] };
+  assert.equal(detail.stopReason, "done", "auto-accept reclassified the termination");
+  assert.equal(detail.doneClaim?.checksPassed, true);
+  assert.ok(detail.rejectedToolCalls.some((r) => r.tool === "done"), "the malformed done was still recorded as rejected");
+});
+
+test("AUTO-ACCEPT does NOT fire when the green is STALE (a write happened after the last run_checks) → not success", async () => {
+  const dir = tmp();
+  // Write, run_checks GREEN, then write AGAIN (makes the green stale), then list_dir forever.
+  // The objective state is no longer trustworthy — auto-accept must NOT rescue it.
+  const { engine } = mockEngine([
+    writeResp("x.ts", "export const x = 1;\n", "w1"),
+    runChecksResp(), // green
+    writeResp("y.ts", "export const y = 2;\n", "w2"), // new write → checks now stale
+    toolResp([call("list_dir", { path: "." })]), // repeats → never re-runs checks, never done
+  ]);
+  const result = await run(makeCtx(dir, "verified", engine), greenExec());
+  assert.notEqual(result.outcome, "success", "stale green is not auto-accepted");
+  const detail = result.detail as { stopReason: string; doneClaim?: unknown };
+  assert.notEqual(detail.stopReason, "done", "no synthesized done over a stale check");
+  assert.equal(detail.doneClaim, undefined, "no completion claim when the green is stale");
+});
