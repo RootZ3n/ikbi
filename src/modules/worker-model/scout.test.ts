@@ -187,3 +187,30 @@ test("FIX#1: index-mode brief orders Key files by relevance score, NOT byte size
   assert.ok(posSmall !== -1 && posBig !== -1, "both files listed in the brief");
   assert.ok(posSmall < posBig, `most-relevant small.ts (score 99) appears before larger big.ts (score 1): ${posSmall} < ${posBig}`);
 });
+
+test("FIX#2: hallucinated path refs are dropped; valid ones (and in-range lines) survive", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-scout-"));
+  writeFileSync(join(dir, "a.ts"), "export const a = 1;\nexport const b = 2;"); // 2 lines
+  // Three findings: a valid ref, a ref to a file that does NOT exist, and a valid file
+  // with an out-of-range line number.
+  const out = ["- a.ts:1 — real, in-range ref", "- ghost.ts:5 — hallucinated file ref", "- a.ts:999 — real file, bogus line"].join("\n");
+  const { ctx } = makeCtx(dir, async () => modelResponse(out));
+
+  const result = await scout(ctx);
+  assert.equal(result.outcome, "success");
+  const detail = result.detail as { findings: ScoutFinding[] };
+  const [valid, hallucinated, outOfRange] = detail.findings;
+
+  // Valid ref preserved verbatim.
+  assert.equal(valid?.path, "a.ts", "valid path kept");
+  assert.deepEqual(valid?.lines, [1, 1], "valid in-range line kept");
+
+  // Hallucinated path filtered out — the prose remains but the drill-down ref is gone.
+  assert.equal(hallucinated?.path, undefined, "ref to nonexistent ghost.ts is dropped");
+  assert.equal(hallucinated?.lines, undefined, "no line range survives for a dropped path");
+  assert.match(hallucinated?.detail ?? "", /hallucinated file ref/, "the finding text itself survives");
+
+  // Out-of-range line: path is real so it stays, but the bogus line range is dropped.
+  assert.equal(outOfRange?.path, "a.ts", "real path kept");
+  assert.equal(outOfRange?.lines, undefined, "out-of-range line (999 > 2) dropped");
+});

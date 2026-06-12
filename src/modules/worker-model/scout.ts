@@ -194,8 +194,37 @@ function extractPathRef(text: string): { path?: string; lines?: [number, number]
   return { path, lines: [start, end] };
 }
 
-/** Parse the model's bullet output into structured findings; fall back to one finding. */
-function parseFindings(content: string): ScoutFinding[] {
+/** Locate the structure-index entry a finding's path ref points at, matching exactly or by path suffix. */
+function findStructureEntry(path: string, structure: readonly ScoutFileEntry[]): ScoutFileEntry | undefined {
+  const lower = path.toLowerCase();
+  return structure.find((e) => {
+    const p = e.path.toLowerCase();
+    return p === lower || p.endsWith(`/${lower}`) || lower.endsWith(`/${p}`);
+  });
+}
+
+/**
+ * Validate an extracted path:line ref against the STRUCTURE index so hallucinated references
+ * never flow to the builder. A path that names no scanned file is DROPPED entirely (the finding's
+ * prose survives, but its drill-down ref does not). A path that exists but cites an out-of-range
+ * line keeps the path and drops only the bogus line range.
+ */
+function validateRef(ref: { path?: string; lines?: [number, number] }, structure: readonly ScoutFileEntry[]): { path?: string; lines?: [number, number] } {
+  if (ref.path === undefined) return {};
+  const entry = findStructureEntry(ref.path, structure);
+  if (entry === undefined) return {}; // hallucinated path — drop the whole ref
+  if (ref.lines === undefined) return { path: ref.path };
+  const [start, end] = ref.lines;
+  const inRange = start >= 1 && end >= start && end <= entry.lines;
+  return inRange ? { path: ref.path, lines: ref.lines } : { path: ref.path }; // out-of-range — drop only the lines
+}
+
+/**
+ * Parse the model's bullet output into structured findings; fall back to one finding.
+ * Each extracted path:line ref is VALIDATED against `structure` (the file list the scout actually
+ * scanned) — refs to nonexistent files or out-of-range lines are dropped rather than handed downstream.
+ */
+function parseFindings(content: string, structure: readonly ScoutFileEntry[]): ScoutFinding[] {
   const lines = content
     .split("\n")
     .map((l) => l.trim())
@@ -204,7 +233,7 @@ function parseFindings(content: string): ScoutFinding[] {
   if (bullets.length > 0) {
     return bullets.map((l, i) => {
       const detail = l.replace(/^([-*]|\d+[.)])\s+/, "");
-      const ref = extractPathRef(detail);
+      const ref = validateRef(extractPathRef(detail), structure);
       return {
         title: `finding-${i + 1}`,
         detail,
@@ -369,7 +398,7 @@ export function createScout(deps: ScoutDeps = {}): RoleFn {
       };
 
       const response = await ctx.engine.invokeModel(request);
-      const findings = parseFindings(response.content);
+      const findings = parseFindings(response.content, structure);
       const brief = buildBrief(structure, relevanceScores);
 
       // ── LAYER 2: Scout-level ambiguity detection ───────────────────────────
