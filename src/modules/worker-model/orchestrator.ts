@@ -1616,6 +1616,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     };
 
     const verifyShadow = async (t: WorkerTask, ws: WorkspaceHandle): Promise<ShadowVerification> => {
+      // Install deps in the shadow workspace before verifying — the shadow is a clean
+      // worktree without node_modules, so pnpm test / vitest will fail without this.
+      await installWorkspaceDeps(ws, parentCtx, deps.dependencyInstall);
       const verifierResult = await dispatchRole("verifier", spawnRole("verifier", parentCtx), t, ws, [], parentCtx, runEngine);
       const verdict = (verifierResult.detail as { verdict?: unknown } | undefined)?.verdict;
       const pass = verifierResult.outcome === "success" && verdict === "pass";
