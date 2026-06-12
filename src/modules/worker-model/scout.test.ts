@@ -214,3 +214,22 @@ test("FIX#2: hallucinated path refs are dropped; valid ones (and in-range lines)
   assert.equal(outOfRange?.path, "a.ts", "real path kept");
   assert.equal(outOfRange?.lines, undefined, "out-of-range line (999 > 2) dropped");
 });
+
+test("FIX#3: legacy selection is goal-aware — goal-relevant files lead the scanned batch", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-scout-"));
+  // Several unrelated files plus one whose name matches a goal token. In raw traversal order
+  // the relevant file is NOT guaranteed first; goal-aware sorting must surface it to the front.
+  writeFileSync(join(dir, "aaa.ts"), "export const a = 1;");
+  writeFileSync(join(dir, "bbb.ts"), "export const b = 1;");
+  writeFileSync(join(dir, "ccc.ts"), "export const c = 1;");
+  writeFileSync(join(dir, "widget.ts"), "export const w = 1;");
+  const { ctx } = makeCtx(dir, async () => modelResponse("- f"), "update the widget renderer");
+
+  const result = await scout(ctx);
+  assert.equal(result.outcome, "success");
+  const detail = result.detail as { structure: { path: string }[]; retrievalMode: string };
+  assert.equal(detail.retrievalMode, "legacy", "exercised the legacy (non-index) path");
+  // widget.ts is the only file matching a goal token ("widget") — it must sort to the front,
+  // ahead of the zero-relevance files, regardless of filesystem walk order.
+  assert.equal(detail.structure[0]?.path, "widget.ts", "goal-relevant file leads the scanned batch");
+});

@@ -24,7 +24,7 @@ import { toUntrustedMessage } from "../../core/injection/index.js";
 import type { ModelMessage, ModelRequest } from "../../core/provider/contract.js";
 import type { RoleFn } from "./contract.js";
 import { driverModel } from "./role-models.js";
-import type { ProjectRetrievalApi } from "../project-retrieval/index.js";
+import { goalTokens, type ProjectRetrievalApi } from "../project-retrieval/index.js";
 import { resolveRetrievalMode, type RetrievalMode } from "./modes.js";
 
 /** A single thing scout learned. Lives in the open `detail` bag — NOT a contract type. */
@@ -93,6 +93,29 @@ function gatherFiles(root: string): string[] {
     }
   }
   return out;
+}
+
+/**
+ * GOAL-AWARE legacy ordering. The legacy walk (`gatherFiles`) returns files in raw
+ * filesystem-traversal order with zero goal relevance — so the first 40 are whatever the
+ * walk happened to hit. This re-orders the SAME bounded set (cap unchanged) so files whose
+ * repo-relative path contains a goal token sort first; ties keep their original walk order
+ * (stable). When the goal yields no usable tokens, order is left exactly as-is.
+ */
+function sortByGoalRelevance(files: readonly string[], root: string, goal: string): string[] {
+  const { pathTokens, nameTokens } = goalTokens(goal);
+  const tokens = [...pathTokens, ...nameTokens].map((t) => t.toLowerCase()).filter((t) => t.length > 0);
+  if (tokens.length === 0) return [...files];
+  const score = (full: string): number => {
+    const rel = relative(root, full).toLowerCase();
+    let s = 0;
+    for (const t of tokens) if (rel.includes(t)) s += 1;
+    return s;
+  };
+  return files
+    .map((f, i) => ({ f, i, s: score(f) }))
+    .sort((a, b) => b.s - a.s || a.i - b.i)
+    .map((x) => x.f);
 }
 
 function fallbackBlockThreshold(env: NodeJS.ProcessEnv): number {
@@ -368,13 +391,15 @@ export function createScout(deps: ScoutDeps = {}): RoleFn {
           if (reachesFileThreshold(root, threshold)) {
             throw new Error(`index retrieval failed on a large repo (>=${threshold} scanned source files); refusing silent legacy fallback. Reason: ${reason}`);
           }
-          files = gatherFiles(root);
+          files = sortByGoalRelevance(gatherFiles(root), root, ctx.task.goal);
           retrievalMode = "index-fallback";
           retrievalFallbackReason = reason;
           modeNote = `IKBI_RETRIEVAL=index but index retrieval FAILED — fell back to legacy scan (reason: ${retrievalFallbackReason})`;
         }
       } else {
-        files = gatherFiles(root); // bounded, read-only — the unchanged default
+        // bounded, read-only — the unchanged default walk, now re-ordered so goal-relevant
+        // files lead the (still 40-capped) set instead of raw traversal order.
+        files = sortByGoalRelevance(gatherFiles(root), root, ctx.task.goal);
       }
 
       const { text, used, structure } = buildContext(files, root);
