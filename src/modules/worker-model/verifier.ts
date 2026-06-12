@@ -202,6 +202,7 @@ export function detectScriptMutation(diff: string): { mutated: boolean; reason?:
     "strictFunctionTypes", "strictBindCallApply",
   ];
   let inPackageJson = false;
+  let isNewFile = false; // greenfield: file didn't exist in base
   let inGuardedConfig = false;
   let inTsconfig = false;
   let guardedConfigName = "";
@@ -227,9 +228,14 @@ export function detectScriptMutation(diff: string): { mutated: boolean; reason?:
       }
       continue;
     }
-    if (line.startsWith("--- ")) continue; // old-file header — not a content line
+    if (line.startsWith("--- /dev/null")) {
+      isNewFile = true; // next +++ is a new file
+      continue;
+    }
+    if (line.startsWith("--- ")) { isNewFile = false; continue; } // old-file header — not a content line
     // Guarded config file (vitest.config, jest.config, etc.): ANY change is flagged.
-    if (inGuardedConfig) {
+    // But NOT for new files — a new config can't weaken an existing one.
+    if (inGuardedConfig && !isNewFile) {
       const changed = line.startsWith("+") || line.startsWith("-");
       if (changed) {
         return { mutated: true, reason: `builder modified verification config "${guardedConfigName}"` };
@@ -247,6 +253,8 @@ export function detectScriptMutation(diff: string): { mutated: boolean; reason?:
       }
     }
     if (!inPackageJson) continue;
+    // Greenfield: package.json is a NEW file — scripts can't weaken what didn't exist.
+    if (isNewFile) continue;
     // A CHANGED content line (added/removed) — not a header (`+++`/`---` handled above).
     const changed = line.startsWith("+") || line.startsWith("-");
     if (!changed) continue;
