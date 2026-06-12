@@ -990,6 +990,11 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
           feedback: `Do this next: fix the failing check(s) — ${failed.join(", ") || "checks did not run"} — then call run_checks until all pass, then call done.`,
         };
       }
+      // HARD GATE: you cannot declare done without writing anything.
+      if (filesWritten.length === 0) {
+        rejectedToolCalls.push({ tool: "done", error: "no files written" });
+        return { accept: false, feedback: "You have not written any files yet. Use write_file or patch to make the change described in the goal, then run_checks, then call done." };
+      }
       return {
         accept: true,
         feedback: "",

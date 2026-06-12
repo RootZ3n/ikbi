@@ -690,7 +690,10 @@ function makeBuilderAwareModel(): (req: ModelRequest) => Promise<ModelResponse> 
   return async (req) => {
     if (!(req.tools ?? []).some((t) => t.name === "done")) return okModelResponse(); // scout/critic
     builderTurn += 1;
-    return builderTurn === 1 ? runChecksModelResponse() : doneModelResponse();
+    if (builderTurn === 1) return { ...okModelResponse(), content: "", finishReason: "tool_calls", toolCalls: [{ id: "rd1", name: "read_file", arguments: JSON.stringify({ path: "a.ts" }) }] };
+    if (builderTurn === 2) return { ...okModelResponse(), content: "", finishReason: "tool_calls", toolCalls: [{ id: "w1", name: "write_file", arguments: JSON.stringify({ path: "a.ts", content: "export const a = 2;\n" }) }] };
+    if (builderTurn === 3) return runChecksModelResponse();
+    return doneModelResponse();
   };
 }
 /** A GREEN governed exec so the builder's in-loop run_checks passes (the verifier is stubbed here). */
@@ -744,7 +747,7 @@ test("real scout/builder/critic + stubbed verifier/integrator → coherent succe
   // inert-neutralized), so it does NOT count as a neutralized tool result.
   const builderDetail = result.roles[1]?.detail as { neutralizedCount: number; checksRuns: number; doneClaim?: { checksPassed: boolean } } | undefined;
   assert.equal(builderDetail?.checksRuns, 1, "the builder ran run_checks in-loop");
-  assert.equal(builderDetail?.neutralizedCount, 0, "run_checks output is actionable feedback, not inert-neutralized; no untrusted repo content this run");
+  assert.equal(builderDetail?.neutralizedCount, 2, "read_file and write_file results are neutralized as untrusted repo content; run_checks is actionable (not counted)");
   assert.equal(builderDetail?.doneClaim?.checksPassed, true, "the builder claims green checks; the verifier still ran independently");
 });
 

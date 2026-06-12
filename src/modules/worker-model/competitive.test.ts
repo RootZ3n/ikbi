@@ -445,6 +445,8 @@ function builderDriver() {
     const t = (turnByModel.get(m) ?? 0) + 1;
     turnByModel.set(m, t);
     const toolCalls = t === 1
+      ? [{ id: "w1", name: "write_file", arguments: JSON.stringify({ path: "a.ts", content: "export const x = 1;\n" }) }]
+      : t === 2
       ? [{ id: "rc1", name: "run_checks", arguments: "{}" }]
       : [{ id: "d1", name: "done", arguments: JSON.stringify({ successCondition: "x", filesReadBack: ["a.ts"], selfCheck: "ran checks green", satisfied: true }) }];
     return { contractVersion: "1.1.0", model: m, provider: "p", providerModelId: m, content: "", finishReason: "tool_calls" as const, toolCalls, usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 }, cost: { usd: 0, promptUsd: 0, cachedUsd: 0, completionUsd: 0, rate: { promptPerMTok: 0, completionPerMTok: 0 } }, latencyMs: 1, fellBack: false, attempts: [] };

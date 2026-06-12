@@ -65,6 +65,10 @@ const runChecksResp = (id = "rc1"): ModelResponse => toolResp([call("run_checks"
 const doneResp = (filesReadBack: string[], satisfied = true, id = "done1"): ModelResponse =>
   toolResp([call("done", { successCondition: "the goal is met", filesReadBack, selfCheck: "re-read the changed files; they satisfy the goal", satisfied }, id)]);
 
+/** A `write_file` tool call — writes a file so the done gate passes. */
+const writeResp = (path: string, content: string, id = "w1"): ModelResponse =>
+  toolResp([call("write_file", { path, content }, id)]);
+
 // --- a mock engine that scripts responses, spies neutralize (real wrap), captures requests ---
 function mockEngine(responses: ModelResponse[]) {
   const requests: ModelRequest[] = [];
@@ -227,7 +231,7 @@ test("loop bound: a model that always wants tools stops at MAX_TOOL_ITERATIONS (
 
 test("finishReason: a valid done → success; length (abnormal) → partial (loop ends, classified)", async () => {
   const dir = tmp();
-  const ok = await run(makeCtx(dir, "verified", mockEngine([runChecksResp(), doneResp(["x"])]).engine));
+  const ok = await run(makeCtx(dir, "verified", mockEngine([writeResp("x.ts", "content"), runChecksResp(), doneResp(["x.ts"])]).engine));
   assert.equal(ok.outcome, "success");
   assert.equal((ok.detail as { stopReason: string }).stopReason, "done");
 
@@ -312,11 +316,11 @@ test("a model throw becomes outcome:failure, not a throw past the boundary", asy
 
 test("malformed tool arguments become a tool error (still neutralized), not a crash", async () => {
   const dir = tmp();
-  const { engine, neutralizeCalls } = mockEngine([toolResp([call("write_file", "{ not json")]), runChecksResp(), doneResp(["x"])]);
+  const { engine, neutralizeCalls } = mockEngine([toolResp([call("write_file", "{ not json")]), writeResp("x.ts", "content"), runChecksResp(), doneResp(["x.ts"])]);
   const result = await run(makeCtx(dir, "verified", engine));
   assert.equal(result.outcome, "success", "the model recovered after the tool error");
   const toolNeut = neutralizeCalls.filter((c) => c.context.source === "mcp_result" && c.context.origin === "write_file");
-  assert.equal(toolNeut.length, 1, "the error result was neutralized like any tool result");
+  assert.equal(toolNeut.length, 2, "both the malformed and valid write_file errors were neutralized");
   assert.match(toolNeut[0]?.content ?? "", /malformed/);
   assert.equal((result.detail as { rejectedToolCalls: ToolCallError[] }).rejectedToolCalls.length, 1);
 });
@@ -770,7 +774,7 @@ test("INJECTED governedExec is PREFERRED over the lazy fallback", async () => {
   const dir = tmp();
   let injectedCalls = 0;
   const spyExec = { run: async (_req: ExecRequest): Promise<ExecResult> => { injectedCalls += 1; return { executed: true, exitCode: 0, stdoutTail: "ok", stderrTail: "" }; } };
-  const { engine } = mockEngine([runChecksResp(), doneResp(["x"])]);
+  const { engine } = mockEngine([writeResp("x.ts", "content"), runChecksResp(), doneResp(["x.ts"])]);
   const result = await createBuilder({ governedExec: spyExec, parentCtx: PARENT_CTX })(makeCtx(dir, "verified", engine));
   assert.equal(injectedCalls, VERIFIER_CHECKS.length, "the INJECTED executor ran the checks (not the lazy singleton fallback)");
   assert.equal(result.outcome, "success", "green via the injected executor");

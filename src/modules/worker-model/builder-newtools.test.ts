@@ -109,6 +109,8 @@ test("builder: terminal output passes through the neutralization chokepoint (sou
   const { engine, neutralized } = mockEngine([
     toolResp([call("terminal", { command: "git status" })]),
     toolResp([call("read_file", { path: "g.ts" })]),
+    toolResp([call("write_file", { path: "g.ts", content: "export const hello = 1;\n" })]),
+    toolResp([call("read_file", { path: "g.ts" })]),
     toolResp([call("run_checks", {})]),
     toolResp([call("done", { successCondition: "x", filesReadBack: ["g.ts"], selfCheck: "y", satisfied: true })]),
   ]);
@@ -145,6 +147,8 @@ test("builder: terminal runs in the WORKTREE (cwd = realpath'd workspace, not th
   const { engine } = mockEngine([
     toolResp([call("terminal", { command: "ls" })]),
     toolResp([call("read_file", { path: "g.ts" })]),
+    toolResp([call("write_file", { path: "g.ts", content: "export const hello = 1;\n" })]),
+    toolResp([call("read_file", { path: "g.ts" })]),
     toolResp([call("run_checks", {})]),
     toolResp([call("done", { successCondition: "x", filesReadBack: ["g.ts"], selfCheck: "y", satisfied: true })]),
   ]);
@@ -166,6 +170,8 @@ test("builder: search_files output is neutralized as untrusted repo content", as
   writeFileSync(join(dir, "g.ts"), "export const hello = 1;\n");
   const { engine, neutralized } = mockEngine([
     toolResp([call("search_files", { pattern: "hello" })]),
+    toolResp([call("read_file", { path: "g.ts" })]),
+    toolResp([call("write_file", { path: "g.ts", content: "export const hello = 1;\n" })]),
     toolResp([call("read_file", { path: "g.ts" })]),
     toolResp([call("run_checks", {})]),
     toolResp([call("done", { successCondition: "x", filesReadBack: ["g.ts"], selfCheck: "y", satisfied: true })]),
