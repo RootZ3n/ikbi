@@ -152,7 +152,7 @@ export const TOOLS: readonly ModelTool[] = [
   {
     name: "read_file",
     description:
-      "Read a UTF-8 text file under the worktree. ALWAYS read a file before you edit it — never edit blind. " +
+      "Read a file in the worktree. " +
       'Example: {"path": "src/routes.ts"}',
     parameters: {
       type: "object",
@@ -163,9 +163,8 @@ export const TOOLS: readonly ModelTool[] = [
   {
     name: "write_file",
     description:
-      "Create a NEW file, or fully rewrite an existing one you have ALREADY read this session. " +
-      "Writing an existing file you have not read is rejected (read it first). For a SMALL change to an " +
-      "existing file, prefer the `patch` tool instead of rewriting it. " +
+      "Write a file in the worktree. Creates new files or overwrites existing ones. " +
+      "For small edits to existing files, prefer the `patch` tool. " +
       'Example: {"path": "src/new.ts", "content": "export const x = 1;\\n"}',
     parameters: {
       type: "object",
