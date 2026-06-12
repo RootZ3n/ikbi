@@ -1596,6 +1596,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     const runCandidate = async (t: WorkerTask, ws: WorkspaceHandle, spec: CandidateSpec): Promise<CandidateRun> => {
       // Each candidate scouts + builds + verifies in ITS OWN worktree — fully isolated, never seeing
       // another candidate's workspace or output (no model-to-model communication).
+      // Install deps first so run_checks can find vitest/tsc/etc.
+      await installWorkspaceDeps(ws, parentCtx, deps.dependencyInstall);
       const scoutResult = await dispatchRole("scout", spawnRole("scout", parentCtx), t, ws, [], parentCtx, runEngine);
       const candidateBuilder = builderForModel(parentCtx, spec.model, spec.mode);
       const builderResult = await dispatchRole("builder", spawnRole("builder", parentCtx), t, ws, [scoutResult], parentCtx, runEngine, candidateBuilder);
