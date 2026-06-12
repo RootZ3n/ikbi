@@ -90,3 +90,7 @@ export const workerTournamentCompleted = defineEvent<{ taskId: string; winnerWor
 export const workerFixLoopCompleted = defineEvent<{ taskId: string; fixIterations: number; success: boolean; lastErrors?: string }>(
   "worker.fix_loop.completed",
 );
+
+export const workerCriticFixLoopCompleted = defineEvent<{ taskId: string; retried: boolean; criticPass: boolean; builderOk?: boolean; verifierPass?: boolean }>(
+  "worker.critic_fix_loop.completed",
+);

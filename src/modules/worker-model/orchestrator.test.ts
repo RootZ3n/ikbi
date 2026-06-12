@@ -1076,3 +1076,91 @@ test("skipVerifier: verifier role is skipped, other roles still run", async () =
   assert.equal(result.outcome, "success");
   assert.equal(ws.calls.promote, 0, "skipPromote prevents promote");
 });
+
+// ── ISSUE 1: critic-driven fix loop (opt-in) ───────────────────────────────
+
+/** Roles where the critic FAILs first then PASSes; builder/verifier always succeed (stateful). */
+function criticFixRoles() {
+  const builderGoals: string[] = [];
+  const calls = { builder: 0, verifier: 0, critic: 0 };
+  let criticCall = 0;
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    scout: async () => ({ role: "scout", outcome: "success", summary: "scout" }),
+    builder: async (ctx) => {
+      calls.builder += 1;
+      builderGoals.push(ctx.task.goal);
+      return { role: "builder", outcome: "success", summary: "built", detail: { filesWritten: ["x.ts"], rejectedToolCalls: [] } };
+    },
+    verifier: async () => {
+      calls.verifier += 1;
+      return { role: "verifier", outcome: "success", summary: "green", detail: { verdict: "pass", checks: [] } };
+    },
+    critic: async () => {
+      criticCall += 1;
+      calls.critic += 1;
+      // First look: the build is green but semantically wrong → FAIL with feedback.
+      if (criticCall === 1) {
+        return { role: "critic", outcome: "success", summary: "critique verdict: FAIL", detail: { pass: false, feedback: "the endpoint ignores the auth header", issues: ["call requireAuth() before the handler"] } };
+      }
+      // After the retry: the fix landed → PASS.
+      return { role: "critic", outcome: "success", summary: "critique verdict: PASS", detail: { pass: true, feedback: "auth now enforced" } };
+    },
+    integrator: realIntegrator,
+  };
+  return { roles, calls, builderGoals };
+}
+
+test("ISSUE 1: with criticFixLoop ON, a critic FAIL retries the builder with the feedback and the re-critique PASSes → promote", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const cf = criticFixRoles();
+  const orch = createOrchestrator(baseDeps({ config: { ...ENABLED, criticFixLoop: true }, resolveIdentity, roleClaim, roles: cf.roles, workspaces: ws.workspaces }));
+  const result = await orch.run(task, parentCtx);
+
+  assert.equal(cf.calls.builder, 2, "builder ran the original build then ONE critic-driven retry");
+  assert.equal(cf.calls.verifier, 2, "re-verified after the retry");
+  assert.equal(cf.calls.critic, 2, "re-critiqued after the retry");
+  // The retry goal carried the critic's feedback + issue — not the original goal.
+  assert.match(cf.builderGoals[1] ?? "", /ignores the auth header/);
+  assert.match(cf.builderGoals[1] ?? "", /requireAuth/);
+  // The post-retry critic verdict is what the integrator saw → promote.
+  const critic = result.roles.find((r) => r.role === "critic");
+  assert.equal((critic?.detail as { pass: boolean }).pass, true, "the spliced-in re-critique PASS is the final critic result");
+  assert.equal(result.outcome, "success");
+  assert.equal(ws.calls.promote, 1, "the fixed build promoted");
+});
+
+test("ISSUE 1: the critic-driven retry is capped at ONE (a still-failing re-critique discards, no further retry)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const calls = { builder: 0, critic: 0 };
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    scout: async () => ({ role: "scout", outcome: "success", summary: "scout" }),
+    builder: async () => { calls.builder += 1; return { role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["x.ts"], rejectedToolCalls: [] } }; },
+    verifier: async () => ({ role: "verifier", outcome: "success", summary: "green", detail: { verdict: "pass", checks: [] } }),
+    // The critic FAILs every time — the retry must NOT loop.
+    critic: async () => { calls.critic += 1; return { role: "critic", outcome: "success", summary: "FAIL", detail: { pass: false, feedback: "still wrong" } }; },
+    integrator: realIntegrator,
+  };
+  const orch = createOrchestrator(baseDeps({ config: { ...ENABLED, criticFixLoop: true }, resolveIdentity, roleClaim, roles, workspaces: ws.workspaces }));
+  const result = await orch.run(task, parentCtx);
+
+  assert.equal(calls.builder, 2, "exactly one retry — never a second");
+  assert.equal(calls.critic, 2, "critiqued twice, then stopped");
+  assert.notEqual(result.outcome, "success", "a persistently-failing critic discards (fail-closed)");
+  assert.equal(ws.calls.promote, 0, "nothing promoted");
+});
+
+test("ISSUE 1: with criticFixLoop OFF (default), a critic FAIL does NOT retry — original discard behavior", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const cf = criticFixRoles();
+  // config without criticFixLoop → default off.
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cf.roles, workspaces: ws.workspaces }));
+  const result = await orch.run(task, parentCtx);
+
+  assert.equal(cf.calls.builder, 1, "no retry when the loop is off");
+  assert.equal(cf.calls.critic, 1, "critic ran exactly once");
+  assert.notEqual(result.outcome, "success", "the single FAIL verdict discards as before");
+  assert.equal(ws.calls.promote, 0, "nothing promoted");
+});

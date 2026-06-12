@@ -91,9 +91,11 @@ import {
   workerStarted,
   workerVerification,
   workerFixLoopCompleted,
+  workerCriticFixLoopCompleted,
 } from "./events.js";
 import { CONTRACT_VERSION, toOutcomeStatus, WorkerError, WORKER_ROLES } from "./contract.js";
 import { runIterativeLoop, DEFAULT_MAX_FIX_ITERATIONS, extractVerifierCheckResult } from "./iterative-loop.js";
+import { runCriticFixLoop, isRetryableCriticFail } from "./critic-fix-loop.js";
 import type {
   RoleContext,
   RoleEngine,
@@ -897,6 +899,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     const escHandoff: EscalationHandoffFields = {};
     let overall: WorkerResult["outcome"] = "success";
     let killedReason: string | undefined;
+    // ISSUE 1: a critic FAIL feeds the critic's feedback back to the builder for ONE retry
+    // (opt-in, config.criticFixLoop). This guard caps it at a single attempt per run so
+    // subjective feedback can never loop forever.
+    let criticFixAttempted = false;
     // Set when a build runs GREEN but its worker tier lacks autoCommit autonomy, so the
     // verified work is deliberately left uncommitted. Carrying the tier + agent lets the terminal
     // step report an explicit, actionable reason instead of a misleading "no changes to promote".
@@ -1062,6 +1068,103 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                   fixIterations: fixLoopOutcome.fixIterations,
                   success: fixLoopOutcome.buildResult.outcome === "success",
                 },
+                project: task.targetRepo,
+              },
+              parentIdentity,
+            );
+          }
+        }
+
+        // ── CRITIC-DRIVEN FIX LOOP: a subjective FAIL is no longer a dead end ──────
+        // When the critic returns a model FAIL verdict (the build is objectively GREEN
+        // — a red verifier short-circuits before the critic — but semantically wrong /
+        // off-goal), feed its feedback back to the builder for ONE retry, re-verify,
+        // and re-critique. Capped at a single attempt (criticFixAttempted) so subjective
+        // feedback can never loop. COMPLEMENTARY to the verifier-driven loop above.
+        // OPT-IN: requires IKBI_WORKER_MODEL_CRITIC_FIX_LOOP=true (default off).
+        if (role === "critic" && config.criticFixLoop && !criticFixAttempted && isRetryableCriticFail(result)) {
+          criticFixAttempted = true;
+          // The prior results the re-run roles inherit: everything EXCEPT the stale builder /
+          // verifier / critic, which are replaced with their fresh results as produced.
+          const carriedPrior = results.filter((r) => r.role !== "builder" && r.role !== "verifier" && r.role !== "critic");
+          const fix = await runCriticFixLoop(result, {
+            builder: async (fixGoal: string) => {
+              const fixCtx: RoleContext = {
+                task: { ...task, goal: fixGoal },
+                role: "builder",
+                identity: spawned.identity,
+                autonomy: spawned.autonomy,
+                workspace,
+                priorResults: [...carriedPrior],
+                engine: runEngine,
+              };
+              return runRoleFn("builder", builderFor(parentCtx, resolveBuilderMode(task)), fixCtx);
+            },
+            verifier: async (builderResult: RoleResult) => {
+              const verifyCtx: RoleContext = {
+                task,
+                role: "verifier",
+                identity: spawned.identity,
+                autonomy: spawned.autonomy,
+                workspace,
+                priorResults: [...carriedPrior, builderResult],
+                engine: runEngine,
+              };
+              const vRes = await runRoleFn("verifier", verifierFor(parentCtx), verifyCtx, Math.max(roleTimeoutMs, resolveCheckTimeoutMs(modeEnv)));
+              // Mirror the main verifier→commit gate: capture the re-verified-good working tree so
+              // the integrator/promote sees the post-retry diff (gated on autoCommit, same as above).
+              if (vRes.outcome === "success" && workspaces.commit !== undefined && spawned.autonomy.autoCommit) {
+                await workspaces.commit(workspace, `ikbi: ${task.goal}`);
+              }
+              return vRes;
+            },
+            critic: async (builderResult: RoleResult, verifierResult: RoleResult) => {
+              const reCriticCtx: RoleContext = {
+                task,
+                role: "critic",
+                identity: spawned.identity,
+                autonomy: spawned.autonomy,
+                workspace,
+                priorResults: [...carriedPrior, builderResult, verifierResult],
+                engine: runEngine,
+              };
+              return runRoleFn("critic", criticFor(), reCriticCtx);
+            },
+          });
+
+          if (fix.ran) {
+            // Splice the fresh role results back into the run so the integrator (and the final
+            // WorkerResult.roles) reflect the post-retry state. Replace by role; critic stays last.
+            const replaceRole = (value: RoleResult): void => {
+              const i = results.findIndex((r) => r.role === value.role);
+              if (i >= 0) results[i] = value;
+              else results.push(value);
+            };
+            if (fix.builderResult !== undefined) replaceRole(fix.builderResult);
+            if (fix.verifierResult !== undefined) replaceRole(fix.verifierResult);
+            result = fix.criticResult;
+            replaceRole(result);
+
+            const criticPass = ((result.detail ?? {}) as Record<string, unknown>).pass === true;
+            const verifierPass = ((fix.verifierResult?.detail ?? {}) as Record<string, unknown>).verdict === "pass";
+            events.publish(
+              workerCriticFixLoopCompleted.create(
+                {
+                  taskId: task.taskId,
+                  retried: true,
+                  criticPass,
+                  ...(fix.builderResult !== undefined ? { builderOk: fix.builderResult.outcome === "success" } : {}),
+                  ...(fix.verifierResult !== undefined ? { verifierPass } : {}),
+                },
+                { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.critic_fix_loop", runId: task.taskId } },
+              ),
+            );
+            await receipts.append(
+              {
+                operation: "worker.critic_fix_loop",
+                outcome: { status: criticPass ? "success" : "failure" },
+                requestId: task.taskId,
+                metadata: { taskId: task.taskId, workspaceId: workspace.id, retried: true, criticPass },
                 project: task.targetRepo,
               },
               parentIdentity,

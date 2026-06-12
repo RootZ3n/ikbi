@@ -111,6 +111,15 @@ export interface WorkerModelConfig {
    */
   readonly fixLoop?: boolean;
   /**
+   * Critic-driven fix loop: when the CRITIC returns a subjective FAIL verdict (the build is
+   * objectively green but semantically wrong / off-goal), feed the critic's feedback back to the
+   * builder as a fix goal, re-verify, and re-critique ONCE. Distinct from the verifier-driven
+   * `fixLoop` (which retries on red checks) — this catches what objective checks cannot. Capped
+   * at a single retry (subjective feedback must not loop forever). DEFAULT OFF (opt-in). Set
+   * IKBI_WORKER_MODEL_CRITIC_FIX_LOOP=true to enable.
+   */
+  readonly criticFixLoop?: boolean;
+  /**
    * The DEFAULT builder lane (agent | patch) from IKBI_BUILDER_MODE. A task's own `builderMode`
    * overrides this. DEFAULT "agent" — the autonomous builder lane is unchanged unless opted out.
    * Optional in the type so pre-existing config literals stay valid; the loader always sets it.
@@ -138,6 +147,7 @@ export function loadWorkerModelConfig(reader = env): WorkerModelConfig {
     retainFailedWorkspaces: reader.bool("RETAIN_FAILED_WORKSPACES", true),
     penalizeTimeouts: reader.bool("PENALIZE_TIMEOUTS", false),
     fixLoop: reader.bool("FIX_LOOP", false),
+    criticFixLoop: reader.bool("CRITIC_FIX_LOOP", false),
     builderMode: loadBuilderMode(),
     candidateModels: loadCandidateModels(),
   });
