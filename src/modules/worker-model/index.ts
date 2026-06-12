@@ -58,9 +58,12 @@ export {
 export {
   workerModelConfig,
   loadWorkerModelConfig,
+  loadBuilderMode,
   DEFAULT_ROLE_TIMEOUT_MS,
   DEFAULT_MAX_CONCURRENT_RUNS,
+  DEFAULT_BUILDER_MODE,
   type WorkerModelConfig,
+  type BuilderMode,
 } from "./config.js";
 export {
   workerStarted,
@@ -71,6 +74,20 @@ export {
 } from "./events.js";
 export { scout } from "./scout.js";
 export { builder } from "./builder.js";
+export { patchsmith, createPatchsmith, type PatchsmithDeps, parseUnifiedDiff, applyFilePatch, extractDiff } from "./patchsmith.js";
+export {
+  runCapabilityHarness,
+  aggregateScorecard,
+  routeFromMetrics,
+  DEFAULT_FIXTURES,
+  ROUTING_THRESHOLDS,
+  type CapabilityScorecard,
+  type CapabilityMetrics,
+  type HarnessFixture,
+  type RecommendedRole,
+  type CapabilityMode,
+  type ModeObservation,
+} from "./capability-harness.js";
 export { critic } from "./critic.js";
 export { verifier } from "./verifier.js";
 export { integrator } from "./integrator.js";

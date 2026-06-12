@@ -23,9 +23,26 @@
  *                                    restore the old eager-discard behavior.
  */
 
+import { configEnv } from "../../core/config.js";
 import { moduleEnv } from "../../core/module-config.js";
 
 const env = moduleEnv("worker-model");
+
+/** Valid builder lanes. "agent" = autonomous tool-caller; "patch" = the Patchsmith diff lane. */
+export type BuilderMode = "agent" | "patch";
+/** The default lane when neither the task nor IKBI_BUILDER_MODE selects one. */
+export const DEFAULT_BUILDER_MODE: BuilderMode = "agent";
+
+/**
+ * Resolve the operator default builder lane from `IKBI_BUILDER_MODE`. Read at the bare
+ * (un-prefixed) env name because the lane is an operator-facing switch, not a worker-model
+ * sub-knob. Unknown/blank values fall back to the safe default ("agent") rather than throwing —
+ * an unrecognised lane must never silently disable the autonomous builder.
+ */
+export function loadBuilderMode(env: NodeJS.ProcessEnv = configEnv): BuilderMode {
+  const raw = (env.IKBI_BUILDER_MODE ?? "").trim().toLowerCase();
+  return raw === "patch" ? "patch" : raw === "agent" ? "agent" : DEFAULT_BUILDER_MODE;
+}
 
 /** Default per-role wall-clock budget (ms) — a named constant, not a magic number. */
 export const DEFAULT_ROLE_TIMEOUT_MS = 300_000; // 5 minutes
@@ -72,6 +89,12 @@ export interface WorkerModelConfig {
    * Set IKBI_WORKER_MODEL_FIX_LOOP=true to enable.
    */
   readonly fixLoop?: boolean;
+  /**
+   * The DEFAULT builder lane (agent | patch) from IKBI_BUILDER_MODE. A task's own `builderMode`
+   * overrides this. DEFAULT "agent" — the autonomous builder lane is unchanged unless opted out.
+   * Optional in the type so pre-existing config literals stay valid; the loader always sets it.
+   */
+  readonly builderMode?: BuilderMode;
 }
 
 /** Load the worker-model config slice from `IKBI_WORKER_MODEL_*`. */
@@ -85,6 +108,7 @@ export function loadWorkerModelConfig(reader = env): WorkerModelConfig {
     retainFailedWorkspaces: reader.bool("RETAIN_FAILED_WORKSPACES", true),
     penalizeTimeouts: reader.bool("PENALIZE_TIMEOUTS", false),
     fixLoop: reader.bool("FIX_LOOP", false),
+    builderMode: loadBuilderMode(),
   });
 }
 

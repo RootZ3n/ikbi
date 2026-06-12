@@ -98,6 +98,15 @@ export interface WorkerTask {
    * to prevent the builder from over-writing existing files when the goal is documentation.
    */
   readonly writeScope?: "all" | "new_only" | "none";
+  /**
+   * Which BUILDER LANE runs this task (the Patchsmith decision #patchsmith):
+   * - "agent" (default): the autonomous tool-calling builder (16 tools, run_checks, done).
+   * - "patch": the PATCHSMITH lane — no tools. ikbi gathers context, the model returns ONE
+   *   unified diff, ikbi applies it in the managed workspace and runs ladder verification.
+   *   Cheap models that fail the tool-agent capability bar but can produce clean diffs are
+   *   routed here. When absent, the orchestrator resolves the lane from IKBI_BUILDER_MODE.
+   */
+  readonly builderMode?: "agent" | "patch";
 }
 
 /** The result a single role produces. */

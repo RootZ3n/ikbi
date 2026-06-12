@@ -55,6 +55,7 @@ import type { ExecRequest, GovernedExec } from "../governed-exec/index.js";
 import type { DependencyInstall } from "../dependency-install/contract.js";
 
 import { builder, createBuilder, MAX_TOOL_ITERATIONS } from "./builder.js";
+import { createPatchsmith } from "./patchsmith.js";
 import { resolveChecks, resolveCheckTimeoutMs, workingTreePackageJsonDiff, workingTreePlanningDiff } from "./checks.js";
 import { builderModel, competitiveBuilderModels } from "./role-models.js";
 import { createCritic, critic } from "./critic.js";
@@ -64,6 +65,7 @@ import { createVerifier, verifier } from "./verifier.js";
 import { resolveRetrievalMode, resolveVerificationMode } from "./modes.js";
 import type { ProjectRetrievalApi } from "../project-retrieval/index.js";
 import {
+  type BuilderMode,
   MAX_COMPETITIVE_N,
   MIN_COMPETITIVE_N,
   workerModelConfig,
@@ -624,20 +626,31 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
    * the verifier uses — so its in-loop `run_checks` runs the verifier's EXACT checks through
    * the same governed path. NO contract change: governedExec/parentCtx are not RoleContext fields.
    */
-  function builderFor(parentCtx: OperationContext): RoleFn {
-    return builderForModel(parentCtx);
+  /**
+   * Resolve the BUILDER LANE for a task: the task's own `builderMode` wins, else the operator
+   * default (IKBI_BUILDER_MODE → config.builderMode). "patch" routes through the Patchsmith lane.
+   */
+  function resolveBuilderMode(task: WorkerTask): BuilderMode {
+    return task.builderMode ?? config.builderMode ?? "agent";
+  }
+
+  function builderFor(parentCtx: OperationContext, mode: BuilderMode = "agent"): RoleFn {
+    return builderForModel(parentCtx, undefined, mode);
   }
 
   /** Like `builderFor`, but for a specific per-candidate model (the head-to-head shootout). */
-  function builderForModel(parentCtx: OperationContext, modelOverride?: string): RoleFn {
+  function builderForModel(parentCtx: OperationContext, modelOverride?: string, mode: BuilderMode = "agent"): RoleFn {
     if (deps.roles?.builder !== undefined) return deps.roles.builder;
-    return createBuilder({
+    // The Patchsmith lane and the agent lane share the SAME module-internal deps (governed checks,
+    // parent identity, the verifier's resolved check set). The lane only changes which RoleFn runs.
+    const builderDeps = {
       ...(govExecForRoles !== undefined ? { governedExec: govExecForRoles } : {}),
       parentCtx,
       ...(modelOverride !== undefined ? { modelOverride } : {}),
       // Same resolved set the verifier uses (Fix 1/2), wired ONLY in production (enforceProjectRoot).
       ...(enforceProjectRoot ? { resolveChecks: (ws: string) => resolveChecks(ws) } : {}),
-    });
+    };
+    return mode === "patch" ? createPatchsmith(builderDeps) : createBuilder(builderDeps);
   }
 
   /**
@@ -888,7 +901,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           priorResults: [...results],
           engine: runEngine,
         };
-        const roleFn = role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderFor(parentCtx) : role === "critic" ? criticFor() : roles[role];
+        const roleFn = role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderFor(parentCtx, resolveBuilderMode(task)) : role === "critic" ? criticFor() : roles[role];
         // H4: floor the verifier's role timeout at the per-check budget. Without this, a 300s role
         // timeout races against 600s checks — the role fails first, orphaning the still-running check.
         const verifierTimeout = role === "verifier" ? Math.max(roleTimeoutMs, resolveCheckTimeoutMs(modeEnv)) : undefined;
@@ -962,7 +975,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               return extractVerifierCheckResult(vResult);
             },
             builder: async (fixGoal: string) => {
-              const fixBuilderFn = builderFor(parentCtx);
+              const fixBuilderFn = builderFor(parentCtx, resolveBuilderMode(task));
               const fixCtx: RoleContext = {
                 task: { ...task, goal: fixGoal },
                 role: "builder",
@@ -1239,7 +1252,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     const ctx: RoleContext = { task, role, identity: spawned.identity, autonomy: spawned.autonomy, workspace, priorResults: [...priorResults], engine };
     // The verifier (C1) and the builder (its in-loop run_checks) run the governed path
     // bound to the run ctx (parentCtx is the minted ValidatedIdentity governed-exec needs).
-    const roleFn = roleFnOverride ?? (role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderFor(parentCtx) : roles[role]);
+    const roleFn = roleFnOverride ?? (role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderFor(parentCtx, resolveBuilderMode(task)) : roles[role]);
     // H4: floor the verifier's role timeout at the per-check budget (same as the cooperative path).
     const verifierTimeout = role === "verifier" ? Math.max(roleTimeoutMs, resolveCheckTimeoutMs(modeEnv)) : undefined;
     const result = await runRoleFn(role, roleFn, ctx, verifierTimeout);
@@ -1361,7 +1374,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         // HEAD-TO-HEAD: candidate ci races its OWN model (the Nth listed model, or the single
         // builder model as fallback) in its OWN worktree — each with the full run_checks rail.
         const candidateModel = competitiveModelList?.[ci] ?? singleBuilderModel;
-        const candidateBuilder = builderForModel(parentCtx, candidateModel);
+        const candidateBuilder = builderForModel(parentCtx, candidateModel, resolveBuilderMode(task));
         const builderResult = await dispatchRole("builder", spawnRole("builder", parentCtx), task, ws, [scoutResult], parentCtx, runEngine, candidateBuilder);
         let verifierResult: RoleResult | undefined;
         const verifierSpawn = spawnRole("verifier", parentCtx);
