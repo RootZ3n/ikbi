@@ -20,13 +20,29 @@
  */
 
 import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { homedir } from "node:os";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /**
  * Load a `.env` file into `env`, never overriding an already-set variable. Dependency-free.
  * Returns the names it set. Never throws — a missing/unreadable file is a no-op.
  */
-export function loadDotenv(path: string, env: NodeJS.ProcessEnv = process.env): string[] {
+export const CWD_DOTENV_FORBIDDEN_KEYS: ReadonlySet<string> = new Set([
+  "IKBI_TRUST_HMAC_KEY",
+  "IKBI_IDENTITY_TOKEN_SALT",
+  "IKBI_OPERATOR_TOKEN",
+  "IKBI_WORKER_TOKEN",
+]);
+
+export class CwdDotenvSecurityError extends Error {
+  constructor(path: string, keys: readonly string[]) {
+    super(`Refusing to load security key(s) from project .env (${path}): ${keys.join(", ")}. Move them to ~/.ikbi/env or the ikbi install-root .env.`);
+    this.name = "CwdDotenvSecurityError";
+  }
+}
+
+export function loadDotenv(path: string, env: NodeJS.ProcessEnv = process.env, opts: { readonly forbiddenKeys?: ReadonlySet<string> } = {}): string[] {
   let text: string;
   try {
     text = readFileSync(path, "utf8");
@@ -34,6 +50,7 @@ export function loadDotenv(path: string, env: NodeJS.ProcessEnv = process.env): 
     return []; // no .env — nothing to load
   }
   const set: string[] = [];
+  const forbiddenSeen: string[] = [];
   for (const rawLine of text.split("\n")) {
     const line = rawLine.trim();
     if (line.length === 0 || line.startsWith("#")) continue;
@@ -42,6 +59,10 @@ export function loadDotenv(path: string, env: NodeJS.ProcessEnv = process.env): 
     if (eq <= 0) continue;
     const key = stripped.slice(0, eq).trim();
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+    if (opts.forbiddenKeys?.has(key)) {
+      forbiddenSeen.push(key);
+      continue;
+    }
     if (env[key] !== undefined) continue; // the real environment always wins
     let val = stripped.slice(eq + 1).trim();
     if (val.length >= 2 && ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'")))) {
@@ -50,7 +71,25 @@ export function loadDotenv(path: string, env: NodeJS.ProcessEnv = process.env): 
     env[key] = val;
     set.push(key);
   }
+  if (forbiddenSeen.length > 0) throw new CwdDotenvSecurityError(path, [...new Set(forbiddenSeen)].sort());
   return set;
+}
+
+export function installRoot(): string {
+  return resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+}
+
+export function loadBootstrapEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  cwd: string = process.cwd(),
+  opts: { readonly installRoot?: string; readonly homeDir?: string } = {},
+): void {
+  const root = opts.installRoot ?? installRoot();
+  const home = opts.homeDir ?? homedir();
+  loadDotenv(resolve(root, ".env"), env);
+  loadDotenv(resolve(home, ".ikbi", "env"), env);
+  const cwdEnv = resolve(cwd, ".env");
+  if (cwdEnv !== resolve(root, ".env")) loadDotenv(cwdEnv, env, { forbiddenKeys: CWD_DOTENV_FORBIDDEN_KEYS });
 }
 
 /** Read-only info commands that perform NO trust operations (safe on the built-in dev keys). */
@@ -100,5 +139,10 @@ export function forceBlockingStdIoForCli(): void {
 
 // ── side effects (run at import, BEFORE core/config is evaluated) ────────────
 forceBlockingStdIoForCli();
-loadDotenv(resolve(process.cwd(), ".env"));
+try {
+  loadBootstrapEnv();
+} catch (err) {
+  process.stderr.write(`ikbi: ${err instanceof Error ? err.message : String(err)}\n`);
+  process.exit(1);
+}
 enableDevKeysForInfoCommand(process.argv.slice(2));

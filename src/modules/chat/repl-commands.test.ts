@@ -157,3 +157,36 @@ test("FIX4: an unknown slash command is reported, not sent to the model", async 
   await runRepl({ session: mkSession("u1"), store, readLine: lines(["/bogus", "/exit"]), out: (o) => { out += o; } });
   assert.match(out, /unknown command: \/bogus/);
 });
+
+test("H3: aborting an in-flight turn prints an interrupted result and exits cleanly", async () => {
+  let sawSignal = false;
+  const session = {
+    id: "abort-1",
+    currentPermissionMode: () => "confirm" as const,
+    send: async (_msg: string, _images?: readonly string[], _mode?: unknown, opts?: { signal?: AbortSignal }) => {
+      sawSignal = opts?.signal instanceof AbortSignal;
+      await new Promise<void>((resolve) => {
+        if (opts?.signal?.aborted === true) return resolve();
+        opts?.signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      return { response: "[ikbi: interrupted]", tools: [] };
+    },
+  };
+  let out = "";
+  let controller: AbortController | undefined;
+  await runRepl({
+    session,
+    store,
+    readLine: lines(["slow turn", "/exit"]),
+    out: (o) => { out += o; },
+    onTurnController: (c) => {
+      controller = c;
+      if (c !== undefined) setImmediate(() => c.abort());
+    },
+  });
+
+  assert.equal(sawSignal, true, "turn received an AbortSignal");
+  assert.equal(controller, undefined, "runRepl clears the active turn controller after the turn");
+  assert.match(out, /\[ikbi: interrupted\]/);
+  assert.match(out, /session ended/);
+});

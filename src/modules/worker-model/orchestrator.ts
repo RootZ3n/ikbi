@@ -55,7 +55,7 @@ import type { ExecRequest, GovernedExec } from "../governed-exec/index.js";
 import type { DependencyInstall } from "../dependency-install/contract.js";
 
 import { builder, createBuilder, MAX_TOOL_ITERATIONS } from "./builder.js";
-import { resolveChecks, workingTreePackageJsonDiff, workingTreePlanningDiff } from "./checks.js";
+import { resolveChecks, resolveCheckTimeoutMs, workingTreePackageJsonDiff, workingTreePlanningDiff } from "./checks.js";
 import { builderModel, competitiveBuilderModels } from "./role-models.js";
 import { createCritic, critic } from "./critic.js";
 import { integrator } from "./integrator.js";
@@ -184,11 +184,10 @@ function foldRoleSignals(
       handoff.goalAlignment = { status: ga.status, summary: ga.summary ?? "", missingFiles: ga.missingFiles ?? [] };
     }
   } else if (role === "builder") {
-    const rejected = Array.isArray(detail.rejectedToolCalls) ? detail.rejectedToolCalls.length : 0;
-    // schemaFailures and rejectedToolCalls both derive from the rejected-tool-call set
-    // (a rejected call is a schema/validation failure) — per the escalation signal map.
-    acc.schemaFailures += rejected;
-    acc.rejectedToolCalls += rejected;
+    const policy = Array.isArray(detail.policyViolations) ? detail.policyViolations.length : Array.isArray(detail.rejectedToolCalls) ? detail.rejectedToolCalls.length : 0;
+    const format = Array.isArray(detail.toolFormatErrors) ? detail.toolFormatErrors.length : 0;
+    acc.schemaFailures += format;
+    acc.rejectedToolCalls += policy;
     const retries = asNumber(detail.retryCount) ?? asNumber(detail.bareStops);
     if (retries !== undefined) acc.retryCount += retries;
     const pct = asNumber(detail.contextPercent);
@@ -480,13 +479,14 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   // run through the normal failure path (discard/retain). The abandoned promise is left to settle
   // and is ignored (JS cannot cancel it). `roleTimeoutMs <= 0` disables the guard.
   const roleTimeoutMs = config.roleTimeoutMs;
-  async function runRoleFn(role: WorkerRole, roleFn: RoleFn, ctx: RoleContext): Promise<RoleResult> {
-    if (!(roleTimeoutMs > 0)) return roleFn(ctx);
+  async function runRoleFn(role: WorkerRole, roleFn: RoleFn, ctx: RoleContext, timeoutOverrideMs?: number): Promise<RoleResult> {
+    const effectiveTimeout = timeoutOverrideMs ?? roleTimeoutMs;
+    if (!(effectiveTimeout > 0)) return roleFn(ctx);
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<RoleResult>((resolve) => {
       timer = setTimeout(
-        () => resolve({ role, outcome: "failure", summary: `role "${role}" exceeded its ${roleTimeoutMs}ms wall-clock timeout`, detail: { timedOut: true, timeoutMs: roleTimeoutMs } }),
-        roleTimeoutMs,
+        () => resolve({ role, outcome: "failure", summary: `role "${role}" exceeded its ${effectiveTimeout}ms wall-clock timeout`, detail: { timedOut: true, timeoutMs: effectiveTimeout } }),
+        effectiveTimeout,
       );
     });
     try {
@@ -699,8 +699,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // were never in this class and always count.
     const detailRec = (result.detail as Record<string, unknown> | undefined) ?? {};
     const stopReason = detailRec.stopReason;
-    const rejectedToolCalls = Array.isArray(detailRec.rejectedToolCalls) ? detailRec.rejectedToolCalls : [];
-    const badOutputEvidence = rejectedToolCalls.length > 0;
+    const rejectedToolCalls = Array.isArray(detailRec.policyViolations) ? detailRec.policyViolations : Array.isArray(detailRec.rejectedToolCalls) ? detailRec.rejectedToolCalls : [];
+    const toolFormatErrors = Array.isArray(detailRec.toolFormatErrors) ? detailRec.toolFormatErrors : [];
+    const badOutputEvidence = toolFormatErrors.length > 0;
     const isPerformanceFailure =
       result.outcome === "failure" && (stopReason === "timeout" || stopReason === "max_iterations");
     // timeout: always suppressible. max_iterations: suppressible only WITHOUT bad-output evidence.
@@ -718,7 +719,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         const why =
           config.penalizeTimeouts === true
             ? "IKBI_WORKER_MODEL_PENALIZE_TIMEOUTS policy is on"
-            : `max_iterations with ${rejectedToolCalls.length} rejected tool call(s) (bad-output evidence)`;
+            : `max_iterations with ${toolFormatErrors.length} tool format error(s) (bad-output evidence)`;
         perfTrust = { decision: "penalized", reason: `${String(stopReason)}: ${why} — counted against trust` };
       }
     }
@@ -888,7 +889,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           engine: runEngine,
         };
         const roleFn = role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderFor(parentCtx) : role === "critic" ? criticFor() : roles[role];
-        let result = await runRoleFn(role, roleFn, ctx);
+        // H4: floor the verifier's role timeout at the per-check budget. Without this, a 300s role
+        // timeout races against 600s checks — the role fails first, orphaning the still-running check.
+        const verifierTimeout = role === "verifier" ? Math.max(roleTimeoutMs, resolveCheckTimeoutMs(modeEnv)) : undefined;
+        let result = await runRoleFn(role, roleFn, ctx, verifierTimeout);
         results.push(result);
 
         events.publish(
@@ -954,7 +958,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 priorResults: [...results],
                 engine: runEngine,
               };
-              const vResult = await runRoleFn("verifier", verifyFn, verifyCtx);
+              const vResult = await runRoleFn("verifier", verifyFn, verifyCtx, Math.max(roleTimeoutMs, resolveCheckTimeoutMs(modeEnv)));
               return extractVerifierCheckResult(vResult);
             },
             builder: async (fixGoal: string) => {
@@ -1236,7 +1240,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // The verifier (C1) and the builder (its in-loop run_checks) run the governed path
     // bound to the run ctx (parentCtx is the minted ValidatedIdentity governed-exec needs).
     const roleFn = roleFnOverride ?? (role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderFor(parentCtx) : roles[role]);
-    const result = await runRoleFn(role, roleFn, ctx);
+    // H4: floor the verifier's role timeout at the per-check budget (same as the cooperative path).
+    const verifierTimeout = role === "verifier" ? Math.max(roleTimeoutMs, resolveCheckTimeoutMs(modeEnv)) : undefined;
+    const result = await runRoleFn(role, roleFn, ctx, verifierTimeout);
     events.publish(
       workerRoleCompleted.create(
         { taskId: task.taskId, role, outcome: result.outcome },
@@ -1263,7 +1269,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     const bd = (builderResult.detail ?? {}) as Record<string, unknown>;
     const toolRounds = typeof bd.toolRounds === "number" ? bd.toolRounds : 0;
     const filesWritten = Array.isArray(bd.filesWritten) ? bd.filesWritten.length : 0;
-    const rejectedToolCalls = Array.isArray(bd.rejectedToolCalls) ? bd.rejectedToolCalls.length : 0;
+    const rejectedToolCalls = Array.isArray(bd.policyViolations) ? bd.policyViolations.length : Array.isArray(bd.rejectedToolCalls) ? bd.rejectedToolCalls.length : 0;
     const stopReason = typeof bd.stopReason === "string" ? bd.stopReason : builderResult.outcome === "success" ? "stop" : "error";
     const v = readVerifier(verifierResult);
     return {

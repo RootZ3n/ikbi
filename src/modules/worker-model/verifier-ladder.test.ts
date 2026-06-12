@@ -177,6 +177,43 @@ test("ladder: IKBI_CHECK_TIMEOUT_MS is passed to governed-exec (separate from ro
   assert.equal(DEFAULT_CHECK_TIMEOUT_MS, 600_000, "default check timeout is the large budget");
 });
 
+test("ladder: IKBI_CHECKS overrides planner tasks as full verification", async () => {
+  const ge = fakeGovernedExec();
+  const v = createVerifier({
+    governedExec: ge.exec,
+    parentCtx: PCTX,
+    diff: async () => diffOf(["src/foo.ts"]),
+    env: {
+      IKBI_VERIFY: "ladder",
+      IKBI_CHECKS: JSON.stringify([{ name: "ci", command: "yarn", args: ["test"] }]),
+    },
+    index: { refresh: async () => { throw new Error("index should not be needed for IKBI_CHECKS override"); } },
+  });
+  const r = await v(makeCtx("/wt"));
+  assert.equal(r.outcome, "success");
+  assert.equal(detail(r).verificationScope, "full");
+  assert.equal(ge.calls.length, 1);
+  assert.equal(ge.calls[0]?.command, "yarn");
+  assert.deepEqual(ge.calls[0]?.args, ["test"]);
+  assert.match(((detail(r).receipts as string[]) ?? []).join("\n"), /IKBI_CHECKS override/);
+});
+
+test("ladder: malformed IKBI_CHECKS is RED and runs no checks", async () => {
+  const ge = fakeGovernedExec();
+  const v = createVerifier({
+    governedExec: ge.exec,
+    parentCtx: PCTX,
+    diff: async () => diffOf(["src/foo.ts"]),
+    env: { IKBI_VERIFY: "ladder", IKBI_CHECKS: "not json" },
+    index: { refresh: async () => ({ data: mkData({}) }) },
+  });
+  const r = await v(makeCtx("/wt"));
+  assert.equal(r.outcome, "failure");
+  assert.match(r.summary ?? "", /IKBI_CHECKS is malformed/);
+  assert.match(r.summary ?? "", /fix IKBI_CHECKS or unset it/);
+  assert.equal(ge.calls.length, 0);
+});
+
 test("ladder: a neutral package does not create a vacuous green — it forces full", async () => {
   const data = mkData({ packages: [pkg("", { test: "pnpm -r test" }), pkg("packages/a", {})], files: [file("packages/a/src/foo.ts")] });
   const ge = fakeGovernedExec();

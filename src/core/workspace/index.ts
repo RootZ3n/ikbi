@@ -36,7 +36,7 @@ export const workspaces: WorkspaceManager = new WorkspaceManager({
   root: config.workspace.root,
   max: config.workspace.max,
   locks,
-  store: createDocumentStore<WorkspaceRecord>({ dir: join(config.workspace.root, "registry") }),
+  store: createDocumentStore<WorkspaceRecord>({ dir: join(config.workspace.root, "registry"), crossProcess: true }),
   logger: log,
   events,
   receipts,

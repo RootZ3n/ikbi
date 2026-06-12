@@ -8,6 +8,7 @@
  */
 
 import { createRequire } from "node:module";
+import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 
 const require = createRequire(import.meta.url);
@@ -29,7 +30,7 @@ export interface IkbiConfig {
    * defaulted, `loadConfig` refuses to start (see the gate in `loadConfig`).
    */
   readonly allowInsecureDevKeys: boolean;
-  /** Root directory for runtime state. `IKBI_STATE_ROOT`, default `<cwd>/state`. */
+  /** Root directory for runtime state. `IKBI_STATE_ROOT`, default `~/.ikbi/state`. */
   readonly stateRoot: string;
   /** Log level. `IKBI_LOG_LEVEL`, default "info". */
   readonly logLevel: string;
@@ -377,7 +378,7 @@ function loadConfig(env: NodeJS.ProcessEnv = process.env): IkbiConfig {
       ? isAbsolute(stateRootRaw)
         ? stateRootRaw
         : resolve(process.cwd(), stateRootRaw)
-      : resolve(process.cwd(), "state");
+      : resolve(homedir(), ".ikbi", "state");
 
   const logLevel = (env.IKBI_LOG_LEVEL ?? "info").trim();
   const runtimeEnv = (env.IKBI_ENV ?? env.NODE_ENV ?? "development").trim();

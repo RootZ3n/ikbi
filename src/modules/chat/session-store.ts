@@ -25,6 +25,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { childLogger } from "../../core/log.js";
+import { atomicWriteFile } from "../../core/substrate/atomic.js";
 import { ChatSession, type ChatSessionDeps, type PersistedSession } from "./session.js";
 
 const log = childLogger("chat-store");
@@ -70,6 +71,10 @@ export interface SessionMeta {
 export interface SaveOptions {
   /** Break (force-unlock) a lock held by another process before writing (the `--force` escape). */
   readonly force?: boolean;
+}
+
+export interface PersistentSessionStoreDeps {
+  readonly atomicWriteFile?: typeof atomicWriteFile;
 }
 
 /**
@@ -137,10 +142,12 @@ function isPidAlive(pid: number): boolean {
 export class PersistentSessionStore {
   private readonly dir: string;
   private readonly maxSessions: number;
+  private readonly atomicWriteFile: typeof atomicWriteFile;
 
-  constructor(dir: string = sessionsDir(), maxSessions?: number) {
+  constructor(dir: string = sessionsDir(), maxSessions?: number, deps: PersistentSessionStoreDeps = {}) {
     this.dir = dir;
     this.maxSessions = resolveMaxSessions(maxSessions);
+    this.atomicWriteFile = deps.atomicWriteFile ?? atomicWriteFile;
   }
 
   private ensureDir(): void {
@@ -209,13 +216,13 @@ export class PersistentSessionStore {
    * however, THROWS `SessionLockedError` so the operator learns of the collision instead of losing
    * the write silently. The lock is always released in `finally`.
    */
-  save(session: Persistable, opts: SaveOptions = {}): void {
+  async save(session: Persistable, opts: SaveOptions = {}): Promise<void> {
     this.ensureDir();
     this.acquireLock(session.id, opts.force === true); // throws SessionLockedError on live contention
     try {
       const data: PersistedSession = session.toPersisted();
       // M7: owner-only (0600) — the file is a transcript, not world-readable data.
-      writeFileSync(this.fileFor(session.id), JSON.stringify(data, null, 2), { encoding: "utf8", mode: 0o600 });
+      await this.atomicWriteFile(this.fileFor(session.id), JSON.stringify(data, null, 2), { mode: 0o600, logger: log });
     } catch (e) {
       log.warn({ err: e instanceof Error ? e.message : String(e), sessionId: session.id }, "chat-store: save failed");
     } finally {

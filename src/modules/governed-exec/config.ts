@@ -33,10 +33,10 @@ export const DEFAULT_ALLOWLIST: readonly string[] = Object.freeze([
   // NOTE: cat is intentionally excluded — the builder uses read_file MCP tool instead.
   //       cat can dump .env / secrets and must remain operator opt-in.
   "ls", "head", "tail", "wc", "find", "grep", "echo",
-  // package manager + typecheck (required for verifier checks and run_checks)
-  // npm/npx can execute arbitrary code, but the verifier NEEDS them to run tests.
-  // The governed-exec wall-clock timeout + the pipeline's writeScope guard limit blast radius.
-  "npm", "npx", "pnpm",
+  // package manager + typecheck (required for verifier checks and run_checks).
+  // Script execution is separately policy-gated to verifier/check purposes; terminal
+  // calls like `pnpm run ...` are denied even though the binary is allowlisted.
+  "npm", "npx", "pnpm", "yarn",
 ]);
 
 /** Per-command wall-clock cap. */

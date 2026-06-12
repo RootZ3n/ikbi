@@ -22,6 +22,7 @@
 import type { OperationContext } from "../../../core/identity/index.js";
 import type { ModelTool } from "../../../core/provider/contract.js";
 import type { ExecResult, GovernedExec } from "../../governed-exec/index.js";
+import { commandPolicyDenyReason } from "../../governed-exec/policy.js";
 
 /** What the terminal tool needs from the builder: the governed executor + the run's identity. */
 export interface TerminalDeps {
@@ -119,6 +120,8 @@ export async function runTerminal(
     return "ERROR: terminal could not parse a command from the input.";
   }
   const rest = tokens.slice(1);
+  const policyDeny = commandPolicyDenyReason(binary, rest, `builder terminal: ${command.slice(0, 120)}`);
+  if (policyDeny !== undefined) return `DENIED: ${policyDeny}`;
   try {
     const result = await deps.governedExec.run({
       parentCtx: deps.parentCtx,

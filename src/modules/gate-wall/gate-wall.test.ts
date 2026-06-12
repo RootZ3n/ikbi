@@ -123,6 +123,27 @@ test("exec action: a requiresApproval tier (probation) → deny fail-closed (sam
   assert.match(g.reason ?? "", /requires operator approval/);
 });
 
+test("exec action: effect policy denies git ref mutation and non-check package scripts even at trusted tier", async () => {
+  for (const action of [
+    execInput("trusted", { command: "git", args: ["push", "origin", "main"] }),
+    execInput("trusted", { command: "git", args: ["branch", "-f", "main", "HEAD"] }),
+    execInput("trusted", { command: "pnpm", args: ["run", "build"], purpose: "builder terminal" }),
+  ]) {
+    const { gw, receiptCalls } = harness();
+    const g = await gw.evaluate(action);
+    assert.equal(g.allow, false);
+    assert.match(g.reason ?? "", /not allowed|only for verifier\/check|denying/);
+    const meta = (receiptCalls[0]!.input as { metadata: Record<string, unknown> }).metadata;
+    assert.equal(meta.allow, false);
+  }
+});
+
+test("exec action: package scripts are allowed for verifier check purposes", async () => {
+  const { gw } = harness();
+  const g = await gw.evaluate(execInput("trusted", { command: "pnpm", args: ["test"], purpose: "verifier check: test" }));
+  assert.equal(g.allow, true);
+});
+
 test("disabled gate denies an exec action too (no allow-all bypass for non-promote)", async () => {
   const { gw } = harness(false);
   const g = await gw.evaluate(execInput("trusted")); // trusted would normally allow

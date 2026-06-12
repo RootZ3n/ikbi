@@ -39,17 +39,21 @@ export const integrator: RoleFn = async (ctx) => {
 
     const builderDetail = detailOf(builder);
     const filesWritten = Array.isArray(builderDetail.filesWritten) ? builderDetail.filesWritten : [];
-    // FAIL-CLOSED: a missing/non-array rejectedToolCalls means "cannot confirm clean"
+    // FAIL-CLOSED: a missing/non-array policyViolations means "cannot confirm clean"
     // → undefined (never []), so the gate below does NOT pass on an absent field.
-    const rejected = Array.isArray(builderDetail.rejectedToolCalls) ? builderDetail.rejectedToolCalls : undefined;
+    const policyViolations = Array.isArray(builderDetail.policyViolations)
+      ? builderDetail.policyViolations
+      : Array.isArray(builderDetail.rejectedToolCalls)
+        ? builderDetail.rejectedToolCalls
+        : undefined;
 
     const builderOk = builder?.outcome === "success" && filesWritten.length > 0;
-    const noRejectedToolCalls = rejected !== undefined && rejected.length === 0;
+    const noPolicyViolations = policyViolations !== undefined && policyViolations.length === 0;
     const criticPass = detailOf(critic).pass === true;
     const verifierPass = detailOf(verifier).verdict === "pass";
 
-    if (builderOk && noRejectedToolCalls && criticPass && verifierPass) {
-      const rationale = `promote: builder wrote ${filesWritten.length} file(s), no rejected tool calls, critic pass, verifier pass`;
+    if (builderOk && noPolicyViolations && criticPass && verifierPass) {
+      const rationale = `promote: builder wrote ${filesWritten.length} file(s), no policy violations, critic pass, verifier pass`;
       return {
         role: "integrator",
         outcome: "success", // "did its job" — the verdict is in detail.decision
@@ -66,8 +70,8 @@ export const integrator: RoleFn = async (ctx) => {
     if (builder === undefined) why = "no builder result";
     else if (builder.outcome !== "success") why = `builder outcome "${builder.outcome}"`;
     else if (filesWritten.length === 0) why = "builder wrote no files";
-    else if (rejected === undefined) why = "builder did not report tool-call policy status (cannot confirm clean)";
-    else if (rejected.length > 0) why = `builder attempted ${rejected.length} out-of-policy tool call(s)`;
+    else if (policyViolations === undefined) why = "builder did not report tool-call policy status (cannot confirm clean)";
+    else if (policyViolations.length > 0) why = `builder attempted ${policyViolations.length} out-of-policy tool call(s)`;
     else if (critic === undefined) why = "no critic result";
     else if (!criticPass) why = "critic pass=false";
     else if (verifier === undefined) why = "no verifier result";

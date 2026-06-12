@@ -622,8 +622,9 @@ export class WorkspaceManager {
 
   /**
    * Reconcile a "promoting" record after a crash: if the target ref equals the
-   * intended afterRef the CAS landed => mark promoted (a landed mutation is always
-   * recorded); otherwise it did not land => revert to allocated (promotable again).
+   * intended afterRef AND the recorded beforeRef is an ancestor of that ref, the
+   * CAS landed => mark promoted (a landed mutation is always recorded); otherwise
+   * it did not land => revert to allocated (promotable again).
    */
   private async reconcilePromoting(rec: WorkspaceRecord): Promise<void> {
     const intent = rec.promoteIntent;
@@ -633,7 +634,10 @@ export class WorkspaceManager {
       return;
     }
     const targetHead = await revParse(rec.targetRepo, rec.baseBranch).catch(() => undefined);
-    if (targetHead === intent.afterRef) {
+    const landed = targetHead === intent.afterRef && (await isAncestor(rec.targetRepo, intent.beforeRef, intent.afterRef).catch(() => false));
+    if (landed) {
+      const checkedOutPath = await worktreeForBranch(rec.targetRepo, rec.baseBranch).catch(() => undefined);
+      if (checkedOutPath !== undefined) await syncWorktreeToRef(checkedOutPath, intent.afterRef);
       const promoted: WorkspaceRecord = { ...rec, state: "promoted", promotedTo: intent.afterRef, updatedAt: this.now(), note: "reconciled: promote landed" };
       await this.store.put(rec.id, promoted);
       this.live.delete(rec.id);

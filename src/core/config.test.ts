@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import { loadConfig } from "./config.js";
@@ -10,7 +12,7 @@ test("defaults: loopback bind on default port", () => {
   assert.equal(cfg.port, 18796);
   assert.equal(cfg.bindHost, "127.0.0.1");
   assert.equal(cfg.allowPublicBind, false);
-  assert.ok(cfg.stateRoot.endsWith("state"));
+  assert.equal(cfg.stateRoot, join(homedir(), ".ikbi", "state"));
 });
 
 test("mimo base URL defaults to the real direct-API endpoint (api.xiaomimimo.com), overridable", () => {

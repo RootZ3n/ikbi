@@ -346,6 +346,35 @@ test("DURABILITY: a crashed promote that LANDED reconciles to promoted (no unrec
     const rec = await mgr.get(ws.id);
     assert.equal(rec?.state, "promoted", "the landed mutation is reconciled to promoted");
     assert.equal(rec?.promotedTo, scratchHead);
+    assert.equal((await runGit(repo, ["rev-parse", "HEAD"])).stdout.trim(), scratchHead, "checked-out target worktree is resynced to the landed ref");
+    assert.equal((await runGit(repo, ["status", "--porcelain"])).stdout.trim(), "", "resynced target worktree is clean");
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
+test("DURABILITY: crashed promote reconcile requires beforeRef to be an ancestor of afterRef", async () => {
+  const repo = await makeRepo();
+  const { mgr, root, store } = makeManager();
+  try {
+    const ws = await mgr.allocate({ targetRepo: repo, identity: ID });
+    await writeFile(join(ws.path, "f.txt"), "x\n");
+    await mgr.commit(ws, "work");
+    const scratchHead = (await runGit(repo, ["rev-parse", ws.scratchBranch])).stdout.trim();
+
+    await writeFile(join(repo, "main-change.txt"), "main\n");
+    await runGit(repo, ["add", "-A"]);
+    await runGit(repo, ["commit", "--quiet", "-m", "main moved"]);
+    const divergentBefore = (await runGit(repo, ["rev-parse", "main"])).stdout.trim();
+
+    // Simulate an impossible/unsafe crashed state: the branch equals afterRef, but
+    // the recorded beforeRef is not an ancestor of afterRef, so this was not the
+    // intended CAS landing and must not be recorded as promoted.
+    await runGit(repo, ["update-ref", "refs/heads/main", scratchHead]);
+    await store.put(ws.id, { ...(await mgr.get(ws.id))!, state: "promoting", promoteIntent: { beforeRef: divergentBefore, afterRef: scratchHead } });
+
+    await mgr.reclaim(repo);
+    assert.equal((await mgr.get(ws.id))?.state, "allocated", "non-ancestral matching afterRef does not reconcile as promoted");
   } finally {
     await cleanup(repo, root);
   }

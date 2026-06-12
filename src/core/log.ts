@@ -9,9 +9,15 @@ import { pino, type Logger } from "pino";
 
 import { config } from "./config.js";
 
+export function resolveLogLevel(env: NodeJS.ProcessEnv = process.env, isTty: boolean = process.stderr.isTTY === true): string {
+  const explicit = env.IKBI_LOG_LEVEL?.trim();
+  if (explicit !== undefined && explicit.length > 0) return explicit;
+  return isTty ? "silent" : config.logLevel;
+}
+
 /** The root logger for the ikbi service. */
 export const log: Logger = pino({
-  level: config.logLevel,
+  level: resolveLogLevel(),
   base: {
     service: "ikbi",
     version: config.version,

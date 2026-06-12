@@ -126,14 +126,14 @@ test("M5: delegate_task requires explicit confirmation with rollback-limit warni
 
 // ── L8: fileStem is injective (no collision) ──────────────────────────────────────
 
-test("L8: previously-colliding ids map to distinct persisted files", () => {
+test("L8: previously-colliding ids map to distinct persisted files", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ikbi-stem-"));
   const store = new PersistentSessionStore(dir);
   // Under the old escape (`_` left unescaped), "x_2f" and "x/" both produced the stem "x_2f".
   const a = new ChatSession("x_2f", { invoke: queued([stop("a")]), worktree: dir });
   const b = new ChatSession("x/", { invoke: queued([stop("b")]), worktree: dir });
-  store.save(a);
-  store.save(b);
+  await store.save(a);
+  await store.save(b);
   assert.equal(store.load("x_2f")?.id, "x_2f", "first id round-trips to its own file");
   assert.equal(store.load("x/")?.id, "x/", "the formerly-colliding id round-trips to a DISTINCT file");
 });

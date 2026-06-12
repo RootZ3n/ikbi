@@ -37,7 +37,7 @@ function buildDefaultStore(): ReceiptStore {
   const rc = config.receipt;
   const logFile = join(rc.dir, "receipts.ndjson");
   return new ReceiptStore({
-    log: createAppendLog<Receipt>({ path: logFile }),
+    log: createAppendLog<Receipt>({ path: logFile, crossProcess: true }),
     logFile,
     locks,
     logger: log,

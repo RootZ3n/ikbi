@@ -141,6 +141,40 @@ test("an allowlisted binary with an allowing gate executes", async () => {
   assert.deepEqual(ex.calls[0]?.args, ["status"]);
 });
 
+test("effect policy denies dangerous git forms and package scripts outside checks", async () => {
+  for (const [command, args] of [
+    ["git", ["-C", "/tmp", "status"]],
+    ["git", ["--git-dir=.git", "status"]],
+    ["git", ["--work-tree", "/tmp", "status"]],
+    ["git", ["push", "origin", "main"]],
+    ["git", ["update-ref", "refs/heads/main", "HEAD"]],
+    ["git", ["branch", "-D", "main"]],
+    ["git", ["branch", "-f", "main", "HEAD"]],
+    ["pnpm", ["run", "build"]],
+    ["npm", ["test"]],
+    ["npx", ["tsx", "script.ts"]],
+  ] as const) {
+    const ex = fakeExecFile();
+    const gate = capturingGate();
+    const ge = createGovernedExec({ config: cfg(["git", "pnpm", "npm", "npx"]), gateWall: gate.gateWall, execFile: ex.fn, receipts: fakeReceipts().receipts, publish: () => {} });
+    const r = await ge.run({ parentCtx: makeCtx("verified"), command, args, purpose: "builder terminal" });
+    assert.equal(r.denied, true, `${command} ${args.join(" ")} denied`);
+    assert.equal(ex.calls.length, 0, "denied command never executes");
+    assert.equal(gate.inputs.length, 0, "module policy denies before gate dispatch");
+  }
+});
+
+test("package-manager scripts are allowed for verifier/check purposes", async () => {
+  const ex = fakeExecFile();
+  const gate = capturingGate();
+  const ge = createGovernedExec({ config: cfg(["pnpm"]), gateWall: gate.gateWall, execFile: ex.fn, receipts: fakeReceipts().receipts, publish: () => {} });
+
+  const r = await ge.run({ parentCtx: makeCtx("verified"), command: "pnpm", args: ["test"], purpose: "verifier check: test" });
+  assert.equal(r.executed, true);
+  assert.equal(ex.calls.length, 1);
+  assert.equal(gate.inputs.length, 1);
+});
+
 // ── sudo is ALWAYS gated ─────────────────────────────────────────────────────
 
 test("sudo on an allowlisted binary at a requiresApproval tier is DENIED by the gate (sudo flows through)", async () => {
@@ -346,7 +380,7 @@ test("a command that exits non-zero is reported executed:true with the exit code
   const rc = fakeReceipts();
   const ge = createGovernedExec({ config: cfg(["git"]), gateWall: capturingGate().gateWall, execFile: ex.fn, receipts: rc.receipts, publish: () => {} });
 
-  const r = await ge.run({ parentCtx: makeCtx("verified"), command: "git", args: ["push"] });
+  const r = await ge.run({ parentCtx: makeCtx("verified"), command: "git", args: ["status"] });
   assert.equal(r.executed, true, "it ran (exit non-zero is not a deny)");
   assert.equal(r.exitCode, 2);
   assert.equal(rc.calls.at(-1)?.input.outcome.status, "failure");

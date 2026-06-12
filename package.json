@@ -15,7 +15,7 @@
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "env -u IKBI_OPERATOR_TOKEN -u IKBI_WORKER_TOKEN IKBI_ALLOW_INSECURE_DEV_KEYS=true node --import tsx --test \"src/**/*.test.ts\""
+    "test": "sh -c 'IKBI_STATE_ROOT=$(mktemp -d /tmp/ikbi-test-state.XXXXXX) env -u IKBI_OPERATOR_TOKEN -u IKBI_WORKER_TOKEN IKBI_ALLOW_INSECURE_DEV_KEYS=true node --import tsx --test \"src/**/*.test.ts\"'"
   },
   "dependencies": {
     "fastify": "^5.2.1",

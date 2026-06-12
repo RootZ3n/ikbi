@@ -44,7 +44,7 @@ import type { GovernedExec } from "../governed-exec/index.js";
 // The check SET is the single shared definition (worker-model/checks.ts) — the SAME
 // constant the builder's in-loop run_checks imports, so the builder previews the
 // verifier's EXACT checks. Behavior here is unchanged; the constant just relocated.
-import { type CheckResult, type ChecksResolution, mapExec, resolveCheckTimeoutMs, VERIFIER_CHECKS } from "./checks.js";
+import { type CheckResult, type ChecksResolution, mapExec, parseChecksEnv, resolveCheckTimeoutMs, VERIFIER_CHECKS } from "./checks.js";
 import type { RoleFn, RoleResult } from "./contract.js";
 import { runQualityChecks, type QualityResult } from "./quality-checks.js";
 // LADDER MODE (opt-in, IKBI_VERIFY=ladder): package/impact-aware verification. These are
@@ -329,24 +329,58 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
       // and fires ~immediately → every check SIGKILL'd → false RED). Shared with the builder.
       const checkTimeoutMs = resolveCheckTimeoutMs(runEnv);
 
-      let data: ProjectIndexData;
-      try {
-        data = (await indexApi.refresh(worktree)).data;
-      } catch (e) {
-        // Fail closed: without an index we cannot scope impact — RED, never a vacuous pass.
-        return red(`verification RED (ladder): project-index unavailable — ${e instanceof Error ? e.message : String(e)}`);
+      const configuredChecks = parseChecksEnv(runEnv.IKBI_CHECKS);
+      if (configuredChecks === "malformed") {
+        return red("verification RED (ladder): IKBI_CHECKS is malformed (expected a non-empty JSON array of {name,command,args}); fix IKBI_CHECKS or unset it to use ladder planning");
       }
 
-      let planningDiff = diff;
-      if (deps.planningDiff !== undefined) {
+      let plan: VerificationPlan;
+      if (configuredChecks !== undefined) {
+        plan = {
+          status: "ok",
+          blocked: false,
+          blockReasons: [],
+          scope: "full",
+          escalateToFull: true,
+          escalationReasons: ["operator-configured IKBI_CHECKS"],
+          affectedPackages: [],
+          affectedTests: [],
+          neutralPackages: [],
+          stubScripts: [],
+          stages: [{
+            stage: "full",
+            tasks: configuredChecks.map((c) => ({
+              package: "",
+              cwd: "",
+              name: c.name,
+              command: c.command,
+              args: c.args,
+              scope: "full",
+              reason: "operator-configured IKBI_CHECKS",
+            })),
+          }],
+          receipts: ["IKBI_CHECKS override: running operator-configured checks as full verification"],
+        };
+      } else {
+        let data: ProjectIndexData;
         try {
-          planningDiff = await deps.planningDiff(rctx.workspace);
+          data = (await indexApi.refresh(worktree)).data;
         } catch (e) {
-          return red(`verification RED (ladder): planning diff unavailable — ${e instanceof Error ? e.message : String(e)}`);
+          // Fail closed: without an index we cannot scope impact — RED, never a vacuous pass.
+          return red(`verification RED (ladder): project-index unavailable — ${e instanceof Error ? e.message : String(e)}`);
         }
+
+        let planningDiff = diff;
+        if (deps.planningDiff !== undefined) {
+          try {
+            planningDiff = await deps.planningDiff(rctx.workspace);
+          } catch (e) {
+            return red(`verification RED (ladder): planning diff unavailable — ${e instanceof Error ? e.message : String(e)}`);
+          }
+        }
+        const changedFiles = parseChangedFiles(planningDiff);
+        plan = planFn({ data, changedFiles });
       }
-      const changedFiles = parseChangedFiles(planningDiff);
-      const plan = planFn({ data, changedFiles });
       const baseReceipts = [...plan.receipts, `check timeout: ${checkTimeoutMs}ms (per check, separate from the model role budget)`];
 
       if (plan.blocked) {

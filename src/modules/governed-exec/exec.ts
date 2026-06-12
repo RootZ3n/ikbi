@@ -44,6 +44,7 @@ import {
   type GovExecEventPayload,
 } from "./events.js";
 import type { ExecRequest, ExecResult, GovernedExec, HttpRequest, HttpResult } from "./contract.js";
+import { commandPolicyDenyReason } from "./policy.js";
 
 const EVENT_SOURCE = "governed-exec";
 const EXEC_OPERATION = "govexec.run";
@@ -238,6 +239,8 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
     if (!allowlist.has(command)) return deny(`binary "${command}" is not on the allowlist`);
     const evalDeny = forbiddenEvalReason(command, args);
     if (evalDeny !== undefined) return deny(evalDeny);
+    const policyDeny = commandPolicyDenyReason(command, args, request.purpose);
+    if (policyDeny !== undefined) return deny(policyDeny);
 
     // (4) the caller's grant. (5) GATE-WALL — sudo is part of the gated action.
     const grant = autonomyForTier(asTier(identity.trustTier ?? TRUST_FLOOR, TRUST_FLOOR));

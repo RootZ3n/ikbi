@@ -150,10 +150,10 @@ export function resolveChecks(worktreeReal: string, env: NodeJS.ProcessEnv = pro
  */
 export async function workingTreePackageJsonDiff(
   runGit: (args: readonly string[]) => Promise<string>,
-  worktreePath: string,
+  _worktreePath: string,
   baseRef: string,
 ): Promise<string> {
-  return runGit(["-C", worktreePath, "diff", baseRef, "--", "*package.json"]);
+  return runGit(["diff", baseRef, "--", "*package.json"]);
 }
 
 const RELEVANT_WORKTREE_EXTS: readonly string[] = [
@@ -193,11 +193,11 @@ function isRelevantWorktreePath(path: string): boolean {
  */
 export async function workingTreePlanningDiff(
   runGit: (args: readonly string[]) => Promise<string>,
-  worktreePath: string,
+  _worktreePath: string,
   baseRef: string,
 ): Promise<string> {
-  const trackedRaw = await runGit(["-C", worktreePath, "diff", "--name-only", baseRef, "--", "."]);
-  const untrackedRaw = await runGit(["-C", worktreePath, "ls-files", "--others", "--exclude-standard", "--", "."]);
+  const trackedRaw = await runGit(["diff", "--name-only", baseRef, "--", "."]);
+  const untrackedRaw = await runGit(["ls-files", "--others", "--exclude-standard", "--", "."]);
   const paths = [...trackedRaw.split(/\r?\n/), ...untrackedRaw.split(/\r?\n/)]
     .map((s) => s.trim())
     .filter((s) => s.length > 0 && isRelevantWorktreePath(s))

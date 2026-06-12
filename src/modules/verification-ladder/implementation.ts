@@ -236,7 +236,7 @@ export function createVerificationLadder(cfg: VerificationLadderConfig = verific
         // (vacuously-green) full stage. Emit a non-runnable BLOCKING marker and block the plan.
         blocked = true;
         const stubNote = stubScripts.length > 0 ? ` (stub/no-op script(s) not counted: ${stubScripts.join(", ")})` : "";
-        const why = `full verification is REQUIRED (${escalationReasons.join("; ")}) but no runnable full-repo checks could be derived (no operator fullChecks and the root package has no real test/typecheck/build script)${stubNote}`;
+        const why = `full verification is REQUIRED (${escalationReasons.join("; ")}) but no runnable full-repo checks could be derived (set IKBI_CHECKS to specify verification commands, or the root package needs a real test/typecheck/build script)${stubNote}`;
         blockReasons.push(why);
         stages.push({
           stage: "full",

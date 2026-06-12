@@ -78,7 +78,7 @@ test("/status reports managed-workspace true, with target repo / workspace / bas
   const { mgr, root } = makeManager();
   try {
     const ws = await allocateSessionWorkspace({ targetRepo: repo, sessionId: "st-1", manager: mgr });
-    const s = new ChatSession("st-1", { workspace: ws, invoke: queued([toolTurn(call("write_file", { path: "p.ts", content: "pending\n" })), stop("done")]) });
+    const s = new ChatSession("st-1", { workspace: ws, invoke: queued([toolTurn(call("write_file", { path: "README.md", content: "pending\n" })), stop("done")]) });
     let out = "";
     await runRepl({ session: s, store: store(), readLine: lines(["add a file", "/status", "/exit"]), out: (o) => { out += o; } });
 

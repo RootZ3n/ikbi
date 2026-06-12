@@ -50,7 +50,8 @@ import { delegateTaskTool, runDelegateTask } from "./builder-tools/delegate.js";
 import { gitDiffTool, gitLogTool, gitStatusTool, GIT_TOOL_NAMES, runGitTool } from "./builder-tools/git-tools.js";
 import { patchTool, runPatch } from "./builder-tools/patch.js";
 import { runSearchFiles, searchFilesTool } from "./builder-tools/search-files.js";
-import { runTerminal, terminalTool } from "./builder-tools/terminal.js";
+import { runTerminal, terminalTool, tokenizeCommand } from "./builder-tools/terminal.js";
+import { commandPolicyDenyReason } from "../governed-exec/policy.js";
 import { runVisionAnalyze, visionAnalyzeTool } from "./builder-tools/vision-tool.js";
 import { runWebExtract, runWebSearch, webExtractTool, webSearchTool, WEB_TOOL_NAMES } from "./builder-tools/web-tools.js";
 import { type CheckResult, type ChecksResolution, mapExec, resolveCheckTimeoutMs, VERIFIER_CHECKS } from "./checks.js";
@@ -459,6 +460,10 @@ function classifyOutcome(stopReason: string): WorkerOutcome {
   }
 }
 
+function isPolicyViolation(e: ToolCallError): boolean {
+  return /escape|write_scope|dependency directory|not allowed|only for verifier\/check|WRITE SCOPE VIOLATION/i.test(e.error);
+}
+
 /** Build a checkable success condition from the goal (+ scout findings) — RAIL 1. Derived
  *  in-builder; NOT a WorkerTask contract field (nothing authors a real spec upstream yet). */
 function deriveSuccessCondition(goal: string, priorResults: ReadonlyArray<{ role: string; summary?: string }>): string {
@@ -519,6 +524,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
   let warnedHighContext = false; // warn-once when pressure crosses 70%
   let stopReason = "max_iterations"; // not "stop": only a validated `done` is success now
   const filesWrittenPerRound: number[] = []; // EARLY STOP: tracks new files written each tool-round iteration
+  let consecutiveRejectedToolRounds = 0;
 
   try {
     // Canonical worktree root for confinement (realpath’d once).
@@ -692,13 +698,20 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         return `ERROR: ${verr}`;
       }
       // WRITE SCOPE: block terminal commands that write files when scope is restricted
+      const cmd = String(args.command ?? "");
       if (writeScope === "none" || writeScope === "new_only") {
-        const cmd = String(args.command ?? "");
         const writePatterns = />\s*[^&|;]+|>>\s*[^&|;]+|\btee\b|\bcp\b.*[^|]\s|\bmv\b|\brm\b|\bsed\s+-i\b|\bnode\b.*writeFile|\bpython.*open\(.*['\"]w['\"]|\becho\b.*>/;
         if (writePatterns.test(cmd)) {
           rejectedToolCalls.push({ tool: "terminal", path: cmd.slice(0, 100), error: `write_scope is '${writeScope}' — terminal write commands are forbidden` });
           return `ERROR: WRITE SCOPE VIOLATION — write scope is '${writeScope}'. Terminal command that writes files is forbidden: ${cmd.slice(0, 100)}`;
         }
+      }
+      const tokens = tokenizeCommand(cmd);
+      const binary = tokens[0];
+      const policyDeny = binary !== undefined ? commandPolicyDenyReason(binary, tokens.slice(1), `builder terminal: ${cmd.slice(0, 120)}`) : undefined;
+      if (policyDeny !== undefined) {
+        rejectedToolCalls.push({ tool: "terminal", path: cmd.slice(0, 100), error: policyDeny });
+        return `DENIED: ${policyDeny}`;
       }
       // CWD = the REALPATH'd worktree (worktreeReal), the SAME canonical root read_file/
       // write_file confine against — never the raw ctx.workspace.path, which can diverge from
@@ -947,7 +960,8 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       }
 
       // EARLY STOP: snapshot filesWritten count so we can detect no-progress after tool rounds
-      const filesWrittenBeforeRound = filesWritten.length;
+        const filesWrittenBeforeRound = filesWritten.length;
+        const rejectedBeforeRound = rejectedToolCalls.length;
 
       // CONTEXT LAYER — deterministic compression: compress old tool results into
       // lightweight summaries using pattern matching (no model call). This runs FIRST
@@ -1076,9 +1090,10 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         // EARLY STOP: track files written in this tool-round iteration
         const newFilesThisRound = filesWritten.length - filesWrittenBeforeRound;
         filesWrittenPerRound.push(newFilesThisRound);
-        // EARLY STOP: stuck detection — if last 3 tool calls were all rejected, builder is stuck
-        const recentRejections = rejectedToolCalls.slice(-3);
-        if (recentRejections.length >= 3) {
+        // EARLY STOP: stuck detection — only consecutive all-rejected tool rounds count.
+        const newRejections = rejectedToolCalls.length - rejectedBeforeRound;
+        consecutiveRejectedToolRounds = newRejections >= response.toolCalls.length ? consecutiveRejectedToolRounds + 1 : 0;
+        if (consecutiveRejectedToolRounds >= 3) {
           stopReason = "stuck_detected";
           break;
         }
@@ -1094,17 +1109,21 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         continue; // keep looping while the model wants tools / has not validly done
       }
 
-      // EARLY STOP: detect when the builder signals completion in its text (no tool calls).
-      // The model said "goal achieved" / "task complete" in plain text — stop.
-      // NOTE: "done" alone is NOT matched here because it's too common in corrective turns
-      // ("call done with your self-check"). The model has a dedicated `done` TOOL for signaling.
+      // A prose completion claim is not completion. Inject a corrective turn and require
+      // the dedicated `done` tool, preserving the run's objective gates.
       const lastAssistantText = typeof response.content === "string" ? response.content.toLowerCase() : "";
       if (
         response.finishReason === "stop" &&
         (lastAssistantText.includes("goal achieved") || lastAssistantText.includes("task complete"))
       ) {
-        stopReason = "builder_done";
-        break;
+        bareStops += 1;
+        messages.push({
+          role: "user",
+          content:
+            "You claimed completion in prose, but completion must be signaled with the `done` tool. " +
+            "Call done with your self-check if the work is complete; otherwise continue using tools.",
+        });
+        continue;
       }
 
       // RAIL 3: a BARE STOP (no done) is INCOMPLETE — inject a corrective turn and loop
@@ -1127,10 +1146,12 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       break;
     }
 
+    const policyViolations = rejectedToolCalls.filter(isPolicyViolation);
+    const toolFormatErrors = rejectedToolCalls.filter((e) => !isPolicyViolation(e));
     const outcome = classifyOutcome(stopReason);
     let summary =
       `builder ${outcome} after ${toolRounds} tool round(s) (stop: ${stopReason}); ` +
-      `wrote ${filesWritten.length}, read ${filesRead.length}, ${rejectedToolCalls.length} rejected` +
+      `wrote ${filesWritten.length}, read ${filesRead.length}, ${policyViolations.length} policy violation(s), ${toolFormatErrors.length} format error(s)` +
       (bareStops > 0 ? `, ${bareStops} bare-stop(s) corrected` : "");
     // ISSUE 3: fold the repair narrative into the role summary so the receipt trail records the
     // suspected root cause + fix rationale (the CLI also surfaces it in the final report).
@@ -1152,6 +1173,8 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         stopReason,
         neutralizedCount,
         rejectedToolCalls,
+        policyViolations,
+        toolFormatErrors,
         // The builder's completion CLAIM (present only on a validated `done`). It is the
         // builder's self-report, NOT the verdict — the verifier role still decides truth.
         ...(doneClaim !== undefined ? { doneClaim } : {}),
@@ -1168,7 +1191,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       role: "builder",
       outcome: "failure",
       summary: `builder failed: ${errMsg(err)}`,
-      detail: { filesWritten, filesRead, toolRounds, stopReason, neutralizedCount, rejectedToolCalls },
+      detail: { filesWritten, filesRead, toolRounds, stopReason, neutralizedCount, rejectedToolCalls, policyViolations: rejectedToolCalls.filter(isPolicyViolation), toolFormatErrors: rejectedToolCalls.filter((e) => !isPolicyViolation(e)) },
     };
   }
   };

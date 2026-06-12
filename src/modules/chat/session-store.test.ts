@@ -4,7 +4,7 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
@@ -113,7 +113,7 @@ test("FIX2: label persists and surfaces in list(); delete() removes a session", 
   const a = new ChatSession("L1", { invoke, worktree: wt(), autosave: (x) => store.save(x) });
   await a.send("hi");
   a.label = "auth-refactor";
-  store.save(a);
+  await store.save(a);
 
   const meta = store.list().find((m) => m.id === "L1");
   assert.equal(meta?.label, "auth-refactor", "label surfaces in the listing");
@@ -139,4 +139,26 @@ test("FIX1: latest() reconstructs the most-recently-used session", async () => {
 test("FIX1: load() of an unknown id returns undefined (no throw)", () => {
   assert.equal(store.load("does-not-exist"), undefined);
   assert.equal(store.loadState("does-not-exist"), undefined);
+});
+
+test("FIX1: failed atomic session save preserves the previous complete JSON", async () => {
+  const { invoke } = scripted([stop("old")]);
+  const s = new ChatSession("crash-save", { invoke, worktree: wt() });
+  await store.save(s);
+  const file = readdirSync(dir).find((f) => f.endsWith(".json"));
+  assert.ok(file, "initial atomic save wrote a session file");
+  const full = join(dir, file);
+  const before = readFileSync(full, "utf8");
+
+  const failing = new PersistentSessionStore(dir, undefined, {
+    atomicWriteFile: async (path, data) => {
+      writeFileSync(`${path}.ikbi-tmp.test-crash`, data);
+      throw new Error("simulated crash mid-write");
+    },
+  });
+  s.label = "new-label-that-must-not-replace-old-json";
+  await failing.save(s);
+
+  assert.equal(readFileSync(full, "utf8"), before, "target file remains the prior complete JSON");
+  assert.equal(new PersistentSessionStore(dir).loadState("crash-save")?.label, undefined, "failed save did not publish the new state");
 });

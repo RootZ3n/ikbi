@@ -6,13 +6,13 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { enableDevKeysForInfoCommand, INFO_COMMANDS, loadDotenv } from "./bootstrap.js";
+import { CwdDotenvSecurityError, enableDevKeysForInfoCommand, INFO_COMMANDS, loadBootstrapEnv, loadDotenv } from "./bootstrap.js";
 
 const tmp = (p: string) => mkdtempSync(join(tmpdir(), p));
 
@@ -43,6 +43,34 @@ test("loadDotenv NEVER overrides an already-set variable (the real env wins)", (
 test("loadDotenv on a missing file is a no-op (never throws)", () => {
   const env: NodeJS.ProcessEnv = {};
   assert.deepEqual(loadDotenv(join(tmp("ikbi-env-missing-"), ".env"), env), []);
+});
+
+test("loadBootstrapEnv loads install-root .env and ~/.ikbi/env from any cwd; cwd cannot override", () => {
+  const root = tmp("ikbi-install-root-");
+  const home = tmp("ikbi-home-");
+  const cwd = tmp("ikbi-random-cwd-");
+  writeFileSync(join(root, ".env"), "IKBI_A=from-root\nIKBI_SHARED=root\n");
+  const ikbiHome = join(home, ".ikbi");
+  writeFileSync(join(cwd, ".env"), "IKBI_SHARED=cwd\nIKBI_C=from-cwd\n");
+  mkdirSync(ikbiHome, { recursive: true });
+  writeFileSync(join(ikbiHome, "env"), "IKBI_B=from-home\nIKBI_SHARED=home\n");
+  const env: NodeJS.ProcessEnv = {};
+  loadBootstrapEnv(env, cwd, { installRoot: root, homeDir: home });
+  assert.equal(env.IKBI_A, "from-root");
+  assert.equal(env.IKBI_B, "from-home");
+  assert.equal(env.IKBI_C, "from-cwd");
+  assert.equal(env.IKBI_SHARED, "root", "higher-trust root env wins");
+});
+
+test("loadBootstrapEnv refuses security keys from cwd .env with a friendly error", () => {
+  const root = tmp("ikbi-install-root-safe-");
+  const home = tmp("ikbi-home-safe-");
+  const cwd = tmp("ikbi-cwd-unsafe-");
+  writeFileSync(join(cwd, ".env"), "IKBI_TRUST_HMAC_KEY=bad\nIKBI_OPERATOR_TOKEN=bad\n");
+  assert.throws(
+    () => loadBootstrapEnv({}, cwd, { installRoot: root, homeDir: home }),
+    (e: unknown) => e instanceof CwdDotenvSecurityError && /Move them to ~\/\.ikbi\/env/.test(e.message),
+  );
 });
 
 // ── enableDevKeysForInfoCommand (pure) ────────────────────────────────────────

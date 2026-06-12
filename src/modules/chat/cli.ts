@@ -79,6 +79,8 @@ export interface ReplDeps {
   readonly store?: PersistentSessionStore;
   /** Factory for a fresh session (`/reset`). May be async (managed-workspace allocation). Optional. */
   readonly newSession?: () => ReplSession | Promise<ReplSession>;
+  /** Optional hook used by the live readline adapter to abort an in-flight turn on Ctrl-C. */
+  readonly onTurnController?: (controller: AbortController | undefined) => void;
 }
 
 /** The mutable per-run state shared with every command handler. */
@@ -114,7 +116,7 @@ function toolLine(tools: readonly ChatToolActivity[]): string {
  * Render a verified `/apply` result (req 3): the verification mode + scope, the checks that ran,
  * and the failure/triage summary when it did not pass — followed by the apply headline.
  */
-function renderApply(ctx: ReplContext, r: ApplyResult): void {
+async function renderApply(ctx: ReplContext, r: ApplyResult): Promise<void> {
   const v = r.verification;
   if (v !== undefined) {
     ctx.out(`verification: ${v.ok ? "PASS" : v.blocked ? "BLOCKED" : v.outcome === "unavailable" ? "UNAVAILABLE" : "FAIL"} — mode=${v.mode}${v.scope !== undefined ? `, scope=${v.scope}` : ""}\n`);
@@ -123,7 +125,7 @@ function renderApply(ctx: ReplContext, r: ApplyResult): void {
     if (!v.ok && v.triageSummary !== undefined) ctx.out(`  failure: ${v.triageSummary}\n`);
   }
   ctx.out(`${r.applied ? "✓ " : ""}${r.summary}\n`);
-  persist(ctx);
+  await persist(ctx);
 }
 
 const DIM = "\x1b[2m";
@@ -158,12 +160,12 @@ function renderToolDiffs(tools: readonly ChatToolActivity[], out: (s: string) =>
 
 /** Persist the current session through the store (no-op when the store/session can't be persisted).
  *  A session-lock conflict (BLOCKER-2) is reported to the operator rather than crashing the REPL. */
-function persist(ctx: ReplContext): void {
+async function persist(ctx: ReplContext): Promise<void> {
   if (ctx.store === undefined) return;
   const s = ctx.session;
   if (typeof s.id === "string" && typeof s.toPersisted === "function") {
     try {
-      ctx.store.save({ id: s.id, toPersisted: s.toPersisted.bind(s) });
+      await ctx.store.save({ id: s.id, toPersisted: s.toPersisted.bind(s) });
     } catch (e) {
       ctx.out(`[save blocked] ${e instanceof Error ? e.message : String(e)}\n`);
     }
@@ -239,7 +241,7 @@ const COMMAND_LIST: readonly ReplCommand[] = [
       // promote; scratch/live-direct cannot apply at all.
       ctx.out(
         managed
-          ? "note:         managed edits are isolated; /apply runs ladder verification, then promotes ONLY on a pass.\n"
+          ? "note:         managed edits are in a separate workspace; /apply runs ladder verification, then promotes ONLY on a pass.\n"
           : "note:         rollback covers tracked file edits only (not terminal/sub-agent side effects).\n",
       );
     },
@@ -267,7 +269,7 @@ const COMMAND_LIST: readonly ReplCommand[] = [
     name: "model",
     description: "Show the current model, or switch to a different one",
     usage: "[name]",
-    handler: (ctx, args) => {
+    handler: async (ctx, args) => {
       const name = args.trim();
       const dm = config.provider.defaultModels;
       if (name.length === 0) {
@@ -291,7 +293,7 @@ const COMMAND_LIST: readonly ReplCommand[] = [
       const prev = ctx.session.currentModel !== undefined ? ctx.session.currentModel() : "?";
       ctx.session.setModel(name);
       ctx.out(`model switched to ${name} — context preserved (${prev} → ${name})\n`);
-      persist(ctx);
+      await persist(ctx);
     },
   },
   {
@@ -304,7 +306,7 @@ const COMMAND_LIST: readonly ReplCommand[] = [
       }
       const r = await ctx.session.compact();
       ctx.out(r.compressed ? `compacted: ${r.before} → ${r.after} messages\n` : `nothing to compact (${r.before} messages)\n`);
-      persist(ctx);
+      await persist(ctx);
     },
   },
   {
@@ -349,14 +351,14 @@ const COMMAND_LIST: readonly ReplCommand[] = [
     name: "label",
     description: "Set a human-friendly label on the current session",
     usage: "<name>",
-    handler: (ctx, args) => {
+    handler: async (ctx, args) => {
       const name = args.trim();
       if (name.length === 0) {
         ctx.out("[usage: /label <name>]\n");
         return;
       }
       ctx.session.label = name;
-      persist(ctx);
+      await persist(ctx);
       ctx.out(`[labelled current session: "${name}"]\n`);
     },
   },
@@ -364,7 +366,7 @@ const COMMAND_LIST: readonly ReplCommand[] = [
     name: "delete",
     description: "Delete a persisted session by id",
     usage: "<id>",
-    handler: (ctx, args) => {
+    handler: async (ctx, args) => {
       const id = args.trim();
       if (ctx.store === undefined) {
         ctx.out("[no persistent store wired]\n");
@@ -394,7 +396,7 @@ const COMMAND_LIST: readonly ReplCommand[] = [
         ctx.out("[apply unavailable for this session]\n");
         return;
       }
-      renderApply(ctx, await ctx.session.apply(args.trim().length > 0 ? args.trim() : undefined));
+      await renderApply(ctx, await ctx.session.apply(args.trim().length > 0 ? args.trim() : undefined));
     },
   },
   {
@@ -405,7 +407,7 @@ const COMMAND_LIST: readonly ReplCommand[] = [
         ctx.out("[apply unavailable for this session]\n");
         return;
       }
-      renderApply(ctx, await ctx.session.apply(args.trim().length > 0 ? args.trim() : undefined));
+      await renderApply(ctx, await ctx.session.apply(args.trim().length > 0 ? args.trim() : undefined));
     },
   },
   {
@@ -428,14 +430,14 @@ const COMMAND_LIST: readonly ReplCommand[] = [
       } else {
         ctx.out(`${r.summary}\n`);
       }
-      persist(ctx);
+      await persist(ctx);
     },
   },
   {
     name: "memory",
     description: "Show / edit your persistent standing instructions",
     usage: "[add <text> | edit | clear]",
-    handler: (ctx, args) => {
+    handler: async (ctx, args) => {
       const trimmed = args.trim();
       const sub = trimmed.split(/\s+/)[0] ?? "";
       const rest = trimmed.slice(sub.length).trim();
@@ -469,7 +471,7 @@ const COMMAND_LIST: readonly ReplCommand[] = [
     name: "rollback",
     description: "Undo the last N file changes made this session (default 1)",
     usage: "[N]",
-    handler: (ctx, args) => {
+    handler: async (ctx, args) => {
       if (ctx.session.rollback === undefined) {
         ctx.out("[rollback unavailable for this session]\n");
         return;
@@ -485,14 +487,14 @@ const COMMAND_LIST: readonly ReplCommand[] = [
       // M4: rollback only tracks write_file/patch edits. Files touched by `terminal` (e.g. a shell
       // redirect) or by a `delegate_task` sub-agent are NOT recorded, so they are NOT undone here.
       ctx.out("[note: terminal and sub-agent mutations are not tracked and were not rolled back]\n");
-      persist(ctx);
+      await persist(ctx);
     },
   },
   {
     name: "permissions",
     description: "Show or set the tool permission mode (auto | confirm | readonly)",
     usage: "[auto|confirm|readonly]",
-    handler: (ctx, args) => {
+    handler: async (ctx, args) => {
       const m = args.trim();
       if (m.length === 0) {
         ctx.out(`permission mode: ${ctx.permissionMode}\n`);
@@ -505,7 +507,7 @@ const COMMAND_LIST: readonly ReplCommand[] = [
       }
       ctx.permissionMode = m;
       ctx.session.setPermissionMode?.(m);
-      persist(ctx);
+      await persist(ctx);
       ctx.out(`permission mode set to ${m}\n`);
     },
   },
@@ -549,7 +551,7 @@ export async function runRepl(deps: ReplDeps): Promise<void> {
   if (deps.session.workdirKind !== undefined && deps.session.worktree !== undefined) {
     const kind = deps.session.workdirKind;
     const descr =
-      kind === "managed" ? `managed workspace off ${deps.session.targetRepo ?? "the repo"} — edits are isolated; /apply to promote, /discard to drop`
+      kind === "managed" ? `managed workspace off ${deps.session.targetRepo ?? "the repo"} — separate from the target until /apply; /discard drops it`
       : kind === "scratch" ? "scratch (non-promotable)"
       : "live-direct edits";
     deps.out(`[workdir: ${deps.session.worktree} — ${descr}]\n`);
@@ -579,13 +581,17 @@ export async function runRepl(deps: ReplDeps): Promise<void> {
     }
     let res: { response: string; tools: ChatToolActivity[]; contextPercent?: number };
     // PROGRESS (FIX 4): a `\r`-overwriting spinner line while the (async) turn runs.
+    const controller = new AbortController();
+    deps.onTurnController?.(controller);
     const onProgress = (phase: string): void => deps.out(`${SPINNER_CLEAR}${DIM}⟳ ${phase}${RESET}`);
-    const turnOpts: TurnOptions = { onProgress, permissionMode: ctx.permissionMode, confirm: ctx.confirmTool };
+    const turnOpts: TurnOptions = { onProgress, signal: controller.signal, permissionMode: ctx.permissionMode, confirm: ctx.confirmTool };
     try {
       res = await ctx.session.send(msg, undefined, ctx.mode, turnOpts);
     } catch (e) {
       deps.out(`${SPINNER_CLEAR}[error: ${errMsg(e)}]\n`);
       continue;
+    } finally {
+      deps.onTurnController?.(undefined);
     }
     deps.out(SPINNER_CLEAR); // clear the spinner line before printing the result
     if (res.tools.length > 0) deps.out(toolLine(res.tools));
@@ -600,7 +606,7 @@ export async function runRepl(deps: ReplDeps): Promise<void> {
 }
 
 /** Bridge a readline interface to the `readLine()` pull model; resolves null on close/SIGINT. */
-function readlineSource(): { readLine: () => Promise<string | null>; close: () => void } {
+function readlineSource(getTurnController?: () => AbortController | undefined): { readLine: () => Promise<string | null>; close: () => void } {
   const rl = createInterface({ input: process.stdin, terminal: process.stdin.isTTY === true });
   const queued: string[] = [];
   let pending: ((v: string | null) => void) | null = null;
@@ -619,8 +625,15 @@ function readlineSource(): { readLine: () => Promise<string | null>; close: () =
     done = true;
     deliver(null);
   });
-  // Ctrl-C: close the interface — `close` resolves the loop cleanly (no stack trace).
-  rl.on("SIGINT", () => rl.close());
+  // Ctrl-C: abort an in-flight turn first. A second Ctrl-C / idle Ctrl-C closes cleanly.
+  rl.on("SIGINT", () => {
+    const controller = getTurnController?.();
+    if (controller !== undefined && !controller.signal.aborted) {
+      controller.abort();
+      return;
+    }
+    rl.close();
+  });
   const readLine = (): Promise<string | null> =>
     new Promise((resolve) => {
       if (queued.length > 0) return resolve(queued.shift() as string);
@@ -642,7 +655,7 @@ export async function liveRepl(argv: readonly string[] = []): Promise<void> {
   const store = Number.isFinite(maxArg) && maxArg > 0 ? new PersistentSessionStore(sessionsDir(), maxArg) : persistentStore;
   // `--force` breaks a stale/foreign session lock on save (BLOCKER-2).
   const force = argv.includes("--force");
-  const autosave = (s: ChatSession): void => store.save(s, { force });
+  const autosave = (s: ChatSession): Promise<void> => store.save(s, { force });
   const scratch = argv.includes("--scratch");
 
   /**
@@ -719,9 +732,10 @@ export async function liveRepl(argv: readonly string[] = []): Promise<void> {
     // Discovery is best-effort cosmetics — never let it block the session.
   }
 
-  const src = readlineSource();
+  let turnController: AbortController | undefined;
+  const src = readlineSource(() => turnController);
   try {
-    await runRepl({ session, store, newSession, readLine: src.readLine, out });
+    await runRepl({ session, store, newSession, readLine: src.readLine, out, onTurnController: (controller) => { turnController = controller; } });
   } finally {
     src.close();
   }

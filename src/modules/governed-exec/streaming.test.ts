@@ -43,7 +43,7 @@ test("onOutput STREAMS each chunk live as it arrives; the result tail is still b
   const live: string[] = [];
   const ge = createGovernedExec({ config: cfg(["pnpm"]), gateWall: gate(), execFileStream: streamFn, receipts: noReceipts, publish: () => {} });
 
-  const r = await ge.run({ parentCtx: makeCtx(), command: "pnpm", args: ["test"], onOutput: (c) => live.push(c) });
+  const r = await ge.run({ parentCtx: makeCtx(), command: "pnpm", args: ["test"], purpose: "verifier check: test", onOutput: (c) => live.push(c) });
 
   assert.equal(r.executed, true);
   assert.equal(r.exitCode, 0);
@@ -59,7 +59,7 @@ test("a streamed non-zero exit is reported (not thrown), with the bounded tail",
     return { stdout: "", stderr: "boom\n", code: 2 };
   };
   const ge = createGovernedExec({ config: cfg(["pnpm"]), gateWall: gate(), execFileStream: streamFn, receipts: noReceipts, publish: () => {} });
-  const r = await ge.run({ parentCtx: makeCtx(), command: "pnpm", args: ["test"], onOutput: () => {} });
+  const r = await ge.run({ parentCtx: makeCtx(), command: "pnpm", args: ["test"], purpose: "verifier check: test", onOutput: () => {} });
   assert.equal(r.executed, true);
   assert.equal(r.exitCode, 2);
   assert.match(r.reason ?? "", /exited 2/);

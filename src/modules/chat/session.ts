@@ -360,6 +360,8 @@ const MUTATING_TOOL_NAMES: ReadonlySet<string> = new Set([
 export interface TurnOptions {
   /** Called as the loop changes phase ("Thinking…", "Running terminal: …") for a spinner (FIX 4). */
   readonly onProgress?: (phase: string) => void;
+  /** Aborts the current interactive turn (Ctrl-C in the REPL). */
+  readonly signal?: AbortSignal;
   /** The session's permission level for THIS turn (FIX 5). Defaults to "auto". */
   readonly permissionMode?: PermissionMode;
   /** In "confirm" mode, asked before each mutating tool; resolve false to BLOCK it (FIX 5). */
@@ -591,7 +593,7 @@ export interface ChatSessionDeps {
   /** Initial permission mode for callers that own an interactive session. */
   readonly permissionMode?: PermissionMode;
   /** Called at the END of every `send()` (after state is mutated) so the caller can auto-persist. */
-  readonly autosave?: (session: ChatSession) => void;
+  readonly autosave?: (session: ChatSession) => void | Promise<void>;
 }
 
 /** One persistent conversation. Holds the message log, worktree, and governed identity. */
@@ -615,7 +617,7 @@ export class ChatSession {
   private readonly identity: AgentIdentity;
   private readonly parentCtx: OperationContext | undefined;
   private readonly invoke: InvokeFn;
-  private readonly autosave: ((session: ChatSession) => void) | undefined;
+  private readonly autosave: ((session: ChatSession) => void | Promise<void>) | undefined;
   /**
    * PROJECT MEMORY carrier (the worktree's CLAUDE.md / AGENTS.md), built once as an isolated
    * UNTRUSTED data-role message and slotted in after the system prompt each turn. Undefined
@@ -1051,11 +1053,13 @@ export class ChatSession {
 
   /** Number of files with pending changes in the workdir (for `/status`). 0 on any error. */
   pendingChangeCount(): number {
+    const recorded = new Set(this.fileHistory.map((m) => m.path)).size;
     try {
       const out = execFileSync("git", ["-C", this.worktree, "status", "--porcelain"], { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 });
-      return out.split("\n").filter((l) => l.trim().length > 0).length;
+      const gitCount = out.split("\n").filter((l) => l.trim().length > 0).length;
+      return gitCount > 0 ? gitCount : recorded;
     } catch {
-      return 0;
+      return recorded;
     }
   }
 
@@ -1339,7 +1343,7 @@ export class ChatSession {
     // loses work. The hook is injected (the persistent store in production; absent in unit tests).
     if (this.autosave !== undefined) {
       try {
-        this.autosave(this);
+        await this.autosave(this);
       } catch (e) {
         log.warn({ err: errMsg(e), sessionId: this.id }, "chat: autosave failed");
       }
@@ -1353,6 +1357,10 @@ export class ChatSession {
     mode: ChatMode = "agent",
     opts: TurnOptions = {},
   ): Promise<{ response: string; tools: ChatToolActivity[]; cost: number; contextPercent: number }> {
+    const interrupted = (): { response: string; tools: ChatToolActivity[]; cost: number; contextPercent: number } => {
+      this.memory.recordToolActivity(tools);
+      return { response: "[ikbi: interrupted]", tools, cost: turnCost, contextPercent: this.contextPercent() };
+    };
     this.lastUsedAt = Date.now();
     // Cost visibility: accumulate every model invocation's cost this turn.
     let turnCost = 0;
@@ -1375,6 +1383,7 @@ export class ChatSession {
 
     let iterations = 0;
     for (;;) {
+      if (opts.signal?.aborted) return interrupted();
       iterations += 1;
       if (iterations > MAX_TOOL_ITERATIONS) {
         this.memory.recordToolActivity(tools);
@@ -1383,6 +1392,7 @@ export class ChatSession {
 
       // PROGRESS (FIX 4): signal the "thinking" phase before the (possibly slow) model call.
       opts.onProgress?.("Thinking…");
+      if (opts.signal?.aborted) return interrupted();
       let response: ModelResponse;
       try {
         response = await this.invoke({
@@ -1422,6 +1432,7 @@ export class ChatSession {
 
       if (response.finishReason === "tool_calls" && response.toolCalls !== undefined && response.toolCalls.length > 0) {
         for (const call of response.toolCalls) {
+          if (opts.signal?.aborted) return interrupted();
           // PROGRESS (FIX 4): name the tool (and a short target) as the spinner phase.
           opts.onProgress?.(progressPhase(call));
           const { output, activity } = await this.runTool(call, mode, opts);

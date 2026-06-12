@@ -22,6 +22,7 @@ import { events as coreEvents } from "../../core/events/index.js";
 import type { EventInput } from "../../core/events/index.js";
 import type { AgentIdentity } from "../../core/identity/contract.js";
 import { receipts as coreReceipts } from "../../core/receipt/index.js";
+import { commandPolicyDenyReason } from "../governed-exec/policy.js";
 import { gateWallConfig, type GateWallConfig } from "./config.js";
 import { gateAllowed, gateDenied, gateEvaluated, type GateEventPayload } from "./events.js";
 import type { GateWall, GateWallAction, GateWallEvaluateInput, PromoteGovernance } from "./contract.js";
@@ -103,6 +104,23 @@ export function createGateWall(deps: GateWallDeps = {}): GateWall {
     let governance: PromoteGovernance;
     if (!config.enabled) {
       governance = { allow: false, reason: "gate-wall disabled — denying (fail-closed)", gateId };
+    } else if (audit.kind === "exec") {
+      const action = input.action;
+      const reason = action.kind === "exec" ? commandPolicyDenyReason(action.command, action.args, action.purpose) : undefined;
+      if (reason !== undefined) governance = { allow: false, reason: `${reason} — denying (fail-closed)`, gateId };
+      else if (input.grant.requiresApproval) {
+        governance = {
+          allow: false,
+          reason: `tier ${tier} requires operator approval; approval mechanism not yet available — denying (fail-closed)`,
+          gateId,
+        };
+      } else {
+        governance = {
+          allow: true,
+          reason: `tier ${tier} permitted (gateLevel=${input.grant.gateLevel}, autoCommit=${input.grant.autoCommit})`,
+          gateId,
+        };
+      }
     } else if (input.grant.requiresApproval) {
       governance = {
         allow: false,

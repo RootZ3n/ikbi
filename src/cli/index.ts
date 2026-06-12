@@ -181,6 +181,11 @@ async function run(argv: readonly string[]): Promise<void> {
       } catch (err) {
         writeStderr(`ikbi: trust preload failed: ${err instanceof Error ? err.message : String(err)}\n`);
       }
+      // H6: best-effort receipt retention prune at startup (non-fatal).
+      try {
+        const { receipts } = await import("../core/receipt/index.js");
+        await receipts.prune();
+      } catch { /* non-fatal — receipt pruning is housekeeping, not a startup gate */ }
       // Module commands compose via the command-registrar seam. Built-ins above
       // take precedence (a module cannot shadow a core command).
       const moduleCmd = commands.get(cmd);

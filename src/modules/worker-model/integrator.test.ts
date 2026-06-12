@@ -94,7 +94,7 @@ test("non-empty rejectedToolCalls forces DISCARD even when every other gate is g
 test("empty rejectedToolCalls with all gates green → promote", async () => {
   const r = await integrator(ctxWith([builderOk, criticPass, verifierPass]));
   assert.equal(decisionOf(r), "promote");
-  assert.match(rationaleOf(r), /no rejected tool calls/);
+  assert.match(rationaleOf(r), /no policy violations/);
 });
 
 test("FAIL-CLOSED: MISSING rejectedToolCalls (undefined) → discard even with all other gates green", async () => {

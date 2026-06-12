@@ -190,3 +190,13 @@ test("terminal: an empty command is rejected before any exec", async () => {
   assert.match(out, /non-empty 'command'/);
   assert.equal(spy.calls.length, 0);
 });
+
+test("terminal: denies effectful git and package-manager script commands before exec", async () => {
+  const dir = tmp();
+  for (const command of ["git -C /tmp status", "git push origin main", "git update-ref refs/heads/main HEAD", "git branch -D main", "pnpm run build", "npm test", "npx tsx script.ts"]) {
+    const spy = execSpy({ executed: true, exitCode: 0 });
+    const out = await runTerminal({ governedExec: spy.exec, parentCtx: FAKE_CTX }, dir, { command });
+    assert.match(out, /DENIED:/, command);
+    assert.equal(spy.calls.length, 0, `${command} must not reach governed-exec`);
+  }
+});

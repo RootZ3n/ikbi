@@ -123,6 +123,18 @@ test("builder: terminal output passes through the neutralization chokepoint (sou
   assert.ok(neutralized.some((n) => n.source === "mcp_result" && n.origin === "terminal"));
 });
 
+test("builder: terminal policy denials are counted as rejected tool calls", async () => {
+  const dir = tmp();
+  const { engine } = mockEngine([
+    toolResp([call("terminal", { command: "git push origin main" })]),
+    { ...base(), content: "continuing", finishReason: "stop" },
+  ]);
+  const exec = { run: async (): Promise<ExecResult> => { throw new Error("terminal policy denial must not execute"); } };
+  const result = await createBuilder({ governedExec: exec, parentCtx: PARENT_CTX })(makeCtx(dir, "verified", engine));
+  const detail = result.detail as { rejectedToolCalls?: Array<{ tool: string; error: string }> };
+  assert.ok((detail.rejectedToolCalls ?? []).some((r) => r.tool === "terminal" && /git push/.test(r.error)));
+});
+
 test("builder: terminal runs in the WORKTREE (cwd = realpath'd workspace, not the CLI cwd)", async () => {
   // Bug 1 regression: the terminal tool MUST execute governed commands in the builder's
   // worktree — the same canonical (realpath'd) root read_file/write_file confine against —

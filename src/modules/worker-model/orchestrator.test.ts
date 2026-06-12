@@ -419,7 +419,7 @@ test("R1: max_iterations WITH rejectedToolCalls (bad output) IS penalized + meta
       role: "builder",
       outcome: "failure",
       summary: "flailing",
-      detail: { stopReason: "max_iterations", rejectedToolCalls: [{ tool: "write_file", error: "malformed tool arguments (not JSON)" }, { tool: "done", error: "checks not green" }] },
+      detail: { stopReason: "max_iterations", rejectedToolCalls: [], toolFormatErrors: [{ tool: "write_file", error: "malformed tool arguments (not JSON)" }, { tool: "done", error: "checks not green" }] },
     }),
   };
   const tr = capturingTrust();
@@ -433,7 +433,7 @@ test("R1: max_iterations WITH rejectedToolCalls (bad output) IS penalized + meta
   const builderReceipt = appended.find((a) => a.operation === "worker.role.builder");
   assert.equal(builderReceipt?.metadata.performanceFailure, true, "metadata flags the performance-class failure");
   assert.equal(builderReceipt?.metadata.trustDecision, "penalized", "metadata records the penalize decision");
-  assert.match(String(builderReceipt?.metadata.trustDecisionReason ?? ""), /rejected tool call/, "metadata explains WHY (bad-output evidence)");
+  assert.match(String(builderReceipt?.metadata.trustDecisionReason ?? ""), /tool format error/, "metadata explains WHY (bad-output evidence)");
 });
 
 test("R1: PENALIZE_TIMEOUTS policy penalizes BOTH timeout and a clean max_iterations", async () => {
