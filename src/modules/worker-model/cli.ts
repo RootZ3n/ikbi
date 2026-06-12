@@ -590,6 +590,9 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
             writeScope: detectWriteScope(step.goal),
             reuseWorkspace: sharedWorkspace,
             skipPromote: true,
+            // Skip verifier on ALL intermediate steps — the project is incomplete
+            // until the last step runs. The final verify pass handles verification.
+            skipVerifier: true,
           };
           lastResult = await orchestrator.run(stepTask, ctx);
           if (lastResult.outcome !== "success") {

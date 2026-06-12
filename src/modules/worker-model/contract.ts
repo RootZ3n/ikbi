@@ -131,6 +131,12 @@ export interface WorkerTask {
    * When false (default), the orchestrator promotes or discards as usual.
    */
   readonly skipPromote?: boolean;
+  /**
+   * STEP-PLANNER: skip the verifier role entirely. Used for intermediate steps
+   * where verification doesn't make sense (e.g., scaffold step in a greenfield
+   * project — no tests exist yet). The final step runs verification normally.
+   */
+  readonly skipVerifier?: boolean;
 }
 
 /** The result a single role produces. */

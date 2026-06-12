@@ -1058,3 +1058,21 @@ test("skipPromote: a failed step still reports failure without discarding", asyn
   assert.equal(ws.calls.promote, 0, "did NOT promote");
   assert.equal(ws.calls.discard, 0, "did NOT discard — workspace stays alive for step planner");
 });
+
+test("skipVerifier: verifier role is skipped, other roles still run", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const cap = capturingRoles();
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, workspaces: ws.workspaces }));
+  const taskSkipV: WorkerTask = { ...task, skipVerifier: true, skipPromote: true };
+  const result = await orch.run(taskSkipV, parentCtx);
+
+  // Verifier was skipped (synthetic success), other 4 roles ran.
+  const verifierRole = result.roles.find((r) => r.role === "verifier");
+  assert.equal(verifierRole?.outcome, "success", "verifier reports success (skipped)");
+  assert.match(verifierRole?.summary ?? "", /skipped/, "verifier summary says skipped");
+  // scout, builder, critic, integrator ran normally; verifier was injected.
+  assert.equal(cap.seen.length, 4, "4 real roles dispatched (verifier skipped)");
+  assert.equal(result.outcome, "success");
+  assert.equal(ws.calls.promote, 0, "skipPromote prevents promote");
+});

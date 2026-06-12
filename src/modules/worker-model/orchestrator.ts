@@ -919,6 +919,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       await installWorkspaceDeps(workspace, parentCtx, deps.dependencyInstall);
 
       for (const role of WORKER_ROLES) {
+        // STEP-PLANNER: skip verifier on intermediate steps (no tests exist yet).
+        if (role === "verifier" && task.skipVerifier === true) {
+          results.push({ role: "verifier", outcome: "success", summary: "skipped (skipVerifier)" });
+          continue;
+        }
         const spawned = spawnRole(role, parentCtx);
 
         events.publish(
