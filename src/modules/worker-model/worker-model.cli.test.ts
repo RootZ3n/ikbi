@@ -218,7 +218,7 @@ test("build runs the full 5-role pipeline through the orchestrator with the real
 
   return cli.build(["fix", "the", "bug", "--repo", "/repo"]).then(() => {
     assert.equal(cap2.exit, undefined, "clean run");
-    assert.deepEqual(cap.seen.map((c) => c.role), ["scout", "builder", "critic", "verifier", "integrator"], "all five roles ran");
+    assert.deepEqual(cap.seen.map((c) => c.role), ["scout", "builder", "verifier", "critic", "integrator"], "all five roles ran");
     for (const c of cap.seen) assert.equal(c.identity.spawnedFrom, "lead", "each role spawned under the dispatching parent");
     assert.equal(gateDecision()?.allow, true, "the REAL gate-wall evaluated the promote (trusted ⇒ allow)");
     const summary = JSON.parse(cap2.out);

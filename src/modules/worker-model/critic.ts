@@ -33,6 +33,11 @@ const MAX_LINES_PER_FILE = 80;
 const CRITIC_SYSTEM =
   "You are the CRITIC in an automated build pipeline. You are a strict gate, not a rubber stamp.\n" +
   "Review the actual workspace diff against the stated goal and the builder's claims.\n\n" +
+  "The VERIFIER (objective checks: typecheck + tests) has ALREADY RUN — its results are provided.\n" +
+  "Do not re-litigate what the verifier already proved. Spend your judgment on what objective\n" +
+  "checks CANNOT catch: does the change actually satisfy the GOAL, is it semantically correct,\n" +
+  "and is it free of silent regressions, stubs that fake success, or unrelated/suspicious edits?\n" +
+  "Green checks are NECESSARY, not sufficient — passing tests on the wrong change still FAILs.\n\n" +
   "Evaluate these dimensions:\n" +
   "1. files_modified: Did the diff actually modify the files the builder claims it wrote?\n" +
   "2. goal_correctness: Do the changes satisfy the stated goal?\n" +
@@ -181,6 +186,35 @@ function parseStructuredVerdict(content: string): ParsedVerdict {
   return { pass: unique[0] === "PASS", feedback: feedback || trimmed, parseFormat: "key_value" };
 }
 
+/**
+ * Distill the VERIFIER's result into a compact, model-readable context block (Issue 2).
+ * The critic now runs AFTER the verifier, so it can read the objective verdict + per-check
+ * pass/fail and focus its judgment on the SEMANTIC concerns checks cannot catch. The check
+ * output is governed-exec output (can echo arbitrary repo/test content) → still untrusted DATA.
+ * Returns undefined when no verifier result is present (Pass-A / verifier-skipped / direct
+ * critic invocation) so the request shape — and every existing critic test — is unchanged.
+ */
+function formatVerifierContext(verifier: RoleResult | undefined): string | undefined {
+  if (verifier === undefined) return undefined;
+  const d = detailOf(verifier);
+  const verdict = typeof d.verdict === "string" ? d.verdict : verifier.outcome === "success" ? "pass" : "fail";
+  const checks = Array.isArray(d.checks)
+    ? (d.checks as Array<{ name?: unknown; exitCode?: unknown; outputTail?: unknown }>)
+    : [];
+  const lines = checks.map((c) => {
+    const name = typeof c.name === "string" ? c.name : "check";
+    const passed = typeof c.exitCode === "number" ? c.exitCode === 0 : undefined;
+    const status = passed === undefined ? "?" : passed ? "PASS" : "FAIL";
+    const tail = passed === false && typeof c.outputTail === "string" && c.outputTail.trim().length > 0 ? `\n${c.outputTail}` : "";
+    return `- ${name}: ${status}${tail}`;
+  });
+  return (
+    `Verifier results (objective checks — already run):\n` +
+    `verdict: ${verdict} (outcome: ${verifier.outcome})\n` +
+    (lines.length > 0 ? lines.join("\n") : "(no per-check detail reported)")
+  );
+}
+
 function objectiveFail(feedback: string, extra: Record<string, unknown> = {}): RoleResult {
   return {
     role: "critic",
@@ -241,6 +275,12 @@ export function createCritic(deps: CriticDeps = {}): RoleFn {
       const untrusted = (raw: string, origin: string): ModelMessage =>
         toUntrustedMessage(ctx.engine.neutralizeUntrusted(raw, { source: "external", identity: ctx.identity, origin }), { role: "user" });
 
+      // ISSUE 2: the verifier ran first — feed its objective verdict + checks into the critic as
+      // context (untrusted DATA, like the diff). Present ONLY when a verifier result exists, so the
+      // request shape is byte-identical when there is none (Pass-A / verifier-skipped / direct call).
+      const verifierResult = ctx.priorResults.find((r) => r.role === "verifier");
+      const verifierContext = formatVerifierContext(verifierResult);
+
       const objectiveContext = {
         builderOutcome: builderResult.outcome,
         filesWritten,
@@ -259,6 +299,7 @@ export function createCritic(deps: CriticDeps = {}): RoleFn {
           untrusted(`Objective pre-check context:\n${JSON.stringify(objectiveContext)}`, "critic_objective_context"),
           untrusted(`Builder summary:\n${builderResult.summary ?? "(none)"}`, "critic_builder_summary"),
           untrusted(`Builder detail:\n${JSON.stringify(builderResult.detail ?? {})}`, "critic_builder_detail"),
+          ...(verifierContext !== undefined ? [untrusted(verifierContext, "critic_verifier_results")] : []),
           untrusted(`Workspace diff:\n${diff.text}`, "critic_workspace_diff"),
         ],
       };

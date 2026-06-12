@@ -15,7 +15,7 @@ test("the worker-model contract is versioned (1.0.0, the initial module contract
 });
 
 test("WorkerRole enum is the complete five-role set, in dispatch order", () => {
-  assert.deepEqual([...WORKER_ROLES], ["scout", "builder", "critic", "verifier", "integrator"]);
+  assert.deepEqual([...WORKER_ROLES], ["scout", "builder", "verifier", "critic", "integrator"]);
   assert.equal(WORKER_ROLES.length, 5);
   for (const r of WORKER_ROLES) assert.equal(isWorkerRole(r), true);
   assert.equal(isWorkerRole("orchestrator"), false);

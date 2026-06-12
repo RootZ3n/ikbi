@@ -254,7 +254,7 @@ test("roles dispatch in canonical order, each carrying spawnedFrom = parent", as
   const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles }));
   await orch.run(task, parentCtx);
 
-  assert.deepEqual(cap.seen.map((c) => c.role), ["scout", "builder", "critic", "verifier", "integrator"]);
+  assert.deepEqual(cap.seen.map((c) => c.role), ["scout", "builder", "verifier", "critic", "integrator"]);
   for (const ctx of cap.seen) {
     assert.equal(ctx.identity.spawnedFrom, "parent-1", "spawned under the parent");
     assert.equal(ctx.identity.functionalRole, ctx.role, "functionalRole set to the role");
@@ -740,7 +740,7 @@ test("real scout/builder/critic + stubbed verifier/integrator → coherent succe
   assert.equal(result.outcome, "success");
   assert.equal(calls.promote, 1);
   assert.equal(calls.discard, 0);
-  assert.deepEqual(result.roles.map((r) => r.role), ["scout", "builder", "critic", "verifier", "integrator"]);
+  assert.deepEqual(result.roles.map((r) => r.role), ["scout", "builder", "verifier", "critic", "integrator"]);
   for (const r of result.roles) assert.equal(r.outcome, "success", `${r.role} succeeded`);
   // Builder really ran its (real) loop — it ran its in-loop run_checks (the verifier's
   // shared checks) green before done. run_checks output is ACTIONABLE feedback (not

@@ -201,6 +201,44 @@ test("critic built without a diff source fails closed before model call", async 
   assert.match(detail.feedback, /no workspace diff source/);
 });
 
+test("Issue 2: the critic receives the VERIFIER's results (verdict + checks) as untrusted context", async () => {
+  // The verifier ran FIRST (new pipeline order) and passed — its result is in priorResults.
+  const verifierResult: RoleResult = {
+    role: "verifier",
+    outcome: "success",
+    summary: "all checks passed",
+    detail: {
+      verdict: "pass",
+      checks: [
+        { name: "typecheck", exitCode: 0, outputTail: "" },
+        { name: "test", exitCode: 0, outputTail: "ok 12 passed" },
+      ],
+    },
+  };
+  const { ctx, calls, role } = makeCtx([builderResult, verifierResult], async () => modelResponse(passJson()));
+  const result = await role(ctx);
+  assert.equal(result.outcome, "success");
+
+  const msgs = calls[0]?.messages ?? [];
+  const verifierMsg = msgs.find((m) => m.untrusted === true && String(m.content).includes("Verifier results"));
+  assert.ok(verifierMsg, "the verifier's results are provided to the critic as a context message");
+  assert.equal(verifierMsg?.role, "user", "verifier context is untrusted DATA, not a trusted instruction");
+  assert.match(String(verifierMsg?.content), /verdict: pass/, "the objective verdict is included");
+  assert.match(String(verifierMsg?.content), /typecheck: PASS/, "per-check status is included");
+  assert.match(String(verifierMsg?.content), /test: PASS/, "per-check status is included");
+});
+
+test("Issue 2: with NO verifier in priorResults the request shape is unchanged (no verifier block)", async () => {
+  // Backward compat: a critic invoked without a verifier result (Pass-A / verifier-skipped) must
+  // produce the exact same five untrusted blocks as before — no empty verifier context slot.
+  const { ctx, calls, role } = makeCtx([builderResult], async () => modelResponse(passJson()));
+  await role(ctx);
+  const msgs = calls[0]?.messages ?? [];
+  assert.ok(!msgs.some((m) => String(m.content).includes("Verifier results")), "no verifier block when none ran");
+  const untrustedContents = msgs.filter((m) => m.untrusted === true).map((m) => String(m.content));
+  assert.equal(untrustedContents.length, 5, "exactly the five original untrusted blocks");
+});
+
 test("an infrastructure (model) failure → outcome:failure", async () => {
   const { ctx, role } = makeCtx([builderResult], async () => {
     throw new Error("provider down");

@@ -48,8 +48,15 @@ import type { WorkspaceHandle } from "../../core/workspace/contract.js";
 /** Semantic version of the worker-model contract. Bump on breaking change. */
 export const CONTRACT_VERSION = "1.0.0";
 
-/** The five worker roles, in canonical dispatch order. */
-export const WORKER_ROLES = ["scout", "builder", "critic", "verifier", "integrator"] as const;
+/**
+ * The five worker roles, in canonical dispatch order.
+ *
+ * The CRITIC runs AFTER the VERIFIER (not before): a critic that has already seen
+ * "tests green, typecheck clean" can specialize in the semantic/goal-alignment
+ * concerns objective checks cannot catch, instead of judging blind. The integrator's
+ * AND-gate reads every role's result from priorResults and is order-independent.
+ */
+export const WORKER_ROLES = ["scout", "builder", "verifier", "critic", "integrator"] as const;
 export type WorkerRole = (typeof WORKER_ROLES)[number];
 
 /** Runtime guard: is `s` a known worker role? */

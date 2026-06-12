@@ -409,7 +409,7 @@ test("C2 headline: a batch subtask runs the SAME governed path as `ikbi build` â
   await cli.batch(["build", "the", "thing"]);
 
   // The subtask reached the governed worker roles (NOT a "no credential configured" throw).
-  assert.deepEqual(gov.cap.seen.map((c) => c.role), ["scout", "builder", "critic", "verifier", "integrator"], "all five governed roles spawned for the subtask");
+  assert.deepEqual(gov.cap.seen.map((c) => c.role), ["scout", "builder", "verifier", "critic", "integrator"], "all five governed roles spawned for the subtask");
   assert.ok(!cap2.err.includes("no credential configured for worker role"), "the bare-orchestrator throw is GONE");
   // The gate-wall was consulted at promote, and the promote landed.
   assert.equal(gov.cap.seen[0]?.identity.spawnedFrom, "lead", "roles spawned under the operator parent (#10)");
