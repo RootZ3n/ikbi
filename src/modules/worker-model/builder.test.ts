@@ -878,3 +878,23 @@ test("AUTO-ACCEPT does NOT fire when the green is STALE (a write happened after 
   assert.notEqual(detail.stopReason, "done", "no synthesized done over a stale check");
   assert.equal(detail.doneClaim, undefined, "no completion claim when the green is stale");
 });
+
+test("AUTO-ACCEPT does NOT fire on a MODEL-FAILURE finish (content_filter) even with green, current writes → FAILURE", async () => {
+  const dir = tmp();
+  // Write a file, run_checks GREEN (current, non-stale), then the model's NEXT response comes back
+  // content-filtered — a MODEL failure, not a protocol termination. A green tree from a prior round
+  // must NOT redeem a filtered response: auto-accept is restricted to protocol terminations
+  // (max_iterations/timeout/stuck_detected/no_progress), so the outcome stays FAILURE.
+  const contentFilterResp = (): ModelResponse => ({ ...base(), content: "", finishReason: "content_filter" });
+  const { engine } = mockEngine([
+    writeResp("x.ts", "export const x = 1;\n"),
+    runChecksResp(), // green, current
+    contentFilterResp(), // the model itself failed — not a ran-out-of-iterations termination
+  ]);
+  const result = await run(makeCtx(dir, "verified", engine), greenExec());
+  assert.equal(result.outcome, "failure", "a content-filtered response is a model failure, not auto-accepted success");
+  const detail = result.detail as { stopReason: string; doneClaim?: unknown; lastChecks?: { allPass: boolean } };
+  assert.equal(detail.stopReason, "content_filter", "the model-failure stop reason is preserved, not reclassified to done");
+  assert.equal(detail.doneClaim, undefined, "no synthesized done over a model-failure finish");
+  assert.equal(detail.lastChecks?.allPass, true, "the checks really were green — auto-accept was withheld on the failure KIND, not on a red tree");
+});

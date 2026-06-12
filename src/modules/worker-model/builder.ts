@@ -1320,9 +1320,18 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
     // objective state: checks last ran GREEN, that green is NOT stale (no write since), and files
     // were actually written. When all hold, synthesize the done claim and classify SUCCESS — the
     // verifier downstream still re-runs the real checks, so this cannot promote unverified work.
+    //
+    // SCOPE (Codex Issue 1): auto-accept is restricted to PROTOCOL terminations — the loop ran out
+    // of iterations / time, or self-detected it was stuck / making no progress. These mean the model
+    // simply never got to emit `done`, so a green tree is real work worth promoting. It does NOT
+    // cover MODEL-FAILURE reasons — "content_filter", "error", "unknown", "length" — where the model
+    // ITSELF failed mid-response. A green tree from a PRIOR round does not redeem a filtered/errored
+    // response: that work may be half-applied or the final intent unexpressed. Those keep the
+    // failure/partial classification from classifyOutcome even when checks were green.
+    const PROTOCOL_TERMINATIONS: ReadonlySet<string> = new Set(["max_iterations", "timeout", "stuck_detected", "no_progress"]);
     if (
       doneClaim === undefined &&
-      stopReason !== "done" &&
+      PROTOCOL_TERMINATIONS.has(stopReason) &&
       lastChecks?.allPass === true &&
       !checksStale &&
       filesWritten.length > 0
