@@ -10,9 +10,10 @@ import type { UntrustedContext } from "../../core/injection/contract.js";
 import type { ModelRequest, ModelResponse } from "../../core/provider/contract.js";
 import { autonomyForTier } from "../../core/trust/index.js";
 import type { WorkspaceHandle } from "../../core/workspace/contract.js";
-import { scout, type ScoutFinding } from "./scout.js";
+import { createScout, scout, type ScoutFinding } from "./scout.js";
 import type { RoleContext } from "./contract.js";
 import { driverModel } from "./role-models.js";
+import type { ProjectRetrievalApi, RetrievalResult, SelectedFile } from "../project-retrieval/index.js";
 
 const IDENTITY: AgentIdentity = { agentId: "worker-1", functionalRole: "scout", trustTier: "probation", spawnedFrom: "parent-1" };
 
@@ -147,4 +148,42 @@ test("a model error becomes outcome:failure, not a throw past the boundary", asy
   const result = await scout(ctx);
   assert.equal(result.outcome, "failure");
   assert.match(result.summary ?? "", /provider exploded/);
+});
+
+/** A stub project-retrieval that returns a fixed, pre-ranked selection (index mode). */
+function fakeRetrieval(files: SelectedFile[]): ProjectRetrievalApi {
+  const result: RetrievalResult = {
+    mode: "index",
+    files,
+    seeds: [],
+    totalBytes: 0,
+    truncatedByBudget: false,
+    lowConfidence: false,
+    receipts: ["test-retrieval"],
+  };
+  return { retrieve: async () => result };
+}
+
+test("FIX#1: index-mode brief orders Key files by relevance score, NOT byte size", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-scout-"));
+  // `big.ts` is the largest file but LEAST relevant; `small.ts` is tiny but MOST relevant.
+  // Legacy ordering (bytes desc) would put big.ts first — relevance ordering must put small.ts first.
+  writeFileSync(join(dir, "big.ts"), `// ${"x".repeat(3000)}\nexport const big = 1;`);
+  writeFileSync(join(dir, "small.ts"), "export const small = 1;");
+  const selected: SelectedFile[] = [
+    { path: "big.ts", bytes: 3000, score: 1, reasons: ["name-match"], why: "weak match" },
+    { path: "small.ts", bytes: 24, score: 99, reasons: ["goal-path-match"], why: "named in goal" },
+  ];
+  const { ctx } = makeCtx(dir, async () => modelResponse("- f"));
+  const indexScout = createScout({ retrieval: fakeRetrieval(selected), mode: "index" });
+
+  const result = await indexScout(ctx);
+  assert.equal(result.outcome, "success");
+  const detail = result.detail as { brief: string; retrievalMode: string };
+  assert.equal(detail.retrievalMode, "index", "ran the index path");
+  assert.match(detail.brief, /Key files \(most relevant first\)/, "brief advertises relevance ordering");
+  const posSmall = detail.brief.indexOf("small.ts");
+  const posBig = detail.brief.indexOf("big.ts");
+  assert.ok(posSmall !== -1 && posBig !== -1, "both files listed in the brief");
+  assert.ok(posSmall < posBig, `most-relevant small.ts (score 99) appears before larger big.ts (score 1): ${posSmall} < ${posBig}`);
 });

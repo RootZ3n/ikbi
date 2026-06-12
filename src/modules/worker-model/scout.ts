@@ -153,22 +153,30 @@ function buildContext(files: readonly string[], root: string): { text: string; u
 
 /**
  * PROGRESSIVE DISCLOSURE: a compact, DETERMINISTIC structure brief the builder sees
- * FIRST — top-level directories + the largest scanned files with line counts — so a
- * cheap model gets the lay of the land without the whole codebase dumped on it. It
+ * FIRST — top-level directories + the most important scanned files with line counts —
+ * so a cheap model gets the lay of the land without the whole codebase dumped on it. It
  * drills into specifics on demand via the builder's `scout_detail` tool.
+ *
+ * RANKING: when `scores` is supplied (index mode, where project-retrieval already computed
+ * per-file relevance), Key files are ordered by relevance DESC. Without scores (legacy mode),
+ * we fall back to the old behavior — largest files first.
  */
-function buildBrief(structure: readonly ScoutFileEntry[]): string {
+function buildBrief(structure: readonly ScoutFileEntry[], scores?: ReadonlyMap<string, number>): string {
   if (structure.length === 0) return "No files were scanned.";
   const dirs = new Set<string>();
   for (const e of structure) {
     const slash = e.path.indexOf("/");
     dirs.add(slash === -1 ? "(root)" : e.path.slice(0, slash) + "/");
   }
-  const top = [...structure].sort((a, b) => b.bytes - a.bytes).slice(0, MAX_BRIEF_FILES);
+  const byRelevance = scores !== undefined;
+  // Index mode: relevance DESC (ties → larger first for stability). Legacy: bytes DESC.
+  const top = [...structure]
+    .sort((a, b) => (byRelevance ? (scores.get(b.path) ?? 0) - (scores.get(a.path) ?? 0) || b.bytes - a.bytes : b.bytes - a.bytes))
+    .slice(0, MAX_BRIEF_FILES);
   const lines = [
     `Repository structure (${structure.length} file(s) scanned).`,
     `Top-level: ${[...dirs].sort().join(", ")}`,
-    "Key files (largest first):",
+    byRelevance ? "Key files (most relevant first):" : "Key files (largest first):",
     ...top.map((e) => `  - ${e.path} (${e.lines} lines)`),
   ];
   return lines.join("\n");
@@ -309,6 +317,9 @@ export function createScout(deps: ScoutDeps = {}): RoleFn {
       let retrievalFallbackReason: string | undefined;
       let modeNote = "via legacy scan";
       let retrievalDetail: { selected: Array<{ path: string; reasons: readonly string[]; why: string }>; receipts: readonly string[] } | undefined;
+      // Index mode only: project-retrieval's per-file relevance scores, keyed by repo-relative path.
+      // Drives buildBrief ordering so the brief leads with the most goal-relevant files, not the biggest.
+      let relevanceScores: Map<string, number> | undefined;
 
       if (wantIndex) {
         try {
@@ -318,6 +329,7 @@ export function createScout(deps: ScoutDeps = {}): RoleFn {
           files = res.files.map((f) => join(root, f.path));
           retrievalMode = "index";
           modeNote = "via index retrieval";
+          relevanceScores = new Map(res.files.map((f) => [f.path, f.score]));
           retrievalDetail = { selected: res.files.map((f) => ({ path: f.path, reasons: f.reasons, why: f.why })), receipts: res.receipts };
         } catch (e) {
           // FAIL-SAFE + LOUD (F4): never let the index path make scout worse — fall back to the legacy
@@ -358,7 +370,7 @@ export function createScout(deps: ScoutDeps = {}): RoleFn {
 
       const response = await ctx.engine.invokeModel(request);
       const findings = parseFindings(response.content);
-      const brief = buildBrief(structure);
+      const brief = buildBrief(structure, relevanceScores);
 
       // ── LAYER 2: Scout-level ambiguity detection ───────────────────────────
       // Check if the goal mentions specific files that the scout found (or didn't find).
