@@ -247,3 +247,144 @@ test("an infrastructure (model) failure → outcome:failure", async () => {
   assert.equal(result.outcome, "failure");
   assert.match(result.summary ?? "", /provider down/);
 });
+
+// ── ISSUE 3: REVIEW-QUALITY tests ──────────────────────────────────────────
+// The tests above assert PLUMBING (parsing, neutralization, fail-closed gates). These assert the
+// critic DISCRIMINATES good work from bad: each feeds a realistic planted diff through the REAL
+// objective pre-checks + verdict pipeline, with a RECORDED critic response representing what a
+// strong reviewer model actually returns for that diff (no live API). The assertions check the
+// verdict AND that the SPECIFIC feedback about the real defect is surfaced — not just a pass bool.
+
+/** A realistic recorded critic response (JSON, with scores) for a given verdict + critique. */
+function recorded(verdict: "PASS" | "FAIL", scores: Record<string, number>, feedback: string, issues: string[] = []): string {
+  return JSON.stringify({ verdict, scores, feedback, issues });
+}
+
+test("review-quality: a PLANTED missing-import bug is caught — FAIL with the specific defect", async () => {
+  const goal = "add a /users route that returns the user list";
+  // The diff calls db.users.findMany() but never imports `db` — a runtime ReferenceError.
+  const diff = [
+    "diff --git a/routes.ts b/routes.ts",
+    "index 1111111..2222222 100644",
+    "--- a/routes.ts",
+    "+++ b/routes.ts",
+    "@@ -1,2 +1,6 @@",
+    " import { Router } from './router';",
+    "+export const usersRoute = Router.get('/users', async (_req, res) => {",
+    "+  const users = await db.users.findMany();",
+    "+  res.json(users);",
+    "+});",
+    "",
+  ].join("\n");
+  const builder: RoleResult = { role: "builder", outcome: "success", summary: "added /users", detail: { filesWritten: ["routes.ts"], rejectedToolCalls: [] } };
+  const response = recorded(
+    "FAIL",
+    { files_modified: 5, goal_correctness: 3, code_quality: 1, tests: 0, suspicious_patterns: 3 },
+    "routes.ts references `db` but never imports it — this throws ReferenceError: db is not defined at runtime.",
+    ["missing import: `db` is used but not imported from './db'", "no test covers the new /users route"],
+  );
+  const { ctx, calls, role } = makeCtx([builder], async () => modelResponse(response), goal, { diff, workspace: makeWorkspace(["routes.ts"]) });
+  const result = await role(ctx);
+
+  assert.equal(calls.length, 1, "the objective pre-checks passed, so the semantic review ran");
+  const detail = result.detail as { pass: boolean; feedback: string; issues?: string[] };
+  assert.equal(detail.pass, false, "the planted bug is rejected");
+  assert.match(detail.feedback, /import/i, "the feedback names the missing import");
+  assert.match(detail.feedback, /\bdb\b/, "the feedback identifies the specific symbol");
+  assert.ok(detail.issues?.some((i) => /import/i.test(i)), "the missing-import defect is itemized");
+});
+
+test("review-quality: a CLEAN diff that satisfies the goal — PASS", async () => {
+  const goal = "add a health endpoint that returns { ok: true }";
+  const diff = [
+    "diff --git a/server.ts b/server.ts",
+    "index 1111111..2222222 100644",
+    "--- a/server.ts",
+    "+++ b/server.ts",
+    "@@ -1,2 +1,5 @@",
+    " import { app } from './app';",
+    "+app.get('/health', (_req, res) => {",
+    "+  res.json({ ok: true });",
+    "+});",
+    "",
+  ].join("\n");
+  const builder: RoleResult = { role: "builder", outcome: "success", summary: "added /health", detail: { filesWritten: ["server.ts"], rejectedToolCalls: [] } };
+  const response = recorded(
+    "PASS",
+    { files_modified: 5, goal_correctness: 5, code_quality: 5, tests: 4, suspicious_patterns: 5 },
+    "The /health endpoint is added correctly and returns { ok: true } exactly as the goal requires.",
+  );
+  const { ctx, role } = makeCtx([builder], async () => modelResponse(response), goal, { diff, workspace: makeWorkspace(["server.ts"]) });
+  const result = await role(ctx);
+
+  const detail = result.detail as { pass: boolean; feedback: string };
+  assert.equal(detail.pass, true, "correct, goal-satisfying work passes");
+  assert.match(detail.feedback, /health/i);
+});
+
+test("review-quality: GOAL MISMATCH (goal asks for auth, diff edits CSS) — FAIL with goal-mismatch feedback", async () => {
+  const goal = "add authentication middleware that protects the /admin routes";
+  // The diff only recolors a stylesheet — it does not touch auth at all.
+  const diff = [
+    "diff --git a/styles.css b/styles.css",
+    "index 1111111..2222222 100644",
+    "--- a/styles.css",
+    "+++ b/styles.css",
+    "@@ -1,3 +1,3 @@",
+    " .admin-panel {",
+    "-  background: #fff;",
+    "+  background: #1a1a1a;",
+    " }",
+    "",
+  ].join("\n");
+  const builder: RoleResult = { role: "builder", outcome: "success", summary: "restyled admin panel", detail: { filesWritten: ["styles.css"], rejectedToolCalls: [] } };
+  const response = recorded(
+    "FAIL",
+    { files_modified: 5, goal_correctness: 0, code_quality: 4, tests: 0, suspicious_patterns: 2 },
+    "The goal asks for authentication middleware protecting /admin, but the diff only changes styles.css colors — no auth code was added. The goal is not addressed.",
+    ["no authentication middleware was added", "the change is unrelated to the stated goal"],
+  );
+  const { ctx, role } = makeCtx([builder], async () => modelResponse(response), goal, { diff, workspace: makeWorkspace(["styles.css"]) });
+  const result = await role(ctx);
+
+  const detail = result.detail as { pass: boolean; feedback: string; scores?: { goal_correctness?: number } };
+  assert.equal(detail.pass, false, "a diff that ignores the goal must FAIL");
+  assert.match(detail.feedback, /auth/i, "feedback references the missing authentication");
+  assert.match(detail.feedback, /styles\.css|css|unrelated/i, "feedback calls out the off-goal change");
+  assert.equal(detail.scores?.goal_correctness, 0, "goal_correctness scored zero");
+});
+
+test("review-quality: RUBBER-STAMP DEFENSE — a subtly broken diff is NOT waved through", async () => {
+  const goal = "fix the off-by-one in paginate(): the last item on each page is dropped";
+  // The "fix" sets end = start + pageSize + 1, which REINTRODUCES an off-by-one (now overlaps pages).
+  // Objectively the build looks fine (files exist, diff non-empty) — only semantic review catches it.
+  const diff = [
+    "diff --git a/paginate.ts b/paginate.ts",
+    "index 1111111..2222222 100644",
+    "--- a/paginate.ts",
+    "+++ b/paginate.ts",
+    "@@ -3,3 +3,3 @@ export function paginate(items, page, pageSize) {",
+    "   const start = page * pageSize;",
+    "-  const end = start + pageSize;",
+    "+  const end = start + pageSize + 1;",
+    "   return items.slice(start, end);",
+    "",
+  ].join("\n");
+  const builder: RoleResult = { role: "builder", outcome: "success", summary: "fixed off-by-one in paginate", detail: { filesWritten: ["paginate.ts"], rejectedToolCalls: [] } };
+  // A real reviewer notices the "+ 1" overlaps adjacent pages rather than fixing the drop.
+  const response = recorded(
+    "FAIL",
+    { files_modified: 5, goal_correctness: 1, code_quality: 2, tests: 0, suspicious_patterns: 3 },
+    "The change sets end = start + pageSize + 1, which makes each page overlap the next item — it reintroduces an off-by-one instead of fixing the dropped last item. The correct fix does not add 1 to the slice end.",
+    ["off-by-one not fixed: `+ 1` causes page overlap", "no regression test added for the boundary"],
+  );
+  const { ctx, calls, role } = makeCtx([builder], async () => modelResponse(response), goal, { diff, workspace: makeWorkspace(["paginate.ts"]) });
+  const result = await role(ctx);
+
+  // The objective gates (non-empty diff, claimed file exists) all PASS — a rubber stamp would wave it
+  // through. The semantic review is what must catch it, so the model WAS consulted and returned FAIL.
+  assert.equal(calls.length, 1, "objective checks passed; the verdict came from semantic review");
+  const detail = result.detail as { pass: boolean; feedback: string };
+  assert.equal(detail.pass, false, "a subtly broken 'fix' is NOT rubber-stamped to PASS");
+  assert.match(detail.feedback, /off-by-one|overlap|\+ 1/i, "feedback pinpoints the real semantic defect");
+});
