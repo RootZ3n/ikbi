@@ -50,6 +50,8 @@ const PARENT_CTX: OperationContext = (() => {
 
 /** A GREEN governed exec — every governed check exits 0 (the deterministic infra seam). */
 const greenExec = () => ({ run: async (_req: ExecRequest): Promise<ExecResult> => ({ executed: true, exitCode: 0, stdoutTail: "ok", stderrTail: "" }) });
+/** A RED governed exec — every governed check exits non-zero with real failure output. */
+const redExec = () => ({ run: async (_req: ExecRequest): Promise<ExecResult> => ({ executed: true, exitCode: 1, stdoutTail: "FAIL: expected 2, got 0", stderrTail: "" }) });
 
 // --- mock provider: scripts model responses, runs the REAL neutralizer ---
 function mockEngine(responses: ModelResponse[]): RoleEngine {
@@ -175,4 +177,83 @@ test("E2E (Issue-1 failure case): builder writes green work but NEVER calls done
 
   const integ = await integrator(makeCtx(dir, "integrator", inertEngine, [scoutResult, builderResult, passingCritic, verifierResult]));
   assert.equal((integ.detail as { decision: string }).decision, "promote", "auto-accepted green work is promoted (the bug this guards against)");
+});
+
+// ── FAILURE PATHS (Issue 3): the pipeline must REJECT bad work, not just promote good work ──
+
+test("E2E (failure: RED checks): builder writes a file but run_checks is RED → builder FAILS → integrator DISCARDS", async () => {
+  const dir = makeProject();
+
+  const scout = createScout();
+  const scoutResult = await scout(makeCtx(dir, "scout", mockEngine([textResp("- src/math.ts:1 mul() present; add sum() to src/sum.ts")])));
+
+  // The builder writes the file, but the governed checks come back RED. `done` is gated on a
+  // green run_checks, so it is rejected every round → stuck_detected. A RED tree can never be
+  // auto-accepted (auto-accept requires lastChecks.allPass === true), so the outcome is FAILURE.
+  const builder = createBuilder({ governedExec: redExec(), parentCtx: PARENT_CTX });
+  const builderResult = await builder(makeCtx(dir, "builder", mockEngine([
+    toolResp([call("write_file", { path: "src/sum.ts", content: SUM_CONTENT })]),
+    toolResp([call("run_checks", {})]), // RED
+    toolResp([call("done", { successCondition: "sum() exists", filesReadBack: ["src/sum.ts"], selfCheck: "re-read it", satisfied: true })]), // gated on red → rejected, repeats
+  ]), [scoutResult]));
+  assert.equal(builderResult.outcome, "failure", "a red check tree is never promoted");
+  const bdetail = builderResult.detail as { stopReason: string; doneClaim?: unknown; lastChecks?: { allPass: boolean } };
+  assert.notEqual(bdetail.stopReason, "done", "no synthesized done over a red tree");
+  assert.equal(bdetail.doneClaim, undefined, "no completion claim when checks are red");
+  assert.equal(bdetail.lastChecks?.allPass, false, "the checks genuinely failed");
+
+  // The integrator weighs the FAILED builder and issues DISCARD — the pipeline does not promote.
+  const integ = await integrator(makeCtx(dir, "integrator", inertEngine, [scoutResult, builderResult, passingCritic]));
+  assert.notEqual((integ.detail as { decision: string }).decision, "promote", "red work is not promoted");
+  assert.equal((integ.detail as { decision: string }).decision, "discard");
+});
+
+test("E2E (failure: STALE green): builder writes AFTER its last green run_checks → auto-accept WITHHELD → builder FAILS → DISCARD", async () => {
+  const dir = makeProject();
+
+  const scout = createScout();
+  const scoutResult = await scout(makeCtx(dir, "scout", mockEngine([textResp("- src/math.ts:1 mul() present; add sum() to src/sum.ts")])));
+
+  // Write, run_checks GREEN, then write a SECOND new file — the green is now STALE (the on-disk
+  // state post-dates the last check). The builder never re-runs checks and never emits done. The
+  // green is real but stale, so auto-accept must NOT kick in (it requires !checksStale).
+  const builder = createBuilder({ governedExec: greenExec(), parentCtx: PARENT_CTX });
+  const builderResult = await builder(makeCtx(dir, "builder", mockEngine([
+    toolResp([call("write_file", { path: "src/sum.ts", content: SUM_CONTENT }, "w1")]),
+    toolResp([call("run_checks", {}, "rc1")]), // green over src/sum.ts
+    toolResp([call("write_file", { path: "src/extra.ts", content: "export const z = 1;\n" }, "w2")]), // green now stale
+    toolResp([call("list_dir", { path: "." }, "ls1")]), // repeats → never re-checks, never done
+  ]), [scoutResult]));
+  assert.equal(builderResult.outcome, "failure", "stale green is not auto-accepted");
+  const bdetail = builderResult.detail as { stopReason: string; doneClaim?: unknown };
+  assert.notEqual(bdetail.stopReason, "done", "no synthesized done while the green is stale");
+  assert.equal(bdetail.doneClaim, undefined, "no completion claim over a stale check");
+
+  const integ = await integrator(makeCtx(dir, "integrator", inertEngine, [scoutResult, builderResult, passingCritic]));
+  assert.notEqual((integ.detail as { decision: string }).decision, "promote", "stale-green work is not promoted");
+});
+
+test("E2E (failure: NO writes): builder runs green checks but writes NO files → builder FAILS → DISCARD", async () => {
+  const dir = makeProject();
+
+  const scout = createScout();
+  const scoutResult = await scout(makeCtx(dir, "scout", mockEngine([textResp("- src/math.ts:1 mul() present; add sum() to src/sum.ts")])));
+
+  // The builder runs GREEN checks but never writes anything. `done` is hard-gated on having
+  // written ≥1 file, so it is rejected every round → stuck_detected. Auto-accept also requires
+  // filesWritten.length > 0, so a green-but-empty run is a FAILURE — a green ancestor suite must
+  // not let a builder that produced no work claim success.
+  const builder = createBuilder({ governedExec: greenExec(), parentCtx: PARENT_CTX });
+  const builderResult = await builder(makeCtx(dir, "builder", mockEngine([
+    toolResp([call("run_checks", {})]), // green, but nothing was written
+    toolResp([call("done", { successCondition: "sum() exists", filesReadBack: ["src/sum.ts"], selfCheck: "re-read it", satisfied: true })]), // gated: no files written, repeats
+  ]), [scoutResult]));
+  assert.equal(builderResult.outcome, "failure", "green checks do not rescue a build that wrote nothing");
+  const bdetail = builderResult.detail as { stopReason: string; doneClaim?: unknown; filesWritten: string[] };
+  assert.notEqual(bdetail.stopReason, "done", "no synthesized done with zero files written");
+  assert.deepEqual(bdetail.filesWritten, [], "the builder genuinely wrote nothing");
+
+  const integ = await integrator(makeCtx(dir, "integrator", inertEngine, [scoutResult, builderResult, passingCritic]));
+  assert.notEqual((integ.detail as { decision: string }).decision, "promote", "an empty build is not promoted");
+  assert.equal((integ.detail as { decision: string }).decision, "discard");
 });
