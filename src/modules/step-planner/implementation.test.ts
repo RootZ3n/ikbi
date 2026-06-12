@@ -1,0 +1,148 @@
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { decompose, decomposeWithModel, complexityScore } from "./implementation.js";
+import { COMPLEX_THRESHOLD } from "./config.js";
+
+describe("step-planner", () => {
+  describe("complexityScore", () => {
+    it("returns 0 for simple goals", () => {
+      assert.equal(complexityScore("Fix the typo in README.md"), 0);
+      assert.equal(complexityScore("Add a LICENSE file"), 0);
+    });
+
+    it("returns >0 for complex goals", () => {
+      const score = complexityScore("Add auth middleware and add tests and update the README");
+      assert.ok(score >= COMPLEX_THRESHOLD, `score ${score} should be >= ${COMPLEX_THRESHOLD}`);
+    });
+
+    it("detects numbered lists", () => {
+      const score = complexityScore("1. Add function\n2. Add test\n3. Update docs");
+      assert.ok(score >= 1);
+    });
+
+    it("detects 'then' chains", () => {
+      const score = complexityScore("First read the file, then modify it, finally run tests");
+      assert.ok(score >= 1);
+    });
+  });
+
+  describe("decompose", () => {
+    it("returns a single step for simple goals", () => {
+      const plan = decompose("Fix the typo in README.md");
+      assert.equal(plan.decomposed, false);
+      assert.equal(plan.steps.length, 1);
+      const step = plan.steps[0];
+      assert.ok(step);
+      assert.equal(step.index, 1);
+      assert.equal(step.goal, "Fix the typo in README.md");
+      assert.equal(plan.source, "heuristic");
+    });
+
+    it("splits on 'and' for complex goals", () => {
+      const plan = decompose(
+        "Add a health endpoint to src/server.ts and add a test for it in tests/health.test.ts and update the README",
+      );
+      assert.equal(plan.decomposed, true);
+      assert.ok(plan.steps.length >= 2, `expected >= 2 steps, got ${plan.steps.length}`);
+      const first = plan.steps[0];
+      assert.ok(first);
+      assert.equal(first.index, 1);
+      for (let i = 0; i < plan.steps.length; i++) {
+        const s = plan.steps[i];
+        assert.ok(s);
+        assert.equal(s.index, i + 1);
+      }
+    });
+
+    it("splits on numbered lists", () => {
+      const plan = decompose("1. Add function X\n2. Add test for X\n3. Update docs");
+      assert.equal(plan.decomposed, true);
+      assert.equal(plan.steps.length, 3);
+      const s0 = plan.steps[0];
+      const s1 = plan.steps[1];
+      const s2 = plan.steps[2];
+      assert.ok(s0 && s1 && s2);
+      assert.equal(s0.goal, "Add function X");
+      assert.equal(s1.goal, "Add test for X");
+      assert.equal(s2.goal, "Update docs");
+    });
+
+    it("splits on semicolons", () => {
+      const plan = decompose(
+        "Add function X to src/a.ts; Add test for X in tests/a.test.ts; Update README with usage",
+      );
+      assert.equal(plan.decomposed, true);
+      assert.ok(plan.steps.length >= 2);
+    });
+
+    it("extracts target files from goals", () => {
+      const plan = decompose("Add function X to src/server.ts and add test in tests/server.test.ts");
+      if (plan.decomposed) {
+        const step1 = plan.steps[0];
+        assert.ok(step1);
+        const step1Files = step1.targetFiles ?? [];
+        assert.ok(step1Files.some((f) => f.includes("server.ts")), `step 1 should target server.ts`);
+      }
+    });
+
+    it("adds verification hint to the last step", () => {
+      const plan = decompose("Add X and add Y and add Z");
+      if (plan.decomposed) {
+        const last = plan.steps[plan.steps.length - 1];
+        assert.ok(last);
+        assert.ok(last.verificationHint !== undefined, "last step should have verification hint");
+      }
+    });
+
+    it("caps at MAX_STEPS", () => {
+      const goal = Array.from({ length: 20 }, (_, i) => `${i + 1}. Step ${i + 1}`).join("\n");
+      const plan = decompose(goal);
+      assert.ok(plan.steps.length <= 10, `expected <= 10 steps, got ${plan.steps.length}`);
+    });
+  });
+
+  describe("decomposeWithModel", () => {
+    it("uses model output when valid", async () => {
+      const mockModel = async () =>
+        JSON.stringify([
+          { goal: "Add function X", targetFiles: ["src/x.ts"] },
+          { goal: "Add test for X", targetFiles: ["tests/x.test.ts"] },
+        ]);
+      const plan = await decomposeWithModel("Complex task", mockModel);
+      assert.equal(plan.source, "model");
+      assert.equal(plan.decomposed, true);
+      assert.equal(plan.steps.length, 2);
+      const s0 = plan.steps[0];
+      assert.ok(s0);
+      assert.equal(s0.goal, "Add function X");
+    });
+
+    it("falls back to heuristic when model returns invalid JSON", async () => {
+      const mockModel = async () => "I can't decompose this";
+      const plan = await decomposeWithModel("Simple fix", mockModel);
+      assert.equal(plan.source, "heuristic");
+    });
+
+    it("falls back to heuristic when model returns single step", async () => {
+      const mockModel = async () => JSON.stringify([{ goal: "Do everything" }]);
+      const plan = await decomposeWithModel("Complex task", mockModel);
+      assert.equal(plan.source, "heuristic");
+    });
+
+    it("falls back to heuristic when model call throws", async () => {
+      const mockModel = async () => {
+        throw new Error("model failed");
+      };
+      const plan = await decomposeWithModel("Complex task", mockModel);
+      assert.equal(plan.source, "heuristic");
+    });
+
+    it("wraps model output in markdown code blocks", async () => {
+      const mockModel = async () =>
+        '```json\n[{"goal": "Step 1", "targetFiles": ["a.ts"]}, {"goal": "Step 2", "targetFiles": ["b.ts"]}]\n```';
+      const plan = await decomposeWithModel("Complex task", mockModel);
+      assert.equal(plan.source, "model");
+      assert.equal(plan.steps.length, 2);
+    });
+  });
+});
