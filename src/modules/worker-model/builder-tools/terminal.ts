@@ -120,6 +120,16 @@ export async function runTerminal(
     return "ERROR: terminal could not parse a command from the input.";
   }
   const rest = tokens.slice(1);
+  // PATH CONFINEMENT: reject absolute paths outside the worktree for read-only tools.
+  // This prevents `head /etc/passwd` or `grep x ~/.ssh/authorized_keys`.
+  const READ_ONLY_TOOLS = new Set(["head", "tail", "wc", "grep", "find", "ls"]);
+  if (READ_ONLY_TOOLS.has(binary)) {
+    for (const arg of rest) {
+      if (arg.startsWith("/") && !arg.startsWith(worktreeDir) && arg !== "/dev/null") {
+        return `DENIED: path '${arg}' is outside the worktree — read tools are confined to the worktree`;
+      }
+    }
+  }
   const policyDeny = commandPolicyDenyReason(binary, rest, `builder terminal: ${command.slice(0, 120)}`);
   if (policyDeny !== undefined) return `DENIED: ${policyDeny}`;
   try {

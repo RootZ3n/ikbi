@@ -48,6 +48,8 @@ export interface DelegateDeps {
   readonly model: string;
   readonly worktreeReal: string;
   readonly maxIterations?: number;
+  /** Write scope inherited from the parent builder — enforced on sub-agent writes. */
+  readonly writeScope?: "all" | "new_only" | "none";
 }
 
 export const delegateTaskTool: ModelTool = {
@@ -125,6 +127,16 @@ export async function runDelegateTask(deps: DelegateDeps, args: Record<string, u
       case "write_file": {
         const c = confinePath(deps.worktreeReal, toolArgs.path);
         if (!c.ok) return `ERROR: ${c.error}`;
+        // DEPENDENCY GUARD: same as parent builder.
+        const BLOCKED = ["node_modules/", ".git/", "dist/", ".next/", ".cache/"];
+        const rp = c.rel.replace(/\\/g, "/");
+        if (BLOCKED.some((bp) => rp.startsWith(bp) || rp.includes(`/${bp}`))) return `ERROR: cannot write to dependency/build directory: ${c.rel}`;
+        // WRITE SCOPE: inherited from parent builder.
+        const scope = deps.writeScope ?? "all";
+        if (scope === "none") return `ERROR: writeScope is 'none' — sub-agent cannot write files`;
+        if (scope === "new_only") {
+          try { readFileSync(c.full, "utf8"); return `ERROR: writeScope is 'new_only' — cannot overwrite existing file ${c.rel}`; } catch { /* file doesn't exist → allowed */ }
+        }
         const content = typeof toolArgs.content === "string" ? toolArgs.content : "";
         try {
           mkdirSync(dirname(c.full), { recursive: true });

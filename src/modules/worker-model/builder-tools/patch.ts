@@ -49,6 +49,12 @@ export function runPatch(worktreeReal: string, args: Record<string, unknown>): B
   if (!c.ok) {
     return { output: `ERROR: ${c.error}`, rejection: { tool: "patch", path: String(args.path ?? ""), error: c.error } };
   }
+  // DEPENDENCY GUARD: same as write_file — block writes to build/dependency directories.
+  const BLOCKED_PATHS = ["node_modules/", ".git/", "dist/", ".next/", ".cache/"];
+  const relPath = c.rel.replace(/\\/g, "/");
+  if (BLOCKED_PATHS.some((bp) => relPath.startsWith(bp) || relPath.includes(`/${bp}`))) {
+    return { output: `ERROR: cannot patch dependency/build directory: ${c.rel}`, rejection: { tool: "patch", path: c.rel, error: `cannot patch dependency directory: ${c.rel}` } };
+  }
   // new_string may legitimately be "" (a deletion); old_string must be a non-empty anchor.
   const oldString = typeof args.old_string === "string" ? args.old_string : "";
   const newString = typeof args.new_string === "string" ? args.new_string : "";

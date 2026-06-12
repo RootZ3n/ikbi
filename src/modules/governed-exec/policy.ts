@@ -7,7 +7,7 @@
  * scripts outside the verifier path.
  */
 
-const PM_COMMANDS = new Set(["npm", "pnpm", "npx"]);
+const PM_COMMANDS = new Set(["npm", "pnpm", "npx", "yarn"]);
 
 function isVerifierPurpose(purpose: string | undefined): boolean {
   if (purpose === undefined) return false;
@@ -24,7 +24,7 @@ function isPackageScriptRun(command: string, args: readonly string[]): boolean {
 function gitSubcommand(args: readonly string[]): string | undefined {
   for (let i = 0; i < args.length; i += 1) {
     const a = args[i] ?? "";
-    if (a === "-C") {
+    if (a === "-C" || a === "-c") {
       i += 1;
       continue;
     }
@@ -40,14 +40,30 @@ function gitBranchForceDelete(args: readonly string[]): boolean {
   return args.some((a) => a === "-f" || a === "--force" || a === "-D" || a === "--delete" || a.includes("D") && /^-[A-Za-z]+$/.test(a));
 }
 
+/** Detect `find` flags that execute arbitrary commands or write files. */
+function findHasExecOrWrite(args: readonly string[]): boolean {
+  return args.some((a) =>
+    a === "-exec" || a === "-execdir" || a === "-ok" ||
+    a === "-fprintf" || a === "-fprint" || a === "-delete" ||
+    a === "-fls" || a === "-printf" && args.includes("-fprint")
+  );
+}
+
 export function commandPolicyDenyReason(command: string, args: readonly string[], purpose?: string): string | undefined {
   if (command === "git") {
-    if (args.some((a) => a === "-C" || a === "--git-dir" || a.startsWith("--git-dir=") || a === "--work-tree" || a.startsWith("--work-tree="))) {
-      return "git worktree/root override flags are not allowed";
+    // Deny ALL git flags that redirect the working directory, config, or exec path.
+    // -c sets git config for one invocation (including alias.* which runs shell commands).
+    // --exec-path redirects the git exec directory.
+    if (args.some((a) => a === "-C" || a === "-c" || a === "--git-dir" || a.startsWith("--git-dir=") || a === "--work-tree" || a.startsWith("--work-tree=") || a === "--exec-path" || a.startsWith("--exec-path="))) {
+      return "git worktree/root/config/exec override flags are not allowed";
     }
     const sub = gitSubcommand(args);
-    if (sub === "push" || sub === "update-ref") return `git ${sub} is not allowed`;
+    if (sub === "push" || sub === "update-ref" || sub === "config") return `git ${sub} is not allowed`;
     if (gitBranchForceDelete(args)) return "git branch force/delete operations are not allowed";
+  }
+  // find -exec/-execdir/-ok/-fprintf/-fprint/-delete execute arbitrary binaries or write files.
+  if (command === "find" && findHasExecOrWrite(args)) {
+    return "find exec/write flags are not allowed";
   }
   if (isPackageScriptRun(command, args) && !isVerifierPurpose(purpose)) {
     return `${command} script execution is allowed only for verifier/check runs`;

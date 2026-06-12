@@ -151,22 +151,39 @@ const BUILDER_SYSTEM =
 export const TOOLS: readonly ModelTool[] = [
   {
     name: "read_file",
-    description: "Read a UTF-8 text file under the worktree.",
-    parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+    description:
+      "Read a UTF-8 text file under the worktree. ALWAYS read a file before you edit it — never edit blind. " +
+      'Example: {"path": "src/routes.ts"}',
+    parameters: {
+      type: "object",
+      properties: { path: { type: "string", description: 'Worktree-relative path, e.g. "src/routes.ts".' } },
+      required: ["path"],
+    },
   },
   {
     name: "write_file",
-    description: "Create or overwrite a UTF-8 text file under the worktree.",
+    description:
+      "Create a NEW file, or fully rewrite an existing one you have ALREADY read this session. " +
+      "Writing an existing file you have not read is rejected (read it first). For a SMALL change to an " +
+      "existing file, prefer the `patch` tool instead of rewriting it. " +
+      'Example: {"path": "src/new.ts", "content": "export const x = 1;\\n"}',
     parameters: {
       type: "object",
-      properties: { path: { type: "string" }, content: { type: "string" } },
+      properties: {
+        path: { type: "string", description: 'Worktree-relative path, e.g. "src/new.ts".' },
+        content: { type: "string", description: "The FULL file content to write (the whole file, not a fragment)." },
+      },
       required: ["path", "content"],
     },
   },
   {
     name: "list_dir",
-    description: "List the entries of a directory under the worktree.",
-    parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+    description: 'List the entries of a directory under the worktree. Example: {"path": "src"}',
+    parameters: {
+      type: "object",
+      properties: { path: { type: "string", description: 'Worktree-relative directory, e.g. "src" or "." for the root.' } },
+      required: ["path"],
+    },
   },
   // Expanded tool suite (worktree-confined): codebase search, surgical edits, governed shell.
   searchFilesTool,
@@ -201,7 +218,9 @@ export const TOOLS: readonly ModelTool[] = [
     // on a green run_checks — the builder cannot declare done while a check is red.
     name: "run_checks",
     description:
-      "Run the project's checks (typecheck + tests) and see the results. These are the SAME checks the verifier runs. You MUST run this and see all checks pass before calling done.",
+      "Run the project's checks (typecheck + tests) and see the results. These are the SAME checks the verifier runs. " +
+      "You MUST run this and see ALL checks pass before calling done — and run it AGAIN after any edit (a write makes the " +
+      'previous result stale). Takes no arguments. Example: {}',
     parameters: { type: "object", properties: {}, required: [] },
   },
   {
@@ -209,16 +228,20 @@ export const TOOLS: readonly ModelTool[] = [
     // call done with a self-check, validated for SUBSTANCE (not a rubber stamp).
     name: "done",
     description:
-      "Declare the work complete. You MUST call this to finish — stopping without it means the work is INCOMPLETE. Provide the self-check. When you FIXED a bug, also provide rootCause (what was actually wrong, the underlying cause) and fixRationale (why your change corrects it).",
+      "Declare the work complete. You MUST call this to finish — stopping without it means the work is INCOMPLETE. " +
+      "Only call it AFTER run_checks is fully green (and re-run after your last edit). When you FIXED a bug, also " +
+      "provide rootCause and fixRationale. " +
+      'Example: {"successCondition": "src/routes.ts links the stylesheet", "filesReadBack": ["src/routes.ts"], ' +
+      '"selfCheck": "re-read src/routes.ts; the <link> is present and run_checks is green", "satisfied": true}',
     parameters: {
       type: "object",
       properties: {
-        successCondition: { type: "string" },
-        filesReadBack: { type: "array", items: { type: "string" } },
-        selfCheck: { type: "string" },
-        satisfied: { type: "boolean" },
-        rootCause: { type: "string" },
-        fixRationale: { type: "string" },
+        successCondition: { type: "string", description: "The single checkable outcome that means 'done'." },
+        filesReadBack: { type: "array", items: { type: "string" }, description: "Every file you changed, re-read to verify. Must include all files you wrote." },
+        selfCheck: { type: "string", description: "How you verified: what you re-read and that run_checks is green." },
+        satisfied: { type: "boolean", description: "true only when the success condition is met and run_checks is green." },
+        rootCause: { type: "string", description: "(bug fixes) The underlying cause that was actually wrong." },
+        fixRationale: { type: "string", description: "(bug fixes) Why your change corrects the root cause." },
       },
       required: ["successCondition", "filesReadBack", "selfCheck", "satisfied"],
     },
@@ -473,6 +496,94 @@ function deriveSuccessCondition(goal: string, priorResults: ReadonlyArray<{ role
 }
 
 /**
+ * PRINCIPLE 2 — FILE TARGETING. Cheap models ignore a `file:line` reference buried in the goal
+ * prose and edit the wrong file. Lift the path-like tokens out of the goal so they can be pinned
+ * as explicit PRIMARY TARGETS in the (trusted) system prompt. Only tokens with a RECOGNIZED CODE
+ * extension are taken — so "fix the thing" / "v2.5" / "1.0" yield nothing — sanitized (no `..`,
+ * no absolute), deduped, and bounded. The tokens are pure paths (no prose), so they carry no
+ * injection surface when placed in the trusted prompt.
+ */
+const TARGET_FILE_EXTS: ReadonlySet<string> = new Set([
+  "ts", "tsx", "js", "jsx", "mjs", "cjs", "json", "css", "scss", "sass", "less", "html", "htm",
+  "vue", "svelte", "md", "mdx", "yaml", "yml", "toml", "py", "go", "rs", "java", "rb", "php",
+  "c", "h", "cpp", "hpp", "cs", "sh", "bash", "sql", "txt", "env", "cfg", "ini", "xml",
+]);
+
+/** Extract concrete file paths the goal names as PRIMARY TARGETS (Principle 2). */
+export function extractTargetFiles(goal: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  // path-like: optional `dir/` segments, a filename, a dot, and a short extension.
+  const re = /(?:[\w.@-]+\/)*[\w.@-]+\.[A-Za-z][A-Za-z0-9]{0,5}/g;
+  for (const raw of goal.match(re) ?? []) {
+    const p = raw.replace(/^\.\//, "");
+    if (p.includes("..") || p.startsWith("/")) continue; // never traverse / escape
+    const ext = (p.split(".").pop() ?? "").toLowerCase();
+    if (!TARGET_FILE_EXTS.has(ext)) continue;
+    if (seen.has(p)) continue;
+    seen.add(p);
+    out.push(p);
+    if (out.length >= 10) break; // bound — a goal naming 50 files isn't a targeted edit
+  }
+  return out;
+}
+
+/** Render the trusted "PRIMARY TARGETS" addendum for the system prompt (empty when none named). */
+function primaryTargetsAddendum(targetFiles: readonly string[]): string {
+  if (targetFiles.length === 0) return "";
+  return (
+    "\n\nPRIMARY TARGETS — the goal names these file(s):\n" +
+    targetFiles.map((f) => `  - ${f}`).join("\n") +
+    "\nWork ONLY on the file(s) above unless the goal EXPLICITLY requires touching others. READ a primary " +
+    "target with read_file before editing it. Do NOT edit unrelated files (e.g. a UI/HTML file the goal did not name)."
+  );
+}
+
+/**
+ * PRINCIPLE 3 — extract a `file:line` location from raw check output so the structured feedback
+ * can point the model AT the failing file. Covers tsc (`src/x.ts(12,3):`), and the
+ * `path:line[:col]` shape jest/vitest/node print. Returns undefined when nothing matches.
+ */
+export function extractCheckLocation(output: string): string | undefined {
+  const m = output.match(/([\w./-]+\.[A-Za-z][A-Za-z0-9]{0,5})[(:](\d+)/);
+  return m ? `${m[1]}:${m[2]}` : undefined;
+}
+
+/** PRINCIPLE 5 — every REMINDER_INTERVAL model rounds, re-anchor a cheap model that has lost the
+ *  thread. Restates the goal, the primary targets, what's been modified, and the last check state. */
+const REMINDER_INTERVAL = 5;
+
+/**
+ * Build the CONTEXT REMINDER (Principle 5). Trusted, ikbi-authored scaffolding — it restates the
+ * OPERATOR'S OWN goal (not upstream-derived data) plus build-system-derived progress (target files,
+ * files modified, last check state), so re-stating it in a trusted slot adds no injection surface.
+ */
+export function buildContextReminder(s: {
+  readonly goal: string;
+  readonly targetFiles: readonly string[];
+  readonly filesWritten: readonly string[];
+  readonly lastChecks?: ChecksOutcome;
+}): string {
+  const targets = s.targetFiles.length > 0 ? s.targetFiles.join(", ") : "(none named in the goal — infer from the goal)";
+  const modified = s.filesWritten.length > 0 ? [...new Set(s.filesWritten)].join(", ") : "(none yet)";
+  const checks =
+    s.lastChecks === undefined
+      ? "not run yet — you MUST run_checks before done"
+      : s.lastChecks.allPass
+        ? "ALL PASS"
+        : `FAILING (${s.lastChecks.checks.filter((c) => c.exitCode !== 0).map((c) => c.name).join(", ") || "see the last output"})`;
+  return [
+    "CONTEXT REMINDER (from the build system — follow this):",
+    `GOAL: ${s.goal}`,
+    `PRIMARY TARGET FILE(S): ${targets}`,
+    `FILES YOU HAVE MODIFIED SO FAR: ${modified}`,
+    `LAST run_checks: ${checks}`,
+    "If the goal is met and run_checks is ALL PASS, call done now. Otherwise continue: read a file before you edit it, " +
+      "stay on the target file(s), and do not touch unrelated files.",
+  ].join("\n");
+}
+
+/**
  * Build a builder RoleFn. `deps` (governedExec + parentCtx) are threaded MODULE-INTERNALLY
  * by the orchestrator's `builderFor(parentCtx)` — the SAME way the verifier is constructed —
  * so the frozen RoleContext/RoleEngine contract is unchanged. Without them, run_checks fails
@@ -518,6 +629,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
   let bareStops = 0; // RAIL 3: times the model stopped without a valid done (corrective turns)
   let doneClaim: DoneClaim | undefined; // the builder's CLAIM (verifier still decides truth)
   let lastChecks: ChecksOutcome | undefined; // last run_checks outcome — gates `done`
+  let checksStale = false; // PRINCIPLE 4(b): a write happened AFTER the last run_checks → green is stale
   let checksRuns = 0; // how many times the builder ran the checks in-loop
   let compressions = 0; // how many times the context was compacted (window management)
   let contextPercent = 0; // SG: latest context-window pressure (0-100), surfaced for visibility
@@ -556,8 +668,19 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
     // root. Rides as an isolated UNTRUSTED message (neutralized) — honored project guidance,
     // but bounded; never raw-concatenated into the trusted system prompt. Missing ⇒ omitted.
     const projectInstructions = ctx.task.projectInstructions ?? loadProjectInstructions(worktreeReal)?.content;
+    // PRINCIPLE 2: pin the goal-named files as PRIMARY TARGETS in the (trusted) system prompt so a
+    // cheap model edits the file the goal points at, not whatever it stumbles on first. Pure paths,
+    // no prose — no injection surface in the trusted slot.
+    const targetFiles = extractTargetFiles(ctx.task.goal);
+    const writeScopeAddendum =
+      writeScope === "all"
+        ? ""
+        : "\n\nWRITE SCOPE: " +
+          (writeScope === "new_only"
+            ? "You may ONLY create NEW files. Do NOT modify any existing file — read_file to inspect, but write_file/patch on an existing file is FORBIDDEN and will be rejected."
+            : "You are in READ-ONLY mode. Do NOT write or patch any file.");
     const messages: ModelMessage[] = [
-      { role: "system", content: writeScope === "all" ? BUILDER_SYSTEM : BUILDER_SYSTEM + "\n\nWRITE SCOPE: " + (writeScope === "new_only" ? "You may ONLY create NEW files. Do NOT modify any existing file — read_file to inspect, but write_file/patch on an existing file is FORBIDDEN and will be rejected." : "You are in READ-ONLY mode. Do NOT write or patch any file.") },
+      { role: "system", content: BUILDER_SYSTEM + writeScopeAddendum + primaryTargetsAddendum(targetFiles) },
       ...(projectInstructions !== undefined
         ? [untrusted(`Project instructions from the target repo (CLAUDE.md/AGENTS.md) — honor these conventions where they apply:\n${projectInstructions}`, "project_instructions")]
         : []),
@@ -624,12 +747,24 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
             rejectedToolCalls.push({ tool: "write_file", path: c.rel, error: `cannot write to dependency directory: ${c.rel}` });
             return `ERROR: Cannot write to ${c.rel} — dependency/build directories are off-limits. Create files in src/, scripts/, docs/, or other project directories instead.`;
           }
+          // PRINCIPLE 1: READ-BEFORE-WRITE. Overwriting an EXISTING file the builder has never read
+          // (and never wrote this run) is the #1 cheap-model failure — it hallucinates the file's
+          // contents and clobbers them. Refuse: force a read_file first. Creating a NEW file (nothing
+          // to clobber) and rewriting a file the builder itself already wrote stay allowed. `patch` is
+          // exempt by design — it requires an EXACT, UNIQUE anchor, so the model must already know the
+          // content. The guard targets blind whole-file overwrites only.
+          if (existsSync(c.full) && !filesRead.includes(c.rel) && !filesWritten.includes(c.rel)) {
+            log.info({ path: c.rel }, "READ-BEFORE-WRITE BLOCKED write_file on an unread existing file");
+            rejectedToolCalls.push({ tool: "write_file", path: c.rel, error: "write before read — existing file not read this session" });
+            return `ERROR: READ-BEFORE-WRITE — ${c.rel} already exists but you have not read it this session. Call read_file('${c.rel}') FIRST so you do not clobber its contents, then write_file with the full corrected content (for a small change, prefer the patch tool).`;
+          }
           log.info({ path: c.rel, writeScope, exists: existsSync(c.full) }, "write_file ALLOWED");
           const content = typeof args.content === "string" ? args.content : "";
           try {
             mkdirSync(dirname(c.full), { recursive: true });
             writeFileSync(c.full, content, "utf8");
             filesWritten.push(c.rel);
+            checksStale = true; // PRINCIPLE 4(b): the green (if any) is now stale until run_checks re-runs
             return `wrote ${Buffer.byteLength(content, "utf8")} bytes to ${c.rel}`;
           } catch (e) {
             return `ERROR: write failed: ${errMsg(e)}`;
@@ -666,7 +801,10 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
           if (res.rejection !== undefined) rejectedToolCalls.push(res.rejection);
           // A successful patch MODIFIES a file — record it so the `done` read-back gate
           // (you must read back every file you changed) covers patched files too.
-          if (res.wrote !== undefined) filesWritten.push(res.wrote);
+          if (res.wrote !== undefined) {
+            filesWritten.push(res.wrote);
+            checksStale = true; // PRINCIPLE 4(b): an edit invalidates any prior green until run_checks re-runs
+          }
           return res.output;
         }
         case "scout_detail":
@@ -775,6 +913,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
           identity: ctx.identity,
           model: builderModelId,
           worktreeReal,
+          writeScope,
         },
         args,
       );
@@ -853,6 +992,12 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         rejectedToolCalls.push({ tool: "done", error: "done before run_checks" });
         return { accept: false, feedback: "You must call run_checks before done. Call run_checks now to verify your changes, then call done only after the checks all pass." };
       }
+      // PRINCIPLE 4(b): run_checks must POST-DATE your last edit. A write/patch after the last
+      // run_checks makes that green STALE — the checks no longer reflect the file on disk. Re-run.
+      if (checksStale) {
+        rejectedToolCalls.push({ tool: "done", error: "checks stale — wrote files after the last run_checks" });
+        return { accept: false, feedback: "ERROR: you changed files AFTER your last run_checks, so the result is stale and no longer reflects the code on disk. Call run_checks again to verify the current state, then call done." };
+      }
       if (!lastChecks.allPass) {
         const failed = lastChecks.checks.filter((c) => c.exitCode !== 0).map((c) => c.name);
         rejectedToolCalls.push({ tool: "done", error: `checks not green (failed: ${failed.join(", ") || "none ran"})` });
@@ -922,8 +1067,24 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       const triaged = results.map((r) => ({ result: r, triage: parseCheckOutput({ name: r.name, command: r.command, exitCode: r.exitCode, stdout: r.outputTail }) }));
       const allPass = !dry && triaged.every((t) => t.triage.passed);
       lastChecks = { allPass, checks: results };
-      const lines = triaged.map(({ result: r, triage }) => `${r.name}: ${triage.passed ? "PASS" : `FAILED — ${triage.errorSummary}`}\n${r.outputTail}`);
-      return `Checks ${allPass ? "ALL PASS" : "FAILED"}:\n${lines.join("\n---\n")}`;
+      checksStale = false; // PRINCIPLE 4(b): the result now reflects the code on disk again
+      // PRINCIPLE 3: STRUCTURED feedback. Cheap models cannot parse raw vitest/tsc output, so each
+      // failing check is broken into the fields they need to act: the error summary, the failing
+      // test/error identifiers, and a file:line LOCATION pulled from the output — then the raw tail.
+      const failedCount = triaged.filter((t) => !t.triage.passed).length;
+      const header = allPass
+        ? "CHECK RESULTS: ALL PASS"
+        : `CHECK RESULTS: FAILED${failedCount > 0 ? ` (${failedCount} of ${triaged.length} check(s) failing)` : " (checks did not produce a verified pass)"}`;
+      const blocks = triaged.map(({ result: r, triage }) => {
+        if (triage.passed) return `[check: ${r.name}] PASS`;
+        const parts = [`[check: ${r.name}] FAILED`, `  error: ${triage.errorSummary}`];
+        if (triage.failures.length > 0) parts.push(`  failing: ${triage.failures.slice(0, 10).join(", ")}`);
+        const loc = extractCheckLocation(r.outputTail);
+        if (loc !== undefined) parts.push(`  location: ${loc}  (open this file:line and fix the cause here)`);
+        parts.push(`  output:\n${r.outputTail}`);
+        return parts.join("\n");
+      });
+      return `${header}\n${blocks.join("\n---\n")}`;
     };
 
     // CAPABILITY ADAPTATION: read the (config/roster-driven) model's profile ONCE and
@@ -1000,6 +1161,17 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       if (contextPercent > 70 && !warnedHighContext) {
         warnedHighContext = true;
         log.warn(`[context] window pressure at ${contextPercent}% of ${caps.context_window} tokens — compaction active`);
+      }
+
+      // PRINCIPLE 5: every REMINDER_INTERVAL rounds, re-anchor the model on the goal, the primary
+      // targets, what it has modified, and the last check state. Cheap models lose the thread after
+      // ~10 rounds. Trusted, ikbi-authored, no model call — it just rides into the next request.
+      if (iterations > 1 && iterations % REMINDER_INTERVAL === 0) {
+        messages.push({
+          role: "user",
+          untrusted: false,
+          content: buildContextReminder({ goal: ctx.task.goal, targetFiles, filesWritten, ...(lastChecks !== undefined ? { lastChecks } : {}) }),
+        });
       }
 
       const response = await ctx.engine.invokeModel({

@@ -182,19 +182,70 @@ function red(reason: string): RoleResult {
  * (the attack is rewriting `test`); a dependency bump does NOT match these keys.
  */
 export function detectScriptMutation(diff: string): { mutated: boolean; reason?: string } {
+  // Files whose modification can weaken verification (neuter tsconfig strictness,
+  // exclude broken files, weaken test configs). Fail-closed: any builder change to
+  // these is flagged.
+  // tsconfig is checked for VERIFICATION-WEAKENING keys only (not all changes).
+  const GUARDED_CONFIG_PATTERNS = [
+    /vitest\.config/,
+    /jest\.config/,
+    /\.babelrc/,
+    /babel\.config/,
+    /webpack\.config/,
+    /vite\.config/,
+  ];
+  const GUARD_TSCONFIG = /tsconfig.*\.json/;
+  const WEAKENING_KEYS = [
+    "strict", "skipLibCheck", "noEmit", "noImplicitAny", "noUnusedLocals",
+    "noUnusedParameters", "exclude", "include", "moduleResolution",
+    "noImplicitReturns", "noFallthroughCasesInSwitch", "strictNullChecks",
+    "strictFunctionTypes", "strictBindCallApply",
+  ];
   let inPackageJson = false;
+  let inGuardedConfig = false;
+  let inTsconfig = false;
+  let guardedConfigName = "";
   for (const line of diff.split("\n")) {
     // A new file section. `git diff` emits `diff --git a/<p> b/<p>` naming the file.
     if (line.startsWith("diff --git ")) {
       inPackageJson = /package\.json/.test(line);
+      inGuardedConfig = GUARDED_CONFIG_PATTERNS.some((p) => p.test(line));
+      inTsconfig = GUARD_TSCONFIG.test(line);
+      guardedConfigName = (inGuardedConfig || inTsconfig) ? line.replace(/.*b\//, "") : "";
       continue;
     }
     // The `+++ b/<p>` header also names the file (diffs without a `diff --git` line).
     if (line.startsWith("+++ ")) {
       if (/package\.json/.test(line)) inPackageJson = true;
+      if (!inGuardedConfig && GUARDED_CONFIG_PATTERNS.some((p) => p.test(line))) {
+        inGuardedConfig = true;
+        guardedConfigName = line.replace(/.*b\//, "");
+      }
+      if (!inTsconfig && GUARD_TSCONFIG.test(line)) {
+        inTsconfig = true;
+        guardedConfigName = line.replace(/.*b\//, "");
+      }
       continue;
     }
     if (line.startsWith("--- ")) continue; // old-file header — not a content line
+    // Guarded config file (vitest.config, jest.config, etc.): ANY change is flagged.
+    if (inGuardedConfig) {
+      const changed = line.startsWith("+") || line.startsWith("-");
+      if (changed) {
+        return { mutated: true, reason: `builder modified verification config "${guardedConfigName}"` };
+      }
+    }
+    // tsconfig: only flag changes to verification-WEAKENING keys.
+    if (inTsconfig) {
+      const changed = line.startsWith("+") || line.startsWith("-");
+      if (changed) {
+        const body = line.slice(1);
+        const keyMatch = /^\s*"([^"]+)"\s*:/.exec(body);
+        if (keyMatch !== null && WEAKENING_KEYS.includes(keyMatch[1]!)) {
+          return { mutated: true, reason: `builder modified tsconfig verification key "${keyMatch[1]}" in ${guardedConfigName}` };
+        }
+      }
+    }
     if (!inPackageJson) continue;
     // A CHANGED content line (added/removed) — not a header (`+++`/`---` handled above).
     const changed = line.startsWith("+") || line.startsWith("-");
