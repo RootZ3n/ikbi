@@ -208,7 +208,7 @@ export function detectScriptMutation(diff: string): { mutated: boolean; reason?:
   for (const line of diff.split("\n")) {
     // A new file section. `git diff` emits `diff --git a/<p> b/<p>` naming the file.
     if (line.startsWith("diff --git ")) {
-      inPackageJson = /package\.json/.test(line);
+      inPackageJson = /(?:^|\/)package\.json(?:\s|$)/.test(line);
       inGuardedConfig = GUARDED_CONFIG_PATTERNS.some((p) => p.test(line));
       inTsconfig = GUARD_TSCONFIG.test(line);
       guardedConfigName = (inGuardedConfig || inTsconfig) ? line.replace(/.*b\//, "") : "";
@@ -216,7 +216,7 @@ export function detectScriptMutation(diff: string): { mutated: boolean; reason?:
     }
     // The `+++ b/<p>` header also names the file (diffs without a `diff --git` line).
     if (line.startsWith("+++ ")) {
-      if (/package\.json/.test(line)) inPackageJson = true;
+      if (/(?:^|\/)package\.json(?:\s|$)/.test(line)) inPackageJson = true;
       if (!inGuardedConfig && GUARDED_CONFIG_PATTERNS.some((p) => p.test(line))) {
         inGuardedConfig = true;
         guardedConfigName = line.replace(/.*b\//, "");
@@ -346,8 +346,14 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
       };
     }
 
-    const allPass = checks.every((c) => c.exitCode === 0);
-    const failed = checks.filter((c) => c.exitCode !== 0).map((c) => c.name);
+    // Triage: detect false-greens (zero tests, exit-swallowing) even in legacy mode.
+    // This brings the legacy path to parity with the ladder and builder run_checks.
+    const triaged = checks.map((c) => ({
+      check: c,
+      triage: parseCheckOutput({ name: c.name, command: c.command, exitCode: c.exitCode, stdout: c.outputTail, stderr: "" }),
+    }));
+    const allPass = triaged.every((t) => t.check.exitCode === 0 && t.triage.passed);
+    const failed = triaged.filter((t) => !t.triage.passed).map((t) => t.check.name);
 
     // QUALITY CHECKS: run AFTER typecheck + tests pass. Deterministic, fast, no model calls.
     // Extract written files from the builder's prior result (if available).

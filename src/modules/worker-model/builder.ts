@@ -835,10 +835,16 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         rejectedToolCalls.push({ tool: "terminal", error: verr });
         return `ERROR: ${verr}`;
       }
-      // WRITE SCOPE: block terminal commands that write files when scope is restricted
+      // WRITE SCOPE: block terminal commands that write files when scope is restricted.
+      // "none" = read-only mode → block ALL terminal (the builder has read_file/search_files
+      // for inspection; no shell needed). "new_only" = regex heuristic for write patterns.
       const cmd = String(args.command ?? "");
-      if (writeScope === "none" || writeScope === "new_only") {
-        const writePatterns = />\s*[^&|;]+|>>\s*[^&|;]+|\btee\b|\bcp\b.*[^|]\s|\bmv\b|\brm\b|\bsed\s+-i\b|\bnode\b.*writeFile|\bpython.*open\(.*['\"]w['\"]|\becho\b.*>/;
+      if (writeScope === "none") {
+        rejectedToolCalls.push({ tool: "terminal", path: cmd.slice(0, 100), error: "write_scope is 'none' — terminal is forbidden in read-only mode" });
+        return `ERROR: WRITE SCOPE VIOLATION — you are in read-only mode. Terminal is forbidden. Use read_file and search_files for inspection.`;
+      }
+      if (writeScope === "new_only") {
+        const writePatterns = />\s*[^&|;]+|>>\s*[^&|;]+|\btee\b|\bcp\b.*[^|]\s|\bmv\b|\brm\b|\bsed\s+-i\b|\bnode\b.*writeFile|\bpython.*open\(.*['"]w['"]|\becho\b.*>|\binstall\b|\bdd\b|\btruncate\b|\bln\b|\bgit\s+apply\b|\bpatch\s+</;
         if (writePatterns.test(cmd)) {
           rejectedToolCalls.push({ tool: "terminal", path: cmd.slice(0, 100), error: `write_scope is '${writeScope}' — terminal write commands are forbidden` });
           return `ERROR: WRITE SCOPE VIOLATION — write scope is '${writeScope}'. Terminal command that writes files is forbidden: ${cmd.slice(0, 100)}`;
@@ -1248,6 +1254,14 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
           } else if (call.name === "delegate_task") {
             // Sub-agent delegation — async; its result is UNTRUSTED to the parent → chokepoint.
             const raw = await runDelegateCall(call);
+            // #10: extract delegated writes and merge into parent's filesWritten + checksStale.
+            const wroteMatch = raw.match(/Files written by sub-agent: (.+)/);
+            if (wroteMatch !== null) {
+              for (const f of wroteMatch[1]!.split(",").map((s) => s.trim()).filter((s) => s.length > 0)) {
+                if (!filesWritten.includes(f)) filesWritten.push(f);
+              }
+              checksStale = true;
+            }
             appendToolResult(raw, call);
           } else if (call.name === "vision_analyze") {
             // Multimodal image analysis — async; the analysis is UNTRUSTED → chokepoint.
