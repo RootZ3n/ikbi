@@ -99,6 +99,32 @@ describe("step-planner", () => {
       const plan = decompose(goal);
       assert.ok(plan.steps.length <= 10, `expected <= 10 steps, got ${plan.steps.length}`);
     });
+
+    // ── OVER-TRIGGER REGRESSION (Issue 2): a verbose SINGLE task is not spuriously split ──
+
+    it("does NOT decompose a verbose single-task goal that merely contains 'and' twice", () => {
+      // One conceptual task (refactor the auth module) described verbosely. It trips the loose
+      // `/\band\b.*\band\b/` complexity indicator, but the later clauses are continuations, not
+      // independent tasks — so it must NOT be decomposed into spurious steps.
+      const goal =
+        "Refactor the authentication module so that it correctly validates incoming tokens " +
+        "and gracefully handles sessions that have already expired " +
+        "and clearly surfaces a helpful error message to the caller";
+      // Sanity: the loose indicator DOES fire (this is the over-trigger we are guarding against).
+      assert.ok(complexityScore(goal) >= 1, "the loose 'and...and' indicator still matches");
+      const plan = decompose(goal);
+      assert.equal(plan.decomposed, false, "a verbose single task is not split into steps");
+      assert.equal(plan.steps.length, 1, "stays a single step");
+      assert.equal(plan.steps[0]?.goal, goal, "the original goal is preserved unchanged");
+    });
+
+    it("STILL decomposes a genuine multi-task goal where each clause is an action-led task", () => {
+      // Positive control: short, but each "and" clause opens with an imperative action verb —
+      // genuinely independent tasks. The guard must let this through.
+      const plan = decompose("Add a logout button and update the navbar styles and write a test for it");
+      assert.equal(plan.decomposed, true, "action-led clauses are a real decomposition");
+      assert.ok(plan.steps.length >= 2);
+    });
   });
 
   describe("decomposeWithModel", () => {
