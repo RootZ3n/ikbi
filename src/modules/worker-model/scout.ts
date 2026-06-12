@@ -217,13 +217,31 @@ function extractPathRef(text: string): { path?: string; lines?: [number, number]
   return { path, lines: [start, end] };
 }
 
-/** Locate the structure-index entry a finding's path ref points at, matching exactly or by path suffix. */
+/**
+ * Locate the structure-index entry a finding's path ref points at, matching exactly or by path
+ * suffix. When several scanned files share a basename (e.g. `src/a/login.ts` and `src/b/login.ts`)
+ * a bare-basename ref is ambiguous — disambiguate deterministically: an EXACT path match wins;
+ * otherwise prefer the candidate whose path differs LEAST from the ref (fewest extra leading
+ * segments), then the shortest path overall. This keeps canonicalization stable and predictable.
+ */
 function findStructureEntry(path: string, structure: readonly ScoutFileEntry[]): ScoutFileEntry | undefined {
   const lower = path.toLowerCase();
-  return structure.find((e) => {
+  const matches = structure.filter((e) => {
     const p = e.path.toLowerCase();
     return p === lower || p.endsWith(`/${lower}`) || lower.endsWith(`/${p}`);
   });
+  if (matches.length <= 1) return matches[0];
+  return [...matches].sort((a, b) => {
+    const ap = a.path.toLowerCase();
+    const bp = b.path.toLowerCase();
+    const aExact = ap === lower ? 0 : 1;
+    const bExact = bp === lower ? 0 : 1;
+    if (aExact !== bExact) return aExact - bExact; // exact path match wins outright
+    const aDiff = Math.abs(ap.length - lower.length);
+    const bDiff = Math.abs(bp.length - lower.length);
+    if (aDiff !== bDiff) return aDiff - bDiff; // smallest path difference next
+    return ap.length - bp.length; // final tiebreak: shortest path
+  })[0];
 }
 
 /**
@@ -231,15 +249,21 @@ function findStructureEntry(path: string, structure: readonly ScoutFileEntry[]):
  * never flow to the builder. A path that names no scanned file is DROPPED entirely (the finding's
  * prose survives, but its drill-down ref does not). A path that exists but cites an out-of-range
  * line keeps the path and drops only the bogus line range.
+ *
+ * CANONICALIZATION: when the model names a file by a SUFFIX (e.g. "login.ts" for the scanned
+ * "src/auth/login.ts"), the surviving ref is rewritten to the matched entry's FULL repo-relative
+ * path. Downstream path-based drilldown (scout_detail) keys on the scanned path, so handing it the
+ * short form could fail to resolve the file — always emit the canonical path.
  */
 function validateRef(ref: { path?: string; lines?: [number, number] }, structure: readonly ScoutFileEntry[]): { path?: string; lines?: [number, number] } {
   if (ref.path === undefined) return {};
   const entry = findStructureEntry(ref.path, structure);
   if (entry === undefined) return {}; // hallucinated path — drop the whole ref
-  if (ref.lines === undefined) return { path: ref.path };
+  const canonical = entry.path; // rewrite suffix/case-variant refs to the scanned file's full path
+  if (ref.lines === undefined) return { path: canonical };
   const [start, end] = ref.lines;
   const inRange = start >= 1 && end >= start && end <= entry.lines;
-  return inRange ? { path: ref.path, lines: ref.lines } : { path: ref.path }; // out-of-range — drop only the lines
+  return inRange ? { path: canonical, lines: ref.lines } : { path: canonical }; // out-of-range — drop only the lines
 }
 
 /**

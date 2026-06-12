@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
 
 import type { AgentIdentity } from "../../core/identity/contract.js";
@@ -290,4 +290,44 @@ test("FIX#4 quality: buildBrief ordering — index mode is relevance-ranked, leg
   const indexBrief = (indexed.detail as { brief: string }).brief;
   assert.match(indexBrief, /Key files \(most relevant first\)/);
   assert.ok(indexBrief.indexOf("tiny.ts") < indexBrief.indexOf("huge.ts"), "index: most-relevant file leads despite smaller size");
+});
+
+/** Write a nested file, creating parent dirs — used by the canonicalization tests below. */
+function writeNested(root: string, rel: string, content: string): void {
+  const abs = join(root, rel);
+  mkdirSync(dirname(abs), { recursive: true });
+  writeFileSync(abs, content);
+}
+
+test("FIX(canonicalize): a suffix-matched ref is rewritten to the scanned file's FULL path", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-scout-"));
+  // Only ONE login.ts, nested. The model names it by bare basename ("login.ts").
+  writeNested(dir, "src/auth/login.ts", "export const a = 1;\nexport const b = 2;\nexport const c = 3;");
+  const { ctx } = makeCtx(dir, async () => modelResponse("- login.ts:2 — handles auth"), "investigate auth login");
+
+  const result = await scout(ctx);
+  assert.equal(result.outcome, "success");
+  const detail = result.detail as { findings: ScoutFinding[] };
+  const f = detail.findings[0];
+  // The short "login.ts" must be canonicalized to the scanned "src/auth/login.ts" so downstream
+  // path-based drilldown (scout_detail) resolves the file. The in-range line survives.
+  assert.equal(f?.path, "src/auth/login.ts", "suffix ref canonicalized to the full scanned path");
+  assert.deepEqual(f?.lines, [2, 2], "in-range line preserved through canonicalization");
+});
+
+test("FIX(canonicalize): duplicate basenames — a disambiguating ref matches the RIGHT file", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-scout-"));
+  // Two files share the basename login.ts. A ref that includes the parent segment ("b/login.ts")
+  // must resolve to src/b/login.ts, NOT src/a/login.ts, and be canonicalized to the full path.
+  writeNested(dir, "src/a/login.ts", "export const a = 1;");
+  writeNested(dir, "src/b/login.ts", "export const b = 1;");
+  const { ctx } = makeCtx(dir, async () => modelResponse("- b/login.ts — the second one"), "investigate login");
+
+  const result = await scout(ctx);
+  assert.equal(result.outcome, "success");
+  const detail = result.detail as { findings: ScoutFinding[]; structure: { path: string }[] };
+  // Both files were scanned (sanity), and the disambiguating ref picked the b/ variant.
+  const paths = detail.structure.map((s) => s.path).sort();
+  assert.deepEqual(paths, ["src/a/login.ts", "src/b/login.ts"], "both duplicate-basename files scanned");
+  assert.equal(detail.findings[0]?.path, "src/b/login.ts", "disambiguating ref resolved to the b/ file, canonicalized");
 });
