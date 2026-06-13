@@ -543,7 +543,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   const execSink = deps.onExecOutput;
   const govExecForRoles: Pick<GovernedExec, "run"> | undefined =
     baseGovExec !== undefined && execSink !== undefined
-      ? { run: (req: ExecRequest) => baseGovExec.run({ ...req, onOutput: execSink }) }
+      ? { run: (req: ExecRequest) => baseGovExec.run({ ...req, onOutput: req.onOutput !== undefined ? (chunk: string, stream: "stdout" | "stderr") => { req.onOutput!(chunk, stream); execSink(chunk, stream); } : execSink }) }
       : baseGovExec;
   // Cooperative kill checkpoint (read-only). Lazy default so worker-model load never
   // eagerly constructs the kill-switch; the loop OBEYS a kill, it never publishes one.
