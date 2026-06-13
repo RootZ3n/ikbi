@@ -207,6 +207,7 @@ export const TOOLS: readonly ModelTool[] = [
         successCondition: { type: "string", description: "What 'done' means." },
         rootCause: { type: "string", description: "(bug fixes) What was wrong." },
         fixRationale: { type: "string", description: "(bug fixes) Why your change fixes it." },
+        noChangeRequired: { type: "boolean", description: "true ONLY if the goal was already satisfied and needed NO file edits (checks must still be green)." },
       },
       required: ["successCondition", "filesReadBack", "selfCheck", "satisfied"],
     },
@@ -253,6 +254,12 @@ export interface DoneClaim {
   readonly rootCause?: string;
   /** WHY the change fixes it — the builder's repair rationale. */
   readonly fixRationale?: string;
+  /**
+   * The goal was already satisfied and required NO file edits (e.g. "verify X exists" and X
+   * already exists). Set ONLY on the no-change done path — it lets a green, zero-write build
+   * finish instead of hitting max_iterations. The verifier still confirms the green state.
+   */
+  readonly noChangeRequired?: boolean;
 }
 
 /** Module-internal injection (mirrors VerifierDeps) — threaded by the orchestrator's
@@ -1017,10 +1024,17 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
           feedback: `Do this next: fix the failing check(s) — ${failed.join(", ") || "checks did not run"} — then call run_checks until all pass, then call done.`,
         };
       }
-      // HARD GATE: you cannot declare done without writing anything.
-      if (filesWritten.length === 0) {
+      // HARD GATE: you cannot declare done without writing anything — UNLESS the goal was
+      // trivially satisfied with NO edits and the model EXPLICITLY declares it. The no-change path
+      // is accepted only when (a) the model set noChangeRequired:true AND (b) checks are already
+      // green (every gate above held, including the green/non-stale run_checks). The DEFAULT (no
+      // flag) still hard-fails a zero-write done, so a model that simply forgot to write is not let
+      // through. This lets a trivial goal ("verify X exists" and X already does) finish instead of
+      // grinding to max_iterations.
+      const noChangeRequired = args.noChangeRequired === true;
+      if (filesWritten.length === 0 && !noChangeRequired) {
         rejectedToolCalls.push({ tool: "done", error: "no files written" });
-        return { accept: false, feedback: "You have not written any files yet. Use write_file or patch to make the change described in the goal, then run_checks, then call done." };
+        return { accept: false, feedback: "You have not written any files yet. Use write_file or patch to make the change described in the goal, then run_checks, then call done. (If the goal genuinely needs NO change and checks are green, call done with noChangeRequired:true.)" };
       }
       return {
         accept: true,
@@ -1033,6 +1047,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
           checksPassed: true,
           ...(typeof args.rootCause === "string" && args.rootCause.trim().length > 0 ? { rootCause: args.rootCause.trim() } : {}),
           ...(typeof args.fixRationale === "string" && args.fixRationale.trim().length > 0 ? { fixRationale: args.fixRationale.trim() } : {}),
+          ...(filesWritten.length === 0 && noChangeRequired ? { noChangeRequired: true } : {}),
         },
       };
     };
@@ -1359,17 +1374,22 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
     // ITSELF failed mid-response. A green tree from a PRIOR round does not redeem a filtered/errored
     // response: that work may be half-applied or the final intent unexpressed. Those keep the
     // failure/partial classification from classifyOutcome even when checks were green.
+    // RECONCILE filesWritten: it is APPEND-ONLY (push at write_file / patch / delegate), so a
+    // write-then-revert or re-writing the same path leaves DUPLICATE entries (["A","A"]). Collapse
+    // to DISTINCT paths before gating + reporting, so the count reflects files actually touched —
+    // not raw write events — and the auto-accept gate cannot be fooled by inflated duplicates.
+    const distinctFilesWritten = [...new Set(filesWritten)];
     const PROTOCOL_TERMINATIONS: ReadonlySet<string> = new Set(["max_iterations", "timeout", "stuck_detected", "no_progress"]);
     if (
       doneClaim === undefined &&
       PROTOCOL_TERMINATIONS.has(stopReason) &&
       lastChecks?.allPass === true &&
       !checksStale &&
-      filesWritten.length > 0
+      distinctFilesWritten.length > 0
     ) {
       doneClaim = {
         successCondition,
-        filesReadBack: [...new Set(filesWritten)],
+        filesReadBack: distinctFilesWritten,
         selfCheck: "auto: checks green at termination",
         satisfied: true,
         checksPassed: true,
@@ -1382,7 +1402,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
     const outcome = classifyOutcome(stopReason);
     let summary =
       `builder ${outcome} after ${toolRounds} tool round(s) (stop: ${stopReason}); ` +
-      `wrote ${filesWritten.length}, read ${filesRead.length}, ${policyViolations.length} policy violation(s), ${toolFormatErrors.length} format error(s)` +
+      `wrote ${distinctFilesWritten.length}, read ${filesRead.length}, ${policyViolations.length} policy violation(s), ${toolFormatErrors.length} format error(s)` +
       (bareStops > 0 ? `, ${bareStops} bare-stop(s) corrected` : "");
     // ISSUE 3: fold the repair narrative into the role summary so the receipt trail records the
     // suspected root cause + fix rationale (the CLI also surfaces it in the final report).
@@ -1393,7 +1413,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       outcome,
       summary,
       detail: {
-        filesWritten,
+        filesWritten: distinctFilesWritten,
         filesRead,
         toolRounds,
         bareStops,

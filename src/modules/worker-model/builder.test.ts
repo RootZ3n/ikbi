@@ -898,3 +898,60 @@ test("AUTO-ACCEPT does NOT fire on a MODEL-FAILURE finish (content_filter) even 
   assert.equal(detail.doneClaim, undefined, "no synthesized done over a model-failure finish");
   assert.equal(detail.lastChecks?.allPass, true, "the checks really were green — auto-accept was withheld on the failure KIND, not on a red tree");
 });
+
+// ── M3: noChangeRequired done path + filesWritten reconciliation (dedup) ──────
+
+test("M3: a trivially-satisfied goal finishes via done(noChangeRequired:true) with ZERO writes when checks are green", async () => {
+  const dir = tmp();
+  // The goal needed no edits (e.g. "verify X exists" and X already does). The model runs green
+  // checks and declares done with noChangeRequired:true and no writes — accepted, not hard-gated.
+  const { engine } = mockEngine([
+    runChecksResp(),
+    toolResp([call("done", {
+      successCondition: "X already exists",
+      filesReadBack: ["existing.ts"],
+      selfCheck: "read existing.ts; the goal is already satisfied — no change required",
+      satisfied: true,
+      noChangeRequired: true,
+    })]),
+  ]);
+  const result = await run(makeCtx(dir, "verified", engine), greenExec());
+
+  assert.equal(result.outcome, "success", "a green, no-change-required build succeeds instead of grinding to max_iterations");
+  const detail = result.detail as { stopReason: string; filesWritten: string[]; doneClaim?: { noChangeRequired?: boolean } };
+  assert.equal(detail.stopReason, "done");
+  assert.deepEqual(detail.filesWritten, [], "no files were written");
+  assert.equal(detail.doneClaim?.noChangeRequired, true, "the claim records the no-change path");
+});
+
+test("M3: a ZERO-write done WITHOUT noChangeRequired is still hard-gated (default behavior unchanged)", async () => {
+  const dir = tmp();
+  // No flag → the HARD GATE still rejects a zero-write done, so the loop never finishes cleanly.
+  const { engine } = mockEngine([
+    runChecksResp(),
+    doneResp(["existing.ts"]), // satisfied:true but no writes and no noChangeRequired flag
+  ]);
+  const result = await run(makeCtx(dir, "verified", engine), greenExec());
+
+  assert.equal(result.outcome, "failure", "a zero-write done without the explicit flag is not accepted");
+  const detail = result.detail as { stopReason: string };
+  assert.notEqual(detail.stopReason, "done", "the gated done never synthesizes a success");
+});
+
+test("M3: filesWritten is reconciled (deduped) — re-writing the same path reports ONE entry, not duplicates", async () => {
+  const dir = tmp();
+  // Write the SAME new path twice (append-only filesWritten would hold ["a.ts","a.ts"]). The
+  // reported detail + the summary count must reflect DISTINCT files touched.
+  const { engine } = mockEngine([
+    writeResp("a.ts", "export const a = 1;\n", "w1"),
+    writeResp("a.ts", "export const a = 2;\n", "w2"),
+    runChecksResp(), // post-dates the writes → not stale
+    doneResp(["a.ts"]),
+  ]);
+  const result = await run(makeCtx(dir, "verified", engine), greenExec());
+
+  assert.equal(result.outcome, "success");
+  const detail = result.detail as { filesWritten: string[] };
+  assert.deepEqual(detail.filesWritten, ["a.ts"], "duplicate write events collapse to one distinct file");
+  assert.match(result.summary ?? "", /wrote 1\b/, "the summary count reflects distinct files, not raw write events");
+});
