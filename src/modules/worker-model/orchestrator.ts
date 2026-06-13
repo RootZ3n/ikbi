@@ -1059,6 +1059,49 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             : await runRoleFn(role, roleFn, ctx, verifierTimeout);
         results.push(result);
 
+        // ── AUTO-VERIFY RESCUE: builder wrote files but NEVER ran checks ──────────
+        // The builder can write CORRECT code yet hit a PROTOCOL termination
+        // (max_iterations / timeout / stuck_detected / no_progress) before it ever calls
+        // run_checks. With ZERO checks run, the builder's OWN green-checks auto-accept
+        // (builder.ts) cannot fire — `lastChecks` is undefined — so correct work sitting on
+        // disk is discarded as a failure and never promotes. RESCUE it: run the verifier
+        // against the workspace and, if it PASSES, reclassify the builder as success.
+        // SCOPED to PROTOCOL terminations only (mirrors the builder's own auto-accept scope):
+        // MODEL-FAILURE stops (error / length / content_filter / unknown) are NOT rescued —
+        // there the model itself failed mid-response, so a passing tree may be half-applied or
+        // the final intent unexpressed. Safe: the verifier runs the real shared checks, so
+        // nothing unverified is promoted, and the main verifier role still runs downstream for
+        // the authoritative verdict. Reclassifying here (before the completed event + recordRole
+        // below) makes the receipt trail + trust outcome reflect the rescued success.
+        if (role === "builder" && result.outcome === "failure") {
+          const bd = (result.detail ?? {}) as Record<string, unknown>;
+          const builderStop = typeof bd.stopReason === "string" ? bd.stopReason : "";
+          const builderFilesWritten = Array.isArray(bd.filesWritten) ? bd.filesWritten.length : 0;
+          const builderChecksRuns = typeof bd.checksRuns === "number" ? bd.checksRuns : 0;
+          const RESCUABLE_TERMINATIONS: ReadonlySet<string> = new Set(["max_iterations", "timeout", "stuck_detected", "no_progress"]);
+          if (RESCUABLE_TERMINATIONS.has(builderStop) && builderFilesWritten > 0 && builderChecksRuns === 0) {
+            const rescueCtx: RoleContext = {
+              task,
+              role: "verifier",
+              identity: spawned.identity,
+              autonomy: spawned.autonomy,
+              workspace,
+              priorResults: [...results],
+              engine: runEngine,
+            };
+            const rescueVerify = await runRoleFn("verifier", verifierFor(parentCtx), rescueCtx, Math.max(roleTimeoutMs, resolveCheckTimeoutMs(modeEnv)));
+            if (rescueVerify.outcome === "success") {
+              result = {
+                ...result,
+                outcome: "success",
+                summary: `${result.summary}; auto-verify rescue: verifier GREEN on written files (no run_checks before ${builderStop})`,
+                detail: { ...bd, autoVerifyRescue: true },
+              };
+              results[results.length - 1] = result;
+            }
+          }
+        }
+
         events.publish(
           workerRoleCompleted.create(
             { taskId: task.taskId, role, outcome: result.outcome },

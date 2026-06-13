@@ -457,6 +457,119 @@ test("R1: PENALIZE_TIMEOUTS policy penalizes BOTH timeout and a clean max_iterat
   }
 });
 
+// ── AUTO-VERIFY RESCUE: builder wrote correct files but hit a protocol stop before run_checks ──
+// The DeepSeek builder consistently writes correct code yet hits no_progress (or timeout /
+// max_iterations / stuck_detected) before ever calling run_checks. With zero checks run the
+// builder's own green-checks auto-accept can't fire, so correct work was discarded as a failure.
+// The orchestrator rescues it: run the verifier; if green, reclassify the builder as success.
+
+/** A builder that wrote files but terminated for `stop` without ever running checks. */
+function builderNoChecks(stop: string, files: readonly string[] = ["a.ts"], checksRuns = 0): RoleFn {
+  return async () => ({ role: "builder", outcome: "failure", summary: stop, detail: { stopReason: stop, filesWritten: [...files], checksRuns, rejectedToolCalls: [] } });
+}
+
+test("AUTO-VERIFY RESCUE: a protocol-terminated builder with written files + no checks is rescued by a green verifier (promotes)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const cap = capturingRoles();
+  let verifierRuns = 0;
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    builder: builderNoChecks("no_progress"),
+    verifier: async (ctx) => { verifierRuns += 1; return cap.roles.verifier!(ctx); },
+  };
+  const ws = fakeWorkspaces(true);
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces }));
+  const result = await orch.run(task, parentCtx);
+
+  const builder = result.roles.find((r) => r.role === "builder");
+  assert.equal(builder?.outcome, "success", "the builder was reclassified to success");
+  assert.equal((builder?.detail as Record<string, unknown> | undefined)?.autoVerifyRescue, true, "rescue is stamped on the builder detail");
+  assert.match(builder?.summary ?? "", /auto-verify rescue/, "summary records the rescue");
+  assert.ok(verifierRuns >= 1, "the verifier was run to rescue the build");
+  assert.equal(result.promoted, true, "the correct work promotes instead of being discarded");
+  assert.equal(ws.calls.discard, 0, "not discarded");
+});
+
+test("AUTO-VERIFY RESCUE: applies to every protocol termination (timeout / max_iterations / stuck_detected / no_progress)", async () => {
+  for (const stop of ["timeout", "max_iterations", "stuck_detected", "no_progress"] as const) {
+    const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+    const cap = capturingRoles();
+    const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: { ...cap.roles, builder: builderNoChecks(stop) } }));
+    const result = await orch.run(task, parentCtx);
+    assert.equal(result.roles.find((r) => r.role === "builder")?.outcome, "success", `${stop} is rescued`);
+    assert.equal(result.promoted, true, `${stop} promotes`);
+  }
+});
+
+test("AUTO-VERIFY RESCUE: a MODEL-failure stop (error/length/content_filter) is NOT rescued even if the verifier would pass", async () => {
+  for (const stop of ["error", "length", "content_filter", "unknown"] as const) {
+    const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+    const cap = capturingRoles();
+    let verifierRuns = 0;
+    const roles: Partial<Record<WorkerRole, RoleFn>> = {
+      ...cap.roles,
+      builder: builderNoChecks(stop),
+      verifier: async (ctx) => { verifierRuns += 1; return cap.roles.verifier!(ctx); },
+    };
+    const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles }));
+    const result = await orch.run(task, parentCtx);
+    assert.equal(result.roles.find((r) => r.role === "builder")?.outcome, "failure", `${stop} stays a failure`);
+    assert.equal(verifierRuns, 0, `${stop} never runs the rescue verifier (builder failure short-circuits)`);
+    assert.equal(result.promoted, false, `${stop} does not promote`);
+  }
+});
+
+test("AUTO-VERIFY RESCUE: a RED rescue verifier keeps the original builder failure", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const cap = capturingRoles();
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    builder: builderNoChecks("no_progress"),
+    verifier: async () => ({ role: "verifier", outcome: "failure", summary: "checks red", detail: { verdict: "fail", checks: [{ name: "test", exitCode: 1 }] } }),
+  };
+  const ws = fakeWorkspaces(true);
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces }));
+  const result = await orch.run(task, parentCtx);
+
+  const builder = result.roles.find((r) => r.role === "builder");
+  assert.equal(builder?.outcome, "failure", "a red verifier does not rescue the build");
+  assert.equal((builder?.detail as Record<string, unknown> | undefined)?.autoVerifyRescue, undefined, "no rescue stamp");
+  assert.equal(result.promoted, false, "nothing unverified promotes");
+});
+
+test("AUTO-VERIFY RESCUE: NOT triggered when checks already ran, or when no files were written", async () => {
+  // checks ran (red): the builder's own auto-accept path owns this; rescue must not fire.
+  {
+    const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+    const cap = capturingRoles();
+    let verifierRuns = 0;
+    const roles: Partial<Record<WorkerRole, RoleFn>> = {
+      ...cap.roles,
+      builder: builderNoChecks("no_progress", ["a.ts"], 2),
+      verifier: async (ctx) => { verifierRuns += 1; return cap.roles.verifier!(ctx); },
+    };
+    const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles }));
+    const result = await orch.run(task, parentCtx);
+    assert.equal(result.roles.find((r) => r.role === "builder")?.outcome, "failure", "checks-ran build is not rescued");
+    assert.equal(verifierRuns, 0, "no rescue verifier when checks already ran");
+  }
+  // no files written: nothing on disk to verify, so no rescue.
+  {
+    const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+    const cap = capturingRoles();
+    let verifierRuns = 0;
+    const roles: Partial<Record<WorkerRole, RoleFn>> = {
+      ...cap.roles,
+      builder: builderNoChecks("no_progress", []),
+      verifier: async (ctx) => { verifierRuns += 1; return cap.roles.verifier!(ctx); },
+    };
+    const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles }));
+    const result = await orch.run(task, parentCtx);
+    assert.equal(result.roles.find((r) => r.role === "builder")?.outcome, "failure", "empty-tree build is not rescued");
+    assert.equal(verifierRuns, 0, "no rescue verifier when no files were written");
+  }
+});
+
 // ── R2: blocked-promotion message must match the ACTUAL workspace disposition ─────
 test("R2: blocked-promotion message says RETAINED when the workspace is actually retained", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("verified", "verified");
