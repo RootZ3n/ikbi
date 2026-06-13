@@ -641,6 +641,51 @@ test("ISSUE-3 legacy: a REAL test script ('node --test') passes the stub guard",
   }
 });
 
+// ── M6: the stub guard scans subpackages + test-lifecycle hooks, not just root "test" ──
+
+test("M6: a SUBPACKAGE stub test script fails closed even when the root test is real", async () => {
+  const dir = _mkdtempSync(_join(_tmpdir(), "ikbi-stub-sub-"));
+  try {
+    _writeFileSync(_join(dir, "package.json"), JSON.stringify({ name: "root", scripts: { test: "pnpm -r test" } }));
+    _mkdirSync(_join(dir, "packages", "a"), { recursive: true });
+    _writeFileSync(_join(dir, "packages", "a", "package.json"), JSON.stringify({ name: "a", scripts: { test: "echo ok" } }));
+    const exec = execStub(() => ({ executed: true, exitCode: 0, stdoutTail: "ok" }));
+    const result = await createVerifier({ governedExec: exec.governedExec, parentCtx: makeParentCtx(), diff: cleanDiff })(ctxAt(dir));
+    assert.equal(result.outcome, "failure", "a stub test in a subpackage is a vacuous green the root-only guard missed");
+    assert.match(result.summary ?? "", /stub test script/);
+    assert.match(result.summary ?? "", /packages\/a\/package\.json/, "the offending subpackage is named");
+  } finally {
+    _rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("M6: a lifecycle-hook no-op ('pretest':'exit 0') fails closed even when 'test' is real", async () => {
+  const dir = _mkdtempSync(_join(_tmpdir(), "ikbi-stub-hook-"));
+  try {
+    _writeFileSync(_join(dir, "package.json"), JSON.stringify({ name: "x", scripts: { pretest: "exit 0", test: "node --test" } }));
+    const exec = execStub(() => ({ executed: true, exitCode: 0, stdoutTail: "ok" }));
+    const result = await createVerifier({ governedExec: exec.governedExec, parentCtx: makeParentCtx(), diff: cleanDiff })(ctxAt(dir));
+    assert.equal(result.outcome, "failure", "a no-op planted on the test lifecycle is not meaningful verification");
+    assert.match(result.summary ?? "", /stub pretest script/);
+  } finally {
+    _rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("M6: a real monorepo (root + subpackage both real) is NOT falsely flagged", async () => {
+  const dir = _mkdtempSync(_join(_tmpdir(), "ikbi-real-mono-"));
+  try {
+    _writeFileSync(_join(dir, "package.json"), JSON.stringify({ name: "root", scripts: { test: "pnpm -r test" } }));
+    _mkdirSync(_join(dir, "packages", "a"), { recursive: true });
+    _writeFileSync(_join(dir, "packages", "a", "package.json"), JSON.stringify({ name: "a", scripts: { test: "vitest run" } }));
+    const exec = execStub(() => ({ executed: true, exitCode: 0, stdoutTail: "ok" }));
+    const result = await createVerifier({ governedExec: exec.governedExec, parentCtx: makeParentCtx(), diff: cleanDiff })(ctxAt(dir));
+    assert.equal(result.outcome, "success", "real test scripts in every package are not flagged");
+  } finally {
+    _rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // ── ISSUE 4: the quality-gate wiring inside the verifier (checks pass → quality runs) ─
 
 /** A verifier ctx at `dir` whose prior builder result declares the given written files. */

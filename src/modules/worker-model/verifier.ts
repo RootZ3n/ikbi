@@ -43,8 +43,8 @@
  * Commands run with `cwd: ctx.workspace.path`.
  */
 
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readdirSync, readFileSync, type Dirent } from "node:fs";
+import { join, relative } from "node:path";
 
 import type { OperationContext } from "../../core/identity/index.js";
 import type { WorkspaceHandle } from "../../core/workspace/contract.js";
@@ -174,26 +174,68 @@ function runQualityCheckFromPrior(
 }
 
 /**
- * LEGACY-MODE STUB GUARD: read the workspace package.json's "test" script and report a reason
- * when it is a no-op stub (`echo …`, `true`, `:`, `exit 0`, a `--passWithNoTests` flag). The ladder
- * catches this via the planner's isStubScript; legacy mode runs a fixed `pnpm test` and would let a
- * greenfield `"test":"echo ok"` pass with exit 0. Returns undefined when there is no package.json,
- * no "test" script, or the script is real (not a stub) — only an actual stub fails closed.
+ * The test-lifecycle script keys a stub can neuter. `pnpm test` runs `pretest` → `test` → `posttest`,
+ * so a no-op in ANY of them is a forged-green vector: a stub `test` exits 0 without verifying, and a
+ * `"pretest":"exit 0"`/`"posttest":"true"` is an explicit no-op planted on the same lifecycle.
+ */
+const STUB_GUARDED_SCRIPT_KEYS: readonly string[] = ["test", "pretest", "posttest"];
+
+/** Directory names never worth walking when scanning a workspace for package.json files. */
+const STUB_SCAN_SKIP_DIRS = new Set(["node_modules", ".git", "dist", "build", "coverage", ".next", "out"]);
+
+/**
+ * Collect every package.json under `root` (bounded depth), skipping dependency/build/VCS dirs. A
+ * monorepo's root `pnpm -r test` delegates to each subpackage, so a stub test in a SUBPACKAGE
+ * passes vacuously the same way a root stub does — the guard must see them all, not just the root.
+ */
+function findWorkspacePackageJsons(root: string, maxDepth = 6): string[] {
+  const found: string[] = [];
+  const walk = (dir: string, depth: number): void => {
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return; // unreadable / nonexistent dir — nothing to scan
+    }
+    for (const e of entries) {
+      if (e.isFile() && e.name === "package.json") found.push(join(dir, e.name));
+      else if (e.isDirectory() && depth < maxDepth && !STUB_SCAN_SKIP_DIRS.has(e.name) && !e.name.startsWith(".")) {
+        walk(join(dir, e.name), depth + 1);
+      }
+    }
+  };
+  walk(root, 0);
+  return found;
+}
+
+/**
+ * LEGACY-MODE STUB GUARD: scan EVERY package.json in the workspace (root + subpackages) and report a
+ * reason when a test-lifecycle script — `test`, `pretest`, or `posttest` — is a no-op stub (`echo …`,
+ * `true`, `:`, `exit 0`, a `--passWithNoTests` flag). The ladder catches this via the planner's
+ * isStubScript; legacy mode runs a fixed `pnpm test` and would let a greenfield `"test":"echo ok"`,
+ * a subpackage `"test":"true"`, or a `"pretest":"exit 0"` neutering the real test pass with exit 0.
+ * Returns undefined when no package.json declares a stubbed test-lifecycle script (only an actual
+ * stub fails closed).
  */
 function detectStubTestScript(workspacePath: string): string | undefined {
-  const pkgPath = join(workspacePath, "package.json");
-  if (!existsSync(pkgPath)) return undefined;
-  let pkg: unknown;
-  try {
-    pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
-  } catch {
-    return undefined; // unparseable package.json is not a stub signal (checks already ran)
-  }
-  const scripts = (pkg as { scripts?: unknown })?.scripts;
-  const testScript = (scripts as Record<string, unknown> | undefined)?.test;
-  if (typeof testScript !== "string" || testScript.length === 0) return undefined;
-  if (isStubScript(testScript)) {
-    return `stub test script ("${testScript}") is not meaningful verification — refusing a vacuous green`;
+  for (const pkgPath of findWorkspacePackageJsons(workspacePath)) {
+    let pkg: unknown;
+    try {
+      pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
+    } catch {
+      continue; // unparseable package.json is not a stub signal (checks already ran)
+    }
+    const scripts = (pkg as { scripts?: unknown })?.scripts;
+    if (scripts === null || typeof scripts !== "object") continue;
+    const s = scripts as Record<string, unknown>;
+    for (const key of STUB_GUARDED_SCRIPT_KEYS) {
+      const script = s[key];
+      if (typeof script !== "string" || script.length === 0) continue;
+      if (isStubScript(script)) {
+        const where = relative(workspacePath, pkgPath) || "package.json";
+        return `stub ${key} script ("${script}") in ${where} is not meaningful verification — refusing a vacuous green`;
+      }
+    }
   }
   return undefined;
 }
