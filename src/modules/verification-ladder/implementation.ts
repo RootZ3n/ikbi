@@ -47,9 +47,23 @@ function stripShellComment(s: string): string {
   return s.replace(/(^|\s)#.*$/, "$1").trim();
 }
 
-/** A single command that ALWAYS succeeds (exit 0) and verifies nothing: echo/true/:/`exit 0`. */
+/**
+ * A single command that ALWAYS succeeds (exit 0) and verifies nothing. Beyond the shell builtins
+ * (`true`, `:`, `exit 0`, `echo …`) this also covers common non-builtin no-ops that masquerade as a
+ * test command: an EMPTY `node -e ''`/`node --eval ""` (evaluates nothing) and `cat /dev/null`
+ * (reads nothing). All exit 0 with zero verification, so a `"test"` built from only these is a stub.
+ */
 function isSuccessNoop(seg: string): boolean {
-  return /^exit\s+0$/.test(seg) || seg === "true" || seg === ":" || /^echo(\s|$)/.test(seg);
+  return (
+    /^exit\s+0$/.test(seg) ||
+    seg === "true" ||
+    seg === ":" ||
+    /^echo(\s|$)/.test(seg) ||
+    // `node -e ''` / `node --eval ""` with an EMPTY program (matched quotes, only whitespace inside).
+    /^node\s+(?:-e|--eval)\s+(['"])\s*\1$/.test(seg) ||
+    // `cat /dev/null` — a no-op read that produces nothing and exits 0.
+    /^cat\s+\/dev\/null$/.test(seg)
+  );
 }
 
 export function isStubScript(body: string): boolean {

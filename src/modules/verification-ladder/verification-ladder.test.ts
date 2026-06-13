@@ -216,6 +216,31 @@ test("Codex-2: a success-no-op left of `||` makes the real right-hand command un
   }
 });
 
+test("M7: non-builtin no-ops (node -e '' / cat /dev/null) and exit-0 short-circuits are stubs", () => {
+  // Each of these exits 0 while verifying NOTHING — they must be detected as stubs.
+  const stubs = [
+    "node -e ''",            // empty eval
+    'node -e ""',            // empty eval (double-quoted)
+    "node --eval ''",        // empty eval (long flag)
+    "cat /dev/null",         // no-op read
+    "true || vitest",        // short-circuit: the real command is unreachable
+    "echo running && exit 0", // explicit exit 0 after an echo
+  ];
+  for (const body of stubs) {
+    assert.equal(isStubScript(body), true, `stub: "${body}"`);
+  }
+  // Real commands that merely LOOK similar must NOT be flagged.
+  const real = [
+    "node -e 'require(\"./run-tests\")'", // non-empty eval actually runs something
+    "node test.js",                        // runs a real script file
+    "cat fixtures/expected.txt",           // reads a real file (not /dev/null)
+    "false || vitest run",                 // the real command DOES run
+  ];
+  for (const body of real) {
+    assert.equal(isStubScript(body), false, `real: "${body}"`);
+  }
+});
+
 // ── C1: ladder emits the `run`-less shorthand for pnpm/yarn so governed-exec (which bans
 //        `<mgr> run <script>`) lets a real typecheck/build pass instead of denying it → RED ──────
 test("C1: non-test scripts use shorthand for pnpm/yarn, `run` only for npm", () => {
