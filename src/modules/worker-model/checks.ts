@@ -298,14 +298,35 @@ export function tail(s: string, max: number): string {
 }
 
 /**
- * Parse the node:test summary ("# tests N" / "# pass N") into a count, when present. Shared by the
+ * Parse a test-runner summary into a { passed, total } count, when present. Shared by the
  * check-capture layer (mapExec, on the FULL output) and the verdict layer (readVerifier) so both
- * read the tally the same way. Returns undefined when the markers are absent.
+ * read the tally the same way. Returns undefined when no recognizable summary is found.
+ *
+ * Recognizes the common runners — node:test, vitest, and jest — plus a generic
+ * "N passing/passed ... M total/tests" shape. The node:test marker is tried first (it is ikbi's own
+ * runner and the most precise); the others are fallbacks so repos under test with vitest/jest are not
+ * stuck "unverified" (which would fail the C1 gate even when tests really ran and passed).
  */
 export function parseTestCount(output: string): { passed: number; total: number } | undefined {
-  const tests = /# tests (\d+)/.exec(output);
-  const pass = /# pass (\d+)/.exec(output);
-  if (tests !== null && pass !== null) return { passed: Number(pass[1]), total: Number(tests[1]) };
+  // node:test: "# tests N" / "# pass N" (the two markers can be far apart in the stream).
+  const nodeTests = /# tests (\d+)/.exec(output);
+  const nodePass = /# pass (\d+)/.exec(output);
+  if (nodeTests !== null && nodePass !== null) {
+    return { passed: Number(nodePass[1]), total: Number(nodeTests[1]) };
+  }
+
+  // vitest: "Tests  3 passed (3)" — passed count then total in parens.
+  const vitest = /Tests\s+(\d+)\s+passed\s+\((\d+)\)/.exec(output);
+  if (vitest !== null) return { passed: Number(vitest[1]), total: Number(vitest[2]) };
+
+  // jest: "Tests:       3 passed, 3 total".
+  const jest = /Tests:\s+(\d+)\s+passed.*?(\d+)\s+total/.exec(output);
+  if (jest !== null) return { passed: Number(jest[1]), total: Number(jest[2]) };
+
+  // Generic "N passing/passed ... M total/tests" (mocha-style and friends).
+  const generic = /(\d+)\s+(?:passing|passed)[\s\S]*?(\d+)\s+(?:total|tests)/.exec(output);
+  if (generic !== null) return { passed: Number(generic[1]), total: Number(generic[2]) };
+
   return undefined;
 }
 
