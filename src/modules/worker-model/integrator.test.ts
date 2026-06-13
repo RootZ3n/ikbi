@@ -114,6 +114,49 @@ test("FAIL-CLOSED: a NON-ARRAY rejectedToolCalls → discard", async () => {
   assert.match(rationaleOf(r), /cannot confirm clean/);
 });
 
+test("PRODUCTION FIELD: empty policyViolations (the builder's filtered set) → promote, even with benign format errors in rejectedToolCalls", async () => {
+  // The real builder emits BOTH fields: policyViolations (true boundary violations) and
+  // rejectedToolCalls (raw, incl. tool-format errors). The integrator PREFERS policyViolations,
+  // so a malformed-JSON tool arg the model recovered from must NOT block an otherwise-green build.
+  const builderProd: RoleResult = {
+    role: "builder", outcome: "success", summary: "b",
+    detail: { filesWritten: ["a.ts"], policyViolations: [], rejectedToolCalls: [{ tool: "write_file", error: "malformed tool arguments (not JSON)" }] },
+  };
+  const r = await integrator(ctxWith([builderProd, criticPass, verifierPass]));
+  assert.equal(decisionOf(r), "promote");
+  assert.match(rationaleOf(r), /no policy violations/);
+});
+
+test("PRODUCTION FIELD: non-empty policyViolations forces discard even when rejectedToolCalls is empty", async () => {
+  // The filtered field is the authority: a true boundary violation blocks promote regardless of
+  // the raw field. (The reverse fallback — only rejectedToolCalls present — is covered above.)
+  const builderProd: RoleResult = {
+    role: "builder", outcome: "success", summary: "b",
+    detail: { filesWritten: ["a.ts"], policyViolations: [{ tool: "write_file", error: "escape" }], rejectedToolCalls: [] },
+  };
+  const r = await integrator(ctxWith([builderProd, criticPass, verifierPass]));
+  assert.equal(decisionOf(r), "discard");
+  assert.match(rationaleOf(r), /attempted 1 out-of-policy tool call/);
+});
+
+test("MULTI-GATE: critic AND verifier both reject → rationale names BOTH failing gates", async () => {
+  const criticFail: RoleResult = { role: "critic", outcome: "success", summary: "c", detail: { pass: false } };
+  const verifierFail: RoleResult = { role: "verifier", outcome: "success", summary: "v", detail: { verdict: "fail", checks: [] } };
+  const r = await integrator(ctxWith([builderOk, criticFail, verifierFail]));
+  assert.equal(decisionOf(r), "discard");
+  assert.match(rationaleOf(r), /critic pass=false/);
+  assert.match(rationaleOf(r), /verifier verdict=fail/);
+});
+
+test("MULTI-GATE: absent builder does NOT add a redundant policy reason (chain collapses to one builder reason)", async () => {
+  // No builder → the empty detail bag would make policyViolations undefined; the rationale must
+  // report the builder absence ALONE, not also "cannot confirm clean".
+  const r = await integrator(ctxWith([criticPass, verifierPass]));
+  assert.equal(decisionOf(r), "discard");
+  assert.match(rationaleOf(r), /no builder result/);
+  assert.doesNotMatch(rationaleOf(r), /cannot confirm clean/);
+});
+
 test("the integrator is deterministic — it never calls invokeModel", async () => {
   let invoked = false;
   await integrator(ctxWith([builderOk, criticPass, verifierPass], () => (invoked = true)));
