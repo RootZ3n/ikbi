@@ -927,7 +927,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       for (const role of WORKER_ROLES) {
         // STEP-PLANNER: skip verifier on intermediate steps (no tests exist yet).
         if (role === "verifier" && task.skipVerifier === true) {
-          results.push({ role: "verifier", outcome: "success", summary: "skipped (skipVerifier)" });
+          // CODEX FIX: mark the skipped verifier with verdict "skipped" — NOT a bare success that
+          // the critic (which runs after the verifier and reads its verdict) would read as a fake
+          // "pass". `verdict: "skipped"` makes formatVerifierContext surface "verdict: skipped"
+          // instead of inferring a pass from the outcome, and the integrator's AND-gate (verdict ===
+          // "pass") still correctly withholds promotion — same as the old bare result did.
+          results.push({ role: "verifier", outcome: "success", summary: "skipped (skipVerifier)", detail: { verdict: "skipped", skipped: true } });
           continue;
         }
         const spawned = spawnRole(role, parentCtx);

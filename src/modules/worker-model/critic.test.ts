@@ -239,6 +239,27 @@ test("Issue 2: with NO verifier in priorResults the request shape is unchanged (
   assert.equal(untrustedContents.length, 5, "exactly the five original untrusted blocks");
 });
 
+test("CODEX Issue 2: a SKIPPED verifier is surfaced as 'skipped', never a fake 'verdict: pass'", async () => {
+  // skipVerifier injects a verifier result the critic still reads. It must NOT read as a pass —
+  // the verifier never ran, so claiming green would mislead the critic into trusting checks it
+  // doesn't have. The orchestrator marks the skip with verdict "skipped".
+  const skippedVerifier: RoleResult = {
+    role: "verifier",
+    outcome: "success",
+    summary: "skipped (skipVerifier)",
+    detail: { verdict: "skipped", skipped: true },
+  };
+  const { ctx, calls, role } = makeCtx([builderResult, skippedVerifier], async () => modelResponse(passJson()));
+  const result = await role(ctx);
+  assert.equal(result.outcome, "success");
+
+  const msgs = calls[0]?.messages ?? [];
+  const verifierMsg = msgs.find((m) => m.untrusted === true && String(m.content).includes("Verifier results"));
+  assert.ok(verifierMsg, "a verifier context block is still present (the skip is reported, not hidden)");
+  assert.match(String(verifierMsg?.content), /verdict: skipped/, "the block says the verifier was SKIPPED");
+  assert.doesNotMatch(String(verifierMsg?.content), /verdict: pass/, "it is NOT a fake pass — the verifier never ran");
+});
+
 test("an infrastructure (model) failure → outcome:failure", async () => {
   const { ctx, role } = makeCtx([builderResult], async () => {
     throw new Error("provider down");

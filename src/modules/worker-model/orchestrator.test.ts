@@ -1110,6 +1110,26 @@ test("skipVerifier: verifier role is skipped, other roles still run", async () =
   assert.equal(ws.calls.promote, 0, "skipPromote prevents promote");
 });
 
+test("CODEX Issue 2: skipVerifier does NOT feed the critic a fake verifier pass", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  let criticPrior: readonly RoleResult[] | undefined;
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    scout: async () => ({ role: "scout", outcome: "success", summary: "s" }),
+    builder: async () => ({ role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["a.ts"] } }),
+    critic: async (ctx) => { criticPrior = ctx.priorResults; return { role: "critic", outcome: "success", summary: "c", detail: { pass: true } }; },
+    integrator: async () => ({ role: "integrator", outcome: "success", summary: "i", detail: { decision: "discard", evaluation: { approved: false } } }),
+  };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces }));
+  await orch.run({ ...task, skipVerifier: true, skipPromote: true }, parentCtx);
+
+  const verifierSeen = criticPrior?.find((r) => r.role === "verifier");
+  assert.ok(verifierSeen !== undefined, "the critic still sees a verifier slot (the skip is reported)");
+  const detail = (verifierSeen?.detail ?? {}) as Record<string, unknown>;
+  assert.equal(detail.verdict, "skipped", "the skipped verifier carries a 'skipped' verdict, not a fake pass");
+  assert.notEqual(detail.verdict, "pass", "the critic is NEVER told the verifier passed when it did not run");
+});
+
 // ── ISSUE 1: critic-driven fix loop (opt-in) ───────────────────────────────
 
 /** Roles where the critic FAILs first then PASSes; builder/verifier always succeed (stateful). */
