@@ -197,6 +197,27 @@ export interface WorkerResult {
    * paths that never invoke a model (e.g. a pre-allocation kill). Surfaced for cost visibility.
    */
   readonly costUsd?: number;
+  /**
+   * The escalation engine's recommendation for this run, surfaced so an operator can ACT on it
+   * (e.g. re-run on a higher tier). OBSERVE-ONLY: the orchestrator never swaps models or retries
+   * on this — it records the strongest recommendation seen across the scoring roles (a `recommended`
+   * one wins over a declined one; ties break on the higher score). Absent when escalation is disabled
+   * or no scoring role ran. Wiring this to an actual model swap is a separately-reviewed follow-up.
+   */
+  readonly escalation?: {
+    /** Whether the engine recommended escalating to a higher tier. */
+    readonly recommended: boolean;
+    /** The tier the run executed at (the cheap `worker` tier). */
+    readonly fromTier: string;
+    /** The tier the engine recommends escalating to (present when `recommended`). */
+    readonly targetTier?: string;
+    /** The computed escalation score total. */
+    readonly total: number;
+    /** Whether the recommended escalation would require human approval. */
+    readonly requiresApproval?: boolean;
+    /** Why escalation was recommended (target) or declined. */
+    readonly reason?: string;
+  };
 }
 
 /**

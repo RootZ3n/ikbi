@@ -222,6 +222,9 @@ function foldRoleSignals(
  * (`worker`) tier, so evaluation runs against that tier. This NEVER mutates the run:
  * no model swap, no retry, no change to promote/discard. Best-effort — it must never
  * throw into the dispatch loop, so the whole body is guarded.
+ *
+ * Returns the decision summary for THIS evaluation (so the run can surface the strongest
+ * recommendation on its result for operators), or `undefined` when no evaluation ran.
  */
 function observeEscalation(
   events: EventBusSurface,
@@ -231,12 +234,12 @@ function observeEscalation(
   acc: MutableEscalationSignals,
   handoff: EscalationHandoffFields,
   identity: AgentIdentity,
-): void {
+): WorkerResult["escalation"] | undefined {
   try {
     foldRoleSignals(role, result, acc, handoff);
-    if (!escalationConfig.enabled) return;
+    if (!escalationConfig.enabled) return undefined;
     // Only the roles that carry escalation-relevant signal trigger an evaluation.
-    if (role !== "builder" && role !== "critic" && role !== "verifier") return;
+    if (role !== "builder" && role !== "critic" && role !== "verifier") return undefined;
 
     const signals: EscalationSignals = { ...acc };
     const decision = escalationEngine.evaluate({
@@ -279,8 +282,22 @@ function observeEscalation(
         ),
       );
     }
+    // Surface this evaluation on the run result (observe-only — the operator decides what to do).
+    return {
+      recommended: decision.escalate,
+      fromTier: decision.currentTier,
+      ...(decision.targetTier !== undefined ? { targetTier: decision.targetTier } : {}),
+      total: decision.score.total,
+      ...(decision.escalate ? { requiresApproval: decision.requiresApproval } : {}),
+      ...(decision.escalate
+        ? { reason: `escalation recommended → ${decision.targetTier ?? "higher tier"}` }
+        : decision.declineReason !== undefined
+          ? { reason: decision.declineReason }
+          : {}),
+    };
   } catch {
     // Escalation observability is ADVISORY — a fold/eval/publish failure never breaks the run.
+    return undefined;
   }
 }
 
@@ -927,6 +944,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // Run-level escalation accumulator (ADDITIVE observability; never alters dispatch).
     const escSignals: MutableEscalationSignals = { schemaFailures: 0, retryCount: 0, contextPressure: 0, criticRejected: false, verificationFailed: false, rejectedToolCalls: 0 };
     const escHandoff: EscalationHandoffFields = {};
+    // The STRONGEST escalation recommendation seen across the scoring roles, surfaced on the
+    // result (observe-only). A `recommended` recommendation wins over a declined one; ties break
+    // on the higher score. Operators read it to decide whether to re-run on a higher tier.
+    let escalationOutcome: WorkerResult["escalation"];
     let overall: WorkerResult["outcome"] = "success";
     let killedReason: string | undefined;
     // ISSUE 1: a critic FAIL feeds the critic's feedback back to the builder for ONE retry
@@ -1291,7 +1312,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 
         // ADDITIVE escalation observability — fold signals + emit escalation.* events.
         // Runs before the short-circuit so a failing role's signals are still scored.
-        observeEscalation(events, task, role, result, escSignals, escHandoff, parentIdentity);
+        const esc = observeEscalation(events, task, role, result, escSignals, escHandoff, parentIdentity);
+        if (esc !== undefined && (escalationOutcome === undefined || (esc.recommended && !escalationOutcome.recommended) || (esc.recommended === escalationOutcome.recommended && esc.total > escalationOutcome.total))) {
+          escalationOutcome = esc;
+        }
 
         if (result.outcome !== "success") {
           overall = result.outcome;
@@ -1510,6 +1534,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       verificationMode: ranVerificationMode,
       retrievalMode: ranRetrievalMode,
       costUsd: runCost(),
+      ...(escalationOutcome !== undefined ? { escalation: escalationOutcome } : {}),
     };
 
     if (overall === "success" || overall === "partial") {
