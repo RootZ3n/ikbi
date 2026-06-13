@@ -381,14 +381,26 @@ function errMsg(e: unknown): string {
 interface ScoutInfo {
   readonly findings: readonly ScoutFinding[];
   readonly brief?: string;
+  /** Scout's goal↔file alignment (status + summary) — surfaced so the builder knows whether the
+   *  goal-named files were actually found in the repo (misaligned/broad/aligned). */
+  readonly goalAlignment?: { readonly status: string; readonly summary: string };
 }
 
-/** Pull the scout's findings + brief from the prior-role results (open detail bag). */
-function extractScout(priorResults: readonly RoleResult[]): ScoutInfo {
+/** Pull the scout's findings + brief + goal alignment from the prior-role results (open detail bag). */
+export function extractScout(priorResults: readonly RoleResult[]): ScoutInfo {
   const scout = priorResults.find((r) => r.role === "scout");
-  const d = scout?.detail as { findings?: unknown; brief?: unknown } | undefined;
+  const d = scout?.detail as { findings?: unknown; brief?: unknown; goalAlignment?: unknown } | undefined;
   const findings = Array.isArray(d?.findings) ? (d.findings as ScoutFinding[]) : [];
-  return { findings, ...(typeof d?.brief === "string" ? { brief: d.brief } : {}) };
+  const ga = d?.goalAlignment as { status?: unknown; summary?: unknown } | undefined;
+  const goalAlignment =
+    ga !== undefined && typeof ga.status === "string" && typeof ga.summary === "string"
+      ? { status: ga.status, summary: ga.summary }
+      : undefined;
+  return {
+    findings,
+    ...(typeof d?.brief === "string" ? { brief: d.brief } : {}),
+    ...(goalAlignment !== undefined ? { goalAlignment } : {}),
+  };
 }
 
 /** Render a finding's location suffix ` (path:start-end)` (empty when no path was found). */
@@ -403,9 +415,15 @@ function findingLoc(f: ScoutFinding): string {
  * scout produced structured findings — appends the BRIEF (structure + finding TITLES only).
  * Full detail is NOT dumped here; the builder pulls it per-finding via scout_detail.
  */
-function buildPriorResultsBlock(priorResults: readonly RoleResult[], scout: ScoutInfo): string {
+export function buildPriorResultsBlock(priorResults: readonly RoleResult[], scout: ScoutInfo): string {
   const summaries = JSON.stringify(priorResults.map((r) => ({ role: r.role, outcome: r.outcome, summary: r.summary })));
   let block = `Prior role results:\n${summaries}`;
+  // GOAL ALIGNMENT: the scout assessed whether the goal-named files were actually found in the
+  // repo. Surface it so the builder knows up front if the goal is misaligned (names files that do
+  // not exist) or broad (names none) — otherwise this signal is computed by the scout and dropped.
+  if (scout.goalAlignment !== undefined) {
+    block += `\n\nGOAL ALIGNMENT (${scout.goalAlignment.status}): ${scout.goalAlignment.summary}`;
+  }
   if (scout.brief !== undefined || scout.findings.length > 0) {
     const parts: string[] = ["SCOUT BRIEF (top-level structure first — drill into a finding with the scout_detail tool):"];
     if (scout.brief !== undefined) parts.push(scout.brief);

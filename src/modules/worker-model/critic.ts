@@ -215,6 +215,30 @@ function formatVerifierContext(verifier: RoleResult | undefined): string | undef
   );
 }
 
+/**
+ * Distill the SCOUT's goal↔file alignment into a compact context block. The scout assesses whether
+ * the goal-named files were actually found in the repo (aligned / broad / misaligned); without this
+ * the critic cannot factor "the goal references files that do not exist" into its judgment. The
+ * summary is derived from the goal + repo structure (untrusted) → still rides as untrusted DATA.
+ * Returns undefined when no scout goalAlignment is present so the request shape is unchanged.
+ */
+function formatGoalAlignment(scout: RoleResult | undefined): string | undefined {
+  if (scout === undefined) return undefined;
+  const ga = detailOf(scout).goalAlignment;
+  if (typeof ga !== "object" || ga === null) return undefined;
+  const g = ga as { status?: unknown; summary?: unknown; missingFiles?: unknown };
+  const status = typeof g.status === "string" ? g.status : undefined;
+  const summary = typeof g.summary === "string" ? g.summary : undefined;
+  if (status === undefined && summary === undefined) return undefined;
+  const missing = asStringArray(g.missingFiles);
+  return (
+    `Scout goal alignment (does the goal map to files found in the repo?):\n` +
+    `status: ${status ?? "unknown"}\n` +
+    (summary ?? "") +
+    (missing.length > 0 ? `\nmissing files (named in the goal, not found in the repo): ${missing.join(", ")}` : "")
+  );
+}
+
 function objectiveFail(feedback: string, extra: Record<string, unknown> = {}): RoleResult {
   return {
     role: "critic",
@@ -281,6 +305,11 @@ export function createCritic(deps: CriticDeps = {}): RoleFn {
       const verifierResult = ctx.priorResults.find((r) => r.role === "verifier");
       const verifierContext = formatVerifierContext(verifierResult);
 
+      // The scout computed goal↔file alignment but it was never surfaced to the critic. Feed it in
+      // (untrusted DATA, like the diff) so the critic can factor a misaligned/broad goal into its
+      // judgment. Present ONLY when a scout goalAlignment exists, so the request shape is unchanged.
+      const goalAlignmentContext = formatGoalAlignment(ctx.priorResults.find((r) => r.role === "scout"));
+
       const objectiveContext = {
         builderOutcome: builderResult.outcome,
         filesWritten,
@@ -296,6 +325,7 @@ export function createCritic(deps: CriticDeps = {}): RoleFn {
         messages: [
           { role: "system", content: CRITIC_SYSTEM },
           untrusted(`Goal (intent):\n${ctx.task.goal}`, "critic_goal"),
+          ...(goalAlignmentContext !== undefined ? [untrusted(goalAlignmentContext, "critic_goal_alignment")] : []),
           untrusted(`Objective pre-check context:\n${JSON.stringify(objectiveContext)}`, "critic_objective_context"),
           untrusted(`Builder summary:\n${builderResult.summary ?? "(none)"}`, "critic_builder_summary"),
           untrusted(`Builder detail:\n${JSON.stringify(builderResult.detail ?? {})}`, "critic_builder_detail"),

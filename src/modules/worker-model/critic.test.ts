@@ -409,3 +409,35 @@ test("review-quality: RUBBER-STAMP DEFENSE — a subtly broken diff is NOT waved
   assert.equal(detail.pass, false, "a subtly broken 'fix' is NOT rubber-stamped to PASS");
   assert.match(detail.feedback, /off-by-one|overlap|\+ 1/i, "feedback pinpoints the real semantic defect");
 });
+
+// ── H1: the scout's goalAlignment reaches the critic ────────────────────────────────────────────
+test("H1: the critic receives the scout's goalAlignment (status + summary) as untrusted context", async () => {
+  const scoutResult: RoleResult = {
+    role: "scout",
+    outcome: "success",
+    summary: "scouted",
+    detail: {
+      findings: [],
+      brief: "Repository structure (1 file).",
+      goalAlignment: {
+        status: "misaligned",
+        summary: "Goal references missing.ts but this file was not found in the repository",
+        missingFiles: ["missing.ts"],
+      },
+    },
+  };
+  const { ctx, calls, role } = makeCtx([scoutResult, builderResult], async () => modelResponse(passJson()));
+  await role(ctx);
+  const gaMsg = calls[0]?.messages?.find((m) => m.untrusted === true && String(m.content).includes("Scout goal alignment"));
+  assert.ok(gaMsg, "the scout's goalAlignment is provided as untrusted context");
+  assert.match(String(gaMsg?.content), /status: misaligned/, "the alignment status is included");
+  assert.match(String(gaMsg?.content), /Goal references missing\.ts/, "the alignment summary is included");
+  assert.match(String(gaMsg?.content), /missing files.*missing\.ts/, "the missing files are included");
+});
+
+test("H1: no scout goalAlignment → no alignment message (request shape unchanged)", async () => {
+  const { ctx, calls, role } = makeCtx([builderResult], async () => modelResponse(passJson()));
+  await role(ctx);
+  const gaMsg = calls[0]?.messages?.find((m) => String(m.content).includes("Scout goal alignment"));
+  assert.equal(gaMsg, undefined, "no alignment context when the scout produced none");
+});
