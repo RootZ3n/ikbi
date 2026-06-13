@@ -1217,3 +1217,35 @@ test("ISSUE 1: with criticFixLoop OFF (default), a critic FAIL does NOT retry â€
   assert.notEqual(result.outcome, "success", "the single FAIL verdict discards as before");
   assert.equal(ws.calls.promote, 0, "nothing promoted");
 });
+
+test("CODEX Issue 3: each critic-fix-loop RETRY stage runs under its OWN role identity (retry builder is functionalRole=builder, not critic)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const builderRoles: Array<string | undefined> = [];
+  const verifierRoles: Array<string | undefined> = [];
+  const criticRoles: Array<string | undefined> = [];
+  let criticCall = 0;
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    scout: async () => ({ role: "scout", outcome: "success", summary: "scout" }),
+    builder: async (ctx) => { builderRoles.push(ctx.identity.functionalRole); return { role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["x.ts"], rejectedToolCalls: [] } }; },
+    verifier: async (ctx) => { verifierRoles.push(ctx.identity.functionalRole); return { role: "verifier", outcome: "success", summary: "green", detail: { verdict: "pass", checks: [] } }; },
+    critic: async (ctx) => {
+      criticCall += 1;
+      criticRoles.push(ctx.identity.functionalRole);
+      // First look FAILs (green-but-wrong) to trigger the retry; the re-critique PASSes.
+      if (criticCall === 1) return { role: "critic", outcome: "success", summary: "FAIL", detail: { pass: false, feedback: "wrong", issues: ["fix it"] } };
+      return { role: "critic", outcome: "success", summary: "PASS", detail: { pass: true } };
+    },
+    integrator: realIntegrator,
+  };
+  const orch = createOrchestrator(baseDeps({ config: { ...ENABLED, criticFixLoop: true }, resolveIdentity, roleClaim, roles, workspaces: ws.workspaces }));
+  await orch.run(task, parentCtx);
+
+  // The builder ran twice: the original build, then the critic-driven retry. BOTH must run as the
+  // BUILDER â€” the retry stage must NOT inherit the critic's identity (the bug Codex found).
+  assert.equal(builderRoles.length, 2, "builder ran original + one critic-driven retry");
+  assert.deepEqual(builderRoles, ["builder", "builder"], "the RETRY builder is functionalRole=builder, NOT the critic's identity");
+  // The retry verifier + re-critique likewise run under their own correct roles.
+  assert.equal(verifierRoles[verifierRoles.length - 1], "verifier", "the retry verifier is functionalRole=verifier");
+  assert.equal(criticRoles[criticRoles.length - 1], "critic", "the re-critique is functionalRole=critic");
+});

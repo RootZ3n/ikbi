@@ -1092,13 +1092,20 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           // The prior results the re-run roles inherit: everything EXCEPT the stale builder /
           // verifier / critic, which are replaced with their fresh results as produced.
           const carriedPrior = results.filter((r) => r.role !== "builder" && r.role !== "verifier" && r.role !== "critic");
+          // CODEX FIX: each retry STAGE runs under its OWN role identity (functionalRole
+          // builder/verifier/critic), spawned fresh under the parent ceiling — NOT the critic's
+          // `spawned` identity from this iteration. Reusing the critic identity ran the retry
+          // builder/verifier with functionalRole="critic", a wrong-attribution / governance hazard.
+          const retryBuilder = spawnRole("builder", parentCtx);
+          const retryVerifier = spawnRole("verifier", parentCtx);
+          const retryCritic = spawnRole("critic", parentCtx);
           const fix = await runCriticFixLoop(result, {
             builder: async (fixGoal: string) => {
               const fixCtx: RoleContext = {
                 task: { ...task, goal: fixGoal },
                 role: "builder",
-                identity: spawned.identity,
-                autonomy: spawned.autonomy,
+                identity: retryBuilder.identity,
+                autonomy: retryBuilder.autonomy,
                 workspace,
                 priorResults: [...carriedPrior],
                 engine: runEngine,
@@ -1109,8 +1116,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               const verifyCtx: RoleContext = {
                 task,
                 role: "verifier",
-                identity: spawned.identity,
-                autonomy: spawned.autonomy,
+                identity: retryVerifier.identity,
+                autonomy: retryVerifier.autonomy,
                 workspace,
                 priorResults: [...carriedPrior, builderResult],
                 engine: runEngine,
@@ -1118,7 +1125,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               const vRes = await runRoleFn("verifier", verifierFor(parentCtx), verifyCtx, Math.max(roleTimeoutMs, resolveCheckTimeoutMs(modeEnv)));
               // Mirror the main verifier→commit gate: capture the re-verified-good working tree so
               // the integrator/promote sees the post-retry diff (gated on autoCommit, same as above).
-              if (vRes.outcome === "success" && workspaces.commit !== undefined && spawned.autonomy.autoCommit) {
+              if (vRes.outcome === "success" && workspaces.commit !== undefined && retryVerifier.autonomy.autoCommit) {
                 await workspaces.commit(workspace, `ikbi: ${task.goal}`);
               }
               return vRes;
@@ -1127,8 +1134,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               const reCriticCtx: RoleContext = {
                 task,
                 role: "critic",
-                identity: spawned.identity,
-                autonomy: spawned.autonomy,
+                identity: retryCritic.identity,
+                autonomy: retryCritic.autonomy,
                 workspace,
                 priorResults: [...carriedPrior, builderResult, verifierResult],
                 engine: runEngine,
