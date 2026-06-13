@@ -1331,6 +1331,64 @@ test("H6: with DEFAULT config (skipCriticOnRed unset, fixLoop off), the critic i
   assert.equal(result.roles.find((r) => r.role === "critic"), undefined, "no critic result is recorded when the critic is skipped");
 });
 
+test("H7: when the fix loop verifies GREEN, the main verifier role REUSES that result — the suite is NOT run a second time", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  let verifierCalls = 0;
+  let builderCalls = 0;
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    scout: async () => ({ role: "scout", outcome: "success", summary: "s" }),
+    builder: async () => { builderCalls += 1; return { role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["a.ts"], rejectedToolCalls: [] } }; },
+    // First verify is RED (drives one fix iteration); every verify after is GREEN.
+    verifier: async () => {
+      verifierCalls += 1;
+      return verifierCalls === 1
+        ? { role: "verifier", outcome: "failure", summary: "checks red", detail: { verdict: "fail", checks: [{ name: "test", exitCode: 1, outputTail: "1 failing" }] } }
+        : { role: "verifier", outcome: "success", summary: "checks green", detail: { verdict: "pass", checks: [{ name: "typecheck", exitCode: 0, outputTail: "ok" }, { name: "test", exitCode: 0, outputTail: "Tests: 2 passed, 2 total" }] } };
+    },
+    critic: async () => ({ role: "critic", outcome: "success", summary: "c", detail: { pass: true } }),
+    integrator: realIntegrator,
+  };
+  // fixLoop ON: builder → verify(red) → fix → verify(green); the fix loop verified green internally,
+  // so the main verifier role must REUSE that result rather than running the suite a third time.
+  const orch = createOrchestrator(baseDeps({ config: { ...ENABLED, fixLoop: true }, resolveIdentity, roleClaim, roles, workspaces: ws.workspaces }));
+  const result = await orch.run(task, parentCtx);
+
+  // The verifier ran exactly TWICE — both inside the fix loop (initial red + post-fix green). The
+  // main verifier role added NO third pass (without H7 it would be 3).
+  assert.equal(verifierCalls, 2, "the verifier ran twice (fix loop only) — the main role reused the green result, not a 3rd suite run");
+  assert.equal(builderCalls, 2, "the builder ran twice: initial build + one fix");
+  const verifierResult = result.roles.find((r) => r.role === "verifier");
+  assert.equal(verifierResult?.outcome, "success", "the reused verifier result is the green one");
+  assert.equal((verifierResult?.detail as Record<string, unknown> | undefined)?.verdict, "pass", "carrying the green verdict the integrator gates on");
+  assert.equal(ws.calls.commit.length, 1, "the reused-green path still commits the verified tree once (work lands)");
+});
+
+test("H7: when the fix loop is EXHAUSTED red, NO green verifier result is reused — the build fails and nothing lands", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  let verifierCalls = 0;
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    scout: async () => ({ role: "scout", outcome: "success", summary: "s" }),
+    builder: async () => ({ role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["a.ts"], rejectedToolCalls: [] } }),
+    // Always RED — the fix loop exhausts its attempts without ever going green.
+    verifier: async () => { verifierCalls += 1; return { role: "verifier", outcome: "failure", summary: "checks red", detail: { verdict: "fail", checks: [{ name: "test", exitCode: 1, outputTail: "1 failing" }] } }; },
+    critic: async () => ({ role: "critic", outcome: "success", summary: "c", detail: { pass: true } }),
+    integrator: realIntegrator,
+  };
+  // fixLoop ON but never green: the fix loop's last verify FAILED, so it is NOT reused (the reuse
+  // guard requires a GREEN last verify). The exhausted fix loop yields a builder FAILURE that
+  // short-circuits the run, so a red build can never falsely reuse a green verifier result.
+  const orch = createOrchestrator(baseDeps({ config: { ...ENABLED, fixLoop: true }, resolveIdentity, roleClaim, roles, workspaces: ws.workspaces }));
+  const result = await orch.run(task, parentCtx);
+
+  assert.ok(verifierCalls >= 2, `the verifier suite actually ran inside the fix loop (saw ${verifierCalls} calls)`);
+  assert.notEqual(result.outcome, "success", "a red build still fails (no false reuse of a green result)");
+  assert.equal(ws.calls.commit.length, 0, "nothing committed on a red build");
+  const verifierResult = result.roles.find((r) => r.role === "verifier");
+  assert.ok(verifierResult === undefined || verifierResult.outcome !== "success", "no green verifier result was synthesized/reused on a red fix loop");
+});
+
 test("CODEX Issue 3: each critic-fix-loop RETRY stage runs under its OWN role identity (retry builder is functionalRole=builder, not critic)", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
   const ws = fakeWorkspaces(true);

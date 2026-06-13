@@ -933,6 +933,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // (opt-in, config.criticFixLoop). This guard caps it at a single attempt per run so
     // subjective feedback can never loop forever.
     let criticFixAttempted = false;
+    // H7: when the verifier-driven fix loop runs (fixIterations > 0) and its LAST verify is GREEN,
+    // we reuse that verifier RoleResult for the main verifier role instead of running the FULL
+    // typecheck+test suite a second time on identical code. Set in the builder block below, consumed
+    // when the loop reaches the verifier role (a redundant verifier pass would just re-confirm green).
+    let fixLoopVerifierResult: RoleResult | undefined;
     // Set when a build runs GREEN but its worker tier lacks autoCommit autonomy, so the
     // verified work is deliberately left uncommitted. Carrying the tier + agent lets the terminal
     // step report an explicit, actionable reason instead of a misleading "no changes to promote".
@@ -1024,7 +1029,13 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         // H4: floor the verifier's role timeout at the per-check budget. Without this, a 300s role
         // timeout races against 600s checks — the role fails first, orphaning the still-running check.
         const verifierTimeout = role === "verifier" ? Math.max(roleTimeoutMs, resolveCheckTimeoutMs(modeEnv)) : undefined;
-        let result = await runRoleFn(role, roleFn, ctx, verifierTimeout);
+        // H7: when the fix loop already verified the SAME code GREEN, reuse its verifier result rather
+        // than running the full typecheck+test suite again. The reused result flows through the normal
+        // record/commit/integrator path below; only the redundant second verifier dispatch is skipped.
+        let result =
+          role === "verifier" && fixLoopVerifierResult !== undefined
+            ? fixLoopVerifierResult
+            : await runRoleFn(role, roleFn, ctx, verifierTimeout);
         results.push(result);
 
         events.publish(
@@ -1086,6 +1097,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         // and verifier internals are unchanged.
         // OPT-IN: requires IKBI_WORKER_MODEL_FIX_LOOP=true (default off).
         if (role === "builder" && result.outcome === "success" && config.fixLoop) {
+          // H7: capture the FULL verifier RoleResult from the fix loop's last verify (the iterative
+          // loop only returns the distilled pass/fail). If that last verify is GREEN we reuse this
+          // result for the main verifier role instead of re-running the suite (see fixLoopVerifierResult).
+          let lastFullVerifierResult: RoleResult | undefined;
           const fixLoopOutcome = await runIterativeLoop(result, {
             maxFixIterations: DEFAULT_MAX_FIX_ITERATIONS,
             verifier: async () => {
@@ -1099,6 +1114,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 engine: runEngine,
               };
               const vResult = await runRoleFn("verifier", verifyFn, verifyCtx, Math.max(roleTimeoutMs, resolveCheckTimeoutMs(modeEnv)));
+              lastFullVerifierResult = vResult;
               return extractVerifierCheckResult(vResult);
             },
             builder: async (fixGoal: string) => {
@@ -1152,6 +1168,13 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               },
               parentIdentity,
             );
+            // H7: the fix loop ran AND its last verify was GREEN — reuse that verifier RoleResult for
+            // the main verifier role so the full typecheck+test suite is not run a SECOND time on the
+            // identical, already-verified working tree. A FAILED last verify is NOT reused: the main
+            // verifier still runs and gives the authoritative final word (fix attempts were exhausted).
+            if (fixLoopOutcome.lastVerifierResult?.success === true && lastFullVerifierResult !== undefined) {
+              fixLoopVerifierResult = lastFullVerifierResult;
+            }
           }
         }
 
