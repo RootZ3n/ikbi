@@ -139,6 +139,19 @@ test("scout wiring (F4): a retrieval failure falls back LOUDLY — index-fallbac
   }
 });
 
+test("M9: the fallback reason LEADS the summary prominently (not buried mid-sentence)", async () => {
+  const { repo, stateRoot } = makeBigFixture();
+  try {
+    const failing: ProjectRetrievalApi = { retrieve: async () => { throw new Error("index db corrupt"); } };
+    const result = await createScout({ env: { IKBI_RETRIEVAL: "index" }, retrieval: failing })(makeCtx(repo, "Fix the widget bug"));
+    const summary = result.summary ?? "";
+    assert.match(summary, /^⚠ index retrieval FAILED — fell back to legacy scan \(reason: index db corrupt\)/, "fallback reason leads the summary so operators see it without digging into detail");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
+  }
+});
+
 test("scout wiring: large repo + retrieval failure refuses silent legacy fallback", async () => {
   const { repo, stateRoot } = makeBigFixture();
   try {

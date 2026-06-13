@@ -418,7 +418,9 @@ export function createScout(deps: ScoutDeps = {}): RoleFn {
           files = sortByGoalRelevance(gatherFiles(root), root, ctx.task.goal);
           retrievalMode = "index-fallback";
           retrievalFallbackReason = reason;
-          modeNote = `IKBI_RETRIEVAL=index but index retrieval FAILED — fell back to legacy scan (reason: ${retrievalFallbackReason})`;
+          // The full reason now LEADS the summary (see fallbackWarning below) so operators/agents
+          // see it without digging into detail; keep modeNote short to avoid a double mention.
+          modeNote = "via legacy scan (index retrieval unavailable)";
         }
       } else {
         // bounded, read-only — the unchanged default walk, now re-ordered so goal-relevant
@@ -454,10 +456,17 @@ export function createScout(deps: ScoutDeps = {}): RoleFn {
       // Check if the goal mentions specific files that the scout found (or didn't find).
       const goalAlignment = assessGoalFileAlignment(ctx.task.goal, structure);
 
+      // M9: when index retrieval failed and we degraded to legacy, LEAD the summary with the
+      // fallback reason so operators/agents see it without digging into detail.retrievalFallbackReason.
+      const fallbackWarning =
+        retrievalMode === "index-fallback" && retrievalFallbackReason !== undefined
+          ? `⚠ index retrieval FAILED — fell back to legacy scan (reason: ${retrievalFallbackReason}). `
+          : "";
+
       return {
         role: "scout",
         outcome: "success",
-        summary: `scouted ${used} file(s) ${modeNote}; produced ${findings.length} finding(s); goal alignment: ${goalAlignment.summary}`,
+        summary: `${fallbackWarning}scouted ${used} file(s) ${modeNote}; produced ${findings.length} finding(s); goal alignment: ${goalAlignment.summary}`,
         // `brief` + `structure` drive PROGRESSIVE DISCLOSURE downstream: the builder shows the
         // brief first and pulls a finding's full `detail` only on demand (scout_detail tool).
         // `retrievalMode` (+ `retrieval` when index-backed) records HOW context was selected.
