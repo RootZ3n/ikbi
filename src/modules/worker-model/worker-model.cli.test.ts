@@ -438,3 +438,25 @@ test("H3: a failed multi-step build DISCARDS the shared workspace (no leak)", ()
     assert.equal(tasks[0]!.taskId.endsWith(":step1"), true, "the one task run was step 1");
   });
 });
+
+// H4: the final verify pass runs the builder read-only (writeScope "none") so it cannot corrupt prior work.
+test("H4: the final verify step passes writeScope 'none' (cannot modify accumulated work)", () => {
+  const { orchestrator, tasks } = multiStepOrchestrator({ autoCommit: true });
+  const stepWs = stepWorkspacesFake();
+  const cap2 = capture();
+  const cli = createWorkerCli({
+    orchestrator, resolveIdentity: makeResolver("trusted", "trusted"),
+    operatorToken: OPERATOR_TOKEN, workerToken: WORKER_TOKEN,
+    stdout: cap2.stdout, stderr: cap2.stderr, setExit: cap2.setExit, now: () => 1, cwd: () => "/repo",
+    interactive: false, stepWorkspaces: stepWs.surface, cognition: benignCognition,
+  });
+  return cli.build([MULTI_STEP_GOAL]).then(() => {
+    const verify = tasks.find((t) => t.taskId.endsWith(":verify"));
+    assert.ok(verify !== undefined, "the final verify step ran after all steps passed");
+    assert.equal(verify!.writeScope, "none", "the verify step is read-only — the builder cannot write/modify files");
+    assert.equal(verify!.reuseWorkspace !== undefined, true, "the verify step reuses the accumulated shared workspace");
+    // The intermediate steps still accumulate writes (not read-only) — only the final verify is locked down.
+    const step1 = tasks.find((t) => t.taskId.endsWith(":step1"));
+    assert.notEqual(step1!.writeScope, "none", "intermediate steps remain writable");
+  });
+});

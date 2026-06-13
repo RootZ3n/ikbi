@@ -625,6 +625,11 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
             targetRepo,
             goal: `Verify all changes from the multi-step plan: ${finalGoal}`,
             reuseWorkspace: sharedWorkspace,
+            // H4: the final pass VERIFIES the accumulated work — it must not MODIFY it. writeScope
+            // "none" blocks the builder from writing/patching/shell-writing any file, so a cheap
+            // builder model cannot revert or corrupt the prior steps' work. The verifier still runs
+            // its objective checks against the accumulated tree.
+            writeScope: "none",
           };
           result = await orchestrator.run(finalTask, ctx);
         } else {
