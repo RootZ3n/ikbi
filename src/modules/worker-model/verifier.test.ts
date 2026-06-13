@@ -10,6 +10,7 @@ import type { AgentIdentity } from "../../core/identity/contract.js";
 import { autonomyForTier } from "../../core/trust/index.js";
 import type { WorkspaceHandle } from "../../core/workspace/contract.js";
 import type { ExecRequest, ExecResult } from "../governed-exec/index.js";
+import type { ProjectIndexData } from "../project-index/index.js";
 import { createVerifier, detectScriptMutation, type CheckResult } from "./verifier.js";
 import type { RoleContext, RoleResult } from "./contract.js";
 
@@ -592,6 +593,95 @@ test("ISSUE-4 quality gate: checks pass and a VALID written file → outcome suc
     const exec = execStub(() => ({ executed: true, exitCode: 0, stdoutTail: "ok" }));
     const result = await createVerifier({ governedExec: exec.governedExec, parentCtx: makeParentCtx(), diff: cleanDiff })(ctxWithBuilt(dir, ["src/good.ts"]));
     assert.equal(result.outcome, "success", "a real, non-empty, well-located file passes the quality gate");
+  } finally {
+    _rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── Codex-3: the post-check quality gate ALSO fires in LADDER mode ────────────
+// The ISSUE-4 tests above only cover legacy mode; the ladder path has its own quality wiring
+// (runs after all runnable tasks pass). These exercise it with the SAME stub/empty/bad-location
+// priorResults, asserting the gate fails the scope-stamped ladder green.
+
+/** A LADDER-mode verifier whose injected plan yields one runnable (passing) check, so the post-check
+ *  quality gate runs against the builder's prior filesWritten exactly as it does in legacy mode. */
+function ladderQualityVerifier(exec: ReturnType<typeof execStub>) {
+  const data: ProjectIndexData = { version: 1, repoPath: "/wt", repoHash: "h", files: [], packages: [], imports: [], fileToTests: {}, truncated: false };
+  return createVerifier({
+    governedExec: exec.governedExec,
+    parentCtx: makeParentCtx(),
+    diff: cleanDiff,
+    env: { IKBI_VERIFY: "ladder" },
+    index: { refresh: async () => ({ data }) },
+    // One runnable task at the worktree root (cwd "") — the faked exec passes it, so control reaches
+    // the quality gate. Mirrors the inline plan shape used by the ladder wiring tests.
+    plan: () => ({
+      status: "ok" as const, blocked: false, blockReasons: [], scope: "impact" as const,
+      escalateToFull: false, escalationReasons: [], affectedPackages: [], affectedTests: [],
+      neutralPackages: [], stubScripts: [],
+      stages: [{ stage: "package-checks", tasks: [{ package: "", cwd: "", name: "test", command: "pnpm", args: ["test"], scope: "package", reason: "test" }] }],
+      receipts: [],
+    }),
+  });
+}
+
+test("Codex-3 ladder quality gate: checks pass but a written STUB file → outcome failure", async () => {
+  const dir = _mkdtempSync(_join(_tmpdir(), "ikbi-lq-stub-"));
+  try {
+    _mkdirSync(_join(dir, "src"), { recursive: true });
+    _writeFileSync(_join(dir, "src", "feature.ts"), "// TODO: implement this later\n");
+    const exec = execStub(() => ({ executed: true, exitCode: 0, stdoutTail: "ok" }));
+    const result = await ladderQualityVerifier(exec)(ctxWithBuilt(dir, ["src/feature.ts"]));
+    assert.equal(result.outcome, "failure", "a stub file fails the ladder post-check quality gate");
+    const detail = result.detail as { verdict: string; verificationMode?: string; verificationScope?: string; qualityIssues?: { kind: string }[] };
+    assert.equal(detail.verdict, "fail");
+    assert.equal(detail.verificationMode, "ladder", "the failure is recorded as a ladder-mode result");
+    assert.equal(detail.verificationScope, "impact", "the ladder quality failure keeps its scope stamp");
+    assert.ok(detail.qualityIssues?.some((i) => i.kind === "stub_file"), "the stub_file quality issue is recorded");
+  } finally {
+    _rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Codex-3 ladder quality gate: checks pass but a written EMPTY file → outcome failure", async () => {
+  const dir = _mkdtempSync(_join(_tmpdir(), "ikbi-lq-empty-"));
+  try {
+    _mkdirSync(_join(dir, "src"), { recursive: true });
+    _writeFileSync(_join(dir, "src", "empty.ts"), ""); // 0 bytes
+    const exec = execStub(() => ({ executed: true, exitCode: 0, stdoutTail: "ok" }));
+    const result = await ladderQualityVerifier(exec)(ctxWithBuilt(dir, ["src/empty.ts"]));
+    assert.equal(result.outcome, "failure", "an empty file fails the ladder post-check quality gate");
+    const detail = result.detail as { qualityIssues?: { kind: string }[] };
+    assert.ok(detail.qualityIssues?.some((i) => i.kind === "empty_file"), "the empty_file quality issue is recorded");
+  } finally {
+    _rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Codex-3 ladder quality gate: checks pass but a file written into node_modules → outcome failure", async () => {
+  const dir = _mkdtempSync(_join(_tmpdir(), "ikbi-lq-loc-"));
+  try {
+    const exec = execStub(() => ({ executed: true, exitCode: 0, stdoutTail: "ok" }));
+    const result = await ladderQualityVerifier(exec)(ctxWithBuilt(dir, ["node_modules/evil/index.ts"]));
+    assert.equal(result.outcome, "failure", "a write into a blocked directory fails the ladder quality gate");
+    const detail = result.detail as { qualityIssues?: { kind: string }[] };
+    assert.ok(detail.qualityIssues?.some((i) => i.kind === "bad_location"), "the bad_location quality issue is recorded");
+  } finally {
+    _rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Codex-3 ladder quality gate: checks pass and a VALID written file → scope-stamped success", async () => {
+  const dir = _mkdtempSync(_join(_tmpdir(), "ikbi-lq-ok-"));
+  try {
+    _mkdirSync(_join(dir, "src"), { recursive: true });
+    _writeFileSync(_join(dir, "src", "good.ts"), "export const x = 1;\nexport function add(a: number, b: number) { return a + b; }\n");
+    const exec = execStub(() => ({ executed: true, exitCode: 0, stdoutTail: "ok" }));
+    const result = await ladderQualityVerifier(exec)(ctxWithBuilt(dir, ["src/good.ts"]));
+    assert.equal(result.outcome, "success", "a real, non-empty, well-located file passes the ladder quality gate");
+    const detail = result.detail as { verdict: string; verificationScope?: string };
+    assert.equal(detail.verdict, "pass");
+    assert.equal(detail.verificationScope, "impact", "a ladder green is scope-stamped");
   } finally {
     _rmSync(dir, { recursive: true, force: true });
   }
