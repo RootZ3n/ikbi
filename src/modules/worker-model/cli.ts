@@ -548,33 +548,44 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       // Cognition failure is non-fatal — proceed with the original goal
     }
 
-    const refinement = preBuildRefinement(goal, cognitionResult);
     // `--yes` (or a non-interactive session) skips the BLOCKING interview prompt entirely and
     // proceeds with the original goal. The cognition layer above still ran (non-blocking).
     const skipInterview = yes === true || !interactive;
     if (skipInterview) {
-      // M4: a cognition `reject` is ADVISORY at this layer — `--yes` (or a non-interactive
-      // session) deliberately proceeds rather than aborting. Design choice: `--yes` means
-      // "don't prompt me", and deliberation can be wrong, so we warn-and-proceed instead of
-      // blocking. But silently discarding a reject hides a real signal, so surface it on
-      // STDERR (not stdout — it must not pollute machine-readable output) before proceeding.
+      // M4: goal refinement is INTERACTIVE-ONLY. `preBuildRefinement` (the Socratic interview)
+      // exists solely to DRIVE the blocking prompt in the else-branch below — its `interview`
+      // output is consumed nowhere else. Under `--yes`/non-interactive there is no prompt to
+      // drive, so we deliberately DO NOT run it here: its result would be computed and then
+      // discarded, which previously made "refinement" a no-op in automated/CI runs. Skipping it
+      // is the honest behavior (and saves the work). The cognition layer's advisory signal still
+      // flows through below.
+      //
+      // A cognition `reject` is ADVISORY at this layer — `--yes` (or a non-interactive session)
+      // deliberately proceeds rather than aborting. Design choice: `--yes` means "don't prompt
+      // me", and deliberation can be wrong, so we warn-and-proceed instead of blocking. But
+      // silently discarding a reject hides a real signal, so surface it on STDERR (not stdout —
+      // it must not pollute machine-readable output) before proceeding.
       if (cognitionResult?.decision === "reject") {
         err(`ikbi: warning: deliberation REJECTED this goal but --yes/non-interactive proceeds anyway: ${cognitionResult.rationale ?? "(no rationale)"}\n`);
       }
       // Nothing interactive to do — proceed with the original goal.
-    } else if (!refinement.proceed && refinement.interview !== undefined) {
-      out(formatInterview(refinement.interview));
-      // Wait for user input — they can refine the goal or press Enter to skip
-      const answer = await prompt("\n  Your answer (or press Enter to skip): ");
-      if (answer.trim().length > 0) {
-        finalGoal = `${goal} — ${answer.trim()}`;
-        out(`\n  Refined goal: "${finalGoal}"\n\n`);
-      } else {
-        out("\n  Proceeding with original goal.\n\n");
+    } else {
+      // INTERACTIVE: run the Socratic-interview refinement and act on it.
+      const refinement = preBuildRefinement(goal, cognitionResult);
+      if (!refinement.proceed && refinement.interview !== undefined) {
+        out(formatInterview(refinement.interview));
+        // Wait for user input — they can refine the goal or press Enter to skip
+        const answer = await prompt("\n  Your answer (or press Enter to skip): ");
+        if (answer.trim().length > 0) {
+          finalGoal = `${goal} — ${answer.trim()}`;
+          out(`\n  Refined goal: "${finalGoal}"\n\n`);
+        } else {
+          out("\n  Proceeding with original goal.\n\n");
+        }
+      } else if (refinement.interview !== undefined && refinement.interview.summary.startsWith("Warning:")) {
+        // Surface warnings but proceed
+        out(`\n  ⚠ ${refinement.interview.summary}\n\n`);
       }
-    } else if (refinement.interview !== undefined && refinement.interview.summary.startsWith("Warning:")) {
-      // Surface warnings but proceed
-      out(`\n  ⚠ ${refinement.interview.summary}\n\n`);
     }
 
     const task: WorkerTask = { taskId: id, targetRepo, goal: finalGoal, writeScope: detectWriteScope(finalGoal) };

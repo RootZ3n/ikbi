@@ -362,6 +362,26 @@ test("M4: under --yes, a cognition `reject` is warned to STDERR (advisory, build
   });
 });
 
+test("M4: under --yes, the Socratic-interview refinement is NOT produced (interactive-only)", () => {
+  // "fix it" is maximally ambiguous — interactively it would emit the "Goal Refinement" interview
+  // banner. M4: under --yes refinement is skipped entirely (its output was historically computed
+  // then discarded), so NO interview text reaches stdout — stdout stays the clean summary JSON.
+  const { orchestrator, resolveIdentity } = realOrchestrator("trusted", "trusted");
+  const cap2 = capture();
+  const cli = createWorkerCli({
+    orchestrator, resolveIdentity, operatorToken: OPERATOR_TOKEN, workerToken: WORKER_TOKEN,
+    stdout: cap2.stdout, stderr: cap2.stderr, setExit: cap2.setExit, now: () => 1, cwd: () => "/repo",
+    interactive: true,
+    prompt: async () => "",
+    cognition: { deliberate: async () => ({ decision: "answer", confidence: 0.9, rationale: "clear", memoryUsed: [] }) },
+  });
+  return cli.build(["fix", "it", "--yes"]).then(() => {
+    assert.equal(cap2.out.includes("Goal Refinement"), false, "no interview banner produced under --yes");
+    assert.equal(cap2.out.includes("I need a bit more clarity"), false, "no interview questions produced under --yes");
+    JSON.parse(cap2.out); // stdout is ONLY the machine-readable summary
+  });
+});
+
 test("M4: under --yes, a non-reject cognition decision emits NO reject warning", () => {
   const { orchestrator, resolveIdentity } = realOrchestrator("trusted", "trusted");
   const cap2 = capture();
