@@ -163,6 +163,26 @@ test("promote (merge): integrates with a moved target; both changes present", as
   }
 });
 
+test("promote (empty diff): NOT promoted — a no-op build lands nothing (defense-in-depth for accumulated passes)", async () => {
+  // The integrator may decide "promote" for an accumulated multi-step build that wrote 0 files this
+  // pass (reuseWorkspace). If EVERY step no-ops, the scratch branch never moves past base — an empty
+  // diff. This is the guard the integrator relies on: promote must refuse to land an empty diff.
+  const repo = await makeRepo();
+  const { mgr, root } = makeManager();
+  try {
+    const ws = await mgr.allocate({ targetRepo: repo, identity: ID });
+    // No writes, no commit: scratchHead === targetHead (an empty diff).
+    assert.equal(await mgr.commit(ws, "nothing to commit"), false, "commit reports nothing to commit");
+
+    const r = await mgr.promote(ws, APPROVE);
+    assert.equal(r.promoted, false, "an empty diff does not land");
+    assert.equal(r.strategy, "noop");
+    assert.match(r.reason ?? "", /no changes to promote/);
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
 test("promote (conflict): NOT promoted, target left untouched, conflict reported", async () => {
   const repo = await makeRepo();
   const { mgr, root } = makeManager();

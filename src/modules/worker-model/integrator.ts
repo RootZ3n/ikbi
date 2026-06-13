@@ -65,9 +65,17 @@ export const integrator: RoleFn = async (ctx) => {
     // DISCARD a fully-verified, critic-approved accumulated build (and because every role succeeded,
     // the orchestrator's retention guard does not even fire — the committed work is lost). On a reuse
     // pass, accept a SUCCESSFUL builder as having produced work; the verifier + critic gates still
-    // prove the accumulated state is good, and a genuinely empty workspace is caught downstream (the
-    // promote sees an empty diff and does not land). Single-pass runs (no reuseWorkspace) keep the
-    // strict filesWritten>0 gate unchanged.
+    // prove the accumulated state is good.
+    //
+    // DEFENSE-IN-DEPTH against a no-op accumulated chain (every step writes nothing → empty diff):
+    // promoting here is SAFE because the empty diff is caught downstream and does NOT land. The
+    // workspace manager's promote compares scratchHead to targetHead and, when they are equal
+    // (nothing committed beyond base), returns { promoted: false, strategy: "noop", reason: "no
+    // changes to promote" } (src/core/workspace/manager.ts). The orchestrator then downgrades that
+    // run to "partial" — nothing is integrated. So an empty accumulated build cannot forge a landed
+    // change even though the integrator decided "promote". (Confirmed by a workspace-manager test of
+    // the empty-diff noop path.) Single-pass runs (no reuseWorkspace) keep the strict filesWritten>0
+    // gate unchanged.
     const accumulatedPass = ctx.task.reuseWorkspace !== undefined;
     const builderOk =
       builder?.outcome === "success" && (filesWritten.length > 0 || accumulatedPass);
