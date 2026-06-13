@@ -151,7 +151,24 @@ function extractJsonObject(content: string): string | undefined {
   return source.slice(start, end + 1);
 }
 
-function parseStructuredVerdict(content: string): ParsedVerdict {
+/**
+ * Default minimum goal_correctness score (0-5) the critic must report for a PASS to stand. The
+ * rubric DEMANDS this score but it was previously collected and never checked — a model that
+ * scored goal_correctness=0 yet said PASS still passed. Enforced below; operator-overridable.
+ */
+const DEFAULT_GOAL_CORRECTNESS_THRESHOLD = 3;
+
+/** Read a single numeric score (0-5) from the (loose) scores object, else undefined. */
+function numericScore(scores: unknown, key: string): number | undefined {
+  if (typeof scores !== "object" || scores === null) return undefined;
+  const v = (scores as Record<string, unknown>)[key];
+  return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}
+
+export function parseStructuredVerdict(
+  content: string,
+  goalCorrectnessThreshold: number = DEFAULT_GOAL_CORRECTNESS_THRESHOLD,
+): ParsedVerdict {
   const trimmed = content.trim();
   if (trimmed.length === 0) throw new Error("empty critic response");
 
@@ -164,9 +181,19 @@ function parseStructuredVerdict(content: string): ParsedVerdict {
     if (verdict !== "PASS" && verdict !== "FAIL") throw new Error("critic JSON missing verdict PASS/FAIL");
     const feedback = typeof obj.feedback === "string" && obj.feedback.trim().length > 0 ? obj.feedback.trim() : verdict;
     const issues = asStringArray(obj.issues);
+    // RUBRIC ENFORCEMENT: the scores are no longer decorative. If the model says PASS but scores
+    // goal_correctness below the threshold, the change does not satisfy the goal — override to FAIL.
+    // FAIL is sticky (a FAIL verdict never becomes PASS); a missing score leaves the verdict as-is.
+    let pass = verdict === "PASS";
+    let effectiveFeedback = feedback;
+    const goalScore = numericScore(obj.scores, "goal_correctness");
+    if (pass && goalScore !== undefined && goalScore < goalCorrectnessThreshold) {
+      pass = false;
+      effectiveFeedback = `[rubric override] goal_correctness=${goalScore} is below the passing threshold (${goalCorrectnessThreshold}): the change does not adequately satisfy the goal, so the PASS is overridden to FAIL. ${feedback}`;
+    }
     return {
-      pass: verdict === "PASS",
-      feedback,
+      pass,
+      feedback: effectiveFeedback,
       ...(obj.scores !== undefined ? { scores: obj.scores } : {}),
       ...(issues.length > 0 ? { issues } : {}),
       parseFormat: "json",

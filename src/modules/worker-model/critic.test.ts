@@ -10,7 +10,7 @@ import type { UntrustedContext } from "../../core/injection/contract.js";
 import type { ModelRequest, ModelResponse } from "../../core/provider/contract.js";
 import { autonomyForTier } from "../../core/trust/index.js";
 import type { WorkspaceHandle } from "../../core/workspace/contract.js";
-import { createCritic } from "./critic.js";
+import { createCritic, parseStructuredVerdict } from "./critic.js";
 import { criticModel } from "./role-models.js";
 import type { RoleContext, RoleResult } from "./contract.js";
 
@@ -440,4 +440,59 @@ test("H1: no scout goalAlignment → no alignment message (request shape unchang
   await role(ctx);
   const gaMsg = calls[0]?.messages?.find((m) => String(m.content).includes("Scout goal alignment"));
   assert.equal(gaMsg, undefined, "no alignment context when the scout produced none");
+});
+
+// ── H2: the critic rubric is enforced — goal_correctness below threshold overrides PASS to FAIL ──
+const verdictJson = (verdict: "PASS" | "FAIL", goalCorrectness: number): string =>
+  JSON.stringify({
+    verdict,
+    scores: { files_modified: 5, goal_correctness: goalCorrectness, code_quality: 5, tests: 5, suspicious_patterns: 5 },
+    feedback: "model said " + verdict,
+    issues: [],
+  });
+
+test("H2: verdict=PASS but goal_correctness=2 is overridden to FAIL", () => {
+  const parsed = parseStructuredVerdict(verdictJson("PASS", 2));
+  assert.equal(parsed.pass, false, "below-threshold goal_correctness flips the PASS to FAIL");
+  assert.match(parsed.feedback, /rubric override/, "the override is surfaced in the feedback");
+  assert.match(parsed.feedback, /goal_correctness=2/, "the failing score is named");
+});
+
+test("H2: verdict=PASS and goal_correctness=4 stays PASS", () => {
+  const parsed = parseStructuredVerdict(verdictJson("PASS", 4));
+  assert.equal(parsed.pass, true, "an at/above-threshold score leaves the PASS intact");
+  assert.equal(parsed.feedback, "model said PASS", "no override annotation when the score passes");
+});
+
+test("H2: verdict=FAIL and goal_correctness=4 stays FAIL (FAIL is sticky)", () => {
+  const parsed = parseStructuredVerdict(verdictJson("FAIL", 4));
+  assert.equal(parsed.pass, false, "a FAIL verdict is never promoted to PASS by a good score");
+});
+
+test("H2: a response with no scores field keeps the original verdict (backward compat)", () => {
+  const passNoScores = JSON.stringify({ verdict: "PASS", feedback: "fine", issues: [] });
+  assert.equal(parseStructuredVerdict(passNoScores).pass, true, "PASS with no scores stays PASS");
+  const failNoScores = JSON.stringify({ verdict: "FAIL", feedback: "nope", issues: [] });
+  assert.equal(parseStructuredVerdict(failNoScores).pass, false, "FAIL with no scores stays FAIL");
+});
+
+test("H2: the goal_correctness threshold is configurable", () => {
+  // With a threshold of 5, a goal_correctness=4 PASS is now below the bar and flips to FAIL.
+  assert.equal(parseStructuredVerdict(verdictJson("PASS", 4), 5).pass, false, "raising the threshold tightens the gate");
+  // With a threshold of 0, nothing is below the bar — the PASS stands.
+  assert.equal(parseStructuredVerdict(verdictJson("PASS", 0), 0).pass, true, "a zero threshold disables the override");
+});
+
+test("H2: the override flows through createCritic end-to-end", async () => {
+  const response = JSON.stringify({
+    verdict: "PASS",
+    scores: { files_modified: 5, goal_correctness: 1, code_quality: 5, tests: 5, suspicious_patterns: 5 },
+    feedback: "looks fine to me",
+    issues: [],
+  });
+  const { ctx, role } = makeCtx([builderResult], async () => modelResponse(response));
+  const result = await role(ctx);
+  const detail = result.detail as { pass: boolean; feedback: string };
+  assert.equal(detail.pass, false, "a PASS with goal_correctness=1 is gated to FAIL by the critic");
+  assert.match(detail.feedback, /rubric override/);
 });
