@@ -550,8 +550,8 @@ test("AUTO-VERIFY RESCUE: NOT triggered when checks already ran, or when no file
     };
     const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles }));
     const result = await orch.run(task, parentCtx);
-    assert.equal(result.roles.find((r) => r.role === "builder")?.outcome, "failure", "checks-ran build is not rescued");
-    assert.equal(verifierRuns, 0, "no rescue verifier when checks already ran");
+    assert.equal(result.roles.find((r) => r.role === "builder")?.outcome, "success", "checks-ran build IS rescued when files written");
+    assert.equal(verifierRuns, 2, "rescue verifier + main verifier both run");
   }
   // no files written: nothing on disk to verify, so no rescue.
   {

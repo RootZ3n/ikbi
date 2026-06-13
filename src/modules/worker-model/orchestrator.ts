@@ -1077,9 +1077,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           const bd = (result.detail ?? {}) as Record<string, unknown>;
           const builderStop = typeof bd.stopReason === "string" ? bd.stopReason : "";
           const builderFilesWritten = Array.isArray(bd.filesWritten) ? bd.filesWritten.length : 0;
-          const builderChecksRuns = typeof bd.checksRuns === "number" ? bd.checksRuns : 0;
           const RESCUABLE_TERMINATIONS: ReadonlySet<string> = new Set(["max_iterations", "timeout", "stuck_detected", "no_progress"]);
-          if (RESCUABLE_TERMINATIONS.has(builderStop) && builderFilesWritten > 0 && builderChecksRuns === 0) {
+          if (RESCUABLE_TERMINATIONS.has(builderStop) && builderFilesWritten > 0) {
             const rescueCtx: RoleContext = {
               task,
               role: "verifier",
