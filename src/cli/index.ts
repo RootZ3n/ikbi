@@ -32,6 +32,7 @@ import { writeStderr, writeStdout } from "./io.js";
 // workspace manager). Imported here so registerCommand fires before dispatch.
 import "./receipts.js";
 import "./summary.js";
+import "./cost.js";
 import "./undo.js";
 import "./clean.js";
 import "./workspace.js";
