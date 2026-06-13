@@ -1351,7 +1351,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 
     // Terminal: a KILL halted the run mid-loop ⇒ discard cleanly (NEVER promote a
     // half-run), surface the kill, return.
-    if (killedReason !== undefined) {
+    // SKIP-PROMOTE EXEMPTION: a step-planner middle step (skipPromote) shares its worktree
+    // with the surrounding steps — discarding it here would destroy the accumulated work of a
+    // multi-step plan. When skipPromote is set, leave the workspace ALIVE and let the
+    // skipPromote terminal below report the outcome; the step planner owns the shared lifecycle.
+    if (killedReason !== undefined && task.skipPromote !== true) {
       await safeDiscard(workspaces, workspace);
       events.publish(
         workerFailed.create(
@@ -1368,7 +1372,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // work and return a precise, actionable reason — a green build is never silently dropped,
     // and the operator is told exactly how to land it. (This does NOT auto-commit: the autonomy
     // model is intact; it only replaces a confusing empty-diff outcome with a clear one.)
-    if (autoCommitSkippedTier !== undefined && overall === "success") {
+    // SKIP-PROMOTE EXEMPTION: this block RETAINS-or-DISCARDS the workspace as a terminal
+    // disposition for a single-run build whose tier could not commit. A step-planner middle step
+    // (skipPromote) must not be disposed of here — its worktree is shared across steps and the
+    // skipPromote terminal below leaves it alive on disk for the next step / final pass.
+    if (autoCommitSkippedTier !== undefined && overall === "success" && task.skipPromote !== true) {
       const agent = autoCommitSkippedAgent ?? "worker";
       // R2: the disposition note must match what ACTUALLY happens. Retention only occurs when the
       // policy is on AND the workspace manager can retain (safeRetain falls back to discard when it

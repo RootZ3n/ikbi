@@ -1110,6 +1110,26 @@ test("skipPromote: a failed step still reports failure without discarding", asyn
   assert.equal(ws.calls.discard, 0, "did NOT discard — workspace stays alive for step planner");
 });
 
+test("M2: skipPromote + non-autoCommit tier — the autoCommit-skipped terminal does NOT fire; workspace retained", async () => {
+  // A step-planner MIDDLE step (skipPromote) on a tier that lacks autoCommit must NOT be disposed
+  // of by the autoCommit-skipped terminal. That block retains-or-discards a SINGLE-RUN build whose
+  // tier could not commit — but a skipPromote step SHARES its worktree across steps. Guarded by
+  // task.skipPromote !== true, the run falls through to the skipPromote terminal, which leaves the
+  // workspace alive. Without the guard this run is wrongly downgraded to "partial" and disposed.
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("verified", "verified");
+  const ws = fakeWorkspaces(true);
+  const cap = capturingRoles(); // every role succeeds
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, workspaces: ws.workspaces }));
+  const result = await orch.run({ ...task, skipPromote: true }, parentCtx);
+
+  assert.equal(ws.calls.commit.length, 0, "autonomy respected: still no auto-commit");
+  assert.equal(ws.calls.discard, 0, "the shared worktree is NOT discarded for a skipPromote step");
+  assert.equal(ws.calls.promote, 0, "skipPromote prevents promote");
+  assert.equal(result.outcome, "success", "reported via the skipPromote terminal, not downgraded to partial");
+  assert.equal(result.promoted, false, "nothing landed");
+  assert.doesNotMatch(result.reason ?? "", /BLOCKED/i, "the autoCommit-skipped 'promotion BLOCKED' terminal did NOT fire");
+});
+
 test("skipVerifier: verifier role is skipped, other roles still run", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
   const ws = fakeWorkspaces(true);
