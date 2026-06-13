@@ -31,6 +31,7 @@ import { writeStderr, writeStdout } from "./io.js";
 // Core-facing operator commands registered from their own files (read the receipt store /
 // workspace manager). Imported here so registerCommand fires before dispatch.
 import "./receipts.js";
+import "./summary.js";
 import "./undo.js";
 import "./clean.js";
 import "./workspace.js";
