@@ -434,3 +434,51 @@ test("L4: 'new file mode' detection sets isNewFile for guarded config files too"
   const r = detectScriptMutation(diff);
   assert.equal(r.mutated, false, "new vitest.config.ts should NOT be flagged");
 });
+
+// ── ISSUE 3: stub-script detector runs in LEGACY mode ────────────────────────
+
+/** Build a verifier ctx whose workspace points at a real on-disk directory. */
+function ctxAt(dir: string): RoleContext {
+  const { ctx } = makeCtx();
+  (ctx.workspace as { path: string }).path = dir;
+  return ctx;
+}
+
+test("ISSUE-3 legacy: a stub test script ('echo ok') fails closed even though the checks exit 0", async () => {
+  const dir = _mkdtempSync(_join(_tmpdir(), "ikbi-stub-"));
+  try {
+    _writeFileSync(_join(dir, "package.json"), JSON.stringify({ name: "x", scripts: { test: "echo ok" } }));
+    const exec = execStub(() => ({ executed: true, exitCode: 0, stdoutTail: "ok" }));
+    const result = await createVerifier({ governedExec: exec.governedExec, parentCtx: makeParentCtx(), diff: cleanDiff })(ctxAt(dir));
+    assert.equal(result.outcome, "failure", "a no-op test script is not meaningful verification (legacy parity with the ladder)");
+    const detail = result.detail as { verdict: string; reason?: string };
+    assert.equal(detail.verdict, "fail");
+    assert.match(result.summary ?? "", /stub test script/);
+  } finally {
+    _rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ISSUE-3 legacy: a --passWithNoTests test script is a stub → fails closed", async () => {
+  const dir = _mkdtempSync(_join(_tmpdir(), "ikbi-stub2-"));
+  try {
+    _writeFileSync(_join(dir, "package.json"), JSON.stringify({ name: "x", scripts: { test: "jest --passWithNoTests" } }));
+    const exec = execStub(() => ({ executed: true, exitCode: 0, stdoutTail: "ok" }));
+    const result = await createVerifier({ governedExec: exec.governedExec, parentCtx: makeParentCtx(), diff: cleanDiff })(ctxAt(dir));
+    assert.equal(result.outcome, "failure", "--passWithNoTests is a trivially-green stub");
+  } finally {
+    _rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ISSUE-3 legacy: a REAL test script ('node --test') passes the stub guard", async () => {
+  const dir = _mkdtempSync(_join(_tmpdir(), "ikbi-real-"));
+  try {
+    _writeFileSync(_join(dir, "package.json"), JSON.stringify({ name: "x", scripts: { test: "node --test" } }));
+    const exec = execStub(() => ({ executed: true, exitCode: 0, stdoutTail: "ok" }));
+    const result = await createVerifier({ governedExec: exec.governedExec, parentCtx: makeParentCtx(), diff: cleanDiff })(ctxAt(dir));
+    assert.equal(result.outcome, "success", "a real test script is not flagged as a stub");
+  } finally {
+    _rmSync(dir, { recursive: true, force: true });
+  }
+});

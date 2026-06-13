@@ -40,6 +40,7 @@
  * Commands run with `cwd: ctx.workspace.path`.
  */
 
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { OperationContext } from "../../core/identity/index.js";
@@ -55,7 +56,7 @@ import { runQualityChecks, type QualityResult } from "./quality-checks.js";
 // LADDER MODE (opt-in, IKBI_VERIFY=ladder): package/impact-aware verification. These are
 // library-only consumers — no side effects at import; the default (legacy) path never calls them.
 import { projectIndex, type ProjectIndexData } from "../project-index/index.js";
-import { verificationLadder, type VerificationPlan } from "../verification-ladder/index.js";
+import { isStubScript, verificationLadder, type VerificationPlan } from "../verification-ladder/index.js";
 import { parseCheckOutput, type CheckTriage } from "../check-triage/index.js";
 import { resolveVerificationMode, type VerificationMode } from "./modes.js";
 
@@ -167,6 +168,31 @@ function runQualityCheckFromPrior(
   const filesWritten = detail?.filesWritten;
   if (filesWritten === undefined || filesWritten.length === 0) return undefined;
   return { result: runQualityChecks(workspacePath, filesWritten) };
+}
+
+/**
+ * LEGACY-MODE STUB GUARD: read the workspace package.json's "test" script and report a reason
+ * when it is a no-op stub (`echo …`, `true`, `:`, `exit 0`, a `--passWithNoTests` flag). The ladder
+ * catches this via the planner's isStubScript; legacy mode runs a fixed `pnpm test` and would let a
+ * greenfield `"test":"echo ok"` pass with exit 0. Returns undefined when there is no package.json,
+ * no "test" script, or the script is real (not a stub) — only an actual stub fails closed.
+ */
+function detectStubTestScript(workspacePath: string): string | undefined {
+  const pkgPath = join(workspacePath, "package.json");
+  if (!existsSync(pkgPath)) return undefined;
+  let pkg: unknown;
+  try {
+    pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
+  } catch {
+    return undefined; // unparseable package.json is not a stub signal (checks already ran)
+  }
+  const scripts = (pkg as { scripts?: unknown })?.scripts;
+  const testScript = (scripts as Record<string, unknown> | undefined)?.test;
+  if (typeof testScript !== "string" || testScript.length === 0) return undefined;
+  if (isStubScript(testScript)) {
+    return `stub test script ("${testScript}") is not meaningful verification — refusing a vacuous green`;
+  }
+  return undefined;
 }
 
 /** The UNTRUSTED verdict — a mutated/unprovable build fails verification, fail-closed. */
@@ -532,6 +558,20 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
     }));
     const allPass = triaged.every((t) => t.check.exitCode === 0 && t.triage.passed);
     const failed = triaged.filter((t) => !t.triage.passed).map((t) => t.check.name);
+
+    // STUB-SCRIPT GUARD (legacy parity with the ladder): a greenfield "test":"echo ok" exits 0 and
+    // would pass — but a no-op test script is not verification. Fail closed before declaring green.
+    if (allPass) {
+      const stubReason = detectStubTestScript(ctx.workspace.path);
+      if (stubReason !== undefined) {
+        return {
+          role: "verifier",
+          outcome: "failure",
+          summary: `verification failed: ${stubReason}`,
+          detail: { verdict: "fail", verificationMode, checks, reason: stubReason },
+        };
+      }
+    }
 
     // QUALITY CHECKS: run AFTER typecheck + tests pass. Deterministic, fast, no model calls.
     // Extract written files from the builder's prior result (if available).
