@@ -56,6 +56,8 @@ import "./model-evaluation/index.js";
 import "./chat/index.js";
 // Receipts — registers GET /api/receipts and GET /api/receipts/:id (read-only build history).
 import "../server/receipts.js";
+// Timeline — registers GET /api/timeline (build activity grouped into time buckets).
+import "../server/timeline.js";
 // Orchestration layer above worker-model (registers the `batch` command on import).
 import "./batch-planner/index.js";
 // Capability-recovery diagnostic (registers the `recover` operator command on import).
