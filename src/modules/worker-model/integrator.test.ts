@@ -140,6 +140,26 @@ test("STEP-PLANNER accumulated pass still fail-closes: a RED verifier discards e
   assert.equal(decisionOf(r), "discard", "the builder gate relaxes on reuse, but verifier/critic gates still hold");
 });
 
+test("M3: a NO-CHANGE build (doneClaim.noChangeRequired, 0 files written) → PROMOTE (not discarded)", async () => {
+  // A "verify X exists" goal the builder satisfied with NO edits. The builder hard-gates the flag
+  // (only set when checks were green at done), so the empty-diff promote is legitimate — the
+  // filesWritten>0 gate must relax exactly like an accumulated pass.
+  const builderNoChange: RoleResult = {
+    role: "builder", outcome: "success", summary: "b",
+    detail: { filesWritten: [], policyViolations: [], doneClaim: { noChangeRequired: true } },
+  };
+  const r = await integrator(ctxWith([builderNoChange, criticPass, verifierPass]));
+  assert.equal(decisionOf(r), "promote", "a builder-declared no-change build promotes on a green verifier+critic");
+  assert.match(rationaleOf(r), /no-change build/);
+});
+
+test("M3: a zero-write build WITHOUT noChangeRequired still DISCARDS (the flag is required to relax the gate)", async () => {
+  const builderForgot: RoleResult = { role: "builder", outcome: "success", summary: "b", detail: { filesWritten: [], policyViolations: [] } };
+  const r = await integrator(ctxWith([builderForgot, criticPass, verifierPass]));
+  assert.equal(decisionOf(r), "discard");
+  assert.match(rationaleOf(r), /no files/);
+});
+
 test("a required prior result absent → discard (fail-closed)", async () => {
   assert.equal(decisionOf(await integrator(ctxWith([criticPass, verifierPass]))), "discard"); // no builder
   assert.equal(decisionOf(await integrator(ctxWith([builderOk, verifierPass]))), "discard"); // no critic

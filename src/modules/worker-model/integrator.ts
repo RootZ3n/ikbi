@@ -51,6 +51,12 @@ export const integrator: RoleFn = async (ctx) => {
 
     const builderDetail = detailOf(builder);
     const filesWritten = Array.isArray(builderDetail.filesWritten) ? builderDetail.filesWritten : [];
+    // NO-CHANGE BUILD (Codex M3): the builder explicitly declared the goal already satisfied with NO
+    // edits (a "verify X exists" task) and stamps doneClaim.noChangeRequired. The builder HARD-GATES
+    // this — the flag is only set when run_checks was green at done — so an empty-diff promote is
+    // legitimate here, not a build that simply forgot to write.
+    const doneClaim = typeof builderDetail.doneClaim === "object" && builderDetail.doneClaim !== null ? (builderDetail.doneClaim as Record<string, unknown>) : {};
+    const noChangeRequired = doneClaim.noChangeRequired === true;
     // FAIL-CLOSED: a missing/non-array policyViolations means "cannot confirm clean"
     // → undefined (never []), so the gate below does NOT pass on an absent field.
     const policyViolations = Array.isArray(builderDetail.policyViolations)
@@ -77,8 +83,11 @@ export const integrator: RoleFn = async (ctx) => {
     // the empty-diff noop path.) Single-pass runs (no reuseWorkspace) keep the strict filesWritten>0
     // gate unchanged.
     const accumulatedPass = ctx.task.reuseWorkspace !== undefined;
+    // A no-change build relaxes the filesWritten>0 gate exactly like an accumulated pass: the
+    // verifier + critic gates still prove the (unchanged) state is good, and an empty diff cannot
+    // forge a landed change — the workspace manager's promote downgrades a zero-diff promote to noop.
     const builderOk =
-      builder?.outcome === "success" && (filesWritten.length > 0 || accumulatedPass);
+      builder?.outcome === "success" && (filesWritten.length > 0 || accumulatedPass || noChangeRequired);
     const noPolicyViolations = policyViolations !== undefined && policyViolations.length === 0;
     const criticPass = detailOf(critic).pass === true;
     const verifierPass = detailOf(verifier).verdict === "pass";
@@ -102,7 +111,9 @@ export const integrator: RoleFn = async (ctx) => {
       const rationale =
         accumulatedPass && filesWritten.length === 0
           ? "promote: accumulated multi-step build (this pass wrote 0 files — prior steps did the work), no policy violations, critic pass, verifier pass"
-          : `promote: builder wrote ${filesWritten.length} file(s), no policy violations, critic pass, verifier pass`;
+          : noChangeRequired && filesWritten.length === 0
+            ? "promote: no-change build (goal already satisfied — builder declared noChangeRequired, 0 files written), no policy violations, critic pass, verifier pass"
+            : `promote: builder wrote ${filesWritten.length} file(s), no policy violations, critic pass, verifier pass`;
       return {
         role: "integrator",
         outcome: "success", // "did its job" — the verdict is in detail.decision
