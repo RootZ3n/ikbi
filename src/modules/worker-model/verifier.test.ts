@@ -688,6 +688,18 @@ test("M6: a lifecycle-hook no-op ('pretest':'exit 0') fails closed even when 'te
   }
 });
 
+test("M6 (Codex): a setup hook ('pretest':'echo preparing') is NOT flagged — only HARD no-ops neuter the lifecycle", async () => {
+  const dir = _mkdtempSync(_join(_tmpdir(), "ikbi-hook-setup-"));
+  try {
+    _writeFileSync(_join(dir, "package.json"), JSON.stringify({ name: "x", scripts: { pretest: "echo preparing", test: "node --test" } }));
+    const exec = execStub(() => ({ executed: true, exitCode: 0, stdoutTail: "ok" }));
+    const result = await createVerifier({ governedExec: exec.governedExec, parentCtx: makeParentCtx(), diff: cleanDiff })(ctxAt(dir));
+    assert.equal(result.outcome, "success", "an echo setup hook is legitimate work, not a stub that suppresses the real test");
+  } finally {
+    _rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("M6: a real monorepo (root + subpackage both real) is NOT falsely flagged", async () => {
   const dir = _mkdtempSync(_join(_tmpdir(), "ikbi-real-mono-"));
   try {

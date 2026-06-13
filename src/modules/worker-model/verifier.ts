@@ -180,6 +180,22 @@ function runQualityCheckFromPrior(
  */
 const STUB_GUARDED_SCRIPT_KEYS: readonly string[] = ["test", "pretest", "posttest"];
 
+/**
+ * Codex M6: a pretest/posttest HOOK only neuters the test lifecycle when it is a HARD no-op that
+ * contributes nothing — `exit 0`, `true`, `:` (or an empty body). A setup command like
+ * `echo preparing` or `tsc -b` is legitimate hook work and must NOT be flagged. This is narrower
+ * than isStubScript (which flags ANY `echo …` as a stub): an `echo` on a HOOK is benign logging,
+ * whereas an `echo`-only `test` script is still a vacuous green (the test key keeps isStubScript).
+ */
+function isNeuteredHook(script: string): boolean {
+  const segments = script
+    .split(/\s*(?:&&|\|\||;)\s*/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  if (segments.length === 0) return true; // an empty hook body is a pure no-op
+  return segments.every((seg) => seg === "true" || seg === ":" || /^exit\s+0$/.test(seg));
+}
+
 /** Directory names never worth walking when scanning a workspace for package.json files. */
 const STUB_SCAN_SKIP_DIRS = new Set(["node_modules", ".git", "dist", "build", "coverage", ".next", "out"]);
 
@@ -231,7 +247,11 @@ function detectStubTestScript(workspacePath: string): string | undefined {
     for (const key of STUB_GUARDED_SCRIPT_KEYS) {
       const script = s[key];
       if (typeof script !== "string" || script.length === 0) continue;
-      if (isStubScript(script)) {
+      // The `test` key is the real signal — ANY stub (echo, true, --passWithNoTests, …) is a vacuous
+      // green. A pretest/posttest HOOK is only a stub when it is a HARD no-op (Codex M6): a setup
+      // command like `echo preparing` is legitimate and must not trip the guard.
+      const stubbed = key === "test" ? isStubScript(script) : isNeuteredHook(script);
+      if (stubbed) {
         const where = relative(workspacePath, pkgPath) || "package.json";
         return `stub ${key} script ("${script}") in ${where} is not meaningful verification — refusing a vacuous green`;
       }
