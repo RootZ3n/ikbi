@@ -955,3 +955,37 @@ test("M3: filesWritten is reconciled (deduped) — re-writing the same path repo
   assert.deepEqual(detail.filesWritten, ["a.ts"], "duplicate write events collapse to one distinct file");
   assert.match(result.summary ?? "", /wrote 1\b/, "the summary count reflects distinct files, not raw write events");
 });
+
+// ── L2: contextPercent reports the PEAK pressure, not the last iteration's ───
+
+test("L2: contextPercent reports the PEAK window pressure, not the last iteration's value", async () => {
+  const dir = tmp();
+  // A big, many-line file (compressible read_file content) and a tiny one. The builder reads the
+  // big file enough to drive window pressure UP, then reads the tiny file many times so the
+  // deterministic context layer ages-out + compresses the big reads and pressure falls back DOWN.
+  // The reported contextPercent must be the EARLIER peak, not the much-lower final value.
+  const bigLines: string[] = [];
+  for (let i = 0; i < 700; i += 1) bigLines.push(`line ${i}: the quick brown fox jumps over the lazy dog`);
+  writeFileSync(join(dir, "big.txt"), bigLines.join("\n"));
+  writeFileSync(join(dir, "tiny.txt"), "ok");
+
+  // 6 big reads (pressure climbs), then a long tail of tiny reads (pressure drops as the big
+  // reads are compressed out). The mock engine repeats the LAST response, so once the scripted
+  // list is exhausted the builder keeps reading tiny.txt until it hits the iteration cap.
+  const bigRead = () => toolResp([call("read_file", { path: "big.txt" }, "rc")]);
+  const tinyRead = () => toolResp([call("read_file", { path: "tiny.txt" }, "rc")]);
+  const responses = [bigRead(), bigRead(), bigRead(), bigRead(), bigRead(), bigRead(), tinyRead()];
+
+  const { engine } = mockEngine(responses);
+  const ctx = makeCtx(dir, "verified", engine);
+  const result = await run(ctx);
+
+  const detail = result.detail as { contextPercent: number; compressions: number };
+  // The deterministic context layer must have compressed at least once (so the message set
+  // genuinely shrank — otherwise peak and last would be identical and prove nothing).
+  assert.ok(detail.compressions >= 1, `expected compaction to occur, got ${detail.compressions}`);
+  // The PEAK pressure from the big-read phase is retained even though the run ended deep in the
+  // low-pressure tiny-read tail. A "last iteration" implementation would report a single-digit
+  // percent here; the peak is far above the floor the final iterations sit at.
+  assert.ok(detail.contextPercent >= 50, `expected peak contextPercent >= 50, got ${detail.contextPercent}`);
+});

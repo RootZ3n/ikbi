@@ -625,7 +625,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
   let checksStale = false; // PRINCIPLE 4(b): a write happened AFTER the last run_checks → green is stale
   let checksRuns = 0; // how many times the builder ran the checks in-loop
   let compressions = 0; // how many times the context was compacted (window management)
-  let contextPercent = 0; // SG: latest context-window pressure (0-100), surfaced for visibility
+  let contextPercent = 0; // SG: PEAK context-window pressure (0-100) across iterations, surfaced for visibility (L2)
   let warnedHighContext = false; // warn-once when pressure crosses 70%
   let stopReason = "max_iterations"; // not "stop": only a validated `done` is success now
   const filesWrittenPerRound: number[] = []; // EARLY STOP: tracks new files written each tool-round iteration
@@ -1188,7 +1188,11 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       // CONTEXT PRESSURE VISIBILITY: estimate how full the model's window is AFTER any
       // compaction, as a 0-100 percent. Surfaced on the builder result (→ progress events).
       // Warn ONCE when it crosses 70% so a silently-compressing run is observable.
-      contextPercent = Math.min(100, Math.round((estimateTokens(messages) / caps.context_window) * 100));
+      // L2: report the PEAK window pressure across iterations, not just the last one. A run that
+      // spikes to 80% mid-build and then compacts back down to 40% must still surface 80% — taking
+      // the last iteration's value would under-report true context pressure to operators.
+      const currentPercent = Math.min(100, Math.round((estimateTokens(messages) / caps.context_window) * 100));
+      contextPercent = Math.max(contextPercent, currentPercent);
       if (contextPercent > 70 && !warnedHighContext) {
         warnedHighContext = true;
         log.warn(`[context] window pressure at ${contextPercent}% of ${caps.context_window} tokens — compaction active`);
