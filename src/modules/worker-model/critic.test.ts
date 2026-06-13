@@ -496,3 +496,20 @@ test("H2: the override flows through createCritic end-to-end", async () => {
   assert.equal(detail.pass, false, "a PASS with goal_correctness=1 is gated to FAIL by the critic");
   assert.match(detail.feedback, /rubric override/);
 });
+
+// ── L3: the key_value fallback no longer accepts a stray `pass:` line ────────
+
+test("L3: a prose `pass: true` line does NOT register as a PASS verdict", () => {
+  // Non-JSON prose that merely mentions `pass: true` must NOT be read as an explicit verdict —
+  // the `pass:` alias was dropped, so this has no structured verdict and fails closed (throws).
+  assert.throws(
+    () => parseStructuredVerdict("The change looks good to me.\npass: true\nShipping it."),
+    /no structured verdict/,
+    "a bare `pass: true` prose line is not a verdict",
+  );
+});
+
+test("L3: explicit `verdict:`/`overall:` lines still parse in the key_value fallback", () => {
+  assert.equal(parseStructuredVerdict("verdict: PASS\nfeedback: all good").pass, true, "verdict: PASS still parses");
+  assert.equal(parseStructuredVerdict("overall: FAIL\nfeedback: nope").pass, false, "overall: FAIL still parses");
+});

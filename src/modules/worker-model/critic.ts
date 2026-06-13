@@ -203,7 +203,10 @@ export function parseStructuredVerdict(
   const verdicts: string[] = [];
   let feedback = "";
   for (const line of trimmed.split("\n")) {
-    const m = /^\s*(?:verdict|overall|pass)\s*:\s*(PASS|FAIL|true|false)\s*$/i.exec(line);
+    // L3: only `verdict:` and `overall:` are accepted prefixes. The `pass:` alias was too loose —
+    // a stray `pass: true` line in prose reads as an explicit PASS verdict, which is too permissive
+    // for a fallback parser. A model that means to pass must say so under `verdict:`/`overall:`.
+    const m = /^\s*(?:verdict|overall)\s*:\s*(PASS|FAIL|true|false)\s*$/i.exec(line);
     if (m?.[1] !== undefined) verdicts.push(m[1].toUpperCase() === "TRUE" ? "PASS" : m[1].toUpperCase() === "FALSE" ? "FAIL" : m[1].toUpperCase());
     const f = /^\s*feedback\s*:\s*(.*)$/i.exec(line);
     if (f?.[1] !== undefined) feedback = f[1].trim();
