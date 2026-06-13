@@ -266,11 +266,21 @@ export function applyFilePatch(original: string, patch: FilePatch): { ok: true; 
     const hint = Math.max(0, h.oldStart - 1);
     if (hint >= searchFrom && matchesAt(hint)) pos = hint;
     if (pos === -1) {
+      // DRIFTED CONTEXT: the hinted line did not match, so scan for the before-block. Mirror the
+      // agent patch tool's UNIQUENESS guard — if the before-block matches more than one location in
+      // the remaining file, the splice site is ambiguous and applying the first match risks editing
+      // the wrong place. Reject and ask the builder for more surrounding context. (An exact hint
+      // match above is already unambiguous by line number, so it skips this scan.)
+      let matchCount = 0;
       for (let p = searchFrom; p <= fileLines.length - before.length; p += 1) {
         if (matchesAt(p)) {
-          pos = p;
-          break;
+          matchCount += 1;
+          if (pos === -1) pos = p;
+          if (matchCount > 1) break;
         }
+      }
+      if (matchCount > 1) {
+        return { ok: false, error: `hunk context is not unique in ${patch.path} (matches multiple locations near line ${h.oldStart}) — add more surrounding context lines to disambiguate` };
       }
     }
     if (pos === -1) return { ok: false, error: `hunk does not apply to ${patch.path} (context not found near line ${h.oldStart})` };

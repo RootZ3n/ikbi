@@ -22,7 +22,7 @@ import { autonomyForTier } from "../../core/trust/index.js";
 import type { WorkspaceHandle } from "../../core/workspace/contract.js";
 import type { ExecRequest, ExecResult } from "../governed-exec/index.js";
 import type { Check, ChecksResolution } from "./checks.js";
-import { createPatchsmith } from "./patchsmith.js";
+import { applyFilePatch, createPatchsmith, parseUnifiedDiff } from "./patchsmith.js";
 import type { RoleContext, RoleEngine } from "./contract.js";
 
 const PARENT_CTX: OperationContext = (() => {
@@ -198,3 +198,29 @@ import { mkdirSync } from "node:fs";
 function mkdirp(dir: string, sub: string): void {
   mkdirSync(join(dir, sub), { recursive: true });
 }
+
+// ── L5: drifted-context search rejects a non-unique before-block ─────────────
+
+test("L5: a drifted hunk whose before-block matches multiple locations is rejected as ambiguous", () => {
+  const original = "foo\ntarget\nbar\ntarget\nbaz\n";
+  // oldStart=1 (hint → line 0 = "foo") does NOT match the "target" before-block, so the apply
+  // falls into the drifted-context scan. "target" appears at two lines → ambiguous → reject.
+  const parsed = parseUnifiedDiff("--- a/f.txt\n+++ b/f.txt\n@@ -1,1 +1,1 @@\n-target\n+TARGET\n");
+  assert.equal(parsed.ok, true);
+  const patch = parsed.ok ? parsed.files[0]! : undefined;
+  assert.ok(patch);
+  const res = applyFilePatch(original, patch);
+  assert.equal(res.ok, false, "non-unique drifted context must not be spliced");
+  if (!res.ok) assert.match(res.error, /not unique/, "the error tells the builder the context is ambiguous");
+});
+
+test("L5: a drifted hunk whose before-block is unique still applies", () => {
+  const original = "foo\ntarget\nbar\nqux\nbaz\n";
+  // "target" is unique; the hint (line 0) still misses, so the scan runs — and finds exactly one.
+  const parsed = parseUnifiedDiff("--- a/f.txt\n+++ b/f.txt\n@@ -1,1 +1,1 @@\n-target\n+TARGET\n");
+  assert.ok(parsed.ok);
+  if (!parsed.ok) return;
+  const res = applyFilePatch(original, parsed.files[0]!);
+  assert.equal(res.ok, true, "a unique before-block applies via the drift scan");
+  if (res.ok) assert.equal(res.content, "foo\nTARGET\nbar\nqux\nbaz\n");
+});
