@@ -298,6 +298,26 @@ test("ISSUE-1 semantic clean: a full-context diff changing only a non-guarded sc
   assert.equal(detectScriptMutation(diff).mutated, false, "changing a non-guarded 'start' script is not a verification mutation");
 });
 
+// ── ISSUE 5: verbose >8MB output must not false-RED (verifier streams its checks) ─
+
+test("ISSUE-5: the verifier routes checks through the streaming path (onOutput set) so a verbose passing suite is not a false RED", async () => {
+  // The buffered execFile throws ENOBUFS past maxBuffer (→ exit 1 → false RED). The streaming path
+  // caps capture without killing, preserving the real exit code. The verifier must opt into it by
+  // passing onOutput on every governed check.
+  let everyCheckStreamed = true;
+  const governedExec = {
+    run: async (req: ExecRequest): Promise<ExecResult> => {
+      if (req.onOutput === undefined) everyCheckStreamed = false;
+      // A verbose-but-passing check: huge output, bounded tail, real exit 0 (streaming semantics).
+      return { executed: true, exitCode: 0, stdoutTail: "…tail of an 8MB+ run\n", stderrTail: "" };
+    },
+  };
+  const { ctx } = makeCtx();
+  const result = await createVerifier({ governedExec, parentCtx: makeParentCtx(), diff: cleanDiff })(ctx);
+  assert.equal(everyCheckStreamed, true, "every governed check sets onOutput → the streaming (bounded, no-kill) path is used");
+  assert.equal(result.outcome, "success", "a verbose passing suite verifies GREEN — no ENOBUFS-induced false RED");
+});
+
 // ── DETERMINISM (regression) ─────────────────────────────────────────────────
 
 test("verifier never invokes the model (asserted via the engine spy)", async () => {

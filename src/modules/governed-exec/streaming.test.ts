@@ -66,6 +66,22 @@ test("a streamed non-zero exit is reported (not thrown), with the bounded tail",
   assert.equal(r.stderrTail, "boom\n");
 });
 
+test("ISSUE-5: a check emitting >maxBuffer output streams without ENOBUFS and reports the real exit code (no false RED)", async () => {
+  // The buffered execFile path throws ENOBUFS once stdout passes maxBuffer → a false exit-1 RED on a
+  // PASSING but verbose suite. The streaming path caps CAPTURE at maxBuffer WITHOUT killing the
+  // process, so the real exit 0 survives and the recorded tail stays bounded.
+  const huge = "x".repeat(2_000_000); // 2MB > the 1MB maxBuffer in cfg()
+  const streamFn: ExecFileStreamFn = async (_b, _a, opts, onOutput) => {
+    onOutput(huge, "stdout"); // delivered live, untruncated
+    return { stdout: huge.slice(0, opts.maxBuffer), stderr: "", code: 0 }; // capture bounded, exit preserved
+  };
+  const ge = createGovernedExec({ config: cfg(["pnpm"]), gateWall: gate(), execFileStream: streamFn, receipts: noReceipts, publish: () => {} });
+  const r = await ge.run({ parentCtx: makeCtx(), command: "pnpm", args: ["test"], purpose: "verifier check: test", onOutput: () => {} });
+  assert.equal(r.executed, true);
+  assert.equal(r.exitCode, 0, "a verbose passing suite is NOT mapped to a false RED");
+  assert.ok((r.stdoutTail?.length ?? 0) <= OUTPUT_TAIL_CHARS, "the captured tail is still bounded");
+});
+
 test("WITHOUT onOutput the buffered execFile path is used (streaming primitive untouched)", async () => {
   let streamed = false;
   const streamFn: ExecFileStreamFn = async () => { streamed = true; return { stdout: "", stderr: "", code: 0 }; };

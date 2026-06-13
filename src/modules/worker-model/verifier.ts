@@ -533,6 +533,10 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
         cwd: ctx.workspace.path,
         purpose: `verifier check: ${c.name}`,
         timeoutMs: legacyCheckTimeoutMs,
+        // STREAMING path: a verbose suite emitting >maxBuffer (8MB) to stdout makes the buffered
+        // execFile throw ENOBUFS → mapped to exit 1 → a FALSE RED on a passing build. The streaming
+        // path caps CAPTURE at maxBuffer WITHOUT killing the process, so the real exit code survives.
+        onOutput: () => {},
       });
       const { check, dryRun } = mapExec(c.name, `${c.command} ${c.args.join(" ")}`, res);
       checks.push(check);
@@ -690,6 +694,9 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
             cwd: task.cwd === "" ? worktree : join(worktree, task.cwd),
             purpose: `verifier[ladder:${task.scope}] ${task.name} (${task.package || "(root)"})`,
             timeoutMs: checkTimeoutMs,
+            // STREAMING path (bounded capture, no kill) so a >maxBuffer verbose suite keeps its real
+            // exit code instead of an ENOBUFS-induced false RED. See the legacy loop for the rationale.
+            onOutput: () => {},
           });
           const { check, dryRun } = mapExec(task.name, cmdStr, res);
           checks.push(check);
