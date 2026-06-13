@@ -31,7 +31,10 @@
  *    verification as UNTRUSTED if the builder modified the script surface the verifier
  *    relies on. A test suite the builder rewrote cannot verify the builder's own work.
  *    Fail-closed: a mutated-scripts build CANNOT pass verification (in competitive mode
- *    the judge then disqualifies it). The guard is MANDATORY: without a diff source to
+ *    the judge then disqualifies it). A SECOND pass extends this past package.json itself: a
+ *    guarded script that stays byte-unchanged but SHELLS OUT to a file the build rewrote
+ *    (`"test": "bash ./test.sh"` + a neutered `test.sh`) is rejected the same way. The guard is
+ *    MANDATORY: without a diff source to
  *    inspect, integrity cannot be proven, so verification fails closed (untrusted) — a
  *    missing diff capability is treated exactly like a diff read failure.
  * ─────────────────────────────────────────────────────────────────────────────
@@ -386,6 +389,69 @@ export function detectScriptMutation(diff: string): { mutated: boolean; reason?:
   return { mutated: false };
 }
 
+// Interpreter/shell-script extensions a guarded script may SHELL OUT to. A guarded script that runs
+// one of these files is only as trustworthy as that file — if the build also modified it, the
+// "passing" signal is forged the same way a rewritten package.json script would be.
+const SCRIPT_FILE_EXTS: readonly string[] = [".sh", ".bash", ".js", ".cjs", ".mjs", ".ts", ".cts", ".mts", ".py", ".rb"];
+
+/**
+ * Extract workspace-relative file paths a script SHELLS OUT to (e.g. `bash ./test.sh` → `test.sh`,
+ * `node scripts/test.js` → `scripts/test.js`). A token is a file reference when it is not a flag,
+ * not absolute, not under node_modules, and either contains a path separator OR ends in a known
+ * interpreter/shell-script extension. `node --test` / `vitest run` yield NOTHING (flags / bare words).
+ */
+function extractScriptFilePaths(script: string): string[] {
+  const out: string[] = [];
+  // Split on whitespace and shell separators (; | & ( ) < >) so each token is a single argument.
+  for (const raw of script.split(/[\s;|&()<>]+/)) {
+    if (raw.length === 0 || raw.startsWith("-")) continue; // empty or a flag (e.g. --test)
+    const unquoted = raw.replace(/^["']|["']$/g, "");
+    if (unquoted.startsWith("/")) continue; // absolute path — not a workspace-relative file
+    const norm = unquoted.replace(/^\.\//, ""); // normalize a leading ./
+    if (norm.length === 0 || norm.includes("node_modules/")) continue;
+    const hasSep = norm.includes("/");
+    const hasScriptExt = SCRIPT_FILE_EXTS.some((e) => norm.toLowerCase().endsWith(e));
+    if (hasSep || hasScriptExt) out.push(norm);
+  }
+  return out;
+}
+
+/**
+ * LAYER-2 (second pass): a guarded script can stay BYTE-FOR-BYTE UNCHANGED in package.json yet still
+ * be neutered if it SHELLS OUT to a file the build rewrote — `"test": "bash ./test.sh"` is clean, but
+ * a `test.sh` rewritten to `exit 0` forges a passing signal exactly like a rewritten inline script.
+ * detectScriptMutation only sees the package.json LINES, so it misses this. This pass reads the
+ * workspace's CURRENT package.json (the scripts that will actually run), extracts each guarded
+ * script's shell-referenced file paths, and flags the build if any of those paths was also modified
+ * in the diff. EXPORTED for unit tests. Fail-closed by design; returns clean when there is no
+ * package.json, no guarded script references a file, or no referenced file was touched.
+ */
+export function detectShellOutMutation(diff: string, workspacePath: string): { mutated: boolean; reason?: string } {
+  const pkgPath = join(workspacePath, "package.json");
+  if (!existsSync(pkgPath)) return { mutated: false };
+  let scripts: Record<string, unknown>;
+  try {
+    const pkg: unknown = JSON.parse(readFileSync(pkgPath, "utf8"));
+    const s = (pkg as { scripts?: unknown })?.scripts;
+    if (s === null || typeof s !== "object") return { mutated: false };
+    scripts = s as Record<string, unknown>;
+  } catch {
+    return { mutated: false }; // unparseable package.json is not a shell-out signal
+  }
+  const changed = new Set(parseChangedFiles(diff));
+  if (changed.size === 0) return { mutated: false };
+  for (const key of GUARDED_SCRIPT_KEYS) {
+    const val = scripts[key];
+    if (typeof val !== "string" || val.length === 0) continue;
+    for (const ref of extractScriptFilePaths(val)) {
+      if (changed.has(ref)) {
+        return { mutated: true, reason: `builder modified "${ref}", a file the guarded package.json script "${key}" shells out to` };
+      }
+    }
+  }
+  return { mutated: false };
+}
+
 /**
  * The legacy LINE-SCAN detector (fallback for partial hunks / non-JSON configs). Flags a changed
  * (added/removed) line that touches the "scripts" key, a guarded script entry, a tsconfig weakening
@@ -491,6 +557,13 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
       // The builder controls the test command — a passing result cannot be trusted and
       // must NOT feed the judge/promote. Do NOT run the mutated script as a real check.
       return untrusted(`verification untrusted: ${mutation.reason}`);
+    }
+    // SECOND PASS: a guarded script unchanged in package.json can still be neutered if it SHELLS OUT
+    // to a file the build rewrote (`"test": "bash ./test.sh"` clean, but test.sh → `exit 0`). The
+    // line/JSON guard above only inspects the package.json scripts, not the files they invoke.
+    const shellOut = detectShellOutMutation(diffText, ctx.workspace.path);
+    if (shellOut.mutated) {
+      return untrusted(`verification untrusted: ${shellOut.reason}`);
     }
 
     // ── LAYER 1: GOVERNED CHECKS ──────────────────────────────────────────────

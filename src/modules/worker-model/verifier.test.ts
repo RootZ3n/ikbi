@@ -11,7 +11,7 @@ import { autonomyForTier } from "../../core/trust/index.js";
 import type { WorkspaceHandle } from "../../core/workspace/contract.js";
 import type { ExecRequest, ExecResult } from "../governed-exec/index.js";
 import type { ProjectIndexData } from "../project-index/index.js";
-import { createVerifier, detectScriptMutation, type CheckResult } from "./verifier.js";
+import { createVerifier, detectScriptMutation, detectShellOutMutation, type CheckResult } from "./verifier.js";
 import type { RoleContext, RoleResult } from "./contract.js";
 
 const silent = () => pino({ level: "silent" });
@@ -443,6 +443,58 @@ test("C2: a COMMITTED package.json scripts mutation visible only with FULL conte
     assert.equal(detectScriptMutation(full).mutated, true, "full-context committed package.json diff flags the scripts mutation (the fix)");
   } finally {
     _rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+// ── C3: detectShellOutMutation — a guarded script that shells out to a build-modified file ──────
+function withPkg(scripts: Record<string, string>, body: (workspacePath: string) => void): void {
+  const dir = _mkdtempSync(_join(_tmpdir(), "ikbi-shellout-"));
+  try {
+    _writeFileSync(_join(dir, "package.json"), `${JSON.stringify({ name: "r", scripts }, null, 2)}\n`);
+    body(dir);
+  } finally {
+    _rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('C3: "test": "bash ./test.sh" + test.sh modified in the diff → flagged', () => {
+  withPkg({ test: "bash ./test.sh" }, (dir) => {
+    const diff = "diff --git a/test.sh b/test.sh\n--- a/test.sh\n+++ b/test.sh\n@@ -1 +1 @@\n-pnpm vitest run\n+exit 0\n";
+    const r = detectShellOutMutation(diff, dir);
+    assert.equal(r.mutated, true, "rewriting the file the test script shells out to forges a passing signal");
+    assert.match(r.reason ?? "", /test\.sh/);
+  });
+});
+
+test('C3: "test": "bash ./test.sh" + test.sh NOT modified → clean', () => {
+  withPkg({ test: "bash ./test.sh" }, (dir) => {
+    const diff = "diff --git a/src/index.ts b/src/index.ts\n--- a/src/index.ts\n+++ b/src/index.ts\n@@ -1 +1 @@\n-const a = 1;\n+const a = 2;\n";
+    assert.equal(detectShellOutMutation(diff, dir).mutated, false, "an unrelated source change does not touch the shelled-out file");
+  });
+});
+
+test('C3: "test": "node --test" (no file reference) → clean', () => {
+  withPkg({ test: "node --test" }, (dir) => {
+    const diff = "diff --git a/test.sh b/test.sh\n--- a/test.sh\n+++ b/test.sh\n@@ -1 +1 @@\n-x\n+exit 0\n";
+    assert.equal(detectShellOutMutation(diff, dir).mutated, false, "a bare runner with only flags references no file");
+  });
+});
+
+test('C3: "test": "node scripts/test.js" + scripts/test.js modified → flagged (nested path)', () => {
+  withPkg({ test: "node scripts/test.js" }, (dir) => {
+    const diff = "diff --git a/scripts/test.js b/scripts/test.js\n--- a/scripts/test.js\n+++ b/scripts/test.js\n@@ -1 +1 @@\n-process.exit(run())\n+process.exit(0)\n";
+    const r = detectShellOutMutation(diff, dir);
+    assert.equal(r.mutated, true, "a nested shell-out target counts");
+    assert.match(r.reason ?? "", /scripts\/test\.js/);
+  });
+});
+
+test("C3: no package.json in the workspace → clean (nothing to inspect)", () => {
+  const dir = _mkdtempSync(_join(_tmpdir(), "ikbi-shellout-empty-"));
+  try {
+    assert.equal(detectShellOutMutation("diff --git a/test.sh b/test.sh\n+exit 0\n", dir).mutated, false);
+  } finally {
+    _rmSync(dir, { recursive: true, force: true });
   }
 });
 
