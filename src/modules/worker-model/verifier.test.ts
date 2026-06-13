@@ -11,7 +11,7 @@ import { autonomyForTier } from "../../core/trust/index.js";
 import type { WorkspaceHandle } from "../../core/workspace/contract.js";
 import type { ExecRequest, ExecResult } from "../governed-exec/index.js";
 import { createVerifier, detectScriptMutation, type CheckResult } from "./verifier.js";
-import type { RoleContext } from "./contract.js";
+import type { RoleContext, RoleResult } from "./contract.js";
 
 const silent = () => pino({ level: "silent" });
 const IDENTITY: AgentIdentity = { agentId: "worker-1", functionalRole: "verifier", trustTier: "verified", spawnedFrom: "parent-1" };
@@ -478,6 +478,73 @@ test("ISSUE-3 legacy: a REAL test script ('node --test') passes the stub guard",
     const exec = execStub(() => ({ executed: true, exitCode: 0, stdoutTail: "ok" }));
     const result = await createVerifier({ governedExec: exec.governedExec, parentCtx: makeParentCtx(), diff: cleanDiff })(ctxAt(dir));
     assert.equal(result.outcome, "success", "a real test script is not flagged as a stub");
+  } finally {
+    _rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── ISSUE 4: the quality-gate wiring inside the verifier (checks pass → quality runs) ─
+
+/** A verifier ctx at `dir` whose prior builder result declares the given written files. */
+function ctxWithBuilt(dir: string, filesWritten: string[]): RoleContext {
+  const ctx = ctxAt(dir);
+  const builder: RoleResult = { role: "builder", outcome: "success", summary: "built", detail: { filesWritten } };
+  (ctx as { priorResults: readonly RoleResult[] }).priorResults = [builder];
+  return ctx;
+}
+
+test("ISSUE-4 quality gate: checks pass but a written STUB file → outcome failure", async () => {
+  const dir = _mkdtempSync(_join(_tmpdir(), "ikbi-q-stub-"));
+  try {
+    _mkdirSync(_join(dir, "src"), { recursive: true });
+    _writeFileSync(_join(dir, "src", "feature.ts"), "// TODO: implement this later\n");
+    const exec = execStub(() => ({ executed: true, exitCode: 0, stdoutTail: "ok" }));
+    const result = await createVerifier({ governedExec: exec.governedExec, parentCtx: makeParentCtx(), diff: cleanDiff })(ctxWithBuilt(dir, ["src/feature.ts"]));
+    assert.equal(result.outcome, "failure", "a stub file fails the post-check quality gate");
+    const detail = result.detail as { verdict: string; qualityIssues?: { kind: string }[] };
+    assert.equal(detail.verdict, "fail");
+    assert.ok(detail.qualityIssues?.some((i) => i.kind === "stub_file"), "the stub_file quality issue is recorded");
+  } finally {
+    _rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ISSUE-4 quality gate: checks pass but a written EMPTY file → outcome failure", async () => {
+  const dir = _mkdtempSync(_join(_tmpdir(), "ikbi-q-empty-"));
+  try {
+    _mkdirSync(_join(dir, "src"), { recursive: true });
+    _writeFileSync(_join(dir, "src", "empty.ts"), ""); // 0 bytes
+    const exec = execStub(() => ({ executed: true, exitCode: 0, stdoutTail: "ok" }));
+    const result = await createVerifier({ governedExec: exec.governedExec, parentCtx: makeParentCtx(), diff: cleanDiff })(ctxWithBuilt(dir, ["src/empty.ts"]));
+    assert.equal(result.outcome, "failure", "an empty file fails the post-check quality gate");
+    const detail = result.detail as { qualityIssues?: { kind: string }[] };
+    assert.ok(detail.qualityIssues?.some((i) => i.kind === "empty_file"), "the empty_file quality issue is recorded");
+  } finally {
+    _rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ISSUE-4 quality gate: checks pass but a file written into node_modules → outcome failure", async () => {
+  const dir = _mkdtempSync(_join(_tmpdir(), "ikbi-q-loc-"));
+  try {
+    const exec = execStub(() => ({ executed: true, exitCode: 0, stdoutTail: "ok" }));
+    const result = await createVerifier({ governedExec: exec.governedExec, parentCtx: makeParentCtx(), diff: cleanDiff })(ctxWithBuilt(dir, ["node_modules/evil/index.ts"]));
+    assert.equal(result.outcome, "failure", "a write into a blocked directory fails the quality gate");
+    const detail = result.detail as { qualityIssues?: { kind: string }[] };
+    assert.ok(detail.qualityIssues?.some((i) => i.kind === "bad_location"), "the bad_location quality issue is recorded");
+  } finally {
+    _rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("ISSUE-4 quality gate: checks pass and a VALID written file → outcome success", async () => {
+  const dir = _mkdtempSync(_join(_tmpdir(), "ikbi-q-ok-"));
+  try {
+    _mkdirSync(_join(dir, "src"), { recursive: true });
+    _writeFileSync(_join(dir, "src", "good.ts"), "export const x = 1;\nexport function add(a: number, b: number) { return a + b; }\n");
+    const exec = execStub(() => ({ executed: true, exitCode: 0, stdoutTail: "ok" }));
+    const result = await createVerifier({ governedExec: exec.governedExec, parentCtx: makeParentCtx(), diff: cleanDiff })(ctxWithBuilt(dir, ["src/good.ts"]));
+    assert.equal(result.outcome, "success", "a real, non-empty, well-located file passes the quality gate");
   } finally {
     _rmSync(dir, { recursive: true, force: true });
   }
