@@ -162,6 +162,24 @@ export async function workingTreePackageJsonDiff(
 }
 
 /**
+ * The COMMITTED diff of package.json files for the `base..scratch` range — what the script-integrity
+ * guard inspects for a candidate that COMMITS before it is judged (competitive mode), where the
+ * working-tree diff is empty. The general committed diff (workspaces.diff → `git diff base..scratch`)
+ * uses git's DEFAULT 3-line context, too narrow for the JSON-semantic parser to reconstruct a whole
+ * package.json: a fragment is not JSON-parseable, so the parser returns indeterminate and falls back
+ * to the weaker line-scan (which misses, e.g., a separate-line "test":/value rewrite). This requests
+ * FULL context (`-U1000000`) for the SAME reason workingTreePackageJsonDiff does, scoped to
+ * `*package.json` so it covers root + every subpackage and stays small.
+ */
+export async function committedPackageJsonDiff(
+  runGit: (args: readonly string[]) => Promise<string>,
+  baseRef: string,
+  scratchBranch: string,
+): Promise<string> {
+  return runGit(["diff", "-U1000000", `${baseRef}..${scratchBranch}`, "--", "*package.json"]);
+}
+
+/**
  * Accumulate the FULL stdout of a STREAMING governed-exec call. governed-exec's ExecResult retains
  * only a bounded `stdoutTail` (the last ~2000 chars). Reading a large `git diff` through that tail
  * truncates the TOP of the diff — a package.json "scripts" mutation above the tail window would be

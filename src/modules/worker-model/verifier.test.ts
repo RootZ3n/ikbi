@@ -353,7 +353,7 @@ import { execFileSync as _execFileSync } from "node:child_process";
 import { mkdtempSync as _mkdtempSync, mkdirSync as _mkdirSync, writeFileSync as _writeFileSync, rmSync as _rmSync } from "node:fs";
 import { tmpdir as _tmpdir } from "node:os";
 import { join as _join } from "node:path";
-import { captureStreamedStdout, workingTreePackageJsonDiff } from "./checks.js";
+import { captureStreamedStdout, committedPackageJsonDiff, workingTreePackageJsonDiff } from "./checks.js";
 
 test("P0/Fix1: working-tree diff catches an UNCOMMITTED package.json rewrite (root + subpackage); committed range is empty", async () => {
   const repo = _mkdtempSync(_join(_tmpdir(), "ikbi-si-"));
@@ -383,6 +383,64 @@ test("P0/Fix1: working-tree diff catches an UNCOMMITTED package.json rewrite (ro
     assert.ok(/echo pass/.test(wt), "root rewrite visible");
     assert.ok(/only-passing/.test(wt), "subpackage rewrite visible");
     assert.equal(detectScriptMutation(wt).mutated, true, "→ script-integrity fails closed at verify time");
+  } finally {
+    _rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("C2: a COMMITTED package.json scripts mutation visible only with FULL context is detected (3-line range misses it)", async () => {
+  const repo = _mkdtempSync(_join(_tmpdir(), "ikbi-si-committed-"));
+  try {
+    const git = (args: string[]): string => _execFileSync("git", ["-C", repo, ...args], { stdio: ["ignore", "pipe", "ignore"], encoding: "utf8" });
+    // The script value sits on its OWN line (separate from the "test": key). With a 3-line-context
+    // diff the changed value line has no key on it, so the line-scan can't match a guarded key AND
+    // the reconstructed fragment isn't whole-JSON-parseable — the mutation slips through. Only a
+    // full-context diff lets the JSON-semantic parser reconstruct the file and compare scripts.test.
+    const base = [
+      "{",
+      '  "name": "r",',
+      '  "version": "1.0.0",',
+      '  "description": "x",',
+      '  "private": true,',
+      '  "scripts": {',
+      '    "lint": "eslint .",',
+      '    "test":',
+      '      "vitest run",',
+      '    "build": "tsc"',
+      "  },",
+      '  "dependencies": {',
+      '    "a": "1",',
+      '    "b": "2"',
+      "  }",
+      "}",
+      "",
+    ].join("\n");
+    try {
+      git(["init", "-q"]);
+      git(["config", "user.email", "t@example.com"]);
+      git(["config", "user.name", "t"]);
+      _writeFileSync(_join(repo, "package.json"), base);
+      git(["add", "-A"]);
+      git(["commit", "-qm", "base"]);
+    } catch {
+      return; // git unavailable → skip (the unit detectScriptMutation tests still cover the parser)
+    }
+    const baseRef = git(["rev-parse", "HEAD"]).trim();
+    // builder COMMITS a rewrite of the test script value (vitest run → echo pass) on a scratch branch
+    git(["checkout", "-q", "-b", "ikbi/ws/scratch"]);
+    _writeFileSync(_join(repo, "package.json"), base.replace('      "vitest run",', '      "echo pass",'));
+    git(["add", "-A"]);
+    git(["commit", "-qm", "rewrite test"]);
+
+    // The DEFAULT 3-line committed range (what workspaces.diff produces) does NOT surface the key on a
+    // changed line and isn't whole-JSON-parseable → the guard MISSES it (the bug).
+    const threeLine = git(["diff", `${baseRef}..ikbi/ws/scratch`]);
+    assert.ok(/echo pass/.test(threeLine), "the 3-line diff still contains the changed value line");
+    assert.equal(detectScriptMutation(threeLine).mutated, false, "the weaker line-scan misses the committed mutation at 3-line context (the bug)");
+
+    // The FIX: full-context committed package.json diff → the JSON-semantic parser catches it.
+    const full = await committedPackageJsonDiff(async (args) => git([...args]), baseRef, "ikbi/ws/scratch");
+    assert.equal(detectScriptMutation(full).mutated, true, "full-context committed package.json diff flags the scripts mutation (the fix)");
   } finally {
     _rmSync(repo, { recursive: true, force: true });
   }

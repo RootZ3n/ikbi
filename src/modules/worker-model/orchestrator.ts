@@ -58,7 +58,7 @@ import { builder, createBuilder, MAX_TOOL_ITERATIONS } from "./builder.js";
 import { createPatchsmith } from "./patchsmith.js";
 import { runTournament } from "./tournament.js";
 import type { CandidateRun, CandidateSpec, ShadowVerification, TournamentEngine, TournamentEvent } from "./tournament.js";
-import { captureStreamedStdout, resolveChecks, resolveCheckTimeoutMs, workingTreePackageJsonDiff, workingTreePlanningDiff } from "./checks.js";
+import { captureStreamedStdout, committedPackageJsonDiff, resolveChecks, resolveCheckTimeoutMs, workingTreePackageJsonDiff, workingTreePlanningDiff } from "./checks.js";
 import { builderModel, competitiveBuilderModels } from "./role-models.js";
 import { createCritic, critic } from "./critic.js";
 import { integrator } from "./integrator.js";
@@ -606,6 +606,20 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       hasCommitted || govExecForRoles !== undefined
         ? (ws: WorkspaceHandle): Promise<string> => {
             const committedP = hasCommitted ? workspaces.diff!(ws) : Promise.resolve("");
+            // C2: the committed base..scratch range above (workspaces.diff) uses git's DEFAULT 3-line
+            // context — too narrow for the JSON-semantic parser to reconstruct a whole package.json, so
+            // a committed scripts mutation (e.g. a separate-line "test":/value rewrite) falls back to
+            // the weaker line-scan and can slip through. Capture the committed package.json range at
+            // FULL context too (governed streamed git), so it is caught semantically. Without governed
+            // git we keep the 3-line committed diff (no regression).
+            const committedPkgP =
+              govExecForRoles !== undefined
+                ? committedPackageJsonDiff(
+                    (args) => captureFullGitDiff(args, ws, "verifier: script-integrity committed package.json diff"),
+                    ws.baseRef,
+                    ws.scratchBranch,
+                  ).catch(() => "")
+                : Promise.resolve("");
             const workingP =
               govExecForRoles !== undefined
                 ? workingTreePackageJsonDiff(
@@ -614,7 +628,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                     ws.baseRef,
                   ).catch(() => "")
                 : Promise.resolve("");
-            return Promise.all([committedP, workingP]).then(([c, w]) => `${c}\n${w}`);
+            return Promise.all([committedP, committedPkgP, workingP]).then(([c, cp, w]) => `${c}\n${cp}\n${w}`);
           }
         : undefined;
     const runGitForDiff = async (args: readonly string[], ws: WorkspaceHandle, purpose: string): Promise<string> => {
