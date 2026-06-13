@@ -58,7 +58,7 @@ import { builder, createBuilder, MAX_TOOL_ITERATIONS } from "./builder.js";
 import { createPatchsmith } from "./patchsmith.js";
 import { runTournament } from "./tournament.js";
 import type { CandidateRun, CandidateSpec, ShadowVerification, TournamentEngine, TournamentEvent } from "./tournament.js";
-import { captureStreamedStdout, committedPackageJsonDiff, resolveChecks, resolveCheckTimeoutMs, workingTreePackageJsonDiff, workingTreePlanningDiff } from "./checks.js";
+import { captureStreamedStdout, committedPackageJsonDiff, parseTestCount, resolveChecks, resolveCheckTimeoutMs, workingTreePackageJsonDiff, workingTreePlanningDiff } from "./checks.js";
 import { builderModel, competitiveBuilderModels } from "./role-models.js";
 import { createCritic, critic } from "./critic.js";
 import { integrator } from "./integrator.js";
@@ -1936,7 +1936,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 }
 
 /** Parse the verifier's check results into the candidate's pass flags + (best-effort) test count. */
-function readVerifier(verifierResult: RoleResult | undefined): { typecheckPass: boolean; testsPass: boolean; testCount?: { passed: number; total: number }; testEvidence: "executed" | "zero" | "unverified" | "absent"; checks: ReadonlyArray<{ name: string; passed: boolean }> } {
+export function readVerifier(verifierResult: RoleResult | undefined): { typecheckPass: boolean; testsPass: boolean; testCount?: { passed: number; total: number }; testEvidence: "executed" | "zero" | "unverified" | "absent"; checks: ReadonlyArray<{ name: string; passed: boolean }> } {
   // Builder failed (no verify ran) ⇒ both gates fail.
   if (verifierResult === undefined) return { typecheckPass: false, testsPass: false, testEvidence: "absent", checks: [] };
   const detail = (verifierResult.detail ?? {}) as Record<string, unknown>;
@@ -1948,7 +1948,18 @@ function readVerifier(verifierResult: RoleResult | undefined): { typecheckPass: 
   const authoritativePass = verdict === "pass" && verifierResult.outcome === "success";
   const typecheckPass = typecheck !== undefined ? typecheck.exitCode === 0 : authoritativePass;
   const testsPass = test !== undefined ? test.exitCode === 0 : authoritativePass;
-  const testCount = test !== undefined && typeof test.outputTail === "string" ? parseTestCount(test.outputTail) : undefined;
+  // Prefer the testCount STAMPED by mapExec from the FULL check output — robust to outputTail
+  // truncation (a "# tests 0" marker emitted EARLY in a verbose passing run is pushed out of the
+  // bounded tail, so re-parsing the tail here would miss it and read "unverified" instead of "zero").
+  // Fall back to parsing the tail only for legacy verifier results that predate the stamped field.
+  const rawCount = test?.testCount;
+  const stampedCount =
+    typeof rawCount === "object" && rawCount !== null &&
+    typeof (rawCount as { passed?: unknown }).passed === "number" &&
+    typeof (rawCount as { total?: unknown }).total === "number"
+      ? { passed: (rawCount as { passed: number }).passed, total: (rawCount as { total: number }).total }
+      : undefined;
+  const testCount = stampedCount ?? (test !== undefined && typeof test.outputTail === "string" ? parseTestCount(test.outputTail) : undefined);
   // Finding D — TEST-EXECUTION EVIDENCE: distinguish a REAL executed suite from a passing command
   // that proved nothing, so the judge cannot score them identically. A passing "test" check with a
   // parsed count>0 is "executed"; a parsed count of 0 is "zero" (a runner that ran nothing); a pass
@@ -1966,14 +1977,6 @@ function readVerifier(verifierResult: RoleResult | undefined): { typecheckPass: 
   // IKBI_CHECKS correctly instead of forcing every run onto the typecheck/tests axes.
   const checkList = checks.map((c) => ({ name: String(c.name), passed: c.exitCode === 0 }));
   return { typecheckPass, testsPass, ...(testCount !== undefined ? { testCount } : {}), testEvidence, checks: checkList };
-}
-
-/** Parse the node:test summary tail ("# tests N" / "# pass N") into a count, when present. */
-function parseTestCount(output: string): { passed: number; total: number } | undefined {
-  const tests = /# tests (\d+)/.exec(output);
-  const pass = /# pass (\d+)/.exec(output);
-  if (tests !== null && pass !== null) return { passed: Number(pass[1]), total: Number(tests[1]) };
-  return undefined;
 }
 
 /** Best-effort discard that never masks the original error. */

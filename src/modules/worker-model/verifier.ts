@@ -599,6 +599,10 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
     const checks: CheckResult[] = [];
     let sawDryRun = false;
     for (const c of checkSet) {
+      // Accumulate the FULL stdout from the streaming sink: governed-exec retains only the bounded
+      // tail, so a zero-test marker printed early in a verbose passing run is gone from stdoutTail.
+      // mapExec parses the test tally from this full stream (robust), not the truncated tail.
+      let fullStdout = "";
       const res = await governedExec.run({
         parentCtx,
         command: c.command,
@@ -609,9 +613,9 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
         // STREAMING path: a verbose suite emitting >maxBuffer (8MB) to stdout makes the buffered
         // execFile throw ENOBUFS → mapped to exit 1 → a FALSE RED on a passing build. The streaming
         // path caps CAPTURE at maxBuffer WITHOUT killing the process, so the real exit code survives.
-        onOutput: () => {},
+        onOutput: (chunk, stream) => { if (stream === "stdout") fullStdout += chunk; },
       });
-      const { check, dryRun } = mapExec(c.name, `${c.command} ${c.args.join(" ")}`, res);
+      const { check, dryRun } = mapExec(c.name, `${c.command} ${c.args.join(" ")}`, res, fullStdout);
       checks.push(check);
       sawDryRun = sawDryRun || dryRun;
     }
@@ -760,6 +764,9 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
             };
           }
           const cmdStr = `${task.command} ${task.args.join(" ")}`;
+          // Accumulate the FULL stdout (see the legacy loop): the bounded tail can drop an early
+          // zero-test marker, so mapExec parses the tally from the whole stream, not the tail.
+          let fullStdout = "";
           const res = await governedExec.run({
             parentCtx: pctx,
             command: task.command,
@@ -769,9 +776,9 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
             timeoutMs: checkTimeoutMs,
             // STREAMING path (bounded capture, no kill) so a >maxBuffer verbose suite keeps its real
             // exit code instead of an ENOBUFS-induced false RED. See the legacy loop for the rationale.
-            onOutput: () => {},
+            onOutput: (chunk, stream) => { if (stream === "stdout") fullStdout += chunk; },
           });
-          const { check, dryRun } = mapExec(task.name, cmdStr, res);
+          const { check, dryRun } = mapExec(task.name, cmdStr, res, fullStdout);
           checks.push(check);
           if (dryRun) {
             return {

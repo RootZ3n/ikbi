@@ -283,17 +283,49 @@ export interface CheckResult {
   readonly command: string;
   readonly exitCode: number;
   readonly outputTail: string;
+  /**
+   * Test tally ("# tests N" / "# pass N") parsed from the FULL, untruncated check output — robust
+   * to `outputTail` truncation. A zero-test marker emitted EARLY in a verbose passing run is pushed
+   * out of the last-MAX_OUTPUT_TAIL-chars tail, so re-parsing the tail downstream would miss it and
+   * read "unverified" instead of "zero". Computed once here from the whole stream and carried so the
+   * verdict layer (readVerifier) has a reliable count. Absent when no count was present in the output.
+   */
+  readonly testCount?: { readonly passed: number; readonly total: number };
 }
 
 export function tail(s: string, max: number): string {
   return s.length <= max ? s : s.slice(s.length - max);
 }
 
-/** Map one governed ExecResult onto a CheckResult (fail-closed on deny / dry-run). */
-export function mapExec(name: string, command: string, res: ExecResult): { check: CheckResult; dryRun: boolean } {
+/**
+ * Parse the node:test summary ("# tests N" / "# pass N") into a count, when present. Shared by the
+ * check-capture layer (mapExec, on the FULL output) and the verdict layer (readVerifier) so both
+ * read the tally the same way. Returns undefined when the markers are absent.
+ */
+export function parseTestCount(output: string): { passed: number; total: number } | undefined {
+  const tests = /# tests (\d+)/.exec(output);
+  const pass = /# pass (\d+)/.exec(output);
+  if (tests !== null && pass !== null) return { passed: Number(pass[1]), total: Number(tests[1]) };
+  return undefined;
+}
+
+/**
+ * Map one governed ExecResult onto a CheckResult (fail-closed on deny / dry-run).
+ *
+ * `fullOutput` (optional) is the COMPLETE, untruncated stdout the caller accumulated from the
+ * streaming `onOutput` sink. governed-exec's ExecResult only retains the last OUTPUT_TAIL_CHARS, so
+ * a zero-test marker emitted early in a verbose run is already gone from `res.stdoutTail`. When the
+ * caller supplies the full stream, the test tally is parsed from THAT (robust); otherwise we fall
+ * back to the bounded tail. The stamped `testCount` lets the verdict layer avoid re-parsing the tail.
+ */
+export function mapExec(name: string, command: string, res: ExecResult, fullOutput?: string): { check: CheckResult; dryRun: boolean } {
   if (res.executed) {
     const output = `${res.stdoutTail ?? ""}${res.stderrTail ?? ""}`;
-    return { check: { name, command, exitCode: res.exitCode ?? 1, outputTail: tail(output, MAX_OUTPUT_TAIL) }, dryRun: false };
+    const testCount = parseTestCount(fullOutput ?? output);
+    return {
+      check: { name, command, exitCode: res.exitCode ?? 1, outputTail: tail(output, MAX_OUTPUT_TAIL), ...(testCount !== undefined ? { testCount } : {}) },
+      dryRun: false,
+    };
   }
   if (res.denied === true) {
     // FAIL CLOSED: a denied / non-allowlisted check is a non-zero check, NEVER a pass.
