@@ -54,6 +54,8 @@ import "./context-packets/index.js";
 import "./model-evaluation/index.js";
 // Chat — registers the POST /chat conversational endpoint (persistent sessions + tool loop).
 import "./chat/index.js";
+// Receipts — registers GET /api/receipts and GET /api/receipts/:id (read-only build history).
+import "../server/receipts.js";
 // Orchestration layer above worker-model (registers the `batch` command on import).
 import "./batch-planner/index.js";
 // Capability-recovery diagnostic (registers the `recover` operator command on import).
