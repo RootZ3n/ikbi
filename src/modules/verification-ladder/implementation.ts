@@ -47,17 +47,33 @@ function stripShellComment(s: string): string {
   return s.replace(/(^|\s)#.*$/, "$1").trim();
 }
 
+/** A single command that ALWAYS succeeds (exit 0) and verifies nothing: echo/true/:/`exit 0`. */
+function isSuccessNoop(seg: string): boolean {
+  return /^exit\s+0$/.test(seg) || seg === "true" || seg === ":" || /^echo(\s|$)/.test(seg);
+}
+
 export function isStubScript(body: string): boolean {
   const s = stripShellComment(body);
   if (s.length === 0) return true;
   // F3: a "pass with no tests" flag lets a runner exit 0 with ZERO tests → trivially green → stub.
   if (/--pass-?with-?no-?(tests|empty-?test-?files)\b/i.test(s)) return true;
+  // `A || B`: B runs ONLY if A fails. The FIRST `||`-group is the only code guaranteed to run; if it
+  // is entirely success-no-ops (echo/true/:/`exit 0` all exit 0) the real command on the right is
+  // unreachable → the whole expression is a no-op stub. (`false || vitest` DOES reach the right, and
+  // `vitest && echo ok || x` runs vitest — neither has an all-no-op first group, so neither trips.)
+  if (s.includes("||")) {
+    const firstGroup = (s.split(/\s*\|\|\s*/)[0] ?? "")
+      .split(/\s*(?:&&|;)\s*/)
+      .map((x) => stripShellComment(x))
+      .filter((x) => x.length > 0);
+    if (firstGroup.length > 0 && firstGroup.every(isSuccessNoop)) return true;
+  }
   const segments = s
     .split(/\s*(?:&&|\|\||;)\s*/)
     .map((x) => stripShellComment(x))
     .filter((x) => x.length > 0);
   if (segments.length === 0) return true;
-  return segments.every((seg) => /^exit\s+0$/.test(seg) || seg === "true" || seg === ":" || /^echo(\s|$)/.test(seg));
+  return segments.every(isSuccessNoop);
 }
 
 /** Runnable script keys whose body is a stub (skipped unless trivial scripts are operator-trusted). */

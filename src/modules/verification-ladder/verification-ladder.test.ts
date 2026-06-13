@@ -204,6 +204,18 @@ test("P0/Fix3: comment-disguised no-ops and no-test passes are detected as stubs
   }
 });
 
+test("Codex-2: a success-no-op left of `||` makes the real right-hand command unreachable → stub", () => {
+  // `A || B` runs B only if A FAILS. A success-no-op (echo/true/:/exit 0) on the left always exits 0,
+  // so the real command on the right is dead code — the whole script verifies nothing.
+  for (const body of ["echo ok || vitest run", "true || vitest run", ": || vitest run", "exit 0 || vitest run", "echo a && echo b || vitest run"]) {
+    assert.equal(isStubScript(body), true, `stub (|| short-circuit): "${body}"`);
+  }
+  // The left side actually runs the real command → NOT a stub.
+  for (const body of ["vitest run || echo fail", "false || vitest run", "vitest run && echo ok || echo fail"]) {
+    assert.equal(isStubScript(body), false, `real (left side runs): "${body}"`);
+  }
+});
+
 // ── C1: ladder emits the `run`-less shorthand for pnpm/yarn so governed-exec (which bans
 //        `<mgr> run <script>`) lets a real typecheck/build pass instead of denying it → RED ──────
 test("C1: non-test scripts use shorthand for pnpm/yarn, `run` only for npm", () => {
