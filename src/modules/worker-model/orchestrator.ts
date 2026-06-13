@@ -58,7 +58,7 @@ import { builder, createBuilder, MAX_TOOL_ITERATIONS } from "./builder.js";
 import { createPatchsmith } from "./patchsmith.js";
 import { runTournament } from "./tournament.js";
 import type { CandidateRun, CandidateSpec, ShadowVerification, TournamentEngine, TournamentEvent } from "./tournament.js";
-import { resolveChecks, resolveCheckTimeoutMs, workingTreePackageJsonDiff, workingTreePlanningDiff } from "./checks.js";
+import { captureStreamedStdout, resolveChecks, resolveCheckTimeoutMs, workingTreePackageJsonDiff, workingTreePlanningDiff } from "./checks.js";
 import { builderModel, competitiveBuilderModels } from "./role-models.js";
 import { createCritic, critic } from "./critic.js";
 import { integrator } from "./integrator.js";
@@ -586,6 +586,21 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // `git diff <baseRef> -- *package.json`, best-effort (errors → ""); (a) is NOT swallowed, so a
     // genuinely-unreadable diff still fails the verifier CLOSED.
     const hasCommitted = workspaces.diff !== undefined;
+    // FIX 1b (script integrity — truncation): the working-tree package.json diff MUST be captured in
+    // FULL. govExec's ExecResult carries only a bounded `stdoutTail` (~2000 chars), so a scripts
+    // mutation near the TOP of a larger diff is truncated away before the JSON-semantic parser sees it
+    // (the full diff flags it; the last-2000-char tail returns clean). We stream the diff and
+    // accumulate every chunk via `captureStreamedStdout`. This calls baseGovExec directly — the
+    // govExecForRoles wrapper OVERRIDES `onOutput` with the UI sink, which would defeat the capture —
+    // and forwards each chunk to that UI sink ourselves to preserve live output. baseGovExec is
+    // defined whenever govExecForRoles is (the wrapper requires it; the non-wrapped branch IS it).
+    const captureFullGitDiff = (args: readonly string[], ws: WorkspaceHandle, purpose: string): Promise<string> =>
+      baseGovExec === undefined
+        ? Promise.resolve("")
+        : captureStreamedStdout(
+            (onOutput) => baseGovExec.run({ parentCtx, command: "git", args: [...args], cwd: ws.path, purpose, onOutput }),
+            execSink,
+          );
     const scriptIntegrityDiff: ((ws: WorkspaceHandle) => Promise<string>) | undefined =
       hasCommitted || govExecForRoles !== undefined
         ? (ws: WorkspaceHandle): Promise<string> => {
@@ -593,7 +608,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             const workingP =
               govExecForRoles !== undefined
                 ? workingTreePackageJsonDiff(
-                    async (args) => (await govExecForRoles.run({ parentCtx, command: "git", args: [...args], cwd: ws.path, purpose: "verifier: script-integrity working-tree diff" })).stdoutTail ?? "",
+                    (args) => captureFullGitDiff(args, ws, "verifier: script-integrity working-tree diff"),
                     ws.path,
                     ws.baseRef,
                   ).catch(() => "")

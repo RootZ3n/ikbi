@@ -161,6 +161,28 @@ export async function workingTreePackageJsonDiff(
   return runGit(["diff", "-U1000000", baseRef, "--", "*package.json"]);
 }
 
+/**
+ * Accumulate the FULL stdout of a STREAMING governed-exec call. governed-exec's ExecResult retains
+ * only a bounded `stdoutTail` (the last ~2000 chars). Reading a large `git diff` through that tail
+ * truncates the TOP of the diff — a package.json "scripts" mutation above the tail window would be
+ * silently dropped before the JSON-semantic parser ever runs (a >2000-char diff flags the mutation,
+ * but the last-2000-char tail returns clean). The streaming `onOutput` sink delivers every chunk
+ * untruncated; this helper concatenates them so the integrity parser sees the whole diff. `forward`
+ * (optional) mirrors each chunk to a secondary sink (e.g. the live UI). Falls back to `stdoutTail`
+ * if nothing streamed (a buffered executor that ignores `onOutput`).
+ */
+export async function captureStreamedStdout(
+  run: (onOutput: (chunk: string, stream: "stdout" | "stderr") => void) => Promise<ExecResult>,
+  forward?: (chunk: string, stream: "stdout" | "stderr") => void,
+): Promise<string> {
+  let full = "";
+  const res = await run((chunk, stream) => {
+    if (stream === "stdout") full += chunk;
+    if (forward !== undefined) forward(chunk, stream);
+  });
+  return full.length > 0 ? full : (res.stdoutTail ?? "");
+}
+
 const RELEVANT_WORKTREE_EXTS: readonly string[] = [
   ".ts",
   ".tsx",

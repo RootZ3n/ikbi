@@ -352,7 +352,7 @@ import { execFileSync as _execFileSync } from "node:child_process";
 import { mkdtempSync as _mkdtempSync, mkdirSync as _mkdirSync, writeFileSync as _writeFileSync, rmSync as _rmSync } from "node:fs";
 import { tmpdir as _tmpdir } from "node:os";
 import { join as _join } from "node:path";
-import { workingTreePackageJsonDiff } from "./checks.js";
+import { captureStreamedStdout, workingTreePackageJsonDiff } from "./checks.js";
 
 test("P0/Fix1: working-tree diff catches an UNCOMMITTED package.json rewrite (root + subpackage); committed range is empty", async () => {
   const repo = _mkdtempSync(_join(_tmpdir(), "ikbi-si-"));
@@ -385,6 +385,33 @@ test("P0/Fix1: working-tree diff catches an UNCOMMITTED package.json rewrite (ro
   } finally {
     _rmSync(repo, { recursive: true, force: true });
   }
+});
+
+test("Codex-1: a >2000-char working-tree diff with the mutation in the first 500 chars is NOT truncated away", async () => {
+  // The integrity diff is read through governed-exec, whose ExecResult retains only the bounded
+  // last-~2000-char `stdoutTail`. A package.json scripts mutation at the TOP of a larger diff would be
+  // dropped from that tail before the parser runs. The streaming capture keeps the WHOLE diff.
+  const mutationHunk =
+    "diff --git a/package.json b/package.json\n--- a/package.json\n+++ b/package.json\n" +
+    '@@ -2,3 +2,3 @@\n   "scripts": {\n-    "test": "vitest run",\n+    "test": "echo ok",\n';
+  const filler = Array.from({ length: 200 }, (_, i) => `   "dep-${i}": "^1.0.0",`).join("\n"); // unrelated context, > 2000 chars
+  const fullDiff = `${mutationHunk}${filler}\n`;
+  assert.ok(fullDiff.length > 2000, "the diff exceeds the stdoutTail bound");
+  assert.ok(fullDiff.indexOf('"test": "echo ok"') < 500, "the mutation is in the first 500 chars");
+
+  // A governed-exec that STREAMS the full diff via onOutput (as the spawn path does) but whose
+  // ExecResult retains only the bounded TAIL — exactly the production truncation that hid the bug.
+  const TAIL = 2000;
+  const fakeRun = async (onOutput: (chunk: string, stream: "stdout" | "stderr") => void): Promise<ExecResult> => {
+    onOutput(fullDiff, "stdout");
+    return { executed: true, exitCode: 0, stdoutTail: fullDiff.slice(fullDiff.length - TAIL), stderrTail: "" };
+  };
+
+  // The OLD wiring read only `stdoutTail` → the mutation is gone; the streaming capture preserves it.
+  const truncated = (await fakeRun(() => {})).stdoutTail ?? "";
+  assert.equal(detectScriptMutation(truncated).mutated, false, "the truncated tail no longer contains the mutation (the bug)");
+  const captured = await captureStreamedStdout(fakeRun);
+  assert.equal(detectScriptMutation(captured).mutated, true, "the full streamed capture still flags the mutation (the fix)");
 });
 
 test("P0/Fix1: a non-stub NARROWED test script is caught by detectScriptMutation", () => {
