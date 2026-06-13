@@ -74,6 +74,31 @@ test("builder wrote no files → discard", async () => {
   assert.match(rationaleOf(r), /no files/);
 });
 
+test("STEP-PLANNER accumulated pass (reuseWorkspace): builder wrote 0 files this pass but verifier+critic pass → PROMOTE", async () => {
+  // On a reuseWorkspace pass the work was written by prior steps; this pass's builder writing
+  // nothing must NOT discard the verified accumulated build.
+  const ctx = ctxWith([{ role: "builder", outcome: "success", summary: "b", detail: { filesWritten: [], policyViolations: [] } }, criticPass, verifierPass]);
+  const reuse: WorkspaceHandle = {
+    id: "ws-shared", targetRepo: "/repo", baseBranch: "main", baseRef: "x", scratchBranch: "ikbi/ws/ws-shared",
+    path: "/repo", identity: IDENTITY, state: "allocated", createdAt: 0,
+  };
+  const accumulatedCtx: RoleContext = { ...ctx, task: { ...ctx.task, reuseWorkspace: reuse } };
+  const r = await integrator(accumulatedCtx);
+  assert.equal(decisionOf(r), "promote", "an accumulated pass promotes on a green verifier+critic even with 0 files this pass");
+  assert.equal((r.detail as { evaluation: { approved: boolean } }).evaluation.approved, true);
+  assert.match(rationaleOf(r), /accumulated multi-step build/);
+});
+
+test("STEP-PLANNER accumulated pass still fail-closes: a RED verifier discards even with reuseWorkspace", async () => {
+  const ctx = ctxWith([{ role: "builder", outcome: "success", summary: "b", detail: { filesWritten: [], policyViolations: [] } }, criticPass, { role: "verifier", outcome: "success", summary: "v", detail: { verdict: "fail", checks: [] } }]);
+  const reuse: WorkspaceHandle = {
+    id: "ws-shared", targetRepo: "/repo", baseBranch: "main", baseRef: "x", scratchBranch: "ikbi/ws/ws-shared",
+    path: "/repo", identity: IDENTITY, state: "allocated", createdAt: 0,
+  };
+  const r = await integrator({ ...ctx, task: { ...ctx.task, reuseWorkspace: reuse } });
+  assert.equal(decisionOf(r), "discard", "the builder gate relaxes on reuse, but verifier/critic gates still hold");
+});
+
 test("a required prior result absent → discard (fail-closed)", async () => {
   assert.equal(decisionOf(await integrator(ctxWith([criticPass, verifierPass]))), "discard"); // no builder
   assert.equal(decisionOf(await integrator(ctxWith([builderOk, verifierPass]))), "discard"); // no critic

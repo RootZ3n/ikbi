@@ -56,13 +56,27 @@ export const integrator: RoleFn = async (ctx) => {
         ? builderDetail.rejectedToolCalls
         : undefined;
 
-    const builderOk = builder?.outcome === "success" && filesWritten.length > 0;
+    // STEP-PLANNER ACCUMULATED PASS: when the task REUSES a workspace, the work was written by
+    // PRIOR steps in that shared workspace, so THIS pass's builder may legitimately write nothing
+    // ("everything is already done — just verify + promote"). Requiring filesWritten>0 here would
+    // DISCARD a fully-verified, critic-approved accumulated build (and because every role succeeded,
+    // the orchestrator's retention guard does not even fire — the committed work is lost). On a reuse
+    // pass, accept a SUCCESSFUL builder as having produced work; the verifier + critic gates still
+    // prove the accumulated state is good, and a genuinely empty workspace is caught downstream (the
+    // promote sees an empty diff and does not land). Single-pass runs (no reuseWorkspace) keep the
+    // strict filesWritten>0 gate unchanged.
+    const accumulatedPass = ctx.task.reuseWorkspace !== undefined;
+    const builderOk =
+      builder?.outcome === "success" && (filesWritten.length > 0 || accumulatedPass);
     const noPolicyViolations = policyViolations !== undefined && policyViolations.length === 0;
     const criticPass = detailOf(critic).pass === true;
     const verifierPass = detailOf(verifier).verdict === "pass";
 
     if (builderOk && noPolicyViolations && criticPass && verifierPass) {
-      const rationale = `promote: builder wrote ${filesWritten.length} file(s), no policy violations, critic pass, verifier pass`;
+      const rationale =
+        accumulatedPass && filesWritten.length === 0
+          ? "promote: accumulated multi-step build (this pass wrote 0 files — prior steps did the work), no policy violations, critic pass, verifier pass"
+          : `promote: builder wrote ${filesWritten.length} file(s), no policy violations, critic pass, verifier pass`;
       return {
         role: "integrator",
         outcome: "success", // "did its job" — the verdict is in detail.decision
