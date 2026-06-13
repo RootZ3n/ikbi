@@ -1218,6 +1218,32 @@ test("ISSUE 1: with criticFixLoop OFF (default), a critic FAIL does NOT retry �
   assert.equal(ws.calls.promote, 0, "nothing promoted");
 });
 
+test("ISSUE 1 (gate): a RED verifier + critic FAIL does NOT trigger the critic fix loop — no subjective-feedback retry", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const calls = { builder: 0, verifier: 0, critic: 0 };
+  const builderGoals: string[] = [];
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    scout: async () => ({ role: "scout", outcome: "success", summary: "scout" }),
+    builder: async (ctx) => { calls.builder += 1; builderGoals.push(ctx.task.goal); return { role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["x.ts"], rejectedToolCalls: [] } }; },
+    // Verifier is RED — the build has real compile/test errors (objective failure).
+    verifier: async () => { calls.verifier += 1; return { role: "verifier", outcome: "failure", summary: "checks red", detail: { verdict: "fail", checks: [{ name: "test", exitCode: 1, outputTail: "1 failing" }] } }; },
+    // The critic also FAILs with subjective feedback — but the verifier already failed, so this
+    // must NOT drive a retry: the objective errors, not the critic's opinion, own the failure.
+    critic: async () => { calls.critic += 1; return { role: "critic", outcome: "success", summary: "FAIL", detail: { pass: false, feedback: "off-goal", issues: ["rename the handler"] } }; },
+    integrator: realIntegrator,
+  };
+  // criticFixLoop is ON — the gate (not the opt-out) is what must suppress the retry here.
+  const orch = createOrchestrator(baseDeps({ config: { ...ENABLED, criticFixLoop: true }, resolveIdentity, roleClaim, roles, workspaces: ws.workspaces }));
+  const result = await orch.run(task, parentCtx);
+
+  assert.equal(calls.builder, 1, "builder ran ONCE — the critic fix loop did not retry it on a red verifier");
+  assert.equal(calls.critic, 1, "the critic ran once and was NOT re-invoked for a re-critique");
+  assert.equal(builderGoals.length, 1, "no second builder goal — no critic-feedback fix goal was issued");
+  assert.notEqual(result.outcome, "success", "the red verifier discards the build (fail-closed)");
+  assert.equal(ws.calls.promote, 0, "nothing promoted");
+});
+
 test("CODEX Issue 3: each critic-fix-loop RETRY stage runs under its OWN role identity (retry builder is functionalRole=builder, not critic)", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
   const ws = fakeWorkspaces(true);

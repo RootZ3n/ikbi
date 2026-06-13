@@ -1096,13 +1096,20 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         }
 
         // ── CRITIC-DRIVEN FIX LOOP: a subjective FAIL is no longer a dead end ──────
-        // When the critic returns a model FAIL verdict (the build is objectively GREEN
-        // — a red verifier short-circuits before the critic — but semantically wrong /
-        // off-goal), feed its feedback back to the builder for ONE retry, re-verify,
-        // and re-critique. Capped at a single attempt (criticFixAttempted) so subjective
-        // feedback can never loop. COMPLEMENTARY to the verifier-driven loop above.
+        // The verifier runs BEFORE the critic but does NOT short-circuit; the critic runs
+        // regardless of the verifier's outcome (so a red verifier still gets semantic
+        // feedback). This subjective fix loop, however, is GATED on the verifier PASSING:
+        // when the build is objectively GREEN but semantically wrong / off-goal, feed the
+        // critic's feedback back to the builder for ONE retry, re-verify, and re-critique.
+        // A RED verifier must NOT trigger this loop — the objective (verifier-driven) fix
+        // loop owns retries on red checks; retrying on the critic's SUBJECTIVE feedback
+        // would leave the actual compile/test errors unaddressed. Capped at a single attempt
+        // (criticFixAttempted) so subjective feedback can never loop. COMPLEMENTARY to the
+        // verifier-driven loop above.
         // OPT-IN: requires IKBI_WORKER_MODEL_CRITIC_FIX_LOOP=true (default off).
-        if (role === "critic" && config.criticFixLoop && !criticFixAttempted && isRetryableCriticFail(result)) {
+        const verifierForCriticGate = results.find((r) => r.role === "verifier");
+        const verifierPassedForCriticGate = verifierForCriticGate !== undefined && verifierForCriticGate.outcome === "success";
+        if (role === "critic" && config.criticFixLoop && !criticFixAttempted && verifierPassedForCriticGate && isRetryableCriticFail(result)) {
           criticFixAttempted = true;
           // The prior results the re-run roles inherit: everything EXCEPT the stale builder /
           // verifier / critic, which are replaced with their fresh results as produced.
