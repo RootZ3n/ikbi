@@ -376,3 +376,65 @@ test("M4: under --yes, a non-reject cognition decision emits NO reject warning",
     assert.equal(cap2.err.includes("REJECTED"), false, "no reject warning when deliberation did not reject");
   });
 });
+
+// ── MULTI-STEP (step-planner) path: H3 leak / H4 read-only verify / H5 land-ability ──
+
+/** A goal that decomposes into 2 atomic steps (numbered list ⇒ strong separator). */
+const MULTI_STEP_GOAL = "1. add the login endpoint\n2. add the logout handler";
+/** A benign deliberation so the multi-step tests don't depend on the live cognition layer. */
+const benignCognition = { deliberate: async () => ({ decision: "answer" as const, confidence: 1, rationale: "ok", memoryUsed: [] }) };
+
+/**
+ * A capturing orchestrator for the multi-step path: records every task passed to run(),
+ * reports a clamped autonomy via spawnRole (drives the H5 land-ability check), and can be
+ * told to FAIL the first step (drives the H3 discard-on-failure path).
+ */
+function multiStepOrchestrator(opts: { autoCommit: boolean; failFirstStep?: boolean }) {
+  const tasks: WorkerTask[] = [];
+  const orchestrator = {
+    run: async (task: WorkerTask): Promise<WorkerResult> => {
+      tasks.push(task);
+      const fail = opts.failFirstStep === true && task.taskId.endsWith(":step1");
+      return {
+        contractVersion: "1.0.0",
+        taskId: task.taskId,
+        outcome: fail ? ("failure" as const) : ("success" as const),
+        roles: [],
+        promoted: false,
+        ...(fail ? { reason: "step blew up" } : {}),
+      };
+    },
+    spawnRole: (_role: WorkerRole, _ctx: unknown) => ({ autonomy: autonomyForTier(opts.autoCommit ? "trusted" : "verified") }),
+  };
+  return { orchestrator, tasks };
+}
+
+/** A step-workspace lifecycle fake that counts allocate/discard (no real git). */
+function stepWorkspacesFake() {
+  const handle = fakeWorkspaceHandle();
+  const calls = { allocate: 0, discard: 0 };
+  const surface = {
+    allocate: async () => { calls.allocate += 1; return handle; },
+    discard: async (h: WorkspaceHandle) => { calls.discard += 1; return { workspaceId: h.id, removed: true }; },
+  };
+  return { handle, calls, surface };
+}
+
+// H3: when a step fails, the shared workspace is discarded (no worktree leak).
+test("H3: a failed multi-step build DISCARDS the shared workspace (no leak)", () => {
+  const { orchestrator, tasks } = multiStepOrchestrator({ autoCommit: true, failFirstStep: true });
+  const stepWs = stepWorkspacesFake();
+  const cap2 = capture();
+  const cli = createWorkerCli({
+    orchestrator, resolveIdentity: makeResolver("trusted", "trusted"),
+    operatorToken: OPERATOR_TOKEN, workerToken: WORKER_TOKEN,
+    stdout: cap2.stdout, stderr: cap2.stderr, setExit: cap2.setExit, now: () => 1, cwd: () => "/repo",
+    interactive: false, stepWorkspaces: stepWs.surface, cognition: benignCognition,
+  });
+  return cli.build([MULTI_STEP_GOAL]).then(() => {
+    assert.equal(stepWs.calls.allocate, 1, "the shared workspace was allocated");
+    assert.equal(stepWs.calls.discard, 1, "the failed build discarded the shared workspace");
+    assert.equal(tasks.length, 1, "broke after the failing step — no final verify pass ran");
+    assert.equal(tasks[0]!.taskId.endsWith(":step1"), true, "the one task run was step 1");
+  });
+});

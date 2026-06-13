@@ -30,7 +30,7 @@ import { config } from "../../core/config.js";
 import { beginOperation, resolveIdentity as coreResolveIdentity } from "../../core/identity/index.js";
 import type { IdentityClaim, OperationContext, ValidatedIdentity } from "../../core/identity/index.js";
 import { workspaces as coreWorkspaces } from "../../core/workspace/index.js";
-import type { WorkspaceHandle, WorkspaceRecord } from "../../core/workspace/contract.js";
+import type { AllocateOptions, DiscardResult, WorkspaceHandle, WorkspaceRecord } from "../../core/workspace/contract.js";
 import { events as coreEvents } from "../../core/events/index.js";
 import type { EventBusSurface } from "../../core/events/index.js";
 import { gateWall as coreGateWall, type GateWall } from "../gate-wall/index.js";
@@ -416,6 +416,15 @@ export interface WorkerCliDeps {
   readonly cwd?: () => string;
   /** Workspace surface for the post-build diff summary (SG-2). Default: the live manager. */
   readonly workspaces?: DiffWorkspaceSurface;
+  /**
+   * Workspace lifecycle surface for the MULTI-STEP (step-planner) path: allocate the shared
+   * workspace the steps accumulate into, and discard it when a step fails (H3 — a failed
+   * multi-step build must not leak the worktree). Default: the live workspace manager.
+   */
+  readonly stepWorkspaces?: {
+    allocate: (opts: AllocateOptions) => Promise<WorkspaceHandle>;
+    discard: (handle: WorkspaceHandle) => Promise<DiscardResult>;
+  };
   /** Event bus the `--verbose` progress stream subscribes to (SG-5). Default: the live bus. */
   readonly events?: EventBusSurface;
   /**
@@ -454,6 +463,7 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
   const now = deps.now ?? Date.now;
   const cwd = deps.cwd ?? (() => process.cwd());
   const summaryWorkspaces: DiffWorkspaceSurface = deps.workspaces ?? coreWorkspaces;
+  const stepWorkspaces = deps.stepWorkspaces ?? coreWorkspaces;
   const eventBus: EventBusSurface = deps.events ?? coreEvents;
   // The live orchestrator via the SHARED production-worker construction (the same wiring
   // `ikbi batch` uses, so build + batch are governed identically). Construction is
@@ -574,7 +584,7 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
         // MULTI-STEP: allocate ONE workspace, run all steps in it, final verify + promote.
         // This is the shared-workspace step planner — changes accumulate across steps.
         out(`  ↳ decomposed into ${stepPlan.steps.length} steps\n`);
-        const sharedWorkspace = await coreWorkspaces.allocate({
+        const sharedWorkspace = await stepWorkspaces.allocate({
           targetRepo,
           identity: who.identity,
           label: `worker:${id}:steps`,
@@ -618,6 +628,15 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
           };
           result = await orchestrator.run(finalTask, ctx);
         } else {
+          // H3: a failing step left the shared workspace ALIVE (intermediate steps set
+          // skipPromote, so the orchestrator neither promotes nor discards it). Discard it here
+          // so a failed multi-step build never leaks the worktree. Best-effort: a discard error
+          // must not mask the original step failure — the leak is reclaimable via `ikbi clean`.
+          try {
+            await stepWorkspaces.discard(sharedWorkspace);
+          } catch {
+            /* discard failure must not mask the step failure; the workspace is reclaimable later */
+          }
           result = lastResult!;
         }
       } else {
