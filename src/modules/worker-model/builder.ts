@@ -467,7 +467,10 @@ function classifyOutcome(stopReason: string): WorkerOutcome {
 }
 
 function isPolicyViolation(e: ToolCallError): boolean {
-  return /escape|write_scope|dependency directory|not allowed|only for verifier\/check|WRITE SCOPE VIOLATION/i.test(e.error);
+  // "denied" covers a governed-exec allowlist denial / terminal path-confinement refusal — an
+  // attempted out-of-policy action, not a benign tool-format error (those say "malformed",
+  // "requires", "unknown tool", never "denied"), so the term does not over-match.
+  return /escape|write_scope|dependency directory|not allowed|only for verifier\/check|WRITE SCOPE VIOLATION|denied/i.test(e.error);
 }
 
 /** Build a checkable success condition from the goal (+ scout findings) — RAIL 1. Derived
@@ -854,7 +857,17 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       // where the builder's writes actually land if any path component is a symlink. Pinning
       // the realpath guarantees `terminal` runs WHERE the builder built (so `ls` sees the files
       // it wrote), not in the CLI's process.cwd().
-      return runTerminal({ governedExec, ...(deps.parentCtx !== undefined ? { parentCtx: deps.parentCtx } : {}) }, worktreeReal, args);
+      const raw = await runTerminal({ governedExec, ...(deps.parentCtx !== undefined ? { parentCtx: deps.parentCtx } : {}) }, worktreeReal, args);
+      // POLICY GATE: a `DENIED:` result from runTerminal — governed-exec allowlist denial or the
+      // tool's own path-confinement refusal — is an ATTEMPTED out-of-policy action. The pre-checks
+      // above already record the denials they catch (write_scope, policy-deny) and return early, so
+      // a DENIED here came from INSIDE runTerminal and was never recorded. Push it so the integrator's
+      // policy gate (which reads detail.policyViolations) sees the attempt — confinement holding is
+      // NOT the same as the run being policy-clean.
+      if (raw.startsWith("DENIED:")) {
+        rejectedToolCalls.push({ tool: "terminal", path: cmd.slice(0, 100), error: `governed terminal denied: ${raw.slice("DENIED:".length).trim()}` });
+      }
+      return raw;
     };
 
     // --- git inspection (git_status / git_diff / git_log): read-only, GOVERNED, async. Same

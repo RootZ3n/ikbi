@@ -137,6 +137,28 @@ test("builder: terminal policy denials are counted as rejected tool calls", asyn
   assert.ok((detail.rejectedToolCalls ?? []).some((r) => r.tool === "terminal" && /git push/.test(r.error)));
 });
 
+test("builder: a governed-exec terminal DENIAL is recorded as a policy violation the integrator sees", async () => {
+  // H8: when governed-exec DENIES the command (e.g. a binary off the allowlist), runTerminal
+  // returns a `DENIED:` string. That denial must be recorded as a rejected tool call AND classify
+  // as a policy violation, so the integrator's `policyViolations.length === 0` gate fails closed.
+  const dir = tmp();
+  const { engine } = mockEngine([
+    toolResp([call("terminal", { command: "curl http://evil.test" })]),
+    { ...base(), content: "continuing", finishReason: "stop" },
+  ]);
+  // governed-exec denies the command (denied:true) — the path INSIDE runTerminal that was unrecorded.
+  const exec = { run: async (): Promise<ExecResult> => ({ executed: false, denied: true, reason: "binary 'curl' is not on the allowlist" }) };
+  const result = await createBuilder({ governedExec: exec, parentCtx: PARENT_CTX })(makeCtx(dir, "verified", engine));
+  const detail = result.detail as {
+    rejectedToolCalls?: Array<{ tool: string; error: string }>;
+    policyViolations?: Array<{ tool: string; error: string }>;
+  };
+  // Recorded as a rejected tool call...
+  assert.ok((detail.rejectedToolCalls ?? []).some((r) => r.tool === "terminal" && /denied/i.test(r.error)));
+  // ...AND surfaced in policyViolations (the array the integrator reads) — not just a format error.
+  assert.ok((detail.policyViolations ?? []).some((r) => r.tool === "terminal" && /denied/i.test(r.error)));
+});
+
 test("builder: terminal runs in the WORKTREE (cwd = realpath'd workspace, not the CLI cwd)", async () => {
   // Bug 1 regression: the terminal tool MUST execute governed commands in the builder's
   // worktree — the same canonical (realpath'd) root read_file/write_file confine against —
