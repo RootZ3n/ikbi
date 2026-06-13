@@ -436,6 +436,13 @@ export function detectScriptMutation(diff: string): { mutated: boolean; reason?:
 // "passing" signal is forged the same way a rewritten package.json script would be.
 const SCRIPT_FILE_EXTS: readonly string[] = [".sh", ".bash", ".js", ".cjs", ".mjs", ".ts", ".cts", ".mts", ".py", ".rb"];
 
+// Codex C3: a TEST file (`foo.test.ts`, `bar.spec.js`, …) named directly on a guarded script
+// (`node --test engine/ledger.test.ts`) is NOT a shell-out helper — editing tests IS the normal
+// purpose of a build, so a modified test file must not forge a shell-out-mutation false positive.
+// This matches only a `.test.`/`.spec.` INFIX (so a helper named `test.sh` or `scripts/test.js`
+// stays guarded — those have no dot before "test"/"spec").
+const TEST_FILE_PATTERN = /\.(?:test|spec)\.[cm]?[jt]sx?$/i;
+
 /**
  * Extract workspace-relative file paths a script SHELLS OUT to (e.g. `bash ./test.sh` → `test.sh`,
  * `node scripts/test.js` → `scripts/test.js`). A token is a file reference when it is not a flag,
@@ -451,6 +458,7 @@ function extractScriptFilePaths(script: string): string[] {
     if (unquoted.startsWith("/")) continue; // absolute path — not a workspace-relative file
     const norm = unquoted.replace(/^\.\//, ""); // normalize a leading ./
     if (norm.length === 0 || norm.includes("node_modules/")) continue;
+    if (TEST_FILE_PATTERN.test(norm)) continue; // C3: a test file named on the script is normal build output, not a shell-out helper
     const hasSep = norm.includes("/");
     const hasScriptExt = SCRIPT_FILE_EXTS.some((e) => norm.toLowerCase().endsWith(e));
     if (hasSep || hasScriptExt) out.push(norm);

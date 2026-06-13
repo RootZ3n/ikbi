@@ -489,6 +489,22 @@ test('C3: "test": "node scripts/test.js" + scripts/test.js modified → flagged 
   });
 });
 
+test('C3: "test": "node --test engine/ledger.test.ts" + ledger.test.ts modified → clean (editing tests is the build)', () => {
+  withPkg({ test: "node --test engine/ledger.test.ts" }, (dir) => {
+    const diff = "diff --git a/engine/ledger.test.ts b/engine/ledger.test.ts\n--- a/engine/ledger.test.ts\n+++ b/engine/ledger.test.ts\n@@ -1 +1,2 @@\n test('x', () => {});\n+test('y', () => {});\n";
+    assert.equal(detectShellOutMutation(diff, dir).mutated, false, "a directly-named test file is normal build output, not a neutered shell-out helper");
+  });
+});
+
+test('C3: a NON-test helper named test.sh stays guarded even alongside the test-file carve-out', () => {
+  withPkg({ test: "bash ./test.sh && node --test app.spec.ts" }, (dir) => {
+    const diff = "diff --git a/test.sh b/test.sh\n--- a/test.sh\n+++ b/test.sh\n@@ -1 +1 @@\n-pnpm vitest run\n+exit 0\n";
+    const r = detectShellOutMutation(diff, dir);
+    assert.equal(r.mutated, true, "the .sh helper is still a shell-out target (only .test./.spec. files are exempt)");
+    assert.match(r.reason ?? "", /test\.sh/);
+  });
+});
+
 test("C3: no package.json in the workspace → clean (nothing to inspect)", () => {
   const dir = _mkdtempSync(_join(_tmpdir(), "ikbi-shellout-empty-"));
   try {
