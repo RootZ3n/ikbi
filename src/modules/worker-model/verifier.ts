@@ -11,9 +11,14 @@
  *  LAYER 1 — GOVERNED EXECUTION. The checks run through GOVERNED-EXEC (gate-wall
  *    authorizes, receipted, default-deny allowlist, dry-run-able), NEVER raw
  *    `spawnSync`. A DENIED check (non-allowlisted binary / gate deny) FAILS CLOSED —
- *    it is a non-zero check, never a silent pass. `pnpm` is NOT on governed-exec's
- *    default allowlist; the operator must add it to IKBI_GOVERNED_EXEC_ALLOWLIST for
- *    real verification (governed-exec's default-deny posture is intentionally kept).
+ *    it is a non-zero check, never a silent pass. The package managers the checks
+ *    invoke (`pnpm`/`npm`/`yarn`/`npx`) ARE on governed-exec's DEFAULT allowlist —
+ *    the verifier must be able to run `pnpm tsc` / `pnpm test` out of the box, so the
+ *    default-deny posture deliberately admits them. What stays denied is script
+ *    EXECUTION via these managers: `<mgr> run …` and code-eval flags are policy-gated
+ *    (see governed-exec policy), so a terminal `pnpm run anything` is still refused
+ *    even though the binary is allowlisted. An operator widens the binary set further
+ *    via IKBI_GOVERNED_EXEC_ALLOWLIST (additive).
  *    governed-exec needs a validated OperationContext (#10) — the orchestrator threads
  *    the run's parent ctx (the spawned role identity is not a minted ValidatedIdentity,
  *    so it cannot itself authorize a governed exec).

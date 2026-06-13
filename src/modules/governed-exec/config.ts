@@ -17,14 +17,23 @@ import { moduleEnv } from "../../core/module-config.js";
 const env = moduleEnv("governed-exec");
 
 /**
- * The default allowlist: a minimal read-only-ish set. Interpreters, package managers, and
- * file dumpers (`node`, `npm`, `pnpm`, `cat`) are intentionally NOT default-allowed: they
- * are dual-use execution/exfiltration primitives and must be explicitly operator-enabled.
+ * The default allowlist: a minimal set covering version control, read-only exploration, and the
+ * package managers the VERIFIER needs to run checks. Pure interpreters (`node`) and file dumpers
+ * (`cat`) are intentionally NOT default-allowed — they are dual-use execution/exfiltration
+ * primitives and must be explicitly operator-enabled.
+ *
+ * The package managers (`npm`/`npx`/`pnpm`/`yarn`) ARE default-allowed because the verifier's
+ * fixed checks (`pnpm tsc --noEmit`, `pnpm test`) and the builder's in-loop `run_checks` cannot
+ * run without them — denying them by default would make verification fail closed on EVERY repo,
+ * not just untrusted ones. The dual-use risk is contained at a NARROWER layer instead: script
+ * execution via these managers (`<mgr> run …`) and code-eval flags (`-e`/`--eval`/`-p`) are
+ * policy-DENIED (see policy.ts / forbiddenEvalReason), so a terminal `pnpm run <anything>` is
+ * still refused even though `pnpm` is allowlisted. The binary on the list ≠ arbitrary execution
+ * through it.
  *
  * The `IKBI_GOVERNED_EXEC_ALLOWLIST` env override is ADDITIVE (see `loadGovernedExecConfig`):
  * it ADDS to these defaults rather than replacing them, so an operator who allows extra
- * binaries (e.g. `python3,mkdir`) does NOT lose the safe defaults the builder relies on
- * for version control and light exploration.
+ * binaries (e.g. `python3,mkdir`) does NOT lose the safe defaults the builder relies on.
  */
 export const DEFAULT_ALLOWLIST: readonly string[] = Object.freeze([
   // version control
@@ -33,9 +42,8 @@ export const DEFAULT_ALLOWLIST: readonly string[] = Object.freeze([
   // NOTE: cat is intentionally excluded — the builder uses read_file MCP tool instead.
   //       cat can dump .env / secrets and must remain operator opt-in.
   "ls", "head", "tail", "wc", "find", "grep", "echo",
-  // package manager + typecheck (required for verifier checks and run_checks).
-  // Script execution is separately policy-gated to verifier/check purposes; terminal
-  // calls like `pnpm run ...` are denied even though the binary is allowlisted.
+  // package managers + typecheck driver (REQUIRED for verifier checks and run_checks). Allowlisted
+  // by default; `<mgr> run …` / code-eval flags remain policy-denied (script exec is gated separately).
   "npm", "npx", "pnpm", "yarn",
 ]);
 
