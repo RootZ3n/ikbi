@@ -148,8 +148,12 @@ export function extractVerifierCheckResult(vResult: RoleResult): VerifierCheckRe
   const testsPassed = (find("test")?.exitCode ?? 1) === 0;
   const failedChecks = checks.filter((c) => c.exitCode !== 0);
   const errors = failedChecks.map((c) => `[${c.name}] ${c.outputTail}`).join("\n");
+  // SUCCESS keys on the VERDICT, not the outcome — matching the integrator's promote gate
+  // (detail.verdict === "pass"). `outcome` only says the verifier RAN; a verifier can run to
+  // completion (outcome "success") yet still report a FAILING verdict (detail.verdict "fail"),
+  // and the fix loop must treat that as a failure to repair, not a green to return.
   return {
-    success: vResult.outcome === "success",
+    success: detail.verdict === "pass",
     errors: failedChecks.length > 0 ? errors : (vResult.outcome !== "success" ? (vResult.summary ?? "unknown verification error") : ""),
     typecheckPassed,
     testsPassed,

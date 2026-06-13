@@ -245,6 +245,30 @@ test("extractVerifierCheckResult: success with all checks passing", () => {
   assert.equal(result.errors, "");
 });
 
+test("extractVerifierCheckResult: outcome=success but verdict=fail → success=false (keys on verdict, not outcome)", () => {
+  // The verifier RAN to completion (outcome "success") but its VERDICT is fail (a check was red).
+  // outcome only means "the verifier did its job"; the fix loop must repair on a failing verdict,
+  // matching the integrator's promote gate (detail.verdict === "pass").
+  const vResult: RoleResult = {
+    role: "verifier",
+    outcome: "success",
+    summary: "checks failed: test",
+    detail: {
+      verdict: "fail",
+      checks: [
+        { name: "typecheck", command: "pnpm tsc --noEmit", exitCode: 0, outputTail: "" },
+        { name: "test", command: "pnpm test", exitCode: 1, outputTail: "FAIL src/a.test.ts" },
+      ],
+    },
+  };
+
+  const result = extractVerifierCheckResult(vResult);
+
+  assert.equal(result.success, false, "a failing verdict is not a success even when outcome is success");
+  assert.equal(result.testsPassed, false);
+  assert.match(result.errors, /\[test\].*FAIL src\/a\.test\.ts/);
+});
+
 test("extractVerifierCheckResult: failure with test errors", () => {
   const vResult: RoleResult = {
     role: "verifier",
