@@ -147,13 +147,18 @@ export function resolveChecks(worktreeReal: string, env: NodeJS.ProcessEnv = pro
  * (git pathspec `*` crosses directories) so it covers root + every subpackage and stays small.
  * A brand-new (untracked) package.json does not appear — that is greenfield-legitimate, and its
  * no-op scripts are caught separately by the verification-ladder stub detector.
+ *
+ * FULL CONTEXT (`-U…`): the integrity guard's JSON-semantic pass reconstructs the whole base/working
+ * package.json from this diff and compares the resolved `scripts` objects. A 3-line-context diff would
+ * only show fragments (not JSON-parseable) and fall back to the weaker line-scan, so we request enough
+ * context to span the file. package.json files are small, so the larger diff is cheap.
  */
 export async function workingTreePackageJsonDiff(
   runGit: (args: readonly string[]) => Promise<string>,
   _worktreePath: string,
   baseRef: string,
 ): Promise<string> {
-  return runGit(["diff", baseRef, "--", "*package.json"]);
+  return runGit(["diff", "-U1000000", baseRef, "--", "*package.json"]);
 }
 
 const RELEVANT_WORKTREE_EXTS: readonly string[] = [

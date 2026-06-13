@@ -174,33 +174,194 @@ function red(reason: string): RoleResult {
   return { role: "verifier", outcome: "failure", summary: reason, detail: { verdict: "fail", reason, checks: [] } };
 }
 
+// Files whose modification can weaken verification (neuter tsconfig strictness, exclude broken
+// files, weaken test configs). jest/vitest/babel/webpack configs are JS (not JSON) — they cannot
+// be semantically parsed, so they keep the conservative line-scan (ANY change flagged).
+const GUARDED_CONFIG_PATTERNS = [
+  /vitest\.config/,
+  /jest\.config/,
+  /\.babelrc/,
+  /babel\.config/,
+  /webpack\.config/,
+  /vite\.config/,
+];
+const GUARD_TSCONFIG = /tsconfig.*\.json/;
+// tsconfig compilerOptions (or root include/exclude) keys whose change can WEAKEN typechecking.
+const WEAKENING_KEYS = [
+  "strict", "skipLibCheck", "noEmit", "noImplicitAny", "noUnusedLocals",
+  "noUnusedParameters", "exclude", "include", "moduleResolution",
+  "noImplicitReturns", "noFallthroughCasesInSwitch", "strictNullChecks",
+  "strictFunctionTypes", "strictBindCallApply",
+];
+
+/** One file's slice of a unified diff (split on `diff --git`), kept as raw text for the line-scan. */
+interface DiffSection { readonly text: string; }
+/** A file slice reconstructed into its old/new content (from context + −/＋ lines). */
+interface SectionShape { readonly fileName: string; readonly isNewFile: boolean; readonly oldText: string; readonly newText: string; }
+/** A per-file verdict: proven clean, can't-prove-semantically (defer to line-scan), or mutated. */
+type SectionVerdict = "clean" | "indeterminate" | { mutated: true; reason: string };
+
+/** Split a unified diff into one section per file (each begins at its `diff --git` header). */
+function splitDiffByFile(diff: string): DiffSection[] {
+  const sections: string[][] = [];
+  let cur: string[] | null = null;
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("diff --git ")) {
+      if (cur !== null) sections.push(cur);
+      cur = [line];
+    } else {
+      if (cur === null) cur = [];
+      cur.push(line);
+    }
+  }
+  if (cur !== null) sections.push(cur);
+  return sections.map((s) => ({ text: s.join("\n") }));
+}
+
 /**
- * LAYER-2 detector: does the unified workspace diff modify package.json's "scripts"
- * surface? Returns mutated:true when any changed (added/removed) line inside a
- * package.json file touches the "scripts" key or a guarded script entry. EXPORTED for
- * unit tests. Fail-closed by design: it flags the verifier-relied-on script commands
- * (the attack is rewriting `test`); a dependency bump does NOT match these keys.
+ * Reconstruct a file section's OLD and NEW content from its diff lines: context lines feed both
+ * sides, `-` lines feed old, `+` lines feed new. With a FULL-context diff (production wires
+ * `git diff -U…`) the two sides are the complete files → JSON-parseable. With a partial hunk
+ * (the unit-test fixtures) they are fragments → JSON.parse fails → caller defers to the line-scan.
+ */
+function analyzeSection(text: string): SectionShape {
+  let fileName = "";
+  let isNewFile = false;
+  const oldLines: string[] = [];
+  const newLines: string[] = [];
+  for (const line of text.split("\n")) {
+    if (line.startsWith("diff --git ")) {
+      const m = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
+      if (m) fileName = m[2] ?? m[1] ?? "";
+      continue;
+    }
+    if (line.startsWith("new file mode") || line.startsWith("--- /dev/null")) { isNewFile = true; continue; }
+    if (line.startsWith("+++ ")) {
+      const m = /^\+\+\+ b\/(.+)$/.exec(line);
+      if (m && m[1] !== undefined) fileName = m[1];
+      continue;
+    }
+    if (
+      line.startsWith("--- ") || line.startsWith("@@") || line.startsWith("index ") ||
+      line.startsWith("old mode ") || line.startsWith("new mode ") || line.startsWith("deleted file mode ") ||
+      line.startsWith("similarity ") || line.startsWith("rename ") || line.startsWith("copy ") || line.startsWith("\\")
+    ) {
+      continue;
+    }
+    if (line.startsWith("-")) { oldLines.push(line.slice(1)); continue; }
+    if (line.startsWith("+")) { newLines.push(line.slice(1)); continue; }
+    if (line.startsWith(" ")) { oldLines.push(line.slice(1)); newLines.push(line.slice(1)); continue; }
+    // A bare line (no diff prefix) is shared context.
+    oldLines.push(line); newLines.push(line);
+  }
+  return { fileName, isNewFile, oldText: oldLines.join("\n"), newText: newLines.join("\n") };
+}
+
+/** Parse text as a JSON OBJECT (not array/scalar); undefined when it isn't valid JSON. */
+function tryParseJsonObject(text: string): Record<string, unknown> | undefined {
+  const t = text.trim();
+  if (t.length === 0) return undefined;
+  try {
+    const v: unknown = JSON.parse(t);
+    return v !== null && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Coerce a value to a plain record (empty when it is not an object). */
+function recordOf(v: unknown): Record<string, unknown> {
+  return v !== null && typeof v === "object" ? (v as Record<string, unknown>) : {};
+}
+
+/** The first guarded script key whose RESOLVED value differs between two package.json objects. */
+function changedGuardedScript(oldPkg: Record<string, unknown>, newPkg: Record<string, unknown>): string | undefined {
+  const o = recordOf(oldPkg.scripts);
+  const n = recordOf(newPkg.scripts);
+  for (const key of GUARDED_SCRIPT_KEYS) {
+    if (o[key] !== n[key]) return key; // added, removed, or value-changed (string compare is exact)
+  }
+  return undefined;
+}
+
+/** The first weakening tsconfig key (compilerOptions first, then root for include/exclude) that changed. */
+function changedWeakeningKey(oldCfg: Record<string, unknown>, newCfg: Record<string, unknown>): string | undefined {
+  const oCo = recordOf(oldCfg.compilerOptions);
+  const nCo = recordOf(newCfg.compilerOptions);
+  for (const key of WEAKENING_KEYS) {
+    const oVal = oCo[key] ?? oldCfg[key];
+    const nVal = nCo[key] ?? newCfg[key];
+    // exclude/include are arrays; the rest are scalars — JSON.stringify compares both structurally.
+    if (JSON.stringify(oVal) !== JSON.stringify(nVal)) return key;
+  }
+  return undefined;
+}
+
+/**
+ * JSON-SEMANTIC verdict for one file section. When both sides parse as JSON we compare the resolved
+ * `scripts` / `compilerOptions` objects key-by-key — the truth the line-scan only approximates.
+ * Returns "indeterminate" (defer to the line-scan) when the section is a partial hunk or a non-JSON
+ * guarded config; "clean" when JSON proves no guarded change (this is what suppresses the
+ * dependency-named-"build" false positive — the line-scan is NOT consulted for a clean parse).
+ */
+function semanticSectionVerdict(section: DiffSection): SectionVerdict {
+  const s = analyzeSection(section.text);
+  if (s.fileName === "") return "indeterminate";
+  if (s.fileName.includes("node_modules/")) return "clean"; // builder-installed deps, not authored code
+  if (s.isNewFile) return "clean"; // greenfield: a new file can't WEAKEN what didn't exist
+  if (/(?:^|\/)package\.json$/.test(s.fileName)) {
+    const oldPkg = tryParseJsonObject(s.oldText);
+    const newPkg = tryParseJsonObject(s.newText);
+    if (oldPkg === undefined || newPkg === undefined) return "indeterminate";
+    const key = changedGuardedScript(oldPkg, newPkg);
+    return key !== undefined ? { mutated: true, reason: `builder modified package.json script "${key}"` } : "clean";
+  }
+  if (GUARD_TSCONFIG.test(s.fileName)) {
+    const oldCfg = tryParseJsonObject(s.oldText);
+    const newCfg = tryParseJsonObject(s.newText);
+    if (oldCfg === undefined || newCfg === undefined) return "indeterminate";
+    const key = changedWeakeningKey(oldCfg, newCfg);
+    return key !== undefined ? { mutated: true, reason: `builder modified tsconfig verification key "${key}" in ${s.fileName}` } : "clean";
+  }
+  return "indeterminate"; // vitest/jest/etc. (non-JSON) and everything else → line-scan
+}
+
+/**
+ * LAYER-2 detector: does the workspace diff modify package.json's "scripts" surface (or weaken a
+ * tsconfig / test config)? EXPORTED for unit tests. Fail-closed by design.
+ *
+ * TWO passes, JSON-semantic FIRST. For each file the semantic pass reconstructs the old/new content
+ * and, when both parse as JSON, compares the resolved `scripts`/`compilerOptions` objects key-by-key.
+ * This kills two line-scan failure modes:
+ *   • FALSE POSITIVE — a dependency literally named "build"/"check" bumped on a version change (the
+ *     line-scan sees the guarded key; the semantic compare sees it lives under dependencies, not scripts).
+ *   • FALSE NEGATIVE — `"test":` and `"echo pass"` split onto SEPARATE lines (the line-scan key/value
+ *     regex never matches; the parsed object still shows the changed value).
+ * A file the semantic pass can't prove (partial hunk, or a non-JSON config) falls back to the legacy
+ * line-scan, so existing partial-diff behavior is byte-unchanged.
  */
 export function detectScriptMutation(diff: string): { mutated: boolean; reason?: string } {
-  // Files whose modification can weaken verification (neuter tsconfig strictness,
-  // exclude broken files, weaken test configs). Fail-closed: any builder change to
-  // these is flagged.
-  // tsconfig is checked for VERIFICATION-WEAKENING keys only (not all changes).
-  const GUARDED_CONFIG_PATTERNS = [
-    /vitest\.config/,
-    /jest\.config/,
-    /\.babelrc/,
-    /babel\.config/,
-    /webpack\.config/,
-    /vite\.config/,
-  ];
-  const GUARD_TSCONFIG = /tsconfig.*\.json/;
-  const WEAKENING_KEYS = [
-    "strict", "skipLibCheck", "noEmit", "noImplicitAny", "noUnusedLocals",
-    "noUnusedParameters", "exclude", "include", "moduleResolution",
-    "noImplicitReturns", "noFallthroughCasesInSwitch", "strictNullChecks",
-    "strictFunctionTypes", "strictBindCallApply",
-  ];
+  for (const section of splitDiffByFile(diff)) {
+    const verdict = semanticSectionVerdict(section);
+    if (verdict === "indeterminate") {
+      const legacy = legacyDetectScriptMutation(section.text);
+      if (legacy.mutated) return legacy;
+    } else if (verdict !== "clean") {
+      return verdict; // semantically proven mutation
+    }
+    // "clean": this file is semantically proven clean — do NOT consult the line-scan (that is exactly
+    // what suppresses the dependency-named-"build" false positive).
+  }
+  return { mutated: false };
+}
+
+/**
+ * The legacy LINE-SCAN detector (fallback for partial hunks / non-JSON configs). Flags a changed
+ * (added/removed) line that touches the "scripts" key, a guarded script entry, a tsconfig weakening
+ * key, or any guarded JS config. Unchanged from the original whole-diff detector; the semantic pass
+ * above only narrows WHEN it runs.
+ */
+function legacyDetectScriptMutation(diff: string): { mutated: boolean; reason?: string } {
   let inPackageJson = false;
   let isNewFile = false; // greenfield: file didn't exist in base
   let inGuardedConfig = false;

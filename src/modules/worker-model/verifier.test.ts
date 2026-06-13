@@ -219,6 +219,85 @@ test("detectScriptMutation: flags test/build/tsc + the scripts key; ignores deps
   assert.equal(detectScriptMutation("").mutated, false, "an empty diff is clean");
 });
 
+// ── ISSUE 1: JSON-SEMANTIC script-integrity (full-context diffs) ─────────────
+
+test("ISSUE-1 false-positive killed: a dependency literally named \"build\" bumped → NOT flagged", () => {
+  // A FULL-context package.json diff: only a dependency named "build" changes its version. The
+  // line-scan would match the guarded key "build"; the semantic pass sees it lives under
+  // dependencies, scripts are unchanged → clean.
+  const diff = [
+    "diff --git a/package.json b/package.json",
+    "--- a/package.json",
+    "+++ b/package.json",
+    "@@ -1,9 +1,9 @@",
+    " {",
+    '   "name": "app",',
+    '   "scripts": {',
+    '     "test": "node --test"',
+    "   },",
+    '   "dependencies": {',
+    '-    "build": "^1.0.0"',
+    '+    "build": "^1.1.0"',
+    "   }",
+    " }",
+  ].join("\n");
+  assert.equal(detectScriptMutation(diff).mutated, false, "a dep named 'build' bumped is NOT a scripts mutation");
+});
+
+test("ISSUE-1 false-negative killed: a separate-line \"test\":/\"echo pass\" rewrite is STILL flagged", () => {
+  // The builder formats the test script with key and value on SEPARATE lines to dodge the
+  // key/value line-scan. The semantic pass parses both sides → the resolved scripts.test changed.
+  const diff = [
+    "diff --git a/package.json b/package.json",
+    "--- a/package.json",
+    "+++ b/package.json",
+    "@@ -1,5 +1,6 @@",
+    " {",
+    '   "scripts": {',
+    '-    "test": "node --test"',
+    '+    "test":',
+    '+      "echo pass"',
+    "   }",
+    " }",
+  ].join("\n");
+  assert.equal(detectScriptMutation(diff).mutated, true, "separate-line key/value formatting cannot bypass the semantic compare");
+});
+
+test("ISSUE-1 actual script change (full diff) → flagged", () => {
+  const diff = [
+    "diff --git a/package.json b/package.json",
+    "--- a/package.json",
+    "+++ b/package.json",
+    "@@ -1,5 +1,5 @@",
+    " {",
+    '   "scripts": {',
+    '-    "test": "node --test"',
+    '+    "test": "echo pass && exit 0"',
+    "   }",
+    " }",
+  ].join("\n");
+  const r = detectScriptMutation(diff);
+  assert.equal(r.mutated, true, "rewriting the test command is flagged");
+  assert.match(r.reason ?? "", /test/);
+});
+
+test("ISSUE-1 semantic clean: a full-context diff changing only a non-guarded script is NOT flagged", () => {
+  const diff = [
+    "diff --git a/package.json b/package.json",
+    "--- a/package.json",
+    "+++ b/package.json",
+    "@@ -1,5 +1,5 @@",
+    " {",
+    '   "scripts": {',
+    '     "test": "node --test",',
+    '-    "start": "node old.js"',
+    '+    "start": "node new.js"',
+    "   }",
+    " }",
+  ].join("\n");
+  assert.equal(detectScriptMutation(diff).mutated, false, "changing a non-guarded 'start' script is not a verification mutation");
+});
+
 // ── DETERMINISM (regression) ─────────────────────────────────────────────────
 
 test("verifier never invokes the model (asserted via the engine spy)", async () => {
