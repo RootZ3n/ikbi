@@ -86,7 +86,7 @@ export function realGovernedExec(allowlist: readonly string[]): GovernedExec {
   });
 }
 
-/** Stub model-driven roles: scout/critic succeed; builder writes (+commits) a file; integrator promotes. */
+/** Stub model-driven roles: scout/critic succeed; builder writes (+commits) a file; integrator promotes a GREEN build. */
 export function stubRoles(opts: { write?: { path: string; content: string } } = {}): Partial<Record<WorkerRole, RoleFn>> {
   const roles: Partial<Record<WorkerRole, RoleFn>> = {};
   for (const r of WORKER_ROLES) {
@@ -100,7 +100,17 @@ export function stubRoles(opts: { write?: { path: string; content: string } } = 
         await runGit(ctx.workspace.path, ["commit", "--quiet", "-m", "stub builder change"]);
         return { role: r, outcome: "success", summary: r, detail: { toolRounds: 1, filesWritten: [opts.write.path], rejectedToolCalls: [], stopReason: "stop" } };
       }
-      if (r === "integrator") return { role: r, outcome: "success", summary: r, detail: { decision: "promote", rationale: "accept", evaluation: { approved: true } } };
+      if (r === "integrator") {
+        // Mirror the REAL integrator's AND-gate: promote ONLY when the verifier passed. The verifier
+        // no longer short-circuits a RED build before the critic/integrator run, so this stub must
+        // gate on the verifier verdict too — otherwise it would unconditionally promote a failed
+        // build that the production integrator (which reads the same priorResults) correctly discards.
+        const verifier = ctx.priorResults.find((x) => x.role === "verifier");
+        const verifierGreen = verifier?.outcome === "success";
+        return verifierGreen
+          ? { role: r, outcome: "success", summary: r, detail: { decision: "promote", rationale: "accept", evaluation: { approved: true } } }
+          : { role: r, outcome: "success", summary: r, detail: { decision: "discard", rationale: "verifier not green", evaluation: { approved: false } } };
+      }
       return { role: r, outcome: "success", summary: r };
     };
   }

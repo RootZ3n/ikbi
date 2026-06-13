@@ -140,10 +140,17 @@ function capturingRoles(outcomeFor: (role: WorkerRole) => WorkerOutcome = () => 
     roles[r] = async (ctx) => {
       seen.push(ctx);
       const outcome = outcomeFor(r);
-      // The integrator returns a well-formed PROMOTE decision by default so the
-      // orchestrator's decision wiring promotes on the happy path.
+      // The integrator returns a well-formed PROMOTE decision by default so the orchestrator's
+      // decision wiring promotes on the happy path. It mirrors the REAL integrator's AND-gate by
+      // discarding when the verifier did NOT pass — the verifier no longer short-circuits a RED
+      // build before the integrator runs, so an unconditional promote here would wrongly land a
+      // failed build (the production integrator reads the same priorResults and discards it).
       if (r === "integrator" && outcome === "success") {
-        return { role: r, outcome, summary: r, detail: { decision: "promote", rationale: "test: promote", evaluation: { approved: true } } };
+        const verifier = ctx.priorResults.find((x) => x.role === "verifier");
+        const verifierGreen = verifier === undefined || verifier.outcome === "success";
+        return verifierGreen
+          ? { role: r, outcome, summary: r, detail: { decision: "promote", rationale: "test: promote", evaluation: { approved: true } } }
+          : { role: r, outcome, summary: r, detail: { decision: "discard", rationale: "test: verifier not green", evaluation: { approved: false } } };
       }
       return { role: r, outcome, summary: r };
     };
@@ -526,6 +533,32 @@ test("NO COMMIT when a role fails (verified fails) — failed work is never comm
   assert.notEqual(result.outcome, "success");
   assert.equal(ws.calls.commit.length, 0, "no commit on a verifier failure");
   assert.equal(ws.calls.discard, 1, "the failed work is discarded, not promoted");
+});
+
+test("CODEX Issue 1: a verifier FAILURE does NOT short-circuit — the critic still runs and receives the verifier's failure", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  let criticPrior: readonly RoleResult[] | undefined;
+  const seen: WorkerRole[] = [];
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    scout: async () => { seen.push("scout"); return { role: "scout", outcome: "success", summary: "s" }; },
+    builder: async () => { seen.push("builder"); return { role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["a.ts"] } }; },
+    // The verifier fails with red checks — the REAL failure the critic must judge with.
+    verifier: async () => { seen.push("verifier"); return { role: "verifier", outcome: "failure", summary: "checks red", detail: { verdict: "fail", checks: [{ name: "test", exitCode: 1, outputTail: "1 failing" }] } }; },
+    critic: async (ctx) => { seen.push("critic"); criticPrior = ctx.priorResults; return { role: "critic", outcome: "success", summary: "c", detail: { pass: true } }; },
+    integrator: async () => { seen.push("integrator"); return { role: "integrator", outcome: "success", summary: "i", detail: { decision: "discard", evaluation: { approved: false } } }; },
+  };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces }));
+  const result = await orch.run(task, parentCtx);
+
+  assert.ok(seen.includes("critic"), "the critic RAN even though the verifier failed (no short-circuit)");
+  assert.ok(criticPrior !== undefined, "the critic was invoked with prior results");
+  const verifierSeen = criticPrior?.find((r) => r.role === "verifier");
+  assert.equal(verifierSeen?.outcome, "failure", "the critic received the verifier's FAILURE result in its context");
+  assert.equal((verifierSeen?.detail as Record<string, unknown> | undefined)?.verdict, "fail", "including the fail verdict the critic should judge with");
+  assert.equal(ws.calls.commit.length, 0, "a failed verification is never committed");
+  assert.equal(result.outcome, "failure", "the run still reports failure — overall records the verifier failure");
+  assert.equal(result.promoted, false, "the integrator's AND-gate discards a red verifier — never promoted");
 });
 
 test("failure path: a role failure short-circuits, workspace DISCARDED (not promoted)", async () => {

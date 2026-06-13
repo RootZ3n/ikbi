@@ -1178,7 +1178,14 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 
         if (result.outcome !== "success") {
           overall = result.outcome;
-          break; // short-circuit on the first non-success
+          // CODEX FIX: do NOT short-circuit on a VERIFIER failure. The critic runs AFTER the
+          // verifier (the whole point of the reorder) and must see the verifier's results —
+          // INCLUDING failures — to give meaningful semantic feedback. Let the critic (and the
+          // integrator's order-independent AND-gate) run; `overall` already records the failure,
+          // the integrator discards on a red verifier, and the post-loop path retains/discards
+          // the workspace exactly as a short-circuit would. Any OTHER non-success role still
+          // breaks: a failed scout/builder leaves nothing for the critic to review.
+          if (role !== "verifier") break;
         }
 
         // COMMIT the VERIFIED-good working tree, gated on autoCommit. The builder's edits live
@@ -1186,7 +1193,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         // the scratch branch HEAD == base HEAD and promote sees an empty diff. After the verifier
         // SUCCEEDS, capture that verified state so the integrator (next role) promotes a real diff.
         // Gated on the worker's autonomy: trusted/operator (autoCommit) commit; lower tiers do not.
-        if (role === "verifier" && workspaces.commit !== undefined) {
+        // Guarded on verifier SUCCESS: the verifier no longer short-circuits on failure (the critic
+        // must still run), so this commit gate must explicitly require a green verifier — a failed
+        // verification is never committed.
+        if (role === "verifier" && result.outcome === "success" && workspaces.commit !== undefined) {
           if (spawned.autonomy.autoCommit) {
             await workspaces.commit(workspace, `ikbi: ${task.goal}`);
           } else {
