@@ -125,9 +125,10 @@ export interface WorkerModelConfig {
    * discards on verifierPass=false regardless of the critic. Running the critic there only spends
    * model tokens on a goal-alignment verdict nobody acts on. With this ON, the critic is skipped
    * in exactly that case (red verifier + fixLoop off). When fixLoop IS active the critic still
-   * runs — its feedback can inform the objective-driven retry. DEFAULT OFF (opt-in): the critic
-   * runs after a red verifier as before unless this is set. Set
-   * IKBI_WORKER_MODEL_SKIP_CRITIC_ON_RED=true to enable.
+   * runs — its feedback can inform the objective-driven retry. DEFAULT ON: a discard-bound critic
+   * call on a red verifier is not paid for unless a retry will consume its feedback. Set
+   * IKBI_WORKER_MODEL_SKIP_CRITIC_ON_RED=false to opt back into running the critic after a red
+   * verifier.
    */
   readonly skipCriticOnRed?: boolean;
   /**
@@ -159,7 +160,7 @@ export function loadWorkerModelConfig(reader = env): WorkerModelConfig {
     penalizeTimeouts: reader.bool("PENALIZE_TIMEOUTS", false),
     fixLoop: reader.bool("FIX_LOOP", false),
     criticFixLoop: reader.bool("CRITIC_FIX_LOOP", false),
-    skipCriticOnRed: reader.bool("SKIP_CRITIC_ON_RED", false),
+    skipCriticOnRed: reader.bool("SKIP_CRITIC_ON_RED", true),
     builderMode: loadBuilderMode(),
     candidateModels: loadCandidateModels(),
   });

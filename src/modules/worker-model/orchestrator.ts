@@ -981,15 +981,16 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           );
           continue;
         }
-        // SKIP-CRITIC-ON-RED (opt-in): a discard-bound build (verifier RED) does not need a paid
+        // SKIP-CRITIC-ON-RED (default ON): a discard-bound build (verifier RED) does not need a paid
         // goal-alignment verdict. The integrator already discards on verifierPass=false, so the
         // critic would only spend model tokens on a build that is already condemned. Skip it ONLY
-        // when no retry will happen — the verifier-driven fixLoop is off. When fixLoop IS active
-        // the critic runs (its feedback can inform the objective-driven retry). DEFAULT OFF so the
-        // CODEX no-short-circuit behavior (critic runs after a red verifier) is preserved unless
-        // explicitly opted in. No critic result is pushed — the integrator reads "no critic result"
-        // and discards, the same terminal outcome a red verifier already forces.
-        if (role === "critic" && config.skipCriticOnRed === true && !config.fixLoop) {
+        // when no retry will consume its feedback — the verifier-driven fixLoop is off. When fixLoop
+        // IS active the critic runs (its feedback can inform the objective-driven retry). DEFAULT ON
+        // (skip-on-red is the default; `skipCriticOnRed !== false`) so condemned-build critic calls
+        // are not paid for; set IKBI_WORKER_MODEL_SKIP_CRITIC_ON_RED=false to opt back into running
+        // the critic after a red verifier. No critic result is pushed — the integrator reads "no
+        // critic result" and discards, the same terminal outcome a red verifier already forces.
+        if (role === "critic" && config.skipCriticOnRed !== false && !config.fixLoop) {
           const verifierForSkip = results.find((r) => r.role === "verifier");
           if (verifierForSkip !== undefined && verifierForSkip.outcome !== "success") {
             events.publish(

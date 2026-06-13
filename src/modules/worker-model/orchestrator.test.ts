@@ -548,7 +548,9 @@ test("CODEX Issue 1: a verifier FAILURE does NOT short-circuit — the critic st
     critic: async (ctx) => { seen.push("critic"); criticPrior = ctx.priorResults; return { role: "critic", outcome: "success", summary: "c", detail: { pass: true } }; },
     integrator: async () => { seen.push("integrator"); return { role: "integrator", outcome: "success", summary: "i", detail: { decision: "discard", evaluation: { approved: false } } }; },
   };
-  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces }));
+  // skipCriticOnRed OFF (opt-out): this test pins the no-short-circuit behavior, so the critic must
+  // run after the red verifier — disable the (now-default) skip-on-red so the critic is dispatched.
+  const orch = createOrchestrator(baseDeps({ config: { ...ENABLED, skipCriticOnRed: false }, resolveIdentity, roleClaim, roles, workspaces: ws.workspaces }));
   const result = await orch.run(task, parentCtx);
 
   assert.ok(seen.includes("critic"), "the critic RAN even though the verifier failed (no short-circuit)");
@@ -1249,8 +1251,10 @@ test("ISSUE 1 (gate): a RED verifier + critic FAIL does NOT trigger the critic f
     critic: async () => { calls.critic += 1; return { role: "critic", outcome: "success", summary: "FAIL", detail: { pass: false, feedback: "off-goal", issues: ["rename the handler"] } }; },
     integrator: realIntegrator,
   };
-  // criticFixLoop is ON — the gate (not the opt-out) is what must suppress the retry here.
-  const orch = createOrchestrator(baseDeps({ config: { ...ENABLED, criticFixLoop: true }, resolveIdentity, roleClaim, roles, workspaces: ws.workspaces }));
+  // criticFixLoop is ON — the gate (not the opt-out) is what must suppress the retry here. The
+  // critic must actually run to exercise that gate, so skipCriticOnRed is OFF (the now-default
+  // skip-on-red would otherwise skip the critic before the gate is reached).
+  const orch = createOrchestrator(baseDeps({ config: { ...ENABLED, criticFixLoop: true, skipCriticOnRed: false }, resolveIdentity, roleClaim, roles, workspaces: ws.workspaces }));
   const result = await orch.run(task, parentCtx);
 
   assert.equal(calls.builder, 1, "builder ran ONCE — the critic fix loop did not retry it on a red verifier");
@@ -1285,7 +1289,7 @@ test("ISSUE 3: skipCriticOnRed ON + red verifier + fixLoop off → the critic is
   assert.equal(critic, undefined, "no critic result is recorded when the critic is skipped");
 });
 
-test("ISSUE 3: with skipCriticOnRed OFF (default), a red verifier STILL runs the critic — CODEX no-short-circuit behavior preserved", async () => {
+test("H6: skipCriticOnRed=false (explicit opt-out) → a red verifier STILL runs the critic — CODEX no-short-circuit behavior preserved", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
   const ws = fakeWorkspaces(true);
   const seen: WorkerRole[] = [];
@@ -1296,11 +1300,35 @@ test("ISSUE 3: with skipCriticOnRed OFF (default), a red verifier STILL runs the
     critic: async () => { seen.push("critic"); return { role: "critic", outcome: "success", summary: "c", detail: { pass: true } }; },
     integrator: realIntegrator,
   };
-  // Default config (skipCriticOnRed unset) → the opt-in skip does NOT fire; the critic runs as before.
-  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces }));
+  // skipCriticOnRed explicitly OFF → the skip does NOT fire; the critic runs after a red verifier.
+  const orch = createOrchestrator(baseDeps({ config: { ...ENABLED, skipCriticOnRed: false }, resolveIdentity, roleClaim, roles, workspaces: ws.workspaces }));
   await orch.run(task, parentCtx);
 
-  assert.ok(seen.includes("critic"), "with the skip OFF, the critic still runs after a red verifier (unchanged default)");
+  assert.ok(seen.includes("critic"), "with the skip opted OFF, the critic still runs after a red verifier");
+});
+
+test("H6: with DEFAULT config (skipCriticOnRed unset, fixLoop off), the critic is SKIPPED on a red verifier — condemned-build critic call not paid for", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const seen: WorkerRole[] = [];
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    scout: async () => { seen.push("scout"); return { role: "scout", outcome: "success", summary: "s" }; },
+    builder: async () => { seen.push("builder"); return { role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["a.ts"] } }; },
+    // RED verifier — the build is discard-bound; with no fix loop, the critic's verdict is unused.
+    verifier: async () => { seen.push("verifier"); return { role: "verifier", outcome: "failure", summary: "checks red", detail: { verdict: "fail", checks: [{ name: "test", exitCode: 1, outputTail: "1 failing" }] } }; },
+    critic: async () => { seen.push("critic"); return { role: "critic", outcome: "success", summary: "c", detail: { pass: true } }; },
+    integrator: realIntegrator,
+  };
+  // DEFAULT config (skipCriticOnRed unset, fixLoop off) → skip-on-red is the default; the critic
+  // is skipped on the red, discard-bound build (no model call spent on a condemned build).
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces }));
+  const result = await orch.run(task, parentCtx);
+
+  assert.ok(!seen.includes("critic"), "the critic was SKIPPED by default on the discard-bound red-verifier build");
+  assert.notEqual(result.outcome, "success", "the red verifier still discards the build");
+  assert.equal(ws.calls.promote, 0, "nothing promoted");
+  assert.equal(ws.calls.discard, 1, "the integrator condemned the build (discarded)");
+  assert.equal(result.roles.find((r) => r.role === "critic"), undefined, "no critic result is recorded when the critic is skipped");
 });
 
 test("CODEX Issue 3: each critic-fix-loop RETRY stage runs under its OWN role identity (retry builder is functionalRole=builder, not critic)", async () => {
