@@ -12,10 +12,16 @@
  * so it works BEFORE tokens are configured (which is the point).
  */
 
+import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+
 import { config, type IkbiConfig } from "../core/config.js";
 import type { ModelProvider } from "../core/provider/contract.js";
 import { registry as defaultRegistry } from "../core/provider/index.js";
 import type { ModelSpec } from "../core/provider/registry.js";
+import { workspaces as coreWorkspaces } from "../core/workspace/index.js";
 import { egressConfig } from "../modules/egress/config.js";
 import { governedExecConfig } from "../modules/governed-exec/config.js";
 import { workerModelConfig } from "../modules/worker-model/config.js";
@@ -26,6 +32,7 @@ import {
   resolveVerificationMode,
   safetyPosture,
 } from "../modules/worker-model/modes.js";
+import { writeStdout } from "./io.js";
 import { postureLines, productPosture } from "./posture.js";
 
 /** The read-only registry surface doctor needs to check role-model resolution. */
@@ -216,4 +223,289 @@ export function runDoctor(inp: DoctorInputs = {}): DoctorResult {
   }
 
   return { lines, ready, missingRequired };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// `ikbi doctor --fix` — automatic repair of common, SAFE-to-repair gaps.
+//
+// `runDoctor` above is READ-ONLY (and stays that way). `--fix` is the opt-in
+// side-effecting twin: for each repairable gap it PRINTS what it is about to do,
+// attempts the repair, then PRINTS the result, returning a non-zero exit code if
+// any attempted repair failed.
+//
+// SAFETY CONTRACT:
+//  - `--fix` is CREATE/REPAIR ONLY — it never deletes. The single destructive
+//    repair (reclaiming stale workspaces) is gated behind `--fix --force`; without
+//    `--force` it only REPORTS what could be reclaimed.
+//  - Every side effect goes through an injectable PORT (DoctorFixPorts) so the
+//    behavior is unit-testable with no real filesystem / process / git mutation.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** A package manager `--fix` can drive to install dependencies (lockfile-detected). */
+export type PackageManager = "pnpm" | "npm" | "yarn";
+
+/**
+ * The side-effecting ports `runDoctorFix` drives. Each is injectable so tests can
+ * assert the repair logic without touching the real filesystem, spawning a process,
+ * or mutating git worktrees. `liveFixPorts()` wires the production implementations.
+ */
+export interface DoctorFixPorts {
+  /** True iff a file or directory exists at `path`. */
+  exists(path: string): boolean;
+  /** Create a directory and any missing parents (mkdir -p). */
+  mkdirp(path: string): Promise<void>;
+  /** Write `content` to `path` (creating the file). Must not clobber an existing file. */
+  writeFile(path: string, content: string): Promise<void>;
+  /** Pick the package manager to install with, from the lockfile present in `projectRoot`. */
+  detectManager(projectRoot: string): PackageManager;
+  /** Install dependencies with `manager` in `projectRoot`. Resolves with ok + a short detail. */
+  install(manager: PackageManager, projectRoot: string): Promise<{ ok: boolean; detail: string }>;
+  /** Count stale (terminal, on-disk, not-yet-reclaimed) workspaces — non-destructive. */
+  countStaleWorkspaces(): Promise<number>;
+  /** Reclaim stale workspaces (the destructive `--force` path). */
+  cleanWorkspaces(opts: { force: boolean }): Promise<{ removed: number; skipped: number }>;
+}
+
+/** Inputs to a `--fix` run — all default to the live singletons / process. */
+export interface DoctorFixInputs {
+  readonly config?: IkbiConfig;
+  /** The project directory whose `.env` / `node_modules` / lockfile are inspected. Default: cwd. */
+  readonly projectRoot?: string;
+  /** When true, also perform the one DESTRUCTIVE repair: reclaim stale workspaces. */
+  readonly force?: boolean;
+}
+
+export interface DoctorFixResult {
+  readonly lines: readonly string[];
+  /** How many repairs were ATTEMPTED (a healthy check is not counted). */
+  readonly attempted: number;
+  /** How many attempted repairs FAILED. */
+  readonly failures: number;
+  /** 0 if every attempted repair succeeded, 1 if any failed. */
+  readonly exitCode: number;
+}
+
+/** The `.env` template `--fix` writes when no `.env` exists. */
+export function envTemplate(): string {
+  return [
+    "# ikbi environment — created by `ikbi doctor --fix`.",
+    "# Fill in the placeholder values, then re-run `ikbi doctor` to verify.",
+    "#",
+    "# SECURITY: the trust/identity SECRETS below are intentionally COMMENTED OUT.",
+    "# ikbi REFUSES to load them from a project .env (see bootstrap CWD_DOTENV_FORBIDDEN_KEYS).",
+    "# Put real secret values in ~/.ikbi/env or the install-root .env instead:",
+    "#   IKBI_OPERATOR_TOKEN=<the operator identity that grants trust>",
+    "#   IKBI_WORKER_TOKEN=<the worker identity builds run under>",
+    "#   IKBI_TRUST_HMAC_KEY=<a strong random key — trust-state integrity>",
+    "#   IKBI_IDENTITY_TOKEN_SALT=<a strong random salt — token hashing>",
+    "",
+    "# --- required for a build (safe to keep in a project .env) -----------------",
+    "IKBI_WORKER_MODEL_ENABLED=true",
+    "IKBI_GOVERNED_EXEC_ALLOWLIST=git,pnpm",
+    "",
+    "# --- model roster (resolved role models) -----------------------------------",
+    "# IKBI_MODEL_DRIVER=mimo-v2.5",
+    "# IKBI_MODEL_BUILDER=mimo-v2.5",
+    "# IKBI_MODEL_CRITIC=deepseek-v4-pro",
+    "# IKBI_COMPETITIVE_MODELS=",
+    "",
+    "# --- egress (default-deny; list the hosts a build may reach) ----------------",
+    "# IKBI_EGRESS_ALLOWLIST=",
+    "# IKBI_EGRESS_ALLOW_LOCAL=",
+    "",
+  ].join("\n");
+}
+
+const errMsg = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+
+/**
+ * Run `ikbi doctor --fix`: attempt to repair each common, safe-to-repair gap, printing
+ * what it does and the outcome of each. PURE over its ports — no real I/O unless the live
+ * ports are injected. The exit code is 0 iff every attempted repair succeeded.
+ */
+export async function runDoctorFix(ports: DoctorFixPorts, inp: DoctorFixInputs = {}): Promise<DoctorFixResult> {
+  const cfg = inp.config ?? config;
+  const projectRoot = inp.projectRoot ?? process.cwd();
+  const force = inp.force ?? false;
+
+  const lines: string[] = [];
+  const push = (s: string) => lines.push(s);
+  let attempted = 0;
+  let failures = 0;
+
+  push("ikbi doctor --fix — repairing common gaps (create/repair only; --force also reclaims stale workspaces)");
+
+  // --- 1. .env file --------------------------------------------------------
+  push("");
+  push("ENV FILE");
+  const envPath = join(projectRoot, ".env");
+  if (ports.exists(envPath)) {
+    push(`  ${OK} .env present — ${envPath} (leaving as-is)`);
+  } else {
+    attempted += 1;
+    push(`  … creating .env template — ${envPath}`);
+    try {
+      await ports.writeFile(envPath, envTemplate());
+      push(`  ${OK} created .env template — fill in the placeholders (secret keys go in ~/.ikbi/env, not here)`);
+    } catch (err) {
+      failures += 1;
+      push(`  ${BAD} failed to create .env: ${errMsg(err)}`);
+    }
+  }
+
+  // --- 2. state directories ------------------------------------------------
+  push("");
+  push("STATE DIRECTORIES");
+  const dirs: Array<{ label: string; path: string }> = [
+    { label: "state root", path: cfg.stateRoot },
+    { label: "trust dir", path: cfg.trust.dir },
+    { label: "workspace root", path: cfg.workspace.root },
+  ];
+  for (const d of dirs) {
+    if (ports.exists(d.path)) {
+      push(`  ${OK} ${d.label} present — ${d.path}`);
+    } else {
+      attempted += 1;
+      push(`  … creating ${d.label} (mkdir -p) — ${d.path}`);
+      try {
+        await ports.mkdirp(d.path);
+        push(`  ${OK} created ${d.label}`);
+      } catch (err) {
+        failures += 1;
+        push(`  ${BAD} failed to create ${d.label}: ${errMsg(err)}`);
+      }
+    }
+  }
+
+  // --- 3. dependencies (node_modules) --------------------------------------
+  push("");
+  push("DEPENDENCIES");
+  const nodeModules = join(projectRoot, "node_modules");
+  if (ports.exists(nodeModules)) {
+    push(`  ${OK} node_modules present`);
+  } else {
+    attempted += 1;
+    const manager = ports.detectManager(projectRoot);
+    push(`  … node_modules missing — running \`${manager} install\` (lockfile-detected)…`);
+    try {
+      const r = await ports.install(manager, projectRoot);
+      if (r.ok) {
+        push(`  ${OK} ${manager} install completed`);
+      } else {
+        failures += 1;
+        push(`  ${BAD} ${manager} install failed: ${r.detail}`);
+      }
+    } catch (err) {
+      failures += 1;
+      push(`  ${BAD} ${manager} install errored: ${errMsg(err)}`);
+    }
+  }
+
+  // --- 4. stale workspaces (report-only without --force; reclaim with) -----
+  push("");
+  push("STALE WORKSPACES");
+  if (!force) {
+    // NON-DESTRUCTIVE: never delete without --force — only report what could be reclaimed.
+    try {
+      const n = await ports.countStaleWorkspaces();
+      if (n === 0) {
+        push(`  ${OK} no stale workspaces to reclaim`);
+      } else {
+        push(`  ${WARN} ${n} stale workspace(s) can be reclaimed — re-run \`ikbi doctor --fix --force\` to remove them (NOT removed without --force)`);
+      }
+    } catch (err) {
+      // A failed inspection is not a failed REPAIR (nothing was attempted) — warn, don't fail.
+      push(`  ${WARN} could not inspect stale workspaces: ${errMsg(err)}`);
+    }
+  } else {
+    attempted += 1;
+    push("  … --force: reclaiming stale workspaces…");
+    try {
+      const r = await ports.cleanWorkspaces({ force: true });
+      push(`  ${OK} reclaimed ${r.removed} stale workspace(s)${r.skipped > 0 ? ` (${r.skipped} skipped)` : ""}`);
+    } catch (err) {
+      failures += 1;
+      push(`  ${BAD} workspace reclamation failed: ${errMsg(err)}`);
+    }
+  }
+
+  // --- summary -------------------------------------------------------------
+  push("");
+  if (failures === 0) {
+    push(attempted === 0 ? `${OK} doctor --fix: nothing to repair — all checks healthy` : `${OK} doctor --fix: ${attempted} repair(s) applied, all succeeded`);
+  } else {
+    push(`${BAD} doctor --fix: ${failures} of ${attempted} repair(s) FAILED — see ${BAD} above`);
+  }
+
+  return { lines, attempted, failures, exitCode: failures === 0 ? 0 : 1 };
+}
+
+/** Detect the package manager from the lockfile present in `projectRoot` (defaults to pnpm). */
+export function detectPackageManager(projectRoot: string, exists: (p: string) => boolean = existsSync): PackageManager {
+  if (exists(join(projectRoot, "pnpm-lock.yaml"))) return "pnpm";
+  if (exists(join(projectRoot, "yarn.lock"))) return "yarn";
+  if (exists(join(projectRoot, "package-lock.json"))) return "npm";
+  return "pnpm"; // ikbi's own default toolchain
+}
+
+/** Spawn `<manager> install` in `cwd`, resolving with ok + a short (last-lines) detail on failure. */
+function runInstall(manager: PackageManager, cwd: string): Promise<{ ok: boolean; detail: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(manager, ["install"], { cwd, stdio: ["ignore", "inherit", "pipe"] });
+    let errTail = "";
+    child.stderr?.on("data", (d: Buffer) => {
+      errTail = (errTail + d.toString()).slice(-2000);
+    });
+    child.on("error", (e) => resolve({ ok: false, detail: e.message }));
+    child.on("close", (code) => {
+      if (code === 0) resolve({ ok: true, detail: "" });
+      else resolve({ ok: false, detail: `exit ${code ?? "?"}: ${errTail.trim().split("\n").slice(-3).join(" | ")}`.trim() });
+    });
+  });
+}
+
+/** Count stale workspaces: terminal records whose worktree dir still exists and is not yet reclaimed. */
+async function countLiveStaleWorkspaces(exists: (p: string) => boolean = existsSync): Promise<number> {
+  const records = await coreWorkspaces.list();
+  return records.filter((r) => (r.state === "promoted" || r.state === "discarded" || r.state === "failed") && r.cleanedAt === undefined && exists(r.path)).length;
+}
+
+/** Wire the production side-effecting ports (real filesystem, child process, workspace manager). */
+export function liveFixPorts(): DoctorFixPorts {
+  return {
+    exists: (p) => existsSync(p),
+    mkdirp: async (p) => {
+      await mkdir(p, { recursive: true });
+    },
+    // `flag: "wx"` — fail rather than clobber an existing .env (belt-and-suspenders over the exists() guard).
+    writeFile: async (p, content) => {
+      await writeFile(p, content, { encoding: "utf8", flag: "wx" });
+    },
+    detectManager: (root) => detectPackageManager(root),
+    install: (manager, root) => runInstall(manager, root),
+    countStaleWorkspaces: () => countLiveStaleWorkspaces(),
+    cleanWorkspaces: async (opts) => {
+      const r = await coreWorkspaces.cleanOrphans(opts);
+      return { removed: r.removed, skipped: r.skipped };
+    },
+  };
+}
+
+/**
+ * CLI driver for `ikbi doctor --fix [--force]`: build the live ports (unless injected),
+ * run the repairs, print the report, and return the process exit code. Any unexpected
+ * top-level error is converted to a one-line message + exit 1 (never a raw stack).
+ */
+export async function runDoctorFixCli(argv: readonly string[], deps: { ports?: DoctorFixPorts; out?: (s: string) => void } = {}): Promise<number> {
+  const out = deps.out ?? writeStdout;
+  const force = argv.includes("--force") || argv.includes("-f");
+  try {
+    const ports = deps.ports ?? liveFixPorts();
+    const r = await runDoctorFix(ports, { force });
+    out(`${r.lines.join("\n")}\n`);
+    return r.exitCode;
+  } catch (err) {
+    out(`${BAD} doctor --fix: ${errMsg(err)}\n`);
+    return 1;
+  }
 }

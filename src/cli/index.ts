@@ -24,7 +24,7 @@ import { config } from "../core/config.js";
 import { registry } from "../core/provider/index.js";
 import { trust } from "../core/trust/index.js";
 import { commands } from "./registry.js";
-import { runDoctor } from "./doctor.js";
+import { runDoctor, runDoctorFixCli } from "./doctor.js";
 import { runCapabilities } from "./capabilities.js";
 import { postureLines } from "./posture.js";
 import { writeStderr, writeStdout } from "./io.js";
@@ -82,6 +82,7 @@ function printUsage(): void {
     "  models [list]      List the model roster (id, role, cost, provider chain)",
     "  providers [list]   List the registered providers",
     "  doctor             Report bootstrap config: what's set, what's missing for a build",
+    "  doctor --fix       Repair common gaps (.env/state dirs/deps); --force also reclaims stale workspaces",
     "  capabilities       List the builder + chat tool inventory (and parity)",
   ];
   if (moduleCmds.length > 0) {
@@ -156,9 +157,19 @@ async function run(argv: readonly string[]): Promise<void> {
     case "providers":
       listProviders();
       return;
-    case "doctor":
+    case "doctor": {
+      // `--fix` is the opt-in side-effecting twin of the read-only report: it repairs
+      // common gaps (create/repair only; `--force` also reclaims stale workspaces) and
+      // sets a non-zero exit code if any repair failed.
+      const doctorArgs = argv.slice(1);
+      if (doctorArgs.includes("--fix")) {
+        const code = await runDoctorFixCli(doctorArgs);
+        if (code !== 0) process.exitCode = code;
+        return;
+      }
       runInfo("doctor", () => writeStdout(`${runDoctor().lines.join("\n")}\n`));
       return;
+    }
     case "capabilities":
       // Tool inventory + the shared product posture: which surfaces are core/experimental/dormant,
       // and which lifecycle guarantees each editing surface actually provides (no overstatement).
