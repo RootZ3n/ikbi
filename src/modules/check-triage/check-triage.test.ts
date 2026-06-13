@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { parseCheckOutput } from "./index.js";
+import { parseCheckOutput, stripAnsi } from "./index.js";
 
 test("node:test — captures the failing test name from TAP `not ok`", () => {
   const r = parseCheckOutput({ name: "test", command: "node --test", exitCode: 1, stdout: "TAP version 13\nok 1 - passes\nnot ok 2 - my failing test\n  ---\n  ...\n" });
@@ -112,6 +112,16 @@ test("VECTOR B — exit 0 but parsed failures (exit-swallowing script) is NOT a 
 test("a real passing test run (exit 0, tests ran, no failures) still passes", () => {
   const r = parseCheckOutput({ name: "test", command: "node --test", exitCode: 0, stdout: "TAP version 13\nok 1 - adds\n1..1\n# tests 1\n# pass 1\n# fail 0\n" });
   assert.equal(r.passed, true, "tests actually ran and passed");
+});
+
+// ── L1 — stripAnsi is ESC-anchored, not a global uppercase strip ─────────────
+
+test("stripAnsi preserves bare uppercase markers and underscores, strips real ESC sequences", () => {
+  // A plain FAILED marker (no preceding ESC) must survive untouched — including underscores.
+  assert.equal(stripAnsi("FAILED"), "FAILED", "bare FAILED is preserved");
+  assert.equal(stripAnsi("FAILED tests/test_x.py::test_foo"), "FAILED tests/test_x.py::test_foo", "underscores preserved");
+  // A real ESC-anchored colour sequence around FAILED is stripped down to FAILED.
+  assert.equal(stripAnsi("\x1b[31mFAILED\x1b[0m"), "FAILED", "ESC[..m sequences removed, FAILED kept");
 });
 
 test("deterministic: identical input → identical output", () => {

@@ -8,12 +8,24 @@
 import { checkTriageConfig, type CheckTriageConfig } from "./config.js";
 import type { CheckInput, CheckTriage } from "./contract.js";
 
-/** Strip ANSI escape sequences (CSI / OSC / single-char) and normalize CR → LF. ESC = U+001B. */
+/**
+ * Strip ANSI escape sequences (CSI / OSC / single-char) and normalize CR → LF. ESC = U+001B.
+ *
+ * Every sequence below is ANCHORED to ESC (\x1b), so ordinary text is never touched — a bare
+ * `FAILED` marker and identifiers with underscores (e.g. `test_foo`) survive intact; only real
+ * escape sequences are removed. The anchors are written as explicit \x1b escapes (not invisible
+ * literal ESC bytes) so the anchoring is legible in source and an edit cannot silently drop it,
+ * which would otherwise turn the single-char rule into a global [@-Z\\-_] strip that mangles
+ * uppercase markers like FAILED.
+ */
 export function stripAnsi(s: string): string {
   return s
-    .replace(/\][^]*(?:|\\)/g, "") // OSC ... terminated by BEL or ST
-    .replace(/\[[0-?]*[ -/]*[@-~]/g, "") // CSI ... final byte
-    .replace(/[@-Z\\-_]/g, "") // other single-char ESC sequences
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "") // OSC ... terminated by BEL or ST
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "") // CSI ... final byte
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b[@-Z\\-_]/g, "") // other single-char ESC sequences
     .replace(/\r\n?/g, "\n"); // CRLF and lone CR → LF (spinner overwrites)
 }
 
