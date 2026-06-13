@@ -496,3 +496,67 @@ test("e2e: no candidate models ⇒ tournament does NOT run (single-workspace pat
 
   assert.equal(ws.allocated.length, 1, "no candidate models ⇒ exactly ONE workspace (single path), no tournament");
 });
+
+// ════════════════════════════════════════════════════════════════════════════
+//  AUTO-VERIFY RESCUE IN TOURNAMENT MODE
+// ════════════════════════════════════════════════════════════════════════════
+
+test("e2e: tournament rescues a builder that wrote files but hit no_progress — candidate proceeds through judge", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities();
+  const ws = tourWorkspaces();
+  let verifierRuns = 0;
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    scout: async () => ({ role: "scout", outcome: "success", summary: "s" }),
+    // Builder writes files but hits no_progress (protocol termination, never calls done).
+    builder: async () => ({
+      role: "builder", outcome: "failure", summary: "no_progress",
+      detail: { stopReason: "no_progress", filesWritten: ["a.ts"], checksRuns: 0, rejectedToolCalls: [], toolRounds: 10 },
+    }),
+    verifier: async (_c: RoleContext) => {
+      verifierRuns += 1;
+      return { role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: [{ name: "typecheck", command: "tsc", exitCode: 0, outputTail: "" }, { name: "test", command: "test", exitCode: 0, outputTail: "# tests 10\n# pass 10\n" }] } };
+    },
+  };
+  const orch = createOrchestrator(tourDeps({
+    resolveIdentity, roleClaim, workspaces: ws.workspaces, roles,
+    candidateModels: ["flash-model"],
+    applyDiff: async () => ({ applied: true }),
+  }));
+
+  const r = await orch.run(task, parentCtx);
+
+  // The rescue should reclassify the builder as success, run the verifier,
+  // the judge scores it, shadow replay runs, and it promotes.
+  assert.equal(r.outcome, "success", r.reason);
+  assert.equal(r.promoted, true, "rescued tournament candidate promotes through shadow");
+  // At least 2 verifier runs: 1 rescue (in candidate) + 1 shadow verify
+  assert.ok(verifierRuns >= 2, `rescue verifier + shadow verifier ran (got ${verifierRuns})`);
+  // The rescued builder detail should carry the rescue stamp.
+  const candidateRoles = r.roles;
+  const builder = candidateRoles.find((x) => x.role === "builder");
+  assert.equal((builder?.detail as Record<string, unknown> | undefined)?.autoVerifyRescue, true, "tournament rescue stamp present");
+});
+
+test("e2e: tournament does NOT rescue a builder with policy violations — candidate fails", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities();
+  const ws = tourWorkspaces();
+  let verifierRuns = 0;
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    scout: async () => ({ role: "scout", outcome: "success", summary: "s" }),
+    builder: async () => ({
+      role: "builder", outcome: "failure", summary: "no_progress",
+      detail: { stopReason: "no_progress", filesWritten: ["a.ts"], checksRuns: 0, rejectedToolCalls: [], policyViolations: [{ kind: "unsafe" }], toolRounds: 10 },
+    }),
+    verifier: async () => { verifierRuns += 1; return { role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: [] } }; },
+  };
+  const orch = createOrchestrator(tourDeps({
+    resolveIdentity, roleClaim, workspaces: ws.workspaces, roles,
+    candidateModels: ["flash-model"],
+  }));
+
+  const r = await orch.run(task, parentCtx);
+
+  assert.equal(r.outcome, "rejected", "tournament rejects when rescue is blocked by policy violations");
+  assert.equal(r.promoted, false);
+  assert.equal(verifierRuns, 0, "no rescue verifier when policy violations block rescue");
+});

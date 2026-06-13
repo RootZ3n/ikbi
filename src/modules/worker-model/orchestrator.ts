@@ -876,6 +876,78 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     return k.killed ? `halted by kill-switch (${k.signal?.mode ?? "soft"})` : undefined;
   }
 
+  // ── AUTO-VERIFY RESCUE HELPER ────────────────────────────────────────────────
+  // Extracted so every orchestrator path (single-run, competitive, tournament) can
+  // rescue a builder that wrote correct code but hit a protocol termination (no_progress,
+  // max_iterations, timeout, stuck_detected) before ever calling run_checks.
+  //
+  // Design constraints (from the user spec):
+  //   • Only applies to the builder role.
+  //   • Only fires on protocol terminations (NOT model-failure stops like error/content_filter).
+  //   • Requires filesWritten > 0 (something on disk to verify).
+  //   • Requires zero policy violations (fail-closed on unsafe work).
+  //   • Runs the REAL verifier — no weakening, no bypass.
+  //   • Stamps autoVerifyRescue: true + original_builder_stop + files_written on the result.
+  //   • Fail-closed: if the verifier is RED or blocked, the original failure stands.
+
+  const RESCUABLE_TERMINATIONS: ReadonlySet<string> = new Set(["max_iterations", "timeout", "stuck_detected", "no_progress"]);
+
+  /**
+   * If `builderResult` is a protocol-terminated builder failure with written files and
+   * no policy violations, run the verifier against the workspace. On GREEN, reclassify
+   * the builder as success and stamp rescue metadata. On RED or blocked, return unchanged.
+   *
+   * @param builderResult  The builder's RoleResult (may be mutated on rescue).
+   * @param runVerifier    A function that dispatches the verifier and returns its RoleResult.
+   * @returns The (possibly rescued) builder result + the rescue verifier result if one ran.
+   */
+  async function maybeAutoVerifyRescueBuilderResult(
+    builderResult: RoleResult,
+    runVerifier: () => Promise<RoleResult>,
+  ): Promise<{ result: RoleResult; rescueVerify?: RoleResult }> {
+    // Guard: only rescue builder failures.
+    if (builderResult.role !== "builder" || builderResult.outcome !== "failure") {
+      return { result: builderResult };
+    }
+    const bd = (builderResult.detail ?? {}) as Record<string, unknown>;
+    const builderStop = typeof bd.stopReason === "string" ? bd.stopReason : "";
+    const builderFilesWritten = Array.isArray(bd.filesWritten) ? bd.filesWritten.length : 0;
+    const policyViolations = Array.isArray(bd.policyViolations) ? bd.policyViolations : [];
+
+    // Guard: only protocol terminations, not model-failure stops.
+    if (!RESCUABLE_TERMINATIONS.has(builderStop)) return { result: builderResult };
+    // Guard: must have files on disk to verify.
+    if (builderFilesWritten <= 0) return { result: builderResult };
+    // Guard: fail closed on any unsafe policy violation.
+    if (policyViolations.length > 0) return { result: builderResult };
+
+    // Run the real verifier against the current workspace.
+    const rescueVerify = await runVerifier();
+    if (rescueVerify.outcome === "success") {
+      const rescued: RoleResult = {
+        ...builderResult,
+        outcome: "success",
+        summary: `${builderResult.summary}; auto-verify rescue: verifier GREEN on written files (no run_checks before ${builderStop})`,
+        detail: {
+          ...bd,
+          autoVerifyRescue: true,
+          originalBuilderStop: builderStop,
+          filesWritten: bd.filesWritten,
+          rescueVerificationResult: "pass",
+        },
+      };
+      return { result: rescued, rescueVerify };
+    }
+    // Verifier RED: the original failure stands. Stamp the attempt for observability.
+    return {
+      result: {
+        ...builderResult,
+        detail: { ...bd, autoVerifyRescueAttempted: true, rescueVerificationResult: "fail" },
+      },
+      rescueVerify,
+    };
+  }
+
   /** Run a worker task under the parent operation context. */
   async function run(task: WorkerTask, parentCtx: OperationContext): Promise<WorkerResult> {
     if (!config.enabled) {
@@ -1060,45 +1132,21 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         results.push(result);
 
         // ── AUTO-VERIFY RESCUE: builder wrote files but NEVER ran checks ──────────
-        // The builder can write CORRECT code yet hit a PROTOCOL termination
-        // (max_iterations / timeout / stuck_detected / no_progress) before it ever calls
-        // run_checks. With ZERO checks run, the builder's OWN green-checks auto-accept
-        // (builder.ts) cannot fire — `lastChecks` is undefined — so correct work sitting on
-        // disk is discarded as a failure and never promotes. RESCUE it: run the verifier
-        // against the workspace and, if it PASSES, reclassify the builder as success.
-        // SCOPED to PROTOCOL terminations only (mirrors the builder's own auto-accept scope):
-        // MODEL-FAILURE stops (error / length / content_filter / unknown) are NOT rescued —
-        // there the model itself failed mid-response, so a passing tree may be half-applied or
-        // the final intent unexpressed. Safe: the verifier runs the real shared checks, so
-        // nothing unverified is promoted, and the main verifier role still runs downstream for
-        // the authoritative verdict. Reclassifying here (before the completed event + recordRole
-        // below) makes the receipt trail + trust outcome reflect the rescued success.
-        if (role === "builder" && result.outcome === "failure") {
-          const bd = (result.detail ?? {}) as Record<string, unknown>;
-          const builderStop = typeof bd.stopReason === "string" ? bd.stopReason : "";
-          const builderFilesWritten = Array.isArray(bd.filesWritten) ? bd.filesWritten.length : 0;
-          const RESCUABLE_TERMINATIONS: ReadonlySet<string> = new Set(["max_iterations", "timeout", "stuck_detected", "no_progress"]);
-          if (RESCUABLE_TERMINATIONS.has(builderStop) && builderFilesWritten > 0) {
+        // Delegated to maybeAutoVerifyRescueBuilderResult (shared with competitive/tournament).
+        if (role === "builder") {
+          const rescue = await maybeAutoVerifyRescueBuilderResult(result, async () => {
             const rescueCtx: RoleContext = {
-              task,
-              role: "verifier",
+              task, role: "verifier",
               identity: spawned.identity,
               autonomy: spawned.autonomy,
               workspace,
               priorResults: [...results],
               engine: runEngine,
             };
-            const rescueVerify = await runRoleFn("verifier", verifierFor(parentCtx), rescueCtx, Math.max(roleTimeoutMs, resolveCheckTimeoutMs(modeEnv)));
-            if (rescueVerify.outcome === "success") {
-              result = {
-                ...result,
-                outcome: "success",
-                summary: `${result.summary}; auto-verify rescue: verifier GREEN on written files (no run_checks before ${builderStop})`,
-                detail: { ...bd, autoVerifyRescue: true },
-              };
-              results[results.length - 1] = result;
-            }
-          }
+            return runRoleFn("verifier", verifierFor(parentCtx), rescueCtx, Math.max(roleTimeoutMs, resolveCheckTimeoutMs(modeEnv)));
+          });
+          result = rescue.result;
+          results[results.length - 1] = result;
         }
 
         events.publish(
@@ -1744,10 +1792,16 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         const candidateModel = competitiveModelList?.[ci] ?? singleBuilderModel;
         const candidateBuilder = builderForModel(parentCtx, candidateModel, resolveBuilderMode(task));
         const builderResult = await dispatchRole("builder", spawnRole("builder", parentCtx), task, ws, [scoutResult], parentCtx, runEngine, candidateBuilder);
+        // AUTO-VERIFY RESCUE: if the builder wrote files but hit a protocol termination,
+        // try the verifier. On GREEN, reclassify the builder so the candidate proceeds.
+        const rescue = await maybeAutoVerifyRescueBuilderResult(builderResult, async () => {
+          return dispatchRole("verifier", spawnRole("verifier", parentCtx), task, ws, [scoutResult, builderResult], parentCtx, runEngine);
+        });
+        const finalBuilderResult = rescue.result;
         let verifierResult: RoleResult | undefined;
         const verifierSpawn = spawnRole("verifier", parentCtx);
-        if (builderResult.outcome === "success") {
-          verifierResult = await dispatchRole("verifier", verifierSpawn, task, ws, [scoutResult, builderResult], parentCtx, runEngine);
+        if (finalBuilderResult.outcome === "success") {
+          verifierResult = rescue.rescueVerify ?? await dispatchRole("verifier", verifierSpawn, task, ws, [scoutResult, finalBuilderResult], parentCtx, runEngine);
         }
         // COMMIT this candidate's VERIFIED-good work (gated on autoCommit) BEFORE the judge —
         // safeDiffLines + buildCandidate read the committed diff, and the winner is promoted, so
@@ -1755,8 +1809,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         if (verifierResult?.outcome === "success" && verifierSpawn.autonomy.autoCommit && workspaces.commit !== undefined) {
           await workspaces.commit(ws, `ikbi: ${task.goal}`);
         }
-        rolesByWs.set(ws.id, [scoutResult, builderResult, ...(verifierResult !== undefined ? [verifierResult] : [])]);
-        candidates.push(buildCandidate(ws, builderResult, verifierResult, await safeDiffLines(ws)));
+        rolesByWs.set(ws.id, [scoutResult, finalBuilderResult, ...(verifierResult !== undefined ? [verifierResult] : [])]);
+        candidates.push(buildCandidate(ws, finalBuilderResult, verifierResult, await safeDiffLines(ws)));
       }
 
       // COOPERATIVE KILL CHECKPOINT (before the IRREVERSIBLE boundary — C6): a kill that
@@ -1938,10 +1992,16 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       const scoutResult = await dispatchRole("scout", spawnRole("scout", parentCtx), t, ws, [], parentCtx, runEngine);
       const candidateBuilder = builderForModel(parentCtx, spec.model, spec.mode);
       const builderResult = await dispatchRole("builder", spawnRole("builder", parentCtx), t, ws, [scoutResult], parentCtx, runEngine, candidateBuilder);
+      // AUTO-VERIFY RESCUE: if the builder wrote files but hit a protocol termination,
+      // try the verifier. On GREEN, reclassify the builder so the candidate proceeds.
+      const rescue = await maybeAutoVerifyRescueBuilderResult(builderResult, async () => {
+        return dispatchRole("verifier", spawnRole("verifier", parentCtx), t, ws, [scoutResult, builderResult], parentCtx, runEngine);
+      });
+      const finalBuilderResult = rescue.result;
       let verifierResult: RoleResult | undefined;
       const verifierSpawn = spawnRole("verifier", parentCtx);
-      if (builderResult.outcome === "success") {
-        verifierResult = await dispatchRole("verifier", verifierSpawn, t, ws, [scoutResult, builderResult], parentCtx, runEngine);
+      if (finalBuilderResult.outcome === "success") {
+        verifierResult = rescue.rescueVerify ?? await dispatchRole("verifier", verifierSpawn, t, ws, [scoutResult, finalBuilderResult], parentCtx, runEngine);
       }
       // COMMIT verified work so the candidate's diff is the clean committed range — that range is
       // both what the judge scores (diffLines) and what gets replayed into the shadow if it wins.
@@ -1949,8 +2009,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         await workspaces.commit(ws, `ikbi: ${t.goal}`);
       }
       const diffText = workspaces.diff !== undefined ? await workspaces.diff(ws).catch(() => "") : "";
-      const candidate = buildCandidate(ws, builderResult, verifierResult, await safeDiffLines(ws));
-      const roles = [scoutResult, builderResult, ...(verifierResult !== undefined ? [verifierResult] : [])];
+      const candidate = buildCandidate(ws, finalBuilderResult, verifierResult, await safeDiffLines(ws));
+      const roles = [scoutResult, finalBuilderResult, ...(verifierResult !== undefined ? [verifierResult] : [])];
       return { spec, workspace: ws, roles, candidate, diff: diffText };
     };
 

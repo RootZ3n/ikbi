@@ -570,6 +570,143 @@ test("AUTO-VERIFY RESCUE: NOT triggered when checks already ran, or when no file
   }
 });
 
+// ── AUTO-VERIFY RESCUE: policy violation blocks rescue ─────────────────────
+test("AUTO-VERIFY RESCUE: a builder with policy violations is NOT rescued even on protocol termination", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const cap = capturingRoles();
+  let verifierRuns = 0;
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    builder: async () => ({
+      role: "builder", outcome: "failure", summary: "no_progress",
+      detail: { stopReason: "no_progress", filesWritten: ["a.ts"], checksRuns: 0, rejectedToolCalls: [], policyViolations: [{ kind: "unsafe_command", command: "rm -rf /" }] },
+    }),
+    verifier: async (ctx) => { verifierRuns += 1; return cap.roles.verifier!(ctx); },
+  };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles }));
+  const result = await orch.run(task, parentCtx);
+
+  assert.equal(result.roles.find((r) => r.role === "builder")?.outcome, "failure", "policy violation blocks rescue");
+  assert.equal(verifierRuns, 0, "no rescue verifier when policy violations exist");
+  assert.equal(result.promoted, false, "nothing with policy violations promotes");
+});
+
+// ── AUTO-VERIFY RESCUE: receipt stamps rescue details ─────────────────────
+test("AUTO-VERIFY RESCUE: rescued builder detail carries autoVerifyRescue, originalBuilderStop, rescueVerificationResult", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const cap = capturingRoles();
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    builder: builderNoChecks("no_progress"),
+    verifier: async (ctx) => cap.roles.verifier!(ctx),
+  };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles }));
+  const result = await orch.run(task, parentCtx);
+
+  const builder = result.roles.find((r) => r.role === "builder");
+  const detail = (builder?.detail ?? {}) as Record<string, unknown>;
+  assert.equal(builder?.outcome, "success", "builder rescued");
+  assert.equal(detail.autoVerifyRescue, true, "autoVerifyRescue stamped");
+  assert.equal(detail.originalBuilderStop, "no_progress", "originalBuilderStop recorded");
+  assert.equal(detail.rescueVerificationResult, "pass", "rescueVerificationResult = pass");
+});
+
+// ── AUTO-VERIFY RESCUE: RED rescue stamps rescueVerificationResult=fail ───
+test("AUTO-VERIFY RESCUE: failed rescue attempt stamps rescueVerificationResult=fail on builder detail", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const cap = capturingRoles();
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    builder: builderNoChecks("no_progress"),
+    verifier: async () => ({ role: "verifier", outcome: "failure", summary: "checks red", detail: { verdict: "fail", checks: [{ name: "test", exitCode: 1 }] } }),
+  };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles }));
+  const result = await orch.run(task, parentCtx);
+
+  const builder = result.roles.find((r) => r.role === "builder");
+  const detail = (builder?.detail ?? {}) as Record<string, unknown>;
+  assert.equal(builder?.outcome, "failure", "builder stays failure");
+  assert.equal(detail.autoVerifyRescue, undefined, "no autoVerifyRescue on failed rescue");
+  assert.equal(detail.autoVerifyRescueAttempted, true, "rescue attempt recorded");
+  assert.equal(detail.rescueVerificationResult, "fail", "rescueVerificationResult = fail");
+});
+
+// ── AUTO-VERIFY RESCUE: competitive mode — rescued builder proceeds through judge ──
+test("AUTO-VERIFY RESCUE (competitive): protocol-terminated builder with files is rescued and candidate proceeds", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const cap = capturingRoles();
+  let verifierRuns = 0;
+  const passingVerifier = async () => {
+    verifierRuns += 1;
+    return { role: "verifier" as const, outcome: "success" as const, summary: "v", detail: { verdict: "pass", checks: [{ name: "typecheck", command: "tsc", exitCode: 0, outputTail: "" }, { name: "test", command: "test", exitCode: 0, outputTail: "# tests 10\n# pass 10\n" }] } };
+  };
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    builder: builderNoChecks("no_progress"),
+    verifier: passingVerifier,
+  };
+  const ws = fakeWorkspaces(true);
+  const orch = createOrchestrator(baseDeps({
+    resolveIdentity, roleClaim, roles, workspaces: ws.workspaces,
+    config: { enabled: true, roleTimeoutMs: 1000, maxConcurrentRuns: 1, competitive: true, competitiveN: 1 },
+    competitiveModels: ["flash"],
+  }));
+  const result = await orch.run(task, parentCtx);
+
+  // The rescued builder should have outcome "success", so the verifier runs,
+  // the judge scores it, and it promotes.
+  const builder = result.roles.find((r) => r.role === "builder");
+  assert.equal(builder?.outcome, "success", "competitive builder rescued");
+  assert.equal((builder?.detail as Record<string, unknown> | undefined)?.autoVerifyRescue, true, "rescue stamp present");
+  assert.ok(verifierRuns >= 1, "rescue verifier ran in competitive mode");
+  assert.equal(result.promoted, true, "rescued competitive candidate promotes");
+});
+
+// ── AUTO-VERIFY RESCUE: competitive mode — RED verifier keeps failure ─────
+test("AUTO-VERIFY RESCUE (competitive): RED rescue verifier keeps the builder failure in competitive mode", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const cap = capturingRoles();
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    builder: builderNoChecks("no_progress"),
+    verifier: async () => ({ role: "verifier", outcome: "failure", summary: "checks red", detail: { verdict: "fail", checks: [{ name: "test", exitCode: 1 }] } }),
+  };
+  const ws = fakeWorkspaces(true);
+  const orch = createOrchestrator(baseDeps({
+    resolveIdentity, roleClaim, roles, workspaces: ws.workspaces,
+    config: { enabled: true, roleTimeoutMs: 1000, maxConcurrentRuns: 1, competitive: true, competitiveN: 1 },
+    competitiveModels: ["flash"],
+  }));
+  const result = await orch.run(task, parentCtx);
+
+  assert.equal(result.promoted, false, "nothing promotes when rescue verifier is RED");
+});
+
+// ── AUTO-VERIFY RESCUE: competitive mode — no files written, no rescue ────
+test("AUTO-VERIFY RESCUE (competitive): no files written means no rescue in competitive mode", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const cap = capturingRoles();
+  let verifierRuns = 0;
+  const passingVerifier = async () => {
+    verifierRuns += 1;
+    return { role: "verifier" as const, outcome: "success" as const, summary: "v", detail: { verdict: "pass", checks: [{ name: "typecheck", command: "tsc", exitCode: 0, outputTail: "" }, { name: "test", command: "test", exitCode: 0, outputTail: "" }] } };
+  };
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    builder: builderNoChecks("no_progress", []),
+    verifier: passingVerifier,
+  };
+  const ws = fakeWorkspaces(true);
+  const orch = createOrchestrator(baseDeps({
+    resolveIdentity, roleClaim, roles, workspaces: ws.workspaces,
+    config: { enabled: true, roleTimeoutMs: 1000, maxConcurrentRuns: 1, competitive: true, competitiveN: 1 },
+    competitiveModels: ["flash"],
+  }));
+  const result = await orch.run(task, parentCtx);
+
+  assert.equal(result.promoted, false, "no rescue when no files written");
+});
+
 // ── R2: blocked-promotion message must match the ACTUAL workspace disposition ─────
 test("R2: blocked-promotion message says RETAINED when the workspace is actually retained", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("verified", "verified");
