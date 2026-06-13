@@ -590,7 +590,10 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
 
     const task: WorkerTask = { taskId: id, targetRepo, goal: finalGoal, writeScope: detectWriteScope(finalGoal) };
 
-    // STEP-PLANNER: decompose complex goals into atomic steps for cheap models.
+    // STEP-PLANNER: decompose complex goals into atomic steps for cheap models. Production uses ONLY
+    // the deterministic, zero-cost heuristic `decompose` — the model-based `decomposeWithModel`
+    // strategy is intentionally DORMANT (not wired here) so the planner never spends a model call;
+    // see step-planner/implementation.ts for the rationale and how to opt in later.
     const { decompose } = await import("../step-planner/index.js");
     const stepPlan = decompose(finalGoal);
 

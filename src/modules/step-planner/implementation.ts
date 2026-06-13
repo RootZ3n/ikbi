@@ -179,8 +179,14 @@ export function decompose(goal: string): StepPlan {
  * Decompose a goal using a model call. The model receives the goal and
  * returns a structured JSON array of steps.
  *
- * This is the MODEL strategy — used when heuristics can't split the goal
- * but complexity is detected.
+ * This is the MODEL strategy — an alternative to the heuristic `decompose`.
+ *
+ * DORMANT: NOT wired in production. The `ikbi build` CLI (worker-model/cli.ts) always uses the
+ * zero-cost heuristic `decompose`; nothing in the production path calls `decomposeWithModel`. It
+ * is retained — and fully unit-tested — as a ready strategy a future opt-in (e.g. an env flag that
+ * threads a model invoker) can switch to when the heuristic is too coarse for a given goal. It is
+ * deliberately NOT removed: wiring it later is a one-line call-site change, not a re-implementation.
+ * Until then it is intentionally unused, not abandoned. See step-planner.test.ts ("DORMANT").
  */
 export async function decomposeWithModel(
   goal: string,

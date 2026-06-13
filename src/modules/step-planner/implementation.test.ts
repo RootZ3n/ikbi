@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { decompose, decomposeWithModel, complexityScore } from "./implementation.js";
 import { COMPLEX_THRESHOLD } from "./config.js";
 
@@ -190,6 +191,22 @@ describe("step-planner", () => {
       const plan = await decomposeWithModel("Complex task", mockModel);
       assert.equal(plan.source, "model");
       assert.equal(plan.steps.length, 2);
+    });
+
+    // ── M5: DORMANT in production — documents intent so the strategy is not mistaken for dead code ──
+    it("DORMANT: is intentionally NOT wired into the production build path (heuristic-only)", () => {
+      // The `ikbi build` CLI imports ONLY `decompose` from the step-planner barrel and never calls
+      // `decomposeWithModel` — the production planner is deterministic and zero-cost by design. This
+      // test pins that intent: `decomposeWithModel` is retained + tested as a ready opt-in strategy,
+      // not abandoned. If a future change wires it into production, update this assertion accordingly.
+      const cliSource = readFileSync(new URL("../worker-model/cli.ts", import.meta.url), "utf8");
+      assert.equal(
+        cliSource.includes("decomposeWithModel("),
+        false,
+        "production cli.ts must not CALL decomposeWithModel — it is a dormant strategy",
+      );
+      // And the function still exists + is exported (retained, not removed).
+      assert.equal(typeof decomposeWithModel, "function", "the dormant strategy is retained for later opt-in");
     });
   });
 });
