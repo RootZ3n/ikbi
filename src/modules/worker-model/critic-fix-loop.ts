@@ -12,8 +12,10 @@
  * This is WRAPPER logic — it does not change the builder, verifier, or critic
  * internals. It is COMPLEMENTARY to the verifier-driven `runIterativeLoop`: that
  * one retries on RED objective checks; this one retries on a GREEN-but-wrong build
- * the critic flagged. The two never fight — by the time the critic runs, the
- * verifier already passed (a red verifier short-circuits before the critic).
+ * the critic flagged. The two never fight: the verifier runs BEFORE the critic but
+ * does NOT short-circuit — the critic runs regardless of the verifier's outcome — and
+ * the orchestrator GATES this critic fix loop on the verifier PASSING. A red verifier
+ * is left to the objective fix loop; only a green-but-wrong build reaches this retry.
  */
 
 import type { RoleResult } from "./contract.js";
