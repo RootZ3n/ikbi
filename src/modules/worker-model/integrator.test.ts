@@ -35,7 +35,9 @@ function ctxWith(priorResults: RoleResult[], onInvoke?: () => void): RoleContext
 
 const builderOk: RoleResult = { role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["a.ts", "b.ts"], rejectedToolCalls: [] } };
 const criticPass: RoleResult = { role: "critic", outcome: "success", summary: "c", detail: { pass: true, feedback: "ok" } };
-const verifierPass: RoleResult = { role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: [] } };
+// A single-run verifier pass carries testEvidence="executed": the integrator now FAILS CLOSED on a
+// missing testEvidence field (Codex C1), so the production-realistic green stamps real test signal.
+const verifierPass: RoleResult = { role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: [], testEvidence: "executed" } };
 
 const decisionOf = (r: RoleResult): string => (r.detail as { decision: string }).decision;
 const rationaleOf = (r: RoleResult): string => (r.detail as { rationale: string }).rationale;
@@ -117,6 +119,15 @@ test('C1: single-run verifier pass with testEvidence="executed" → PROMOTE (rea
   const verifierExecuted: RoleResult = { role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: [], testEvidence: "executed" } };
   const r = await integrator(ctxWith([builderOk, criticPass, verifierExecuted]));
   assert.equal(decisionOf(r), "promote");
+});
+
+test("C1 (fail-closed): single-run verifier pass with MISSING testEvidence → DISCARD (cannot confirm a real signal)", async () => {
+  // No testEvidence field at all — the integrator no longer exempts it (Codex C1). An absent field
+  // is treated like "zero"/"unverified": promote requires a verified "executed" signal.
+  const verifierNoEvidence: RoleResult = { role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: [] } };
+  const r = await integrator(ctxWith([builderOk, criticPass, verifierNoEvidence]));
+  assert.equal(decisionOf(r), "discard");
+  assert.match(rationaleOf(r), /no real test evidence/);
 });
 
 test("STEP-PLANNER accumulated pass still fail-closes: a RED verifier discards even with reuseWorkspace", async () => {

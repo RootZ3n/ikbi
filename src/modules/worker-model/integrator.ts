@@ -89,11 +89,14 @@ export const integrator: RoleFn = async (ctx) => {
     // tests, an unparseable green like `echo done`, or no "test" check at all) proved nothing about
     // behavior — promoting it would forge a passing test signal. So require "executed" evidence for
     // single-run promotes. ACCUMULATED builds (reuseWorkspace set) are EXEMPT: prior steps already
-    // verified, and this pass may legitimately run no tests. A MISSING field (a legacy verifier
-    // result that never reported evidence) is NOT blocked — backward-compatible; the production
-    // orchestrator stamps testEvidence onto every verifier result, so real runs always report it.
+    // verified, and this pass may legitimately run no tests.
+    //
+    // FAIL-CLOSED (Codex C1): a MISSING testEvidence field is NOT exempted. The production
+    // orchestrator stamps testEvidence onto every verifier result, so a real single-run promote
+    // always reports "executed"; an absent field means we cannot confirm a real test signal, which
+    // must block promote exactly like "zero"/"unverified" — never promote on unproven evidence.
     const testEvidence = detailOf(verifier).testEvidence;
-    const testEvidenceOk = accumulatedPass || testEvidence === undefined || testEvidence === "executed";
+    const testEvidenceOk = accumulatedPass || testEvidence === "executed";
 
     if (builderOk && noPolicyViolations && criticPass && verifierPass && testEvidenceOk) {
       const rationale =

@@ -1279,7 +1279,16 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               else results.push(value);
             };
             if (fix.builderResult !== undefined) replaceRole(fix.builderResult);
-            if (fix.verifierResult !== undefined) replaceRole(fix.verifierResult);
+            if (fix.verifierResult !== undefined) {
+              // C1: stamp testEvidence onto the re-verified result (mirrors the main role loop above).
+              // The raw re-run verifier result carries no testEvidence; without this stamp the
+              // integrator's fail-closed test-evidence gate would discard a legitimately-fixed build.
+              const reVerifier: RoleResult = {
+                ...fix.verifierResult,
+                detail: { ...((fix.verifierResult.detail as Record<string, unknown> | undefined) ?? {}), testEvidence: readVerifier(fix.verifierResult).testEvidence },
+              };
+              replaceRole(reVerifier);
+            }
             result = fix.criticResult;
             replaceRole(result);
 

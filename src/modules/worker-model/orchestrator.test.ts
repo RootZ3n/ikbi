@@ -1184,7 +1184,9 @@ function criticFixRoles() {
     },
     verifier: async () => {
       calls.verifier += 1;
-      return { role: "verifier", outcome: "success", summary: "green", detail: { verdict: "pass", checks: [] } };
+      // A REAL test check with a parsed count → readVerifier classifies testEvidence="executed", so the
+      // re-verified fixed build clears the integrator's fail-closed test-evidence gate (Codex C1).
+      return { role: "verifier", outcome: "success", summary: "green", detail: { verdict: "pass", checks: [{ name: "test", exitCode: 0, outputTail: "# tests 1\n# pass 1", testCount: { passed: 1, total: 1 } }] } };
     },
     critic: async () => {
       criticCall += 1;

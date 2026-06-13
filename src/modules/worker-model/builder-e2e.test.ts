@@ -36,7 +36,14 @@ import { createBuilder } from "./builder.js";
 import { createScout } from "./scout.js";
 import { createVerifier } from "./verifier.js";
 import { integrator } from "./integrator.js";
+import { readVerifier } from "./orchestrator.js";
 import type { RoleContext, RoleEngine, RoleFn, RoleResult, WorkerRole } from "./contract.js";
+
+/** Stamp testEvidence onto a verifier result exactly as the orchestrator does before the integrator
+ *  reads it — these tests wire the roles by hand, so they must replicate that production step. */
+function stampTestEvidence(v: RoleResult): RoleResult {
+  return { ...v, detail: { ...((v.detail as Record<string, unknown> | undefined) ?? {}), testEvidence: readVerifier(v).testEvidence } };
+}
 
 // --- shared identity / governed-exec wiring (mirrors builder.test / verifier.test) ---
 const PARENT_CTX: OperationContext = (() => {
@@ -48,8 +55,16 @@ const PARENT_CTX: OperationContext = (() => {
   return beginOperation(resolver.resolve({ token: "parent-secret" }), { requestId: "req-e2e" });
 })();
 
-/** A GREEN governed exec — every governed check exits 0 (the deterministic infra seam). */
-const greenExec = () => ({ run: async (_req: ExecRequest): Promise<ExecResult> => ({ executed: true, exitCode: 0, stdoutTail: "ok", stderrTail: "" }) });
+/** A GREEN governed exec — every governed check exits 0 (the deterministic infra seam). Emits a real
+ *  node:test tally on the streaming sink so the verifier parses an EXECUTED test signal (a real
+ *  `node --test` run prints this), which the integrator's fail-closed test-evidence gate requires. */
+const GREEN_TEST_TALLY = "# tests 1\n# pass 1\n# fail 0\n";
+const greenExec = () => ({
+  run: async (req: ExecRequest): Promise<ExecResult> => {
+    req.onOutput?.(GREEN_TEST_TALLY, "stdout");
+    return { executed: true, exitCode: 0, stdoutTail: `${GREEN_TEST_TALLY}ok`, stderrTail: "" };
+  },
+});
 /** A RED governed exec — every governed check exits non-zero with real failure output. */
 const redExec = () => ({ run: async (_req: ExecRequest): Promise<ExecResult> => ({ executed: true, exitCode: 1, stdoutTail: "FAIL: expected 2, got 0", stderrTail: "" }) });
 
@@ -144,8 +159,9 @@ test("E2E (happy path): real scout → real builder (valid done) → real verifi
   assert.equal(verifierResult.outcome, "success", "verifier passed");
   assert.equal((verifierResult.detail as { verdict: string }).verdict, "pass", "verdict is pass (quality + checks green)");
 
-  // 4) REAL INTEGRATOR — weighs the chain and issues the PROMOTE decision.
-  const integ = await integrator(makeCtx(dir, "integrator", inertEngine, [scoutResult, builderResult, passingCritic, verifierResult]));
+  // 4) REAL INTEGRATOR — weighs the chain and issues the PROMOTE decision. testEvidence is stamped
+  // by the orchestrator in production; replicate that here so the fail-closed gate sees the signal.
+  const integ = await integrator(makeCtx(dir, "integrator", inertEngine, [scoutResult, builderResult, passingCritic, stampTestEvidence(verifierResult)]));
   assert.equal((integ.detail as { decision: string }).decision, "promote", "the full pipeline produces a PROMOTED result");
 });
 
@@ -175,7 +191,7 @@ test("E2E (Issue-1 failure case): builder writes green work but NEVER calls done
   assert.equal(verifierResult.outcome, "success", "verifier passes the auto-accepted work");
   assert.equal((verifierResult.detail as { verdict: string }).verdict, "pass");
 
-  const integ = await integrator(makeCtx(dir, "integrator", inertEngine, [scoutResult, builderResult, passingCritic, verifierResult]));
+  const integ = await integrator(makeCtx(dir, "integrator", inertEngine, [scoutResult, builderResult, passingCritic, stampTestEvidence(verifierResult)]));
   assert.equal((integ.detail as { decision: string }).decision, "promote", "auto-accepted green work is promoted (the bug this guards against)");
 });
 
