@@ -164,6 +164,7 @@ export function decompose(goal: string): StepPlan {
     index: i + 1,
     goal: part,
     targetFiles: extractPaths(part),
+    // L4: verificationHint is RESERVED metadata — no caller consumes it yet (see Step.verificationHint).
     ...(i === parts.length - 1 ? { verificationHint: "run pnpm test to verify all changes" } : {}),
   }));
 

@@ -18,7 +18,15 @@ export interface Step {
   readonly goal: string;
   /** Files this step is expected to touch (best-effort, for context). */
   readonly targetFiles?: readonly string[];
-  /** How to verify this step succeeded (human-readable, for the verifier). */
+  /**
+   * How to verify this step succeeded (human-readable, for the verifier).
+   *
+   * L4 — RESERVED, not yet consumed. The planner stamps this on the LAST step, but no current
+   * caller reads it: the `ikbi build` CLI runs its own fixed verification (pnpm test via the
+   * verifier role) regardless. It is retained as the documented seam for a future enhancement
+   * that threads the hint into the final verify goal — wiring it later is a call-site change,
+   * not a contract change. Until then it is intentionally advisory metadata, not dead weight.
+   */
   readonly verificationHint?: string;
 }
 
