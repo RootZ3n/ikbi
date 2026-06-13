@@ -88,6 +88,7 @@ import {
   workerFailed,
   workerRoleCompleted,
   workerRoleDispatched,
+  workerRoleSkipped,
   workerStarted,
   workerVerification,
   workerFixLoopCompleted,
@@ -949,6 +950,26 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           // "pass") still correctly withholds promotion — same as the old bare result did.
           results.push({ role: "verifier", outcome: "success", summary: "skipped (skipVerifier)", detail: { verdict: "skipped", skipped: true } });
           continue;
+        }
+        // SKIP-CRITIC-ON-RED (opt-in): a discard-bound build (verifier RED) does not need a paid
+        // goal-alignment verdict. The integrator already discards on verifierPass=false, so the
+        // critic would only spend model tokens on a build that is already condemned. Skip it ONLY
+        // when no retry will happen — the verifier-driven fixLoop is off. When fixLoop IS active
+        // the critic runs (its feedback can inform the objective-driven retry). DEFAULT OFF so the
+        // CODEX no-short-circuit behavior (critic runs after a red verifier) is preserved unless
+        // explicitly opted in. No critic result is pushed — the integrator reads "no critic result"
+        // and discards, the same terminal outcome a red verifier already forces.
+        if (role === "critic" && config.skipCriticOnRed === true && !config.fixLoop) {
+          const verifierForSkip = results.find((r) => r.role === "verifier");
+          if (verifierForSkip !== undefined && verifierForSkip.outcome !== "success") {
+            events.publish(
+              workerRoleSkipped.create(
+                { taskId: task.taskId, role: "critic", reason: "verifier-red-discard-bound" },
+                { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.role.critic", runId: task.taskId } },
+              ),
+            );
+            continue;
+          }
         }
         const spawned = spawnRole(role, parentCtx);
 

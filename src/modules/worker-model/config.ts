@@ -120,6 +120,17 @@ export interface WorkerModelConfig {
    */
   readonly criticFixLoop?: boolean;
   /**
+   * Skip the critic on discard-bound builds: when the verifier is RED and no retry will happen
+   * (the verifier-driven `fixLoop` is off), the build is already condemned — the integrator
+   * discards on verifierPass=false regardless of the critic. Running the critic there only spends
+   * model tokens on a goal-alignment verdict nobody acts on. With this ON, the critic is skipped
+   * in exactly that case (red verifier + fixLoop off). When fixLoop IS active the critic still
+   * runs — its feedback can inform the objective-driven retry. DEFAULT OFF (opt-in): the critic
+   * runs after a red verifier as before unless this is set. Set
+   * IKBI_WORKER_MODEL_SKIP_CRITIC_ON_RED=true to enable.
+   */
+  readonly skipCriticOnRed?: boolean;
+  /**
    * The DEFAULT builder lane (agent | patch) from IKBI_BUILDER_MODE. A task's own `builderMode`
    * overrides this. DEFAULT "agent" — the autonomous builder lane is unchanged unless opted out.
    * Optional in the type so pre-existing config literals stay valid; the loader always sets it.
@@ -148,6 +159,7 @@ export function loadWorkerModelConfig(reader = env): WorkerModelConfig {
     penalizeTimeouts: reader.bool("PENALIZE_TIMEOUTS", false),
     fixLoop: reader.bool("FIX_LOOP", false),
     criticFixLoop: reader.bool("CRITIC_FIX_LOOP", false),
+    skipCriticOnRed: reader.bool("SKIP_CRITIC_ON_RED", false),
     builderMode: loadBuilderMode(),
     candidateModels: loadCandidateModels(),
   });

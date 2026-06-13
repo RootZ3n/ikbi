@@ -1244,6 +1244,49 @@ test("ISSUE 1 (gate): a RED verifier + critic FAIL does NOT trigger the critic f
   assert.equal(ws.calls.promote, 0, "nothing promoted");
 });
 
+test("ISSUE 3: skipCriticOnRed ON + red verifier + fixLoop off → the critic is SKIPPED (saves the model call), build discards", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const seen: WorkerRole[] = [];
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    scout: async () => { seen.push("scout"); return { role: "scout", outcome: "success", summary: "s" }; },
+    builder: async () => { seen.push("builder"); return { role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["a.ts"] } }; },
+    // RED verifier — the build is discard-bound.
+    verifier: async () => { seen.push("verifier"); return { role: "verifier", outcome: "failure", summary: "checks red", detail: { verdict: "fail", checks: [{ name: "test", exitCode: 1, outputTail: "1 failing" }] } }; },
+    critic: async () => { seen.push("critic"); return { role: "critic", outcome: "success", summary: "c", detail: { pass: true } }; },
+    integrator: realIntegrator,
+  };
+  // skipCriticOnRed ON, fixLoop OFF (no retry will happen) → the critic is condemned-build-bound.
+  const orch = createOrchestrator(baseDeps({ config: { ...ENABLED, skipCriticOnRed: true }, resolveIdentity, roleClaim, roles, workspaces: ws.workspaces }));
+  const result = await orch.run(task, parentCtx);
+
+  assert.ok(!seen.includes("critic"), "the critic was SKIPPED on the discard-bound red-verifier build — no model call");
+  assert.notEqual(result.outcome, "success", "the red verifier still discards the build");
+  assert.equal(ws.calls.promote, 0, "nothing promoted");
+  assert.equal(ws.calls.discard, 1, "the real integrator still ran and condemned the build (discarded)");
+  // No critic result is recorded when the critic is skipped — the integrator discards on 'no critic result'.
+  const critic = result.roles.find((r) => r.role === "critic");
+  assert.equal(critic, undefined, "no critic result is recorded when the critic is skipped");
+});
+
+test("ISSUE 3: with skipCriticOnRed OFF (default), a red verifier STILL runs the critic — CODEX no-short-circuit behavior preserved", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const seen: WorkerRole[] = [];
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    scout: async () => { seen.push("scout"); return { role: "scout", outcome: "success", summary: "s" }; },
+    builder: async () => { seen.push("builder"); return { role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["a.ts"] } }; },
+    verifier: async () => { seen.push("verifier"); return { role: "verifier", outcome: "failure", summary: "checks red", detail: { verdict: "fail", checks: [{ name: "test", exitCode: 1, outputTail: "1 failing" }] } }; },
+    critic: async () => { seen.push("critic"); return { role: "critic", outcome: "success", summary: "c", detail: { pass: true } }; },
+    integrator: realIntegrator,
+  };
+  // Default config (skipCriticOnRed unset) → the opt-in skip does NOT fire; the critic runs as before.
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces }));
+  await orch.run(task, parentCtx);
+
+  assert.ok(seen.includes("critic"), "with the skip OFF, the critic still runs after a red verifier (unchanged default)");
+});
+
 test("CODEX Issue 3: each critic-fix-loop RETRY stage runs under its OWN role identity (retry builder is functionalRole=builder, not critic)", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
   const ws = fakeWorkspaces(true);

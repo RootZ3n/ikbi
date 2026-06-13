@@ -23,6 +23,11 @@ export const workerRoleCompleted = defineEvent<{ taskId: string; role: WorkerRol
   "worker.role.completed",
 );
 
+/** A role was deliberately skipped (e.g. the critic on a discard-bound red-verifier build). (Attribution: parent.) */
+export const workerRoleSkipped = defineEvent<{ taskId: string; role: WorkerRole; reason: string }>(
+  "worker.role.skipped",
+);
+
 /** BUILDER tool activity at the role boundary — round count + files written + context pressure. (Attribution: role.) */
 export const workerBuilderActivity = defineEvent<{ taskId: string; toolRounds: number; filesWritten: number; contextPercent?: number }>(
   "worker.builder.activity",
