@@ -593,6 +593,10 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
             // Skip verifier on ALL intermediate steps — the project is incomplete
             // until the last step runs. The final verify pass handles verification.
             skipVerifier: true,
+            // Skip the critic too: on an intermediate (skipPromote) step its verdict is
+            // discarded, so the paid model call buys nothing. The final pass critiques the
+            // accumulated work against the full goal.
+            skipCritic: true,
           };
           lastResult = await orchestrator.run(stepTask, ctx);
           if (lastResult.outcome !== "success") {

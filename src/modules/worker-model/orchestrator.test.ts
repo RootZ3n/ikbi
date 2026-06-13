@@ -1043,6 +1043,22 @@ test("skipPromote: orchestrator runs all roles but skips promote/discard", async
   assert.equal(cap.seen.length, 5, "all five roles dispatched");
 });
 
+test("skipCritic: orchestrator skips the critic role (no critic dispatched, others still run)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const cap = capturingRoles();
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, workspaces: ws.workspaces }));
+  // Intermediate-step shape: skipPromote + skipCritic (the step planner sets both).
+  const taskSkip: WorkerTask = { ...task, skipPromote: true, skipCritic: true };
+  const result = await orch.run(taskSkip, parentCtx);
+
+  const dispatched = cap.seen.map((c) => c.role);
+  assert.ok(!dispatched.includes("critic"), "the critic was NOT dispatched (no paid model call)");
+  assert.deepEqual(dispatched, ["scout", "builder", "verifier", "integrator"], "every other role still ran, in order");
+  assert.ok(!result.roles.some((r) => r.role === "critic"), "no critic result recorded");
+  assert.equal(result.outcome, "success", "skipping the critic does not fail the step");
+});
+
 test("reuseWorkspace + skipPromote: shared workspace across steps, no lifecycle", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
   const ws = fakeWorkspaces(true);

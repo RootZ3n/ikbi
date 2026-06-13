@@ -951,6 +951,22 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           results.push({ role: "verifier", outcome: "success", summary: "skipped (skipVerifier)", detail: { verdict: "skipped", skipped: true } });
           continue;
         }
+        // STEP-PLANNER: skip the critic on intermediate steps (skipCritic). The critic would
+        // judge a PARTIAL build against a sub-goal and its verdict is structurally discarded
+        // (skipPromote ignores the integrator decision; a critic FAIL still returns success), so
+        // running it only burns a model call. No critic result is pushed — the integrator reads
+        // "no critic result", but skipPromote returns before that decision is enacted. The final
+        // (non-skipping) step runs the critic normally. Distinct from skipCriticOnRed below, which
+        // skips a discard-bound critic on a RED verifier in a normal promote run.
+        if (role === "critic" && task.skipCritic === true) {
+          events.publish(
+            workerRoleSkipped.create(
+              { taskId: task.taskId, role: "critic", reason: "skipCritic (step-planner intermediate step)" },
+              { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.role.critic", runId: task.taskId } },
+            ),
+          );
+          continue;
+        }
         // SKIP-CRITIC-ON-RED (opt-in): a discard-bound build (verifier RED) does not need a paid
         // goal-alignment verdict. The integrator already discards on verifierPass=false, so the
         // critic would only spend model tokens on a build that is already condemned. Skip it ONLY

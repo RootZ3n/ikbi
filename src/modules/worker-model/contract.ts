@@ -144,6 +144,16 @@ export interface WorkerTask {
    * project — no tests exist yet). The final step runs verification normally.
    */
   readonly skipVerifier?: boolean;
+  /**
+   * STEP-PLANNER: skip the CRITIC role entirely. Used for intermediate steps whose
+   * critique would be both meaningless and wasted: the critic judges a PARTIAL build
+   * against a sub-goal, its model verdict is discarded (an intermediate step sets
+   * `skipPromote`, so the integrator's decision never runs, and a critic FAIL still
+   * returns `outcome:"success"` so it never stops the step). Skipping it removes a paid
+   * model call per intermediate step. The final step runs the critic normally. DEFAULT
+   * OFF — only the step planner sets it, so single-pass behavior is byte-unchanged.
+   */
+  readonly skipCritic?: boolean;
 }
 
 /** The result a single role produces. */
