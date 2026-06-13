@@ -89,6 +89,36 @@ test("STEP-PLANNER accumulated pass (reuseWorkspace): builder wrote 0 files this
   assert.match(rationaleOf(r), /accumulated multi-step build/);
 });
 
+// C1 — TEST EVIDENCE GATE. The verifier stamps a 4-state testEvidence onto its result detail.
+// A single-run build that VERIFIES but ran no real tests proved nothing and must NOT promote;
+// an accumulated build (reuseWorkspace) is exempt because prior steps already verified.
+const reuseHandle: WorkspaceHandle = {
+  id: "ws-shared", targetRepo: "/repo", baseBranch: "main", baseRef: "x", scratchBranch: "ikbi/ws/ws-shared",
+  path: "/repo", identity: IDENTITY, state: "allocated", createdAt: 0,
+};
+for (const evidence of ["zero", "unverified"] as const) {
+  const verifierNoTests: RoleResult = { role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: [], testEvidence: evidence } };
+
+  test(`C1: single-run verifier pass with testEvidence="${evidence}" → DISCARD (no real test signal)`, async () => {
+    const r = await integrator(ctxWith([builderOk, criticPass, verifierNoTests]));
+    assert.equal(decisionOf(r), "discard");
+    assert.match(rationaleOf(r), /no real test evidence/);
+    assert.match(rationaleOf(r), new RegExp(evidence));
+  });
+
+  test(`C1: ACCUMULATED verifier pass with testEvidence="${evidence}" → PROMOTE (prior steps verified)`, async () => {
+    const ctx = ctxWith([{ role: "builder", outcome: "success", summary: "b", detail: { filesWritten: [], policyViolations: [] } }, criticPass, verifierNoTests]);
+    const r = await integrator({ ...ctx, task: { ...ctx.task, reuseWorkspace: reuseHandle } });
+    assert.equal(decisionOf(r), "promote", "an accumulated pass is exempt from the test-evidence gate");
+  });
+}
+
+test('C1: single-run verifier pass with testEvidence="executed" → PROMOTE (real test signal)', async () => {
+  const verifierExecuted: RoleResult = { role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: [], testEvidence: "executed" } };
+  const r = await integrator(ctxWith([builderOk, criticPass, verifierExecuted]));
+  assert.equal(decisionOf(r), "promote");
+});
+
 test("STEP-PLANNER accumulated pass still fail-closes: a RED verifier discards even with reuseWorkspace", async () => {
   const ctx = ctxWith([{ role: "builder", outcome: "success", summary: "b", detail: { filesWritten: [], policyViolations: [] } }, criticPass, { role: "verifier", outcome: "success", summary: "v", detail: { verdict: "fail", checks: [] } }]);
   const reuse: WorkspaceHandle = {

@@ -26,7 +26,10 @@
  *                            BOTH force discard — fail-closed, matching the egress
  *                            default-deny posture;
  *   - critic approved:       detail.pass === true;
- *   - verifier passed:       detail.verdict === "pass".
+ *   - verifier passed:       detail.verdict === "pass";
+ *   - real test evidence:    SINGLE-RUN builds require detail.testEvidence === "executed" (a verified
+ *                            green with no real test signal proves nothing). ACCUMULATED builds
+ *                            (reuseWorkspace set) are exempt — prior steps already verified.
  *
  * On discard the rationale names EVERY failing gate (not just the first), so the
  * receipt trail tells an operator/agent the full reason a build did not land.
@@ -72,7 +75,19 @@ export const integrator: RoleFn = async (ctx) => {
     const criticPass = detailOf(critic).pass === true;
     const verifierPass = detailOf(verifier).verdict === "pass";
 
-    if (builderOk && noPolicyViolations && criticPass && verifierPass) {
+    // REAL TEST EVIDENCE (single-run only). The verifier classifies test signal four ways
+    // (executed / zero / unverified / absent — see readVerifier in orchestrator.ts, stamped onto
+    // the verifier result detail). A SINGLE-RUN build that VERIFIES but ran no real tests (zero
+    // tests, an unparseable green like `echo done`, or no "test" check at all) proved nothing about
+    // behavior — promoting it would forge a passing test signal. So require "executed" evidence for
+    // single-run promotes. ACCUMULATED builds (reuseWorkspace set) are EXEMPT: prior steps already
+    // verified, and this pass may legitimately run no tests. A MISSING field (a legacy verifier
+    // result that never reported evidence) is NOT blocked — backward-compatible; the production
+    // orchestrator stamps testEvidence onto every verifier result, so real runs always report it.
+    const testEvidence = detailOf(verifier).testEvidence;
+    const testEvidenceOk = accumulatedPass || testEvidence === undefined || testEvidence === "executed";
+
+    if (builderOk && noPolicyViolations && criticPass && verifierPass && testEvidenceOk) {
       const rationale =
         accumulatedPass && filesWritten.length === 0
           ? "promote: accumulated multi-step build (this pass wrote 0 files — prior steps did the work), no policy violations, critic pass, verifier pass"
@@ -105,6 +120,9 @@ export const integrator: RoleFn = async (ctx) => {
     }
     if (!criticPass) failures.push(critic === undefined ? "no critic result" : "critic pass=false");
     if (!verifierPass) failures.push(verifier === undefined ? "no verifier result" : "verifier verdict=fail");
+    // Only an ADDITIONAL constraint on an otherwise-passing verifier: a RED verifier already names
+    // its own failure above, so the test-evidence note is redundant noise there.
+    else if (!testEvidenceOk) failures.push(`single-run build has no real test evidence (test evidence "${String(testEvidence)}")`);
 
     const rationale = `discard: ${failures.join("; ")}`;
     return {

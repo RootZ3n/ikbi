@@ -1036,6 +1036,14 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           );
         } else if (role === "verifier") {
           const v = readVerifier(result);
+          // C1 — surface the 4-state test-execution evidence on the verifier RESULT (not just the
+          // judged candidate) so the integrator's promote gate can require REAL test signal for a
+          // single-run build. detail is readonly, so replace the result in `results` (the array the
+          // integrator reads via priorResults) with a stamped copy.
+          const stamped: RoleResult = { ...result, detail: { ...((result.detail as Record<string, unknown> | undefined) ?? {}), testEvidence: v.testEvidence } };
+          const verifierIdx = results.lastIndexOf(result);
+          if (verifierIdx >= 0) results[verifierIdx] = stamped;
+          result = stamped;
           const vd = (result.detail as Record<string, unknown> | undefined) ?? {};
           const verdict = vd.verdict;
           const scope = vd.verificationScope === "impact" || vd.verificationScope === "full" ? vd.verificationScope : undefined;
