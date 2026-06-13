@@ -31,6 +31,7 @@ import { beginOperation, resolveIdentity as coreResolveIdentity } from "../../co
 import type { IdentityClaim, OperationContext, ValidatedIdentity } from "../../core/identity/index.js";
 import { workspaces as coreWorkspaces } from "../../core/workspace/index.js";
 import type { AllocateOptions, DiscardResult, WorkspaceHandle, WorkspaceRecord } from "../../core/workspace/contract.js";
+import type { AutonomyGrant } from "../../core/trust/contract.js";
 import { events as coreEvents } from "../../core/events/index.js";
 import type { EventBusSurface } from "../../core/events/index.js";
 import { gateWall as coreGateWall, type GateWall } from "../gate-wall/index.js";
@@ -234,7 +235,7 @@ function approvalRequiredFromEnv(env: NodeJS.ProcessEnv = process.env): boolean 
 
 export function createProductionWorker(
   opts: { workerToken: string | undefined; gateWall?: GateWall; onExecOutput?: (chunk: string, stream: "stdout" | "stderr") => void; requestApproval?: (req: { taskId: string; workspaceId: string; goal: string }) => Promise<boolean> },
-): { run: (task: WorkerTask, ctx: OperationContext) => Promise<WorkerResult> } {
+): { run: (task: WorkerTask, ctx: OperationContext) => Promise<WorkerResult>; spawnRole: (role: WorkerRole, ctx: OperationContext) => { readonly autonomy: AutonomyGrant } } {
   // Explicitly thread the governed executor to BOTH roles (builder run_checks + verifier) via
   // the orchestrator. LAZY wrapper (not an eager import): importing the governed-exec singleton
   // at module scope would force the gate-wall/egress wiring order — the same reason the verifier
@@ -403,7 +404,15 @@ export function formatCost(costUsd: number | undefined): string {
 /** Injectable surfaces so the construction + roleClaim + spawn/clamp + gate chain is testable. */
 export interface WorkerCliDeps {
   /** The run surface. Default: a live orchestrator wired with the production roleClaim + real gate-wall. */
-  readonly orchestrator?: { run: (task: WorkerTask, ctx: OperationContext) => Promise<WorkerResult> };
+  readonly orchestrator?: {
+    run: (task: WorkerTask, ctx: OperationContext) => Promise<WorkerResult>;
+    /**
+     * H5: optionally inspect a role's CLAMPED autonomy without running it, so the multi-step
+     * path can refuse a plan the worker tier could never land (no autoCommit). Absent on a
+     * run-only orchestrator — the caller then proceeds (preserves the legacy single-step path).
+     */
+    readonly spawnRole?: (role: WorkerRole, ctx: OperationContext) => { readonly autonomy: AutonomyGrant };
+  };
   readonly resolveIdentity?: (claim: IdentityClaim) => ValidatedIdentity;
   /** Gate-wall evaluator wired into the default orchestrator. Default: the live gate-wall (REAL, not advisory). */
   readonly gateWall?: GateWall;
@@ -581,6 +590,22 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       let result: WorkerResult;
 
       if (stepPlan.decomposed && stepPlan.steps.length > 1) {
+        // H5: a multi-step plan only LANDS on a tier with autoCommit autonomy. Intermediate
+        // steps set skipPromote (they never commit), and the final step's commit is gated on
+        // autoCommit — so on a non-autoCommit tier (verified/probation/untrusted) every green
+        // step would still evaporate to "partial" with nothing landed. Refuse the plan up front
+        // with an actionable message instead of burning N model calls on work that can't land.
+        // (A run-only orchestrator exposes no spawnRole ⇒ proceed, preserving the legacy path.)
+        const canLand = orchestrator.spawnRole?.("builder", ctx).autonomy.autoCommit ?? true;
+        if (!canLand) {
+          err(
+            `ikbi: this goal decomposes into ${stepPlan.steps.length} steps, but the worker tier lacks autoCommit autonomy — ` +
+              `intermediate steps never commit and the accumulated work would evaporate to "partial" (nothing lands). ` +
+              `Grant the worker the "trusted" tier and re-run, or restate the goal so it runs as a single step.\n`,
+          );
+          setExit(1);
+          return;
+        }
         // MULTI-STEP: allocate ONE workspace, run all steps in it, final verify + promote.
         // This is the shared-workspace step planner — changes accumulate across steps.
         out(`  ↳ decomposed into ${stepPlan.steps.length} steps\n`);

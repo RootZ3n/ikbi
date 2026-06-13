@@ -460,3 +460,22 @@ test("H4: the final verify step passes writeScope 'none' (cannot modify accumula
     assert.notEqual(step1!.writeScope, "none", "intermediate steps remain writable");
   });
 });
+
+// H5: a non-autoCommit tier cannot land a multi-step plan — refuse it BEFORE allocating/running.
+test("H5: multi-step plan is REFUSED (exit 1, nothing allocated/run) on a tier without autoCommit", () => {
+  const { orchestrator, tasks } = multiStepOrchestrator({ autoCommit: false });
+  const stepWs = stepWorkspacesFake();
+  const cap2 = capture();
+  const cli = createWorkerCli({
+    orchestrator, resolveIdentity: makeResolver("verified", "verified"),
+    operatorToken: OPERATOR_TOKEN, workerToken: WORKER_TOKEN,
+    stdout: cap2.stdout, stderr: cap2.stderr, setExit: cap2.setExit, now: () => 1, cwd: () => "/repo",
+    interactive: false, stepWorkspaces: stepWs.surface, cognition: benignCognition,
+  });
+  return cli.build([MULTI_STEP_GOAL]).then(() => {
+    assert.equal(cap2.exit, 1, "the unlandable multi-step plan exits non-zero");
+    assert.match(cap2.err, /autoCommit/, "the refusal explains the worker tier lacks autoCommit");
+    assert.equal(stepWs.calls.allocate, 0, "no workspace was allocated for a plan that can't land");
+    assert.equal(tasks.length, 0, "no step was run — refused before any model call");
+  });
+});
