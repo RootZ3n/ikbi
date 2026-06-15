@@ -491,8 +491,11 @@ export function formatProgressEvent(e: { type: string; payload?: unknown }): str
     }
     case "worker.role.dispatched":
       return `  → ${String(p.role ?? "?")} …\n`;
-    case "worker.role.completed":
-      return `  ${p.outcome === "success" ? "✓" : "✗"} ${String(p.role ?? "?")}: ${String(p.outcome ?? "?")}\n`;
+    case "worker.role.completed": {
+      const icon = p.outcome === "success" ? "✓" : "✗";
+      const costNote = typeof p.costUsd === "number" && p.costUsd > 0 ? ` ($${p.costUsd.toFixed(4)})` : "";
+      return `  ${icon} ${String(p.role ?? "?")}: ${String(p.outcome ?? "?")}${costNote}\n`;
+    }
     case "worker.builder.activity": {
       // SG: surface context-window pressure alongside the tool-activity line when present.
       const ctxNote = typeof p.contextPercent === "number" ? `, context ${String(p.contextPercent)}%` : "";
@@ -570,6 +573,23 @@ export function formatRepairNarrative(r: WorkerResult): string {
 /** Format a run's total cost as a human one-line ($USD, 4 decimals). */
 export function formatCost(costUsd: number | undefined): string {
   return `Cost: $${(costUsd ?? 0).toFixed(4)}`;
+}
+
+/** Format a per-role cost breakdown table for the --cost flag. */
+export function formatCostBreakdown(r: WorkerResult): string {
+  const lines: string[] = ["Cost breakdown:"];
+  for (const roleResult of r.roles) {
+    const detail = (roleResult.detail ?? {}) as Record<string, unknown>;
+    const roleCost = typeof detail.costUsd === "number" ? detail.costUsd : 0;
+    lines.push(`  ${roleResult.role.padEnd(10)}  $${roleCost.toFixed(4)}`);
+  }
+  lines.push(`  ${"─".repeat(22)}`);
+  lines.push(`  ${"total".padEnd(10)}  $${(r.costUsd ?? 0).toFixed(4)}`);
+  const builderDetail = (r.roles.find((x) => x.role === "builder")?.detail ?? {}) as Record<string, unknown>;
+  if (typeof builderDetail.model === "string" && builderDetail.model.length > 0) {
+    lines.push(`  Model: ${builderDetail.model}`);
+  }
+  return `${lines.join("\n")}\n`;
 }
 
 /** Injectable surfaces so the construction + roleClaim + spawn/clamp + gate chain is testable. */
@@ -863,8 +883,8 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       out(summarize(result));
       // ISSUE 3: surface the repair report (root cause / files / rationale / tests) when present.
       out(formatRepairNarrative(result));
-      // --cost: print the run's total model cost as a human one-liner after the build.
-      if (cost === true) out(`${formatCost(result.costUsd)}\n`);
+      // --cost: print a per-role cost breakdown after the build.
+      if (cost === true) out(formatCostBreakdown(result));
       // SG-2: after the run, show a one-line diff summary of what changed (best-effort).
       if (result.workspaceId !== undefined) await printDiffSummary(result.workspaceId);
       // Operator experience: failure details + next-command hints on STDERR (not stdout, which

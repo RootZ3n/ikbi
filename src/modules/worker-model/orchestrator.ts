@@ -1210,14 +1210,23 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           results[results.length - 1] = result;
         }
 
+        // Per-role cost: compute once after rescue (rescue verifier calls count against builder).
+        const roleCost = runCost() - costBeforeRole;
+        // Stamp into detail (open shape) so the CLI post-build breakdown can read it without
+        // changing the WorkerResult contract. Also stamp the model on the builder role.
+        if (roleCost > 0) {
+          const prevDetail = (result.detail as Record<string, unknown> | undefined) ?? {};
+          result = { ...result, detail: { ...prevDetail, costUsd: roleCost, ...(role === "builder" ? { model: singleBuilderModel } : {}) } };
+          results[results.length - 1] = result;
+        }
         events.publish(
           workerRoleCompleted.create(
-            { taskId: task.taskId, role, outcome: result.outcome },
+            { taskId: task.taskId, role, outcome: result.outcome, ...(roleCost > 0 ? { costUsd: roleCost } : {}) },
             { source: EVENT_SOURCE, attribution: { identity: spawned.identity, operation: `worker.role.${role}`, runId: task.taskId } },
           ),
         );
 
-        await recordRole(task, workspace, spawned, result, runCost() - costBeforeRole, singleBuilderModel);
+        await recordRole(task, workspace, spawned, result, roleCost, singleBuilderModel);
 
         // SG-5 PROGRESS: structured per-role detail beyond start/end — builder tool activity
         // and the verifier's verdict — so `--verbose` can show what each phase actually did.

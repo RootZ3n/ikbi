@@ -19,7 +19,7 @@ export const workerRoleDispatched = defineEvent<{ taskId: string; role: WorkerRo
 );
 
 /** A role finished. (Attribution: role identity.) */
-export const workerRoleCompleted = defineEvent<{ taskId: string; role: WorkerRole; outcome: WorkerOutcome }>(
+export const workerRoleCompleted = defineEvent<{ taskId: string; role: WorkerRole; outcome: WorkerOutcome; costUsd?: number | undefined }>(
   "worker.role.completed",
 );
 
