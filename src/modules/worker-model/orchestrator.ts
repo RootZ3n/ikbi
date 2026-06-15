@@ -1534,14 +1534,18 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       throw err;
     }
 
-    // Terminal: a KILL halted the run mid-loop ⇒ discard cleanly (NEVER promote a
-    // half-run), surface the kill, return.
+    // Terminal: a KILL halted the run mid-loop ⇒ stop cleanly (NEVER promote a half-run),
+    // surface the kill, return. The workspace is RETAINED (not discarded) so its partial work
+    // survives for inspection — `ikbi workspace ls` shows it; `ikbi workspace discard <id>` or
+    // `ikbi clean --force` removes it deliberately. Falls back to discard when retention is off
+    // or the manager has no retain method.
     // SKIP-PROMOTE EXEMPTION: a step-planner middle step (skipPromote) shares its worktree
     // with the surrounding steps — discarding it here would destroy the accumulated work of a
     // multi-step plan. When skipPromote is set, leave the workspace ALIVE and let the
     // skipPromote terminal below report the outcome; the step planner owns the shared lifecycle.
     if (killedReason !== undefined && task.skipPromote !== true) {
-      await safeDiscard(workspaces, workspace);
+      if (retainFailedWorkspaces) await safeRetain(workspaces, workspace, `interrupted: ${killedReason}`);
+      else await safeDiscard(workspaces, workspace);
       events.publish(
         workerFailed.create(
           { taskId: task.taskId, reason: killedReason, workspaceId: workspace.id },
