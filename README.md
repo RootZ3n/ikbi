@@ -47,20 +47,106 @@ trust and capability are granted, never assumed.
 ```sh
 pnpm install
 pnpm build        # tsc -> dist/
-pnpm start        # node dist/index.js
 ```
 
-Then:
+**Run a build** (the primary use case):
 
 ```sh
+# Minimum required env (add to .env or export):
+IKBI_ALLOW_INSECURE_DEV_KEYS=true      # dev only — use real keys in production
+IKBI_WORKER_MODEL_ENABLED=true
+IKBI_OPERATOR_TOKEN=<32+ char token>
+IKBI_WORKER_TOKEN=<32+ char token>
+IKBI_GOVERNED_EXEC_ALLOWLIST=pnpm      # let the verifier run `pnpm test`
+<YOUR_PROVIDER>_API_KEY=<key>           # e.g. ANTHROPIC_API_KEY
+
+node dist/cli/index.js build "fix the failing test" --repo /path/to/repo
+```
+
+ikbi allocates an isolated git worktree, runs the 5-role pipeline (scout → builder →
+critic → verifier → integrator), and promotes the change only when verification passes.
+After the build, inspect what happened:
+
+```sh
+node dist/cli/index.js diff <workspace-id>     # git diff of the change
+node dist/cli/index.js receipts --latest        # build receipt (what ran, verdict)
+node dist/cli/index.js undo <receipt-id>        # revert if needed
+```
+
+Run `ikbi doctor` to see what's configured, what's missing, and how to fix each gap.
+
+**Start the HTTP service** (if you need the `/chat` or `/capabilities` endpoints):
+
+```sh
+pnpm start        # node dist/index.js
 curl localhost:18796/health   # {"status":"ok","service":"ikbi","version":"0.1.0"}
 curl localhost:18796/ready    # {"status":"ready","ready":true}
 ```
 
-Run `ikbi doctor` to see, in one command, what's configured, what's missing for a
-build, and how to fix each gap (it needs no identity and no network — config only).
-
 Stop it with `Ctrl-C` (SIGINT) or `kill -TERM <pid>` — it drains and exits 0.
+
+## CLI commands
+
+| Command | What it does |
+| ------- | ------------ |
+| `ikbi build <goal...>` | Run the 5-role pipeline toward a goal; promotes on verify pass |
+| `ikbi diff <workspace-id>` | Print a workspace's git diff (base..scratch) + change summary |
+| `ikbi undo <receipt-id\|commit\|--latest>` | Revert a promoted change (previews diff before reverting) |
+| `ikbi receipts` | Show receipt history — what ran, outcomes, costs |
+| `ikbi workspace ls` | List build workspaces (state, branch, target repo) |
+| `ikbi workspace discard <id>` | Drop a workspace that was retained or failed |
+| `ikbi workspace clean` | Bulk-clean stale/terminal workspaces (dry-run by default) |
+| `ikbi workspaces` | Alias — inspect and manage workspaces |
+| `ikbi clean` | Reclaim orphaned git worktrees (retained work is preserved) |
+| `ikbi cost` | Cost breakdown by task from the receipt log |
+| `ikbi audit <repo>` | Read-only diagnostic snapshot of a repo |
+| `ikbi doctor` | Report bootstrap config; `--fix` repairs common gaps |
+| `ikbi capabilities` | Tool inventory + surface classification |
+| `ikbi repos` | List registered repos (from state/repos.json) |
+| `ikbi models` | List the model roster (id, role, cost, provider chain) |
+| `ikbi providers` | List registered providers |
+
+### Key flags for `ikbi build`
+
+| Flag | Meaning |
+| ---- | ------- |
+| `--repo <path>` | Target repository (git worktree is allocated here) |
+| `--verbose` | Stream per-role progress events to stdout as the build runs |
+| `--cost` | Print a per-role cost breakdown table after the build |
+| `--yes` | Skip the interactive confirmation prompt before promoting |
+| `--delegation <json>` | Accept a delegation envelope from Pehlichi (see below) |
+| `--no-memory` | Skip loading project memory (CLAUDE.md / AGENTS.md / .ikbi/) |
+| `--memory-diff` | Show what project memory was loaded, then exit |
+
+### Pehlichi integration (`--delegation`)
+
+Pehlichi (the lab's lead agent) delegates builds to ikbi by passing a signed
+`DelegationEnvelope` as JSON:
+
+```sh
+ikbi build --delegation '{"goal":"fix the test","targetRepo":"/path","delegatedBy":"pehlichi-1","taskId":"t-123"}'
+```
+
+The envelope's `goal` and `targetRepo` override any positional arguments. ikbi
+validates the envelope fields before starting the pipeline.
+
+### Custom verification (`IKBI_CHECKS`)
+
+By default ikbi runs `pnpm test` and `pnpm typecheck` as the verifier's checks.
+Override for non-JS repos or custom runners:
+
+```sh
+# Python project:
+IKBI_CHECKS='[{"name":"test","command":"python3","args":["-m","pytest"]}]' \
+  ikbi build "fix the import error" --repo /path/to/python-repo
+
+# Multiple checks:
+IKBI_CHECKS='[{"name":"build","command":"make"},{"name":"test","command":"make","args":["test"]}]' \
+  ikbi build "add the new endpoint" --repo /path/to/c-repo
+```
+
+`IKBI_CHECKS` is a JSON array of `{name, command, args?}` objects. A malformed value
+fails closed (RED) — the verifier will not promote on a misconfigured check set.
 
 ## Scripts
 
@@ -93,6 +179,7 @@ your `IKBI_*` tokens in `.env`. The most important ones:
 | `IKBI_IDENTITY_TOKEN_SALT`    | *(required)*  | Global pepper for the token-hash KDF                                |
 | `IKBI_ALLOW_INSECURE_DEV_KEYS`| `false`       | Opt in to start on the built-in default trust keys (dev only)       |
 | `IKBI_WORKER_MODEL_ENABLED`   | `false`       | Master switch — builds are disabled until this is on                |
+| `IKBI_CHECKS`                 | *(auto)*      | JSON array of `{name,command,args?}` — override the verifier's check set |
 | `IKBI_GOVERNED_EXEC_ALLOWLIST`| *(empty)*     | Binaries the verifier may run (needs `pnpm` for tsc/tests)          |
 | `IKBI_EGRESS_ALLOWLIST`       | *(empty)*     | Default-deny network egress allowlist (hosts)                       |
 | `IKBI_ALLOW_PUBLIC_BIND`      | `false`       | Required to bind a non-loopback (public) interface                  |
