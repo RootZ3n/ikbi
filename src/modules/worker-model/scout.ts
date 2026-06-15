@@ -17,8 +17,9 @@
  * role identity (#10).
  */
 
-import { type Dirent, readdirSync, readFileSync } from "node:fs";
+import { type Dirent, readdirSync } from "node:fs";
 import { extname, join, relative } from "node:path";
+import { gatherFiles, buildContext, SCOUT_MAX_FILES_SCANNED as MAX_FILES_SCANNED, SCOUT_MAX_FILE_BYTES as MAX_FILE_BYTES, SCOUT_MAX_TOTAL_BYTES as MAX_TOTAL_BYTES, SCAN_EXTENSIONS, SKIP_DIRS, type ScoutFileEntry as _ScoutFileEntry } from "./scout-files.js";
 
 import { toUntrustedMessage } from "../../core/injection/index.js";
 import type { ModelMessage, ModelRequest } from "../../core/provider/contract.js";
@@ -39,27 +40,14 @@ export interface ScoutFinding {
 }
 
 /** One entry in the scout's STRUCTURE index — a scanned file with its size. The brief is built from these. */
-export interface ScoutFileEntry {
-  readonly path: string;
-  readonly lines: number;
-  readonly bytes: number;
-}
+export type ScoutFileEntry = _ScoutFileEntry;
 
 // --- named constants (no magic values inline) ------------------------------
 // The model id is DRIVER-tier and config-driven (see role-models.ts) — resolved at
 // request time so an operator's IKBI_MODEL_DRIVER takes effect without a roster alias.
 const SCOUT_TEMPERATURE = 0.2;
 const SCOUT_MAX_TOKENS = 1024;
-/** Hard cap on files visited — scout never walks the whole tree. */
-const MAX_FILES_SCANNED = 40;
-/** Per-file byte cap fed to the model. */
-const MAX_FILE_BYTES = 4_000;
-/** Total byte cap of gathered context. */
-const MAX_TOTAL_BYTES = 60_000;
 const DEFAULT_INDEX_FALLBACK_BLOCK_MIN_FILES = 500;
-const SCAN_EXTENSIONS: ReadonlySet<string> = new Set([".ts", ".tsx", ".js", ".jsx", ".json", ".md"]);
-const SKIP_DIRS: ReadonlySet<string> = new Set(["node_modules", ".git", "dist", "build", "coverage", ".next", "out"]);
-
 const SCOUT_SYSTEM =
   "You are the SCOUT in a build pipeline. Investigate the provided repository " +
   "excerpts against the stated goal and list concise, concrete findings (one per " +
@@ -70,30 +58,6 @@ const SCOUT_SYSTEM =
 /** Max files listed in the deterministic structure brief (keeps the brief cheap-model sized). */
 const MAX_BRIEF_FILES = 15;
 
-/** Bounded, read-only directory walk. Stops at MAX_FILES_SCANNED; skips heavy dirs. */
-function gatherFiles(root: string): string[] {
-  const out: string[] = [];
-  const stack: string[] = [root];
-  while (stack.length > 0 && out.length < MAX_FILES_SCANNED) {
-    const dir = stack.pop() as string;
-    let entries: Dirent[];
-    try {
-      entries = readdirSync(dir, { withFileTypes: true });
-    } catch {
-      continue; // unreadable dir — skip (read-only, never fail the walk on one dir)
-    }
-    for (const e of entries) {
-      if (out.length >= MAX_FILES_SCANNED) break;
-      const full = join(dir, e.name);
-      if (e.isDirectory()) {
-        if (!SKIP_DIRS.has(e.name)) stack.push(full);
-      } else if (e.isFile() && SCAN_EXTENSIONS.has(extname(e.name))) {
-        out.push(full);
-      }
-    }
-  }
-  return out;
-}
 
 /**
  * GOAL-AWARE legacy ordering. The legacy walk (`gatherFiles`) returns files in raw
@@ -149,30 +113,6 @@ function reachesFileThreshold(root: string, threshold: number): boolean {
   return false;
 }
 
-/** Read a bounded slice of each file into a single context string. Read-only. Also
- *  returns the STRUCTURE index (each scanned file's path + line/byte size). */
-function buildContext(files: readonly string[], root: string): { text: string; used: number; structure: ScoutFileEntry[] } {
-  const parts: string[] = [];
-  const structure: ScoutFileEntry[] = [];
-  let total = 0;
-  let used = 0;
-  for (const f of files) {
-    if (total >= MAX_TOTAL_BYTES) break;
-    let content: string;
-    try {
-      content = readFileSync(f, "utf8");
-    } catch {
-      continue;
-    }
-    const slice = content.slice(0, MAX_FILE_BYTES);
-    const rel = relative(root, f);
-    parts.push(`--- ${rel} ---\n${slice}`);
-    structure.push({ path: rel, lines: content.split("\n").length, bytes: Buffer.byteLength(content, "utf8") });
-    total += Buffer.byteLength(slice, "utf8");
-    used += 1;
-  }
-  return { text: parts.join("\n\n"), used, structure };
-}
 
 /**
  * PROGRESSIVE DISCLOSURE: a compact, DETERMINISTIC structure brief the builder sees

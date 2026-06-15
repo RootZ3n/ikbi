@@ -7,6 +7,9 @@
  *   - Active workspace status for this repo
  *   - Last build result and recent receipt history
  *
+ * With `--compare model1,model2`: also runs the scout with each model and
+ * produces a comparison report showing agreements, disagreements, and coverage.
+ *
  * This is a diagnostic tool for operators before or after a build: understand
  * the repo's posture quickly without touching anything.
  */
@@ -31,6 +34,12 @@ export interface AuditDeps {
   readonly fileExists?: (path: string) => Promise<boolean>;
   /** Read a file as UTF-8 text. Default: fs.readFile. */
   readonly readFileText?: (path: string) => Promise<string>;
+  /** Multi-audit runner (injectable for tests). Default: lazy import. */
+  readonly runMultiAudit?: (options: {
+    repoPath: string;
+    models: readonly string[];
+    goal?: string;
+  }) => Promise<import("../modules/worker-model/multi-audit.js").ComparisonResult>;
 }
 
 /** Detected information about a repository. All fields are best-effort. */
@@ -129,6 +138,25 @@ async function receiptInfoFor(repoPath: string, rc: { query(): Promise<Receipt[]
   }
 }
 
+/** Parse --compare model1,model2 from argv. Returns models array or undefined. */
+function parseCompareFlag(argv: readonly string[]): { models: string[]; remaining: string[] } | undefined {
+  const remaining: string[] = [];
+  let models: string[] | undefined;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!;
+    if (arg === "--compare") {
+      const next = argv[++i];
+      if (next === undefined || next.startsWith("-")) {
+        return undefined; // --compare without value
+      }
+      models = next.split(",").map((m) => m.trim()).filter((m) => m.length > 0);
+    } else {
+      remaining.push(arg);
+    }
+  }
+  return models !== undefined && models.length > 0 ? { models, remaining } : undefined;
+}
+
 /** Build the `audit` handler. */
 export function createAuditCli(deps: AuditDeps = {}) {
   const out = deps.stdout ?? ((s: string) => void process.stdout.write(s));
@@ -141,9 +169,13 @@ export function createAuditCli(deps: AuditDeps = {}) {
   const readFileText = deps.readFileText ?? ((p: string) => readFile(p, "utf8"));
 
   async function audit(argv: readonly string[]): Promise<void> {
-    const repoPath = argv[0];
+    // Parse --compare flag
+    const compareResult = parseCompareFlag(argv);
+    const effectiveArgv = compareResult !== undefined ? compareResult.remaining : argv;
+
+    const repoPath = effectiveArgv[0];
     if (repoPath === undefined || repoPath.length === 0) {
-      err("ikbi audit: a repo path is required — usage: ikbi audit <repo>\n");
+      err("ikbi audit: a repo path is required — usage: ikbi audit <repo> [--compare m1,m2]\n");
       setExit(1);
       return;
     }
@@ -203,6 +235,33 @@ export function createAuditCli(deps: AuditDeps = {}) {
       out(`Last build:      (none)\n`);
     }
     out(`\n`);
+
+    // ── Multi-model comparison ─────────────────────────────────────────────────
+    if (compareResult !== undefined) {
+      out(`═══ Multi-Model Audit: ${compareResult.models.join(" vs ")} ═══\n`);
+      out(`Running scout with ${compareResult.models.length} model(s)...\n\n`);
+
+      try {
+        const runMulti = deps.runMultiAudit ?? (async (opts) => {
+          const { runMultiAudit } = await import("../modules/worker-model/multi-audit.js");
+          return runMultiAudit(opts);
+        });
+
+        const result = await runMulti({
+          repoPath,
+          models: compareResult.models,
+        });
+
+        // Format and output the comparison report
+        const { formatComparisonReport } = await import("../modules/worker-model/multi-audit.js");
+        out(formatComparisonReport(result));
+        out(`\n`);
+      } catch (multiErr) {
+        err(`ikbi audit: multi-model comparison failed: ${multiErr instanceof Error ? multiErr.message : String(multiErr)}\n`);
+        setExit(1);
+      }
+    }
+
     out(`Tip: run \`ikbi build "..." --repo ${repoPath}\` to start a build.\n`);
   }
 
@@ -212,6 +271,6 @@ export function createAuditCli(deps: AuditDeps = {}) {
 registerCommand({
   name: "audit",
   summary: "Read-only diagnostic snapshot of a repo (type, workspaces, receipts)",
-  usage: "ikbi audit <repo>",
+  usage: "ikbi audit <repo> [--compare m1,m2]",
   run: (argv) => createAuditCli().audit(argv),
 });
