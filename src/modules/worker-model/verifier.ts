@@ -668,8 +668,7 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
     // exclusion must not be a loophole that lets the builder neuter a verification helper by naming
     // it in the task description.
     const allGoalFiles = extractGoalFiles(ctx.task?.goal ?? "");
-    const goalTestFiles = new Set([...allGoalFiles].filter((f) => TEST_FILE_PATTERN.test(f)));
-    const shellOut = detectShellOutMutation(diffText, ctx.workspace.path, goalTestFiles.size > 0 ? goalTestFiles : undefined);
+    const shellOut = detectShellOutMutation(diffText, ctx.workspace.path, allGoalFiles.size > 0 ? allGoalFiles : undefined);
     if (shellOut.mutated) {
       return untrusted(`verification untrusted: ${shellOut.reason}`);
     }
