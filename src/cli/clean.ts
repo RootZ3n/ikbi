@@ -26,6 +26,14 @@ export interface CleanCliDeps {
   readonly setExit?: (code: number) => void;
 }
 
+/** Format a byte count as a human-readable string (KB/MB/GB). */
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)}KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${Math.round(bytes / (1024 * 1024))}MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)}GB`;
+}
+
 /** Build the `clean` handler. Default reclaims via the live workspace manager. */
 export function createCleanCli(deps: CleanCliDeps = {}) {
   const workspaces: CleanWorkspaces = deps.workspaces ?? coreWorkspaces;
@@ -37,7 +45,8 @@ export function createCleanCli(deps: CleanCliDeps = {}) {
     const force = argv.includes("--force") || argv.includes("-f");
     try {
       const r = await workspaces.cleanOrphans({ force });
-      out(`clean: reclaimed ${r.removed} orphaned worktree(s) (checked ${r.checked} terminal workspace${r.checked === 1 ? "" : "s"}).\n`);
+      const reclaimedStr = r.reclaimed !== undefined && r.reclaimed > 0 ? `, freed ~${formatBytes(r.reclaimed)}` : "";
+      out(`clean: reclaimed ${r.removed} orphaned worktree(s) (checked ${r.checked} terminal workspace${r.checked === 1 ? "" : "s"})${reclaimedStr}.\n`);
       const skipped = r.skipped ?? 0;
       if (skipped > 0) {
         out(
