@@ -3,10 +3,12 @@
  *
  *   ikbi workspace ls            — list workspaces (id, state, path), flagging RETAINED work
  *   ikbi workspace discard <id>  — deliberately remove ONE workspace (worktree dir + scratch branch)
+ *   ikbi workspace clean         — bulk-remove terminal workspaces (dry-run, --retained, --stale)
  *
  * `ls` makes retained failed-build work discoverable (it is the only copy of uncommitted work);
- * `discard` is the explicit, per-workspace removal the failure message points operators to —
- * unlike `ikbi clean`, it never touches anything but the named workspace.
+ * `discard` is the explicit, per-workspace removal the failure message points operators to;
+ * `clean` is the bulk removal path with filtering — unlike `ikbi clean`, it operates on
+ * individual workspace records (not just orphaned worktrees) and supports dry-run preview.
  */
 
 import { registerCommand } from "./registry.js";
@@ -31,6 +33,17 @@ export interface WorkspaceCliDeps {
 /** True iff a failed record was deliberately RETAINED (its note is stamped `retained: …`). */
 function isRetained(rec: WorkspaceRecord): boolean {
   return rec.state === "failed" && (rec.note ?? "").startsWith("retained:");
+}
+
+/** Human-readable age string for display in workspace clean output. */
+function formatAge(ms: number): string {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s old`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m old`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h old`;
+  return `${Math.floor(h / 24)}d old`;
 }
 
 /** Build the `workspace` handler. Default drives the live workspace manager. */
@@ -91,6 +104,77 @@ export function createWorkspaceCli(deps: WorkspaceCliDeps = {}) {
     }
   }
 
+  // Terminal workspace states eligible for bulk clean.
+  const TERMINAL_STATES: ReadonlySet<string> = new Set(["promoted", "failed", "discarded"]);
+
+  async function clean(argv: readonly string[]): Promise<void> {
+    const dryRun = argv.includes("--dry-run") || argv.includes("-n");
+    const retainedOnly = argv.includes("--retained");
+    const force = argv.includes("--force") || argv.includes("-f");
+    const staleArg = argv.find((a) => a.startsWith("--stale="));
+    const staleDays = staleArg !== undefined ? Number(staleArg.slice("--stale=".length)) : undefined;
+
+    let records: WorkspaceRecord[];
+    try {
+      records = await workspaces.list();
+    } catch (e) {
+      err(`ikbi workspace clean: failed to list workspaces: ${e instanceof Error ? e.message : String(e)}\n`);
+      setExit(1);
+      return;
+    }
+
+    const now = Date.now();
+    const staleCutoffMs =
+      staleDays !== undefined && Number.isFinite(staleDays) && staleDays > 0
+        ? now - staleDays * 24 * 60 * 60 * 1000
+        : undefined;
+
+    const candidates = records.filter((r) => {
+      if (!TERMINAL_STATES.has(r.state)) return false; // never touch active workspaces
+      if (retainedOnly && !isRetained(r)) return false; // --retained: only retained ones
+      // Without --force or --retained, preserved retained work (user must opt in explicitly).
+      if (!force && !retainedOnly && isRetained(r)) return false;
+      if (staleCutoffMs !== undefined && r.createdAt > staleCutoffMs) return false; // --stale filter
+      return true;
+    });
+
+    if (candidates.length === 0) {
+      out(
+        retainedOnly
+          ? "workspace clean: no retained workspaces to remove.\n"
+          : "workspace clean: nothing to clean (use --force to include retained workspaces).\n",
+      );
+      return;
+    }
+
+    candidates.sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
+    out(`workspace clean: ${dryRun ? "(dry run) " : ""}${candidates.length} workspace(s) to remove:\n`);
+    for (const r of candidates) {
+      const flag = isRetained(r) ? "  [RETAINED]" : "";
+      const age = formatAge(now - r.createdAt);
+      out(`  ${r.id}  ${r.state.padEnd(10)}  ${r.path}  (${age})${flag}\n`);
+    }
+
+    if (dryRun) {
+      out("(dry run — run without --dry-run to remove)\n");
+      return;
+    }
+
+    let removed = 0;
+    let failed = 0;
+    for (const r of candidates) {
+      try {
+        await workspaces.discard(r);
+        removed++;
+      } catch (e) {
+        err(`workspace clean: failed to discard ${r.id}: ${e instanceof Error ? e.message : String(e)}\n`);
+        failed++;
+      }
+    }
+    out(`workspace clean: removed ${removed} workspace(s)${failed > 0 ? `, ${failed} failed (see stderr)` : ""}.\n`);
+    if (failed > 0) setExit(1);
+  }
+
   async function workspace(argv: readonly string[]): Promise<void> {
     const sub = argv[0];
     switch (sub) {
@@ -102,18 +186,21 @@ export function createWorkspaceCli(deps: WorkspaceCliDeps = {}) {
       case "rm":
         await discard(argv[1]);
         return;
+      case "clean":
+        await clean(argv.slice(1));
+        return;
       default:
-        err(`ikbi workspace: unknown subcommand "${sub ?? ""}" — usage: ikbi workspace <ls|discard <id>>\n`);
+        err(`ikbi workspace: unknown subcommand "${sub ?? ""}" — usage: ikbi workspace <ls|discard <id>|clean>\n`);
         setExit(1);
     }
   }
 
-  return { workspace, ls, discard };
+  return { workspace, ls, discard, clean };
 }
 
 registerCommand({
   name: "workspace",
-  summary: "List build workspaces (flagging retained work) or discard one by id",
-  usage: "ikbi workspace <ls | discard <id>>",
+  summary: "List, discard, or bulk-clean build workspaces",
+  usage: "ikbi workspace <ls | discard <id> | clean [--dry-run] [--retained] [--stale=N] [--force]>",
   run: (argv) => createWorkspaceCli().workspace(argv),
 });
