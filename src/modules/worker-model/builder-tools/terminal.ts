@@ -19,10 +19,13 @@
  * PRODUCES the result string; it never builds a message.
  */
 
+import { realpathSync } from "node:fs";
+
 import type { OperationContext } from "../../../core/identity/index.js";
 import type { ModelTool } from "../../../core/provider/contract.js";
 import type { ExecResult, GovernedExec } from "../../governed-exec/index.js";
 import { commandPolicyDenyReason } from "../../governed-exec/policy.js";
+import { confinePath } from "./confine.js";
 
 /** What the terminal tool needs from the builder: the governed executor + the run's identity. */
 export interface TerminalDeps {
@@ -83,6 +86,32 @@ export function tokenizeCommand(command: string): string[] {
   return tokens;
 }
 
+/**
+ * For a read-only tool's argument list, return the FIRST operand that escapes the managed
+ * workspace, or undefined when every path-like operand stays inside. A token is treated as a
+ * path operand unless it is a flag (`-x` / `--long`); `/dev/null` is allowed (a common sink).
+ * Confinement is delegated to the shared realpath-based `confinePath`, so `..` traversal,
+ * absolute-outside paths, and symlink escapes are all caught — a bare in-workspace pattern
+ * (e.g. the regex in `grep foo file`) resolves inside and is NOT flagged.
+ */
+export function firstEscapingOperand(worktreeDir: string, args: readonly string[]): string | undefined {
+  // Resolve symlinks on the worktree root once so the confinement compares canonical paths
+  // (matches how the session/builder pass an already-realpath'd worktree). Best-effort.
+  let root = worktreeDir;
+  try {
+    root = realpathSync(worktreeDir);
+  } catch {
+    root = worktreeDir;
+  }
+  for (const arg of args) {
+    if (arg.length === 0 || arg.startsWith("-")) continue; // flags (and the bare `-` stdin marker)
+    if (arg === "/dev/null") continue; // common, harmless sink
+    const c = confinePath(root, arg);
+    if (!c.ok) return arg;
+  }
+  return undefined;
+}
+
 /** Render a governed ExecResult into a bounded, model-readable string. */
 function formatExecResult(result: ExecResult): string {
   if (result.denied === true) {
@@ -120,14 +149,18 @@ export async function runTerminal(
     return "ERROR: terminal could not parse a command from the input.";
   }
   const rest = tokens.slice(1);
-  // PATH CONFINEMENT: reject absolute paths outside the worktree for read-only tools.
-  // This prevents `head /etc/passwd` or `grep x ~/.ssh/authorized_keys`.
+  // PATH CONFINEMENT: for read-only tools, resolve every path-like operand against the worktree
+  // root (via the shared realpath-based `confinePath`) and DENY any escape. This blocks not just
+  // absolute-outside paths (`head /etc/passwd`) but also relative `..` traversal (`ls ..`,
+  // `grep x ../file`, `find ../outside`) and symlinks whose target leaves the tree — none of which
+  // the old absolute-prefix check caught. Flags (tokens starting with `-`) are skipped, and a bare
+  // pattern/value that resolves INSIDE the worktree (e.g. the regex in `grep foo file`) is allowed;
+  // only operands that escape the managed workspace are refused.
   const READ_ONLY_TOOLS = new Set(["head", "tail", "wc", "grep", "find", "ls"]);
   if (READ_ONLY_TOOLS.has(binary)) {
-    for (const arg of rest) {
-      if (arg.startsWith("/") && !arg.startsWith(worktreeDir) && arg !== "/dev/null") {
-        return `DENIED: path '${arg}' is outside the worktree — read tools are confined to the worktree`;
-      }
+    const escape = firstEscapingOperand(worktreeDir, rest);
+    if (escape !== undefined) {
+      return `DENIED: path '${escape}' escapes the managed workspace — read tools are confined to the worktree`;
     }
   }
   const policyDeny = commandPolicyDenyReason(binary, rest, `builder terminal: ${command.slice(0, 120)}`);

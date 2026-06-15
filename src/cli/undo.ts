@@ -18,6 +18,8 @@ import type { IdentityClaim, ValidatedIdentity } from "../core/identity/index.js
 import { receipts as coreReceipts } from "../core/receipt/index.js";
 import type { Receipt, ReceiptInput, ReceiptQuery } from "../core/receipt/index.js";
 import type { AgentIdentity } from "../core/identity/contract.js";
+import { workspaces as coreWorkspaces } from "../core/workspace/index.js";
+import type { WorkspaceRecord } from "../core/workspace/contract.js";
 import { isWorktreeClean as gitIsClean, revParse as gitRevParse, syncWorktreeToRef as gitSync, updateRefCas as gitCas, worktreeForBranch as gitWtForBranch } from "../core/workspace/git.js";
 
 /** The git surface undo drives (injectable for tests; defaults to the real worktree git). */
@@ -37,6 +39,26 @@ export interface UndoCliDeps {
   readonly stdout?: (s: string) => void;
   readonly stderr?: (s: string) => void;
   readonly setExit?: (code: number) => void;
+  /**
+   * The durable workspace registry — undo's RECOVERY source when the normal promote receipt is
+   * missing (PROMOTED_BUT_RECEIPT_FAILED). A landed promote always writes a `promoted` record with
+   * `promoteIntent.beforeRef` + `promotedTo`, so undo can revert even if the receipt append failed.
+   */
+  readonly workspaces?: { list(): Promise<WorkspaceRecord[]> };
+}
+
+/** A revertible promote resolved from EITHER a receipt or the durable workspace registry record. */
+interface Revertible {
+  readonly repo: string;
+  readonly branch: string;
+  readonly beforeRef: string;
+  readonly afterRef: string;
+  /** Receipt id to mark `corrects` on the undo receipt (when sourced from a receipt). */
+  readonly correctsReceiptId?: string;
+  readonly requestId?: string;
+  readonly project?: string;
+  /** Where the revert was resolved from — for the operator-facing message. */
+  readonly source: "receipt" | "registry";
 }
 
 const defaultGit: UndoGit = {
@@ -57,6 +79,7 @@ const short = (sha: string): string => sha.slice(0, 8);
 /** Build the `undo` handler. Defaults wire the live receipt store + real git. */
 export function createUndoCli(deps: UndoCliDeps = {}) {
   const receipts = deps.receipts ?? coreReceipts;
+  const workspaces = deps.workspaces ?? coreWorkspaces;
   const git = deps.git ?? defaultGit;
   const resolveIdentity = deps.resolveIdentity ?? coreResolveIdentity;
   const operatorToken = "operatorToken" in deps ? deps.operatorToken : config.identity.operatorToken;
@@ -88,34 +111,29 @@ export function createUndoCli(deps: UndoCliDeps = {}) {
     }
     const identity = operator();
     if (identity === undefined) return;
-    let all: Receipt[];
-    try {
-      all = await receipts.query();
-    } catch (e) {
-      err(`ikbi undo: could not read the receipt log: ${e instanceof Error ? e.message : String(e)}\n`);
+
+    // RESOLVE the revertible promote — from a receipt if one exists, else FALL BACK to the durable
+    // workspace registry record (PROMOTED_BUT_RECEIPT_FAILED recovery). A receipt-log read failure is
+    // NOT fatal: undo can still recover from the registry, so we try the registry before giving up.
+    let receiptReadError: string | undefined;
+    let revertible = await resolveFromReceipt(idArg).catch((e: unknown) => {
+      receiptReadError = e instanceof Error ? e.message : String(e);
+      return undefined;
+    });
+    if (revertible === undefined) {
+      revertible = await resolveFromRegistry(idArg).catch(() => undefined);
+    }
+    if (revertible === undefined) {
+      if (receiptReadError !== undefined) {
+        err(`ikbi undo: could not read the receipt log (${receiptReadError}) and no durable promote record matched "${idArg}"\n`);
+      } else {
+        err(`ikbi undo: no revertible promote found for "${idArg}" (a receipt id, a promoted commit sha, or a workspace id)\n`);
+      }
       setExit(1);
       return;
     }
-    // Match by receipt id first, else by the promoted (after) commit it landed.
-    const target =
-      all.find((r) => r.id === idArg && stateChange(r) !== undefined) ??
-      all.find((r) => stateChange(r)?.after?.ref === idArg);
-    if (target === undefined) {
-      err(`ikbi undo: no revertible promote found for "${idArg}" (a receipt id or a promoted commit sha)\n`);
-      setExit(1);
-      return;
-    }
-    const ch = stateChange(target)!;
-    const beforeRef = ch.before!.ref as string;
-    const afterRef = ch.after!.ref as string;
-    const hashIdx = ch.target.lastIndexOf("#");
-    const repo = ch.target.slice(0, hashIdx);
-    const branch = ch.target.slice(hashIdx + 1);
-    if (repo.length === 0 || branch.length === 0) {
-      err(`ikbi undo: receipt ${target.id} has a malformed change target ("${ch.target}")\n`);
-      setExit(1);
-      return;
-    }
+    const { repo, branch, beforeRef, afterRef } = revertible;
+    const targetSpec = `${repo}#${branch}`;
 
     // The branch must still be AT the promoted commit — otherwise it moved on and a blind
     // reset would drop later work. Fail-closed (refuse) rather than clobber.
@@ -153,15 +171,74 @@ export function createUndoCli(deps: UndoCliDeps = {}) {
       {
         operation: "workspace.undo",
         outcome: { status: "success", detail: `reverted ${branch} ${short(afterRef)} → ${short(beforeRef)}` },
-        changes: [{ kind: "state", target: ch.target, before: { ref: afterRef }, after: { ref: beforeRef }, inverse: { operation: "git.update-ref", args: { ref: `refs/heads/${branch}`, to: afterRef } } }],
-        corrects: target.id,
-        ...(target.requestId !== undefined ? { requestId: target.requestId } : {}),
-        ...(target.project !== undefined ? { project: target.project } : {}),
+        changes: [{ kind: "state", target: targetSpec, before: { ref: afterRef }, after: { ref: beforeRef }, inverse: { operation: "git.update-ref", args: { ref: `refs/heads/${branch}`, to: afterRef } } }],
+        ...(revertible.correctsReceiptId !== undefined ? { corrects: revertible.correctsReceiptId } : {}),
+        ...(revertible.requestId !== undefined ? { requestId: revertible.requestId } : {}),
+        ...(revertible.project !== undefined ? { project: revertible.project } : {}),
       },
       identity,
     ).catch((e: unknown) => err(`ikbi undo: revert landed but recording the undo receipt failed: ${e instanceof Error ? e.message : String(e)}\n`));
 
-    out(`undone: "${branch}" reset ${short(afterRef)} → ${short(beforeRef)} (reverting receipt ${target.id})\n`);
+    const via = revertible.source === "registry" ? "durable promote record (receipt was missing — PROMOTED_BUT_RECEIPT_FAILED recovery)" : `receipt ${revertible.correctsReceiptId}`;
+    out(`undone: "${branch}" reset ${short(afterRef)} → ${short(beforeRef)} (reverting ${via})\n`);
+  }
+
+  /** Resolve a revertible promote from the receipt log (by receipt id, else by promoted commit). */
+  async function resolveFromReceipt(idArg: string): Promise<Revertible | undefined> {
+    const all = await receipts.query();
+    const target =
+      all.find((r) => r.id === idArg && stateChange(r) !== undefined) ??
+      all.find((r) => stateChange(r)?.after?.ref === idArg);
+    if (target === undefined) return undefined;
+    const ch = stateChange(target)!;
+    const hashIdx = ch.target.lastIndexOf("#");
+    const repo = ch.target.slice(0, hashIdx);
+    const branch = ch.target.slice(hashIdx + 1);
+    if (repo.length === 0 || branch.length === 0) return undefined;
+    return {
+      repo,
+      branch,
+      beforeRef: ch.before!.ref as string,
+      afterRef: ch.after!.ref as string,
+      correctsReceiptId: target.id,
+      ...(target.requestId !== undefined ? { requestId: target.requestId } : {}),
+      ...(target.project !== undefined ? { project: target.project } : {}),
+      source: "receipt",
+    };
+  }
+
+  /**
+   * Resolve a revertible promote from the DURABLE workspace registry — the recovery path when the
+   * normal promote receipt never landed. Matches a `promoted` record by its promoted commit
+   * (`promotedTo`/intent afterRef) or by workspace id, and reconstructs the revert from the durable
+   * before/after refs the manager wrote BEFORE moving the branch.
+   */
+  async function resolveFromRegistry(idArg: string): Promise<Revertible | undefined> {
+    let records: WorkspaceRecord[];
+    try {
+      records = await workspaces.list();
+    } catch {
+      return undefined;
+    }
+    const candidates = records.filter((r) => r.state === "promoted");
+    const pick = (r: WorkspaceRecord): { before: string; after: string } | undefined => {
+      const after = r.promotedTo ?? r.promoteIntent?.afterRef;
+      const before = r.promoteIntent?.beforeRef;
+      return after !== undefined && before !== undefined ? { before, after } : undefined;
+    };
+    // Prefer an exact workspace-id match, else match by the promoted commit.
+    const byId = candidates.find((r) => r.id === idArg && pick(r) !== undefined);
+    const byCommit = candidates.find((r) => pick(r)?.after === idArg);
+    const rec = byId ?? byCommit;
+    if (rec === undefined) return undefined;
+    const refs = pick(rec)!;
+    return {
+      repo: rec.targetRepo,
+      branch: rec.baseBranch,
+      beforeRef: refs.before,
+      afterRef: refs.after,
+      source: "registry",
+    };
   }
 
   return { undo };

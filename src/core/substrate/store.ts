@@ -104,6 +104,8 @@ export async function readModifyWrite<T>(
 
 const DEFAULT_ID_PATTERN = /^[A-Za-z0-9._-]{1,200}$/;
 const DOC_EXT = ".json";
+/** Short lock budget for tolerant read-only reads before falling back to a lockless read. */
+const READ_TOLERANT_LOCK_TIMEOUT_MS = 750;
 
 export interface DocumentStoreOptions {
   readonly dir: string;
@@ -151,6 +153,35 @@ export class DocumentStore<T> {
   async get(id: string): Promise<T | undefined> {
     const path = this.pathFor(id);
     return this.locks.withLock(path, () => readJsonFile<T>(path, this.corruptPolicy, this.log, this.now), this.acquireOpts(path));
+  }
+
+  /**
+   * READ-ONLY tolerant read for status/inspection commands (Codex blocker 2). A document write is an
+   * atomic rename, so a reader can never observe a torn file — the cross-process lock on a READ only
+   * serializes against a writer that is mid-RMW. So under a LIVE cross-process lock (a running build
+   * holding the registry) a read-only CLI must NOT hang for the full timeout and then crash with a raw
+   * lock-acquisition error: it tries the lock with a SHORT timeout and, on contention, falls back to a
+   * direct lockless read (still atomic-safe). Stale locks are recovered by the lock layer as usual.
+   * Non-cross-process stores behave exactly like `get`.
+   */
+  async getTolerant(id: string): Promise<T | undefined> {
+    const path = this.pathFor(id);
+    if (!this.crossProcess) return this.get(id);
+    try {
+      return await this.locks.withLock(
+        path,
+        () => readJsonFile<T>(path, this.corruptPolicy, this.log, this.now),
+        { file: `${path}.lock`, timeoutMs: READ_TOLERANT_LOCK_TIMEOUT_MS },
+      );
+    } catch (err) {
+      if (err instanceof SubstrateError && err.kind === "lock_timeout") {
+        // A LIVE writer holds the lock — degrade to a lockless read rather than crashing. The
+        // atomic-rename write guarantees we still see a whole (old-or-new) document, never a torn one.
+        this.log.warn({ event: "read_tolerant_lockless_fallback", path }, "read-only access fell back to a lockless read under a live lock");
+        return readJsonFile<T>(path, this.corruptPolicy, this.log, this.now);
+      }
+      throw err;
+    }
   }
 
   /** True if a document exists (does not validate its contents). */

@@ -312,18 +312,38 @@ export class WorkspaceManager {
         await this.store.put(handle.id, promoted);
         this.live.delete(handle.id);
 
-        const result: PromoteResult = { promoted: true, workspaceId: handle.id, targetBranch: handle.baseBranch, beforeRef: targetHead, afterRef, ...(mergeCommit !== undefined ? { mergeCommit } : {}), strategy };
-        await this.recordPromoteReceipt(handle.identity, handle.targetRepo, handle.baseBranch, handle.id, targetHead, afterRef, strategy);
+        // Record the normal promote RECEIPT. The branch has already moved (the durable record above is
+        // the landing proof), so a receipt failure here MUST NOT be swallowed: surface
+        // PROMOTED_BUT_RECEIPT_FAILED and stamp the durable record so status/ls/undo can see the
+        // degraded state and still recover from this record's before/after refs.
+        const receiptStatus = await this.recordPromoteReceiptDurable(handle.identity, handle.targetRepo, handle.baseBranch, handle.id, targetHead, afterRef, strategy);
+        // The single terminal record carried through cleanup, so the stamp is never overwritten.
+        let landedRecord: WorkspaceRecord = promoted;
+        if (receiptStatus !== undefined) {
+          landedRecord =
+            receiptStatus === "failed"
+              ? { ...promoted, receiptStatus, note: `PROMOTED_BUT_RECEIPT_FAILED: target moved ${targetHead}→${afterRef} but the promote receipt did not append — recover/undo via this durable record (\`ikbi undo ${afterRef}\`)` }
+              : { ...promoted, receiptStatus };
+          await this.store.put(handle.id, landedRecord).catch((e) =>
+            this.log.error({ err: e instanceof Error ? e.message : String(e), workspaceId: handle.id }, "failed to stamp promote receiptStatus on the durable record"),
+          );
+          if (receiptStatus === "failed") {
+            this.log.error({ event: "workspace_promote_receipt_failed", workspaceId: handle.id, beforeRef: targetHead, afterRef }, "PROMOTED_BUT_RECEIPT_FAILED: the target ref moved but the promote receipt append failed");
+          }
+        }
+
+        const result: PromoteResult = { promoted: true, workspaceId: handle.id, targetBranch: handle.baseBranch, beforeRef: targetHead, afterRef, ...(mergeCommit !== undefined ? { mergeCommit } : {}), strategy, ...(receiptStatus !== undefined ? { receiptStatus } : {}) };
         this.events?.publish(
           WorkspaceEvents.promoted.create({ workspaceId: handle.id, targetBranch: handle.baseBranch, strategy, beforeRef: targetHead, afterRef }, { source: "workspace", attribution: { identity: handle.identity } }),
         );
-        this.log.info({ event: "workspace_promoted", workspaceId: handle.id, strategy, beforeRef: targetHead, afterRef, targetBranch: handle.baseBranch }, "workspace promoted");
+        this.log.info({ event: "workspace_promoted", workspaceId: handle.id, strategy, beforeRef: targetHead, afterRef, targetBranch: handle.baseBranch, receiptStatus }, "workspace promoted");
 
         // SG-7: the source worktree DIRECTORY is no longer needed once promoted — free the disk
         // (best-effort; never undoes the landed promote). The scratch BRANCH is intentionally
         // KEPT so a post-build `ikbi diff <id>` can still compute base..scratch; `ikbi clean` /
-        // reclaim removes the now-orphan branch later. The promoted record stays terminal.
-        await this.removeWorktreeDir(promoted).catch((e) =>
+        // reclaim removes the now-orphan branch later. The promoted record stays terminal — and
+        // KEEPS its receiptStatus stamp (removeWorktreeDir re-persists THIS record, not the pre-stamp one).
+        await this.removeWorktreeDir(landedRecord).catch((e) =>
           this.log.warn({ err: e instanceof Error ? e.message : String(e), workspaceId: handle.id }, "post-promote worktree cleanup failed (non-fatal)"),
         );
         return result;
@@ -463,14 +483,17 @@ export class WorkspaceManager {
   }
 
   async get(id: string): Promise<WorkspaceRecord | undefined> {
-    return this.store.get(id);
+    // Read-only access (CLI `diff`/`discard`-probe/`undo` recovery/build summary): degrade cleanly
+    // under a live cross-process lock instead of crashing with a raw lock-acquisition error.
+    return this.store.getTolerant(id);
   }
 
   /** All persisted workspace records (for `ikbi workspace ls`). Unreadable docs are skipped. */
   async list(): Promise<WorkspaceRecord[]> {
     const out: WorkspaceRecord[] = [];
     for (const id of await this.store.list()) {
-      const rec = await this.store.get(id).catch(() => undefined);
+      // Tolerant read so `ikbi workspace ls` (read-only) never crashes on a live registry lock.
+      const rec = await this.store.getTolerant(id).catch(() => undefined);
       if (rec !== undefined) out.push(rec);
     }
     return out;
@@ -641,7 +664,14 @@ export class WorkspaceManager {
       const promoted: WorkspaceRecord = { ...rec, state: "promoted", promotedTo: intent.afterRef, updatedAt: this.now(), note: "reconciled: promote landed" };
       await this.store.put(rec.id, promoted);
       this.live.delete(rec.id);
-      await this.recordPromoteReceipt(rec.identity, rec.targetRepo, rec.baseBranch, rec.id, intent.beforeRef, intent.afterRef, "merge");
+      // A reconciled landing still records its receipt; a receipt failure here is the same
+      // PROMOTED_BUT_RECEIPT_FAILED degraded state (the durable record stays the recovery source).
+      const receiptStatus = await this.recordPromoteReceiptDurable(rec.identity, rec.targetRepo, rec.baseBranch, rec.id, intent.beforeRef, intent.afterRef, "merge");
+      if (receiptStatus === "failed") {
+        await this.store.put(rec.id, { ...promoted, receiptStatus, note: `${promoted.note}; PROMOTED_BUT_RECEIPT_FAILED on reconcile` }).catch(() => undefined);
+      } else if (receiptStatus === "recorded") {
+        await this.store.put(rec.id, { ...promoted, receiptStatus }).catch(() => undefined);
+      }
       this.events?.publish(WorkspaceEvents.promoted.create({ workspaceId: rec.id, targetBranch: rec.baseBranch, strategy: "reconciled", beforeRef: intent.beforeRef, afterRef: intent.afterRef }, { source: "workspace", attribution: { identity: rec.identity } }));
       this.log.warn({ event: "workspace_promote_reconciled", workspaceId: rec.id, afterRef: intent.afterRef }, "reconciled a crashed promote that had landed");
     } else {
@@ -652,7 +682,13 @@ export class WorkspaceManager {
     }
   }
 
-  private async recordPromoteReceipt(
+  /**
+   * Append the durable promote RECEIPT. Returns "recorded" on success, "failed" if the append threw
+   * (the caller surfaces PROMOTED_BUT_RECEIPT_FAILED and stamps the registry record), or `undefined`
+   * when no receipt sink is wired (nothing to record — not a failure). NEVER throws (a receipt
+   * failure must not unwind a landed promote) and NEVER silently swallows: a failure is returned.
+   */
+  private async recordPromoteReceiptDurable(
     identity: AgentIdentity,
     targetRepo: string,
     baseBranch: string,
@@ -660,10 +696,10 @@ export class WorkspaceManager {
     beforeRef: string,
     afterRef: string,
     strategy: string,
-  ): Promise<void> {
-    if (this.receipts === undefined) return;
-    await this.receipts
-      .append(
+  ): Promise<"recorded" | "failed" | undefined> {
+    if (this.receipts === undefined) return undefined;
+    try {
+      await this.receipts.append(
         {
           operation: "workspace.promote",
           outcome: { status: "success", detail: strategy },
@@ -680,7 +716,11 @@ export class WorkspaceManager {
           metadata: { workspaceId, strategy, contractVersion: WORKSPACE_CONTRACT_VERSION },
         },
         identity,
-      )
-      .catch((err: unknown) => this.log.error({ err, workspaceId }, "failed to record promote receipt"));
+      );
+      return "recorded";
+    } catch (err) {
+      this.log.error({ err, workspaceId }, "failed to record promote receipt (PROMOTED_BUT_RECEIPT_FAILED)");
+      return "failed";
+    }
   }
 }

@@ -16,6 +16,8 @@ import { execFileSync } from "node:child_process";
 
 import type { OperationContext } from "../../core/identity/index.js";
 import type { AgentIdentity } from "../../core/provider/contract.js";
+import { autonomyForTier } from "../../core/trust/contract.js";
+import { asTier, TRUST_FLOOR } from "../../core/trust/index.js";
 import {
   workspaces,
   type DiscardResult,
@@ -23,8 +25,9 @@ import {
   type WorkspaceHandle,
   type WorkspaceRecord,
 } from "../../core/workspace/index.js";
+import { gateWall as coreGateWall, type GateWall } from "../gate-wall/index.js";
 import { resolveChecks } from "../worker-model/checks.js";
-import type { RoleContext, RoleFn, RoleResult } from "../worker-model/contract.js";
+import type { RoleContext, RoleFn, RoleResult, WorkerTask } from "../worker-model/contract.js";
 import { resolveVerificationMode } from "../worker-model/modes.js";
 import { createVerifier } from "../worker-model/verifier.js";
 import type { ApplyVerification, SessionWorkspace } from "./session.js";
@@ -115,6 +118,8 @@ class ManagedWorkspace implements SessionWorkspace {
     private readonly sessionId: string,
     /** Injectable verifier (tests). Default: the production-equivalent ladder verifier. */
     private readonly verifierOverride?: RoleFn,
+    /** Injectable gate-wall (tests). Default: the live, fail-closed gate-wall the build path uses. */
+    private readonly gateWall: GateWall = coreGateWall,
   ) {}
 
   get id(): string {
@@ -139,13 +144,31 @@ class ManagedWorkspace implements SessionWorkspace {
   commit(message: string): Promise<boolean> {
     return this.mgr.commit(this.handle, message);
   }
-  promote(message: string): Promise<PromoteResult> {
-    // OPERATOR-AUTHORIZED promote: the operator explicitly typed `/apply`, so they are both the
-    // evaluator and the governance authority. This is the operator's own decision in an interactive
-    // session — it does NOT route through the build path's gate-wall (build governance is unchanged).
+  async promote(message: string): Promise<PromoteResult> {
+    // GOVERNED promote (Codex blocker 3): the operator explicitly typed `/apply` (operator
+    // intent + evaluation), but the promotion ROUTES THROUGH THE SAME gate-wall decision path
+    // production build uses — no alternate UI path is weaker than build. The gate produces a
+    // durable decision receipt (allow OR deny); a DENY blocks the promote (nothing lands).
+    const identity = chatIdentity(this.sessionId);
+    const grant = autonomyForTier(asTier(identity.trustTier ?? TRUST_FLOOR, TRUST_FLOOR));
+    const task: WorkerTask = { taskId: `repl-apply-${this.handle.id}`, targetRepo: this.handle.targetRepo, goal: message };
+    const governance = await this.gateWall.evaluate({ grant, action: { kind: "promote", task, results: [] }, identity });
+    if (!governance.allow) {
+      // Fail-closed: the gate-wall denied. It already recorded the deny decision receipt; do not
+      // promote (the workspace manager would also refuse a non-allow governance).
+      return {
+        promoted: false,
+        workspaceId: this.handle.id,
+        targetBranch: this.handle.baseBranch,
+        beforeRef: this.handle.baseRef,
+        strategy: "noop",
+        reason: `gate-wall denied promotion: ${governance.reason ?? "no reason given"}`,
+      };
+    }
     return this.mgr.promote(this.handle, {
+      // The operator typed `/apply` → evaluation approved; governance is the REAL gate verdict.
       evaluation: { approved: true, evaluatorId: "repl-operator", reason: "operator invoked /apply" },
-      governance: { allow: true, gateId: "repl-operator", reason: "operator invoked /apply" },
+      governance,
       message,
     });
   }
@@ -207,14 +230,14 @@ export function resolveRepoTarget(cwd: string): string | undefined {
 }
 
 /** Allocate a managed workspace off `targetRepo` and return it as a `SessionWorkspace`. */
-export async function allocateSessionWorkspace(opts: { targetRepo: string; sessionId: string; label?: string; manager?: WorkspaceManagerLike; verifier?: RoleFn }): Promise<SessionWorkspace> {
+export async function allocateSessionWorkspace(opts: { targetRepo: string; sessionId: string; label?: string; manager?: WorkspaceManagerLike; verifier?: RoleFn; gateWall?: GateWall }): Promise<SessionWorkspace> {
   const mgr = opts.manager ?? workspaces;
   const handle = await mgr.allocate({
     targetRepo: opts.targetRepo,
     identity: chatIdentity(opts.sessionId),
     ...(opts.label !== undefined ? { label: opts.label } : {}),
   });
-  return new ManagedWorkspace(handle, mgr, opts.sessionId, opts.verifier);
+  return new ManagedWorkspace(handle, mgr, opts.sessionId, opts.verifier, opts.gateWall ?? coreGateWall);
 }
 
 /**
@@ -222,9 +245,9 @@ export async function allocateSessionWorkspace(opts: { targetRepo: string; sessi
  * undefined when the workspace is gone or no longer in an editable `allocated` state (promoted /
  * discarded / failed) — the caller then discloses that the managed lifecycle is unavailable.
  */
-export async function reconnectSessionWorkspace(workspaceId: string, opts: { manager?: WorkspaceManagerLike; sessionId?: string; verifier?: RoleFn } = {}): Promise<SessionWorkspace | undefined> {
+export async function reconnectSessionWorkspace(workspaceId: string, opts: { manager?: WorkspaceManagerLike; sessionId?: string; verifier?: RoleFn; gateWall?: GateWall } = {}): Promise<SessionWorkspace | undefined> {
   const mgr = opts.manager ?? workspaces;
   const rec = await mgr.get(workspaceId);
   if (rec === undefined || rec.state !== "allocated") return undefined;
-  return new ManagedWorkspace(rec, mgr, opts.sessionId ?? workspaceId, opts.verifier);
+  return new ManagedWorkspace(rec, mgr, opts.sessionId ?? workspaceId, opts.verifier, opts.gateWall ?? coreGateWall);
 }

@@ -14,14 +14,20 @@ import { test } from "node:test";
 const ENTRY = fileURLToPath(new URL("../../dist/cli/index.js", import.meta.url));
 const freshCwd = () => mkdtempSync(join(tmpdir(), "ikbi-smoke-"));
 
-/** Run the built CLI in a clean env (only PATH+HOME) from a cwd with no .env. */
-function runCli(args: string[]): { status: number | null; stdout: string; stderr: string; combined: string } {
+/**
+ * Run the built CLI in a clean env (no IKBI_* keys) from a cwd with no .env, with an ISOLATED HOME so
+ * the default state root (`<HOME>/.ikbi/state`) is a fresh temp dir per run — the smoke suite never
+ * depends on, or contends with, the user's real `~/.ikbi/state` (Codex blocker 2). An optional
+ * `extraEnv` injects per-test overrides (e.g. a tiny lock timeout for the live-lock scenario).
+ */
+function runCli(args: string[], extraEnv: Record<string, string> = {}): { status: number | null; stdout: string; stderr: string; combined: string; home: string } {
+  const home = mkdtempSync(join(tmpdir(), "ikbi-smoke-home-"));
   const res = spawnSync(process.execPath, [ENTRY, ...args], {
     cwd: freshCwd(),
-    env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" },
+    env: { PATH: process.env.PATH ?? "", HOME: home, ...extraEnv },
     encoding: "utf8",
   });
-  return { status: res.status, stdout: res.stdout, stderr: res.stderr, combined: `${res.stdout}\n${res.stderr}` };
+  return { status: res.status, stdout: res.stdout, stderr: res.stderr, combined: `${res.stdout}\n${res.stderr}`, home };
 }
 const noStack = (s: string): boolean => !/\n\s+at\s+\S/.test(s);
 

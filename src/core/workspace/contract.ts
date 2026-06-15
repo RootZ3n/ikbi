@@ -89,6 +89,13 @@ export interface WorkspaceRecord extends WorkspaceHandle {
   readonly promoteIntent?: { readonly beforeRef: string; readonly afterRef: string; readonly mergeCommit?: string };
   /** Set when the worktree of an already-promoted workspace was cleaned up. */
   readonly cleanedAt?: number;
+  /**
+   * Durability of the promote's normal RECEIPT (separate from this registry record, which is the
+   * landing proof). "recorded" = the promote receipt appended; "failed" = the branch MOVED but the
+   * receipt append failed afterwards (PROMOTED_BUT_RECEIPT_FAILED). When "failed", `ikbi undo` still
+   * recovers from THIS record's `promoteIntent.beforeRef` / `promotedTo`. Searchable in status/ls.
+   */
+  readonly receiptStatus?: "recorded" | "failed";
   readonly note?: string;
 }
 
@@ -145,6 +152,14 @@ export interface PromoteResult {
   readonly strategy?: PromoteStrategy;
   /** Files with merge conflicts (present when NOT promoted due to conflict). */
   readonly conflicts?: readonly string[];
+  /**
+   * Durability of the promote RECEIPT when `promoted` is true. "recorded" = the durable promote
+   * receipt landed; "failed" = PROMOTED_BUT_RECEIPT_FAILED — the target ref MOVED but the receipt
+   * append failed. A "failed" promote is NOT a clean success: the landing is real (recoverable from
+   * the durable workspace registry record / `ikbi undo`), but the normal audit receipt is missing.
+   * Absent when no receipt sink is wired (nothing to record).
+   */
+  readonly receiptStatus?: "recorded" | "failed";
   readonly reason?: string;
 }
 

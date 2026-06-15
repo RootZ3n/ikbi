@@ -11,7 +11,7 @@
  * Read-only: the checks (`tsc --noEmit`, `test`) do not mutate the workspace.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 import type { ExecResult } from "../governed-exec/index.js";
@@ -35,15 +35,76 @@ const NPM_CHECKS: readonly Check[] = [
   { name: "test", command: "npm", args: ["test"] },
 ];
 
+/** Rust (Cargo) native checks. `cargo`/`go`/`python3` are NOT default-allowlisted in governed-exec —
+ *  an un-allowlisted binary returns a fail-closed RED with the actionable "add X to the allowlist"
+ *  note (mapExec), never a vacuous pass; allowlisting them runs the real native suite. */
+const RUST_CHECKS: readonly Check[] = [
+  { name: "check", command: "cargo", args: ["check"] },
+  { name: "test", command: "cargo", args: ["test"] },
+];
+
+/** Go native checks. */
+const GO_CHECKS: readonly Check[] = [
+  { name: "build", command: "go", args: ["build", "./..."] },
+  { name: "test", command: "go", args: ["test", "./..."] },
+];
+
+/** Python native checks (pytest) — only emitted when a pytest signal is detected (else fail closed). */
+const PYTHON_PYTEST_CHECKS: readonly Check[] = [{ name: "test", command: "python3", args: ["-m", "pytest", "-q"] }];
+
+/** True iff a file under `root` exists. */
+function rootHas(root: string, file: string): boolean {
+  return existsSync(join(root, file));
+}
+
 /**
- * Detect the package manager from lockfiles in the project root and return
- * the matching check set. Defaults to pnpm when ambiguous.
+ * Resolve a NON-JS Python project's checks. Prefer pytest when a clear signal exists (a
+ * pytest/tox config file, or a pyproject/setup.cfg that mentions pytest); otherwise FAIL CLOSED with
+ * guidance to set IKBI_CHECKS rather than inventing a runner that might silently pass nothing.
  */
-function detectChecksForProject(projectRoot: string): readonly Check[] {
-  const hasPnpmLock = existsSync(join(projectRoot, "pnpm-lock.yaml"));
-  const hasNpmLock = existsSync(join(projectRoot, "package-lock.json"));
-  if (hasNpmLock && !hasPnpmLock) return NPM_CHECKS;
-  return VERIFIER_CHECKS;
+function detectPythonChecks(projectRoot: string): ChecksResolution {
+  let pytestSignal = rootHas(projectRoot, "pytest.ini") || rootHas(projectRoot, "tox.ini");
+  for (const cfg of ["pyproject.toml", "setup.cfg"]) {
+    if (pytestSignal) break;
+    try {
+      if (/pytest/i.test(readFileSync(join(projectRoot, cfg), "utf8"))) pytestSignal = true;
+    } catch {
+      /* file absent/unreadable — no signal from it */
+    }
+  }
+  if (pytestSignal) return { ok: true, checks: PYTHON_PYTEST_CHECKS, source: "default" };
+  return {
+    ok: false,
+    reason:
+      `Python project at ${projectRoot} has no detectable test runner (no pytest/tox config) — refusing to invent checks. ` +
+      `Set IKBI_CHECKS to declare them, e.g. IKBI_CHECKS='[{"name":"test","command":"python3","args":["-m","pytest"]}]' (RED until configured).`,
+  };
+}
+
+/**
+ * Detect the language-native check set from the manifests in the project root. JS/TS keeps its exact
+ * prior behavior (pnpm default, npm when only package-lock.json is present). Rust/Go get native
+ * cargo/go checks; Python gets pytest when detectable, else fails closed. An unrecognized manifest
+ * (e.g. Deno) FAILS CLOSED with guidance — ikbi never silently runs pnpm/tsc against a non-JS repo.
+ */
+function detectChecksForProject(projectRoot: string): ChecksResolution {
+  // JS/TS — package.json (or a pnpm workspace root) is the strongest signal. Preserve prior behavior.
+  if (rootHas(projectRoot, "package.json") || rootHas(projectRoot, "pnpm-workspace.yaml")) {
+    const hasPnpmLock = rootHas(projectRoot, "pnpm-lock.yaml");
+    const hasNpmLock = rootHas(projectRoot, "package-lock.json");
+    return { ok: true, checks: hasNpmLock && !hasPnpmLock ? NPM_CHECKS : VERIFIER_CHECKS, source: "default" };
+  }
+  if (rootHas(projectRoot, "Cargo.toml")) return { ok: true, checks: RUST_CHECKS, source: "default" };
+  if (rootHas(projectRoot, "go.mod")) return { ok: true, checks: GO_CHECKS, source: "default" };
+  if (rootHas(projectRoot, "pyproject.toml") || rootHas(projectRoot, "setup.py") || rootHas(projectRoot, "setup.cfg")) {
+    return detectPythonChecks(projectRoot);
+  }
+  return {
+    ok: false,
+    reason:
+      `project root ${projectRoot} has a manifest but no recognized JS/Rust/Go/Python check set — ` +
+      `set IKBI_CHECKS to declare the checks (RED until configured; ikbi will not run irrelevant pnpm/tsc here).`,
+  };
 }
 
 /**
@@ -136,7 +197,9 @@ export function resolveChecks(worktreeReal: string, env: NodeJS.ProcessEnv = pro
     return { ok: false, reason: "IKBI_CHECKS is malformed (expected a non-empty JSON array of {name,command,args}) — cannot verify (RED)" };
   }
   if (fromEnv !== undefined) return { ok: true, checks: fromEnv, source: "env" };
-  return { ok: true, checks: detectChecksForProject(wt), source: "default" };
+  // Language-native detection (JS/TS unchanged; Rust/Go native; Python pytest-or-fail-closed; any
+  // other manifest fails closed with guidance). NEVER silently runs pnpm/tsc against a non-JS repo.
+  return detectChecksForProject(wt);
 }
 
 /**
@@ -220,6 +283,12 @@ const RELEVANT_WORKTREE_EXTS: readonly string[] = [
   ".mdx",
   ".yaml",
   ".yml",
+  // Non-JS source languages — so planning/diff relevance covers Rust/Go/Python work too (a build
+  // that only touches .py/.go/.rs is no longer seen as an empty, impact-scoped "nothing changed").
+  ".py",
+  ".go",
+  ".rs",
+  ".toml",
 ];
 
 function syntheticAddedDiff(path: string): string {
