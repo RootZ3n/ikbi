@@ -39,7 +39,7 @@ import type { EventBusSurface } from "../../core/events/index.js";
 import { gateWall as coreGateWall, type GateWall } from "../gate-wall/index.js";
 import type { ExecRequest, ExecResult } from "../governed-exec/index.js";
 import { createOrchestrator } from "./orchestrator.js";
-import { WorkerError, type WorkerResult, type WorkerRole, type WorkerTask } from "./contract.js";
+import { WorkerError, validateDelegationEnvelope, type DelegationEnvelope, type WorkerResult, type WorkerRole, type WorkerTask } from "./contract.js";
 import { preBuildRefinement, formatInterview } from "../../core/goal-refinement.js";
 import { createCognitionLayer } from "../cognition-layer/cognition.js";
 import { loadRepoRegistry } from "../../core/repo-registry.js";
@@ -450,16 +450,17 @@ function detectWriteScope(goal: string): "all" | "new_only" | "none" {
 }
 
 /**
- * Parse `--repo <path>` / `--repo=<path>`, `--verbose`/`-v`, `--cost`, and `--yes`/`-y`;
- * the rest is the goal prose. `--yes` skips the interactive Socratic interview prompt and
- * proceeds with the original goal (the cognition layer still runs — it is non-blocking).
+ * Parse `--repo <path>` / `--repo=<path>`, `--verbose`/`-v`, `--cost`, `--yes`/`-y`,
+ * and `--delegation <json>`; the rest is the goal prose. `--yes` skips the interactive
+ * Socratic interview prompt and proceeds with the original goal.
  */
-export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbose?: boolean; cost?: boolean; yes?: boolean; rest: string[] } {
+export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbose?: boolean; cost?: boolean; yes?: boolean; delegation?: string; rest: string[] } {
   const rest: string[] = [];
   let repo: string | undefined;
   let verbose = false;
   let cost = false;
   let yes = false;
+  let delegation: string | undefined;
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i] as string;
     if (a === "--repo") {
@@ -473,11 +474,16 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
       cost = true;
     } else if (a === "--yes" || a === "-y") {
       yes = true;
+    } else if (a === "--delegation") {
+      delegation = argv[i + 1];
+      i += 1;
+    } else if (a.startsWith("--delegation=")) {
+      delegation = a.slice("--delegation=".length);
     } else {
       rest.push(a);
     }
   }
-  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), ...(verbose ? { verbose } : {}), ...(cost ? { cost } : {}), ...(yes ? { yes } : {}), rest };
+  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), ...(verbose ? { verbose } : {}), ...(cost ? { cost } : {}), ...(yes ? { yes } : {}), ...(delegation !== undefined ? { delegation } : {}), rest };
 }
 
 /** Render a worker `worker.*` progress event into a concise human line (for `--verbose`). PURE. */
@@ -678,8 +684,32 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
   const interactive = deps.interactive ?? (process.stdin.isTTY === true);
 
   async function build(argv: readonly string[]): Promise<void> {
-    const { repo, verbose, cost, yes, rest } = parseBuildArgs(argv);
-    const goal = rest.join(" ").trim();
+    const { repo, verbose, cost, yes, delegation: delegationJson, rest } = parseBuildArgs(argv);
+
+    // Parse and validate a --delegation envelope when present. The envelope overrides goal +
+    // targetRepo and stamps originAgent into the task for receipt attribution.
+    let envelope: DelegationEnvelope | undefined;
+    if (delegationJson !== undefined) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(delegationJson);
+      } catch {
+        err("ikbi: --delegation: invalid JSON\n");
+        setExit(1);
+        return;
+      }
+      envelope = parsed as DelegationEnvelope;
+      const validation = validateDelegationEnvelope(envelope);
+      if (!validation.valid) {
+        err(`ikbi: --delegation: invalid envelope: ${validation.reason}\n`);
+        setExit(1);
+        return;
+      }
+    }
+
+    // Goal: delegation envelope objective takes precedence; fall back to argv goal.
+    const rawGoal = envelope !== undefined ? envelope.objective : rest.join(" ").trim();
+    const goal = rawGoal;
     if (goal.length === 0) {
       err("ikbi: build needs a goal — usage: ikbi build <goal...> [--repo <path>]\n");
       setExit(1);
@@ -697,11 +727,13 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       return;
     }
 
-    // H1: resolve the target repo BEFORE any work. Only fall back to cwd when --repo was NOT given.
-    // An explicit --repo that does not resolve (a typo'd alias) must FAIL LOUDLY — never silently
-    // run the build against the wrong directory (cwd).
+    // H1: resolve the target repo BEFORE any work. Delegation envelope repoPath takes precedence
+    // over --repo. Only fall back to cwd when neither is given.
     let targetRepo: string;
-    if (repo === undefined || repo.length === 0) {
+    if (envelope !== undefined) {
+      // Delegation: repoPath is already validated as non-empty.
+      targetRepo = envelope.repoPath;
+    } else if (repo === undefined || repo.length === 0) {
       targetRepo = cwd();
     } else {
       const resolved = resolveRepo(repo);
@@ -779,7 +811,13 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       }
     }
 
-    const task: WorkerTask = { taskId: id, targetRepo, goal: finalGoal, writeScope: detectWriteScope(finalGoal) };
+    const task: WorkerTask = {
+      taskId: id,
+      targetRepo,
+      goal: finalGoal,
+      writeScope: detectWriteScope(finalGoal),
+      ...(envelope !== undefined ? { originAgent: envelope.originAgent } : {}),
+    };
 
     // STEP-PLANNER: decompose complex goals into atomic steps for cheap models. Production uses ONLY
     // the deterministic, zero-cost heuristic `decompose` — the model-based `decomposeWithModel`

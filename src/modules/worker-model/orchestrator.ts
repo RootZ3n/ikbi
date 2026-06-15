@@ -1749,6 +1749,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           verificationResult: verifierResult !== undefined ? verifierResult.outcome : "not_run",
           verificationMode: ranVerificationMode,
           retrievalMode: ranRetrievalMode,
+          ...(task.originAgent !== undefined ? { originAgent: task.originAgent } : {}),
         },
         project: task.targetRepo,
       },
