@@ -30,6 +30,8 @@ import { config } from "../../core/config.js";
 import { beginOperation, resolveIdentity as coreResolveIdentity } from "../../core/identity/index.js";
 import type { IdentityClaim, OperationContext, ValidatedIdentity } from "../../core/identity/index.js";
 import { workspaces as coreWorkspaces } from "../../core/workspace/index.js";
+import { receipts as coreReceipts } from "../../core/receipt/index.js";
+import type { Receipt } from "../../core/receipt/index.js";
 import type { AllocateOptions, DiscardResult, WorkspaceHandle, WorkspaceRecord } from "../../core/workspace/contract.js";
 import type { AutonomyGrant } from "../../core/trust/contract.js";
 import { events as coreEvents } from "../../core/events/index.js";
@@ -241,9 +243,16 @@ export interface DiffWorkspaceSurface {
   diff(handle: WorkspaceHandle): Promise<string>;
 }
 
+/** The receipt reader surface the diff command uses to look up verification status. */
+export interface DiffReceiptReader {
+  query(): Promise<Receipt[]>;
+}
+
 /** Injectable surfaces for the `ikbi diff` command (tests inject a fake workspace surface). */
 export interface DiffCliDeps {
   readonly workspaces?: DiffWorkspaceSurface;
+  /** Optional receipt reader — used to show verification status from the run summary receipt. */
+  readonly receipts?: DiffReceiptReader;
   readonly stdout?: (s: string) => void;
   readonly stderr?: (s: string) => void;
   readonly setExit?: (code: number) => void;
@@ -254,11 +263,43 @@ export interface DiffCliDeps {
 /** Build the `ikbi diff <workspace-id>` handler — prints the workspace diff + a change summary. */
 export function createDiffCli(deps: DiffCliDeps = {}) {
   const workspaces: DiffWorkspaceSurface = deps.workspaces ?? coreWorkspaces;
+  const receiptReader: DiffReceiptReader = deps.receipts ?? coreReceipts;
   const out = deps.stdout ?? writeStdout;
   const err = deps.stderr ?? writeStderr;
   const setExit = deps.setExit ?? ((c: number) => void (process.exitCode = c));
   // Only colorize for an interactive terminal — piped/redirected output stays clean ANSI-free.
   const colorize = deps.colorize ?? (process.stdout.isTTY === true);
+
+  /** Look up a run summary receipt for the given workspace id to find verification + promotion status. */
+  async function findRunSummary(id: string): Promise<Receipt | undefined> {
+    try {
+      const all = await receiptReader.query();
+      return all.find((r) => r.operation === "worker.run.summary" && (r.metadata as Record<string, unknown>)?.workspaceId === id);
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Format the verification result from a run summary receipt into a human-readable label. */
+  function verifiedLabel(vr: unknown): string {
+    if (vr === "success") return "yes";
+    if (vr === "not_run") return "not run";
+    if (typeof vr === "string") return `no (${vr})`;
+    return "unknown";
+  }
+
+  /** Print extra workspace status lines (promoted, verified, receipt warnings) after the header line. */
+  async function printWorkspaceExtras(id: string, rec: WorkspaceRecord): Promise<void> {
+    out(`  Promoted: ${rec.state === "promoted" ? "yes" : "no"}\n`);
+    if (rec.receiptStatus === "failed") {
+      out(`  Warning:  promote landed but receipt was not recorded (PROMOTED_BUT_RECEIPT_FAILED)\n`);
+    }
+    const summary = await findRunSummary(id);
+    if (summary !== undefined) {
+      const meta = summary.metadata as Record<string, unknown>;
+      out(`  Verified: ${verifiedLabel(meta.verificationResult)}\n`);
+    }
+  }
 
   async function diff(argv: readonly string[]): Promise<void> {
     const id = argv[0];
@@ -291,6 +332,7 @@ export function createDiffCli(deps: DiffCliDeps = {}) {
     if (text.trim().length === 0) {
       out(`workspace ${id}: no changes\n`);
       out(`State: ${WS_STATE_LABEL[rec.state] ?? rec.state}\n`);
+      await printWorkspaceExtras(id, rec);
       return;
     }
     // Colorize for terminal display only; summarizeDiff still parses the RAW text.
@@ -308,6 +350,7 @@ export function createDiffCli(deps: DiffCliDeps = {}) {
     }
     // Workspace state — promoted/discarded/retained so the operator knows the fate of these changes.
     out(`\nWorkspace ${id}: ${WS_STATE_LABEL[rec.state] ?? rec.state}\n`);
+    await printWorkspaceExtras(id, rec);
   }
 
   return { diff };
