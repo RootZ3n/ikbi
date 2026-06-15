@@ -11,7 +11,7 @@
  * Read-only: the checks (`tsc --noEmit`, `test`) do not mutate the workspace.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 import type { ExecResult } from "../governed-exec/index.js";
@@ -39,6 +39,13 @@ const NPM_CHECKS: readonly Check[] = [
 const JS_TEST_ONLY_CHECKS: readonly Check[] = [{ name: "test", command: "pnpm", args: ["test"] }];
 const NPM_TEST_ONLY_CHECKS: readonly Check[] = [{ name: "test", command: "npm", args: ["test"] }];
 
+/** yarn checks (yarn.lock detected, no pnpm/npm lockfile). */
+const YARN_CHECKS: readonly Check[] = [
+  { name: "typecheck", command: "yarn", args: ["tsc", "--noEmit"] },
+  { name: "test", command: "yarn", args: ["test"] },
+];
+const YARN_TEST_ONLY_CHECKS: readonly Check[] = [{ name: "test", command: "yarn", args: ["test"] }];
+
 /** Rust (Cargo) native checks. `cargo`/`go`/`python3` are NOT default-allowlisted in governed-exec —
  *  an un-allowlisted binary returns a fail-closed RED with the actionable "add X to the allowlist"
  *  note (mapExec), never a vacuous pass; allowlisting them runs the real native suite. */
@@ -59,6 +66,31 @@ const PYTHON_PYTEST_CHECKS: readonly Check[] = [{ name: "test", command: "python
 /** True iff a file under `root` exists. */
 function rootHas(root: string, file: string): boolean {
   return existsSync(join(root, file));
+}
+
+/** True iff `dir` contains at least one .js/.ts/.jsx/.tsx file (shallow, non-recursive). */
+function hasJsTsFiles(dir: string): boolean {
+  try {
+    return readdirSync(dir, { withFileTypes: true }).some((e) => e.isFile() && /\.[jt]sx?$/i.test(e.name));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * True iff the package.json at `root` declares a non-empty `scripts.test`. Returns
+ * true (no warning) when the file is absent/unreadable — fail-open for warnings only;
+ * also returns true for pnpm-workspace roots that may not have a root package.json test
+ * script (they delegate testing to workspace packages).
+ */
+function hasTestScript(root: string): boolean {
+  try {
+    const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { scripts?: Record<string, string> };
+    const t = pkg.scripts?.test;
+    return typeof t === "string" && t.trim().length > 0;
+  } catch {
+    return true; // fail-open: if unreadable, do not warn
+  }
 }
 
 /**
@@ -86,23 +118,62 @@ function detectPythonChecks(projectRoot: string): ChecksResolution {
 }
 
 /**
- * Detect the language-native check set from the manifests in the project root. JS/TS keeps its exact
- * prior behavior (pnpm default, npm when only package-lock.json is present). Rust/Go get native
- * cargo/go checks; Python gets pytest when detectable, else fails closed. An unrecognized manifest
- * (e.g. Deno) FAILS CLOSED with guidance — ikbi never silently runs pnpm/tsc against a non-JS repo.
+ * Detect the language-native check set from the manifests in the project root. JS/TS detects
+ * the package manager from lockfiles (pnpm > npm > yarn; bun-only fails closed; no lockfile
+ * defaults to pnpm with a warning). Rust/Go get native cargo/go checks; Python gets pytest
+ * when detectable, else fails closed. An unrecognized manifest (e.g. Deno) FAILS CLOSED with
+ * guidance — ikbi never silently runs pnpm/tsc against a non-JS repo.
  */
 function detectChecksForProject(projectRoot: string): ChecksResolution {
-  // JS/TS — package.json (or a pnpm workspace root) is the strongest signal. Preserve prior behavior.
+  // JS/TS — package.json (or a pnpm workspace root) is the strongest signal.
   if (rootHas(projectRoot, "package.json") || rootHas(projectRoot, "pnpm-workspace.yaml")) {
     const hasPnpmLock = rootHas(projectRoot, "pnpm-lock.yaml");
     const hasNpmLock = rootHas(projectRoot, "package-lock.json");
+    const hasYarnLock = rootHas(projectRoot, "yarn.lock");
+    const hasBunLock = rootHas(projectRoot, "bun.lockb");
     const hasTsconfig = rootHas(projectRoot, "tsconfig.json");
-    const useNpm = hasNpmLock && !hasPnpmLock;
-    // JS-only repos (no tsconfig.json): skip typecheck — tsc would just print help and confuse the builder.
-    if (!hasTsconfig) {
-      return { ok: true, checks: useNpm ? NPM_TEST_ONLY_CHECKS : JS_TEST_ONLY_CHECKS, source: "default" };
+
+    // Bun: fail closed only when bun.lockb is the SOLE lockfile (no supported pm fallback).
+    if (hasBunLock && !hasPnpmLock && !hasNpmLock && !hasYarnLock) {
+      return {
+        ok: false,
+        reason:
+          `JS/TS project at ${projectRoot} has only bun.lockb — bun is not a supported package manager. ` +
+          `Set IKBI_CHECKS to declare checks explicitly, or add a pnpm-lock.yaml / package-lock.json / yarn.lock (RED until configured).`,
+      };
     }
-    return { ok: true, checks: useNpm ? NPM_CHECKS : VERIFIER_CHECKS, source: "default" };
+
+    // Package manager precedence: pnpm > npm > yarn; no lockfile → pnpm default.
+    const useNpm = hasNpmLock && !hasPnpmLock;
+    const useYarn = hasYarnLock && !hasPnpmLock && !hasNpmLock;
+
+    const warnings: string[] = [];
+
+    if (!hasPnpmLock && !hasNpmLock && !hasYarnLock) {
+      warnings.push(
+        `no lockfile (pnpm-lock.yaml, package-lock.json, yarn.lock) found at ${projectRoot} — ` +
+        `defaulting to pnpm checks; add a lockfile for reproducible dependency installs`,
+      );
+    }
+
+    // Warn (not fail-closed) when package.json has no test script — the checks will still
+    // fail at runtime with a clear "Missing script: test" message.
+    if (rootHas(projectRoot, "package.json") && !hasTestScript(projectRoot)) {
+      warnings.push(
+        `package.json at ${projectRoot} has no "test" script — add scripts.test or set IKBI_CHECKS; ` +
+        `the test check will fail with "Missing script: test"`,
+      );
+    }
+
+    const warn = warnings.length > 0 ? { warning: warnings.join("; ") } : {};
+
+    // JS-only repos (no tsconfig.json): skip typecheck — tsc would just print help.
+    if (!hasTsconfig) {
+      const checks = useYarn ? YARN_TEST_ONLY_CHECKS : useNpm ? NPM_TEST_ONLY_CHECKS : JS_TEST_ONLY_CHECKS;
+      return { ok: true, checks, source: "default", ...warn };
+    }
+    const checks = useYarn ? YARN_CHECKS : useNpm ? NPM_CHECKS : VERIFIER_CHECKS;
+    return { ok: true, checks, source: "default", ...warn };
   }
   if (rootHas(projectRoot, "Cargo.toml")) return { ok: true, checks: RUST_CHECKS, source: "default" };
   if (rootHas(projectRoot, "go.mod")) return { ok: true, checks: GO_CHECKS, source: "default" };
@@ -147,7 +218,7 @@ export function resolveProjectRoot(start: string): string | undefined {
 
 /** The resolved check set, or a fail-closed RED reason when the target has no valid project root. */
 export type ChecksResolution =
-  | { readonly ok: true; readonly checks: readonly Check[]; readonly source: "default" | "env" }
+  | { readonly ok: true; readonly checks: readonly Check[]; readonly source: "default" | "env"; readonly warning?: string }
   | { readonly ok: false; readonly reason: string };
 
 /**
@@ -196,6 +267,15 @@ export function resolveChecks(worktreeReal: string, env: NodeJS.ProcessEnv = pro
   const wt = resolve(worktreeReal);
   const root = resolveProjectRoot(wt);
   if (root === undefined) {
+    // Give a more actionable message when we can detect the language without a manifest.
+    if (hasJsTsFiles(wt)) {
+      return {
+        ok: false,
+        reason:
+          `found JavaScript/TypeScript source files at ${wt} but no package.json or other recognizable project manifest — ` +
+          `add a package.json with a "test" script, or set IKBI_CHECKS (RED until configured).`,
+      };
+    }
     return { ok: false, reason: `no recognizable project manifest at or above the worktree (${wt}) — cannot verify (RED, never a vacuous pass)` };
   }
   if (root !== wt) {
