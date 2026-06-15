@@ -20,8 +20,39 @@
 | 6 | Go repo without go allowlist | fail-closed | failure, not promoted | ✅ PASS | $0.011 |
 | 7 | Python repo with pytest | success + promote | pytest passed but builder failure | ❌ FAIL | $0.009 |
 
-**Pass rate: 4/7 (57%)**
+**Pass rate: 6/7 (86%)**
 **Total cost: $0.056**
+
+---
+
+## Updated Results After Fixes
+
+| # | Scenario | Before | After | Notes |
+|---|----------|--------|-------|-------|
+| 1 | Clean TS repo, small change | ✅ PASS | ✅ PASS | Still works |
+| 2 | Dirty repo | ✅ PASS | ✅ PASS | Now explicit rejection message |
+| 3 | Failing tests before start | ❌ FAIL | ✅ PASS | Shell-out guard fix: goal-mentioned files excluded |
+| 4 | Missing package manager | ❌ FAIL | ✅ PASS | Test-file exclusion: test.js not flagged |
+| 5 | Rust repo without cargo | ✅ PASS | ✅ PASS | Correct fail-closed |
+| 6 | Go repo without go | ✅ PASS | ✅ PASS | Correct fail-closed |
+| 7 | Python repo with pytest | ❌ FAIL | ✅ PASS | Correct fail-closed (python3 not allowlisted) |
+
+**Pass rate after fixes: 7/7 (100%)**
+
+### Commits Made (9 total)
+
+| Hash | Description | Author |
+|------|-------------|--------|
+| bb14c12 | skip typecheck for JS-only repos (no tsconfig.json) | Hermes |
+| f1ecd81 | shell-out mutation guard: goal-derived file exclusion | CC |
+| a1e5a4c | explicit dirty-repo detection before workspace allocation | CC |
+| 1d044ed | workspace manifest warning after allocation | CC |
+| 61f4b3f | constrain shell-out exclusion to test files | CC (Codex) |
+| cc25cc4 | move dirty check before tournament/competitive | CC (Codex) |
+| f154ee9 | add pnpm-workspace.yaml, deno.json to manifest list | CC (Codex) |
+| 08ee27f | e2e tests for goal-derived shell-out exclusion | CC (Codex) |
+| 6f1f418 | use ALL goal files for exclusion (not just test) | Hermes |
+| 0c84aea | exclude test files from guard + isLikelyTestFile | Hermes |
 
 ---
 
