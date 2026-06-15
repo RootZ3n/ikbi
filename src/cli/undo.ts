@@ -20,7 +20,7 @@ import type { Receipt, ReceiptInput, ReceiptQuery } from "../core/receipt/index.
 import type { AgentIdentity } from "../core/identity/contract.js";
 import { workspaces as coreWorkspaces } from "../core/workspace/index.js";
 import type { WorkspaceRecord } from "../core/workspace/contract.js";
-import { isWorktreeClean as gitIsClean, revParse as gitRevParse, syncWorktreeToRef as gitSync, updateRefCas as gitCas, worktreeForBranch as gitWtForBranch } from "../core/workspace/git.js";
+import { isWorktreeClean as gitIsClean, revParse as gitRevParse, syncWorktreeToRef as gitSync, updateRefCas as gitCas, worktreeForBranch as gitWtForBranch, diffRange as gitDiffRange } from "../core/workspace/git.js";
 
 /** The git surface undo drives (injectable for tests; defaults to the real worktree git). */
 export interface UndoGit {
@@ -29,6 +29,8 @@ export interface UndoGit {
   isWorktreeClean(worktreePath: string): Promise<boolean>;
   updateRefCas(repo: string, ref: string, newSha: string, oldSha: string): Promise<void>;
   syncWorktreeToRef(worktreePath: string, ref: string): Promise<void>;
+  /** Optional: compute the diff between two refs (used for preview before revert). */
+  gitDiff?(repo: string, fromRef: string, toRef: string): Promise<string>;
 }
 
 export interface UndoCliDeps {
@@ -67,6 +69,7 @@ const defaultGit: UndoGit = {
   isWorktreeClean: gitIsClean,
   updateRefCas: gitCas,
   syncWorktreeToRef: gitSync,
+  gitDiff: (repo, from, to) => gitDiffRange(repo, from, to),
 };
 
 /** The revertible state change a promote receipt carries (kind "state", with before/after refs). */
@@ -103,37 +106,71 @@ export function createUndoCli(deps: UndoCliDeps = {}) {
   }
 
   async function undo(argv: readonly string[]): Promise<void> {
-    const idArg = argv[0];
-    if (idArg === undefined || idArg.length === 0) {
-      err("ikbi undo: a receipt id or promoted commit is required — usage: ikbi undo <receipt-id|commit>\n");
+    const useLatest = argv[0] === "--latest";
+    const idArg = useLatest ? undefined : argv[0];
+
+    if (!useLatest && (idArg === undefined || idArg.length === 0)) {
+      err("ikbi undo: a receipt id or promoted commit is required — usage: ikbi undo <receipt-id|commit|--latest>\n");
       setExit(1);
       return;
     }
+
+    // Auth check before any receipt or registry reads.
     const identity = operator();
     if (identity === undefined) return;
 
-    // RESOLVE the revertible promote — from a receipt if one exists, else FALL BACK to the durable
-    // workspace registry record (PROMOTED_BUT_RECEIPT_FAILED recovery). A receipt-log read failure is
-    // NOT fatal: undo can still recover from the registry, so we try the registry before giving up.
-    let receiptReadError: string | undefined;
-    let revertible = await resolveFromReceipt(idArg).catch((e: unknown) => {
-      receiptReadError = e instanceof Error ? e.message : String(e);
-      return undefined;
-    });
-    if (revertible === undefined) {
-      revertible = await resolveFromRegistry(idArg).catch(() => undefined);
-    }
-    if (revertible === undefined) {
-      if (receiptReadError !== undefined) {
-        err(`ikbi undo: could not read the receipt log (${receiptReadError}) and no durable promote record matched "${idArg}"\n`);
-      } else {
-        err(`ikbi undo: no revertible promote found for "${idArg}" (a receipt id, a promoted commit sha, or a workspace id)\n`);
+    let revertible: Revertible | undefined;
+
+    if (useLatest) {
+      revertible = await resolveLatest().catch(() => undefined);
+      if (revertible === undefined) {
+        err("ikbi undo: no revertible promotion found in the receipt log\n");
+        setExit(1);
+        return;
       }
-      setExit(1);
-      return;
+    } else {
+      // RESOLVE the revertible promote — from a receipt if one exists, else FALL BACK to the durable
+      // workspace registry record (PROMOTED_BUT_RECEIPT_FAILED recovery). A receipt-log read failure is
+      // NOT fatal: undo can still recover from the registry, so we try the registry before giving up.
+      let receiptReadError: string | undefined;
+      revertible = await resolveFromReceipt(idArg!).catch((e: unknown) => {
+        receiptReadError = e instanceof Error ? e.message : String(e);
+        return undefined;
+      });
+      if (revertible === undefined) {
+        revertible = await resolveFromRegistry(idArg!).catch(() => undefined);
+      }
+      if (revertible === undefined) {
+        if (receiptReadError !== undefined) {
+          err(`ikbi undo: could not read the receipt log (${receiptReadError}) and no durable promote record matched "${idArg}"\n`);
+        } else {
+          err(`ikbi undo: no revertible promote found for "${idArg}" (a receipt id, a promoted commit sha, or a workspace id)\n`);
+        }
+        setExit(1);
+        return;
+      }
     }
+
     const { repo, branch, beforeRef, afterRef } = revertible;
     const targetSpec = `${repo}#${branch}`;
+
+    // Show a preview of what will be reverted before touching anything.
+    out(`Revert preview: "${branch}" in ${repo}\n`);
+    out(`  promoted commit: ${short(afterRef)}  (will be reset to: ${short(beforeRef)})\n`);
+    if (git.gitDiff !== undefined) {
+      try {
+        const diffText = await git.gitDiff(repo, beforeRef, afterRef);
+        if (diffText.trim().length > 0) {
+          const diffLines = diffText.split("\n");
+          const truncated = diffLines.length > 50;
+          out(`\nChanges that will be undone:\n`);
+          out(diffLines.slice(0, 50).join("\n") + (truncated ? "\n... (truncated — run `git diff` for the full diff)\n" : "\n"));
+        }
+      } catch {
+        // diff preview is best-effort — a missing worktree or git error must not block the revert
+      }
+    }
+    out(`\n`);
 
     // The branch must still be AT the promoted commit — otherwise it moved on and a blind
     // reset would drop later work. Fail-closed (refuse) rather than clobber.
@@ -158,6 +195,8 @@ export function createUndoCli(deps: UndoCliDeps = {}) {
       return;
     }
 
+    out(`Safe to revert: branch is at the promoted commit${wt !== undefined ? ", worktree is clean" : ""}\n\n`);
+
     try {
       await git.updateRefCas(repo, `refs/heads/${branch}`, beforeRef, afterRef); // after → before, atomically
       if (wt !== undefined) await git.syncWorktreeToRef(wt, beforeRef); // working tree back to the prior ref
@@ -181,6 +220,31 @@ export function createUndoCli(deps: UndoCliDeps = {}) {
 
     const via = revertible.source === "registry" ? "durable promote record (receipt was missing — PROMOTED_BUT_RECEIPT_FAILED recovery)" : `receipt ${revertible.correctsReceiptId}`;
     out(`undone: "${branch}" reset ${short(afterRef)} → ${short(beforeRef)} (reverting ${via})\n`);
+  }
+
+  /** Resolve the most recent revertible promote from the receipt log (for `--latest`). */
+  async function resolveLatest(): Promise<Revertible | undefined> {
+    const all = await receipts.query();
+    const promotes = all
+      .filter((r) => r.operation === "workspace.promote" && r.outcome.status === "success" && stateChange(r) !== undefined)
+      .sort((a, b) => b.seq - a.seq);
+    const latest = promotes[0];
+    if (latest === undefined) return undefined;
+    const ch = stateChange(latest)!;
+    const hashIdx = ch.target.lastIndexOf("#");
+    const repo = ch.target.slice(0, hashIdx);
+    const branch = ch.target.slice(hashIdx + 1);
+    if (repo.length === 0 || branch.length === 0) return undefined;
+    return {
+      repo,
+      branch,
+      beforeRef: ch.before!.ref as string,
+      afterRef: ch.after!.ref as string,
+      correctsReceiptId: latest.id,
+      ...(latest.requestId !== undefined ? { requestId: latest.requestId } : {}),
+      ...(latest.project !== undefined ? { project: latest.project } : {}),
+      source: "receipt",
+    };
   }
 
   /** Resolve a revertible promote from the receipt log (by receipt id, else by promoted commit). */
@@ -246,7 +310,7 @@ export function createUndoCli(deps: UndoCliDeps = {}) {
 
 registerCommand({
   name: "undo",
-  summary: "Revert a promoted change by receipt id or promoted commit",
-  usage: "ikbi undo <receipt-id|commit>",
+  summary: "Revert a promoted change (shows preview + diff before reverting)",
+  usage: "ikbi undo <receipt-id|commit|--latest>",
   run: (argv) => createUndoCli().undo(argv),
 });

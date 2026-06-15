@@ -169,3 +169,63 @@ test("undo requires a resolved operator identity before reading or reverting", a
   assert.equal(denied.exit, 1);
   assert.match(denied.err, /operator identity resolution failed: bad credentials/);
 });
+
+// ── --latest flag ─────────────────────────────────────────────────────────────
+
+test("undo --latest undoes the most recent successful promotion", async () => {
+  const mem = memReceipts(REC());
+  const g = fakeGit();
+  const cap = capture();
+  await createUndoCli({ receipts: mem.store, git: g.git, operatorToken: "op-token", resolveIdentity: () => VALIDATED, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit }).undo(["--latest"]);
+  assert.equal(cap.exit, undefined, "--latest succeeded");
+  assert.deepEqual(g.cas, [{ ref: "refs/heads/main", newSha: "BEFORE", oldSha: "AFTER" }], "the promoted commit was reset");
+  assert.match(cap.out, /undone: "main" reset/, "success message is printed");
+  assert.equal(mem.appended.length, 1);
+  assert.equal(mem.appended[0]?.corrects, "promo-1");
+});
+
+test("undo --latest fails cleanly when there are no successful promotions", async () => {
+  const mem = memReceipts([]); // empty receipt log
+  const g = fakeGit();
+  const cap = capture();
+  await createUndoCli({ receipts: mem.store, git: g.git, operatorToken: "op-token", resolveIdentity: () => VALIDATED, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit }).undo(["--latest"]);
+  assert.equal(cap.exit, 1);
+  assert.match(cap.err, /no revertible promotion/);
+  assert.equal(g.cas.length, 0, "no ref was reset");
+});
+
+test("undo --latest picks the most recent of multiple promotions", async () => {
+  const base = promoteReceipt("/repo", "main", "BASE", "V1");
+  const older: Receipt = { ...base, id: "old-promo", seq: 0 };
+  const next: Receipt = { ...base, id: "new-promo", seq: 1, changes: [{ kind: "state", target: "/repo#main", before: { ref: "V1" }, after: { ref: "V2" }, inverse: { operation: "git.update-ref", args: { ref: "refs/heads/main", to: "V1" } } }] };
+  const mem = memReceipts([older, next]);
+  const g = fakeGit({ revParse: async () => "V2" }); // branch is at V2 (the newer promotion)
+  const cap = capture();
+  await createUndoCli({ receipts: mem.store, git: g.git, operatorToken: "op-token", resolveIdentity: () => VALIDATED, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit }).undo(["--latest"]);
+  assert.equal(cap.exit, undefined, "succeeded");
+  assert.deepEqual(g.cas, [{ ref: "refs/heads/main", newSha: "V1", oldSha: "V2" }], "reverted V2 → V1, not BASE → V1");
+  assert.equal(mem.appended[0]?.corrects, "new-promo", "corrects the newer receipt");
+});
+
+// ── preview output ────────────────────────────────────────────────────────────
+
+test("undo shows a revert preview and safety confirmation before reverting", async () => {
+  const mem = memReceipts(REC());
+  const g = fakeGit();
+  const cap = capture();
+  await createUndoCli({ receipts: mem.store, git: g.git, operatorToken: "op-token", resolveIdentity: () => VALIDATED, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit }).undo(["promo-1"]);
+  assert.equal(cap.exit, undefined, "succeeded");
+  assert.match(cap.out, /Revert preview/, "shows a preview header");
+  assert.match(cap.out, /promoted commit/, "shows the promoted commit label");
+  assert.match(cap.out, /Safe to revert/, "confirms the revert is safe");
+});
+
+test("undo preview shows the diff when gitDiff is provided", async () => {
+  const mem = memReceipts(REC());
+  const g = fakeGit({ gitDiff: async () => "diff --git a/x b/x\n+added line\n-removed line\n" });
+  const cap = capture();
+  await createUndoCli({ receipts: mem.store, git: g.git, operatorToken: "op-token", resolveIdentity: () => VALIDATED, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit }).undo(["promo-1"]);
+  assert.equal(cap.exit, undefined, "succeeded");
+  assert.match(cap.out, /Changes that will be undone/, "diff section header shown");
+  assert.match(cap.out, /added line/, "diff content shown");
+});
