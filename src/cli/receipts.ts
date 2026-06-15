@@ -167,7 +167,7 @@ export function createReceiptsCli(deps: ReceiptsCliDeps = {}) {
         // failures, not "filter the most-recent N receipts for failures".
         const all = await store.query({});
         const allFailed = all.filter((r) => r.outcome.status !== "success");
-        const failed = limit !== undefined ? allFailed.slice(-limit) : allFailed;
+        const failed = limit === 0 ? [] : (limit !== undefined ? allFailed.slice(-limit) : allFailed);
         if (failed.length === 0) { out("no failed receipts\n"); return; }
         out(`${failed.length} failed receipt(s) (most recent last):\n`);
         for (const r of failed) {
