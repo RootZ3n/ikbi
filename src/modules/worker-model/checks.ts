@@ -35,6 +35,10 @@ const NPM_CHECKS: readonly Check[] = [
   { name: "test", command: "npm", args: ["test"] },
 ];
 
+/** Test-only checks for JS repos without tsconfig.json (no typecheck — tsc would just print help). */
+const JS_TEST_ONLY_CHECKS: readonly Check[] = [{ name: "test", command: "pnpm", args: ["test"] }];
+const NPM_TEST_ONLY_CHECKS: readonly Check[] = [{ name: "test", command: "npm", args: ["test"] }];
+
 /** Rust (Cargo) native checks. `cargo`/`go`/`python3` are NOT default-allowlisted in governed-exec —
  *  an un-allowlisted binary returns a fail-closed RED with the actionable "add X to the allowlist"
  *  note (mapExec), never a vacuous pass; allowlisting them runs the real native suite. */
@@ -92,7 +96,13 @@ function detectChecksForProject(projectRoot: string): ChecksResolution {
   if (rootHas(projectRoot, "package.json") || rootHas(projectRoot, "pnpm-workspace.yaml")) {
     const hasPnpmLock = rootHas(projectRoot, "pnpm-lock.yaml");
     const hasNpmLock = rootHas(projectRoot, "package-lock.json");
-    return { ok: true, checks: hasNpmLock && !hasPnpmLock ? NPM_CHECKS : VERIFIER_CHECKS, source: "default" };
+    const hasTsconfig = rootHas(projectRoot, "tsconfig.json");
+    const useNpm = hasNpmLock && !hasPnpmLock;
+    // JS-only repos (no tsconfig.json): skip typecheck — tsc would just print help and confuse the builder.
+    if (!hasTsconfig) {
+      return { ok: true, checks: useNpm ? NPM_TEST_ONLY_CHECKS : JS_TEST_ONLY_CHECKS, source: "default" };
+    }
+    return { ok: true, checks: useNpm ? NPM_CHECKS : VERIFIER_CHECKS, source: "default" };
   }
   if (rootHas(projectRoot, "Cargo.toml")) return { ok: true, checks: RUST_CHECKS, source: "default" };
   if (rootHas(projectRoot, "go.mod")) return { ok: true, checks: GO_CHECKS, source: "default" };
