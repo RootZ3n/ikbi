@@ -502,12 +502,19 @@ export function formatProgressEvent(e: { type: string; payload?: unknown }): str
       const modes = p.verificationMode !== undefined || p.retrievalMode !== undefined ? ` [verify: ${String(p.verificationMode ?? "?")}, retrieval: ${String(p.retrievalMode ?? "?")}]` : "";
       return `  → run started (workspace ${String(p.workspaceId ?? "?")})${modes}\n`;
     }
-    case "worker.role.dispatched":
-      return `  → ${String(p.role ?? "?")} …\n`;
+    case "worker.role.dispatched": {
+      const dispatchLabel: Record<string, string> = { scout: "reading", builder: "editing", verifier: "verifying", critic: "reviewing", integrator: "promoting" };
+      const role = String(p.role ?? "?");
+      const label = dispatchLabel[role] !== undefined ? ` (${dispatchLabel[role]})` : "";
+      return `  → ${role} …${label}\n`;
+    }
     case "worker.role.completed": {
+      const completeLabel: Record<string, string> = { scout: "planning", builder: "editing", verifier: "verifying", critic: "reviewing", integrator: "promoting" };
       const icon = p.outcome === "success" ? "✓" : "✗";
       const costNote = typeof p.costUsd === "number" && p.costUsd > 0 ? ` ($${p.costUsd.toFixed(4)})` : "";
-      return `  ${icon} ${String(p.role ?? "?")}: ${String(p.outcome ?? "?")}${costNote}\n`;
+      const role = String(p.role ?? "?");
+      const label = completeLabel[role] !== undefined ? ` (${completeLabel[role]})` : "";
+      return `  ${icon} ${role}: ${String(p.outcome ?? "?")}${costNote}${label}\n`;
     }
     case "worker.builder.activity": {
       // SG: surface context-window pressure alongside the tool-activity line when present.
