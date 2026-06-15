@@ -661,11 +661,15 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
     // SECOND PASS: a guarded script unchanged in package.json can still be neutered if it SHELLS OUT
     // to a file the build rewrote (`"test": "bash ./test.sh"` clean, but test.sh → `exit 0`). The
     // line/JSON guard above only inspects the package.json scripts, not the files they invoke.
-    // Goal-derived exclusion: if the operator explicitly asked for a file to be modified (it's in
-    // the goal text), the guard does not flag it — the guard targets SNEAKY rewrites, not INTENTIONAL
-    // fixes the builder was tasked with.
-    const goalFiles = extractGoalFiles(ctx.task?.goal ?? "");
-    const shellOut = detectShellOutMutation(diffText, ctx.workspace.path, goalFiles.size > 0 ? goalFiles : undefined);
+    // Goal-derived exclusion: if the operator explicitly asked for a TEST file to be modified (it's
+    // in the goal text and matches the .test./.spec. infix), the guard does not flag it — editing
+    // tests IS the normal purpose of a build. Non-test files mentioned in the goal (e.g. test.sh,
+    // scripts/runner.js) are still potential shell-out helpers and must remain guarded — the goal
+    // exclusion must not be a loophole that lets the builder neuter a verification helper by naming
+    // it in the task description.
+    const allGoalFiles = extractGoalFiles(ctx.task?.goal ?? "");
+    const goalTestFiles = new Set([...allGoalFiles].filter((f) => TEST_FILE_PATTERN.test(f)));
+    const shellOut = detectShellOutMutation(diffText, ctx.workspace.path, goalTestFiles.size > 0 ? goalTestFiles : undefined);
     if (shellOut.mutated) {
       return untrusted(`verification untrusted: ${shellOut.reason}`);
     }
