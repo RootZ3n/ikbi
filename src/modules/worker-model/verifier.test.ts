@@ -915,3 +915,43 @@ test("Fix1: detectShellOutMutation — non-goal file still flagged even when exc
     assert.match(r.reason ?? "", /test\.sh/);
   });
 });
+
+// ── Fix A / Fix D: createVerifier e2e — goal-derived exclusion constrained to test files ─────────
+// These tests prove the FULL PATH: createVerifier() extracts ctx.task.goal → filters to test files
+// only (Fix A) → passes exclusion to detectShellOutMutation → verification proceeds correctly.
+
+test("FIX-D e2e: createVerifier — goal naming a .test.ts file does NOT cause untrusted (editing tests is the build)", async () => {
+  const dir = _mkdtempSync(_join(_tmpdir(), "ikbi-goal-e2e-test-"));
+  try {
+    _writeFileSync(_join(dir, "package.json"), JSON.stringify({ name: "r", scripts: { test: "node --test engine/ledger.test.ts" } }));
+    const diff = "diff --git a/engine/ledger.test.ts b/engine/ledger.test.ts\n--- a/engine/ledger.test.ts\n+++ b/engine/ledger.test.ts\n@@ -1 +1,2 @@\n test('x', () => {});\n+test('y', () => {});\n";
+    const exec = execStub(() => ({ executed: true, exitCode: 0, stdoutTail: "ok" }));
+    const ctx = ctxAt(dir);
+    (ctx.task as { goal: string }).goal = "Fix the failing assertion in engine/ledger.test.ts";
+    const result = await createVerifier({ governedExec: exec.governedExec, parentCtx: makeParentCtx(), diff: async () => diff })(ctx);
+    const detail = (result.detail ?? {}) as Record<string, unknown>;
+    assert.notEqual(detail.verdict, "untrusted", "modifying a .test.ts file named in the goal must NOT trigger untrusted");
+  } finally {
+    _rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("FIX-D / Fix A e2e: createVerifier — goal naming a NON-test shell helper STILL causes untrusted (helpers stay guarded)", async () => {
+  // The goal mentions test-runner.sh — a shell helper, not a .test./.spec. file.
+  // Fix A: the goal-derived exclusion only applies to test files, so this helper remains guarded.
+  const dir = _mkdtempSync(_join(_tmpdir(), "ikbi-goal-e2e-sh-"));
+  try {
+    _writeFileSync(_join(dir, "package.json"), JSON.stringify({ name: "r", scripts: { test: "bash ./test-runner.sh" } }));
+    const diff = "diff --git a/test-runner.sh b/test-runner.sh\n--- a/test-runner.sh\n+++ b/test-runner.sh\n@@ -1 +1 @@\n-pnpm vitest run\n+exit 0\n";
+    const exec = execStub(() => ({ executed: true, exitCode: 0, stdoutTail: "ok" }));
+    const ctx = ctxAt(dir);
+    // goal names the shell helper — but it's not a .test./.spec. file → Fix A keeps it guarded
+    (ctx.task as { goal: string }).goal = "Fix test-runner.sh to use the new framework";
+    const result = await createVerifier({ governedExec: exec.governedExec, parentCtx: makeParentCtx(), diff: async () => diff })(ctx);
+    const detail = (result.detail ?? {}) as Record<string, unknown>;
+    assert.equal(detail.verdict, "untrusted", "a non-test shell helper mentioned in the goal must remain guarded (Fix A)");
+    assert.match(result.summary ?? "", /untrusted/);
+  } finally {
+    _rmSync(dir, { recursive: true, force: true });
+  }
+});
