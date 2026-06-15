@@ -486,6 +486,20 @@ function extractScriptFilePaths(script: string): string[] {
   return out;
 }
 
+/** Test-file patterns: files that are obviously test files and safe to modify during a build. */
+const TEST_FILE_PATTERNS = [
+  /\.(?:test|spec)\.[cm]?[jt]sx?$/i,  // *.test.js, *.spec.ts, etc.
+  /(?:^|\/)test[^/]*\.[cm]?[jt]sx?$/i, // test.js, test_utils.ts, etc.
+  /(?:^|\/)tests?\//i,                  // tests/ or test/ directory
+  /_test\.(?:py|go|rs|rb)$/i,           // *_test.py, *_test.go, etc.
+  /test_[^/]+\.(?:py|go|rs|rb)$/i,     // test_*.py, test_*.go, etc.
+];
+
+/** Returns true if the path is obviously a test file (safe for builder to modify). */
+export function isLikelyTestFile(path: string): boolean {
+  return TEST_FILE_PATTERNS.some((p) => p.test(path));
+}
+
 /** Source-file extensions to look for when extracting file names from a build goal. */
 const GOAL_FILE_EXTS = new Set([
   ".js", ".ts", ".cjs", ".mjs", ".jsx", ".tsx", ".cts", ".mts",
@@ -661,13 +675,15 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
     // SECOND PASS: a guarded script unchanged in package.json can still be neutered if it SHELLS OUT
     // to a file the build rewrote (`"test": "bash ./test.sh"` clean, but test.sh → `exit 0`). The
     // line/JSON guard above only inspects the package.json scripts, not the files they invoke.
-    // Goal-derived exclusion: if the operator explicitly asked for a TEST file to be modified (it's
-    // in the goal text and matches the .test./.spec. infix), the guard does not flag it — editing
-    // tests IS the normal purpose of a build. Non-test files mentioned in the goal (e.g. test.sh,
-    // scripts/runner.js) are still potential shell-out helpers and must remain guarded — the goal
-    // exclusion must not be a loophole that lets the builder neuter a verification helper by naming
-    // it in the task description.
+    // Goal-derived + test-file exclusion: the operator's explicit targets AND any file that
+    // is obviously a test file (test.js, *.test.ts, *_test.py, test_*.go, etc.) are excluded
+    // from shell-out mutation detection. The guard targets SNEAKY rewrites (builder rewrites
+    // test.sh to `exit 0`), not NORMAL test-writing behavior (builder adds tests for new code).
     const allGoalFiles = extractGoalFiles(ctx.task?.goal ?? "");
+    const changedFiles = parseChangedFiles(diffText);
+    for (const f of changedFiles) {
+      if (isLikelyTestFile(f)) allGoalFiles.add(f);
+    }
     const shellOut = detectShellOutMutation(diffText, ctx.workspace.path, allGoalFiles.size > 0 ? allGoalFiles : undefined);
     if (shellOut.mutated) {
       return untrusted(`verification untrusted: ${shellOut.reason}`);
