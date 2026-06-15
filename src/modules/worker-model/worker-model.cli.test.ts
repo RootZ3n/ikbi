@@ -254,11 +254,47 @@ test("a gate-denied promote (probation parent) surfaces a discarded/partial outc
 
   return cli.build(["ship", "it"]).then(() => {
     assert.equal(cap2.exit, undefined, "a gate denial is NOT a crash");
-    assert.equal(cap2.err, "", "nothing on stderr");
+    // Phase 2: rejected outcomes now emit failure detail + next hints on stderr.
+    assert.match(cap2.err, /Build REJECTED/, "rejected outcome emits failure detail on stderr");
     assert.equal(gateDecision()?.allow, false, "the real gate-wall DENIED the probation promote");
     const summary = JSON.parse(cap2.out);
     assert.equal(summary.promoted, false, "not promoted");
     assert.notEqual(summary.outcome, "success");
+  });
+});
+
+// ── Phase 2: formatFailureDetail + formatNextHints integration through createWorkerCli ──
+
+test("Phase 2: a failure result surfaces failure detail and next-command hints on stderr", () => {
+  const failOrchestrator = {
+    run: async (task: WorkerTask): Promise<WorkerResult> => ({
+      contractVersion: "1.0.0",
+      taskId: task.taskId,
+      outcome: "failure" as const,
+      roles: [{ role: "builder" as const, outcome: "failure" as const, summary: "compilation error", detail: { filesWritten: ["src/foo.ts"] } }],
+      workspaceId: "ws-fail-test",
+      promoted: false,
+      reason: "compilation error",
+    }),
+  };
+  const cap2 = capture();
+  const cli = createWorkerCli({
+    orchestrator: failOrchestrator, resolveIdentity: makeResolver("trusted", "trusted"),
+    operatorToken: OPERATOR_TOKEN, workerToken: WORKER_TOKEN,
+    stdout: cap2.stdout, stderr: cap2.stderr, setExit: cap2.setExit, now: () => 1, cwd: () => "/repo",
+  });
+  return cli.build(["fix the compilation error"]).then(() => {
+    // The failure detail section
+    assert.match(cap2.err, /Build FAILED/, "failure label is present in stderr");
+    assert.match(cap2.err, /builder/, "the failing role is named");
+    assert.match(cap2.err, /compilation error/, "the reason/summary is included");
+    assert.match(cap2.err, /ws-fail-test/, "the workspace id is surfaced");
+    // The next-command hints section
+    assert.match(cap2.err, /ikbi diff ws-fail-test/, "diff hint is included");
+    assert.match(cap2.err, /ikbi workspace discard ws-fail-test/, "discard hint is included");
+    // stdout is still machine-readable JSON
+    const summary = JSON.parse(cap2.out);
+    assert.equal(summary.outcome, "failure");
   });
 });
 

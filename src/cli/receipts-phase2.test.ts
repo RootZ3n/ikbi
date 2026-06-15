@@ -130,3 +130,43 @@ test("`receipts --failures` on a store with no failures outputs 'no failed recei
   assert.equal(cap.exit, undefined);
   assert.match(cap.out, /no failed receipts/);
 });
+
+// ── --failures --limit: filter FIRST, then cap ────────────────────────────────
+
+test("`receipts --failures --limit N` finds older failures even when recent receipts are all successes", async () => {
+  // The older failure (seq 1) is hidden behind 4 recent successes (seq 2-5).
+  // --limit 1 should return that one failure, NOT "no failed receipts".
+  const hiddenFailure: Receipt[] = [
+    rec({ seq: 1, operation: "worker.role.builder", status: "failure", detail: "old failure" }),
+    rec({ seq: 2, operation: "worker.role.scout", status: "success" }),
+    rec({ seq: 3, operation: "workspace.promote", status: "success" }),
+    rec({ seq: 4, operation: "worker.role.verifier", status: "success" }),
+    rec({ seq: 5, operation: "worker.role.critic", status: "success" }),
+  ];
+  const s = store(hiddenFailure);
+  const cap = capture();
+  await createReceiptsCli({ receipts: s.receipts, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit }).receipts(["--failures", "--limit", "1"]);
+  assert.equal(cap.exit, undefined);
+  assert.match(cap.out, /1 failed receipt\(s\)/, "the older failure was found despite the limit");
+  assert.match(cap.out, /#1/, "seq 1 (the failure) is shown");
+  assert.doesNotMatch(cap.out, /no failed receipts/, "should NOT report no failures");
+});
+
+test("`receipts --failures --limit N` with N smaller than total failures returns the N most-recent failures", async () => {
+  // 3 failures (seq 1, 3, 5) with successes interspersed. --limit 2 should return seq 3 and 5.
+  const mixed: Receipt[] = [
+    rec({ seq: 1, operation: "worker.role.builder", status: "failure" }),
+    rec({ seq: 2, operation: "worker.role.scout", status: "success" }),
+    rec({ seq: 3, operation: "worker.role.builder", status: "rejected" }),
+    rec({ seq: 4, operation: "workspace.promote", status: "success" }),
+    rec({ seq: 5, operation: "worker.role.verifier", status: "failure" }),
+  ];
+  const s = store(mixed);
+  const cap = capture();
+  await createReceiptsCli({ receipts: s.receipts, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit }).receipts(["--failures", "--limit", "2"]);
+  assert.equal(cap.exit, undefined);
+  assert.match(cap.out, /2 failed receipt\(s\)/, "the 2 most-recent failures are shown");
+  assert.match(cap.out, /#3/, "seq 3 (rejected) is shown");
+  assert.match(cap.out, /#5/, "seq 5 (failure) is shown");
+  assert.doesNotMatch(cap.out, /#1/, "seq 1 (older failure) is NOT in the limited result");
+});

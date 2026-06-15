@@ -825,10 +825,10 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       // SG-2: after the run, show a one-line diff summary of what changed (best-effort).
       if (result.workspaceId !== undefined) await printDiffSummary(result.workspaceId);
       // Operator experience: failure details + next-command hints on STDERR (not stdout, which
-      // stays machine-readable JSON). Scoped to "success" and "failure" outcomes — gate-denial
-      // ("rejected") and promote-conflict ("partial") preserve the existing silent behavior.
-      if (result.outcome === "failure") err(formatFailureDetail(result));
-      if (result.outcome === "success" || result.outcome === "failure") err(formatNextHints(result));
+      // stays machine-readable JSON). All non-success outcomes get failure detail; all outcomes
+      // get next-command hints.
+      if (result.outcome !== "success") err(formatFailureDetail(result));
+      err(formatNextHints(result));
     } catch (e) {
       err(`ikbi: build failed: ${errMsg(e)}\n`);
       setExit(1);
