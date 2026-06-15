@@ -853,6 +853,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           role: result.role,
           taskId: task.taskId,
           workspaceId: workspace.id,
+          targetBranch: workspace.baseBranch,
           outcome: result.outcome,
           ...(costUsd !== undefined ? { costUsd } : {}),
           ...(model !== undefined ? { model } : {}),
@@ -1712,6 +1713,35 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         ),
       );
     }
+
+    // Write a run-level summary receipt that captures the full standardized metadata for this
+    // task. This is the single place in the trail that has: taskId, workspaceId, repo, branch,
+    // model, cost, verification result, and promotion result — enabling `receipts --task` to
+    // show a complete picture without inspecting individual role receipts.
+    const verifierResult = results.find((r) => r.role === "verifier");
+    await receipts.append(
+      {
+        operation: "worker.run.summary",
+        outcome: { status: toOutcomeStatus(overall), ...(reason !== undefined ? { detail: reason } : {}) },
+        requestId: task.taskId,
+        metadata: {
+          taskId: task.taskId,
+          workspaceId: workspace.id,
+          targetBranch: workspace.baseBranch,
+          targetRepo: task.targetRepo,
+          outcome: overall,
+          promoted,
+          model: singleBuilderModel,
+          costUsd: runCost(),
+          verificationResult: verifierResult !== undefined ? verifierResult.outcome : "not_run",
+          verificationMode: ranVerificationMode,
+          retrievalMode: ranRetrievalMode,
+        },
+        project: task.targetRepo,
+      },
+      parentIdentity,
+    );
+
     return result;
   }
 

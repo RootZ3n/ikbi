@@ -4,6 +4,7 @@
  *   ikbi receipts                 recent receipts (most-recent last)
  *   ikbi receipts --task <id>     the full trail of one run (roles, verification, promote)
  *   ikbi receipts [--limit <n>]   cap the recent list
+ *   ikbi receipts verify          check receipt integrity (seq numbers sequential, no gaps)
  *
  * Read-only: it only `query()`s the receipt store (no writes, no identity, no network).
  */
@@ -55,6 +56,28 @@ function taskIdOf(r: Receipt): string | undefined {
   return typeof t === "string" ? t : undefined;
 }
 
+/** Result of a receipt integrity check. */
+export interface VerifyResult {
+  readonly total: number;
+  readonly gaps: ReadonlyArray<{ afterSeq: number; beforeSeq: number }>;
+  readonly ok: boolean;
+}
+
+/** Check receipt integrity: seq numbers must be sequential with no gaps. Pure, no I/O. */
+export function verifyReceiptIntegrity(receipts: readonly Receipt[]): VerifyResult {
+  if (receipts.length === 0) return { total: 0, gaps: [], ok: true };
+  const sorted = [...receipts].sort((a, b) => a.seq - b.seq);
+  const gaps: Array<{ afterSeq: number; beforeSeq: number }> = [];
+  for (let i = 1; i < sorted.length; i += 1) {
+    const prev = sorted[i - 1]!;
+    const curr = sorted[i]!;
+    if (curr.seq !== prev.seq + 1) {
+      gaps.push({ afterSeq: prev.seq, beforeSeq: curr.seq });
+    }
+  }
+  return { total: receipts.length, gaps, ok: gaps.length === 0 };
+}
+
 /** Build the `receipts` handler. Default reads the live receipt store. */
 export function createReceiptsCli(deps: ReceiptsCliDeps = {}) {
   const store = deps.receipts ?? coreReceipts;
@@ -76,10 +99,17 @@ export function createReceiptsCli(deps: ReceiptsCliDeps = {}) {
     };
     const verifier = roleReceipts.find((r) => roleOf(r) === "verifier");
     const promote = trail.find((r) => r.operation === "workspace.promote");
+    // Phase 3: the run summary receipt carries standardized metadata.
+    const summary = trail.find((r) => r.operation === "worker.run.summary");
+    const meta = summary?.metadata as Record<string, unknown> | undefined;
     out(`Task ${task}\n`);
+    if (meta?.targetRepo !== undefined) out(`  repo: ${String(meta.targetRepo)}\n`);
+    if (meta?.targetBranch !== undefined) out(`  branch: ${String(meta.targetBranch)}\n`);
+    if (meta?.model !== undefined) out(`  model: ${String(meta.model)}\n`);
+    if (meta?.costUsd !== undefined) out(`  cost: $${Number(meta.costUsd).toFixed(6)}\n`);
     if (roleReceipts.length > 0) out(`  roles: ${roleReceipts.map((r) => `${roleOf(r)}=${r.outcome.status}`).join(", ")}\n`);
     out(`  verification: ${verifier !== undefined ? verifier.outcome.status : "(not run)"}\n`);
-    out(`  promote: ${promote !== undefined ? `${promote.outcome.status}${promote.outcome.detail !== undefined ? ` (${promote.outcome.detail})` : ""}` : "(none)"}\n`);
+    out(`  promote: ${promote !== undefined ? `${promote.outcome.status}${promote.outcome.detail !== undefined ? ` (${promote.outcome.detail})` : ""}` : meta?.promoted === true ? "success (via run summary)" : "(none)"}\n`);
     out(`  receipts: ${trail.length}\n`);
     for (const r of trail) {
       out(`    [${iso(r.timestamp)}] ${r.operation} → ${r.outcome.status}${r.outcome.detail !== undefined ? ` (${r.outcome.detail})` : ""}\n`);
@@ -97,7 +127,30 @@ export function createReceiptsCli(deps: ReceiptsCliDeps = {}) {
     }
   }
 
+  async function verifyIntegrity(): Promise<void> {
+    const all = await store.query({});
+    const result = verifyReceiptIntegrity(all);
+    out(`receipts: ${result.total} total\n`);
+    if (result.ok) {
+      out(`integrity: OK (seq 0..${result.total - 1} are sequential, no gaps)\n`);
+      return;
+    }
+    out(`integrity: GAPS DETECTED (${result.gaps.length} gap(s))\n`);
+    for (const g of result.gaps) {
+      out(`  gap: seq ${g.afterSeq} → ${g.beforeSeq} (missing ${g.beforeSeq - g.afterSeq - 1} receipt(s))\n`);
+    }
+    setExit(1);
+  }
+
   async function receipts(argv: readonly string[]): Promise<void> {
+    // `receipts verify` is a positional subcommand, not a flag.
+    if (argv[0] === "verify") {
+      try { await verifyIntegrity(); } catch (e) {
+        err(`ikbi receipts verify: could not read the receipt log: ${e instanceof Error ? e.message : String(e)}\n`);
+        setExit(1);
+      }
+      return;
+    }
     const { task, limit, latest, failures } = parseReceiptsArgs(argv);
     try {
       if (task !== undefined) {
@@ -134,7 +187,7 @@ export function createReceiptsCli(deps: ReceiptsCliDeps = {}) {
 
 registerCommand({
   name: "receipts",
-  summary: "Show receipt history (--task, --latest, --failures, --limit)",
-  usage: "ikbi receipts [--task <id>] [--latest] [--failures] [--limit <n>]",
+  summary: "Show receipt history (--task, --latest, --failures, --limit, verify)",
+  usage: "ikbi receipts [verify] [--task <id>] [--latest] [--failures] [--limit <n>]",
   run: (argv) => createReceiptsCli().receipts(argv),
 });

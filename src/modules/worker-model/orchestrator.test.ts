@@ -892,12 +892,18 @@ test("each role's outcome is recorded to receipts + trust under the ROLE identit
   const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, trust: tr.trust, receipts: rc.receipts }));
   await orch.run(task, parentCtx);
 
-  assert.equal(rc.calls.length, 5, "one receipt per role");
+  // Phase 3: one run-level summary receipt is now appended after role receipts complete.
+  assert.equal(rc.calls.length, 6, "five role receipts + one worker.run.summary");
   assert.equal(tr.calls.length, 5, "one trust outcome per role");
-  for (const c of rc.calls) {
+  const roleReceipts = rc.calls.filter((c) => c.operation.startsWith("worker.role."));
+  assert.equal(roleReceipts.length, 5, "one receipt per role");
+  for (const c of roleReceipts) {
     assert.equal(c.agentId, "worker-1", "receipt attributed to the role identity");
     assert.equal(c.spawnedFrom, "parent-1", "role identity carries spawnedFrom");
   }
+  const summary = rc.calls.find((c) => c.operation === "worker.run.summary");
+  assert.ok(summary !== undefined, "a run-level summary receipt was written");
+  assert.equal(summary!.agentId, "parent-1", "summary receipt attributed to the parent identity");
   assert.deepEqual(tr.calls.map((c) => c.operation), WORKER_ROLES.map((r) => `worker.role.${r}`));
   for (const c of tr.calls) assert.equal(c.status, "success");
   // The orchestrator THREADS the genuine ValidatedIdentity as the recordOutcome subject
