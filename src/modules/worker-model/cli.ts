@@ -97,6 +97,122 @@ export function formatDiffSummary(s: DiffSummary): string {
   return `Δ ${s.files} file${s.files === 1 ? "" : "s"} changed, +${s.insertions}/-${s.deletions}`;
 }
 
+/** Per-file change counts extracted from a unified diff. */
+export interface FileDiffEntry {
+  readonly file: string;
+  readonly insertions: number;
+  readonly deletions: number;
+}
+
+/** Extract per-file change counts from a unified diff. PURE. */
+export function parseFileDiff(diffText: string): FileDiffEntry[] {
+  const files: FileDiffEntry[] = [];
+  let file = "";
+  let ins = 0;
+  let del = 0;
+  let active = false;
+  for (const line of diffText.split("\n")) {
+    if (line.startsWith("diff --git ")) {
+      if (active) files.push({ file, insertions: ins, deletions: del });
+      const m = line.match(/^diff --git a\/.+ b\/(.+)$/);
+      file = m !== null && m[1] !== undefined ? m[1] : line.slice(11);
+      ins = 0;
+      del = 0;
+      active = true;
+    } else if (line.startsWith("+++") || line.startsWith("---")) {
+      // file headers — not content lines
+    } else if (line.startsWith("+") && active) {
+      ins += 1;
+    } else if (line.startsWith("-") && active) {
+      del += 1;
+    }
+  }
+  if (active) files.push({ file, insertions: ins, deletions: del });
+  return files;
+}
+
+/** Workspace state → human-readable description. */
+const WS_STATE_LABEL: Record<string, string> = {
+  promoted: "promoted (changes are live on the target branch)",
+  discarded: "discarded (changes were not promoted)",
+  failed: "failed (workspace retained for inspection)",
+  allocated: "in-progress (build may still be running or was interrupted)",
+  promoting: "promoting (merge in progress)",
+  allocating: "allocating (workspace being set up)",
+};
+
+/** Human-readable failure details for a failed or rejected build. PURE. */
+export function formatFailureDetail(r: WorkerResult): string {
+  if (r.outcome === "success") return "";
+  const failedRole = r.roles.find((x) => x.outcome !== "success");
+  const lines: string[] = [];
+
+  const label = r.outcome === "rejected" ? "REJECTED" : r.outcome === "partial" ? "PARTIAL" : "FAILED";
+  lines.push(`Build ${label} — ${failedRole?.role ?? "unknown"}`);
+
+  const reason = failedRole?.summary ?? r.reason;
+  if (reason !== undefined && reason.trim().length > 0) {
+    lines.push(`  Reason: ${reason}`);
+  }
+
+  if (failedRole?.role === "verifier") {
+    const vd = (failedRole.detail ?? {}) as Record<string, unknown>;
+    const checks = Array.isArray(vd.checks) ? (vd.checks as Array<{ name?: unknown; passed?: unknown }>) : [];
+    const failed = checks.filter((c) => c.passed === false || c.passed === undefined);
+    if (failed.length > 0) lines.push(`  Checks failed: ${failed.map((c) => String(c.name ?? "?")).join(", ")}`);
+    const blocked = Array.isArray(vd.blockReasons) ? (vd.blockReasons as unknown[]).map(String) : [];
+    if (blocked.length > 0) lines.push(`  Blocked: ${blocked.join("; ")}`);
+  } else if (failedRole?.role === "builder") {
+    const bd = (failedRole.detail ?? {}) as Record<string, unknown>;
+    const written = Array.isArray(bd.filesWritten) ? (bd.filesWritten as unknown[]).map(String) : [];
+    if (written.length > 0) lines.push(`  Files touched: ${written.join(", ")}`);
+  } else if (failedRole?.role === "critic") {
+    const cd = (failedRole.detail ?? {}) as Record<string, unknown>;
+    const fb = typeof cd.feedback === "string" ? cd.feedback.trim() : "";
+    if (fb.length > 0) lines.push(`  Critic: ${fb.slice(0, 120)}${fb.length > 120 ? "…" : ""}`);
+  }
+
+  if (r.workspaceId !== undefined) {
+    lines.push(`  Workspace: ${r.workspaceId}`);
+    lines.push(`  Changes: run \`ikbi diff ${r.workspaceId}\` to inspect`);
+  } else {
+    lines.push(`  Changes: none (build did not reach the workspace stage)`);
+  }
+
+  lines.push(`  Undo available: ${r.promoted ? "yes" : "no (build was not promoted)"}`);
+
+  return `\n${lines.join("\n")}\n`;
+}
+
+/** "Next command" hints for the operator after any build. PURE. */
+export function formatNextHints(r: WorkerResult): string {
+  const cmds: Array<[string, string]> = [];
+
+  if (r.promoted) {
+    cmds.push([`ikbi undo ${r.taskId}`, "revert this promotion"]);
+  }
+  if (r.workspaceId !== undefined) {
+    const ws = r.workspaceId;
+    if (!r.promoted) {
+      cmds.push([`ikbi diff ${ws}`, "inspect what changed"]);
+      cmds.push([`ikbi workspace discard ${ws}`, "reclaim this workspace"]);
+    } else {
+      cmds.push([`ikbi diff ${ws}`, "inspect the promoted changes"]);
+    }
+  }
+  if (r.outcome !== "success") {
+    cmds.push([`ikbi receipts --task ${r.taskId}`, "full audit trail for this run"]);
+  }
+
+  if (cmds.length === 0) return "";
+  const maxLen = Math.max(...cmds.map(([c]) => c.length));
+  const lines = ["\nNext:"];
+  for (const [cmd, hint] of cmds) {
+    lines.push(`  ${cmd.padEnd(maxLen + 2)}— ${hint}`);
+  }
+  return lines.join("\n") + "\n";
+}
+
 // ── colored diff display (HUMAN-facing only) ──────────────────────────────────
 // Raw ANSI (no chalk dependency in the CLI context). Models never see this — the diff
 // TEXT handed to a model is unchanged; only the terminal display is colorized.
@@ -174,12 +290,24 @@ export function createDiffCli(deps: DiffCliDeps = {}) {
     }
     if (text.trim().length === 0) {
       out(`workspace ${id}: no changes\n`);
+      out(`State: ${WS_STATE_LABEL[rec.state] ?? rec.state}\n`);
       return;
     }
     // Colorize for terminal display only; summarizeDiff still parses the RAW text.
     const display = colorize ? colorizeDiff(text) : text;
     out(display.endsWith("\n") ? display : `${display}\n`);
     out(`\n${formatDiffSummary(summarizeDiff(text))}\n`);
+    // Per-file breakdown — each file's +/- line counts at a glance.
+    const fileChanges = parseFileDiff(text);
+    if (fileChanges.length > 0) {
+      const maxFile = Math.max(...fileChanges.map((f) => f.file.length));
+      out("\n");
+      for (const fc of fileChanges) {
+        out(`  ${fc.file.padEnd(maxFile + 2)}+${fc.insertions}/-${fc.deletions}\n`);
+      }
+    }
+    // Workspace state — promoted/discarded/retained so the operator knows the fate of these changes.
+    out(`\nWorkspace ${id}: ${WS_STATE_LABEL[rec.state] ?? rec.state}\n`);
   }
 
   return { diff };
@@ -696,6 +824,11 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       if (cost === true) out(`${formatCost(result.costUsd)}\n`);
       // SG-2: after the run, show a one-line diff summary of what changed (best-effort).
       if (result.workspaceId !== undefined) await printDiffSummary(result.workspaceId);
+      // Operator experience: failure details + next-command hints on STDERR (not stdout, which
+      // stays machine-readable JSON). Scoped to "success" and "failure" outcomes — gate-denial
+      // ("rejected") and promote-conflict ("partial") preserve the existing silent behavior.
+      if (result.outcome === "failure") err(formatFailureDetail(result));
+      if (result.outcome === "success" || result.outcome === "failure") err(formatNextHints(result));
     } catch (e) {
       err(`ikbi: build failed: ${errMsg(e)}\n`);
       setExit(1);
