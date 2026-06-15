@@ -24,18 +24,27 @@ export interface ReceiptsCliDeps {
   readonly setExit?: (code: number) => void;
 }
 
-/** Parse `--task <id>`/`--task=<id>` and `--limit <n>`/`--limit=<n>`. */
-export function parseReceiptsArgs(argv: readonly string[]): { task?: string; limit?: number } {
+/** Parse `--task <id>`/`--task=<id>`, `--limit <n>`/`--limit=<n>`, `--latest`, `--failures`. */
+export function parseReceiptsArgs(argv: readonly string[]): { task?: string; limit?: number; latest?: boolean; failures?: boolean } {
   let task: string | undefined;
   let limit: number | undefined;
+  let latest = false;
+  let failures = false;
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i] as string;
     if (a === "--task") { task = argv[i + 1]; i += 1; }
     else if (a.startsWith("--task=")) task = a.slice("--task=".length);
     else if (a === "--limit") { limit = Number(argv[i + 1]); i += 1; }
     else if (a.startsWith("--limit=")) limit = Number(a.slice("--limit=".length));
+    else if (a === "--latest") latest = true;
+    else if (a === "--failures") failures = true;
   }
-  return { ...(task !== undefined && task.length > 0 ? { task } : {}), ...(limit !== undefined && Number.isFinite(limit) ? { limit } : {}) };
+  return {
+    ...(task !== undefined && task.length > 0 ? { task } : {}),
+    ...(limit !== undefined && Number.isFinite(limit) ? { limit } : {}),
+    ...(latest ? { latest } : {}),
+    ...(failures ? { failures } : {}),
+  };
 }
 
 const iso = (ms: number): string => new Date(ms).toISOString();
@@ -89,11 +98,26 @@ export function createReceiptsCli(deps: ReceiptsCliDeps = {}) {
   }
 
   async function receipts(argv: readonly string[]): Promise<void> {
-    const { task, limit } = parseReceiptsArgs(argv);
+    const { task, limit, latest, failures } = parseReceiptsArgs(argv);
     try {
       if (task !== undefined) {
         // No requestId clause in ReceiptQuery — query then filter by task in-process.
         printTaskTrail(task, await store.query());
+      } else if (latest === true) {
+        // --latest: show only the single most-recent receipt (last in most-recent-last order).
+        const all = await store.query({});
+        const last = all.length > 0 ? all[all.length - 1] : undefined;
+        if (last === undefined) { out("no receipts yet\n"); return; }
+        printRecent([last]);
+      } else if (failures === true) {
+        // --failures: show only non-success receipts (failure, rejected, partial).
+        const all = await store.query(limit !== undefined ? { limit } : {});
+        const failed = all.filter((r) => r.outcome.status !== "success");
+        if (failed.length === 0) { out("no failed receipts\n"); return; }
+        out(`${failed.length} failed receipt(s) (most recent last):\n`);
+        for (const r of failed) {
+          out(`  #${r.seq} [${iso(r.timestamp)}] ${r.operation} → ${r.outcome.status}  by ${r.identity.agentId}${r.requestId !== undefined ? `  (task ${r.requestId})` : ""}${r.outcome.detail !== undefined ? `  ${r.outcome.detail}` : ""}\n`);
+        }
       } else {
         printRecent(await store.query(limit !== undefined ? { limit } : {}));
       }
@@ -108,7 +132,7 @@ export function createReceiptsCli(deps: ReceiptsCliDeps = {}) {
 
 registerCommand({
   name: "receipts",
-  summary: "Show receipt history (use --task <id> for one run's trail)",
-  usage: "ikbi receipts [--task <id>] [--limit <n>]",
+  summary: "Show receipt history (--task, --latest, --failures, --limit)",
+  usage: "ikbi receipts [--task <id>] [--latest] [--failures] [--limit <n>]",
   run: (argv) => createReceiptsCli().receipts(argv),
 });
