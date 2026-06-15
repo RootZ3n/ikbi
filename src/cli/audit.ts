@@ -138,10 +138,11 @@ async function receiptInfoFor(repoPath: string, rc: { query(): Promise<Receipt[]
   }
 }
 
-/** Parse --compare model1,model2 from argv. Returns models array or undefined. */
-function parseCompareFlag(argv: readonly string[]): { models: string[]; remaining: string[] } | undefined {
+/** Parse --compare model1,model2 and --structured from argv. */
+function parseCompareFlag(argv: readonly string[]): { models: string[]; remaining: string[]; structured: boolean } | undefined {
   const remaining: string[] = [];
   let models: string[] | undefined;
+  let structured = false;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
     if (arg === "--compare") {
@@ -150,11 +151,13 @@ function parseCompareFlag(argv: readonly string[]): { models: string[]; remainin
         return undefined; // --compare without value
       }
       models = next.split(",").map((m) => m.trim()).filter((m) => m.length > 0);
+    } else if (arg === "--structured") {
+      structured = true;
     } else {
       remaining.push(arg);
     }
   }
-  return models !== undefined && models.length > 0 ? { models, remaining } : undefined;
+  return models !== undefined && models.length > 0 ? { models, remaining, structured } : undefined;
 }
 
 /** Build the `audit` handler. */
@@ -239,7 +242,7 @@ export function createAuditCli(deps: AuditDeps = {}) {
     // ── Multi-model comparison ─────────────────────────────────────────────────
     if (compareResult !== undefined) {
       out(`═══ Multi-Model Audit: ${compareResult.models.join(" vs ")} ═══\n`);
-      out(`Running scout with ${compareResult.models.length} model(s)...\n\n`);
+      out(`Running scout with ${compareResult.models.length} model(s)...${compareResult.structured ? " (structured JSON)" : ""}\n\n`);
 
       try {
         const runMulti = deps.runMultiAudit ?? (async (opts) => {
@@ -250,6 +253,7 @@ export function createAuditCli(deps: AuditDeps = {}) {
         const result = await runMulti({
           repoPath,
           models: compareResult.models,
+          ...(compareResult.structured ? { structured: true } : {}),
         });
 
         // Format and output the comparison report
@@ -271,6 +275,6 @@ export function createAuditCli(deps: AuditDeps = {}) {
 registerCommand({
   name: "audit",
   summary: "Read-only diagnostic snapshot of a repo (type, workspaces, receipts)",
-  usage: "ikbi audit <repo> [--compare m1,m2]",
+  usage: "ikbi audit <repo> [--compare m1,m2] [--structured]",
   run: (argv) => createAuditCli().audit(argv),
 });

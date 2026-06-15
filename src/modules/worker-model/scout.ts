@@ -18,6 +18,7 @@
  */
 
 import { type Dirent, readdirSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { extname, join, relative } from "node:path";
 import { gatherFiles, buildContext, SCOUT_MAX_FILES_SCANNED as MAX_FILES_SCANNED, SCOUT_MAX_FILE_BYTES as MAX_FILE_BYTES, SCOUT_MAX_TOTAL_BYTES as MAX_TOTAL_BYTES, SCAN_EXTENSIONS, SKIP_DIRS, type ScoutFileEntry as _ScoutFileEntry } from "./scout-files.js";
 
@@ -37,6 +38,14 @@ export interface ScoutFinding {
   readonly path?: string;
   /** The line range within `path` the finding points at, as [start, end] (1-based), if given. */
   readonly lines?: readonly [number, number];
+  /** STRUCTURED: severity normalized to lab scale (critical/high/medium/low/info). */
+  readonly severity?: "critical" | "high" | "medium" | "low" | "info";
+  /** STRUCTURED: finding category for grouping. */
+  readonly category?: "security" | "correctness" | "performance" | "maintainability" | "testing" | "integration" | "documentation" | "other";
+  /** STRUCTURED: model's confidence in this finding (0.0-1.0). */
+  readonly confidence?: number;
+  /** STRUCTURED: stable ID derived from file + title + severity for dedup. */
+  readonly id?: string;
 }
 
 /** One entry in the scout's STRUCTURE index — a scanned file with its size. The brief is built from these. */
@@ -57,6 +66,59 @@ const SCOUT_SYSTEM =
   "builder can drill straight to it. Read-only — do not propose edits.";
 /** Max files listed in the deterministic structure brief (keeps the brief cheap-model sized). */
 const MAX_BRIEF_FILES = 15;
+
+/**
+ * STRUCTURED SCOUT PROMPT: asks the model to return JSON findings instead of
+ * free-text bullets. Each finding includes severity, category, confidence, and
+ * file references — making cross-model comparison deterministic instead of
+ * relying on Jaccard word overlap.
+ */
+const SCOUT_SYSTEM_STRUCTURED =
+  "You are the SCOUT in a build pipeline. Investigate the provided repository " +
+  "excerpts against the stated goal. Return ONLY a JSON array of findings, no prose.\n\n" +
+  "Each finding is an object with these fields:\n" +
+  '  "title": short description (10 words max)\n' +
+  '  "detail": full explanation\n' +
+  '  "severity": one of "critical", "high", "medium", "low", "info"\n' +
+  '  "category": one of "security", "correctness", "performance", "maintainability", "testing", "integration", "documentation", "other"\n' +
+  '  "confidence": 0.0 to 1.0\n' +
+  '  "path": file path (relative to repo root, if applicable)\n' +
+  '  "lines": [start, end] line range (if applicable)\n\n' +
+  "Example:\n" +
+  '[{"title":"missing input validation","detail":"The endpoint handler at src/api.ts:42 does not validate the request body before passing it to the database layer.","severity":"high","category":"security","confidence":0.9,"path":"src/api.ts","lines":[40,55]}]\n\n' +
+  "Be concrete. Reference real files and line numbers. Read-only — do not propose edits.";
+
+/** Severity normalization map: model-specific terms → lab scale. */
+const SEVERITY_MAP: Record<string, ScoutFinding["severity"]> = {
+  // Critical
+  critical: "critical", "critical severity": "critical", "severe": "critical",
+  "p0": "critical", "blocker": "critical",
+  // High
+  high: "high", "high severity": "high", "important": "high",
+  "p1": "high", "major": "high",
+  // Medium
+  medium: "medium", "medium severity": "medium", "moderate": "medium",
+  "p2": "medium", "minor": "medium",
+  // Low
+  low: "low", "low severity": "low", "cosmetic": "low", "style": "low",
+  "p3": "low", "trivial": "low",
+  // Info
+  info: "info", informational: "info", "note": "info", "observation": "info",
+  "p4": "info", "suggestion": "info",
+};
+
+/** Category normalization: model-specific terms → lab categories. */
+const CATEGORY_MAP: Record<string, ScoutFinding["category"]> = {
+  security: "security", vuln: "security", vulnerability: "security", injection: "security",
+  auth: "security", "authn": "security", "authz": "security",
+  correctness: "correctness", bug: "correctness", logic: "correctness", error: "correctness",
+  performance: "performance", perf: "performance", slow: "performance", memory: "performance",
+  maintainability: "maintainability", maintain: "maintainability", refactor: "maintainability",
+  complexity: "maintainability", readability: "maintainability",
+  testing: "testing", test: "testing", coverage: "testing", missing_tests: "testing",
+  integration: "integration", compat: "integration", compatibility: "integration",
+  documentation: "documentation", docs: "documentation", readme: "documentation",
+};
 
 
 /**
@@ -211,7 +273,81 @@ function validateRef(ref: { path?: string; lines?: [number, number] }, structure
  * Each extracted path:line ref is VALIDATED against `structure` (the file list the scout actually
  * scanned) — refs to nonexistent files or out-of-range lines are dropped rather than handed downstream.
  */
+/** Generate a stable finding ID from its key fields. */
+function stableFindingId(path: string | undefined, title: string, severity: string | undefined): string {
+  const key = `${path ?? "(general)"}|${title}|${severity ?? "info"}`;
+  return createHash("sha256").update(key).digest("hex").slice(0, 12);
+}
+
+/** Normalize a severity string to the lab scale. */
+function normalizeSeverity(raw: unknown): ScoutFinding["severity"] {
+  if (typeof raw !== "string") return undefined;
+  return SEVERITY_MAP[raw.toLowerCase().trim()] ?? undefined;
+}
+
+/** Normalize a category string to the lab categories. */
+function normalizeCategory(raw: unknown): ScoutFinding["category"] {
+  if (typeof raw !== "string") return undefined;
+  return CATEGORY_MAP[raw.toLowerCase().trim()] ?? "other";
+}
+
+/**
+ * STRUCTURED JSON PARSER: try to parse model output as a JSON array of findings.
+ * Returns null when the output isn't valid JSON or isn't an array, so the caller
+ * can fall back to bullet parsing.
+ */
+function tryParseJsonFindings(content: string, structure: readonly ScoutFileEntry[]): ScoutFinding[] | null {
+  // Quick heuristic: if it doesn't start with '[', it's not JSON.
+  const trimmed = content.trim();
+  if (!trimmed.startsWith("[")) return null;
+
+  let raw: unknown;
+  try {
+    raw = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(raw)) return null;
+
+  return raw
+    .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
+    .map((item, i) => {
+      const title = typeof item.title === "string" ? item.title : `finding-${i + 1}`;
+      const detail = typeof item.detail === "string" ? item.detail : JSON.stringify(item);
+      const path = typeof item.path === "string" ? item.path : undefined;
+      const severity = normalizeSeverity(item.severity);
+      const category = normalizeCategory(item.category);
+      const confidence = typeof item.confidence === "number" && item.confidence >= 0 && item.confidence <= 1
+        ? item.confidence : undefined;
+      const lines = Array.isArray(item.lines) && item.lines.length === 2
+        ? [Number(item.lines[0]), Number(item.lines[1])] as [number, number]
+        : undefined;
+
+      // Validate path against the structure index (same as bullet parser).
+      const refInput: { path?: string; lines?: [number, number] } = {};
+      if (path !== undefined) refInput.path = path;
+      if (lines !== undefined) refInput.lines = lines;
+      const ref = validateRef(refInput, structure);
+
+      return {
+        title,
+        detail,
+        ...(ref.path !== undefined ? { path: ref.path } : {}),
+        ...(ref.lines !== undefined ? { lines: ref.lines } : {}),
+        ...(severity !== undefined ? { severity } : {}),
+        ...(category !== undefined ? { category } : {}),
+        ...(confidence !== undefined ? { confidence } : {}),
+        id: stableFindingId(ref.path, title, severity),
+      };
+    });
+}
+
 function parseFindings(content: string, structure: readonly ScoutFileEntry[]): ScoutFinding[] {
+  // LAYER 1: try structured JSON first.
+  const jsonFindings = tryParseJsonFindings(content, structure);
+  if (jsonFindings !== null && jsonFindings.length > 0) return jsonFindings;
+
+  // LAYER 2: fall back to bullet parsing (backward compatible).
   const lines = content
     .split("\n")
     .map((l) => l.trim())
@@ -305,6 +441,12 @@ export interface ScoutDeps {
    * FAIL-SAFE: any retrieval failure/empty selection still falls back to the legacy scan.
    */
   readonly mode?: RetrievalMode;
+  /**
+   * STRUCTURED OUTPUT: when true, the scout's system prompt asks for JSON findings
+   * with severity, category, confidence, and stable IDs. Falls back to bullet parsing
+   * when the model doesn't return valid JSON. Default: false (bullet output).
+   */
+  readonly structured?: boolean;
 }
 
 /**
@@ -381,7 +523,7 @@ export function createScout(deps: ScoutDeps = {}): RoleFn {
         maxTokens: SCOUT_MAX_TOKENS,
         identity: ctx.identity, // the spawned, ceiling-clamped role identity (#10)
         messages: [
-          { role: "system", content: SCOUT_SYSTEM },
+          { role: "system", content: deps.structured ? SCOUT_SYSTEM_STRUCTURED : SCOUT_SYSTEM },
           untrusted(`Goal:\n${ctx.task.goal}`, "scout_goal"),
           untrusted(`Task metadata: ${JSON.stringify(ctx.task.metadata ?? {})}`, "scout_metadata"),
           untrusted(`Repository excerpts (${used} file(s)):\n${text}`, "scout_repo_excerpts"),

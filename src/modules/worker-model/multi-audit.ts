@@ -13,6 +13,7 @@
 
 import { toUntrustedMessage } from "../../core/injection/index.js";
 import { neutralizeUntrusted as coreNeutralize } from "../../core/injection/index.js";
+import { createHash } from "node:crypto";
 import type { ModelRequest, ModelResponse, AgentIdentity } from "../../core/provider/contract.js";
 import type { ScoutFinding } from "./scout.js";
 import { gatherFiles, buildContext, type ScoutFileEntry } from "./scout-files.js";
@@ -61,6 +62,8 @@ export interface MultiAuditOptions {
   readonly goal?: string;
   readonly timeoutMs?: number;
   readonly invokeModel?: (request: ModelRequest) => Promise<ModelResponse>;
+  /** When true, use structured JSON prompt and parser. */
+  readonly structured?: boolean;
 }
 
 // ── Constants ──────────────────────────────────────────────────────────────────
@@ -76,6 +79,39 @@ const SCOUT_SYSTEM =
   "should know. When a finding is about a specific file, START the line with its " +
   "path and (if you can) a line number, like `- src/foo.ts:42 — does X`, so the " +
   "builder can drill straight to it. Read-only — do not propose edits.";
+
+const SCOUT_SYSTEM_STRUCTURED =
+  "You are the SCOUT in a build pipeline. Investigate the provided repository " +
+  "excerpts against the stated goal. Return ONLY a JSON array of findings, no prose.\n\n" +
+  "Each finding is an object with these fields:\n" +
+  '  "title": short description (10 words max)\n' +
+  '  "detail": full explanation\n' +
+  '  "severity": one of "critical", "high", "medium", "low", "info"\n' +
+  '  "category": one of "security", "correctness", "performance", "maintainability", "testing", "integration", "documentation", "other"\n' +
+  '  "confidence": 0.0 to 1.0\n' +
+  '  "path": file path (relative to repo root, if applicable)\n' +
+  '  "lines": [start, end] line range (if applicable)\n\n' +
+  "Example:\n" +
+  '[{"title":"missing input validation","detail":"The endpoint handler at src/api.ts:42 does not validate the request body.","severity":"high","category":"security","confidence":0.9,"path":"src/api.ts","lines":[40,55]}]\n\n' +
+  "Be concrete. Reference real files and line numbers. Read-only — do not propose edits.";
+
+const SEVERITY_MAP: Record<string, ScoutFinding["severity"]> = {
+  critical: "critical", "critical severity": "critical", severe: "critical", p0: "critical", blocker: "critical",
+  high: "high", "high severity": "high", important: "high", p1: "high", major: "high",
+  medium: "medium", "medium severity": "medium", moderate: "medium", p2: "medium", minor: "medium",
+  low: "low", "low severity": "low", cosmetic: "low", style: "low", p3: "low", trivial: "low",
+  info: "info", informational: "info", note: "info", observation: "info", p4: "info", suggestion: "info",
+};
+
+const CATEGORY_MAP: Record<string, ScoutFinding["category"]> = {
+  security: "security", vuln: "security", vulnerability: "security", injection: "security",
+  correctness: "correctness", bug: "correctness", logic: "correctness", error: "correctness",
+  performance: "performance", perf: "performance", slow: "performance",
+  maintainability: "maintainability", maintain: "maintainability", refactor: "maintainability",
+  testing: "testing", test: "testing", coverage: "testing",
+  integration: "integration", compat: "integration",
+  documentation: "documentation", docs: "documentation",
+};
 
 /** Default agent identity for the multi-audit (probation tier, read-only). */
 const AUDIT_IDENTITY: AgentIdentity = {
@@ -102,10 +138,55 @@ function extractPathRef(text: string): { path?: string; lines?: [number, number]
 }
 
 /**
- * Parse the model's bullet output into structured findings; fall back to one finding.
+ * Parse the model's output into structured findings.
+ * Tries JSON first (when structured prompt was used), falls back to bullet parsing.
  * Validates path refs against the structure (same logic as scout).
  */
 function parseFindings(content: string, structure: readonly ScoutFileEntry[]): ScoutFinding[] {
+  // LAYER 1: try structured JSON.
+  const trimmed = content.trim();
+  if (trimmed.startsWith("[")) {
+    try {
+      const raw = JSON.parse(trimmed);
+      if (Array.isArray(raw) && raw.length > 0) {
+        return raw
+          .filter((item): item is Record<string, unknown> => typeof item === "object" && item !== null)
+          .map((item, i) => {
+            const title = typeof item.title === "string" ? item.title : `finding-${i + 1}`;
+            const detail = typeof item.detail === "string" ? item.detail : JSON.stringify(item);
+            const path = typeof item.path === "string" ? item.path : undefined;
+            const severity = typeof item.severity === "string" ? (SEVERITY_MAP[item.severity.toLowerCase()] ?? undefined) : undefined;
+            const category = typeof item.category === "string" ? (CATEGORY_MAP[item.category.toLowerCase()] ?? "other") : undefined;
+            const confidence = typeof item.confidence === "number" ? item.confidence : undefined;
+            const lines = Array.isArray(item.lines) && item.lines.length === 2
+              ? [Number(item.lines[0]), Number(item.lines[1])] as [number, number]
+              : undefined;
+            const validatedPath = path !== undefined
+              ? structure.find((e) => {
+                  const p = e.path.toLowerCase();
+                  const ref = path.toLowerCase();
+                  return p === ref || p.endsWith(`/${ref}`) || ref.endsWith(`/${p}`);
+                })?.path
+              : undefined;
+            const id = createHash("sha256").update(`${validatedPath ?? "(general)"}|${title}|${severity ?? "info"}`).digest("hex").slice(0, 12);
+            return {
+              title,
+              detail,
+              ...(validatedPath !== undefined ? { path: validatedPath } : {}),
+              ...(lines !== undefined ? { lines } : {}),
+              ...(severity !== undefined ? { severity } : {}),
+              ...(category !== undefined ? { category } : {}),
+              ...(confidence !== undefined ? { confidence } : {}),
+              id,
+            };
+          });
+      }
+    } catch {
+      // Not valid JSON — fall through to bullet parsing.
+    }
+  }
+
+  // LAYER 2: fall back to bullet parsing.
   const lines = content
     .split("\n")
     .map((l) => l.trim())
@@ -264,6 +345,7 @@ async function runScoutModel(
   goal: string,
   timeoutMs: number,
   invokeModel: (request: ModelRequest) => Promise<ModelResponse>,
+  structured = false,
 ): Promise<ModelFindings> {
   const start = performance.now();
   try {
@@ -277,7 +359,7 @@ async function runScoutModel(
       identity: AUDIT_IDENTITY,
       timeoutMs,
       messages: [
-        { role: "system", content: SCOUT_SYSTEM },
+        { role: "system", content: structured ? SCOUT_SYSTEM_STRUCTURED : SCOUT_SYSTEM },
         toUntrustedMessage(coreNeutralize(`Goal:\n${goal}`, { source: "external", identity: AUDIT_IDENTITY, origin: "multi-audit-goal" }), { role: "user" }),
         untrustedExcerpts,
       ],
@@ -321,6 +403,7 @@ export async function runMultiAudit(options: MultiAuditOptions): Promise<Compari
       ? Number.parseInt(process.env.IKBI_MULTI_AUDIT_TIMEOUT_MS, 10) || DEFAULT_TIMEOUT_MS
       : DEFAULT_TIMEOUT_MS,
     invokeModel,
+    structured = false,
   } = options;
 
   // Gather files once — shared across all models
@@ -332,7 +415,7 @@ export async function runMultiAudit(options: MultiAuditOptions): Promise<Compari
 
   // Run all models in parallel
   const results = await Promise.all(
-    models.map((m) => runScoutModel(m, context, goal, timeoutMs, invoke)),
+    models.map((m) => runScoutModel(m, context, goal, timeoutMs, invoke, structured)),
   );
 
   // Compare pairwise (for 2 models)
