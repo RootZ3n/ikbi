@@ -76,6 +76,63 @@ export function toOutcomeStatus(outcome: WorkerOutcome): "success" | "failure" |
   return outcome === "stub" ? "partial" : outcome;
 }
 
+// ── Pehlichi Delegation ───────────────────────────────────────────────────────
+
+/**
+ * Structured envelope for delegation requests from an orchestrator agent (e.g. Pehlichi).
+ * Carries the origin, governance metadata, and task parameters as a typed unit.
+ */
+export interface DelegationEnvelope {
+  /** The agent issuing this delegation (e.g. 'pehlichi'). */
+  readonly originAgent: string;
+  /** The human operator who approved this delegation. Required when `approvalRequired` is true. */
+  readonly humanOperator?: string | undefined;
+  /** Absolute path to the target repository. */
+  readonly repoPath: string;
+  /** Branch to work on. */
+  readonly targetBranch?: string | undefined;
+  /** The kind of work being delegated. */
+  readonly taskType: "build" | "audit" | "fix";
+  /** The goal text passed to the worker pipeline. */
+  readonly objective: string;
+  /** Additional constraints forwarded to the pipeline. */
+  readonly constraints?: readonly string[] | undefined;
+  /** Whether human approval is required before the run starts. */
+  readonly approvalRequired?: boolean | undefined;
+  /** Tool restrictions (passed through as advisory metadata). */
+  readonly allowedTools?: readonly string[] | undefined;
+  /** Where to send receipts (advisory — receipt routing is not yet wired). */
+  readonly receiptDestination?: string | undefined;
+  /** Conditions under which the run should stop early. */
+  readonly stopConditions?: readonly string[] | undefined;
+}
+
+/** Typed validation result for a DelegationEnvelope. */
+export type DelegationValidationResult =
+  | { readonly valid: true }
+  | { readonly valid: false; readonly reason: string };
+
+/**
+ * Validate a DelegationEnvelope before dispatching a delegation run.
+ * Returns `{ valid: true }` on success, or `{ valid: false, reason }` on the first violation.
+ */
+export function validateDelegationEnvelope(env: DelegationEnvelope): DelegationValidationResult {
+  if (env.repoPath.trim().length === 0) {
+    return { valid: false, reason: "repoPath must be non-empty" };
+  }
+  if (env.objective.trim().length === 0) {
+    return { valid: false, reason: "objective must be non-empty" };
+  }
+  const validTypes: ReadonlyArray<DelegationEnvelope["taskType"]> = ["build", "audit", "fix"];
+  if (!validTypes.includes(env.taskType)) {
+    return { valid: false, reason: `taskType must be one of: ${validTypes.join(", ")}` };
+  }
+  if (env.approvalRequired === true && (env.humanOperator === undefined || env.humanOperator.trim().length === 0)) {
+    return { valid: false, reason: "humanOperator must be set when approvalRequired is true" };
+  }
+  return { valid: true };
+}
+
 /** A unit of work handed to the orchestrator. */
 export interface WorkerTask {
   /** Caller-provided correlation id (ties events/receipts together). */
@@ -94,7 +151,12 @@ export interface WorkerTask {
    */
   readonly projectInstructions?: string;
   /** Free-form correlation metadata (never secrets). */
-  readonly metadata?: Readonly<Record<string, unknown>>;
+  readonly metadata?: Readonly<Record<string, unknown>> | undefined;
+  /**
+   * The orchestrator agent that delegated this task (e.g. 'pehlichi'). Stamped into the
+   * run summary receipt when present so the audit trail records the delegation source.
+   */
+  readonly originAgent?: string | undefined;
   /**
    * Write scope constraint for the builder. Controls which files the builder can modify.
    * - "all" (default): builder can create and modify any file in the worktree
