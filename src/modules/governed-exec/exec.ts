@@ -77,13 +77,26 @@ export type ExecFileStreamFn = (
 /** Default streaming impl over node `spawn` (array args, no shell). Bounds capture at maxBuffer. */
 const defaultExecFileStream: ExecFileStreamFn = (binary, args, opts, onOutput) =>
   new Promise((resolveP) => {
-    const child = nodeSpawn(binary, args as string[], { ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}), env: opts.env });
+    const child = nodeSpawn(binary, args as string[], {
+      ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
+      env: opts.env,
+      detached: true, // own process group — lets us kill the entire tree, not just the direct child
+    });
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    // Kill the process GROUP (not just the direct child) so grandchildren cannot become orphans.
+    const killGroup = (): void => {
+      try {
+        if (child.pid !== undefined) process.kill(-child.pid, "SIGKILL");
+        else child.kill("SIGKILL");
+      } catch {
+        try { child.kill("SIGKILL"); } catch { /* already dead */ }
+      }
+    };
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGKILL");
+      killGroup();
     }, opts.timeout);
     const onData = (which: "stdout" | "stderr") => (d: Buffer | string) => {
       const s = typeof d === "string" ? d : d.toString("utf8");
@@ -285,7 +298,8 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
         await receipt(EXEC_OPERATION, identity, { status: "success", detail: `exec ${command} ok` }, { action: "exec", command, argCount, sudo, allow: true, exitCode: 0 }, requestId, cwd);
         return { executed: true, exitCode: 0, stdoutTail: tail(stdout), stderrTail: tail(stderr) };
       }
-      const reason = `command exited ${code}`;
+      // Code 124 is the conventional timeout-kill exit code (set by the streaming impl).
+      const reason = code === 124 ? `command timed out after ${effectiveTimeout}ms (killed)` : `command exited ${code}`;
       emit(govexecFailed, { ...base, allow: true, exitCode: code, reason }, identity, EXEC_OPERATION, requestId);
       await receipt(EXEC_OPERATION, identity, { status: "failure", error: reason, code: String(code) }, { action: "exec", command, argCount, sudo, allow: true, exitCode: code }, requestId, cwd);
       return { executed: true, exitCode: code, reason, stdoutTail: tail(stdout), stderrTail: tail(stderr) };
