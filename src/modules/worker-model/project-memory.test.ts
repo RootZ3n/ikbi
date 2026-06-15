@@ -5,7 +5,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -20,7 +20,7 @@ import type { ModelRequest, ModelResponse, ToolCall } from "../../core/provider/
 import { autonomyForTier } from "../../core/trust/index.js";
 import type { WorkspaceHandle } from "../../core/workspace/contract.js";
 import type { ExecRequest, ExecResult } from "../governed-exec/index.js";
-import { loadProjectInstructions, MAX_PROJECT_INSTRUCTION_BYTES } from "./project-memory.js";
+import { loadProjectInstructions, loadProjectMemory, IKBI_CONFIG_FILES, MAX_PROJECT_INSTRUCTION_BYTES } from "./project-memory.js";
 import { createBuilder } from "./builder.js";
 import type { RoleContext, RoleEngine } from "./contract.js";
 
@@ -121,4 +121,137 @@ test("builder does NOT crash when the target has no CLAUDE.md (project memory si
   // No project_instructions message present.
   const noneMsgs = requests[0]?.messages ?? [];
   assert.ok(!noneMsgs.some((m) => typeof m.content === "string" && m.content.includes("Project instructions from the target repo")), "no project-memory message when there is no file");
+});
+
+// ── loadProjectMemory (Phase 9: extended loader) ───────────────────────────────
+
+test("loadProjectMemory returns undefined when no files exist", () => {
+  const dir = tmp("ikbi-pm-mem-none-");
+  assert.equal(loadProjectMemory(dir), undefined);
+});
+
+test("loadProjectMemory loads CLAUDE.md as the primary source", () => {
+  const dir = tmp("ikbi-pm-mem-claude-");
+  writeFileSync(join(dir, "CLAUDE.md"), RULE);
+  const r = loadProjectMemory(dir);
+  assert.ok(r !== undefined);
+  assert.equal(r.source, "CLAUDE.md");
+  assert.ok(r.content.includes(RULE));
+  assert.equal(r.files.length, 1);
+  assert.equal(r.files[0]?.path, "CLAUDE.md");
+  assert.ok((r.files[0]?.bytes ?? 0) > 0);
+  assert.equal(r.files[0]?.truncated, false);
+});
+
+test("loadProjectMemory falls back to AGENTS.md when CLAUDE.md is missing", () => {
+  const dir = tmp("ikbi-pm-mem-agents-");
+  writeFileSync(join(dir, "AGENTS.md"), "use AGENTS rules");
+  const r = loadProjectMemory(dir);
+  assert.ok(r !== undefined);
+  assert.equal(r.source, "AGENTS.md");
+});
+
+test("loadProjectMemory loads IKBI.md additively alongside CLAUDE.md", () => {
+  const dir = tmp("ikbi-pm-mem-ikbi-");
+  writeFileSync(join(dir, "CLAUDE.md"), "claude rules");
+  writeFileSync(join(dir, "IKBI.md"), "ikbi rules");
+  const r = loadProjectMemory(dir);
+  assert.ok(r !== undefined);
+  assert.equal(r.source, "CLAUDE.md");
+  assert.ok(r.content.includes("claude rules"));
+  assert.ok(r.content.includes("ikbi rules"));
+  assert.equal(r.files.length, 2);
+  assert.ok(r.files.some((f) => f.path === "CLAUDE.md"));
+  assert.ok(r.files.some((f) => f.path === "IKBI.md"));
+});
+
+test("loadProjectMemory loads .ikbi/project.md additively", () => {
+  const dir = tmp("ikbi-pm-mem-dot-");
+  mkdirSync(join(dir, ".ikbi"));
+  writeFileSync(join(dir, ".ikbi/project.md"), "project config");
+  const r = loadProjectMemory(dir);
+  assert.ok(r !== undefined);
+  assert.ok(r.content.includes("project config"));
+  assert.ok(r.files.some((f) => f.path === ".ikbi/project.md"));
+});
+
+test("loadProjectMemory loads all .ikbi/ config files together", () => {
+  const dir = tmp("ikbi-pm-mem-all-");
+  writeFileSync(join(dir, "CLAUDE.md"), "base");
+  mkdirSync(join(dir, ".ikbi"));
+  writeFileSync(join(dir, ".ikbi/project.md"), "project md");
+  writeFileSync(join(dir, ".ikbi/checks.yaml"), "checks: []");
+  writeFileSync(join(dir, ".ikbi/ignore"), "*.log");
+  const r = loadProjectMemory(dir);
+  assert.ok(r !== undefined);
+  assert.ok(r.content.includes("base"));
+  assert.ok(r.content.includes("project md"));
+  assert.ok(r.content.includes("checks: []"));
+  assert.ok(r.content.includes("*.log"));
+  assert.equal(r.files.length, 4);
+});
+
+test("loadProjectMemory populates missing list for absent ikbi config files", () => {
+  const dir = tmp("ikbi-pm-mem-missing-");
+  writeFileSync(join(dir, "CLAUDE.md"), "base");
+  const r = loadProjectMemory(dir);
+  assert.ok(r !== undefined);
+  // All IKBI_CONFIG_FILES are missing when none exist
+  for (const name of IKBI_CONFIG_FILES) {
+    assert.ok(r.missing.includes(name), `${name} should be in missing list`);
+  }
+});
+
+test("loadProjectMemory bounds a huge IKBI.md", () => {
+  const dir = tmp("ikbi-pm-mem-big-ikbi-");
+  writeFileSync(join(dir, "IKBI.md"), "x".repeat(MAX_PROJECT_INSTRUCTION_BYTES + 5_000));
+  const r = loadProjectMemory(dir);
+  assert.ok(r !== undefined);
+  assert.equal(r.files[0]?.path, "IKBI.md");
+  assert.equal(r.files[0]?.truncated, true);
+  assert.ok(r.content.includes("truncated"));
+});
+
+test("loadProjectInstructions delegates to loadProjectMemory (backward compat)", () => {
+  const dir = tmp("ikbi-pm-compat-");
+  writeFileSync(join(dir, "CLAUDE.md"), RULE);
+  mkdirSync(join(dir, ".ikbi"));
+  writeFileSync(join(dir, ".ikbi/project.md"), "extra config");
+  const r = loadProjectInstructions(dir);
+  assert.ok(r !== undefined);
+  assert.equal(r.source, "CLAUDE.md");
+  // content now includes the .ikbi/project.md content too (additive)
+  assert.ok(r.content.includes(RULE));
+  assert.ok(r.content.includes("extra config"));
+});
+
+test("builder respects skipProjectMemory flag (no project context injected)", async () => {
+  const dir = tmp("ikbi-pm-skip-");
+  writeFileSync(join(dir, "CLAUDE.md"), RULE);
+  const requests: ModelRequest[] = [];
+  let i = 0;
+  const responses: ModelResponse[] = [
+    { ...base(), content: "", finishReason: "tool_calls", toolCalls: [call("run_checks", {})] },
+    { ...base(), content: "", finishReason: "tool_calls", toolCalls: [call("done", { successCondition: "met", filesReadBack: [], selfCheck: "ran checks", satisfied: true })] },
+  ];
+  const engine: RoleEngine = {
+    invokeModel: async (req) => { requests.push(req); const r = responses[Math.min(i, responses.length - 1)]!; i += 1; return r; },
+    neutralizeUntrusted: (content, ctx) => coreNeutralize(content, ctx),
+  };
+  const ws: import("../../core/workspace/contract.js").WorkspaceHandle = {
+    id: "ws-skip", targetRepo: dir, baseBranch: "main", baseRef: "x",
+    scratchBranch: "ikbi/ws/ws-skip", path: dir, identity: ID, state: "allocated", createdAt: 0,
+  };
+  const ctx: import("./contract.js").RoleContext = {
+    task: { taskId: "t-skip", targetRepo: dir, goal: "do the thing", skipProjectMemory: true },
+    role: "builder", identity: ID, autonomy: autonomyForTier("verified"), workspace: ws,
+    priorResults: [], engine,
+  };
+  const result = await createBuilder({ governedExec: greenExec(), parentCtx: makeParentCtx() })(ctx);
+  assert.equal(result.role, "builder");
+  const msgs = requests[0]?.messages ?? [];
+  assert.ok(
+    !msgs.some((m) => typeof m.content === "string" && m.content.includes("Project instructions from the target repo")),
+    "skipProjectMemory=true must suppress project memory injection even when CLAUDE.md exists",
+  );
 });

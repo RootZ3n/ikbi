@@ -44,6 +44,7 @@ import { preBuildRefinement, formatInterview } from "../../core/goal-refinement.
 import { createCognitionLayer } from "../cognition-layer/cognition.js";
 import { loadRepoRegistry } from "../../core/repo-registry.js";
 import type { CognitionDecision, CognitionLayer } from "../cognition-layer/contract.js";
+import { loadProjectMemory, type ProjectMemoryResult } from "./project-memory.js";
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -454,13 +455,15 @@ function detectWriteScope(goal: string): "all" | "new_only" | "none" {
  * and `--delegation <json>`; the rest is the goal prose. `--yes` skips the interactive
  * Socratic interview prompt and proceeds with the original goal.
  */
-export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbose?: boolean; cost?: boolean; yes?: boolean; delegation?: string; rest: string[] } {
+export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbose?: boolean; cost?: boolean; yes?: boolean; delegation?: string; noMemory?: boolean; memoryDiff?: boolean; rest: string[] } {
   const rest: string[] = [];
   let repo: string | undefined;
   let verbose = false;
   let cost = false;
   let yes = false;
   let delegation: string | undefined;
+  let noMemory = false;
+  let memoryDiff = false;
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i] as string;
     if (a === "--repo") {
@@ -479,11 +482,15 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
       i += 1;
     } else if (a.startsWith("--delegation=")) {
       delegation = a.slice("--delegation=".length);
+    } else if (a === "--no-memory") {
+      noMemory = true;
+    } else if (a === "--memory-diff") {
+      memoryDiff = true;
     } else {
       rest.push(a);
     }
   }
-  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), ...(verbose ? { verbose } : {}), ...(cost ? { cost } : {}), ...(yes ? { yes } : {}), ...(delegation !== undefined ? { delegation } : {}), rest };
+  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), ...(verbose ? { verbose } : {}), ...(cost ? { cost } : {}), ...(yes ? { yes } : {}), ...(delegation !== undefined ? { delegation } : {}), ...(noMemory ? { noMemory } : {}), ...(memoryDiff ? { memoryDiff } : {}), rest };
 }
 
 /** Render a worker `worker.*` progress event into a concise human line (for `--verbose`). PURE. */
@@ -579,6 +586,32 @@ export function formatRepairNarrative(r: WorkerResult): string {
 /** Format a run's total cost as a human one-line ($USD, 4 decimals). */
 export function formatCost(costUsd: number | undefined): string {
   return `Cost: $${(costUsd ?? 0).toFixed(4)}`;
+}
+
+/** Format a byte count as a human-readable string (B / KB). PURE. */
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  return `${(n / 1024).toFixed(1)} KB`;
+}
+
+/**
+ * Format the project memory context block for verbose pre-build display. PURE.
+ * Shows which files were loaded, their sizes, and (on --memory-diff) the missing list.
+ */
+export function formatProjectMemoryContext(mem: ProjectMemoryResult | undefined, showMissing = false): string {
+  const lines: string[] = [];
+  if (mem === undefined) {
+    lines.push("  → project context: none (no CLAUDE.md, AGENTS.md, or .ikbi/ files found)");
+  } else {
+    const fileList = mem.files
+      .map((f) => `${f.path} (${formatBytes(f.bytes)}${f.truncated ? ", truncated" : ""})`)
+      .join(", ");
+    lines.push(`  → project context: ${fileList}`);
+    if (showMissing && mem.missing.length > 0) {
+      lines.push(`    missing ikbi config: ${mem.missing.join(", ")}`);
+    }
+  }
+  return `${lines.join("\n")}\n`;
 }
 
 /** Format a per-role cost breakdown table for the --cost flag. */
@@ -684,7 +717,7 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
   const interactive = deps.interactive ?? (process.stdin.isTTY === true);
 
   async function build(argv: readonly string[]): Promise<void> {
-    const { repo, verbose, cost, yes, delegation: delegationJson, rest } = parseBuildArgs(argv);
+    const { repo, verbose, cost, yes, delegation: delegationJson, noMemory, memoryDiff, rest } = parseBuildArgs(argv);
 
     // Parse and validate a --delegation envelope when present. The envelope overrides goal +
     // targetRepo and stamps originAgent into the task for receipt attribution.
@@ -811,12 +844,30 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       }
     }
 
+    // ── CONTEXT DISPLAY (verbose / --memory-diff) ────────────────────────────
+    // Load project memory once here so we can (a) display it in verbose mode and
+    // (b) pass it directly to the task (avoids a second disk read in the builder).
+    const projectMem: ProjectMemoryResult | undefined = noMemory === true ? undefined : loadProjectMemory(targetRepo);
+    if (memoryDiff === true) {
+      // --memory-diff: show what project memory would be used and exit without building.
+      out(formatProjectMemoryContext(projectMem, true));
+      return;
+    }
+    if (verbose === true) {
+      out(formatProjectMemoryContext(projectMem, false));
+    }
+
     const task: WorkerTask = {
       taskId: id,
       targetRepo,
       goal: finalGoal,
       writeScope: detectWriteScope(finalGoal),
       ...(envelope !== undefined ? { originAgent: envelope.originAgent } : {}),
+      // Pass pre-loaded memory content so the builder doesn't re-read the disk.
+      // When --no-memory is set, projectMem is undefined; skipProjectMemory tells
+      // the builder not to fall back to its own file load.
+      ...(projectMem !== undefined ? { projectInstructions: projectMem.content } : {}),
+      ...(noMemory === true ? { skipProjectMemory: true } : {}),
     };
 
     // STEP-PLANNER: decompose complex goals into atomic steps for cheap models. Production uses ONLY
@@ -959,7 +1010,7 @@ const live = createWorkerCli();
 registerCommand({
   name: "build",
   summary: "Run a worker build pipeline toward a goal",
-  usage: "ikbi build <goal...> [--repo <path>] [--verbose] [--cost] [--yes]",
+  usage: "ikbi build <goal...> [--repo <path>] [--verbose] [--cost] [--yes] [--no-memory] [--memory-diff]",
   run: (argv) => live.build(argv),
 });
 

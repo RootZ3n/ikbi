@@ -216,6 +216,12 @@ export interface WorkerTask {
    * OFF — only the step planner sets it, so single-pass behavior is byte-unchanged.
    */
   readonly skipCritic?: boolean;
+  /**
+   * Skip loading project memory (CLAUDE.md / AGENTS.md / IKBI.md / .ikbi/) entirely.
+   * When true, the builder does NOT inject any project instructions into the model context.
+   * Activated via `--no-memory` on the CLI. Default: false (project memory is loaded).
+   */
+  readonly skipProjectMemory?: boolean | undefined;
 }
 
 /** The result a single role produces. */

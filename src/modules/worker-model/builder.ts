@@ -59,7 +59,7 @@ import { workerModelConfig } from "./config.js";
 import { estimateTokens, maybeCompress } from "./context-manager.js";
 import { ContextLayer } from "./context-layer.js";
 import type { RoleFn, RoleResult, WorkerOutcome } from "./contract.js";
-import { loadProjectInstructions } from "./project-memory.js";
+import { loadProjectMemory } from "./project-memory.js";
 import { builderModel } from "./role-models.js";
 import type { ScoutFinding } from "./scout.js";
 
@@ -660,7 +660,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
     // PROJECT MEMORY (CLAUDE.md / AGENTS.md): caller-supplied, else loaded from the worktree
     // root. Rides as an isolated UNTRUSTED message (neutralized) — honored project guidance,
     // but bounded; never raw-concatenated into the trusted system prompt. Missing ⇒ omitted.
-    const projectInstructions = ctx.task.projectInstructions ?? loadProjectInstructions(worktreeReal)?.content;
+    const projectInstructions = ctx.task.projectInstructions ?? (ctx.task.skipProjectMemory === true ? undefined : loadProjectMemory(worktreeReal)?.content);
     // PRINCIPLE 2: pin the goal-named files as PRIMARY TARGETS in the (trusted) system prompt so a
     // cheap model edits the file the goal points at, not whatever it stumbles on first. Pure paths,
     // no prose — no injection surface in the trusted slot.
@@ -675,7 +675,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
     const messages: ModelMessage[] = [
       { role: "system", content: BUILDER_SYSTEM + writeScopeAddendum + primaryTargetsAddendum(targetFiles) },
       ...(projectInstructions !== undefined
-        ? [untrusted(`Project instructions from the target repo (CLAUDE.md/AGENTS.md) — honor these conventions where they apply:\n${projectInstructions}`, "project_instructions")]
+        ? [untrusted(`Project instructions from the target repo (CLAUDE.md/AGENTS.md/IKBI.md/.ikbi/) — honor these conventions where they apply:\n${projectInstructions}`, "project_instructions")]
         : []),
       untrusted(`Goal:\n${ctx.task.goal}`, "builder_goal"),
       untrusted(successCondition, "builder_success_condition"),
