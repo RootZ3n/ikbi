@@ -990,6 +990,20 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     }
     const parentIdentity = parentCtx.identity.identity;
 
+    // DIRTY REPO CHECK: refuse to build against a repo with uncommitted changes.
+    // Runs BEFORE any workspace allocation, regardless of mode (single, competitive, tournament) —
+    // all modes allocate worktrees from the same base and would inherit the ambiguous partial state.
+    // Skip when reusing a workspace — the step planner already checked on the first step.
+    if (task.reuseWorkspace === undefined) {
+      const checkDirty = deps.checkTargetDirty ?? ((repo) => Promise.resolve(liveCheckTargetDirty(repo)));
+      const dirtyReason = await checkDirty(task.targetRepo);
+      if (dirtyReason !== undefined) {
+        const reason = `Refusing to build: ${dirtyReason}`;
+        events.publish(workerFailed.create({ taskId: task.taskId, reason }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } }));
+        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason };
+      }
+    }
+
     // CANDIDATE TOURNAMENT MODE (#tournament, default OFF). When the task (or config) names
     // candidate models, race them independently, verify + score all, replay the WINNER's diff into
     // a clean shadow workspace, re-verify, then take the existing promote path. Takes precedence
@@ -1022,18 +1036,6 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       if (preKill !== undefined) {
         events.publish(workerFailed.create({ taskId: task.taskId, reason: preKill }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } }));
         return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason: preKill };
-      }
-
-      // DIRTY REPO CHECK: refuse to build against a repo with uncommitted changes.
-      // A dirty base means the worktree inherits an ambiguous partial state and the
-      // operator would get a confusing failure deep in the pipeline instead of a clear
-      // early refusal. Runs only on fresh (non-reused) workspaces.
-      const checkDirty = deps.checkTargetDirty ?? ((repo) => Promise.resolve(liveCheckTargetDirty(repo)));
-      const dirtyReason = await checkDirty(task.targetRepo);
-      if (dirtyReason !== undefined) {
-        const reason = `Refusing to build: ${dirtyReason}`;
-        events.publish(workerFailed.create({ taskId: task.taskId, reason }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } }));
-        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason };
       }
     }
 
