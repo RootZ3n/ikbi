@@ -767,6 +767,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     workspace: WorkspaceHandle,
     spawned: SpawnedRole,
     result: RoleResult,
+    costUsd?: number,
+    model?: string,
   ): Promise<void> {
     const status = toOutcomeStatus(result.outcome);
     const operation = `worker.role.${result.role}`;
@@ -824,6 +826,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           taskId: task.taskId,
           workspaceId: workspace.id,
           outcome: result.outcome,
+          ...(costUsd !== undefined ? { costUsd } : {}),
+          ...(model !== undefined ? { model } : {}),
           ...(perfTrust !== undefined
             ? { performanceFailure: true, trustDecision: perfTrust.decision, trustDecisionReason: perfTrust.reason }
             : {}),
@@ -1122,6 +1126,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         // H4: floor the verifier's role timeout at the per-check budget. Without this, a 300s role
         // timeout races against 600s checks — the role fails first, orphaning the still-running check.
         const verifierTimeout = role === "verifier" ? Math.max(roleTimeoutMs, resolveCheckTimeoutMs(modeEnv)) : undefined;
+        // Per-role cost snapshot: capture before execution so we can attribute cost to this role.
+        const costBeforeRole = runCost();
         // H7: when the fix loop already verified the SAME code GREEN, reuse its verifier result rather
         // than running the full typecheck+test suite again. The reused result flows through the normal
         // record/commit/integrator path below; only the redundant second verifier dispatch is skipped.
@@ -1156,7 +1162,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           ),
         );
 
-        await recordRole(task, workspace, spawned, result);
+        await recordRole(task, workspace, spawned, result, runCost() - costBeforeRole, singleBuilderModel);
 
         // SG-5 PROGRESS: structured per-role detail beyond start/end — builder tool activity
         // and the verifier's verdict — so `--verbose` can show what each phase actually did.
@@ -1274,6 +1280,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                   workspaceId: workspace.id,
                   fixIterations: fixLoopOutcome.fixIterations,
                   success: fixLoopOutcome.buildResult.outcome === "success",
+                  costUsd: runCost(),
                 },
                 project: task.targetRepo,
               },
@@ -1401,7 +1408,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 operation: "worker.critic_fix_loop",
                 outcome: { status: criticPass ? "success" : "failure" },
                 requestId: task.taskId,
-                metadata: { taskId: task.taskId, workspaceId: workspace.id, retried: true, criticPass },
+                metadata: { taskId: task.taskId, workspaceId: workspace.id, retried: true, criticPass, costUsd: runCost() },
                 project: task.targetRepo,
               },
               parentIdentity,
@@ -1658,7 +1665,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 
   /** Dispatch one role in one workspace (events + recordRole), returning its result.
    *  `roleFnOverride` lets the competitive loop inject a per-candidate builder (its own model). */
-  async function dispatchRole(role: WorkerRole, spawned: SpawnedRole, task: WorkerTask, workspace: WorkspaceHandle, priorResults: readonly RoleResult[], parentCtx: OperationContext, engine: RoleEngine, roleFnOverride?: RoleFn): Promise<RoleResult> {
+  async function dispatchRole(role: WorkerRole, spawned: SpawnedRole, task: WorkerTask, workspace: WorkspaceHandle, priorResults: readonly RoleResult[], parentCtx: OperationContext, engine: RoleEngine, roleFnOverride?: RoleFn, cost?: () => number): Promise<RoleResult> {
     events.publish(
       workerRoleDispatched.create(
         { taskId: task.taskId, role, ...(spawned.identity.trustTier !== undefined ? { tier: spawned.identity.trustTier } : {}) },
@@ -1671,6 +1678,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     const roleFn = roleFnOverride ?? (role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderFor(parentCtx, resolveBuilderMode(task)) : roles[role]);
     // H4: floor the verifier's role timeout at the per-check budget (same as the cooperative path).
     const verifierTimeout = role === "verifier" ? Math.max(roleTimeoutMs, resolveCheckTimeoutMs(modeEnv)) : undefined;
+    const costBeforeRole = cost?.() ?? 0;
     const result = await runRoleFn(role, roleFn, ctx, verifierTimeout);
     events.publish(
       workerRoleCompleted.create(
@@ -1678,7 +1686,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         { source: EVENT_SOURCE, attribution: { identity: spawned.identity, operation: `worker.role.${role}`, runId: task.taskId } },
       ),
     );
-    await recordRole(task, workspace, spawned, result);
+    const roleCost = cost !== undefined ? cost() - costBeforeRole : undefined;
+    await recordRole(task, workspace, spawned, result, roleCost, singleBuilderModel);
     return result;
   }
 
@@ -1771,7 +1780,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 
       // 2. scout ONCE (shared, read-only, in the first worktree's clean base state) —
       //    its findings seed every builder. (Per-workspace scout is a future option.)
-      const scoutResult = await dispatchRole("scout", spawnRole("scout", parentCtx), task, handles[0]!, [], parentCtx, runEngine);
+      const scoutResult = await dispatchRole("scout", spawnRole("scout", parentCtx), task, handles[0]!, [], parentCtx, runEngine, undefined, runCost);
 
       // 3. builder + verifier PER workspace (sequential in v1; parallelism is a future
       //    optimization). Each builder writes into ITS worktree; each verifier checks ITS
@@ -1791,17 +1800,17 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         // builder model as fallback) in its OWN worktree — each with the full run_checks rail.
         const candidateModel = competitiveModelList?.[ci] ?? singleBuilderModel;
         const candidateBuilder = builderForModel(parentCtx, candidateModel, resolveBuilderMode(task));
-        const builderResult = await dispatchRole("builder", spawnRole("builder", parentCtx), task, ws, [scoutResult], parentCtx, runEngine, candidateBuilder);
+        const builderResult = await dispatchRole("builder", spawnRole("builder", parentCtx), task, ws, [scoutResult], parentCtx, runEngine, candidateBuilder, runCost);
         // AUTO-VERIFY RESCUE: if the builder wrote files but hit a protocol termination,
         // try the verifier. On GREEN, reclassify the builder so the candidate proceeds.
         const rescue = await maybeAutoVerifyRescueBuilderResult(builderResult, async () => {
-          return dispatchRole("verifier", spawnRole("verifier", parentCtx), task, ws, [scoutResult, builderResult], parentCtx, runEngine);
+          return dispatchRole("verifier", spawnRole("verifier", parentCtx), task, ws, [scoutResult, builderResult], parentCtx, runEngine, undefined, runCost);
         });
         const finalBuilderResult = rescue.result;
         let verifierResult: RoleResult | undefined;
         const verifierSpawn = spawnRole("verifier", parentCtx);
         if (finalBuilderResult.outcome === "success") {
-          verifierResult = rescue.rescueVerify ?? await dispatchRole("verifier", verifierSpawn, task, ws, [scoutResult, finalBuilderResult], parentCtx, runEngine);
+          verifierResult = rescue.rescueVerify ?? await dispatchRole("verifier", verifierSpawn, task, ws, [scoutResult, finalBuilderResult], parentCtx, runEngine, undefined, runCost);
         }
         // COMMIT this candidate's VERIFIED-good work (gated on autoCommit) BEFORE the judge —
         // safeDiffLines + buildCandidate read the committed diff, and the winner is promoted, so
@@ -1989,19 +1998,19 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       // another candidate's workspace or output (no model-to-model communication).
       // Install deps first so run_checks can find vitest/tsc/etc.
       await installWorkspaceDeps(ws, parentCtx, deps.dependencyInstall);
-      const scoutResult = await dispatchRole("scout", spawnRole("scout", parentCtx), t, ws, [], parentCtx, runEngine);
+      const scoutResult = await dispatchRole("scout", spawnRole("scout", parentCtx), t, ws, [], parentCtx, runEngine, undefined, runCost);
       const candidateBuilder = builderForModel(parentCtx, spec.model, spec.mode);
-      const builderResult = await dispatchRole("builder", spawnRole("builder", parentCtx), t, ws, [scoutResult], parentCtx, runEngine, candidateBuilder);
+      const builderResult = await dispatchRole("builder", spawnRole("builder", parentCtx), t, ws, [scoutResult], parentCtx, runEngine, candidateBuilder, runCost);
       // AUTO-VERIFY RESCUE: if the builder wrote files but hit a protocol termination,
       // try the verifier. On GREEN, reclassify the builder so the candidate proceeds.
       const rescue = await maybeAutoVerifyRescueBuilderResult(builderResult, async () => {
-        return dispatchRole("verifier", spawnRole("verifier", parentCtx), t, ws, [scoutResult, builderResult], parentCtx, runEngine);
+        return dispatchRole("verifier", spawnRole("verifier", parentCtx), t, ws, [scoutResult, builderResult], parentCtx, runEngine, undefined, runCost);
       });
       const finalBuilderResult = rescue.result;
       let verifierResult: RoleResult | undefined;
       const verifierSpawn = spawnRole("verifier", parentCtx);
       if (finalBuilderResult.outcome === "success") {
-        verifierResult = rescue.rescueVerify ?? await dispatchRole("verifier", verifierSpawn, t, ws, [scoutResult, finalBuilderResult], parentCtx, runEngine);
+        verifierResult = rescue.rescueVerify ?? await dispatchRole("verifier", verifierSpawn, t, ws, [scoutResult, finalBuilderResult], parentCtx, runEngine, undefined, runCost);
       }
       // COMMIT verified work so the candidate's diff is the clean committed range — that range is
       // both what the judge scores (diffLines) and what gets replayed into the shadow if it wins.
@@ -2018,7 +2027,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       // Install deps in the shadow workspace before verifying — the shadow is a clean
       // worktree without node_modules, so pnpm test / vitest will fail without this.
       await installWorkspaceDeps(ws, parentCtx, deps.dependencyInstall);
-      const verifierResult = await dispatchRole("verifier", spawnRole("verifier", parentCtx), t, ws, [], parentCtx, runEngine);
+      const verifierResult = await dispatchRole("verifier", spawnRole("verifier", parentCtx), t, ws, [], parentCtx, runEngine, undefined, runCost);
       const verdict = (verifierResult.detail as { verdict?: unknown } | undefined)?.verdict;
       const pass = verifierResult.outcome === "success" && verdict === "pass";
       return { pass, roles: [verifierResult], ...(pass ? {} : { reason: verifierResult.summary ?? "shadow verifier did not pass" }) };
@@ -2064,6 +2073,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               winner: receipt.winner,
               shadow: receipt.shadow,
               promoted: receipt.promoted,
+              costUsd: runCost(),
             },
             project: task.targetRepo,
           },

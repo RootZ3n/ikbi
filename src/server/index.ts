@@ -8,6 +8,10 @@
  */
 
 import Fastify from "fastify";
+import fastifyStatic from "@fastify/static";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { existsSync } from "node:fs";
 
 import { config } from "../core/config.js";
 import { log } from "../core/log.js";
@@ -118,6 +122,18 @@ export function buildServer() {
   // so endpoint-exposing modules are added WITHOUT editing server/index.ts. Each
   // registrar runs in its own Fastify encapsulation context.
   routes.applyTo(app as unknown as Parameters<typeof routes.applyTo>[0]);
+
+  // Serve the world-engine UI from the repo's ui/ directory.
+  const __dirname = dirname(fileURLToPath(import.meta.url));
+  const uiDir = join(__dirname, "..", "..", "ui");
+  if (existsSync(join(uiDir, "index.html"))) {
+    void app.register(fastifyStatic, {
+      root: uiDir,
+      prefix: "/",
+      decorateReply: false,
+    });
+    log.info({ uiDir }, "UI served from ui/");
+  }
 
   return app;
 }
