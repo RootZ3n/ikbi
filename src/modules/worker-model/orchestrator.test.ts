@@ -1692,3 +1692,57 @@ test("CODEX Issue 3: each critic-fix-loop RETRY stage runs under its OWN role id
   assert.equal(verifierRoles[verifierRoles.length - 1], "verifier", "the retry verifier is functionalRole=verifier");
   assert.equal(criticRoles[criticRoles.length - 1], "critic", "the re-critique is functionalRole=critic");
 });
+
+// ── Fix 2: dirty repo detection ────────────────────────────────────────────────────────────────
+
+test("Fix2: dirty-repo check → explicit rejected outcome before workspace allocation", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  let allocateCalled = false;
+  const ws = fakeWorkspaces();
+  const workspaces = { ...ws.workspaces, allocate: async () => { allocateCalled = true; return ws.handle; } };
+  const cap = capturingRoles();
+  const orch = createOrchestrator(baseDeps({
+    resolveIdentity,
+    roleClaim,
+    workspaces,
+    roles: cap.roles,
+    checkTargetDirty: async () => "target repo has uncommitted changes — commit or stash them first",
+  }));
+  const result = await orch.run(task, parentCtx);
+  assert.equal(result.outcome, "rejected", "dirty repo produces a rejected outcome");
+  assert.match(result.reason ?? "", /uncommitted changes/, "reason message names the cause");
+  assert.equal(allocateCalled, false, "workspace is never allocated for a dirty repo");
+  assert.equal(cap.seen.length, 0, "no roles run for a dirty repo");
+});
+
+test("Fix2: dirty-repo check → clean repo proceeds normally", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const cap = capturingRoles();
+  const orch = createOrchestrator(baseDeps({
+    resolveIdentity,
+    roleClaim,
+    roles: cap.roles,
+    checkTargetDirty: async () => undefined,
+  }));
+  const result = await orch.run(task, parentCtx);
+  assert.notEqual(result.outcome, "rejected", "a clean repo is not rejected");
+  assert.ok(cap.seen.length > 0, "roles run normally when repo is clean");
+});
+
+test("Fix2: dirty-repo check skipped when reuseWorkspace is set (step-planner path)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  let checkCalled = false;
+  const cap = capturingRoles();
+  const existing = fakeWorkspaceHandle();
+  const orch = createOrchestrator(baseDeps({
+    resolveIdentity,
+    roleClaim,
+    roles: cap.roles,
+    checkTargetDirty: async () => { checkCalled = true; return "dirty"; },
+  }));
+  // reuseWorkspace bypasses the dirty check (step planner reuses an existing workspace)
+  const result = await orch.run({ ...task, reuseWorkspace: existing }, parentCtx);
+  assert.equal(checkCalled, false, "dirty check is not run when reuseWorkspace is set");
+  assert.notEqual(result.outcome, "rejected", "step-planner path is not affected by dirty check");
+});
+

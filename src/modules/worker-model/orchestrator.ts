@@ -131,8 +131,28 @@ interface EscalationHandoffFields {
 
 // ── DEPENDENCY INSTALL: ensure worktree has node_modules ──────────────────────
 
+import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+
+/**
+ * Run `git status --porcelain` on `targetRepo`. Returns a human-readable reason
+ * string when the repo has uncommitted changes, undefined when clean or when git
+ * is unavailable / the path is not a git repo (fail-open: let workspace allocation
+ * surface the real error).
+ */
+function liveCheckTargetDirty(targetRepo: string): string | undefined {
+  try {
+    const out = execFileSync("git", ["-C", targetRepo, "status", "--porcelain"], {
+      encoding: "utf8",
+      timeout: 5000,
+      maxBuffer: 1024 * 1024,
+    }).trim();
+    return out.length === 0 ? undefined : "target repo has uncommitted changes — commit or stash them first";
+  } catch {
+    return undefined; // git unavailable or not a git repo — let workspace allocation handle it
+  }
+}
 
 /**
  * Install dependencies in the worktree if node_modules is missing.
@@ -421,6 +441,14 @@ export interface OrchestratorDeps {
    * production scout takes the index path without touching the filesystem.
    */
   readonly retrieval?: ProjectRetrievalApi;
+  /**
+   * Pre-allocation dirty-repo check. When the target repo has uncommitted changes the run is
+   * rejected immediately with a clear message (before any workspace is allocated). Default: the
+   * live `git status --porcelain` check. Injectable for tests so they can drive the rejection
+   * path without a real git repo.
+   * Returns a non-empty reason string when the repo is dirty, undefined when clean or unknown.
+   */
+  readonly checkTargetDirty?: (targetRepo: string) => Promise<string | undefined>;
 }
 
 /** A role identity spawned under the parent ceiling (#10). */
@@ -994,6 +1022,18 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       if (preKill !== undefined) {
         events.publish(workerFailed.create({ taskId: task.taskId, reason: preKill }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } }));
         return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason: preKill };
+      }
+
+      // DIRTY REPO CHECK: refuse to build against a repo with uncommitted changes.
+      // A dirty base means the worktree inherits an ambiguous partial state and the
+      // operator would get a confusing failure deep in the pipeline instead of a clear
+      // early refusal. Runs only on fresh (non-reused) workspaces.
+      const checkDirty = deps.checkTargetDirty ?? ((repo) => Promise.resolve(liveCheckTargetDirty(repo)));
+      const dirtyReason = await checkDirty(task.targetRepo);
+      if (dirtyReason !== undefined) {
+        const reason = `Refusing to build: ${dirtyReason}`;
+        events.publish(workerFailed.create({ taskId: task.taskId, reason }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } }));
+        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason };
       }
     }
 
