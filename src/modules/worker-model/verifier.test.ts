@@ -11,7 +11,7 @@ import { autonomyForTier } from "../../core/trust/index.js";
 import type { WorkspaceHandle } from "../../core/workspace/contract.js";
 import type { ExecRequest, ExecResult } from "../governed-exec/index.js";
 import type { ProjectIndexData } from "../project-index/index.js";
-import { createVerifier, detectScriptMutation, detectShellOutMutation, type CheckResult } from "./verifier.js";
+import { createVerifier, detectScriptMutation, detectShellOutMutation, extractGoalFiles, type CheckResult } from "./verifier.js";
 import type { RoleContext, RoleResult } from "./contract.js";
 
 const silent = () => pino({ level: "silent" });
@@ -868,4 +868,50 @@ test("Codex-3 ladder quality gate: checks pass and a VALID written file → scop
   } finally {
     _rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ── Fix 1: extractGoalFiles + detectShellOutMutation exclusion ────────────────────────────────
+
+test("Fix1: extractGoalFiles — basic file extraction from goal", () => {
+  const files = extractGoalFiles("Fix the failing test in test.js. The assertion is wrong.");
+  assert.ok(files.has("test.js"), "plain test.js extracted from goal");
+  assert.equal(files.size, 1);
+});
+
+test("Fix1: extractGoalFiles — multiple files in goal", () => {
+  const files = extractGoalFiles("Fix add() in src/math.ts and the test in test.js");
+  assert.ok(files.has("src/math.ts"), "path with separator extracted");
+  assert.ok(files.has("test.js"), "plain filename extracted");
+});
+
+test("Fix1: extractGoalFiles — no files in goal", () => {
+  const files = extractGoalFiles("Fix the add function so it returns the correct sum");
+  assert.equal(files.size, 0, "no file-like tokens means empty set");
+});
+
+test("Fix1: extractGoalFiles — trailing period stripped", () => {
+  const files = extractGoalFiles("Fix test.js. It produces wrong output.");
+  assert.ok(files.has("test.js"), "trailing period is stripped from the filename");
+});
+
+test("Fix1: detectShellOutMutation — goal-excluded file NOT flagged", () => {
+  withPkg({ test: "node --test test.js" }, (dir) => {
+    const diff = "diff --git a/test.js b/test.js\n--- a/test.js\n+++ b/test.js\n@@ -1 +1 @@\n-assert.equal(mod(7,2), 0)\n+assert.equal(mod(7,2), 1)\n";
+    // Without exclusion → flagged
+    const flagged = detectShellOutMutation(diff, dir);
+    assert.equal(flagged.mutated, true, "without exclusion the modification is flagged");
+    // With goal-derived exclusion → clean
+    const clean = detectShellOutMutation(diff, dir, new Set(["test.js"]));
+    assert.equal(clean.mutated, false, "goal target file is excluded from shell-out mutation detection");
+  });
+});
+
+test("Fix1: detectShellOutMutation — non-goal file still flagged even when exclusion set present", () => {
+  withPkg({ test: "bash ./test.sh && node --test test.js" }, (dir) => {
+    const diff = "diff --git a/test.sh b/test.sh\n--- a/test.sh\n+++ b/test.sh\n@@ -1 +1 @@\n-pnpm vitest run\n+exit 0\n";
+    // test.js is in exclusion set but test.sh is not — test.sh still flagged
+    const r = detectShellOutMutation(diff, dir, new Set(["test.js"]));
+    assert.equal(r.mutated, true, "a non-excluded shell-out helper is still guarded");
+    assert.match(r.reason ?? "", /test\.sh/);
+  });
 });

@@ -486,6 +486,32 @@ function extractScriptFilePaths(script: string): string[] {
   return out;
 }
 
+/** Source-file extensions to look for when extracting file names from a build goal. */
+const GOAL_FILE_EXTS = new Set([
+  ".js", ".ts", ".cjs", ".mjs", ".jsx", ".tsx", ".cts", ".mts",
+  ".py", ".rb", ".sh", ".bash", ".go", ".rs", ".java", ".c", ".cpp", ".h",
+  ".json", ".yaml", ".yml", ".toml",
+]);
+
+/**
+ * Extract workspace-relative file paths mentioned in a build goal string.
+ * E.g. "Fix the failing test in test.js" → Set{"test.js"}.
+ * Used to build the shell-out mutation exclusion set so the guard does not flag a file
+ * the operator explicitly asked the builder to modify. EXPORTED for unit tests.
+ */
+export function extractGoalFiles(goal: string): Set<string> {
+  const out = new Set<string>();
+  for (const raw of goal.split(/[\s"'()[\]{},;:!?]+/)) {
+    const norm = raw.replace(/[.,;:!?]+$/, "").replace(/^\.\//, "");
+    if (norm.length === 0) continue;
+    const dotIdx = norm.lastIndexOf(".");
+    if (dotIdx < 0) continue;
+    const ext = norm.slice(dotIdx).toLowerCase();
+    if (GOAL_FILE_EXTS.has(ext)) out.add(norm);
+  }
+  return out;
+}
+
 /**
  * LAYER-2 (second pass): a guarded script can stay BYTE-FOR-BYTE UNCHANGED in package.json yet still
  * be neutered if it SHELLS OUT to a file the build rewrote — `"test": "bash ./test.sh"` is clean, but
@@ -495,8 +521,11 @@ function extractScriptFilePaths(script: string): string[] {
  * script's shell-referenced file paths, and flags the build if any of those paths was also modified
  * in the diff. EXPORTED for unit tests. Fail-closed by design; returns clean when there is no
  * package.json, no guarded script references a file, or no referenced file was touched.
+ * @param excludeFiles  Goal-derived file set: paths the operator explicitly asked the builder to
+ *                      modify are NOT flagged as shell-out mutations (the guard targets SNEAKY
+ *                      rewrites, not INTENTIONAL fixes). Pass undefined when the goal names no files.
  */
-export function detectShellOutMutation(diff: string, workspacePath: string): { mutated: boolean; reason?: string } {
+export function detectShellOutMutation(diff: string, workspacePath: string, excludeFiles?: ReadonlySet<string>): { mutated: boolean; reason?: string } {
   const pkgPath = join(workspacePath, "package.json");
   if (!existsSync(pkgPath)) return { mutated: false };
   let scripts: Record<string, unknown>;
@@ -514,6 +543,7 @@ export function detectShellOutMutation(diff: string, workspacePath: string): { m
     const val = scripts[key];
     if (typeof val !== "string" || val.length === 0) continue;
     for (const ref of extractScriptFilePaths(val)) {
+      if (excludeFiles !== undefined && excludeFiles.has(ref)) continue; // goal target — operator asked for this change
       if (changed.has(ref)) {
         return { mutated: true, reason: `builder modified "${ref}", a file the guarded package.json script "${key}" shells out to` };
       }
@@ -631,7 +661,11 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
     // SECOND PASS: a guarded script unchanged in package.json can still be neutered if it SHELLS OUT
     // to a file the build rewrote (`"test": "bash ./test.sh"` clean, but test.sh → `exit 0`). The
     // line/JSON guard above only inspects the package.json scripts, not the files they invoke.
-    const shellOut = detectShellOutMutation(diffText, ctx.workspace.path);
+    // Goal-derived exclusion: if the operator explicitly asked for a file to be modified (it's in
+    // the goal text), the guard does not flag it — the guard targets SNEAKY rewrites, not INTENTIONAL
+    // fixes the builder was tasked with.
+    const goalFiles = extractGoalFiles(ctx.task?.goal ?? "");
+    const shellOut = detectShellOutMutation(diffText, ctx.workspace.path, goalFiles.size > 0 ? goalFiles : undefined);
     if (shellOut.mutated) {
       return untrusted(`verification untrusted: ${shellOut.reason}`);
     }
