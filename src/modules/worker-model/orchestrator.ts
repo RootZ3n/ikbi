@@ -1663,6 +1663,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             governance,
             // Auditability: record the verification scope the promote relied on in the commit message.
             message: `worker-model: ${task.goal}${decision.rationale !== undefined ? ` — ${decision.rationale}` : ""}${verificationScope !== undefined ? ` [verification: ${verificationScope}]` : ""}`,
+            requestId: task.taskId,
           });
           promoted = promote.promoted;
           if (!promoted) {
@@ -1980,6 +1981,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         evaluation: { approved: true, score: verdict.winner.composite, evaluatorId: "deterministic-judge" },
         governance,
         message: `worker-model (competitive): ${task.goal}`,
+        requestId: task.taskId,
       });
       for (const ws of handles) if (ws.id !== winner.id) await safeDiscard(workspaces, ws);
 
@@ -2141,6 +2143,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         evaluation: { approved: true, score: composite, evaluatorId: "deterministic-judge" },
         governance,
         message: `worker-model (tournament): ${t.goal}`,
+        requestId: t.taskId,
       });
       return {
         promoted: result.promoted,

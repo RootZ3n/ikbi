@@ -135,6 +135,7 @@ export interface PromoteApproval {
   readonly evaluation: WorkspaceEvaluation;
   readonly governance?: PromoteGovernance;
   readonly message?: string;
+  readonly requestId?: string;
 }
 
 export type PromoteStrategy = "noop" | "fast_forward" | "merge";

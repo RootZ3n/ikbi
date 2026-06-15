@@ -316,7 +316,7 @@ export class WorkspaceManager {
         // the landing proof), so a receipt failure here MUST NOT be swallowed: surface
         // PROMOTED_BUT_RECEIPT_FAILED and stamp the durable record so status/ls/undo can see the
         // degraded state and still recover from this record's before/after refs.
-        const receiptStatus = await this.recordPromoteReceiptDurable(handle.identity, handle.targetRepo, handle.baseBranch, handle.id, targetHead, afterRef, strategy);
+        const receiptStatus = await this.recordPromoteReceiptDurable(handle.identity, handle.targetRepo, handle.baseBranch, handle.id, targetHead, afterRef, strategy, approval.requestId);
         // The single terminal record carried through cleanup, so the stamp is never overwritten.
         let landedRecord: WorkspaceRecord = promoted;
         if (receiptStatus !== undefined) {
@@ -666,7 +666,7 @@ export class WorkspaceManager {
       this.live.delete(rec.id);
       // A reconciled landing still records its receipt; a receipt failure here is the same
       // PROMOTED_BUT_RECEIPT_FAILED degraded state (the durable record stays the recovery source).
-      const receiptStatus = await this.recordPromoteReceiptDurable(rec.identity, rec.targetRepo, rec.baseBranch, rec.id, intent.beforeRef, intent.afterRef, "merge");
+      const receiptStatus = await this.recordPromoteReceiptDurable(rec.identity, rec.targetRepo, rec.baseBranch, rec.id, intent.beforeRef, intent.afterRef, "merge", undefined);
       if (receiptStatus === "failed") {
         await this.store.put(rec.id, { ...promoted, receiptStatus, note: `${promoted.note}; PROMOTED_BUT_RECEIPT_FAILED on reconcile` }).catch(() => undefined);
       } else if (receiptStatus === "recorded") {
@@ -696,6 +696,7 @@ export class WorkspaceManager {
     beforeRef: string,
     afterRef: string,
     strategy: string,
+    requestId?: string,
   ): Promise<"recorded" | "failed" | undefined> {
     if (this.receipts === undefined) return undefined;
     try {
@@ -714,6 +715,7 @@ export class WorkspaceManager {
             },
           ],
           metadata: { workspaceId, strategy, contractVersion: WORKSPACE_CONTRACT_VERSION },
+          ...(requestId !== undefined ? { requestId } : {}),
         },
         identity,
       );

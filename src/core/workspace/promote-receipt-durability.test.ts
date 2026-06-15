@@ -168,3 +168,62 @@ test("a healthy promote records receiptStatus=recorded (no false PROMOTED_BUT_RE
     await cleanup(repo, root);
   }
 });
+
+test("promote receipt includes requestId when provided", async () => {
+  const repo = await makeRepo();
+  const captured: ReceiptInput[] = [];
+  const mockReceipts = {
+    append: async (input: ReceiptInput): Promise<unknown> => {
+      captured.push(input);
+      return { id: "test-receipt" };
+    }
+  };
+  const { mgr, root } = makeManager({ receipts: mockReceipts });
+  try {
+    const { ws } = await makeChange(mgr, repo);
+    const testRequestId = "test-request-123";
+    const approval = {
+      evaluation: { approved: true },
+      governance: { allow: true },
+      requestId: testRequestId
+    };
+    const r = await mgr.promote(ws, approval);
+
+    assert.equal(r.promoted, true);
+    assert.equal(r.receiptStatus, "recorded");
+    assert.equal(captured.length, 1, "exactly one receipt was recorded");
+    assert.equal(captured[0]?.requestId, testRequestId, "receipt includes the provided requestId");
+    assert.equal(captured[0]?.operation, "workspace.promote", "receipt is for promote operation");
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
+test("promote receipt has no requestId when not provided", async () => {
+  const repo = await makeRepo();
+  const captured: ReceiptInput[] = [];
+  const mockReceipts = {
+    append: async (input: ReceiptInput): Promise<unknown> => {
+      captured.push(input);
+      return { id: "test-receipt" };
+    }
+  };
+  const { mgr, root } = makeManager({ receipts: mockReceipts });
+  try {
+    const { ws } = await makeChange(mgr, repo);
+    const approval = {
+      evaluation: { approved: true },
+      governance: { allow: true }
+      // no requestId provided
+    };
+    const r = await mgr.promote(ws, approval);
+
+    assert.equal(r.promoted, true);
+    assert.equal(r.receiptStatus, "recorded");
+    assert.equal(captured.length, 1, "exactly one receipt was recorded");
+    assert.equal(captured[0]?.requestId, undefined, "receipt has no requestId when not provided");
+    assert.equal(captured[0]?.operation, "workspace.promote", "receipt is for promote operation");
+  } finally {
+    await cleanup(repo, root);
+  }
+});
