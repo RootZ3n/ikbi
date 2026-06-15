@@ -1046,6 +1046,18 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       label: `worker:${task.taskId}`,
     });
 
+    // MANIFEST CHECK: warn early when no project manifest exists in the worktree root.
+    // Without a manifest, `resolveChecks` will fail with "no recognizable project manifest"
+    // during verification — this gives the operator an actionable early indicator.
+    // The check is best-effort (non-fatal): the workspace path may not yet be readable if
+    // allocation deferred I/O, and the operator can still inspect the workspace after the run.
+    if (existsSync(workspace.path)) {
+      const MANIFESTS = ["package.json", "pyproject.toml", "Cargo.toml", "go.mod"] as const;
+      if (!MANIFESTS.some((m) => existsSync(join(workspace.path, m)))) {
+        console.warn(`[ikbi] workspace ${workspace.id}: no project manifest (package.json, pyproject.toml, Cargo.toml, go.mod) found at ${workspace.path} — verification checks may fail`);
+      }
+    }
+
     events.publish(
       workerStarted.create(
         { taskId: task.taskId, workspaceId: workspace.id, verificationMode, retrievalMode },

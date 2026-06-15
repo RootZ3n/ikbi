@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -1746,3 +1746,45 @@ test("Fix2: dirty-repo check skipped when reuseWorkspace is set (step-planner pa
   assert.notEqual(result.outcome, "rejected", "step-planner path is not affected by dirty check");
 });
 
+// ── Fix 3: workspace manifest check ───────────────────────────────────────────────────────────
+
+test("Fix3: warn when worktree has no project manifest", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-no-manifest-"));
+  const warnMessages: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (...args: unknown[]) => { warnMessages.push(args.map(String).join(" ")); };
+  try {
+    const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+    const ws = fakeWorkspaces();
+    const handle = { ...ws.handle, path: dir };
+    const workspaces = { ...ws.workspaces, allocate: async () => handle };
+    const cap = capturingRoles();
+    const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, workspaces, roles: cap.roles }));
+    await orch.run(task, parentCtx);
+    assert.ok(warnMessages.some((m) => m.includes("no project manifest")), "should warn when no manifest found in workspace");
+  } finally {
+    console.warn = origWarn;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Fix3: no warning when worktree has package.json", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-has-manifest-"));
+  writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "t", version: "1.0.0" }));
+  const warnMessages: string[] = [];
+  const origWarn = console.warn;
+  console.warn = (...args: unknown[]) => { warnMessages.push(args.map(String).join(" ")); };
+  try {
+    const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+    const ws = fakeWorkspaces();
+    const handle = { ...ws.handle, path: dir };
+    const workspaces = { ...ws.workspaces, allocate: async () => handle };
+    const cap = capturingRoles();
+    const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, workspaces, roles: cap.roles }));
+    await orch.run(task, parentCtx);
+    assert.ok(!warnMessages.some((m) => m.includes("no project manifest")), "no warning when package.json exists");
+  } finally {
+    console.warn = origWarn;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
