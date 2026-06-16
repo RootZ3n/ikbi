@@ -17,6 +17,13 @@ import {
   createMinimaxProvider,
   createMimoProvider,
   createOpenRouterProvider,
+  createOpenAIProvider,
+  createAnthropicProvider,
+  createOllamaProvider,
+  createGoogleProvider,
+  createGroqProvider,
+  createMistralProvider,
+  createTogetherProvider,
   DEEPSEEK_PROVIDER_ID,
   MINIMAX_PROVIDER_ID,
   MIMO_PROVIDER_ID,
@@ -97,7 +104,19 @@ function buildDefaultRegistry(): ModelRegistry {
 
   const reg = new ModelRegistry({
     models: defaultModels,
-    providers: [createMimoProvider(pc.mimo), createOpenRouterProvider(pc.openrouter), createDeepseekProvider(pc.deepseek), createMinimaxProvider(pc.minimax)],
+    providers: [
+      createMimoProvider(pc.mimo),
+      createOpenRouterProvider(pc.openrouter),
+      createDeepseekProvider(pc.deepseek),
+      createMinimaxProvider(pc.minimax),
+      createOpenAIProvider(pc.openai),
+      createAnthropicProvider(pc.anthropic),
+      createOllamaProvider(pc.ollama),
+      createGoogleProvider(pc.google),
+      createGroqProvider(pc.groq),
+      createMistralProvider(pc.mistral),
+      createTogetherProvider(pc.together),
+    ],
   });
 
   try {
@@ -161,8 +180,22 @@ export type { Clock, CircuitState, CircuitSnapshot } from "./circuit-breaker.js"
 export {
   createMimoProvider,
   createOpenRouterProvider,
+  createOpenAIProvider,
+  createAnthropicProvider,
+  createOllamaProvider,
+  createGoogleProvider,
+  createGroqProvider,
+  createMistralProvider,
+  createTogetherProvider,
   OpenAICompatibleProvider,
   MIMO_PROVIDER_ID,
   OPENROUTER_PROVIDER_ID,
+  OPENAI_PROVIDER_ID,
+  ANTHROPIC_PROVIDER_ID,
+  OLLAMA_PROVIDER_ID,
+  GOOGLE_PROVIDER_ID,
+  GROQ_PROVIDER_ID,
+  MISTRAL_PROVIDER_ID,
+  TOGETHER_PROVIDER_ID,
 } from "./providers/index.js";
 export type { FetchLike, OpenAICompatibleOptions } from "./providers/openai-compatible.js";

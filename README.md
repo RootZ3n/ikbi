@@ -44,9 +44,17 @@ trust and capability are granted, never assumed.
 
 ## Quick start
 
+### Prerequisites
+
+- Node.js >= 22
+- pnpm
+- Git
+
 ```sh
+git clone <repo-url> ikbi
+cd ikbi
 pnpm install
-pnpm build        # tsc -> dist/
+pnpm run build        # tsc -> dist/
 ```
 
 **Run a build** (the primary use case):

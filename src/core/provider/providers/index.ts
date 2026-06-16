@@ -62,4 +62,82 @@ export function createOpenRouterProvider(
   });
 }
 
+/** Build the OpenAI direct-API provider (OpenAI-compatible). */
+export const OPENAI_PROVIDER_ID = "openai";
+export function createOpenAIProvider(cfg: ProviderEndpointConfig, fetchImpl?: FetchLike): ModelProvider {
+  return new OpenAICompatibleProvider({
+    id: OPENAI_PROVIDER_ID,
+    baseUrl: cfg.baseUrl,
+    apiKey: cfg.apiKey,
+    ...(fetchImpl ? { fetchImpl } : {}),
+  });
+}
+
+/** Build the Anthropic provider endpoint config (OpenAI-compatible proxy shape; native Anthropic API requires a dedicated adapter). */
+export const ANTHROPIC_PROVIDER_ID = "anthropic";
+export function createAnthropicProvider(cfg: ProviderEndpointConfig, fetchImpl?: FetchLike): ModelProvider {
+  return new OpenAICompatibleProvider({
+    id: ANTHROPIC_PROVIDER_ID,
+    baseUrl: cfg.baseUrl,
+    apiKey: cfg.apiKey,
+    ...(fetchImpl ? { fetchImpl } : {}),
+  });
+}
+
+/** Build the Ollama local provider (OpenAI-compatible, keyless). */
+export const OLLAMA_PROVIDER_ID = "ollama";
+export function createOllamaProvider(cfg: ProviderEndpointConfig, fetchImpl?: FetchLike): ModelProvider {
+  return new OpenAICompatibleProvider({
+    id: OLLAMA_PROVIDER_ID,
+    baseUrl: cfg.baseUrl,
+    apiKey: cfg.apiKey,
+    keyless: true,
+    ...(fetchImpl ? { fetchImpl } : {}),
+  });
+}
+
+/** Build the Google/Gemini provider endpoint config (OpenAI-compatible proxy shape; native Gemini API requires a dedicated adapter). */
+export const GOOGLE_PROVIDER_ID = "google";
+export function createGoogleProvider(cfg: ProviderEndpointConfig, fetchImpl?: FetchLike): ModelProvider {
+  return new OpenAICompatibleProvider({
+    id: GOOGLE_PROVIDER_ID,
+    baseUrl: cfg.baseUrl,
+    apiKey: cfg.apiKey,
+    ...(fetchImpl ? { fetchImpl } : {}),
+  });
+}
+
+/** Build the Groq direct-API provider (OpenAI-compatible). */
+export const GROQ_PROVIDER_ID = "groq";
+export function createGroqProvider(cfg: ProviderEndpointConfig, fetchImpl?: FetchLike): ModelProvider {
+  return new OpenAICompatibleProvider({
+    id: GROQ_PROVIDER_ID,
+    baseUrl: cfg.baseUrl,
+    apiKey: cfg.apiKey,
+    ...(fetchImpl ? { fetchImpl } : {}),
+  });
+}
+
+/** Build the Mistral direct-API provider (OpenAI-compatible). */
+export const MISTRAL_PROVIDER_ID = "mistral";
+export function createMistralProvider(cfg: ProviderEndpointConfig, fetchImpl?: FetchLike): ModelProvider {
+  return new OpenAICompatibleProvider({
+    id: MISTRAL_PROVIDER_ID,
+    baseUrl: cfg.baseUrl,
+    apiKey: cfg.apiKey,
+    ...(fetchImpl ? { fetchImpl } : {}),
+  });
+}
+
+/** Build the Together direct-API provider (OpenAI-compatible). */
+export const TOGETHER_PROVIDER_ID = "together";
+export function createTogetherProvider(cfg: ProviderEndpointConfig, fetchImpl?: FetchLike): ModelProvider {
+  return new OpenAICompatibleProvider({
+    id: TOGETHER_PROVIDER_ID,
+    baseUrl: cfg.baseUrl,
+    apiKey: cfg.apiKey,
+    ...(fetchImpl ? { fetchImpl } : {}),
+  });
+}
+
 export { OpenAICompatibleProvider, type FetchLike } from "./openai-compatible.js";

@@ -221,8 +221,21 @@ export interface ProviderConfig {
   readonly deepseek: ProviderEndpointConfig;
   /** MiniMax direct API endpoint (OpenAI-compatible). */
   readonly minimax: ProviderEndpointConfig;
-  /**
-   * Default logical model ids for the standard roles (config-driven, not hardcoded
+  /** OpenAI direct API endpoint. */
+  readonly openai: ProviderEndpointConfig;
+  /** Anthropic API endpoint (via OpenAI-compatible proxy or direct). */
+  readonly anthropic: ProviderEndpointConfig;
+  /** Ollama local daemon endpoint (OpenAI-compatible, keyless). */
+  readonly ollama: ProviderEndpointConfig;
+  /** Google/Gemini API endpoint (via OpenAI-compatible proxy or direct). */
+  readonly google: ProviderEndpointConfig;
+  /** Groq direct API endpoint (OpenAI-compatible). */
+  readonly groq: ProviderEndpointConfig;
+  /** Mistral direct API endpoint (OpenAI-compatible). */
+  readonly mistral: ProviderEndpointConfig;
+  /** Together direct API endpoint (OpenAI-compatible). */
+  readonly together: ProviderEndpointConfig;
+  /**\n   * Default logical model ids for the standard roles (config-driven, not hardcoded
    * downstream). `builder` has its OWN id (IKBI_MODEL_BUILDER) that falls through to the
    * driver when unset. `competitiveModels` (IKBI_COMPETITIVE_MODELS) is the optional
    * head-to-head list — competitive mode races one candidate per listed model.
@@ -320,6 +333,34 @@ function loadProviderConfig(env: NodeJS.ProcessEnv, stateRoot: string): Provider
       // MiniMax's OpenAI-compatible endpoint. Override via IKBI_MINIMAX_BASE_URL.
       baseUrl: optStr(env.IKBI_MINIMAX_BASE_URL) ?? "https://api.minimax.chat/v1",
       apiKey: optStr(env.IKBI_MINIMAX_API_KEY),
+    },
+    openai: {
+      baseUrl: optStr(env.IKBI_OPENAI_BASE_URL) ?? "https://api.openai.com/v1",
+      apiKey: optStr(env.IKBI_OPENAI_API_KEY),
+    },
+    anthropic: {
+      baseUrl: optStr(env.IKBI_ANTHROPIC_BASE_URL) ?? "https://api.anthropic.com/v1",
+      apiKey: optStr(env.IKBI_ANTHROPIC_API_KEY),
+    },
+    ollama: {
+      baseUrl: optStr(env.IKBI_OLLAMA_BASE_URL) ?? "http://127.0.0.1:11434/v1",
+      apiKey: undefined,
+    },
+    google: {
+      baseUrl: optStr(env.IKBI_GOOGLE_BASE_URL) ?? "https://generativelanguage.googleapis.com/v1beta/openai",
+      apiKey: optStr(env.IKBI_GOOGLE_API_KEY),
+    },
+    groq: {
+      baseUrl: optStr(env.IKBI_GROQ_BASE_URL) ?? "https://api.groq.com/openai/v1",
+      apiKey: optStr(env.IKBI_GROQ_API_KEY),
+    },
+    mistral: {
+      baseUrl: optStr(env.IKBI_MISTRAL_BASE_URL) ?? "https://api.mistral.ai/v1",
+      apiKey: optStr(env.IKBI_MISTRAL_API_KEY),
+    },
+    together: {
+      baseUrl: optStr(env.IKBI_TOGETHER_BASE_URL) ?? "https://api.together.xyz/v1",
+      apiKey: optStr(env.IKBI_TOGETHER_API_KEY),
     },
     defaultModels: {
       driver: optStr(env.IKBI_MODEL_DRIVER) ?? "mimo-v2.5",
