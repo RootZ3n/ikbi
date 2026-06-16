@@ -253,7 +253,7 @@ export function evaluate(registry: CapabilityRegistry, request: CapabilityReques
 export function defaultRegistryPath(): string {
   const env = process.env["LAB_CAPABILITY_REGISTRY"];
   if (isNonEmptyString(env)) return env;
-  return "/pehverse/repos/lab-capability/registry.json";
+  return resolve(process.cwd(), "lab-capability", "registry.json");
 }
 
 /** Load from a path and evaluate in one call; any load failure is a fail-closed deny. */

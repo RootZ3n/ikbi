@@ -213,7 +213,7 @@
     html += section('Actions',
       '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">' +
       '<button class="ikbi-run-btn" type="button" ' +
-      'onclick="IkbiApp.runCommand(\'health\');IkbiGuide.toggle(true);IkbiGuide.log(\'Run: cd /pehverse/repos/ikbi && pnpm test\', \'note\')">' +
+      'onclick="IkbiApp.runCommand(\'health\');IkbiGuide.toggle(true);IkbiGuide.log(\'Run: pnpm test\', \'note\')">' +
       'Check engine</button>' +
       '<span style="font-size:12px;color:var(--ink-dim)">Run <code style="font-family:var(--mono);font-size:11px;color:var(--peh-accent)">pnpm test</code> in a terminal for live results</span>' +
       '</div>'

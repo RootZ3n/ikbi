@@ -3,7 +3,7 @@
  *
  * Loads from `<stateRoot>/repos.json` at startup. The CLI `--repo` flag
  * resolves through this registry so operators can write `--repo toba`
- * instead of `--repo /pehverse/repos/toba`.
+ * instead of `--repo /path/to/toba`.
  *
  * The `repos` CLI command lists all registered repos.
  */

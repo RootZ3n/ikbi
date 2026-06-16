@@ -87,7 +87,7 @@ export const brainSyncTool: ModelTool = {
   description:
     "Import a project directory into ikbi's knowledge brain (gbrain) and embed it, so its contents become searchable. " +
     "GOVERNED: requires operator authorization. " +
-    'Example: {"path": "/pehverse/repos/ikbi"}',
+    'Example: {"path": "/path/to/project"}',
   parameters: {
     type: "object",
     properties: { path: { type: "string", description: "Absolute path of the project directory to import + embed." } },
