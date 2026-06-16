@@ -53,6 +53,83 @@ export interface ComparisonResult {
   readonly unique: Readonly<Record<string, readonly ScoutFinding[]>>;
   readonly contradictions: readonly ContradictionEntry[];
   readonly summary: string;
+  /** How findings were compared (e.g. "fuzzy Jaccard title similarity per shared file"). */
+  readonly comparisonMethod?: string;
+  /** The title-similarity threshold used to call two findings "agreement". */
+  readonly similarityThreshold?: number;
+  /** Explicit statement that these outputs are unverified model hypotheses, not proof. */
+  readonly limitations?: string;
+}
+
+/**
+ * The standing limitations statement for EVERY multi-model audit. These outputs
+ * are model-generated hypotheses, not verified facts — agreement is correlated
+ * opinion, contradiction is a flag for review, and paths may be inferred.
+ */
+export const AUDIT_LIMITATIONS =
+  "These findings are MODEL-GENERATED HYPOTHESES, not verified facts. Model agreement is " +
+  "correlated opinion (two models guessing alike), not proof. A 'possible contradiction' is a " +
+  "flag for human review, not a confirmed defect. Paths may be inferred and unverified. Nothing " +
+  "here is confirmed until a human or a deterministic verifier checks it against the actual code.";
+
+const COMPARISON_METHOD =
+  "fuzzy Jaccard title-token similarity per shared file; agreement at/above the similarity " +
+  "threshold, same-file mismatches flagged as possible contradictions";
+
+/** Audit receipt metadata — what a multi-audit receipt should carry so the output
+ *  can never be mistaken for verified proof. Computed from the comparison result. */
+export interface AuditReceiptMetadata {
+  readonly kind: "multi_model_audit";
+  /** These outputs are unverified hypotheses requiring confirmation. */
+  readonly verified: false;
+  readonly findingClass: "model_hypothesis";
+  readonly modelsCompared: readonly string[];
+  readonly modelVersions: readonly string[];
+  readonly costPerModelUsd: Readonly<Record<string, number | null>>;
+  readonly timingPerModelMs: Readonly<Record<string, number>>;
+  readonly findingsPerModel: Readonly<Record<string, number>>;
+  readonly modelErrors: Readonly<Record<string, string>>;
+  readonly agreements: number;
+  readonly uniqueFindings: number;
+  readonly possibleContradictions: number;
+  readonly comparisonMethod: string;
+  readonly similarityThreshold: number;
+  readonly limitations: string;
+  /** True only if every compared model returned findings (no consensus can be claimed otherwise). */
+  readonly allModelsSucceeded: boolean;
+}
+
+/** Build the audit receipt metadata from a comparison result. */
+export function buildAuditMetadata(result: ComparisonResult): AuditReceiptMetadata {
+  const costPerModelUsd: Record<string, number | null> = {};
+  const timingPerModelMs: Record<string, number> = {};
+  const findingsPerModel: Record<string, number> = {};
+  const modelErrors: Record<string, string> = {};
+  for (const m of result.models) {
+    costPerModelUsd[m.model] = m.cost ?? null;
+    timingPerModelMs[m.model] = Math.round(m.durationMs);
+    findingsPerModel[m.model] = m.findings.length;
+    if (m.error !== undefined) modelErrors[m.model] = m.error;
+  }
+  const uniqueFindings = Object.values(result.unique).reduce((sum, u) => sum + u.length, 0);
+  return {
+    kind: "multi_model_audit",
+    verified: false,
+    findingClass: "model_hypothesis",
+    modelsCompared: result.models.map((m) => m.model),
+    modelVersions: result.models.map((m) => m.model),
+    costPerModelUsd,
+    timingPerModelMs,
+    findingsPerModel,
+    modelErrors,
+    agreements: result.agreement.length,
+    uniqueFindings,
+    possibleContradictions: result.contradictions.length,
+    comparisonMethod: result.comparisonMethod ?? COMPARISON_METHOD,
+    similarityThreshold: result.similarityThreshold ?? TITLE_SIMILARITY_THRESHOLD,
+    limitations: result.limitations ?? AUDIT_LIMITATIONS,
+    allModelsSucceeded: result.models.length > 0 && result.models.every((m) => m.error === undefined),
+  };
 }
 
 /** Options for the multi-audit runner. */
@@ -123,18 +200,40 @@ const AUDIT_IDENTITY: AgentIdentity = {
 
 // ── Finding parsing ────────────────────────────────────────────────────────────
 
-/** Extract a leading `path[:line[-line]]` reference from a finding line, if present.
- *  Handles backtick-wrapped paths like `src/foo.ts:42`. */
+/** Extract a `path[:line[-line]]` reference from a finding line, if present.
+ *  Handles: backtick-wrapped paths (`src/foo.ts:42`), "path:line", markdown
+ *  bullet/link forms ([x](src/foo.ts)), and plain repo-relative file paths. */
 function extractPathRef(text: string): { path?: string; lines?: [number, number] } {
-  // Strip backticks and try to find a path reference
-  const stripped = text.replace(/`/g, " ");
-  const m = stripped.match(/(?:^|\s)([\w./-]+\.[A-Za-z0-9]+)(?::(\d+)(?:-(\d+))?)?/);
+  // Normalize: strip backticks and markdown-link wrappers so the path token is bare.
+  const stripped = text
+    .replace(/`/g, " ")
+    .replace(/\]\(([^)]+)\)/g, " $1 ") // [label](path) → path
+    .replace(/[[\]()]/g, " ");
+  // A path token: dotted filename (foo.ts), optionally with dir segments, optional :line[-line].
+  const m = stripped.match(/(?:^|\s)((?:[\w.-]+\/)*[\w.-]+\.[A-Za-z0-9]+)(?::(\d+)(?:-(\d+))?)?/);
   if (m === null || m[1] === undefined) return {};
   const path = m[1];
   if (m[2] === undefined) return { path };
   const start = Number.parseInt(m[2], 10);
   const end = m[3] !== undefined ? Number.parseInt(m[3], 10) : start;
   return { path, lines: [start, end] };
+}
+
+/** Resolve an extracted path against the repo file set. Returns the validated path + confidence. */
+function resolvePathConfidence(
+  path: string | undefined,
+  structure: readonly ScoutFileEntry[],
+): { path?: string; pathConfidence: "exact" | "inferred" | "missing" } {
+  if (path === undefined) return { pathConfidence: "missing" };
+  const validated = structure.find((e) => {
+    const p = e.path.toLowerCase();
+    const ref = path.toLowerCase();
+    return p === ref || p.endsWith(`/${ref}`) || ref.endsWith(`/${p}`);
+  })?.path;
+  if (validated !== undefined) return { path: validated, pathConfidence: "exact" };
+  // A path-like token was named but does not match a real file — keep it but flag it inferred
+  // so consumers never treat a possibly-hallucinated path as a confirmed location.
+  return { path, pathConfidence: "inferred" };
 }
 
 /**
@@ -161,18 +260,13 @@ function parseFindings(content: string, structure: readonly ScoutFileEntry[]): S
             const lines = Array.isArray(item.lines) && item.lines.length === 2
               ? [Number(item.lines[0]), Number(item.lines[1])] as [number, number]
               : undefined;
-            const validatedPath = path !== undefined
-              ? structure.find((e) => {
-                  const p = e.path.toLowerCase();
-                  const ref = path.toLowerCase();
-                  return p === ref || p.endsWith(`/${ref}`) || ref.endsWith(`/${p}`);
-                })?.path
-              : undefined;
-            const id = createHash("sha256").update(`${validatedPath ?? "(general)"}|${title}|${severity ?? "info"}`).digest("hex").slice(0, 12);
+            const resolved = resolvePathConfidence(path, structure);
+            const id = createHash("sha256").update(`${resolved.path ?? "(general)"}|${title}|${severity ?? "info"}`).digest("hex").slice(0, 12);
             return {
               title,
               detail,
-              ...(validatedPath !== undefined ? { path: validatedPath } : {}),
+              ...(resolved.path !== undefined ? { path: resolved.path } : {}),
+              pathConfidence: resolved.pathConfidence,
               ...(lines !== undefined ? { lines } : {}),
               ...(severity !== undefined ? { severity } : {}),
               ...(category !== undefined ? { category } : {}),
@@ -196,18 +290,12 @@ function parseFindings(content: string, structure: readonly ScoutFileEntry[]): S
     return bullets.map((l, i) => {
       const detail = l.replace(/^([-*]|\d+[.)])\s+/, "");
       const { path, lines: lineRange } = extractPathRef(detail);
-      // Validate path against structure — drop refs to nonexistent files
-      const validatedPath = path !== undefined
-        ? structure.find((e) => {
-            const p = e.path.toLowerCase();
-            const ref = path.toLowerCase();
-            return p === ref || p.endsWith(`/${ref}`) || ref.endsWith(`/${p}`);
-          })?.path
-        : undefined;
+      const resolved = resolvePathConfidence(path, structure);
       return {
         title: `finding-${i + 1}`,
         detail,
-        ...(validatedPath !== undefined ? { path: validatedPath } : {}),
+        ...(resolved.path !== undefined ? { path: resolved.path } : {}),
+        pathConfidence: resolved.pathConfidence,
         ...(lineRange !== undefined ? { lines: lineRange } : {}),
       };
     });
@@ -477,7 +565,9 @@ export async function runMultiAudit(options: MultiAuditOptions): Promise<Compari
     .map((r) => `${r.model}: ${r.findings.length}/${totalFindings}`)
     .join(", ");
 
-  const summary = `Compared ${models.length} model(s); ${allAgreement.length} agreement(s), ${allContradictions.length} contradiction(s). Coverage: ${coverage}`;
+  const summary =
+    `Compared ${models.length} model(s) — UNVERIFIED HYPOTHESES: ${allAgreement.length} model agreement(s), ` +
+    `${allContradictions.length} possible contradiction(s). Coverage: ${coverage}`;
 
   return {
     models: results,
@@ -485,6 +575,9 @@ export async function runMultiAudit(options: MultiAuditOptions): Promise<Compari
     unique: allUnique,
     contradictions: allContradictions,
     summary,
+    comparisonMethod: COMPARISON_METHOD,
+    similarityThreshold: TITLE_SIMILARITY_THRESHOLD,
+    limitations: AUDIT_LIMITATIONS,
   };
 }
 
@@ -510,6 +603,7 @@ export function formatComparisonReport(result: ComparisonResult): string {
   // Header
   const modelNames = result.models.map((m) => m.model).join(" vs ");
   lines.push(`═══ Multi-Model Audit: ${modelNames} ═══`);
+  lines.push("⚠️ UNVERIFIED HYPOTHESES — model-generated, NOT verified facts. Confirm before acting.");
   lines.push("");
 
   // Per-model summary
@@ -521,15 +615,15 @@ export function formatComparisonReport(result: ComparisonResult): string {
   }
   lines.push("");
 
-  // Agreements
+  // Agreements — model overlap, NOT proof.
   if (result.agreement.length > 0) {
-    lines.push(`✅ AGREEMENT (${result.agreement.length} finding(s) both models found):`);
+    lines.push(`✅ MODEL AGREEMENT (${result.agreement.length}) — correlated model opinion, NOT proof:`);
     for (let i = 0; i < result.agreement.length; i++) {
       const a = result.agreement[i]!;
       lines.push(`  ${i + 1}. ${a.file} — ${a.title}`);
     }
   } else {
-    lines.push("✅ AGREEMENT (0): (none)");
+    lines.push("✅ MODEL AGREEMENT (0): (none)");
   }
   lines.push("");
 
@@ -547,16 +641,16 @@ export function formatComparisonReport(result: ComparisonResult): string {
     lines.push("");
   }
 
-  // Contradictions
+  // Contradictions — POSSIBLE only; a flag for review, not a confirmed conflict.
   if (result.contradictions.length > 0) {
-    lines.push(`⚠️ CONTRADICTIONS (${result.contradictions.length}):`);
+    lines.push(`⚠️ POSSIBLE CONTRADICTIONS (${result.contradictions.length}) — flag for review, NOT confirmed:`);
     for (const c of result.contradictions) {
       lines.push(`  ${c.file}:`);
       lines.push(`    A: ${c.modelAFinding.detail}`);
       lines.push(`    B: ${c.modelBFinding.detail}`);
     }
   } else {
-    lines.push("⚠️ CONTRADICTIONS (0): (none)");
+    lines.push("⚠️ POSSIBLE CONTRADICTIONS (0): (none)");
   }
   lines.push("");
 
@@ -571,6 +665,21 @@ export function formatComparisonReport(result: ComparisonResult): string {
       return `${m.model} found ${found}/${totalUnique} (${pct}%)`;
     });
   lines.push(`Coverage: ${coverageLines.join(", ")}`);
+
+  // If any model errored, no consensus can be claimed — say so explicitly.
+  const errored = result.models.filter((m) => m.error !== undefined);
+  if (errored.length > 0) {
+    const ok = result.models.filter((m) => m.error === undefined).map((m) => m.model);
+    lines.push("");
+    lines.push(
+      `NOTE: ${errored.length} model(s) failed (${errored.map((m) => m.model).join(", ")}). ` +
+        `Showing ${ok.length > 0 ? ok.join(", ") : "no"} model's findings WITHOUT consensus — agreement cannot be assessed.`,
+    );
+  }
+
+  // Limitations — every report states that these are unverified hypotheses.
+  lines.push("");
+  lines.push(`LIMITATIONS: ${result.limitations ?? AUDIT_LIMITATIONS}`);
 
   return lines.join("\n");
 }

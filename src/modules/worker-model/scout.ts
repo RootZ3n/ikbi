@@ -46,6 +46,13 @@ export interface ScoutFinding {
   readonly confidence?: number;
   /** STRUCTURED: stable ID derived from file + title + severity for dedup. */
   readonly id?: string;
+  /**
+   * How trustworthy `path` is: "exact" = validated against the repo file set;
+   * "inferred" = a path-like token was extracted but did NOT match a real file;
+   * "missing" = no path reference at all. Lets consumers avoid treating an
+   * unverified/hallucinated path as a confirmed location.
+   */
+  readonly pathConfidence?: "exact" | "inferred" | "missing";
 }
 
 /** One entry in the scout's STRUCTURE index — a scanned file with its size. The brief is built from these. */

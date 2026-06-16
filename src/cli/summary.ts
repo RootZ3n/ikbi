@@ -12,6 +12,7 @@
 import { registerCommand } from "./registry.js";
 import { receipts as coreReceipts } from "../core/receipt/index.js";
 import type { Receipt, ReceiptQuery } from "../core/receipt/index.js";
+import { groupReceiptsByTask } from "../core/receipt/grouping.js";
 
 export interface ReceiptReader {
   query(filter?: ReceiptQuery): Promise<Receipt[]>;
@@ -70,36 +71,34 @@ export function createSummaryCli(deps: SummaryCliDeps = {}) {
       return;
     }
 
-    // Group by requestId — each distinct requestId is one "build".
-    const buildMap = new Map<string, Receipt[]>();
     const agentCounts = new Map<string, number>();
     let totalCostUsd = 0;
-
     for (const r of all) {
       agentCounts.set(r.identity.agentId, (agentCounts.get(r.identity.agentId) ?? 0) + 1);
       totalCostUsd += costOf(r);
-      if (r.requestId !== undefined) {
-        const group = buildMap.get(r.requestId) ?? [];
-        group.push(r);
-        buildMap.set(r.requestId, group);
-      }
     }
 
-    // Classify each build: success = has a successful workspace.promote.
+    // Group into task/build groups with the SHARED grouping logic so summary,
+    // timeline, receipts, and audit agree. A build counts as a success when it
+    // promoted — detected from a standalone workspace.promote OR (the fallback)
+    // a worker.run.summary that recorded a successful promotion, so a successful
+    // promote is never undercounted when its standalone receipt is missing.
+    const groups = groupReceiptsByTask(all);
+
     let successCount = 0;
     const failureReasons: string[] = [];
-
-    for (const [, group] of buildMap) {
-      const promote = group.find((r) => r.operation === "workspace.promote");
-      if (promote?.outcome.status === "success") {
+    for (const group of groups) {
+      if (group.promoted) {
         successCount += 1;
       } else {
-        const failed = group.find((r) => r.outcome.status === "failure" || r.outcome.status === "rejected");
+        const failed = group.receipts.find(
+          (r) => r.outcome.status === "failure" || r.outcome.status === "rejected",
+        );
         if (failed !== undefined) failureReasons.push(failureReasonOf(failed));
       }
     }
 
-    const totalBuilds = buildMap.size;
+    const totalBuilds = groups.length;
     const successRate = totalBuilds > 0 ? (successCount / totalBuilds) * 100 : 0;
     const avgCostUsd = totalBuilds > 0 ? totalCostUsd / totalBuilds : 0;
 

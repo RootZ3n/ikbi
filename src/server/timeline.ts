@@ -14,6 +14,7 @@ import type { FastifyInstance } from "fastify";
 
 import { receipts as coreReceipts } from "../core/receipt/index.js";
 import type { Receipt, ReceiptQuery } from "../core/receipt/index.js";
+import { groupReceiptsByTask } from "../core/receipt/grouping.js";
 import { registerRoutes } from "./registry.js";
 
 export interface ReceiptReader {
@@ -24,10 +25,23 @@ type Period = "hour" | "day";
 
 interface TimelineBucket {
   timestamp: string;
+  /**
+   * LEGACY raw-receipt count (one per receipt). Retained for backward compatibility
+   * with existing consumers/tests. Prefer the task-grouped counts below for build
+   * accounting — those agree with `summary`/`receipts`/`audit`.
+   */
   builds: number;
   successes: number;
   failures: number;
   totalCostUsd: number;
+  /** Distinct task/build groups in this bucket (grouped by requestId/taskId). */
+  taskGroups: number;
+  /** Task groups that promoted (the build-level success count that agrees with summary). */
+  taskSuccesses: number;
+  /** Task groups that failed (explicit failure/rejected and did not promote). */
+  taskFailures: number;
+  /** Task groups that promoted a commit. */
+  taskPromotes: number;
 }
 
 function floorToBucket(timestampMs: number, period: Period): number {
@@ -82,6 +96,7 @@ export function createTimelineRouteRegistrar(store: ReceiptReader = coreReceipts
 
         const buckets = new Map<number, TimelineBucket>();
 
+        // Pass 1 — legacy raw-receipt counts (builds/successes/failures/cost).
         for (const r of all) {
           const key = floorToBucket(r.timestamp, period);
           const existing = buckets.get(key);
@@ -95,6 +110,10 @@ export function createTimelineRouteRegistrar(store: ReceiptReader = coreReceipts
               successes: isSuccess ? 1 : 0,
               failures: isFailure ? 1 : 0,
               totalCostUsd: costOf(r),
+              taskGroups: 0,
+              taskSuccesses: 0,
+              taskFailures: 0,
+              taskPromotes: 0,
             });
           } else {
             existing.builds += 1;
@@ -102,6 +121,19 @@ export function createTimelineRouteRegistrar(store: ReceiptReader = coreReceipts
             if (isFailure) existing.failures += 1;
             existing.totalCostUsd += costOf(r);
           }
+        }
+
+        // Pass 2 — task-grouped counts via the SHARED grouping logic (agrees with
+        // summary). A task is bucketed by its newest receipt's timestamp so a build
+        // is counted once, in one bucket — not once per receipt.
+        for (const group of groupReceiptsByTask(all)) {
+          const key = floorToBucket(group.latestTimestamp, period);
+          const bucket = buckets.get(key);
+          if (bucket === undefined) continue;
+          bucket.taskGroups += 1;
+          if (group.status === "success") bucket.taskSuccesses += 1;
+          else if (group.status === "failure") bucket.taskFailures += 1;
+          if (group.promoted) bucket.taskPromotes += 1;
         }
 
         const sorted = [...buckets.entries()]
