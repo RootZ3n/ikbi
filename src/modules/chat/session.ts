@@ -54,6 +54,7 @@ import { loadProjectInstructions } from "../worker-model/project-memory.js";
 import { type CheckResult, mapExec, resolveCheckTimeoutMs, resolveChecks } from "../worker-model/checks.js";
 import { confinePath } from "../worker-model/builder-tools/confine.js";
 import { BRAIN_TOOLS, runBrainTool } from "../worker-model/builder-tools/brain-tools.js";
+import { gbrainBridge } from "../../core/gbrain-bridge.js";
 import { delegateTaskTool, runDelegateTask } from "../worker-model/builder-tools/delegate.js";
 import { gitDiffTool, gitLogTool, gitStatusTool, runGitTool } from "../worker-model/builder-tools/git-tools.js";
 import { patchTool, runPatch } from "../worker-model/builder-tools/patch.js";
@@ -951,9 +952,16 @@ export class ChatSession {
       case "brain_think":
       case "brain_put":
       case "brain_sync": {
-        const ctx: OperationContext | undefined = this.parentCtx;
-        const brainResult = await runBrainTool(call.name, args, ctx);
-        return { output: brainResult.output, activity: { name: call.name, ok: brainResult.ok, summary: brainResult.summary } };
+        // gbrain knowledge access — same deps shape the builder uses. runBrainTool returns a STRING:
+        // a `DENIED:` prefix marks a governance refusal, `ERROR:` a tool failure. Output is retrieved
+        // KNOWLEDGE → UNTRUSTED → re-neutralized at the chokepoint like every other tool result.
+        const out = runBrainTool(
+          { bridge: gbrainBridge, ...(this.parentCtx !== undefined ? { parentCtx: this.parentCtx } : {}) },
+          call.name,
+          args,
+        );
+        const ok = !out.startsWith("ERROR") && !out.startsWith("DENIED");
+        return { output: out, activity: { name: call.name, ok, ...(typeof args.query === "string" ? { summary: args.query.slice(0, 80) } : typeof args.slug === "string" ? { summary: args.slug } : {}) } };
       }
       default:
         return { output: `ERROR: unknown tool "${call.name}"`, activity: { name: call.name, ok: false, summary: "unknown tool" } };

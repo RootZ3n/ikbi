@@ -304,6 +304,15 @@ export function createDiffCli(deps: DiffCliDeps = {}) {
 
   async function diff(argv: readonly string[]): Promise<void> {
     const id = argv[0];
+    // --help is NOT a workspace id: print usage and exit 0 without touching workspace state.
+    if (id === "--help" || id === "-h") {
+      out(
+        "Usage: ikbi diff <workspace-id>\n\n" +
+          "Print a workspace's git diff (base..scratch) plus a change summary and per-file line counts.\n" +
+          "List workspace ids with `ikbi workspaces list`.\n",
+      );
+      return;
+    }
     if (id === undefined || id.length === 0) {
       err("ikbi diff: a workspace id is required — usage: ikbi diff <workspace-id>\n");
       setExit(1);

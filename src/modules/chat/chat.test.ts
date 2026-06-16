@@ -214,6 +214,27 @@ test("send: the loop is bounded — a model that always calls tools cannot spin 
   assert.match(response, /iteration limit/);
 });
 
+test("send: brain tools route through runBrainTool and the result is fed back as untrusted", async () => {
+  // brain_search with an empty query hits runBrainTool's deterministic validation path (no shell-out):
+  // it returns an `ERROR:` string. This pins the chat call site to the real runBrainTool(deps, name, args)
+  // signature and the string→{output, ok} wrapping (the breakage Codex flagged).
+  const { invoke, requests } = scripted([
+    toolResp([call("brain_search", { query: "" })]),
+    stop("Nothing to recall."),
+  ]);
+  const s = new ChatSession("s-brain", { invoke, worktree: tmp() });
+  const { response, tools } = await s.send("recall something");
+  assert.equal(tools[0]?.name, "brain_search");
+  assert.equal(tools[0]?.ok, false, "an empty query is reported as a failed (not successful) tool call");
+  assert.match(response, /Nothing to recall/);
+  // The brain result must re-enter the loop as an UNTRUSTED tool-role message (the chokepoint).
+  const secondReq = requests[1] as { messages: Array<{ role: string; untrusted?: boolean }> };
+  assert.ok(
+    secondReq.messages.some((m) => m.role === "tool" && m.untrusted === true),
+    "brain tool result re-entered as untrusted",
+  );
+});
+
 // ── the FULL builder tool suite is wired into chat ───────────────────────────
 
 test("chat advertises the full builder tool suite to the model", async () => {

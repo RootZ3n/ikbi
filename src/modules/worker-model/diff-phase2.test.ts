@@ -47,6 +47,33 @@ function capture() {
   };
 }
 
+// ── --help (Codex P2) ─────────────────────────────────────────────────────────
+
+test("`ikbi diff --help` prints usage and exits 0 WITHOUT querying workspace state", async () => {
+  const cap = capture();
+  let getCalled = false;
+  const workspaces = {
+    get: async (id: string) => { getCalled = true; return rec(id); },
+    diff: async () => SAMPLE_DIFF,
+  };
+  const cli = createDiffCli({ workspaces, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit, colorize: false });
+  await cli.diff(["--help"]);
+
+  assert.equal(cap.exit, undefined, "exit code is 0 (unset)");
+  assert.equal(getCalled, false, "--help must NOT be treated as a workspace id");
+  assert.match(cap.out, /Usage: ikbi diff <workspace-id>/);
+  assert.equal(cap.err, "", "no error output");
+});
+
+test("`ikbi diff -h` also prints usage and exits 0", async () => {
+  const cap = capture();
+  const workspaces = { get: async (id: string) => rec(id), diff: async () => SAMPLE_DIFF };
+  const cli = createDiffCli({ workspaces, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit, colorize: false });
+  await cli.diff(["-h"]);
+  assert.equal(cap.exit, undefined);
+  assert.match(cap.out, /Usage: ikbi diff/);
+});
+
 // ── per-file breakdown ────────────────────────────────────────────────────────
 
 test("`ikbi diff` shows a per-file +/- breakdown after the summary line", async () => {
