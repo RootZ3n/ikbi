@@ -45,6 +45,8 @@ import { adaptMaxTokens, getCapabilities } from "../../core/provider/capabilitie
 import type { ModelMessage, ModelTool, ToolCall } from "../../core/provider/contract.js";
 import { parseCheckOutput } from "../check-triage/index.js";
 import type { GovernedExec } from "../governed-exec/index.js";
+import { gbrainBridge } from "../../core/gbrain-bridge.js";
+import { BRAIN_TOOLS, BRAIN_TOOL_NAMES, runBrainTool } from "./builder-tools/brain-tools.js";
 import { confinePath, type ToolCallError } from "./builder-tools/confine.js";
 import { delegateTaskTool, runDelegateTask } from "./builder-tools/delegate.js";
 import { gitDiffTool, gitLogTool, gitStatusTool, GIT_TOOL_NAMES, runGitTool } from "./builder-tools/git-tools.js";
@@ -164,6 +166,9 @@ export const TOOLS: readonly ModelTool[] = [
   // Web research (through the egress SSRF guard; fail-closed unless the host is allowlisted).
   webSearchTool,
   webExtractTool,
+  // Knowledge brain (gbrain): recall prior knowledge, synthesize across it, write findings back.
+  // brain_sync is GOVERNANCE-GATED (fails closed without an operator identity).
+  ...BRAIN_TOOLS,
   // Delegation: hand an independent subtask to a focused sub-agent (simplified tool set).
   delegateTaskTool,
   // Vision: analyze an image (screenshot/diagram/chart) via a multimodal message.
@@ -661,6 +666,15 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
     // root. Rides as an isolated UNTRUSTED message (neutralized) — honored project guidance,
     // but bounded; never raw-concatenated into the trusted system prompt. Missing ⇒ omitted.
     const projectInstructions = ctx.task.projectInstructions ?? (ctx.task.skipProjectMemory === true ? undefined : loadProjectMemory(worktreeReal)?.content);
+    // INTELLIGENCE LAYER (gbrain): recall knowledge relevant to THIS goal from ikbi's brain and
+    // inject it ALONGSIDE the project instructions (never replacing them). Best-effort + bounded:
+    // projectContext swallows an unavailable/locked brain (returns undefined) so a build is NEVER
+    // blocked. OPT-IN via IKBI_GBRAIN_CONTEXT (default off) so it does not exec gbrain on every
+    // run / in test. Skipped when project memory is skipped. Output is UNTRUSTED → neutralized.
+    const brainContext =
+      configEnv.IKBI_GBRAIN_CONTEXT === "1" && ctx.task.skipProjectMemory !== true
+        ? gbrainBridge.projectContext(ctx.task.goal)
+        : undefined;
     // PRINCIPLE 2: pin the goal-named files as PRIMARY TARGETS in the (trusted) system prompt so a
     // cheap model edits the file the goal points at, not whatever it stumbles on first. Pure paths,
     // no prose — no injection surface in the trusted slot.
@@ -676,6 +690,9 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       { role: "system", content: BUILDER_SYSTEM + writeScopeAddendum + primaryTargetsAddendum(targetFiles) },
       ...(projectInstructions !== undefined
         ? [untrusted(`Project instructions from the target repo (CLAUDE.md/AGENTS.md/IKBI.md/.ikbi/) — honor these conventions where they apply:\n${projectInstructions}`, "project_instructions")]
+        : []),
+      ...(brainContext !== undefined
+        ? [untrusted(`Relevant knowledge recalled from ikbi's brain (gbrain) — background context, verify against the repo before relying on it:\n${brainContext}`, "brain_context")]
         : []),
       untrusted(`Goal:\n${ctx.task.goal}`, "builder_goal"),
       untrusted(successCondition, "builder_success_condition"),
@@ -949,6 +966,25 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       }
       return runVisionAnalyze(
         { invokeModel: ctx.engine.invokeModel, identity: ctx.identity, model: builderModelId, worktreeReal },
+        args,
+      );
+    };
+
+    // --- brain_*: gbrain knowledge access (search / think / put / sync). The bridge shells the
+    // gbrain CLI synchronously, but we wrap async for uniform dispatch. brain_sync is governance-
+    // gated INSIDE runBrainTool (fails closed without parentCtx → "DENIED:", recorded like
+    // terminal). Output is retrieved KNOWLEDGE — UNTRUSTED → chokepoint. ---
+    const runBrainCall = async (call: ToolCall): Promise<string> => {
+      let args: Record<string, unknown>;
+      try {
+        args = JSON.parse(call.arguments && call.arguments.length > 0 ? call.arguments : "{}") as Record<string, unknown>;
+      } catch {
+        rejectedToolCalls.push({ tool: call.name, error: "malformed tool arguments (not JSON)" });
+        return `ERROR: malformed arguments for ${call.name} (not valid JSON)`;
+      }
+      return runBrainTool(
+        { bridge: gbrainBridge, ...(deps.parentCtx !== undefined ? { parentCtx: deps.parentCtx } : {}) },
+        call.name,
         args,
       );
     };
@@ -1295,6 +1331,15 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
           } else if (call.name === "vision_analyze") {
             // Multimodal image analysis — async; the analysis is UNTRUSTED → chokepoint.
             const raw = await runVisionCall(call);
+            appendToolResult(raw, call);
+          } else if (BRAIN_TOOL_NAMES.has(call.name)) {
+            // gbrain knowledge access — async; output is UNTRUSTED knowledge → chokepoint.
+            const raw = await runBrainCall(call);
+            // POLICY GATE: a `DENIED:` from brain_sync is an ATTEMPTED out-of-policy action (the
+            // governance gate refused). Record it so the integrator's policy gate sees the attempt.
+            if (raw.startsWith("DENIED:")) {
+              rejectedToolCalls.push({ tool: call.name, error: `brain governed denied: ${raw.slice("DENIED:".length).trim()}` });
+            }
             appendToolResult(raw, call);
           } else {
             const raw = runTool(call); // pure: produces a result string (schema-gated inside)

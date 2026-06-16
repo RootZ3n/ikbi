@@ -53,6 +53,7 @@ import { estimateTokens, maybeCompress } from "../worker-model/context-manager.j
 import { loadProjectInstructions } from "../worker-model/project-memory.js";
 import { type CheckResult, mapExec, resolveCheckTimeoutMs, resolveChecks } from "../worker-model/checks.js";
 import { confinePath } from "../worker-model/builder-tools/confine.js";
+import { BRAIN_TOOLS, runBrainTool } from "../worker-model/builder-tools/brain-tools.js";
 import { delegateTaskTool, runDelegateTask } from "../worker-model/builder-tools/delegate.js";
 import { gitDiffTool, gitLogTool, gitStatusTool, runGitTool } from "../worker-model/builder-tools/git-tools.js";
 import { patchTool, runPatch } from "../worker-model/builder-tools/patch.js";
@@ -190,6 +191,8 @@ export const CHAT_TOOLS: readonly ModelTool[] = [
   webExtractTool,
   delegateTaskTool,
   visionAnalyzeTool,
+  // Knowledge brain (gbrain): recall prior knowledge, synthesize across it, write findings back.
+  ...BRAIN_TOOLS,
   // Parity with the builder's final three (adapted to chat — see the tool defs above).
   SCOUT_DETAIL_TOOL,
   RUN_CHECKS_TOOL,
@@ -943,6 +946,14 @@ export class ChatSession {
           `- success condition: ${sc}\n- satisfied: ${satisfied}\n- self-check: ${selfCheck}` +
           (files.length > 0 ? `\n- files reviewed: ${files.join(", ")}` : "");
         return { output: out, activity: { name: "done", ok: true, summary: "session checkpoint" } };
+      }
+      case "brain_search":
+      case "brain_think":
+      case "brain_put":
+      case "brain_sync": {
+        const ctx: OperationContext | undefined = this.parentCtx;
+        const brainResult = await runBrainTool(call.name, args, ctx);
+        return { output: brainResult.output, activity: { name: call.name, ok: brainResult.ok, summary: brainResult.summary } };
       }
       default:
         return { output: `ERROR: unknown tool "${call.name}"`, activity: { name: call.name, ok: false, summary: "unknown tool" } };
