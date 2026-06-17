@@ -176,6 +176,44 @@ test("send: drives the builder tools — write_file then patch — and reports a
   assert.equal(readFileSync(join(dir, "g.ts"), "utf8"), "export const hello = 1;\n");
 });
 
+test("text emulation: a no-tool-API chat model drives write_file via a fenced JSON call", async () => {
+  const dir = tmp();
+  const { invoke, requests } = scripted([
+    stop('I will create it.\n```json\n{"tool":"write_file","args":{"path":"a.ts","content":"export const x = 1;\\n"}}\n```'),
+    stop("Created a.ts."),
+  ]);
+  // model "deepseek-reasoner" ⇒ getCapabilities → supports_tools:false ⇒ emulation on.
+  const s = new ChatSession("s-emul", { invoke, worktree: dir, model: "deepseek-reasoner" });
+  const { tools } = await s.send("make a.ts");
+
+  // The text-emitted tool call actually executed.
+  assert.equal(tools[0]?.name, "write_file");
+  assert.equal(tools[0]?.ok, true);
+  assert.equal(readFileSync(join(dir, "a.ts"), "utf8"), "export const x = 1;\n");
+  // Emulated mode sends NO native tools array (the model can't use one) ...
+  assert.deepEqual((requests[0] as { tools?: unknown }).tools, []);
+  // ... and folds the text-protocol instructions into the system prompt.
+  const sys = (requests[0] as { messages?: { role?: string; content?: string }[] }).messages?.[0];
+  assert.equal(sys?.role, "system");
+  assert.match(String(sys?.content ?? ""), /no native tool API/);
+  // The tool RESULT is fed back as a USER-role data message (no real tool_call_id to attach to),
+  // never as a tool-role message a strict no-tool-API provider would reject.
+  const followup = (requests[1] as { messages?: { role?: string; content?: string }[] }).messages ?? [];
+  assert.ok(followup.some((m) => m.role === "user" && /a\.ts/.test(String(m.content ?? ""))), "emulated result fed back as user-role");
+  assert.ok(!followup.some((m) => m.role === "tool"), "no tool-role message in emulated mode");
+});
+
+test("text emulation OFF for a native-tool chat model: native tools are sent, no protocol text", async () => {
+  const dir = tmp();
+  const { invoke, requests } = scripted([stop("hi")]);
+  const s = new ChatSession("s-native", { invoke, worktree: dir }); // default mimo-v2.5 ⇒ native
+  await s.send("hello");
+  const sent = (requests[0] as { tools?: unknown[] }).tools ?? [];
+  assert.ok(Array.isArray(sent) && sent.length > 0, "a native-tool model receives the tools array");
+  const sys = (requests[0] as { messages?: { content?: string }[] }).messages?.[0];
+  assert.doesNotMatch(String(sys?.content ?? ""), /no native tool API/, "no text-protocol instructions for a native model");
+});
+
 test("send: a tool path escaping the worktree is rejected (confinement) and surfaced as not-ok", async () => {
   const dir = tmp();
   const { invoke } = scripted([

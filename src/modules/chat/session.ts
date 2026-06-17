@@ -63,6 +63,7 @@ import { multiEditTool, runMultiEdit } from "../worker-model/builder-tools/multi
 import { globTool, runGlob } from "../worker-model/builder-tools/glob.js";
 import { runSearchFiles, searchFilesTool } from "../worker-model/builder-tools/search-files.js";
 import { runTerminal, terminalTool } from "../worker-model/builder-tools/terminal.js";
+import { parseTextToolCalls, textToolProtocolInstructions } from "../worker-model/builder-tools/text-tool-protocol.js";
 import { runVisionAnalyze, visionAnalyzeTool } from "../worker-model/builder-tools/vision-tool.js";
 import { runWebExtract, runWebSearch, webExtractTool, webSearchTool } from "../worker-model/builder-tools/web-tools.js";
 import type { ChatToolActivity } from "./contract.js";
@@ -643,6 +644,9 @@ export class ChatSession {
   private readonly userMsg: ModelMessage | undefined;
   /** The driver model id for this session — switchable at runtime via setModel (`/model`). */
   private model: string;
+  /** True while THIS round's tool calls were parsed from TEXT (no-native-tool-API model): their
+   *  results feed back as user-role data, not tool-role (no real tool_call_id exists). */
+  private emulatedRound = false;
   /** When the session was first created (carried across resume, for `/status`). */
   readonly createdAt: number;
   /** Last-touched timestamp (for LRU eviction). */
@@ -1051,24 +1055,39 @@ export class ChatSession {
   /** The neutralization chokepoint: a tool result becomes a message ONLY through here. */
   private appendToolResult(raw: string, call: ToolCall): void {
     const safe = neutralizeUntrusted(raw, { source: "mcp_result", identity: this.identity, origin: call.name });
-    this.messages.push(toUntrustedMessage(safe, { role: "tool", toolCallId: call.id }));
+    // Emulated (text-protocol) rounds have no real tool_call_id to attach a tool-role message to —
+    // feed the (still-neutralized) result back as a user-role data message instead. Mirrors builder.
+    this.messages.push(
+      this.emulatedRound
+        ? toUntrustedMessage(safe, { role: "user" })
+        : toUntrustedMessage(safe, { role: "tool", toolCallId: call.id }),
+    );
   }
 
   /** Build the per-invoke message view: the (clean, trusted) system prompt, then the memory
    *  carrier as isolated UNTRUSTED data, then the live conversation. The memory message is NOT
    *  persisted into `this.messages` — it is recomputed per turn and slotted in right after system. */
-  private viewWithMemory(memMsg: ModelMessage | undefined, mode: ChatMode = "agent"): ModelMessage[] {
+  private viewWithMemory(
+    memMsg: ModelMessage | undefined,
+    mode: ChatMode = "agent",
+    toolInstructions?: string,
+  ): ModelMessage[] {
     // PLAN MODE: fold the plan-mode directive into a fresh system message for THIS turn only
     // (never mutate the persisted clean system prompt). Agent mode uses the clean prompt as-is.
+    // TEXT TOOL PROTOCOL: when the model has no native tool API, append the tool catalogue + JSON
+    // envelope to the (per-turn) system message too — same per-turn-only treatment as plan mode.
     const sys0 = this.messages[0] as ModelMessage;
-    const sys: ModelMessage = mode === "plan" ? { role: "system", content: sys0.content + PLAN_SYSTEM_EXTENSION } : sys0;
+    let sysContent = sys0.content;
+    if (mode === "plan") sysContent += PLAN_SYSTEM_EXTENSION;
+    if (toolInstructions !== undefined) sysContent += `\n\n${toolInstructions}`;
+    const sys: ModelMessage = sysContent === sys0.content ? sys0 : { role: "system", content: sysContent };
     // Slot the (persistent) PROJECT-MEMORY + USER-MEMORY carriers and the (per-turn) MEMORY carrier
     // in right after the clean system prompt — all as isolated UNTRUSTED data, never merged into system.
     const extras: ModelMessage[] = [];
     if (this.projectMsg !== undefined) extras.push(this.projectMsg);
     if (this.userMsg !== undefined) extras.push(this.userMsg);
     if (memMsg !== undefined) extras.push(memMsg);
-    if (extras.length === 0 && mode !== "plan") return this.messages;
+    if (extras.length === 0 && sys === sys0) return this.messages;
     return [sys, ...extras, ...this.messages.slice(1)];
   }
 
@@ -1423,6 +1442,14 @@ export class ChatSession {
     let turnCost = 0;
     // Plan mode runs the READ-ONLY tool subset; agent mode runs the full suite.
     const activeTools = mode === "plan" ? PLAN_TOOLS : CHAT_TOOLS;
+    // TEXT TOOL PROTOCOL (cheap/local-model parity with the builder): a model with no native
+    // function-calling API cannot emit structured tool_calls. Rather than hand it a tools array it
+    // can't use (and watch it bare-stop), describe the tools + a strict JSON envelope in the system
+    // prompt and parse tool calls back out of its text. Gated strictly on supports_tools === false,
+    // so every native-tool model is byte-unchanged.
+    const emulateTools = getCapabilities(this.model).supports_tools === false;
+    const toolsForModel = emulateTools ? [] : activeTools;
+    const toolInstructions = emulateTools ? textToolProtocolInstructions(activeTools) : undefined;
     // CONVERSATION MEMORY: a brief summary of prior-turn facts (files modified, command/test
     // results, conclusions). The facts are model-authored, but a recorded conclusion could echo
     // text from a malicious file the model read — so the summary rides as ISOLATED UNTRUSTED DATA
@@ -1457,8 +1484,8 @@ export class ChatSession {
           temperature: TEMPERATURE,
           maxTokens: MAX_TOKENS,
           identity: this.identity,
-          messages: this.viewWithMemory(memMsg, mode),
-          tools: activeTools,
+          messages: this.viewWithMemory(memMsg, mode, toolInstructions),
+          tools: toolsForModel,
         });
       } catch (e) {
         this.memory.recordToolActivity(tools);
@@ -1487,8 +1514,23 @@ export class ChatSession {
         ...(response.toolCalls !== undefined && response.toolCalls.length > 0 ? { toolCalls: response.toolCalls } : {}),
       });
 
+      // Resolve this round's tool calls: native structured calls when present; otherwise (only for
+      // no-tool-API models) parse them out of the model's TEXT. `emulatedRound` steers the tool-result
+      // feedback to a user-role message (no tool_call_id exists to attach to) — see appendToolResult.
+      this.emulatedRound = false;
+      let roundToolCalls: readonly ToolCall[] | undefined;
       if (response.finishReason === "tool_calls" && response.toolCalls !== undefined && response.toolCalls.length > 0) {
-        for (const call of response.toolCalls) {
+        roundToolCalls = response.toolCalls;
+      } else if (emulateTools && typeof response.content === "string") {
+        const parsed = parseTextToolCalls(response.content);
+        if (parsed.length > 0) {
+          roundToolCalls = parsed;
+          this.emulatedRound = true;
+        }
+      }
+
+      if (roundToolCalls !== undefined) {
+        for (const call of roundToolCalls) {
           if (opts.signal?.aborted) return interrupted();
           // PROGRESS (FIX 4): name the tool (and a short target) as the spinner phase.
           opts.onProgress?.(progressPhase(call));
