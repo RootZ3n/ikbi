@@ -38,12 +38,19 @@ import { neutralizeUntrusted, toUntrustedMessage } from "../../core/injection/in
 import { childLogger } from "../../core/log.js";
 import {
   invokeModel,
+  invokeModelStream,
+  priceUsage,
+  StreamAccumulator,
   type AgentIdentity,
   type ContentPart,
+  type Cost,
   type ModelMessage,
   type ModelResponse,
+  type ModelStream,
   type ModelTool,
+  type StreamDelta,
   type ToolCall,
+  type TokenUsage,
 } from "../../core/provider/index.js";
 import type { DiscardResult, PromoteResult } from "../../core/workspace/index.js";
 import { getCapabilities } from "../../core/provider/capabilities.js";
@@ -550,6 +557,20 @@ function resolveProvidedWorkdir(input: unknown, createIfMissing: boolean): strin
 /** The model-invocation function shape — injectable so the tool loop is testable without network. */
 export type InvokeFn = typeof invokeModel;
 
+/** The streaming-invocation function shape — injectable so `sendStream` is testable without network. */
+export type InvokeStreamFn = typeof invokeModelStream;
+
+/**
+ * One streamed event surfaced by `sendStream`: the raw provider `delta` plus the assistant
+ * content accumulated SO FAR in the current model round (so a caller can either append the
+ * delta slice or re-render from the running total). Tool execution happens between rounds and
+ * is reflected in the generator's RETURN value, not in these events.
+ */
+export interface StreamEvent {
+  readonly delta: StreamDelta;
+  readonly fullContent: string;
+}
+
 /**
  * A session serialized to disk (the persistent-store shape). Holds everything needed to
  * reconstruct a live ChatSession: identity/worktree, the full message log, the key-fact
@@ -586,6 +607,8 @@ export interface PersistedSession {
 export interface ChatSessionDeps {
   /** Override the model invoker (tests script responses); defaults to the real provider. */
   readonly invoke?: InvokeFn;
+  /** Override the STREAMING invoker (tests script deltas); defaults to the real provider. */
+  readonly invokeStream?: InvokeStreamFn;
   /** Override the worktree (tests pin a known dir); defaults to IKBI_CHAT_WORKDIR or a tmp sandbox. */
   readonly worktree?: string;
   /** Current shell cwd for auto workdir selection; defaults to process.cwd(). */
@@ -630,6 +653,7 @@ export class ChatSession {
   private readonly identity: AgentIdentity;
   private readonly parentCtx: OperationContext | undefined;
   private readonly invoke: InvokeFn;
+  private readonly invokeStream: InvokeStreamFn | undefined;
   private readonly autosave: ((session: ChatSession) => void | Promise<void>) | undefined;
   /**
    * PROJECT MEMORY carrier (the worktree's CLAUDE.md / AGENTS.md), built once as an isolated
@@ -716,6 +740,7 @@ export class ChatSession {
     this.identity = { agentId: "ikbi-chat", functionalRole: "assistant", trustTier: "trusted", sessionId: id };
     this.parentCtx = resolveParentCtx(id);
     this.invoke = deps.invoke ?? invokeModel;
+    this.invokeStream = deps.invokeStream; // undefined → sendStream degrades to invoke
     this.autosave = deps.autosave;
     this.model = deps.model ?? restore?.model ?? config.provider.defaultModels.driver;
     // messages[0] is ALWAYS the clean, trusted system prompt — even on resume we force a fresh
@@ -1552,6 +1577,196 @@ export class ChatSession {
       // Context pressure VISIBILITY: warn when the conversation crosses 70% of the window.
       if (contextPercent > 70) log.warn({ sessionId: this.id, contextPercent }, "chat: context window pressure above 70%");
       return { response: response.content, tools, cost: turnCost, contextPercent };
+    }
+  }
+
+  /** Fold one model round's token usage + cost into the cumulative session counters. Returns the
+   *  round's USD so the caller can also accumulate the per-turn cost. Mirrors `runTurn`'s inline
+   *  accounting (incl. prompt-cache savings) for the streaming path. */
+  private accountUsage(usage: TokenUsage | undefined, cost: Cost | undefined): number {
+    const usd = cost?.usd ?? 0;
+    this.tokensIn += usage?.promptTokens ?? 0;
+    this.tokensOut += usage?.completionTokens ?? 0;
+    this.costTotal += usd;
+    const cached = usage?.cachedTokens ?? 0;
+    if (cached > 0) {
+      this.cachedTokens += cached;
+      const rate = cost?.rate;
+      if (rate !== undefined) {
+        const cachedRate = rate.cachedPromptPerMTok ?? rate.promptPerMTok;
+        this.cacheSavedUsd += (cached / 1_000_000) * Math.max(0, rate.promptPerMTok - cachedRate);
+      }
+    }
+    return usd;
+  }
+
+  /**
+   * STREAMING variant of `send` (chat REPL only). Same message construction and bounded tool loop,
+   * but each model round is consumed as a stream: the generator YIELDS a `StreamEvent` per content
+   * delta (for live token-by-token display) and, after the stream and the tool loop complete,
+   * RETURNS the same `{ response, tools, cost, contextPercent }` shape `send` resolves to.
+   *
+   * Turn serialization (the `turnQueue`) and autosave are preserved: a streamed turn waits for any
+   * in-flight turn, and the session is persisted once the generator finishes.
+   */
+  async *sendStream(
+    userMessage: string,
+    images?: readonly string[],
+    mode: ChatMode = "agent",
+    opts: TurnOptions = {},
+  ): AsyncGenerator<StreamEvent, { response: string; tools: ChatToolActivity[]; cost: number; contextPercent: number }, void> {
+    // Serialize against other turns (send/sendStream share the queue). Acquire the slot, run, release.
+    const prior = this.turnQueue;
+    let release!: () => void;
+    this.turnQueue = new Promise<void>((r) => { release = r; });
+    try {
+      await prior.catch(() => undefined);
+      const result = yield* this.runTurnStream(userMessage, images, mode, opts);
+      if (this.autosave !== undefined) {
+        try {
+          await this.autosave(this);
+        } catch (e) {
+          log.warn({ err: errMsg(e), sessionId: this.id }, "chat: autosave failed");
+        }
+      }
+      return result;
+    } finally {
+      release();
+    }
+  }
+
+  private async *runTurnStream(
+    userMessage: string,
+    images?: readonly string[],
+    mode: ChatMode = "agent",
+    opts: TurnOptions = {},
+  ): AsyncGenerator<StreamEvent, { response: string; tools: ChatToolActivity[]; cost: number; contextPercent: number }, void> {
+    this.lastUsedAt = Date.now();
+    let turnCost = 0;
+    const tools: ChatToolActivity[] = [];
+    const finish = (response: string): { response: string; tools: ChatToolActivity[]; cost: number; contextPercent: number } => {
+      this.memory.recordToolActivity(tools);
+      return { response, tools, cost: turnCost, contextPercent: this.contextPercent() };
+    };
+
+    const activeTools = mode === "plan" ? PLAN_TOOLS : CHAT_TOOLS;
+    const emulateTools = getCapabilities(this.model).supports_tools === false;
+    const toolsForModel = emulateTools ? [] : activeTools;
+    const toolInstructions = emulateTools ? textToolProtocolInstructions(activeTools) : undefined;
+    const memSummary = this.memory.summary();
+    const memMsg = memSummary.length > 0
+      ? toUntrustedMessage(neutralizeUntrusted(memSummary, { source: "external", identity: this.identity, origin: "chat_memory" }), { role: "user" })
+      : undefined;
+    const imageParts = buildImageParts(userMessage, images);
+    this.messages.push({ role: "user", content: userMessage, ...(imageParts !== undefined ? { parts: imageParts } : {}) });
+
+    let iterations = 0;
+    for (;;) {
+      if (opts.signal?.aborted) return finish("[ikbi: interrupted]");
+      iterations += 1;
+      if (iterations > MAX_TOOL_ITERATIONS) {
+        return finish("[ikbi: reached the tool-iteration limit for this turn — try narrowing the request.]");
+      }
+
+      opts.onProgress?.("Thinking…");
+      if (opts.signal?.aborted) return finish("[ikbi: interrupted]");
+
+      // Open the stream for this round (a pre-stream failure ends the turn with an error reply).
+      // When invokeStream is not provided (tests, providers without streaming), degrade to the
+      // non-streaming invoke and synthesize a single-delta stream from the result.
+      const req = {
+        model: this.model,
+        temperature: TEMPERATURE,
+        maxTokens: MAX_TOKENS,
+        identity: this.identity,
+        messages: this.viewWithMemory(memMsg, mode, toolInstructions),
+        tools: toolsForModel,
+      };
+      const acc = new StreamAccumulator();
+      let aborted = false;
+      let roundCost: Cost | undefined; // used by non-streaming fallback to carry the response's cost
+
+      if (this.invokeStream !== undefined) {
+        let stream: ModelStream;
+        try {
+          stream = await this.invokeStream(req);
+        } catch (e) {
+          return finish(`[ikbi: model call failed: ${errMsg(e)}]`);
+        }
+        try {
+          for await (const delta of stream) {
+            acc.push(delta);
+            if (delta.content !== undefined && delta.content.length > 0) {
+              yield { delta, fullContent: acc.currentContent };
+            }
+            if (opts.signal?.aborted) { aborted = true; break; }
+          }
+        } catch (e) {
+          return finish(`[ikbi: model stream failed: ${errMsg(e)}]`);
+        }
+      } else {
+        // Non-streaming fallback: call invoke, yield the full content as a single delta.
+        let result: ModelResponse;
+        try {
+          result = await this.invoke(req);
+        } catch (e) {
+          return finish(`[ikbi: model call failed: ${errMsg(e)}]`);
+        }
+        const delta: StreamDelta = {
+          content: result.content,
+          finishReason: result.finishReason,
+          usage: result.usage,
+          ...(result.toolCalls !== undefined ? { toolCalls: result.toolCalls.map((tc, i) => ({ index: i, id: tc.id, name: tc.name, arguments: tc.arguments })) } : {}),
+        };
+        acc.push(delta);
+        roundCost = result.cost;
+        if (result.content.length > 0) {
+          yield { delta, fullContent: acc.currentContent };
+        }
+      }
+      const round = acc.result();
+
+      // Token + cost accounting for this round (usage rides the trailing stream chunk when present).
+      // Non-streaming fallback carries the response's cost directly; streaming computes from usage.
+      turnCost += this.accountUsage(round.usage, roundCost ?? (round.usage !== undefined ? priceUsage(this.model, round.usage) : undefined));
+
+      this.messages.push({
+        role: "assistant",
+        content: round.content,
+        ...(round.toolCalls.length > 0 ? { toolCalls: round.toolCalls } : {}),
+      });
+
+      if (aborted) return finish("[ikbi: interrupted]");
+
+      // Resolve this round's tool calls: native structured calls, else (no-tool-API models) text-parsed.
+      this.emulatedRound = false;
+      let roundToolCalls: readonly ToolCall[] | undefined;
+      if (round.finishReason === "tool_calls" && round.toolCalls.length > 0) {
+        roundToolCalls = round.toolCalls;
+      } else if (emulateTools && round.content.length > 0) {
+        const parsed = parseTextToolCalls(round.content);
+        if (parsed.length > 0) {
+          roundToolCalls = parsed;
+          this.emulatedRound = true;
+        }
+      }
+
+      if (roundToolCalls !== undefined) {
+        for (const call of roundToolCalls) {
+          if (opts.signal?.aborted) return finish("[ikbi: interrupted]");
+          opts.onProgress?.(progressPhase(call));
+          const { output, activity } = await this.runTool(call, mode, opts);
+          tools.push(activity);
+          this.appendToolResult(withErrorHint(output), call); // chokepoint: neutralize + append
+        }
+        continue; // let the model read the (neutralized) results and continue
+      }
+
+      this.memory.recordToolActivity(tools);
+      if (!round.content.startsWith("[ikbi:")) this.memory.recordDecision(round.content);
+      const contextPercent = this.contextPercent();
+      if (contextPercent > 70) log.warn({ sessionId: this.id, contextPercent }, "chat: context window pressure above 70%");
+      return { response: round.content, tools, cost: turnCost, contextPercent };
     }
   }
 }

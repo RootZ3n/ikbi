@@ -9,9 +9,9 @@
 import { config } from "../config.js";
 import { childLogger } from "../log.js";
 import { wrapModelInvocation } from "./invoke-wrapper.js";
-import { ProviderInvoker } from "./invoke.js";
+import { computeCost, ProviderInvoker } from "./invoke.js";
 import { getCapabilities, type ModelCapabilities } from "./capabilities.js";
-import type { ModelRequest, ModelResponse } from "./contract.js";
+import type { Cost, CostRate, ModelRequest, ModelResponse, ModelStream, TokenUsage } from "./contract.js";
 import {
   createDeepseekProvider,
   createMinimaxProvider,
@@ -29,7 +29,7 @@ import {
   MIMO_PROVIDER_ID,
   OPENROUTER_PROVIDER_ID,
 } from "./providers/index.js";
-import { ModelRegistry, type ModelSpec } from "./registry.js";
+import { ModelRegistry, type ModelSpec, resolveRate } from "./registry.js";
 
 const log = childLogger("provider");
 
@@ -157,6 +157,32 @@ export function invokeModel(request: ModelRequest): Promise<ModelResponse> {
 }
 
 /**
+ * The STREAMING entry point (1.3.0). Walks the same fallback chain as `invokeModel` and
+ * yields `StreamDelta`s. Streaming is NOT routed through the caching floor — a stream is
+ * a live, incremental response, not a cacheable artifact — so this calls the invoker
+ * directly. Used by the chat REPL for live token-by-token output; the builder stays
+ * request/response on `invokeModel`.
+ */
+export function invokeModelStream(request: ModelRequest): Promise<ModelStream> {
+  return invoker.invokeModelStream(request);
+}
+
+/**
+ * Price a `TokenUsage` against a model's PRIMARY route rate — the cost helper the streaming
+ * path needs (the invoker computes cost inline on the non-streaming path, but a stream's usage
+ * surfaces at the consumer). Falls back to a zero rate for an unknown/route-less model so callers
+ * never throw on cost accounting.
+ */
+export function priceUsage(model: string, usage: TokenUsage): Cost {
+  const spec = registry.getModel(model);
+  const route = spec?.providers[0];
+  const rate: CostRate = spec !== undefined && route !== undefined
+    ? resolveRate(spec, route)
+    : { promptPerMTok: 0, completionPerMTok: 0 };
+  return computeCost(rate, usage);
+}
+
+/**
  * Resolve a model's capabilities WITH the roster override layered on top of the
  * known/family/default profile. Callers that already hold a bare model id and do
  * not want the registry can import `getCapabilities` from ./capabilities directly;
@@ -176,6 +202,10 @@ export { ModelRegistry, resolveRate } from "./registry.js";
 export type { ModelSpec, ProviderRoute, RegistryInit } from "./registry.js";
 export { getCapabilities, adaptMaxTokens, FALLBACK_CAPABILITIES } from "./capabilities.js";
 export type { ModelCapabilities, ReasoningLevel, SpeedClass } from "./capabilities.js";
+export { StreamAccumulator } from "./stream-accumulate.js";
+export type { AccumulatedResponse } from "./stream-accumulate.js";
+export { parseSseBuffer, SSE_DONE } from "./providers/sse-parse.js";
+export type { SseParseResult } from "./providers/sse-parse.js";
 export { CircuitBreaker } from "./circuit-breaker.js";
 export type { Clock, CircuitState, CircuitSnapshot } from "./circuit-breaker.js";
 export {

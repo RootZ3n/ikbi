@@ -33,7 +33,7 @@ test("all EIGHT frozen-contract pins are present and match the version table", (
   // These are the exact targets index.ts asserts at load. Each must be compatible
   // with the present frozen version (the version table = CONTRACT_VERSIONS).
   const pins: Array<[Parameters<typeof checkCompatibility>[0], string]> = [
-    ["provider", "1.2.0"],
+    ["provider", "1.3.0"],
     ["injection", "1.0.0"],
     ["identity", "1.1.0"],
     ["trust", "1.0.0"],

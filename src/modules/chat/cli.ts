@@ -25,7 +25,7 @@ import { registry } from "../../core/provider/index.js";
 import { colorizeDiff } from "../worker-model/cli.js";
 import type { ChatMode, ChatToolActivity } from "./contract.js";
 import { discoverProject, formatOverview } from "./project-discovery.js";
-import { ChatSession, type ApplyResult, type DiscardOutcome, type PermissionMode, type PersistedSession, type RollbackResult, type TurnOptions, type WorkdirKind } from "./session.js";
+import { ChatSession, type ApplyResult, type DiscardOutcome, type PermissionMode, type PersistedSession, type RollbackResult, type StreamEvent, type TurnOptions, type WorkdirKind } from "./session.js";
 import { allocateSessionWorkspace, reconnectSessionWorkspace, resolveRepoTarget } from "./repl-workspace.js";
 import { persistentStore, PersistentSessionStore, sessionsDir } from "./session-store.js";
 import { defaultBinDir, installLauncher, launcherExists, setupInstructions } from "./shell-integration.js";
@@ -39,6 +39,9 @@ function errMsg(e: unknown): string {
  *  optional so a lightweight fake (just `send`) still satisfies it for tests. */
 export interface ReplSession {
   send(userMessage: string, images?: readonly string[], mode?: ChatMode, opts?: TurnOptions): Promise<{ response: string; tools: ChatToolActivity[]; cost?: number; contextPercent?: number }>;
+  /** Streaming variant: yields content deltas for live display, returns the final turn summary.
+   *  Optional — when absent the REPL falls back to the request/response `send`. */
+  sendStream?(userMessage: string, images?: readonly string[], mode?: ChatMode, opts?: TurnOptions): AsyncGenerator<StreamEvent, { response: string; tools: ChatToolActivity[]; cost?: number; contextPercent?: number }, void>;
   readonly id?: string;
   readonly worktree?: string;
   readonly workdirKind?: WorkdirKind;
@@ -516,6 +519,50 @@ const COMMAND_LIST: readonly ReplCommand[] = [
 /** Name → command lookup, plus the `quit` alias for `exit` (both handled inline in the loop). */
 const COMMANDS: ReadonlyMap<string, ReplCommand> = new Map(COMMAND_LIST.map((c) => [c.name, c]));
 
+/** The turn summary shape both `send` and `sendStream` resolve/return. */
+type TurnResult = { response: string; tools: ChatToolActivity[]; cost?: number; contextPercent?: number };
+
+/**
+ * Drive ONE streamed turn: consume the session's `sendStream` generator, writing assistant content
+ * to the terminal token-by-token as it arrives. Manages the transient spinner line so progress
+ * updates (between tool rounds) never clobber already-printed prose. Returns the final turn summary
+ * plus whether any prose was streamed (so the caller knows not to re-print `response`).
+ */
+async function streamTurn(
+  session: ReplSession,
+  msg: string,
+  mode: ChatMode,
+  turnOpts: Omit<TurnOptions, "onProgress">,
+  out: (s: string) => void,
+): Promise<{ res: TurnResult; streamedProse: boolean }> {
+  let spinnerShowing = false;
+  let midLine = false; // prose was written without a trailing newline
+  let printedAny = false;
+  const onProgress = (phase: string): void => {
+    // Move off any partial prose line first so the spinner's `\r` erase can't eat streamed text.
+    if (midLine) { out("\n"); midLine = false; }
+    out(`${SPINNER_CLEAR}${DIM}⟳ ${phase}${RESET}`);
+    spinnerShowing = true;
+  };
+  const writeContent = (s: string): void => {
+    if (s.length === 0) return;
+    if (spinnerShowing) { out(SPINNER_CLEAR); spinnerShowing = false; }
+    out(s);
+    printedAny = true;
+    midLine = !s.endsWith("\n");
+  };
+  const gen = session.sendStream!(msg, undefined, mode, { ...turnOpts, onProgress });
+  let res: TurnResult;
+  for (;;) {
+    const next = await gen.next();
+    if (next.done === true) { res = next.value; break; }
+    writeContent(next.value.delta.content ?? "");
+  }
+  if (spinnerShowing) out(SPINNER_CLEAR);
+  if (midLine) out("\n");
+  return { res, streamedProse: printedAny };
+}
+
 /**
  * Drive a conversational session: prompt → read → send → print, until `/exit`, `/quit`,
  * or end-of-input. Multi-turn history is the session's own (each `send` appends to it).
@@ -579,24 +626,35 @@ export async function runRepl(deps: ReplDeps): Promise<void> {
       if (ctx.exit) break;
       continue;
     }
-    let res: { response: string; tools: ChatToolActivity[]; contextPercent?: number };
+    let res: TurnResult;
+    // STREAMING: when the session supports it, print the reply token-by-token as it arrives (the
+    // clearest "this is responsive" signal). Otherwise fall back to request/response + spinner.
+    let streamedProse = false;
     // PROGRESS (FIX 4): a `\r`-overwriting spinner line while the (async) turn runs.
     const controller = new AbortController();
     deps.onTurnController?.(controller);
-    const onProgress = (phase: string): void => deps.out(`${SPINNER_CLEAR}${DIM}⟳ ${phase}${RESET}`);
-    const turnOpts: TurnOptions = { onProgress, signal: controller.signal, permissionMode: ctx.permissionMode, confirm: ctx.confirmTool };
+    const baseOpts = { signal: controller.signal, permissionMode: ctx.permissionMode, confirm: ctx.confirmTool } as const;
     try {
-      res = await ctx.session.send(msg, undefined, ctx.mode, turnOpts);
+      if (typeof ctx.session.sendStream === "function") {
+        const streamed = await streamTurn(ctx.session, msg, ctx.mode, baseOpts, deps.out);
+        res = streamed.res;
+        streamedProse = streamed.streamedProse;
+      } else {
+        const onProgress = (phase: string): void => deps.out(`${SPINNER_CLEAR}${DIM}⟳ ${phase}${RESET}`);
+        res = await ctx.session.send(msg, undefined, ctx.mode, { ...baseOpts, onProgress });
+        deps.out(SPINNER_CLEAR); // clear the spinner line before printing the result
+      }
     } catch (e) {
       deps.out(`${SPINNER_CLEAR}[error: ${errMsg(e)}]\n`);
       continue;
     } finally {
       deps.onTurnController?.(undefined);
     }
-    deps.out(SPINNER_CLEAR); // clear the spinner line before printing the result
     if (res.tools.length > 0) deps.out(toolLine(res.tools));
     renderToolDiffs(res.tools, deps.out); // FIX 3: colorized inline diffs for file mutations
-    deps.out(`${res.response}\n`);
+    // The prose was already streamed live; only print it here when it wasn't (non-stream path, or a
+    // synthetic [ikbi: …] reply that never produced content deltas).
+    if (!streamedProse) deps.out(`${res.response}\n`);
     // Cache-hit segment for the context bar (FIX 7), when caching is active this session.
     const u = ctx.session.usage?.();
     const cachePct = ctx.session.cacheHitPercent?.() ?? (u !== undefined && (u.cachedTokens ?? 0) > 0 && u.tokensIn > 0 ? Math.round(((u.cachedTokens ?? 0) / u.tokensIn) * 100) : undefined);

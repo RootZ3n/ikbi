@@ -25,14 +25,17 @@ import {
   type ModelProvider,
   type ModelRequest,
   type ModelResponse,
+  type ModelStream,
   ModelNotFoundError,
   type ProviderAttempt,
   ProviderError,
   type ProviderResult,
+  type StreamDelta,
   type ToolCall,
+  type ToolCallDelta,
   type TokenUsage,
 } from "./contract.js";
-import { type ModelRegistry, type ProviderRoute, resolveRate } from "./registry.js";
+import { type ModelRegistry, type ModelSpec, type ProviderRoute, resolveRate } from "./registry.js";
 
 /**
  * Compute cost (USD) for a usage against a per-1M-token rate. Cached prompt
@@ -48,6 +51,25 @@ export function computeCost(rate: CostRate, usage: TokenUsage): Cost {
   const cachedUsd = (cachedTokens / 1_000_000) * cachedRate;
   const completionUsd = (usage.completionTokens / 1_000_000) * rate.completionPerMTok;
   return { usd: promptUsd + cachedUsd + completionUsd, promptUsd, cachedUsd, completionUsd, rate };
+}
+
+/**
+ * Adapt a non-streaming `ProviderResult` to a single terminal `StreamDelta` — the bridge
+ * used when a provider on the chain cannot stream. Tool calls become index-ordered deltas.
+ */
+function resultToDelta(result: ProviderResult): StreamDelta {
+  const toolCalls: ToolCallDelta[] = (result.toolCalls ?? []).map((tc, index) => ({
+    index,
+    id: tc.id,
+    name: tc.name,
+    arguments: tc.arguments,
+  }));
+  return {
+    ...(result.content.length > 0 ? { content: result.content } : {}),
+    ...(toolCalls.length > 0 ? { toolCalls } : {}),
+    finishReason: result.finishReason,
+    usage: result.usage,
+  };
 }
 
 /** Same-route retry tuning (transient failures). Mirrors config.RetryConfig. */
@@ -281,6 +303,126 @@ export class ProviderInvoker {
       "all providers failed for model",
     );
     throw new AllProvidersFailedError(request.model, attempts);
+  }
+
+  /**
+   * The STREAMING entry point (1.3.0). Walks the SAME deterministic fallback chain as
+   * `invokeModel`, but yields `StreamDelta`s. A provider that implements `invokeStream`
+   * is streamed directly; one that does not is invoked request/response and adapted to a
+   * single terminal delta. A PRE-stream failure (auth/HTTP/network) falls through to the
+   * next route exactly like the non-streaming path; a MID-stream failure fails the call
+   * (no mid-stream retry). Resolves to the stream eagerly so a bad model id throws here.
+   */
+  async invokeModelStream(request: ModelRequest): Promise<ModelStream> {
+    const spec = this.registry.getModel(request.model);
+    if (spec === undefined) throw new ModelNotFoundError(request.model);
+    const timeoutMs = request.timeoutMs ?? this.defaultTimeoutMs;
+    return this.streamWalk(request, spec, timeoutMs);
+  }
+
+  /** The fallback walk for `invokeModelStream`, expressed as an async generator of deltas. */
+  private async *streamWalk(request: ModelRequest, spec: ModelSpec, timeoutMs: number): AsyncGenerator<StreamDelta> {
+    const attempts: ProviderAttempt[] = [];
+    let previousProvider: string | undefined;
+
+    for (const [index, route] of spec.providers.entries()) {
+      const isFallback = index > 0;
+      const provider = this.registry.getProvider(route.provider);
+      const breaker = this.breakerFor(route.provider, route.providerModelId);
+
+      if (provider === undefined) {
+        attempts.push({ provider: route.provider, providerModelId: route.providerModelId, outcome: "error", latencyMs: 0, error: "provider not registered" });
+        this.log.warn({ event: "provider_missing", model: request.model, provider: route.provider }, "provider route has no registered provider; skipping (stream)");
+        continue;
+      }
+      if (!breaker.canAttempt()) {
+        attempts.push({ provider: route.provider, providerModelId: route.providerModelId, outcome: "skipped_open_circuit", latencyMs: 0 });
+        this.log.warn({ event: "circuit_open_skip", model: request.model, provider: route.provider, providerModelId: route.providerModelId }, "skipping provider: circuit open (stream)");
+        continue;
+      }
+      if (isFallback) {
+        this.log.warn({ event: "provider_fallback", model: request.model, fromProvider: previousProvider, toProvider: route.provider, attempt: index }, "falling back to next provider (stream)");
+      }
+      previousProvider = route.provider;
+
+      const t0 = this.now();
+
+      // FALLBACK: a provider with no streaming support is invoked request/response and adapted
+      // to one terminal delta. The full-response timeout is appropriate here (it is a single call).
+      if (typeof provider.invokeStream !== "function") {
+        try {
+          const result = await this.invokeWithTimeout(provider, route.providerModelId, request, timeoutMs);
+          breaker.recordSuccess();
+          attempts.push({ provider: route.provider, providerModelId: route.providerModelId, outcome: "success", latencyMs: this.now() - t0, usage: result.usage });
+          yield resultToDelta(result);
+          return;
+        } catch (err) {
+          this.recordStreamFailure(attempts, route, breaker, err, this.now() - t0, request.model);
+          continue;
+        }
+      }
+
+      // STREAMING: open the stream first (pre-stream errors fall through to the next route);
+      // once open, a mid-stream error propagates out and fails the call.
+      const controller = new AbortController();
+      let stream: ModelStream;
+      try {
+        stream = await provider.invokeStream({ providerModelId: route.providerModelId, request, timeoutMs, signal: controller.signal });
+      } catch (err) {
+        controller.abort();
+        this.recordStreamFailure(attempts, route, breaker, err, this.now() - t0, request.model);
+        continue;
+      }
+      breaker.recordSuccess();
+      attempts.push({ provider: route.provider, providerModelId: route.providerModelId, outcome: "success", latencyMs: this.now() - t0 });
+      this.log.info({ event: "model_stream_started", model: request.model, provider: route.provider, providerModelId: route.providerModelId, agentId: request.identity.agentId, fellBack: isFallback }, "model stream started");
+      try {
+        // Delegation propagates consumer `.return()`/`.throw()` into the provider stream so its
+        // own cleanup (reader cancel) runs; the controller.abort() is belt-and-suspenders.
+        yield* stream;
+      } finally {
+        controller.abort();
+      }
+      return;
+    }
+
+    this.log.error({ event: "model_stream_exhausted", model: request.model, attempts }, "all providers failed for model (stream)");
+    throw new AllProvidersFailedError(request.model, attempts);
+  }
+
+  /** Record a PRE-stream provider failure on the attempts list + breaker (mirrors invokeModel). */
+  private recordStreamFailure(
+    attempts: ProviderAttempt[],
+    route: ProviderRoute,
+    breaker: CircuitBreaker,
+    err: unknown,
+    latencyMs: number,
+    model: string,
+  ): void {
+    const isProviderErr = err instanceof ProviderError;
+    const isTimeout = isProviderErr && err.kind === "timeout";
+    const permanent = isProviderErr && err.retriable === false;
+    if (permanent) breaker.recordIgnoredFailure();
+    else breaker.recordFailure();
+    attempts.push({
+      provider: route.provider,
+      providerModelId: route.providerModelId,
+      outcome: isTimeout ? "timeout" : permanent ? "permanent_error" : "error",
+      latencyMs,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    this.log.warn(
+      {
+        event: permanent ? "provider_stream_permanent_error" : "provider_stream_failed",
+        model,
+        provider: route.provider,
+        providerModelId: route.providerModelId,
+        kind: isProviderErr ? err.kind : "unknown",
+        permanent,
+        latencyMs,
+      },
+      "stream provider attempt failed",
+    );
   }
 
   /** Circuit-breaker state for a (provider, model) route — for observability/tests. */

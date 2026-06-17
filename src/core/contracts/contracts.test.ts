@@ -24,9 +24,9 @@ test("the registry lists all 8 frozen contracts with versions", () => {
   // Frozen-core contracts at their additive-bumped versions:
   //  - identity 1.1.0 — the `OperationContext.dryRun` seam (Step S).
   //  - provider 1.2.0 — the fetch-guard seam (1.1.0) + multimodal `parts` (1.2.0).
-  // All additive-MINOR per the codified rule; the rest remain 1.0.0.
-  const expected: Record<string, string> = {
-    provider: "1.2.0",
+  //  - provider 1.3.0 — the fetch-guard seam (1.1.0) + multimodal `parts` (1.2.0) + streaming deltas (1.3.0).
+  const VERSIONS: Record<string, string> = {
+    provider: "1.3.0",
     injection: "1.0.0",
     identity: "1.1.0",
     substrate: "1.0.0",
@@ -35,7 +35,7 @@ test("the registry lists all 8 frozen contracts with versions", () => {
     events: "1.0.0",
     workspace: "1.0.0",
   };
-  for (const name of CONTRACT_NAMES) assert.equal(CONTRACT_VERSIONS[name], expected[name]);
+  for (const name of CONTRACT_NAMES) assert.equal(CONTRACT_VERSIONS[name], VERSIONS[name]);
 });
 
 test("the registry is sourced from the contracts themselves (single source of truth)", async () => {

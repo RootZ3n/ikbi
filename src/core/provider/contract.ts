@@ -13,6 +13,12 @@
 /**
  * Semantic version of the request/response contract.
  *
+ * 1.3.0 — additive: STREAMING. A `ModelProvider` MAY implement an OPTIONAL
+ *         `invokeStream(invocation)` returning a `ModelStream` (an async iterable of
+ *         `StreamDelta`). The request/response shapes are UNCHANGED — streaming is a
+ *         separate, additive consumption path layered beside `invoke`; a provider that
+ *         omits `invokeStream` is unaffected and callers fall back to request/response.
+ *         New OPTIONAL method → MINOR bump.
  * 1.2.0 — additive: multimodal (vision) message content. `ModelMessage` gains an
  *         OPTIONAL `parts?: ContentPart[]` (text + image_url parts). `content`
  *         (string) is UNCHANGED and remains the canonical text — `parts`, when
@@ -26,7 +32,7 @@
  *         provider@1.0.x stay compatible.
  * 1.0.0 — frozen-core provider contract.
  */
-export const CONTRACT_VERSION = "1.2.0";
+export const CONTRACT_VERSION = "1.3.0";
 
 // ---------------------------------------------------------------------------
 // Request
@@ -288,10 +294,45 @@ export interface ProviderResult {
   readonly usage: TokenUsage;
 }
 
-// NOTE — parked seams (documented, intentionally NOT built in Phase 1):
-//  * Streaming: `invokeModel` is request/response only. A streaming variant
-//    (e.g. `invokeModelStream` yielding deltas) will be added later; the
-//    contract above is the non-streaming shape it will share.
+// ---------------------------------------------------------------------------
+// Streaming (1.3.0, additive) — a separate, OPTIONAL consumption path.
+// ---------------------------------------------------------------------------
+
+/**
+ * A single incremental delta from a streamed model response. Each field is
+ * independently optional: a chunk may carry only a slice of `content`, only a
+ * piece of one or more tool calls, only the terminal `finishReason`, and/or the
+ * final `usage` accounting (some providers send usage on a trailing, otherwise-
+ * empty chunk). Consumers accumulate deltas into the same shape `invoke` returns.
+ */
+export interface StreamDelta {
+  /** A slice of assistant text to append to the running content. */
+  readonly content?: string;
+  /** Incremental tool-call chunks (OpenAI streams tool calls piecewise by index). */
+  readonly toolCalls?: readonly ToolCallDelta[];
+  /** The terminal finish reason, present on the final content-bearing chunk. */
+  readonly finishReason?: FinishReason;
+  /** Token usage, present when the provider reports it (often a trailing chunk). */
+  readonly usage?: TokenUsage;
+}
+
+/**
+ * One incremental tool-call chunk. OpenAI streaming sends a tool call across
+ * several chunks keyed by `index`: the first carries `id` + `name`, later ones
+ * append `arguments` fragments. Consumers assemble by `index` into a `ToolCall`.
+ */
+export interface ToolCallDelta {
+  readonly index: number;
+  readonly id?: string;
+  readonly name?: string;
+  /** A fragment of the JSON argument string — concatenate in arrival order. */
+  readonly arguments?: string;
+}
+
+/** An async iterable of streaming deltas — what `invokeStream` yields. */
+export type ModelStream = AsyncIterable<StreamDelta>;
+
+// NOTE — parked seam (documented, intentionally NOT built yet):
 //  * Stop sequences: a `stop?: readonly string[]` request field can be added
 //    backward-compatibly when needed.
 
@@ -304,6 +345,14 @@ export interface ModelProvider {
   readonly id: string;
   /** Perform a single invocation. MUST throw `ProviderError` on failure. */
   invoke(invocation: ProviderInvocation): Promise<ProviderResult>;
+  /**
+   * ADDITIVE (1.3.0, OPTIONAL): stream a response as a `ModelStream` of deltas.
+   * Providers that cannot stream simply omit this method; the invoker then falls
+   * back to the request/response `invoke` path. MUST throw `ProviderError` on a
+   * pre-stream failure (auth/HTTP/bad-response), exactly like `invoke`. A failure
+   * MID-stream fails the call (no mid-stream retry/fallback).
+   */
+  invokeStream?(invocation: ProviderInvocation): Promise<ModelStream>;
 }
 
 // ---------------------------------------------------------------------------
