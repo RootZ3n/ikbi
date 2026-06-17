@@ -7,7 +7,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -102,5 +102,41 @@ test("planning diff relevance: changed .py/.go/.rs files appear in the planning 
   const diff = await workingTreePlanningDiff(fakeGit, "/wt", "BASE");
   for (const f of ["src/main.py", "srv/app.go", "lib/core.rs"]) {
     assert.match(diff, new RegExp(f.replace(/[.]/g, "\\.")), `${f} is in the planning diff`);
+  }
+});
+
+test("resolveChecks: a Godot repo (project.godot) gets headless check by default", () => {
+  const wt = repo("godot");
+  writeFileSync(join(wt, "project.godot"), "[application]\nconfig/name=\"TestGame\"\n");
+  const r = resolveChecks(wt, NOENV);
+  assert.ok(r.ok, "Godot repo resolves to a check set");
+  if (r.ok) {
+    assert.equal(r.checks[0]?.command, "godot", "uses godot binary");
+    assert.ok(r.checks[0]?.args.includes("--headless"), "runs headless");
+    assert.ok(r.checks[0]?.args.includes("--check-only"), "syntax check mode");
+    assert.ok(!r.checks.some((c) => c.command === "pnpm"), "no pnpm against Godot");
+  }
+});
+
+test("resolveChecks: a Godot repo with GUT config gets GUT test checks", () => {
+  const wt = repo("godot-gut");
+  writeFileSync(join(wt, "project.godot"), "[application]\nconfig/name=\"TestGame\"\n");
+  writeFileSync(join(wt, ".gutconfig.json"), JSON.stringify({ should_exit: true }));
+  const r = resolveChecks(wt, NOENV);
+  assert.ok(r.ok, "Godot+GUT repo resolves");
+  if (r.ok) {
+    assert.ok(r.checks[0]?.args.includes("addons/gut/gut_cmdln.gd"), "runs GUT");
+  }
+});
+
+test("resolveChecks: a Godot repo with gdUnit4 gets gdUnit checks", () => {
+  const wt = repo("godot-gdunit");
+  writeFileSync(join(wt, "project.godot"), "[application]\nconfig/name=\"TestGame\"\n");
+  mkdirSync(join(wt, "addons/gdUnit4"), { recursive: true });
+  writeFileSync(join(wt, "addons/gdUnit4/placeholder"), "");
+  const r = resolveChecks(wt, NOENV);
+  assert.ok(r.ok, "Godot+gdUnit4 repo resolves");
+  if (r.ok) {
+    assert.ok(r.checks[0]?.args.includes("addons/gdUnit4/bin/GdUnitCmdTool.gd"), "runs gdUnit4");
   }
 });

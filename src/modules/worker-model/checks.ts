@@ -63,6 +63,15 @@ const GO_CHECKS: readonly Check[] = [
 /** Python native checks (pytest) — only emitted when a pytest signal is detected (else fail closed). */
 const PYTHON_PYTEST_CHECKS: readonly Check[] = [{ name: "test", command: "python3", args: ["-m", "pytest", "-q"] }];
 
+/** Godot headless syntax check (Godot 4.x — lightweight, no test framework needed). */
+const GODOT_HEADLESS_CHECKS: readonly Check[] = [{ name: "check", command: "godot", args: ["--headless", "--check-only"] }];
+
+/** Godot with GUT (Godot Unit Test) framework. */
+const GODOT_GUT_CHECKS: readonly Check[] = [{ name: "test", command: "godot", args: ["--headless", "-s", "addons/gut/gut_cmdln.gd"] }];
+
+/** Godot with gdUnit4 test framework. */
+const GODOT_GDUNIT_CHECKS: readonly Check[] = [{ name: "test", command: "godot", args: ["--headless", "-s", "addons/gdUnit4/bin/GdUnitCmdTool.gd"] }];
+
 /** True iff a file under `root` exists. */
 function rootHas(root: string, file: string): boolean {
   return existsSync(join(root, file));
@@ -180,6 +189,17 @@ function detectChecksForProject(projectRoot: string): ChecksResolution {
   if (rootHas(projectRoot, "pyproject.toml") || rootHas(projectRoot, "setup.py") || rootHas(projectRoot, "setup.cfg")) {
     return detectPythonChecks(projectRoot);
   }
+  if (rootHas(projectRoot, "project.godot")) {
+    // Prefer test framework (GUT > gdUnit4) over bare headless check.
+    if (rootHas(projectRoot, ".gutconfig.json") || rootHas(projectRoot, "gutconfig.json")) {
+      return { ok: true, checks: GODOT_GUT_CHECKS, source: "default" };
+    }
+    if (rootHas(projectRoot, "addons/gdUnit4")) {
+      return { ok: true, checks: GODOT_GDUNIT_CHECKS, source: "default" };
+    }
+    // Godot 4.x headless syntax check — lightweight, always available.
+    return { ok: true, checks: GODOT_HEADLESS_CHECKS, source: "default" };
+  }
   return {
     ok: false,
     reason:
@@ -201,6 +221,7 @@ export const PROJECT_MANIFESTS: readonly string[] = [
   "pyproject.toml",
   "deno.json",
   "deno.jsonc",
+  "project.godot",
 ];
 
 /** Walk up from `start` to the nearest directory holding a project manifest; undefined if none. */

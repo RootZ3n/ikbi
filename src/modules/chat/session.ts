@@ -496,6 +496,7 @@ const PROJECT_MARKERS = [
   "deno.jsonc",
   "requirements.txt",
   "Makefile",
+  "project.godot",
 ] as const;
 
 function isProjectLike(dir: string): boolean {

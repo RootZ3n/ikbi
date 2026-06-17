@@ -1092,9 +1092,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // The check is best-effort (non-fatal): the workspace path may not yet be readable if
     // allocation deferred I/O, and the operator can still inspect the workspace after the run.
     if (existsSync(workspace.path)) {
-      const MANIFESTS = ["package.json", "pnpm-workspace.yaml", "pyproject.toml", "Cargo.toml", "go.mod", "deno.json", "deno.jsonc"] as const;
+      const MANIFESTS = ["package.json", "pnpm-workspace.yaml", "pyproject.toml", "Cargo.toml", "go.mod", "deno.json", "deno.jsonc", "project.godot"] as const;
       if (!MANIFESTS.some((m) => existsSync(join(workspace.path, m)))) {
-        console.warn(`[ikbi] workspace ${workspace.id}: no project manifest (package.json, pnpm-workspace.yaml, pyproject.toml, Cargo.toml, go.mod, deno.json, deno.jsonc) found at ${workspace.path} — verification checks may fail`);
+        console.warn(`[ikbi] workspace ${workspace.id}: no project manifest (package.json, pnpm-workspace.yaml, pyproject.toml, Cargo.toml, go.mod, deno.json, deno.jsonc, project.godot) found at ${workspace.path} — verification checks may fail`);
       }
     }
 

@@ -85,6 +85,24 @@ test("audit detects a Python repo (pyproject.toml)", async () => {
   assert.match(cap.out, /Type:\s+Python/);
 });
 
+test("audit detects a Godot repo (project.godot)", async () => {
+  const { fileExists, readFileText } = fakeFS(["/repo", "/repo/project.godot"]);
+  const cap = capture();
+  await createAuditCli({ fileExists, readFileText, workspaces: noWorkspaces(), receipts: noReceipts(), stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit }).audit(["/repo"]);
+  assert.equal(cap.exit, undefined);
+  assert.match(cap.out, /Type:\s+Godot \(GDScript\)/);
+  assert.match(cap.out, /Test command:\s+godot --headless --check-only/);
+});
+
+test("audit detects Godot with GUT test framework", async () => {
+  const { fileExists, readFileText } = fakeFS(["/repo", "/repo/project.godot", "/repo/.gutconfig.json"]);
+  const cap = capture();
+  await createAuditCli({ fileExists, readFileText, workspaces: noWorkspaces(), receipts: noReceipts(), stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit }).audit(["/repo"]);
+  assert.equal(cap.exit, undefined);
+  assert.match(cap.out, /Type:\s+Godot \(GDScript\)/);
+  assert.match(cap.out, /Test command:\s+godot --headless -s addons\/gut\/gut_cmdln\.gd/);
+});
+
 test("audit shows unknown type when no known indicator is present", async () => {
   const { fileExists, readFileText } = fakeFS(["/repo"]);
   const cap = capture();

@@ -2,7 +2,7 @@
  * ikbi `audit <repo>` — read-only diagnostic snapshot of a target repository.
  *
  * Inspects the repo WITHOUT creating workspaces or running builds:
- *   - Repo type (Node.js/Rust/Go/Python/unknown) and package manager
+ *   - Repo type (Node.js/Rust/Go/Python/Godot/unknown) and package manager
  *   - Test commands, tsconfig presence, lockfile status
  *   - Active workspace status for this repo
  *   - Last build result and recent receipt history
@@ -70,6 +70,7 @@ async function detectRepoType(repoPath: string, fileExists: (p: string) => Promi
   if (await fileExists(join(repoPath, "go.mod"))) return "Go";
   if (await fileExists(join(repoPath, "pyproject.toml"))) return "Python (pyproject.toml)";
   if (await fileExists(join(repoPath, "requirements.txt"))) return "Python (requirements.txt)";
+  if (await fileExists(join(repoPath, "project.godot"))) return "Godot (GDScript)";
   if (await fileExists(join(repoPath, "package.json"))) return "Node.js";
   return UNKNOWN;
 }
@@ -89,6 +90,21 @@ async function detectLockfile(repoPath: string, fileExists: (p: string) => Promi
   for (const name of candidates) {
     if (await fileExists(join(repoPath, name))) return name;
   }
+  return undefined;
+}
+
+/** Detect a Godot test command from GUT/gdUnit config or headless check. */
+async function detectGodotTestCommand(
+  repoPath: string,
+  fileExists: (p: string) => Promise<boolean>,
+): Promise<string | undefined> {
+  // GUT (Godot Unit Test) — most common Godot test framework
+  if (await fileExists(join(repoPath, ".gutconfig.json"))) return "godot --headless -s addons/gut/gut_cmdln.gd";
+  if (await fileExists(join(repoPath, "gutconfig.json"))) return "godot --headless -s addons/gut/gut_cmdln.gd";
+  // gdUnit4
+  if (await fileExists(join(repoPath, "addons/gdUnit4"))) return "godot --headless -s addons/gdUnit4/bin/GdUnitCmdTool.gd";
+  // Godot 4.x headless syntax check — lightweight, no test framework needed
+  if (await fileExists(join(repoPath, "project.godot"))) return "godot --headless --check-only";
   return undefined;
 }
 
@@ -200,7 +216,9 @@ export function createAuditCli(deps: AuditDeps = {}) {
       workspacesFor(repoPath, ws),
       receiptInfoFor(repoPath, rc),
     ]);
-    const testCmd = await detectTestCommand(repoPath, pkgMgr, fileExists, readFileText);
+    const testCmd = repoType.startsWith("Godot")
+      ? await detectGodotTestCommand(repoPath, fileExists)
+      : await detectTestCommand(repoPath, pkgMgr, fileExists, readFileText);
 
     // ── Repo identity ──────────────────────────────────────────────────────────
     out(`Repo:            ${repoPath}\n`);
