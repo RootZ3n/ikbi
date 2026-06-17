@@ -51,6 +51,9 @@ import { confinePath, type ToolCallError } from "./builder-tools/confine.js";
 import { delegateTaskTool, runDelegateTask } from "./builder-tools/delegate.js";
 import { gitDiffTool, gitLogTool, gitStatusTool, GIT_TOOL_NAMES, runGitTool } from "./builder-tools/git-tools.js";
 import { patchTool, runPatch } from "./builder-tools/patch.js";
+import { multiEditTool, runMultiEdit } from "./builder-tools/multi-edit.js";
+import { globTool, runGlob } from "./builder-tools/glob.js";
+import { parseTextToolCalls, textToolProtocolInstructions } from "./builder-tools/text-tool-protocol.js";
 import { runSearchFiles, searchFilesTool } from "./builder-tools/search-files.js";
 import { runTerminal, terminalTool, tokenizeCommand } from "./builder-tools/terminal.js";
 import { commandPolicyDenyReason } from "../governed-exec/policy.js";
@@ -157,7 +160,9 @@ export const TOOLS: readonly ModelTool[] = [
   },
   // Expanded tool suite (worktree-confined): codebase search, surgical edits, governed shell.
   searchFilesTool,
+  globTool,
   patchTool,
+  multiEditTool,
   terminalTool,
   // Read-only git inspection (governed): see what changed and the history.
   gitStatusTool,
@@ -288,6 +293,13 @@ export interface BuilderDeps {
    * resolver. DEFAULT (tests / direct construction): pnpm VERIFIER_CHECKS, no guard — unchanged.
    */
   readonly resolveChecks?: (worktreeReal: string) => ChecksResolution;
+  /**
+   * Cooperative mid-loop halt check, polled once PER ITERATION. The orchestrator wires this to
+   * the kill-switch + whole-pipeline budget, so a long builder loop stops promptly (iteration
+   * granularity) on a kill or budget overrun instead of grinding to its role timeout. Absent
+   * (tests / direct construction) ⇒ no poll, behavior unchanged. Read-only — it never kills.
+   */
+  readonly checkHalt?: () => Promise<{ halt: boolean; reason?: string }>;
 }
 
 /** The last run_checks outcome — gates `done` (RAIL: no done while red). */
@@ -635,6 +647,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
   let stopReason = "max_iterations"; // not "stop": only a validated `done` is success now
   const filesWrittenPerRound: number[] = []; // EARLY STOP: tracks new files written each tool-round iteration
   let consecutiveRejectedToolRounds = 0;
+  let emulatedToolRound = false; // this round's tool calls came from TEXT (no native tool API) → feed results back as user, not tool-role
 
   try {
     // Canonical worktree root for confinement (realpath’d once).
@@ -726,9 +739,14 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
             return `ERROR: ${c.error}`;
           }
           try {
-            const body = readFileSync(c.full, "utf8").slice(0, MAX_READ_BYTES);
+            const raw = readFileSync(c.full, "utf8");
             filesRead.push(c.rel);
-            return body;
+            // TRUNCATION NOTICE: a silent cut lets a cheap model edit a file it only
+            // partially saw. When we slice, tell it explicitly so it can fetch the rest.
+            if (raw.length > MAX_READ_BYTES) {
+              return `${raw.slice(0, MAX_READ_BYTES)}\n\n[truncated — showed the first ${MAX_READ_BYTES} of ${raw.length} chars of ${c.rel}. Use search_files to locate the part you need, or patch by exact anchor; do NOT overwrite this file from memory.]`;
+            }
+            return raw;
           } catch (e) {
             return `ERROR: read failed: ${errMsg(e)}`;
           }
@@ -793,9 +811,14 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
             return `ERROR: ${c.error}`;
           }
           try {
-            const entries = readdirSync(c.full, { withFileTypes: true })
+            const all = readdirSync(c.full, { withFileTypes: true });
+            const entries = all
               .slice(0, MAX_LIST_ENTRIES)
               .map((e) => (e.isDirectory() ? `${e.name}/` : e.name));
+            // TRUNCATION NOTICE: the directory had more entries than we returned.
+            if (all.length > MAX_LIST_ENTRIES) {
+              entries.push(`[truncated — showed ${MAX_LIST_ENTRIES} of ${all.length} entries; narrow with a subdirectory path or search_files]`);
+            }
             return entries.join("\n");
           } catch (e) {
             return `ERROR: list failed: ${errMsg(e)}`;
@@ -804,6 +827,24 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         case "search_files": {
           const res = runSearchFiles(worktreeReal, args);
           if (res.rejection !== undefined) rejectedToolCalls.push(res.rejection);
+          return res.output;
+        }
+        case "glob":
+          // Read-only filename discovery, worktree-confined.
+          return runGlob(worktreeReal, args);
+        case "multi_edit": {
+          // Like patch, modifies existing files — honor write scope.
+          if (writeScope === "none" || writeScope === "new_only") {
+            const targetPath = String(args.path ?? "");
+            rejectedToolCalls.push({ tool: "multi_edit", path: targetPath, error: `write_scope is '${writeScope}' — cannot modify existing files` });
+            return `ERROR: Create a NEW file with write_file instead — this task does not allow editing existing files like ${targetPath}.`;
+          }
+          const res = runMultiEdit(worktreeReal, args);
+          if (res.rejection !== undefined) rejectedToolCalls.push(res.rejection);
+          if (res.wrote !== undefined) {
+            filesWritten.push(res.wrote);
+            checksStale = true; // an edit invalidates any prior green until run_checks re-runs
+          }
           return res.output;
         }
         case "patch": {
@@ -998,7 +1039,13 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         origin: call.name,
       });
       neutralizedCount += 1;
-      messages.push(toUntrustedMessage(safe, { role: "tool", toolCallId: call.id }));
+      // Emulated (text-protocol) rounds have no real tool_call_id to attach a tool-role message
+      // to — feed the (still-neutralized) result back as a user-role data message instead.
+      messages.push(
+        emulatedToolRound
+          ? toUntrustedMessage(safe, { role: "user" })
+          : toUntrustedMessage(safe, { role: "tool", toolCallId: call.id }),
+      );
     };
 
     // --- RAIL 3: the `done` self-check gate. Returns whether to TERMINATE (a valid,
@@ -1163,6 +1210,16 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
     const caps = getCapabilities(builderModelId);
     const effectiveMaxTokens = adaptMaxTokens(BUILDER_MAX_TOKENS, caps);
     const effectiveTools = caps.supports_tools ? TOOLS : simplifyTools(TOOLS);
+    // TEXT TOOL PROTOCOL: a model with no native function-calling API cannot emit structured
+    // tool_calls. Rather than send it a tools array it can't use (and watch it bare-stop to
+    // max_iterations), we describe the tools + a strict JSON envelope in the system prompt and
+    // parse tool calls back out of its text. Gated strictly on supports_tools === false so every
+    // native-tool model is byte-unchanged.
+    const emulateTools = caps.supports_tools === false;
+    const toolsForModel = emulateTools ? [] : effectiveTools;
+    if (emulateTools && messages[0] !== undefined) {
+      messages[0] = { ...messages[0], content: `${messages[0].content}\n\n${textToolProtocolInstructions(effectiveTools)}` };
+    }
 
     // CONTEXT LAYER: deterministic, model-agnostic compression. Runs BEFORE the
     // model-based maybeCompress — compresses old tool results into one-line summaries
@@ -1185,6 +1242,15 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       if (Date.now() - startedAt > timeoutMs) {
         stopReason = "timeout";
         break;
+      }
+      // COOPERATIVE MID-LOOP HALT: a kill-switch kill or a blown whole-pipeline budget stops
+      // the builder HERE (iteration granularity) rather than waiting for the role to end.
+      if (deps.checkHalt !== undefined) {
+        const h = await deps.checkHalt();
+        if (h.halt) {
+          stopReason = h.reason ?? "halted";
+          break;
+        }
       }
 
       // EARLY STOP: snapshot filesWritten count so we can detect no-progress after tool rounds
@@ -1252,7 +1318,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         maxTokens: effectiveMaxTokens, // adapted to the model's context window (capability profile)
         identity: ctx.identity, // clamped spawned identity (#10), by reference, EVERY round
         messages,
-        tools: effectiveTools, // simplified schemas when the model lacks native tool-calling
+        tools: toolsForModel, // [] in emulated mode — the model has no native tool API
       });
 
       // Round-trip the assistant turn (with any tool calls it emitted).
@@ -1262,10 +1328,25 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         ...(response.toolCalls !== undefined && response.toolCalls.length > 0 ? { toolCalls: response.toolCalls } : {}),
       });
 
+      // Resolve this round's tool calls: native structured calls when present; otherwise (only
+      // for no-tool-API models) parse them out of the model's TEXT. emulatedToolRound steers the
+      // tool-result feedback to a user-role message (no tool_call_id exists to attach to).
+      let roundToolCalls: readonly ToolCall[] | undefined;
+      emulatedToolRound = false;
       if (response.finishReason === "tool_calls" && response.toolCalls !== undefined && response.toolCalls.length > 0) {
+        roundToolCalls = response.toolCalls;
+      } else if (emulateTools && typeof response.content === "string") {
+        const parsed = parseTextToolCalls(response.content);
+        if (parsed.length > 0) {
+          roundToolCalls = parsed;
+          emulatedToolRound = true;
+        }
+      }
+
+      if (roundToolCalls !== undefined) {
         toolRounds += 1;
         let terminated = false;
-        for (const call of response.toolCalls) {
+        for (const call of roundToolCalls) {
           if (call.name === "done") {
             const verdict = handleDone(call);
             if (verdict.accept) {
@@ -1282,12 +1363,11 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
             // etc.) accept it. The system prompt's tier classification still applies: build-system
             // feedback is classified as FOLLOW regardless of role. Neutralization is skipped because
             // this is trusted ikbi-authored content, not repo content.
-            messages.push({
-              role: "tool",
-              toolCallId: call.id,
-              content: wrapActionableFeedback(verdict.feedback, "harness_instruction"),
-              untrusted: false,
-            });
+            messages.push(
+              emulatedToolRound
+                ? { role: "user", untrusted: false, content: wrapActionableFeedback(verdict.feedback, "harness_instruction") }
+                : { role: "tool", toolCallId: call.id, content: wrapActionableFeedback(verdict.feedback, "harness_instruction"), untrusted: false },
+            );
           } else if (call.name === "run_checks") {
             // The independent signal: run the shared checks and feed the result back as a tool
             // result with matching toolCallId. The ikbi FRAMING is followable ("act on these results"),
@@ -1296,12 +1376,11 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
             // this is trusted ikbi-authored content. Delivered as tool result (not user) to satisfy
             // providers with strict tool_call_id validation (DeepSeek, etc.).
             const out = await runChecks();
-            messages.push({
-              role: "tool",
-              toolCallId: call.id,
-              content: wrapActionableFeedback(out, "check_results"),
-              untrusted: false,
-            });
+            messages.push(
+              emulatedToolRound
+                ? { role: "user", untrusted: false, content: wrapActionableFeedback(out, "check_results") }
+                : { role: "tool", toolCallId: call.id, content: wrapActionableFeedback(out, "check_results"), untrusted: false },
+            );
           } else if (call.name === "terminal") {
             // Governed shell — async. Its output is UNTRUSTED command output, so it goes
             // through the SAME neutralization chokepoint as read_file / search_files.
@@ -1352,7 +1431,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         filesWrittenPerRound.push(newFilesThisRound);
         // EARLY STOP: stuck detection — only consecutive all-rejected tool rounds count.
         const newRejections = rejectedToolCalls.length - rejectedBeforeRound;
-        consecutiveRejectedToolRounds = newRejections >= response.toolCalls.length ? consecutiveRejectedToolRounds + 1 : 0;
+        consecutiveRejectedToolRounds = newRejections >= roundToolCalls.length ? consecutiveRejectedToolRounds + 1 : 0;
         if (consecutiveRejectedToolRounds >= 3) {
           stopReason = "stuck_detected";
           break;

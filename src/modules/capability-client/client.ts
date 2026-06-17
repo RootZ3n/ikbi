@@ -8,8 +8,15 @@
  * one and otherwise returns empty/null — the caller falls back to static config.
  *
  * It uses plain `fetch` (NOT the egress fetch-guard): the ledger is internal lab infra
- * on loopback, which the SSRF guard blocks BY DESIGN. This path is read-only, talks to
- * a single configured endpoint, and carries no model/web egress.
+ * on loopback (default `http://localhost:18783`, enabled by default), which the SSRF
+ * guard blocks BY DESIGN. This path is read-only, talks to a SINGLE endpoint, and carries
+ * no model/web egress. The SSRF guard's job is to stop a MODEL-chosen (untrusted) URL from
+ * reaching internal space — it is the wrong tool here, where the URL is OPERATOR config
+ * reaching out to known internal infra; routing this through the guard would break the
+ * default loopback setup. Residual: `IKBI_CAPABILITY_LEDGER_URL` is operator-controlled,
+ * so an operator who points it at a public host gets an un-allowlisted plain-HTTP call —
+ * a trust-the-operator boundary, not a model-exposed one. The feature degrades gracefully
+ * (falls back to static config) on any failure, so this is bounded and fail-safe.
  */
 
 import { childLogger } from "../../core/log.js";

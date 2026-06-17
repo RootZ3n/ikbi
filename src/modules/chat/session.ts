@@ -58,6 +58,8 @@ import { gbrainBridge } from "../../core/gbrain-bridge.js";
 import { delegateTaskTool, runDelegateTask } from "../worker-model/builder-tools/delegate.js";
 import { gitDiffTool, gitLogTool, gitStatusTool, runGitTool } from "../worker-model/builder-tools/git-tools.js";
 import { patchTool, runPatch } from "../worker-model/builder-tools/patch.js";
+import { multiEditTool, runMultiEdit } from "../worker-model/builder-tools/multi-edit.js";
+import { globTool, runGlob } from "../worker-model/builder-tools/glob.js";
 import { runSearchFiles, searchFilesTool } from "../worker-model/builder-tools/search-files.js";
 import { runTerminal, terminalTool } from "../worker-model/builder-tools/terminal.js";
 import { runVisionAnalyze, visionAnalyzeTool } from "../worker-model/builder-tools/vision-tool.js";
@@ -183,7 +185,9 @@ export const CHAT_TOOLS: readonly ModelTool[] = [
   WRITE_FILE_TOOL,
   LIST_DIR_TOOL,
   searchFilesTool,
+  globTool,
   patchTool,
+  multiEditTool,
   terminalTool,
   gitStatusTool,
   gitDiffTool,
@@ -208,6 +212,7 @@ const READ_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([
   "read_file",
   "list_dir",
   "search_files",
+  "glob",
   "git_status",
   "git_diff",
   "git_log",
@@ -389,7 +394,7 @@ export interface FileMutation {
   /** File content AFTER the mutation. */
   readonly afterContent: string;
   /** Which tool made it. */
-  readonly tool: "write_file" | "patch";
+  readonly tool: "write_file" | "patch" | "multi_edit";
   readonly timestamp: number;
 }
 
@@ -793,7 +798,12 @@ export class ChatSession {
         const c = confinePath(this.worktree, args.path);
         if (!c.ok) return { output: `ERROR: ${c.error}`, activity: { name: "read_file", ok: false, summary: c.error } };
         try {
-          const body = readFileSync(c.full, "utf8").slice(0, MAX_READ_BYTES);
+          const raw = readFileSync(c.full, "utf8");
+          // TRUNCATION NOTICE: tell the model when content was cut so it doesn't reason
+          // about (or overwrite) a file it only partially saw.
+          const body = raw.length > MAX_READ_BYTES
+            ? `${raw.slice(0, MAX_READ_BYTES)}\n\n[truncated — showed the first ${MAX_READ_BYTES} of ${raw.length} chars of ${c.rel}. Use search_files to locate the part you need, or patch by exact anchor.]`
+            : raw;
           return { output: body, activity: { name: "read_file", ok: true, summary: c.rel } };
         } catch (e) {
           return { output: `ERROR: read failed: ${errMsg(e)}`, activity: { name: "read_file", ok: false, summary: c.rel } };
@@ -824,9 +834,13 @@ export class ChatSession {
         const c = confinePath(this.worktree, args.path);
         if (!c.ok) return { output: `ERROR: ${c.error}`, activity: { name: "list_dir", ok: false, summary: c.error } };
         try {
-          const entries = readdirSync(c.full, { withFileTypes: true })
+          const all = readdirSync(c.full, { withFileTypes: true });
+          const entries = all
             .slice(0, MAX_LIST_ENTRIES)
             .map((e) => (e.isDirectory() ? `${e.name}/` : e.name));
+          if (all.length > MAX_LIST_ENTRIES) {
+            entries.push(`[truncated — showed ${MAX_LIST_ENTRIES} of ${all.length} entries; narrow with a subdirectory path or search_files]`);
+          }
           return { output: entries.join("\n"), activity: { name: "list_dir", ok: true, summary: c.rel } };
         } catch (e) {
           return { output: `ERROR: list failed: ${errMsg(e)}`, activity: { name: "list_dir", ok: false, summary: c.rel } };
@@ -835,6 +849,10 @@ export class ChatSession {
       case "search_files": {
         const res = runSearchFiles(this.worktree, args);
         return { output: res.output, activity: { name: "search_files", ok: res.rejection === undefined, ...(typeof args.pattern === "string" ? { summary: args.pattern } : {}) } };
+      }
+      case "glob": {
+        const out = runGlob(this.worktree, args);
+        return { output: out, activity: { name: "glob", ok: !out.startsWith("ERROR"), ...(typeof args.pattern === "string" ? { summary: args.pattern } : {}) } };
       }
       case "patch": {
         // Capture BEFORE content (for rollback + diff) before the in-place edit. Confine here too so
@@ -862,6 +880,24 @@ export class ChatSession {
           diff = boundDiff(computeLineDiff(before ?? "", after));
         }
         return { output: res.output, activity: { name: "patch", ok, ...(res.wrote !== undefined ? { summary: res.wrote } : {}), ...(diff.length > 0 ? { diff } : {}) } };
+      }
+      case "multi_edit": {
+        // Mirror patch: capture BEFORE for rollback + diff, apply atomically, record the mutation.
+        const c = confinePath(this.worktree, args.path);
+        let before: string | null = null;
+        if (c.ok) {
+          try { before = readFileSync(c.full, "utf8"); } catch { before = null; }
+        }
+        const res = runMultiEdit(this.worktree, args);
+        const ok = res.rejection === undefined;
+        let diff = "";
+        if (ok && c.ok) {
+          let after = "";
+          try { after = readFileSync(c.full, "utf8"); } catch { after = ""; }
+          this.recordMutation({ path: c.rel, full: c.full, beforeContent: before, afterContent: after, tool: "multi_edit", timestamp: Date.now() });
+          diff = boundDiff(computeLineDiff(before ?? "", after));
+        }
+        return { output: res.output, activity: { name: "multi_edit", ok, ...(res.wrote !== undefined ? { summary: res.wrote } : {}), ...(diff.length > 0 ? { diff } : {}) } };
       }
       case "terminal": {
         const out = await runTerminal({ governedExec, ...(this.parentCtx !== undefined ? { parentCtx: this.parentCtx } : {}) }, this.worktree, args);

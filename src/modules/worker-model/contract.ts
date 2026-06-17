@@ -169,7 +169,7 @@ export interface WorkerTask {
   readonly writeScope?: "all" | "new_only" | "none";
   /**
    * Which BUILDER LANE runs this task (the Patchsmith decision #patchsmith):
-   * - "agent" (default): the autonomous tool-calling builder (16 tools, run_checks, done).
+   * - "agent" (default): the autonomous tool-calling builder (full tool suite, run_checks, done).
    * - "patch": the PATCHSMITH lane — no tools. ikbi gathers context, the model returns ONE
    *   unified diff, ikbi applies it in the managed workspace and runs ladder verification.
    *   Cheap models that fail the tool-agent capability bar but can produce clean diffs are

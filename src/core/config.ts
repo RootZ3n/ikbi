@@ -205,12 +205,24 @@ export interface CircuitConfig {
   readonly halfOpenMaxTrials: number;
 }
 
+/** Same-route retry tuning for transient provider failures (5xx/429/network/timeout). */
+export interface RetryConfig {
+  /** Max RETRIES (beyond the first attempt) per route. `IKBI_PROVIDER_MAX_RETRIES`, default 2. 0 disables. */
+  readonly maxRetries: number;
+  /** Base backoff (exponential: base·2^n) before the nth retry. `IKBI_PROVIDER_RETRY_BASE_MS`, default 300. */
+  readonly baseDelayMs: number;
+  /** Ceiling for a single computed backoff. `IKBI_PROVIDER_RETRY_MAX_MS`, default 5000. */
+  readonly maxDelayMs: number;
+}
+
 /** Configuration for the model provider layer. All `IKBI_*` env, read here only. */
 export interface ProviderConfig {
   /** Per-request timeout. `IKBI_PROVIDER_TIMEOUT_MS`, default 60000. */
   readonly timeoutMs: number;
   /** Circuit-breaker tuning. */
   readonly circuit: CircuitConfig;
+  /** Same-route transient-failure retry tuning. */
+  readonly retry: RetryConfig;
   /** Path to the JSON roster file (models + cost table + provider routes). `IKBI_PROVIDER_CONFIG`. */
   readonly rosterFile: string;
   /** mimo direct API endpoint. */
@@ -280,6 +292,16 @@ function parsePositiveInt(name: string, raw: string | undefined, fallback: numbe
   return n;
 }
 
+/** Like parsePositiveInt but allows 0 (e.g. "0 retries" to disable). Rejects negatives. */
+function parseNonNegativeInt(name: string, raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) {
+    throw new Error(`Invalid ${name}: "${raw}" (expected non-negative integer)`);
+  }
+  return n;
+}
+
 /** Optional trimmed string env var — undefined when absent or blank. */
 function optStr(raw: string | undefined): string | undefined {
   const v = raw?.trim();
@@ -308,6 +330,11 @@ function loadProviderConfig(env: NodeJS.ProcessEnv, stateRoot: string): Provider
         env.IKBI_CIRCUIT_HALF_OPEN_TRIALS,
         1,
       ),
+    },
+    retry: {
+      maxRetries: parseNonNegativeInt("IKBI_PROVIDER_MAX_RETRIES", env.IKBI_PROVIDER_MAX_RETRIES, 2),
+      baseDelayMs: parsePositiveInt("IKBI_PROVIDER_RETRY_BASE_MS", env.IKBI_PROVIDER_RETRY_BASE_MS, 300),
+      maxDelayMs: parsePositiveInt("IKBI_PROVIDER_RETRY_MAX_MS", env.IKBI_PROVIDER_RETRY_MAX_MS, 5_000),
     },
     rosterFile,
     mimo: {

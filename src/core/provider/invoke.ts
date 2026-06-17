@@ -50,6 +50,13 @@ export function computeCost(rate: CostRate, usage: TokenUsage): Cost {
   return { usd: promptUsd + cachedUsd + completionUsd, promptUsd, cachedUsd, completionUsd, rate };
 }
 
+/** Same-route retry tuning (transient failures). Mirrors config.RetryConfig. */
+export interface InvokerRetryConfig {
+  readonly maxRetries: number;
+  readonly baseDelayMs: number;
+  readonly maxDelayMs: number;
+}
+
 export interface InvokerDeps {
   readonly registry: ModelRegistry;
   readonly circuit: CircuitConfig;
@@ -57,6 +64,14 @@ export interface InvokerDeps {
   readonly logger: Logger;
   /** Clock for breaker cooldown + latency measurement. Defaults to Date.now. */
   readonly now?: Clock;
+  /**
+   * Same-route retry policy for transient (retriable) failures. Defaults to NO retries
+   * ({maxRetries:0}) so the bare invoker behaves exactly as before unless configured —
+   * production wires this from `config.provider.retry`.
+   */
+  readonly retry?: InvokerRetryConfig;
+  /** Injectable delay (tests pass a no-op for determinism). Defaults to a real timer. */
+  readonly sleep?: (ms: number) => Promise<void>;
 }
 
 /** Breaker key: a bad model must not open the whole provider. */
@@ -70,6 +85,8 @@ export class ProviderInvoker {
   private readonly defaultTimeoutMs: number;
   private readonly log: Logger;
   private readonly now: Clock;
+  private readonly retry: InvokerRetryConfig;
+  private readonly sleep: (ms: number) => Promise<void>;
   private readonly breakers = new Map<string, CircuitBreaker>();
 
   constructor(deps: InvokerDeps) {
@@ -78,6 +95,20 @@ export class ProviderInvoker {
     this.defaultTimeoutMs = deps.defaultTimeoutMs;
     this.log = deps.logger;
     this.now = deps.now ?? Date.now;
+    this.retry = deps.retry ?? { maxRetries: 0, baseDelayMs: 0, maxDelayMs: 0 };
+    this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  }
+
+  /**
+   * Backoff before the next retry. Honors a server `Retry-After` (already bounded by the
+   * provider) when present; otherwise exponential (base·2^tryNo) capped at maxDelayMs, with
+   * full jitter to avoid synchronized retries across concurrent calls.
+   */
+  private backoffMs(tryNo: number, retryAfterMs: number | undefined): number {
+    if (retryAfterMs !== undefined && retryAfterMs > 0) return retryAfterMs;
+    const exp = this.retry.baseDelayMs * 2 ** tryNo;
+    const capped = Math.min(exp, this.retry.maxDelayMs);
+    return Math.floor(capped * (0.5 + Math.random() * 0.5));
   }
 
   /** The frozen entry point: invoke a model with deterministic, hardened fallback. */
@@ -143,6 +174,12 @@ export class ProviderInvoker {
         );
       }
       previousProvider = route.provider;
+
+      // Per-route retry loop: a transient (retriable) failure is retried on the SAME route
+      // with backoff BEFORE falling through to the next route. Most models have a single
+      // route, so without this a single 5xx/429/network blip would hard-fail the call.
+      for (let tryNo = 0; ; tryNo++) {
+        if (tryNo > 0 && !breaker.canAttempt()) break; // breaker opened mid-retry → next route
 
       const t0 = this.now();
       try {
@@ -214,7 +251,28 @@ export class ProviderInvoker {
           },
           permanent ? "provider attempt failed (permanent, breaker not tripped)" : "provider attempt failed",
         );
-        continue;
+
+        // Transient failure → retry the SAME route (bounded by maxRetries + breaker), else
+        // fall through to the next route. A permanent failure is never retried.
+        if (!permanent && tryNo < this.retry.maxRetries && breaker.canAttempt()) {
+          const delayMs = this.backoffMs(tryNo, err instanceof ProviderError ? err.retryAfterMs : undefined);
+          this.log.info(
+            {
+              event: "provider_retry",
+              model: request.model,
+              provider: route.provider,
+              providerModelId: route.providerModelId,
+              retry: tryNo + 1,
+              maxRetries: this.retry.maxRetries,
+              delayMs,
+            },
+            "retrying provider after transient failure",
+          );
+          await this.sleep(delayMs);
+          continue; // retry same route
+        }
+        break; // give up on this route → next route
+      }
       }
     }
 

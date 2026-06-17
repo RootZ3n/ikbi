@@ -329,6 +329,12 @@ export class ProviderError extends Error {
   readonly status?: number;
   /** Token usage the provider reported, if it charged before/while failing. */
   readonly usage?: TokenUsage;
+  /**
+   * Server-requested backoff in milliseconds, parsed from a `Retry-After` header
+   * (seconds or HTTP-date form). When present, the invoker waits AT LEAST this long
+   * before retrying this route instead of its computed exponential backoff.
+   */
+  readonly retryAfterMs?: number;
 
   constructor(
     message: string,
@@ -338,6 +344,7 @@ export class ProviderError extends Error {
       retriable?: boolean;
       status?: number;
       usage?: TokenUsage;
+      retryAfterMs?: number;
       cause?: unknown;
     },
   ) {
@@ -348,6 +355,7 @@ export class ProviderError extends Error {
     this.retriable = opts.retriable ?? true;
     if (opts.status !== undefined) this.status = opts.status;
     if (opts.usage !== undefined) this.usage = opts.usage;
+    if (opts.retryAfterMs !== undefined) this.retryAfterMs = opts.retryAfterMs;
   }
 }
 

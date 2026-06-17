@@ -83,6 +83,28 @@ export interface OpenAICompatibleOptions {
 
 const DEFAULT_MAX_ERROR_DETAIL = 300;
 
+/** Cap on a server-requested backoff we will honor (a hostile/absurd value can't wedge us). */
+const MAX_RETRY_AFTER_MS = 120_000;
+
+/**
+ * Parse an HTTP `Retry-After` header into milliseconds. Supports the delta-seconds form
+ * (`"5"`) and the HTTP-date form (`"Wed, 21 Oct 2025 07:28:00 GMT"`). Returns undefined for
+ * an absent/unparseable/non-positive value. Clamped to MAX_RETRY_AFTER_MS.
+ */
+export function parseRetryAfter(header: string | null, nowMs: number = Date.now()): number | undefined {
+  if (header === null) return undefined;
+  const trimmed = header.trim();
+  if (trimmed.length === 0) return undefined;
+  if (/^\d+$/.test(trimmed)) {
+    const ms = Number(trimmed) * 1000;
+    return ms > 0 ? Math.min(ms, MAX_RETRY_AFTER_MS) : undefined;
+  }
+  const when = Date.parse(trimmed);
+  if (Number.isNaN(when)) return undefined;
+  const delta = when - nowMs;
+  return delta > 0 ? Math.min(delta, MAX_RETRY_AFTER_MS) : undefined;
+}
+
 /** Strip control chars (incl. newlines) and bound length — provider bodies are untrusted. */
 function sanitizeDetail(raw: string, max: number): string {
   let out = "";
@@ -310,6 +332,8 @@ export class OpenAICompatibleProvider implements ModelProvider {
 
     if (!res.ok) {
       const detail = sanitizeDetail(await res.text().catch(() => ""), this.maxErrorDetail);
+      const retriable = res.status >= 500 || res.status === 429;
+      const retryAfterMs = retriable ? parseRetryAfter(res.headers?.get("retry-after") ?? null) : undefined;
       throw new ProviderError(`HTTP ${res.status} from ${this.id}: ${detail}`, {
         kind:
           res.status === 401 || res.status === 403
@@ -320,7 +344,8 @@ export class OpenAICompatibleProvider implements ModelProvider {
         provider: this.id,
         status: res.status,
         // 4xx (except 429) are permanent on this provider; 5xx/429 are retriable.
-        retriable: res.status >= 500 || res.status === 429,
+        retriable,
+        ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
       });
     }
 

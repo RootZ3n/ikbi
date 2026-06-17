@@ -139,6 +139,7 @@ export const invoker = new ProviderInvoker({
   registry,
   circuit: config.provider.circuit,
   defaultTimeoutMs: config.provider.timeoutMs,
+  retry: config.provider.retry,
   logger: log,
 });
 

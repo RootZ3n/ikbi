@@ -4,7 +4,7 @@
  * Lists the tools the two model+tool loops expose: the worker BUILDER's `TOOLS` and the
  * CHAT session's `CHAT_TOOLS`. It is the operator's quick answer to "what can the agent
  * actually do?" and the check the audit assumed — `ikbi capabilities` shows the builder's
- * 16 tools and confirms chat parity. PURE over its inputs (the live arrays by default), so
+ * 22 tools and confirms chat parity. PURE over its inputs (the live arrays by default), so
  * the formatting is unit-testable without touching the model.
  */
 

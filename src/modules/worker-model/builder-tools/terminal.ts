@@ -34,15 +34,21 @@ export interface TerminalDeps {
   readonly parentCtx?: OperationContext;
 }
 
+/** Default terminal timeout (ms) — generous enough for installs/test suites. */
+export const DEFAULT_TERMINAL_TIMEOUT_MS = 120_000;
+/** Hard ceiling for a model-requested terminal timeout (ms). Commands MUST terminate. */
+export const MAX_TERMINAL_TIMEOUT_MS = 600_000;
+
 /** The tool declared to the model. */
 export const terminalTool: ModelTool = {
   name: "terminal",
   description:
-    "Run a shell command in the worktree through ikbi's GOVERNED executor (allowlisted binaries only, no shell metacharacters — arguments are passed literally). Returns exit code, stdout, and stderr. Use for build/inspection commands; a command whose binary is not allowlisted is denied.",
+    "Run a shell command in the worktree through ikbi's GOVERNED executor (allowlisted binaries only, no shell metacharacters — arguments are passed literally). Returns exit code, stdout, and stderr. Use for build/inspection commands; a command whose binary is not allowlisted is denied. The command must TERMINATE — long-running daemons (dev servers, watch mode) are not supported and will be killed at the timeout. For a slow command (a big install or test suite) pass `timeout_ms` (default 120000, max 600000).",
   parameters: {
     type: "object",
     properties: {
       command: { type: "string", description: "The command line, e.g. `git status` or `ls src`. The first token is the binary; the rest are literal arguments." },
+      timeout_ms: { type: "number", description: `Max run time in ms before the command is killed. Default ${DEFAULT_TERMINAL_TIMEOUT_MS}, max ${MAX_TERMINAL_TIMEOUT_MS}. Raise it for slow installs/test suites.` },
     },
     required: ["command"],
   },
@@ -165,6 +171,11 @@ export async function runTerminal(
   }
   const policyDeny = commandPolicyDenyReason(binary, rest, `builder terminal: ${command.slice(0, 120)}`);
   if (policyDeny !== undefined) return `DENIED: ${policyDeny}`;
+  // Model-facing timeout: a daily driver must be able to run a slow install / test suite past
+  // the governed default. Clamp to a hard ceiling so a wedged command can never run unbounded
+  // (governed-exec SIGKILLs the whole process group at the timeout — no orphaned processes).
+  const requested = typeof args.timeout_ms === "number" && Number.isFinite(args.timeout_ms) ? args.timeout_ms : undefined;
+  const timeoutMs = Math.min(MAX_TERMINAL_TIMEOUT_MS, Math.max(1_000, requested ?? DEFAULT_TERMINAL_TIMEOUT_MS));
   try {
     const result = await deps.governedExec.run({
       parentCtx: deps.parentCtx,
@@ -172,6 +183,7 @@ export async function runTerminal(
       args: rest,
       cwd: worktreeDir,
       purpose: `builder terminal: ${command.slice(0, 120)}`,
+      timeoutMs,
     });
     return formatExecResult(result);
   } catch (e) {

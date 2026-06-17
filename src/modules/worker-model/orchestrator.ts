@@ -379,6 +379,8 @@ export interface OrchestratorDeps {
    * (discard, no half-promote). NEVER publishes a kill — the loop only OBEYS.
    */
   readonly killCheck?: (target: { agentId?: string; runId?: string; requestId?: string }) => Promise<{ killed: boolean; signal?: { mode?: string; reason?: string } }>;
+  /** Clock for the whole-pipeline budget deadline. Default Date.now. Injectable for tests. */
+  readonly now?: () => number;
   /**
    * Governed executor the VERIFIER routes its checks through (C1). Default: the live
    * governed-exec singleton (lazily imported inside the verifier). Injectable for tests.
@@ -547,6 +549,28 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   // run through the normal failure path (discard/retain). The abandoned promise is left to settle
   // and is ignored (JS cannot cancel it). `roleTimeoutMs <= 0` disables the guard.
   const roleTimeoutMs = config.roleTimeoutMs;
+
+  // WHOLE-PIPELINE BUDGET (H3 companion): per-role timeouts bound each role, but a run does
+  // scout→builder→critic→verifier→integrator with retry/rescue and competitive/tournament
+  // fan-out — each role re-armed with a fresh role budget. Without a total ceiling a
+  // misbehaving run can consume many multiples of the role timeout. We arm a per-run deadline
+  // and surface it through `killHalt`, so the EXISTING role-boundary kill checkpoints enforce
+  // it for free (clean stop: discard, no half-promote). `totalBudgetMs <= 0` disables it.
+  const nowMs = deps.now ?? Date.now;
+  const totalBudgetMs = config.totalBudgetMs ?? 0;
+  const buildDeadlines = new WeakMap<WorkerTask, number>();
+  function armBudget(task: WorkerTask): void {
+    if (totalBudgetMs > 0 && !buildDeadlines.has(task)) buildDeadlines.set(task, nowMs() + totalBudgetMs);
+  }
+  function budgetExceeded(task: WorkerTask): boolean {
+    const deadline = buildDeadlines.get(task);
+    return deadline !== undefined && nowMs() > deadline;
+  }
+
+  // The active run's mid-loop halt check, handed to the (real) builder so its loop can stop at
+  // iteration granularity on a kill or budget overrun. Set at run() entry; builds are serial.
+  let activeCheckHalt: (() => Promise<{ halt: boolean; reason?: string }>) | undefined;
+
   async function runRoleFn(role: WorkerRole, roleFn: RoleFn, ctx: RoleContext, timeoutOverrideMs?: number): Promise<RoleResult> {
     const effectiveTimeout = timeoutOverrideMs ?? roleTimeoutMs;
     if (!(effectiveTimeout > 0)) return roleFn(ctx);
@@ -746,6 +770,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       ...(modelOverride !== undefined ? { modelOverride } : {}),
       // Same resolved set the verifier uses (Fix 1/2), wired ONLY in production (enforceProjectRoot).
       ...(enforceProjectRoot ? { resolveChecks: (ws: string) => resolveChecks(ws) } : {}),
+      // Mid-loop kill/budget halt for the real builder loop (no-op when unset / injected roles).
+      ...(activeCheckHalt !== undefined ? { checkHalt: activeCheckHalt } : {}),
     };
     return mode === "patch" ? createPatchsmith(builderDeps) : createBuilder(builderDeps);
   }
@@ -906,7 +932,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   /** Cooperative kill checkpoint: does an active kill target THIS run? (read-only; never publishes). */
   async function killHalt(task: WorkerTask, parentIdentity: AgentIdentity, parentCtx: OperationContext): Promise<string | undefined> {
     const k = await killCheck({ agentId: parentIdentity.agentId, runId: task.taskId, ...(parentCtx.requestId !== undefined ? { requestId: parentCtx.requestId } : {}) });
-    return k.killed ? `halted by kill-switch (${k.signal?.mode ?? "soft"})` : undefined;
+    if (k.killed) return `halted by kill-switch (${k.signal?.mode ?? "soft"})`;
+    // Whole-pipeline budget: treat an exceeded deadline like a cooperative halt so the run
+    // stops cleanly at this role boundary (discard, no half-promote) instead of grinding on.
+    if (budgetExceeded(task)) return `halted: total build budget exceeded (${totalBudgetMs}ms)`;
+    return undefined;
   }
 
   // ── AUTO-VERIFY RESCUE HELPER ────────────────────────────────────────────────
@@ -990,6 +1020,13 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       throw new WorkerError("identity", "run requires an OperationContext carrying a validated identity");
     }
     const parentIdentity = parentCtx.identity.identity;
+    armBudget(task); // start the whole-pipeline wall-clock deadline (covers every dispatch path)
+    // Hand the (real) builder a mid-loop halt check so its loop stops promptly on a kill/budget
+    // overrun. Reuses killHalt (kill-switch + budget); no-op for tests that inject a fake builder.
+    activeCheckHalt = async () => {
+      const reason = await killHalt(task, parentIdentity, parentCtx);
+      return reason !== undefined ? { halt: true, reason } : { halt: false };
+    };
 
     // DIRTY REPO CHECK: refuse to build against a repo with uncommitted changes.
     // Runs BEFORE any workspace allocation, regardless of mode (single, competitive, tournament) —

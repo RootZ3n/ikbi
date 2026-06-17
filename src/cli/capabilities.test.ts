@@ -34,12 +34,12 @@ test("runCapabilities surfaces a parity MISMATCH in both directions", () => {
   assert.match(r.lines.join("\n"), /Parity: MISMATCH — builder-only: \[scout_detail\]; chat-only: \[vision_analyze\]\./);
 });
 
-test("the LIVE builder and chat tool sets are in parity at exactly 20 tools", () => {
+test("the LIVE builder and chat tool sets are in parity at exactly 22 tools", () => {
   // Defaults read the real TOOLS / CHAT_TOOLS arrays — the audit's invariant, pinned.
-  // 16 original + 4 brain tools (brain_search, brain_think, brain_put, brain_sync).
+  // 18 original (incl. glob + multi_edit) + 4 brain tools (brain_search, brain_think, brain_put, brain_sync).
   const r = runCapabilities();
-  assert.equal(r.builder.length, 20, "builder declares 20 tools");
-  assert.equal(r.chat.length, 20, "chat declares 20 tools");
+  assert.equal(r.builder.length, 22, "builder declares 22 tools");
+  assert.equal(r.chat.length, 22, "chat declares 22 tools");
   assert.deepEqual(r.builderOnly, [], "no builder-only tool (full chat parity)");
   assert.deepEqual(r.chatOnly, [], "no chat-only tool");
 });

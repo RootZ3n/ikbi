@@ -243,19 +243,19 @@ test("chat advertises the full builder tool suite to the model", async () => {
   await s.send("hello");
   const firstReq = requests[0] as { tools: Array<{ name: string }> };
   const names = firstReq.tools.map((t) => t.name);
-  // FULL PARITY — all TWENTY builder tools must be offered to the chat model.
-  // 16 original + 4 brain tools (brain_search, brain_think, brain_put, brain_sync).
-  const ALL_TWENTY = [
-    "read_file", "write_file", "list_dir", "search_files", "patch", "terminal",
+  // FULL PARITY — all builder tools must be offered to the chat model.
+  // 18 original (incl. glob + multi_edit) + 4 brain tools (brain_search, brain_think, brain_put, brain_sync).
+  const ALL_TOOLS = [
+    "read_file", "write_file", "list_dir", "search_files", "glob", "patch", "multi_edit", "terminal",
     "git_status", "git_diff", "git_log", "web_search", "web_extract", "delegate_task",
     "vision_analyze",
     "brain_search", "brain_think", "brain_put", "brain_sync",
     "scout_detail", "run_checks", "done",
   ];
-  for (const t of ALL_TWENTY) {
+  for (const t of ALL_TOOLS) {
     assert.ok(names.includes(t), `chat advertises ${t}`);
   }
-  assert.equal(new Set(names).size, ALL_TWENTY.length, "chat advertises exactly the 20 builder tools");
+  assert.equal(new Set(names).size, ALL_TOOLS.length, "chat advertises exactly the builder tools");
 });
 
 test("send: scout_detail reports no findings (chat runs no scout phase)", async () => {
