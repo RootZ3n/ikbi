@@ -124,6 +124,34 @@ test("M5: delegate_task requires explicit confirmation with rollback-limit warni
   assert.match(target, /rollback cannot cover/, "confirmation discloses rollback cannot cover sub-agent side effects");
 });
 
+// ── multi_edit is a writer — must be permission-gated like write_file/patch ────────
+
+test("multi_edit is blocked under readonly and consults confirm before writing", async () => {
+  // readonly: the gate must block multi_edit before it can touch the worktree.
+  const ro = new ChatSession("me-ro", {
+    invoke: queued([toolTurn(call("multi_edit", { path: "x.ts", edits: [{ find: "a", replace: "b" }] })), stop("done")]),
+    worktree: wt(),
+  });
+  const roRes = await ro.send("edit it", undefined, "agent", { permissionMode: "readonly" });
+  const roTool = roRes.tools.find((t) => t.name === "multi_edit");
+  assert.equal(roTool?.ok, false, "multi_edit is treated as mutating and blocked under readonly");
+  assert.match(roTool!.summary ?? "", /readonly/);
+
+  // confirm: the operator callback must be consulted; a decline blocks the write.
+  let asked = false;
+  const cf = new ChatSession("me-cf", {
+    invoke: queued([toolTurn(call("multi_edit", { path: "x.ts", edits: [{ find: "a", replace: "b" }] })), stop("done")]),
+    worktree: wt(),
+  });
+  const cfRes = await cf.send("edit it", undefined, "agent", {
+    permissionMode: "confirm",
+    confirm: async () => { asked = true; return false; },
+  });
+  const cfTool = cfRes.tools.find((t) => t.name === "multi_edit");
+  assert.equal(asked, true, "the operator confirm callback is consulted for multi_edit");
+  assert.equal(cfTool?.ok, false, "a declined multi_edit does not write");
+});
+
 // ── L8: fileStem is injective (no collision) ──────────────────────────────────────
 
 test("L8: previously-colliding ids map to distinct persisted files", async () => {

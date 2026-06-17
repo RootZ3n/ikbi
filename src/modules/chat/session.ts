@@ -350,7 +350,7 @@ export interface DiscardOutcome {
 
 /**
  * Tools that MUTATE the worktree OR run effecting/arbitrary work — gated by permission mode.
- * Beyond the obvious writers (write_file / patch) this includes: `terminal` and `delegate_task`
+ * Beyond the obvious writers (write_file / patch / multi_edit) this includes: `terminal` and `delegate_task`
  * (arbitrary execution), `run_checks` (M3 — runs the project's test suite, i.e. arbitrary code),
  * and `web_search` / `web_extract` (M3 — outbound network I/O). In "readonly" all are blocked; in
  * "confirm" they require operator approval (delegate_task is blocked outright — see runTool).
@@ -358,6 +358,7 @@ export interface DiscardOutcome {
 const MUTATING_TOOL_NAMES: ReadonlySet<string> = new Set([
   "write_file",
   "patch",
+  "multi_edit",
   "terminal",
   "delegate_task",
   "run_checks",
