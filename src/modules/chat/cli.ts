@@ -28,6 +28,8 @@ import { discoverProject, formatOverview } from "./project-discovery.js";
 import { ChatSession, type ApplyResult, type DiscardOutcome, type PermissionMode, type PersistedSession, type RollbackResult, type StreamEvent, type TurnOptions, type WorkdirKind } from "./session.js";
 import { allocateSessionWorkspace, reconnectSessionWorkspace, resolveRepoTarget } from "./repl-workspace.js";
 import { persistentStore, PersistentSessionStore, sessionsDir } from "./session-store.js";
+import { createProductionGovernor } from "../memory-governor/create.js";
+import { gbrainBridge } from "../../core/gbrain-bridge.js";
 import { defaultBinDir, installLauncher, launcherExists, setupInstructions } from "./shell-integration.js";
 import { addInstruction, clearInstructions, editInstructions, instructionsPath, readInstructions } from "./user-memory.js";
 
@@ -716,6 +718,11 @@ export async function liveRepl(argv: readonly string[] = []): Promise<void> {
   const autosave = (s: ChatSession): Promise<void> => store.save(s, { force });
   const scratch = argv.includes("--scratch");
 
+  // MEMORY GOVERNOR: intercepts governed writes (CLAUDE.md, .ikbi/*, brain pages) into
+  // operator-reviewed proposals. Constructed once for the REPL session, shared across
+  // new/resumed sessions. gbrainBridge enables brain page approval.
+  const memoryGovernor = createProductionGovernor({ gbrainBridge });
+
   /**
    * Mint a fresh session. DEFAULT (cwd is a git repo, no `--scratch`): allocate a MANAGED workspace
    * — an isolated worktree off the repo — so edits never touch the target until an explicit `/apply`.
@@ -729,20 +736,20 @@ export async function liveRepl(argv: readonly string[] = []): Promise<void> {
     // default applies only when the operator has NOT pinned a workdir.
     const explicitWorkdir = process.env.IKBI_CHAT_WORKDIR;
     if (!scratch && explicitWorkdir !== undefined && explicitWorkdir.trim().length > 0) {
-      return new ChatSession(id, { autosave, cwd: process.cwd(), permissionMode: "confirm" });
+      return new ChatSession(id, { autosave, cwd: process.cwd(), permissionMode: "confirm", memoryGovernor });
     }
     if (!scratch) {
       const target = resolveRepoTarget(process.cwd());
       if (target !== undefined) {
         try {
           const ws = await allocateSessionWorkspace({ targetRepo: target, sessionId: id });
-          return new ChatSession(id, { workspace: ws, autosave, permissionMode: "confirm" });
+          return new ChatSession(id, { workspace: ws, autosave, permissionMode: "confirm", memoryGovernor });
         } catch (e) {
           out(`[managed workspace allocation failed (${errMsg(e)}) — falling back to a scratch session]\n`);
         }
       }
     }
-    return new ChatSession(id, { autosave, cwd: process.cwd(), scratch: true, permissionMode: "confirm" });
+    return new ChatSession(id, { autosave, cwd: process.cwd(), scratch: true, permissionMode: "confirm", memoryGovernor });
   };
 
   /** Resume a persisted session, reconnecting its managed workspace when one was recorded. */
@@ -757,7 +764,7 @@ export async function liveRepl(argv: readonly string[] = []): Promise<void> {
         out(`[This session is read-only. Start a new session (ikbi repl) to make and apply changes.]\n`);
       }
     }
-    return new ChatSession(state.id, { restore: state, autosave, ...(workspace !== undefined ? { workspace } : {}) });
+    return new ChatSession(state.id, { restore: state, autosave, ...(workspace !== undefined ? { workspace } : {}), memoryGovernor });
   };
 
   let session: ChatSession;

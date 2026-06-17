@@ -451,6 +451,13 @@ export interface OrchestratorDeps {
    * Returns a non-empty reason string when the repo is dirty, undefined when clean or unknown.
    */
   readonly checkTargetDirty?: (targetRepo: string) => Promise<string | undefined>;
+  /**
+   * Memory governor — intercepts writes to governed surfaces (CLAUDE.md, .ikbi/*, brain pages)
+   * and converts them to operator-reviewed proposals. When wired, the builder's tool-executor
+   * routes governed writes through the governor instead of writing directly.
+   * Absent ⇒ no interception (backward compatible).
+   */
+  readonly memoryGovernor?: import("../memory-governor/contract.js").MemoryGovernor;
 }
 
 /** A role identity spawned under the parent ceiling (#10). */
@@ -772,6 +779,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       ...(enforceProjectRoot ? { resolveChecks: (ws: string) => resolveChecks(ws) } : {}),
       // Mid-loop kill/budget halt for the real builder loop (no-op when unset / injected roles).
       ...(activeCheckHalt !== undefined ? { checkHalt: activeCheckHalt } : {}),
+      // Memory governor: intercepts governed writes into proposals.
+      ...(deps.memoryGovernor !== undefined ? { memoryGovernor: deps.memoryGovernor } : {}),
     };
     return mode === "patch" ? createPatchsmith(builderDeps) : createBuilder(builderDeps);
   }

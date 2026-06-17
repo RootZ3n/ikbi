@@ -19,3 +19,5 @@ export {
 export { isGovernedPath, isGovernedBrainSlug, brainSurface, makeProposalId } from "./guard.js";
 
 export { createMemoryGovernor, type MemoryGovernorDeps } from "./store.js";
+export { createProductionGovernor, type ProductionGovernorDeps } from "./create.js";
+export { applyFileProposal, createBrainApply, createCombinedApply } from "./apply.js";

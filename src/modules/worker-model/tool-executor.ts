@@ -157,10 +157,13 @@ export async function interceptMemoryGovernor(deps: ToolExecutorDeps, call: Tool
     if (target.length === 0) return NOT_INTERCEPTED;
     const surface = isGovernedPath(target);
     if (surface === undefined) return NOT_INTERCEPTED;
+    // Resolve to absolute path so the apply function can find the file at approve-time
+    // (the worktree may be gone by then if it was a managed workspace).
+    const absTarget = target.startsWith("/") ? target : `${deps.worktreeReal}/${target}`;
     const content = proposalContentFor(call.name, args);
     const proposal = await governor.propose({
       surface,
-      target,
+      target: absTarget,
       content,
       reason: `${call.name} to ${target}`,
       agentId: deps.agentId,

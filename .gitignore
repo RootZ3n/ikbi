@@ -25,3 +25,4 @@ state/
 *.swp
 .idea/
 .vscode/
+memory-governor/

@@ -82,7 +82,7 @@ test("executeTool: write_file to CLAUDE.md becomes a memory proposal (nothing wr
   const pending = await gov.list("pending");
   assert.equal(pending.length, 1);
   assert.equal(pending[0]!.surface, "instruction_file");
-  assert.equal(pending[0]!.target, "CLAUDE.md");
+  assert.equal(pending[0]!.target, `${root}/CLAUDE.md`);
   assert.equal(pending[0]!.content, "# Overwritten\n");
 });
 
@@ -122,7 +122,7 @@ test("executeTool: multi_edit to AGENTS.md becomes a proposal", async () => {
   assert.equal(res.proposed, true);
   const pending = await gov.list("pending");
   assert.equal(pending.length, 1);
-  assert.equal(pending[0]!.target, "AGENTS.md");
+  assert.equal(pending[0]!.target, `${root}/AGENTS.md`);
 });
 
 // ── 5. brain_put → proposal (never reaches the bridge) ───────────────────────

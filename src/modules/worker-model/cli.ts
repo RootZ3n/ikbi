@@ -45,6 +45,7 @@ import { createCognitionLayer } from "../cognition-layer/cognition.js";
 import { loadRepoRegistry } from "../../core/repo-registry.js";
 import type { CognitionDecision, CognitionLayer } from "../cognition-layer/contract.js";
 import { loadProjectMemory, type ProjectMemoryResult } from "./project-memory.js";
+import { createProductionGovernor } from "../memory-governor/create.js";
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -420,7 +421,7 @@ function approvalRequiredFromEnv(env: NodeJS.ProcessEnv = process.env): boolean 
 }
 
 export function createProductionWorker(
-  opts: { workerToken: string | undefined; gateWall?: GateWall; onExecOutput?: (chunk: string, stream: "stdout" | "stderr") => void; requestApproval?: (req: { taskId: string; workspaceId: string; goal: string }) => Promise<boolean> },
+  opts: { workerToken: string | undefined; gateWall?: GateWall; onExecOutput?: (chunk: string, stream: "stdout" | "stderr") => void; requestApproval?: (req: { taskId: string; workspaceId: string; goal: string }) => Promise<boolean>; memoryGovernor?: import("../memory-governor/contract.js").MemoryGovernor },
 ): { run: (task: WorkerTask, ctx: OperationContext) => Promise<WorkerResult>; spawnRole: (role: WorkerRole, ctx: OperationContext) => { readonly autonomy: AutonomyGrant } } {
   // Explicitly thread the governed executor to BOTH roles (builder run_checks + verifier) via
   // the orchestrator. LAZY wrapper (not an eager import): importing the governed-exec singleton
@@ -431,7 +432,7 @@ export function createProductionWorker(
   // COMMIT the verified-good work — without it the scratch branch never advances and promote
   // sees an empty diff ("no changes to promote"). coreWorkspaces is the same manager the
   // orchestrator would default to; passing it makes the commit dependency explicit.
-  return createOrchestrator({ roleClaim: productionRoleClaim(opts.workerToken), gateWall: opts.gateWall ?? coreGateWall, governedExec, workspaces: coreWorkspaces, enforceProjectRoot: true, ...(opts.onExecOutput !== undefined ? { onExecOutput: opts.onExecOutput } : {}), ...(opts.requestApproval !== undefined ? { requestApproval: opts.requestApproval } : {}) });
+  return createOrchestrator({ roleClaim: productionRoleClaim(opts.workerToken), gateWall: opts.gateWall ?? coreGateWall, governedExec, workspaces: coreWorkspaces, enforceProjectRoot: true, ...(opts.onExecOutput !== undefined ? { onExecOutput: opts.onExecOutput } : {}), ...(opts.requestApproval !== undefined ? { requestApproval: opts.requestApproval } : {}), ...(opts.memoryGovernor !== undefined ? { memoryGovernor: opts.memoryGovernor } : {}) });
 }
 
 /**
@@ -708,6 +709,8 @@ export interface WorkerCliDeps {
   readonly interactive?: boolean;
   /** Pre-build deliberation surface. Default: a fresh `createCognitionLayer()`. Injectable for tests. */
   readonly cognition?: Pick<CognitionLayer, "deliberate">;
+  /** Memory governor for the build pipeline. Default: a production governor (lazy import). Injectable for tests. */
+  readonly memoryGovernor?: import("../memory-governor/contract.js").MemoryGovernor;
 }
 
 /** Resolve a repo name or path through the repo registry. Returns undefined if not provided. */
@@ -737,7 +740,10 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
   // refuses before that). SG-1: stream the governed check output live to the operator's stdout.
   // SG-10: wire the human-approval gate when explicitly provided or when IKBI_REQUIRE_APPROVAL is set.
   const requestApproval = deps.approvalPrompt ?? (approvalRequiredFromEnv() ? stdinApprovalPrompt : undefined);
-  const orchestrator = deps.orchestrator ?? createProductionWorker({ workerToken, gateWall, onExecOutput: (chunk) => out(chunk), ...(requestApproval !== undefined ? { requestApproval } : {}) });
+  // MEMORY GOVERNOR: intercepts governed writes (CLAUDE.md, .ikbi/*, brain pages) into
+  // operator-reviewed proposals. Constructed once per build, shared across the pipeline.
+  const memoryGovernor = deps.memoryGovernor ?? createProductionGovernor({});
+  const orchestrator = deps.orchestrator ?? createProductionWorker({ workerToken, gateWall, onExecOutput: (chunk) => out(chunk), ...(requestApproval !== undefined ? { requestApproval } : {}), memoryGovernor });
   const prompt = deps.prompt ?? promptUser;
   // Default to interactive ONLY when stdin is a real terminal — a piped/redirected/CI stdin
   // never blocks the build waiting for an answer that can't come.
