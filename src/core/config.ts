@@ -60,6 +60,11 @@ export interface WorkspaceConfig {
   readonly root: string;
   /** Max concurrently-allocated workspaces (bounds disk). `IKBI_WORKSPACE_MAX`, default 32. */
   readonly max: number;
+  /**
+   * Max age (hours) a workspace may sit on disk before `ikbi doctor --fix` reclaims it.
+   * Bounds unbounded accumulation (Gap M16). `IKBI_WORKSPACE_MAX_AGE_HOURS`, default 168 (7 days).
+   */
+  readonly maxAgeHours: number;
 }
 
 /** Configuration for the in-process event bus. */
@@ -91,6 +96,14 @@ export interface TrustConfig {
   readonly hmacKey: string;
   /** True when `hmacKey` is the insecure built-in default (for a startup warning). */
   readonly hmacKeyIsDefault: boolean;
+  /**
+   * Opt-in auto-promotion of the worker to `trusted` after N consecutive successful builds.
+   * FAIL-CLOSED DEFAULT: OFF. `IKBI_TRUST_AUTO_PROMOTE`, default false — trust is granted, never
+   * assumed; the operator opts in (or promotes explicitly via `ikbi trust promote`).
+   */
+  readonly autoPromote: boolean;
+  /** Consecutive successful builds before auto-promotion fires (when enabled). `IKBI_TRUST_AUTO_PROMOTE_AFTER`, default 3. */
+  readonly autoPromoteAfter: number;
 }
 
 /** Insecure built-in trust MAC key used only when IKBI_TRUST_HMAC_KEY is unset. */
@@ -495,6 +508,8 @@ function loadConfig(env: NodeJS.ProcessEnv = process.env): IkbiConfig {
       ),
       hmacKey: optStr(env.IKBI_TRUST_HMAC_KEY) ?? DEFAULT_TRUST_HMAC_KEY,
       hmacKeyIsDefault: optStr(env.IKBI_TRUST_HMAC_KEY) === undefined,
+      autoPromote: parseBool(env.IKBI_TRUST_AUTO_PROMOTE, false),
+      autoPromoteAfter: parsePositiveInt("IKBI_TRUST_AUTO_PROMOTE_AFTER", env.IKBI_TRUST_AUTO_PROMOTE_AFTER, 3),
     },
     events: {
       maxQueue: parsePositiveInt("IKBI_EVENT_MAX_QUEUE", env.IKBI_EVENT_MAX_QUEUE, 1000),
@@ -506,6 +521,7 @@ function loadConfig(env: NodeJS.ProcessEnv = process.env): IkbiConfig {
           : resolve(process.cwd(), env.IKBI_WORKSPACE_ROOT as string)
         : resolve(stateRoot, "workspaces"),
       max: parsePositiveInt("IKBI_WORKSPACE_MAX", env.IKBI_WORKSPACE_MAX, 32),
+      maxAgeHours: parsePositiveInt("IKBI_WORKSPACE_MAX_AGE_HOURS", env.IKBI_WORKSPACE_MAX_AGE_HOURS, 168),
     },
     substrate: {
       lockTimeoutMs: parsePositiveInt("IKBI_LOCK_TIMEOUT_MS", env.IKBI_LOCK_TIMEOUT_MS, 10_000),

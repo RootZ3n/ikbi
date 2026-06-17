@@ -32,6 +32,10 @@ export interface TrustCliDeps {
   readonly resolveIdentity?: (claim: IdentityClaim) => ValidatedIdentity;
   readonly operatorToken?: string | undefined;
   readonly defaultTrustTier?: string;
+  /** The worker agent id `promote` targets by default. Default: config.identity.workerAgentId. */
+  readonly workerAgentId?: string;
+  /** Operator confirmation seam (`promote`). Default: prompt on a TTY, else proceed (token is the gate). */
+  readonly confirm?: (question: string) => Promise<boolean>;
   readonly stdout?: (s: string) => void;
   readonly stderr?: (s: string) => void;
   readonly setExit?: (code: number) => void;
@@ -42,6 +46,8 @@ export function createTrustCli(deps: TrustCliDeps = {}) {
   const resolveIdentity = deps.resolveIdentity ?? coreResolveIdentity;
   const operatorToken = "operatorToken" in deps ? deps.operatorToken : config.identity.operatorToken;
   const defaultTrustTier = deps.defaultTrustTier ?? config.identity.workerTrustTier;
+  const workerAgentId = deps.workerAgentId ?? config.identity.workerAgentId;
+  const confirm = deps.confirm ?? defaultConfirm;
   const out = deps.stdout ?? ((s: string) => void process.stdout.write(s));
   const err = deps.stderr ?? ((s: string) => void process.stderr.write(s));
   const setExit = deps.setExit ?? ((c: number) => void (process.exitCode = c));
@@ -92,6 +98,41 @@ export function createTrustCli(deps: TrustCliDeps = {}) {
     }
   }
 
+  /**
+   * `ikbi trust promote [<agentId>] [--yes]` — the OPERATOR shortcut for the cold-start on-ramp
+   * (Gap M18). A fresh worker resolves to the untrusted floor (fail-closed) and is rejected on its
+   * first build ("approval required — refusing to write"); there was no friendly path off the floor
+   * except `trust grant <agent> trusted`. `promote` is exactly that grant with the worker as the
+   * default target and the agent ceiling ("trusted") as the tier — operator-gated (the operator
+   * token IS the authorization), confirmed, durable, and MAC-protected (delegates to `grantTier`).
+   */
+  async function promote(argv: readonly string[]): Promise<void> {
+    const auto = argv.includes("--yes") || argv.includes("-y");
+    const positional = argv.find((a) => !a.startsWith("-"));
+    const agentId = positional ?? workerAgentId;
+    if (agentId === undefined || agentId.length === 0) {
+      err("ikbi: usage: ikbi trust promote [<agentId>] [--yes]  (defaults to the configured worker)\n");
+      setExit(1);
+      return;
+    }
+    const who = operator();
+    if (who === undefined) return;
+    if (!auto) {
+      const ok = await confirm(`Promote "${agentId}" to "${AGENT_CEILING}" (durable, operator-authorized)? [y/N] `);
+      if (!ok) {
+        out(`trust promote: aborted (no change to ${agentId})\n`);
+        return;
+      }
+    }
+    try {
+      const state = await trust.grantTier({ agentId, kind: "agent", tier: AGENT_CEILING, defaultTrustTier }, who);
+      out(`trust promoted: ${agentId} -> ${state.tier} (durable, MAC-protected)\n`);
+    } catch (e) {
+      err(`ikbi: trust promote rejected: ${errMsg(e)}\n`);
+      setExit(1);
+    }
+  }
+
   async function status(argv: readonly string[]): Promise<void> {
     const agentId = argv[0];
     if (agentId === undefined || agentId.length === 0) {
@@ -113,22 +154,39 @@ export function createTrustCli(deps: TrustCliDeps = {}) {
       case "grant":
         await grant(argv.slice(1));
         return;
+      case "promote":
+        await promote(argv.slice(1));
+        return;
       case "status":
         await status(argv.slice(1));
         return;
       default:
-        err("ikbi: usage: ikbi trust <grant|status> ...\n");
+        err("ikbi: usage: ikbi trust <grant|promote|status> ...\n");
         setExit(1);
     }
   }
 
-  return { grant, status, dispatch };
+  return { grant, promote, status, dispatch };
+}
+
+/** Default operator-confirmation prompt: ask on an interactive TTY, otherwise proceed (the operator
+ *  token already authorized this; non-interactive automation must not hang on a prompt). */
+async function defaultConfirm(question: string): Promise<boolean> {
+  if (!process.stdin.isTTY) return true;
+  const { createInterface } = await import("node:readline/promises");
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = (await rl.question(question)).trim().toLowerCase();
+    return answer === "y" || answer === "yes";
+  } finally {
+    rl.close();
+  }
 }
 
 const live = createTrustCli();
 registerCommand({
   name: "trust",
-  summary: "Operator trust grant / status (the cold-start on-ramp)",
-  usage: "ikbi trust grant <agent> <tier> | ikbi trust status <agent>",
+  summary: "Operator trust grant / promote / status (the cold-start on-ramp)",
+  usage: "ikbi trust grant <agent> <tier> | ikbi trust promote [<agent>] [--yes] | ikbi trust status <agent>",
   run: (argv) => live.dispatch(argv),
 });
