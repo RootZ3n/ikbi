@@ -186,7 +186,11 @@ export function createGuardedFetch(deps: GuardedFetchDeps): FetchLike {
         })();
         return block("invalid_url", host, `redirect limit exceeded after ${MAX_REDIRECT_HOPS} hops`);
       }
-      current = new URL(location, current).toString();
+      try {
+        current = new URL(location, current).toString();
+      } catch {
+        return block("invalid_url", current, `malformed redirect Location: ${location}`);
+      }
     }
     return block("invalid_url", input, "redirect limit exceeded");
   };
