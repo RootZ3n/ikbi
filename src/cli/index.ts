@@ -39,6 +39,7 @@ import "./workspace.js";
 import "./workspaces.js";
 import "./serve.js";
 import "./audit.js";
+import "./fix.js";
 import { workspaces as coreWorkspaces } from "../core/workspace/index.js";
 // The DEFAULT router: input that is not a known command is treated as a GOAL and
 // deliberated by cognition-layer (which decides the path + recommends the next
