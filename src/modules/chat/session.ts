@@ -26,9 +26,9 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 
 import { config } from "../../core/config.js";
@@ -60,16 +60,17 @@ import { scoutDetail } from "../worker-model/builder.js";
 import { estimateTokens, maybeCompress } from "../worker-model/context-manager.js";
 import { loadProjectInstructions } from "../worker-model/project-memory.js";
 import { type CheckResult, mapExec, resolveCheckTimeoutMs, resolveChecks } from "../worker-model/checks.js";
-import { confinePath } from "../worker-model/builder-tools/confine.js";
-import { BRAIN_TOOLS, runBrainTool } from "../worker-model/builder-tools/brain-tools.js";
+import { executeTool, type ToolExecutorDeps, type ToolExecutionResult } from "../worker-model/tool-executor.js";
+import type { MemoryGovernor } from "../memory-governor/contract.js";
+import { BRAIN_TOOLS } from "../worker-model/builder-tools/brain-tools.js";
 import { gbrainBridge } from "../../core/gbrain-bridge.js";
 import { delegateTaskTool, runDelegateTask } from "../worker-model/builder-tools/delegate.js";
 import { gitDiffTool, gitLogTool, gitStatusTool, runGitTool } from "../worker-model/builder-tools/git-tools.js";
-import { patchTool, runPatch } from "../worker-model/builder-tools/patch.js";
-import { multiEditTool, runMultiEdit } from "../worker-model/builder-tools/multi-edit.js";
-import { globTool, runGlob } from "../worker-model/builder-tools/glob.js";
-import { runSearchFiles, searchFilesTool } from "../worker-model/builder-tools/search-files.js";
-import { runTerminal, terminalTool } from "../worker-model/builder-tools/terminal.js";
+import { patchTool } from "../worker-model/builder-tools/patch.js";
+import { multiEditTool } from "../worker-model/builder-tools/multi-edit.js";
+import { globTool } from "../worker-model/builder-tools/glob.js";
+import { searchFilesTool } from "../worker-model/builder-tools/search-files.js";
+import { terminalTool } from "../worker-model/builder-tools/terminal.js";
 import { parseTextToolCalls, textToolProtocolInstructions } from "../worker-model/builder-tools/text-tool-protocol.js";
 import { runVisionAnalyze, visionAnalyzeTool } from "../worker-model/builder-tools/vision-tool.js";
 import { runWebExtract, runWebSearch, webExtractTool, webSearchTool } from "../worker-model/builder-tools/web-tools.js";
@@ -85,10 +86,6 @@ const MAX_TOOL_ITERATIONS = 16;
 const MAX_TOKENS = 4096;
 /** Conversational temperature (warmer than the builder's 0.0 — this is dialogue, not edits). */
 const TEMPERATURE = 0.4;
-/** Max bytes returned by read_file. */
-const MAX_READ_BYTES = 32_000;
-/** Max entries returned by list_dir. */
-const MAX_LIST_ENTRIES = 200;
 /** Max concurrent sessions kept in memory (LRU-evicted beyond this). */
 const MAX_SESSIONS = 100;
 /** Max images a single turn may carry (the operator paste cap). */
@@ -375,6 +372,27 @@ const MUTATING_TOOL_NAMES: ReadonlySet<string> = new Set([
   "web_extract",
 ]);
 
+/**
+ * The tools the chat dispatches through the SHARED tool-executor (confinement + memory-governor +
+ * execution). The same code path the builder shares for governance — one dispatch path, one
+ * governance path. Chat-specific tools (git inspectors, web, delegate, vision, scout_detail,
+ * run_checks, done) keep their bespoke handling below.
+ */
+const SHARED_EXECUTOR_TOOLS: ReadonlySet<string> = new Set([
+  "read_file",
+  "list_dir",
+  "search_files",
+  "glob",
+  "write_file",
+  "patch",
+  "multi_edit",
+  "terminal",
+  "brain_search",
+  "brain_think",
+  "brain_put",
+  "brain_sync",
+]);
+
 /** Per-turn options threaded from the REPL into the tool loop (progress + permissions). */
 export interface TurnOptions {
   /** Called as the loop changes phase ("Thinking…", "Running terminal: …") for a spinner (FIX 4). */
@@ -630,6 +648,40 @@ export interface ChatSessionDeps {
   readonly permissionMode?: PermissionMode;
   /** Called at the END of every `send()` (after state is mutated) so the caller can auto-persist. */
   readonly autosave?: (session: ChatSession) => void | Promise<void>;
+  /**
+   * The memory governor. When wired, writes to durable surfaces (CLAUDE.md / .ikbi/* / brain
+   * pages) from this session are intercepted by the SHARED tool-executor chokepoint and become
+   * operator-reviewed PROPOSALS instead of unattended writes (closes RED-1). Absent ⇒ no
+   * interception (governed writes execute normally — backward compatible).
+   */
+  readonly memoryGovernor?: MemoryGovernor;
+}
+
+/**
+ * The display `summary` for a shared-executor tool's activity — chosen to MATCH the exact value the
+ * chat surfaced before the dispatch was unified. Path tools report the worktree-relative path (or
+ * the confinement error); search/glob report the pattern; terminal/brain report the command/query.
+ * write_file/patch/multi_edit SUCCESS is handled separately (it carries a diff); this covers the
+ * failure paths and the read-only tools.
+ */
+function sharedToolSummary(name: string, args: Record<string, unknown>, res: ToolExecutionResult): string | undefined {
+  switch (name) {
+    case "read_file":
+    case "list_dir":
+    case "write_file":
+      return res.rel ?? res.rejection?.error;
+    case "patch":
+    case "multi_edit":
+      return res.wrote; // failure ⇒ undefined (matches the prior no-summary behavior)
+    case "search_files":
+    case "glob":
+      return typeof args.pattern === "string" ? args.pattern : undefined;
+    case "terminal":
+      return typeof args.command === "string" ? args.command.slice(0, 80) : undefined;
+    default:
+      // brain_search / brain_think / brain_put / brain_sync
+      return typeof args.query === "string" ? args.query.slice(0, 80) : typeof args.slug === "string" ? args.slug : undefined;
+  }
 }
 
 /** One persistent conversation. Holds the message log, worktree, and governed identity. */
@@ -652,6 +704,8 @@ export class ChatSession {
   private messages: ModelMessage[];
   private readonly identity: AgentIdentity;
   private readonly parentCtx: OperationContext | undefined;
+  /** The memory governor for the shared tool-executor chokepoint (undefined ⇒ no interception). */
+  private readonly memoryGovernor: MemoryGovernor | undefined;
   private readonly invoke: InvokeFn;
   private readonly invokeStream: InvokeStreamFn | undefined;
   private readonly autosave: ((session: ChatSession) => void | Promise<void>) | undefined;
@@ -739,6 +793,7 @@ export class ChatSession {
     }
     this.identity = { agentId: "ikbi-chat", functionalRole: "assistant", trustTier: "trusted", sessionId: id };
     this.parentCtx = resolveParentCtx(id);
+    this.memoryGovernor = deps.memoryGovernor;
     this.invoke = deps.invoke ?? invokeModel;
     this.invokeStream = deps.invokeStream; // undefined → sendStream degrades to invoke
     this.autosave = deps.autosave;
@@ -825,117 +880,14 @@ export class ChatSession {
         return { output: `ERROR: ${call.name} was DENIED by the operator (permission mode: confirm).`, activity: { name: call.name, ok: false, summary: "denied" } };
       }
     }
+    // SHARED TOOL EXECUTOR: confinement + memory-governor interception + execution, the SAME path
+    // the builder shares for governance. A governed write becomes an operator-reviewed proposal
+    // (closes RED-1); everything else executes as before. The chat formats the raw result into its
+    // {output, activity} shape and records mutations for /rollback here.
+    if (SHARED_EXECUTOR_TOOLS.has(call.name)) {
+      return await this.runSharedExecutorTool(call, args);
+    }
     switch (call.name) {
-      case "read_file": {
-        const c = confinePath(this.worktree, args.path);
-        if (!c.ok) return { output: `ERROR: ${c.error}`, activity: { name: "read_file", ok: false, summary: c.error } };
-        try {
-          const raw = readFileSync(c.full, "utf8");
-          // TRUNCATION NOTICE: tell the model when content was cut so it doesn't reason
-          // about (or overwrite) a file it only partially saw.
-          const body = raw.length > MAX_READ_BYTES
-            ? `${raw.slice(0, MAX_READ_BYTES)}\n\n[truncated — showed the first ${MAX_READ_BYTES} of ${raw.length} chars of ${c.rel}. Use search_files to locate the part you need, or patch by exact anchor.]`
-            : raw;
-          return { output: body, activity: { name: "read_file", ok: true, summary: c.rel } };
-        } catch (e) {
-          return { output: `ERROR: read failed: ${errMsg(e)}`, activity: { name: "read_file", ok: false, summary: c.rel } };
-        }
-      }
-      case "write_file": {
-        const c = confinePath(this.worktree, args.path);
-        if (!c.ok) return { output: `ERROR: ${c.error}`, activity: { name: "write_file", ok: false, summary: c.error } };
-        const content = typeof args.content === "string" ? args.content : "";
-        // Capture BEFORE content for rollback + diff (null ⇒ a brand-new file).
-        let before: string | null = null;
-        try {
-          before = readFileSync(c.full, "utf8");
-        } catch {
-          before = null;
-        }
-        try {
-          mkdirSync(dirname(c.full), { recursive: true });
-          writeFileSync(c.full, content, "utf8");
-          this.recordMutation({ path: c.rel, full: c.full, beforeContent: before, afterContent: content, tool: "write_file", timestamp: Date.now() });
-          const diff = boundDiff(computeLineDiff(before ?? "", content));
-          return { output: `wrote ${Buffer.byteLength(content, "utf8")} bytes to ${c.rel}`, activity: { name: "write_file", ok: true, summary: c.rel, ...(diff.length > 0 ? { diff } : {}) } };
-        } catch (e) {
-          return { output: `ERROR: write failed: ${errMsg(e)}`, activity: { name: "write_file", ok: false, summary: c.rel } };
-        }
-      }
-      case "list_dir": {
-        const c = confinePath(this.worktree, args.path);
-        if (!c.ok) return { output: `ERROR: ${c.error}`, activity: { name: "list_dir", ok: false, summary: c.error } };
-        try {
-          const all = readdirSync(c.full, { withFileTypes: true });
-          const entries = all
-            .slice(0, MAX_LIST_ENTRIES)
-            .map((e) => (e.isDirectory() ? `${e.name}/` : e.name));
-          if (all.length > MAX_LIST_ENTRIES) {
-            entries.push(`[truncated — showed ${MAX_LIST_ENTRIES} of ${all.length} entries; narrow with a subdirectory path or search_files]`);
-          }
-          return { output: entries.join("\n"), activity: { name: "list_dir", ok: true, summary: c.rel } };
-        } catch (e) {
-          return { output: `ERROR: list failed: ${errMsg(e)}`, activity: { name: "list_dir", ok: false, summary: c.rel } };
-        }
-      }
-      case "search_files": {
-        const res = runSearchFiles(this.worktree, args);
-        return { output: res.output, activity: { name: "search_files", ok: res.rejection === undefined, ...(typeof args.pattern === "string" ? { summary: args.pattern } : {}) } };
-      }
-      case "glob": {
-        const out = runGlob(this.worktree, args);
-        return { output: out, activity: { name: "glob", ok: !out.startsWith("ERROR"), ...(typeof args.pattern === "string" ? { summary: args.pattern } : {}) } };
-      }
-      case "patch": {
-        // Capture BEFORE content (for rollback + diff) before the in-place edit. Confine here too so
-        // we have the absolute path; runPatch re-confines internally (cheap, and keeps it self-contained).
-        const c = confinePath(this.worktree, args.path);
-        let before: string | null = null;
-        if (c.ok) {
-          try {
-            before = readFileSync(c.full, "utf8");
-          } catch {
-            before = null;
-          }
-        }
-        const res = runPatch(this.worktree, args);
-        const ok = res.rejection === undefined;
-        let diff = "";
-        if (ok && c.ok) {
-          let after = "";
-          try {
-            after = readFileSync(c.full, "utf8");
-          } catch {
-            after = "";
-          }
-          this.recordMutation({ path: c.rel, full: c.full, beforeContent: before, afterContent: after, tool: "patch", timestamp: Date.now() });
-          diff = boundDiff(computeLineDiff(before ?? "", after));
-        }
-        return { output: res.output, activity: { name: "patch", ok, ...(res.wrote !== undefined ? { summary: res.wrote } : {}), ...(diff.length > 0 ? { diff } : {}) } };
-      }
-      case "multi_edit": {
-        // Mirror patch: capture BEFORE for rollback + diff, apply atomically, record the mutation.
-        const c = confinePath(this.worktree, args.path);
-        let before: string | null = null;
-        if (c.ok) {
-          try { before = readFileSync(c.full, "utf8"); } catch { before = null; }
-        }
-        const res = runMultiEdit(this.worktree, args);
-        const ok = res.rejection === undefined;
-        let diff = "";
-        if (ok && c.ok) {
-          let after = "";
-          try { after = readFileSync(c.full, "utf8"); } catch { after = ""; }
-          this.recordMutation({ path: c.rel, full: c.full, beforeContent: before, afterContent: after, tool: "multi_edit", timestamp: Date.now() });
-          diff = boundDiff(computeLineDiff(before ?? "", after));
-        }
-        return { output: res.output, activity: { name: "multi_edit", ok, ...(res.wrote !== undefined ? { summary: res.wrote } : {}), ...(diff.length > 0 ? { diff } : {}) } };
-      }
-      case "terminal": {
-        const out = await runTerminal({ governedExec, ...(this.parentCtx !== undefined ? { parentCtx: this.parentCtx } : {}) }, this.worktree, args);
-        const ok = !out.startsWith("ERROR") && !out.startsWith("DENIED");
-        return { output: out, activity: { name: "terminal", ok, ...(typeof args.command === "string" ? { summary: args.command.slice(0, 80) } : {}) } };
-      }
       case "git_status":
       case "git_diff":
       case "git_log": {
@@ -1016,24 +968,44 @@ export class ChatSession {
           (files.length > 0 ? `\n- files reviewed: ${files.join(", ")}` : "");
         return { output: out, activity: { name: "done", ok: true, summary: "session checkpoint" } };
       }
-      case "brain_search":
-      case "brain_think":
-      case "brain_put":
-      case "brain_sync": {
-        // gbrain knowledge access — same deps shape the builder uses. runBrainTool returns a STRING:
-        // a `DENIED:` prefix marks a governance refusal, `ERROR:` a tool failure. Output is retrieved
-        // KNOWLEDGE → UNTRUSTED → re-neutralized at the chokepoint like every other tool result.
-        const out = runBrainTool(
-          { bridge: gbrainBridge, ...(this.parentCtx !== undefined ? { parentCtx: this.parentCtx } : {}) },
-          call.name,
-          args,
-        );
-        const ok = !out.startsWith("ERROR") && !out.startsWith("DENIED");
-        return { output: out, activity: { name: call.name, ok, ...(typeof args.query === "string" ? { summary: args.query.slice(0, 80) } : typeof args.slug === "string" ? { summary: args.slug } : {}) } };
-      }
       default:
         return { output: `ERROR: unknown tool "${call.name}"`, activity: { name: call.name, ok: false, summary: "unknown tool" } };
     }
+  }
+
+  /**
+   * Dispatch a SHARED_EXECUTOR_TOOLS call through the shared tool-executor and format the raw
+   * result into the chat's {output, activity} shape. This is the ONE place the chat touches the
+   * confinement / memory-governor / execution machinery — the same governance chokepoint the
+   * builder shares. Mutations are recorded here for /rollback, and a colorizable diff is attached.
+   */
+  private async runSharedExecutorTool(call: ToolCall, args: Record<string, unknown>): Promise<{ output: string; activity: ChatToolActivity }> {
+    const deps: ToolExecutorDeps = {
+      worktreeReal: this.worktree,
+      agentId: this.identity.agentId,
+      governedExec,
+      gbrainBridge,
+      ...(this.parentCtx !== undefined ? { parentCtx: this.parentCtx } : {}),
+      ...(this.memoryGovernor !== undefined ? { memoryGovernor: this.memoryGovernor } : {}),
+    };
+    const res = await executeTool(deps, call);
+    const name = call.name;
+
+    // MEMORY GOVERNOR: the write was intercepted and stored as a proposal — no mutation happened.
+    if (res.proposed) {
+      return { output: res.output, activity: { name, ok: true, summary: "memory proposal (pending review)" } };
+    }
+
+    // MUTATORS: record for /rollback and attach a colorizable diff (preserves the prior behavior).
+    if ((name === "write_file" || name === "patch" || name === "multi_edit") && res.ok && res.wrote !== undefined && res.full !== undefined) {
+      this.recordMutation({ path: res.wrote, full: res.full, beforeContent: res.before ?? null, afterContent: res.after ?? "", tool: name, timestamp: Date.now() });
+      const diff = boundDiff(computeLineDiff(res.before ?? "", res.after ?? ""));
+      return { output: res.output, activity: { name, ok: true, summary: res.wrote, ...(diff.length > 0 ? { diff } : {}) } };
+    }
+
+    // Everything else: map the raw result to an activity, choosing the summary the chat surfaced before.
+    const summary = sharedToolSummary(name, args, res);
+    return { output: res.output, activity: { name, ok: res.ok, ...(summary !== undefined ? { summary } : {}) } };
   }
 
   /**
