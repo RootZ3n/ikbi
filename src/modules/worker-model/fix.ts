@@ -76,6 +76,8 @@ export function defaultFixCheckFor(repo: string, env: NodeJS.ProcessEnv = proces
 const PATCH_TEMPERATURE = 0;
 const PATCH_MAX_TOKENS = 4_096;
 const MAX_FILE_BYTES = 24_000;
+/** How many patch+verify attempts the fix-retry loop makes before giving up (Gap M6). */
+export const MAX_FIX_ATTEMPTS = 3;
 const DEFAULT_IDENTITY: AgentIdentity = { agentId: "fix", functionalRole: "fix" };
 
 /** Config files a fix may not touch without `--allow-config-edits` (alters test discovery). */
@@ -324,25 +326,15 @@ export async function runFixPipeline(opts: FixOptions, deps: FixDeps): Promise<F
   if (planFiles.length === 0) return terminalNoEdit("NEEDS_HUMAN", diagnosis);
   if (diagnosis.affectedFiles.length > maxFiles) return terminalNoEdit("NEEDS_HUMAN", diagnosis);
 
-  // ── STAGE 7: APPLY ─────────────────────────────────────────────────────────
-  // Snapshot the planned files' BEFORE content, generate a minimal diff, validate every path
-  // (confinement + scope + test/config posture), apply, and record before/after for anti-cheat.
+  // Snapshot the planned files' BEFORE content ONCE. Each retry regenerates its patch against this
+  // original snapshot (and the disk is reset to it first), so every attempt is independent and a
+  // diff authored against the original always applies to a clean base.
   const before = new Map<string, string | null>();
   const fileBlocks: Array<{ path: string; body: string }> = [];
   for (const f of planFiles) {
     const content = readFile(opts.repo, f);
     before.set(f, content);
     if (content !== null) fileBlocks.push({ path: f, body: content.slice(0, MAX_FILE_BYTES) });
-  }
-
-  const patchResult = await generateFixPatch({ diagnosis, files: fileBlocks, rawOutput: reproduce.output }, { invokeModel, neutralize, modelId, identity });
-  if (!patchResult.ok) {
-    builder.recordPatch("", []);
-    builder.recordTargetedCheck(false, `(no patch applied: ${patchResult.reason})`);
-    // SAFE_FAIL: we tried, could not produce a usable patch, but changed nothing (no cheat).
-    const verdict = antiCheatCheck({ changes: [], allowedFiles: planFiles, allowTestEdits });
-    builder.recordAntiCheat(verdict.passed, verdict.checks);
-    return { result: "SAFE_FAIL", receipt: builder.finalize("SAFE_FAIL"), promoted: false, filesModified: [], diagnosis };
   }
 
   const worktreeReal = (() => {
@@ -352,86 +344,157 @@ export async function runFixPipeline(opts: FixOptions, deps: FixDeps): Promise<F
       return opts.repo;
     }
   })();
-  const parsed = parseUnifiedDiff(patchResult.diff);
-  if (!parsed.ok) {
-    builder.recordPatch(patchResult.diff, []);
-    builder.recordTargetedCheck(false, `(patch did not parse: ${parsed.error})`);
-    const verdict = antiCheatCheck({ changes: [], allowedFiles: planFiles, allowTestEdits });
-    builder.recordAntiCheat(verdict.passed, verdict.checks);
-    return { result: "SAFE_FAIL", receipt: builder.finalize("SAFE_FAIL"), promoted: false, filesModified: [], diagnosis };
-  }
-
-  // VALIDATE every touched path BEFORE writing a byte (reject the patch WHOLE on any violation).
   const planSet = new Set(planFiles.map((p) => p.replace(/\\/g, "/")));
-  const changes: FileChange[] = [];
-  const filesModified: string[] = [];
-  let violation: string | undefined;
-  const writes: Array<{ rel: string; content: string }> = [];
-  for (const fp of parsed.files) {
-    const c = confinePath(worktreeReal, fp.path);
-    if (!c.ok) {
-      violation = c.error;
-      break;
-    }
-    const rel = c.rel.replace(/\\/g, "/");
-    if (!planSet.has(rel)) {
-      violation = `patch touches a file outside the diagnosed scope: ${rel}`;
-      break;
-    }
-    if (!allowTestEdits && isTestFile(rel)) {
-      violation = `patch edits a test file without --allow-test-edits: ${rel}`;
-      break;
-    }
-    if (!allowConfigEdits && CONFIG_FILE_RE.test(rel)) {
-      violation = `patch edits a config file without --allow-config-edits: ${rel}`;
-      break;
-    }
-    const original = before.has(rel) ? before.get(rel) ?? "" : readFile(opts.repo, rel) ?? "";
-    const applied = applyFilePatch(original, fp);
-    if (!applied.ok) {
-      violation = applied.error;
-      break;
-    }
-    writes.push({ rel, content: applied.content });
-  }
 
-  if (violation !== undefined) {
-    builder.recordPatch(patchResult.diff, []);
-    builder.recordTargetedCheck(false, `(patch rejected: ${violation})`);
-    // A rejected patch wrote NOTHING — anti-cheat over zero changes; SAFE_FAIL (we refused to apply).
-    const verdict = antiCheatCheck({ changes: [], allowedFiles: planFiles, allowTestEdits });
-    builder.recordAntiCheat(verdict.passed, verdict.checks);
+  // Restore every file a prior attempt wrote back to its original snapshot — guarantees the next
+  // attempt starts from a clean base (so a partial earlier patch never leaks across attempts).
+  const restore = (touched: readonly string[]): void => {
+    for (const rel of touched) {
+      try {
+        writeFile(opts.repo, rel, before.get(rel) ?? "");
+      } catch {
+        /* best-effort revert; the next apply overwrites the planned files anyway */
+      }
+    }
+  };
+
+  // Assemble a SAFE_FAIL outcome that left the disk clean (anti-cheat over zero changes).
+  const safeFailNoChange = (diff: string, note: string, attempts: number): FixOutcome => {
+    builder.recordPatch(diff, []);
+    builder.recordTargetedCheck(false, note);
+    const v = antiCheatCheck({ changes: [], allowedFiles: planFiles, allowTestEdits });
+    builder.recordAntiCheat(v.passed, v.checks);
+    builder.recordAttempts(attempts);
     return { result: "SAFE_FAIL", receipt: builder.finalize("SAFE_FAIL"), promoted: false, filesModified: [], diagnosis };
+  };
+
+  // ── STAGES 7-10 (THE FIX-RETRY LOOP): APPLY -> TARGETED_CHECK -> ANTI_CHEAT, up to MAX_FIX_ATTEMPTS.
+  // The cheap builder diagnoses bugs far more reliably than it fixes them on the first try; feeding
+  // it WHY its patch failed and re-prompting closes most of that gap (Gap M6). We retry ONLY a
+  // clean-but-ineffective patch: a patch the anti-cheat catches is a terminal UNSAFE_FAIL (we never
+  // re-prompt a cheat), and an unusable/garbage patch is a terminal SAFE_FAIL (identical inputs
+  // would not help). Anti-cheat runs on EVERY attempt, including each retry.
+  let feedbackOutput = reproduce.output; // verification output fed back to the next attempt
+  let previousDiff: string | undefined; // the prior failed patch, shown to the model on a retry
+  let everModified: string[] = []; // files written by the most-recent attempt (reset before the next)
+  let lastVerdict = antiCheatCheck({ changes: [], allowedFiles: planFiles, allowTestEdits });
+  let lastFilesModified: string[] = [];
+
+  for (let attempt = 1; attempt <= MAX_FIX_ATTEMPTS; attempt++) {
+    // Reset the disk to the original snapshot before regenerating (no-op on the first attempt).
+    if (everModified.length > 0) {
+      restore(everModified);
+      everModified = [];
+    }
+
+    // ── STAGE 7: APPLY (generate -> validate every path -> apply) ──────────────
+    const patchResult = await generateFixPatch(
+      { diagnosis, files: fileBlocks, rawOutput: feedbackOutput, ...(previousDiff !== undefined ? { previousDiff } : {}) },
+      { invokeModel, neutralize, modelId, identity, attempt },
+    );
+    if (!patchResult.ok) {
+      // Could not produce a usable patch — terminal SAFE_FAIL (nothing changed; no cheat).
+      return safeFailNoChange("", `(no patch applied: ${patchResult.reason})`, attempt);
+    }
+
+    const parsed = parseUnifiedDiff(patchResult.diff);
+    if (!parsed.ok) {
+      return safeFailNoChange(patchResult.diff, `(patch did not parse: ${parsed.error})`, attempt);
+    }
+
+    // VALIDATE every touched path BEFORE writing a byte (reject the patch WHOLE on any violation).
+    const changes: FileChange[] = [];
+    const filesModified: string[] = [];
+    let violation: string | undefined;
+    const writes: Array<{ rel: string; content: string }> = [];
+    for (const fp of parsed.files) {
+      const c = confinePath(worktreeReal, fp.path);
+      if (!c.ok) {
+        violation = c.error;
+        break;
+      }
+      const rel = c.rel.replace(/\\/g, "/");
+      if (!planSet.has(rel)) {
+        violation = `patch touches a file outside the diagnosed scope: ${rel}`;
+        break;
+      }
+      if (!allowTestEdits && isTestFile(rel)) {
+        violation = `patch edits a test file without --allow-test-edits: ${rel}`;
+        break;
+      }
+      if (!allowConfigEdits && CONFIG_FILE_RE.test(rel)) {
+        violation = `patch edits a config file without --allow-config-edits: ${rel}`;
+        break;
+      }
+      // Always patch against the ORIGINAL snapshot (the disk was reset above), so a diff authored
+      // against the original applies cleanly even after a prior attempt touched the same file.
+      const original = before.has(rel) ? before.get(rel) ?? "" : readFile(opts.repo, rel) ?? "";
+      const applied = applyFilePatch(original, fp);
+      if (!applied.ok) {
+        violation = applied.error;
+        break;
+      }
+      writes.push({ rel, content: applied.content });
+    }
+
+    if (violation !== undefined) {
+      // A rejected patch wrote NOTHING — terminal SAFE_FAIL (we refused to apply a bad patch).
+      return safeFailNoChange(patchResult.diff, `(patch rejected: ${violation})`, attempt);
+    }
+
+    try {
+      for (const w of writes) {
+        writeFile(opts.repo, w.rel, w.content);
+        filesModified.push(w.rel);
+        changes.push({ path: w.rel, before: before.get(w.rel) ?? null, after: w.content });
+      }
+    } catch (e) {
+      // A write failure mid-apply (e.g. confinement / fs error) — revert what we wrote and fail
+      // closed with a complete receipt. The pipeline NEVER throws past this boundary.
+      restore(filesModified);
+      return safeFailNoChange(patchResult.diff, `(patch write failed: ${errMsg(e)})`, attempt);
+    }
+    everModified = [...filesModified];
+    builder.recordPatch(patchResult.diff, filesModified);
+
+    // ── STAGE 8: TARGETED_CHECK ───────────────────────────────────────────────
+    const targeted = await deps.runCheck(opts.repo, check);
+    const targetedOutcomes = parseOutcomes(check, targeted);
+    builder.recordTargetedCheck(targetedOutcomes.passed, targeted.output);
+
+    // ── STAGE 10: ANTI_CHEAT (runs on EVERY attempt, including each retry) ─────
+    const verdict = antiCheatCheck({ changes, allowedFiles: planFiles, allowTestEdits });
+    lastVerdict = verdict;
+    lastFilesModified = filesModified;
+
+    // A cheat is terminal — NEVER retry it (that would let the loop grind toward a dishonest pass).
+    if (!verdict.passed) {
+      builder.recordFullCheck(targetedOutcomes.passed, 0);
+      builder.recordAntiCheat(verdict.passed, verdict.checks);
+      builder.recordAttempts(attempt);
+      return { result: "UNSAFE_FAIL", receipt: builder.finalize("UNSAFE_FAIL"), promoted: false, filesModified, diagnosis };
+    }
+    // An honest green ends the loop — FIXED_NARROWLY (stages 9/11/12).
+    if (targetedOutcomes.passed) {
+      builder.recordFullCheck(true, 0);
+      builder.recordAntiCheat(verdict.passed, verdict.checks);
+      builder.recordAttempts(attempt);
+      return { result: "FIXED_NARROWLY", receipt: builder.finalize("FIXED_NARROWLY"), promoted: false, filesModified, diagnosis };
+    }
+
+    // Clean patch, but the check still fails — feed the failure back and retry (if attempts remain).
+    feedbackOutput = targeted.output;
+    previousDiff = patchResult.diff;
   }
 
-  for (const w of writes) {
-    writeFile(opts.repo, w.rel, w.content);
-    filesModified.push(w.rel);
-    changes.push({ path: w.rel, before: before.get(w.rel) ?? null, after: w.content });
-  }
-  builder.recordPatch(patchResult.diff, filesModified);
-
-  // ── STAGE 8: TARGETED_CHECK ────────────────────────────────────────────────
-  const targeted = await deps.runCheck(opts.repo, check);
-  const targetedOutcomes = parseOutcomes(check, targeted);
-  builder.recordTargetedCheck(targetedOutcomes.passed, targeted.output);
-
-  // ── STAGE 9: FULL_CHECK ────────────────────────────────────────────────────
-  // The slice's ground-truth set is the single check — reuse the targeted run, 0 other checks.
-  builder.recordFullCheck(targetedOutcomes.passed, 0);
-
-  // ── STAGE 10: ANTI_CHEAT ───────────────────────────────────────────────────
-  const verdict = antiCheatCheck({ changes, allowedFiles: planFiles, allowTestEdits });
-  builder.recordAntiCheat(verdict.passed, verdict.checks);
-
-  // ── STAGE 11: RESULT ───────────────────────────────────────────────────────
-  let result: FixResult;
-  if (!verdict.passed) result = "UNSAFE_FAIL";
-  else if (targetedOutcomes.passed) result = "FIXED_NARROWLY";
-  else result = "SAFE_FAIL";
-
-  // ── STAGE 12: RECEIPT ──────────────────────────────────────────────────────
-  return { result, receipt: builder.finalize(result), promoted: false, filesModified, diagnosis };
+  // ── STAGES 9/11/12: attempts exhausted without a green check → SAFE_FAIL ──────
+  // The last attempt's patch is left applied on disk (it never promotes), mirroring the original
+  // single-attempt SAFE_FAIL. Anti-cheat already passed on that attempt (a cheat would have
+  // returned UNSAFE_FAIL above).
+  builder.recordFullCheck(false, 0);
+  builder.recordAntiCheat(lastVerdict.passed, lastVerdict.checks);
+  builder.recordAttempts(MAX_FIX_ATTEMPTS);
+  return { result: "SAFE_FAIL", receipt: builder.finalize("SAFE_FAIL"), promoted: false, filesModified: lastFilesModified, diagnosis };
 }
 
 /** Patch-generation deps (a subset of FixDeps, already defaulted). */
@@ -440,14 +503,31 @@ interface PatchDeps {
   readonly neutralize: (content: string, context: UntrustedContext) => NeutralizedContent;
   readonly modelId: string;
   readonly identity: AgentIdentity;
+  /** 1-based attempt number (Gap M6). Tagged onto the model request metadata for observability. */
+  readonly attempt?: number;
 }
 
-/** Ask the model for a minimal unified diff that repairs the diagnosed problem. */
+/**
+ * Ask the model for a minimal unified diff that repairs the diagnosed problem. On a retry
+ * (`args.previousDiff` set), the model is shown its prior failed patch alongside the fresh
+ * verification output and explicitly told to try a DIFFERENT approach (Gap M6 fix-retry loop).
+ */
 export async function generateFixPatch(
-  args: { diagnosis: Diagnosis; files: ReadonlyArray<{ path: string; body: string }>; rawOutput: string },
+  args: { diagnosis: Diagnosis; files: ReadonlyArray<{ path: string; body: string }>; rawOutput: string; previousDiff?: string },
   deps: PatchDeps,
 ): Promise<{ ok: true; diff: string } | { ok: false; reason: string }> {
   const fileBlocks = args.files.length > 0 ? args.files.map((f) => `--- ${f.path} ---\n${f.body}`).join("\n\n") : "(no source files were located)";
+  const retrySection =
+    args.previousDiff !== undefined
+      ? [
+          "",
+          "YOUR PREVIOUS PATCH FAILED VERIFICATION. This is the diff you tried last time:",
+          args.previousDiff.length > 0 ? args.previousDiff : "(empty diff)",
+          "",
+          "It did NOT make the check pass — the test still fails (see the verification output above).",
+          "Try a DIFFERENT approach. Do not repeat the same diff; reconsider the root cause.",
+        ]
+      : [];
   const contextBody = [
     `DIAGNOSIS: ${args.diagnosis.category} (confidence ${args.diagnosis.confidence.toFixed(2)})`,
     `EVIDENCE: ${args.diagnosis.evidence}`,
@@ -455,6 +535,7 @@ export async function generateFixPatch(
     "",
     "FAILING CHECK OUTPUT:",
     args.rawOutput.length > 0 ? args.rawOutput : "(none)",
+    ...retrySection,
     "",
     "FILES:",
     fileBlocks,
@@ -465,7 +546,14 @@ export async function generateFixPatch(
 
   let raw: string;
   try {
-    const response = await deps.invokeModel({ model: deps.modelId, temperature: PATCH_TEMPERATURE, maxTokens: PATCH_MAX_TOKENS, identity: deps.identity, messages, metadata: { fixStage: "patch" } });
+    const response = await deps.invokeModel({
+      model: deps.modelId,
+      temperature: PATCH_TEMPERATURE,
+      maxTokens: PATCH_MAX_TOKENS,
+      identity: deps.identity,
+      messages,
+      metadata: { fixStage: "patch", ...(deps.attempt !== undefined ? { fixAttempt: deps.attempt } : {}) },
+    });
     raw = response.content;
   } catch (e) {
     return { ok: false, reason: `patch model call failed: ${errMsg(e)}` };

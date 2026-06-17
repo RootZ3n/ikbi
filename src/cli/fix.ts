@@ -118,6 +118,7 @@ export function formatFixReceipt(o: FixOutcome): string {
   } else {
     lines.push(`  patched:     (no files changed)`);
   }
+  if (r.attempts !== undefined && r.attempts > 1) lines.push(`  attempts:    ${r.attempts} (fix-retry loop re-prompted the model)`);
   lines.push(`  anti-cheat:  ${r.antiCheat.passed ? "PASS" : "FAIL"}`);
   for (const c of r.antiCheat.checks) lines.push(`     ${c.passed ? "✓" : "✗"} ${c.name}: ${c.evidence}`);
   lines.push(`  promoted:    ${r.promoted ? "yes" : "no (fix mode never promotes without approval)"}`);

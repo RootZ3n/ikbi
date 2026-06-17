@@ -81,6 +81,13 @@ export interface FixReceipt {
   readonly targetedCheck: { readonly passed: boolean; readonly output: string };
   readonly fullCheck: { readonly passed: boolean; readonly regressionCount: number };
   readonly antiCheat: { readonly passed: boolean; readonly checks: readonly AntiCheatCheckResult[] };
+  /**
+   * How many patch+verify attempts the fix-retry loop made (Gap M6). 0 means no repair was
+   * attempted (a refusal/terminal diagnosis); 1 means the first patch settled it; >1 means the
+   * model was fed the verification failure and retried. Optional for back-compat with receipts
+   * authored before the field existed — the builder always populates it.
+   */
+  readonly attempts?: number;
   readonly result: FixResult;
   /** Whether the fix was promoted. ALWAYS false in this slice — promote requires explicit approval. */
   readonly promoted: boolean;
@@ -113,6 +120,7 @@ export class FixReceiptBuilder {
   private targetedCheck: FixReceipt["targetedCheck"] = { passed: false, output: "(skipped: no edit attempted)" };
   private fullCheck: FixReceipt["fullCheck"] = { passed: false, regressionCount: 0 };
   private antiCheat: FixReceipt["antiCheat"] = { passed: true, checks: [] };
+  private attempts = 0;
 
   constructor(started: { timestamp: string; repo: string; check: string; head: string }) {
     this.started = { ...started };
@@ -146,6 +154,11 @@ export class FixReceiptBuilder {
     this.antiCheat = { passed, checks: [...checks] };
   }
 
+  /** Record how many patch+verify attempts the fix-retry loop made (Gap M6). */
+  recordAttempts(n: number): void {
+    this.attempts = n;
+  }
+
   /** Produce the immutable receipt. `promoted` is hardcoded false (no promote without approval). */
   finalize(result: FixResult): FixReceipt {
     return {
@@ -157,6 +170,7 @@ export class FixReceiptBuilder {
       targetedCheck: this.targetedCheck,
       fullCheck: this.fullCheck,
       antiCheat: this.antiCheat,
+      attempts: this.attempts,
       result,
       promoted: false,
     };
