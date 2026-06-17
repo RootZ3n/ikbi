@@ -69,6 +69,7 @@ import type { RoleFn, RoleResult, WorkerOutcome } from "./contract.js";
 import { loadProjectMemory } from "./project-memory.js";
 import { builderModel } from "./role-models.js";
 import type { ScoutFinding } from "./scout.js";
+import { isGovernedPath } from "../memory-governor/guard.js";
 
 // ToolCallError now lives in builder-tools/confine.ts (shared by every builder tool);
 // re-exported here so existing importers (and tests) keep `import { ToolCallError } from "./builder.js"`.
@@ -302,6 +303,12 @@ export interface BuilderDeps {
    * (tests / direct construction) ⇒ no poll, behavior unchanged. Read-only — it never kills.
    */
   readonly checkHalt?: () => Promise<{ halt: boolean; reason?: string }>;
+  /**
+   * Memory governor — intercepts writes to durable memory surfaces (brain pages,
+   * project instruction files) and converts them to proposals requiring operator review.
+   * Absent (tests / direct construction) ⇒ no interception, behavior unchanged.
+   */
+  readonly memoryGovernor?: import("../memory-governor/contract.js").MemoryGovernor;
 }
 
 /** The last run_checks outcome — gates `done` (RAIL: no done while red). */
@@ -1416,6 +1423,29 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
             const raw = await runVisionCall(call);
             appendToolResult(raw, call);
           } else if (BRAIN_TOOL_NAMES.has(call.name)) {
+            // MEMORY GOVERNOR: intercept brain_put (writes to the knowledge brain) and convert
+            // to a proposal requiring operator review. Other brain tools (search/think/sync)
+            // pass through normally — search/think are read-only, sync is already identity-gated.
+            if (call.name === "brain_put" && deps.memoryGovernor !== undefined) {
+              let brainArgs: Record<string, unknown>;
+              try {
+                brainArgs = JSON.parse(call.arguments && call.arguments.length > 0 ? call.arguments : "{}") as Record<string, unknown>;
+              } catch { brainArgs = {}; }
+              const slug = typeof brainArgs.slug === "string" ? brainArgs.slug : "";
+              const content = typeof brainArgs.content === "string" ? brainArgs.content : "";
+              if (slug.length > 0 && content.length > 0) {
+                const proposal = await deps.memoryGovernor.propose({
+                  surface: "brain_page",
+                  target: slug,
+                  content,
+                  reason: `brain_put to "${slug}"`,
+                  agentId: ctx.identity.agentId,
+                });
+                log.info({ slug, proposalId: proposal.id }, "MEMORY GOVERNOR: brain_put intercepted → proposal stored");
+                appendToolResult(`PROPOSED: Your brain page "${slug}" has been stored as a memory proposal (id: ${proposal.id}) pending operator review. It will be written to the brain after approval.`, call);
+                continue; // skip the normal brain_put execution
+              }
+            }
             // gbrain knowledge access — async; output is UNTRUSTED knowledge → chokepoint.
             const raw = await runBrainCall(call);
             // POLICY GATE: a `DENIED:` from brain_sync is an ATTEMPTED out-of-policy action (the
@@ -1424,6 +1454,32 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
               rejectedToolCalls.push({ tool: call.name, error: `brain governed denied: ${raw.slice("DENIED:".length).trim()}` });
             }
             appendToolResult(raw, call);
+          } else if ((call.name === "write_file" || call.name === "patch") && deps.memoryGovernor !== undefined) {
+            // MEMORY GOVERNOR: intercept write_file/patch to governed memory surfaces.
+            let toolArgs: Record<string, unknown>;
+            try {
+              toolArgs = JSON.parse(call.arguments && call.arguments.length > 0 ? call.arguments : "{}") as Record<string, unknown>;
+            } catch { toolArgs = {}; }
+            const targetPath = typeof toolArgs.path === "string" ? toolArgs.path : "";
+            const govSurface = isGovernedPath(targetPath);
+            if (govSurface !== undefined) {
+              const content = call.name === "write_file"
+                ? (typeof toolArgs.content === "string" ? toolArgs.content : "")
+                : (typeof toolArgs.patch === "string" ? toolArgs.patch : "");
+              const proposal = await deps.memoryGovernor.propose({
+                surface: govSurface,
+                target: targetPath,
+                content,
+                reason: `${call.name} to ${targetPath}`,
+                agentId: ctx.identity.agentId,
+              });
+              log.info({ path: targetPath, surface: govSurface, proposalId: proposal.id }, "MEMORY GOVERNOR: write intercepted → proposal stored");
+              appendToolResult(`PROPOSED: Your ${call.name} to "${targetPath}" has been stored as a memory proposal (id: ${proposal.id}) pending operator review. It will be applied after approval.`, call);
+            } else {
+              // Not governed — fall through to normal execution
+              const raw = runTool(call);
+              appendToolResult(raw, call);
+            }
           } else {
             const raw = runTool(call); // pure: produces a result string (schema-gated inside)
             appendToolResult(raw, call); // chokepoint: neutralize + append (only path)

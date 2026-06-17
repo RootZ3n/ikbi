@@ -1,0 +1,11 @@
+{
+  "id": "instruction_file:CLAUDE.md",
+  "surface": "instruction_file",
+  "target": "CLAUDE.md",
+  "content": "# Test\n\nThis is a test page.",
+  "reason": "recording a finding",
+  "agentId": "ikbi-worker",
+  "status": "pending",
+  "createdAt": 1781724538054,
+  "updatedAt": 1781724598697
+}

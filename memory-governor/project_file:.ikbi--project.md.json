@@ -1,0 +1,13 @@
+{
+  "id": "project_file:.ikbi--project.md",
+  "surface": "project_file",
+  "target": ".ikbi/project.md",
+  "content": "# Project Config\n\nAlways use pytest for testing.\n",
+  "reason": "learned from successful build",
+  "agentId": "ikbi-worker",
+  "status": "approved",
+  "createdAt": 1781724538052,
+  "updatedAt": 1781724598709,
+  "reviewedAt": 1781724598709,
+  "reviewedBy": "operator"
+}

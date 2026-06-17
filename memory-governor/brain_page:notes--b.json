@@ -1,0 +1,13 @@
+{
+  "id": "brain_page:notes--b",
+  "surface": "brain_page",
+  "target": "notes/b",
+  "content": "# Test\n\nThis is a test page.",
+  "reason": "recording a finding",
+  "agentId": "ikbi-worker",
+  "status": "rejected",
+  "createdAt": 1781724537917,
+  "updatedAt": 1781724598633,
+  "reviewedAt": 1781724598633,
+  "reviewedBy": "operator"
+}
