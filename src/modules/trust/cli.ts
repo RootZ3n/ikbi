@@ -34,7 +34,8 @@ export interface TrustCliDeps {
   readonly defaultTrustTier?: string;
   /** The worker agent id `promote` targets by default. Default: config.identity.workerAgentId. */
   readonly workerAgentId?: string;
-  /** Operator confirmation seam (`promote`). Default: prompt on a TTY, else proceed (token is the gate). */
+  /** Operator confirmation seam (`promote`). Default: prompt on a TTY; in a non-TTY fail closed
+   *  (require `--yes`) — a durable promotion is never auto-confirmed by automation. */
   readonly confirm?: (question: string) => Promise<boolean>;
   readonly stdout?: (s: string) => void;
   readonly stderr?: (s: string) => void;
@@ -115,6 +116,14 @@ export function createTrustCli(deps: TrustCliDeps = {}) {
       setExit(1);
       return;
     }
+    // Ceiling check (Codex C2): `promote` targets the agent ceiling ("trusted"), but an operator may
+    // have LOWERED the effective ceiling for this worker (IKBI_WORKER_TRUST_TIER). Never promote
+    // ABOVE the configured ceiling — fail closed with a clear message (lower rank = MORE trust).
+    if (isTrustTier(defaultTrustTier) && tierRank(AGENT_CEILING) < tierRank(defaultTrustTier)) {
+      err(`ikbi: cannot promote to "${AGENT_CEILING}" — ceiling is "${defaultTrustTier}"\n`);
+      setExit(1);
+      return;
+    }
     const who = operator();
     if (who === undefined) return;
     if (!auto) {
@@ -169,10 +178,11 @@ export function createTrustCli(deps: TrustCliDeps = {}) {
   return { grant, promote, status, dispatch };
 }
 
-/** Default operator-confirmation prompt: ask on an interactive TTY, otherwise proceed (the operator
- *  token already authorized this; non-interactive automation must not hang on a prompt). */
+/** Default operator-confirmation prompt: ask on an interactive TTY. In a NON-TTY (automation, CI)
+ *  we FAIL CLOSED — a durable trust promotion is never auto-confirmed; the caller must pass `--yes`
+ *  to authorize it non-interactively (Codex C3). This keeps fail-closed as the default. */
 async function defaultConfirm(question: string): Promise<boolean> {
-  if (!process.stdin.isTTY) return true;
+  if (!process.stdin.isTTY) return false;
   const { createInterface } = await import("node:readline/promises");
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   try {
