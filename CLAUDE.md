@@ -1,98 +1,62 @@
 # ikbi — Build/Repair Engine
 
 ## What This Is
-ikbi (Choctaw: "to build") is the lab's coding agent. It's designed to be a Claude Code replacement that works with cheap/local models. The architecture gives cheap models every advantage: evidence-based verification, governed execution, competitive mode.
+ikbi (Choctaw: "to build") is a governed AI coding agent designed to be a Claude Code
+replacement that works with cheap/local models. The architecture gives cheap models every
+advantage: evidence-based verification, governed execution, earned trust, and an optional
+competitive mode. It runs both as a long-running localhost/Tailscale service and as a CLI.
 
 ## Architecture
-- **14 modules**, TypeScript, Node.js 22+
-- **Core modules:** provider (model invocation), injection (security), trust (earned autonomy), identity, workspace (git worktrees), events, receipt, substrate
-- **Action modules:** worker-model (scout/builder/critic/verifier/integrator), batch-planner, agent-router, cognition-layer, mcp-model-loop, gate-wall, governed-exec, subagent-spawning, egress, cache, self-observation, capability-recovery, drift-prevention, lab-context-memory, kill-switch, dependency-install
-- **CLI:** `node dist/cli/index.js` (built with `pnpm build`)
-- **Server:** Fastify on port 18796
-- **Tests:** `pnpm test` (717 tests, all passing)
-- **Build:** `pnpm build` (TypeScript compilation)
+- **TypeScript, Node.js 22+**, ESM. `pnpm` workspace.
+- **Frozen core** (`src/core/`): provider (model invocation), injection (neutralization
+  chokepoint), trust (earned tiers, MAC-protected), identity, workspace (git worktrees),
+  events, receipt, substrate (atomic writes + locking), config, contracts.
+- **Engine modules** (`src/modules/`): worker-model (scout/builder/critic/verifier/integrator),
+  chat (the `ikbi repl` + `/chat` session loop), agent-router, batch-planner, step-planner,
+  cognition-layer, mcp-model-loop, gate-wall, governed-exec, egress, escalation, cache,
+  self-observation, capability-* , drift-prevention, lab-context-memory, kill-switch,
+  dependency-install, deterministic-judge, verification-ladder, project-index/retrieval,
+  context-packets, model-evaluation, check-triage.
+- **CLI** (`src/cli/`): `node dist/cli/index.js <command>`. Built with `pnpm build`.
+- **Server** (`src/server/`): Fastify on port 18796 (`/health` `/ready` `/agent`
+  `/capabilities` `/chat`).
+- **TUI** (`tui/`): a standalone Ink/React client package (talks to `/chat`; not the primary
+  surface — `ikbi repl` is the rich interactive daily-driver).
+- **Web UI** (`ui/`): a static SPA served at `/`.
 
-## Key Directories
-- `src/core/` — frozen core (provider, injection, trust, identity, workspace, events, receipt, substrate, contracts)
-- `src/modules/` — 14 modules (each has index.ts, config.ts, contract.ts, events.ts, implementation.ts)
-- `src/cli/` — CLI entry, registry, doctor
-- `src/server/` — Fastify HTTP server
-- `tui/` — Ink/React terminal UI (TO BE CREATED)
+## Surfaces (what to use)
+- `ikbi build "<goal>" --repo <path>` — the golden batch path: 5-role pipeline in an
+  isolated worktree, promotes only on ladder-verified pass.
+- `ikbi repl` — interactive, multi-turn, tool-calling session (managed worktree, slash
+  commands, resume, permission prompts). The closest analog to Claude Code's REPL.
+- `ikbi doctor` / `capabilities` / `models` / `providers` / `receipts` / `cost` / `diff` /
+  `undo` / `workspace*` / `clean` / `audit` — operator + inspection commands.
 
-## Current State
-The BUILDER (src/modules/worker-model/builder.ts) has only 5 tools:
-- read_file, write_file, list_dir, run_checks, done
-
-It NEEDS more tools to match Claude Code. The trio (Pehlichi/Ptah/Luna) already has a full tool suite at `/pehverse/bridges/shared/agent-tools/` with 31 tools.
-
-## What To Build
-
-### Part 1: Builder Tool Expansion
-Port these tools from `/pehverse/bridges/shared/agent-tools/` into `src/modules/worker-model/builder-tools/`:
-1. `terminal.ts` — shell command execution (THE most important tool)
-2. `search-files.ts` — grep/rg codebase search
-3. `patch.ts` — surgical file edits (find-and-replace)
-
-Add these to the builder's TOOLS array in builder.ts.
-
-### Part 2: TUI (Ink/React)
-Create `tui/` directory with:
-- `tui/src/app.tsx` — Main TUI app (Ink/React)
-- `tui/src/entry.tsx` — Entry point
-- `tui/src/lib/skin.ts` — Skin loader (reads skin.yaml)
-- `tui/src/lib/personality.ts` — Personality loader (reads personality/*.yaml)
-- `tui/src/lib/chat.ts` — Chat session (conversation state, API calls)
-- `tui/src/lib/agent-chat.ts` — Agent chat with tool-calling loop
-- `tui/src/harness.ts` — Test harness
-- `skin.yaml` — Visual theme (colors, banner, spinner)
-- `personality/ikbi.yaml` — ikbi personality
-
-### Part 3: HTTP Chat Endpoint
-Add a `/chat` POST endpoint to the Fastify server for persistent conversation sessions.
-
-## Constraints
-- **NO shared dependencies with the trio** — ikbi is standalone
-- **NO frozen-core changes** — build in modules only
-- **ikbi's own modules are the integration point** — use the existing module pattern
-- **Tests must pass** — `pnpm test` after every change
-- **TypeScript strict mode** — `pnpm build` must succeed
-- **Do NOT modify existing tests** — only add new ones
-- **Do NOT change the provider system** — it works
-- **Do NOT change the trust system** — it works
-- **Do NOT add new npm dependencies without checking existing ones first**
-
-## ikbi's Identity
-ikbi is a BUILD ENGINE, not a squirrel or an alien. It's the disciplined engineer:
-- Methodical, evidence-based, precise
-- Speaks in clear technical language
-- Uses build metaphors (foundation, scaffolding, blueprint)
-- Color theme: amber/gold (construction/engineering)
-- ASCII art: geometric/architectural, not cute
-
-## Existing Dependencies
-```json
-{
-  "dependencies": { "fastify": "...", "pino": "..." },
-  "devDependencies": { "@types/node": "...", "tsx": "...", "typescript": "..." }
-}
-```
-
-For the TUI, you'll need to add: ink, react, ink-text-input, js-yaml, @types/react, @types/js-yaml, @types/ink
+## Tooling (builder & chat each expose 20 tools)
+read_file, write_file, list_dir, patch, terminal, search_files, git tools, web_search/extract,
+vision_analyze, delegate_task, brain tools, run_checks, done (+ scout_detail in chat). The
+builder gates `done` on a green `run_checks`. Every tool RESULT re-enters the model only through
+the neutralization chokepoint; all file/search/exec tools are worktree-confined; terminal routes
+through governed-exec (allowlist + gate-wall + receipts).
 
 ## How To Run
 ```bash
 cd /pehverse/repos/ikbi
-pnpm build                    # compile TypeScript
-pnpm test                     # run all 717 tests
-node dist/cli/index.js        # run CLI
-node dist/cli/index.js doctor # pre-flight check
+pnpm install
+pnpm build                     # tsc -> dist/  (also typechecks *.test.ts)
+pnpm test                      # node:test runner — 2055 tests, all passing
+node dist/cli/index.js doctor  # pre-flight check
+node dist/cli/index.js repl    # interactive session
 ```
+Tests use `node:test` (NOT vitest). `pnpm build` typechecks test files too, so a type error
+in a `*.test.ts` fails the build.
 
-## CRITICAL CONSTRAINTS — READ LAST
-- **Do NOT create a shared core package** — ikbi is standalone
-- **Do NOT modify the provider system** — it works
-- **Do NOT modify the trust system** — it works  
-- **Do NOT change existing tests** — only add new ones
-- **Do NOT add dependencies beyond what's listed above** without checking
-- **STOP after completing the 3 parts above** — do not add extra features
-- **If a test fails, fix it before moving on** — do not leave broken tests
+## Constraints — READ THESE
+- **No shared dependencies / no shared core package** — ikbi is standalone.
+- **Frozen core is sensitive** — change `src/core/` only with care and tests; prefer modules.
+- **Tests must pass** — run `pnpm test` after changes; `pnpm build` must succeed (strict mode).
+- **Do NOT modify existing tests to make them pass** — fix the code, or add new tests. Only
+  change a test when the contract it pins genuinely, intentionally changed.
+- **Check existing deps before adding new ones.** Runtime deps: fastify, @fastify/static, pino.
+- **Fail-closed is the design** — never make a dangerous thing the default. Trust/capability is
+  granted, not assumed.

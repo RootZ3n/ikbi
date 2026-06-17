@@ -17,6 +17,10 @@ capability is granted rather than assumed. Concretely:
   trust and identity modules construct).
 - **Network egress → default-deny.** No host is reachable unless it is on the egress
   allowlist, and every resolved IP is validated against internal ranges before connect.
+  The allowlist mechanism is default-deny; the *shipped default* is non-empty (the
+  configured model-provider API hosts plus `developer.mozilla.org` / `stackoverflow.com`)
+  so model calls work out of the box. Setting `IKBI_EGRESS_ALLOWLIST` **replaces** that
+  default, so a custom list must still include your provider host(s).
 
 This document records the **known residuals** — risks that are understood, bounded,
 and tracked, so they are documented choices rather than folklore.
