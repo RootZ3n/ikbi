@@ -22,7 +22,7 @@ import { events as coreEvents } from "../../core/events/index.js";
 import type { EventInput } from "../../core/events/index.js";
 import type { AgentIdentity } from "../../core/identity/contract.js";
 import { receipts as coreReceipts } from "../../core/receipt/index.js";
-import { commandPolicyDenyReason } from "../governed-exec/policy.js";
+import { commandPolicyDenyReason } from "../execution-policy/risk.js";
 import { gateWallConfig, type GateWallConfig } from "./config.js";
 import { gateAllowed, gateDenied, gateEvaluated, type GateEventPayload } from "./events.js";
 import type { GateWall, GateWallAction, GateWallEvaluateInput, PromoteGovernance } from "./contract.js";

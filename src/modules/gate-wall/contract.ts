@@ -25,67 +25,26 @@
  *           surface returning the frozen PromoteGovernance. Minimal policy: tiers
  *           that require operator approval are DENIED fail-closed until a human
  *           approval mechanism exists; non-approval tiers are allowed with audit.
+ *
+ * DEPENDENCY DIRECTION: the shared types (GateWall, GateWallAction, etc.) now live
+ * in the neutral `execution-policy` module to break the circular dependency between
+ * gate-wall, governed-exec, and worker-model. This file re-exports them for backward
+ * compatibility — consumers of `gate-wall/contract` see no change.
  */
 
-import type { AgentIdentity } from "../../core/identity/contract.js";
-import type { AutonomyGrant } from "../../core/trust/contract.js";
-import type { PromoteGovernance } from "../../core/workspace/contract.js";
-import type { RoleResult, WorkerTask } from "../worker-model/contract.js";
+// Re-export the shared types from the neutral execution-policy module.
+// This preserves backward compatibility: `import type { GateWall } from "../gate-wall/contract.js"`
+// continues to work. The canonical definitions live in execution-policy/contract.ts.
+export type {
+  GateWall,
+  GateWallAction,
+  GateWallActionExec,
+  GateWallActionPromote,
+  GateWallEvaluateInput,
+  PromoteGovernance,
+  RoleResult,
+  WorkerTask,
+} from "../execution-policy/contract.js";
 
 /** Semantic version of the gate-wall contract. Bump on breaking change. */
 export const CONTRACT_VERSION = "1.1.0";
-
-/**
- * A promote action — the worker-model orchestrator's workspace promote. Carries the
- * task + the role results so the audit records WHAT was promoted.
- */
-export interface GateWallActionPromote {
-  readonly kind: "promote";
-  readonly task: WorkerTask;
-  readonly results: readonly RoleResult[];
-}
-
-/**
- * An exec action — a governed shell/curl command (gated by governed-exec, next
- * build, through THIS layer). The gate logs `command` + arg COUNT + `sudo`; the full
- * args are governed-exec's own receipt concern, NOT logged verbatim here.
- */
-export interface GateWallActionExec {
-  readonly kind: "exec";
-  /** The binary name (e.g. "curl", "apt-get"). */
-  readonly command: string;
-  /** The command arguments (logged by COUNT here, not verbatim). */
-  readonly args: readonly string[];
-  /** Whether the command runs under sudo. */
-  readonly sudo: boolean;
-  /** Optional human purpose for the audit trail. */
-  readonly purpose?: string;
-}
-
-/**
- * The action being gated — a discriminated union on `kind`. Additive: a new action
- * kind extends this union without breaking the grant→governance evaluation, which is
- * action-agnostic. The action feeds the audit payload only.
- */
-export type GateWallAction = GateWallActionPromote | GateWallActionExec;
-
-/**
- * Input to a governance evaluation. `identity` is the agent the action is on behalf
- * of — carried so the gate decision is attributable on receipts/events. The decision
- * is a pure function of `grant`; `action` describes what is gated for the audit.
- */
-export interface GateWallEvaluateInput {
-  /** The autonomy grant of the action's governance subject (the agent's tier grant). */
-  readonly grant: AutonomyGrant;
-  /** The action being gated (promote | exec). Feeds the audit payload only. */
-  readonly action: GateWallAction;
-  /** Attribution identity for the audit trail (receipt + events). */
-  readonly identity: AgentIdentity;
-}
-
-/** The gate-wall evaluator surface. Returns the frozen PromoteGovernance verdict. */
-export interface GateWall {
-  evaluate(input: GateWallEvaluateInput): Promise<PromoteGovernance>;
-}
-
-export type { PromoteGovernance };

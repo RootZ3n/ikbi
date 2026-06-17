@@ -16,8 +16,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { applyFileProposal, createBrainApply, createCombinedApply } from "./apply.js";
 import { createProductionGovernor } from "./create.js";
-import { createMemoryGovernor } from "./store.js";
-import type { MemoryGovernor, MemoryProposal, ProposalInput } from "./contract.js";
+import type { MemoryProposal, ProposalInput } from "./contract.js";
 import type { GbrainBridge } from "../../core/gbrain-bridge.js";
 import type { DocumentStore } from "../../core/substrate/store.js";
 

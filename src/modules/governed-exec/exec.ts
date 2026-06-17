@@ -34,7 +34,8 @@ import type { ReceiptInput } from "../../core/receipt/contract.js";
 import { asTier, autonomyForTier, TRUST_FLOOR } from "../../core/trust/index.js";
 import type { FetchLike } from "../../core/provider/providers/openai-compatible.js";
 import { resolveFetchGuard } from "../../core/provider/fetch-guard.js";
-import { gateWall as coreGateWall, type GateWall } from "../gate-wall/index.js";
+import { type GateWall } from "../execution-policy/contract.js";
+import { gateWall as coreGateWall } from "../gate-wall/index.js";
 import { governedExecConfig, OUTPUT_TAIL_CHARS, type GovernedExecConfig } from "./config.js";
 import {
   govexecDenied,
