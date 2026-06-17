@@ -104,7 +104,7 @@ async function detectGodotTestCommand(
   // gdUnit4
   if (await fileExists(join(repoPath, "addons/gdUnit4"))) return "godot --headless -s addons/gdUnit4/bin/GdUnitCmdTool.gd";
   // Godot 4.x headless syntax check — lightweight, no test framework needed
-  if (await fileExists(join(repoPath, "project.godot"))) return "godot --headless --check-only";
+  if (await fileExists(join(repoPath, "project.godot"))) return "godot --headless --quit";
   return undefined;
 }
 

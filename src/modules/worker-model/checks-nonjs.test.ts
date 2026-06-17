@@ -113,7 +113,7 @@ test("resolveChecks: a Godot repo (project.godot) gets headless check by default
   if (r.ok) {
     assert.equal(r.checks[0]?.command, "godot", "uses godot binary");
     assert.ok(r.checks[0]?.args.includes("--headless"), "runs headless");
-    assert.ok(r.checks[0]?.args.includes("--check-only"), "syntax check mode");
+    assert.ok(r.checks[0]?.args.includes("--quit"), "headless quit mode");
     assert.ok(!r.checks.some((c) => c.command === "pnpm"), "no pnpm against Godot");
   }
 });

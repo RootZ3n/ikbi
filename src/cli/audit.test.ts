@@ -91,7 +91,7 @@ test("audit detects a Godot repo (project.godot)", async () => {
   await createAuditCli({ fileExists, readFileText, workspaces: noWorkspaces(), receipts: noReceipts(), stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit }).audit(["/repo"]);
   assert.equal(cap.exit, undefined);
   assert.match(cap.out, /Type:\s+Godot \(GDScript\)/);
-  assert.match(cap.out, /Test command:\s+godot --headless --check-only/);
+  assert.match(cap.out, /Test command:\s+godot --headless --quit/);
 });
 
 test("audit detects Godot with GUT test framework", async () => {

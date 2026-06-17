@@ -64,7 +64,7 @@ const GO_CHECKS: readonly Check[] = [
 const PYTHON_PYTEST_CHECKS: readonly Check[] = [{ name: "test", command: "python3", args: ["-m", "pytest", "-q"] }];
 
 /** Godot headless syntax check (Godot 4.x — lightweight, no test framework needed). */
-const GODOT_HEADLESS_CHECKS: readonly Check[] = [{ name: "check", command: "godot", args: ["--headless", "--check-only"] }];
+const GODOT_HEADLESS_CHECKS: readonly Check[] = [{ name: "check", command: "godot", args: ["--headless", "--quit"] }];
 
 /** Godot with GUT (Godot Unit Test) framework. */
 const GODOT_GUT_CHECKS: readonly Check[] = [{ name: "test", command: "godot", args: ["--headless", "-s", "addons/gut/gut_cmdln.gd"] }];
