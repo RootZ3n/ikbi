@@ -381,6 +381,12 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
         signal: AbortSignal.timeout(config.networkTimeoutMs),
       });
       const body = await res.text();
+      // Cap the body to prevent OOM from oversized responses (Bubbles HIGH-3).
+      const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
+      const bodyBuf = Buffer.from(body, "utf8");
+      const cappedBody = bodyBuf.length > MAX_RESPONSE_BYTES
+        ? new TextDecoder("utf-8").decode(bodyBuf.subarray(0, MAX_RESPONSE_BYTES)) + "\n[truncated: response exceeded 5 MB limit]"
+        : body;
       emit(govexecExecuted, { ...base, status: res.status }, identity, FETCH_OPERATION, requestId);
       await receipt(
         FETCH_OPERATION,
@@ -390,7 +396,7 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
         requestId,
         undefined,
       );
-      return { executed: true, status: res.status, bodyTail: tail(body) };
+      return { executed: true, status: res.status, bodyTail: tail(cappedBody) };
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
       emit(govexecFailed, { ...base, reason }, identity, FETCH_OPERATION, requestId);

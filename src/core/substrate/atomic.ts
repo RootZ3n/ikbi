@@ -99,7 +99,14 @@ export async function atomicWriteFile(
     }
   } catch (cause) {
     await unlink(tmp).catch(() => undefined);
-    throw new SubstrateError("write_failed", `failed to write temp file for ${filePath}`, { path: filePath, cause });
+    // Surface disk-full as a distinct error code so callers can distinguish it from
+    // permission/I/O errors (Bubbles LOW-1).
+    const isEnospc = cause instanceof Error && (cause as NodeJS.ErrnoException).code === "ENOSPC";
+    throw new SubstrateError(
+      isEnospc ? "disk_full" : "write_failed",
+      isEnospc ? `disk full writing temp file for ${filePath}` : `failed to write temp file for ${filePath}`,
+      { path: filePath, cause },
+    );
   }
 
   try {

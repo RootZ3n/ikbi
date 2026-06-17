@@ -44,7 +44,10 @@ export interface ModelCapabilities {
  */
 export const FALLBACK_CAPABILITIES: ModelCapabilities = Object.freeze({
   context_window: 8_192,
-  supports_tools: true,
+  // Conservative: unknown models default to text-tool emulation (no native tool calling).
+  // Known models override this in KNOWN_CAPABILITIES or FAMILY_PATTERNS.
+  // Roster entries can also override via ModelSpec.capabilities.supports_tools.
+  supports_tools: false,
   reasoning_level: "medium",
   speed_class: "medium",
 });
@@ -67,8 +70,8 @@ const FAMILY_PATTERNS: ReadonlyArray<{ readonly match: RegExp; readonly caps: Mo
   { match: /gpt-4o|gpt-4\.1|o[134]/i, caps: { context_window: 128_000, supports_tools: true, reasoning_level: "high", speed_class: "medium" } },
   { match: /claude/i, caps: { context_window: 200_000, supports_tools: true, reasoning_level: "high", speed_class: "medium" } },
   { match: /minimax/i, caps: { context_window: 131_072, supports_tools: true, reasoning_level: "high", speed_class: "medium" } },
-  { match: /qwen/i, caps: { context_window: 32_768, supports_tools: true, reasoning_level: "medium", speed_class: "fast" } },
-  { match: /(llama|gemma|phi|mistral|mixtral)/i, caps: { context_window: 8_192, supports_tools: true, reasoning_level: "low", speed_class: "fast" } },
+  { match: /qwen/i, caps: { context_window: 32_768, supports_tools: false, reasoning_level: "medium", speed_class: "fast" } },
+  { match: /(llama|gemma|phi|mistral|mixtral)/i, caps: { context_window: 8_192, supports_tools: false, reasoning_level: "low", speed_class: "fast" } },
 ];
 
 /** True iff `o` is a (possibly partial) capabilities override with at least one valid field. */

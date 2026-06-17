@@ -117,6 +117,7 @@ export function neutralizeUntrusted(
     defangedCount,
     truncated,
     omittedBytes,
+    blocked: scan.recommendedAction === "block",
   };
 
   const logFields = {

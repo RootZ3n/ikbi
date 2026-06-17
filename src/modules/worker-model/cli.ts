@@ -152,6 +152,11 @@ export function formatFailureDetail(r: WorkerResult): string {
 
   const label = r.outcome === "rejected" ? "REJECTED" : r.outcome === "partial" ? "PARTIAL" : "FAILED";
   lines.push(`Build ${label} — ${failedRole?.role ?? "unknown"}`);
+  // Show which roles were skipped (Bubbles FIX 15): the result only lists roles that ran.
+  const ALL_ROLES: WorkerRole[] = ["scout", "builder", "critic", "verifier", "integrator"];
+  const ranRoles = new Set(r.roles.map((x) => x.role));
+  const skipped = ALL_ROLES.filter((role) => !ranRoles.has(role));
+  if (skipped.length > 0) lines.push(`  Skipped: ${skipped.join(", ")} (not run)`);
 
   const reason = failedRole?.summary ?? r.reason;
   if (reason !== undefined && reason.trim().length > 0) {
@@ -461,15 +466,19 @@ function detectWriteScope(goal: string): "all" | "new_only" | "none" {
 
 /**
  * Parse `--repo <path>` / `--repo=<path>`, `--verbose`/`-v`, `--cost`, `--yes`/`-y`,
- * and `--delegation <json>`; the rest is the goal prose. `--yes` skips the interactive
- * Socratic interview prompt and proceeds with the original goal.
+ * `--json`, and `--delegation <json>`; the rest is the goal prose. `--yes` skips the
+ * interactive Socratic interview prompt and proceeds with the original goal. `--json`
+ * forces a CLEAN machine-readable contract: ONLY the JSON result is written to STDOUT —
+ * every progress/diagnostic/hint/repair/cost line is routed to STDERR so a caller can pipe
+ * stdout straight into a JSON parser without log noise interleaved (FIX 3).
  */
-export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbose?: boolean; cost?: boolean; yes?: boolean; delegation?: string; noMemory?: boolean; memoryDiff?: boolean; rest: string[] } {
+export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbose?: boolean; cost?: boolean; yes?: boolean; json?: boolean; delegation?: string; noMemory?: boolean; memoryDiff?: boolean; rest: string[] } {
   const rest: string[] = [];
   let repo: string | undefined;
   let verbose = false;
   let cost = false;
   let yes = false;
+  let json = false;
   let delegation: string | undefined;
   let noMemory = false;
   let memoryDiff = false;
@@ -486,6 +495,8 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
       cost = true;
     } else if (a === "--yes" || a === "-y") {
       yes = true;
+    } else if (a === "--json") {
+      json = true;
     } else if (a === "--delegation") {
       delegation = argv[i + 1];
       i += 1;
@@ -499,7 +510,7 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
       rest.push(a);
     }
   }
-  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), ...(verbose ? { verbose } : {}), ...(cost ? { cost } : {}), ...(yes ? { yes } : {}), ...(delegation !== undefined ? { delegation } : {}), ...(noMemory ? { noMemory } : {}), ...(memoryDiff ? { memoryDiff } : {}), rest };
+  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), ...(verbose ? { verbose } : {}), ...(cost ? { cost } : {}), ...(yes ? { yes } : {}), ...(json ? { json } : {}), ...(delegation !== undefined ? { delegation } : {}), ...(noMemory ? { noMemory } : {}), ...(memoryDiff ? { memoryDiff } : {}), rest };
 }
 
 /** Render a worker `worker.*` progress event into a concise human line (for `--verbose`). PURE. */

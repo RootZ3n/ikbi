@@ -1131,7 +1131,7 @@ export class ChatSession {
   pendingChangeCount(): number {
     const recorded = new Set(this.fileHistory.map((m) => m.path)).size;
     try {
-      const out = execFileSync("git", ["-C", this.worktree, "status", "--porcelain"], { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 });
+      const out = execFileSync("git", ["-C", this.worktree, "status", "--porcelain"], { encoding: "utf8", maxBuffer: 4 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] });
       const gitCount = out.split("\n").filter((l) => l.trim().length > 0).length;
       return gitCount > 0 ? gitCount : recorded;
     } catch {
@@ -1141,7 +1141,7 @@ export class ChatSession {
 
   pendingDiff(): string {
     try {
-      return execFileSync("git", ["-C", this.worktree, "diff", "--"], { encoding: "utf8", maxBuffer: 4 * 1024 * 1024 });
+      return execFileSync("git", ["-C", this.worktree, "diff", "--"], { encoding: "utf8", maxBuffer: 4 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"] });
     } catch {
       return "[diff unavailable: workdir is not a git repository or git failed]\n";
     }

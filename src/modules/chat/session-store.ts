@@ -186,8 +186,12 @@ export class PersistentSessionStore {
           throw new SessionLockedError(id, owner.pid, owner.startedAt);
         }
         // Stale (dead/unknown owner) or force: clear the lock and retry the create.
+        // Add a small random delay to reduce the window where two processes race
+        // on reclaiming the same stale lock (Bubbles MED-3).
         log.warn({ sessionId: id, holderPid: owner?.pid, forced: force }, "chat-store: reclaiming stale/forced session lock");
-        rmSync(lockDir, { recursive: true, force: true });
+        try { rmSync(lockDir, { recursive: true, force: true }); } catch { /* already gone */ }
+        // Brief sleep to let concurrent reclaimers finish their mkdir first.
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10 + Math.floor(Math.random() * 20));
       }
     }
   }

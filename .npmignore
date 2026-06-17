@@ -1,0 +1,5 @@
+# Exclude test files from npm package (Fix 17: Codex LOW)
+dist/**/*.test.js
+dist/**/*.test.js.map
+dist/**/*.test.d.ts
+dist/**/*.test.d.ts.map

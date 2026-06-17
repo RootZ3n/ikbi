@@ -157,7 +157,7 @@ export function createMcpCli(deps: McpCliDeps = {}) {
 const liveMcp = createMcpCli();
 registerCommand({
   name: "mcp",
-  summary: "Run the governed MCP model+tool loop against a stdio MCP server",
+  summary: "[experimental] standalone MCP model+tool loop (not yet wired into build/REPL)",
   usage: 'ikbi mcp --server "<command [args...]>" <goal...> [--model <id>]',
   run: (argv) => liveMcp.run(argv),
 });

@@ -206,6 +206,8 @@ export interface NeutralizedContent {
   readonly truncated: boolean;
   /** UTF-8 bytes omitted by truncation (0 when not truncated). */
   readonly omittedBytes: number;
+  /** True when the scanner recommends blocking (recommendedAction === "block"). */
+  readonly blocked: boolean;
 }
 
 /** Options accepted by the chokepoint entry points. */

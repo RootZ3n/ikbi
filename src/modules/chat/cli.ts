@@ -694,7 +694,10 @@ export async function liveRepl(argv: readonly string[] = []): Promise<void> {
     let workspace;
     if (state.workdirKind === "managed" && state.workspaceId !== undefined) {
       workspace = await reconnectSessionWorkspace(state.workspaceId, { sessionId: state.id });
-      if (workspace === undefined) out(`[managed workspace ${state.workspaceId} is no longer available — /diff, /apply, /discard are disabled this session]\n`);
+      if (workspace === undefined) {
+        out(`[WARNING: managed workspace ${state.workspaceId} is gone — /diff, /apply, /discard are DISABLED]\n`);
+        out(`[This session is read-only. Start a new session (ikbi repl) to make and apply changes.]\n`);
+      }
     }
     return new ChatSession(state.id, { restore: state, autosave, ...(workspace !== undefined ? { workspace } : {}) });
   };

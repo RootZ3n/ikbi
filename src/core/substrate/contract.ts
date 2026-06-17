@@ -41,6 +41,7 @@ export type SubstrateErrorKind =
   | "lock_timeout" // could not acquire a lock within the timeout
   | "corrupt_state" // a state file failed to parse/validate (fail-closed)
   | "write_failed" // an atomic write could not be completed durably
+  | "disk_full" // ENOSPC — disk full during write (Bubbles LOW-1)
   | "invalid_key" // an unsafe document id / key (e.g. path traversal)
   | "io"; // an underlying filesystem error
 

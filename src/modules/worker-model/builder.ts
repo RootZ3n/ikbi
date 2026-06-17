@@ -20,7 +20,9 @@
  *  PATH CONFINEMENT: every tool path is resolved against the worktree and rejected
  *     if it escapes (.. traversal, absolute-outside, or symlink escape). A rejected
  *     call returns a tool ERROR (still neutralized) and never touches the real fs
- *     outside the worktree.
+ *     outside the worktree. NOTE: symlink check has a documented TOCTOU window
+ *     (confine.ts:54-56) between realpath check and file operation — exploitation
+ *     requires attacker write access to worktree + microsecond timing.
  *  BOUNDED LOOP: MAX_TOOL_ITERATIONS rounds AND a wall-clock budget
  *     (config.roleTimeoutMs). The loop continues only while finishReason ===
  *     "tool_calls".
@@ -871,8 +873,10 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
           // appendToolResult's neutralization chokepoint like every other tool result.
           return scoutDetail(scoutInfo.findings, args);
         default:
-          rejectedToolCalls.push({ tool: call.name, error: "unknown tool" });
-          return `ERROR: unknown tool "${call.name}"`;
+          rejectedToolCalls.push({ tool: "[redacted]", error: "unknown tool" });
+          // Don't embed the raw tool name (model output, untrusted) in the error string
+          // — the chokepoint handles it, but defense-in-depth says sanitize at the source.
+          return `ERROR: unknown tool (name redacted for safety)`;
       }
     };
 

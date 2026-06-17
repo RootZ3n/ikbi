@@ -104,6 +104,7 @@ export function runDoctor(inp: DoctorInputs = {}): DoctorResult {
     ...(competitive ?? []).map((id) => ({ label: "competitive model", id, ok: resolves(reg.getModel(id)) })),
   ];
   const broken = modelChecks.filter((m) => !m.ok);
+  // Structural check: do role models resolve to registered providers? (checked via `broken` above)
   const providerEntry = broken.length === 0
     ? { ok: true, label: `provider — all role models resolve (driver '${driverId}', builder '${builderId}', critic '${criticId}'${competitive ? `, competitive ${competitive.map((m) => `'${m}'`).join(", ")}` : ""})`, fix: "" }
     : (() => {

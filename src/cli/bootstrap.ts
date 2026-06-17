@@ -118,7 +118,9 @@ export function enableDevKeysForInfoCommand(argv: readonly string[], env: NodeJS
   const isInfo = cmd === undefined || INFO_COMMANDS.has(cmd);
   if (!isInfo) return false;
   if (env.IKBI_ALLOW_INSECURE_DEV_KEYS !== undefined) return false; // operator already chose
-  const keysMissing = env.IKBI_TRUST_HMAC_KEY === undefined || env.IKBI_IDENTITY_TOKEN_SALT === undefined;
+  // Treat blank strings as missing too — config.ts:optStr() treats them as undefined,
+  // so a blank key in .env would pass this check but still throw a raw stack from config.
+  const keysMissing = !env.IKBI_TRUST_HMAC_KEY?.trim() || !env.IKBI_IDENTITY_TOKEN_SALT?.trim();
   if (!keysMissing) return false;
   env.IKBI_ALLOW_INSECURE_DEV_KEYS = "true";
   return true;

@@ -129,6 +129,13 @@ export class WorkspaceManager {
     return this.initPromise;
   }
 
+  /** Force a fresh preload on next access (invalidates the cache). Used when cross-process
+   *  changes may have occurred since the last preload (Bubbles LOW-2). */
+  invalidatePreloadCache(): void {
+    // eslint-disable-next-line @typescript-eslint/no-dynamic-delete
+    delete this.initPromise;
+  }
+
   private async doPreload(): Promise<number> {
     let loaded = 0;
     for (const id of await this.store.list()) {
@@ -157,9 +164,17 @@ export class WorkspaceManager {
       throw new WorkspaceError("config", `target is not a git repository: ${opts.targetRepo}`);
     }
     await this.preload();
+    // Cross-process file lock: CLI + server share the same workspace store,
+    // so the allocation check + create must be serialized across processes.
     return this.locks.withLock(ALLOC_LOCK, async () => {
       if (this.live.size >= this.max) {
-        throw new WorkspaceError("limit", `workspace limit reached (${this.max}); cannot allocate`);
+        // Refresh the live Map from the persistent store before failing — another
+        // process may have discarded workspaces since our last preload (Bubbles LOW-2).
+        this.invalidatePreloadCache();
+        await this.preload();
+        if (this.live.size >= this.max) {
+          throw new WorkspaceError("limit", `workspace limit reached (${this.max}); cannot allocate`);
+        }
       }
       const baseBranch = opts.baseBranch ?? (await currentBranch(opts.targetRepo));
       const baseRef = await revParse(opts.targetRepo, baseBranch);

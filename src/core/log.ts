@@ -15,21 +15,16 @@ export function resolveLogLevel(env: NodeJS.ProcessEnv = process.env, isTty: boo
   return isTty ? "silent" : config.logLevel;
 }
 
-/** The root logger for the ikbi service. */
-export const log: Logger = pino({
-  level: resolveLogLevel(),
-  base: {
-    service: "ikbi",
-    version: config.version,
+/** The root logger for the ikbi service. Routes to stderr so CLI stdout stays clean. */
+export const log: Logger = pino(
+  {
+    level: resolveLogLevel(),
+    base: { service: "ikbi", version: config.version },
+    formatters: { level(label) { return { level: label }; } },
+    timestamp: pino.stdTimeFunctions.isoTime,
   },
-  formatters: {
-    // Emit the level as a human-readable string ("info") rather than a number.
-    level(label) {
-      return { level: label };
-    },
-  },
-  timestamp: pino.stdTimeFunctions.isoTime,
-});
+  process.stderr,
+);
 
 /** Create a child logger bound to a named component (e.g. "server", "config"). */
 export function childLogger(component: string): Logger {

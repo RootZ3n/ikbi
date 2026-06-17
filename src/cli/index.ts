@@ -71,7 +71,7 @@ const cognitionRouter = createCognitionRouter({ dispatch: dispatchCommand });
 function printUsage(): void {
   const moduleCmds = commands.all().filter((c) => !BUILTINS.has(c.name));
   const lines = [
-    `ikbi v${config.version} — build/repair engine (skeleton)`,
+    `ikbi v${config.version} — governed build/repair engine (experimental CLI)`,
     "",
     "Usage: ikbi <command> | ikbi <goal...> [--project <name>]",
     "",
