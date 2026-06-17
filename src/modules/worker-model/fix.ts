@@ -36,6 +36,7 @@ import { diagnoseFailure, type Diagnosis, type DiagnosisFile } from "./fix-diagn
 import { FixReceiptBuilder, type FixReceipt, type FixResult, type ParsedOutcomes } from "./fix-receipt.js";
 import { applyFilePatch, extractDiff, parseUnifiedDiff } from "./patchsmith.js";
 import { builderModel } from "./role-models.js";
+import { escalationConfig } from "../escalation/config.js";
 
 /** A check command fix mode runs to reproduce/verify (e.g. `pytest -q`). */
 export interface FixCheckCommand {
@@ -78,6 +79,19 @@ const PATCH_MAX_TOKENS = 4_096;
 const MAX_FILE_BYTES = 24_000;
 /** How many patch+verify attempts the fix-retry loop makes before giving up (Gap M6). */
 export const MAX_FIX_ATTEMPTS = 3;
+
+/**
+ * The default per-attempt patch model roster (dual-model escalation, Gap M6): the cheap worker
+ * model carries the early attempts, escalating to the mid tier on the LAST attempt. The cheap
+ * builder diagnoses well but can stall on a fix; spending a stronger model only on the final retry
+ * (after the cheap model has already tried twice) recovers the hard cases without paying the mid
+ * tier on every fix. The worker fallback is `base` (the configured builder), and the escalation
+ * target is the first entry of `IKBI_ESCALATION_MID_MODELS` (falling back to `base` when unset).
+ */
+export function defaultEscalationModels(base: string): readonly string[] {
+  const mid = escalationConfig.tierModels.mid[0] ?? base;
+  return [base, base, mid];
+}
 const DEFAULT_IDENTITY: AgentIdentity = { agentId: "fix", functionalRole: "fix" };
 
 /** Config files a fix may not touch without `--allow-config-edits` (alters test discovery). */
@@ -98,6 +112,13 @@ export interface FixOptions {
   readonly diagnoseOnly?: boolean;
   /** Optional free-form context handed to diagnosis (e.g. an operator note). */
   readonly goal?: string;
+  /**
+   * Per-attempt patch model ids (dual-model escalation, Gap M6). Index `i` is the model used on
+   * attempt `i+1`; attempts beyond the list reuse the last entry. Default: cheap worker model for
+   * the first attempts, escalating to the mid tier on the final attempt (see
+   * `defaultEscalationModels`). e.g. ["deepseek-v4-flash", "deepseek-v4-flash", "deepseek-v4-pro"].
+   */
+  readonly escalationModels?: readonly string[];
 }
 
 export interface FixDeps {
@@ -380,7 +401,15 @@ export async function runFixPipeline(opts: FixOptions, deps: FixDeps): Promise<F
   let lastVerdict = antiCheatCheck({ changes: [], allowedFiles: planFiles, allowTestEdits });
   let lastFilesModified: string[] = [];
 
+  // Per-attempt patch model (dual-model escalation, Gap M6): early attempts use the cheap worker
+  // model, the final attempt escalates to the mid tier. Attempts beyond the roster reuse its last
+  // entry. `modelId` (the diagnosis model) is the fallback when an entry is missing.
+  const attemptModels = opts.escalationModels ?? defaultEscalationModels(modelId);
+
   for (let attempt = 1; attempt <= MAX_FIX_ATTEMPTS; attempt++) {
+    const currentModel = attemptModels[Math.min(attempt - 1, attemptModels.length - 1)] ?? modelId;
+    builder.recordAttemptModel(currentModel);
+
     // Reset the disk to the original snapshot before regenerating (no-op on the first attempt).
     if (everModified.length > 0) {
       restore(everModified);
@@ -390,7 +419,7 @@ export async function runFixPipeline(opts: FixOptions, deps: FixDeps): Promise<F
     // ── STAGE 7: APPLY (generate -> validate every path -> apply) ──────────────
     const patchResult = await generateFixPatch(
       { diagnosis, files: fileBlocks, rawOutput: feedbackOutput, ...(previousDiff !== undefined ? { previousDiff } : {}) },
-      { invokeModel, neutralize, modelId, identity, attempt },
+      { invokeModel, neutralize, modelId: currentModel, identity, attempt },
     );
     if (!patchResult.ok) {
       // Could not produce a usable patch — terminal SAFE_FAIL (nothing changed; no cheat).

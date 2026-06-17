@@ -88,6 +88,12 @@ export interface FixReceipt {
    * authored before the field existed — the builder always populates it.
    */
   readonly attempts?: number;
+  /**
+   * The patch model used on each attempt, in order (dual-model escalation, Gap M6). Index `i` is
+   * the model id of attempt `i+1`. Empty when no repair was attempted. Optional for back-compat with
+   * receipts authored before the field existed — the builder always populates it.
+   */
+  readonly attemptModels?: readonly string[];
   readonly result: FixResult;
   /** Whether the fix was promoted. ALWAYS false in this slice — promote requires explicit approval. */
   readonly promoted: boolean;
@@ -121,6 +127,7 @@ export class FixReceiptBuilder {
   private fullCheck: FixReceipt["fullCheck"] = { passed: false, regressionCount: 0 };
   private antiCheat: FixReceipt["antiCheat"] = { passed: true, checks: [] };
   private attempts = 0;
+  private readonly attemptModels: string[] = [];
 
   constructor(started: { timestamp: string; repo: string; check: string; head: string }) {
     this.started = { ...started };
@@ -159,6 +166,11 @@ export class FixReceiptBuilder {
     this.attempts = n;
   }
 
+  /** Record the patch model used on one attempt, in order (dual-model escalation, Gap M6). */
+  recordAttemptModel(model: string): void {
+    this.attemptModels.push(model);
+  }
+
   /** Produce the immutable receipt. `promoted` is hardcoded false (no promote without approval). */
   finalize(result: FixResult): FixReceipt {
     return {
@@ -171,6 +183,7 @@ export class FixReceiptBuilder {
       fullCheck: this.fullCheck,
       antiCheat: this.antiCheat,
       attempts: this.attempts,
+      attemptModels: [...this.attemptModels],
       result,
       promoted: false,
     };
