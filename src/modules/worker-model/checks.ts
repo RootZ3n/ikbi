@@ -528,9 +528,19 @@ function detectToolLimitation(command: string, output: string): { reason: string
     if (/Unexpected token.*async/i.test(output) || /Unexpected token.*'NAME'.*'async'/i.test(output)) {
       return { reason: "gdtoolkit parser does not support `async func` syntax (GDScript 4.x) — tool limitation, not a project error" };
     }
-    if (/Unexpected token/i.test(output) && /Expected one of/i.test(output)) {
-      // Generic parser failure — could be modern syntax the tool doesn't know
-      return { reason: "gdtoolkit parser failed on syntax the tool does not recognize — may be a tool limitation" };
+    // A generic "Unexpected token … Expected one of" is NOT enough on its own — that matches ANY
+    // parse error, including a real syntax mistake in the project (which is a PROJECT_RED, not a
+    // tool limitation). Only classify it as a tool limitation when the UNEXPECTED token is a known
+    // modern-syntax construct the tool predates (C5: gdtoolkit detector was too broad).
+    const TOOL_LIMITATION_PATTERNS: readonly RegExp[] = [
+      /async\s+func/i, // GDScript 4.x async functions
+      /@export|@onready|@tool\b|@icon|@rpc/i, // GDScript 4.x annotations (named forms)
+      /Token\('AT'/, // gdtoolkit's token name for an annotation '@'
+      /match\s*[:{]/, // Python 3.10+ / GDScript match-case
+      /type\s+\w+\s*=/i, // Python 3.10+ type aliases
+    ];
+    if (/Unexpected token/i.test(output) && /Expected one of/i.test(output) && TOOL_LIMITATION_PATTERNS.some((re) => re.test(output))) {
+      return { reason: "gdtoolkit parser failed on modern syntax it does not recognize (e.g. an annotation or async func) — tool limitation, not a project error" };
     }
   }
   // Python tools: syntax version mismatches
