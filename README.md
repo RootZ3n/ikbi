@@ -130,6 +130,7 @@ Stop it with `Ctrl-C` (SIGINT) or `kill -TERM <pid>` — it drains and exits 0.
 | `ikbi clean` | Reclaim orphaned git worktrees (retained work is preserved) |
 | `ikbi cost` | Cost breakdown by task from the receipt log |
 | `ikbi audit <repo>` | Read-only diagnostic snapshot of a repo |
+| `ikbi memory [proposals\|approve\|reject\|reject-all\|stats]` | Review and manage memory governance proposals (brain pages, project files) |
 | `ikbi doctor` | Report bootstrap config; `--fix` repairs common gaps |
 | `ikbi capabilities` | Tool inventory + surface classification |
 | `ikbi repos` | List registered repos (from state/repos.json) |
@@ -331,6 +332,25 @@ deliberate deferral). Each surface's honest classification and lifecycle truth i
 doctor`, `ikbi capabilities`, the REPL `/status` command, and the HTTP `GET /capabilities` endpoint,
 and is specified in [`docs/PRODUCT-SPINE.md`](docs/PRODUCT-SPINE.md) and
 [`docs/ARCHITECTURE-INVARIANTS.md`](docs/ARCHITECTURE-INVARIANTS.md).
+
+## Memory Governance
+
+Ikbi intercepts writes to durable memory surfaces and converts them into **proposals** requiring operator review. This prevents the model from installing bad beliefs, bad instructions, or bad self-improvement rules into permanent storage.
+
+**Governed surfaces:**
+- `brain_put` (knowledge brain pages)
+- `.ikbi/project.md`, `.ikbi/checks.yaml`, `.ikbi/ignore`
+- `CLAUDE.md`, `AGENTS.md`, `IKBI.md`
+
+**Proposal lifecycle:** Model proposes → operator reviews → approved proposals are applied.
+
+```
+ikbi memory proposals              # list pending proposals
+ikbi memory approve <id>           # approve and apply
+ikbi memory reject <id>            # reject
+ikbi memory reject-all             # reject all pending
+ikbi memory stats                  # counts by status
+```
 
 ## Running under systemd
 

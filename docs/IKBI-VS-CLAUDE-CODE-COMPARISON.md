@@ -99,7 +99,7 @@ ikbi has the full stdio transport (`src/modules/mcp-model-loop/transports/stdio.
 
 These were found in prior audits and are now verified fixed:
 
-- **Chat/builder tool parity 16/16** — was 13/16 (`scout_detail`, `run_checks`, `done` missing from chat). Fixed. Verified via `ikbi capabilities` output.
+- **Chat/builder tool parity 22/22** — was 13/16 (`scout_detail`, `run_checks`, `done` missing from chat). Fixed. Verified via `ikbi capabilities` output.
 - **MCP stdio transport** — was mock-only. Now real wire protocol in `src/modules/mcp-model-loop/transports/stdio.ts`. Not default yet.
 - **Cognition layer wiring** — was import-only in CLI fallback. Now live for `ikbi <goal>` bare-goal routing.
 - **Context compressor invocation** — was wired in builder but untested. Now `maybeCompress()` called before every model invocation.
@@ -165,7 +165,7 @@ These are open from the Bubbles pass (June 8 audit) that are still relevant:
 
 ## Summary
 
-ikbi strengths:  Security/Governance (★★★), Audit Trail (★★★), Cheap Models (★★★), Build Pipeline (★★★), Multi-Agent Safety (★★★), Cost Efficiency (★★★), Tool Set 16 tools (★★☆)
+ikbi strengths:  Security/Governance (★★★), Audit Trail (★★★), Cheap Models (★★★), Build Pipeline (★★★), Multi-Agent Safety (★★★), Cost Efficiency (★★★), Tool Set 22 tools (★★☆)
 CC strengths:     IDE Integration (★★★), MCP Tools (★★★), User Memory (★★★), Modes (★★☆), Desktop/Web App (★★☆), Prompt Caching (★★☆), Hook System (★★☆), CI/CD Integration (★★☆), Auto-update (★★☆)
 
 **ikbi is production-ready for development use with two small fixes.** The architecture is sound, the tests pass (924/924), and the gaps are tactical integration surfaces rather than fundamental design issues. MCP transport default and user-facing memory are the only must-fix items before ikbi can be a full CC replacement.
