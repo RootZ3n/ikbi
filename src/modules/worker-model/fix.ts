@@ -28,6 +28,7 @@ import { dirname, join } from "node:path";
 import { neutralizeUntrusted, toUntrustedMessage } from "../../core/injection/index.js";
 import type { NeutralizedContent, UntrustedContext } from "../../core/injection/contract.js";
 import type { AgentIdentity, ModelMessage, ModelRequest, ModelResponse } from "../../core/provider/contract.js";
+import { resolveChecks } from "./checks.js";
 import { parseCheckOutput } from "../check-triage/index.js";
 import { confinePath } from "./builder-tools/confine.js";
 import { antiCheatCheck, isTestFile, type FileChange } from "./fix-anti-cheat.js";
@@ -48,8 +49,29 @@ export interface CheckRun {
   readonly output: string;
 }
 
-/** The DEFAULT check for the thin slice (one Python pytest repo). */
+/** The LAST-RESORT check when project-type detection fails (no recognizable manifest). */
 export const DEFAULT_FIX_CHECK: FixCheckCommand = { command: "python3", args: ["-m", "pytest", "-q"] };
+
+/**
+ * Resolve the default reproduce/verify check for a repo by DETECTING its project type — the same
+ * detection the verifier and `audit` use (`resolveChecks`: Node→pnpm/npm/yarn test, Rust→cargo test,
+ * Go→go test, Python→pytest, Godot→godot --headless). A Node.js repo no longer defaults to pytest
+ * (the M1 bug). Picks the suite check (the one named "test", else the last resolved check — typecheck
+ * comes first), and honors an operator-set `IKBI_CHECKS`. Falls back to pytest (DEFAULT_FIX_CHECK)
+ * ONLY when no project type can be detected, preserving the original thin-slice behavior.
+ */
+export function defaultFixCheckFor(repo: string, env: NodeJS.ProcessEnv = process.env): FixCheckCommand {
+  let root = repo;
+  try {
+    root = realpathSync(repo);
+  } catch {
+    /* unresolvable path — resolveChecks will fail closed and we fall back below */
+  }
+  const resolution = resolveChecks(root, env);
+  if (!resolution.ok || resolution.checks.length === 0) return DEFAULT_FIX_CHECK;
+  const test = resolution.checks.find((c) => c.name === "test") ?? resolution.checks[resolution.checks.length - 1]!;
+  return { command: test.command, args: [...test.args] };
+}
 
 const PATCH_TEMPERATURE = 0;
 const PATCH_MAX_TOKENS = 4_096;
@@ -234,7 +256,7 @@ function refusalResult(d: Diagnosis, allowTestEdits: boolean): FixResult | undef
  * surfaces as a SAFE_FAIL/UNRESOLVED outcome with a complete receipt. Never promotes.
  */
 export async function runFixPipeline(opts: FixOptions, deps: FixDeps): Promise<FixOutcome> {
-  const check = opts.check ?? DEFAULT_FIX_CHECK;
+  const check = opts.check ?? defaultFixCheckFor(opts.repo);
   const allowTestEdits = opts.allowTestEdits ?? false;
   const allowConfigEdits = opts.allowConfigEdits ?? false;
   const maxFiles = opts.maxFiles ?? 5;

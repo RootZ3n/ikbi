@@ -167,7 +167,7 @@ export function createFixCli(deps: FixCliDeps = {}) {
         "Usage: ikbi fix <repo> [--check \"<cmd>\"] [options]\n\n" +
           "Diagnose a failing check and repair it narrowly — or correctly refuse.\n\n" +
           "Options:\n" +
-          "  --check \"<cmd>\"       The failing check to reproduce (default: python3 -m pytest -q)\n" +
+          "  --check \"<cmd>\"       The failing check to reproduce (default: auto-detected from the repo — Node→pnpm/npm/yarn test, Rust→cargo test, Go→go test, Python→pytest, Godot→godot --headless)\n" +
           "  --allow-test-edits    Permit editing test files (default: off — tests are ground truth)\n" +
           "  --allow-config-edits  Permit editing test-discovery config files (default: off)\n" +
           "  --diagnose-only       Stages 1-4 only (classify, no edits)\n" +
