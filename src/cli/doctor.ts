@@ -265,6 +265,12 @@ export interface DoctorFixPorts {
   countStaleWorkspaces(): Promise<number>;
   /** Reclaim stale workspaces (the destructive `--force` path). */
   cleanWorkspaces(opts: { force: boolean }): Promise<{ removed: number; skipped: number }>;
+  /**
+   * Gap M16 — SAFE age-bounded auto-reclaim: remove ONLY terminal workspaces past the retention
+   * window (`IKBI_WORKSPACE_MAX_AGE_HOURS`), runnable WITHOUT `--force`. Optional: when absent
+   * (e.g. a test that does not opt in), the age sweep is skipped and only the report-only count runs.
+   */
+  reclaimAgedWorkspaces?(maxAgeHours: number): Promise<{ removed: number; skipped: number }>;
 }
 
 /** Inputs to a `--fix` run — all default to the live singletons / process. */
@@ -406,7 +412,22 @@ export async function runDoctorFix(ports: DoctorFixPorts, inp: DoctorFixInputs =
   push("");
   push("STALE WORKSPACES");
   if (!force) {
-    // NON-DESTRUCTIVE: never delete without --force — only report what could be reclaimed.
+    // M16 — SAFE auto-reclaim of workspaces PAST the retention window (default 7 days). This is
+    // bounded by age (never touches recent work) and so is safe WITHOUT --force, bounding the
+    // unbounded accumulation. Workspaces still inside the window are reported below for --force.
+    const maxAgeHours = cfg.workspace.maxAgeHours;
+    if (ports.reclaimAgedWorkspaces !== undefined) {
+      attempted += 1;
+      push(`  … auto-reclaiming workspaces older than ${maxAgeHours}h (past the retention window)…`);
+      try {
+        const aged = await ports.reclaimAgedWorkspaces(maxAgeHours);
+        push(`  ${OK} reclaimed ${aged.removed} aged workspace(s)${aged.skipped > 0 ? ` (${aged.skipped} still inside the window — kept)` : ""}`);
+      } catch (err) {
+        failures += 1;
+        push(`  ${BAD} aged-workspace auto-reclaim failed: ${errMsg(err)}`);
+      }
+    }
+    // NON-DESTRUCTIVE: never delete RECENT stale work without --force — only report it.
     try {
       const n = await ports.countStaleWorkspaces();
       if (n === 0) {
@@ -487,6 +508,10 @@ export function liveFixPorts(): DoctorFixPorts {
     countStaleWorkspaces: () => countLiveStaleWorkspaces(),
     cleanWorkspaces: async (opts) => {
       const r = await coreWorkspaces.cleanOrphans(opts);
+      return { removed: r.removed, skipped: r.skipped };
+    },
+    reclaimAgedWorkspaces: async (maxAgeHours) => {
+      const r = await coreWorkspaces.cleanOrphans({ force: false, olderThanMs: maxAgeHours * 60 * 60 * 1000 });
       return { removed: r.removed, skipped: r.skipped };
     },
   };

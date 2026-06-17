@@ -539,9 +539,13 @@ export class WorkspaceManager {
    * `ikbi clean` passes `force:false`; `ikbi clean --force` opts into removing them. The core
    * default is also `force:false` so direct/programmatic callers are safe by default.
    */
-  async cleanOrphans(opts: { force?: boolean } = {}): Promise<{ removed: number; checked: number; skipped: number; reclaimed: number; skippedIds: string[] }> {
+  async cleanOrphans(opts: { force?: boolean; olderThanMs?: number } = {}): Promise<{ removed: number; checked: number; skipped: number; reclaimed: number; skippedIds: string[] }> {
     await this.preload();
     const force = opts.force ?? false;
+    // Gap M16 — age-bounded sweep. When `olderThanMs` is set, only TERMINAL records last touched
+    // before the cutoff are reclaimed (the safe retention-window auto-clean `ikbi doctor --fix`
+    // runs without --force); a record still inside the window is left for an explicit `--force`.
+    const ageCutoff = opts.olderThanMs !== undefined ? this.now() - opts.olderThanMs : undefined;
 
     // Wire reclaim (previously zero production callers): reconcile crash-leaked active records +
     // prune orphan worktrees/branches per distinct repo, BEFORE sweeping terminal dirs.
@@ -569,6 +573,12 @@ export class WorkspaceManager {
       const terminal = rec.state === "promoted" || rec.state === "discarded" || rec.state === "failed";
       if (!terminal) continue;
       checked += 1;
+      // Age-bounded sweep (M16): a terminal record still inside the retention window is left alone.
+      if (ageCutoff !== undefined && rec.updatedAt > ageCutoff) {
+        skipped += 1;
+        skippedIds.push(id);
+        continue;
+      }
       if (!(await this.pathExists(rec.path))) continue; // dir already gone — nothing to reclaim
       // SAFETY: never destroy retained (the only copy of failed-build work) without --force.
       if (!force && this.isRetained(rec)) {
