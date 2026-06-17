@@ -18,7 +18,10 @@ export interface ChatResponse {
 
 export type StreamCallback = (chunk: string) => void;
 
-/** Default model endpoint — overridable via IKBI_CHAT_* env or constructor opts. */
+// Default model endpoint: the documented default MiMo provider (mimo-v2.5),
+// matching ikbi's core config default (src/core/config.ts) and egress allowlist.
+// Point at any OpenAI-compatible endpoint via IKBI_CHAT_BASE_URL / IKBI_CHAT_MODEL
+// (or the constructor opts) — e.g. a local model or your own gateway.
 const DEFAULT_BASE_URL = 'https://api.xiaomimimo.com/v1';
 const DEFAULT_MODEL = 'mimo-v2.5';
 
