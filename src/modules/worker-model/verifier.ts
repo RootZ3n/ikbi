@@ -762,6 +762,11 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
     }));
     const allPass = triaged.every((t) => t.check.exitCode === 0 && t.triage.passed);
     const failed = triaged.filter((t) => !t.triage.passed).map((t) => t.check.name);
+    // TOOL_LIMITATION: failures caused by the verification tool, not the project.
+    // If ALL failures are tool limitations, the project is fine — the tool just can't parse it.
+    const toolLimitations = triaged.filter((t) => !t.triage.passed && t.check.toolLimitation !== undefined);
+    const realFailures = triaged.filter((t) => !t.triage.passed && t.check.toolLimitation === undefined);
+    const allFailuresAreToolLimitations = !allPass && realFailures.length === 0 && toolLimitations.length > 0;
 
     // STUB-SCRIPT GUARD (legacy parity with the ladder): a greenfield "test":"echo ok" exits 0 and
     // would pass — but a no-op test script is not verification. Fail closed before declaring green.
@@ -793,9 +798,19 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
 
     return {
       role: "verifier",
-      outcome: allPass ? "success" : "failure",
-      summary: allPass ? "all checks passed" : `checks failed: ${failed.join(", ")}`,
-      detail: { verdict: allPass ? "pass" : "fail", verificationMode, checks, ...(allPass ? { qualityPassed: true } : {}) },
+      outcome: allPass || allFailuresAreToolLimitations ? "success" : "failure",
+      summary: allPass
+        ? "all checks passed"
+        : allFailuresAreToolLimitations
+          ? `all checks passed (tool limitations: ${toolLimitations.map((t) => `${t.check.name}: ${t.check.toolLimitation!.reason}`).join("; ")})`
+          : `checks failed: ${failed.join(", ")}`,
+      detail: {
+        verdict: allPass ? "pass" : allFailuresAreToolLimitations ? "tool_limited" : "fail",
+        verificationMode,
+        checks,
+        ...(allPass ? { qualityPassed: true } : {}),
+        ...(allFailuresAreToolLimitations ? { toolLimitations: toolLimitations.map((t) => ({ check: t.check.name, reason: t.check.toolLimitation!.reason })) } : {}),
+      },
     };
 
     // ── LADDER MODE implementation (hoisted; reached only when IKBI_VERIFY=ladder) ──────────

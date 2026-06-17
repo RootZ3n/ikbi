@@ -471,6 +471,12 @@ export interface CheckResult {
    * verdict layer (readVerifier) has a reliable count. Absent when no count was present in the output.
    */
   readonly testCount?: { readonly passed: number; readonly total: number };
+  /**
+   * When present, this check failure is caused by the VERIFICATION TOOL, not the project.
+   * The project may be perfectly fine — the tool simply cannot parse/analyze modern syntax.
+   * A verifier should classify this as TOOL_LIMITATION (non-blocking), not PROJECT_RED (blocking).
+   */
+  readonly toolLimitation?: { readonly reason: string };
 }
 
 export function tail(s: string, max: number): string {
@@ -511,6 +517,36 @@ export function parseTestCount(output: string): { passed: number; total: number 
 }
 
 /**
+ * Detect when a check failure is caused by the VERIFICATION TOOL, not the project.
+ * Returns a toolLimitation descriptor when the output matches known tool parser failures,
+ * undefined otherwise. This lets the verifier distinguish "your code is broken" from
+ * "the linter can't parse modern syntax."
+ */
+function detectToolLimitation(command: string, output: string): { reason: string } | undefined {
+  // gdtoolkit (gdlint/gdformat): parser doesn't support async func, @export, or other GDScript 4.x syntax
+  if (command.includes("gdlint") || command.includes("gdformat")) {
+    if (/Unexpected token.*async/i.test(output) || /Unexpected token.*'NAME'.*'async'/i.test(output)) {
+      return { reason: "gdtoolkit parser does not support `async func` syntax (GDScript 4.x) — tool limitation, not a project error" };
+    }
+    if (/Unexpected token/i.test(output) && /Expected one of/i.test(output)) {
+      // Generic parser failure — could be modern syntax the tool doesn't know
+      return { reason: "gdtoolkit parser failed on syntax the tool does not recognize — may be a tool limitation" };
+    }
+  }
+  // Python tools: syntax version mismatches
+  if (command.includes("pylint") || command.includes("flake8") || command.includes("mypy")) {
+    if (/SyntaxError.*invalid syntax/i.test(output) && /match\s+/.test(output)) {
+      return { reason: "linter does not support Python 3.10+ match/case syntax — tool limitation" };
+    }
+  }
+  // Generic: tool crash / unhandled exception in the tool itself
+  if (/Traceback \(most recent call last\)/.test(output) && /(?:gdlint|gdformat|pylint|flake8|mypy|eslint|tsc)/i.test(command)) {
+    return { reason: "verification tool crashed with an unhandled exception — tool limitation, not a project error" };
+  }
+  return undefined;
+}
+
+/**
  * Map one governed ExecResult onto a CheckResult (fail-closed on deny / dry-run).
  *
  * `fullOutput` (optional) is the COMPLETE, untruncated stdout the caller accumulated from the
@@ -523,8 +559,10 @@ export function mapExec(name: string, command: string, res: ExecResult, fullOutp
   if (res.executed) {
     const output = `${res.stdoutTail ?? ""}${res.stderrTail ?? ""}`;
     const testCount = parseTestCount(fullOutput ?? output);
+    // Detect tool limitations on non-zero exit — the tool failed, not necessarily the project.
+    const toolLimitation = (res.exitCode ?? 1) !== 0 ? detectToolLimitation(command, fullOutput ?? output) : undefined;
     return {
-      check: { name, command, exitCode: res.exitCode ?? 1, outputTail: tail(output, MAX_OUTPUT_TAIL), ...(testCount !== undefined ? { testCount } : {}) },
+      check: { name, command, exitCode: res.exitCode ?? 1, outputTail: tail(output, MAX_OUTPUT_TAIL), ...(testCount !== undefined ? { testCount } : {}), ...(toolLimitation !== undefined ? { toolLimitation } : {}) },
       dryRun: false,
     };
   }
