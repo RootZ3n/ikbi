@@ -18,9 +18,9 @@
 export type DiagnosisCategory =
   | "implementation_bug"
   | "test_bug"
-  | "fixture_bug"
-  | "verifier_environment_missing"
   | "tool_limitation"
+  | "verifier_environment_missing"
+  | "fixture_bug"
   | "contract_mismatch"
   | "parser_bug"
   | "receipt_metadata_gap"

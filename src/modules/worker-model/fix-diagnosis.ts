@@ -64,14 +64,23 @@ const DIAGNOSIS_MAX_TOKENS = 1_024;
 
 /** The trusted system instruction for the classify-only model call. */
 export const DIAGNOSIS_SYSTEM =
-  "You are a failure-diagnosis classifier for a code repair engine. A test check FAILED with an " +
-  "assertion error. You are given the source code, the test, and the failing output. Decide which " +
-  "of EXACTLY TWO categories applies:\n" +
+  "You are a failure-diagnosis classifier for a code repair engine. A check FAILED. You are given " +
+  "the source code, the test (if any), and the failing output. Decide which of FOUR categories applies:\n" +
   "  - \"implementation_bug\": the CODE is wrong and the TEST is correct. Fix the code.\n" +
-  "  - \"test_bug\": the TEST is wrong (e.g. asserts the wrong expected value) and the CODE is correct.\n\n" +
-  "Read both carefully and reason about which one is actually correct. Reply with ONLY a JSON object:\n" +
-  '{"category": "implementation_bug" | "test_bug", "confidence": 0.0-1.0, "evidence": "<one sentence>", "affectedFiles": ["path", ...]}\n' +
-  "affectedFiles must list the file(s) that are WRONG (the code file for implementation_bug, the test file for test_bug). " +
+  "  - \"test_bug\": the TEST is wrong (e.g. asserts the wrong expected value) and the CODE is correct.\n" +
+  "  - \"tool_limitation\": the VERIFICATION TOOL (linter, type checker, formatter) is wrong — it rejects " +
+  "valid code. The code and tests are both correct. Do NOT edit the code; the tool needs fixing or updating.\n" +
+  "  - \"verifier_environment_missing\": the check failed because a required tool/binary is not installed " +
+  "or not available. The code and tests are both correct. Do NOT edit the code.\n\n" +
+  "KEY DISTINCTIONS:\n" +
+  "- If pytest assertions fail → implementation_bug or test_bug (read code AND test to decide).\n" +
+  "- If a LINTER/FORMATTER/TYPE-CHECKER fails on code that pytest passes → tool_limitation.\n" +
+  "- If the check command itself cannot run (missing binary, permission denied) → verifier_environment_missing.\n" +
+  "- If a non-pytest tool prints errors about valid syntax → tool_limitation.\n\n" +
+  "Reply with ONLY a JSON object:\n" +
+  '{"category": "implementation_bug" | "test_bug" | "tool_limitation" | "verifier_environment_missing", "confidence": 0.0-1.0, "evidence": "<one sentence>", "affectedFiles": ["path", ...]}\n' +
+  "affectedFiles must list the file(s) that are WRONG (code file for implementation_bug, test file for test_bug, " +
+  "tool config for tool_limitation, empty for verifier_environment_missing). " +
   "Do NOT include any prose outside the JSON.";
 
 /** Extract the first balanced top-level JSON object from a model response (tolerant of prose). */
@@ -135,6 +144,31 @@ export async function diagnoseFailure(input: DiagnosisInput, deps: DiagnosisDeps
     };
   }
 
+  // STAGE-4a2 (deterministic): the check command was denied by governed-exec or the binary is
+  // missing. This is an environment issue — the code and tests are fine.
+  if (/denied|not on the allowlist|not found|No such file|permission denied/i.test(input.rawOutput) &&
+      !/AssertionError|FAILED|FAIL\b/.test(input.rawOutput)) {
+    return {
+      category: "verifier_environment_missing",
+      confidence: 0.9,
+      evidence: `the check command failed due to environment/access issues (not a code failure): ${input.rawOutput.slice(0, 200)}`,
+      affectedFiles: [],
+    };
+  }
+
+  // STAGE-4a3 (deterministic): a non-pytest linter/formatter/type-checker failed but tests pass.
+  // The tool rejects valid code — this is a tool limitation, not a code bug.
+  const hasTestFailures = input.outcomes.failingTests.length > 0 || /FAIL\b|FAILED|AssertionError/.test(input.rawOutput);
+  const looksLikeLinter = /E\d{3}\b|W\d{3}\b|lint|format|style|mypy|flake8|pylint|ruff|gdlint/i.test(input.rawOutput);
+  if (!hasTestFailures && looksLikeLinter) {
+    return {
+      category: "tool_limitation",
+      confidence: 0.85,
+      evidence: `a linter/formatter/type-checker failed on code that has no test failures — tool limitation, not a code bug`,
+      affectedFiles: [],
+    };
+  }
+
   // STAGE-4b (model): an assertion failed — a test ran and disagreed with the code. Read both and
   // decide whether the CODE is wrong (implementation_bug) or the TEST is wrong (test_bug).
   const neutralize = deps.neutralize ?? neutralizeUntrusted;
@@ -173,19 +207,24 @@ export async function diagnoseFailure(input: DiagnosisInput, deps: DiagnosisDeps
     return { category: "unresolved", confidence: 0, evidence: `diagnosis model call failed: ${err instanceof Error ? err.message : String(err)}`, affectedFiles: [] };
   }
 
+  const VALID_CATEGORIES = new Set(["implementation_bug", "test_bug", "tool_limitation", "verifier_environment_missing"]);
   const obj = extractJsonObject(raw);
   const category = obj?.category;
-  if (category !== "implementation_bug" && category !== "test_bug") {
+  if (typeof category !== "string" || !VALID_CATEGORIES.has(category)) {
     return { category: "unresolved", confidence: 0.2, evidence: `could not classify from the model response (got: ${typeof category === "string" ? category : "no category"})`, affectedFiles: [] };
   }
 
   // Default affectedFiles from the model; fall back to the obvious file for the category.
   const modelFiles = Array.isArray(obj?.affectedFiles) ? (obj!.affectedFiles as unknown[]).filter((x): x is string => typeof x === "string") : [];
-  const fallback = input.files.filter((f) => (category === "test_bug" ? f.isTest : !f.isTest)).map((f) => f.path);
+  const fallback = category === "test_bug"
+    ? input.files.filter((f) => f.isTest).map((f) => f.path)
+    : category === "implementation_bug"
+      ? input.files.filter((f) => !f.isTest).map((f) => f.path)
+      : []; // tool_limitation / verifier_environment_missing — no files to fix
   const affectedFiles = modelFiles.length > 0 ? modelFiles : fallback;
 
   return {
-    category,
+    category: category as DiagnosisCategory,
     confidence: clampConfidence(obj?.confidence),
     evidence: typeof obj?.evidence === "string" && obj.evidence.length > 0 ? obj.evidence : `classified as ${category}`,
     affectedFiles,
