@@ -29,6 +29,9 @@ competitive mode. It runs both as a long-running localhost/Tailscale service and
   isolated worktree, promotes only on ladder-verified pass.
 - `ikbi repl` — interactive, multi-turn, tool-calling session (managed worktree, slash
   commands, resume, permission prompts). The closest analog to Claude Code's REPL.
+- `ikbi fix <repo>` — diagnose a failing check and repair it narrowly (or correctly
+  refuse); never promotes. Includes a fix-retry loop with verification feedback and
+  dual-model escalation.
 - `ikbi doctor` / `capabilities` / `models` / `providers` / `receipts` / `cost` / `diff` /
   `undo` / `workspace*` / `clean` / `audit` — operator + inspection commands.
 
@@ -44,7 +47,7 @@ through governed-exec (allowlist + gate-wall + receipts).
 cd /pehverse/repos/ikbi
 pnpm install
 pnpm build                     # tsc -> dist/  (also typechecks *.test.ts)
-pnpm test                      # node:test runner — 2171 tests, all passing
+pnpm test                      # node:test runner — 2199 tests, all passing
 node dist/cli/index.js doctor  # pre-flight check
 node dist/cli/index.js repl    # interactive session
 ```

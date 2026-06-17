@@ -35,7 +35,7 @@ trust and capability are granted, never assumed.
 - **Cheap-model harness** — the `worker-model` orchestrator that drives small,
   inexpensive models through the governed roles to land verified fixes cold → working
   for a fraction of a cent.
-- **2171 tests** covering the core, the modules, the CLI, and end-to-end acceptance.
+- **2199 tests** covering the core, the modules, the CLI, and end-to-end acceptance.
 
 ## Requirements
 
@@ -120,6 +120,7 @@ Stop it with `Ctrl-C` (SIGINT) or `kill -TERM <pid>` — it drains and exits 0.
 | `ikbi repl` | Interactive conversational session (multi-turn, tool-calling); `--continue`/`--resume <id>` for durable history |
 | `ikbi setup` | Install a global `ikbi` launcher (shell integration) so `ikbi` works from any directory |
 | `ikbi build <goal...>` | Run the 5-role pipeline toward a goal; promotes on verify pass |
+| `ikbi fix <repo>` | Diagnose a failing check and repair it narrowly (or correctly refuse); never promotes |
 | `ikbi diff <workspace-id>` | Print a workspace's git diff (base..scratch) + change summary |
 | `ikbi undo <receipt-id\|commit\|--latest>` | Revert a promoted change (previews diff before reverting) |
 | `ikbi receipts` | Show receipt history — what ran, outcomes, costs |
