@@ -235,9 +235,10 @@ export function runDoctor(inp: DoctorInputs = {}): DoctorResult {
 // any attempted repair failed.
 //
 // SAFETY CONTRACT:
-//  - `--fix` is CREATE/REPAIR ONLY — it never deletes. The single destructive
-//    repair (reclaiming stale workspaces) is gated behind `--fix --force`; without
-//    `--force` it only REPORTS what could be reclaimed.
+//  - `--fix` is CREATE/REPAIR ONLY by default — it never deletes. BOTH destructive
+//    repairs are gated behind `--fix --force` (Codex C4): reclaiming stale workspaces,
+//    and the age-bounded reclaim of terminal workspaces past the retention window.
+//    Without `--force`, `--fix` only REPORTS what could be reclaimed — it removes nothing.
 //  - Every side effect goes through an injectable PORT (DoctorFixPorts) so the
 //    behavior is unit-testable with no real filesystem / process / git mutation.
 // ═══════════════════════════════════════════════════════════════════════════
@@ -266,9 +267,9 @@ export interface DoctorFixPorts {
   /** Reclaim stale workspaces (the destructive `--force` path). */
   cleanWorkspaces(opts: { force: boolean }): Promise<{ removed: number; skipped: number }>;
   /**
-   * Gap M16 — SAFE age-bounded auto-reclaim: remove ONLY terminal workspaces past the retention
-   * window (`IKBI_WORKSPACE_MAX_AGE_HOURS`), runnable WITHOUT `--force`. Optional: when absent
-   * (e.g. a test that does not opt in), the age sweep is skipped and only the report-only count runs.
+   * Gap M16 — age-bounded reclaim: remove ONLY terminal workspaces past the retention window
+   * (`IKBI_WORKSPACE_MAX_AGE_HOURS`). It is a DELETION, so it runs only under `--force` (Codex C4).
+   * Optional: when absent (e.g. a test that does not opt in), the age sweep is skipped entirely.
    */
   reclaimAgedWorkspaces?(maxAgeHours: number): Promise<{ removed: number; skipped: number }>;
 }
@@ -278,7 +279,11 @@ export interface DoctorFixInputs {
   readonly config?: IkbiConfig;
   /** The project directory whose `.env` / `node_modules` / lockfile are inspected. Default: cwd. */
   readonly projectRoot?: string;
-  /** When true, also perform the one DESTRUCTIVE repair: reclaim stale workspaces. */
+  /**
+   * When true, perform the DESTRUCTIVE repairs: reclaim stale workspaces AND the age-bounded
+   * reclaim of terminal workspaces past the retention window (Gap M16). Both are DELETIONS, so
+   * both are gated behind this single `--force` flag (Codex C4). Without it, they are only REPORTED.
+   */
   readonly force?: boolean;
 }
 
@@ -340,7 +345,7 @@ export async function runDoctorFix(ports: DoctorFixPorts, inp: DoctorFixInputs =
   let attempted = 0;
   let failures = 0;
 
-  push("ikbi doctor --fix — repairing common gaps (create/repair only; --force also reclaims stale workspaces)");
+  push("ikbi doctor --fix — repairing common gaps (create/repair only; --force reclaims stale + aged workspaces)");
 
   // --- 1. .env file --------------------------------------------------------
   push("");
@@ -411,23 +416,13 @@ export async function runDoctorFix(ports: DoctorFixPorts, inp: DoctorFixInputs =
   // --- 4. stale workspaces (report-only without --force; reclaim with) -----
   push("");
   push("STALE WORKSPACES");
+  const maxAgeHours = cfg.workspace.maxAgeHours;
   if (!force) {
-    // M16 — SAFE auto-reclaim of workspaces PAST the retention window (default 7 days). This is
-    // bounded by age (never touches recent work) and so is safe WITHOUT --force, bounding the
-    // unbounded accumulation. Workspaces still inside the window are reported below for --force.
-    const maxAgeHours = cfg.workspace.maxAgeHours;
+    // NON-DESTRUCTIVE without --force: never delete, only REPORT. Both the age-bounded reclaim
+    // (M16) and the full stale reclaim are DELETIONS, so both are gated behind --force (Codex C4).
     if (ports.reclaimAgedWorkspaces !== undefined) {
-      attempted += 1;
-      push(`  … auto-reclaiming workspaces older than ${maxAgeHours}h (past the retention window)…`);
-      try {
-        const aged = await ports.reclaimAgedWorkspaces(maxAgeHours);
-        push(`  ${OK} reclaimed ${aged.removed} aged workspace(s)${aged.skipped > 0 ? ` (${aged.skipped} still inside the window — kept)` : ""}`);
-      } catch (err) {
-        failures += 1;
-        push(`  ${BAD} aged-workspace auto-reclaim failed: ${errMsg(err)}`);
-      }
+      push(`  ${WARN} workspaces older than ${maxAgeHours}h can be auto-reclaimed — re-run \`ikbi doctor --fix --force\` to remove them (NOT removed without --force)`);
     }
-    // NON-DESTRUCTIVE: never delete RECENT stale work without --force — only report it.
     try {
       const n = await ports.countStaleWorkspaces();
       if (n === 0) {
@@ -440,6 +435,19 @@ export async function runDoctorFix(ports: DoctorFixPorts, inp: DoctorFixInputs =
       push(`  ${WARN} could not inspect stale workspaces: ${errMsg(err)}`);
     }
   } else {
+    // --force: age-bounded reclaim FIRST (M16 — only terminal workspaces past the retention
+    // window), then reclaim the remaining stale workspaces. Both are gated behind --force (Codex C4).
+    if (ports.reclaimAgedWorkspaces !== undefined) {
+      attempted += 1;
+      push(`  … --force: reclaiming workspaces older than ${maxAgeHours}h (past the retention window)…`);
+      try {
+        const aged = await ports.reclaimAgedWorkspaces(maxAgeHours);
+        push(`  ${OK} reclaimed ${aged.removed} aged workspace(s)${aged.skipped > 0 ? ` (${aged.skipped} still inside the window — kept)` : ""}`);
+      } catch (err) {
+        failures += 1;
+        push(`  ${BAD} aged-workspace auto-reclaim failed: ${errMsg(err)}`);
+      }
+    }
     attempted += 1;
     push("  … --force: reclaiming stale workspaces…");
     try {

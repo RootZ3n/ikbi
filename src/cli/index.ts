@@ -85,7 +85,7 @@ function printUsage(): void {
     "  models [list]      List the model roster (id, role, cost, provider chain)",
     "  providers [list]   List the registered providers",
     "  doctor             Report bootstrap config: what's set, what's missing for a build",
-    "  doctor --fix       Repair common gaps (.env/state dirs/deps); --force also reclaims stale workspaces",
+    "  doctor --fix       Repair common gaps (.env/state dirs/deps); --force reclaims stale + aged workspaces",
     "  capabilities       List the builder + chat tool inventory (and parity)",
   ];
   if (moduleCmds.length > 0) {
@@ -162,7 +162,7 @@ async function run(argv: readonly string[]): Promise<void> {
       return;
     case "doctor": {
       // `--fix` is the opt-in side-effecting twin of the read-only report: it repairs
-      // common gaps (create/repair only; `--force` also reclaims stale workspaces) and
+      // common gaps (create/repair only; `--force` reclaims stale + aged workspaces) and
       // sets a non-zero exit code if any repair failed.
       const doctorArgs = argv.slice(1);
       if (doctorArgs.includes("--fix")) {
