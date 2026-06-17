@@ -1,9 +1,10 @@
 /**
  * ikbi chat — persistent conversational session with a bounded tool-calling loop.
  *
- * Each session runs ALL SIXTEEN of the builder's tools — read_file / write_file /
- * list_dir / search_files / patch / governed terminal, the read-only git inspectors
- * (git_status / git_diff / git_log), web research (web_search / web_extract),
+ * Each session runs the builder's full tool suite — read_file / write_file /
+ * list_dir / search_files / glob / patch / multi_edit / governed terminal, the read-only
+ * git inspectors (git_status / git_diff / git_log), web research (web_search / web_extract),
+ * the knowledge-brain tools (brain_search / brain_think / brain_put / brain_sync),
  * delegate_task (a focused sub-agent), vision_analyze (multimodal image understanding),
  * and scout_detail / run_checks / done — confined to a per-session worktree, through the
  * SAME security machinery the builder uses. The last three are adapted to the chat

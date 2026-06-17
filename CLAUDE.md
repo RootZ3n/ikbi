@@ -32,10 +32,10 @@ competitive mode. It runs both as a long-running localhost/Tailscale service and
 - `ikbi doctor` / `capabilities` / `models` / `providers` / `receipts` / `cost` / `diff` /
   `undo` / `workspace*` / `clean` / `audit` — operator + inspection commands.
 
-## Tooling (builder & chat each expose 20 tools)
-read_file, write_file, list_dir, patch, terminal, search_files, git tools, web_search/extract,
-vision_analyze, delegate_task, brain tools, run_checks, done (+ scout_detail in chat). The
-builder gates `done` on a green `run_checks`. Every tool RESULT re-enters the model only through
+## Tooling (builder & chat each expose 22 tools)
+read_file, write_file, list_dir, patch, multi_edit, terminal, search_files, glob, git tools,
+web_search/extract, vision_analyze, delegate_task, brain tools, scout_detail, run_checks, done.
+The builder gates `done` on a green `run_checks`. Every tool RESULT re-enters the model only through
 the neutralization chokepoint; all file/search/exec tools are worktree-confined; terminal routes
 through governed-exec (allowlist + gate-wall + receipts).
 
