@@ -35,10 +35,20 @@ function buildDefaultTrust(): TrustSystem {
   if (tc.hmacKeyIsDefault) {
     log.warn({}, "IKBI_TRUST_HMAC_KEY is unset — using the insecure built-in trust-state MAC key; set it in production");
   }
+  // Gap M15 — opt-in auto-promotion. When IKBI_TRUST_AUTO_PROMOTE is on, a worker earns a
+  // tier after `autoPromoteAfter` consecutive PROMOTABLE successes (default 3) instead of the
+  // conservative 20. This ONLY tightens the streak threshold of the EXISTING earned-promotion
+  // machinery — the anti-farming guards (read-only verbs excluded, `minDistinctOps` distinct
+  // operations) and the fail-closed floor are unchanged; trust is still EARNED, never assumed.
+  // FAIL-CLOSED: default OFF, so the conservative streak stands unless the operator opts in.
+  const effectivePromoteStreak = tc.autoPromote ? tc.autoPromoteAfter : tc.promoteStreak;
+  if (tc.autoPromote) {
+    log.info({ promoteStreak: effectivePromoteStreak }, "IKBI_TRUST_AUTO_PROMOTE is on — workers auto-promote after the configured success streak");
+  }
   return new TrustSystem({
     store: createDocumentStore<PersistedTrustState>({ dir: tc.dir }),
     logger: log,
-    promoteStreak: tc.promoteStreak,
+    promoteStreak: effectivePromoteStreak,
     demoteStreak: tc.demoteStreak,
     minDistinctOps: tc.promoteMinDistinctOps,
     hmacKey: tc.hmacKey,
