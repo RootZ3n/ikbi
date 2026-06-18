@@ -61,6 +61,7 @@ import { estimateTokens, maybeCompress } from "../worker-model/context-manager.j
 import { loadProjectInstructions } from "../worker-model/project-memory.js";
 import { type CheckResult, mapExec, resolveCheckTimeoutMs, resolveChecks } from "../worker-model/checks.js";
 import { executeTool, type ToolExecutorDeps, type ToolExecutionResult } from "../worker-model/tool-executor.js";
+import { discoverMcpTools, isMcpToolName, type McpToolRegistry } from "../mcp-model-loop/registry.js";
 import type { MemoryGovernor } from "../memory-governor/contract.js";
 import { BRAIN_TOOLS } from "../worker-model/builder-tools/brain-tools.js";
 import { gbrainBridge } from "../../core/gbrain-bridge.js";
@@ -743,6 +744,13 @@ export class ChatSession {
   private readonly fileHistory: FileMutation[] = [];
   private permissionMode: PermissionMode = "auto";
   private turnQueue: Promise<unknown> = Promise.resolve();
+  /**
+   * MCP TOOLS (lazy): operator-configured MCP servers' tools, discovered ONCE on the first
+   * agent-mode turn and cached for the session's life. `mcpDiscoveryAttempted` makes discovery
+   * a one-shot — a failed connect never re-spawns servers each turn. Undefined ⇒ none discovered.
+   */
+  private mcpRegistry: McpToolRegistry | undefined;
+  private mcpDiscoveryAttempted = false;
 
   constructor(id: string, deps: ChatSessionDeps = {}) {
     const restore = deps.restore;
@@ -836,6 +844,45 @@ export class ChatSession {
       : undefined;
   }
 
+  /**
+   * Lazily discover the operator-configured MCP servers' tools (ONCE per session). Returns the
+   * cached registry (or undefined when none / discovery failed). Best-effort: a discovery failure
+   * is logged and the session continues without MCP tools — it NEVER throws or blocks the turn.
+   */
+  private async ensureMcpRegistry(): Promise<McpToolRegistry | undefined> {
+    if (this.mcpDiscoveryAttempted) return this.mcpRegistry;
+    this.mcpDiscoveryAttempted = true;
+    try {
+      this.mcpRegistry = await discoverMcpTools({ identity: this.identity });
+    } catch (e) {
+      log.warn({ err: errMsg(e) }, "chat: MCP tool discovery failed — continuing without MCP tools");
+      this.mcpRegistry = undefined;
+    }
+    return this.mcpRegistry;
+  }
+
+  /** The MCP tools to advertise this turn (agent mode only; empty otherwise). */
+  private mcpToolsFor(mode: ChatMode): readonly ModelTool[] {
+    if (mode !== "agent" || this.mcpRegistry === undefined) return [];
+    return this.mcpRegistry.tools;
+  }
+
+  /**
+   * Release session-held resources — currently the MCP transports' spawned child processes.
+   * Best-effort and idempotent; the REPL calls this when the interactive session ends.
+   */
+  async dispose(): Promise<void> {
+    const reg = this.mcpRegistry;
+    this.mcpRegistry = undefined;
+    if (reg !== undefined) {
+      try {
+        await reg.close();
+      } catch {
+        /* best-effort teardown */
+      }
+    }
+  }
+
   /** Run one tool call; returns the raw result string + display activity (NOT yet neutralized). */
   private async runTool(call: ToolCall, mode: ChatMode = "agent", opts: TurnOptions = {}): Promise<{ output: string; activity: ChatToolActivity }> {
     // PLAN MODE: defense-in-depth — even though plan mode only OFFERS read-only tools, reject any
@@ -860,7 +907,7 @@ export class ChatSession {
         return { output: `ERROR: ${call.name} was DENIED by the operator. Rollback cannot cover terminal/sub-agent side effects.`, activity: { name: call.name, ok: false, summary: "denied" } };
       }
     }
-    if (permissionMode !== "auto" && MUTATING_TOOL_NAMES.has(call.name)) {
+    if (permissionMode !== "auto" && (MUTATING_TOOL_NAMES.has(call.name) || isMcpToolName(call.name))) {
       const target =
         typeof args.path === "string" ? args.path
         : typeof args.command === "string" ? args.command
@@ -879,6 +926,15 @@ export class ChatSession {
       if (!allowed) {
         return { output: `ERROR: ${call.name} was DENIED by the operator (permission mode: confirm).`, activity: { name: call.name, ok: false, summary: "denied" } };
       }
+    }
+    // MCP TOOL: route through the registry's GOVERNED dispatch (gate-wall'd per call before the
+    // transport is touched). The raw result is UNTRUSTED command/server output → it re-enters the
+    // conversation ONLY via the caller's appendToolResult neutralization chokepoint, like every
+    // other tool result. (MCP tools are advertised in agent mode only; see mcpToolsFor.)
+    if (this.mcpRegistry !== undefined && this.mcpRegistry.has(call.name)) {
+      const raw = await this.mcpRegistry.dispatch(call, this.identity);
+      const ok = !raw.startsWith("ERROR") && !raw.startsWith("DENIED");
+      return { output: raw, activity: { name: call.name, ok, summary: "mcp tool" } };
     }
     // SHARED TOOL EXECUTOR: confinement + memory-governor interception + execution, the SAME path
     // the builder shares for governance. A governed write becomes an operator-reviewed proposal
@@ -1438,8 +1494,11 @@ export class ChatSession {
     this.lastUsedAt = Date.now();
     // Cost visibility: accumulate every model invocation's cost this turn.
     let turnCost = 0;
-    // Plan mode runs the READ-ONLY tool subset; agent mode runs the full suite.
-    const activeTools = mode === "plan" ? PLAN_TOOLS : CHAT_TOOLS;
+    // MCP TOOLS: discover (once) and expose the operator-configured MCP servers' tools in agent
+    // mode. Best-effort — discovery failure leaves the built-in suite untouched.
+    if (mode === "agent") await this.ensureMcpRegistry();
+    // Plan mode runs the READ-ONLY tool subset; agent mode runs the full suite + any MCP tools.
+    const activeTools = mode === "plan" ? PLAN_TOOLS : [...CHAT_TOOLS, ...this.mcpToolsFor(mode)];
     // TEXT TOOL PROTOCOL (cheap/local-model parity with the builder): a model with no native
     // function-calling API cannot emit structured tool_calls. Rather than hand it a tools array it
     // can't use (and watch it bare-stop), describe the tools + a strict JSON envelope in the system
@@ -1621,7 +1680,9 @@ export class ChatSession {
       return { response, tools, cost: turnCost, contextPercent: this.contextPercent() };
     };
 
-    const activeTools = mode === "plan" ? PLAN_TOOLS : CHAT_TOOLS;
+    // MCP TOOLS: discover (once) and expose the operator-configured MCP servers' tools in agent mode.
+    if (mode === "agent") await this.ensureMcpRegistry();
+    const activeTools = mode === "plan" ? PLAN_TOOLS : [...CHAT_TOOLS, ...this.mcpToolsFor(mode)];
     const emulateTools = getCapabilities(this.model).supports_tools === false;
     const toolsForModel = emulateTools ? [] : activeTools;
     const toolInstructions = emulateTools ? textToolProtocolInstructions(activeTools) : undefined;

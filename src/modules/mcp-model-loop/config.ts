@@ -9,13 +9,21 @@
  *   IKBI_MCP_MODEL_LOOP_MAX_TOOL_ITERATIONS hard cap on tool-call rounds.
  *   IKBI_MCP_MODEL_LOOP_TIMEOUT_MS          loop wall-clock budget.
  *
- * MCP server endpoints are NOT configured here — that belongs to the real transport
- * (a follow-up). This pass ships an in-process mock.
+ * MCP SERVER ENDPOINTS — `IKBI_MCP_SERVERS`: a JSON array of stdio MCP servers the
+ * REPL/builder connect to and discover tools from (see `loadMcpServers`). It is read
+ * here (the module's config slice, NOT core `config.ts` — a module never adds a field
+ * to `IkbiConfig`) by its EXACT name rather than through the auto-prefixing `moduleEnv`
+ * reader, because the variable is `IKBI_MCP_SERVERS`, not `IKBI_MCP_MODEL_LOOP_SERVERS`.
+ * DEFAULT: empty (no MCP servers — zero behavior change). Example:
+ *   IKBI_MCP_SERVERS='[{"name":"fs","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/tmp"]}]'
  */
 
+import { configEnv } from "../../core/config.js";
+import { childLogger } from "../../core/log.js";
 import { moduleEnv } from "../../core/module-config.js";
 
 const env = moduleEnv("mcp-model-loop");
+const cfgLog = childLogger("mcp-config");
 
 /** Logical roster model id the loop drives. */
 export const LOOP_MODEL = "mimo-v2.5";
@@ -48,3 +56,64 @@ export function loadMcpModelLoopConfig(reader = env): McpModelLoopConfig {
 
 /** The process-wide mcp-model-loop config. */
 export const mcpModelLoopConfig: McpModelLoopConfig = loadMcpModelLoopConfig();
+
+/**
+ * One operator-configured stdio MCP server. The `command` is OPERATOR-controlled
+ * (never model-controlled) — like adding a binary to the governed-exec allowlist.
+ */
+export interface McpServerConfig {
+  /** A short, unique label for the server (namespaces its tools: `mcp__<name>__<tool>`). */
+  readonly name: string;
+  /** The MCP server executable to spawn. */
+  readonly command: string;
+  /** Arguments for the server. */
+  readonly args: readonly string[];
+  /** Optional working directory for the server process. */
+  readonly cwd?: string;
+}
+
+/**
+ * Parse `IKBI_MCP_SERVERS` (a JSON array of `{name, command, args, cwd?}`) into the
+ * configured server list. LENIENT BY DESIGN: a malformed value, a non-array, or an
+ * entry missing `name`/`command` is logged and skipped — never a startup crash (a bad
+ * MCP config must never block ikbi). Absent/blank ⇒ `[]` (no MCP servers).
+ */
+export function loadMcpServers(raw: string | undefined = configEnv.IKBI_MCP_SERVERS): readonly McpServerConfig[] {
+  const value = raw?.trim();
+  if (value === undefined || value.length === 0) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch (e) {
+    cfgLog.warn({ err: e instanceof Error ? e.message : String(e) }, "IKBI_MCP_SERVERS is not valid JSON — ignoring (no MCP servers)");
+    return [];
+  }
+  if (!Array.isArray(parsed)) {
+    cfgLog.warn("IKBI_MCP_SERVERS must be a JSON array of {name,command,args} — ignoring (no MCP servers)");
+    return [];
+  }
+  const servers: McpServerConfig[] = [];
+  const seen = new Set<string>();
+  for (const item of parsed) {
+    if (typeof item !== "object" || item === null) continue;
+    const o = item as Record<string, unknown>;
+    const name = typeof o.name === "string" ? o.name.trim() : "";
+    const command = typeof o.command === "string" ? o.command.trim() : "";
+    if (name.length === 0 || command.length === 0) {
+      cfgLog.warn({ entry: o }, "IKBI_MCP_SERVERS entry missing name/command — skipping");
+      continue;
+    }
+    if (seen.has(name)) {
+      cfgLog.warn({ name }, "IKBI_MCP_SERVERS has a duplicate server name — skipping the later one");
+      continue;
+    }
+    seen.add(name);
+    const args = Array.isArray(o.args) ? o.args.filter((a): a is string => typeof a === "string") : [];
+    const cwd = typeof o.cwd === "string" && o.cwd.trim().length > 0 ? o.cwd.trim() : undefined;
+    servers.push(Object.freeze({ name, command, args: Object.freeze([...args]), ...(cwd !== undefined ? { cwd } : {}) }));
+  }
+  return Object.freeze(servers);
+}
+
+/** The process-wide configured MCP servers (parsed from `IKBI_MCP_SERVERS`). */
+export const mcpServers: readonly McpServerConfig[] = loadMcpServers();

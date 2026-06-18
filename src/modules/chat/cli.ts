@@ -806,6 +806,12 @@ export async function liveRepl(argv: readonly string[] = []): Promise<void> {
     await runRepl({ session, store, newSession, readLine: src.readLine, out, onTurnController: (controller) => { turnController = controller; } });
   } finally {
     src.close();
+    // Release the session's MCP transports (spawned child processes), if any. Best-effort.
+    try {
+      await session.dispose();
+    } catch {
+      /* best-effort teardown */
+    }
   }
 }
 

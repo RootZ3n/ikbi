@@ -34,6 +34,9 @@ export { createMcpCli, parseMcpArgs, splitServerCommand, type McpCliDeps } from 
 // OPT-IN real transport: stdio (spawn a child MCP server, JSON-RPC over stdin/stdout).
 // The mock transport remains the default; wire this via createMcpModelLoop({ transport }).
 export { createStdioTransport, type StdioTransportOptions, type SpawnLike, type SpawnedChild } from "./transports/stdio.js";
+// THE REGISTRY: discover operator-configured MCP servers' tools and expose them, governed,
+// to the REPL/builder loops (the other integration — host loops augment their own tool set).
+export { discoverMcpTools, isMcpToolName, type McpToolRegistry, type DiscoverMcpToolsOptions } from "./registry.js";
 export {
   CONTRACT_VERSION,
   type McpLoopRequest,
@@ -50,7 +53,10 @@ export {
   LOOP_MAX_TOKENS,
   DEFAULT_MAX_TOOL_ITERATIONS,
   DEFAULT_LOOP_TIMEOUT_MS,
+  loadMcpServers,
+  mcpServers,
   type McpModelLoopConfig,
+  type McpServerConfig,
 } from "./config.js";
 export {
   mcpLoopStarted,

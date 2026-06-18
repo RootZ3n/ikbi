@@ -70,6 +70,7 @@ import { loadProjectMemory } from "./project-memory.js";
 import { builderModel } from "./role-models.js";
 import type { ScoutFinding } from "./scout.js";
 import { interceptMemoryGovernor, type ToolExecutorDeps } from "./tool-executor.js";
+import { discoverMcpTools, type McpToolRegistry } from "../mcp-model-loop/registry.js";
 
 // ToolCallError now lives in builder-tools/confine.ts (shared by every builder tool);
 // re-exported here so existing importers (and tests) keep `import { ToolCallError } from "./builder.js"`.
@@ -657,10 +658,20 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
   const filesWrittenPerRound: number[] = []; // EARLY STOP: tracks new files written each tool-round iteration
   let consecutiveRejectedToolRounds = 0;
   let emulatedToolRound = false; // this round's tool calls came from TEXT (no native tool API) → feed results back as user, not tool-role
+  // MCP TOOLS: operator-configured MCP servers' tools, discovered once at builder start and
+  // exposed alongside the built-in suite. Declared out here so the finally always tears the
+  // transports (spawned child processes) down. Empty (no spawn) when none are configured.
+  let mcpRegistry: McpToolRegistry | undefined;
 
   try {
     // Canonical worktree root for confinement (realpath’d once).
     const worktreeReal = realpathSync(ctx.workspace.path);
+    // MCP TOOL DISCOVERY: connect to any configured MCP servers and collect their tools. The
+    // builder's clamped identity gates the session + every call; discovery is best-effort and
+    // NEVER throws — a failed server is logged and skipped (no MCP servers ⇒ a no-op empty set).
+    // Bound to a const for the loop (non-undefined); the outer `let` is only for the finally teardown.
+    const mcp = await discoverMcpTools({ identity: ctx.identity });
+    mcpRegistry = mcp;
     // MEMORY GOVERNOR deps for the SHARED governance chokepoint (tool-executor). The same
     // `interceptMemoryGovernor` the chat uses — one governance path for both surfaces.
     const governorDeps: ToolExecutorDeps = {
@@ -1227,7 +1238,10 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
     const builderModelId = deps.modelOverride ?? builderModel();
     const caps = getCapabilities(builderModelId);
     const effectiveMaxTokens = adaptMaxTokens(BUILDER_MAX_TOKENS, caps);
-    const effectiveTools = caps.supports_tools ? TOOLS : simplifyTools(TOOLS);
+    const builtinTools = caps.supports_tools ? TOOLS : simplifyTools(TOOLS);
+    // MCP AUGMENTATION: expose the discovered MCP tools (namespaced `mcp__…`) alongside the
+    // built-in suite so the model can call them. Empty when no servers are configured.
+    const effectiveTools = mcp.tools.length > 0 ? [...builtinTools, ...mcp.tools] : builtinTools;
     // TEXT TOOL PROTOCOL: a model with no native function-calling API cannot emit structured
     // tool_calls. Rather than send it a tools array it can't use (and watch it bare-stop to
     // max_iterations), we describe the tools + a strict JSON envelope in the system prompt and
@@ -1447,6 +1461,12 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
               rejectedToolCalls.push({ tool: call.name, error: `brain governed denied: ${raw.slice("DENIED:".length).trim()}` });
             }
             appendToolResult(raw, call);
+          } else if (mcp.has(call.name)) {
+            // MCP TOOL: route through the registry's GOVERNED dispatch (gate-wall'd per call
+            // before the transport is touched). The raw result is UNTRUSTED → it re-enters
+            // ONLY via appendToolResult's neutralization chokepoint, like every other tool.
+            const raw = await mcp.dispatch(call, ctx.identity);
+            appendToolResult(raw, call);
           } else {
             // MEMORY GOVERNOR (shared chokepoint): a write_file/patch/multi_edit to a governed
             // surface becomes a proposal — otherwise fall through to the builder's specialized
@@ -1609,6 +1629,15 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       summary: `builder failed: ${errMsg(err)}`,
       detail: { filesWritten, filesRead, toolRounds, stopReason, neutralizedCount, rejectedToolCalls, policyViolations: rejectedToolCalls.filter(isPolicyViolation), toolFormatErrors: rejectedToolCalls.filter((e) => !isPolicyViolation(e)) },
     };
+  } finally {
+    // Tear down any MCP transports (spawned child processes) — once, on every exit path. Best-effort.
+    if (mcpRegistry !== undefined) {
+      try {
+        await mcpRegistry.close();
+      } catch {
+        /* best-effort cleanup — never mask the role result/error */
+      }
+    }
   }
   };
 }
