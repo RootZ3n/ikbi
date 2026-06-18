@@ -21,7 +21,7 @@ import { createInterface } from "node:readline";
 
 import { registerCommand } from "../../cli/registry.js";
 import { config } from "../../core/config.js";
-import { registry } from "../../core/provider/index.js";
+import { registry, invokeModelStream } from "../../core/provider/index.js";
 import { colorizeDiff } from "../worker-model/cli.js";
 import type { ChatMode, ChatToolActivity } from "./contract.js";
 import { discoverProject, formatOverview } from "./project-discovery.js";
@@ -736,20 +736,20 @@ export async function liveRepl(argv: readonly string[] = []): Promise<void> {
     // default applies only when the operator has NOT pinned a workdir.
     const explicitWorkdir = process.env.IKBI_CHAT_WORKDIR;
     if (!scratch && explicitWorkdir !== undefined && explicitWorkdir.trim().length > 0) {
-      return new ChatSession(id, { autosave, cwd: process.cwd(), permissionMode: "confirm", memoryGovernor });
+      return new ChatSession(id, { autosave, cwd: process.cwd(), permissionMode: "confirm", memoryGovernor, invokeStream: invokeModelStream });
     }
     if (!scratch) {
       const target = resolveRepoTarget(process.cwd());
       if (target !== undefined) {
         try {
           const ws = await allocateSessionWorkspace({ targetRepo: target, sessionId: id });
-          return new ChatSession(id, { workspace: ws, autosave, permissionMode: "confirm", memoryGovernor });
+          return new ChatSession(id, { workspace: ws, autosave, permissionMode: "confirm", memoryGovernor, invokeStream: invokeModelStream });
         } catch (e) {
           out(`[managed workspace allocation failed (${errMsg(e)}) — falling back to a scratch session]\n`);
         }
       }
     }
-    return new ChatSession(id, { autosave, cwd: process.cwd(), scratch: true, permissionMode: "confirm", memoryGovernor });
+    return new ChatSession(id, { autosave, cwd: process.cwd(), scratch: true, permissionMode: "confirm", memoryGovernor, invokeStream: invokeModelStream });
   };
 
   /** Resume a persisted session, reconnecting its managed workspace when one was recorded. */
@@ -764,7 +764,7 @@ export async function liveRepl(argv: readonly string[] = []): Promise<void> {
         out(`[This session is read-only. Start a new session (ikbi repl) to make and apply changes.]\n`);
       }
     }
-    return new ChatSession(state.id, { restore: state, autosave, ...(workspace !== undefined ? { workspace } : {}), memoryGovernor });
+    return new ChatSession(state.id, { restore: state, autosave, ...(workspace !== undefined ? { workspace } : {}), memoryGovernor, invokeStream: invokeModelStream });
   };
 
   let session: ChatSession;
