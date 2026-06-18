@@ -748,6 +748,25 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
 
     // --- the one tool: returns a raw result STRING; records side effects. It NEVER
     // builds a message — that is appendToolResult's exclusive job (the chokepoint). ---
+    //
+    // DELIBERATE DUPLICATION (YELLOW / Issue 3 — dispatch unification is incomplete). This
+    // `runTool` and the per-tool dispatch in the loop below (terminal/git/brain/file) re-implement
+    // the SAME confine→govern→execute core as the shared `executeTool` (tool-executor.ts), which the
+    // chat dispatches through. The two paths share ONLY the governance chokepoint today
+    // (`interceptMemoryGovernor`, called below before every mutation), NOT the executor itself,
+    // because the builder needs surface-specific behavior the shared executor intentionally omits:
+    //   - BATCH error handling: every rejection is pushed onto `rejectedToolCalls` (the integrator's
+    //     policy gate reads it); the chat just formats a one-off `{output, activity}`.
+    //   - WRITE-SCOPE + read-before-write: `write_scope` ("none"/"new_only"/"all") and the
+    //     dependency-install guard gate writes here; the chat has no batch write policy.
+    //   - SIDE-EFFECT TRACKING: `filesRead` / `filesWritten` / `checksStale` feed `done`-gating and
+    //     the verifier ladder — bookkeeping the shared executor does not own.
+    //   - STEP-PLANNER / run_checks integration lives on this loop, not in the executor.
+    // CANONICAL PATH: the shared `executeTool` is the canonical dispatch for the CHAT surface.
+    // FUTURE CONSOLIDATION TARGET: fold the builder onto `executeTool` (threading the batch
+    // bookkeeping back through the `ToolExecutionResult` it already returns — `wrote`/`rel`/
+    // `rejection` are there for exactly this) so terminal/background/file behavior can never drift
+    // between the two surfaces. Until then, KEEP THE TWO IN SYNC by hand when changing either.
     const runTool = (call: ToolCall): string => {
       let args: Record<string, unknown>;
       try {
@@ -1389,6 +1408,15 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       if (roundToolCalls !== undefined) {
         toolRounds += 1;
         let terminated = false;
+        // DELIBERATE DUPLICATION (YELLOW / Issue 3): this per-tool dispatch chain re-implements the
+        // confine→govern→execute core of the shared `executeTool` (tool-executor.ts — the CANONICAL
+        // path for the chat surface). It is kept separate ON PURPOSE: the builder folds each tool's
+        // result into BATCH bookkeeping (rejectedToolCalls / filesWritten / checksStale), gates
+        // `done` on green run_checks, and runs done/run_checks/step-planner branches the chat has no
+        // analog for. Only the GOVERNANCE chokepoint is shared (`interceptMemoryGovernor`, called
+        // before every brain_put / file mutation below). FUTURE CONSOLIDATION TARGET: route the file/
+        // terminal/brain branches through `executeTool` so background/terminal/file behavior cannot
+        // drift between surfaces; see the longer note on `runTool` above. Until then, keep in sync.
         for (const call of roundToolCalls) {
           if (call.name === "done") {
             const verdict = handleDone(call);
