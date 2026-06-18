@@ -559,7 +559,10 @@ export function formatProgressEvent(e: { type: string; payload?: unknown }): str
     case "worker.builder.activity": {
       // SG: surface context-window pressure alongside the tool-activity line when present.
       const ctxNote = typeof p.contextPercent === "number" ? `, context ${String(p.contextPercent)}%` : "";
-      return `    builder: ${String(p.toolRounds ?? 0)} tool round(s), ${String(p.filesWritten ?? 0)} file(s) written${ctxNote}\n`;
+      // WO5: surface the TRUST TIER the builder ran under so the governance posture of the work is
+      // visible in the builder's own output line, not buried in internal state.
+      const tierNote = typeof p.tier === "string" && p.tier.length > 0 ? ` [tier: ${p.tier}]` : "";
+      return `    builder: ${String(p.toolRounds ?? 0)} tool round(s), ${String(p.filesWritten ?? 0)} file(s) written${ctxNote}${tierNote}\n`;
     }
     case "worker.verification": {
       // ISSUE 4: show the ACTUAL per-check results (correct for custom IKBI_CHECKS — no phantom
@@ -573,6 +576,17 @@ export function formatProgressEvent(e: { type: string; payload?: unknown }): str
       // Scope-stamp the verify line in ladder mode so operators see impact vs full at a glance.
       const scope = p.verificationScope === "impact" || p.verificationScope === "full" ? ` [${p.verificationScope}]` : "";
       return `    verify: ${String(p.verdict ?? "?")}${scope} (${detail})\n`;
+    }
+    case "worker.trust.established": {
+      // WO5: the verified-bootstrap moment — say plainly which trust tier the landed work runs under
+      // and the autonomy that tier grants, so the operator never has to infer the posture.
+      const grantNotes: string[] = [];
+      if (p.sandboxed === true) grantNotes.push("sandboxed");
+      if (p.requiresApproval === true) grantNotes.push("approval-gated");
+      if (p.autoCommit === true) grantNotes.push("auto-commit");
+      if (typeof p.gateLevel === "string") grantNotes.push(`gates: ${p.gateLevel}`);
+      const grant = grantNotes.length > 0 ? ` — ${grantNotes.join(", ")}` : "";
+      return `  ⛨ trust tier: ${String(p.tier ?? "?")}${grant}\n`;
     }
     case "worker.completed":
       return `  ✓ run complete (promoted=${String(p.promoted ?? false)})\n`;

@@ -28,8 +28,11 @@ export const workerRoleSkipped = defineEvent<{ taskId: string; role: WorkerRole;
   "worker.role.skipped",
 );
 
-/** BUILDER tool activity at the role boundary — round count + files written + context pressure. (Attribution: role.) */
-export const workerBuilderActivity = defineEvent<{ taskId: string; toolRounds: number; filesWritten: number; contextPercent?: number }>(
+/** BUILDER tool activity at the role boundary — round count + files written + context pressure.
+ *  Carries the TRUST TIER the builder actually executed under (the spawned role's clamped tier) so
+ *  the operator sees the governance posture of the work in the builder's own output, not just
+ *  internal state. (Attribution: role.) */
+export const workerBuilderActivity = defineEvent<{ taskId: string; toolRounds: number; filesWritten: number; contextPercent?: number; tier?: string }>(
   "worker.builder.activity",
 );
 
@@ -62,6 +65,28 @@ export const workerToolCallStalled = defineEvent<{
 export const workerVerification = defineEvent<{ taskId: string; verdict: string; typecheckPassed: boolean; testsPassed: boolean; checks?: ReadonlyArray<{ name: string; passed: boolean }>; verificationScope?: "impact" | "full" }>(
   "worker.verification",
 );
+
+/**
+ * TRUST-TIER UX (WO5): a verified build LANDED (was promoted) — the project's work is now
+ * bootstrapped under a known trust tier. Emitted at the verified-bootstrap moment so the operator
+ * sees, plainly, WHICH trust tier authorized the work to land and what autonomy that tier grants
+ * (sandboxing, gate friction, approval requirement, auto-commit). This is a pure VISIBILITY signal —
+ * it does not grant, weaken, or alter trust; the tier + grant are read straight from the governance
+ * decision that already authorized the promote. (Attribution: parent.) */
+export const workerTrustEstablished = defineEvent<{
+  taskId: string;
+  workspaceId: string;
+  /** The trust tier that authorized the promote (the run's governance tier). */
+  tier: string;
+  /** Was the work run in a disposable shadow-workspace? (probation/untrusted) */
+  sandboxed: boolean;
+  /** How much gate friction the tier applies ("all" | "standard" | "reduced"). */
+  gateLevel: string;
+  /** Does the tier require an operator-approval pause before irreversible actions? */
+  requiresApproval: boolean;
+  /** May the tier auto-commit? (trusted/operator only) */
+  autoCommit: boolean;
+}>("worker.trust.established");
 
 /** A verified build is PAUSED awaiting operator approval before promote (SG-10). (Attribution: parent.) */
 export const workerApprovalRequested = defineEvent<{ taskId: string; workspaceId: string }>("worker.approval.requested");

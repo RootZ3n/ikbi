@@ -101,6 +101,30 @@ test("formatProgressEvent renders each worker.* event to a concise line", () => 
   assert.equal(formatProgressEvent({ type: "worker.competitive.started", payload: {} }), "", "unmapped events render empty");
 });
 
+// ── WO5: trust-tier visibility (builder output + verified-bootstrap event) ─────
+
+test("WO5: the builder activity line surfaces the trust tier it ran under", () => {
+  const line = formatProgressEvent({ type: "worker.builder.activity", payload: { toolRounds: 3, filesWritten: 2, tier: "verified" } });
+  assert.match(line, /builder: 3 tool round\(s\), 2 file\(s\) written \[tier: verified\]/, "tier is visible in the builder's own output line");
+  // backward-compatible: an event without a tier renders the original line unchanged.
+  assert.doesNotMatch(formatProgressEvent({ type: "worker.builder.activity", payload: { toolRounds: 1, filesWritten: 0 } }), /\[tier:/);
+});
+
+test("WO5: the trust-established line names the tier and its autonomy grant", () => {
+  const verified = formatProgressEvent({ type: "worker.trust.established", payload: { tier: "verified", sandboxed: false, gateLevel: "standard", requiresApproval: false, autoCommit: false } });
+  assert.match(verified, /trust tier: verified/, "the landed tier is named");
+  assert.match(verified, /gates: standard/, "the gate posture is shown");
+  assert.doesNotMatch(verified, /auto-commit/, "verified does not auto-commit");
+  // a low-trust tier surfaces its restrictive posture plainly.
+  const probation = formatProgressEvent({ type: "worker.trust.established", payload: { tier: "probation", sandboxed: true, gateLevel: "all", requiresApproval: true, autoCommit: false } });
+  assert.match(probation, /trust tier: probation/);
+  assert.match(probation, /sandboxed/);
+  assert.match(probation, /approval-gated/);
+  // a trusted tier shows auto-commit.
+  const trusted = formatProgressEvent({ type: "worker.trust.established", payload: { tier: "trusted", sandboxed: false, gateLevel: "reduced", requiresApproval: false, autoCommit: true } });
+  assert.match(trusted, /auto-commit/);
+});
+
 // ── --verbose streams the events to stdout ────────────────────────────────────
 
 test("`ikbi build --verbose` streams the progress events to stdout", async () => {
@@ -211,6 +235,57 @@ test("scope reaches the verification + completed events (operators/judges see im
 
   assert.equal(sent.find((e) => e.type === "worker.verification")?.payload.verificationScope, "impact", "verification event carries scope");
   assert.equal(sent.find((e) => e.type === "worker.completed")?.payload.verificationScope, "impact", "completed event carries scope (promotion auditability)");
+});
+
+// ── WO5: the orchestrator emits the trust tier on a verified bootstrap ─────────
+test("WO5: a promoted build emits worker.trust.established AND tags builder activity with the tier", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = ids();
+  const sent: Array<{ type: string; payload: Record<string, unknown> }> = [];
+  const bus: EventBusSurface = {
+    publish: <P>(i: EventInput<P>): IkbiEvent<P> => { sent.push(i as unknown as { type: string; payload: Record<string, unknown> }); return { ...i, contractVersion: "1.0.0", id: `e${sent.length}`, seq: sent.length, timestamp: 0 } as IkbiEvent<P>; },
+    subscribe: () => ({ id: "s", unsubscribe: () => {}, stats: () => ({ delivered: 0, dropped: 0, failures: 0, queued: 0 }) }),
+    flush: async () => {},
+  };
+  const orch = createOrchestrator({
+    config: { enabled: true, roleTimeoutMs: 1000, maxConcurrentRuns: 1 },
+    resolveIdentity, roleClaim, roles: progressRoles(), workspaces: fakeWs(), trust: fakeTrust, receipts: fakeReceipts, events: bus, gateWall: allowGate,
+    invokeModel: async () => { throw new Error("unused"); },
+  });
+  await orch.run({ taskId: "t-1", targetRepo: "/repo", goal: "g" }, parentCtx);
+
+  // The builder's own activity event carries the tier it executed under (registry tier: "trusted").
+  const activity = sent.find((e) => e.type === "worker.builder.activity");
+  assert.equal(activity?.payload.tier, "trusted", "builder activity tags the tier it ran under (not just internal state)");
+
+  // The verified bootstrap emits a standalone, clear trust-tier event naming the tier + its grant.
+  const established = sent.find((e) => e.type === "worker.trust.established");
+  assert.ok(established !== undefined, "a promoted (verified) build emits worker.trust.established");
+  assert.equal(established!.payload.tier, "trusted", "names the trust tier that authorized the landed work");
+  assert.equal(established!.payload.autoCommit, true, "carries the tier's autonomy grant (trusted ⇒ auto-commit)");
+  assert.equal(established!.payload.sandboxed, false, "trusted work is not sandboxed");
+  // Ordering: the trust signal precedes the generic completion line.
+  assert.ok(sent.findIndex((e) => e.type === "worker.trust.established") < sent.findIndex((e) => e.type === "worker.completed"), "trust tier is surfaced before run-complete");
+});
+
+test("WO5: a NON-promoted build does NOT emit worker.trust.established (no false bootstrap signal)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = ids();
+  const sent: Array<{ type: string; payload: Record<string, unknown> }> = [];
+  const bus: EventBusSurface = {
+    publish: <P>(i: EventInput<P>): IkbiEvent<P> => { sent.push(i as unknown as { type: string; payload: Record<string, unknown> }); return { ...i, contractVersion: "1.0.0", id: `e${sent.length}`, seq: sent.length, timestamp: 0 } as IkbiEvent<P>; },
+    subscribe: () => ({ id: "s", unsubscribe: () => {}, stats: () => ({ delivered: 0, dropped: 0, failures: 0, queued: 0 }) }),
+    flush: async () => {},
+  };
+  // Integrator declines to promote ⇒ nothing lands ⇒ no trust-established signal.
+  const roles = progressRoles();
+  roles.integrator = async () => ({ role: "integrator", outcome: "success", summary: "i", detail: { decision: "discard", rationale: "not promotable" } });
+  const orch = createOrchestrator({
+    config: { enabled: true, roleTimeoutMs: 1000, maxConcurrentRuns: 1 },
+    resolveIdentity, roleClaim, roles, workspaces: fakeWs(), trust: fakeTrust, receipts: fakeReceipts, events: bus, gateWall: allowGate,
+    invokeModel: async () => { throw new Error("unused"); },
+  });
+  await orch.run({ taskId: "t-1", targetRepo: "/repo", goal: "g" }, parentCtx);
+
+  assert.equal(sent.find((e) => e.type === "worker.trust.established"), undefined, "no promote ⇒ no trust-established event");
 });
 
 test("the --verbose verify line is scope-stamped in ladder mode (and unchanged in legacy)", () => {

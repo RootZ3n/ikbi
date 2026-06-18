@@ -90,6 +90,7 @@ import {
   workerRoleDispatched,
   workerRoleSkipped,
   workerStarted,
+  workerTrustEstablished,
   workerVerification,
   workerFixLoopCompleted,
   workerCriticFixLoopCompleted,
@@ -1401,7 +1402,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           const bd = (result.detail ?? {}) as Record<string, unknown>;
           events.publish(
             workerBuilderActivity.create(
-              { taskId: task.taskId, toolRounds: typeof bd.toolRounds === "number" ? bd.toolRounds : 0, filesWritten: Array.isArray(bd.filesWritten) ? bd.filesWritten.length : 0, ...(typeof bd.contextPercent === "number" ? { contextPercent: bd.contextPercent } : {}) },
+              { taskId: task.taskId, toolRounds: typeof bd.toolRounds === "number" ? bd.toolRounds : 0, filesWritten: Array.isArray(bd.filesWritten) ? bd.filesWritten.length : 0, ...(typeof bd.contextPercent === "number" ? { contextPercent: bd.contextPercent } : {}), tier: spawned.autonomy.tier },
               { source: EVENT_SOURCE, attribution: { identity: spawned.identity, operation: "worker.role.builder", runId: task.taskId } },
             ),
           );
@@ -1876,6 +1877,27 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       ...(escalationOutcome !== undefined ? { escalation: escalationOutcome } : {}),
     };
 
+    // TRUST-TIER UX (WO5): the work LANDED (verified + promoted) — surface the trust tier that
+    // authorized it as a clear, standalone event BEFORE the generic completion line. The tier and
+    // its autonomy grant are read straight from the governance tier already used for the promote
+    // (no new decision, no weakening) — this is pure visibility into the bootstrap's trust posture.
+    if (promoted) {
+      const landedGrant = autonomyForTier(asTier(parentIdentity.trustTier ?? TRUST_FLOOR, TRUST_FLOOR));
+      events.publish(
+        workerTrustEstablished.create(
+          {
+            taskId: task.taskId,
+            workspaceId: workspace.id,
+            tier: landedGrant.tier,
+            sandboxed: landedGrant.sandboxed,
+            gateLevel: landedGrant.gateLevel,
+            requiresApproval: landedGrant.requiresApproval,
+            autoCommit: landedGrant.autoCommit,
+          },
+          { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } },
+        ),
+      );
+    }
     if (overall === "success" || overall === "partial") {
       events.publish(
         workerCompleted.create(
