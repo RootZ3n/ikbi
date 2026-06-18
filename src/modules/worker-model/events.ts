@@ -33,6 +33,31 @@ export const workerBuilderActivity = defineEvent<{ taskId: string; toolRounds: n
   "worker.builder.activity",
 );
 
+/**
+ * STREAM-STALL RECOVERY (WO4): a model stream was cut off WHILE emitting a tool call —
+ * the truncated action was NOT executed (fail-closed). The builder retries (bounded) or
+ * terminates cleanly. CONTENT is redacted: only the partial-argument BYTE COUNT is carried,
+ * never the partial argument values. Surfaced so an operator can correlate stalls with a
+ * flaky model/provider. (Attribution: role identity.) */
+export const workerToolCallStalled = defineEvent<{
+  taskId: string;
+  /** The stalled tool name(s) the partial call carried, if any. */
+  tools: readonly string[];
+  /** Total bytes of partial arguments received — the CONTENT is redacted, never the values. */
+  partialArgBytes: number;
+  /** Logical model + serving provider that stalled, for provider-stability triage. */
+  model?: string;
+  provider?: string;
+  /** Correlation id (the run/task id). */
+  requestId?: string;
+  /** 1-based stall attempt within this build. */
+  attempt: number;
+  /** Max stalls tolerated before a clean failure. */
+  maxAttempts: number;
+  /** Whether the builder will retry the tool call (false ⇒ this stall is terminal). */
+  willRetry: boolean;
+}>("worker.tool_call_stalled");
+
 /** VERIFICATION status — the verifier's verdict + which checks passed. (Attribution: role.) */
 export const workerVerification = defineEvent<{ taskId: string; verdict: string; typecheckPassed: boolean; testsPassed: boolean; checks?: ReadonlyArray<{ name: string; passed: boolean }>; verificationScope?: "impact" | "full" }>(
   "worker.verification",

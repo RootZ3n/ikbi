@@ -40,11 +40,12 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFi
 import { dirname } from "node:path";
 
 import { configEnv } from "../../core/config.js";
+import { events } from "../../core/events/index.js";
 import type { OperationContext } from "../../core/identity/index.js";
 import { toUntrustedMessage } from "../../core/injection/index.js";
 import { childLogger } from "../../core/log.js";
 import { adaptMaxTokens, getCapabilities } from "../../core/provider/capabilities.js";
-import type { ModelMessage, ModelTool, ToolCall } from "../../core/provider/contract.js";
+import type { ModelMessage, ModelResponse, ModelTool, ToolCall } from "../../core/provider/contract.js";
 import { parseCheckOutput } from "../check-triage/index.js";
 import type { GovernedExec } from "../governed-exec/index.js";
 import { gbrainBridge } from "../../core/gbrain-bridge.js";
@@ -69,6 +70,7 @@ import type { RoleFn, RoleResult, WorkerOutcome } from "./contract.js";
 import { loadProjectMemory } from "./project-memory.js";
 import { builderModel } from "./role-models.js";
 import type { ScoutFinding } from "./scout.js";
+import { workerToolCallStalled } from "./events.js";
 import { interceptMemoryGovernor, type ToolExecutorDeps } from "./tool-executor.js";
 import { discoverMcpTools, type McpToolRegistry } from "../mcp-model-loop/registry.js";
 
@@ -105,6 +107,14 @@ function resolveMaxToolIterations(): number {
 
 /** Hard cap on model rounds — IKBI_MAX_TOOL_ITERATIONS overrides the default (40). */
 export const MAX_TOOL_ITERATIONS = resolveMaxToolIterations();
+/**
+ * WO4 — STREAM-STALL RECOVERY. Max number of stalls (the initial stall + its retries)
+ * tolerated within a single build before terminating cleanly with `tool_call_stalled`.
+ * A stalled tool call is NEVER executed; on a stall the builder retries the round, up to
+ * this many strikes, then fails closed. Bounded so a persistently-flaky provider cannot
+ * loop forever.
+ */
+const MAX_TOOL_CALL_STALLS = 3;
 /** Max bytes returned by read_file (untrusted content is bounded before the model). */
 const MAX_READ_BYTES = 32_000;
 /** Max entries returned by list_dir. */
@@ -317,6 +327,13 @@ export interface BuilderDeps {
    * Absent (tests / direct construction) ⇒ no interception, behavior unchanged.
    */
   readonly memoryGovernor?: import("../memory-governor/contract.js").MemoryGovernor;
+  /**
+   * WO4 — receipt store seam. A stream stall mid tool-call writes a DURABLE stall receipt
+   * here (the action never ran, but the stall is recorded for audit/triage). Absent (tests /
+   * direct construction) ⇒ lazily resolved to the process receipt singleton ONLY when a stall
+   * actually occurs, so the common path constructs nothing. Injectable for tests.
+   */
+  readonly receipts?: Pick<import("../../core/receipt/index.js").ReceiptStore, "append">;
 }
 
 /** The last run_checks outcome — gates `done` (RAIL: no done while red). */
@@ -501,10 +518,61 @@ function classifyOutcome(stopReason: string): WorkerOutcome {
       return "success"; // RAIL 3: the ONLY success path is a validated `done` self-check
     case "length":
       return "partial"; // generation truncated — work may be incomplete
+    case "tool_call_stalled":
+      return "failure"; // WO4: stream stalled mid tool-call past the retry budget — no action ran
     default:
       // max_iterations, timeout, content_filter, error, unknown, stop-without-done → did not converge
       return "failure";
   }
+}
+
+/** A single stream-stall observation surfaced on the builder result (WO4). */
+interface StallRecord {
+  /** The stalled tool name(s), when the partial call carried a name. */
+  readonly tools: readonly string[];
+  /** Byte count of the partial arguments received (CONTENT is redacted — never the values). */
+  readonly partialArgBytes: number;
+  /** 1-based stall attempt within this build. */
+  readonly attempt: number;
+  /** Whether the builder retried after this stall (false ⇒ terminal). */
+  readonly willRetry: boolean;
+}
+
+/**
+ * WO4 — STREAM-STALL DETECTION. A stream cut off WHILE the model is still emitting a tool
+ * call yields a TRUNCATED response: `finishReason === "length"` with one or more partial
+ * tool calls whose argument JSON never completed. Executing such a call would run a malformed
+ * action, so the builder treats this as a STALL and NEVER executes it. Returns the partial
+ * tool names + the partial-argument byte count (the CONTENT is redacted for safety — only the
+ * length is surfaced), or undefined when the round did not stall mid tool-call.
+ *
+ * A clean `finishReason === "tool_calls"` round is NOT a stall (the model finished its call);
+ * a `length` finish with NO tool calls is plain text truncation, handled elsewhere.
+ */
+function detectStalledToolCall(response: ModelResponse): { tools: string[]; partialArgBytes: number } | undefined {
+  if (response.finishReason !== "length") return undefined;
+  const calls = response.toolCalls;
+  if (calls === undefined || calls.length === 0) return undefined;
+  const tools = calls.map((c) => c.name).filter((n): n is string => typeof n === "string" && n.length > 0);
+  const partialArgBytes = calls.reduce((n, c) => n + (typeof c.arguments === "string" ? c.arguments.length : 0), 0);
+  return { tools, partialArgBytes };
+}
+
+/**
+ * WO4 — actionable stall message fed back to the model (or recorded on terminal failure).
+ * Names the stalled tool, states the cause, and the recovery action — without ever echoing
+ * the redacted partial arguments.
+ */
+function stallMessage(tools: readonly string[], attempt: number, max: number, willRetry: boolean): string {
+  const named = tools.length > 0 ? tools.join(", ") : "unknown";
+  const head =
+    `Tool call stalled: ${named}\n` +
+    "Partial arguments received (redacted for safety).\n" +
+    "Cause: stream interrupted before complete tool-call JSON.";
+  const action = willRetry
+    ? `Action: retrying automatically (attempt ${attempt}/${max}).`
+    : `Action: max stall retries (${max}) reached — not retrying.`;
+  return `${head}\n${action}\nIf this persists, check model provider stability.`;
 }
 
 function isPolicyViolation(e: ToolCallError): boolean {
@@ -662,6 +730,8 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
   let contextPercent = 0; // SG: PEAK context-window pressure (0-100) across iterations, surfaced for visibility (L2)
   let warnedHighContext = false; // warn-once when pressure crosses 70%
   let stopReason = "max_iterations"; // not "stop": only a validated `done` is success now
+  let toolCallStalls = 0; // WO4: stream-stall recovery — strikes when a stream cut off mid tool-call
+  const stallRecords: StallRecord[] = []; // WO4: per-stall observations surfaced on the result + receipt
   const filesWrittenPerRound: number[] = []; // EARLY STOP: tracks new files written each tool-round iteration
   let consecutiveRejectedToolRounds = 0;
   let emulatedToolRound = false; // this round's tool calls came from TEXT (no native tool API) → feed results back as user, not tool-role
@@ -1383,6 +1453,87 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         tools: toolsForModel, // [] in emulated mode — the model has no native tool API
       });
 
+      // WO4 — STREAM-STALL RECOVERY. A round whose stream was cut off MID tool-call
+      // (finishReason "length" WITH partial tool calls) must NEVER execute the truncated
+      // action — fail-closed. Emit a structured event + a durable receipt, surface it on the
+      // result, and RETRY the round (bounded by MAX_TOOL_CALL_STALLS). When the stall budget
+      // is spent — or no iteration/time budget remains — terminate cleanly with reason
+      // `tool_call_stalled`. The partial assistant turn is NOT round-tripped (its dangling
+      // tool calls have no matching tool result and would wedge the next request).
+      const stall = detectStalledToolCall(response);
+      if (stall !== undefined) {
+        toolCallStalls += 1;
+        const willRetry =
+          toolCallStalls < MAX_TOOL_CALL_STALLS && iterations < MAX_TOOL_ITERATIONS && Date.now() - startedAt <= timeoutMs;
+        stallRecords.push({ tools: stall.tools, partialArgBytes: stall.partialArgBytes, attempt: toolCallStalls, willRetry });
+        events.publish(
+          workerToolCallStalled.create(
+            {
+              taskId: ctx.task.taskId,
+              tools: stall.tools,
+              partialArgBytes: stall.partialArgBytes,
+              model: response.model,
+              provider: response.provider,
+              requestId: ctx.task.taskId,
+              attempt: toolCallStalls,
+              maxAttempts: MAX_TOOL_CALL_STALLS,
+              willRetry,
+            },
+            {
+              source: "worker-model",
+              attribution: { identity: ctx.identity, operation: "worker.tool_call_stalled", runId: ctx.task.taskId, requestId: ctx.task.taskId },
+            },
+          ),
+        );
+        // DURABLE RECEIPT — the stall is recorded even though NO action ran. Best-effort: a
+        // receipt-write failure must never mask the stall handling. CONTENT is redacted (only
+        // the partial-argument byte count is kept), never the partial argument values.
+        try {
+          const store = deps.receipts ?? (await import("../../core/receipt/index.js")).receipts;
+          await store.append(
+            {
+              operation: "worker.tool_call_stalled",
+              outcome: {
+                status: willRetry ? "partial" : "failure",
+                detail:
+                  `stream stalled mid tool-call (${stall.tools.join(", ") || "unknown"}); not executed` +
+                  (willRetry ? `; retrying ${toolCallStalls}/${MAX_TOOL_CALL_STALLS}` : "; stall budget exhausted"),
+              },
+              requestId: ctx.task.taskId,
+              metadata: {
+                taskId: ctx.task.taskId,
+                tools: stall.tools,
+                partialArgBytes: stall.partialArgBytes,
+                attempt: toolCallStalls,
+                maxAttempts: MAX_TOOL_CALL_STALLS,
+                willRetry,
+                model: response.model,
+                provider: response.provider,
+              },
+              project: ctx.task.targetRepo,
+            },
+            ctx.identity,
+          );
+        } catch (e) {
+          log.warn(`[stall] failed to write stall receipt: ${errMsg(e)}`);
+        }
+        log.warn(
+          `[stall] tool call stalled (${stall.tools.join(", ") || "unknown"}) attempt ${toolCallStalls}/${MAX_TOOL_CALL_STALLS}` +
+            (willRetry ? " — retrying" : " — terminating"),
+        );
+        if (!willRetry) {
+          stopReason = "tool_call_stalled";
+          break;
+        }
+        // Round-trip a CLEAN assistant turn (NO partial tool calls) + the actionable corrective
+        // guidance, then retry. The model is asked to re-emit the tool call from scratch.
+        if (typeof response.content === "string" && response.content.length > 0) {
+          messages.push({ role: "assistant", content: response.content });
+        }
+        messages.push({ role: "user", content: stallMessage(stall.tools, toolCallStalls, MAX_TOOL_CALL_STALLS, true) });
+        continue;
+      }
+
       // Round-trip the assistant turn (with any tool calls it emitted).
       messages.push({
         role: "assistant",
@@ -1630,6 +1781,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       (bareStops > 0 ? `, ${bareStops} bare-stop(s) corrected` : "");
     // ISSUE 3: fold the repair narrative into the role summary so the receipt trail records the
     // suspected root cause + fix rationale (the CLI also surfaces it in the final report).
+    if (toolCallStalls > 0) summary += `, ${toolCallStalls} tool-call stall(s)`;
     if (doneClaim?.rootCause !== undefined) summary += `; root cause: ${doneClaim.rootCause}`;
     if (doneClaim?.fixRationale !== undefined) summary += `; fix: ${doneClaim.fixRationale}`;
     return {
@@ -1650,6 +1802,8 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         rejectedToolCalls,
         policyViolations,
         toolFormatErrors,
+        // WO4: stream-stall observations (empty unless a round was cut off mid tool-call).
+        ...(stallRecords.length > 0 ? { toolCallStalls: stallRecords } : {}),
         // The builder's completion CLAIM (present only on a validated `done`). It is the
         // builder's self-report, NOT the verdict — the verifier role still decides truth.
         ...(doneClaim !== undefined ? { doneClaim } : {}),

@@ -19,8 +19,11 @@ import type { ModelRequest, ModelResponse, ToolCall } from "../../core/provider/
 import { autonomyForTier } from "../../core/trust/index.js";
 import type { WorkspaceHandle } from "../../core/workspace/contract.js";
 import type { ExecRequest, ExecResult } from "../governed-exec/index.js";
+import { events, type IkbiEvent } from "../../core/events/index.js";
+import type { ReceiptInput } from "../../core/receipt/index.js";
 import { createBuilder, MAX_TOOL_ITERATIONS, simplifyTools, TOOLS, type ToolCallError } from "./builder.js";
 import { VERIFIER_CHECKS } from "./checks.js";
+import { workerToolCallStalled } from "./events.js";
 import { builderModel } from "./role-models.js";
 import type { RoleContext, RoleEngine, RoleResult } from "./contract.js";
 
@@ -58,6 +61,9 @@ function base(): Omit<ModelResponse, "content" | "finishReason" | "toolCalls"> {
 const stopResp = (content = "done"): ModelResponse => ({ ...base(), content, finishReason: "stop" });
 const lengthResp = (): ModelResponse => ({ ...base(), content: "", finishReason: "length" });
 const toolResp = (calls: ToolCall[]): ModelResponse => ({ ...base(), content: "", finishReason: "tool_calls", toolCalls: calls });
+/** A STALLED round (WO4): the stream was cut off MID tool-call — finishReason "length" WITH
+ *  partial tool calls whose argument JSON never completed. Must NEVER be executed. */
+const stallResp = (calls: ToolCall[], content = ""): ModelResponse => ({ ...base(), content, finishReason: "length", toolCalls: calls });
 const call = (name: string, args: unknown, id = "c1"): ToolCall => ({ id, name, arguments: typeof args === "string" ? args : JSON.stringify(args) });
 /** A `run_checks` tool call — the in-loop independent signal. done is gated on a green one. */
 const runChecksResp = (id = "rc1"): ModelResponse => toolResp([call("run_checks", {}, id)]);
@@ -988,4 +994,128 @@ test("L2: contextPercent reports the PEAK window pressure, not the last iteratio
   // low-pressure tiny-read tail. A "last iteration" implementation would report a single-digit
   // percent here; the peak is far above the floor the final iterations sit at.
   assert.ok(detail.contextPercent >= 50, `expected peak contextPercent >= 50, got ${detail.contextPercent}`);
+});
+
+// ── WO4: stream-stall / tool-call recovery ─────────────────────────────────
+
+/** Collect every `worker.tool_call_stalled` event published during `fn`. */
+async function captureStallEvents(fn: () => Promise<unknown>): Promise<Array<IkbiEvent<{ tools: readonly string[]; model?: string; provider?: string; partialArgBytes: number; attempt: number; maxAttempts: number; willRetry: boolean }>>> {
+  const seen: Array<IkbiEvent<never>> = [];
+  const sub = events.subscribe({ types: [workerToolCallStalled.type] }, (e) => { seen.push(e as IkbiEvent<never>); });
+  try {
+    await fn();
+    await events.flush();
+  } finally {
+    sub.unsubscribe();
+  }
+  return seen as never;
+}
+
+/** A receipt-store spy injectable as BuilderDeps.receipts. */
+function receiptSpy() {
+  const appended: Array<{ input: ReceiptInput; identity: AgentIdentity }> = [];
+  const receipts = { append: async (input: ReceiptInput, identity: AgentIdentity) => { appended.push({ input, identity }); return {} as never; } };
+  return { receipts, appended };
+}
+
+test("WO4: a tool call stalled mid-stream is NEVER executed (no side effect on disk)", async () => {
+  const dir = tmp();
+  // The stalled write carries COMPLETE, valid JSON args — if the builder executed it on the
+  // finish reason alone it WOULD write the file. finishReason "length" marks it stalled, so the
+  // builder must refuse it regardless of the args being parseable.
+  const { engine } = mockEngine([
+    stallResp([call("write_file", { path: "stalled.txt", content: "SHOULD-NOT-WRITE" }, "s1")]),
+    writeResp("ok.txt", "ok\n"),
+    runChecksResp(),
+    doneResp(["ok.txt"]),
+  ]);
+  const result = await run(makeCtx(dir, "verified", engine));
+
+  assert.ok(!existsSync(join(dir, "stalled.txt")), "the stalled write must NOT touch the fs");
+  assert.equal(result.outcome, "success", "the build recovers after the stall and converges");
+  const detail = result.detail as { filesWritten: string[]; toolCallStalls: Array<{ attempt: number; willRetry: boolean }> };
+  assert.deepEqual(detail.filesWritten, ["ok.txt"], "only the post-stall write landed");
+  assert.equal(detail.toolCallStalls.length, 1, "the stall is recorded");
+  assert.equal(detail.toolCallStalls[0]?.willRetry, true, "the first stall retried");
+});
+
+test("WO4: a stall emits worker.tool_call_stalled with the tool + model/provider metadata", async () => {
+  const dir = tmp();
+  const { engine } = mockEngine([
+    stallResp([call("terminal", { command: "ls -la" }, "s1")]),
+    writeResp("ok.txt", "ok\n"),
+    runChecksResp(),
+    doneResp(["ok.txt"]),
+  ]);
+  const seen = await captureStallEvents(() => run(makeCtx(dir, "verified", engine)));
+
+  assert.equal(seen.length, 1, "exactly one stall event");
+  const p = seen[0]!.payload;
+  assert.deepEqual(p.tools, ["terminal"], "the stalled tool name is carried");
+  assert.equal(p.model, "mimo-v2.5", "the model that stalled is recorded");
+  assert.equal(p.provider, "mimo", "the serving provider is recorded");
+  assert.equal(p.attempt, 1);
+  assert.equal(p.maxAttempts, 3);
+  assert.equal(p.willRetry, true);
+  assert.ok(p.partialArgBytes > 0, "the partial-argument byte count is surfaced (redacted content)");
+  assert.equal(seen[0]!.source, "worker-model");
+});
+
+test("WO4: retry works — a stall then a clean round converges, with an actionable corrective message", async () => {
+  const dir = tmp();
+  const { engine, requests } = mockEngine([
+    stallResp([call("write_file", { path: "x.txt", content: "x" }, "s1")]),
+    writeResp("x.txt", "x\n"),
+    runChecksResp(),
+    doneResp(["x.txt"]),
+  ]);
+  const result = await run(makeCtx(dir, "verified", engine));
+
+  assert.equal(result.outcome, "success");
+  // The round AFTER the stall must carry the actionable, named, redacted corrective guidance.
+  const afterStall = requests[1]?.messages ?? [];
+  const corrective = afterStall.find((m) => typeof m.content === "string" && m.content.includes("Tool call stalled: write_file"));
+  assert.ok(corrective, "the next request includes the named stall message");
+  assert.match(String(corrective?.content), /retrying automatically \(attempt 1\/3\)/, "the message states the retry attempt");
+  assert.match(String(corrective?.content), /redacted for safety/, "the partial args are described as redacted, not echoed");
+});
+
+test("WO4: max stall retries reached → clean failure (tool_call_stalled), nothing executed", async () => {
+  const dir = tmp();
+  // The mock repeats the last response → every round stalls.
+  const { engine } = mockEngine([stallResp([call("terminal", { command: "echo hi" }, "s1")])]);
+  const seen = await captureStallEvents(async () => {
+    const result = await run(makeCtx(dir, "verified", engine));
+    assert.equal(result.outcome, "failure", "an exhausted stall budget is a clean failure");
+    const detail = result.detail as { stopReason: string; filesWritten: string[]; toolCallStalls: Array<{ attempt: number; willRetry: boolean }> };
+    assert.equal(detail.stopReason, "tool_call_stalled", "the failure reason names the stall");
+    assert.equal(detail.toolCallStalls.length, 3, "three strikes (MAX_TOOL_CALL_STALLS)");
+    assert.deepEqual(detail.toolCallStalls.map((s) => s.willRetry), [true, true, false], "retry twice, then terminate");
+    assert.equal(detail.filesWritten.length, 0, "no tool ever executed");
+  });
+  assert.equal(seen.length, 3, "an event per stall, including the terminal one");
+  assert.equal(seen[2]!.payload.willRetry, false, "the terminal stall event is marked non-retrying");
+});
+
+test("WO4: a stall writes a durable receipt with REDACTED stall info (no partial arg values)", async () => {
+  const dir = tmp();
+  const SECRET = "TOPSECRET-9f3a-do-not-leak";
+  const spy = receiptSpy();
+  const { engine } = mockEngine([
+    stallResp([call("write_file", { path: "s.txt", content: SECRET }, "s1")]),
+    writeResp("ok.txt", "ok\n"),
+    runChecksResp(),
+    doneResp(["ok.txt"]),
+  ]);
+  await createBuilder({ governedExec: greenExec(), parentCtx: PARENT_CTX, receipts: spy.receipts })(makeCtx(dir, "verified", engine));
+
+  const stallReceipt = spy.appended.find((a) => a.input.operation === "worker.tool_call_stalled");
+  assert.ok(stallReceipt, "a stall receipt was appended");
+  const meta = stallReceipt!.input.metadata as { tools: string[]; partialArgBytes: number; attempt: number; willRetry: boolean };
+  assert.deepEqual(meta.tools, ["write_file"], "the receipt records the stalled tool");
+  assert.equal(typeof meta.partialArgBytes, "number");
+  assert.equal(meta.attempt, 1);
+  // REDACTION: the partial argument VALUES must never appear anywhere in the receipt.
+  assert.ok(!JSON.stringify(stallReceipt!.input).includes(SECRET), "the receipt must not leak the partial argument content");
+  assert.equal(stallReceipt!.identity, makeCtx(dir, "verified", engine).identity.agentId === "worker-1" ? stallReceipt!.identity : undefined, "attributed to the run identity");
 });

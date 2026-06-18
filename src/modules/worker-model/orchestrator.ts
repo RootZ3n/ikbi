@@ -961,6 +961,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       | { rootCause?: string; fixRationale?: string }
       | undefined;
     const filesWritten = (result.detail as Record<string, unknown> | undefined)?.filesWritten;
+    // WO4: stream-stall observations (builder rounds cut off mid tool-call) — folded into the
+    // role receipt so the run-level audit trail records that stalls happened, alongside the
+    // per-stall receipts the builder writes at detection time.
+    const toolCallStalls = (result.detail as Record<string, unknown> | undefined)?.toolCallStalls;
 
     await receipts.append(
       {
@@ -981,6 +985,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           ...(doneClaim?.rootCause !== undefined ? { rootCause: doneClaim.rootCause } : {}),
           ...(doneClaim?.fixRationale !== undefined ? { fixRationale: doneClaim.fixRationale } : {}),
           ...(Array.isArray(filesWritten) ? { filesChanged: filesWritten } : {}),
+          ...(Array.isArray(toolCallStalls) && toolCallStalls.length > 0 ? { toolCallStalls } : {}),
         },
         project: task.targetRepo,
       },
