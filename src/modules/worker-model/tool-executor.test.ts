@@ -176,6 +176,52 @@ test("executeTool: terminal without a governed-exec fails closed", async () => {
   assert.match(res.output, /unavailable/);
 });
 
+// ── 7b. terminal background → the jobs control is threaded through (Issue 2) ──
+
+test("executeTool: terminal background mode reaches the jobs control when wired", async () => {
+  const root = worktree();
+  let bgRan = "";
+  const fakeExec = {
+    run: async (req: { command: string; background?: boolean }) => {
+      bgRan = req.command;
+      return { executed: true, jobId: "job-1", pid: 42 };
+    },
+  };
+  let polled = "";
+  const fakeJobs = {
+    listJobs: () => [],
+    readJobOutput: (id: string) => { polled = id; return { found: true, status: "running", output: "tick", nextOffset: 4 }; },
+    killJob: (_id: string) => ({ found: true }),
+    jobStatus: (_id: string) => ({ found: true, status: "running" }),
+  };
+  // Starting a background job is only reachable when `jobs` is wired (else runTerminal errors).
+  const start = await executeTool(
+    baseDeps(root, { governedExec: fakeExec as never, jobs: fakeJobs as never, parentCtx: fakeCtx }),
+    call("terminal", { command: "node server.js", background: true }),
+  );
+  assert.equal(bgRan, "node", "the background command ran through governed-exec");
+  assert.match(start.output, /started background job job-1/);
+
+  // Polling proves deps.jobs was threaded through to the terminal tool invocation.
+  const poll = await executeTool(
+    baseDeps(root, { governedExec: fakeExec as never, jobs: fakeJobs as never, parentCtx: fakeCtx }),
+    call("terminal", { poll_job_id: "job-1" }),
+  );
+  assert.equal(polled, "job-1", "the terminal tool received the jobs control and polled it");
+  assert.match(poll.output, /tick/);
+});
+
+test("executeTool: terminal background WITHOUT jobs reports it is unavailable", async () => {
+  const root = worktree();
+  const fakeExec = { run: async () => ({ executed: true, jobId: "x" }) };
+  const res = await executeTool(
+    baseDeps(root, { governedExec: fakeExec as never, parentCtx: fakeCtx }),
+    call("terminal", { command: "node server.js", background: true }),
+  );
+  assert.equal(res.ok, false);
+  assert.match(res.output, /background processes are not available/);
+});
+
 // ── 8. read_file confinement ─────────────────────────────────────────────────
 
 test("executeTool: read_file reads inside the worktree and rejects a traversal escape", async () => {

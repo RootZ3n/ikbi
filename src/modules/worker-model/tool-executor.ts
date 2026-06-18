@@ -45,7 +45,7 @@ import { runSearchFiles } from "./builder-tools/search-files.js";
 import { runGlob } from "./builder-tools/glob.js";
 import { runPatch } from "./builder-tools/patch.js";
 import { runMultiEdit } from "./builder-tools/multi-edit.js";
-import { runTerminal } from "./builder-tools/terminal.js";
+import { runTerminal, type JobControl } from "./builder-tools/terminal.js";
 import { runBrainTool } from "./builder-tools/brain-tools.js";
 
 /** Max bytes returned by read_file (matches the chat/builder caps). */
@@ -65,6 +65,13 @@ export interface ToolExecutorDeps {
   readonly gbrainBridge?: GbrainBridge;
   /** Governed-exec surface — required for `terminal`; absent ⇒ terminal errors. */
   readonly governedExec?: Pick<GovernedExec, "run">;
+  /**
+   * BACKGROUND job control (list/poll/kill of detached processes) for `terminal background:true`.
+   * Absent ⇒ a background / poll / kill request returns an error (the foreground path is unaffected).
+   * MUST be the SAME governed-exec instance as `governedExec` so a job started here can be polled
+   * and killed here. Without this the terminal tool ADVERTISES background mode it cannot reach.
+   */
+  readonly jobs?: JobControl;
   /** The run's validated identity — authorizes governed terminal / brain_sync. Absent ⇒ those fail closed. */
   readonly parentCtx?: OperationContext;
 }
@@ -305,7 +312,11 @@ export async function executeTool(deps: ToolExecutorDeps, call: ToolCall): Promi
         return { output: "ERROR: terminal is unavailable (no governed-exec wired).", ok: false };
       }
       const out = await runTerminal(
-        { governedExec: deps.governedExec, ...(deps.parentCtx !== undefined ? { parentCtx: deps.parentCtx } : {}) },
+        {
+          governedExec: deps.governedExec,
+          ...(deps.jobs !== undefined ? { jobs: deps.jobs } : {}),
+          ...(deps.parentCtx !== undefined ? { parentCtx: deps.parentCtx } : {}),
+        },
         worktreeReal,
         args,
       );

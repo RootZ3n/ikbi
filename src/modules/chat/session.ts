@@ -1079,6 +1079,10 @@ export class ChatSession {
       worktreeReal: this.worktree,
       agentId: this.identity.agentId,
       governedExec,
+      // BACKGROUND jobs: the SAME governed-exec singleton runs commands, so its job manager can
+      // poll/kill a `terminal background:true` job. Without this the tool advertises background
+      // mode the executor can never reach.
+      jobs: governedExec,
       gbrainBridge,
       ...(this.parentCtx !== undefined ? { parentCtx: this.parentCtx } : {}),
       ...(this.memoryGovernor !== undefined ? { memoryGovernor: this.memoryGovernor } : {}),

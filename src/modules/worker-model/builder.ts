@@ -57,7 +57,7 @@ import { multiEditTool, runMultiEdit } from "./builder-tools/multi-edit.js";
 import { globTool, runGlob } from "./builder-tools/glob.js";
 import { parseTextToolCalls, textToolProtocolInstructions } from "./builder-tools/text-tool-protocol.js";
 import { runSearchFiles, searchFilesTool } from "./builder-tools/search-files.js";
-import { runTerminal, terminalTool, tokenizeCommand } from "./builder-tools/terminal.js";
+import { runTerminal, terminalTool, tokenizeCommand, type JobControl } from "./builder-tools/terminal.js";
 import { commandPolicyDenyReason } from "../governed-exec/policy.js";
 import { runVisionAnalyze, visionAnalyzeTool } from "./builder-tools/vision-tool.js";
 import { runWebExtract, runWebSearch, webExtractTool, webSearchTool, WEB_TOOL_NAMES } from "./builder-tools/web-tools.js";
@@ -282,6 +282,13 @@ export interface DoneClaim {
 export interface BuilderDeps {
   /** Governed executor — run_checks routes through it (gate-wall + allowlist + receipts). */
   readonly governedExec?: Pick<GovernedExec, "run">;
+  /**
+   * BACKGROUND job control for `terminal background:true` (poll/kill of detached processes). Absent
+   * ⇒ resolved lazily to the governed-exec singleton's job manager — the SAME instance every run()
+   * path (the injected production wrapper AND the lazy fallback) delegates command execution to, so
+   * a job started here can be polled/killed here. Injectable for tests.
+   */
+  readonly jobs?: JobControl;
   /** The run's validated OperationContext (#10). Absent ⇒ run_checks cannot run (fail-closed). */
   readonly parentCtx?: OperationContext;
   /**
@@ -951,7 +958,11 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       // where the builder's writes actually land if any path component is a symlink. Pinning
       // the realpath guarantees `terminal` runs WHERE the builder built (so `ls` sees the files
       // it wrote), not in the CLI's process.cwd().
-      const raw = await runTerminal({ governedExec, ...(deps.parentCtx !== undefined ? { parentCtx: deps.parentCtx } : {}) }, worktreeReal, args);
+      // BACKGROUND jobs: thread job control so a `terminal background:true` request can actually
+      // spawn/poll/kill. deps.jobs wins (tests); else the live governed-exec singleton — the SAME
+      // JobManager the lazy/injected run() delegates to, so a started job is pollable here.
+      const jobs = deps.jobs ?? (await import("../governed-exec/index.js")).governedExec;
+      const raw = await runTerminal({ governedExec, jobs, ...(deps.parentCtx !== undefined ? { parentCtx: deps.parentCtx } : {}) }, worktreeReal, args);
       // POLICY GATE: a `DENIED:` result from runTerminal — governed-exec allowlist denial or the
       // tool's own path-confinement refusal — is an ATTEMPTED out-of-policy action. The pre-checks
       // above already record the denials they catch (write_scope, policy-deny) and return early, so
