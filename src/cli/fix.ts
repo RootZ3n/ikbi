@@ -140,10 +140,17 @@ export interface FixCliDeps {
 }
 
 /** Map a governed ExecResult into the pipeline's CheckRun shape (a denial is a non-zero, honest output). */
-function execToCheckRun(res: ExecResult): CheckRun {
+function execToCheckRun(res: ExecResult, command?: string): CheckRun {
   const output = `${res.stdoutTail ?? ""}${res.stderrTail ?? ""}`;
   if (res.denied === true) {
-    return { exitCode: 126, output: `GOVERNED-EXEC DENIED: ${res.reason ?? "command refused (allowlist/gate)"}\n${output}` };
+    const reason = res.reason ?? "command refused (allowlist/gate)";
+    // Make a native-toolchain denial ACTIONABLE: cargo/go/python3 are not default-allowlisted, so a
+    // Rust/Go/Python `ikbi fix` fails closed here. Name the exact env var + binary the operator must
+    // allowlist (mirrors the builder's `mapExec` note) instead of a bare "not on the allowlist".
+    const hint = /not on the allowlist/i.test(reason) && command !== undefined
+      ? ` — add "${command}" to IKBI_GOVERNED_EXEC_ALLOWLIST (e.g. IKBI_GOVERNED_EXEC_ALLOWLIST=${command}) to run the real check`
+      : "";
+    return { exitCode: 126, output: `GOVERNED-EXEC DENIED: ${reason}${hint}\n${output}` };
   }
   if (!res.executed) {
     return { exitCode: 1, output: `check did not execute: ${res.reason ?? "unknown"}\n${output}` };
@@ -201,7 +208,7 @@ export function createFixCli(deps: FixCliDeps = {}) {
     // The check runs through governed-exec (allowlist + gate-wall + receipts) under the operator ctx.
     const runCheck = async (repoPath: string, check: FixCheckCommand): Promise<CheckRun> => {
       const res = await governedExec.run({ parentCtx: ctx, command: check.command, args: [...check.args], cwd: repoPath, purpose: `fix check: ${check.command} ${check.args.join(" ")}`.trim(), timeoutMs: checkTimeoutMs });
-      return execToCheckRun(res);
+      return execToCheckRun(res, check.command);
     };
 
     const opts: FixOptions = {

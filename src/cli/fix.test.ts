@@ -157,6 +157,28 @@ test("fix CLI: a denied governed check is surfaced as a non-zero CheckRun (fail-
   assert.match(seen?.output ?? "", /DENIED/);
 });
 
+test("fix CLI: an allowlist denial is ACTIONABLE — names the env var + binary to allowlist", async () => {
+  // A Rust/Go/Python repo's native check (cargo/go/python3) is not default-allowlisted, so it fails
+  // closed HERE. The message must tell the operator exactly how to enable it (not a bare denial).
+  let seen: CheckRun | undefined;
+  const cli = createFixCli({
+    resolveIdentity: makeResolver(),
+    operatorToken: OPERATOR_TOKEN,
+    governedExec: { run: async (): Promise<ExecResult> => ({ executed: false, denied: true, reason: 'binary "cargo" is not on the allowlist' }) },
+    runPipeline: async (_o, deps) => {
+      seen = await deps.runCheck("/repo", { command: "cargo", args: ["test"] });
+      return fakeOutcome("ENVIRONMENT_MISSING");
+    },
+    stdout: () => {},
+    stderr: () => {},
+    setExit: () => {},
+  });
+  await cli.fix(["/repo"]);
+  assert.equal(seen?.exitCode, 126);
+  assert.match(seen?.output ?? "", /IKBI_GOVERNED_EXEC_ALLOWLIST/, "names the env var");
+  assert.match(seen?.output ?? "", /cargo/, "names the denied binary");
+});
+
 test("fix CLI: no operator token fails closed before any run", async () => {
   const cap = capture();
   let ran = false;
