@@ -47,8 +47,11 @@ export const DEFAULT_ALLOWLIST: readonly string[] = Object.freeze([
   "npm", "npx", "pnpm", "yarn",
 ]);
 
-/** Per-command wall-clock cap. */
+/** Per-command wall-clock cap. NOTE: applies to FOREGROUND commands only — a background job (spawned
+ *  detached via `background:true`) has no timeout and runs until it exits or is killed. */
 export const DEFAULT_EXEC_TIMEOUT_MS = 30_000;
+/** Grace (ms) between SIGTERM and the follow-up SIGKILL when a background job is killed. */
+export const DEFAULT_JOB_KILL_GRACE_MS = 5_000;
 /** Max captured stdout/stderr bytes (output beyond this aborts the command). */
 export const DEFAULT_MAX_BUFFER = 8 * 1024 * 1024;
 /** Per-HTTP-call wall-clock cap. */
@@ -64,6 +67,8 @@ export interface GovernedExecConfig {
   readonly execTimeoutMs: number;
   readonly maxBuffer: number;
   readonly networkTimeoutMs: number;
+  /** Grace (ms) between SIGTERM and SIGKILL when killing a background job. */
+  readonly jobKillGraceMs: number;
 }
 
 /**
@@ -86,6 +91,7 @@ export function loadGovernedExecConfig(reader = env): GovernedExecConfig {
     execTimeoutMs: reader.int("EXEC_TIMEOUT_MS", DEFAULT_EXEC_TIMEOUT_MS, { min: 1 }),
     maxBuffer: reader.int("MAX_BUFFER", DEFAULT_MAX_BUFFER, { min: 1 }),
     networkTimeoutMs: reader.int("NETWORK_TIMEOUT_MS", DEFAULT_NETWORK_TIMEOUT_MS, { min: 1 }),
+    jobKillGraceMs: reader.int("JOB_KILL_GRACE_MS", DEFAULT_JOB_KILL_GRACE_MS, { min: 1 }),
   });
 }
 

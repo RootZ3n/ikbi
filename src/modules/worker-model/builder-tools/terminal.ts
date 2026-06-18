@@ -23,13 +23,23 @@ import { realpathSync } from "node:fs";
 
 import type { OperationContext } from "../../../core/identity/index.js";
 import type { ModelTool } from "../../../core/provider/contract.js";
-import type { ExecResult, GovernedExec } from "../../governed-exec/index.js";
+import type { ExecResult, GovernedExec, JobOutputResult } from "../../governed-exec/index.js";
 import { commandPolicyDenyReason } from "../../governed-exec/policy.js";
 import { confinePath } from "./confine.js";
+
+/** The background-job control surface the terminal tool needs to poll/kill long-running jobs. */
+export type JobControl = Pick<GovernedExec, "listJobs" | "readJobOutput" | "killJob" | "jobStatus">;
 
 /** What the terminal tool needs from the builder: the governed executor + the run's identity. */
 export interface TerminalDeps {
   readonly governedExec: Pick<GovernedExec, "run">;
+  /**
+   * BACKGROUND job control (poll/kill/list of detached processes). Absent ⇒ background mode is
+   * unavailable and a `background:true` / `poll_job_id` / `kill_job_id` request returns an error;
+   * the foreground path is unaffected. MUST be the SAME executor instance as `governedExec` so a
+   * job started here can be polled/killed here.
+   */
+  readonly jobs?: JobControl;
   /** The run's validated OperationContext. Absent ⇒ the tool fails closed (cannot authorize). */
   readonly parentCtx?: OperationContext;
 }
@@ -43,14 +53,20 @@ export const MAX_TERMINAL_TIMEOUT_MS = 600_000;
 export const terminalTool: ModelTool = {
   name: "terminal",
   description:
-    "Run a shell command in the worktree through ikbi's GOVERNED executor (allowlisted binaries only, no shell metacharacters — arguments are passed literally). Returns exit code, stdout, and stderr. Use for build/inspection commands; a command whose binary is not allowlisted is denied. The command must TERMINATE — long-running daemons (dev servers, watch mode) are not supported and will be killed at the timeout. For a slow command (a big install or test suite) pass `timeout_ms` (default 120000, max 600000).",
+    "Run a shell command in the worktree through ikbi's GOVERNED executor (allowlisted binaries only, no shell metacharacters — arguments are passed literally). Returns exit code, stdout, and stderr. Use for build/inspection commands; a command whose binary is not allowlisted is denied. " +
+    "A normal (foreground) command must TERMINATE and is killed at `timeout_ms` (default 120000, max 600000) — raise it for slow installs/test suites. " +
+    "For a long-running process (dev server, watch mode, a suite that may exceed the timeout) set `background: true`: it is spawned detached with NO timeout and returns a `job` id immediately. Poll its output by calling terminal again with `poll_job_id` (pass the returned `next_offset` as `offset` to read only new output), and stop it with `kill_job_id`. Background jobs are cleaned up automatically when the session ends.",
   parameters: {
     type: "object",
     properties: {
-      command: { type: "string", description: "The command line, e.g. `git status` or `ls src`. The first token is the binary; the rest are literal arguments." },
-      timeout_ms: { type: "number", description: `Max run time in ms before the command is killed. Default ${DEFAULT_TERMINAL_TIMEOUT_MS}, max ${MAX_TERMINAL_TIMEOUT_MS}. Raise it for slow installs/test suites.` },
+      command: { type: "string", description: "The command line, e.g. `git status` or `ls src`. The first token is the binary; the rest are literal arguments. Required unless polling/killing a job." },
+      timeout_ms: { type: "number", description: `Foreground only: max run time in ms before the command is killed. Default ${DEFAULT_TERMINAL_TIMEOUT_MS}, max ${MAX_TERMINAL_TIMEOUT_MS}. Ignored for background jobs.` },
+      background: { type: "boolean", description: "Run `command` as a detached background job (no timeout). Returns a job id; use poll_job_id/kill_job_id to manage it. Use for dev servers, watch mode, or very long suites." },
+      poll_job_id: { type: "string", description: "Instead of running a command, read newly captured output from this background job id. Pair with `offset`." },
+      kill_job_id: { type: "string", description: "Instead of running a command, stop this background job id (SIGTERM, then SIGKILL after a grace period)." },
+      offset: { type: "number", description: "With poll_job_id: the byte offset to read from (use the `next_offset` from the previous poll to read only new output). Default 0." },
     },
-    required: ["command"],
+    required: [],
   },
 };
 
@@ -132,6 +148,28 @@ function formatExecResult(result: ExecResult): string {
   return parts.join("\n");
 }
 
+/** Render the result of STARTING a background job (the handle the model polls/kills). */
+function formatBackgroundStart(result: ExecResult): string {
+  if (result.denied === true) {
+    return `DENIED: ${result.reason ?? "command not permitted by the governed executor"}`;
+  }
+  if (!result.executed || result.jobId === undefined) {
+    return `ERROR: background command did not start${result.reason !== undefined ? `: ${result.reason}` : ""}`;
+  }
+  return (
+    `started background job ${result.jobId}${result.pid !== undefined ? ` (pid ${result.pid})` : ""}. ` +
+    `Poll output: terminal poll_job_id=${result.jobId} (pass the returned next_offset as offset). ` +
+    `Stop it: terminal kill_job_id=${result.jobId}.`
+  );
+}
+
+/** Render a poll of a background job's captured output (status + the new bytes). */
+function formatJobOutput(jobId: string, out: JobOutputResult): string {
+  const exit = out.exitCode !== undefined ? ` exit ${out.exitCode}` : "";
+  const header = `job ${jobId} [${out.status ?? "unknown"}${exit}] next_offset=${out.nextOffset}`;
+  return out.output.length > 0 ? `${header}\n${out.output}` : `${header}\n(no new output)`;
+}
+
 /**
  * Run a governed terminal command in the worktree. Async (governed-exec is async).
  * Returns the raw result STRING for the builder to neutralize + append; never
@@ -142,9 +180,36 @@ export async function runTerminal(
   worktreeDir: string,
   args: Record<string, unknown>,
 ): Promise<string> {
+  const pollJobId = typeof args.poll_job_id === "string" && args.poll_job_id.length > 0 ? args.poll_job_id : undefined;
+  const killJobId = typeof args.kill_job_id === "string" && args.kill_job_id.length > 0 ? args.kill_job_id : undefined;
+  const background = args.background === true;
+
+  // BACKGROUND CONTROL (poll/kill) — operates on an EXISTING job, so no command is needed. These
+  // never spawn or execute; they only read captured output or signal a job through the same
+  // executor instance that started it.
+  if (pollJobId !== undefined || killJobId !== undefined) {
+    if (deps.jobs === undefined) {
+      return "ERROR: background jobs are not available in this session.";
+    }
+    if (killJobId !== undefined) {
+      const r = deps.jobs.killJob(killJobId);
+      return r.found
+        ? `killed background job ${killJobId} (SIGTERM now; SIGKILL after the grace period).`
+        : `ERROR: no background job '${killJobId}'.`;
+    }
+    const rawOffset = typeof args.offset === "number" && Number.isFinite(args.offset) ? args.offset : 0;
+    const offset = rawOffset > 0 ? Math.floor(rawOffset) : 0;
+    const out = deps.jobs.readJobOutput(pollJobId as string, offset);
+    if (!out.found) return `ERROR: no background job '${pollJobId as string}'.`;
+    return formatJobOutput(pollJobId as string, out);
+  }
+
   const command = typeof args.command === "string" ? args.command.trim() : "";
   if (command.length === 0) {
     return "ERROR: terminal requires a non-empty 'command'";
+  }
+  if (background && deps.jobs === undefined) {
+    return "ERROR: background processes are not available in this session.";
   }
   if (deps.parentCtx === undefined) {
     return "ERROR: terminal is unavailable (no parent identity wired to authorize the governed command).";
@@ -177,6 +242,19 @@ export async function runTerminal(
   const requested = typeof args.timeout_ms === "number" && Number.isFinite(args.timeout_ms) ? args.timeout_ms : undefined;
   const timeoutMs = Math.min(MAX_TERMINAL_TIMEOUT_MS, Math.max(1_000, requested ?? DEFAULT_TERMINAL_TIMEOUT_MS));
   try {
+    // BACKGROUND: spawn detached (no timeout) and return the job handle. Still routes through the
+    // SAME governed-exec run() — gate-wall + allowlist + policy + receipt — only the wait is dropped.
+    if (background) {
+      const result = await deps.governedExec.run({
+        parentCtx: deps.parentCtx,
+        command: binary,
+        args: rest,
+        cwd: worktreeDir,
+        purpose: `builder terminal (background): ${command.slice(0, 120)}`,
+        background: true,
+      });
+      return formatBackgroundStart(result);
+    }
     const result = await deps.governedExec.run({
       parentCtx: deps.parentCtx,
       command: binary,

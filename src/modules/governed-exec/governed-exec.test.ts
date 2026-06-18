@@ -29,7 +29,7 @@ function makeCtx(tier: string, opts: { dryRun?: boolean } = {}): OperationContex
 }
 
 function cfg(allowlist: string[], enabled = true): GovernedExecConfig {
-  return { enabled, allowlist, execTimeoutMs: 1000, maxBuffer: 1_000_000, networkTimeoutMs: 1000 };
+  return { enabled, allowlist, execTimeoutMs: 1000, maxBuffer: 1_000_000, networkTimeoutMs: 1000, jobKillGraceMs: 5000 };
 }
 
 function fakeExecFile(result: { stdout: string; stderr: string } = { stdout: "out", stderr: "" }) {

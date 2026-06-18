@@ -20,18 +20,32 @@ assertContractCompatible("events", "1.0.0");
 
 export { createGovernedExec, governedExec, type ExecFileFn, type GovernedExecDeps } from "./exec.js";
 export {
+  createJobManager,
+  type BackgroundChildProcess,
+  type JobManager,
+  type JobManagerDeps,
+  type SpawnBackgroundFn,
+  type SpawnJobRequest,
+} from "./jobs.js";
+export {
   CONTRACT_VERSION,
   type ExecRequest,
   type ExecResult,
   type GovernedExec,
   type HttpRequest,
   type HttpResult,
+  type JobKillResult,
+  type JobOutputResult,
+  type JobState,
+  type JobStatusResult,
+  type JobSummary,
 } from "./contract.js";
 export {
   governedExecConfig,
   loadGovernedExecConfig,
   DEFAULT_ALLOWLIST,
   DEFAULT_EXEC_TIMEOUT_MS,
+  DEFAULT_JOB_KILL_GRACE_MS,
   DEFAULT_MAX_BUFFER,
   DEFAULT_NETWORK_TIMEOUT_MS,
   OUTPUT_TAIL_CHARS,

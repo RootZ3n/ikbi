@@ -79,7 +79,7 @@ export function makeManager() {
 /** A REAL governed executor with a test allowlist (the real governance logic; config is test-set). */
 export function realGovernedExec(allowlist: readonly string[]): GovernedExec {
   return createGovernedExec({
-    config: { enabled: true, allowlist: [...allowlist], execTimeoutMs: 30_000, maxBuffer: 8_000_000, networkTimeoutMs: 5_000 },
+    config: { enabled: true, allowlist: [...allowlist], execTimeoutMs: 30_000, maxBuffer: 8_000_000, networkTimeoutMs: 5_000, jobKillGraceMs: 5_000 },
     gateWall: createGateWall({ receipts: { append: async () => ({}) }, publish: () => {} }),
     receipts: { append: async () => ({}) },
     publish: () => {},

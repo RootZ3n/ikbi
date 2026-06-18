@@ -29,6 +29,8 @@ export interface GovExecEventPayload {
   readonly reason?: string;
   /** True when reported under dry-run (nothing executed). */
   readonly dryRun?: boolean;
+  /** True when the command was spawned as a detached BACKGROUND job (no wait, no timeout). */
+  readonly background?: boolean;
 }
 
 /** Emitted when an execution is requested (before any gate/run). */

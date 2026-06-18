@@ -44,8 +44,19 @@ import {
   govexecRequested,
   type GovExecEventPayload,
 } from "./events.js";
-import type { ExecRequest, ExecResult, GovernedExec, HttpRequest, HttpResult } from "./contract.js";
+import type {
+  ExecRequest,
+  ExecResult,
+  GovernedExec,
+  HttpRequest,
+  HttpResult,
+  JobKillResult,
+  JobOutputResult,
+  JobStatusResult,
+  JobSummary,
+} from "./contract.js";
 import { commandPolicyDenyReason } from "./policy.js";
+import { createJobManager, type JobManager } from "./jobs.js";
 
 const EVENT_SOURCE = "governed-exec";
 const EXEC_OPERATION = "govexec.run";
@@ -131,6 +142,12 @@ export interface GovernedExecDeps {
   readonly execFile?: ExecFileFn;
   /** The STREAMING exec primitive (used when a request sets `onOutput`). Default: node spawn. */
   readonly execFileStream?: ExecFileStreamFn;
+  /**
+   * The BACKGROUND job manager (used when a request sets `background:true`). Default: a fresh
+   * manager wired to node's detached spawn + process-group kill, bounded by `config.maxBuffer`.
+   * Tests substitute a fake-spawn manager to exercise the lifecycle without real processes.
+   */
+  readonly jobManager?: JobManager;
 }
 
 /** Last `OUTPUT_TAIL_CHARS` of a captured stream (bounded; never the full body). */
@@ -180,6 +197,7 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
   const publish = deps.publish ?? ((input: EventInput<GovExecEventPayload>) => void coreEvents.publish(input));
   const execFile = deps.execFile ?? defaultExecFile;
   const execFileStream = deps.execFileStream ?? defaultExecFileStream;
+  const jobManager = deps.jobManager ?? createJobManager({ maxBuffer: config.maxBuffer, killGraceMs: config.jobKillGraceMs });
   const allowlist = new Set(config.allowlist);
   // Lazy: resolving the egress guard at construction would throw if egress is not yet
   // registered. Resolve per-call so importing this module never forces that ordering.
@@ -278,6 +296,29 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
         cwd,
       );
       return { executed: false, reason };
+    }
+
+    // (7-bg) BACKGROUND — spawn DETACHED and return IMMEDIATELY with a job handle. The command has
+    // ALREADY passed the same gate-wall + allowlist + policy path a foreground command does (above);
+    // only the wait + the wall-clock timeout are dropped (a dev server / watch must run until killed).
+    // Output is captured for incremental polling via `readJobOutput`; the receipt records the handle.
+    if (request.background === true) {
+      const { jobId, pid } = jobManager.spawn({
+        command,
+        args,
+        ...(cwd !== undefined ? { cwd } : {}),
+        env: scrubbedEnv(),
+      });
+      emit(govexecExecuted, { ...base, allow: true, background: true }, identity, EXEC_OPERATION, requestId);
+      await receipt(
+        EXEC_OPERATION,
+        identity,
+        { status: "success", detail: `exec ${command} → background job ${jobId}` },
+        { action: "exec", command, argCount, sudo, allow: true, background: true, jobId },
+        requestId,
+        cwd,
+      );
+      return { executed: true, jobId, ...(pid !== undefined ? { pid } : {}) };
     }
 
     // (7) EXECUTE — array args, NO shell. (8) receipt the outcome.
@@ -407,7 +448,16 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
     }
   }
 
-  return { run, fetch };
+  // BACKGROUND job surface — list/poll/kill/status + the session-end dispose hook. These operate
+  // on jobs THIS executor spawned (the manager is per-executor-instance), so the lazy singleton's
+  // jobs and the foreground run share one instance in production.
+  const listJobs = (): JobSummary[] => jobManager.list();
+  const readJobOutput = (jobId: string, offset?: number): JobOutputResult => jobManager.readOutput(jobId, offset);
+  const killJob = (jobId: string): JobKillResult => jobManager.kill(jobId);
+  const jobStatus = (jobId: string): JobStatusResult => jobManager.status(jobId);
+  const disposeJobs = (): void => jobManager.dispose();
+
+  return { run, fetch, listJobs, readJobOutput, killJob, jobStatus, disposeJobs };
 }
 
 /** The default process-wide governed executor, wired to the live singletons + gate-wall + egress. */
