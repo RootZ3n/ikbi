@@ -51,6 +51,17 @@ import { createCognitionRouter } from "../modules/cognition-layer/index.js";
 const BUILTINS = new Set(["version", "models", "providers", "doctor", "capabilities", "help"]);
 
 /**
+ * Does this arg list ask for a subcommand's help? (`--help`/`-h` anywhere in the args.)
+ * Help must be answerable with NO provider init, NO trust preload, and NO network — so
+ * the dispatcher consults this BEFORE the cold-start preload, and each subcommand's own
+ * handler prints its usage and returns early. Keeping the check here means a missing/slow
+ * model config can never make `ikbi <cmd> --help` hang.
+ */
+function wantsHelp(argv: readonly string[]): boolean {
+  return argv.includes("--help") || argv.includes("-h");
+}
+
+/**
  * Auto-run dispatcher for the cognition router: act on a recommendation by re-entering
  * the CLI's own command lookup (`commands.get`). Only KNOWN module commands are ever
  * dispatched — the recommendation maps to build/batch/classify/ask — so this can never
@@ -152,6 +163,11 @@ async function run(argv: readonly string[]): Promise<void> {
   const cmd = argv[0];
   switch (cmd) {
     case "version":
+    case "--version":
+    case "-V":
+      // `--version`/`-V` are aliases for `version` — handled here as builtins so they never
+      // fall through to the cognition router (which would make a model call to "deliberate"
+      // a version request). Pure, offline, no provider init.
       writeStdout(`${config.version}\n`);
       return;
     case "models":
@@ -161,10 +177,22 @@ async function run(argv: readonly string[]): Promise<void> {
       listProviders();
       return;
     case "doctor": {
+      const doctorArgs = argv.slice(1);
+      // `--help` prints usage and exits 0 — it must NOT run the report (which reads config).
+      if (wantsHelp(doctorArgs)) {
+        writeStdout(
+          "Usage: ikbi doctor [--fix] [--force]\n\n" +
+            "Report bootstrap config: what's set, what's missing for a build, and how to fix each gap.\n" +
+            "Read-only by default (no identity, no network).\n\n" +
+            "Options:\n" +
+            "  --fix    Repair common gaps (.env / state dirs / deps); creates/repairs only\n" +
+            "  --force  With --fix, also reclaim stale + aged workspaces\n",
+        );
+        return;
+      }
       // `--fix` is the opt-in side-effecting twin of the read-only report: it repairs
       // common gaps (create/repair only; `--force` reclaims stale + aged workspaces) and
       // sets a non-zero exit code if any repair failed.
-      const doctorArgs = argv.slice(1);
       if (doctorArgs.includes("--fix")) {
         const code = await runDoctorFixCli(doctorArgs);
         if (code !== 0) process.exitCode = code;
@@ -185,24 +213,31 @@ async function run(argv: readonly string[]): Promise<void> {
       runInfo("help", printUsage);
       return;
     default: {
-      // STARTUP PRELOAD (the cold-start on-ramp's second half): warm the trust cache
-      // from durable state BEFORE any command resolves worker trust. Without this, a
-      // granted worker still resolves cold to the floor (system.ts cold path) and the
-      // grant is invisible. Skipped for the pure-info builtins above (no trust path).
-      // A rejected count (MAC failures) is surfaced, never silently dropped.
-      try {
-        const { rejected } = await trust.preload();
-        if (rejected > 0) {
-          writeStderr(`ikbi: trust preload rejected ${rejected} unreadable/forged state doc(s) (fail-closed)\n`);
+      // A subcommand `--help`/`-h` is answered by the command's own handler with NO
+      // side effects: skip the cold-start preload + receipt prune entirely so help can
+      // never block on durable state, and dispatch straight to the handler (which prints
+      // its usage and returns). This is what keeps `ikbi build --help` fast and offline.
+      const sawHelp = wantsHelp(argv.slice(1));
+      if (!sawHelp) {
+        // STARTUP PRELOAD (the cold-start on-ramp's second half): warm the trust cache
+        // from durable state BEFORE any command resolves worker trust. Without this, a
+        // granted worker still resolves cold to the floor (system.ts cold path) and the
+        // grant is invisible. Skipped for the pure-info builtins above (no trust path).
+        // A rejected count (MAC failures) is surfaced, never silently dropped.
+        try {
+          const { rejected } = await trust.preload();
+          if (rejected > 0) {
+            writeStderr(`ikbi: trust preload rejected ${rejected} unreadable/forged state doc(s) (fail-closed)\n`);
+          }
+        } catch (err) {
+          writeStderr(`ikbi: trust preload failed: ${err instanceof Error ? err.message : String(err)}\n`);
         }
-      } catch (err) {
-        writeStderr(`ikbi: trust preload failed: ${err instanceof Error ? err.message : String(err)}\n`);
+        // H6: best-effort receipt retention prune at startup (non-fatal).
+        try {
+          const { receipts } = await import("../core/receipt/index.js");
+          await receipts.prune();
+        } catch { /* non-fatal — receipt pruning is housekeeping, not a startup gate */ }
       }
-      // H6: best-effort receipt retention prune at startup (non-fatal).
-      try {
-        const { receipts } = await import("../core/receipt/index.js");
-        await receipts.prune();
-      } catch { /* non-fatal — receipt pruning is housekeeping, not a startup gate */ }
       // Module commands compose via the command-registrar seam. Built-ins above
       // take precedence (a module cannot shadow a core command).
       const moduleCmd = commands.get(cmd);

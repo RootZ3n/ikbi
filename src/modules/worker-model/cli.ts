@@ -769,7 +769,39 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
   const interactive = deps.interactive ?? (process.stdin.isTTY === true);
 
   async function build(argv: readonly string[]): Promise<void> {
+    // `--help`/`-h` prints usage and exits 0 BEFORE any credential check, identity
+    // resolution, or cognition deliberation (a model call). Without this, `--help` falls
+    // through as a goal and the build path makes a model call — hanging on a missing/slow
+    // model config. Help must be answerable offline.
+    if (argv.includes("--help") || argv.includes("-h")) {
+      out(
+        "Usage: ikbi build <goal...> [--repo <path>] [options]\n\n" +
+          "Run the 5-role worker pipeline (scout→builder→critic→verifier→integrator) in an\n" +
+          "isolated worktree, promoting only on a ladder-verified pass.\n\n" +
+          "Options:\n" +
+          "  --repo <path>     Target repo (name from state/repos.json or absolute path; default: cwd)\n" +
+          "  --verbose, -v     Stream per-role progress events as they fire\n" +
+          "  --cost            Print a per-role cost breakdown after the build\n" +
+          "  --yes, -y         Skip the interactive goal-refinement interview\n" +
+          "  --json            Emit only the JSON result on stdout (logs/hints go to stderr)\n" +
+          "  --no-memory       Do not load project memory (CLAUDE.md / AGENTS.md / .ikbi/)\n" +
+          "  --memory-diff     Show which project memory would be used, then exit (no build)\n" +
+          "  --check \"<cmd>\"   Explicit verification command for a repo with no manifest\n" +
+          "  --delegation <json>  Run from a delegation envelope (overrides goal + repo)\n",
+      );
+      return;
+    }
+
     const { repo, verbose, cost, yes, delegation: delegationJson, noMemory, memoryDiff, check, rest } = parseBuildArgs(argv);
+
+    // `--check "<cmd>"` declares an explicit verification command for a repo with no
+    // recognizable manifest: convert it to the IKBI_CHECKS JSON the verifier reads and the
+    // orchestrator's bare-repo fast-fail honors (hasExplicitChecks). Operator-declared, NEVER
+    // model-chosen. Only set when non-empty; the override applies to this single CLI run.
+    if (check !== undefined) {
+      const checksJson = checkToIkbiChecksJson(check);
+      if (checksJson !== undefined) process.env.IKBI_CHECKS = checksJson;
+    }
 
     // Parse and validate a --delegation envelope when present. The envelope overrides goal +
     // targetRepo and stamps originAgent into the task for receipt attribution.

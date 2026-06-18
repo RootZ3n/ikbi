@@ -127,6 +127,19 @@ registerCommand({
   usage: "ikbi memory [proposals [--all] | approve <id> | reject <id> | reject-all | stats]",
   run: async (argv) => {
     const sub = argv[0] ?? "proposals";
+    // `--help`/`-h` prints usage and exits 0 BEFORE constructing the governor (which reads
+    // state). Help must be answerable with no side effects.
+    if (sub === "--help" || sub === "-h" || argv.includes("--help") || argv.includes("-h")) {
+      out("Usage: ikbi memory [proposals [--all] | approve <id> | reject <id> | reject-all | stats]\n");
+      out("Review and manage memory governance proposals (brain pages, project files).\n");
+      out("Subcommands:");
+      out("  proposals [--all]   List pending (or all) proposals");
+      out("  approve <id>        Approve a proposal (writes it to the target surface)");
+      out("  reject <id>         Reject a proposal (discards it)");
+      out("  reject-all          Reject all pending proposals");
+      out("  stats               Proposal counts by status");
+      return;
+    }
     // Construct a governor with the real apply function so approve actually writes.
     // gbrainBridge is best-effort — if it fails to load, brain proposals skip on approve.
     let governor: MemoryGovernor;
