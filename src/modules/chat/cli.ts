@@ -113,8 +113,39 @@ interface ReplCommand {
 }
 
 /** Render a turn's tool activity as a compact one-liner (✗ marks a failed tool). */
+/** Human-readable tool names for the activity summary line (beginner-friendly). */
+const TOOL_DISPLAY_NAMES: Readonly<Record<string, string>> = {
+  read_file: "Read files",
+  list_dir: "Listed dirs",
+  search_files: "Searched code",
+  glob: "Found files",
+  write_file: "Wrote files",
+  patch: "Edited files",
+  multi_edit: "Edited files",
+  terminal: "Ran commands",
+  git_status: "Git status",
+  git_diff: "Git diff",
+  git_log: "Git log",
+  web_search: "Web search",
+  web_extract: "Read web",
+  delegate_task: "Delegated",
+  vision_analyze: "Analyzed image",
+  run_checks: "Ran checks",
+  scout_detail: "Scout detail",
+  done: "Checkpoint",
+  mcp: "MCP tool",
+};
+
 function toolLine(tools: readonly ChatToolActivity[]): string {
-  return `  · ${tools.map((t) => `${t.name}${t.ok ? "" : "✗"}`).join(", ")}\n`;
+  const names = tools.map((t) => {
+    const display = TOOL_DISPLAY_NAMES[t.name] ?? t.name;
+    return `${display}${t.ok ? "" : "✗"}`;
+  });
+  // Deduplicate: "Read files (×3)" instead of "Read files, Read files, Read files"
+  const counts = new Map<string, number>();
+  for (const n of names) counts.set(n, (counts.get(n) ?? 0) + 1);
+  const deduped = [...counts.entries()].map(([n, c]) => c > 1 ? `${n} (×${c})` : n);
+  return `  · ${deduped.join(", ")}\n`;
 }
 
 /**

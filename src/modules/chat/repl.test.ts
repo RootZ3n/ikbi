@@ -90,6 +90,6 @@ test("end-of-input (Ctrl-C / EOF) ends the loop cleanly; blank lines are skipped
   let out = "";
   await runRepl({ session: f.session, readLine: lines(["", "   ", "use a tool"]), out: (s) => { out += s; } });
   assert.deepEqual(f.sent, ["use a tool"], "blank lines skipped; one real message sent, then EOF ended it");
-  assert.match(out, /· read_file/, "tool activity is surfaced");
+  assert.match(out, /· Read files/, "tool activity is surfaced");
   assert.match(out, /session ended/);
 });

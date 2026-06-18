@@ -501,6 +501,28 @@ function withErrorHint(output: string): string {
 }
 
 /** Build a spinner phase line for a tool call ("Running terminal: pnpm test"), best-effort. */
+/** Human-readable verbs for tool progress indicators (beginner-friendly). */
+const TOOL_VERBS: Readonly<Record<string, string>> = {
+  read_file: "Reading",
+  list_dir: "Looking at",
+  search_files: "Searching for",
+  glob: "Finding files matching",
+  write_file: "Writing",
+  patch: "Editing",
+  multi_edit: "Editing",
+  terminal: "Running",
+  git_status: "Checking git status",
+  git_diff: "Looking at changes",
+  git_log: "Checking git history",
+  web_search: "Searching the web for",
+  web_extract: "Reading",
+  delegate_task: "Working on",
+  vision_analyze: "Analyzing",
+  run_checks: "Running checks",
+  scout_detail: "Looking at finding",
+  done: "Checkpoint",
+};
+
 function progressPhase(call: ToolCall): string {
   let target = "";
   try {
@@ -510,7 +532,9 @@ function progressPhase(call: ToolCall): string {
   } catch {
     target = "";
   }
-  return target.length > 0 ? `Running ${call.name}: ${target}` : `Running ${call.name}`;
+  const verb = TOOL_VERBS[call.name] ?? "Running";
+  const needsTarget = !["git_status", "git_diff", "git_log", "run_checks", "done"].includes(call.name);
+  return target.length > 0 && needsTarget ? `${verb} ${target}…` : `${verb}…`;
 }
 
 /** Resolve a governed parent identity from configured tokens; undefined ⇒ terminal fails closed. */

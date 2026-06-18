@@ -84,7 +84,7 @@ test("FIX5: /permissions readonly blocks a subsequent write tool", async () => {
   let out = "";
   await runRepl({ session: s, store: store(), readLine: lines(["/permissions readonly", "make an edit", "/exit"]), out: (o) => { out += o; } });
   assert.match(out, /permission mode set to readonly/);
-  assert.match(out, /write_file✗/, "the blocked write is marked failed in the tool line");
+  assert.match(out, /Wrote files✗/, "the blocked write is marked failed in the tool line");
   assert.ok(!existsSync(join(dir, "nope.ts")), "no file written under readonly");
 });
 
