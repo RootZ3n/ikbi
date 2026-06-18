@@ -473,7 +473,7 @@ function detectWriteScope(goal: string): "all" | "new_only" | "none" {
  * every progress/diagnostic/hint/repair/cost line is routed to STDERR so a caller can pipe
  * stdout straight into a JSON parser without log noise interleaved (FIX 3).
  */
-export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbose?: boolean; cost?: boolean; yes?: boolean; json?: boolean; delegation?: string; noMemory?: boolean; memoryDiff?: boolean; rest: string[] } {
+export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbose?: boolean; cost?: boolean; yes?: boolean; json?: boolean; delegation?: string; noMemory?: boolean; memoryDiff?: boolean; check?: string; rest: string[] } {
   const rest: string[] = [];
   let repo: string | undefined;
   let verbose = false;
@@ -483,6 +483,7 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
   let delegation: string | undefined;
   let noMemory = false;
   let memoryDiff = false;
+  let check: string | undefined;
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i] as string;
     if (a === "--repo") {
@@ -507,11 +508,29 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
       noMemory = true;
     } else if (a === "--memory-diff") {
       memoryDiff = true;
+    } else if (a === "--check") {
+      check = argv[i + 1];
+      i += 1;
+    } else if (a.startsWith("--check=")) {
+      check = a.slice("--check=".length);
     } else {
       rest.push(a);
     }
   }
-  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), ...(verbose ? { verbose } : {}), ...(cost ? { cost } : {}), ...(yes ? { yes } : {}), ...(json ? { json } : {}), ...(delegation !== undefined ? { delegation } : {}), ...(noMemory ? { noMemory } : {}), ...(memoryDiff ? { memoryDiff } : {}), rest };
+  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), ...(verbose ? { verbose } : {}), ...(cost ? { cost } : {}), ...(yes ? { yes } : {}), ...(json ? { json } : {}), ...(delegation !== undefined ? { delegation } : {}), ...(noMemory ? { noMemory } : {}), ...(memoryDiff ? { memoryDiff } : {}), ...(check !== undefined && check.trim().length > 0 ? { check } : {}), rest };
+}
+
+/**
+ * Convert a `--check "<cmd> <args...>"` string into the IKBI_CHECKS JSON the verifier reads — a
+ * single operator-declared check, whitespace-tokenized into command + args. Returns undefined when
+ * the string is empty. This is the `ikbi build` analogue of `ikbi fix --check`: it lets the operator
+ * verify a repo that has no recognizable manifest (e.g. a bare loose-source repo), overriding the
+ * fast-fail manifest detection with an explicit command. NEVER model-chosen.
+ */
+export function checkToIkbiChecksJson(raw: string): string | undefined {
+  const toks = raw.trim().split(/\s+/).filter((t) => t.length > 0);
+  if (toks.length === 0) return undefined;
+  return JSON.stringify([{ name: "check", command: toks[0], args: toks.slice(1) }]);
 }
 
 /** Render a worker `worker.*` progress event into a concise human line (for `--verbose`). PURE. */
@@ -750,7 +769,7 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
   const interactive = deps.interactive ?? (process.stdin.isTTY === true);
 
   async function build(argv: readonly string[]): Promise<void> {
-    const { repo, verbose, cost, yes, delegation: delegationJson, noMemory, memoryDiff, rest } = parseBuildArgs(argv);
+    const { repo, verbose, cost, yes, delegation: delegationJson, noMemory, memoryDiff, check, rest } = parseBuildArgs(argv);
 
     // Parse and validate a --delegation envelope when present. The envelope overrides goal +
     // targetRepo and stamps originAgent into the task for receipt attribution.
