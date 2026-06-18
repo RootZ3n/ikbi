@@ -1794,3 +1794,117 @@ test("Fix3: no warning when worktree has package.json", async () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ── Work Order 2: FAST-FAIL bare-repo / no-package-manager diagnostic ──────────────────────────
+
+/** A production-wired (enforceProjectRoot) orchestrator over a capturing role set + fake workspaces. */
+function bareRepoHarness(extra: Partial<OrchestratorDeps> = {}) {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const cap = capturingRoles();
+  const bus = fakeBus();
+  const orch = createOrchestrator(
+    baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, workspaces: ws.workspaces, events: bus.bus, enforceProjectRoot: true, ...extra }),
+  );
+  return { orch, parentCtx, ws, cap, sent: bus.sent };
+}
+
+test("WO2: a bare JS-file repo (no manifest) FAST-FAILS before any model call or allocation", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-wo2-barejs-"));
+  try {
+    writeFileSync(join(dir, "hello.js"), "console.log('hello');\n");
+    writeFileSync(join(dir, "test.js"), "require('assert').strictEqual(1+1,2);\n");
+    const h = bareRepoHarness();
+    const result = await h.orch.run({ taskId: "t-barejs", targetRepo: dir, goal: "do the thing" }, h.parentCtx);
+
+    assert.equal(result.outcome, "rejected", "rejected — not promoted, not hung");
+    assert.equal(result.promoted, false);
+    assert.equal(result.roles.length, 0, "no roles ran (zero model calls)");
+    assert.equal(h.cap.seen.length, 0, "no role was dispatched");
+    assert.equal(h.ws.calls.allocate.length, 0, "no workspace was allocated");
+    assert.match(result.reason ?? "", /No project manifest or verifier detected/);
+    assert.match(result.reason ?? "", /Detected files: .*\.js/, "summarizes the loose .js files");
+    assert.match(result.reason ?? "", /ikbi fix <repo> --check/, "actionable next steps");
+    assert.ok(h.sent.some((e) => e.type === "worker.failed"), "emits a worker.failed event");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("WO2: an EMPTY repo (no manifest, no source) FAST-FAILS with 'empty or unrecognized'", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-wo2-empty-"));
+  try {
+    const h = bareRepoHarness();
+    const result = await h.orch.run({ taskId: "t-empty", targetRepo: dir, goal: "do the thing" }, h.parentCtx);
+
+    assert.equal(result.outcome, "rejected");
+    assert.equal(h.cap.seen.length, 0, "no role dispatched");
+    assert.equal(h.ws.calls.allocate.length, 0, "no workspace allocated");
+    assert.match(result.reason ?? "", /empty or unrecognized repo/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("WO2: a repo WITH a manifest proceeds through the normal flow (no regression)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-wo2-manifest-"));
+  try {
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "t", version: "1.0.0" }));
+    const h = bareRepoHarness();
+    const result = await h.orch.run({ taskId: "t-manifest", targetRepo: dir, goal: "do the thing" }, h.parentCtx);
+
+    assert.equal(result.outcome, "success", "manifest present → normal pipeline runs");
+    assert.equal(h.cap.seen.length, 5, "all five roles dispatched");
+    assert.equal(h.ws.calls.allocate.length, 1, "workspace allocated normally");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("WO2: a bare repo with an explicit --check override (IKBI_CHECKS) PROCEEDS normally", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-wo2-check-"));
+  try {
+    writeFileSync(join(dir, "hello.js"), "console.log('hello');\n");
+    const env: NodeJS.ProcessEnv = { IKBI_CHECKS: '[{"name":"test","command":"node","args":["test.js"]}]' };
+    const h = bareRepoHarness({ env });
+    const result = await h.orch.run({ taskId: "t-check", targetRepo: dir, goal: "do the thing" }, h.parentCtx);
+
+    assert.equal(result.outcome, "success", "operator-declared checks bypass the manifest fast-fail");
+    assert.equal(h.cap.seen.length, 5, "all five roles ran");
+    assert.equal(h.ws.calls.allocate.length, 1, "workspace allocated");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("WO2: a bare repo with skipVerifier (greenfield scaffold step) is NOT fast-failed", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-wo2-greenfield-"));
+  try {
+    writeFileSync(join(dir, "hello.js"), "console.log('hello');\n");
+    const h = bareRepoHarness();
+    const result = await h.orch.run({ taskId: "t-green", targetRepo: dir, goal: "scaffold", skipVerifier: true, skipPromote: true }, h.parentCtx);
+
+    assert.notEqual(result.outcome, "rejected", "greenfield scaffold step is allowed to run without a manifest");
+    assert.ok(h.cap.seen.length > 0, "roles ran");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("WO2: the fast-fail is PRODUCTION-only — a non-enforceProjectRoot orchestrator runs bare repos", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-wo2-nonprod-"));
+  try {
+    writeFileSync(join(dir, "hello.js"), "console.log('hello');\n");
+    // No enforceProjectRoot → checks are not enforced; bare-file flows are legitimate here.
+    const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+    const ws = fakeWorkspaces(true);
+    const cap = capturingRoles();
+    const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, workspaces: ws.workspaces }));
+    const result = await orch.run({ taskId: "t-nonprod", targetRepo: dir, goal: "do the thing" }, parentCtx);
+
+    assert.notEqual(result.outcome, "rejected", "non-production orchestrator does not fast-fail bare repos");
+    assert.equal(cap.seen.length, 5, "all roles ran");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

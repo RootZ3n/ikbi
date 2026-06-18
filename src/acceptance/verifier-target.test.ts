@@ -1,6 +1,6 @@
 /**
  * HB-1 acceptance: the production orchestrator (enforceProjectRoot ON) over REAL collaborators.
- *  - a target with NO package.json ⇒ verifier RED, build NOT promoted.
+ *  - a target with NO package.json ⇒ FAST-FAIL (rejected before any role), build NOT promoted.
  *  - a target WITH a valid project + a passing check ⇒ verifier GREEN, build PROMOTED.
  */
 
@@ -9,7 +9,12 @@ import { test } from "node:test";
 
 import { cleanup, makeGitRepo, makeIdentities, makeManager, realGovernedExec, realOrchestrator, stubRoles } from "./harness.js";
 
-test("HB-1: a no-manifest target ⇒ verifier RED, NOT promoted", async () => {
+// WORK ORDER 2 (contract change): a no-manifest target used to run the full pipeline and surface a
+// verifier RED. The orchestrator now FAST-FAILS such a target BEFORE dispatching any role — no model
+// calls, no workspace allocation, no risk of a bare loose-file repo hanging the loop. The guarantee
+// it pins is unchanged and STRONGER (fail-closed, never promoted), just enforced earlier with an
+// actionable diagnostic instead of a late verifier RED.
+test("HB-1: a no-manifest target ⇒ FAST-FAIL (rejected before any role), NOT promoted", async () => {
   const repo = await makeGitRepo(); // NO package.json
   const { manager, root } = makeManager();
   try {
@@ -20,10 +25,10 @@ test("HB-1: a no-manifest target ⇒ verifier RED, NOT promoted", async () => {
     });
     const result = await orch.run({ taskId: "t-red", targetRepo: repo, goal: "fix add" }, parentCtx);
 
-    const verifier = result.roles.find((r) => r.role === "verifier");
-    assert.equal(verifier?.outcome, "failure", "the verifier reports RED on a target with no recognizable project");
-    assert.match((verifier?.summary ?? ""), /RED/);
-    assert.equal(result.promoted, false, "a RED build is NOT promoted");
+    assert.equal(result.outcome, "rejected", "a no-manifest target is rejected fast (never a vacuous pass)");
+    assert.equal(result.roles.length, 0, "no role ran — the fast-fail precedes dispatch (zero model cost)");
+    assert.match(result.reason ?? "", /No project manifest or verifier detected/, "actionable diagnostic");
+    assert.equal(result.promoted, false, "a no-manifest build is NOT promoted");
   } finally {
     await cleanup(repo, root);
   }

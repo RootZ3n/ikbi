@@ -58,7 +58,7 @@ import { builder, createBuilder, MAX_TOOL_ITERATIONS } from "./builder.js";
 import { createPatchsmith } from "./patchsmith.js";
 import { runTournament } from "./tournament.js";
 import type { CandidateRun, CandidateSpec, ShadowVerification, TournamentEngine, TournamentEvent } from "./tournament.js";
-import { captureStreamedStdout, committedPackageJsonDiff, parseTestCount, resolveChecks, resolveCheckTimeoutMs, workingTreePackageJsonDiff, workingTreePlanningDiff } from "./checks.js";
+import { captureStreamedStdout, committedPackageJsonDiff, parseChecksEnv, parseTestCount, PROJECT_MANIFESTS, resolveChecks, resolveCheckTimeoutMs, workingTreePackageJsonDiff, workingTreePlanningDiff } from "./checks.js";
 import { builderModel, competitiveBuilderModels } from "./role-models.js";
 import { createCritic, critic } from "./critic.js";
 import { integrator } from "./integrator.js";
@@ -132,7 +132,7 @@ interface EscalationHandoffFields {
 // ── DEPENDENCY INSTALL: ensure worktree has node_modules ──────────────────────
 
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, type Dirent } from "node:fs";
 import { join } from "node:path";
 
 /**
@@ -191,6 +191,89 @@ async function installWorkspaceDeps(
 /** Coerce an unknown detail field to a finite number, else undefined. */
 function asNumber(v: unknown): number | undefined {
   return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}
+
+// ── FAST-FAIL BARE-REPO DIAGNOSTIC (Work Order 2) ─────────────────────────────
+// A target with NO project manifest at its root cannot be verified: `resolveChecks`
+// fails closed RED, but only AFTER the scout + builder have already burned paid model
+// calls — and a bare loose-file repo (e.g. a single `hello.js`) could keep the loop
+// churning toward a timeout. We detect the unverifiable shape HERE, before any model
+// call or workspace allocation, and reject with an ACTIONABLE diagnostic at zero API cost.
+
+/** Source-file extensions used to tell "loose source, no manifest" from "empty/unrecognized". */
+const SOURCE_EXTENSIONS: ReadonlySet<string> = new Set([
+  ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".cts", ".mts",
+  ".py", ".rs", ".go", ".gd", ".rb", ".java", ".kt", ".cs",
+  ".c", ".h", ".cpp", ".cc", ".hpp", ".hh", ".swift", ".php",
+]);
+
+/** Directories never worth scanning for source files (vcs / build / vendor). */
+const DIAGNOSTIC_SKIP_DIRS: ReadonlySet<string> = new Set([
+  ".git", "node_modules", "dist", "build", "out", "target", ".venv", "venv", "__pycache__", ".ikbi",
+]);
+
+/**
+ * Diagnose a target repo that cannot be verified. Returns an actionable message when the repo
+ * root has NO recognizable project manifest (mirrors `resolveChecks`, which requires a manifest
+ * AT the worktree root), or `undefined` when a manifest exists (normal flow) or the path is
+ * unreadable (fail-open — let workspace allocation surface the real error). Best-effort and
+ * never throws: a bounded, depth-limited walk summarizes whatever source files ARE present so
+ * the operator sees what ikbi saw.
+ */
+function diagnoseBareRepo(root: string): string | undefined {
+  // A recognizable manifest AT the root is exactly what resolveChecks needs (root === worktree).
+  if (PROJECT_MANIFESTS.some((m) => existsSync(join(root, m)))) return undefined;
+  if (!existsSync(root)) return undefined; // unreadable — fail-open
+
+  // No manifest — summarize the source files that ARE here (depth-limited; skip vcs/build dirs).
+  const counts = new Map<string, number>();
+  let totalFiles = 0;
+  const walk = (dir: string, depth: number): void => {
+    if (depth > 2 || totalFiles > 200) return;
+    let entries: Dirent[];
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return; // unreadable subdir — skip (best-effort)
+    }
+    for (const e of entries) {
+      if (totalFiles > 200) return;
+      if (e.isDirectory()) {
+        if (!DIAGNOSTIC_SKIP_DIRS.has(e.name)) walk(join(dir, e.name), depth + 1);
+      } else if (e.isFile()) {
+        const dot = e.name.lastIndexOf(".");
+        const ext = dot > 0 ? e.name.slice(dot).toLowerCase() : "";
+        if (SOURCE_EXTENSIONS.has(ext)) {
+          counts.set(ext, (counts.get(ext) ?? 0) + 1);
+          totalFiles += 1;
+        }
+      }
+    }
+  };
+  walk(root, 0);
+
+  const summary =
+    totalFiles === 0
+      ? "empty or unrecognized repo (no source files, no manifest)"
+      : [...counts.entries()]
+          .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+          .map(([ext, n]) => `${n} ${ext}`)
+          .join(", ");
+
+  return [
+    "No project manifest or verifier detected.",
+    `Detected files: ${summary}`,
+    "Suggested next steps:",
+    "  - Initialize a package manifest (e.g., `pnpm init`, `cargo init`)",
+    '  - Provide an explicit check command: `ikbi build <repo> --check "python -m pytest"`',
+    '  - Use `ikbi fix <repo> --check "<command>"` for fix mode',
+  ].join("\n");
+}
+
+/** True when the operator declared an explicit, well-formed check override (IKBI_CHECKS). */
+function hasExplicitChecks(env: NodeJS.ProcessEnv): boolean {
+  const parsed = parseChecksEnv(env.IKBI_CHECKS);
+  return parsed !== undefined && parsed !== "malformed";
 }
 
 /**
@@ -1048,6 +1131,36 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         const reason = `Refusing to build: ${dirtyReason}`;
         events.publish(workerFailed.create({ taskId: task.taskId, reason }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } }));
         return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason };
+      }
+    }
+
+    // FAST-FAIL BARE-REPO DIAGNOSTIC (Work Order 2): a target with no project manifest at its
+    // root cannot be verified — `resolveChecks` fails RED, but only AFTER the scout + builder have
+    // burned paid model calls, and a bare loose-file repo can churn the loop toward a timeout.
+    // Detect it HERE, before any model call / workspace allocation, and reject at zero API cost.
+    // Gated on `enforceProjectRoot` so it fires for the PRODUCTION wiring only (the same gate that
+    // turns on resolveChecks); non-production/test orchestrators do not enforce checks and run
+    // bare-file flows legitimately. Bypassed when: the operator declared explicit checks
+    // (IKBI_CHECKS / `--check`) — they own verification; a step-planner step reuses a workspace
+    // (`reuseWorkspace`) whose manifest may be written by a later step; or `skipVerifier` (a
+    // greenfield scaffold step with no tests yet — verified at the final step). Because this
+    // returns BEFORE the builder, a manifest-less, check-less run can never start the loop and
+    // hang — the fast-fail is the bare-repo timeout guard.
+    if (
+      enforceProjectRoot &&
+      task.reuseWorkspace === undefined &&
+      task.skipVerifier !== true &&
+      !hasExplicitChecks(modeEnv)
+    ) {
+      const diagnostic = diagnoseBareRepo(task.targetRepo);
+      if (diagnostic !== undefined) {
+        events.publish(
+          workerFailed.create(
+            { taskId: task.taskId, reason: diagnostic },
+            { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } },
+          ),
+        );
+        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason: diagnostic };
       }
     }
 
