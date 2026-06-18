@@ -121,6 +121,14 @@ test("HTTP sessions (SessionStore.getOrCreate) are scratch / non-managed and CAN
   assert.equal(r.verification, undefined, "a scratch session never runs verification");
 });
 
+test("HTTP sessions (SessionStore.getOrCreate) have a memory governor wired (RED-1)", () => {
+  // A network /chat turn can call brain_put / write governed files. Those durable writes must go
+  // through the memory governor (operator-reviewed proposals), not land unattended in gbrain/disk.
+  // The store wires the production governor the same way the REPL does (cli.ts).
+  const s = sessionStore.getOrCreate("http-governed-1");
+  assert.equal(s.hasMemoryGovernor(), true, "HTTP /chat sessions must have a memory governor wired");
+});
+
 // ── session store ───────────────────────────────────────────────────────────
 
 test("sessionStore mints a new id when none is given and reuses an existing one", () => {

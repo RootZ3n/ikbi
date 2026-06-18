@@ -63,6 +63,7 @@ import { type CheckResult, mapExec, resolveCheckTimeoutMs, resolveChecks } from 
 import { executeTool, type ToolExecutorDeps, type ToolExecutionResult } from "../worker-model/tool-executor.js";
 import { discoverMcpTools, isMcpToolName, type McpToolRegistry } from "../mcp-model-loop/registry.js";
 import type { MemoryGovernor } from "../memory-governor/contract.js";
+import { createProductionGovernor } from "../memory-governor/create.js";
 import { BRAIN_TOOLS } from "../worker-model/builder-tools/brain-tools.js";
 import { gbrainBridge } from "../../core/gbrain-bridge.js";
 import { delegateTaskTool, runDelegateTask } from "../worker-model/builder-tools/delegate.js";
@@ -1219,6 +1220,16 @@ export class ChatSession {
     return this.workspace !== undefined;
   }
 
+  /**
+   * True when a memory governor is wired, so writes to durable surfaces (CLAUDE.md / .ikbi/* /
+   * brain pages) become operator-reviewed proposals via the shared tool-executor chokepoint.
+   * Exposed so the HTTP route / tests can assert governance is present (closes RED-1: HTTP /chat
+   * brain_put writes must be governed, not unattended).
+   */
+  hasMemoryGovernor(): boolean {
+    return this.memoryGovernor !== undefined;
+  }
+
   /** Number of files with pending changes in the workdir (for `/status`). 0 on any error. */
   pendingChangeCount(): number {
     const recorded = new Set(this.fileHistory.map((m) => m.path)).size;
@@ -1845,6 +1856,19 @@ export class ChatSession {
 /** The in-memory session store — bounded, LRU-evicted. */
 class SessionStore {
   private readonly sessions = new Map<string, ChatSession>();
+  /**
+   * MEMORY GOVERNOR (RED-1): the same production governor the REPL wires (cli.ts), constructed once
+   * and shared across HTTP /chat sessions. Without it, a network turn's brain_put / governed-file
+   * write would land in durable gbrain/disk state with NO operator review. Wiring it here routes
+   * those writes through the shared tool-executor chokepoint as reviewable proposals. Lazily built
+   * (and overridable in tests) so importing this module never forces governor construction.
+   */
+  private governor: MemoryGovernor | undefined;
+
+  private memoryGovernor(): MemoryGovernor {
+    if (this.governor === undefined) this.governor = createProductionGovernor({ gbrainBridge });
+    return this.governor;
+  }
 
   /** Get an existing session by id, or create a fresh one (minting a new id if none given). */
   getOrCreate(sessionId?: string): ChatSession {
@@ -1856,8 +1880,10 @@ class SessionStore {
     const id = sessionId !== undefined && sessionId.length > 0 ? sessionId : randomUUID();
     // HTTP /chat sessions are EXPLICITLY ephemeral + non-managed (Phase 2 req 9): force a scratch
     // workspace so a network turn never edits the server's cwd live-direct and never allocates a
-    // managed worktree. Upgrading HTTP to managed sessions is deliberately deferred.
-    const session = new ChatSession(id, { scratch: true });
+    // managed worktree. Upgrading HTTP to managed sessions is deliberately deferred. The memory
+    // governor IS wired (RED-1) so durable brain_put / governed-file writes become reviewable
+    // proposals instead of unattended writes — the same governance the REPL gets.
+    const session = new ChatSession(id, { scratch: true, memoryGovernor: this.memoryGovernor() });
     this.sessions.set(id, session);
     this.evictIfNeeded();
     return session;
