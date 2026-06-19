@@ -36,3 +36,9 @@ test("parseTestCount: generic mocha-style 'N passing'", () => {
 test("parseTestCount: no recognizable summary returns undefined", () => {
   assert.equal(parseTestCount("all done"), undefined);
 });
+
+test("parseTestCount: pytest \"N passed in X.XXs\"", () => {
+  assert.deepEqual(parseTestCount("===== 5 passed in 0.03s ====="), { passed: 5, total: 5 });
+  assert.deepEqual(parseTestCount("===== 12 passed, 2 failed in 1.23s ====="), { passed: 12, total: 12 });
+  assert.deepEqual(parseTestCount("===== 1 passed in 0.01s ====="), { passed: 1, total: 1 });
+});

@@ -513,6 +513,10 @@ export function parseTestCount(output: string): { passed: number; total: number 
   const generic = /(\d+)\s+(?:passing|passed)[\s\S]*?(\d+)\s+(?:total|tests)/.exec(output);
   if (generic !== null) return { passed: Number(generic[1]), total: Number(generic[2]) };
 
+
+  // pytest: "N passed in X.XXs" or "N passed, M failed in X.XXs" (passed count only)
+  const pytest = /(\d+)\s+passed(?:,\s+\d+\s+\w+)*\s+in\s+[\d.]+s/.exec(output);
+  if (pytest !== null) { const n = Number(pytest[1]); return { passed: n, total: n }; }
   return undefined;
 }
 
