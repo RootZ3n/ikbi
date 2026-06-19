@@ -137,7 +137,7 @@ interface EscalationHandoffFields {
 
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, symlinkSync, mkdirSync, type Dirent } from "node:fs";
-import { join } from "node:path";
+import { join, basename } from "node:path";
 
 /**
  * Run `git status --porcelain` on `targetRepo`. Returns a human-readable reason
@@ -197,7 +197,9 @@ async function installWorkspaceDeps(
       if (!spec.startsWith("file:")) continue;
       const relPath = spec.slice(5); // remove "file:" prefix
       const absTarget = join(workspace.targetRepo, relPath);
-      const symlinkPath = join(worktreeParent, relPath);
+      // Use basename to avoid relPath's ".." escaping the worktree parent.
+      // e.g. "../velum" → symlink at wt/velum → points to /pehverse/repos/velum
+      const symlinkPath = join(worktreeParent, basename(absTarget));
       if (!existsSync(symlinkPath) && existsSync(absTarget)) {
         mkdirSync(join(symlinkPath, ".."), { recursive: true });
         symlinkSync(absTarget, symlinkPath);
