@@ -134,7 +134,7 @@ test("deliberation reasons over CROSS-AGENT memory (multiple agents' entries fee
     entry({ id: "demo:artist:pattern:c", agent: "artist", kind: "pattern" }),
   ]);
   const r = await mk({ invokeModel: sm.invokeModel, labMemory: lm }).deliberate(goalInput(makeCtx()));
-  assert.deepEqual([...r.memoryUsed].sort(), ["demo:ikbi:activity:a", "demo:artist:pattern:c", "demo:mechanic:capability:b"], "all agents' entries informed it");
+  assert.deepEqual([...r.memoryUsed].sort(), ["demo:artist:pattern:c", "demo:ikbi:activity:a", "demo:mechanic:capability:b"], "all agents' entries informed it");
   // The model prompt included a data-role message per cross-agent entry.
   const userMsgs = (sm.calls[0]?.messages ?? []).filter((m) => m.role === "user" && m.untrusted === true);
   assert.ok(userMsgs.length >= 4, "3 memory entries + the goal, all untrusted");

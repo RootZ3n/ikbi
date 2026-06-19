@@ -108,7 +108,7 @@ test("byProject returns EVERY agent's contributions to a project (lab memory, no
 
   const luak = await mem.byProject("Luak");
   const agents = luak.map((e) => e.agent).sort();
-  assert.deepEqual(agents, ["ikbi", "artist", "mechanic"], "all three agents' Luak entries are visible to a single project query");
+  assert.deepEqual(agents, ["artist", "ikbi", "mechanic"], "all three agents' Luak entries are visible to a single project query");
   assert.equal(luak.length, 3);
   assert.ok(!luak.some((e) => e.project === "Other"), "scoped to the project");
 });
