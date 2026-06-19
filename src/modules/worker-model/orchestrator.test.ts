@@ -1908,3 +1908,79 @@ test("WO2: the fast-fail is PRODUCTION-only — a non-enforceProjectRoot orchest
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ── BUILD-MODE ESCALATION: flash auto-escalates to pro on builder failure ────────
+// The escalation engine is a process-wide SINGLETON keyed by taskId, so each test below uses a
+// UNIQUE taskId to avoid sharing per-task escalation history. A builder failure whose detail
+// carries `toolFormatErrors` (schemaFailures) + `retryCount` folds to a score of 50, exactly the
+// default worker→mid threshold — so the engine recommends escalating to the mid tier, whose first
+// model is "deepseek-v4-pro". Both the cheap attempt and the escalated retry route through the same
+// injected `roles.builder` (builderForModel returns the injected role); the retry is distinguished
+// by the "[escalation]" handoff prose spliced into its goal.
+
+test("build-mode escalation: builder fails on the cheap tier → engine recommends mid → retry runs on the escalated model and the build converges", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const bus = fakeBus();
+  const cap = capturingRoles();
+  const builderGoals: string[] = [];
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    builder: async (ctx: RoleContext): Promise<RoleResult> => {
+      builderGoals.push(ctx.task.goal);
+      // Cheap attempt: FAIL with signals that fold to score 50 (worker→mid threshold).
+      if (!ctx.task.goal.includes("[escalation]")) {
+        return { role: "builder", outcome: "failure", summary: "flash gave up", detail: { toolFormatErrors: [1, 2], retryCount: 3 } };
+      }
+      // Escalated retry (mid tier / pro model): converge.
+      return { role: "builder", outcome: "success", summary: "pro fixed it" };
+    },
+  };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces, events: bus.bus }));
+  const result = await orch.run({ taskId: "t-esc-success", targetRepo: "/repo", goal: "do the thing" }, parentCtx);
+
+  assert.equal(builderGoals.length, 2, "builder ran twice: cheap attempt + one escalated retry");
+  assert.match(builderGoals[1] ?? "", /\[escalation\]/, "the retry carried the escalation handoff context");
+  assert.match(builderGoals[1] ?? "", /deepseek-v4-pro/, "the handoff names the escalated model");
+  assert.match(builderGoals[1] ?? "", /Previous attempt outcome: flash gave up/, "the handoff relays what the cheap attempt got wrong");
+  assert.ok(result.escalationRetry, "escalationRetry surfaced on the result");
+  assert.equal(result.escalationRetry?.attempted, true);
+  assert.equal(result.escalationRetry?.succeeded, true, "the escalated retry converged");
+  assert.equal(result.escalationRetry?.model, "deepseek-v4-pro", "ran on the first model of the mid tier (pro)");
+  assert.equal(result.outcome, "success", "the escalated build verified and promoted like a first-try green build");
+  assert.equal(result.promoted, true);
+  assert.equal(ws.calls.promote, 1, "promoted the escalated work");
+  const retried = bus.sent.find((e) => e.type === "worker.escalation.retried");
+  assert.ok(retried, "worker.escalation.retried event emitted");
+  assert.equal((retried?.payload as { toModel: string; success: boolean } | undefined)?.toModel, "deepseek-v4-pro");
+  assert.equal((retried?.payload as { success: boolean } | undefined)?.success, true);
+});
+
+test("build-mode escalation: a failed escalated retry leaves the original failure standing (fail-closed, exactly ONE retry — escalationAttempted caps the loop)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const bus = fakeBus();
+  const cap = capturingRoles();
+  let builderCalls = 0;
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    // BOTH the cheap attempt AND the escalated retry fail with escalation-worthy signals — proving
+    // the retry runs exactly once (escalationAttempted) and a failed retry never loops or promotes.
+    builder: async (_ctx: RoleContext): Promise<RoleResult> => {
+      builderCalls += 1;
+      return { role: "builder", outcome: "failure", summary: "still failing", detail: { toolFormatErrors: [1, 2], retryCount: 3 } };
+    },
+  };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces, events: bus.bus }));
+  const result = await orch.run({ taskId: "t-esc-fail", targetRepo: "/repo", goal: "do the thing" }, parentCtx);
+
+  assert.equal(builderCalls, 2, "exactly one escalated retry — escalationAttempted prevents an escalation loop");
+  assert.equal(result.escalationRetry?.attempted, true);
+  assert.equal(result.escalationRetry?.succeeded, false, "the escalated retry also failed");
+  assert.equal(result.escalationRetry?.model, "deepseek-v4-pro");
+  assert.notEqual(result.outcome, "success", "the original failure stands (fail-closed)");
+  assert.equal(result.promoted, false, "a failed build never promotes");
+  assert.equal(ws.calls.promote, 0, "no promote attempted after a failed escalated retry");
+  const retried = bus.sent.find((e) => e.type === "worker.escalation.retried");
+  assert.equal((retried?.payload as { success: boolean } | undefined)?.success, false, "the retry event reports the failure");
+});

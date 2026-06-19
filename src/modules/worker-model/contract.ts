@@ -266,11 +266,11 @@ export interface WorkerResult {
    */
   readonly costUsd?: number;
   /**
-   * The escalation engine's recommendation for this run, surfaced so an operator can ACT on it
-   * (e.g. re-run on a higher tier). OBSERVE-ONLY: the orchestrator never swaps models or retries
-   * on this — it records the strongest recommendation seen across the scoring roles (a `recommended`
-   * one wins over a declined one; ties break on the higher score). Absent when escalation is disabled
-   * or no scoring role ran. Wiring this to an actual model swap is a separately-reviewed follow-up.
+   * The escalation engine's recommendation for this run, surfaced so an operator can see the
+   * strongest recommendation across the scoring roles (a `recommended` one wins over a declined one;
+   * ties break on the higher score). Absent when escalation is disabled or no scoring role ran. This
+   * field is the OBSERVE-ONLY recommendation; when build mode actually ACTS on it (swaps the builder
+   * model + retries), that is reported separately on `escalationRetry`.
    */
   readonly escalation?: {
     /** Whether the engine recommended escalating to a higher tier. */
@@ -285,6 +285,20 @@ export interface WorkerResult {
     readonly requiresApproval?: boolean;
     /** Why escalation was recommended (target) or declined. */
     readonly reason?: string;
+  };
+  /**
+   * Records that build-mode escalation ACTED on a recommendation: a builder that failed on the
+   * cheap (worker) tier was re-run ONCE on the escalated (mid) model in the SAME workspace. Distinct
+   * from `escalation` (observe-only): this is present only when the model swap + retry actually ran.
+   * `succeeded === false` means the escalated retry also failed and the original failure stands.
+   */
+  readonly escalationRetry?: {
+    /** Always true when present (the retry was enacted). */
+    readonly attempted: boolean;
+    /** The escalated model the retry ran on (the first model of the mid tier). */
+    readonly model: string;
+    /** Whether the escalated builder retry converged (`success`); false ⇒ original failure stood. */
+    readonly succeeded: boolean;
   };
 }
 

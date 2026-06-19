@@ -149,3 +149,13 @@ export const workerFixLoopCompleted = defineEvent<{ taskId: string; fixIteration
 export const workerCriticFixLoopCompleted = defineEvent<{ taskId: string; retried: boolean; criticPass: boolean; builderOk?: boolean; verifierPass?: boolean }>(
   "worker.critic_fix_loop.completed",
 );
+
+/**
+ * A builder failed on the cheap (worker) tier and the escalation engine recommended a mid-tier
+ * retry, so the orchestrator re-ran the builder ONCE on the escalated model in the SAME workspace.
+ * `success` reports whether that retry converged — a `false` here means the original failure stood
+ * (fail-closed). Emitted only when the model swap + retry actually ran (not for an observe-only eval).
+ */
+export const workerEscalationRetried = defineEvent<{ taskId: string; fromModel?: string; toModel: string; success: boolean }>(
+  "worker.escalation.retried",
+);

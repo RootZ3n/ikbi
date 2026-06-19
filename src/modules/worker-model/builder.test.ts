@@ -1117,5 +1117,5 @@ test("WO4: a stall writes a durable receipt with REDACTED stall info (no partial
   assert.equal(meta.attempt, 1);
   // REDACTION: the partial argument VALUES must never appear anywhere in the receipt.
   assert.ok(!JSON.stringify(stallReceipt!.input).includes(SECRET), "the receipt must not leak the partial argument content");
-  assert.equal(stallReceipt!.identity, makeCtx(dir, "verified", engine).identity.agentId === "worker-1" ? stallReceipt!.identity : undefined, "attributed to the run identity");
+  assert.equal(stallReceipt!.identity.agentId, "worker-1", "the receipt is attributed to the run identity");
 });

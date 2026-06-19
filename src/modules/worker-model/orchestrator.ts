@@ -38,10 +38,12 @@ import type { ModelRequest, ModelResponse } from "../../core/provider/contract.j
 import { deterministicJudge } from "../deterministic-judge/index.js";
 import type { BuildCandidate, JudgeResult } from "../deterministic-judge/index.js";
 
-// Escalation (ADDITIVE, hook-only): the orchestrator folds hard signals across the
-// scoring roles and asks the escalation engine whether a higher tier is warranted,
-// emitting `escalation.*` events. It NEVER alters dispatch/promote/discard — the
-// actual model swap + retry is a separately-reviewed follow-up. See observeEscalation.
+// Escalation: the orchestrator folds hard signals across the scoring roles and asks the
+// escalation engine whether a higher tier is warranted, emitting `escalation.*` events
+// (see observeEscalation). In BUILD MODE it also ACTS on the recommendation: a builder that
+// fails on the cheap (worker) tier, when the engine recommends a mid-tier escalation, is
+// re-run ONCE on the escalated model in the SAME workspace (see the build-mode escalation
+// retry block in run()). Capped at a single retry (escalationAttempted) and fail-closed.
 import {
   escalationConfig,
   escalationEngine,
@@ -49,7 +51,7 @@ import {
   escalationTriggered,
   escalationDeclined,
 } from "../escalation/index.js";
-import type { EscalationSignals } from "../escalation/index.js";
+import type { EscalationSignals, EscalationDecision } from "../escalation/index.js";
 
 import type { ExecRequest, GovernedExec } from "../governed-exec/index.js";
 import type { DependencyInstall } from "../dependency-install/contract.js";
@@ -94,6 +96,7 @@ import {
   workerVerification,
   workerFixLoopCompleted,
   workerCriticFixLoopCompleted,
+  workerEscalationRetried,
 } from "./events.js";
 import { CONTRACT_VERSION, toOutcomeStatus, WorkerError, WORKER_ROLES } from "./contract.js";
 import { runIterativeLoop, DEFAULT_MAX_FIX_ITERATIONS, extractVerifierCheckResult } from "./iterative-loop.js";
@@ -327,9 +330,16 @@ function foldRoleSignals(
  * no model swap, no retry, no change to promote/discard. Best-effort — it must never
  * throw into the dispatch loop, so the whole body is guarded.
  *
- * Returns the decision summary for THIS evaluation (so the run can surface the strongest
- * recommendation on its result for operators), or `undefined` when no evaluation ran.
+ * Returns BOTH the decision summary for THIS evaluation (so the run can surface the strongest
+ * recommendation on its result for operators) AND the full `EscalationDecision` (so the build-mode
+ * orchestrator can ACT on it — swap models + retry). `summary`/`decision` are `undefined` when no
+ * evaluation ran (escalation disabled, a non-scoring role, or a guarded failure).
  */
+interface EscalationObservation {
+  readonly summary: WorkerResult["escalation"] | undefined;
+  readonly decision: EscalationDecision | undefined;
+}
+
 function observeEscalation(
   events: EventBusSurface,
   task: WorkerTask,
@@ -338,12 +348,12 @@ function observeEscalation(
   acc: MutableEscalationSignals,
   handoff: EscalationHandoffFields,
   identity: AgentIdentity,
-): WorkerResult["escalation"] | undefined {
+): EscalationObservation {
   try {
     foldRoleSignals(role, result, acc, handoff);
-    if (!escalationConfig.enabled) return undefined;
+    if (!escalationConfig.enabled) return { summary: undefined, decision: undefined };
     // Only the roles that carry escalation-relevant signal trigger an evaluation.
-    if (role !== "builder" && role !== "critic" && role !== "verifier") return undefined;
+    if (role !== "builder" && role !== "critic" && role !== "verifier") return { summary: undefined, decision: undefined };
 
     const signals: EscalationSignals = { ...acc };
     const decision = escalationEngine.evaluate({
@@ -386,8 +396,9 @@ function observeEscalation(
         ),
       );
     }
-    // Surface this evaluation on the run result (observe-only — the operator decides what to do).
-    return {
+    // Surface this evaluation on the run result (observe-only summary) AND hand the full decision
+    // back so the build-mode orchestrator can act on it (model swap + retry).
+    const summary: WorkerResult["escalation"] = {
       recommended: decision.escalate,
       fromTier: decision.currentTier,
       ...(decision.targetTier !== undefined ? { targetTier: decision.targetTier } : {}),
@@ -399,9 +410,10 @@ function observeEscalation(
           ? { reason: decision.declineReason }
           : {}),
     };
+    return { summary, decision };
   } catch {
     // Escalation observability is ADVISORY — a fold/eval/publish failure never breaks the run.
-    return undefined;
+    return { summary: undefined, decision: undefined };
   }
 }
 
@@ -1244,6 +1256,13 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // result (observe-only). A `recommended` recommendation wins over a declined one; ties break
     // on the higher score. Operators read it to decide whether to re-run on a higher tier.
     let escalationOutcome: WorkerResult["escalation"];
+    // BUILD-MODE ESCALATION (acts, not just observes): when the builder fails on the cheap tier and
+    // the engine recommends a mid-tier retry, re-run the builder ONCE on the escalated model in the
+    // SAME workspace. `escalationAttempted` caps it at a single retry per run (fail-closed — a
+    // failed escalated retry leaves the original failure standing). `escalationRetryOutcome` surfaces
+    // that the swap+retry actually ran (distinct from the observe-only `escalationOutcome` above).
+    let escalationAttempted = false;
+    let escalationRetryOutcome: WorkerResult["escalationRetry"];
     let overall: WorkerResult["outcome"] = "success";
     let killedReason: string | undefined;
     // ISSUE 1: a critic FAIL feeds the critic's feedback back to the builder for ONE retry
@@ -1647,9 +1666,114 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 
         // ADDITIVE escalation observability — fold signals + emit escalation.* events.
         // Runs before the short-circuit so a failing role's signals are still scored.
-        const esc = observeEscalation(events, task, role, result, escSignals, escHandoff, parentIdentity);
+        const escObservation = observeEscalation(events, task, role, result, escSignals, escHandoff, parentIdentity);
+        const esc = escObservation.summary;
         if (esc !== undefined && (escalationOutcome === undefined || (esc.recommended && !escalationOutcome.recommended) || (esc.recommended === escalationOutcome.recommended && esc.total > escalationOutcome.total))) {
           escalationOutcome = esc;
+        }
+
+        // ── BUILD-MODE ESCALATION RETRY (the wired follow-up to observe-only) ─────────
+        // A builder that FAILED on the cheap (worker) tier, when the engine recommends a mid-tier
+        // escalation, is re-run ONCE on the escalated model in the SAME workspace. The handoff
+        // context tells the stronger model what the cheap attempt got wrong. Capped at one retry
+        // (escalationAttempted) so it can never loop; fail-closed (a failed retry leaves the
+        // original failure standing). When the retry SUCCEEDS, its result replaces the failed
+        // builder entry and the pipeline continues to the verifier — so the escalated work is
+        // verified + promoted exactly like a first-try green build.
+        const decision = escObservation.decision;
+        if (
+          role === "builder" &&
+          result.outcome === "failure" &&
+          !escalationAttempted &&
+          decision !== undefined &&
+          decision.escalate &&
+          decision.targetTier === "mid"
+        ) {
+          escalationAttempted = true;
+          const midModel = escalationConfig.tierModels.mid[0];
+          if (midModel !== undefined) {
+            const failedResult = result;
+            const failedDetail = (failedResult.detail ?? {}) as Record<string, unknown>;
+            const failedModel = typeof failedDetail.model === "string" ? failedDetail.model : singleBuilderModel;
+            // The escalated model gets the original goal PLUS what the cheap attempt got wrong (the
+            // handoff's score breakdown, the builder's own failure summary, and any verifier/critic
+            // detail already gathered). This is the handoff context the decision computed.
+            const handoff = decision.handoffContext;
+            const escalatedGoal = [
+              task.goal,
+              "",
+              `[escalation] A cheaper model (${failedModel}) failed this task and it was escalated to you (${midModel}).`,
+              ...(handoff !== undefined ? [`Reason: ${handoff.escalationReason}.`] : []),
+              ...(failedResult.summary !== undefined ? [`Previous attempt outcome: ${failedResult.summary}`] : []),
+              ...(handoff?.verificationDetails !== undefined ? [`Verification failure: ${handoff.verificationDetails}`] : []),
+              ...(handoff?.criticFeedback !== undefined ? [`Critic feedback: ${handoff.criticFeedback}`] : []),
+              "Fix what the previous attempt got wrong; do not repeat it.",
+            ].join("\n");
+
+            // Fresh role identity for the retry (clamped under the parent ceiling, like every role —
+            // escalation swaps the MODEL, never the trust tier).
+            const escalatedSpawn = spawnRole("builder", parentCtx);
+            events.publish(
+              workerRoleDispatched.create(
+                { taskId: task.taskId, role: "builder", ...(escalatedSpawn.identity.trustTier !== undefined ? { tier: escalatedSpawn.identity.trustTier } : {}) },
+                { source: EVENT_SOURCE, attribution: { identity: escalatedSpawn.identity, operation: "worker.role.builder", runId: task.taskId } },
+              ),
+            );
+            const escalatedBuilder = builderForModel(parentCtx, midModel, resolveBuilderMode(task));
+            const escalatedCtx: RoleContext = {
+              task: { ...task, goal: escalatedGoal },
+              role: "builder",
+              identity: escalatedSpawn.identity,
+              autonomy: escalatedSpawn.autonomy,
+              workspace,
+              priorResults: [...results],
+              engine: runEngine,
+            };
+            const costBeforeRetry = runCost();
+            let escalatedResult = await runRoleFn("builder", escalatedBuilder, escalatedCtx);
+            const retryCost = runCost() - costBeforeRetry;
+            // Stamp the escalated model (+ a marker) so the cost breakdown + audit show this builder
+            // ran on the mid tier, not the cheap one.
+            escalatedResult = {
+              ...escalatedResult,
+              detail: { ...((escalatedResult.detail as Record<string, unknown> | undefined) ?? {}), ...(retryCost > 0 ? { costUsd: retryCost } : {}), model: midModel, escalated: true },
+            };
+            const retrySucceeded = escalatedResult.outcome === "success";
+            events.publish(
+              workerRoleCompleted.create(
+                { taskId: task.taskId, role: "builder", outcome: escalatedResult.outcome, ...(retryCost > 0 ? { costUsd: retryCost } : {}) },
+                { source: EVENT_SOURCE, attribution: { identity: escalatedSpawn.identity, operation: "worker.role.builder", runId: task.taskId } },
+              ),
+            );
+            events.publish(
+              workerEscalationRetried.create(
+                { taskId: task.taskId, fromModel: failedModel, toModel: midModel, success: retrySucceeded },
+                { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.escalation.retry", runId: task.taskId } },
+              ),
+            );
+            await recordRole(task, workspace, escalatedSpawn, escalatedResult, retryCost, midModel);
+            await receipts.append(
+              {
+                operation: "worker.escalation.retry",
+                outcome: { status: retrySucceeded ? "success" : "failure" },
+                requestId: task.taskId,
+                metadata: { taskId: task.taskId, workspaceId: workspace.id, fromModel: failedModel, toModel: midModel, success: retrySucceeded, costUsd: runCost() },
+                project: task.targetRepo,
+              },
+              parentIdentity,
+            );
+            escalationRetryOutcome = { attempted: true, model: midModel, succeeded: retrySucceeded };
+
+            if (retrySucceeded) {
+              // The escalated build converged — its result REPLACES the failed builder entry so the
+              // integrator (and the run's roles array) reflect the work that actually landed, and the
+              // pipeline continues to the verifier. A FAILED retry is NOT spliced: the original failure
+              // result stands (fail-closed) and the short-circuit below breaks the run.
+              const builderIdx = results.lastIndexOf(failedResult);
+              if (builderIdx >= 0) results[builderIdx] = escalatedResult;
+              result = escalatedResult;
+            }
+          }
         }
 
         if (result.outcome !== "success") {
@@ -1875,6 +1999,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       retrievalMode: ranRetrievalMode,
       costUsd: runCost(),
       ...(escalationOutcome !== undefined ? { escalation: escalationOutcome } : {}),
+      ...(escalationRetryOutcome !== undefined ? { escalationRetry: escalationRetryOutcome } : {}),
     };
 
     // TRUST-TIER UX (WO5): the work LANDED (verified + promoted) — surface the trust tier that
