@@ -9,6 +9,7 @@
 
 import Fastify from "fastify";
 import fastifyStatic from "@fastify/static";
+import { velumFastify } from "velum-ai/adapters/fastify";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { existsSync } from "node:fs";
@@ -37,6 +38,9 @@ export function buildServer() {
     loggerInstance: log,
     disableRequestLogging: false,
   });
+
+  // Velum: AI privacy/injection defense middleware
+  velumFastify(app, { defaultPiiLevel: 2 });
 
   app.setErrorHandler((err: unknown, request, reply) => {
     const maybe = err as { statusCode?: unknown; message?: unknown };

@@ -40,6 +40,7 @@
     "test": "sh -c 'IKBI_STATE_ROOT=$(mktemp -d /tmp/ikbi-test-state.XXXXXX) env -u IKBI_OPERATOR_TOKEN -u IKBI_WORKER_TOKEN IKBI_ALLOW_INSECURE_DEV_KEYS=true node --import tsx --test \"src/**/*.test.ts\"'"
   },
   "dependencies": {
+    "velum-ai": "file:../velum",
     "@fastify/static": "^9.1.3",
     "fastify": "^5.2.1",
     "pino": "^9.6.0"
