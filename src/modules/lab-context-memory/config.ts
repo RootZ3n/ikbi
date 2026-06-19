@@ -11,7 +11,7 @@
  *                                    workspaces — so the gitignored `state/` covers it
  *                                    and lab memory can never be committed. Set this
  *                                    override to point at a SHARED lab location that
- *                                    other agents (Ptah, Peh, …) also use — NOT
+ *                                    other agents (the Mechanic, Peh, …) also use — NOT
  *                                    ikbi-private. The override always wins.
  *   IKBI_LAB_CONTEXT_MEMORY_MAX_RECEIPTS_PER_PROJECTION  cap per projection run.
  *   IKBI_LAB_CONTEXT_MEMORY_MAX_VALUE_BYTES  cap on a single record()'s serialized

@@ -4,7 +4,7 @@
  * The self-repair module is ikbi watching ITSELF: a set of cheap, read-only health
  * checks (service reachability, test suite, workspace hygiene, service dependencies)
  * that, when one trips, emit a durable WORK ORDER to a shared queue. A separate
- * mechanic (Ptah's `ptah-self-repair` skill) drains that queue and dispatches `ikbi fix`.
+ * mechanic (the Mechanic's `mechanic-self-repair` skill) drains that queue and dispatches `ikbi fix`.
  *
  * Everything here is data + interfaces only — no behavior, no I/O. The runner and the
  * live ports live in `monitor.ts`; this file is what other code (and tests) import.

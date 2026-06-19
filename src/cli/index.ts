@@ -195,7 +195,7 @@ async function run(argv: readonly string[]): Promise<void> {
         return;
       }
       // `--self-repair` runs ikbi's self-monitor (Part 1): cheap read-only checks that
-      // file work orders to the shared queue for the mechanic (Ptah) to drain. It mints
+      // file work orders to the shared queue for the mechanic (the Mechanic) to drain. It mints
       // no fix and promotes nothing — it only reports + records.
       if (doctorArgs.includes("--self-repair")) {
         const report = await runSelfRepair(writeStdout);

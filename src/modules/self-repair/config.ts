@@ -6,8 +6,8 @@
  *
  *   IKBI_SELF_REPAIR_ENABLED        on/off. DEFAULT ON.
  *   IKBI_SELF_REPAIR_WORK_ORDER_DIR ABSOLUTE path where WO-NNNN.json files are written.
- *                                   This is the SHARED lab queue the mechanic (Ptah) drains;
- *                                   it MUST match Ptah's documented `/pehverse/state/work-orders`.
+ *                                   This is the SHARED lab queue the mechanic (the Mechanic) drains;
+ *                                   it MUST match the Mechanic's documented `/pehverse/state/work-orders`.
  *                                   DEFAULT `<stateRoot>/../work-orders`. Set this explicitly
  *                                   whenever the engine state root is not a child of
  *                                   `/pehverse/state` so writer and reader agree on one path.
@@ -34,7 +34,7 @@ const env = moduleEnv("self-repair");
  * Default work-order queue: a sibling of the engine state root (`state/../work-orders`),
  * which resolves to the lab-wide `/pehverse/state/work-orders` for the standard layout.
  * Override with `IKBI_SELF_REPAIR_WORK_ORDER_DIR` (absolute path) when the state root is
- * elsewhere — the writer (ikbi) and the reader (Ptah) MUST point at the same directory.
+ * elsewhere — the writer (ikbi) and the reader (the Mechanic) MUST point at the same directory.
  */
 export const DEFAULT_WORK_ORDER_DIR = resolve(config.stateRoot, "..", "work-orders");
 
