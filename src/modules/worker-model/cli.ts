@@ -421,7 +421,7 @@ function approvalRequiredFromEnv(env: NodeJS.ProcessEnv = process.env): boolean 
 }
 
 export function createProductionWorker(
-  opts: { workerToken: string | undefined; gateWall?: GateWall; onExecOutput?: (chunk: string, stream: "stdout" | "stderr") => void; requestApproval?: (req: { taskId: string; workspaceId: string; goal: string }) => Promise<boolean>; memoryGovernor?: import("../memory-governor/contract.js").MemoryGovernor },
+  opts: { workerToken: string | undefined; gateWall?: GateWall; onExecOutput?: (chunk: string, stream: "stdout" | "stderr") => void; requestApproval?: (req: { taskId: string; workspaceId: string; goal: string }) => Promise<boolean>; memoryGovernor?: import("../memory-governor/contract.js").MemoryGovernor; killCheck?: (target: { agentId?: string; runId?: string; requestId?: string }) => Promise<{ killed: boolean; signal?: { mode?: string; reason?: string } }> },
 ): { run: (task: WorkerTask, ctx: OperationContext) => Promise<WorkerResult>; spawnRole: (role: WorkerRole, ctx: OperationContext) => { readonly autonomy: AutonomyGrant } } {
   // Explicitly thread the governed executor to BOTH roles (builder run_checks + verifier) via
   // the orchestrator. LAZY wrapper (not an eager import): importing the governed-exec singleton
@@ -432,7 +432,11 @@ export function createProductionWorker(
   // COMMIT the verified-good work — without it the scratch branch never advances and promote
   // sees an empty diff ("no changes to promote"). coreWorkspaces is the same manager the
   // orchestrator would default to; passing it makes the commit dependency explicit.
-  return createOrchestrator({ roleClaim: productionRoleClaim(opts.workerToken), gateWall: opts.gateWall ?? coreGateWall, governedExec, workspaces: coreWorkspaces, enforceProjectRoot: true, ...(opts.onExecOutput !== undefined ? { onExecOutput: opts.onExecOutput } : {}), ...(opts.requestApproval !== undefined ? { requestApproval: opts.requestApproval } : {}), ...(opts.memoryGovernor !== undefined ? { memoryGovernor: opts.memoryGovernor } : {}) });
+  // The optional killCheck lets an embedding caller (e.g. the HTTP task service) wire a
+  // COOPERATIVE per-run cancellation seam: the orchestrator already checks killCheck before
+  // start + at each role boundary (target.runId === task.taskId), so a cancelled task stops
+  // cleanly (discard, no half-promote). Absent ⇒ the live kill-switch default (unchanged).
+  return createOrchestrator({ roleClaim: productionRoleClaim(opts.workerToken), gateWall: opts.gateWall ?? coreGateWall, governedExec, workspaces: coreWorkspaces, enforceProjectRoot: true, ...(opts.onExecOutput !== undefined ? { onExecOutput: opts.onExecOutput } : {}), ...(opts.requestApproval !== undefined ? { requestApproval: opts.requestApproval } : {}), ...(opts.memoryGovernor !== undefined ? { memoryGovernor: opts.memoryGovernor } : {}), ...(opts.killCheck !== undefined ? { killCheck: opts.killCheck } : {}) });
 }
 
 /**

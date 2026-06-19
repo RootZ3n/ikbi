@@ -58,6 +58,9 @@ import "./chat/index.js";
 import "../server/receipts.js";
 // Timeline — registers GET /api/timeline (build activity grouped into time buckets).
 import "../server/timeline.js";
+// Tasks — registers the external-agent integration API (POST /api/build|fix, GET /api/tasks*,
+// task cancel + SSE progress stream). Phase 10.1: the Pehlichi↔ikbi delegation foundation.
+import "../server/tasks.js";
 // Orchestration layer above worker-model (registers the `batch` command on import).
 import "./batch-planner/index.js";
 // Capability-recovery diagnostic (registers the `recover` operator command on import).
