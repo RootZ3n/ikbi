@@ -11,7 +11,7 @@
  */
 
 /** Bump on any breaking change to a type exported from this file. */
-export const CONTRACT_VERSION = "1.0.0";
+export const CONTRACT_VERSION = "1.1.0";
 
 /** Work-order severity, lowest → highest. Drives the mechanic's triage order. */
 export type Severity = "low" | "medium" | "high" | "critical";
@@ -88,11 +88,30 @@ export interface CheckOutcome {
   readonly workOrderId?: string;
   /** True when a failure matched an already-open work order, so none was filed. */
   readonly deduped?: boolean;
+  /**
+   * True when a failure was detected but the work order could NOT be filed (queue write
+   * failed — disk full, permission denied). The failure is real but UNTRACKED.
+   */
+  readonly fileError?: boolean;
 }
 
-/** The result of a full `runMonitor` pass. */
+/**
+ * The result of a full `runMonitor` pass.
+ *
+ * Three distinct truths — do not conflate them:
+ *  - `healthy`: every check actually PASSED. The only true all-green state.
+ *  - `handled`: every detected failure is covered by an open work order (freshly filed
+ *    OR already open / de-duped). A de-duped failure is `handled` but NOT `healthy` — so a
+ *    persistent problem is never mistaken for green.
+ *  - `ok`: backward-compatible alias — true iff nothing new was filed and every outcome is
+ *    ok-or-deduped (i.e. `healthy` OR fully de-duped with no new filings).
+ */
 export interface MonitorReport {
   readonly ok: boolean;
+  /** True iff every check passed (no failures at all). */
+  readonly healthy: boolean;
+  /** True iff every detected failure is tracked by an open work order (filed or de-duped). */
+  readonly handled: boolean;
   readonly outcomes: readonly CheckOutcome[];
   readonly filed: readonly string[];
   /** One line per check, for human/operator (`doctor --self-repair`) output. */

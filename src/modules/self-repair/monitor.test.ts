@@ -14,6 +14,7 @@ import {
   healthCheck,
   parseTestFailures,
   runMonitor,
+  runTestCommand,
   serviceDependenciesCheck,
   sourceKey,
   testSuiteCheck,
@@ -231,4 +232,81 @@ test("toWorkOrder falls back to sane defaults when a check omits fields", () => 
   assert.equal(wo.severity, "medium");
   assert.equal(wo.category, "bug");
   assert.match(wo.title, /bare/);
+});
+
+// --- report health semantics (healthy vs handled) ---------------------------
+
+test("runMonitor reports healthy:true/handled:true when every check passes", async () => {
+  const { ports } = memPorts();
+  const report = await runMonitor(OPTS, ports);
+  assert.equal(report.healthy, true);
+  assert.equal(report.handled, true);
+});
+
+test("runMonitor reports healthy:false but handled:true when a failure is de-duped", async () => {
+  const existing = new Set<string>([sourceKey("health", { ok: false, category: "service-down" } as CheckResult)]);
+  const { ports } = memPorts({
+    healthProbe: async () => ({ ok: false, status: 0 }),
+    openWorkOrderSources: async () => existing,
+  });
+  const report = await runMonitor(OPTS, ports);
+  // A persistent, already-tracked failure must NOT read as all-green.
+  assert.equal(report.healthy, false, "deduped failure means not healthy");
+  assert.equal(report.handled, true, "the failure is still tracked by an open work order");
+  // Back-compat: `ok` keeps its historical meaning (nothing new filed).
+  assert.equal(report.ok, true);
+});
+
+test("runMonitor reports healthy:false when it files new work orders", async () => {
+  const { ports } = memPorts({ healthProbe: async () => ({ ok: false, status: 0, detail: "down" }) });
+  const report = await runMonitor(OPTS, ports);
+  assert.equal(report.healthy, false);
+  assert.equal(report.handled, true);
+});
+
+// --- Finding 3: queue-write resilience --------------------------------------
+
+test("runMonitor records fileError and keeps going when a work-order write fails", async () => {
+  const { ports } = memPorts({
+    healthProbe: async () => ({ ok: false, status: 0, detail: "down" }),
+    countStaleWorkspaces: async () => 50,
+    writeWorkOrder: async () => {
+      throw new Error("ENOSPC: no space left on device");
+    },
+  });
+  const report = await runMonitor(OPTS, ports);
+  // Both failing checks were attempted (the first write failure did not abort the pass).
+  const failing = report.outcomes.filter((o) => !o.result.ok);
+  assert.equal(failing.length, 2);
+  assert.ok(failing.every((o) => o.fileError === true), "every un-fileable failure is flagged");
+  assert.equal(report.filed.length, 0);
+  assert.equal(report.healthy, false);
+  assert.equal(report.handled, false, "un-filed failures are NOT handled");
+});
+
+test("runMonitor continues when reading open work orders throws", async () => {
+  const { ports, written } = memPorts({
+    healthProbe: async () => ({ ok: false, status: 0, detail: "down" }),
+    openWorkOrderSources: async () => {
+      throw new Error("EACCES: permission denied");
+    },
+  });
+  const report = await runMonitor(OPTS, ports);
+  // Without de-dup info we still file the failure rather than skipping the check.
+  assert.equal(written.length, 1);
+  assert.equal(report.healthy, false);
+});
+
+// --- Finding 1: test-command timeout ----------------------------------------
+
+test("runTestCommand kills a hung command and reports it as a failure", async () => {
+  // `sleep 30` would never finish within the test; the 250ms timeout must kill it.
+  const r = await runTestCommand("sleep 30", process.cwd(), 250);
+  assert.equal(r.ok, false);
+  assert.match(r.detail, /did not finish within 250ms/);
+});
+
+test("runTestCommand returns ok for a fast successful command", async () => {
+  const r = await runTestCommand("true", process.cwd(), 5000);
+  assert.equal(r.ok, true);
 });

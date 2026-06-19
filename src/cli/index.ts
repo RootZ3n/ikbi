@@ -199,7 +199,9 @@ async function run(argv: readonly string[]): Promise<void> {
       // no fix and promotes nothing — it only reports + records.
       if (doctorArgs.includes("--self-repair")) {
         const report = await runSelfRepair(writeStdout);
-        if (!report.ok) process.exitCode = 1;
+        // Non-zero whenever ikbi is not actually healthy — a problem that already has an
+        // open work order (de-duped) is still unhealthy, so it must not exit 0.
+        if (!report.healthy) process.exitCode = 1;
         return;
       }
       // `--fix` is the opt-in side-effecting twin of the read-only report: it repairs

@@ -201,7 +201,15 @@ export async function runMonitor(
   checks: readonly MonitorCheck[] = defaultChecks(opts),
 ): Promise<MonitorReport> {
   const ctx: MonitorContext = { ports, opts };
-  const openSources = await ports.openWorkOrderSources();
+  // Reading the existing queue must never abort the pass — a failure here just means we
+  // can't de-dup (we may re-file), which is strictly safer than skipping checks entirely.
+  let openSources: ReadonlySet<string>;
+  try {
+    openSources = await ports.openWorkOrderSources();
+  } catch (err) {
+    openSources = new Set<string>();
+    log.error({ err: errMsg(err) }, "self-repair: could not read open work orders; continuing without de-dup");
+  }
   const seenThisPass = new Set<string>();
   const outcomes: CheckOutcome[] = [];
   const filed: string[] = [];
@@ -237,15 +245,35 @@ export async function runMonitor(
     }
 
     seenThisPass.add(source);
-    const id = await ports.nextWorkOrderId();
-    const order = toWorkOrder(id, check.name, result, opts, ports.now());
-    await ports.writeWorkOrder(order);
-    filed.push(id);
-    outcomes.push({ name: check.name, result, workOrderId: id });
-    lines.push(`  ${BAD} ${check.name} — ${result.title} → filed ${id} [${result.severity}]`);
+    // Filing must never abort the pass: a queue write that fails (disk full, permission
+    // denied) is logged and the failure recorded as UNTRACKED (`fileError`) so we move on
+    // to the remaining checks instead of losing them.
+    try {
+      const id = await ports.nextWorkOrderId();
+      const order = toWorkOrder(id, check.name, result, opts, ports.now());
+      await ports.writeWorkOrder(order);
+      filed.push(id);
+      outcomes.push({ name: check.name, result, workOrderId: id });
+      lines.push(`  ${BAD} ${check.name} — ${result.title} → filed ${id} [${result.severity}]`);
+    } catch (err) {
+      // The failure is real but we could not persist a work order for it.
+      seenThisPass.delete(source);
+      outcomes.push({ name: check.name, result, fileError: true });
+      log.error(
+        { check: check.name, err: errMsg(err) },
+        "self-repair: failed to file work order; continuing",
+      );
+      lines.push(`  ${BAD} ${check.name} — ${result.title} (could NOT file work order: ${errMsg(err)})`);
+    }
   }
 
-  return { ok: filed.length === 0 && outcomes.every((o) => o.result.ok || o.deduped), outcomes, filed, lines };
+  // healthy = every check passed. handled = every failure is covered by a work order
+  // (freshly filed or already-open/de-duped) — a `fileError` outcome is NOT handled.
+  const healthy = outcomes.every((o) => o.result.ok);
+  const handled = outcomes.every((o) => o.result.ok || o.deduped || o.workOrderId !== undefined);
+  // `ok` keeps its historical meaning: nothing new filed and nothing slipped through.
+  const ok = filed.length === 0 && outcomes.every((o) => o.result.ok || o.deduped);
+  return { ok, healthy, handled, outcomes, filed, lines };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -282,22 +310,55 @@ function probeHealth(url: string, timeoutMs = 3000): Promise<HealthProbeResult> 
   });
 }
 
-/** Spawn the test command, resolving ok + a short (last-lines) detail. Never rejects. */
-function runTestCommand(command: string, cwd: string): Promise<TestRunResult> {
+/**
+ * Spawn the test command, resolving ok + a short (last-lines) detail. Never rejects.
+ *
+ * A stuck or hung test command must not hang the whole self-repair pass, so the child is
+ * killed after `timeoutMs` (SIGTERM, then SIGKILL) and the result is reported as a
+ * test-failure with a timeout note — the caller (`testSuiteCheck`) files a `test-failure`
+ * work order from any `ok:false`, so a timeout becomes a tracked failure like any other.
+ */
+export function runTestCommand(command: string, cwd: string, timeoutMs: number): Promise<TestRunResult> {
   return new Promise((resolve) => {
+    let settled = false;
+    const done = (r: TestRunResult): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(r);
+    };
     // Run through a shell so `pnpm test` (with args) works as configured.
     const child = spawn(command, { cwd, shell: true, stdio: ["ignore", "pipe", "pipe"] });
     let tail = "";
+    let timedOut = false;
     const onData = (d: Buffer): void => {
       tail = (tail + d.toString()).slice(-4000);
     };
+    // Kill a wedged test command rather than waiting on it forever.
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+      // Escalate to SIGKILL if it ignores SIGTERM (e.g. a shell that traps it).
+      setTimeout(() => child.kill("SIGKILL"), 5000).unref?.();
+    }, timeoutMs);
+    timer.unref?.();
     child.stdout?.on("data", onData);
     child.stderr?.on("data", onData);
-    child.on("error", (e) => resolve({ ok: false, detail: e.message }));
+    child.on("error", (e) => done({ ok: false, detail: e.message }));
     child.on("close", (code) => {
+      if (timedOut) {
+        const recent = tail.trim().split("\n").slice(-10).join("\n");
+        done({
+          ok: false,
+          detail:
+            `\`${command}\` did not finish within ${timeoutMs}ms and was killed ` +
+            `(possible hang / wedged test). Last output:\n${recent || "(no output captured)"}`,
+        });
+        return;
+      }
       const detail = tail.trim().split("\n").slice(-12).join("\n");
       const failures = parseTestFailures(tail);
-      resolve(failures !== undefined ? { ok: code === 0, detail, failures } : { ok: code === 0, detail });
+      done(failures !== undefined ? { ok: code === 0, detail, failures } : { ok: code === 0, detail });
     });
   });
 }
@@ -358,7 +419,7 @@ async function readOpenSources(dir: string): Promise<ReadonlySet<string>> {
 export function liveMonitorPorts(workOrderDir: string = selfRepairConfig.workOrderDir): MonitorPorts {
   return {
     healthProbe: (url) => probeHealth(url),
-    runTests: (command, cwd) => runTestCommand(command, cwd),
+    runTests: (command, cwd) => runTestCommand(command, cwd, selfRepairConfig.testTimeoutMs),
     countStaleWorkspaces: () => countStale(),
     envGet: (name) => process.env[name],
     isWritable: async (dir) => {
@@ -393,27 +454,46 @@ export async function runSelfRepair(
 ): Promise<MonitorReport> {
   if (!selfRepairConfig.enabled) {
     out("self-repair is DISABLED (IKBI_SELF_REPAIR_ENABLED=false)\n");
-    return { ok: true, outcomes: [], filed: [], lines: [] };
+    return { ok: true, healthy: true, handled: true, outcomes: [], filed: [], lines: [] };
   }
   const opts = monitorOptions();
   const ports = liveMonitorPorts(selfRepairConfig.workOrderDir);
   // The lock file lives in the queue dir — ensure it exists before acquiring the lock.
-  await mkdir(selfRepairConfig.workOrderDir, { recursive: true });
-  const report = await locks.withLock(
-    "self-repair-work-orders",
-    () => runMonitor(opts, ports),
-    { file: join(selfRepairConfig.workOrderDir, ".self-repair.lock") },
-  );
+  // A failure to set up the queue dir must not crash `doctor`; degrade to an unlocked
+  // pass (the live ports' writes will surface their own errors per-check via Finding 3).
+  let report: MonitorReport;
+  try {
+    await mkdir(selfRepairConfig.workOrderDir, { recursive: true });
+    report = await locks.withLock(
+      "self-repair-work-orders",
+      () => runMonitor(opts, ports),
+      { file: join(selfRepairConfig.workOrderDir, ".self-repair.lock") },
+    );
+  } catch (err) {
+    log.error(
+      { dir: selfRepairConfig.workOrderDir, err: errMsg(err) },
+      "self-repair: could not prepare the work-order queue / lock",
+    );
+    out(
+      `self-repair could not prepare the work-order queue at ${selfRepairConfig.workOrderDir}: ` +
+        `${errMsg(err)}\n` +
+        "running an unlocked pass (concurrent passes may race on id allocation)\n\n",
+    );
+    report = await runMonitor(opts, ports);
+  }
   out("ikbi self-repair — monitoring pass\n\n");
   out(`${report.lines.join("\n")}\n\n`);
   if (report.filed.length > 0) {
     out(`filed ${report.filed.length} work order(s): ${report.filed.join(", ")}\n`);
     out(`queue: ${selfRepairConfig.workOrderDir}\n`);
     log.warn({ filed: report.filed }, "self-repair filed work orders");
-  } else if (report.ok) {
+  }
+  if (report.healthy) {
     out("all checks healthy — no work orders filed\n");
+  } else if (report.handled) {
+    out("problems found and tracked (open work orders exist) — NOT healthy\n");
   } else {
-    out("problems found but already tracked (open work orders exist) — nothing re-filed\n");
+    out("problems found but some could NOT be filed (see log) — NOT healthy, NOT fully tracked\n");
   }
   return report;
 }
