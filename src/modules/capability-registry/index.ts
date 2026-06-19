@@ -2,6 +2,11 @@
  * ikbi capability-registry consumer — the in-repo binding to the lab's shared
  * capability registry (L6 autonomy safety layer, req #1).
  *
+ * Status: DORMANT — This module is built but not yet wired into production.
+ * It will be activated when ikbi needs to advertise its capabilities to agents
+ * (e.g., for inter-agent delegation, tool discovery, or governed unattended
+ * execution). Do not delete.
+ *
  * ikbi stays STANDALONE: this module does not import a shared package. It consumes
  * the shared registry as DATA (the JSON contract at lab-capability/registry.json,
  * located via the LAB_CAPABILITY_REGISTRY env var or an explicit path) and runs the

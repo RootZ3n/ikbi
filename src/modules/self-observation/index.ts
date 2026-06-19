@@ -1,6 +1,11 @@
 /**
  * ikbi self-observation — module entrypoint.
  *
+ * Status: DORMANT — This module is built but not yet wired into production.
+ * It will be activated when ikbi needs self-monitoring capabilities (e.g.,
+ * runtime introspection, event-ring snapshots for debugging, or health
+ * dashboards). Do not delete.
+ *
  * Pins the FROZEN-CORE contracts this module builds against (exact targets) so a
  * drift throws a clear ContractVersionError at load. It registers NO guard / side-
  * effect and executes NOTHING — a passive observer (2-eyes). The status route that
