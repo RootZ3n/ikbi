@@ -7,12 +7,80 @@
  * All knobs are `IKBI_*` prefixed.
  */
 
+import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
-import { isAbsolute, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
 const pkg = require("../../package.json") as { version: string };
+
+/**
+ * Parse a `.env` file's contents and apply each `KEY=VALUE` into `env`, but ONLY
+ * when the key is not already present. This makes the shell environment
+ * authoritative: a value already exported in the process env is never clobbered
+ * by the file. Comments (`#…`), blank lines, and malformed lines are skipped;
+ * surrounding single/double quotes on a value are stripped.
+ *
+ * ikbi takes no `dotenv` dependency — this is the entire loader, deliberately
+ * tiny and zero-dep. Exported for tests.
+ */
+export function applyDotEnv(contents: string, env: NodeJS.ProcessEnv = process.env): void {
+  for (const line of contents.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (trimmed === "" || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq <= 0) continue;
+    const key = trimmed.slice(0, eq).trim();
+    if (key === "") continue;
+    // Shell env wins: never overwrite an already-set key.
+    if (Object.prototype.hasOwnProperty.call(env, key)) continue;
+    let value = trimmed.slice(eq + 1).trim();
+    if (
+      value.length >= 2 &&
+      ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))
+    ) {
+      value = value.slice(1, -1);
+    }
+    env[key] = value;
+  }
+}
+
+/** Walk up from `startDir` looking for the directory that holds `package.json`. */
+function findProjectRoot(startDir: string): string | undefined {
+  let dir = startDir;
+  // Bounded walk — a sane repo is never 50 levels deep.
+  for (let i = 0; i < 50; i++) {
+    if (existsSync(join(dir, "package.json"))) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return undefined;
+}
+
+/**
+ * Auto-load `<project-root>/.env` into `process.env` before the config singleton
+ * (and the `configEnv` freeze) reads it. Missing/unreadable file is a no-op —
+ * `.env` is optional. Runs exactly once, at module import, before `loadConfig()`.
+ */
+function autoLoadDotEnv(): void {
+  // Stay hermetic under the node:test runner — tests must not inherit the
+  // developer's local `.env`. `NODE_TEST_CONTEXT` is set by node:test in each
+  // test subprocess and by nothing else; production surfaces (repl/build/server/
+  // CLI) never set it, so the `.env` autoload still runs for them.
+  if (process.env.NODE_TEST_CONTEXT !== undefined) return;
+  const here = dirname(fileURLToPath(import.meta.url));
+  const root = findProjectRoot(here) ?? process.cwd();
+  const envPath = join(root, ".env");
+  if (!existsSync(envPath)) return;
+  try {
+    applyDotEnv(readFileSync(envPath, "utf8"));
+  } catch {
+    // .env is best-effort; a read error must not block startup.
+  }
+}
 
 /** Resolved, validated, immutable runtime configuration. */
 export interface IkbiConfig {
@@ -564,6 +632,10 @@ function loadReceiptConfig(env: NodeJS.ProcessEnv, stateRoot: string): ReceiptCo
     retentionDays: parsePositiveInt("IKBI_RECEIPT_RETENTION_DAYS", env.IKBI_RECEIPT_RETENTION_DAYS, 30),
   };
 }
+
+// Load `<project-root>/.env` into process.env BEFORE the config singleton reads
+// it and before the `configEnv` snapshot is frozen below. Shell env still wins.
+autoLoadDotEnv();
 
 /** The resolved configuration for this process. Loaded once at import. */
 export const config: IkbiConfig = loadConfig();
