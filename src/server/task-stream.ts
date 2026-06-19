@@ -125,7 +125,11 @@ export function registerTaskStream(app: FastifyInstance, service: TaskService, b
         if (p.taskId !== taskId) return;
         if (TERMINAL_EVENT_TYPES.has(e.type)) {
           const current = service.registry.get(taskId);
-          writeSse(raw, "task_completed", { status: current?.status ?? "failure", totalCost: current?.totalCost ?? 0 });
+          // `task.cancelled` is emitted while the task is still in the non-terminal `cancelling`
+          // state (the run is draining). Report the TERMINAL `cancelled` status in the final frame
+          // so a client reading the last frame never sees a non-terminal status (H4).
+          const status = e.type === "task.cancelled" ? "cancelled" : (current?.status ?? "failure");
+          writeSse(raw, "task_completed", { status, totalCost: current?.totalCost ?? 0 });
           close();
           return;
         }

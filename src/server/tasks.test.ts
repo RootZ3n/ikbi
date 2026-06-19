@@ -8,6 +8,7 @@ import { afterEach, beforeEach, test } from "node:test";
 import Fastify, { type FastifyInstance } from "fastify";
 
 import type { WorkerResult, WorkerTask } from "../modules/worker-model/index.js";
+import type { FixOutcome } from "../modules/worker-model/fix.js";
 import type { ValidatedIdentity } from "../core/identity/index.js";
 import type { EventBusSurface, IkbiEvent } from "../core/events/index.js";
 import { TaskService, type TaskServiceDeps } from "./task-service.js";
@@ -32,6 +33,17 @@ function successResult(taskId: string): WorkerResult {
       { role: "integrator", outcome: "success", detail: { costUsd: 0.014 } },
     ],
   };
+}
+
+/** A minimal FixOutcome fixture (finalizeFix reads only result / filesModified / fullCheck.passed). */
+function fixOutcome(result: string): FixOutcome {
+  return {
+    result,
+    filesModified: [],
+    promoted: false,
+    receipt: { fullCheck: { passed: false } },
+    diagnosis: {},
+  } as unknown as FixOutcome;
 }
 
 /** Build a service with injected fakes (no model key / worktree / real identity needed). */
@@ -277,6 +289,33 @@ test("a cancelled task's run result does NOT overwrite the cancelled status", as
   }
 });
 
+test("a fix run receives the cancellation seam; SAFE_FAIL after cancel settles to cancelled (H1)", async () => {
+  let observedCancelled: (() => boolean) | undefined;
+  let release!: () => void;
+  const service = fakeService({
+    runFix: (_req, _ctx, isCancelled) => {
+      // The service must THREAD its cancellation seam into the injected runner (H1).
+      observedCancelled = isCancelled;
+      return new Promise<FixOutcome>((r) => { release = () => r(fixOutcome("SAFE_FAIL")); });
+    },
+  });
+  const app = await makeApp(service);
+  try {
+    const taskId = (await app.inject({ method: "POST", url: "/api/fix", payload: { repo: REPO } })).json().taskId;
+    await waitFor(() => observedCancelled !== undefined);
+    assert.equal(observedCancelled!(), false); // not cancelled yet
+    const c = await app.inject({ method: "POST", url: `/api/tasks/${taskId}/cancel` });
+    assert.equal(c.statusCode, 200);
+    assert.equal(observedCancelled!(), true); // the seam now reflects the cancellation — the pipeline can stop early
+    release(); // the pipeline returns a SAFE_FAIL once it has seen the cancellation
+    await waitFor(() => service.registry.get(taskId)?.status === "cancelled");
+    // A cancelled fix settles to the terminal `cancelled` status — never a regular `failure`.
+    assert.equal(service.registry.get(taskId)?.status, "cancelled");
+  } finally {
+    await app.close();
+  }
+});
+
 test("rate limiting: a 4th concurrent task → 429", async () => {
   const service = fakeService({ runBuild: () => new Promise<WorkerResult>(() => {}) });
   const app = await makeApp(service);
@@ -469,6 +508,18 @@ test("SSE stream closes (cleans up) when its task is cancelled (H4)", async () =
   const taskId = service.submitBuild({ goal: "g", repo: REPO });
   const data = await openSseAndAct(service, bus, `/api/tasks/${taskId}/stream`, () => { service.cancel(taskId); });
   assert.match(data, /event: task_completed/);
+});
+
+test("SSE cancellation frame reports the TERMINAL 'cancelled' status, not 'cancelling' (H4)", async () => {
+  const bus = makeBus();
+  const service = fakeService({ events: bus, runBuild: () => new Promise<WorkerResult>(() => {}) });
+  const taskId = service.submitBuild({ goal: "g", repo: REPO });
+  const data = await openSseAndAct(service, bus, `/api/tasks/${taskId}/stream`, () => { service.cancel(taskId); });
+  assert.match(data, /event: task_completed/);
+  // The task is still in the non-terminal `cancelling` state when task.cancelled fires, but the
+  // final frame must carry the TERMINAL `cancelled` status so a client reading it sees a terminal state.
+  assert.match(data, /"status":"cancelled"/);
+  assert.doesNotMatch(data, /"status":"cancelling"/);
 });
 
 test("SSE stream closes (cleans up) when its task errors (H4)", async () => {

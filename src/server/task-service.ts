@@ -62,8 +62,12 @@ export interface TaskServiceDeps {
    * production worker (shared-worker roleClaim + real gate-wall + per-run kill-check).
    */
   readonly runBuild?: (task: WorkerTask, ctx: OperationContext, isCancelled: () => boolean) => Promise<WorkerResult>;
-  /** Run a fix pipeline to completion. Default: the governed fix pipeline. */
-  readonly runFix?: (req: FixSubmission, ctx: OperationContext) => Promise<FixOutcome>;
+  /**
+   * Run a fix pipeline to completion under the given cancellation seam (H1): the pipeline
+   * polls `isCancelled` at its check boundaries and stops early (SAFE_FAIL) when set.
+   * Default: the governed fix pipeline.
+   */
+  readonly runFix?: (req: FixSubmission, ctx: OperationContext, isCancelled: () => boolean) => Promise<FixOutcome>;
   /** Resolve a token to a validated identity. Default: the core resolver. */
   readonly resolveIdentity?: (claim: { token: string }) => ValidatedIdentity;
   /** Event bus the role-progress folder subscribes to. Default: the live bus. */
@@ -256,8 +260,8 @@ export class TaskService {
   private async runFix(state: TaskState, sub: FixSubmission): Promise<void> {
     try {
       const ctx = this.beginOperation(state.taskId);
-      const run = this.deps.runFix ?? ((req, c) => this.liveRunFix(req, c, () => this.isCancelled(state.taskId)));
-      const outcome = await run(sub, ctx);
+      const run = this.deps.runFix ?? ((req, c, cancelled) => this.liveRunFix(req, c, cancelled));
+      const outcome = await run(sub, ctx, () => this.isCancelled(state.taskId));
       this.finalizeFix(state, outcome);
     } catch (e) {
       this.finalizeError(state, errMsg(e));
