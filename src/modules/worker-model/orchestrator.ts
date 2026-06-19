@@ -136,7 +136,7 @@ interface EscalationHandoffFields {
 // ── DEPENDENCY INSTALL: ensure worktree has node_modules ──────────────────────
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readdirSync, type Dirent } from "node:fs";
+import { existsSync, readdirSync, readFileSync, symlinkSync, mkdirSync, type Dirent } from "node:fs";
 import { join } from "node:path";
 
 /**
@@ -183,6 +183,29 @@ async function installWorkspaceDeps(
   const hasPnpmLock = existsSync(join(worktreePath, "pnpm-lock.yaml"));
   const hasNpmLock = existsSync(join(worktreePath, "package-lock.json"));
   const pm: "pnpm" | "npm" = hasNpmLock && !hasPnpmLock ? "npm" : "pnpm";
+
+  // Symlink local file: deps so pnpm install can resolve them in the isolated worktree.
+  // Reads package.json from the TARGET repo (not worktree) to find file: references,
+  // resolves them relative to the target repo root, and creates symlinks in the worktree
+  // parent directory so the relative paths work.
+  try {
+    const raw = readFileSync(join(workspace.targetRepo, "package.json"), "utf-8");
+    const pkg = JSON.parse(raw) as Record<string, Record<string, string>>;
+    const allDeps = { ...pkg.dependencies, ...pkg.devDependencies, ...pkg.peerDependencies };
+    const worktreeParent = join(worktreePath, "..");
+    for (const [, spec] of Object.entries(allDeps)) {
+      if (!spec.startsWith("file:")) continue;
+      const relPath = spec.slice(5); // remove "file:" prefix
+      const absTarget = join(workspace.targetRepo, relPath);
+      const symlinkPath = join(worktreeParent, relPath);
+      if (!existsSync(symlinkPath) && existsSync(absTarget)) {
+        mkdirSync(join(symlinkPath, ".."), { recursive: true });
+        symlinkSync(absTarget, symlinkPath);
+      }
+    }
+  } catch {
+    // Non-fatal: if we can't read/symlink, the install will fail and the builder sees it
+  }
 
   try {
     const di = installer ?? (await import("../dependency-install/index.js")).dependencyInstall;
