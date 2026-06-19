@@ -1479,23 +1479,34 @@ test("ISSUE 1: with criticFixLoop ON, a critic FAIL retries the builder with the
   assert.equal(ws.calls.promote, 1, "the fixed build promoted");
 });
 
-test("ISSUE 1: the critic-driven retry is capped at ONE (a still-failing re-critique discards, no further retry)", async () => {
+test("ISSUE 1: the critic-driven retry is capped at ONE, then escalates ONCE, then discards (no infinite loop, fail-closed)", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
   const ws = fakeWorkspaces(true);
-  const calls = { builder: 0, critic: 0 };
+  // CONTRACT CHANGE: a still-failing critic on a verifier-GREEN build is no longer a flat dead end.
+  // The cheap critic-fix retry is still capped at ONE; when it exhausts, the build escalates to the
+  // mid tier ONCE (see the critic-driven escalation tests below). Both mechanisms are capped, so the
+  // sequence is bounded: cheap build → cheap fix retry → ONE escalated build, then discard. This test
+  // pins that bound (no second fix retry, no second escalation) and the fail-closed discard.
+  const calls = { cheapBuild: 0, escalatedBuild: 0, critic: 0 };
   const roles: Partial<Record<WorkerRole, RoleFn>> = {
     scout: async () => ({ role: "scout", outcome: "success", summary: "scout" }),
-    builder: async () => { calls.builder += 1; return { role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["x.ts"], rejectedToolCalls: [] } }; },
+    builder: async (ctx) => {
+      if (ctx.task.goal.includes("[escalation]")) calls.escalatedBuild += 1; else calls.cheapBuild += 1;
+      return { role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["x.ts"], rejectedToolCalls: [] } };
+    },
     verifier: async () => ({ role: "verifier", outcome: "success", summary: "green", detail: { verdict: "pass", checks: [] } }),
-    // The critic FAILs every time — the retry must NOT loop.
+    // The critic FAILs every time — neither the cheap retry NOR the escalation must loop.
     critic: async () => { calls.critic += 1; return { role: "critic", outcome: "success", summary: "FAIL", detail: { pass: false, feedback: "still wrong" } }; },
     integrator: realIntegrator,
   };
   const orch = createOrchestrator(baseDeps({ config: { ...ENABLED, criticFixLoop: true }, resolveIdentity, roleClaim, roles, workspaces: ws.workspaces }));
   const result = await orch.run(task, parentCtx);
 
-  assert.equal(calls.builder, 2, "exactly one retry — never a second");
-  assert.equal(calls.critic, 2, "critiqued twice, then stopped");
+  assert.equal(calls.cheapBuild, 2, "the cheap fix retry ran exactly once — original + one retry, never a second");
+  assert.equal(calls.escalatedBuild, 1, "escalated to the mid tier exactly once — never a second escalation");
+  assert.equal(calls.critic, 3, "critiqued the cheap build, the cheap retry, and the escalated build — then stopped");
+  assert.equal(result.escalationRetry?.attempted, true, "an escalation was attempted after the cheap retry exhausted");
+  assert.equal(result.escalationRetry?.succeeded, false, "the escalated build also failed the critic");
   assert.notEqual(result.outcome, "success", "a persistently-failing critic discards (fail-closed)");
   assert.equal(ws.calls.promote, 0, "nothing promoted");
 });
@@ -1983,4 +1994,117 @@ test("build-mode escalation: a failed escalated retry leaves the original failur
   assert.equal(ws.calls.promote, 0, "no promote attempted after a failed escalated retry");
   const retried = bus.sent.find((e) => e.type === "worker.escalation.retried");
   assert.equal((retried?.payload as { success: boolean } | undefined)?.success, false, "the retry event reports the failure");
+});
+
+// ── CRITIC-DRIVEN ESCALATION: a verifier-GREEN, critic-REJECTED build escalates to the mid tier ──
+// A build the cheap model gets past the VERIFIER but never past the CRITIC used to be a dead end:
+// the critic-fix loop retried the cheap model ONCE and, if it still failed, the build was discarded
+// with the strong critic's feedback wasted. The signal-scored escalation engine cannot rescue it
+// (a critic rejection alone scores below the worker→mid threshold), so this is a DETERMINISTIC,
+// fix-loop-exhaustion-driven escalation: swap the builder to the mid model (deepseek-v4-pro) once,
+// re-verify, re-critique, and promote IFF the stronger model finally satisfies the critic.
+
+test("critic-driven escalation: a verifier-GREEN build the cheap model can't get past the critic escalates to the mid tier and converges → promote", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const bus = fakeBus();
+  const builderGoals: string[] = [];
+  let criticCall = 0;
+  const calls = { builder: 0, verifier: 0, critic: 0 };
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    scout: async () => ({ role: "scout", outcome: "success", summary: "scout" }),
+    builder: async (ctx) => { calls.builder += 1; builderGoals.push(ctx.task.goal); return { role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["x.ts"], rejectedToolCalls: [] } }; },
+    // The build is objectively GREEN every time — a REAL test check so testEvidence="executed" clears
+    // the integrator's fail-closed test-evidence gate.
+    verifier: async () => { calls.verifier += 1; return { role: "verifier", outcome: "success", summary: "green", detail: { verdict: "pass", checks: [{ name: "test", exitCode: 0, outputTail: "# tests 1\n# pass 1", testCount: { passed: 1, total: 1 } }] } }; },
+    critic: async () => {
+      criticCall += 1; calls.critic += 1;
+      // Cheap original (1) + cheap critic-fix re-critique (2) both FAIL; the escalated critique (3) PASSes.
+      if (criticCall < 3) return { role: "critic", outcome: "success", summary: "critique verdict: FAIL", detail: { pass: false, feedback: "the cheap model missed the spec", issues: ["enforce the invariant"] } };
+      return { role: "critic", outcome: "success", summary: "critique verdict: PASS", detail: { pass: true, feedback: "now correct" } };
+    },
+    integrator: realIntegrator,
+  };
+  const orch = createOrchestrator(baseDeps({ config: { ...ENABLED, criticFixLoop: true }, resolveIdentity, roleClaim, roles, workspaces: ws.workspaces, events: bus.bus }));
+  const result = await orch.run({ taskId: "t-critic-esc-success", targetRepo: "/repo", goal: "do the thing" }, parentCtx);
+
+  assert.equal(calls.builder, 3, "cheap build + critic-fix retry + ONE escalated build");
+  assert.equal(calls.critic, 3, "cheap critique + cheap re-critique + escalated critique");
+  // The escalated build carried the handoff context naming the mid model + the critic's feedback.
+  assert.match(builderGoals[2] ?? "", /\[escalation\]/, "the escalated build carried the handoff context");
+  assert.match(builderGoals[2] ?? "", /deepseek-v4-pro/, "the handoff names the escalated mid model");
+  assert.match(builderGoals[2] ?? "", /missed the spec/, "the handoff relays the critic's feedback the cheap model could not satisfy");
+  assert.ok(result.escalationRetry, "escalationRetry surfaced on the result");
+  assert.equal(result.escalationRetry?.attempted, true);
+  assert.equal(result.escalationRetry?.succeeded, true, "the escalated build finally satisfied the critic");
+  assert.equal(result.escalationRetry?.model, "deepseek-v4-pro", "ran on the first model of the mid tier (pro)");
+  const critic = result.roles.find((r) => r.role === "critic");
+  assert.equal((critic?.detail as { pass: boolean }).pass, true, "the escalated PASS critique is the final critic result");
+  assert.equal(result.outcome, "success", "the escalated build verified, critic-passed, and promoted");
+  assert.equal(ws.calls.promote, 1, "promoted the escalated work");
+  const retried = bus.sent.find((e) => e.type === "worker.escalation.retried");
+  assert.ok(retried, "worker.escalation.retried event emitted");
+  assert.equal((retried?.payload as { toModel: string } | undefined)?.toModel, "deepseek-v4-pro");
+  assert.equal((retried?.payload as { success: boolean } | undefined)?.success, true);
+});
+
+test("critic-driven escalation: a still-rejected escalated build leaves the original FAIL standing (fail-closed, exactly ONE swap)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const bus = fakeBus();
+  const builderGoals: string[] = [];
+  const calls = { builder: 0, verifier: 0, critic: 0 };
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    scout: async () => ({ role: "scout", outcome: "success", summary: "scout" }),
+    builder: async (ctx) => { calls.builder += 1; builderGoals.push(ctx.task.goal); return { role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["x.ts"], rejectedToolCalls: [] } }; },
+    verifier: async () => { calls.verifier += 1; return { role: "verifier", outcome: "success", summary: "green", detail: { verdict: "pass", checks: [{ name: "test", exitCode: 0, outputTail: "# tests 1\n# pass 1", testCount: { passed: 1, total: 1 } }] } }; },
+    // The critic FAILs on EVERY attempt — even the escalated mid model cannot satisfy it.
+    critic: async () => { calls.critic += 1; return { role: "critic", outcome: "success", summary: "critique verdict: FAIL", detail: { pass: false, feedback: "still off-goal" } }; },
+    integrator: realIntegrator,
+  };
+  const orch = createOrchestrator(baseDeps({ config: { ...ENABLED, criticFixLoop: true }, resolveIdentity, roleClaim, roles, workspaces: ws.workspaces, events: bus.bus }));
+  const result = await orch.run({ taskId: "t-critic-esc-fail", targetRepo: "/repo", goal: "do the thing" }, parentCtx);
+
+  assert.equal(calls.builder, 3, "cheap build + critic-fix retry + ONE escalated build, then no more (escalationAttempted caps it)");
+  assert.equal(calls.critic, 3, "cheap critique + cheap re-critique + escalated critique — never a fourth");
+  assert.equal(result.escalationRetry?.attempted, true);
+  assert.equal(result.escalationRetry?.succeeded, false, "the escalated build also failed the critic");
+  assert.equal(result.escalationRetry?.model, "deepseek-v4-pro");
+  assert.notEqual(result.outcome, "success", "the original critic FAIL stands → discard (fail-closed)");
+  assert.equal(ws.calls.promote, 0, "a critic-rejected build never promotes, escalated or not");
+  const retried = bus.sent.find((e) => e.type === "worker.escalation.retried");
+  assert.equal((retried?.payload as { success: boolean } | undefined)?.success, false, "the retry event reports the failure");
+});
+
+test("critic-driven escalation: with criticFixLoop OFF, a critic FAIL does NOT escalate (the loop gate also gates the escalation)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const cf = criticFixRoles();
+  // criticFixLoop OFF (default) → no critic-fix retry AND no critic-driven escalation.
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cf.roles, workspaces: ws.workspaces }));
+  const result = await orch.run({ taskId: "t-critic-esc-off", targetRepo: "/repo", goal: "do the thing" }, parentCtx);
+
+  assert.equal(cf.calls.builder, 1, "no critic-fix retry and no escalation — builder ran exactly once");
+  assert.equal(result.escalationRetry, undefined, "no escalation was attempted");
+  assert.notEqual(result.outcome, "success", "the single FAIL verdict discards as before");
+  assert.equal(ws.calls.promote, 0, "nothing promoted");
+});
+
+test("DIAGNOSTIC: a critic FAIL that does not drive the fix loop records a worker.critic_fix_loop.skipped receipt naming the blocking sub-condition", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const recCalls: Array<Record<string, unknown>> = [];
+  const receipts = { append: async (input: unknown, _identity: AgentIdentity): Promise<unknown> => { recCalls.push(input as Record<string, unknown>); return {}; } };
+  const cf = criticFixRoles();
+  // criticFixLoop OFF → the loop will not fire even though the critic FAILs on a verifier-GREEN build.
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cf.roles, workspaces: ws.workspaces, receipts }));
+  await orch.run({ taskId: "t-critic-diag", targetRepo: "/repo", goal: "do the thing" }, parentCtx);
+
+  const skipped = recCalls.find((c) => c.operation === "worker.critic_fix_loop.skipped");
+  assert.ok(skipped, "a diagnostic receipt was recorded for the no-fire critic FAIL");
+  const meta = skipped?.metadata as Record<string, unknown>;
+  assert.equal(meta.criticFixLoopEnabled, false, "the diagnostic records that the fix loop was disabled");
+  assert.equal(meta.isRetryableCriticFail, true, "the FAIL itself was a retryable subjective verdict");
+  assert.equal(meta.verifierPassedForCriticGate, true, "the verifier had passed — the only blocker was the disabled loop");
+  assert.deepEqual(meta.blockedBy, ["criticFixLoopEnabled"], "the diagnostic names the disabled fix loop as the sole blocker");
 });

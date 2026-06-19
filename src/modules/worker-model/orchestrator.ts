@@ -1558,6 +1558,40 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         // OPT-IN: requires IKBI_WORKER_MODEL_CRITIC_FIX_LOOP=true (default off).
         const verifierForCriticGate = results.find((r) => r.role === "verifier");
         const verifierPassedForCriticGate = verifierForCriticGate !== undefined && verifierForCriticGate.outcome === "success";
+        // DIAGNOSTIC: a critic FAIL that does NOT drive the fix loop is a dead end — the build is
+        // discarded with the strong critic's feedback thrown away. Record EXACTLY which sub-condition
+        // blocked the loop so the no-fire is debuggable from the receipt trail instead of silently
+        // swallowed. Emitted only when the critic actually produced a SUBJECTIVE fail verdict
+        // (detail.pass === false) — a PASS, or an objective fail-closed gate, is not a missed
+        // fix-loop opportunity worth recording.
+        if (role === "critic") {
+          const criticFailVerdict = ((result.detail ?? {}) as Record<string, unknown>).pass === false;
+          const subConditions = {
+            criticFixLoopEnabled: config.criticFixLoop === true,
+            notAlreadyAttempted: !criticFixAttempted,
+            verifierPassedForCriticGate,
+            isRetryableCriticFail: isRetryableCriticFail(result),
+          };
+          const willFire = subConditions.criticFixLoopEnabled && subConditions.notAlreadyAttempted && subConditions.verifierPassedForCriticGate && subConditions.isRetryableCriticFail;
+          if (criticFailVerdict && !willFire) {
+            await receipts.append(
+              {
+                operation: "worker.critic_fix_loop.skipped",
+                outcome: { status: "failure" },
+                requestId: task.taskId,
+                metadata: {
+                  taskId: task.taskId,
+                  workspaceId: workspace.id,
+                  reason: "critic returned FAIL but the critic-fix loop did not fire",
+                  ...subConditions,
+                  blockedBy: Object.entries(subConditions).filter(([, v]) => v !== true).map(([k]) => k),
+                },
+                project: task.targetRepo,
+              },
+              parentIdentity,
+            );
+          }
+        }
         if (role === "critic" && config.criticFixLoop && !criticFixAttempted && verifierPassedForCriticGate && isRetryableCriticFail(result)) {
           criticFixAttempted = true;
           // The prior results the re-run roles inherit: everything EXCEPT the stale builder /
@@ -1661,6 +1695,166 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               },
               parentIdentity,
             );
+          }
+        }
+
+        // ── CRITIC-DRIVEN ESCALATION: the cheap model exhausted its critic-feedback retry ─────
+        // When the critic-fix loop RAN (the cheap builder already got ONE retry with the critic's
+        // feedback) and the critic STILL rejects a verifier-GREEN build, the cheap model has
+        // demonstrably failed to satisfy the critic on this goal. The signal-scored escalation engine
+        // will NOT cross its worker→mid threshold on a critic rejection alone (criticRejected weight <
+        // the threshold, by design), so the build would simply be discarded with the feedback wasted.
+        // This is a DETERMINISTIC, policy-driven escalation that complements the engine's signal path
+        // (the build-mode escalation retry below, which fires on a builder FAILURE): swap the builder
+        // to the mid tier ONCE, re-verify, and re-critique. It SHARES the `escalationAttempted` cap
+        // with that builder-failure escalation — at most one model swap per run, and the two can never
+        // both fire (a builder failure breaks the loop before the critic ever runs). FAIL-CLOSED: a
+        // still-rejected escalated build leaves the ORIGINAL critic FAIL standing so the integrator
+        // discards — there is no half-promote.
+        const verifierAfterCriticLoop = results.find((r) => r.role === "verifier");
+        const verifierStillGreen = verifierAfterCriticLoop !== undefined && verifierAfterCriticLoop.outcome === "success";
+        if (
+          role === "critic" &&
+          config.criticFixLoop &&
+          criticFixAttempted &&
+          !escalationAttempted &&
+          verifierStillGreen &&
+          isRetryableCriticFail(result)
+        ) {
+          const midModel = escalationConfig.tierModels.mid[0];
+          if (midModel !== undefined) {
+            escalationAttempted = true;
+            const rejectedDetail = (result.detail ?? {}) as Record<string, unknown>;
+            const criticFeedback = typeof rejectedDetail.feedback === "string" ? rejectedDetail.feedback : (result.summary ?? "");
+            const criticIssues = Array.isArray(rejectedDetail.issues) ? rejectedDetail.issues.filter((x): x is string => typeof x === "string") : [];
+            // The escalated model gets the original goal PLUS the critic feedback the cheap attempts
+            // could not satisfy — the handoff context that makes the stronger model's retry informed.
+            const escalatedGoal = [
+              task.goal,
+              "",
+              `[escalation] A cheaper model (${singleBuilderModel}) could not satisfy the critic on this task — even after a retry with the critic's feedback — so it was escalated to you (${midModel}).`,
+              ...(criticFeedback.trim().length > 0 ? [`Critic feedback: ${criticFeedback.trim()}`] : []),
+              ...(criticIssues.length > 0 ? [`Specific issues: ${criticIssues.join("; ")}`] : []),
+              "Resolve the critic's concerns without breaking the passing checks; do not repeat what the previous attempts got wrong.",
+            ].join("\n");
+
+            // The carried prior results the re-run roles inherit: everything EXCEPT the stale
+            // builder/verifier/critic, which are replaced with their fresh escalated results.
+            const carriedPrior = results.filter((r) => r.role !== "builder" && r.role !== "verifier" && r.role !== "critic");
+
+            // Fresh role identities under the parent ceiling — escalation swaps the MODEL, not the tier.
+            const escBuilder = spawnRole("builder", parentCtx);
+            const escVerifier = spawnRole("verifier", parentCtx);
+            const escCritic = spawnRole("critic", parentCtx);
+
+            events.publish(
+              workerRoleDispatched.create(
+                { taskId: task.taskId, role: "builder", ...(escBuilder.identity.trustTier !== undefined ? { tier: escBuilder.identity.trustTier } : {}) },
+                { source: EVENT_SOURCE, attribution: { identity: escBuilder.identity, operation: "worker.role.builder", runId: task.taskId } },
+              ),
+            );
+            const costBeforeEsc = runCost();
+            const escBuilderFn = builderForModel(parentCtx, midModel, resolveBuilderMode(task));
+            let escBuilderResult = await runRoleFn("builder", escBuilderFn, {
+              task: { ...task, goal: escalatedGoal },
+              role: "builder",
+              identity: escBuilder.identity,
+              autonomy: escBuilder.autonomy,
+              workspace,
+              priorResults: [...carriedPrior],
+              engine: runEngine,
+            });
+            const escBuilderCost = runCost() - costBeforeEsc;
+            // Stamp the escalated model (+ marker) so the cost breakdown + audit show this builder ran
+            // on the mid tier, not the cheap one.
+            escBuilderResult = {
+              ...escBuilderResult,
+              detail: { ...((escBuilderResult.detail as Record<string, unknown> | undefined) ?? {}), ...(escBuilderCost > 0 ? { costUsd: escBuilderCost } : {}), model: midModel, escalated: true },
+            };
+            events.publish(
+              workerRoleCompleted.create(
+                { taskId: task.taskId, role: "builder", outcome: escBuilderResult.outcome, ...(escBuilderCost > 0 ? { costUsd: escBuilderCost } : {}) },
+                { source: EVENT_SOURCE, attribution: { identity: escBuilder.identity, operation: "worker.role.builder", runId: task.taskId } },
+              ),
+            );
+            await recordRole(task, workspace, escBuilder, escBuilderResult, escBuilderCost, midModel);
+
+            let escSucceeded = false;
+            if (escBuilderResult.outcome === "success") {
+              const escVerifyResult = await runRoleFn(
+                "verifier",
+                verifierFor(parentCtx),
+                {
+                  task,
+                  role: "verifier",
+                  identity: escVerifier.identity,
+                  autonomy: escVerifier.autonomy,
+                  workspace,
+                  priorResults: [...carriedPrior, escBuilderResult],
+                  engine: runEngine,
+                },
+                Math.max(roleTimeoutMs, resolveCheckTimeoutMs(modeEnv)),
+              );
+              // Mirror the main verifier→commit gate: capture the re-verified-good working tree so the
+              // integrator/promote sees the escalated diff (gated on autoCommit, as everywhere else).
+              if (escVerifyResult.outcome === "success" && workspaces.commit !== undefined && escVerifier.autonomy.autoCommit) {
+                await workspaces.commit(workspace, `ikbi: ${task.goal}`);
+              }
+              // C1: stamp testEvidence onto the re-verified result so the integrator's fail-closed
+              // test-evidence gate does not discard a legitimately-escalated, re-verified build.
+              const escVerifyStamped: RoleResult = {
+                ...escVerifyResult,
+                detail: { ...((escVerifyResult.detail as Record<string, unknown> | undefined) ?? {}), testEvidence: readVerifier(escVerifyResult).testEvidence },
+              };
+              const escCriticResult = await runRoleFn("critic", criticFor(), {
+                task,
+                role: "critic",
+                identity: escCritic.identity,
+                autonomy: escCritic.autonomy,
+                workspace,
+                priorResults: [...carriedPrior, escBuilderResult, escVerifyStamped],
+                engine: runEngine,
+              });
+
+              const escVerifierPass = escVerifyStamped.outcome === "success";
+              const escCriticPass = ((escCriticResult.detail ?? {}) as Record<string, unknown>).pass === true;
+              if (escVerifierPass && escCriticPass) {
+                // The escalated build CONVERGED — splice the fresh roles in so the integrator (and the
+                // run's roles array) reflect the work that actually landed. Replace by role; critic last.
+                const replaceRole = (value: RoleResult): void => {
+                  const i = results.findIndex((r) => r.role === value.role);
+                  if (i >= 0) results[i] = value;
+                  else results.push(value);
+                };
+                replaceRole(escBuilderResult);
+                replaceRole(escVerifyStamped);
+                result = escCriticResult;
+                replaceRole(result);
+                escSucceeded = true;
+              }
+              // A FAILED escalation (builder failed, verifier red, or critic still rejects) is NOT
+              // spliced — the original critic FAIL stays in `results`, so the integrator discards
+              // (fail-closed). The escalated builder's tree may be committed-but-unpromoted; the
+              // workspace is discarded as a unit, so nothing leaks.
+            }
+
+            events.publish(
+              workerEscalationRetried.create(
+                { taskId: task.taskId, fromModel: singleBuilderModel, toModel: midModel, success: escSucceeded },
+                { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.escalation.retry", runId: task.taskId } },
+              ),
+            );
+            await receipts.append(
+              {
+                operation: "worker.escalation.retry",
+                outcome: { status: escSucceeded ? "success" : "failure" },
+                requestId: task.taskId,
+                metadata: { taskId: task.taskId, workspaceId: workspace.id, trigger: "critic-rejected", fromModel: singleBuilderModel, toModel: midModel, success: escSucceeded, costUsd: runCost() },
+                project: task.targetRepo,
+              },
+              parentIdentity,
+            );
+            escalationRetryOutcome = { attempted: true, model: midModel, succeeded: escSucceeded };
           }
         }
 

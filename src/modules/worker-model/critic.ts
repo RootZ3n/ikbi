@@ -377,10 +377,22 @@ export function createCritic(deps: CriticDeps = {}): RoleFn {
       try {
         parsed = parseStructuredVerdict(response.content);
       } catch (err) {
-        return objectiveFail(`critic fail-closed: could not parse structured verdict (${err instanceof Error ? err.message : String(err)})`, {
-          finishReason: response.finishReason,
-          diffStats: { filesChanged: diff.files.length, additions: diff.additions, deletions: diff.deletions, truncated: diff.truncated },
-        });
+        // Parse failure from a cheap model is NOT an objective failure — it's a model
+        // capability issue. Return as a subjective FAIL (pass: false, no objectiveFailure)
+        // so isRetryableCriticFail returns true and the fix loop / escalation can fire.
+        // An objectiveFail would block the fix loop and the build would die here.
+        return {
+          role: "critic",
+          outcome: "success",
+          summary: "critique verdict: FAIL",
+          detail: {
+            pass: false,
+            feedback: `critic could not produce a structured verdict (${err instanceof Error ? err.message : String(err)}). A stronger model may succeed.`,
+            finishReason: response.finishReason,
+            diffStats: { filesChanged: diff.files.length, additions: diff.additions, deletions: diff.deletions, truncated: diff.truncated },
+            parseFailed: true,
+          },
+        };
       }
 
       // IMPORTANT: pass=false is a SUCCESSFUL critique that found problems. The role

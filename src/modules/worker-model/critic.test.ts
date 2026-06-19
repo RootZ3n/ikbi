@@ -189,7 +189,7 @@ test("unparseable or ambiguous model output fails closed", async () => {
   const result = await role(ctx);
   const detail = result.detail as { pass: boolean; feedback: string };
   assert.equal(detail.pass, false);
-  assert.match(detail.feedback, /could not parse structured verdict/);
+  assert.match(detail.feedback, /could not (?:parse|produce) a? ?structured verdict/);
 });
 
 test("critic built without a diff source fails closed before model call", async () => {
