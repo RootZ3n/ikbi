@@ -477,7 +477,7 @@ function detectWriteScope(goal: string): "all" | "new_only" | "none" {
  * every progress/diagnostic/hint/repair/cost line is routed to STDERR so a caller can pipe
  * stdout straight into a JSON parser without log noise interleaved (FIX 3).
  */
-export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbose?: boolean; cost?: boolean; yes?: boolean; json?: boolean; delegation?: string; noMemory?: boolean; memoryDiff?: boolean; check?: string; rest: string[] } {
+export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbose?: boolean; cost?: boolean; yes?: boolean; json?: boolean; delegation?: string; noMemory?: boolean; memoryDiff?: boolean; check?: string; complexity?: "small" | "medium" | "large"; rest: string[] } {
   const rest: string[] = [];
   let repo: string | undefined;
   let verbose = false;
@@ -488,6 +488,7 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
   let noMemory = false;
   let memoryDiff = false;
   let check: string | undefined;
+  let complexity: "small" | "medium" | "large" | undefined;
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i] as string;
     if (a === "--repo") {
@@ -517,11 +518,18 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
       i += 1;
     } else if (a.startsWith("--check=")) {
       check = a.slice("--check=".length);
+    } else if (a === "--complexity") {
+      const val = argv[i + 1];
+      if (val === "small" || val === "medium" || val === "large") complexity = val;
+      i += 1;
+    } else if (a.startsWith("--complexity=")) {
+      const val = a.slice("--complexity=".length);
+      if (val === "small" || val === "medium" || val === "large") complexity = val;
     } else {
       rest.push(a);
     }
   }
-  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), ...(verbose ? { verbose } : {}), ...(cost ? { cost } : {}), ...(yes ? { yes } : {}), ...(json ? { json } : {}), ...(delegation !== undefined ? { delegation } : {}), ...(noMemory ? { noMemory } : {}), ...(memoryDiff ? { memoryDiff } : {}), ...(check !== undefined && check.trim().length > 0 ? { check } : {}), rest };
+  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), ...(verbose ? { verbose } : {}), ...(cost ? { cost } : {}), ...(yes ? { yes } : {}), ...(json ? { json } : {}), ...(delegation !== undefined ? { delegation } : {}), ...(noMemory ? { noMemory } : {}), ...(memoryDiff ? { memoryDiff } : {}), ...(check !== undefined && check.trim().length > 0 ? { check } : {}), ...(complexity !== undefined ? { complexity } : {}), rest };
 }
 
 /**
@@ -805,12 +813,13 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
           "  --no-memory       Do not load project memory (CLAUDE.md / AGENTS.md / .ikbi/)\n" +
           "  --memory-diff     Show which project memory would be used, then exit (no build)\n" +
           "  --check \"<cmd>\"   Explicit verification command for a repo with no manifest\n" +
-          "  --delegation <json>  Run from a delegation envelope (overrides goal + repo)\n",
+          "  --delegation <json>  Run from a delegation envelope (overrides goal + repo)\n" +
+          "  --complexity <level>  small | medium | large — large skips flash entirely (uses pro)\n",
       );
       return;
     }
 
-    const { repo, verbose, cost, yes, delegation: delegationJson, noMemory, memoryDiff, check, rest } = parseBuildArgs(argv);
+    const { repo, verbose, cost, yes, delegation: delegationJson, noMemory, memoryDiff, check, complexity, rest } = parseBuildArgs(argv);
 
     // `--check "<cmd>"` declares an explicit verification command for a repo with no
     // recognizable manifest: convert it to the IKBI_CHECKS JSON the verifier reads and the
@@ -965,6 +974,7 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       goal: finalGoal,
       writeScope: detectWriteScope(finalGoal),
       ...(envelope !== undefined ? { originAgent: envelope.originAgent } : {}),
+      ...(complexity !== undefined ? { complexity } : {}),
       // Pass pre-loaded memory content so the builder doesn't re-read the disk.
       // When --no-memory is set, projectMem is undefined; skipProjectMemory tells
       // the builder not to fall back to its own file load.

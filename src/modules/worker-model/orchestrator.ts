@@ -123,6 +123,7 @@ interface MutableEscalationSignals {
   verificationFailed: boolean;
   stopReason?: string;
   rejectedToolCalls: number;
+  builderFailed: boolean;
 }
 
 /** Handoff-only context captured from roles (not scored). */
@@ -336,6 +337,11 @@ function foldRoleSignals(
     const pct = asNumber(detail.contextPercent);
     if (pct !== undefined) acc.contextPressure = Math.min(1, Math.max(0, pct / 100));
     if (typeof detail.stopReason === "string") acc.stopReason = detail.stopReason;
+    // Set builderFailed only for genuine progress failures (no_progress, timeout, stuck_detected)
+    // where the builder could not make progress — NOT for max_iterations with tool format errors,
+    // which are already captured by schemaFailures/rejectedToolCalls signals.
+    const BUILDER_FAILURE_REASONS = new Set(["no_progress", "timeout", "stuck_detected", "blocked"]);
+    if (result.outcome === "failure" && typeof detail.stopReason === "string" && BUILDER_FAILURE_REASONS.has(detail.stopReason)) acc.builderFailed = true;
   } else if (role === "critic") {
     if (result.outcome === "failure" || result.outcome === "rejected") acc.criticRejected = true;
     if (typeof result.summary === "string") handoff.criticFeedback = result.summary;
@@ -1155,6 +1161,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       throw new WorkerError("identity", "run requires an OperationContext carrying a validated identity");
     }
     const parentIdentity = parentCtx.identity.identity;
+    // --complexity large: override the builder model to the first mid-tier model, skipping flash entirely.
+    const effectiveBuilderModel = task.complexity === "large" ? (escalationConfig.tierModels.mid[0] ?? singleBuilderModel) : singleBuilderModel;
     armBudget(task); // start the whole-pipeline wall-clock deadline (covers every dispatch path)
     // Hand the (real) builder a mid-loop halt check so its loop stops promptly on a kill/budget
     // overrun. Reuses killHalt (kill-switch + budget); no-op for tests that inject a fake builder.
@@ -1275,7 +1283,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 
     const results: RoleResult[] = [];
     // Run-level escalation accumulator (ADDITIVE observability; never alters dispatch).
-    const escSignals: MutableEscalationSignals = { schemaFailures: 0, retryCount: 0, contextPressure: 0, criticRejected: false, verificationFailed: false, rejectedToolCalls: 0 };
+    const escSignals: MutableEscalationSignals = { schemaFailures: 0, retryCount: 0, contextPressure: 0, criticRejected: false, verificationFailed: false, rejectedToolCalls: 0, builderFailed: false };
     const escHandoff: EscalationHandoffFields = {};
     // The STRONGEST escalation recommendation seen across the scoring roles, surfaced on the
     // result (observe-only). A `recommended` recommendation wins over a declined one; ties break
@@ -1386,7 +1394,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           priorResults: [...results],
           engine: runEngine,
         };
-        const roleFn = role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderFor(parentCtx, resolveBuilderMode(task)) : role === "critic" ? criticFor() : roles[role];
+        // --complexity large: skip the worker-tier builder entirely and start with the mid-tier
+        // model. This avoids wasting a flash attempt on repos known to be too large for cheap models.
+        const complexityModel = task.complexity === "large" ? escalationConfig.tierModels.mid[0] : undefined;
+        const roleFn = role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderForModel(parentCtx, complexityModel, resolveBuilderMode(task)) : role === "critic" ? criticFor() : roles[role];
         // H4: floor the verifier's role timeout at the per-check budget. Without this, a 300s role
         // timeout races against 600s checks — the role fails first, orphaning the still-running check.
         const verifierTimeout = role === "verifier" ? Math.max(roleTimeoutMs, resolveCheckTimeoutMs(modeEnv)) : undefined;
@@ -1425,7 +1436,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         // changing the WorkerResult contract. Also stamp the model on the builder role.
         if (roleCost > 0) {
           const prevDetail = (result.detail as Record<string, unknown> | undefined) ?? {};
-          result = { ...result, detail: { ...prevDetail, costUsd: roleCost, ...(role === "builder" ? { model: singleBuilderModel } : {}) } };
+          result = { ...result, detail: { ...prevDetail, costUsd: roleCost, ...(role === "builder" ? { model: effectiveBuilderModel } : {}) } };
           results[results.length - 1] = result;
         }
         events.publish(
@@ -1435,7 +1446,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           ),
         );
 
-        await recordRole(task, workspace, spawned, result, roleCost, singleBuilderModel);
+        await recordRole(task, workspace, spawned, result, roleCost, effectiveBuilderModel);
 
         // SG-5 PROGRESS: structured per-role detail beyond start/end — builder tool activity
         // and the verifier's verdict — so `--verbose` can show what each phase actually did.

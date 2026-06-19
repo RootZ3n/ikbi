@@ -60,6 +60,8 @@ export interface EscalationSignals {
   readonly rejectedToolCalls: number;
   /** Historical pass rate for this task category on this model (from Luak). Absent ⇒ no signal. */
   readonly benchmarkPassRate?: number;
+  /** Whether the builder role failed (e.g. no_progress, policy violation). Binary signal. */
+  readonly builderFailed: boolean;
 }
 
 /** The computed escalation score with per-signal breakdown. */
@@ -173,6 +175,7 @@ export interface EscalationWeights {
   readonly verificationFailed: number; // default 25
   readonly rejectedToolCalls: number; // default 10
   readonly benchmarkPassRate: number; // default 5
+  readonly builderFailed: number; // default 40
 }
 
 /** Configuration for the escalation engine. */

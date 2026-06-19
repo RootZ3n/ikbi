@@ -57,6 +57,7 @@ export function computeScore(signals: EscalationSignals, weights: EscalationWeig
     rejectedToolCalls: capped(signals.rejectedToolCalls * (weights.rejectedToolCalls / 3), CAP_REJECTED_TOOL_CALLS),
     benchmarkPassRate:
       signals.benchmarkPassRate === undefined ? 0 : floored((1 - signals.benchmarkPassRate) * weights.benchmarkPassRate),
+    builderFailed: signals.builderFailed ? weights.builderFailed : 0,
   };
 
   let sum = 0;

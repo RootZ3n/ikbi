@@ -34,6 +34,7 @@ export const DEFAULT_WEIGHTS: EscalationWeights = Object.freeze({
   verificationFailed: 25,
   rejectedToolCalls: 10,
   benchmarkPassRate: 5,
+  builderFailed: 40,
 });
 
 export const DEFAULT_WORKER_MODELS = ["deepseek-v4-flash", "mimo-v2.5", "minimax-m3"] as const;
@@ -50,6 +51,7 @@ export function loadEscalationConfig(reader = env): EscalationConfig {
     verificationFailed: reader.number("WEIGHT_VERIFICATION_FAILED", DEFAULT_WEIGHTS.verificationFailed, { min: 0 }),
     rejectedToolCalls: reader.number("WEIGHT_REJECTED_TOOL_CALLS", DEFAULT_WEIGHTS.rejectedToolCalls, { min: 0 }),
     benchmarkPassRate: reader.number("WEIGHT_BENCHMARK_PASS_RATE", DEFAULT_WEIGHTS.benchmarkPassRate, { min: 0 }),
+    builderFailed: reader.number("WEIGHT_BUILDER_FAILED", DEFAULT_WEIGHTS.builderFailed, { min: 0 }),
   });
 
   const tierModels = Object.freeze({

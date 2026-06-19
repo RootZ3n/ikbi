@@ -40,6 +40,7 @@ function signals(over: Partial<EscalationSignals> = {}): EscalationSignals {
     criticRejected: false,
     verificationFailed: false,
     rejectedToolCalls: 0,
+    builderFailed: false,
     ...over,
   };
 }
@@ -105,15 +106,34 @@ test("scorer — contextPressure scales the fraction by its weight", () => {
 
 test("scorer — total is clamped to 100", () => {
   const maxed = computeScore(
-    signals({ schemaFailures: 10, retryCount: 10, criticRejected: true, verificationFailed: true, rejectedToolCalls: 10 }),
+    signals({ schemaFailures: 10, retryCount: 10, criticRejected: true, verificationFailed: true, rejectedToolCalls: 10, builderFailed: true }),
     DEFAULT_WEIGHTS,
   );
-  assert.equal(maxed.total, 100, "30+20+20+25+15 = 110 clamps to 100");
+  assert.equal(maxed.total, 100, "30+20+20+25+15+40 = 150 clamps to 100");
 });
 
 test("scorer — negative / non-finite signals never lower the score", () => {
   const s = computeScore(signals({ schemaFailures: -5, contextPressure: -1, scoutScore: 2 }), DEFAULT_WEIGHTS);
   assert.equal(s.total, 0, "floored at 0 per contribution");
+});
+
+test("scorer — builderFailed uses its full weight (binary signal)", () => {
+  assert.equal(computeScore(signals({ builderFailed: true }), DEFAULT_WEIGHTS).total, 40);
+  assert.equal(computeScore(signals({ builderFailed: false }), DEFAULT_WEIGHTS).total, 0);
+});
+
+test("scorer — builderFailed + rejectedToolCalls crosses threshold", () => {
+  // builderFailed(40) + rejectedToolCalls(3 * 10/3 = 10) = 50 ≥ threshold
+  const s = computeScore(signals({ builderFailed: true, rejectedToolCalls: 3 }), DEFAULT_WEIGHTS);
+  assert.equal(s.total, 50);
+  assert.equal(s.breakdown.builderFailed, 40);
+  assert.equal(s.breakdown.rejectedToolCalls, 10);
+});
+
+test("scorer — builderFailed + verificationFailed crosses threshold", () => {
+  // builderFailed(40) + verificationFailed(25) = 65 ≥ 50
+  const s = computeScore(signals({ builderFailed: true, verificationFailed: true }), DEFAULT_WEIGHTS);
+  assert.equal(s.total, 65);
 });
 
 test("scorer — 100% deterministic: identical input ⇒ identical output", () => {

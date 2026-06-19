@@ -207,6 +207,13 @@ export interface WorkerTask {
    */
   readonly skipVerifier?: boolean;
   /**
+   * REPO COMPLEXITY HINT: when "large", the orchestrator skips the worker-tier (flash)
+   * builder entirely and starts with the mid-tier (pro) model. Avoids wasting a flash
+   * attempt on repos that are known to be too large for cheap models. Default: undefined
+   * (uses the normal worker-tier model).
+   */
+  readonly complexity?: "small" | "medium" | "large";
+  /**
    * STEP-PLANNER: skip the CRITIC role entirely. Used for intermediate steps whose
    * critique would be both meaningless and wasted: the critic judges a PARTIAL build
    * against a sub-goal, its model verdict is discarded (an intermediate step sets
