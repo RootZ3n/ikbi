@@ -20,11 +20,15 @@
  * Fastify app with an injected service (no model key / worktree needed).
  */
 
-import { existsSync, statSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import { sep } from "node:path";
 import { timingSafeEqual } from "node:crypto";
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
+import { events as coreEvents } from "../core/events/index.js";
+import type { EventBusSurface } from "../core/events/index.js";
+import { loadRepoRegistry } from "../core/repo-registry.js";
 import { registerRoutes } from "./registry.js";
 import { taskService, type TaskService } from "./task-service.js";
 import { toPublicTask, type TaskStatus } from "./task-registry.js";
@@ -99,7 +103,62 @@ function repoExists(repo: string): boolean {
   }
 }
 
-const VALID_STATUSES: readonly TaskStatus[] = ["running", "success", "failure", "cancelled"];
+/** Resolve `repo` to its real path, falling back to the literal path when unresolvable. */
+function realPathOf(repo: string): string {
+  try {
+    return realpathSync(repo);
+  } catch {
+    return repo;
+  }
+}
+
+/** Parse IKBI_API_ALLOWED_REPOS into glob patterns, or undefined when unset/blank. */
+function allowedRepoGlobs(): readonly string[] | undefined {
+  const raw = process.env.IKBI_API_ALLOWED_REPOS?.trim();
+  if (raw === undefined || raw.length === 0) return undefined;
+  const globs = raw.split(",").map((s) => s.trim()).filter((s) => s.length > 0);
+  return globs.length > 0 ? globs : undefined;
+}
+
+/** Compile a single path glob (`*` within a segment, `**` across segments, `?` one char) to an anchored RegExp. */
+function globToRegExp(glob: string): RegExp {
+  let re = "";
+  for (let i = 0; i < glob.length; i += 1) {
+    const c = glob[i]!;
+    if (c === "*") {
+      if (glob[i + 1] === "*") {
+        re += ".*";
+        i += 1;
+      } else {
+        re += "[^/]*";
+      }
+    } else if (c === "?") {
+      re += "[^/]";
+    } else {
+      re += c.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+    }
+  }
+  return new RegExp(`^${re}$`);
+}
+
+/**
+ * Is `repo` allowed to be targeted by the API (MEDIUM 6)? When IKBI_API_ALLOWED_REPOS is set,
+ * the repo must match one of its comma-separated glob patterns. Otherwise it must be one of the
+ * repos registered in `state/repos.json` (the path itself, or a path inside it). Both the literal
+ * and the realpath form are checked so a symlinked path cannot dodge the allowlist.
+ */
+function repoAllowed(repo: string): boolean {
+  const candidates = [repo, realPathOf(repo)];
+  const globs = allowedRepoGlobs();
+  if (globs !== undefined) {
+    const res = globs.map(globToRegExp);
+    return candidates.some((p) => res.some((re) => re.test(p)));
+  }
+  const registered = loadRepoRegistry().list().map((r) => r.path);
+  return candidates.some((p) => registered.some((base) => p === base || p.startsWith(base.endsWith(sep) ? base : base + sep)));
+}
+
+const VALID_STATUSES: readonly TaskStatus[] = ["running", "cancelling", "success", "failure", "cancelled"];
 
 /** Parse + validate the optional `status` query filter. Returns undefined when absent/invalid-ignored. */
 function parseStatus(raw: unknown): TaskStatus | undefined {
@@ -122,7 +181,7 @@ interface TaskListQ { status?: string; limit?: string; offset?: string }
  * Register all task routes on `app`, bound to `service`. Production calls this from the
  * registerRoutes seam with the live singleton; tests call it on a bare app with a fake service.
  */
-export function registerTaskRoutes(app: FastifyInstance, service: TaskService): void {
+export function registerTaskRoutes(app: FastifyInstance, service: TaskService, bus: EventBusSurface = coreEvents): void {
   app.addHook("preHandler", apiAuth);
 
   app.post<{ Body: BuildBody }>("/api/build", { schema: { body: buildBodySchema } }, async (request, reply) => {
@@ -130,6 +189,10 @@ export function registerTaskRoutes(app: FastifyInstance, service: TaskService): 
     if (!repoExists(repo)) {
       reply.code(400);
       return { error: `repo "${repo}" does not exist or is not a directory` };
+    }
+    if (!repoAllowed(repo)) {
+      reply.code(403);
+      return { error: `repo "${repo}" is not allowed (set IKBI_API_ALLOWED_REPOS or register it in state/repos.json)` };
     }
     if (!service.credentialsConfigured()) {
       reply.code(503);
@@ -149,6 +212,10 @@ export function registerTaskRoutes(app: FastifyInstance, service: TaskService): 
     if (!repoExists(repo)) {
       reply.code(400);
       return { error: `repo "${repo}" does not exist or is not a directory` };
+    }
+    if (!repoAllowed(repo)) {
+      reply.code(403);
+      return { error: `repo "${repo}" is not allowed (set IKBI_API_ALLOWED_REPOS or register it in state/repos.json)` };
     }
     if (!service.credentialsConfigured()) {
       reply.code(503);
@@ -195,11 +262,13 @@ export function registerTaskRoutes(app: FastifyInstance, service: TaskService): 
     }
     service.cancel(taskId);
     reply.code(200);
-    return { taskId, status: "cancelled" };
+    // The run is now draining: report the live status ("cancelling"), which settles to
+    // "cancelled" once the underlying work actually stops (it keeps its concurrency slot, H2).
+    return { taskId, status: state.status };
   });
 
   // SSE progress stream — shares this registrar's encapsulation context + auth pre-handler.
-  registerTaskStream(app, service);
+  registerTaskStream(app, service, bus);
 }
 
 // Register the LIVE routes against the global registry (the server composes them; no

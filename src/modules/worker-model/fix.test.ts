@@ -244,3 +244,30 @@ test("fix: a collection error is diagnosed as tool_limitation with no edits", as
   assert.deepEqual(model.stages, [], "no model call was made for a collection error");
   assert.equal(outcome.receipt.antiCheat.passed, true);
 });
+
+// ────────────────────────────────────────────────────────────────────────────────
+// Cancellation (HIGH 1): the cooperative kill-check stops the pipeline at a boundary.
+// ────────────────────────────────────────────────────────────────────────────────
+
+test("fix: an armed kill-check stops the pipeline before any check or model call (H1)", async () => {
+  const repo = makeRepo({
+    "calculator.py": "def add(a, b):\n    return a - b\n",
+    "test_calculator.py": "def test_add():\n    assert add(2, 3) == 5\n",
+  });
+
+  let checks = 0;
+  const runCheck = async (): Promise<CheckRun> => { checks += 1; return { exitCode: 1, output: failingOutput("-1", "5") }; };
+  const model = makeModel({ diagnose: JSON.stringify({ category: "implementation_bug", confidence: 0.9, evidence: "x", affectedFiles: ["calculator.py"] }) });
+
+  const outcome = await runFixPipeline(
+    { repo, check: CHECK },
+    { runCheck, invokeModel: model.invokeModel, isCancelled: () => true, candidateFiles: candidates(repo, [{ path: "calculator.py", isTest: false }]), ...STABLE_DEPS },
+  );
+
+  assert.equal(outcome.result, "SAFE_FAIL");
+  assert.deepEqual([...outcome.filesModified], []);
+  assert.equal(checks, 0, "no check ran — the kill-check fired before reproduce");
+  assert.deepEqual(model.stages, [], "no model call was made for a cancelled run");
+  // The repo was left untouched.
+  assert.equal(readFileSync(join(repo, "calculator.py"), "utf8"), "def add(a, b):\n    return a - b\n");
+});

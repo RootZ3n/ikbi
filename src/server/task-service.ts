@@ -22,7 +22,7 @@ import type { EventBusSurface, IkbiEvent } from "../core/events/index.js";
 import { config } from "../core/config.js";
 import type { WorkerResult, WorkerTask } from "../modules/worker-model/index.js";
 import type { FixCheckCommand, FixOutcome } from "../modules/worker-model/fix.js";
-import { TaskRegistry, type TaskRoleState, type TaskState } from "./task-registry.js";
+import { TaskRegistry, type TaskRoleState, type TaskState, type TaskStatus } from "./task-registry.js";
 
 /** Validated body for a build submission (the route validates shape; this is the typed unit). */
 export interface BuildSubmission {
@@ -80,6 +80,14 @@ export interface TaskServiceDeps {
 export class TaskService {
   readonly registry = new TaskRegistry();
   private readonly cancelled = new Set<string>();
+  /**
+   * Task ids whose run is ACTUALLY executing right now — the true concurrency gate. A task
+   * stays in this set from submit until its run settles (success/failure/cancelled), so a
+   * `cancelling` task keeps its slot reserved and cannot be used to bypass the cap (H2).
+   */
+  private readonly live = new Set<string>();
+  /** Monotonic suffix making same-millisecond task ids unique (H5). */
+  private idCounter = 0;
   private readonly deps: TaskServiceDeps;
   private readonly events: EventBusSurface;
   private readonly now: () => number;
@@ -98,9 +106,18 @@ export class TaskService {
     return op !== undefined && op.length > 0 && wk !== undefined && wk.length > 0;
   }
 
-  /** Are we already at the concurrent-task cap? */
+  /**
+   * Are we already at the concurrent-task cap? Counts tasks whose run is ACTUALLY live —
+   * a `cancelling` task still counts (its run is draining), so cancel cannot free a slot
+   * for a new submission before the underlying work has stopped (H2).
+   */
   atCapacity(): boolean {
-    return this.registry.runningCount() >= MAX_CONCURRENT_TASKS;
+    return this.live.size >= MAX_CONCURRENT_TASKS;
+  }
+
+  /** Mint a unique task id — `<kind>-<ms>-<counter>` — collision-free even within one ms (H5). */
+  private nextTaskId(kind: "build" | "fix"): string {
+    return `${kind}-${this.now()}-${this.idCounter++}`;
   }
 
   /**
@@ -108,7 +125,7 @@ export class TaskService {
    * id immediately — the caller (route) has already validated the body + capacity.
    */
   submitBuild(sub: BuildSubmission): string {
-    const taskId = `build-${this.now()}`;
+    const taskId = this.nextTaskId("build");
     const state: TaskState = {
       taskId,
       kind: "build",
@@ -121,6 +138,7 @@ export class TaskService {
       filesChanged: [],
     };
     this.registry.add(state);
+    this.live.add(taskId);
     this.ensureSubscribed();
     void this.runBuild(state, sub);
     return taskId;
@@ -128,7 +146,7 @@ export class TaskService {
 
   /** Submit a fix. Same async-accept contract as {@link submitBuild}. */
   submitFix(sub: FixSubmission): string {
-    const taskId = `fix-${this.now()}`;
+    const taskId = this.nextTaskId("fix");
     const state: TaskState = {
       taskId,
       kind: "fix",
@@ -141,23 +159,27 @@ export class TaskService {
       filesChanged: [],
     };
     this.registry.add(state);
+    this.live.add(taskId);
     this.ensureSubscribed();
     void this.runFix(state, sub);
     return taskId;
   }
 
   /**
-   * Cancel a running task. Returns false if unknown or already terminal. Marks the task
-   * cancelled and arms the cooperative kill-check; the in-flight worker stops at its next
-   * role boundary, and the eventual run result will NOT overwrite the cancelled status.
+   * Request cancellation of a running task. Returns false if unknown or already terminal/
+   * cancelling. Moves the task to the non-terminal `cancelling` state and arms the
+   * cooperative kill-check: the in-flight worker (build) or fix pipeline stops at its next
+   * check boundary, the slot stays reserved (H2) until the run drains, and the eventual run
+   * result settles the task to the terminal `cancelled` status (it never flips to success).
+   * Emits a terminal `task.cancelled` event so any open SSE stream closes promptly (H4).
    */
   cancel(taskId: string): boolean {
     const state = this.registry.get(taskId);
     if (state === undefined || state.status !== "running") return false;
     this.cancelled.add(taskId);
-    state.status = "cancelled";
-    state.finishedAt = new Date(this.now()).toISOString();
+    state.status = "cancelling";
     state.reason = "cancelled by operator";
+    this.emitTerminal("task.cancelled", taskId, state.status, state.totalCost);
     return true;
   }
 
@@ -223,6 +245,10 @@ export class TaskService {
       this.finalizeBuild(state, result);
     } catch (e) {
       this.finalizeError(state, errMsg(e));
+    } finally {
+      // The run has actually stopped — release its concurrency slot now (NOT at cancel time, H2).
+      this.live.delete(state.taskId);
+      this.cancelled.delete(state.taskId);
     }
   }
 
@@ -230,11 +256,14 @@ export class TaskService {
   private async runFix(state: TaskState, sub: FixSubmission): Promise<void> {
     try {
       const ctx = this.beginOperation(state.taskId);
-      const run = this.deps.runFix ?? ((req, c) => this.liveRunFix(req, c));
+      const run = this.deps.runFix ?? ((req, c) => this.liveRunFix(req, c, () => this.isCancelled(state.taskId)));
       const outcome = await run(sub, ctx);
       this.finalizeFix(state, outcome);
     } catch (e) {
       this.finalizeError(state, errMsg(e));
+    } finally {
+      this.live.delete(state.taskId);
+      this.cancelled.delete(state.taskId);
     }
   }
 
@@ -260,8 +289,12 @@ export class TaskService {
     return worker.run(task, ctx);
   }
 
-  /** Live fix: the governed fix pipeline, check routed through governed-exec under the ctx. */
-  private async liveRunFix(req: FixSubmission, ctx: OperationContext): Promise<FixOutcome> {
+  /**
+   * Live fix: the governed fix pipeline, check routed through governed-exec under the ctx.
+   * `isCancelled` is the cooperative kill-check (H1): the pipeline polls it at its check
+   * boundaries and stops early when an operator has cancelled the task.
+   */
+  private async liveRunFix(req: FixSubmission, ctx: OperationContext, isCancelled: () => boolean): Promise<FixOutcome> {
     const { runFixPipeline } = await import("../modules/worker-model/fix.js");
     const { resolveCheckTimeoutMs } = await import("../modules/worker-model/checks.js");
     const { governedExec } = await import("../modules/governed-exec/index.js");
@@ -276,13 +309,36 @@ export class TaskService {
     const check = splitCheck(req.check);
     return runFixPipeline(
       { repo: req.repo, ...(check !== undefined ? { check } : {}), allowTestEdits: req.allowTestEdits === true, ...(req.goal !== undefined ? { goal: req.goal } : {}) },
-      { runCheck },
+      { runCheck, isCancelled },
     );
+  }
+
+  /**
+   * If the task was cancelled mid-flight, write its terminal `cancelled` state (the run has
+   * now drained) and report it handled, so a late run result never overwrites a cancellation.
+   * The `task.cancelled` SSE-terminal event was already emitted by {@link cancel}.
+   */
+  private settleCancelled(state: TaskState): boolean {
+    if (state.status !== "cancelling") return false;
+    state.status = "cancelled";
+    state.finishedAt = new Date(this.now()).toISOString();
+    if (state.reason === undefined) state.reason = "cancelled by operator";
+    return true;
+  }
+
+  /** Publish a terminal task.* event so any open SSE stream closes (H4). Best-effort. */
+  private emitTerminal(type: "task.completed" | "task.cancelled" | "task.error", taskId: string, status: TaskStatus, totalCost: number): void {
+    try {
+      this.events.publish({ type, payload: { taskId, status, totalCost }, source: "http-task-service" });
+    } catch {
+      /* a bus publish failure must never break finalization */
+    }
   }
 
   /** Write the terminal state for a completed build run (no-op if already cancelled). */
   private finalizeBuild(state: TaskState, result: WorkerResult): void {
-    if (state.status !== "running") return; // cancelled mid-flight — keep the cancelled terminal
+    if (this.settleCancelled(state)) return; // cancelled mid-flight — settle to the cancelled terminal
+    if (state.status !== "running") return;
     state.status = result.outcome === "success" ? "success" : "failure";
     state.finishedAt = new Date(this.now()).toISOString();
     state.totalCost = result.costUsd ?? state.totalCost;
@@ -299,10 +355,12 @@ export class TaskService {
     const verifier = result.roles.find((r) => r.role === "verifier");
     if (verifier !== undefined) state.verificationResult = verifier.outcome === "success" ? "pass" : "fail";
     if (result.outcome !== "success" && result.reason !== undefined) state.reason = result.reason;
+    this.emitTerminal("task.completed", state.taskId, state.status, state.totalCost);
   }
 
   /** Write the terminal state for a completed fix run (no-op if already cancelled). */
   private finalizeFix(state: TaskState, outcome: FixOutcome): void {
+    if (this.settleCancelled(state)) return;
     if (state.status !== "running") return;
     const ok = outcome.result === "FIXED_NARROWLY" || outcome.result === "CORRECT_REFUSAL";
     state.status = ok ? "success" : "failure";
@@ -311,14 +369,17 @@ export class TaskService {
     state.filesChanged = [...outcome.filesModified];
     state.verificationResult = outcome.receipt.fullCheck.passed ? "pass" : "fail";
     if (!ok) state.reason = outcome.result;
+    this.emitTerminal("task.completed", state.taskId, state.status, state.totalCost);
   }
 
   /** Write a failure terminal state from a thrown error (no-op if already cancelled). */
   private finalizeError(state: TaskState, reason: string): void {
+    if (this.settleCancelled(state)) return;
     if (state.status !== "running") return;
     state.status = "failure";
     state.finishedAt = new Date(this.now()).toISOString();
     state.reason = reason;
+    this.emitTerminal("task.error", state.taskId, state.status, state.totalCost);
   }
 }
 

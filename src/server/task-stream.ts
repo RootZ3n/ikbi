@@ -2,9 +2,12 @@
  * ikbi HTTP task SSE stream — GET /api/tasks/:taskId/stream (Phase 10.1).
  *
  * A Server-Sent Events stream of a single task's live progress. It subscribes to the
- * worker `worker.*` event bus, filters to THIS task's id, and translates each event into
- * a named SSE event (role_started / tool_activity / role_completed / escalation /
- * task_completed). The subscription is torn down on task completion OR client disconnect.
+ * `worker.*` and `task.*` event buses, filters to THIS task's id, and translates each event
+ * into a named SSE event (role_started / tool_activity / role_completed / escalation /
+ * task_completed). The subscription is torn down on ANY terminal signal — natural completion
+ * (worker.completed/failed, task.completed), cancellation (task.cancelled), an error
+ * (task.error) — on client disconnect, OR after an idle timeout (H4), so a stream can never
+ * leak a subscription + open socket when its task stops emitting.
  *
  * The handler HIJACKS the Fastify reply and writes raw SSE frames to the socket, so the
  * normal serializer / error handler never touches the response.
@@ -42,6 +45,18 @@ function writeSse(raw: NodeJS.WritableStream, event: string, data: Record<string
   raw.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
+/** Terminal event types that close the stream (natural completion, cancellation, error). */
+const TERMINAL_EVENT_TYPES = new Set(["worker.completed", "worker.failed", "task.completed", "task.cancelled", "task.error"]);
+
+/** Default idle timeout (ms) before an inactive stream is force-closed. Overridable via env (H4). */
+const DEFAULT_SSE_IDLE_TIMEOUT_MS = 30_000;
+
+/** Resolve the SSE idle timeout, read per request so an operator can tune it without a restart. */
+function sseIdleTimeoutMs(): number {
+  const raw = Number(process.env.IKBI_SSE_IDLE_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_SSE_IDLE_TIMEOUT_MS;
+}
+
 /**
  * Register the SSE stream route on `app`, bound to `service`. Called from the tasks
  * registrar (so it shares the same encapsulation context + auth pre-handler).
@@ -64,38 +79,60 @@ export function registerTaskStream(app: FastifyInstance, service: TaskService, b
     reply.hijack();
     const raw = reply.raw;
 
-    // Replay the current snapshot so a late subscriber immediately knows where the task stands.
-    writeSse(raw, "snapshot", toPublicTask(state));
-
     let closed = false;
     let sub: Subscription | undefined;
+    let idleTimer: NodeJS.Timeout | undefined;
+    const idleMs = sseIdleTimeoutMs();
     const close = (): void => {
       if (closed) return;
       closed = true;
+      if (idleTimer !== undefined) clearTimeout(idleTimer);
       sub?.unsubscribe();
       raw.end();
     };
+    // (Re)arm the idle timeout — any frame resets it; an idle stream is force-closed (H4). The
+    // timer is unref'd so it never holds the process open on its own.
+    const armIdle = (): void => {
+      if (idleTimer !== undefined) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        if (closed) return;
+        writeSse(raw, "timeout", { reason: "idle", afterMs: idleMs });
+        close();
+      }, idleMs);
+      idleTimer.unref?.();
+    };
+    const emit = (event: string, data: Record<string, unknown>): void => {
+      writeSse(raw, event, data);
+      armIdle();
+    };
 
-    // If the task already finished, emit the terminal frame and close immediately.
+    // Replay the current snapshot so a late subscriber immediately knows where the task stands.
+    emit("snapshot", toPublicTask(state));
+
+    // If the task already finished (or is cancelling), emit the terminal frame and close now.
     if (state.status !== "running") {
       writeSse(raw, "task_completed", { status: state.status, totalCost: state.totalCost });
       close();
       return reply;
     }
 
-    sub = bus.subscribe({ typePrefix: "worker.", label: `sse:${taskId}` }, (e: IkbiEvent) => {
-      if (closed) return;
-      const p = (e.payload ?? {}) as Record<string, unknown>;
-      if (p.taskId !== taskId) return;
-      if (e.type === "worker.completed" || e.type === "worker.failed") {
-        const current = service.registry.get(taskId);
-        writeSse(raw, "task_completed", { status: current?.status ?? "failure", totalCost: current?.totalCost ?? 0 });
-        close();
-        return;
-      }
-      const mapped = mapWorkerEventToSse(e);
-      if (mapped !== null) writeSse(raw, mapped.event, mapped.data);
-    });
+    // Subscribe to BOTH worker.* progress and task.* terminal signals (cancel/error/completed).
+    sub = bus.subscribe(
+      { predicate: (e) => e.type.startsWith("worker.") || e.type.startsWith("task."), label: `sse:${taskId}` },
+      (e: IkbiEvent) => {
+        if (closed) return;
+        const p = (e.payload ?? {}) as Record<string, unknown>;
+        if (p.taskId !== taskId) return;
+        if (TERMINAL_EVENT_TYPES.has(e.type)) {
+          const current = service.registry.get(taskId);
+          writeSse(raw, "task_completed", { status: current?.status ?? "failure", totalCost: current?.totalCost ?? 0 });
+          close();
+          return;
+        }
+        const mapped = mapWorkerEventToSse(e);
+        if (mapped !== null) emit(mapped.event, mapped.data);
+      },
+    );
 
     // Clean up when the client disconnects.
     request.raw.on("close", close);

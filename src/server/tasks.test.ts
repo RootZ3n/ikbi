@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import http from "node:http";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +9,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 
 import type { WorkerResult, WorkerTask } from "../modules/worker-model/index.js";
 import type { ValidatedIdentity } from "../core/identity/index.js";
+import type { EventBusSurface, IkbiEvent } from "../core/events/index.js";
 import { TaskService, type TaskServiceDeps } from "./task-service.js";
 import { registerTaskRoutes } from "./tasks.js";
 
@@ -67,9 +69,13 @@ async function waitFor(cond: () => boolean): Promise<void> {
 
 beforeEach(() => {
   delete process.env.IKBI_API_TOKEN;
+  // Allow the temp REPO so the build/fix routes pass the allowlist (MEDIUM 6) in tests.
+  process.env.IKBI_API_ALLOWED_REPOS = REPO;
 });
 afterEach(() => {
   delete process.env.IKBI_API_TOKEN;
+  delete process.env.IKBI_API_ALLOWED_REPOS;
+  delete process.env.IKBI_SSE_IDLE_MS;
 });
 
 test("POST /api/build with a valid request → 202 + taskId", async () => {
@@ -79,7 +85,7 @@ test("POST /api/build with a valid request → 202 + taskId", async () => {
     const res = await app.inject({ method: "POST", url: "/api/build", payload: { goal: "Fix the login bug", repo: REPO } });
     assert.equal(res.statusCode, 202);
     const body = res.json();
-    assert.match(body.taskId, /^build-\d+$/);
+    assert.match(body.taskId, /^build-\d+-\d+$/);
     assert.equal(body.status, "accepted");
     assert.equal(body.message, "Build task accepted");
   } finally {
@@ -119,7 +125,7 @@ test("POST /api/fix with a valid request → 202 + taskId", async () => {
   try {
     const res = await app.inject({ method: "POST", url: "/api/fix", payload: { repo: REPO, check: "pnpm test", goal: "Fix failing tests", allowTestEdits: false } });
     assert.equal(res.statusCode, 202);
-    assert.match(res.json().taskId, /^fix-\d+$/);
+    assert.match(res.json().taskId, /^fix-\d+-\d+$/);
     assert.equal(res.json().message, "Fix task accepted");
   } finally {
     await app.close();
@@ -225,17 +231,18 @@ test("GET /api/tasks → 200 + list with total, filterable by status", async () 
   }
 });
 
-test("POST /api/tasks/:taskId/cancel → 200 + cancelled, and the state reflects it", async () => {
-  const service = fakeService({ runBuild: () => new Promise<WorkerResult>(() => {}) });
+test("POST /api/tasks/:taskId/cancel → 200 + cancelling while the run drains (slot held)", async () => {
+  const service = fakeService({ runBuild: () => new Promise<WorkerResult>(() => {}) }); // never resolves: keeps draining
   const app = await makeApp(service);
   try {
     const taskId = (await app.inject({ method: "POST", url: "/api/build", payload: { goal: "g", repo: REPO } })).json().taskId;
     const res = await app.inject({ method: "POST", url: `/api/tasks/${taskId}/cancel` });
     assert.equal(res.statusCode, 200);
-    assert.deepEqual(res.json(), { taskId, status: "cancelled" });
+    // The run hasn't actually stopped yet → non-terminal "cancelling", no finishedAt, slot still held.
+    assert.deepEqual(res.json(), { taskId, status: "cancelling" });
     const state = (await app.inject({ method: "GET", url: `/api/tasks/${taskId}` })).json();
-    assert.equal(state.status, "cancelled");
-    assert.ok(typeof state.finishedAt === "string");
+    assert.equal(state.status, "cancelling");
+    assert.equal(state.finishedAt, undefined);
   } finally {
     await app.close();
   }
@@ -310,6 +317,176 @@ test("IKBI_API_TOKEN gates every /api route with a bearer check", async () => {
   } finally {
     await app.close();
   }
+});
+
+// ── HARDENING REGRESSION TESTS (Codex adversarial audit) ─────────────────────
+
+test("task ids are unique even for same-millisecond submissions (H5)", async () => {
+  // A fixed clock forces every id onto the same millisecond — the counter suffix must disambiguate.
+  const service = fakeService({ now: () => 1000, runBuild: () => new Promise<WorkerResult>(() => {}) });
+  const app = await makeApp(service);
+  try {
+    const ids = new Set<string>();
+    for (let i = 0; i < 3; i += 1) {
+      const r = await app.inject({ method: "POST", url: "/api/build", payload: { goal: `g${i}`, repo: REPO } });
+      assert.equal(r.statusCode, 202); // pre-fix the 2nd add() threw (duplicate id) → 500
+      ids.add(r.json().taskId);
+    }
+    assert.equal(ids.size, 3);
+  } finally {
+    await app.close();
+  }
+});
+
+test("rate limiting: a cancelled-but-still-draining task keeps its slot (H2)", async () => {
+  const service = fakeService({ runBuild: () => new Promise<WorkerResult>(() => {}) }); // runs never resolve
+  const app = await makeApp(service);
+  try {
+    const ids: string[] = [];
+    for (let i = 0; i < 3; i += 1) {
+      const r = await app.inject({ method: "POST", url: "/api/build", payload: { goal: `g${i}`, repo: REPO } });
+      assert.equal(r.statusCode, 202);
+      ids.push(r.json().taskId);
+    }
+    const c = await app.inject({ method: "POST", url: `/api/tasks/${ids[0]}/cancel` });
+    assert.equal(c.statusCode, 200);
+    assert.equal(c.json().status, "cancelling");
+    // The cancelled run hasn't actually stopped, so its slot is still held: a 4th submit is rejected.
+    const fourth = await app.inject({ method: "POST", url: "/api/build", payload: { goal: "g4", repo: REPO } });
+    assert.equal(fourth.statusCode, 429);
+  } finally {
+    await app.close();
+  }
+});
+
+test("a finished run releases its slot, re-opening capacity", async () => {
+  let resolveOne!: () => void;
+  let resolved = false;
+  const service = fakeService({
+    runBuild: (t: WorkerTask) =>
+      resolved ? new Promise<WorkerResult>(() => {}) : new Promise<WorkerResult>((r) => { resolveOne = () => { resolved = true; r(successResult(t.taskId)); }; }),
+  });
+  const app = await makeApp(service);
+  try {
+    for (let i = 0; i < 3; i += 1) assert.equal((await app.inject({ method: "POST", url: "/api/build", payload: { goal: `g${i}`, repo: REPO } })).statusCode, 202);
+    assert.equal((await app.inject({ method: "POST", url: "/api/build", payload: { goal: "g4", repo: REPO } })).statusCode, 429);
+    resolveOne(); // the first run completes → its slot frees
+    await waitFor(() => !service.atCapacity());
+    assert.equal((await app.inject({ method: "POST", url: "/api/build", payload: { goal: "g5", repo: REPO } })).statusCode, 202);
+  } finally {
+    await app.close();
+  }
+});
+
+test("POST /api/build for a repo outside the allowlist → 403 (MEDIUM 6)", async () => {
+  const outside = mkdtempSync(join(tmpdir(), "ikbi-task-outside-")); // exists, but not the allowlisted REPO
+  const service = fakeService({ runBuild: () => new Promise<WorkerResult>(() => {}) });
+  const app = await makeApp(service);
+  try {
+    const res = await app.inject({ method: "POST", url: "/api/build", payload: { goal: "g", repo: outside } });
+    assert.equal(res.statusCode, 403);
+    assert.match(res.json().error, /not allowed/);
+  } finally {
+    await app.close();
+  }
+});
+
+test("POST /api/fix for a repo outside the allowlist → 403 (MEDIUM 6)", async () => {
+  const outside = mkdtempSync(join(tmpdir(), "ikbi-task-outside-fix-"));
+  const service = fakeService({ runFix: () => new Promise(() => {}) });
+  const app = await makeApp(service);
+  try {
+    const res = await app.inject({ method: "POST", url: "/api/fix", payload: { repo: outside } });
+    assert.equal(res.statusCode, 403);
+  } finally {
+    await app.close();
+  }
+});
+
+test("IKBI_API_ALLOWED_REPOS glob patterns admit a matching repo", async () => {
+  process.env.IKBI_API_ALLOWED_REPOS = `${tmpdir()}/**`; // a glob covering all temp dirs
+  const service = fakeService({ runBuild: () => new Promise<WorkerResult>(() => {}) });
+  const app = await makeApp(service);
+  try {
+    const res = await app.inject({ method: "POST", url: "/api/build", payload: { goal: "g", repo: REPO } });
+    assert.equal(res.statusCode, 202);
+  } finally {
+    await app.close();
+  }
+});
+
+// A minimal in-memory event bus so an SSE test owns an isolated bus shared by the service + stream.
+function makeBus(): EventBusSurface {
+  const subs = new Set<{ match: (e: IkbiEvent) => boolean; handler: (e: IkbiEvent) => void }>();
+  return {
+    publish(input) {
+      const e = { ...input, id: "evt", seq: 0, timestamp: "t", contractVersion: "1.0.0" } as unknown as IkbiEvent;
+      for (const s of subs) if (s.match(e)) queueMicrotask(() => s.handler(e));
+      return e as never;
+    },
+    subscribe(opts, handler) {
+      const match = (e: IkbiEvent): boolean => {
+        if (opts.types && !opts.types.includes(e.type)) return false;
+        if (opts.typePrefix && !e.type.startsWith(opts.typePrefix)) return false;
+        if (opts.predicate && !opts.predicate(e)) return false;
+        return true;
+      };
+      const rec = { match, handler: handler as (e: IkbiEvent) => void };
+      subs.add(rec);
+      return { id: "sub", unsubscribe: () => subs.delete(rec), stats: () => ({ delivered: 0, dropped: 0, failures: 0, queued: 0 }) };
+    },
+    flush: () => Promise.resolve(),
+  };
+}
+
+/** Open a real SSE stream, run `act` once it's connected, and resolve with everything the stream wrote before it closed. */
+async function openSseAndAct(service: TaskService, bus: EventBusSurface, path: string, act: () => void): Promise<string> {
+  const app = Fastify();
+  registerTaskRoutes(app, service, bus);
+  await app.listen({ port: 0, host: "127.0.0.1" });
+  const addr = app.server.address() as { port: number };
+  try {
+    return await new Promise<string>((resolve, reject) => {
+      const req = http.get({ host: "127.0.0.1", port: addr.port, path }, (res) => {
+        let data = "";
+        res.on("data", (c) => { data += String(c); });
+        res.on("end", () => resolve(data));
+        res.on("error", reject);
+        setImmediate(() => setImmediate(act)); // act once the stream is subscribed
+      });
+      req.on("error", reject);
+      const t = setTimeout(() => reject(new Error("SSE stream did not close in time")), 5000);
+      t.unref();
+    });
+  } finally {
+    await app.close();
+  }
+}
+
+test("SSE stream closes (cleans up) when its task is cancelled (H4)", async () => {
+  const bus = makeBus();
+  const service = fakeService({ events: bus, runBuild: () => new Promise<WorkerResult>(() => {}) });
+  const taskId = service.submitBuild({ goal: "g", repo: REPO });
+  const data = await openSseAndAct(service, bus, `/api/tasks/${taskId}/stream`, () => { service.cancel(taskId); });
+  assert.match(data, /event: task_completed/);
+});
+
+test("SSE stream closes (cleans up) when its task errors (H4)", async () => {
+  const bus = makeBus();
+  let fail!: () => void;
+  const service = fakeService({ events: bus, runBuild: () => new Promise<WorkerResult>((_, r) => { fail = () => r(new Error("boom")); }) });
+  const taskId = service.submitBuild({ goal: "g", repo: REPO });
+  const data = await openSseAndAct(service, bus, `/api/tasks/${taskId}/stream`, () => { fail(); });
+  assert.match(data, /event: task_completed/);
+});
+
+test("SSE stream force-closes after the idle timeout (H4)", async () => {
+  process.env.IKBI_SSE_IDLE_MS = "120";
+  const bus = makeBus();
+  const service = fakeService({ events: bus, runBuild: () => new Promise<WorkerResult>(() => {}) });
+  const taskId = service.submitBuild({ goal: "g", repo: REPO });
+  const data = await openSseAndAct(service, bus, `/api/tasks/${taskId}/stream`, () => { /* stay idle */ });
+  assert.match(data, /event: timeout/);
 });
 
 test("the tasks routes register via the registerRoutes seam (served by buildServer)", async () => {

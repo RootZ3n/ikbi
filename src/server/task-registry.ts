@@ -12,10 +12,13 @@
 export type TaskKind = "build" | "fix";
 
 /**
- * A task's lifecycle status. `running` is the only non-terminal state; the three
- * terminal states are written exactly once (a cancelled task never flips to success).
+ * A task's lifecycle status. `running` and `cancelling` are the non-terminal states;
+ * the three terminal states are written exactly once (a cancelled task never flips to
+ * success). `cancelling` means an operator requested cancellation but the underlying run
+ * is still draining (it stops at its next check boundary, then settles to `cancelled`) —
+ * a cancelling task still occupies a concurrency slot until its run actually finishes.
  */
-export type TaskStatus = "running" | "success" | "failure" | "cancelled";
+export type TaskStatus = "running" | "cancelling" | "success" | "failure" | "cancelled";
 
 /** One role's progress within a task (mirrors the worker pipeline's per-role result). */
 export interface TaskRoleState {

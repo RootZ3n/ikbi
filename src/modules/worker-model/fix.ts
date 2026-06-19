@@ -124,6 +124,12 @@ export interface FixOptions {
 export interface FixDeps {
   /** Run a check in the repo (gate-wall/governed in production; a fake in tests). REQUIRED. */
   readonly runCheck: (repo: string, check: FixCheckCommand) => Promise<CheckRun>;
+  /**
+   * Cooperative kill-check (default: never cancelled). Polled at the pipeline's check
+   * boundaries — before reproduce, before diagnosis, and before each patch attempt — so an
+   * operator cancellation stops the run promptly without leaving a half-applied patch on disk.
+   */
+  readonly isCancelled?: () => boolean;
   /** The model seam — the SAME `invokeModel` build mode uses. Default: the live provider (lazy). */
   readonly invokeModel?: (request: ModelRequest) => Promise<ModelResponse>;
   /** #8 neutralization seam. Default: the core chokepoint. */
@@ -293,6 +299,7 @@ export async function runFixPipeline(opts: FixOptions, deps: FixDeps): Promise<F
   const candidateFiles = deps.candidateFiles ?? defaultCandidateFiles;
   const modelId = deps.modelId ?? builderModel();
   const identity = deps.identity ?? DEFAULT_IDENTITY;
+  const isCancelled = deps.isCancelled ?? (() => false);
 
   // ── STAGE 1: SNAPSHOT ──────────────────────────────────────────────────────
   const builder = new FixReceiptBuilder({ timestamp: now(), repo: opts.repo, check: checkLabel(check), head: headOf(opts.repo) });
@@ -304,6 +311,16 @@ export async function runFixPipeline(opts: FixOptions, deps: FixDeps): Promise<F
     builder.recordAntiCheat(verdict.passed, verdict.checks);
     return { result, receipt: builder.finalize(result), promoted: false, filesModified: [], diagnosis };
   };
+
+  // A cancellation terminal: the operator cancelled before this boundary — stop cleanly with a
+  // SAFE_FAIL (no changes are owned by a cancelled run; the caller settles status to "cancelled").
+  const cancelledDiagnosis: Diagnosis = { category: "unresolved", confidence: 0, evidence: "fix cancelled by operator", affectedFiles: [] };
+
+  // Kill-check #1 — before the (potentially slow) reproduce check runs.
+  if (isCancelled()) {
+    builder.recordDiagnosis(cancelledDiagnosis);
+    return terminalNoEdit("SAFE_FAIL", cancelledDiagnosis);
+  }
 
   // ── STAGE 2: REPRODUCE ─────────────────────────────────────────────────────
   let reproduce: CheckRun;
@@ -319,6 +336,12 @@ export async function runFixPipeline(opts: FixOptions, deps: FixDeps): Promise<F
   // ── STAGE 3: PARSE ─────────────────────────────────────────────────────────
   const outcomes = parseOutcomes(check, reproduce);
   builder.recordReproduce(reproduce.exitCode, outcomes, reproduce.output);
+
+  // Kill-check #2 — before the diagnosis model call (the next expensive boundary).
+  if (isCancelled()) {
+    builder.recordDiagnosis(cancelledDiagnosis);
+    return terminalNoEdit("SAFE_FAIL", cancelledDiagnosis);
+  }
 
   // ── STAGE 4: CLASSIFY ──────────────────────────────────────────────────────
   const files = candidateFiles(opts.repo);
@@ -407,6 +430,14 @@ export async function runFixPipeline(opts: FixOptions, deps: FixDeps): Promise<F
   const attemptModels = opts.escalationModels ?? defaultEscalationModels(modelId);
 
   for (let attempt = 1; attempt <= MAX_FIX_ATTEMPTS; attempt++) {
+    // Kill-check #3 — at each patch/verify boundary. Revert any patch a prior attempt wrote so a
+    // cancelled run leaves the repo clean, then terminate (the caller settles status to cancelled).
+    if (isCancelled()) {
+      if (everModified.length > 0) restore(everModified);
+      builder.recordAttempts(attempt - 1);
+      return terminalNoEdit("SAFE_FAIL", diagnosis);
+    }
+
     const currentModel = attemptModels[Math.min(attempt - 1, attemptModels.length - 1)] ?? modelId;
     builder.recordAttemptModel(currentModel);
 
