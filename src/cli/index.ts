@@ -25,6 +25,7 @@ import { registry } from "../core/provider/index.js";
 import { trust } from "../core/trust/index.js";
 import { commands } from "./registry.js";
 import { runDoctor, runDoctorFixCli } from "./doctor.js";
+import { runSelfRepair } from "../modules/self-repair/index.js";
 import { runCapabilities } from "./capabilities.js";
 import { postureLines } from "./posture.js";
 import { writeStderr, writeStdout } from "./io.js";
@@ -97,6 +98,7 @@ function printUsage(): void {
     "  providers [list]   List the registered providers",
     "  doctor             Report bootstrap config: what's set, what's missing for a build",
     "  doctor --fix       Repair common gaps (.env/state dirs/deps); --force reclaims stale + aged workspaces",
+    "  doctor --self-repair  Run the self-monitor; file a work order per problem found",
     "  capabilities       List the builder + chat tool inventory (and parity)",
   ];
   if (moduleCmds.length > 0) {
@@ -181,13 +183,23 @@ async function run(argv: readonly string[]): Promise<void> {
       // `--help` prints usage and exits 0 — it must NOT run the report (which reads config).
       if (wantsHelp(doctorArgs)) {
         writeStdout(
-          "Usage: ikbi doctor [--fix] [--force]\n\n" +
+          "Usage: ikbi doctor [--fix] [--force] [--self-repair]\n\n" +
             "Report bootstrap config: what's set, what's missing for a build, and how to fix each gap.\n" +
             "Read-only by default (no identity, no network).\n\n" +
             "Options:\n" +
-            "  --fix    Repair common gaps (.env / state dirs / deps); creates/repairs only\n" +
-            "  --force  With --fix, also reclaim stale + aged workspaces\n",
+            "  --fix          Repair common gaps (.env / state dirs / deps); creates/repairs only\n" +
+            "  --force        With --fix, also reclaim stale + aged workspaces\n" +
+            "  --self-repair  Run the self-monitor: health/test/workspace/dependency checks;\n" +
+            "                 file a work order for each problem found (does not promote/fix)\n",
         );
+        return;
+      }
+      // `--self-repair` runs ikbi's self-monitor (Part 1): cheap read-only checks that
+      // file work orders to the shared queue for the mechanic (Ptah) to drain. It mints
+      // no fix and promotes nothing — it only reports + records.
+      if (doctorArgs.includes("--self-repair")) {
+        const report = await runSelfRepair(writeStdout);
+        if (!report.ok) process.exitCode = 1;
         return;
       }
       // `--fix` is the opt-in side-effecting twin of the read-only report: it repairs

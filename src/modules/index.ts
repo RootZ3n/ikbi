@@ -67,6 +67,10 @@ import "./batch-planner/index.js";
 import "./capability-recovery/index.js";
 // Trust operator CLI (registers the `trust` grant/status command — the cold-start on-ramp).
 import "./trust/index.js";
+// Self-repair — ikbi watching itself: read-only health checks that file work orders to
+// the shared queue. Library-only at import (no command/route); its operator surface is
+// `ikbi doctor --self-repair`, wired in src/cli/index.ts.
+import "./self-repair/index.js";
 // Kill-switch LAST — its index reads the durable latch at engine start (graceful
 // degradation), and registers the `kill`/`unkill`/`kill-status` operator commands.
 import "./kill-switch/index.js";
