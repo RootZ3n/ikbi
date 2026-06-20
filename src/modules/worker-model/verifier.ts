@@ -420,6 +420,9 @@ function changedGuardedScriptExcludingStubs(oldPkg: Record<string, unknown>, new
     if (o[key] !== n[key]) {
       // If the old value was a stub and the new value is a real runner, this is expected.
       if (isExpectedManifestChange(o[key] as string | undefined, n[key] as string | undefined)) continue;
+      // If the key is NEW (didn't exist in old scripts), adding it is greenfield — not suspicious.
+      // The security risk is REWRITING an existing script, not adding a new one.
+      if (!(key in o)) continue;
       return key;
     }
   }
@@ -706,6 +709,11 @@ function legacyDetectScriptMutation(diff: string): { mutated: boolean; reason?: 
         if (oldValue !== undefined) {
           pendingRemovals.delete(keyName);
           if (isExpectedManifestChange(oldValue, value)) continue; // stub→runner: expected
+        } else if (oldValue === undefined && !pendingRemovals.has(keyName)) {
+          // NEW script addition (no corresponding - line): adding a guarded script key that
+          // didn't exist before is greenfield — not a security concern. The security risk is
+          // REWRITING an existing script (e.g. test → echo done), not adding a new one.
+          continue;
         }
         return { mutated: true, reason: `builder modified package.json script "${keyName}"` };
       }

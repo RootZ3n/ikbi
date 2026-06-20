@@ -212,7 +212,7 @@ test("LAYER 2 diff-throws: an unreadable workspace diff fails CLOSED (untrusted)
 
 test("detectScriptMutation: flags test/build/tsc + the scripts key; ignores deps and non-package files", () => {
   assert.equal(detectScriptMutation("diff --git a/package.json b/package.json\n-    \"test\": \"node --test\",\n+    \"test\": \"echo hi\",").mutated, true, "test script change flagged");
-  assert.equal(detectScriptMutation("diff --git a/package.json b/package.json\n+    \"build\": \"tsc -p .\",").mutated, true, "build script add flagged");
+  assert.equal(detectScriptMutation("diff --git a/package.json b/package.json\n+    \"build\": \"tsc -p .\",").mutated, false, "NEW build script add is greenfield (not rewriting existing)");
   assert.equal(detectScriptMutation("diff --git a/package.json b/package.json\n-    \"pretest\": \"x\",").mutated, true, "pretest hook removal flagged");
   assert.equal(detectScriptMutation("diff --git a/package.json b/package.json\n+  \"scripts\": {\n+    \"foo\": \"bar\"\n+  },").mutated, true, "adding the scripts object flagged");
   assert.equal(detectScriptMutation("diff --git a/package.json b/package.json\n-    \"lodash\": \"^4.17.20\",\n+    \"lodash\": \"^4.17.21\",").mutated, false, "a dependency bump is NOT a scripts change");
