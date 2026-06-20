@@ -11,7 +11,7 @@ import { autonomyForTier } from "../../core/trust/index.js";
 import type { WorkspaceHandle } from "../../core/workspace/contract.js";
 import type { ExecRequest, ExecResult } from "../governed-exec/index.js";
 import type { ProjectIndexData } from "../project-index/index.js";
-import { createVerifier, detectScriptMutation, detectShellOutMutation, extractGoalFiles, type CheckResult } from "./verifier.js";
+import { createVerifier, detectScriptMutation, detectShellOutMutation, extractGoalFiles, isExpectedManifestChange, type CheckResult } from "./verifier.js";
 import type { RoleContext, RoleResult } from "./contract.js";
 
 const silent = () => pino({ level: "silent" });
@@ -954,4 +954,65 @@ test("FIX-D / Fix A e2e: createVerifier — goal naming a shell helper EXCLUDES 
   } finally {
     _rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ── STUB→RUNNER EXPECTED MANIFEST CHANGE ─────────────────────────
+
+test("isExpectedManifestChange: stub echo 'no test specified' → vitest is expected", () => {
+  assert.equal(isExpectedManifestChange('echo "Error: no test specified" && exit 1', "vitest run"), true);
+});
+
+test("isExpectedManifestChange: stub exit 1 → jest is expected", () => {
+  assert.equal(isExpectedManifestChange("exit 1", "jest"), true);
+});
+
+test("isExpectedManifestChange: stub empty → pytest is expected", () => {
+  assert.equal(isExpectedManifestChange("", "pytest"), true);
+});
+
+test("isExpectedManifestChange: real runner → different runner is NOT expected", () => {
+  assert.equal(isExpectedManifestChange("jest", "vitest run"), false, "jest→vitest is a real change");
+});
+
+test("isExpectedManifestChange: real runner → echo is NOT expected", () => {
+  assert.equal(isExpectedManifestChange("vitest run", "echo done"), false, "weakening is not expected");
+});
+
+test("isExpectedManifestChange: undefined → anything is NOT expected", () => {
+  assert.equal(isExpectedManifestChange(undefined, "vitest run"), false);
+});
+
+test("detectScriptMutation: stub → vitest is NOT flagged as mutated (semantic)", () => {
+  // Full JSON-semantic test: the semantic pass parses old/new JSON objects directly.
+  // The stub "echo Error" script → vitest should be clean.
+  const diff = [
+    "diff --git a/package.json b/package.json",
+    '--- a/package.json',
+    '+++ b/package.json',
+    '@@ -4,3 +4,3 @@',
+    '   "scripts": {',
+    '-    "test": "echo Error: no test specified"',
+    '+    "test": "vitest run"',
+    '   }',
+  ].join("\n");
+  assert.equal(detectScriptMutation(diff).mutated, false, "stub→vitest is expected manifest change");
+});
+
+test("detectScriptMutation: real → echo IS flagged as mutated", () => {
+  const diff = 'diff --git a/package.json b/package.json\n-    "test": "vitest run",\n+    "test": "echo done",';
+  assert.equal(detectScriptMutation(diff).mutated, true, "weakening is still flagged");
+});
+
+test("detectScriptMutation: stub → typecheck is NOT flagged (semantic)", () => {
+  const diff = [
+    "diff --git a/package.json b/package.json",
+    '--- a/package.json',
+    '+++ b/package.json',
+    '@@ -4,3 +4,3 @@',
+    '   "scripts": {',
+    '-    "test": "exit 1"',
+    '+    "test": "tsc --noEmit"',
+    '   }',
+  ].join("\n");
+  assert.equal(detectScriptMutation(diff).mutated, false, "stub→tsc is expected");
 });

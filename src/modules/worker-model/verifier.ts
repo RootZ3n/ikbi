@@ -90,6 +90,45 @@ export function parseChangedFiles(diff: string): string[] {
 export type { CheckResult } from "./checks.js";
 
 /**
+ * Stub/placeholder scripts that a greenfield build is EXPECTED to replace.
+ * When the old script matches one of these patterns and the new script is a
+ * real test runner, the change is classified as EXPECTED_MANIFEST_CHANGE
+ * rather than a suspicious mutation.
+ */
+const STUB_SCRIPT_PATTERNS: readonly RegExp[] = [
+  /^echo\s+.*no test specified/i,
+  /^echo\s+.*Error/i,
+  /^echo\s+.*not implemented/i,
+  /^exit\s+1$/,
+  /^true$/,
+  /^:$/,        // bash no-op
+  /^\s*$/,      // empty/whitespace
+];
+
+/** Real test-runner commands that replace stubs. */
+const REAL_TEST_RUNNERS: readonly RegExp[] = [
+  /\bvitest\b/i,
+  /\bjest\b/i,
+  /\bmocha\b/i,
+  /\bpytest\b/i,
+  /\bcargo\s+test\b/i,
+  /\bgo\s+test\b/i,
+  /\bnpm\s+test\b/,
+  /\bnode\s+--test\b/,
+  /\btsc\b/,
+  /\beslint\b/,
+];
+
+/** Returns true when oldScript is a stub and newScript is a real runner. */
+export function isExpectedManifestChange(oldScript: string | undefined, newScript: string | undefined): boolean {
+  if (newScript === undefined || newScript === null) return false;
+  if (oldScript === undefined || oldScript === null) return false;
+  const isStub = STUB_SCRIPT_PATTERNS.some((p) => p.test(oldScript.trim()));
+  const isReal = REAL_TEST_RUNNERS.some((p) => p.test(newScript.trim()));
+  return isStub && isReal;
+}
+
+/**
  * The package.json script keys the verifier's checks depend on: `pnpm test` runs the
  * "test" script (and its pre/post hooks); `pnpm tsc`/build the tsc/build surface. A
  * builder change to ANY of these means the command the verifier runs is attacker-defined.
@@ -370,12 +409,19 @@ function recordOf(v: unknown): Record<string, unknown> {
   return v !== null && typeof v === "object" ? (v as Record<string, unknown>) : {};
 }
 
-/** The first guarded script key whose RESOLVED value differs between two package.json objects. */
-function changedGuardedScript(oldPkg: Record<string, unknown>, newPkg: Record<string, unknown>): string | undefined {
+/**
+ * The first guarded script key whose RESOLVED value differs between two package.json objects,
+ * EXCLUDING stub→real-runner transitions (expected manifest change, not suspicious).
+ */
+function changedGuardedScriptExcludingStubs(oldPkg: Record<string, unknown>, newPkg: Record<string, unknown>): string | undefined {
   const o = recordOf(oldPkg.scripts);
   const n = recordOf(newPkg.scripts);
   for (const key of GUARDED_SCRIPT_KEYS) {
-    if (o[key] !== n[key]) return key; // added, removed, or value-changed (string compare is exact)
+    if (o[key] !== n[key]) {
+      // If the old value was a stub and the new value is a real runner, this is expected.
+      if (isExpectedManifestChange(o[key] as string | undefined, n[key] as string | undefined)) continue;
+      return key;
+    }
   }
   return undefined;
 }
@@ -409,7 +455,7 @@ function semanticSectionVerdict(section: DiffSection): SectionVerdict {
     const oldPkg = tryParseJsonObject(s.oldText);
     const newPkg = tryParseJsonObject(s.newText);
     if (oldPkg === undefined || newPkg === undefined) return "indeterminate";
-    const key = changedGuardedScript(oldPkg, newPkg);
+    const key = changedGuardedScriptExcludingStubs(oldPkg, newPkg);
     return key !== undefined ? { mutated: true, reason: `builder modified package.json script "${key}"` } : "clean";
   }
   if (GUARD_TSCONFIG.test(s.fileName)) {
@@ -578,9 +624,15 @@ function legacyDetectScriptMutation(diff: string): { mutated: boolean; reason?: 
   let inGuardedConfig = false;
   let inTsconfig = false;
   let guardedConfigName = "";
+  const pendingRemovals = new Map<string, string | undefined>(); // key → old value for stub detection
   for (const line of diff.split("\n")) {
     // A new file section. `git diff` emits `diff --git a/<p> b/<p>` naming the file.
     if (line.startsWith("diff --git ")) {
+      // Flush pending removals from the previous section before switching files.
+      for (const [k] of pendingRemovals) {
+        return { mutated: true, reason: `builder modified package.json script "${k}"` };
+      }
+      pendingRemovals.clear();
       // Skip node_modules — builder-installed deps are not builder-authored code.
       if (line.includes("node_modules/")) { inPackageJson = false; inGuardedConfig = false; inTsconfig = false; continue; }
       inPackageJson = /(?:^|\/)package\.json(?:\s|$)/.test(line);
@@ -640,13 +692,31 @@ function legacyDetectScriptMutation(diff: string): { mutated: boolean; reason?: 
     }
     const key = /^\s*"([A-Za-z0-9:_-]+)"\s*:/.exec(body);
     if (key !== null && GUARDED_SCRIPT_KEYS.includes(key[1]!)) {
-      return { mutated: true, reason: `builder modified package.json script "${key[1]}"` };
+      // STUB→RUNNER EXCLUSION: when both the removed and added lines exist for this key,
+      // check if the transition is a stub→real-runner (expected manifest change).
+      const keyName = key[1]!;
+      const valueMatch = /^\s*"[^"]+"\s*:\s*"(.*)"(?:,?)$/.exec(body);
+      const value = valueMatch ? valueMatch[1] : undefined;
+      if (line.startsWith("-")) {
+        pendingRemovals.set(keyName, value);
+        continue; // defer: if the next + line is the same key, we'll check stub→runner
+      }
+      if (line.startsWith("+")) {
+        const oldValue = pendingRemovals.get(keyName);
+        if (oldValue !== undefined) {
+          pendingRemovals.delete(keyName);
+          if (isExpectedManifestChange(oldValue, value)) continue; // stub→runner: expected
+        }
+        return { mutated: true, reason: `builder modified package.json script "${keyName}"` };
+      }
     }
+  }
+  // Flush any remaining pending removals (script key removed with no corresponding addition).
+  for (const [k] of pendingRemovals) {
+    return { mutated: true, reason: `builder modified package.json script "${k}"` };
   }
   return { mutated: false };
 }
-
-/** Build a verifier. Tests inject fakes; the default wires the live governed-exec. */
 export function createVerifier(deps: VerifierDeps = {}): RoleFn {
   const governedExec = deps.governedExec ?? lazyGovernedExec();
   return async (ctx) => {
