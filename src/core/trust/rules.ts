@@ -101,6 +101,11 @@ export function applyOutcome(
   switch (input.status) {
     case "success":
       s.successCount += 1;
+      // FIX C: any success breaks the consecutive-failure streak so cross-build
+      // accumulation stops.  Previously consecutiveFailures was NEVER reset on
+      // success — it only reset AFTER a demotion fired, meaning failures could
+      // accumulate across builds and trigger a delayed demotion.
+      s.consecutiveFailures = 0;
       if (promotable) {
         s.promotableStreak += 1;
         if (!s.streakOperations.includes(input.operation)) {

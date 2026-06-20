@@ -949,7 +949,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     return { identity, kind: resolved.kind, autonomy: autonomyForTier(effectiveTier), validated: resolved };
   }
 
-  /** Record a role's outcome to receipts + trust under the role's attributed identity. */
+  /** Record a role's outcome to receipts. Trust recording is opt-in (skipTrust=true skips it). */
   async function recordRole(
     task: WorkerTask,
     workspace: WorkspaceHandle,
@@ -957,6 +957,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     result: RoleResult,
     costUsd?: number,
     model?: string,
+    skipTrust?: boolean,
   ): Promise<void> {
     const status = toOutcomeStatus(result.outcome);
     const operation = `worker.role.${result.role}`;
@@ -975,9 +976,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     const toolFormatErrors = Array.isArray(detailRec.toolFormatErrors) ? detailRec.toolFormatErrors : [];
     const badOutputEvidence = toolFormatErrors.length > 0;
     const isPerformanceFailure =
-      result.outcome === "failure" && (stopReason === "timeout" || stopReason === "max_iterations");
-    // timeout: always suppressible. max_iterations: suppressible only WITHOUT bad-output evidence.
-    const suppressEligible = stopReason === "timeout" || (stopReason === "max_iterations" && !badOutputEvidence);
+      result.outcome === "failure" && (stopReason === "timeout" || stopReason === "max_iterations" || stopReason === "no_progress" || stopReason === "stuck_detected");
+    // FIX B: no_progress and stuck_detected are model-behavior limits (the model
+    // ran out of productive moves), not quality failures. They join timeout as
+    // always-suppressible. max_iterations remains suppressible only without bad-output evidence.
+    const suppressEligible = stopReason === "timeout" || stopReason === "no_progress" || stopReason === "stuck_detected" || (stopReason === "max_iterations" && !badOutputEvidence);
     const suppressTrustSignal = isPerformanceFailure && suppressEligible && config.penalizeTimeouts !== true;
 
     // R1: an explicit, auditable record of the trust decision for EVERY performance-class failure —
@@ -985,7 +988,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     let perfTrust: { decision: "suppressed" | "penalized"; reason: string } | undefined;
     if (isPerformanceFailure) {
       if (suppressTrustSignal) {
-        const why = stopReason === "timeout" ? "wall-clock timeout (performance)" : "max_iterations with no bad-output evidence";
+        const whyMap: Record<string, string> = {
+          timeout: "wall-clock timeout (performance)",
+          no_progress: "model out of productive moves (performance)",
+          stuck_detected: "model stuck in loop (performance)",
+        };
+        const why = whyMap[String(stopReason)] ?? "max_iterations with no bad-output evidence";
         perfTrust = { decision: "suppressed", reason: `${why} — trust signal suppressed (not counted)` };
       } else {
         const why =
@@ -1033,6 +1041,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       },
       spawned.identity,
     );
+
+    // FIX A: per-build trust recording. When skipTrust is set, trust is recorded ONCE
+    // after the build completes (worker.build) instead of per-role (worker.role.*).
+    // This eliminates the cascade where one failed build = 3-4 consecutive failures.
+    if (skipTrust) return;
 
     if (suppressTrustSignal) {
       // EXPLICIT, auditable receipt for the autonomy decision: trust is deliberately left
@@ -1444,7 +1457,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           ),
         );
 
-        await recordRole(task, workspace, spawned, result, roleCost, effectiveBuilderModel);
+        await recordRole(task, workspace, spawned, result, roleCost, effectiveBuilderModel, true);
 
         // SG-5 PROGRESS: structured per-role detail beyond start/end — builder tool activity
         // and the verifier's verdict — so `--verbose` can show what each phase actually did.
@@ -1811,7 +1824,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 { source: EVENT_SOURCE, attribution: { identity: escBuilder.identity, operation: "worker.role.builder", runId: task.taskId } },
               ),
             );
-            await recordRole(task, workspace, escBuilder, escBuilderResult, escBuilderCost, midModel);
+            await recordRole(task, workspace, escBuilder, escBuilderResult, escBuilderCost, midModel, true);
 
             let escSucceeded = false;
             if (escBuilderResult.outcome === "success") {
@@ -1979,7 +1992,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.escalation.retry", runId: task.taskId } },
               ),
             );
-            await recordRole(task, workspace, escalatedSpawn, escalatedResult, retryCost, midModel);
+            await recordRole(task, workspace, escalatedSpawn, escalatedResult, retryCost, midModel, true);
             await receipts.append(
               {
                 operation: "worker.escalation.retry",
@@ -2296,6 +2309,21 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       parentIdentity,
     );
 
+    // FIX A: record ONE trust outcome per BUILD (not per role). This eliminates
+    // the cascade where one failed build = 3-4 consecutive trust failures
+    // (scout + builder + verifier + integrator each recorded separately).
+    // The operation is "worker.build" and the status is the overall build outcome.
+    await trust.recordOutcome(
+      {
+        agentId: parentIdentity.agentId,
+        kind: parentCtx.identity.kind,
+        defaultTrustTier: parentIdentity.trustTier ?? TRUST_FLOOR,
+        operation: "worker.build",
+        status: toOutcomeStatus(overall),
+      },
+      parentCtx.identity,
+    );
+
     return result;
   }
 
@@ -2325,7 +2353,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       ),
     );
     const roleCost = cost !== undefined ? cost() - costBeforeRole : undefined;
-    await recordRole(task, workspace, spawned, result, roleCost, singleBuilderModel);
+    await recordRole(task, workspace, spawned, result, roleCost, singleBuilderModel, true);
     return result;
   }
 

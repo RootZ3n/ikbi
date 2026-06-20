@@ -363,8 +363,10 @@ test("ISSUE 1: a builder TIMEOUT does NOT feed the trust signal (no demotion) an
   const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, trust: tr.trust, receipts: rc.receipts }));
   await orch.run(task, parentCtx);
 
-  assert.equal(tr.calls.filter((c) => c.operation === "worker.role.builder").length, 0, "the builder timeout did NOT feed a trust signal");
-  assert.ok(rc.calls.some((c) => c.operation === "worker.trust.signal_suppressed"), "an explicit suppression receipt was written");
+  // FIX A: trust is now per-build, so there's always exactly 1 trust call.
+  // The build overall outcome is "failure" (builder timed out → integrator can't promote).
+  assert.equal(tr.calls.length, 1, "FIX A: one trust outcome per build");
+  assert.equal(tr.calls[0]!.operation, "worker.build", "FIX A: per-build operation");
 });
 
 test("ISSUE 1: with PENALIZE_TIMEOUTS policy on, a timeout IS counted as a trust failure", async () => {
@@ -377,10 +379,11 @@ test("ISSUE 1: with PENALIZE_TIMEOUTS policy on, a timeout IS counted as a trust
   const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, trust: tr.trust, config: { ...ENABLED, penalizeTimeouts: true } }));
   await orch.run(task, parentCtx);
 
+  // FIX A: trust is now per-build. The overall outcome is "failure" (builder timed out).
   assert.equal(
-    tr.calls.filter((c) => c.operation === "worker.role.builder" && c.status === "failure").length,
-    2,
-    "policy on → both original and escalated builder failures are trust signals",
+    tr.calls.filter((c) => c.operation === "worker.build" && c.status === "failure").length,
+    1,
+    "FIX A: per-build trust records the overall failure",
   );
 });
 
@@ -396,10 +399,11 @@ test("ISSUE 1: a REAL failure (failed verification) still feeds the trust signal
   const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, trust: tr.trust }));
   await orch.run(task, parentCtx);
 
+  // FIX A: trust is now per-build. Verifier failure → overall outcome "failure".
   assert.equal(
-    tr.calls.filter((c) => c.operation === "worker.role.verifier" && c.status === "failure").length,
+    tr.calls.filter((c) => c.operation === "worker.build" && c.status === "failure").length,
     1,
-    "a failed verification is a real failure → always a trust signal",
+    "FIX A: per-build trust records the overall failure from failed verification",
   );
 });
 
@@ -414,7 +418,9 @@ test("R1: max_iterations with NO bad-output evidence is suppressed (treated as p
   const rc = fakeReceipts();
   const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, trust: tr.trust, receipts: rc.receipts }));
   await orch.run(task, parentCtx);
-  assert.equal(tr.calls.filter((c) => c.operation === "worker.role.builder").length, 0, "clean max_iterations did NOT feed a trust signal");
+  // FIX A: trust is now per-build. Build failed (builder max_iterations → overall failure).
+  assert.equal(tr.calls.length, 1, "FIX A: one trust outcome per build");
+  assert.equal(tr.calls[0]!.operation, "worker.build", "FIX A: per-build operation");
   assert.ok(rc.calls.some((c) => c.operation === "worker.trust.signal_suppressed"), "suppression receipt written");
 });
 
@@ -435,8 +441,9 @@ test("R1: max_iterations WITH rejectedToolCalls (bad output) IS penalized + meta
   const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, trust: tr.trust, receipts }));
   await orch.run(task, parentCtx);
 
-  assert.equal(tr.calls.filter((c) => c.operation === "worker.role.builder" && c.status === "failure").length, 1, "bad-output max_iterations IS a trust failure signal");
-  assert.ok(!appended.some((a) => a.operation === "worker.trust.signal_suppressed"), "no suppression receipt — it was penalized");
+  // FIX A: trust is now per-build. Build failed (builder flailing → overall failure).
+  assert.equal(tr.calls.filter((c) => c.operation === "worker.build" && c.status === "failure").length, 1, "FIX A: per-build trust records the overall failure");
+  assert.ok(!appended.some((a) => a.operation === "worker.trust.signal_suppressed"), "no suppression receipt — build-level trust is always recorded");
   const builderReceipt = appended.find((a) => a.operation === "worker.role.builder");
   assert.equal(builderReceipt?.metadata.performanceFailure, true, "metadata flags the performance-class failure");
   assert.equal(builderReceipt?.metadata.trustDecision, "penalized", "metadata records the penalize decision");
@@ -453,7 +460,8 @@ test("R1: PENALIZE_TIMEOUTS policy penalizes BOTH timeout and a clean max_iterat
     const tr = capturingTrust();
     const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, trust: tr.trust, config: { ...ENABLED, penalizeTimeouts: true } }));
     await orch.run(task, parentCtx);
-    assert.equal(tr.calls.filter((c) => c.operation === "worker.role.builder" && c.status === "failure").length, 1, `policy on → ${stop} IS a trust failure`);
+    // FIX A: trust is now per-build. Build failed → one trust failure.
+    assert.equal(tr.calls.filter((c) => c.operation === "worker.build" && c.status === "failure").length, 1, `FIX A: per-build trust records overall failure for ${stop}`);
   }
 });
 
@@ -894,7 +902,7 @@ test("each role's outcome is recorded to receipts + trust under the ROLE identit
 
   // Phase 3: one run-level summary receipt is now appended after role receipts complete.
   assert.equal(rc.calls.length, 6, "five role receipts + one worker.run.summary");
-  assert.equal(tr.calls.length, 5, "one trust outcome per role");
+  assert.equal(tr.calls.length, 1, "FIX A: one trust outcome per BUILD, not per role");
   const roleReceipts = rc.calls.filter((c) => c.operation.startsWith("worker.role."));
   assert.equal(roleReceipts.length, 5, "one receipt per role");
   for (const c of roleReceipts) {
@@ -904,7 +912,7 @@ test("each role's outcome is recorded to receipts + trust under the ROLE identit
   const summary = rc.calls.find((c) => c.operation === "worker.run.summary");
   assert.ok(summary !== undefined, "a run-level summary receipt was written");
   assert.equal(summary!.agentId, "parent-1", "summary receipt attributed to the parent identity");
-  assert.deepEqual(tr.calls.map((c) => c.operation), WORKER_ROLES.map((r) => `worker.role.${r}`));
+  assert.deepEqual(tr.calls.map((c) => c.operation), ["worker.build"], "FIX A: per-build trust operation");
   for (const c of tr.calls) assert.equal(c.status, "success");
   // The orchestrator THREADS the genuine ValidatedIdentity as the recordOutcome subject
   // (provenance): every call carries a real minted identity matching the recorded agent.

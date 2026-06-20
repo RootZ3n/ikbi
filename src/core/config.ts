@@ -572,7 +572,10 @@ function loadConfig(env: NodeJS.ProcessEnv = process.env): IkbiConfig {
       promoteMinDistinctOps: parsePositiveInt(
         "IKBI_TRUST_PROMOTE_MIN_DISTINCT_OPS",
         env.IKBI_TRUST_PROMOTE_MIN_DISTINCT_OPS,
-        2,
+        1, // FIX A: per-build trust uses a single operation (worker.build), so the old default of 2
+           // blocked all promotions. 1 still prevents read-only farming (those verbs are excluded
+           // entirely by isPromotableOperation). Set IKBI_TRUST_PROMOTE_MIN_DISTINCT_OPS=2+ for
+           // environments with multiple substantive operation types.
       ),
       hmacKey: optStr(env.IKBI_TRUST_HMAC_KEY) ?? DEFAULT_TRUST_HMAC_KEY,
       hmacKeyIsDefault: optStr(env.IKBI_TRUST_HMAC_KEY) === undefined,
