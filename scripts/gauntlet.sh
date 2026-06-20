@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
 # ikbi Hostile Gauntlet — 12 scenarios.
+# Runs with trust resets between scenarios to isolate each test.
 set -uo pipefail
 
+export IKBI_ALLOW_INSECURE_DEV_KEYS=true
 IKBI="npx ikbi"
 RESULTS_FILE="/tmp/gauntlet-results.txt"
 > "$RESULTS_FILE"
 
 pass=0; partial=0; fail=0; incomplete=0; unsafe=0
+
+# Reset trust state and re-grant trusted tier between scenarios.
+reset_trust() {
+  rm -rf ~/.ikbi/state/trust
+  $IKBI trust grant worker trusted 2>/dev/null
+}
 
 run_scenario() {
   local id="$1" name="$2" dir="$3" goal="$4"
@@ -14,6 +22,9 @@ run_scenario() {
   local setup_cmds=("$@")
   
   echo "═══ $id: $name ═══"
+  
+  # Reset trust to isolate each scenario
+  reset_trust
   
   # Clean and prepare
   rm -rf "$dir"
