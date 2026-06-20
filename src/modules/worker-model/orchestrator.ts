@@ -2392,9 +2392,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         const d = (r.detail ?? {}) as Record<string, unknown>;
         const stop = String(d.stopReason ?? "");
         const hasEvidence = Array.isArray(d.toolFormatErrors) && d.toolFormatErrors.length > 0;
-        return ["timeout", "no_progress", "stuck_detected"].includes(stop) && !hasEvidence;
+        return ["timeout", "no_progress", "stuck_detected", "max_iterations"].includes(stop) && !hasEvidence;
       });
-      if (allPerformanceFailures && failedRoles.length > 0) {
+      if (allPerformanceFailures && failedRoles.length > 0 && config.penalizeTimeouts !== true) {
         // All failures were performance-class with no bad output evidence.
         // Suppress the trust signal (don't demote) but count toward the backstop.
         buildTrustSuppressed = true;

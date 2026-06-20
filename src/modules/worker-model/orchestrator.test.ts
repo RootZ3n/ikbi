@@ -363,10 +363,11 @@ test("ISSUE 1: a builder TIMEOUT does NOT feed the trust signal (no demotion) an
   const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, trust: tr.trust, receipts: rc.receipts }));
   await orch.run(task, parentCtx);
 
-  // FIX A: trust is now per-build, so there's always exactly 1 trust call.
-  // The build overall outcome is "failure" (builder timed out → integrator can't promote).
-  assert.equal(tr.calls.length, 1, "FIX A: one trust outcome per build");
-  assert.equal(tr.calls[0]!.operation, "worker.build", "FIX A: per-build operation");
+  // FIX A + suppression: performance failures are fully suppressed from trust.
+  // The trust mock is NOT called — a suppression receipt is written instead.
+  assert.equal(tr.calls.length, 0, "performance failure: trust.recordOutcome NOT called (suppressed)");
+  // Verify a suppression receipt was written
+  assert.ok(rc.calls.some((c) => c.operation === "worker.trust.signal_suppressed"), "suppression receipt written for timeout");
 });
 
 test("ISSUE 1: with PENALIZE_TIMEOUTS policy on, a timeout IS counted as a trust failure", async () => {
@@ -418,9 +419,8 @@ test("R1: max_iterations with NO bad-output evidence is suppressed (treated as p
   const rc = fakeReceipts();
   const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, trust: tr.trust, receipts: rc.receipts }));
   await orch.run(task, parentCtx);
-  // FIX A: trust is now per-build. Build failed (builder max_iterations → overall failure).
-  assert.equal(tr.calls.length, 1, "FIX A: one trust outcome per build");
-  assert.equal(tr.calls[0]!.operation, "worker.build", "FIX A: per-build operation");
+  // Performance failures are fully suppressed — trust.recordOutcome is NOT called.
+  assert.equal(tr.calls.length, 0, "performance failure: trust.recordOutcome NOT called (suppressed)");
   assert.ok(rc.calls.some((c) => c.operation === "worker.trust.signal_suppressed"), "suppression receipt written");
 });
 
