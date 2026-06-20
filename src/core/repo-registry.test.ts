@@ -17,11 +17,11 @@ function teardown(): void {
 }
 
 test("resolve a registered repo name to its path", () => {
-  const dir = setupState({ repos: { toba: { path: "/pehverse/repos/toba", description: "career" } } });
+  const dir = setupState({ repos: { toba: { path: "/pehverse/repos/ecosystem/toba", description: "career" } } });
   try {
     const reg = loadRepoRegistry(dir);
-    assert.equal(reg.resolve("toba"), "/pehverse/repos/toba");
-    assert.equal(reg.resolve("Toba"), "/pehverse/repos/toba"); // case-insensitive
+    assert.equal(reg.resolve("toba"), "/pehverse/repos/ecosystem/toba");
+    assert.equal(reg.resolve("Toba"), "/pehverse/repos/ecosystem/toba"); // case-insensitive
   } finally {
     teardown();
   }
@@ -38,7 +38,7 @@ test("resolve passes through absolute paths", () => {
 });
 
 test("resolve returns undefined for unknown names", () => {
-  const dir = setupState({ repos: { toba: { path: "/pehverse/repos/toba", description: "career" } } });
+  const dir = setupState({ repos: { toba: { path: "/pehverse/repos/ecosystem/toba", description: "career" } } });
   try {
     const reg = loadRepoRegistry(dir);
     assert.equal(reg.resolve("nonexistent"), undefined);
@@ -50,8 +50,8 @@ test("resolve returns undefined for unknown names", () => {
 test("list returns all registered repos", () => {
   const dir = setupState({
     repos: {
-      toba: { path: "/pehverse/repos/toba", description: "career", port: 18815 },
-      ikbi: { path: "/pehverse/repos/ikbi", description: "builder" },
+      toba: { path: "/pehverse/repos/ecosystem/toba", description: "career", port: 18815 },
+      ikbi: { path: "/pehverse/repos/ecosystem/ikbi", description: "builder" },
     },
   });
   try {
@@ -66,7 +66,7 @@ test("list returns all registered repos", () => {
 });
 
 test("has() checks existence", () => {
-  const dir = setupState({ repos: { toba: { path: "/pehverse/repos/toba", description: "career" } } });
+  const dir = setupState({ repos: { toba: { path: "/pehverse/repos/ecosystem/toba", description: "career" } } });
   try {
     const reg = loadRepoRegistry(dir);
     assert.equal(reg.has("toba"), true);

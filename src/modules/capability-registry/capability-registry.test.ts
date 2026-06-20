@@ -58,13 +58,13 @@ test("malformed / missing registry fails closed", () => {
 });
 
 test("ikbi reads the shared canonical registry: real-repo read allowed, write denied", () => {
-  const path = "/pehverse/repos/lab-capability/registry.json";
+  const path = "/pehverse/repos/ecosystem/lab-capability/registry.json";
   const loaded = loadRegistry(path);
   // The shared registry should exist in the lab; if not, skip rather than fail CI on a
   // machine without the sibling repo checked out.
   if (!loaded.ok) return;
-  const read = loadAndEvaluate(path, { actor: "ikbi-worker", workspaceRoot: "/pehverse/repos/ikbi/src", operation: "read", riskLevel: "low", environment: "real" });
+  const read = loadAndEvaluate(path, { actor: "ikbi-worker", workspaceRoot: "/pehverse/repos/ecosystem/ikbi/src", operation: "read", riskLevel: "low", environment: "real" });
   assert.equal(read.allowed, true, read.reason);
-  const write = loadAndEvaluate(path, { actor: "ikbi-worker", workspaceRoot: "/pehverse/repos/ikbi/src", operation: "patch-propose", riskLevel: "low", environment: "real" });
+  const write = loadAndEvaluate(path, { actor: "ikbi-worker", workspaceRoot: "/pehverse/repos/ecosystem/ikbi/src", operation: "patch-propose", riskLevel: "low", environment: "real" });
   assert.equal(write.allowed, false);
 });

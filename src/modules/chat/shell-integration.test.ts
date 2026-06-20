@@ -14,7 +14,7 @@ import { buildLauncherScript, installLauncher, setupInstructions } from "./shell
 
 test("FIX6: installLauncher writes an executable launcher referencing the CLI entry", () => {
   const binDir = mkdtempSync(join(tmpdir(), "ikbi-bin-"));
-  const root = "/pehverse/repos/ikbi";
+  const root = "/pehverse/repos/ecosystem/ikbi";
   const install = installLauncher(binDir, root);
 
   assert.equal(install.path, join(binDir, "ikbi"));

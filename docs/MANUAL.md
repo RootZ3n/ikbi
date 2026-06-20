@@ -35,7 +35,7 @@ guarantees real.
 ### Installation
 
 ```bash
-cd /pehverse/repos/ikbi
+cd /pehverse/repos/ecosystem/ikbi
 pnpm install
 pnpm build                      # tsc -> dist/ (also typechecks *.test.ts)
 node dist/cli/index.js doctor   # pre-flight check

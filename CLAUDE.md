@@ -44,7 +44,7 @@ through governed-exec (allowlist + gate-wall + receipts).
 
 ## How To Run
 ```bash
-cd /pehverse/repos/ikbi
+cd /pehverse/repos/ecosystem/ikbi
 pnpm install
 pnpm build                     # tsc -> dist/  (also typechecks *.test.ts)
 pnpm test                      # node:test runner — 2199 tests, all passing

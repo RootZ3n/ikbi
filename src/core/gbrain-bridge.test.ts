@@ -115,10 +115,10 @@ test("syncProject: runs import then embed --stale", () => {
   const { fn, calls } = mockExec((args) => (args[0] === "import" ? "imported 10" : "embedded 3"));
   const brain = createGbrainBridge({ execFileSync: fn, homeDir: HOME });
 
-  const res = brain.syncProject("/pehverse/repos/ikbi");
+  const res = brain.syncProject("/pehverse/repos/ecosystem/ikbi");
 
   assert.equal(calls.length, 2);
-  assert.deepEqual(calls[0]!.args, ["import", "/pehverse/repos/ikbi"]);
+  assert.deepEqual(calls[0]!.args, ["import", "/pehverse/repos/ecosystem/ikbi"]);
   assert.deepEqual(calls[1]!.args, ["embed", "--stale"]);
   assert.equal(res.imported, "imported 10");
   assert.equal(res.embedded, "embedded 3");
