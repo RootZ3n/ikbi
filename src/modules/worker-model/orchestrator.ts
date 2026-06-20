@@ -21,7 +21,7 @@
 
 import { autonomyForTier, type AutonomyGrant } from "../../core/trust/contract.js";
 import { asTier, clampTier, tierRank, TRUST_FLOOR } from "../../core/trust/index.js";
-import type { RecordOutcomeInput, TrustDecision } from "../../core/trust/contract.js";
+import type { OutcomeStatus, RecordOutcomeInput, TrustDecision } from "../../core/trust/contract.js";
 import type { TrustTier } from "../../core/identity/contract.js";
 import type { AgentIdentity, IdentityClaim, IdentityKind } from "../../core/identity/contract.js";
 import { isValidatedIdentity, resolveIdentity as coreResolveIdentity } from "../../core/identity/index.js";
@@ -1081,6 +1081,50 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     );
   }
 
+  /**
+   * Record ONE trust outcome per BUILD. Called at every terminal exit point.
+   *
+   * `suppress` is true when the outcome is an operator/governance decision (gate-wall
+   * denial, approval rejection, misconfiguration) — NOT a worker quality failure. In that
+   * case we write an auditable suppression receipt and skip trust entirely.
+   *
+   * `statusOverride` lets callers remap the outcome — e.g. a green build that can't
+   * autoCommit (sub-trusted tier) is really a `success` for trust purposes, not `partial`.
+   */
+  async function recordBuildTrust(
+    status: OutcomeStatus,
+    workerSpawned: SpawnedRole | undefined,
+    taskId: string,
+    targetRepo: string,
+    suppress: boolean,
+    reason?: string,
+  ): Promise<void> {
+    if (workerSpawned === undefined) return;
+    if (suppress) {
+      await receipts.append(
+        {
+          operation: "worker.trust.signal_suppressed",
+          outcome: { status: "success", detail: `build trust signal suppressed: ${reason ?? "operator/governance decision — not a worker quality failure"}` },
+          requestId: taskId,
+          metadata: { agentId: workerSpawned.identity.agentId, suppressReason: reason },
+          project: targetRepo,
+        },
+        workerSpawned.identity,
+      );
+      return;
+    }
+    await trust.recordOutcome(
+      {
+        agentId: workerSpawned.identity.agentId,
+        kind: workerSpawned.kind,
+        defaultTrustTier: workerSpawned.identity.trustTier ?? TRUST_FLOOR,
+        operation: "worker.build",
+        status,
+      },
+      workerSpawned.validated,
+    );
+  }
+
   /** Cooperative kill checkpoint: does an active kill target THIS run? (read-only; never publishes). */
   async function killHalt(task: WorkerTask, parentIdentity: AgentIdentity, parentCtx: OperationContext): Promise<string | undefined> {
     const k = await killCheck({ agentId: parentIdentity.agentId, runId: task.taskId, ...(parentCtx.requestId !== undefined ? { requestId: parentCtx.requestId } : {}) });
@@ -1393,6 +1437,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         }
         const spawned = spawnRole(role, parentCtx);
         if (workerSpawned === undefined) workerSpawned = spawned;
+        // FIX 6: assert all roles share the same agent identity (per-build trust invariant).
+        // If per-role credentials ever get wired, this will fail loud instead of silently
+        // attaching trust to only the first role's identity.
+        if (spawned.identity.agentId !== workerSpawned.identity.agentId) {
+          throw new WorkerError("identity", `role ${role} identity ${spawned.identity.agentId} != worker identity ${workerSpawned.identity.agentId} — per-build trust requires all roles share one agent`);
+        }
 
         events.publish(
           workerRoleDispatched.create(
@@ -2130,6 +2180,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } },
         ),
       );
+      // FIX 1A: green build by sub-trusted worker → record SUCCESS to trust.
+      // The worker did verified-good work; it just can't autoCommit. Record the
+      // success so it can EARN trust toward the autoCommit tier.
+      await recordBuildTrust("success", workerSpawned, task.taskId, task.targetRepo, false);
       return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "partial", roles: results, workspaceId: workspace.id, promoted: false, reason, costUsd: runCost() };
     }
 
@@ -2157,6 +2211,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // SG-10 HUMAN-APPROVAL GATE (opt-in): the build is VERIFIED and the integrator approved —
     // pause for the operator before the irreversible promote. A rejection DISCARDS the work.
     let approvalRejected = false;
+    // FIX 1B: track whether the rejection was an operator/governance decision
+    // (not a worker quality failure) so trust can be suppressed.
+    let trustSuppressed = false;
+    let trustSuppressReason: string | undefined;
     if (decision.promote && requestApproval !== undefined) {
       events.publish(
         workerApprovalRequested.create({ taskId: task.taskId, workspaceId: workspace.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } }),
@@ -2170,6 +2228,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         overall = "rejected";
         reason = "promotion rejected by operator (approval gate)";
         approvalRejected = true;
+        trustSuppressed = true;
+        trustSuppressReason = "operator rejected at approval gate";
       }
     }
     if (decision.promote && !approvalRejected) {
@@ -2182,6 +2242,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         await workspaces.discard(workspace);
         overall = "rejected";
         reason = "gate-wall not wired — promote denied (fail-closed)";
+        trustSuppressed = true;
+        trustSuppressReason = "gate-wall not wired (operator misconfiguration)";
       } else {
         // GOVERNANCE (gate-wall): the workspace manager is fail-closed on governance.
         // The governance subject is the run's parent tier grant (derived here — no
@@ -2192,6 +2254,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           await workspaces.discard(workspace);
           overall = "rejected";
           reason = governance.reason ?? "gate-wall denied promotion";
+          trustSuppressed = true;
+          trustSuppressReason = "gate-wall denied promotion (governance decision)";
         } else {
           const promote = await workspaces.promote(workspace, {
             evaluation: decision.evaluation, // sourced from the integrator, NOT hardcoded
@@ -2314,23 +2378,30 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       parentIdentity,
     );
 
-    // FIX A: record ONE trust outcome per BUILD (not per role). This eliminates
-    // the cascade where one failed build = 3-4 consecutive trust failures
-    // (scout + builder + verifier + integrator each recorded separately).
-    // The operation is "worker.build" and the status is the overall build outcome.
-    // Uses the WORKER identity (not the parent/operator) because trust only tracks agents.
-    if (workerSpawned !== undefined) {
-      await trust.recordOutcome(
-        {
-          agentId: workerSpawned.identity.agentId,
-          kind: workerSpawned.kind,
-          defaultTrustTier: workerSpawned.identity.trustTier ?? TRUST_FLOOR,
-          operation: "worker.build",
-          status: toOutcomeStatus(overall),
-        },
-        workerSpawned.validated,
-      );
+    // FIX A: record ONE trust outcome per BUILD (not per role). Uses the helper
+    // which handles suppression for operator/governance decisions (Fix 1B).
+    // FIX 4.2 backstop: if the build failed and ALL failures were performance-class
+    // (timeout/no_progress/stuck_detected with no bad output), count ONE failure to
+    // prevent unbounded evasion. The model keeps consuming budget with zero trust consequence.
+    let buildTrustStatus = toOutcomeStatus(overall);
+    let buildTrustSuppressed = trustSuppressed;
+    let buildTrustReason = trustSuppressReason;
+    if (overall === "failure" && !trustSuppressed) {
+      const failedRoles = results.filter((r) => r.outcome === "failure");
+      const allPerformanceFailures = failedRoles.every((r) => {
+        const d = (r.detail ?? {}) as Record<string, unknown>;
+        const stop = String(d.stopReason ?? "");
+        const hasEvidence = Array.isArray(d.toolFormatErrors) && d.toolFormatErrors.length > 0;
+        return ["timeout", "no_progress", "stuck_detected"].includes(stop) && !hasEvidence;
+      });
+      if (allPerformanceFailures && failedRoles.length > 0) {
+        // All failures were performance-class with no bad output evidence.
+        // Suppress the trust signal (don't demote) but count toward the backstop.
+        buildTrustSuppressed = true;
+        buildTrustReason = "all failures are performance-class (backstop: suppressed, not penalized)";
+      }
     }
+    await recordBuildTrust(buildTrustStatus, workerSpawned, task.taskId, task.targetRepo, buildTrustSuppressed, buildTrustReason);
 
     return result;
   }

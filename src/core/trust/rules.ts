@@ -128,6 +128,9 @@ export function applyOutcome(
       break;
     case "partial":
       s.partialCount += 1;
+      // FIX 1C: partial is not a failure — reset consecutive failures so
+      // "consecutive" means consecutive failures, not failures-since-last-success.
+      s.consecutiveFailures = 0;
       s.promotableStreak = 0;
       s.streakOperations = [];
       break;

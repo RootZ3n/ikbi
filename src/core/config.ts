@@ -153,7 +153,7 @@ export interface TrustConfig {
   readonly promoteStreak: number;
   /** Consecutive failures required to demote one tier. `IKBI_TRUST_DEMOTE_STREAK`, default 3. */
   readonly demoteStreak: number;
-  /** Min DISTINCT substantive operations a promotion streak must span (anti-farming). `IKBI_TRUST_PROMOTE_MIN_DISTINCT_OPS`, default 2. */
+  /** Min DISTINCT substantive operations a promotion streak must span (anti-farming). `IKBI_TRUST_PROMOTE_MIN_DISTINCT_OPS`, default 1. */
   readonly promoteMinDistinctOps: number;
   /**
    * MAC key for trust-state integrity, kept SEPARATE from the trust dir so a
