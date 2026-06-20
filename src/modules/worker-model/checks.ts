@@ -517,6 +517,26 @@ export function parseTestCount(output: string): { passed: number; total: number 
   // pytest: "N passed in X.XXs" or "N passed, M failed in X.XXs" (passed count only)
   const pytest = /(\d+)\s+passed(?:,\s+\d+\s+\w+)*\s+in\s+[\d.]+s/.exec(output);
   if (pytest !== null) { const n = Number(pytest[1]); return { passed: n, total: n }; }
+
+  // cargo test: "test result: ok. N passed; M failed; K ignored; L measured; J filtered out"
+  const cargoResult = /test result:\s*ok\.\s*(\d+)\s+passed;\s*(\d+)\s+failed/.exec(output);
+  if (cargoResult !== null) {
+    const passed = Number(cargoResult[1]);
+    const failed = Number(cargoResult[2]);
+    return { passed, total: passed + failed };
+  }
+  // cargo test: simpler form — "test result: ok. N passed" (no failures mentioned)
+  const cargoOk = /test result:\s*ok\.\s*(\d+)\s+passed/.exec(output);
+  if (cargoOk !== null) { const n = Number(cargoOk[1]); return { passed: n, total: n }; }
+
+  // go test: "ok  \tpackage/path\t0.123s" (pass) or "FAIL\tpackage/path\t0.123s" (fail)
+  // Count ok/FAIL lines to determine total packages tested.
+  const goOk = (output.match(/^ok\s+/gm) || []).length;
+  const goFail = (output.match(/^FAIL\s+/gm) || []).length;
+  if (goOk > 0 || goFail > 0) {
+    return { passed: goOk, total: goOk + goFail };
+  }
+
   return undefined;
 }
 

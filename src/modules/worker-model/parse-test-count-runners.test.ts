@@ -42,3 +42,35 @@ test("parseTestCount: pytest \"N passed in X.XXs\"", () => {
   assert.deepEqual(parseTestCount("===== 12 passed, 2 failed in 1.23s ====="), { passed: 12, total: 12 });
   assert.deepEqual(parseTestCount("===== 1 passed in 0.01s ====="), { passed: 1, total: 1 });
 });
+
+test("parseTestCount: cargo test 'test result: ok. N passed; M failed'", () => {
+  assert.deepEqual(
+    parseTestCount("test result: ok. 15 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out"),
+    { passed: 15, total: 17 },
+  );
+  assert.deepEqual(
+    parseTestCount("test result: ok. 42 passed; 0 failed; 0 ignored"),
+    { passed: 42, total: 42 },
+  );
+});
+
+test("parseTestCount: cargo test simpler form 'test result: ok. N passed'", () => {
+  assert.deepEqual(parseTestCount("test result: ok. 8 passed"), { passed: 8, total: 8 });
+});
+
+test("parseTestCount: go test ok/FAIL lines", () => {
+  const output = [
+    "ok  \tgithub.com/user/pkg1\t0.123s",
+    "ok  \tgithub.com/user/pkg2\t0.456s",
+    "FAIL\tgithub.com/user/pkg3\t0.789s",
+  ].join("\n");
+  assert.deepEqual(parseTestCount(output), { passed: 2, total: 3 });
+});
+
+test("parseTestCount: go test all passing", () => {
+  const output = [
+    "ok  \tgithub.com/user/pkg1\t0.123s",
+    "ok  \tgithub.com/user/pkg2\t0.456s",
+  ].join("\n");
+  assert.deepEqual(parseTestCount(output), { passed: 2, total: 2 });
+});

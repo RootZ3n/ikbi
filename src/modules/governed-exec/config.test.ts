@@ -31,8 +31,8 @@ test("ALLOWLIST override is ADDITIVE — defaults are preserved, new binaries ap
   assert.equal(cfg.allowlist.filter((b) => b === "pnpm").length, 1);
   assert.equal(cfg.allowlist.filter((b) => b === "node").length, 1);
   // Order-stable: defaults first, then the genuinely-new binaries in operator order.
-  // pnpm and npm are now defaults so they get deduped from the override.
-  assert.deepEqual([...cfg.allowlist], [...DEFAULT_ALLOWLIST, "node", "python3", "mkdir", "cp"]);
+  // pnpm, npm, and python3 are now defaults so they get deduped from the override.
+  assert.deepEqual([...cfg.allowlist], [...DEFAULT_ALLOWLIST, "node", "mkdir", "cp"]);
 });
 
 test("dangerous interpreters and file dumpers are not default-allowed", () => {

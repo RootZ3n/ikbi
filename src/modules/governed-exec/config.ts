@@ -45,6 +45,9 @@ export const DEFAULT_ALLOWLIST: readonly string[] = Object.freeze([
   // package managers + typecheck driver (REQUIRED for verifier checks and run_checks). Allowlisted
   // by default; `<mgr> run …` / code-eval flags remain policy-denied (script exec is gated separately).
   "npm", "npx", "pnpm", "yarn",
+  // language-native toolchains (REQUIRED for multi-language verification). cargo/go/python3 run
+  // project-owned code by design — the governed-exec policy layer blocks dangerous flags/patterns.
+  "cargo", "go", "python3", "godot",
 ]);
 
 /** Per-command wall-clock cap. NOTE: applies to FOREGROUND commands only — a background job (spawned
