@@ -2483,6 +2483,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     const preKill = await killHalt(task, parentIdentity, parentCtx);
     if (preKill !== undefined) {
       events.publish(workerFailed.create({ taskId: task.taskId, reason: preKill }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
+      await recordBuildTrust("rejected", undefined, task.taskId, task.targetRepo, true, preKill);
       return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason: preKill };
     }
 
@@ -2510,6 +2511,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         reason: `${reason}; retained candidate workspace ${keep.id} at ${keep.path}. Inspect with \`ikbi diff ${keep.id}\`; discard with \`ikbi workspace discard ${keep.id}\`.`,
       };
     };
+    // FIX 5: capture worker identity for trust recording (competitive mode).
+    // Declared outside try so the catch block can record trust too.
+    let compWorkerSpawned: SpawnedRole | undefined;
     try {
       // 1. allocate N isolated worktrees (the workspace layer is already concurrent-capable).
       for (let i = 0; i < n; i += 1) {
@@ -2525,7 +2529,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 
       // 2. scout ONCE (shared, read-only, in the first worktree's clean base state) —
       //    its findings seed every builder. (Per-workspace scout is a future option.)
-      const scoutResult = await dispatchRole("scout", spawnRole("scout", parentCtx), task, handles[0]!, [], parentCtx, runEngine, undefined, runCost);
+      const scoutSpawn = spawnRole("scout", parentCtx);
+      const scoutResult = await dispatchRole("scout", scoutSpawn, task, handles[0]!, [], parentCtx, runEngine, undefined, runCost);
+      // FIX 5: capture worker identity for trust recording (competitive mode).
+      // The first spawned role carries the shared agent identity — subsequent roles
+      // assert the same identity (Fix 6 invariant), so one capture suffices.
+      const compWorkerSpawned: SpawnedRole = scoutSpawn;
 
       // 3. builder + verifier PER workspace (sequential in v1; parallelism is a future
       //    optimization). Each builder writes into ITS worktree; each verifier checks ITS
@@ -2539,6 +2548,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         if (killReason !== undefined) {
           for (const h of handles) await safeDiscard(workspaces, h);
           events.publish(workerFailed.create({ taskId: task.taskId, reason: killReason, workspaceId: handles[0]?.id ?? ws.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
+          await recordBuildTrust("rejected", compWorkerSpawned, task.taskId, task.targetRepo, true, killReason);
           return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: rolesByWs.get(handles[0]?.id ?? "") ?? [], ...(handles[0] !== undefined ? { workspaceId: handles[0].id } : {}), promoted: false, reason: killReason };
         }
         // HEAD-TO-HEAD: candidate ci races its OWN model (the Nth listed model, or the single
@@ -2576,6 +2586,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         for (const h of handles) await safeDiscard(workspaces, h);
         const repId = handles[0]?.id;
         events.publish(workerFailed.create({ taskId: task.taskId, reason: finalKill, ...(repId !== undefined ? { workspaceId: repId } : {}) }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
+        await recordBuildTrust("rejected", compWorkerSpawned, task.taskId, task.targetRepo, true, finalKill);
         return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: repId !== undefined ? rolesByWs.get(repId) ?? [] : [], ...(repId !== undefined ? { workspaceId: repId } : {}), promoted: false, reason: finalKill };
       }
 
@@ -2595,6 +2606,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         const retained = await retainCompetitiveFailure(reason, repId);
         events.publish(workerCompetitiveCompleted.create({ taskId: task.taskId, candidateCount: n, winnerWorkspaceId: null }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
         events.publish(workerFailed.create({ taskId: task.taskId, reason: retained.reason, ...(retained.retained !== undefined ? { workspaceId: retained.retained.id } : repId !== undefined ? { workspaceId: repId } : {}) }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
+        await recordBuildTrust("rejected", compWorkerSpawned, task.taskId, task.targetRepo, false);
         const resultId = retained.retained?.id ?? repId;
         return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: resultId !== undefined ? rolesByWs.get(resultId) ?? [] : [], ...(resultId !== undefined ? { workspaceId: resultId } : {}), promoted: false, reason: retained.reason };
       }
@@ -2611,6 +2623,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         const retained = await retainCompetitiveFailure(reason, winner.id);
         events.publish(workerCompetitiveCompleted.create({ taskId: task.taskId, candidateCount: n, winnerWorkspaceId: winner.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
         events.publish(workerFailed.create({ taskId: task.taskId, reason: retained.reason, workspaceId: retained.retained?.id ?? winner.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
+        await recordBuildTrust("rejected", compWorkerSpawned, task.taskId, task.targetRepo, true, reason);
         return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: winnerRoles, workspaceId: retained.retained?.id ?? winner.id, promoted: false, reason: retained.reason };
       }
 
@@ -2621,6 +2634,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         const retained = await retainCompetitiveFailure(reason, winner.id);
         events.publish(workerCompetitiveCompleted.create({ taskId: task.taskId, candidateCount: n, winnerWorkspaceId: winner.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
         events.publish(workerFailed.create({ taskId: task.taskId, reason: retained.reason, workspaceId: retained.retained?.id ?? winner.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
+        await recordBuildTrust("rejected", compWorkerSpawned, task.taskId, task.targetRepo, true, reason);
         return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: winnerRoles, workspaceId: retained.retained?.id ?? winner.id, promoted: false, reason: retained.reason, costUsd: runCost() };
       }
       const promote = await workspaces.promote(winner, {
@@ -2650,13 +2664,20 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       } else {
         events.publish(workerFailed.create({ taskId: task.taskId, reason: reason ?? outcome, workspaceId: winner.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
       }
+      // FIX 5: record trust for the competitive build outcome.
+      // `outcome` maps directly to OutcomeStatus. Suppress only if the promotion
+      // itself was denied by governance (operator decision), not if the worker earned it.
+      const compSuppress = !promoted && outcome === "rejected";
+      await recordBuildTrust(outcome as OutcomeStatus, compWorkerSpawned, task.taskId, task.targetRepo, compSuppress, reason);
       return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome, roles: winnerRoles, workspaceId: winner.id, promoted, ...(reason !== undefined ? { reason } : {}), costUsd: runCost() };
     } catch (err) {
       // Mid-run failure (allocation / role / judge): retain one useful failed candidate when
-      // supported, discard the rest, then fail.
+      // supported, discard the rest, and fail.
       const reason = err instanceof Error ? err.message : String(err);
       const retained = await retainCompetitiveFailure(reason);
       events.publish(workerFailed.create({ taskId: task.taskId, reason: retained.reason, ...(retained.retained !== undefined ? { workspaceId: retained.retained.id } : handles[0] !== undefined ? { workspaceId: handles[0].id } : {}) }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
+      // FIX 5: mid-run failure is a genuine failure (not operator decision).
+      await recordBuildTrust("rejected", compWorkerSpawned, task.taskId, task.targetRepo, false, reason);
       throw err;
     }
   }
@@ -2664,7 +2685,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   // ── CANDIDATE TOURNAMENT MODE (#tournament) ─────────────────────────────────
 
   /** Map a tournament lifecycle event onto the event bus (parent attribution). */
-  function emitTournamentEvent(task: WorkerTask, parentIdentity: AgentIdentity, ev: TournamentEvent): void {
+  async function emitTournamentEvent(task: WorkerTask, parentIdentity: AgentIdentity, ev: TournamentEvent, tournWorkerSpawned?: SpawnedRole): Promise<void> {
     const attribution = { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.tournament", runId: task.taskId } };
     switch (ev.kind) {
       case "started":
@@ -2678,9 +2699,14 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         if (ev.shadowWorkspaceId !== undefined) {
           events.publish(workerCompleted.create({ taskId: task.taskId, outcome: ev.promoted ? "success" : "partial", promoted: ev.promoted, workspaceId: ev.shadowWorkspaceId, ...(verificationMode !== undefined ? { verificationMode } : {}) }, attribution));
         }
+        // FIX 5: record trust for tournament completion.
+        const tournStatus: OutcomeStatus = ev.promoted ? "success" : "partial";
+        await recordBuildTrust(tournStatus, tournWorkerSpawned, task.taskId, task.targetRepo, !ev.promoted, ev.promoted ? undefined : "tournament shadow not promoted");
         break;
       case "failed":
         events.publish(workerFailed.create({ taskId: task.taskId, reason: ev.reason, ...(ev.workspaceId !== undefined ? { workspaceId: ev.workspaceId } : {}) }, attribution));
+        // FIX 5: record trust for tournament failure (not suppressed — genuine failure).
+        await recordBuildTrust("rejected", tournWorkerSpawned, task.taskId, task.targetRepo, false, ev.reason);
         break;
     }
   }
@@ -2725,6 +2751,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
    */
   function makeTournamentEngine(task: WorkerTask, parentCtx: OperationContext, parentIdentity: AgentIdentity): TournamentEngine {
     const { engine: runEngine, cost: runCost } = makeCostingEngine();
+    // FIX 5: capture worker identity for trust recording (tournament mode).
+    // The first spawned role carries the shared agent identity.
+    let tournWorkerSpawned: SpawnedRole | undefined;
 
     const allocate = async (label: string): Promise<WorkspaceHandle | null> => {
       try {
@@ -2744,7 +2773,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       // another candidate's workspace or output (no model-to-model communication).
       // Install deps first so run_checks can find vitest/tsc/etc.
       await installWorkspaceDeps(ws, parentCtx, deps.dependencyInstall);
-      const scoutResult = await dispatchRole("scout", spawnRole("scout", parentCtx), t, ws, [], parentCtx, runEngine, undefined, runCost);
+      const scoutSpawn = spawnRole("scout", parentCtx);
+      if (tournWorkerSpawned === undefined) tournWorkerSpawned = scoutSpawn;
+      const scoutResult = await dispatchRole("scout", scoutSpawn, t, ws, [], parentCtx, runEngine, undefined, runCost);
       const candidateBuilder = builderForModel(parentCtx, spec.model, spec.mode);
       const builderResult = await dispatchRole("builder", spawnRole("builder", parentCtx), t, ws, [scoutResult], parentCtx, runEngine, candidateBuilder, runCost);
       // AUTO-VERIFY RESCUE: if the builder wrote files but hit a protocol termination,
@@ -2829,7 +2860,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       },
       cost: runCost,
       killed: async () => killHalt(task, parentIdentity, parentCtx),
-      emit: (ev) => emitTournamentEvent(task, parentIdentity, ev),
+      emit: (ev) => emitTournamentEvent(task, parentIdentity, ev, tournWorkerSpawned),
     };
   }
 

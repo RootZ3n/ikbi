@@ -52,6 +52,8 @@ function buildDefaultTrust(): TrustSystem {
     demoteStreak: tc.demoteStreak,
     minDistinctOps: tc.promoteMinDistinctOps,
     hmacKey: tc.hmacKey,
+    // FIX 6: 4-hour failure decay window. Stale failures don't accumulate across idle periods.
+    failureWindowMs: 4 * 60 * 60 * 1000,
     // NOTE: the AUTHORITATIVE starting-tier registry is wired post-construction by
     // identity/index via `attachRegistry` — NOT here. identity/index already imports
     // this trust singleton (for the resolver's trustResolver); importing it back would

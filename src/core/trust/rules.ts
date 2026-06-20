@@ -41,6 +41,13 @@ export interface RuleOptions {
   /** Min distinct substantive operations a promotion streak must span. */
   readonly minDistinctOps: number;
   readonly now: number;
+  /**
+   * Time window (ms) for failure decay. If the last failure was more than this
+   * many milliseconds ago, the consecutive-failure streak resets to 0 before
+   * evaluating the current outcome. Default: undefined (no decay — legacy behavior).
+   * Recommended: 4 hours (14_400_000) for production; keeps "consecutive" temporal.
+   */
+  readonly failureWindowMs?: number;
 }
 
 export interface ApplyResult {
@@ -97,6 +104,13 @@ export function applyOutcome(
   const injection = input.signals?.injection === true;
   const promotable = input.status === "success" && isPromotableOperation(input.operation);
 
+  // FIX 6: time-windowed failure decay. If the last failure was more than
+  // `failureWindowMs` ago, reset the consecutive-failure streak so stale
+  // failures don't accumulate across idle periods.
+  if (opts.failureWindowMs !== undefined && s.lastFailureAt !== undefined && (opts.now - s.lastFailureAt) > opts.failureWindowMs) {
+    s.consecutiveFailures = 0;
+  }
+
   // --- counters + streaks ---
   switch (input.status) {
     case "success":
@@ -117,12 +131,14 @@ export function applyOutcome(
     case "failure":
       s.failureCount += 1;
       s.consecutiveFailures += 1;
+      s.lastFailureAt = opts.now;
       s.promotableStreak = 0;
       s.streakOperations = [];
       break;
     case "rejected":
       s.rejectedCount += 1;
       s.consecutiveFailures += 1;
+      s.lastFailureAt = opts.now;
       s.promotableStreak = 0;
       s.streakOperations = [];
       break;

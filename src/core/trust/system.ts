@@ -72,6 +72,12 @@ export interface TrustSystemDeps {
   readonly hmacKey: string;
   /** Authoritative source of a never-seen agent's starting tier (NOT the caller). */
   readonly registry?: TrustAgentRegistry;
+  /**
+   * Time window (ms) for failure decay. If the last failure was more than this
+   * many milliseconds ago, the consecutive-failure streak resets before evaluating
+   * the current outcome. Default: undefined (no decay).
+   */
+  readonly failureWindowMs?: number;
   readonly sink?: TrustTransitionSink;
   readonly receiptReader?: TrustReceiptReader;
   readonly now?: () => number;
@@ -87,6 +93,7 @@ export class TrustSystem implements TrustTierResolver {
   private readonly promoteStreak: number;
   private readonly demoteStreak: number;
   private readonly minDistinctOps: number;
+  private readonly failureWindowMs: number | undefined;
   private readonly key: string;
   /** Authoritative starting-tier source. Set in the constructor OR wired post-construction
    *  via `attachRegistry` (the singleton path, to avoid a trust↔identity load cycle). */
@@ -108,6 +115,7 @@ export class TrustSystem implements TrustTierResolver {
     this.promoteStreak = deps.promoteStreak;
     this.demoteStreak = deps.demoteStreak;
     this.minDistinctOps = deps.minDistinctOps;
+    this.failureWindowMs = deps.failureWindowMs;
     this.key = deps.hmacKey;
     if (deps.registry) this.registry = deps.registry;
     if (deps.sink) this.sink = deps.sink;
@@ -221,7 +229,7 @@ export class TrustSystem implements TrustTierResolver {
     // The input applyOutcome sees uses the registry-sourced tier + subject identity.
     const effectiveInput: RecordOutcomeInput = { ...input, agentId, kind, defaultTrustTier: startingTier };
 
-    const opts = { promoteStreak: this.promoteStreak, demoteStreak: this.demoteStreak, minDistinctOps: this.minDistinctOps, now: this.now() };
+    const opts = { promoteStreak: this.promoteStreak, demoteStreak: this.demoteStreak, minDistinctOps: this.minDistinctOps, now: this.now(), ...(this.failureWindowMs !== undefined ? { failureWindowMs: this.failureWindowMs } : {}) };
     let previousTier: TrustTier = clampTier(startingTier, TRUST_FLOOR, AGENT_CEILING);
     let transition: TrustTransition | undefined;
     let newState: TrustState | undefined;

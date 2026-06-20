@@ -115,8 +115,8 @@ export interface TournamentEngine {
   cost(): number;
   /** Cooperative kill checkpoint: is THIS run killed? (read-only; returns the reason or undefined). */
   killed(): Promise<string | undefined>;
-  /** Publish a lifecycle event (best-effort). */
-  emit(event: TournamentEvent): void;
+  /** Publish a lifecycle event (best-effort). May be async for trust recording. */
+  emit(event: TournamentEvent): void | Promise<void>;
 }
 
 /** Map a candidate run onto its objective receipt line. */
@@ -168,8 +168,8 @@ export async function runTournament(
   const withMode = <T extends Record<string, unknown>>(base: T): T & { verificationMode?: string } =>
     engine.verificationMode !== undefined ? { ...base, verificationMode: engine.verificationMode } : base;
 
-  const fail = (reason: string, workspaceId?: string): WorkerResult => {
-    engine.emit({ kind: "failed", reason, ...(workspaceId !== undefined ? { workspaceId } : {}) });
+  const fail = async (reason: string, workspaceId?: string): Promise<WorkerResult> => {
+    await engine.emit({ kind: "failed", reason, ...(workspaceId !== undefined ? { workspaceId } : {}) });
     return withMode({
       contractVersion: CONTRACT_VERSION,
       taskId: task.taskId,
@@ -182,11 +182,11 @@ export async function runTournament(
     });
   };
 
-  engine.emit({ kind: "started", candidateCount: specs.length });
+  await engine.emit({ kind: "started", candidateCount: specs.length });
 
   // Pre-allocation kill checkpoint: do not start anything when this run is killed.
   const preKill = await engine.killed();
-  if (preKill !== undefined) return fail(preKill);
+  if (preKill !== undefined) return await fail(preKill);
 
   // 1. Run each candidate INDEPENDENTLY in its OWN workspace. A failed allocation skips that
   //    candidate and continues with the rest (per the error-handling contract).
@@ -199,17 +199,17 @@ export async function runTournament(
     if (killReason !== undefined) {
       await engine.discard(ws);
       for (const r of runs) await engine.discard(r.workspace);
-      return fail(killReason, ws.id);
+      return await fail(killReason, ws.id);
     }
     runs.push(await engine.runCandidate(task, ws, specs[i]!));
   }
 
   // Every candidate workspace failed to allocate → nothing to judge, fail closed.
-  if (runs.length === 0) return fail("all candidate workspaces failed to allocate — tournament fails closed");
+  if (runs.length === 0) return await fail("all candidate workspaces failed to allocate — tournament fails closed");
 
   // 2. JUDGE — deterministic, pure, no model. Verified pass beats all; ties broken objectively.
   const verdict = engine.judge(runs.map((r) => r.candidate));
-  engine.emit({ kind: "judged", candidateCount: runs.length, winnerWorkspaceId: verdict.winner?.workspaceId ?? null });
+  await engine.emit({ kind: "judged", candidateCount: runs.length, winnerWorkspaceId: verdict.winner?.workspaceId ?? null });
 
   const discardAll = async (): Promise<void> => {
     for (const r of runs) await engine.discard(r.workspace);
@@ -232,7 +232,7 @@ export async function runTournament(
     const reason = verdict.reason ?? "no candidate passed verification — tournament fails closed";
     const retainedId = await retainBest(reason);
     await engine.recordReceipt(buildReceipt(task, runs, null, { applied: false, verified: false }, false, reason));
-    return fail(reason, retainedId);
+    return await fail(reason, retainedId);
   }
 
   const winnerId = verdict.winner.workspaceId;
@@ -242,14 +242,14 @@ export async function runTournament(
 
   // 3. SHADOW REPLAY — allocate a CLEAN workspace from the same base ref and apply the winner's diff.
   const shadowKill = await engine.killed();
-  if (shadowKill !== undefined) return fail(shadowKill, await retainBest(shadowKill));
+  if (shadowKill !== undefined) return await fail(shadowKill, await retainBest(shadowKill));
 
   const shadow = await engine.allocate(`tournament:${task.taskId}:shadow`);
   if (shadow === null) {
     const reason = "shadow workspace allocation failed — tournament fails closed";
     const id = await retainBest(reason);
     await engine.recordReceipt(buildReceipt(task, runs, winnerRef, { applied: false, verified: false, reason }, false, reason));
-    return fail(reason, id);
+    return await fail(reason, id);
   }
 
   const apply = await engine.applyDiff(shadow, winner.diff);
@@ -258,7 +258,7 @@ export async function runTournament(
     await engine.discard(shadow);
     const id = await retainBest(reason);
     await engine.recordReceipt(buildReceipt(task, runs, winnerRef, { workspaceId: shadow.id, applied: false, verified: false, reason }, false, reason));
-    return fail(reason, id);
+    return await fail(reason, id);
   }
 
   // 4. VERIFY the shadow — the winning diff must pass in a PRISTINE tree (not the candidate's messy one).
@@ -268,14 +268,14 @@ export async function runTournament(
     await engine.discard(shadow);
     const id = await retainBest(reason);
     await engine.recordReceipt(buildReceipt(task, runs, winnerRef, { workspaceId: shadow.id, applied: true, verified: false, reason }, false, reason));
-    return fail(reason, id);
+    return await fail(reason, id);
   }
 
   // 5. PROMOTE the shadow through the EXISTING promote path (gate-wall governs).
   const promoteKill = await engine.killed();
   if (promoteKill !== undefined) {
     await engine.discard(shadow);
-    return fail(promoteKill, await retainBest(promoteKill));
+    return await fail(promoteKill, await retainBest(promoteKill));
   }
 
   // The authoritative roles for the promote (gate-wall input) + the final result are the WINNER's
@@ -291,7 +291,7 @@ export async function runTournament(
     const reason = promote.reason ?? "shadow not promoted (gate denied or conflict)";
     await engine.retain(shadow, reason);
     await engine.recordReceipt(buildReceipt(task, runs, winnerRef, { workspaceId: shadow.id, applied: true, verified: true, reason }, false, reason));
-    engine.emit({ kind: "completed", winnerWorkspaceId: winner.workspace.id, shadowWorkspaceId: shadow.id, promoted: false });
+    await engine.emit({ kind: "completed", winnerWorkspaceId: winner.workspace.id, shadowWorkspaceId: shadow.id, promoted: false });
     return withMode({
       contractVersion: CONTRACT_VERSION,
       taskId: task.taskId,
@@ -305,7 +305,7 @@ export async function runTournament(
   }
 
   await engine.recordReceipt(buildReceipt(task, runs, winnerRef, { workspaceId: shadow.id, applied: true, verified: true }, true));
-  engine.emit({ kind: "completed", winnerWorkspaceId: winner.workspace.id, shadowWorkspaceId: shadow.id, promoted: true });
+  await engine.emit({ kind: "completed", winnerWorkspaceId: winner.workspace.id, shadowWorkspaceId: shadow.id, promoted: true });
   return withMode({
     contractVersion: CONTRACT_VERSION,
     taskId: task.taskId,

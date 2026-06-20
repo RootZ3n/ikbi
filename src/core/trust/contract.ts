@@ -138,6 +138,8 @@ export interface TrustState {
   readonly lastTransition?: TrustTransition;
   readonly createdAt: number;
   readonly lastOutcomeAt?: number;
+  /** Timestamp of the most recent failure/rejection (used for time-windowed decay). */
+  readonly lastFailureAt?: number;
   readonly updatedAt: number;
 }
 
