@@ -337,11 +337,9 @@ function foldRoleSignals(
     const pct = asNumber(detail.contextPercent);
     if (pct !== undefined) acc.contextPressure = Math.min(1, Math.max(0, pct / 100));
     if (typeof detail.stopReason === "string") acc.stopReason = detail.stopReason;
-    // Set builderFailed only for genuine progress failures (no_progress, timeout, stuck_detected)
-    // where the builder could not make progress — NOT for max_iterations with tool format errors,
-    // which are already captured by schemaFailures/rejectedToolCalls signals.
-    const BUILDER_FAILURE_REASONS = new Set(["no_progress", "timeout", "stuck_detected", "blocked"]);
-    if (result.outcome === "failure" && typeof detail.stopReason === "string" && BUILDER_FAILURE_REASONS.has(detail.stopReason)) acc.builderFailed = true;
+    // builderFailed: ANY builder failure is a strong signal that the cheap model can't handle
+    // this task. Combined with the high weight (50), this alone crosses the escalation threshold.
+    if (result.outcome === "failure") acc.builderFailed = true;
   } else if (role === "critic") {
     if (result.outcome === "failure" || result.outcome === "rejected") acc.criticRejected = true;
     if (typeof result.summary === "string") handoff.criticFeedback = result.summary;

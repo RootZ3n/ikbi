@@ -379,8 +379,8 @@ test("ISSUE 1: with PENALIZE_TIMEOUTS policy on, a timeout IS counted as a trust
 
   assert.equal(
     tr.calls.filter((c) => c.operation === "worker.role.builder" && c.status === "failure").length,
-    1,
-    "policy on → the timeout IS a trust failure signal",
+    2,
+    "policy on → both original and escalated builder failures are trust signals",
   );
 });
 

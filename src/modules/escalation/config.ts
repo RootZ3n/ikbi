@@ -34,7 +34,7 @@ export const DEFAULT_WEIGHTS: EscalationWeights = Object.freeze({
   verificationFailed: 25,
   rejectedToolCalls: 10,
   benchmarkPassRate: 5,
-  builderFailed: 40,
+  builderFailed: 50,
 });
 
 export const DEFAULT_WORKER_MODELS = ["deepseek-v4-flash", "mimo-v2.5", "minimax-m3"] as const;
