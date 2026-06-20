@@ -1309,6 +1309,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     let escalationRetryOutcome: WorkerResult["escalationRetry"];
     let overall: WorkerResult["outcome"] = "success";
     let killedReason: string | undefined;
+    // FIX A: capture a worker spawned identity for per-build trust recording.
+    // The parent is the operator (kind=operator, skipped by trust). The WORKER
+    // agent is the entity whose trust we need to record.
+    let workerSpawned: SpawnedRole | undefined;
     // ISSUE 1: a critic FAIL feeds the critic's feedback back to the builder for ONE retry
     // (opt-in, config.criticFixLoop). This guard caps it at a single attempt per run so
     // subjective feedback can never loop forever.
@@ -1388,6 +1392,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           }
         }
         const spawned = spawnRole(role, parentCtx);
+        if (workerSpawned === undefined) workerSpawned = spawned;
 
         events.publish(
           workerRoleDispatched.create(
@@ -2313,16 +2318,19 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // the cascade where one failed build = 3-4 consecutive trust failures
     // (scout + builder + verifier + integrator each recorded separately).
     // The operation is "worker.build" and the status is the overall build outcome.
-    await trust.recordOutcome(
-      {
-        agentId: parentIdentity.agentId,
-        kind: parentCtx.identity.kind,
-        defaultTrustTier: parentIdentity.trustTier ?? TRUST_FLOOR,
-        operation: "worker.build",
-        status: toOutcomeStatus(overall),
-      },
-      parentCtx.identity,
-    );
+    // Uses the WORKER identity (not the parent/operator) because trust only tracks agents.
+    if (workerSpawned !== undefined) {
+      await trust.recordOutcome(
+        {
+          agentId: workerSpawned.identity.agentId,
+          kind: workerSpawned.kind,
+          defaultTrustTier: workerSpawned.identity.trustTier ?? TRUST_FLOOR,
+          operation: "worker.build",
+          status: toOutcomeStatus(overall),
+        },
+        workerSpawned.validated,
+      );
+    }
 
     return result;
   }
