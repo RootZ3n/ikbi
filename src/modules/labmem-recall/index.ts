@@ -16,7 +16,8 @@
  * error rather than crashing the caller.
  */
 
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /** ikbi's labmem namespace. */
 export const IKBI_AGENT = "ikbi";
@@ -25,9 +26,26 @@ export class LabmemUnavailable extends Error {
   override readonly name = "LabmemUnavailable";
 }
 
-/** Resolve the labmem root (env override, else the lab default install path). */
+/**
+ * Portable default labmem root: the in-ecosystem vendored labmem, resolved by
+ * walking up to the `ecosystem/` directory so the code ships no absolute lab
+ * path. The vendored copy ships CODE only — set LABMEM_ROOT to point at the real
+ * mutable memory DATA (the home lab sets it via .env; public installs set their own).
+ */
+function defaultLabmemRoot(): string {
+  let d = dirname(fileURLToPath(import.meta.url));
+  for (let i = 0; i < 12; i++) {
+    if (basename(d) === "ecosystem") return join(d, "lab-memory", "labmem");
+    const parent = dirname(d);
+    if (parent === d) break;
+    d = parent;
+  }
+  return join(process.cwd(), "lab-memory", "labmem");
+}
+
+/** Resolve the labmem root (env override, else the in-ecosystem vendored labmem). */
 export function labmemRoot(): string {
-  return process.env["LABMEM_ROOT"] ?? "/pehverse/repos/lab-utilities/lab-memory/labmem";
+  return process.env["LABMEM_ROOT"] ?? defaultLabmemRoot();
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
