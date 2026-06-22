@@ -210,20 +210,19 @@ function pehDevSwitchProduct(productId){
 }
 var _dashAutoOpenDone=false;
 function pehAutoOpenDashboard(){
-  pehProductWorkspaces(pehActiveProductId()).filter(function(id){
-    const d=pehWorkspaceDef(id);return d&&d.product!=null;
-  }).forEach(function(id){
-    const def=pehWorkspaceDef(id);if(!def)return;
-    if(state.pehverse.workspaces.find(function(w){return w.defId===id;}))return;
-    state.pehverse.workspaces.push({uid:'ws'+(++state.pehverse.wsSeq),defId:id,dock:def.dock||'right',min:false});
-  });
-  if(state.pehverse.workspaces.length)
-    state.pehverse.focus=state.pehverse.workspaces[state.pehverse.workspaces.length-1].uid;
+  // INTENTIONALLY DISABLED — opening all workspaces at once floods the screen.
+  // Users should click a hotspot or use fast travel to open specific workspaces.
+  // The workspace chooser (pehWorkspaceChooser) handles the empty state.
 }
 function pehSetMode(mode){
   if(mode!=='immersive'&&mode!=='dashboard')return;
   state.pehverse.mode=mode;
   localStorage.setItem('pehverse-mode',mode);
+  if(mode==='immersive'){
+    // Close all workspaces when entering immersive — show the clean world map
+    state.pehverse.workspaces=[];
+    state.pehverse.focus=null;
+  }
   if(mode==='dashboard'){_dashAutoOpenDone=false;}
   render();
 }
