@@ -111,12 +111,10 @@
   }
 
   var SCENE_ALIASES = {
-    hub: 'command-center', center: 'command-center', command: 'command-center',
-    workshop: 'workshop', build: 'workshop',
-    testing: 'testing-ground', tests: 'testing-ground', test: 'testing-ground',
-    armory: 'armory', tools: 'armory',
-    archive: 'archive', history: 'archive', logs: 'archive',
-    control: 'control-room', config: 'control-room', settings: 'control-room',
+    hub: 'the-heartwood', center: 'the-heartwood', heartwood: 'the-heartwood', command: 'the-heartwood',
+    grove: 'the-grove', terminal: 'the-grove', build: 'the-grove', builder: 'the-grove',
+    flame: 'the-sacred-flame', testing: 'the-sacred-flame', tests: 'the-sacred-flame', test: 'the-sacred-flame',
+    river: 'the-rivers-end', history: 'the-rivers-end', archive: 'the-rivers-end', logs: 'the-rivers-end',
   };
 
   async function summarize(label, promise, fmt) {
@@ -157,7 +155,7 @@
         if (target && typeof pehGoScene === 'function' && pehScene(pehActiveProductId(), target)) {
           pehGoScene(target);
         } else {
-          IkbiGuide.log('Unknown area: "' + rest + '". Try: hub, workshop, testing, armory, archive, control', 'warn');
+          IkbiGuide.log('Unknown area: "' + rest + '". Try: hub, grove, flame, river', 'warn');
         }
         break;
       case 'ask':

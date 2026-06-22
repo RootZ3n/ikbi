@@ -332,7 +332,12 @@ button{font-family:inherit}
 .peh-dash-here h1{font-size:clamp(20px,5vw,28px);margin:2px 0 4px;font-weight:800}
 .peh-dash-here p{margin:0 0 8px;color:var(--ink-soft);font-size:13px;max-width:56ch}
 .peh-dash .peh-waypoints{position:static;padding:0;margin-top:4px}
-.peh-grid{display:grid;grid-template-columns:1fr;gap:12px;padding:12px}
+.peh-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:12px}
+/* The Grove (terminal) always pins to the top and spans the full grid width. */
+.peh-tile[data-def*="grove"]{grid-column:1 / -1}
+/* A lone open workspace spans the full width; two-column kicks in with .multi. */
+.peh-grid:not(.multi) .peh-tile{grid-column:1 / -1}
+@media (max-width:768px){.peh-grid{grid-template-columns:1fr}}
 .peh-tile{min-height:60vh}
 .peh-tile .peh-panel-body{max-height:none}
 
@@ -431,7 +436,7 @@ button{font-family:inherit}
   .peh-panel.dock-bottom{left:14px;right:14px;bottom:14px;top:auto;height:min(58%,640px);border-radius:16px}
   .peh-panel.dock-fullscreen{inset:14px;width:auto;border-radius:16px}
 
-  .peh-grid{grid-template-columns:1fr;padding:16px;gap:16px}
+  .peh-grid{grid-template-columns:1fr 1fr;padding:16px;gap:16px}
   .peh-grid.multi{grid-template-columns:repeat(2,1fr)}
   .peh-tile{min-height:min(70vh,680px)}
   .peh-chooser{grid-template-columns:repeat(auto-fill,minmax(190px,1fr))}
@@ -442,7 +447,7 @@ button{font-family:inherit}
 }
 @media (min-width:1280px){
   .peh-panel.dock-right{width:min(680px,42vw)}
-  .peh-grid.multi{grid-template-columns:repeat(3,1fr)}
+  .peh-grid.multi{grid-template-columns:repeat(2,1fr)}
 }
 @media (prefers-reduced-motion:reduce){
   .peh-pin::after{animation:none}

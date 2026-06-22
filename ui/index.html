@@ -61,44 +61,27 @@ const PRODUCT_REGISTRY=[
 const PEH_DEFAULT_PRODUCT='ikbi';
 
 // ── SceneRegistry ──────────────────────────────────────────────────────
-// Seven sacred locations on the ikbi world map — exact positions matched
-// to the actual ikbi_desktop.png landscape.
+// Four sacred locations on the ikbi world map — exact positions matched
+// to the actual ikbi_desktop.png landscape. The Heartwood is the hub and
+// carries every workspace hotspot (builder, launch, modules) directly.
 const SCENE_REGISTRY={
   ikbi:[
     {id:'the-heartwood', title:'The Heartwood', purpose:'Hub / overview', route:'/heartwood',
      desc:'The central clearing where every path converges. Sun-dappled grass, wildflowers, and the quiet hum of the engine.', peh:'star',
      pehSlot:{x:49, y:48, anchor:'center', variant:'guardian'}, hotspots:[
       {id:'hw-status',   label:'Engine Status',    x:49, y:38, workspace:'engine-status',  greeting:"The heartbeat of the engine — status, tools, features. Everything you need, at a glance."},
-      {id:'hw-tablets',  label:'The Stone Tablets', x:20, y:26, scene:'the-stone-tablets',  greeting:"The Stone Tablets — where plans are carved. Blueprints, builds, and the first mark."},
-      {id:'hw-spring',   label:'The Living Spring',  x:17, y:67, scene:'the-living-spring',   greeting:"The Living Spring — where new builds begin. Clean water, clean code."},
-      {id:'hw-grove',    label:'The Grove',          x:48, y:15, scene:'the-grove',           greeting:"The Grove — where you speak directly to the engine. Type a goal, and ikbi builds."},
-      {id:'hw-ring',     label:'The Stone Ring',     x:83, y:41, scene:'the-stone-ring',      greeting:"The Stone Ring — cycles within cycles. Module health and diagnostics."},
-      {id:'hw-flame',    label:'The Sacred Flame',   x:77, y:73, scene:'the-sacred-flame',    greeting:"The Sacred Flame — every build tested here. 800 trials, each one a rite."},
-      {id:'hw-river',    label:"The River's End",    x:78, y:18, scene:'the-rivers-end',      greeting:"The River's End — where all builds arrive. History and receipts."}
-    ]},
-    {id:'the-stone-tablets', title:'The Stone Tablets', purpose:'Builder workspace', route:'/tablets',
-     desc:'A carved stone shrine etched with ancient runes. A red fox guards the entrance. This is where blueprints are drawn and code is first shaped.', peh:'tools',
-     pehSlot:{x:20, y:26, anchor:'center', variant:'scribe'}, hotspots:[
-      {id:'st-build', label:'Builder',               x:46, y:48, workspace:'builder-ws',    greeting:"Pick up the chisel — let's shape something."},
-      {id:'st-back',  label:'Back to the Heartwood',  x:72, y:82, scene:'the-heartwood',    greeting:"Back to the Heartwood — follow me."}
-    ]},
-    {id:'the-living-spring', title:'The Living Spring', purpose:'Launch builds', route:'/spring',
-     desc:'A glowing waterfall feeds a turquoise pool surrounded by wildflowers and ritual pottery. The water hums with energy. New builds begin here.', peh:'spark',
-     pehSlot:{x:17, y:67, anchor:'center', variant:'source'}, hotspots:[
-      {id:'ls-launch', label:'Launch Pad',             x:46, y:48, workspace:'builder-ws',    greeting:"The water is clear — time to build something new."},
-      {id:'ls-back',   label:'Back to the Heartwood',  x:72, y:20, scene:'the-heartwood',    greeting:"Back to the Heartwood — follow me."}
+      {id:'hw-builder',  label:'Builder',          x:20, y:26, workspace:'builder-ws',     greeting:"Pick up the chisel — builder tools, provider model, and a direct line to the engine."},
+      {id:'hw-launch',   label:'Launch Pad',       x:17, y:67, workspace:'builder-ws',     greeting:"The water is clear — time to build something new."},
+      {id:'hw-grove',    label:'The Grove',        x:48, y:15, scene:'the-grove',          greeting:"The Grove — where you speak directly to the engine. Type a goal, and ikbi builds."},
+      {id:'hw-modules',  label:'Modules',          x:83, y:41, workspace:'modules-ws',     greeting:"28 modules, each a stone in the ring. Let's check their health."},
+      {id:'hw-flame',    label:'The Sacred Flame', x:77, y:73, scene:'the-sacred-flame',   greeting:"The Sacred Flame — every build tested here. 800 trials, each one a rite."},
+      {id:'hw-river',    label:"The River's End",  x:78, y:18, scene:'the-rivers-end',     greeting:"The River's End — where all builds arrive. History and receipts."}
     ]},
     {id:'the-grove', title:'The Grove', purpose:'Terminal & conversation', route:'/grove',
      desc:'An ancient grove where the old tree speaks. This is where you talk to ikbi — directly, in the terminal. Type a goal and watch the engine work.', peh:'leaf',
      pehSlot:{x:48, y:15, anchor:'center', variant:'elder'}, hotspots:[
       {id:'gr-terminal', label:'Terminal',               x:46, y:48, workspace:'grove-ws',     greeting:"The Grove awaits. Type your goal — ikbi will read the ground truth and build."},
       {id:'gr-back',     label:'Back to the Heartwood', x:50, y:82, scene:'the-heartwood',    greeting:"Back to the Heartwood — follow me."}
-    ]},
-    {id:'the-stone-ring', title:'The Stone Ring', purpose:'Modules & diagnostics', route:'/ring',
-     desc:'A circular stone henge with planted garden beds. Each stone represents a module in the engine. The garden turns with the seasons — diagnostics never sleep.', peh:'gear',
-     pehSlot:{x:83, y:41, anchor:'center', variant:'healer'}, hotspots:[
-      {id:'sr-modules', label:'Module Health',          x:46, y:48, workspace:'modules-ws',    greeting:"28 modules, each stone in the ring. Let's check their health."},
-      {id:'sr-back',    label:'Back to the Heartwood',  x:20, y:78, scene:'the-heartwood',     greeting:"Back to the Heartwood — follow me."}
     ]},
     {id:'the-sacred-flame', title:'The Sacred Flame', purpose:'Test results', route:'/flame',
      desc:'A ceremonial fire circle with stone seating and feathered posts. Every build faces the flame. 800 tests — each one a rite of passage.', peh:'star',
@@ -471,7 +454,11 @@ function renderPehImmersive(product,scene,deckMarkup){
 }
 
 function renderPehDashboard(product,scene,deckMarkup){
-  const open=state.pehverse.workspaces;
+  // grove-ws (the terminal) always sorts first so it pins to the top of the grid.
+  const open=state.pehverse.workspaces.slice().sort((a,b)=>{
+    const ag=a.defId==='grove-ws'?0:1, bg=b.defId==='grove-ws'?0:1;
+    return ag-bg;
+  });
   const grid=open.length
     ? open.map((w)=>renderWorkspaceTile(w,deckMarkup)).join('')
     : pehWorkspaceChooser(product);
@@ -521,7 +508,7 @@ function renderWorkspacePanel(w,deckMarkup){
 }
 function renderWorkspaceTile(w,deckMarkup){
   const def=pehWorkspaceDef(w.defId)||{};
-  return `<section class="peh-tile ${state.pehverse.focus===w.uid?'focused':''}" data-uid="${w.uid}" onmousedown="pehFocusWorkspace('${w.uid}')" aria-label="${esc(def.title||w.defId)} workspace">
+  return `<section class="peh-tile ${state.pehverse.focus===w.uid?'focused':''}" data-uid="${w.uid}" data-def="${esc(w.defId)}" onmousedown="pehFocusWorkspace('${w.uid}')" aria-label="${esc(def.title||w.defId)} workspace">
     ${renderWorkspaceHeader(w,def,true)}
     <div class="peh-panel-body">${pehWorkspaceBody(w,deckMarkup)}</div>
   </section>`;
@@ -618,10 +605,10 @@ function renderPehDevSwitcher(active){
 function renderWorkshopConsole(){
   const cards=[
     {ws:'engine-status', scene:'the-heartwood',     glyph:'gear',   title:'Engine Status',  desc:'Service status, model, features, lifecycle posture — the heartbeat.'},
-    {ws:'builder-ws',    scene:'the-stone-tablets', glyph:'tools',  title:'Builder',        desc:'Builder tools, provider model, and a direct chat interface to the engine.'},
+    {ws:'builder-ws',    scene:'the-heartwood',     glyph:'tools',  title:'Builder',        desc:'Builder tools, provider model, and a direct chat interface to the engine.'},
     {ws:'test-results',  scene:'the-sacred-flame',  glyph:'star',   title:'Test Results',   desc:'800+ tests, every gate checked. Nothing ships without passing through here.'},
     {ws:'trust-ws',      scene:'the-heartwood',     glyph:'shield', title:'Trust & Safety', desc:'Lifecycle posture, security features, surface classifications.'},
-    {ws:'modules-ws',    scene:'the-stone-ring',    glyph:'gear',   title:'Modules',        desc:'Full tool inventory, feature flags, surface map.'},
+    {ws:'modules-ws',    scene:'the-heartwood',     glyph:'gear',   title:'Modules',        desc:'Full tool inventory, feature flags, surface map.'},
     {ws:'history-ws',    scene:'the-rivers-end',    glyph:'book',   title:'History',        desc:'Activity log, session info, build receipts.'},
     {ws:'grove-ws',      scene:'the-grove',         glyph:'leaf',   title:'The Grove',      desc:'Speak directly to ikbi in the terminal. Type a goal — the engine builds.'}
   ];
