@@ -71,6 +71,12 @@ import "./trust/index.js";
 // the shared queue. Library-only at import (no command/route); its operator surface is
 // `ikbi doctor --self-repair`, wired in src/cli/index.ts.
 import "./self-repair/index.js";
+// Job Cards — reusable, named, bounded automations with guardrails and receipts.
+import "./job-cards/index.js";
+// Repo Doctor — health analysis across 6 dimensions, wired to project-index.
+import "./repo-doctor/index.js";
+// Spec Artifact — first-class editable plans from step-planner.
+import "./spec-artifact/index.js";
 // Kill-switch LAST — its index reads the durable latch at engine start (graceful
 // degradation), and registers the `kill`/`unkill`/`kill-status` operator commands.
 import "./kill-switch/index.js";
