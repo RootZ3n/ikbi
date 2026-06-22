@@ -501,6 +501,70 @@ input { font-family: inherit; font-size: inherit; color: inherit; background: no
   font-size: 11px; color: var(--red);
 }
 
+/* ─── Corrections Library ──────────────────────────────────────────────── */
+.corr-card {
+  background: var(--bg-card);
+  border: 1px solid rgba(212,168,67,.08);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  transition: border-color .15s;
+}
+.corr-card:hover { border-color: var(--amber-dim); }
+.corr-card.corr-approved { border-left: 3px solid var(--green); }
+.corr-card.corr-pending { border-left: 3px solid var(--amber); }
+.corr-head {
+  display: flex; align-items: center; gap: 8px;
+  margin-bottom: 6px; flex-wrap: wrap;
+}
+.corr-badge {
+  font-size: 10px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .5px; padding: 2px 6px; border-radius: 3px;
+  background: var(--amber-dim); color: var(--amber);
+}
+.corr-badge.cat-expected_manifest_change { background: var(--green-dim); color: var(--green); }
+.corr-badge.cat-tool_limitation { background: var(--blue-dim); color: var(--blue); }
+.corr-badge.cat-environment_missing { background: var(--red-dim); color: var(--red); }
+.corr-badge.cat-verification_forgery { background: var(--red-dim); color: var(--red); }
+.corr-badge.cat-test_weakening { background: var(--amber-dim); color: var(--amber); }
+.corr-badge.cat-forbidden_file { background: var(--red-dim); color: var(--red); }
+.corr-status {
+  font-size: 10px; color: var(--ink-dim); text-transform: uppercase;
+  letter-spacing: .5px;
+}
+.corr-count {
+  font-size: 10px; color: var(--ink-dim); margin-left: auto;
+}
+.corr-finding, .corr-correction, .corr-regression {
+  font-size: 11px; color: var(--ink-soft);
+  margin-bottom: 3px; line-height: 1.4;
+}
+.corr-finding strong, .corr-correction strong, .corr-regression strong {
+  color: var(--ink-dim); font-weight: 600; text-transform: uppercase;
+  font-size: 9px; letter-spacing: .5px; margin-right: 4px;
+}
+.corr-actions {
+  display: flex; gap: 6px; margin-top: 8px;
+}
+.corr-approve-btn, .corr-reject-btn {
+  font-size: 10px; padding: 3px 10px; border-radius: 4px;
+  border: 1px solid; cursor: pointer; font-weight: 600;
+  transition: all .15s;
+}
+.corr-approve-btn {
+  background: var(--green-dim); border-color: var(--green);
+  color: var(--green);
+}
+.corr-approve-btn:hover { background: var(--green); color: var(--bg-deep); }
+.corr-reject-btn {
+  background: var(--red-dim); border-color: var(--red);
+  color: var(--red);
+}
+.corr-reject-btn:hover { background: var(--red); color: var(--bg-deep); }
+.corr-approved-label {
+  font-size: 10px; color: var(--green); font-weight: 600;
+}
+
 /* ═══ RESPONSIVE ════════════════════════════════════════════════════════ */
 @media (max-width: 768px) {
   #ikbi-app { height: auto; min-height: 100vh; max-height: none; overflow-y: auto; }

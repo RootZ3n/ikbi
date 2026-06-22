@@ -56,22 +56,19 @@
     return result;
   }
 
-  async function post(path, body, opts) {
+  async function request(method, path, body, opts) {
     opts = opts || {};
     try {
       var ctrl = new AbortController();
       var timer = setTimeout(function () { ctrl.abort(); }, opts.timeout || 30000);
-      var headers = { 'Content-Type': 'application/json', 'Accept': 'application/json' };
-      // Attach the chat token if available (POST /chat requires Bearer auth).
+      var headers = { 'Accept': 'application/json' };
+      if (body) headers['Content-Type'] = 'application/json';
       if (typeof window !== 'undefined' && window.IKBI_CHAT_TOKEN) {
         headers['Authorization'] = 'Bearer ' + window.IKBI_CHAT_TOKEN;
       }
-      var res = await fetch(BASE + path, {
-        method: 'POST',
-        signal: ctrl.signal,
-        headers: headers,
-        body: JSON.stringify(body || {}),
-      });
+      var fetchOpts = { method: method, signal: ctrl.signal, headers: headers };
+      if (body) fetchOpts.body = JSON.stringify(body);
+      var res = await fetch(BASE + path, fetchOpts);
       clearTimeout(timer);
       var data = null;
       try { data = await res.json(); } catch (e) { /* ignore */ }
@@ -80,6 +77,10 @@
       var msg = (err && err.name === 'AbortError') ? 'timed out' : (err && err.message) || String(err);
       return { ok: false, status: 0, data: null, error: msg };
     }
+  }
+
+  async function post(path, body, opts) {
+    return request('POST', path, body, opts);
   }
 
   window.IkbiAPI = {
@@ -94,5 +95,21 @@
     // Drop cached reads so the next call refetches.
     refresh: function () { cache.clear(); },
     _get: get,
+    _post: post,
+    _request: request,
+    // Correction library
+    listCorrections: function (filter) {
+      var qs = [];
+      if (filter && filter.category) qs.push('category=' + encodeURIComponent(filter.category));
+      if (filter && filter.approved != null) qs.push('approved=' + filter.approved);
+      var q = qs.length ? '?' + qs.join('&') : '';
+      return get('/ikbi/corrections' + q);
+    },
+    approveCorrection: function (id) {
+      return request('PATCH', '/ikbi/corrections/' + encodeURIComponent(id) + '/approve');
+    },
+    rejectCorrection: function (id) {
+      return request('DELETE', '/ikbi/corrections/' + encodeURIComponent(id));
+    },
   };
 })();

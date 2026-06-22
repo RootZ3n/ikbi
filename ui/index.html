@@ -60,6 +60,7 @@
     <button class="win-toggle" data-win="build-history">Build History</button>
     <button class="win-toggle" data-win="modules">Modules</button>
     <button class="win-toggle" data-win="config">Configuration</button>
+    <button class="win-toggle" data-win="corrections">Corrections</button>
   </div>
 
   <!-- ═══ 3a. HOTSPOT WINDOWS CONTAINER ═══ -->
@@ -140,6 +141,19 @@
         </div>
       </div>
       <div class="hw-body" id="hw-config-body"></div>
+    </div>
+
+    <!-- Corrections Library -->
+    <div class="hw hidden" id="hw-corrections" data-win="corrections">
+      <div class="hw-head">
+        <span class="hw-title">Corrections</span>
+        <div class="hw-actions">
+          <button class="hw-btn" onclick="Ikbui.refreshCorrections()" title="Refresh">↻</button>
+          <button class="hw-btn hw-min" data-action="minimize" title="Minimize">─</button>
+          <button class="hw-btn hw-close" data-action="close" title="Close">✕</button>
+        </div>
+      </div>
+      <div class="hw-body" id="hw-corrections-body"></div>
     </div>
   </section>
 </div>

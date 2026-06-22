@@ -294,6 +294,7 @@
       case 'build-history': loadBuildHistory(); break;
       case 'modules': loadModules(); break;
       case 'config': loadConfig(); break;
+      case 'corrections': loadCorrections(); break;
     }
   }
 
@@ -501,6 +502,79 @@
       }).join('') + '</div>';
   }
 
+  // ── Corrections Library ─────────────────────────────────────────────
+  var CATEGORY_LABELS = {
+    expected_manifest_change: 'Manifest',
+    tool_limitation: 'Tool Limit',
+    environment_missing: 'Env Missing',
+    suspicious_pattern: 'Suspicious',
+    test_weakening: 'Test Weaken',
+    forbidden_file: 'Forbidden',
+    verification_forgery: 'Forgery',
+    conflict_resolution: 'Conflict',
+    custom: 'Custom',
+  };
+
+  async function loadCorrections() {
+    var body = document.getElementById('hw-corrections-body');
+    if (!body) return;
+    body.innerHTML = '<div class="hw-loading">Loading corrections…</div>';
+    var r = await IkbiAPI.listCorrections();
+    if (!r.ok || !r.data) {
+      body.innerHTML = '<div class="offline-notice">Cannot load corrections — engine offline.</div>';
+      return;
+    }
+    var corrections = r.data.corrections || [];
+    if (!corrections.length) {
+      body.innerHTML = '<div class="hw-empty">No corrections proposed yet. Corrections are lessons learned from build failures — proposed by the refuter or an operator, then approved before taking effect.</div>';
+      return;
+    }
+    body.innerHTML = corrections.map(function (c) {
+      var cat = CATEGORY_LABELS[c.category] || c.category;
+      var statusCls = c.approved ? 'corr-approved' : 'corr-pending';
+      var statusLabel = c.approved ? 'Approved' : 'Pending';
+      return '<div class="corr-card ' + statusCls + '">' +
+        '<div class="corr-head">' +
+          '<span class="corr-badge corr-cat-' + esc(c.category) + '">' + esc(cat) + '</span>' +
+          '<span class="corr-status">' + statusLabel + '</span>' +
+          '<span class="corr-count">applied ' + (c.appliedCount || 0) + '×</span>' +
+        '</div>' +
+        '<div class="corr-finding"><strong>Finding:</strong> ' + esc(c.finding) + '</div>' +
+        '<div class="corr-correction"><strong>Correction:</strong> ' + esc(c.correction) + '</div>' +
+        '<div class="corr-regression"><strong>Regression:</strong> ' + esc(c.regression) + '</div>' +
+        '<div class="corr-actions">' +
+          (c.approved
+            ? '<span class="corr-approved-label">✓ Approved</span>'
+            : '<button class="corr-approve-btn" onclick="Ikbui.approveCorrection(\'' + esc(c.id) + '\')">Approve</button>' +
+              '<button class="corr-reject-btn" onclick="Ikbui.rejectCorrection(\'' + esc(c.id) + '\')">Reject</button>') +
+        '</div></div>';
+    }).join('');
+  }
+
+  async function approveCorrection(id) {
+    tui('Approving correction: ' + id, 'cmd');
+    var r = await IkbiAPI.approveCorrection(id);
+    if (r.ok) {
+      tui('Correction approved.', 'ok');
+    } else {
+      tui('Failed to approve: ' + (r.error || 'unknown'), 'err');
+    }
+    windowLoaded['corrections'] = false;
+    loadCorrections();
+  }
+
+  async function rejectCorrection(id) {
+    tui('Rejecting correction: ' + id, 'cmd');
+    var r = await IkbiAPI.rejectCorrection(id);
+    if (r.ok) {
+      tui('Correction rejected and deleted.', 'ok');
+    } else {
+      tui('Failed to reject: ' + (r.error || 'unknown'), 'err');
+    }
+    windowLoaded['corrections'] = false;
+    loadCorrections();
+  }
+
   // ── Configuration ───────────────────────────────────────────────────
   async function loadConfig() {
     var body = document.getElementById('hw-config-body');
@@ -552,6 +626,9 @@
     refreshHistory: function () { windowLoaded['build-history'] = false; loadBuildHistory(); },
     refreshModules: function () { windowLoaded['modules'] = false; loadModules(); },
     refreshConfig: function () { windowLoaded['config'] = false; loadConfig(); },
+    refreshCorrections: function () { windowLoaded['corrections'] = false; loadCorrections(); },
+    approveCorrection: approveCorrection,
+    rejectCorrection: rejectCorrection,
     toggleFindings: toggleFindings,
     sendChat: sendChatMessage,
   };

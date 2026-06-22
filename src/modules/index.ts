@@ -77,6 +77,9 @@ import "./job-cards/index.js";
 import "./repo-doctor/index.js";
 // Spec Artifact — first-class editable plans from step-planner.
 import "./spec-artifact/index.js";
+// Correction Library — reusable lessons learned from build failures (proposed, then
+// operator-approved). The refuter files proposals here; nothing auto-installs.
+import "./correction-library/index.js";
 // Kill-switch LAST — its index reads the durable latch at engine start (graceful
 // degradation), and registers the `kill`/`unkill`/`kill-status` operator commands.
 import "./kill-switch/index.js";
