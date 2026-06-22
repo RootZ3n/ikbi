@@ -64,6 +64,7 @@ import { captureStreamedStdout, committedPackageJsonDiff, parseChecksEnv, parseT
 import { builderModel, competitiveBuilderModels } from "./role-models.js";
 import { createCritic, critic } from "./critic.js";
 import { createRefuter, refuter, proposalFromFinding, type RefuterFinding } from "./refuter.js";
+import { liveCorrectionAccess } from "./correction-application.js";
 import { createCorrection } from "../correction-library/store.js";
 import type { CorrectionProposeInput } from "../correction-library/contract.js";
 import { integrator } from "./integrator.js";
@@ -871,6 +872,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       // The resolved mode honors an explicit IKBI_VERIFY=legacy opt-out + env IKBI_VERIFY=ladder.
       mode: verificationMode,
       env: modeEnv,
+      // Codex HIGH-2: load operator-APPROVED corrections so an approved expected_manifest_change
+      // actually takes effect when classifying package.json changes (and its appliedCount advances).
+      corrections: liveCorrectionAccess,
     });
   }
 
@@ -895,6 +899,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     if (deps.roles?.refuter !== undefined) return deps.roles.refuter;
     return createRefuter({
       ...(workspaces.diff !== undefined ? { diff: (ws: WorkspaceHandle) => workspaces.diff!(ws) } : {}),
+      // Codex HIGH-2: load operator-APPROVED corrections so an approved correction suppresses the
+      // matching refutation finding (and its appliedCount advances) instead of being ignored.
+      corrections: liveCorrectionAccess,
     });
   }
 
@@ -1484,8 +1491,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         }
         // REFUTER (optional gate): skip entirely unless enabled, emitting NO result so the default
         // pipeline's role set + every existing full-run test stay byte-unchanged. When enabled it
-        // runs after the critic; a refuted build files PROPOSED corrections (below) but does not by
-        // itself force discard here — the integrator's existing gates remain the promote authority.
+        // runs BEFORE the integrator (WORKER_ROLES order), so its result is in the integrator's
+        // priorResults. A refuted build (detail.refuted === true) files PROPOSED corrections (below)
+        // AND forces the integrator to DISCARD (Codex HIGH-1) — the integrator reads the refuter
+        // verdict from priorResults and fail-closes on it.
         if (role === "refuter" && !refuterEnabled) {
           continue;
         }

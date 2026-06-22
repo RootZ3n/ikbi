@@ -430,7 +430,7 @@
   async function executeSpec(id) {
     tui('Executing spec: ' + id, 'cmd');
     setTuiStatus('building');
-    var r = await IkbiAPI._get('/ikbi/spec/' + encodeURIComponent(id) + '/execute', { timeout: 30000 });
+    var r = await IkbiAPI._post('/ikbi/spec/' + encodeURIComponent(id) + '/execute', null, { timeout: 30000 });
     setTuiStatus('idle');
     if (r.ok) {
       tui('Spec execution started.', 'ok');

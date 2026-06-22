@@ -37,6 +37,7 @@ import type { CorrectionCategory, CorrectionProposeInput } from "../correction-l
 import type { RoleFn, RoleResult } from "./contract.js";
 import { isExpectedManifestChange } from "./verifier.js";
 import { refuterModel } from "./role-models.js";
+import { type CorrectionAccess, indexByCategory, NOOP_CORRECTIONS } from "./correction-application.js";
 
 // ── Public shapes ──────────────────────────────────────────────────────────
 
@@ -458,6 +459,59 @@ export interface RefuterDeps {
   readonly receiptsPresent?: (taskId: string) => boolean | Promise<boolean>;
   /** Enable the model-driven semantic spec-match check (#7). Default false. */
   readonly semantic?: boolean;
+  /**
+   * APPROVED-correction access (Codex HIGH-2). Default: NO-OP (load nothing) so the bare
+   * constructor + existing tests are byte-unchanged; PRODUCTION wires `liveCorrectionAccess`.
+   * A failed refutation finding whose category matches an approved correction is SUPPRESSED
+   * (the operator already accepted that class of finding), so it no longer refutes the build —
+   * and the correction's appliedCount is incremented.
+   */
+  readonly corrections?: CorrectionAccess;
+}
+
+/**
+ * Codex HIGH-2: apply APPROVED corrections to a raw refutation result. A FAILED finding whose
+ * mapped category (CHECK_TO_CATEGORY) has an approved correction is SUPPRESSED — marked passed and
+ * downgraded to info — because the operator already accepted that class of finding. The applied
+ * correction's appliedCount is recorded. Returns the (possibly) revised findings + recomputed
+ * `refuted` verdict; with no matching corrections the result is byte-identical to the input.
+ */
+function applyCorrectionsToRefutation(
+  base: RefutationResult,
+  corrections: CorrectionAccess,
+): RefutationResult {
+  const byCategory = indexByCategory(corrections.listApproved());
+  if (byCategory.size === 0) return base;
+
+  const applied = new Set<string>();
+  const findings = base.findings.map((f): RefuterFinding => {
+    if (f.passed) return f;
+    const category = CHECK_TO_CATEGORY[f.check];
+    const match = category !== undefined ? byCategory.get(category)?.[0] : undefined;
+    if (match === undefined) return f;
+    applied.add(match.id);
+    return {
+      ...f,
+      passed: true,
+      severity: "info",
+      evidence: `${f.evidence} — suppressed by approved correction ${match.id} (${match.category})`,
+    };
+  });
+  if (applied.size === 0) return base;
+
+  for (const id of applied) corrections.recordApplied(id);
+
+  const refuted = findings.some((f) => !f.passed && f.severity === "critical");
+  const failed = findings.filter((f) => !f.passed);
+  const feedback = refuted
+    ? `REFUTED — ${failed.filter((f) => f.severity === "critical").length} critical finding(s): ${failed
+        .filter((f) => f.severity === "critical")
+        .map((f) => f.check)
+        .join(", ")}`
+    : failed.length > 0
+      ? `not refuted, but ${failed.length} non-critical concern(s): ${failed.map((f) => f.check).join(", ")}`
+      : "not refuted — the build survived every refutation check (after applying approved corrections)";
+  return { refuted, findings, feedback };
 }
 
 const REFUTER_SYSTEM =
@@ -484,6 +538,7 @@ function asStringArray(value: unknown): string[] {
 }
 
 export function createRefuter(deps: RefuterDeps = {}): RoleFn {
+  const corrections = deps.corrections ?? NOOP_CORRECTIONS;
   return async (ctx) => {
     try {
       const builder = ctx.priorResults.find((r) => r.role === "builder");
@@ -535,7 +590,7 @@ export function createRefuter(deps: RefuterDeps = {}): RoleFn {
         }
       }
 
-      const result = runRefutation({
+      const rawResult = runRefutation({
         goal: ctx.task.goal,
         diffText,
         filesClaimed,
@@ -549,6 +604,9 @@ export function createRefuter(deps: RefuterDeps = {}): RoleFn {
         ...(receiptsPresent !== undefined ? { receiptsPresent } : {}),
         ...(specMatch !== undefined ? { specMatch } : {}),
       });
+      // Codex HIGH-2: suppress findings already addressed by an operator-APPROVED correction
+      // (and record each application). With no approved corrections this is a no-op.
+      const result = applyCorrectionsToRefutation(rawResult, corrections);
 
       return {
         role: "refuter",

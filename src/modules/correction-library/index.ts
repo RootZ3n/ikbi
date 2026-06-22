@@ -61,6 +61,9 @@ registerRoutes("correction-library", (app: FastifyInstance) => {
       void reply.code(400);
       return { error: "category (valid), finding, correction, and regression are required" };
     }
+    // GOVERNANCE (Codex LOW-1): a POSTed correction is always PROPOSED. The `approved` field
+    // from the request body is IGNORED — approval is a separate, deliberate step (PATCH
+    // /approve), so a propose call can never pre-approve itself and silently install a lesson.
     const entry = createCorrection({
       category: body.category,
       finding: body.finding as string,
@@ -68,7 +71,7 @@ registerRoutes("correction-library", (app: FastifyInstance) => {
       regression: body.regression as string,
       ...(typeof body.sourceRunId === "string" ? { sourceRunId: body.sourceRunId } : {}),
       ...(typeof body.proposedBy === "string" ? { proposedBy: body.proposedBy } : {}),
-      ...(typeof body.approved === "boolean" ? { approved: body.approved } : {}),
+      approved: false,
     });
     void reply.code(201);
     return entry;

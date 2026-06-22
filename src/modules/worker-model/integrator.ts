@@ -48,6 +48,13 @@ export const integrator: RoleFn = async (ctx) => {
     const builder = ctx.priorResults.find((r) => r.role === "builder");
     const critic = ctx.priorResults.find((r) => r.role === "critic");
     const verifier = ctx.priorResults.find((r) => r.role === "verifier");
+    // REFUTER GATE (Codex HIGH-1): the refuter is the OPTIONAL adversarial gate (off by default).
+    // When it ran (a refuter result is present in priorResults) and it REFUTED the build
+    // (detail.refuted === true), the build is proven to be lying/broken and MUST NOT promote —
+    // regardless of how the builder/critic/verifier voted. This is gated on the refuter actually
+    // having run: with NO refuter result, behavior is unchanged (the default five-role pipeline).
+    const refuter = ctx.priorResults.find((r) => r.role === "refuter");
+    const refuterRefuted = detailOf(refuter).refuted === true;
 
     const builderDetail = detailOf(builder);
     const filesWritten = Array.isArray(builderDetail.filesWritten) ? builderDetail.filesWritten : [];
@@ -107,7 +114,7 @@ export const integrator: RoleFn = async (ctx) => {
     const testEvidence = detailOf(verifier).testEvidence;
     const testEvidenceOk = accumulatedPass || testEvidence === "executed";
 
-    if (builderOk && noPolicyViolations && criticPass && verifierPass && testEvidenceOk) {
+    if (builderOk && noPolicyViolations && criticPass && verifierPass && testEvidenceOk && !refuterRefuted) {
       const rationale =
         accumulatedPass && filesWritten.length === 0
           ? "promote: accumulated multi-step build (this pass wrote 0 files — prior steps did the work), no policy violations, critic pass, verifier pass"
@@ -145,6 +152,13 @@ export const integrator: RoleFn = async (ctx) => {
     // Only an ADDITIONAL constraint on an otherwise-passing verifier: a RED verifier already names
     // its own failure above, so the test-evidence note is redundant noise there.
     else if (!testEvidenceOk) failures.push(`single-run build has no real test evidence (test evidence "${String(testEvidence)}")`);
+    // REFUTER (HIGH-1): an adversarial REFUTAL is an independent discard reason — it can hold even
+    // when every other gate is green (the whole point of the adversarial gate), so it is reported
+    // unconditionally (not chained behind the verifier like the test-evidence note).
+    if (refuterRefuted) {
+      const fb = detailOf(refuter).feedback;
+      failures.push(`refuter refuted the build${typeof fb === "string" && fb.length > 0 ? ` (${fb})` : ""}`);
+    }
 
     const rationale = `discard: ${failures.join("; ")}`;
     return {

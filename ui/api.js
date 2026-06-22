@@ -111,5 +111,13 @@
     rejectCorrection: function (id) {
       return request('DELETE', '/ikbi/corrections/' + encodeURIComponent(id));
     },
+    // Spec artifacts. listSpecs reads the GET list route; executeSpec POSTs (the
+    // server mutates spec status — execution is never a GET).
+    listSpecs: function (o) {
+      return get('/ikbi/spec', o);
+    },
+    executeSpec: function (id, o) {
+      return post('/ikbi/spec/' + encodeURIComponent(id) + '/execute', null, o);
+    },
   };
 })();

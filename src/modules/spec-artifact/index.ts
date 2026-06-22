@@ -8,7 +8,7 @@ import type { FastifyInstance } from "fastify";
 import { registerRoutes } from "../../server/registry.js";
 import { decompose } from "../step-planner/implementation.js";
 import type { SpecArtifact, SpecCardFields, SpecStep } from "./contract.js";
-import { createSpec, getSpec, updateSpec } from "./store.js";
+import { createSpec, getSpec, listSpecs, updateSpec } from "./store.js";
 import { parseStructuredSpec } from "./structured.js";
 
 export type { SpecArtifact, SpecStep, SpecStatus, SpecScope, SpecCardFields } from "./contract.js";
@@ -80,6 +80,12 @@ registerRoutes("spec-artifact", (app: FastifyInstance) => {
         : generateSpec(body.goal as string, undefined, overrides);
     void reply.code(201);
     return spec;
+  });
+
+  // List all specs (the dashboard's spec window reads this on load — HIGH-3)
+  app.get("/ikbi/spec", async () => {
+    const specs = listSpecs();
+    return { specs, count: specs.length };
   });
 
   // Get a spec

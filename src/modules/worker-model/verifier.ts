@@ -62,6 +62,8 @@ import { projectIndex, type ProjectIndexData } from "../project-index/index.js";
 import { isStubScript, verificationLadder, type VerificationPlan } from "../verification-ladder/index.js";
 import { parseCheckOutput, type CheckTriage } from "../check-triage/index.js";
 import { resolveVerificationMode, type VerificationMode } from "./modes.js";
+import { type CorrectionAccess, NOOP_CORRECTIONS } from "./correction-application.js";
+import type { CorrectionEntry } from "../correction-library/contract.js";
 
 // The check-timeout constants + resolver now live in the SHARED check definition (checks.ts) so the
 // verifier and the builder's in-loop run_checks resolve the SAME per-check budget. Re-exported here
@@ -187,6 +189,66 @@ export interface VerifierDeps {
   readonly plan?: (req: { data: ProjectIndexData; changedFiles: string[] }) => VerificationPlan;
   /** Check-output triage for ladder mode. Default: the live `parseCheckOutput`. */
   readonly triage?: typeof parseCheckOutput;
+  /**
+   * APPROVED-correction access (Codex HIGH-2). Default: NO-OP (load nothing) so the bare
+   * constructor + existing tests are byte-unchanged; PRODUCTION wires `liveCorrectionAccess`.
+   * When an approved `expected_manifest_change` / `verification_forgery` correction exists, a
+   * flagged package.json test-script mutation whose NEW value is a real test runner is
+   * reclassified as an EXPECTED change instead of failing verification untrusted — and the
+   * correction's appliedCount is incremented.
+   */
+  readonly corrections?: CorrectionAccess;
+}
+
+/**
+ * Codex HIGH-2: extract the NEW (added) value of a package.json `"<key>": "..."` script line from
+ * a unified diff. Scans only within package.json file sections so a same-named key elsewhere is not
+ * misread. Returns undefined when the key is not set on any added line.
+ */
+function extractAddedScriptValue(diff: string, key: string): string | undefined {
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`^\\+\\s*"${escapedKey}"\\s*:\\s*"(.*)"\\s*,?\\s*$`);
+  let inPkg = false;
+  for (const line of diff.split("\n")) {
+    if (line.startsWith("diff --git ")) {
+      inPkg = /(?:^|\/)package\.json(?:\s|$)/.test(line);
+      continue;
+    }
+    if (line.startsWith("+++ ")) {
+      if (/(?:^|\/)package\.json/.test(line)) inPkg = true;
+      continue;
+    }
+    if (!inPkg) continue;
+    const m = re.exec(line);
+    if (m && m[1] !== undefined) return m[1];
+  }
+  return undefined;
+}
+
+/**
+ * Codex HIGH-2: decide whether an APPROVED correction reclassifies a flagged package.json script
+ * mutation as an EXPECTED manifest change. Applies ONLY to package.json SCRIPT mutations whose NEW
+ * value is a recognized REAL test runner — so an operator-approved correction can whitelist a
+ * stub→real-runner transition the built-in patterns miss (e.g. a non-standard old stub), but NEVER
+ * a real→stub forgery (a stub new value is not a real runner, so it stays rejected). Records the
+ * application of the first matching approved correction and returns it; undefined ⇒ no override.
+ */
+function expectedManifestCorrection(
+  reason: string | undefined,
+  diff: string,
+  corrections: CorrectionAccess,
+): CorrectionEntry | undefined {
+  const keyMatch = /package\.json script "([^"]+)"/.exec(reason ?? "");
+  if (keyMatch === null || keyMatch[1] === undefined) return undefined;
+  const newValue = extractAddedScriptValue(diff, keyMatch[1]);
+  if (newValue === undefined) return undefined;
+  if (!REAL_TEST_RUNNERS.some((p) => p.test(newValue.trim()))) return undefined;
+  const match = corrections
+    .listApproved()
+    .find((c) => c.category === "expected_manifest_change" || c.category === "verification_forgery");
+  if (match === undefined) return undefined;
+  corrections.recordApplied(match.id);
+  return match;
 }
 
 /** Lazy live governed-exec — importing it eagerly would force the gate-wall/egress wiring order. */
@@ -727,6 +789,7 @@ function legacyDetectScriptMutation(diff: string): { mutated: boolean; reason?: 
 }
 export function createVerifier(deps: VerifierDeps = {}): RoleFn {
   const governedExec = deps.governedExec ?? lazyGovernedExec();
+  const corrections = deps.corrections ?? NOOP_CORRECTIONS;
   return async (ctx) => {
     // ── LAYER 2: SCRIPT-INTEGRITY GUARD (MANDATORY, before ANY check) ─────────
     // The guard is not optional: WITHOUT the ability to inspect the diff the verifier
@@ -746,9 +809,16 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
     }
     const mutation = detectScriptMutation(diffText);
     if (mutation.mutated) {
-      // The builder controls the test command — a passing result cannot be trusted and
-      // must NOT feed the judge/promote. Do NOT run the mutated script as a real check.
-      return untrusted(`verification untrusted: ${mutation.reason}`);
+      // Codex HIGH-2: an operator-APPROVED expected_manifest_change/verification_forgery correction
+      // can reclassify a flagged package.json test-script mutation as EXPECTED — but only when the
+      // NEW script is a real test runner (never a real→stub forgery). When it applies, the rejection
+      // is suppressed (verification continues) and the correction's appliedCount advances.
+      const override = expectedManifestCorrection(mutation.reason, diffText, corrections);
+      if (override === undefined) {
+        // The builder controls the test command — a passing result cannot be trusted and
+        // must NOT feed the judge/promote. Do NOT run the mutated script as a real check.
+        return untrusted(`verification untrusted: ${mutation.reason}`);
+      }
     }
     // SECOND PASS: a guarded script unchanged in package.json can still be neutered if it SHELLS OUT
     // to a file the build rewrote (`"test": "bash ./test.sh"` clean, but test.sh → `exit 0`). The
