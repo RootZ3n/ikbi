@@ -63,6 +63,9 @@ import type { CandidateRun, CandidateSpec, ShadowVerification, TournamentEngine,
 import { captureStreamedStdout, committedPackageJsonDiff, parseChecksEnv, parseTestCount, PROJECT_MANIFESTS, resolveChecks, resolveCheckTimeoutMs, workingTreePackageJsonDiff, workingTreePlanningDiff } from "./checks.js";
 import { builderModel, competitiveBuilderModels } from "./role-models.js";
 import { createCritic, critic } from "./critic.js";
+import { createRefuter, refuter, proposalFromFinding, type RefuterFinding } from "./refuter.js";
+import { createCorrection } from "../correction-library/store.js";
+import type { CorrectionProposeInput } from "../correction-library/contract.js";
 import { integrator } from "./integrator.js";
 import { createScout, scout } from "./scout.js";
 import { createVerifier, verifier } from "./verifier.js";
@@ -454,6 +457,12 @@ export interface OrchestratorDeps {
   /** Produce the credential claim for a role. Default: fail-closed (must be configured). */
   readonly roleClaim?: (role: WorkerRole) => IdentityClaim;
   readonly trust?: { recordOutcome: (input: RecordOutcomeInput, subject: ValidatedIdentity) => Promise<TrustDecision> };
+  /**
+   * Sink for the PROPOSED corrections the refuter files after a refuted build. Default writes them
+   * to the correction-library store (~/.ikbi/corrections, approved=false). Injectable so tests can
+   * capture proposals without touching disk. Best-effort: a throw here never fails the run.
+   */
+  readonly proposeCorrection?: (input: CorrectionProposeInput) => void;
   readonly workspaces?: {
     allocate: (opts: { targetRepo: string; identity: AgentIdentity; baseBranch?: string; label?: string }) => Promise<WorkspaceHandle>;
     promote: (handle: WorkspaceHandle, approval: { evaluation: WorkspaceEvaluation; governance?: PromoteGovernance; message?: string }) => Promise<PromoteResult>;
@@ -594,7 +603,7 @@ interface SpawnedRole {
   readonly validated: ValidatedIdentity;
 }
 
-const DEFAULT_ROLES: Record<WorkerRole, RoleFn> = { scout, builder, critic, verifier, integrator };
+const DEFAULT_ROLES: Record<WorkerRole, RoleFn> = { scout, builder, critic, verifier, refuter, integrator };
 
 /** Lazy provider import — never construct the provider singleton at module load. */
 async function lazyInvokeModel(request: ModelRequest): Promise<ModelResponse> {
@@ -871,6 +880,44 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     return createCritic({
       ...(workspaces.diff !== undefined ? { diff: (ws: WorkspaceHandle) => workspaces.diff!(ws) } : {}),
     });
+  }
+
+  // REFUTER: the OPTIONAL adversarial gate. Enabled ONLY by config.enableRefuter (env
+  // IKBI_WORKER_MODEL_ENABLE_REFUTER / deps.config). Deliberately NOT keyed off an injected
+  // deps.roles.refuter — tests build the full role map by iterating WORKER_ROLES, so keying on
+  // injection would silently enable the refuter (and add a 6th dispatched role) everywhere. With
+  // config the sole switch, the default five-role pipeline and every existing full-run test are
+  // byte-unchanged; a refuter test opts in via deps.config.enableRefuter.
+  const refuterEnabled = config.enableRefuter === true;
+
+  /** The refuter for THIS run. Honors injected tests, otherwise wires it to the workspace diff. */
+  function refuterFor(): RoleFn {
+    if (deps.roles?.refuter !== undefined) return deps.roles.refuter;
+    return createRefuter({
+      ...(workspaces.diff !== undefined ? { diff: (ws: WorkspaceHandle) => workspaces.diff!(ws) } : {}),
+    });
+  }
+
+  // Sink for refuter-proposed corrections (best-effort; default writes to the correction store).
+  const proposeCorrection: (input: CorrectionProposeInput) => void =
+    deps.proposeCorrection ?? ((input) => { createCorrection(input); });
+
+  /**
+   * After a REFUTED build, file each failed refuter finding as a PROPOSED correction
+   * (approved=false — governance requires human/operator approval before it takes effect).
+   * Best-effort: proposing corrections must never fail the run.
+   */
+  function fileRefuterCorrections(refuterResult: RoleResult, runId: string): void {
+    try {
+      const detail = (refuterResult.detail ?? {}) as { refuted?: unknown; findings?: unknown };
+      if (detail.refuted !== true || !Array.isArray(detail.findings)) return;
+      for (const f of detail.findings as RefuterFinding[]) {
+        if (f.passed) continue;
+        proposeCorrection(proposalFromFinding(f, runId));
+      }
+    } catch {
+      // best-effort — never let correction proposal break the build pipeline
+    }
   }
 
   /**
@@ -1435,6 +1482,14 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             continue;
           }
         }
+        // REFUTER (optional gate): skip entirely unless enabled, emitting NO result so the default
+        // pipeline's role set + every existing full-run test stay byte-unchanged. When enabled it
+        // runs after the critic; a refuted build files PROPOSED corrections (below) but does not by
+        // itself force discard here — the integrator's existing gates remain the promote authority.
+        if (role === "refuter" && !refuterEnabled) {
+          continue;
+        }
+
         const spawned = spawnRole(role, parentCtx);
         if (workerSpawned === undefined) workerSpawned = spawned;
         // FIX 6: assert all roles share the same agent identity (per-build trust invariant).
@@ -1463,7 +1518,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         // --complexity large: skip the worker-tier builder entirely and start with the mid-tier
         // model. This avoids wasting a flash attempt on repos known to be too large for cheap models.
         const complexityModel = task.complexity === "large" ? escalationConfig.tierModels.mid[0] : undefined;
-        const roleFn = role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderForModel(parentCtx, complexityModel, resolveBuilderMode(task)) : role === "critic" ? criticFor() : roles[role];
+        const roleFn = role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderForModel(parentCtx, complexityModel, resolveBuilderMode(task)) : role === "critic" ? criticFor() : role === "refuter" ? refuterFor() : roles[role];
         // H4: floor the verifier's role timeout at the per-check budget. Without this, a 300s role
         // timeout races against 600s checks — the role fails first, orphaning the still-running check.
         const verifierTimeout = role === "verifier" ? Math.max(roleTimeoutMs, resolveCheckTimeoutMs(modeEnv)) : undefined;
@@ -1477,6 +1532,13 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             ? fixLoopVerifierResult
             : await runRoleFn(role, roleFn, ctx, verifierTimeout);
         results.push(result);
+
+        // REFUTER → CORRECTION LIBRARY: a refuted build files each failed finding as a PROPOSED
+        // correction (approved=false). Governance requires a human/operator to approve before any
+        // correction takes effect; this only records the lesson. Best-effort (never fails the run).
+        if (role === "refuter") {
+          fileRefuterCorrections(result, task.taskId);
+        }
 
         // ── AUTO-VERIFY RESCUE: builder wrote files but NEVER ran checks ──────────
         // Delegated to maybeAutoVerifyRescueBuilderResult (shared with competitive/tournament).

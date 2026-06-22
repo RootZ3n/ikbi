@@ -25,6 +25,11 @@
  *   critic     — reviews builder output against task intent: pass/fail + feedback.
  *   verifier   — runs objective checks (tests/typecheck) against the workspace:
  *                a verdict.
+ *   refuter    — the ADVERSARIAL gate (OPTIONAL, off by default): runs a fixed
+ *                refutation checklist that tries to PROVE the build is broken/lying.
+ *                A single critical finding refutes the build. The orchestrator only
+ *                dispatches it when explicitly enabled, so the default pipeline is
+ *                byte-unchanged; when disabled it is skipped (no result emitted).
  *   integrator — produces the promote DECISION on success / discard on failure.
  *                NOTE: the WORKSPACE LIFECYCLE (allocate/promote/discard) is
  *                executed by the ORCHESTRATOR (freeze-critical), not the role; the
@@ -55,8 +60,12 @@ export const CONTRACT_VERSION = "1.0.0";
  * "tests green, typecheck clean" can specialize in the semantic/goal-alignment
  * concerns objective checks cannot catch, instead of judging blind. The integrator's
  * AND-gate reads every role's result from priorResults and is order-independent.
+ *
+ * The REFUTER sits between the critic and the integrator (the last gate before the
+ * promote decision). It is OPTIONAL: the orchestrator skips it unless explicitly
+ * enabled, so adding it to the enum does NOT change the default five-role pipeline.
  */
-export const WORKER_ROLES = ["scout", "builder", "verifier", "critic", "integrator"] as const;
+export const WORKER_ROLES = ["scout", "builder", "verifier", "critic", "refuter", "integrator"] as const;
 export type WorkerRole = (typeof WORKER_ROLES)[number];
 
 /** Runtime guard: is `s` a known worker role? */

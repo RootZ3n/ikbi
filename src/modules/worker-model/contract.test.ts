@@ -14,9 +14,12 @@ test("the worker-model contract is versioned (1.0.0, the initial module contract
   assert.equal(CONTRACT_VERSION, "1.0.0");
 });
 
-test("WorkerRole enum is the complete five-role set, in dispatch order", () => {
-  assert.deepEqual([...WORKER_ROLES], ["scout", "builder", "verifier", "critic", "integrator"]);
-  assert.equal(WORKER_ROLES.length, 5);
+test("WorkerRole enum is the complete six-role set, in dispatch order", () => {
+  // The REFUTER sits between the critic and the integrator (the adversarial gate before the
+  // promote decision). It is OPTIONAL — the orchestrator skips it unless explicitly enabled —
+  // so its presence in the enum does not change the default pipeline.
+  assert.deepEqual([...WORKER_ROLES], ["scout", "builder", "verifier", "critic", "refuter", "integrator"]);
+  assert.equal(WORKER_ROLES.length, 6);
   for (const r of WORKER_ROLES) assert.equal(isWorkerRole(r), true);
   assert.equal(isWorkerRole("orchestrator"), false);
   assert.equal(isWorkerRole(""), false);

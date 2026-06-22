@@ -2116,3 +2116,91 @@ test("DIAGNOSTIC: a critic FAIL that does not drive the fix loop records a worke
   assert.equal(meta.verifierPassedForCriticGate, true, "the verifier had passed — the only blocker was the disabled loop");
   assert.deepEqual(meta.blockedBy, ["criticFixLoopEnabled"], "the diagnostic names the disabled fix loop as the sole blocker");
 });
+
+// ── REFUTER gate + correction-library wiring ───────────────────────────────
+
+const REFUTER_ON = { ...ENABLED, enableRefuter: true };
+
+test("refuter is OFF by default: not dispatched and no corrections proposed", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const cap = capturingRoles();
+  const proposals: unknown[] = [];
+  const orch = createOrchestrator(
+    baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, proposeCorrection: (i) => proposals.push(i) }),
+  );
+  await orch.run(task, parentCtx);
+
+  assert.deepEqual(cap.seen.map((c) => c.role), ["scout", "builder", "verifier", "critic", "integrator"]);
+  assert.equal(proposals.length, 0, "no corrections proposed when the refuter is off");
+});
+
+test("refuter (enabled) dispatches between critic and integrator", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const cap = capturingRoles();
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, config: REFUTER_ON }));
+  await orch.run(task, parentCtx);
+
+  assert.deepEqual(cap.seen.map((c) => c.role), ["scout", "builder", "verifier", "critic", "refuter", "integrator"]);
+});
+
+test("refuter (enabled) files PROPOSED corrections for each failed finding on a refuted build", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const cap = capturingRoles();
+  const proposals: Array<{ category: string; approved: boolean; sourceRunId?: string }> = [];
+  const roles = {
+    ...cap.roles,
+    refuter: async (_ctx: RoleContext): Promise<RoleResult> => ({
+      role: "refuter",
+      outcome: "success",
+      summary: "refutation verdict: REFUTED",
+      detail: {
+        refuted: true,
+        findings: [
+          { check: "tests_not_weakened", passed: false, evidence: "assertions removed", severity: "critical" },
+          { check: "no_forbidden_files", passed: false, evidence: ".github modified", severity: "critical" },
+          { check: "tests_actually_run", passed: true, evidence: "ok", severity: "info" }, // passing → not proposed
+        ],
+      },
+    }),
+  };
+  const orch = createOrchestrator(
+    baseDeps({
+      resolveIdentity,
+      roleClaim,
+      roles,
+      config: REFUTER_ON,
+      proposeCorrection: (i) => proposals.push(i as { category: string; approved: boolean; sourceRunId?: string }),
+    }),
+  );
+  await orch.run({ taskId: "t-refute", targetRepo: "/repo", goal: "do the thing" }, parentCtx);
+
+  assert.equal(proposals.length, 2, "only the two FAILED findings became proposals");
+  assert.ok(proposals.every((p) => p.approved === false), "corrections are PROPOSED, never auto-approved");
+  assert.ok(proposals.every((p) => p.sourceRunId === "t-refute"), "each proposal carries the source run id");
+  assert.deepEqual(
+    proposals.map((p) => p.category).sort(),
+    ["forbidden_file", "test_weakening"],
+    "findings map to their correction categories",
+  );
+});
+
+test("refuter (enabled) proposes NO corrections when the build survives", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const cap = capturingRoles();
+  const proposals: unknown[] = [];
+  const roles = {
+    ...cap.roles,
+    refuter: async (_ctx: RoleContext): Promise<RoleResult> => ({
+      role: "refuter",
+      outcome: "success",
+      summary: "refutation verdict: SURVIVED",
+      detail: { refuted: false, findings: [{ check: "tests_not_weakened", passed: true, evidence: "ok", severity: "info" }] },
+    }),
+  };
+  const orch = createOrchestrator(
+    baseDeps({ resolveIdentity, roleClaim, roles, config: REFUTER_ON, proposeCorrection: (i) => proposals.push(i) }),
+  );
+  await orch.run(task, parentCtx);
+
+  assert.equal(proposals.length, 0, "a survived build files no corrections");
+});

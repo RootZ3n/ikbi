@@ -35,6 +35,15 @@ export function criticModel(cfg: IkbiConfig = config): string {
   return cfg.provider.defaultModels.critic;
 }
 
+/**
+ * The REFUTER-tier model id. The refuter's adversarial semantic spec-match reuses the
+ * CRITIC model id (both are strict, low-temperature judgment roles); resolving it through
+ * its own seam lets an operator repoint the refuter independently later without a roster alias.
+ */
+export function refuterModel(cfg: IkbiConfig = config): string {
+  return cfg.provider.defaultModels.critic;
+}
+
 /** The head-to-head competitive model list (IKBI_COMPETITIVE_MODELS), or undefined if unset. */
 export function competitiveBuilderModels(cfg: IkbiConfig = config): readonly string[] | undefined {
   return cfg.provider.defaultModels.competitiveModels;

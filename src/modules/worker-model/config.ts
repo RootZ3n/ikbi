@@ -145,6 +145,15 @@ export interface WorkerModelConfig {
    */
   readonly skipCriticOnRed?: boolean;
   /**
+   * Enable the adversarial REFUTER gate (runs after the critic, before the integrator). It runs a
+   * fixed refutation checklist that tries to PROVE the build is broken/lying; a single critical
+   * finding refutes the build and the orchestrator files PROPOSED corrections from the findings.
+   * DEFAULT OFF — adding the refuter to WORKER_ROLES must not change the default five-role pipeline.
+   * Set IKBI_WORKER_MODEL_ENABLE_REFUTER=true to opt in. Optional in the type so pre-existing
+   * config literals stay valid; the loader always sets it.
+   */
+  readonly enableRefuter?: boolean;
+  /**
    * The DEFAULT builder lane (agent | patch) from IKBI_BUILDER_MODE. A task's own `builderMode`
    * overrides this. DEFAULT "agent" — the autonomous builder lane is unchanged unless opted out.
    * Optional in the type so pre-existing config literals stay valid; the loader always sets it.
@@ -175,6 +184,7 @@ export function loadWorkerModelConfig(reader = env): WorkerModelConfig {
     fixLoop: reader.bool("FIX_LOOP", false),
     criticFixLoop: reader.bool("CRITIC_FIX_LOOP", false),
     skipCriticOnRed: reader.bool("SKIP_CRITIC_ON_RED", true),
+    enableRefuter: reader.bool("ENABLE_REFUTER", false),
     builderMode: loadBuilderMode(),
     candidateModels: loadCandidateModels(),
   });
