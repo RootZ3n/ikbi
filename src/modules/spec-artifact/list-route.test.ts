@@ -52,3 +52,22 @@ test("HIGH-3: a generated spec appears in GET /ikbi/spec (route reflects listSpe
     rmSync(join(resolveStoreDir(), `${created.id}.json`), { force: true });
   });
 });
+
+test("HIGH-2: POST /ikbi/spec/:id/execute returns not_implemented status (dry-run preview)", async () => {
+  await withServer(async (app) => {
+    const created = (
+      await app.inject({ method: "POST", url: "/ikbi/spec/generate", payload: { goal: "fix the auth bug" } })
+    ).json();
+    assert.ok(created.id, "a spec was generated");
+
+    const result = (
+      await app.inject({ method: "POST", url: `/ikbi/spec/${created.id}/execute` })
+    ).json();
+    assert.equal(result.status, "not_implemented", "execute should set status to not_implemented, not completed");
+    assert.match(result.output, /dry-run preview/i, "output should mention dry-run preview");
+    assert.match(result.output, /not yet implemented/i, "output should say execution is not yet implemented");
+
+    // Cleanup
+    rmSync(join(resolveStoreDir(), `${created.id}.json`), { force: true });
+  });
+});

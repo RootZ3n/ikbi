@@ -337,3 +337,121 @@ test("createRefuter RoleFn: claimed file that exists on disk survives", async ()
   const result = await role(ctx);
   assert.equal((result.detail as { refuted: boolean }).refuted, false);
 });
+
+// ── Semantic mode (HIGH-3) ──────────────────────────────────────────────────
+
+test("HIGH-3: semantic off (default) — result_matches_spec uses heuristic, passes when diff exists", async () => {
+  // Without semantic:true, check #7 falls through to the trivial heuristic that
+  // passes whenever any diff is present — even if the diff is off-target.
+  const role = createRefuter({ diff: async () => CLEAN_DIFF });
+  const ctx = makeCtx([
+    { role: "builder", outcome: "success", detail: { filesWritten: [] } },
+    { role: "verifier", outcome: "success", detail: { verdict: "pass", testEvidence: "executed" } },
+  ]);
+  const result = await role(ctx);
+  const detail = result.detail as { refuted: boolean; findings: RefuterFinding[] };
+  assert.equal(detail.refuted, false, "should not be refuted with heuristic mode");
+  const f = detail.findings.find((x) => x.check === "result_matches_spec");
+  assert.ok(f, "result_matches_spec finding exists");
+  assert.equal(f!.passed, true, "heuristic passes when diff exists");
+  assert.match(f!.evidence, /not semantically evaluated/i, "evidence says heuristic was used");
+});
+
+test("HIGH-3: semantic on — invokes model for result_matches_spec", async () => {
+  let modelCalled = false;
+  const ctx: RoleContext = {
+    task: { taskId: "t-semantic", targetRepo: "/tmp/fake", goal: "add a health endpoint" },
+    role: "refuter",
+    identity: IDENTITY,
+    autonomy: autonomyForTier("verified"),
+    workspace: makeWorkspace(),
+    priorResults: [
+      { role: "builder", outcome: "success", detail: { filesWritten: [] } },
+      { role: "verifier", outcome: "success", detail: { verdict: "pass", testEvidence: "executed" } },
+    ],
+    engine: {
+      invokeModel: async (_req: ModelRequest) => {
+        modelCalled = true;
+        return modelResponse('{"matched": true, "evidence": "health endpoint matches goal"}');
+      },
+      neutralizeUntrusted: (content, context) => coreNeutralize(content, context),
+    },
+  };
+  const role = createRefuter({ diff: async () => CLEAN_DIFF, semantic: true });
+  const result = await role(ctx);
+  assert.equal(modelCalled, true, "model should be invoked when semantic=true");
+  const detail = result.detail as { refuted: boolean; findings: RefuterFinding[] };
+  const f = detail.findings.find((x) => x.check === "result_matches_spec");
+  assert.ok(f, "result_matches_spec finding exists");
+  assert.equal(f!.passed, true, "model said matched=true");
+  assert.equal(f!.evidence, "health endpoint matches goal", "uses model evidence");
+});
+
+test("HIGH-3: semantic mode catches off-target builds (model says matched=false)", async () => {
+  // A builder that reformatted a README instead of fixing an auth bug.
+  // With semantic mode, the model should catch this as off-target.
+  const offTargetDiff = [
+    "diff --git a/README.md b/README.md",
+    "--- a/README.md",
+    "+++ b/README.md",
+    "@@ -1,3 +1,3 @@",
+    "-# My Project",
+    "+# My Project ",
+    " Some description",
+    " More text",
+    "",
+  ].join("\n");
+
+  const ctx: RoleContext = {
+    task: { taskId: "t-offtarget", targetRepo: "/tmp/fake", goal: "fix the authentication bug in login endpoint" },
+    role: "refuter",
+    identity: IDENTITY,
+    autonomy: autonomyForTier("verified"),
+    workspace: makeWorkspace(),
+    priorResults: [
+      { role: "builder", outcome: "success", detail: { filesWritten: [] } },
+      { role: "verifier", outcome: "success", detail: { verdict: "pass", testEvidence: "executed" } },
+    ],
+    engine: {
+      invokeModel: async (_req: ModelRequest) =>
+        modelResponse('{"matched": false, "evidence": "README reformatting does not fix the auth bug"}'),
+      neutralizeUntrusted: (content, context) => coreNeutralize(content, context),
+    },
+  };
+  const role = createRefuter({ diff: async () => offTargetDiff, semantic: true });
+  const result = await role(ctx);
+  const detail = result.detail as { refuted: boolean; findings: RefuterFinding[] };
+  assert.equal(detail.refuted, true, "off-target build should be refuted in semantic mode");
+  const f = detail.findings.find((x) => x.check === "result_matches_spec");
+  assert.ok(f, "result_matches_spec finding exists");
+  assert.equal(f!.passed, false, "model said matched=false");
+  assert.equal(f!.severity, "critical", "mismatch is critical severity");
+  assert.match(f!.evidence, /README.*auth bug/i, "evidence explains the mismatch");
+});
+
+test("HIGH-3: semantic model failure falls through to heuristic gracefully", async () => {
+  // If the model throws, #7 should fall through to the deterministic heuristic.
+  const ctx: RoleContext = {
+    task: { taskId: "t-fallback", targetRepo: "/tmp/fake", goal: "add a health endpoint" },
+    role: "refuter",
+    identity: IDENTITY,
+    autonomy: autonomyForTier("verified"),
+    workspace: makeWorkspace(),
+    priorResults: [
+      { role: "builder", outcome: "success", detail: { filesWritten: [] } },
+      { role: "verifier", outcome: "success", detail: { verdict: "pass", testEvidence: "executed" } },
+    ],
+    engine: {
+      invokeModel: async () => { throw new Error("model unavailable"); },
+      neutralizeUntrusted: (content, context) => coreNeutralize(content, context),
+    },
+  };
+  const role = createRefuter({ diff: async () => CLEAN_DIFF, semantic: true });
+  const result = await role(ctx);
+  const detail = result.detail as { refuted: boolean; findings: RefuterFinding[] };
+  // Should fall through to heuristic (passes when diff exists)
+  const f = detail.findings.find((x) => x.check === "result_matches_spec");
+  assert.ok(f, "result_matches_spec finding exists");
+  assert.equal(f!.passed, true, "falls through to heuristic when model fails");
+  assert.match(f!.evidence, /not semantically evaluated/i, "heuristic fallback evidence");
+});

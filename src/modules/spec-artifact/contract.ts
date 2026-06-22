@@ -6,7 +6,7 @@
  */
 
 /** Status of a spec artifact. */
-export type SpecStatus = "draft" | "approved" | "executing" | "completed" | "failed";
+export type SpecStatus = "draft" | "approved" | "executing" | "completed" | "failed" | "not_implemented";
 
 /** A single step in a spec. */
 export interface SpecStep {

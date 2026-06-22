@@ -902,6 +902,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       // Codex HIGH-2: load operator-APPROVED corrections so an approved correction suppresses the
       // matching refutation finding (and its appliedCount advances) instead of being ignored.
       corrections: liveCorrectionAccess,
+      // HIGH-3: wire semantic spec-match (#7) when IKBI_REFUTER_SEMANTIC is set.
+      // Without this, check #7 falls through to a trivial heuristic that passes whenever
+      // any diff exists — even off-target builds (e.g. reformatting a README instead of
+      // fixing an auth bug). Default: false for backward compat.
+      ...(process.env.IKBI_REFUTER_SEMANTIC === "true" ? { semantic: true } : {}),
     });
   }
 

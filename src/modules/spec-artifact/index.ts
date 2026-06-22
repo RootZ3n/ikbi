@@ -136,9 +136,11 @@ registerRoutes("spec-artifact", (app: FastifyInstance) => {
     try {
       const outputs: string[] = [];
       for (const step of spec.steps) {
-        outputs.push(`Step ${step.index}: ${step.goal} — received`);
+        outputs.push(`Step ${step.index}: ${step.goal} — received (dry-run preview)`);
       }
-      const result = updateSpec(id, { status: "completed", output: outputs.join("\n") });
+      outputs.push("");
+      outputs.push("Spec execution is not yet implemented. This is a dry-run preview.");
+      const result = updateSpec(id, { status: "not_implemented", output: outputs.join("\n") });
       return result;
     } catch (err) {
       const error = err instanceof Error ? err.message : String(err);
