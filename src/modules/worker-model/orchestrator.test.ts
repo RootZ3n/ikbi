@@ -1983,19 +1983,25 @@ test("build-mode escalation: builder succeeds with 0 files → cheap retry → p
   assert.equal((proRetried?.payload as { success: boolean } | undefined)?.success, true);
 });
 
-test("build-mode escalation: builder fails on the cheap tier → engine recommends mid → pro retry runs on the escalated model and the build converges (no cheap retry for explicit failures)", async () => {
+test("build-mode escalation: builder fails on the cheap tier → cheap retry → pro escalation converges", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
   const ws = fakeWorkspaces(true);
   const bus = fakeBus();
   const cap = capturingRoles();
   const builderGoals: string[] = [];
+  let cheapRetried = false;
   const roles: Partial<Record<WorkerRole, RoleFn>> = {
     ...cap.roles,
     builder: async (ctx: RoleContext): Promise<RoleResult> => {
       builderGoals.push(ctx.task.goal);
       // Cheap attempt: FAIL with signals that fold to score 50 (worker→mid threshold).
-      if (!ctx.task.goal.includes("[escalation]")) {
+      if (!ctx.task.goal.includes("[escalation]") && !ctx.task.goal.includes("[retry]")) {
         return { role: "builder", outcome: "failure", summary: "flash gave up", detail: { toolFormatErrors: [1, 2], retryCount: 3 } };
+      }
+      // Cheap retry (same model with feedback): also FAIL — triggers pro escalation.
+      if (ctx.task.goal.includes("[retry]")) {
+        cheapRetried = true;
+        return { role: "builder", outcome: "failure", summary: "cheap retry also failed" };
       }
       // Escalated retry (mid tier / pro model): converge.
       return { role: "builder", outcome: "success", summary: "pro fixed it" };
@@ -2004,10 +2010,11 @@ test("build-mode escalation: builder fails on the cheap tier → engine recommen
   const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces, events: bus.bus }));
   const result = await orch.run({ taskId: "t-esc-explicit-fail", targetRepo: "/repo", goal: "do the thing" }, parentCtx);
 
-  assert.equal(builderGoals.length, 2, "builder ran twice: cheap attempt + one escalated retry (no cheap retry for explicit failures)");
-  assert.match(builderGoals[1] ?? "", /\[escalation\]/, "the retry carried the escalation handoff context");
-  assert.match(builderGoals[1] ?? "", /deepseek-v4-pro/, "the handoff names the escalated model");
-  assert.match(builderGoals[1] ?? "", /Previous attempt outcome: flash gave up/, "the handoff relays what the cheap attempt got wrong");
+  assert.ok(cheapRetried, "cheap retry fired for explicit failure");
+  assert.equal(builderGoals.length, 3, "builder ran three times: cheap attempt + cheap retry + one escalated retry");
+  assert.match(builderGoals[1] ?? "", /\[retry\]/, "the cheap retry carried retry context");
+  assert.match(builderGoals[2] ?? "", /\[escalation\]/, "the escalated retry carried the escalation handoff context");
+  assert.match(builderGoals[2] ?? "", /deepseek-v4-pro/, "the handoff names the escalated model");
   assert.ok(result.escalationRetry, "escalationRetry surfaced on the result");
   assert.equal(result.escalationRetry?.attempted, true);
   assert.equal(result.escalationRetry?.succeeded, true, "the escalated retry converged");
@@ -2015,13 +2022,14 @@ test("build-mode escalation: builder fails on the cheap tier → engine recommen
   assert.equal(result.outcome, "success", "the escalated build verified and promoted like a first-try green build");
   assert.equal(result.promoted, true);
   assert.equal(ws.calls.promote, 1, "promoted the escalated work");
-  const retried = bus.sent.find((e) => e.type === "worker.escalation.retried");
-  assert.ok(retried, "worker.escalation.retried event emitted");
-  assert.equal((retried?.payload as { toModel: string; success: boolean } | undefined)?.toModel, "deepseek-v4-pro");
-  assert.equal((retried?.payload as { success: boolean } | undefined)?.success, true);
+  const retried = bus.sent.filter((e) => e.type === "worker.escalation.retried");
+  assert.ok(retried.length >= 2, "both cheap retry and pro escalation events emitted");
+  const proRetried = retried[retried.length - 1];
+  assert.equal((proRetried?.payload as { toModel: string; success: boolean } | undefined)?.toModel, "deepseek-v4-pro");
+  assert.equal((proRetried?.payload as { success: boolean } | undefined)?.success, true);
 });
 
-test("build-mode escalation: a failed escalated retry leaves the original failure standing (fail-closed, silent success → cheap retry → pro — all fail)", async () => {
+test("build-mode escalation: a failed escalated retry leaves the original failure standing (fail-closed, flash → cheap retry → pro — all fail)", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
   const ws = fakeWorkspaces(true);
   const bus = fakeBus();
@@ -2029,30 +2037,27 @@ test("build-mode escalation: a failed escalated retry leaves the original failur
   let builderCalls = 0;
   const roles: Partial<Record<WorkerRole, RoleFn>> = {
     ...cap.roles,
-    // ALL attempts fail: silent success (0 files), cheap retry, AND escalated retry — proving
+    // ALL attempts fail: cheap attempt, cheap retry, AND escalated retry — proving
     // the dual-model pattern runs exactly once each (cheapRetryAttempted + escalationAttempted).
     builder: async (_ctx: RoleContext): Promise<RoleResult> => {
       builderCalls += 1;
-      // First call: silent success (0 files) — triggers cheap retry
-      if (builderCalls === 1) {
-        return { role: "builder", outcome: "success", summary: "called done", detail: { filesWritten: [], toolRounds: 9 } };
-      }
-      // Subsequent calls: explicit failures (cheap retry + pro)
-      return { role: "builder", outcome: "failure", summary: "still failing" };
+      return { role: "builder", outcome: "failure", summary: "still failing", detail: { toolFormatErrors: [1, 2], retryCount: 3 } };
     },
   };
   const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces, events: bus.bus }));
-  const result = await orch.run({ taskId: "t-esc-silent-fail", targetRepo: "/repo", goal: "do the thing" }, parentCtx);
+  const result = await orch.run({ taskId: "t-esc-all-fail", targetRepo: "/repo", goal: "do the thing" }, parentCtx);
 
-  assert.equal(builderCalls, 3, "silent success + cheap retry + one escalated retry — escalationAttempted prevents an escalation loop");
+  assert.equal(builderCalls, 3, "flash attempt + cheap retry + one escalated retry — escalationAttempted prevents an escalation loop");
   assert.equal(result.escalationRetry?.attempted, true);
   assert.equal(result.escalationRetry?.succeeded, false, "the escalated retry also failed");
   assert.equal(result.escalationRetry?.model, "deepseek-v4-pro");
   assert.notEqual(result.outcome, "success", "the original failure stands (fail-closed)");
   assert.equal(result.promoted, false, "a failed build never promotes");
   assert.equal(ws.calls.promote, 0, "no promote attempted after a failed escalated retry");
-  const retried = bus.sent.find((e) => e.type === "worker.escalation.retried");
-  assert.equal((retried?.payload as { success: boolean } | undefined)?.success, false, "the retry event reports the failure");
+  const retried = bus.sent.filter((e) => e.type === "worker.escalation.retried");
+  assert.ok(retried.length >= 1, "escalation retry events emitted");
+  const lastRetried = retried[retried.length - 1];
+  assert.equal((lastRetried?.payload as { success: boolean } | undefined)?.success, false, "the retry event reports the failure");
 });
 
 // ── CRITIC-DRIVEN ESCALATION: a verifier-GREEN, critic-REJECTED build escalates to the mid tier ──

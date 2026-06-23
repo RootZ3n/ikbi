@@ -2086,15 +2086,14 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             // ── STEP 1: CHEAP RETRY — same model, with failure feedback ──────
             // Before escalating to the mid-tier model, give the cheap model ONE more chance
             // with the failure context. This implements: flash → flash retry → pro.
-            // ONLY fires when the builder "succeeded" but wrote 0 files (the silent failure
-            // case). Explicit failures (outcome === "failure") skip straight to pro escalation.
-            if (!cheapModelRetryAttempted && result.outcome === "success" && escSignals.builderFailed) {
+            // Fires on ANY builder struggle: explicit failure OR silent success with 0 files.
+            if (!cheapModelRetryAttempted) {
               cheapModelRetryAttempted = true;
               const cheapRetryGoal = [
                 task.goal,
                 "",
                 `[retry] Your previous attempt failed. ${failedResult.summary ?? "No files were written."}`,
-                ...(escSignals.builderFailed ? ["You called done but wrote 0 files — you MUST write the actual code changes."] : []),
+                ...(escSignals.builderFailed && result.outcome === "success" ? ["You called done but wrote 0 files — you MUST write the actual code changes."] : []),
                 "Fix what went wrong; do not repeat the same mistake.",
               ].join("\n");
 
