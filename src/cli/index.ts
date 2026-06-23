@@ -167,6 +167,59 @@ function printUsage(argv: readonly string[] = []): void {
   }
 }
 
+/** Blessed model profiles for `ikbi models --recommend`. */
+interface RecommendProfile {
+  label: string;
+  builder: string;
+  critic: string;
+  fallback?: string;
+  caveats: string;
+}
+
+const RECOMMENDED: RecommendProfile[] = [
+  {
+    label: "Budget",
+    builder: "deepseek-v4-flash",
+    critic: "deepseek-v4-flash",
+    caveats: "Fastest/cheapest. Good for experiments and low-stakes work. May miss complex patterns.",
+  },
+  {
+    label: "Balanced",
+    builder: "claude-sonnet-4",
+    critic: "deepseek-v4-pro",
+    fallback: "deepseek-v4-pro",
+    caveats: "Best quality-to-price. Recommended for daily use. Critic catches most issues.",
+  },
+  {
+    label: "Max Quality",
+    builder: "claude-opus-4",
+    critic: "claude-sonnet-4",
+    caveats: "Strongest models. Best for complex multi-file refactors. Higher cost and latency.",
+  },
+  {
+    label: "Local Only",
+    builder: "ollama:qwen3",
+    critic: "ollama:qwen3",
+    caveats: "No API keys needed. Runs on your machine. Slower, less capable than cloud models.",
+  },
+];
+
+function printRecommendations(): void {
+  writeStdout("Blessed model configurations (ikbi models --recommend)\\n");
+  writeStdout("=====================================================\\n\\n");
+  for (let i = 0; i < RECOMMENDED.length; i++) {
+    const r = RECOMMENDED[i]!;
+    writeStdout(`[${i + 1}] ${r.label}\\n`);
+    writeStdout(`    Builder:    ${r.builder}\\n`);
+    writeStdout(`    Critic:     ${r.critic}\\n`);
+    if (r.fallback) writeStdout(`    Fallback:   ${r.fallback}\\n`);
+    writeStdout(`    Caveats:    ${r.caveats}\\n\\n`);
+  }
+  writeStdout("Apply with: ikbi models --set-recommend <n>\\n");
+  writeStdout("  (writes IKBI_BUILDER_MODEL + IKBI_CRITIC_MODEL to .env)\\n");
+}
+
+function listModels(): void {
 
 function listModels(): void {
   const models = registry.listModels();
@@ -287,13 +340,46 @@ async function run(argv: readonly string[]): Promise<void> {
       // a version request). Pure, offline, no provider init.
       writeStdout(`${config.version}\n`);
       return;
-    case "models":
-      if (argv.includes("--rank")) {
-        await runModelsRank(argv.slice(1));
+    case "models": {
+      const modelsArgs = argv.slice(1);
+      if (modelsArgs.includes("--recommend")) {
+        printRecommendations();
+        return;
+      }
+      if (modelsArgs.includes("--set-recommend")) {
+        const idx = modelsArgs.indexOf("--set-recommend");
+        const n = parseInt(modelsArgs[idx + 1] ?? "", 10);
+        if (n < 1 || n > RECOMMENDED.length || !Number.isFinite(n)) {
+          writeStderr(`ikbi models --set-recommend: need 1-${RECOMMENDED.length}\n`);
+          process.exitCode = 1;
+          return;
+        }
+        const r = RECOMMENDED[n - 1]!;
+        const envPath = require("node:path").join(process.cwd(), ".env");
+        const { existsSync, readFileSync, writeFileSync } = require("node:fs");
+        let env = existsSync(envPath) ? readFileSync(envPath, "utf-8") : "";
+        const append = (key: string, val: string): void => {
+          const re = new RegExp(`^${key}=.*$`, "m");
+          if (re.test(env)) env = env.replace(re, `${key}=${val}`);
+          else env += `\n${key}=${val}\n`;
+        };
+        append("IKBI_BUILDER_MODEL", r.builder);
+        append("IKBI_CRITIC_MODEL", r.critic);
+        if (r.fallback) append("IKBI_FALLBACK_MODEL", r.fallback);
+        writeFileSync(envPath, env);
+        writeStdout(`Applied profile [${n}] ${r.label} to ${envPath}\n`);
+        writeStdout(`  IKBI_BUILDER_MODEL=${r.builder}\n`);
+        writeStdout(`  IKBI_CRITIC_MODEL=${r.critic}\n`);
+        if (r.fallback) writeStdout(`  IKBI_FALLBACK_MODEL=${r.fallback}\n`);
+        return;
+      }
+      if (modelsArgs.includes("--rank")) {
+        await runModelsRank(modelsArgs);
         return;
       }
       listModels();
       return;
+    }
     case "providers":
       listProviders();
       return;
