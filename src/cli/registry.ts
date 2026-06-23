@@ -32,6 +32,8 @@ export interface CliCommand {
   readonly summary: string;
   /** Optional usage/args hint shown beside the summary. */
   readonly usage?: string;
+  /** Visibility category: "core" (shown in default help) or "advanced" (hidden behind --advanced). */
+  readonly category?: "core" | "advanced";
   /** Run the command with the args AFTER the subcommand token. May be async. */
   run(argv: readonly string[]): void | Promise<void>;
 }
@@ -70,6 +72,13 @@ class CommandRegistry {
   /** All registered commands, sorted by name (for stable `help` output). */
   all(): CliCommand[] {
     return [...this.cmds.values()].sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /** Commands matching a category filter. Pass undefined for all commands. */
+  inCategory(cat: "core" | "advanced" | undefined): CliCommand[] {
+    const all = this.all();
+    if (cat === undefined) return all;
+    return all.filter((c) => (c.category ?? "core") === cat);
   }
 
   /** Test-only: clear all registrations. */

@@ -35,11 +35,20 @@ test("smoke: the built CLI exists (run `pnpm build` first)", () => {
   assert.ok(existsSync(ENTRY), `built CLI not found at ${ENTRY}`);
 });
 
-test("smoke: `ikbi help` lists all commands incl. repl/undo/receipts/clean/diff", () => {
+test("smoke: `ikbi help` shows core commands", () => {
   const r = runCli(["help"]);
   assert.equal(r.status, 0, `help exited ${r.status}\n${r.combined}`);
-  for (const cmd of ["repl", "undo", "receipts", "clean", "diff", "build", "doctor", "capabilities"]) {
+  for (const cmd of ["repl", "build", "init", "doctor", "models", "workspaces"]) {
     assert.match(r.stdout, new RegExp(`\\b${cmd}\\b`), `help lists "${cmd}"`);
+  }
+  assert.ok(noStack(r.combined), "no stack trace");
+});
+
+test("smoke: `ikbi help --advanced` lists all commands incl. repl/undo/receipts/clean/diff", () => {
+  const r = runCli(["help", "--advanced"]);
+  assert.equal(r.status, 0, `help --advanced exited ${r.status}\n${r.combined}`);
+  for (const cmd of ["repl", "undo", "receipts", "clean", "diff", "build", "doctor", "capabilities"]) {
+    assert.match(r.stdout, new RegExp(`\\b${cmd}\\b`), `help --advanced lists "${cmd}"`);
   }
   assert.ok(noStack(r.combined), "no stack trace");
 });

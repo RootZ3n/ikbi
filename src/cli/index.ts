@@ -90,43 +90,83 @@ async function dispatchCommand(argv: readonly string[]): Promise<void> {
 /** The cognition router (behind --headless), with auto-dispatch wired (cli owns the command registry). */
 const cognitionRouter = createCognitionRouter({ dispatch: dispatchCommand });
 
-function printUsage(): void {
-  const moduleCmds = commands.all().filter((c) => !BUILTINS.has(c.name));
-  const lines = [
-    `ikbi v${config.version} — governed build/repair engine (experimental CLI)`,
-    "",
-    "Usage: ikbi <command> | ikbi <goal...> [--project <name>]",
-    "",
-    "A bare <goal> (anything that is not a command below) is deliberated by the",
-    "cognition layer, which decides the path and recommends the next command.",
-    "",
-    "Commands:",
-    "  version            Print the ikbi version",
-    "  models [list]      List the model roster (id, role, cost, provider chain)",
-    "  models --rank      Rank the roster by Luak benchmark score (--min-score N: cheapest above bar)",
-    "  providers [list]   List the registered providers",
-    "  init               Guided first-run setup — detect keys, pick models, write config",
-    "  doctor             Report bootstrap config: what's set, what's missing for a build",
-    "  doctor --fix       Repair common gaps (.env/state dirs/deps); --force reclaims stale + aged workspaces",
-    "  doctor --self-repair  Run the self-monitor; file a work order per problem found",
-    "  capabilities       List the builder + chat tool inventory (and parity)",
-  ];
-  if (moduleCmds.length > 0) {
-    lines.push("", "Module commands:");
-    const width = Math.max(...moduleCmds.map((c) => c.name.length));
-    for (const c of moduleCmds) {
-      const usage = c.usage ? ` ${c.usage}` : "";
-      lines.push(`  ${(c.name + usage).padEnd(width + 11)}${c.summary}`);
+function printUsage(argv: readonly string[] = []): void {
+  const showAdvanced = argv.includes("--advanced");
+  const allModuleCmds = commands.all().filter((c) => !BUILTINS.has(c.name));
+  const moduleCmds = showAdvanced
+    ? allModuleCmds
+    : allModuleCmds.filter((c) => (c.category ?? "core") === "core");
+
+  if (showAdvanced) {
+    const lines = [
+      `ikbi v${config.version} — governed build/repair engine`,
+      "",
+      "Usage: ikbi                Start interactive coding session",
+      "       ikbi \"fix the bug\"  Start session with a prompt",
+      "       ikbi build <goal>   Headless build/repair",
+      "       ikbi init           First-run guided setup",
+      "       ikbi doctor         Check configuration health",
+      "",
+      "Core commands:",
+      "  version            Print the ikbi version",
+      "  models [list]      List the model roster (id, role, cost, provider chain)",
+      "  models --rank      Rank the roster by Luak benchmark score",
+      "  providers [list]   List the registered providers",
+      "  init               Guided first-run setup",
+      "  doctor             Report bootstrap config",
+      "  doctor --fix       Repair common gaps",
+      "  doctor --self-repair  Run the self-monitor",
+      "  capabilities       List the builder + chat tool inventory",
+    ];
+    if (allModuleCmds.length > 0) {
+      lines.push("", "All registered commands:");
+      const width = Math.max(...allModuleCmds.map((c) => c.name.length));
+      for (const c of allModuleCmds) {
+        const usage = c.usage ? ` ${c.usage}` : "";
+        lines.push(`  ${(c.name + usage).padEnd(width + 11)}${c.summary}`);
+      }
     }
+    lines.push(
+      "",
+      `Roster file: ${config.provider.rosterFile}`,
+      "(Edit that JSON file to add/remove models & providers — no code change.)",
+      "",
+    );
+    writeStdout(lines.join("\n"));
+  } else {
+    const lines = [
+      `ikbi v${config.version} — governed build/repair engine`,
+      "",
+      "Usage: ikbi                Start interactive coding session",
+      "       ikbi \"fix bug\"      Start session with a prompt",
+      "       ikbi build <goal>   Headless build/repair",
+      "       ikbi init           First-run guided setup",
+      "       ikbi doctor         Check configuration health",
+      "",
+      "Common commands:",
+      "  repl        Interactive session (default)",
+      "  build       Headless build/repair",
+      "  init        First-run guided setup",
+      "  doctor      Config health check + repair",
+      "  models      List/rank available models",
+      "  workspaces  Manage build workspaces",
+    ];
+    if (moduleCmds.length > 0) {
+      const width = Math.max(...moduleCmds.map((c) => c.name.length));
+      for (const c of moduleCmds) {
+        const usage = c.usage ? ` ${c.usage}` : "";
+        lines.push(`  ${(c.name + usage).padEnd(width + 11)}${c.summary}`);
+      }
+    }
+    lines.push(
+      "",
+      "Type `ikbi --help --advanced` for all commands and flags.",
+      "",
+    );
+    writeStdout(lines.join("\n"));
   }
-  lines.push(
-    "",
-    `Roster file: ${config.provider.rosterFile}`,
-    "(Edit that JSON file to add/remove models & providers — no code change.)",
-    "",
-  );
-  writeStdout(lines.join("\n"));
 }
+
 
 function listModels(): void {
   const models = registry.listModels();
@@ -317,7 +357,7 @@ async function run(argv: readonly string[]): Promise<void> {
     case "help":
     case "--help":
     case "-h":
-      runInfo("help", printUsage);
+      runInfo("help", () => printUsage(argv));
       return;
     default: {
       // A subcommand `--help`/`-h` is answered by the command's own handler with NO
