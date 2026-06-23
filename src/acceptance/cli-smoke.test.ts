@@ -20,12 +20,13 @@ const freshCwd = () => mkdtempSync(join(tmpdir(), "ikbi-smoke-"));
  * depends on, or contends with, the user's real `~/.ikbi/state` (Codex blocker 2). An optional
  * `extraEnv` injects per-test overrides (e.g. a tiny lock timeout for the live-lock scenario).
  */
-function runCli(args: string[], extraEnv: Record<string, string> = {}): { status: number | null; stdout: string; stderr: string; combined: string; home: string } {
+function runCli(args: string[], extraEnv: Record<string, string> = {}, input?: string): { status: number | null; stdout: string; stderr: string; combined: string; home: string } {
   const home = mkdtempSync(join(tmpdir(), "ikbi-smoke-home-"));
   const res = spawnSync(process.execPath, [ENTRY, ...args], {
     cwd: freshCwd(),
     env: { PATH: process.env.PATH ?? "", HOME: home, ...extraEnv },
     encoding: "utf8",
+    ...(input !== undefined ? { input } : {}),
   });
   return { status: res.status, stdout: res.stdout, stderr: res.stderr, combined: `${res.stdout}\n${res.stderr}`, home };
 }
@@ -55,6 +56,36 @@ test("smoke: `ikbi help --advanced` lists all commands incl. repl/undo/receipts/
     assert.match(r.stdout, new RegExp(`\\b${cmd}\\b`), `help --advanced lists "${cmd}"`);
   }
   assert.ok(noStack(r.combined), "no stack trace");
+});
+
+test("smoke: `ikbi help <command>` shows the command's detailed page", () => {
+  const r = runCli(["help", "build"]);
+  assert.equal(r.status, 0, `help build exited ${r.status}\n${r.combined}`);
+  assert.match(r.stdout, /^ikbi build —/m, "leads with the command's one-liner");
+  assert.match(r.stdout, /Usage:/);
+  assert.match(r.stdout, /Examples:/);
+  assert.match(r.stdout, /--max-budget-usd/, "documents the flags");
+  assert.match(r.stdout, /See also:/);
+  assert.ok(noStack(r.combined), "no stack trace");
+  // Each of the required topics resolves to a page (not the general usage).
+  for (const topic of ["init", "models", "serve", "repl"]) {
+    const p = runCli(["help", topic]);
+    assert.match(p.stdout, new RegExp(`^ikbi ${topic} —`, "m"), `help ${topic} shows its page`);
+  }
+});
+
+test("smoke: `ikbi` with no args opens the REPL (not the usage screen), with zero noise", () => {
+  // Empty stdin ⇒ the REPL reads no message and exits cleanly. The point of the test is the
+  // FIRST thing the user sees is the REPL, not the help/usage text, and nothing leaks.
+  const r = runCli([], {}, "");
+  assert.equal(r.status, 0, `no-args exited ${r.status}\n${r.combined}`);
+  assert.match(r.stdout, /ikbi repl/, "the REPL opened");
+  assert.doesNotMatch(r.stdout, /governed build\/repair engine/, "did NOT print the usage screen");
+  assert.doesNotMatch(r.stdout, /ikbi help --advanced/, "did NOT print the usage screen");
+  // Zero noise: no structured startup logs, no stack trace, no fatal config throw.
+  assert.doesNotMatch(r.combined, /"level":"(info|debug|warn)"/, "no structured startup logs leaked");
+  assert.ok(noStack(r.combined), "no stack trace");
+  assert.ok(!r.combined.includes("Refusing to start with insecure default trust keys"), "no fatal config throw");
 });
 
 test("smoke: `ikbi doctor` runs in a clean env, reports what's missing, no stack trace", () => {

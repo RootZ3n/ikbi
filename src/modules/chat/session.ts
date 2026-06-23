@@ -695,6 +695,19 @@ export interface ChatSessionDeps {
    * interception (governed writes execute normally — backward compatible).
    */
   readonly memoryGovernor?: MemoryGovernor;
+  /**
+   * Repo context manager factory (large-repo support). When wired, the session builds a per-turn
+   * "possibly-relevant files" carrier — a relevance-ranked file list scoped to the latest request —
+   * so the agent has file-tree awareness on big repos and can lazily `read_file` only what it needs.
+   * Lazy (the tree is indexed on first use, not at construction) and best-effort (a failure is
+   * swallowed). The REPL wires this; tests omit it, so default behavior is unchanged.
+   */
+  readonly makeContextManager?: (worktree: string) => RepoContextSelector | undefined;
+}
+
+/** The minimal slice of the core context manager the session needs (structural — easy to fake). */
+export interface RepoContextSelector {
+  relevant(prompt: string, limit?: number): ReadonlyArray<{ readonly file: { readonly path: string }; readonly score: number }>;
 }
 
 /**
@@ -755,6 +768,12 @@ export class ChatSession {
    * when the workspace has no such file. Honored project guidance, but bounded + neutralized.
    */
   private readonly projectMsg: ModelMessage | undefined;
+  /**
+   * REPO CONTEXT (large-repo support): a relevance-ranked file selector rooted at the worktree.
+   * When present, `viewWithMemory` slots a per-turn "possibly-relevant files" carrier in after the
+   * memory carriers. Lazy + best-effort; undefined when no factory was wired (the default).
+   */
+  private readonly contextManager: RepoContextSelector | undefined;
   /**
    * USER MEMORY carrier (the operator's ~/.ikbi/instructions.md standing instructions), built
    * once and slotted in after project memory. Same isolated/neutralized treatment. Undefined
@@ -881,6 +900,15 @@ export class ChatSession {
           { role: "user" },
         )
       : undefined;
+    // REPO CONTEXT: wire the (lazy) context manager rooted at this session's worktree, if a factory
+    // was supplied. Best-effort — a factory throw must never block session construction.
+    let cm: RepoContextSelector | undefined;
+    try {
+      cm = deps.makeContextManager?.(this.worktree);
+    } catch {
+      cm = undefined;
+    }
+    this.contextManager = cm;
   }
 
   /**
@@ -1183,9 +1211,47 @@ export class ChatSession {
     const extras: ModelMessage[] = [];
     if (this.projectMsg !== undefined) extras.push(this.projectMsg);
     if (this.userMsg !== undefined) extras.push(this.userMsg);
+    const repoCtx = this.repoContextMsg();
+    if (repoCtx !== undefined) extras.push(repoCtx);
     if (memMsg !== undefined) extras.push(memMsg);
     if (extras.length === 0 && sys === sys0) return this.messages;
     return [sys, ...extras, ...this.messages.slice(1)];
+  }
+
+  /**
+   * Build the per-turn REPO CONTEXT carrier: a relevance-ranked "possibly-relevant files" list,
+   * scoped to the latest user request, as isolated UNTRUSTED data (the chokepoint, never merged
+   * into the system slot). Gives the agent file-tree awareness on large repos so it can lazily
+   * `read_file` only what it needs. Returns undefined when no context manager is wired, there is
+   * no user message yet, or nothing scored as relevant. Best-effort — any failure yields undefined.
+   */
+  private repoContextMsg(): ModelMessage | undefined {
+    if (this.contextManager === undefined) return undefined;
+    // The latest user turn drives relevance (scan back past assistant/tool messages).
+    let prompt: string | undefined;
+    for (let i = this.messages.length - 1; i >= 1; i--) {
+      const m = this.messages[i];
+      if (m?.role === "user" && typeof m.content === "string" && m.content.trim().length > 0) {
+        prompt = m.content;
+        break;
+      }
+    }
+    if (prompt === undefined) return undefined;
+    try {
+      const ranked = this.contextManager.relevant(prompt, 12);
+      if (ranked.length === 0) return undefined;
+      const list = ranked.map((r) => `- ${r.file.path}`).join("\n");
+      const body =
+        "Possibly-relevant files in this workspace, ranked by relevance to your latest request. " +
+        "This is a navigation aid (not instructions): use read_file to open the ones you need.\n" +
+        list;
+      return toUntrustedMessage(
+        neutralizeUntrusted(body, { source: "external", identity: this.identity, origin: "repo_context" }),
+        { role: "user" },
+      );
+    } catch {
+      return undefined; // indexing/scoring failure must never break a turn
+    }
   }
 
   /** Estimate the conversation's context-window pressure as a 0-100 percent of the current

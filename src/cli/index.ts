@@ -36,6 +36,8 @@ import { runSelfRepair } from "../modules/self-repair/index.js";
 import { runCapabilities } from "./capabilities.js";
 import { postureLines } from "./posture.js";
 import { writeStderr, writeStdout } from "./io.js";
+import { translateError, formatFriendlyError } from "../core/errors/index.js";
+import { helpForTopic } from "./help-pages.js";
 // Core-facing operator commands registered from their own files (read the receipt store /
 // workspace manager). Imported here so registerCommand fires before dispatch.
 import "./receipts.js";
@@ -91,6 +93,18 @@ async function dispatchCommand(argv: readonly string[]): Promise<void> {
 const cognitionRouter = createCognitionRouter({ dispatch: dispatchCommand });
 
 function printUsage(argv: readonly string[] = []): void {
+  // `ikbi help <command>` → that command's detailed page. The topic is the first non-flag
+  // argument after `help`/`--help`/`-h` (so `ikbi help build` and `ikbi build --help`-style
+  // `help` invocations both resolve). Unknown topics fall through to the general usage.
+  const topic = argv.find((a, i) => i > 0 && !a.startsWith("-"));
+  if (topic !== undefined) {
+    const page = helpForTopic(topic);
+    if (page !== undefined) {
+      writeStdout(page);
+      return;
+    }
+  }
+
   const showAdvanced = argv.includes("--advanced");
   const allModuleCmds = commands.all().filter((c) => !BUILTINS.has(c.name));
 
@@ -145,6 +159,7 @@ function printUsage(argv: readonly string[] = []): void {
       "  ikbi serve                Start HTTP server",
       "  ikbi help                 Show this help",
       "",
+      "Type `ikbi help <command>` for detailed usage (e.g. `ikbi help build`).",
       "Type `ikbi help --advanced` for all commands and flags.",
       "",
     ];
@@ -312,6 +327,27 @@ function runInfo(name: string, fn: () => void): void {
   }
 }
 
+/**
+ * The cold-start on-ramp: warm the trust cache from durable state (so a granted worker resolves
+ * correctly instead of cold-flooring), then best-effort prune the receipt store. Both are silent
+ * on the happy path — only MAC-rejected state docs surface a (fail-closed) warning. Shared by the
+ * no-args REPL launch and the module-command dispatch path.
+ */
+async function coldStartPreload(): Promise<void> {
+  try {
+    const { rejected } = await trust.preload();
+    if (rejected > 0) {
+      writeStderr(`ikbi: trust preload rejected ${rejected} unreadable/forged state doc(s) (fail-closed)\n`);
+    }
+  } catch (err) {
+    writeStderr(`ikbi: trust preload failed: ${err instanceof Error ? err.message : String(err)}\n`);
+  }
+  try {
+    const { receipts } = await import("../core/receipt/index.js");
+    await receipts.prune();
+  } catch { /* non-fatal — receipt pruning is housekeeping, not a startup gate */ }
+}
+
 async function run(argv: readonly string[]): Promise<void> {
   const cmd = argv[0];
   switch (cmd) {
@@ -422,12 +458,21 @@ async function run(argv: readonly string[]): Promise<void> {
       // and which lifecycle guarantees each editing surface actually provides (no overstatement).
       runInfo("capabilities", () => writeStdout(`${runCapabilities().lines.join("\n")}\n\n${postureLines().join("\n")}\n`));
       return;
-    case undefined:
     case "help":
     case "--help":
     case "-h":
+      // `ikbi help <command>` prints that command's detailed page; bare `ikbi help` prints
+      // the focused usage. Either way: no provider init, no trust preload, no network.
       runInfo("help", () => printUsage(argv));
       return;
+    case undefined: {
+      // GOLDEN PATH (no args): open the interactive REPL with zero startup noise — the prompt is
+      // the first thing the user sees. Warm the trust cache silently first (so a granted worker
+      // resolves correctly), then hand off to the REPL.
+      await coldStartPreload();
+      await liveRepl([], undefined);
+      return;
+    }
     default: {
       // A subcommand `--help`/`-h` is answered by the command's own handler with NO
       // side effects: skip the cold-start preload + receipt prune entirely so help can
@@ -435,24 +480,10 @@ async function run(argv: readonly string[]): Promise<void> {
       // its usage and returns). This is what keeps `ikbi build --help` fast and offline.
       const sawHelp = wantsHelp(argv.slice(1));
       if (!sawHelp) {
-        // STARTUP PRELOAD (the cold-start on-ramp's second half): warm the trust cache
-        // from durable state BEFORE any command resolves worker trust. Without this, a
-        // granted worker still resolves cold to the floor (system.ts cold path) and the
-        // grant is invisible. Skipped for the pure-info builtins above (no trust path).
-        // A rejected count (MAC failures) is surfaced, never silently dropped.
-        try {
-          const { rejected } = await trust.preload();
-          if (rejected > 0) {
-            writeStderr(`ikbi: trust preload rejected ${rejected} unreadable/forged state doc(s) (fail-closed)\n`);
-          }
-        } catch (err) {
-          writeStderr(`ikbi: trust preload failed: ${err instanceof Error ? err.message : String(err)}\n`);
-        }
-        // H6: best-effort receipt retention prune at startup (non-fatal).
-        try {
-          const { receipts } = await import("../core/receipt/index.js");
-          await receipts.prune();
-        } catch { /* non-fatal — receipt pruning is housekeeping, not a startup gate */ }
+        // STARTUP PRELOAD (the cold-start on-ramp): warm the trust cache from durable state
+        // BEFORE any command resolves worker trust, then prune receipts. Skipped for the
+        // pure-info builtins above (no trust path) and for subcommand --help.
+        await coldStartPreload();
       }
       // Module commands compose via the command-registrar seam. Built-ins above
       // take precedence (a module cannot shadow a core command).
@@ -498,7 +529,17 @@ process.on("SIGINT", () => {
 });
 
 run(process.argv.slice(2)).catch((err: unknown) => {
-  writeStderr(`ikbi: ${err instanceof Error ? err.message : String(err)}\n`);
+  // A broken pipe (reader closed early — e.g. `ikbi models | head`) is normal, not a failure:
+  // exit quietly rather than translating it into a confusing "something went wrong".
+  if (typeof err === "object" && err !== null && (err as { code?: unknown }).code === "EPIPE") {
+    process.exit(0);
+  }
+  // Translate the raw failure to a friendly message + suggested action. The full technical
+  // detail (and stack) is shown only under --verbose/--debug (bootstrap raised the log level).
+  const verbose = process.argv.includes("--verbose") || process.argv.includes("--debug");
+  const fe = translateError(err);
+  const stack = err instanceof Error ? err.stack : undefined;
+  writeStderr(`ikbi: ${formatFriendlyError(fe, { verbose, ...(stack !== undefined ? { stack } : {}) })}\n`);
   process.exitCode = 1;
 });
 

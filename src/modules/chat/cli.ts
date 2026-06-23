@@ -21,6 +21,8 @@ import { createInterface } from "node:readline";
 
 import { registerCommand } from "../../cli/registry.js";
 import { config } from "../../core/config.js";
+import { translateError, formatFriendlyError } from "../../core/errors/index.js";
+import { createContextManager } from "../../core/context/index.js";
 import { registry, invokeModelStream } from "../../core/provider/index.js";
 import { colorizeDiff, readPipedStdin } from "../worker-model/cli.js";
 import type { ChatMode, ChatToolActivity } from "./contract.js";
@@ -88,6 +90,8 @@ export interface ReplDeps {
   readonly onTurnController?: (controller: AbortController | undefined) => void;
   /** When true, suppress tool activity and only show the model's response (--quiet). */
   readonly quiet?: boolean;
+  /** When true, append the raw technical detail (+stack) to friendly error messages (--verbose). */
+  readonly verbose?: boolean;
 }
 
 /** The mutable per-run state shared with every command handler. */
@@ -102,6 +106,8 @@ interface ReplContext {
   readonly newSession: (() => ReplSession | Promise<ReplSession>) | undefined;
   /** When true, suppress tool activity and only show the model's response text. */
   readonly quiet: boolean;
+  /** When true, append raw technical detail to friendly error messages. */
+  readonly verbose: boolean;
   /** Read ONE line and resolve true on an affirmative (y/yes) — used by `/reset`. */
   readonly confirm: () => Promise<boolean>;
   /** Read ONE line as a permission decision; default-NO ([y/N]) — used by `/permissions confirm`. */
@@ -632,6 +638,7 @@ export async function runRepl(deps: ReplDeps): Promise<void> {
     confirm,
     confirmTool,
     quiet: deps.quiet ?? false,
+    verbose: deps.verbose ?? false,
   };
   // `--quiet` ⇒ model-output-only: route the banner/workdir/prompt/tool/context chatter through
   // `say` (a no-op when quiet), leaving only the model's prose on `deps.out`.
@@ -689,7 +696,16 @@ export async function runRepl(deps: ReplDeps): Promise<void> {
         say(SPINNER_CLEAR); // clear the spinner line before printing the result
       }
     } catch (e) {
-      deps.out(`${SPINNER_CLEAR}[error: ${errMsg(e)}]\n`);
+      // A user-initiated Ctrl-C abort is not a failure — acknowledge it plainly, no friendly
+      // "something went wrong" wrapping.
+      if (controller.signal.aborted) {
+        deps.out(`${SPINNER_CLEAR}[interrupted]\n`);
+        continue;
+      }
+      // Everything else is mapped to a friendly message (raw stack only under --verbose).
+      const fe = translateError(e);
+      const stack = e instanceof Error ? e.stack : undefined;
+      deps.out(`${SPINNER_CLEAR}${formatFriendlyError(fe, { verbose: ctx.verbose, ...(stack !== undefined ? { stack } : {}) })}\n`);
       continue;
     } finally {
       deps.onTurnController?.(undefined);
@@ -757,6 +773,8 @@ function readlineSource(getTurnController?: () => AbortController | undefined): 
 export async function liveRepl(argv: readonly string[] = [], initialMessage?: string): Promise<void> {
   const out = (s: string): void => void process.stdout.write(s);
   const quiet = argv.includes("--quiet");
+  // `--verbose`/`--debug` opt into raw technical detail (+stack) on translated error messages.
+  const verbose = argv.includes("--verbose") || argv.includes("--debug");
   // `--quiet` is model-output-only: suppress every status/diagnostic line (project overview,
   // resume/fork notices) and let only the model's response reach stdout. Model prose still
   // uses `out` directly; non-model chatter routes through `status`.
@@ -775,6 +793,11 @@ export async function liveRepl(argv: readonly string[] = [], initialMessage?: st
   // new/resumed sessions. gbrainBridge enables brain page approval.
   const memoryGovernor = createProductionGovernor({ gbrainBridge });
 
+  // REPO CONTEXT (large-repo support): a lazy, relevance-ranked file selector rooted at each
+  // session's worktree. Indexing is deferred to the first turn, so this adds NO startup cost or
+  // noise. Shared factory across new/resumed sessions.
+  const makeContextManager = (worktree: string): ReturnType<typeof createContextManager> => createContextManager(worktree);
+
   /**
    * Mint a fresh session. DEFAULT (cwd is a git repo, no `--scratch`): allocate a MANAGED workspace
    * — an isolated worktree off the repo — so edits never touch the target until an explicit `/apply`.
@@ -788,20 +811,20 @@ export async function liveRepl(argv: readonly string[] = [], initialMessage?: st
     // default applies only when the operator has NOT pinned a workdir.
     const explicitWorkdir = process.env.IKBI_CHAT_WORKDIR;
     if (!scratch && explicitWorkdir !== undefined && explicitWorkdir.trim().length > 0) {
-      return new ChatSession(id, { autosave, cwd: process.cwd(), permissionMode: "confirm", memoryGovernor, invokeStream: invokeModelStream });
+      return new ChatSession(id, { autosave, cwd: process.cwd(), permissionMode: "confirm", memoryGovernor, invokeStream: invokeModelStream, makeContextManager });
     }
     if (!scratch) {
       const target = resolveRepoTarget(process.cwd());
       if (target !== undefined) {
         try {
           const ws = await allocateSessionWorkspace({ targetRepo: target, sessionId: id });
-          return new ChatSession(id, { workspace: ws, autosave, permissionMode: "confirm", memoryGovernor, invokeStream: invokeModelStream });
+          return new ChatSession(id, { workspace: ws, autosave, permissionMode: "confirm", memoryGovernor, invokeStream: invokeModelStream, makeContextManager });
         } catch (e) {
           out(`[managed workspace allocation failed (${errMsg(e)}) — falling back to a scratch session]\n`);
         }
       }
     }
-    return new ChatSession(id, { autosave, cwd: process.cwd(), scratch: true, permissionMode: "confirm", memoryGovernor, invokeStream: invokeModelStream });
+    return new ChatSession(id, { autosave, cwd: process.cwd(), scratch: true, permissionMode: "confirm", memoryGovernor, invokeStream: invokeModelStream, makeContextManager });
   };
 
   /** Resume a persisted session, reconnecting its managed workspace when one was recorded. */
@@ -816,7 +839,7 @@ export async function liveRepl(argv: readonly string[] = [], initialMessage?: st
         out(`[This session is read-only. Start a new session (ikbi repl) to make and apply changes.]\n`);
       }
     }
-    return new ChatSession(state.id, { restore: state, autosave, ...(workspace !== undefined ? { workspace } : {}), memoryGovernor, invokeStream: invokeModelStream });
+    return new ChatSession(state.id, { restore: state, autosave, ...(workspace !== undefined ? { workspace } : {}), memoryGovernor, invokeStream: invokeModelStream, makeContextManager });
   };
 
   let session: ChatSession;
@@ -886,7 +909,7 @@ export async function liveRepl(argv: readonly string[] = [], initialMessage?: st
     return src.readLine();
   };
   try {
-    await runRepl({ session, store, newSession, readLine, out, quiet, onTurnController: (controller) => { turnController = controller; } });
+    await runRepl({ session, store, newSession, readLine, out, quiet, verbose, onTurnController: (controller) => { turnController = controller; } });
   } finally {
     src.close();
     // Release the session's MCP transports (spawned child processes), if any. Best-effort.
