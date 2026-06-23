@@ -344,6 +344,15 @@ function foldRoleSignals(
     // builderFailed: ANY builder failure is a strong signal that the cheap model can't handle
     // this task. Combined with the high weight (50), this alone crosses the escalation threshold.
     if (result.outcome === "failure") acc.builderFailed = true;
+    // ALSO flag as failed when the builder called done but wrote ZERO files — a model that
+    // reads files and calls done without writing anything is functionally failed even though
+    // the outcome is "success". This closes the gap where a cheap model produces nothing but
+    // the escalation engine never fires because the outcome gate blocks it.
+    // ONLY fires when filesWritten is explicitly present and empty — absent means the builder
+    // didn't report file counts (stubs, injected test roles), not that it wrote nothing.
+    if (result.outcome === "success" && Array.isArray(detail.filesWritten) && detail.filesWritten.length === 0) {
+      acc.builderFailed = true;
+    }
   } else if (role === "critic") {
     if (result.outcome === "failure" || result.outcome === "rejected") acc.criticRejected = true;
     if (typeof result.summary === "string") handoff.criticFeedback = result.summary;
@@ -1412,6 +1421,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // failed escalated retry leaves the original failure standing). `escalationRetryOutcome` surfaces
     // that the swap+retry actually ran (distinct from the observe-only `escalationOutcome` above).
     let escalationAttempted = false;
+    // DUAL-MODEL BUILDER: retry the cheap model ONCE with feedback before escalating to pro.
+    // The user's expected pattern: flash attempt 1 → flash attempt 2 (with failure feedback) →
+    // pro (auto-escalation). This flag caps the cheap retry at one attempt so it never loops.
+    let cheapModelRetryAttempted = false;
     let escalationRetryOutcome: WorkerResult["escalationRetry"];
     let overall: WorkerResult["outcome"] = "success";
     let killedReason: string | undefined;
@@ -2048,28 +2061,130 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         }
 
         // ── BUILD-MODE ESCALATION RETRY (the wired follow-up to observe-only) ─────────
-        // A builder that FAILED on the cheap (worker) tier, when the engine recommends a mid-tier
-        // escalation, is re-run ONCE on the escalated model in the SAME workspace. The handoff
-        // context tells the stronger model what the cheap attempt got wrong. Capped at one retry
-        // (escalationAttempted) so it can never loop; fail-closed (a failed retry leaves the
-        // original failure standing). When the retry SUCCEEDS, its result replaces the failed
-        // builder entry and the pipeline continues to the verifier — so the escalated work is
-        // verified + promoted exactly like a first-try green build.
+        // DUAL-MODEL BUILDER PATTERN: flash attempt 1 → flash attempt 2 (cheap retry with
+        // feedback) → pro (auto-escalation). The cheap model gets ONE retry before the mid-tier
+        // model is tried. This is the user's expected default behavior — not opt-in.
+        //
+        // The gate fires on EITHER `result.outcome === "failure"` OR `escSignals.builderFailed`
+        // (which is set when the builder writes 0 files even if it called done). This closes
+        // the gap where a cheap model produces nothing but the outcome gate blocked escalation.
         const decision = escObservation.decision;
         if (
           role === "builder" &&
-          result.outcome === "failure" &&
+          (result.outcome === "failure" || escSignals.builderFailed) &&
           !escalationAttempted &&
           decision !== undefined &&
           decision.escalate &&
           decision.targetTier === "mid"
         ) {
-          escalationAttempted = true;
           const midModel = escalationConfig.tierModels.mid[0];
           if (midModel !== undefined) {
             const failedResult = result;
             const failedDetail = (failedResult.detail ?? {}) as Record<string, unknown>;
             const failedModel = typeof failedDetail.model === "string" ? failedDetail.model : singleBuilderModel;
+
+            // ── STEP 1: CHEAP RETRY — same model, with failure feedback ──────
+            // Before escalating to the mid-tier model, give the cheap model ONE more chance
+            // with the failure context. This implements: flash → flash retry → pro.
+            // ONLY fires when the builder "succeeded" but wrote 0 files (the silent failure
+            // case). Explicit failures (outcome === "failure") skip straight to pro escalation.
+            if (!cheapModelRetryAttempted && result.outcome === "success" && escSignals.builderFailed) {
+              cheapModelRetryAttempted = true;
+              const cheapRetryGoal = [
+                task.goal,
+                "",
+                `[retry] Your previous attempt failed. ${failedResult.summary ?? "No files were written."}`,
+                ...(escSignals.builderFailed ? ["You called done but wrote 0 files — you MUST write the actual code changes."] : []),
+                "Fix what went wrong; do not repeat the same mistake.",
+              ].join("\n");
+
+              const cheapRetrySpawn = spawnRole("builder", parentCtx);
+              events.publish(
+                workerRoleDispatched.create(
+                  { taskId: task.taskId, role: "builder", ...(cheapRetrySpawn.identity.trustTier !== undefined ? { tier: cheapRetrySpawn.identity.trustTier } : {}) },
+                  { source: EVENT_SOURCE, attribution: { identity: cheapRetrySpawn.identity, operation: "worker.role.builder", runId: task.taskId } },
+                ),
+              );
+              const cheapRetryBuilder = builderForModel(parentCtx, undefined, resolveBuilderMode(task));
+              const cheapRetryCtx: RoleContext = {
+                task: { ...task, goal: cheapRetryGoal },
+                role: "builder",
+                identity: cheapRetrySpawn.identity,
+                autonomy: cheapRetrySpawn.autonomy,
+                workspace,
+                priorResults: [...results],
+                engine: runEngine,
+              };
+              const costBeforeCheapRetry = runCost();
+              let cheapRetryResult = await runRoleFn("builder", cheapRetryBuilder, cheapRetryCtx);
+              const cheapRetryCost = runCost() - costBeforeCheapRetry;
+              cheapRetryResult = {
+                ...cheapRetryResult,
+                detail: { ...((cheapRetryResult.detail as Record<string, unknown> | undefined) ?? {}), ...(cheapRetryCost > 0 ? { costUsd: cheapRetryCost } : {}), model: failedModel, cheapRetry: true },
+              };
+              const cheapRetrySucceeded = cheapRetryResult.outcome === "success";
+
+              events.publish(
+                workerRoleCompleted.create(
+                  { taskId: task.taskId, role: "builder", outcome: cheapRetryResult.outcome, ...(cheapRetryCost > 0 ? { costUsd: cheapRetryCost } : {}) },
+                  { source: EVENT_SOURCE, attribution: { identity: cheapRetrySpawn.identity, operation: "worker.role.builder", runId: task.taskId } },
+                ),
+              );
+              await recordRole(task, workspace, cheapRetrySpawn, cheapRetryResult, cheapRetryCost, failedModel, true);
+
+              if (cheapRetrySucceeded) {
+                // Cheap retry SUCCEEDED — replace the failed builder result and continue the
+                // pipeline (critic → verifier → integrator). No escalation needed.
+                const builderIdx = results.lastIndexOf(failedResult);
+                if (builderIdx >= 0) results[builderIdx] = cheapRetryResult;
+                result = cheapRetryResult;
+                events.publish(
+                  workerEscalationRetried.create(
+                    { taskId: task.taskId, fromModel: failedModel, toModel: `${failedModel} (cheap retry)`, success: true },
+                    { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.cheap_retry", runId: task.taskId } },
+                  ),
+                );
+                await receipts.append(
+                  {
+                    operation: "worker.cheap_retry",
+                    outcome: { status: "success" },
+                    requestId: task.taskId,
+                    metadata: { taskId: task.taskId, workspaceId: workspace.id, fromModel: failedModel, success: true, costUsd: runCost() },
+                    project: task.targetRepo,
+                  },
+                  parentIdentity,
+                );
+                // Skip the pro escalation — cheap retry worked.
+                continue; // eslint-disable-line no-continue -- exits the escalation block; pipeline continues with critic
+              }
+
+              // Cheap retry ALSO failed — log it and fall through to pro escalation.
+              events.publish(
+                workerEscalationRetried.create(
+                  { taskId: task.taskId, fromModel: failedModel, toModel: `${failedModel} (cheap retry)`, success: false },
+                  { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.cheap_retry", runId: task.taskId } },
+                ),
+              );
+              await receipts.append(
+                {
+                  operation: "worker.cheap_retry",
+                  outcome: { status: "failure" },
+                  requestId: task.taskId,
+                  metadata: { taskId: task.taskId, workspaceId: workspace.id, fromModel: failedModel, success: false, costUsd: runCost() },
+                  project: task.targetRepo,
+                },
+                parentIdentity,
+              );
+              // Update the failed result to the cheap retry's result (the more recent failure).
+              // The pro escalation will use this as the "what went wrong" context.
+              // NOTE: do NOT update `result` here — the pro escalation block reads the ORIGINAL
+              // failed result. The cheap retry's failure is recorded in receipts for audit.
+            }
+
+            // ── STEP 2: PRO ESCALATION — swap to mid-tier model ──────────────
+            // The cheap model failed twice (initial + cheap retry). Now escalate to pro.
+            escalationAttempted = true;
+            // Reuse failedResult/failedModel from the cheap retry section above.
             // The escalated model gets the original goal PLUS what the cheap attempt got wrong (the
             // handoff's score breakdown, the builder's own failure summary, and any verifier/critic
             // detail already gathered). This is the handoff context the decision computed.
@@ -2147,6 +2262,14 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               const builderIdx = results.lastIndexOf(failedResult);
               if (builderIdx >= 0) results[builderIdx] = escalatedResult;
               result = escalatedResult;
+            } else if (result.outcome === "success") {
+              // SILENT SUCCESS + FAILED ESCALATION: the original builder called done but wrote 0
+              // files, and the escalated retry also failed. Without this, the pipeline would continue
+              // with the original "success" result, bypassing the short-circuit. Force the result to
+              // failure so the short-circuit breaks the pipeline.
+              result = { ...result, outcome: "failure" as const, summary: `escalation to ${midModel} failed after silent success (0 files written)` };
+              const builderIdx = results.lastIndexOf(failedResult);
+              if (builderIdx >= 0) results[builderIdx] = result;
             }
           }
         }
