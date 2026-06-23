@@ -49,10 +49,11 @@ import "./audit.js";
 import "./fix.js";
 import "./memory.js";
 import { workspaces as coreWorkspaces } from "../core/workspace/index.js";
-// The DEFAULT router: input that is not a known command is treated as a GOAL and
-// deliberated by cognition-layer (which decides the path + recommends the next
-// command). Imported AFTER the barrel so the egress guard is already registered.
+// The DEFAULT router — no-args or bare text opens the interactive REPL (golden path).
+// The cognition-layer router is still available behind `--headless` for headless/CI use.
+// Imported AFTER the barrel so the egress guard is already registered.
 import { createCognitionRouter } from "../modules/cognition-layer/index.js";
+import { liveRepl } from "../modules/chat/cli.js";
 
 /** Built-in command names — reserved, cannot be shadowed by a module command. */
 const BUILTINS = new Set(["version", "models", "providers", "doctor", "capabilities", "help"]);
@@ -85,7 +86,7 @@ async function dispatchCommand(argv: readonly string[]): Promise<void> {
   await sub.run(argv.slice(1));
 }
 
-/** The default router, with auto-dispatch wired (cli owns the command registry). */
+/** The cognition router (behind --headless), with auto-dispatch wired (cli owns the command registry). */
 const cognitionRouter = createCognitionRouter({ dispatch: dispatchCommand });
 
 function printUsage(): void {
@@ -335,11 +336,19 @@ async function run(argv: readonly string[]): Promise<void> {
         await moduleCmd.run(argv.slice(1));
         return;
       }
-      // DEFAULT ROUTER: not a known command ⇒ treat the WHOLE input as a goal and let
-      // cognition-layer deliberate which path is appropriate. It reports the decision
-      // and then AUTO-DISPATCHES the recommended command (via dispatchCommand) unless
-      // --no-run was passed. The deliberation IS the routing.
-      await cognitionRouter.route(argv);
+      // GOLDEN PATH: not a known command ⇒ launch the interactive REPL.
+      // Bare text (`ikbi fix the bug`) seeds the first turn. The `--headless` flag
+      // restores the old cognition-router behavior for CI/scripting use.
+      const headlessIdx = argv.indexOf("--headless");
+      if (headlessIdx >= 0) {
+        // Strip --headless and route through cognition-layer (old behavior)
+        const cleanArgv = argv.filter((_, i) => i !== headlessIdx);
+        await cognitionRouter.route(cleanArgv);
+      } else {
+        // Default: REPL with bare text as initial message (empty string if no args)
+        const initialMessage = argv.join(" ");
+        await liveRepl([], initialMessage || undefined);
+      }
     }
   }
 }
