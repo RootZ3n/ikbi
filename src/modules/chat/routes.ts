@@ -26,6 +26,7 @@ import type { ChatRequest, ChatResponse } from "./contract.js";
 // transcript to disk, whereas REPL sessions are long-lived and resumable (`--continue`/`--resume`).
 // The two stores are deliberately NOT unified.
 import { sessionStore, type PermissionMode } from "./session.js";
+import { persistentStore } from "./session-store.js";
 
 const CHAT_RATE_WINDOW_MS = 60_000;
 const CHAT_RATE_LIMIT = 60;
@@ -129,6 +130,8 @@ registerRoutes("chat", (app: FastifyInstance) => {
       // IKBI_CHAT_TOKEN is configured (and was verified by chatAuth); "readonly" otherwise.
       const permissionMode = resolvePermissionMode();
       const { response, tools, cost, contextPercent } = await session.send(message, images, mode ?? "agent", { permissionMode });
+      // Persist to disk so sessions survive restarts (CC parity). Best-effort.
+      try { await persistentStore.save(session); } catch { /* best-effort */ }
       reply.code(200);
       return {
         response,
@@ -136,10 +139,9 @@ registerRoutes("chat", (app: FastifyInstance) => {
         ...(tools.length > 0 ? { tools } : {}),
         cost,
         context_percent: contextPercent,
-        session_persistence: "ephemeral",
-        resumable: false,
+        session_persistence: "durable",
+        resumable: true,
         non_promotable: true,
-        warning: "HTTP /chat sessions are in-memory only, non-promotable, and do not survive server restart; use `ikbi repl --continue` for durable promotable sessions.",
       };
     },
   );

@@ -51,6 +51,7 @@ import type { GovernedExec } from "../governed-exec/index.js";
 import { gbrainBridge } from "../../core/gbrain-bridge.js";
 import { BRAIN_TOOLS, BRAIN_TOOL_NAMES, runBrainTool } from "./builder-tools/brain-tools.js";
 import { confinePath, type ToolCallError } from "./builder-tools/confine.js";
+import { fireHooks, loadHooks } from "../hooks/index.js";
 import { delegateTaskTool, runDelegateTask } from "./builder-tools/delegate.js";
 import { gitDiffTool, gitLogTool, gitStatusTool, GIT_TOOL_NAMES, runGitTool } from "./builder-tools/git-tools.js";
 import { patchTool, runPatch } from "./builder-tools/patch.js";
@@ -739,8 +740,12 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
   // exposed alongside the built-in suite. Declared out here so the finally always tears the
   // transports (spawned child processes) down. Empty (no spawn) when none are configured.
   let mcpRegistry: McpToolRegistry | undefined;
+  // Hooks: loaded once at builder start (best-effort)
+  let hooks: ReturnType<typeof loadHooks> = [];
 
   try {
+    // Load project hooks (best-effort, never blocks startup)
+    try { hooks = loadHooks(ctx.workspace.path); } catch { /* best-effort */ }
     // Canonical worktree root for confinement (realpath’d once).
     const worktreeReal = realpathSync(ctx.workspace.path);
     // MCP TOOL DISCOVERY: connect to any configured MCP servers and collect their tools. The
@@ -782,14 +787,14 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
     // PROJECT MEMORY (CLAUDE.md / AGENTS.md): caller-supplied, else loaded from the worktree
     // root. Rides as an isolated UNTRUSTED message (neutralized) — honored project guidance,
     // but bounded; never raw-concatenated into the trusted system prompt. Missing ⇒ omitted.
-    const projectInstructions = ctx.task.projectInstructions ?? (ctx.task.skipProjectMemory === true ? undefined : loadProjectMemory(worktreeReal)?.content);
+    const projectInstructions = ctx.task.projectInstructions ?? ((ctx.task.skipProjectMemory === true || ctx.task.bare === true) ? undefined : loadProjectMemory(worktreeReal)?.content);
     // INTELLIGENCE LAYER (gbrain): recall knowledge relevant to THIS goal from ikbi's brain and
     // inject it ALONGSIDE the project instructions (never replacing them). Best-effort + bounded:
     // projectContext swallows an unavailable/locked brain (returns undefined) so a build is NEVER
     // blocked. OPT-IN via IKBI_GBRAIN_CONTEXT (default off) so it does not exec gbrain on every
     // run / in test. Skipped when project memory is skipped. Output is UNTRUSTED → neutralized.
     const brainContext =
-      configEnv.IKBI_GBRAIN_CONTEXT === "1" && ctx.task.skipProjectMemory !== true
+      configEnv.IKBI_GBRAIN_CONTEXT === "1" && ctx.task.skipProjectMemory !== true && ctx.task.bare !== true
         ? gbrainBridge.projectContext(ctx.task.goal)
         : undefined;
     // PRINCIPLE 2: pin the goal-named files as PRIMARY TARGETS in the (trusted) system prompt so a
@@ -1668,7 +1673,17 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
               appendToolResult(gov.message, call);
               continue;
             }
-            const raw = runTool(call); // pure: produces a result string (schema-gated inside)
+            const raw = runTool(call);
+            // PostToolUse hook — fire-and-forget, best-effort
+            if (hooks.length > 0) {
+              fireHooks(hooks, {
+                type: "PostToolUse",
+                toolName: call.name,
+                toolInput: call.arguments ?? "{}",
+                toolOutput: raw,
+                projectDir: worktreeReal,
+              }).catch(() => {});
+            } // pure: produces a result string (schema-gated inside)
             appendToolResult(raw, call); // chokepoint: neutralize + append (only path)
           }
         }

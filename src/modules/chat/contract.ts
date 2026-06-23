@@ -71,7 +71,7 @@ export interface ChatResponse {
   /** Context-window pressure for the session after this turn, 0-100 (context visibility). */
   readonly context_percent?: number;
   /** HTTP /chat session persistence disclosure. REPL sessions use the disk store; HTTP sessions do not. */
-  readonly session_persistence?: "ephemeral";
-  readonly resumable?: false;
+  readonly session_persistence?: "ephemeral" | "durable";
+  readonly resumable?: boolean;
   readonly warning?: string;
 }

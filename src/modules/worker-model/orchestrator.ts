@@ -103,6 +103,7 @@ import {
   workerEscalationRetried,
 } from "./events.js";
 import { CONTRACT_VERSION, toOutcomeStatus, WorkerError, WORKER_ROLES } from "./contract.js";
+import { fireStopHooks } from "../hooks/index.js";
 import { runIterativeLoop, DEFAULT_MAX_FIX_ITERATIONS, extractVerifierCheckResult } from "./iterative-loop.js";
 import { runCriticFixLoop, isRetryableCriticFail } from "./critic-fix-loop.js";
 import type {
@@ -779,7 +780,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
    * competitive candidates) accumulates `response.cost.usd` into one running total. The
    * neutralization seam is passed through untouched. `cost()` reads the accumulated total.
    */
-  function makeCostingEngine(maxBudgetUsd?: number): { engine: RoleEngine; cost: () => number } {
+  function makeCostingEngine(maxBudgetUsd?: number, effort?: "low" | "medium" | "high" | "max"): { engine: RoleEngine; cost: () => number } {
     let total = 0;
     let budgetExhausted = false;
     const budget = maxBudgetUsd;
@@ -788,7 +789,16 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         if (budgetExhausted) {
           throw Object.assign(new Error(`budget exhausted: cumulative cost exceeded $${budget?.toFixed(4)} cap`), { code: "BUDGET_EXHAUSTED" });
         }
-        const r = await invokeModel(request);
+        // Apply effort-level overrides to the model request (temperature, maxTokens)
+        // when the task specified --effort. These override role defaults.
+        const effortParams = effort !== undefined ? (() => { 
+          const { effortModelParams: emp } = require("./contract.js") as { effortModelParams: (e?: string) => { temperature: number; maxTokens: number } | undefined };
+          return emp(effort);
+        })() : undefined;
+        const effRequest = effortParams !== undefined
+          ? { ...request, temperature: effortParams.temperature, maxTokens: effortParams.maxTokens }
+          : request;
+        const r = await invokeModel(effRequest);
         total += r.cost?.usd ?? 0;
         if (budget !== undefined && total > budget && budget > 0) {
           budgetExhausted = true;
@@ -1386,6 +1396,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       }
     }
 
+    // Hooks: loaded once per run (best-effort)
+    const hooks = (() => { try { return require("../hooks/index.js").loadHooks(task.targetRepo); } catch { return []; } })();
     // STEP-PLANNER: reuse an existing workspace (changes accumulate across steps)
     // or allocate a fresh one (default single-step behavior).
     const workspace = task.reuseWorkspace ?? await workspaces.allocate({
@@ -1415,7 +1427,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     );
 
     // Per-run costing engine: accumulates every model invocation's cost across all roles.
-    const { engine: runEngine, cost: runCost } = makeCostingEngine(task.maxBudgetUsd);
+    const { engine: runEngine, cost: runCost } = makeCostingEngine(task.maxBudgetUsd, task.effort);
 
     const results: RoleResult[] = [];
     // Run-level escalation accumulator (ADDITIVE observability; never alters dispatch).
@@ -2390,6 +2402,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } },
         ),
       );
+      fireStopHooks(hooks, task.targetRepo).catch(() => {});
       return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: results, workspaceId: workspace.id, promoted: false, reason: killedReason };
     }
 
@@ -2732,7 +2745,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     }
 
     // Per-run costing engine: accumulates model cost across the shared scout + every candidate.
-    const { engine: runEngine, cost: runCost } = makeCostingEngine(task.maxBudgetUsd);
+    const { engine: runEngine, cost: runCost } = makeCostingEngine(task.maxBudgetUsd, task.effort);
 
     const handles: WorkspaceHandle[] = [];
     const rolesByWs = new Map<string, RoleResult[]>();
@@ -2994,7 +3007,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
    * engine is shared across every candidate + the shadow.
    */
   function makeTournamentEngine(task: WorkerTask, parentCtx: OperationContext, parentIdentity: AgentIdentity): TournamentEngine {
-    const { engine: runEngine, cost: runCost } = makeCostingEngine(task.maxBudgetUsd);
+    const { engine: runEngine, cost: runCost } = makeCostingEngine(task.maxBudgetUsd, task.effort);
     // FIX 5: capture worker identity for trust recording (tournament mode).
     // The first spawned role carries the shared agent identity.
     let tournWorkerSpawned: SpawnedRole | undefined;
