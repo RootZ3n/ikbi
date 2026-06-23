@@ -43,7 +43,11 @@
     try {
       var ctrl = new AbortController();
       var timer = setTimeout(function () { ctrl.abort(); }, opts.timeout || 6000);
-      var res = await fetch(BASE + path, { method: 'GET', signal: ctrl.signal, headers: { 'Accept': 'application/json' } });
+      var headers = { 'Accept': 'application/json' };
+      if (typeof window !== 'undefined' && window.IKBI_API_TOKEN) {
+        headers['Authorization'] = 'Bearer ' + window.IKBI_API_TOKEN;
+      }
+      var res = await fetch(BASE + path, { method: 'GET', signal: ctrl.signal, headers: headers });
       clearTimeout(timer);
       var data = null;
       try { data = await res.json(); } catch (e) { /* non-JSON body */ }
@@ -63,8 +67,8 @@
       var timer = setTimeout(function () { ctrl.abort(); }, opts.timeout || 30000);
       var headers = { 'Accept': 'application/json' };
       if (body) headers['Content-Type'] = 'application/json';
-      if (typeof window !== 'undefined' && window.IKBI_CHAT_TOKEN) {
-        headers['Authorization'] = 'Bearer ' + window.IKBI_CHAT_TOKEN;
+      if (typeof window !== 'undefined' && window.IKBI_API_TOKEN) {
+        headers['Authorization'] = 'Bearer ' + window.IKBI_API_TOKEN;
       }
       var fetchOpts = { method: method, signal: ctrl.signal, headers: headers };
       if (body) fetchOpts.body = JSON.stringify(body);

@@ -491,6 +491,85 @@
   }
 
   // ── defId → renderer map ─────────────────────────────────────────────────
+
+  // job-cards-ws — Reusable build recipes
+  async function rJobCardsWs() {
+    var r = await window.IkbiAPI._get('/ikbi/job-cards');
+    if (!r.ok) return offline(r);
+    var cards = r.data || [];
+    var html = '<div class="ikbi-ws">';
+    html += '<div class="peh-stats">' + stat('job cards', cards.length) + '</div>';
+    if (cards.length) {
+      html += section('Job Cards', '<div class="ikbi-tools-grid">' + cards.map(function (c) {
+        return '<div class="ikbi-tool-card"><span class="ikbi-tool-name">' + esc(c.name || c.title || c.id) + '</span>' +
+          '<span class="ikbi-flag-name" style="font-size:11px;color:var(--ink-dim)">' + esc(c.category || 'general') + '</span></div>';
+      }).join('') + '</div>');
+    } else {
+      html += section('Job Cards', '<p class="peh-live-empty">No job cards yet. Create one via the API or build engine.</p>');
+    }
+    html += '</div>';
+    return html;
+  }
+
+  // repo-doctor-ws — Repo health scanner
+  function rRepoDoctorWs() {
+    return '<div class="ikbi-ws">' +
+      section('Repo Doctor', '<p class="ikbi-ws-head">Scan a repository for health issues, missing configs, and structural problems.</p>' +
+        '<div style="margin-top:12px"><button class="ikbi-run-btn" type="button" ' +
+        'onclick="IkbiApp.runCommand(\'repo-doctor\')">Run Repo Doctor</button>' +
+        '<span style="font-size:12px;color:var(--ink-dim);margin-left:10px">Or use: <code style="font-family:var(--mono);color:var(--peh-accent)">ikbi repo-doctor</code></span></div>') +
+      '</div>';
+  }
+
+  // spec-artifact-ws — Structured spec cards
+  async function rSpecArtifactWs() {
+    var r = await window.IkbiAPI.listSpecs();
+    if (!r.ok) return offline(r);
+    var data = r.data || {};
+    var specs = data.specs || [];
+    var html = '<div class="ikbi-ws">';
+    html += '<div class="peh-stats">' + stat('specs', specs.length) + '</div>';
+    if (specs.length) {
+      html += section('Spec Artifacts', '<div class="ikbi-tools-grid">' + specs.map(function (s) {
+        var status = s.status || 'draft';
+        var color = status === 'completed' ? 'on' : status === 'not_implemented' ? 'off' : '';
+        return '<div class="ikbi-tool-card"><span class="ikbi-tool-name">' + esc(s.goal || s.id) + '</span>' +
+          '<span class="ikbi-flag-dot ' + color + '"></span><span class="ikbi-flag-name">' + esc(status) + '</span></div>';
+      }).join('') + '</div>');
+    } else {
+      html += section('Spec Artifacts', '<p class="peh-live-empty">No specs yet. Generate one via the API.</p>');
+    }
+    html += '</div>';
+    return html;
+  }
+
+  // corrections-ws — Correction library (lessons learned)
+  async function rCorrectionsWs() {
+    var r = await window.IkbiAPI.listCorrections();
+    if (!r.ok) return offline(r);
+    var data = r.data || {};
+    var corrections = data.corrections || [];
+    var approved = corrections.filter(function (c) { return c.approved; }).length;
+    var pending = corrections.length - approved;
+    var html = '<div class="ikbi-ws">';
+    html += '<div class="peh-stats">' +
+      stat('total', corrections.length) +
+      stat('approved', approved) +
+      stat('pending', pending) +
+      '</div>';
+    if (corrections.length) {
+      html += section('Corrections Library', '<div class="ikbi-tools-grid">' + corrections.map(function (c) {
+        var icon = c.approved ? '✓' : '○';
+        return '<div class="ikbi-tool-card"><span class="ikbi-tool-name">' + esc(icon + ' ' + (c.title || c.category)) + '</span>' +
+          '<span class="ikbi-flag-name" style="font-size:11px;color:var(--ink-dim)">' + esc(c.category) + '</span></div>';
+      }).join('') + '</div>');
+    } else {
+      html += section('Corrections Library', '<p class="peh-live-empty">No corrections yet. The refuter will propose them as builds run.</p>');
+    }
+    html += '</div>';
+    return html;
+  }
+
   var MAP = {
     'console': {
       fn: rBuildOverview,
@@ -529,6 +608,24 @@
         if (inp) { try { setTimeout(function () { inp.focus(); }, 60); } catch (e) {} }
       },
       options: [['Clear', "window.groveClear()"], ['New session', "IkbiScenes.fill('grove-ws',true)"]]
+    },
+
+    // ── New feature workspaces ──────────────────────────────────────────
+    'job-cards-ws': {
+      fn: rJobCardsWs,
+      options: [['Refresh', "IkbiScenes.fill('job-cards-ws',true)"]]
+    },
+    'repo-doctor-ws': {
+      fn: rRepoDoctorWs,
+      options: [['Scan', "IkbiScenes.fill('repo-doctor-ws',true)"]]
+    },
+    'spec-artifact-ws': {
+      fn: rSpecArtifactWs,
+      options: [['Refresh', "IkbiScenes.fill('spec-artifact-ws',true)"]]
+    },
+    'corrections-ws': {
+      fn: rCorrectionsWs,
+      options: [['Refresh', "IkbiScenes.fill('corrections-ws',true)"]]
     },
   };
 

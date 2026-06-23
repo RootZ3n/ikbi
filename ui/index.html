@@ -3,164 +3,932 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ikbi · Dashboard</title>
+<title>The Workshop · ikbi</title>
 <link rel="stylesheet" href="ikbi.css">
 </head>
 <body>
-<div id="ikbi-app">
-  <!-- ═══ HEADER ═══ -->
-  <header id="hdr">
-    <div class="hdr-brand">
-      <span class="hdr-logo">⚙</span>
-      <span class="hdr-title">ikbi</span>
-      <span class="hdr-sub">build engine</span>
-    </div>
-    <div class="hdr-status">
-      <span id="engine-dot" class="dot dot-amber"></span>
-      <span id="engine-label">checking…</span>
-    </div>
-  </header>
+<div id="app"></div>
+<script>
+// ══════════════════════════════════════════════════════════════════════
+// IKBI · THE WORKSHOP — Pehverse world engine
+// Self-contained. The engine architecture (state shape, render pipeline,
+// function names) mirrors the Pehverse world shell so the engine can be
+// synced across repos. This is a BUILD ENGINE UI — no benchmark/scoring
+// logic. Workspace panels show placeholder content for now.
+// ══════════════════════════════════════════════════════════════════════
 
-  <!-- ═══ 1. RUNTIME TUI ═══ -->
-  <section id="tui" class="panel">
-    <div class="panel-head">
-      <span class="panel-title">Runtime</span>
-      <span id="tui-status" class="tui-status-idle">
-        <span class="tui-status-dot"></span> idle
-      </span>
-    </div>
-    <div id="tui-log" class="tui-log"></div>
-    <form id="tui-form" class="tui-input-bar">
-      <span class="tui-prompt" aria-hidden="true">❯</span>
-      <input id="tui-input" type="text" autocomplete="off" spellcheck="false"
-             placeholder="Run a command — try: help">
-      <button type="submit" class="tui-run-btn">Run</button>
-    </form>
-  </section>
+// ── TAB_CONFIG — ikbi-specific. Labels the build coordination areas
+//    and backs the "open related console" affordance in placeholder panels.
+const TAB_CONFIG={
+  overview:{key:'overview',label:'Build Overview',laneTitle:'Overview'},
+  builder:{key:'builder',label:'Builder',laneTitle:'Builder'},
+  tests:{key:'tests',label:'Tests',laneTitle:'Tests'},
+  trust:{key:'trust',label:'Trust & Safety',laneTitle:'Trust'},
+  config:{key:'config',label:'Configuration',laneTitle:'Config'}
+};
 
-  <!-- ═══ 2. CHAT WITH PEH ═══ -->
-  <section id="chat" class="panel">
-    <div class="panel-head">
-      <span class="panel-title">Chat with Peh</span>
-    </div>
-    <div id="chat-msgs" class="chat-msgs"></div>
-    <form id="chat-form" class="chat-input-bar">
-      <input id="chat-input" type="text" autocomplete="off" spellcheck="false"
-             placeholder="Ask Peh — the medicine man…">
-      <button type="submit" class="chat-send-btn">Send</button>
-    </form>
-  </section>
+// ── Small helpers (mirrors the shared engine utilities) ────────────────
+const esc=(v)=>String(v??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+function safeStr(value){const s=String(value??'');return(s==='undefined'||s==='null'||s==='NaN')?'':s}
+function humanizeToken(text){const raw=String(text||'').replace(/[_-]+/g,' ').replace(/\s+/g,' ').trim();if(!raw)return'General';return raw.replace(/\b\w/g,(m)=>m.toUpperCase())}
 
-  <!-- ═══ 3. HOTSPOT WINDOWS TOOLBAR ═══ -->
-  <div id="win-toolbar" class="win-toolbar">
-    <span class="win-toolbar-label">Windows:</span>
-    <button class="win-toggle active" data-win="job-cards">Job Cards</button>
-    <button class="win-toggle active" data-win="repo-doctor">Repo Doctor</button>
-    <button class="win-toggle" data-win="spec-artifact">Spec Artifact</button>
-    <button class="win-toggle" data-win="build-history">Build History</button>
-    <button class="win-toggle" data-win="modules">Modules</button>
-    <button class="win-toggle" data-win="config">Configuration</button>
-    <button class="win-toggle" data-win="corrections">Corrections</button>
-  </div>
+// ── State — same shape as the Pehverse shell, scoped to ikbi. ─────────
+const state={
+  activeTab:'overview',
+  pehverse:{
+    product:'ikbi',
+    scene:localStorage.getItem('pehverse-scene')||null,
+    mode:localStorage.getItem('pehverse-mode')||'dashboard',
+    workspaces:[],
+    focus:null,
+    fastTravel:false,
+    wsSeq:0,
+    pehBubble:null,
+    pehPosition:null
+  }
+};
 
-  <!-- ═══ 3a. HOTSPOT WINDOWS CONTAINER ═══ -->
-  <section id="win-area" class="win-area">
-    <!-- Job Cards -->
-    <div class="hw" id="hw-job-cards" data-win="job-cards">
-      <div class="hw-head">
-        <span class="hw-title">Job Cards</span>
-        <div class="hw-actions">
-          <button class="hw-btn" onclick="Ikbui.refreshJobCards()" title="Refresh">↻</button>
-          <button class="hw-btn hw-min" data-action="minimize" title="Minimize">─</button>
-          <button class="hw-btn hw-close" data-action="close" title="Close">✕</button>
-        </div>
+// ── ProductRegistry ─────────────────────────────────────────────────────
+// ikbi — the build engine. amber/gold construction theme.
+const PRODUCT_REGISTRY=[
+  {id:'ikbi', displayName:'The Workshop', tagline:'Where code gets built',
+   status:'public', order:1, accent:'#d4a843', accent2:'#4ecdc4',
+   peh:'gear', defaultScene:'the-heartwood',
+   mascotArt:'assets/peh-guide.png',
+   blurb:'ikbi is the build engine — methodical, evidence-based, precise. Every great structure starts with a solid foundation.'}
+];
+
+const PEH_DEFAULT_PRODUCT='ikbi';
+
+// ── SceneRegistry ──────────────────────────────────────────────────────
+// Four sacred locations on the ikbi world map — exact positions matched
+// to the actual ikbi_desktop.png landscape. The Heartwood is the hub and
+// carries every workspace hotspot (builder, launch, modules) directly.
+const SCENE_REGISTRY={
+  ikbi:[
+    {id:'the-heartwood', title:'The Heartwood', purpose:'Hub / overview', route:'/heartwood',
+     desc:'The central clearing where every path converges. Sun-dappled grass, wildflowers, and the quiet hum of the engine.', peh:'star',
+     pehSlot:{x:49, y:48, anchor:'center', variant:'guardian'}, hotspots:[
+      {id:'hw-status',   label:'Engine Status',    x:49, y:38, workspace:'engine-status',  greeting:"The heartbeat of the engine — status, tools, features. Everything you need, at a glance."},
+      {id:'hw-builder',  label:'Builder',          x:20, y:26, workspace:'builder-ws',     greeting:"Pick up the chisel — builder tools, provider model, and a direct line to the engine."},
+      {id:'hw-launch',   label:'Launch Pad',       x:17, y:67, workspace:'builder-ws',     greeting:"The water is clear — time to build something new."},
+      {id:'hw-grove',    label:'The Grove',        x:48, y:15, scene:'the-grove',          greeting:"The Grove — where you speak directly to the engine. Type a goal, and ikbi builds."},
+      {id:'hw-modules',  label:'Modules',          x:83, y:41, workspace:'modules-ws',     greeting:"28 modules, each a stone in the ring. Let's check their health."},
+      {id:'hw-flame',    label:'The Sacred Flame', x:77, y:73, scene:'the-sacred-flame',   greeting:"The Sacred Flame — every build tested here. 800 trials, each one a rite."},
+      {id:'hw-river',    label:"The River's End",  x:78, y:18, scene:'the-rivers-end',     greeting:"The River's End — where all builds arrive. History and receipts."},
+      {id:'hw-jobs',     label:'Job Cards',        x:35, y:75, workspace:'job-cards-ws',   greeting:"Job Cards — reusable build recipes. Every task, a card. Every card, a plan."},
+      {id:'hw-doctor',   label:'Repo Doctor',      x:65, y:75, workspace:'repo-doctor-ws', greeting:"The Doctor sees all. Let me scan the repo and find what ails it."},
+      {id:'hw-specs',    label:'Spec Artifact',    x:35, y:25, workspace:'spec-artifact-ws', greeting:"Specs — the blueprints before the build. Every great structure starts with a plan."},
+      {id:'hw-corr',     label:'Corrections',      x:65, y:25, workspace:'corrections-ws', greeting:"Corrections — every failure becomes a lesson. Every lesson, a stronger build."}
+    ]},
+    {id:'the-grove', title:'The Grove', purpose:'Terminal & conversation', route:'/grove',
+     desc:'An ancient grove where the old tree speaks. This is where you talk to ikbi — directly, in the terminal. Type a goal and watch the engine work.', peh:'leaf',
+     pehSlot:{x:48, y:15, anchor:'center', variant:'elder'}, hotspots:[
+      {id:'gr-terminal', label:'Terminal',               x:46, y:48, workspace:'grove-ws',     greeting:"The Grove awaits. Type your goal — ikbi will read the ground truth and build."},
+      {id:'gr-back',     label:'Back to the Heartwood', x:50, y:82, scene:'the-heartwood',    greeting:"Back to the Heartwood — follow me."}
+    ]},
+    {id:'the-sacred-flame', title:'The Sacred Flame', purpose:'Test results', route:'/flame',
+     desc:'A ceremonial fire circle with stone seating and feathered posts. Every build faces the flame. 800 tests — each one a rite of passage.', peh:'star',
+     pehSlot:{x:77, y:73, anchor:'center', variant:'firekeeper'}, hotspots:[
+      {id:'sf-tests', label:'Test Results',            x:46, y:48, workspace:'test-results',   greeting:"The Sacred Flame awaits. 800+ tests — let's see what endures."},
+      {id:'sf-back',  label:'Back to the Heartwood',   x:30, y:20, scene:'the-heartwood',      greeting:"Back to the Heartwood — follow me."}
+    ]},
+    {id:'the-rivers-end', title:"The River's End", purpose:'Build history', route:'/river',
+     desc:'A distant waterfall feeds a winding river through the valley. Every build flows downstream to here — receipts, history, and the record that never lies.', peh:'book',
+     pehSlot:{x:78, y:18, anchor:'center', variant:'keeper'}, hotspots:[
+      {id:'re-history', label:'Build History',          x:46, y:48, workspace:'history-ws',     greeting:"Every build flows here. Receipts, history, and the current that carries us."},
+      {id:'re-back',    label:'Back to the Heartwood',  x:25, y:80, scene:'the-heartwood',      greeting:"Back to the Heartwood — follow me."}
+    ]}
+  ]
+};
+
+// ── WorkspaceManager: definitions ──────────────────────────────────────
+// Hub ('console') is kind:'deck' — the Build Overview console. All other
+// workspaces are kind:'live' wired to the backend API.
+const WORKSPACE_REGISTRY={
+  'console':          {product:null,   title:'Heartwood Dashboard', kind:'deck', dock:'fullscreen', peh:'star'},
+  'engine-status':    {product:'ikbi', title:'Engine Status',       kind:'live', dock:'fullscreen', peh:'gear'},
+  'builder-ws':       {product:'ikbi', title:'Builder',             kind:'live', dock:'fullscreen', peh:'tools'},
+  'test-results':     {product:'ikbi', title:'Test Results',        kind:'live', dock:'fullscreen', peh:'star'},
+  'trust-ws':         {product:'ikbi', title:'Trust & Safety',      kind:'live', dock:'fullscreen', peh:'shield'},
+  'modules-ws':       {product:'ikbi', title:'Modules',             kind:'live', dock:'fullscreen', peh:'gear'},
+  'history-ws':       {product:'ikbi', title:'History',             kind:'live', dock:'fullscreen', peh:'book'},
+  'grove-ws':         {product:'ikbi', title:'The Grove',           kind:'live', dock:'fullscreen', peh:'leaf'}
+};
+
+// ── Registry lookups ───────────────────────────────────────────────────
+function pehProduct(id){return PRODUCT_REGISTRY.find((p)=>p.id===id)||null}
+function pehPublicProducts(){return PRODUCT_REGISTRY.filter((p)=>p.status==='public').sort((a,b)=>a.order-b.order)}
+function pehFutureProducts(){return PRODUCT_REGISTRY.filter((p)=>p.status==='future').sort((a,b)=>a.order-b.order)}
+function pehScenes(productId){return SCENE_REGISTRY[productId]||[]}
+function pehScene(productId,sceneId){return pehScenes(productId).find((s)=>s.id===sceneId)||null}
+function pehWorkspaceDef(defId){return WORKSPACE_REGISTRY[defId]||null}
+
+// ── Product isolation: dev mode + active-product resolution ────────────
+function pehDevMode(){
+  try{
+    if(typeof window!=='undefined'&&window.PEHVERSE_DEV===true)return true;
+    if(typeof location!=='undefined'&&/[?&]peh-dev=1(?:&|$)/.test(location.search||'')){
+      try{localStorage.setItem('pehverse-dev','1')}catch(e){}
+    }
+    return (typeof localStorage!=='undefined'&&localStorage.getItem('pehverse-dev')==='1');
+  }catch(e){return false}
+}
+function pehResolveActiveProduct(){
+  let injected=null,devSel=null;
+  try{injected=(typeof window!=='undefined'&&window.PEHVERSE_PRODUCT)||null}catch(e){}
+  try{devSel=pehDevMode()?localStorage.getItem('pehverse-product'):null}catch(e){}
+  const want=injected||devSel||PEH_DEFAULT_PRODUCT;
+  const p=pehProduct(want);
+  return (p&&p.status==='public')?p.id:PEH_DEFAULT_PRODUCT;
+}
+function pehActiveProduct(){
+  const p=pehProduct(state.pehverse.product);
+  return (p&&p.status==='public')?p:pehProduct(PEH_DEFAULT_PRODUCT);
+}
+function pehActiveProductId(){const p=pehActiveProduct();return p?p.id:PEH_DEFAULT_PRODUCT}
+function pehCurrentScene(){
+  const p=pehActiveProduct(); if(!p)return null;
+  const sid=state.pehverse.scene||p.defaultScene;
+  return pehScene(p.id,sid)||pehScenes(p.id)[0]||null;
+}
+function pehInitProduct(){
+  const pid=pehResolveActiveProduct();
+  state.pehverse.product=pid;
+  const prod=pehProduct(pid);
+  if(!state.pehverse.scene||!pehScene(pid,state.pehverse.scene)){
+    state.pehverse.scene=(prod&&prod.defaultScene)||(pehScenes(pid)[0]&&pehScenes(pid)[0].id)||null;
+  }
+}
+function pehWorkspaceBelongsToActive(def){
+  if(!def)return false;
+  return def.product==null||def.product===pehActiveProductId();
+}
+
+// ── Navigation ─────────────────────────────────────────────────────────
+function pehSetScene(sceneId){
+  if(!pehScene(pehActiveProductId(),sceneId))return;
+  state.pehverse.scene=sceneId;
+  state.pehverse.pehPosition=null;
+  localStorage.setItem('pehverse-scene',sceneId);
+  render();
+}
+function pehGoScene(sceneId){
+  if(!pehScene(pehActiveProductId(),sceneId))return;
+  state.pehverse.scene=sceneId;
+  state.pehverse.pehPosition=null;
+  state.pehverse.fastTravel=false;
+  localStorage.setItem('pehverse-scene',sceneId);
+  render();
+}
+function pehDevSwitchProduct(productId){
+  if(!pehDevMode())return;
+  const p=pehProduct(productId);
+  if(!p||p.status!=='public')return;
+  state.pehverse.product=p.id;
+  state.pehverse.scene=p.defaultScene||(pehScenes(p.id)[0]&&pehScenes(p.id)[0].id)||null;
+  state.pehverse.workspaces=[];
+  state.pehverse.focus=null;
+  state.pehverse.pehBubble=null;
+  state.pehverse.pehPosition=null;
+  state.pehverse.fastTravel=false;
+  try{localStorage.setItem('pehverse-product',p.id);if(state.pehverse.scene)localStorage.setItem('pehverse-scene',state.pehverse.scene)}catch(e){}
+  render();
+}
+var _dashAutoOpenDone=false;
+function pehAutoOpenDashboard(){
+  // INTENTIONALLY DISABLED — opening all workspaces at once floods the screen.
+  // Users should click a hotspot or use fast travel to open specific workspaces.
+  // The workspace chooser (pehWorkspaceChooser) handles the empty state.
+}
+function pehSetMode(mode){
+  if(mode!=='immersive'&&mode!=='dashboard')return;
+  state.pehverse.mode=mode;
+  localStorage.setItem('pehverse-mode',mode);
+  if(mode==='immersive'){
+    // Close all workspaces when entering immersive — show the clean world map
+    state.pehverse.workspaces=[];
+    state.pehverse.focus=null;
+  }
+  if(mode==='dashboard'){_dashAutoOpenDone=false;}
+  render();
+}
+function pehToggleMode(){pehSetMode(state.pehverse.mode==='immersive'?'dashboard':'immersive')}
+function pehToggleFastTravel(force){
+  state.pehverse.fastTravel=(typeof force==='boolean')?force:!state.pehverse.fastTravel;
+  render();
+}
+
+// ── WorkspaceManager: open/close/dock/focus/minimize ───────────────────
+function pehOpenWorkspace(defId,opts){
+  const def=pehWorkspaceDef(defId); if(!def)return;
+  if(!pehWorkspaceBelongsToActive(def)){
+    if(typeof console!=='undefined'&&console.warn){
+      console.warn('[pehverse] blocked cross-product workspace open:',defId,'(owned by',def.product,'· active',pehActiveProductId()+')');
+    }
+    return;
+  }
+  let ws=state.pehverse.workspaces.find((w)=>w.defId===defId);
+  if(!ws){
+    ws={uid:'ws'+(++state.pehverse.wsSeq),defId,dock:(opts&&opts.dock)||def.dock||'right',min:false};
+    state.pehverse.workspaces.push(ws);
+  }
+  ws.min=false;
+  pehFocusWorkspace(ws.uid,true);
+  render();
+}
+
+// ── Peh-as-guide: contextual speech bubble ─────────────────────────────
+let pehBubbleFadeTimer=null;
+let pehBubbleClearTimer=null;
+const PEH_BUBBLE_HOLD_MS=6000;
+const PEH_BUBBLE_FADE_MS=300;
+function pehClearBubbleTimers(){
+  if(pehBubbleFadeTimer){clearTimeout(pehBubbleFadeTimer);pehBubbleFadeTimer=null;}
+  if(pehBubbleClearTimer){clearTimeout(pehBubbleClearTimer);pehBubbleClearTimer=null;}
+}
+function pehBubbleAnchor(hotspot){return (hotspot.y!=null&&hotspot.y<24)?'down':'up';}
+function pehSayGreeting(hotspot,scene){
+  if(!hotspot)return;
+  const text=hotspot.greeting||(scene?`Entering ${scene.title}.`:'This way!');
+  const x=Math.max(16,Math.min(84,hotspot.x!=null?hotspot.x:50));
+  const y=hotspot.y!=null?hotspot.y:50;
+  pehClearBubbleTimers();
+  state.pehverse.pehBubble={
+    text,x,y,
+    anchor:pehBubbleAnchor(hotspot),
+    variant:(scene&&scene.pehSlot&&scene.pehSlot.variant)||'engineer',
+    hotspotId:hotspot.id,
+    phase:'enter'
+  };
+  state.pehverse.pehPosition={x:hotspot.x!=null?hotspot.x:50,y};
+  render();
+  pehBubbleFadeTimer=setTimeout(()=>{
+    pehBubbleFadeTimer=null;
+    if(!state.pehverse.pehBubble||state.pehverse.pehBubble.hotspotId!==hotspot.id)return;
+    state.pehverse.pehBubble.phase='exit';
+    render();
+    pehBubbleClearTimer=setTimeout(()=>{
+      pehBubbleClearTimer=null;
+      if(state.pehverse.pehBubble&&state.pehverse.pehBubble.hotspotId===hotspot.id){
+        state.pehverse.pehBubble=null;
+        render();
+      }
+    },PEH_BUBBLE_FADE_MS);
+  },PEH_BUBBLE_HOLD_MS);
+}
+function pehDismissBubble(){
+  if(!state.pehverse.pehBubble)return;
+  pehClearBubbleTimers();
+  state.pehverse.pehBubble.phase='exit';
+  render();
+  pehBubbleClearTimer=setTimeout(()=>{
+    pehBubbleClearTimer=null;
+    state.pehverse.pehBubble=null;
+    render();
+  },PEH_BUBBLE_FADE_MS);
+}
+function pehHotspot(defId,sceneId){
+  if(sceneId&&pehScene(pehActiveProductId(),sceneId)){
+    state.pehverse.scene=sceneId;state.pehverse.pehPosition=null;localStorage.setItem('pehverse-scene',sceneId);
+  }
+  pehOpenWorkspace(defId);
+}
+function pehHotspotActivate(sceneId,hotspotId){
+  const scene=pehScene(pehActiveProductId(),sceneId);
+  const hotspot=scene&&scene.hotspots?scene.hotspots.find((h)=>h.id===hotspotId):null;
+  if(hotspot)pehSayGreeting(hotspot,scene);
+  setTimeout(()=>{
+    if(!hotspot)return;
+    if(hotspot.workspace)pehHotspot(hotspot.workspace,hotspot.scene);
+    else if(hotspot.scene)pehSetScene(hotspot.scene);
+  },300);
+}
+function pehFocusWorkspace(uid,skipRender){
+  const ws=state.pehverse.workspaces.find((w)=>w.uid===uid);
+  if(!ws){if(!skipRender)render();return}
+  state.pehverse.focus=uid;
+  const def=pehWorkspaceDef(ws.defId);
+  if(def&&def.kind==='lane'&&def.tab)state.activeTab=def.tab;
+  state.pehverse.workspaces=state.pehverse.workspaces.filter((w)=>w.uid!==uid).concat(ws);
+  if(!skipRender)render();
+}
+function pehCloseWorkspace(uid){
+  state.pehverse.workspaces=state.pehverse.workspaces.filter((w)=>w.uid!==uid);
+  if(state.pehverse.focus===uid){
+    const stack=state.pehverse.workspaces;
+    state.pehverse.focus=stack.length?stack[stack.length-1].uid:null;
+  }
+  render();
+}
+function pehDockWorkspace(uid,dock){
+  const ws=state.pehverse.workspaces.find((w)=>w.uid===uid); if(!ws)return;
+  ws.dock=dock; ws.min=false; pehFocusWorkspace(uid,true); render();
+}
+function pehMinimizeWorkspace(uid){
+  const ws=state.pehverse.workspaces.find((w)=>w.uid===uid); if(!ws)return;
+  ws.min=!ws.min; render();
+}
+function pehCloseAllWorkspaces(){
+  state.pehverse.workspaces=[]; state.pehverse.focus=null; render();
+}
+function pehBackToMap(uid){
+  if(uid)state.pehverse.workspaces=state.pehverse.workspaces.filter((w)=>w.uid!==uid);
+  const stack=state.pehverse.workspaces;
+  state.pehverse.focus=stack.length?stack[stack.length-1].uid:null;
+  state.pehverse.mode='immersive';
+  try{localStorage.setItem('pehverse-mode','immersive')}catch(e){}
+  render();
+}
+function pehOpenRelatedLane(tab){if(tab)state.activeTab=tab;pehOpenWorkspace('console')}
+
+// ── Peh glyphs ─────────────────────────────────────────────────────────
+function pehGlyph(key){
+  const P={
+    microscope:'<path d="M9 17h7M6 21h12M11 5l3 3-4 4-3-3zM12.5 9.5l3.5 3.5a4 4 0 0 1-5 6"/>',
+    telescope:'<path d="M3 14l11-4 1.6 4.4L5 18zM14 10l4-1.4.9 2.6-4 1.4zM7 17l-2 4M12 18v3M9 21h6"/>',
+    beaker:'<path d="M9 3h6M10 3v6l-5 8a2 2 0 0 0 1.8 3h10.4A2 2 0 0 0 19 17l-5-8V3M7.5 14h9"/>',
+    book:'<path d="M5 4h10a2 2 0 0 1 2 2v13a1 1 0 0 0-1-1H5zM5 18a1 1 0 0 0-1 1V6a2 2 0 0 1 1-1.7M9 8h5M9 11h5"/>',
+    gear:'<circle cx="12" cy="12" r="3"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/>',
+    leaf:'<path d="M5 19c0-8 5-13 14-13 0 9-5 14-13 14M5 19c2-5 5-8 9-9"/>',
+    tools:'<path d="M14.5 5.5a3.5 3.5 0 0 0 4.6 4.6L21 12l-9 9-2-2 6.9-6.9M9 9l-5 5L6 16M3.5 8.5l3-3 3 3-3 3z"/>',
+    signal:'<path d="M12 18v3M9 21h6M5 11a9 9 0 0 1 14 0M8 13.5a5 5 0 0 1 8 0"/><circle cx="12" cy="16" r="1.6"/>',
+    star:'<path d="M12 3l2.6 5.6L21 9.3l-4.5 4.3 1.1 6.1L12 17l-5.6 2.7 1.1-6.1L3 9.3l6.4-.7z"/>',
+    orbit:'<circle cx="12" cy="12" r="3"/><path d="M5 5c4-2 10 4 8 8M19 19c-4 2-10-4-8-8"/>',
+    wrench:'<path d="M15 7a4 4 0 0 1-5.2 3.8L5 15.6 8.4 19l4.8-4.8A4 4 0 0 1 17 9l-2 2-2-2 2-2z"/>',
+    spark:'<path d="M12 3v6M12 15v6M3 12h6M15 12h6"/>'
+  };
+  return `<svg class="peh-glyph" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[key]||'<circle cx="12" cy="12" r="7"/>'}</svg>`;
+}
+
+// ── Peh slot (Pehlichi guide medallion) ────────────────────────────────
+function pehSlotMarkup(slot,opts){
+  if(!slot)return'';
+  const o=opts||{};
+  const variant=slot.variant||'guardian';
+  const inline=o.inline;
+  const pos=inline?'' : `left:${slot.x}%;top:${slot.y}%;`;
+  const anchor=slot.anchor||'center';
+  return `<div class="peh-slot peh-slot-${anchor} ${inline?'peh-slot-inline':''} ${o.glow?'glow':''}" style="${pos}" data-variant="${esc(variant)}" data-anchor="${esc(anchor)}" title="Peh — your guide (${esc(variant)})" aria-label="Peh — ${esc(variant)}">
+    <span class="peh-slot-medallion" aria-hidden="true"><img src="assets/peh-guide.png" alt="" loading="lazy" width="100%" height="100%"></span>
+    ${inline?'':'<span class="peh-slot-tag">Peh</span>'}
+  </div>`;
+}
+function renderPehSlot(scene){
+  if(!scene||!scene.pehSlot)return'';
+  const pv=state.pehverse;
+  const slot=pv.pehPosition
+    ? Object.assign({},scene.pehSlot,{x:pv.pehPosition.x,y:pv.pehPosition.y})
+    : scene.pehSlot;
+  return pehSlotMarkup(slot,{inline:false,glow:!!pv.pehBubble});
+}
+function renderPehBubble(){
+  const b=state.pehverse.pehBubble;
+  if(!b)return'';
+  const phaseClass=b.phase==='exit'?'peh-bubble-exit':'peh-bubble-enter';
+  return `<div class="peh-bubble-layer" aria-hidden="false">
+    <div class="peh-bubble peh-bubble-anchor-${esc(b.anchor)} ${phaseClass}" style="left:${b.x}%;top:${b.y}%" role="status" title="Dismiss" onclick="pehDismissBubble()">
+      <div class="peh-bubble-content">
+        <span class="peh-bubble-name">ikbi</span>
+        <p class="peh-bubble-text">${esc(b.text)}</p>
       </div>
-      <div class="hw-body" id="hw-job-cards-body"></div>
+      <div class="peh-bubble-tail" aria-hidden="true"></div>
     </div>
+  </div>`;
+}
+function renderPehGuide(product){
+  return `<figure class="peh-guide" aria-hidden="true">
+    <span class="peh-guide-frame"><img class="peh-guide-img" src="assets/peh-guide.png" alt="" loading="lazy"></span>
+    <figcaption class="peh-guide-cap"><b>Peh</b><i>your guide</i></figcaption>
+  </figure>`;
+}
 
-    <!-- Repo Doctor -->
-    <div class="hw" id="hw-repo-doctor" data-win="repo-doctor">
-      <div class="hw-head">
-        <span class="hw-title">Repo Doctor</span>
-        <div class="hw-actions">
-          <button class="hw-btn" onclick="Ikbui.scanRepoDoctor()" title="Scan">🔍</button>
-          <button class="hw-btn hw-min" data-action="minimize" title="Minimize">─</button>
-          <button class="hw-btn hw-close" data-action="close" title="Close">✕</button>
-        </div>
+// ── PehverseShell: top-level renderer ──────────────────────────────────
+function renderPehverse(deckMarkup){
+  const pv=state.pehverse;
+  const product=pehActiveProduct();
+  const scene=pehCurrentScene();
+  const styleVars=`--peh-accent:${product.accent};--peh-accent2:${product.accent2||product.accent}`;
+  return `<div class="peh-shell peh-mode-${pv.mode} peh-product-${product.id}" data-product="${product.id}" style="${styleVars}">
+    ${renderPehTopBar(product,scene)}
+    <div class="peh-stage">${renderPehStage(product,scene,deckMarkup)}</div>
+    ${renderPehTaskbar()}
+    ${renderFastTravelMenu()}
+  </div>`;
+}
+
+function renderPehTopBar(product,scene){
+  const pv=state.pehverse;
+  const dev=pehDevMode();
+  return `<header class="peh-topbar">
+    <div class="peh-brand"><span class="peh-brand-mark" title="Pehverse ecosystem">PEH</span><span class="peh-brand-word">${esc(product.displayName)}</span>${dev?'<span class="peh-dev-badge" title="Dev mode — product switcher enabled">DEV</span>':''}</div>
+    <button class="peh-travel-btn" type="button" onclick="pehToggleFastTravel()" aria-haspopup="dialog" aria-expanded="${pv.fastTravel?'true':'false'}" title="Fast travel — areas in ${esc(product.displayName)} (Alt+T)">
+      <span class="peh-travel-glyph" aria-hidden="true">✦</span>
+      <span class="peh-here"><b>${esc(product.displayName)}</b><i>${esc(scene?scene.title:product.tagline)}</i></span>
+      <span class="peh-travel-cta">Fast travel</span>
+    </button>
+    <div class="peh-mode-toggle" role="group" aria-label="View mode (Alt+M to toggle)">
+      <button type="button" class="${pv.mode==='immersive'?'active':''}" aria-pressed="${pv.mode==='immersive'}" onclick="pehSetMode('immersive')">Immersive</button>
+      <button type="button" class="${pv.mode==='dashboard'?'active':''}" aria-pressed="${pv.mode==='dashboard'}" onclick="pehSetMode('dashboard')">Dashboard</button>
+    </div>
+  </header>`;
+}
+
+function renderPehStage(product,scene,deckMarkup){
+  return state.pehverse.mode==='dashboard'
+    ? renderPehDashboard(product,scene,deckMarkup)
+    : renderPehImmersive(product,scene,deckMarkup);
+}
+
+function renderPehImmersive(product,scene,deckMarkup){
+  return `<div class="peh-scene" data-scene="${scene?scene.id:''}">
+    <div class="peh-scene-atmos" aria-hidden="true"></div>
+    <div class="peh-scene-caption">
+      <span class="peh-scene-tag">${esc(product.displayName)} · ${esc(product.tagline)}</span>
+      <h1 class="peh-scene-title">${esc(scene?scene.title:product.displayName)}</h1>
+      <p class="peh-scene-desc">${esc(scene?scene.desc:product.blurb)}</p>
+    </div>
+    ${renderPehSlot(scene)}
+    ${renderPehBubble()}
+    ${renderPehGuide(product)}
+    ${renderHotspotLayer(scene)}
+    ${renderPehWaypoints(product,scene)}
+    ${renderWorkspaceOverlays(deckMarkup)}
+  </div>`;
+}
+
+function renderPehDashboard(product,scene,deckMarkup){
+  // grove-ws (the terminal) always sorts first so it pins to the top of the grid.
+  const open=state.pehverse.workspaces.slice().sort((a,b)=>{
+    const ag=a.defId==='grove-ws'?0:1, bg=b.defId==='grove-ws'?0:1;
+    return ag-bg;
+  });
+  const grid=open.length
+    ? open.map((w)=>renderWorkspaceTile(w,deckMarkup)).join('')
+    : pehWorkspaceChooser(product);
+  return `<div class="peh-dash">
+    <div class="peh-dash-head">
+      <div class="peh-dash-here">${scene&&scene.pehSlot?pehSlotMarkup(scene.pehSlot,{inline:true}):''}<span class="peh-scene-tag">${esc(product.displayName)}</span><h1>${esc(scene?scene.title:product.displayName)}</h1><p>${esc(scene?scene.desc:product.blurb)}</p></div>
+      ${renderPehWaypoints(product,scene)}
+    </div>
+    <div class="peh-grid ${open.length>1?'multi':''}">${grid}</div>
+  </div>`;
+}
+
+// ── HotspotLayer ───────────────────────────────────────────────────────
+function renderHotspotLayer(scene){
+  if(!scene||!scene.hotspots||!scene.hotspots.length)return'';
+  return `<div class="peh-hotspots" aria-label="${esc(scene.title)} hotspots">${scene.hotspots.map((h)=>{
+    const action=`pehHotspotActivate('${scene.id}','${h.id}')`;
+    const kind=h.workspace?(pehWorkspaceDef(h.workspace)||{}).kind:'travel';
+    return `<button class="peh-hotspot" type="button" style="left:${h.x}%;top:${h.y}%" title="${esc(h.label)}" aria-label="${esc(h.label)}" onclick="${action}">
+      <span class="peh-pin" aria-hidden="true"></span>
+      <span class="peh-hotspot-label">${esc(h.label)}${kind==='deck'?'<i class="peh-dot-live"></i>':''}</span>
+    </button>`;
+  }).join('')}</div>`;
+}
+
+function renderPehWaypoints(product,scene){
+  const scenes=pehScenes(product.id);
+  if(scenes.length<2)return'';
+  return `<nav class="peh-waypoints" aria-label="${esc(product.displayName)} areas">${scenes.map((s)=>`<button type="button" class="peh-waypoint ${scene&&s.id===scene.id?'active':''}" aria-current="${scene&&s.id===scene.id?'true':'false'}" onclick="pehSetScene('${s.id}')">${esc(s.title)}</button>`).join('')}</nav>`;
+}
+
+// ── WorkspaceManager: panel + tile + body renderers ────────────────────
+function renderWorkspaceOverlays(deckMarkup){
+  const open=state.pehverse.workspaces;
+  if(!open.length)return'';
+  let ws=open.find((w)=>w.uid===state.pehverse.focus)||open[open.length-1];
+  if(ws.min)return'';
+  return `<div class="peh-overlays">${renderWorkspacePanel(ws,deckMarkup)}</div>`;
+}
+function renderWorkspacePanel(w,deckMarkup){
+  const def=pehWorkspaceDef(w.defId)||{};
+  const focused=state.pehverse.focus===w.uid;
+  return `<section class="peh-panel dock-${w.dock} ${focused?'focused':''} ${w.min?'min':''}" data-uid="${w.uid}" onmousedown="pehFocusWorkspace('${w.uid}')" aria-label="${esc(def.title||w.defId)} workspace">
+    ${renderWorkspaceHeader(w,def,false)}
+    <div class="peh-panel-body">${w.min?'':pehWorkspaceBody(w,deckMarkup)}</div>
+  </section>`;
+}
+function renderWorkspaceTile(w,deckMarkup){
+  const def=pehWorkspaceDef(w.defId)||{};
+  return `<section class="peh-tile ${state.pehverse.focus===w.uid?'focused':''}" data-uid="${w.uid}" data-def="${esc(w.defId)}" onmousedown="pehFocusWorkspace('${w.uid}')" aria-label="${esc(def.title||w.defId)} workspace">
+    ${renderWorkspaceHeader(w,def,true)}
+    <div class="peh-panel-body">${pehWorkspaceBody(w,deckMarkup)}</div>
+  </section>`;
+}
+function renderWorkspaceHeader(w,def,isTile){
+  const kindTag=(def.kind==='lane'||def.kind==='live')?'LIVE':def.kind==='deck'?'CONSOLE':'PLACEHOLDER';
+  const dockBtn=(d,glyph,label)=>`<button class="peh-dockbtn ${w.dock===d?'on':''}" type="button" title="Dock ${label}" aria-label="Dock ${label}" onmousedown="event.stopPropagation()" onclick="event.stopPropagation();pehDockWorkspace('${w.uid}','${d}')">${glyph}</button>`;
+  return `<header class="peh-panel-head">
+    ${isTile?'':`<button class="peh-backmap" type="button" title="Back to the map" aria-label="Back to the map" onmousedown="event.stopPropagation()" onclick="event.stopPropagation();pehBackToMap('${w.uid}')"><span aria-hidden="true">‹</span> Map</button>`}
+    <span class="peh-panel-glyph">${pehGlyph(def.peh)}</span>
+    <span class="peh-panel-title">${esc(def.title||w.defId)}</span>
+    <span class="peh-panel-kind k-${kindTag.toLowerCase()}">${kindTag}</span>
+    <span class="peh-panel-ctrls">
+      ${isTile?'':dockBtn('right','⫼','right')+dockBtn('bottom','▭','bottom')+dockBtn('fullscreen','⛶','full')}
+      <button class="peh-dockbtn" type="button" title="Minimize" aria-label="Minimize" onmousedown="event.stopPropagation()" onclick="event.stopPropagation();pehMinimizeWorkspace('${w.uid}')">—</button>
+      <button class="peh-dockbtn close" type="button" title="Close" aria-label="Close" onmousedown="event.stopPropagation()" onclick="event.stopPropagation();pehCloseWorkspace('${w.uid}')">×</button>
+    </span>
+  </header>`;
+}
+function pehWorkspaceBody(w,deckMarkup){
+  const def=pehWorkspaceDef(w.defId); if(!def)return'';
+  if(def.kind==='deck')return `<div class="peh-deck-wrap">${deckMarkup}</div>`;
+  return pehPlaceholderBody(def);
+}
+function pehPlaceholderBody(def){
+  return `<div class="peh-ph">
+    <div class="peh-ph-glyph">${pehGlyph(def.peh)}</div>
+    <p class="peh-ph-blurb">${esc(def.blurb||'Workspace placeholder.')}</p>
+    ${def.relatedTab?`<button class="button secondary" type="button" onclick="pehOpenRelatedLane('${def.relatedTab}')">Open ${esc(TAB_CONFIG[def.relatedTab]?TAB_CONFIG[def.relatedTab].label:def.relatedTab)} overview</button>`:''}
+    <div class="peh-ph-tag">PLACEHOLDER · coming soon</div>
+  </div>`;
+}
+
+function pehProductWorkspaces(productId){
+  return Object.keys(WORKSPACE_REGISTRY).filter((id)=>{
+    const d=WORKSPACE_REGISTRY[id];
+    return d.product===productId||d.product==null;
+  });
+}
+function pehWorkspaceChooser(product){
+  const defs=pehProductWorkspaces(product.id);
+  return `<div class="peh-chooser">${defs.map((id)=>{
+    const d=WORKSPACE_REGISTRY[id];
+    return `<button class="peh-choice" type="button" onclick="pehOpenWorkspace('${id}')">
+      <span class="peh-choice-glyph">${pehGlyph(d.peh)}</span>
+      <span class="peh-choice-title">${esc(d.title)}</span>
+      <span class="peh-choice-kind">${d.kind==='lane'?'live lane':d.kind==='deck'?'console':'placeholder'}</span>
+    </button>`;
+  }).join('')}</div>`;
+}
+
+// ── Taskbar ────────────────────────────────────────────────────────────
+function renderPehTaskbar(){
+  const open=state.pehverse.workspaces;
+  return `<div class="peh-taskbar" role="toolbar" aria-label="Open workspaces">
+    <button class="peh-task-travel" type="button" onclick="pehToggleFastTravel()" title="Fast travel (Alt+T)" aria-label="Fast travel"><span aria-hidden="true">✦</span></button>
+    <div class="peh-task-chips">${open.length?open.map((w)=>{
+      const def=pehWorkspaceDef(w.defId)||{};
+      return `<button class="peh-task-chip ${state.pehverse.focus===w.uid?'active':''} ${w.min?'min':''}" type="button" onclick="pehFocusWorkspace('${w.uid}')" title="${esc(def.title||w.defId)}"><span class="peh-task-glyph">${pehGlyph(def.peh)}</span><span class="peh-task-name">${esc(def.title||w.defId)}</span><span class="peh-task-x" role="button" tabindex="0" title="Close" aria-label="Close ${esc(def.title||w.defId)}" onmousedown="event.stopPropagation()" onclick="event.stopPropagation();pehCloseWorkspace('${w.uid}')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();event.stopPropagation();pehCloseWorkspace('${w.uid}')}">×</span></button>`;
+    }).join(''):`<span class="peh-task-empty">No open workspaces — tap a hotspot, or ✦ Fast travel.</span>`}</div>
+    ${open.length?`<button class="peh-task-clear" type="button" onclick="pehCloseAllWorkspaces()">Close all</button>`:''}
+  </div>`;
+}
+
+// ── FastTravelMenu ─────────────────────────────────────────────────────
+function renderFastTravelMenu(){
+  if(!state.pehverse.fastTravel)return'';
+  const product=pehActiveProduct();
+  const here=pehCurrentScene();
+  const scenes=pehScenes(product.id);
+  return `<div class="peh-ft-overlay" role="dialog" aria-modal="true" aria-label="Fast travel" onclick="if(event.target===this)pehToggleFastTravel(false)">
+    <div class="peh-ft">
+      <header class="peh-ft-head"><h2>Fast travel</h2><span class="peh-ft-hint">Within ${esc(product.displayName)} · jump to any area</span><button class="peh-ft-close" type="button" onclick="pehToggleFastTravel(false)" aria-label="Close fast travel">×</button></header>
+      <div class="peh-ft-scenes peh-ft-scenes-main">${scenes.length?scenes.map((s)=>`<button class="peh-ft-scene ${here&&here.id===s.id?'active':''}" aria-current="${here&&here.id===s.id?'true':'false'}" type="button" onclick="pehGoScene('${s.id}')">${esc(s.title)}</button>`).join(''):`<span class="peh-ft-empty">No additional areas in ${esc(product.displayName)} yet.</span>`}</div>
+      ${pehDevMode()?renderPehDevSwitcher(product):''}
+    </div>
+  </div>`;
+}
+function renderPehDevSwitcher(active){
+  const pub=pehPublicProducts();
+  const future=pehFutureProducts();
+  return `<div class="peh-ft-dev">
+    <span class="peh-ft-dev-label">⚙ Dev only · product switcher</span>
+    <div class="peh-ft-dev-products">
+      ${pub.map((p)=>`<button class="peh-ft-dev-product ${p.id===active.id?'active':''}" type="button" onclick="pehDevSwitchProduct('${p.id}')">${esc(p.displayName)}</button>`).join('')}
+      ${future.map((p)=>`<span class="peh-ft-dev-soon">${esc(p.displayName)} · config only</span>`).join('')}
+    </div>
+  </div>`;
+}
+
+// ── Workshop console (the kind:'deck' workspace body) ──────────────────
+// ikbi's Build Overview: a technical command-center console.
+// 5 area cards + live status strip (appended by app.js).
+function renderWorkshopConsole(){
+  const cards=[
+    {ws:'engine-status', scene:'the-heartwood',     glyph:'gear',   title:'Engine Status',  desc:'Service status, model, features, lifecycle posture — the heartbeat.'},
+    {ws:'builder-ws',    scene:'the-heartwood',     glyph:'tools',  title:'Builder',        desc:'Builder tools, provider model, and a direct chat interface to the engine.'},
+    {ws:'test-results',  scene:'the-sacred-flame',  glyph:'star',   title:'Test Results',   desc:'800+ tests, every gate checked. Nothing ships without passing through here.'},
+    {ws:'trust-ws',      scene:'the-heartwood',     glyph:'shield', title:'Trust & Safety', desc:'Lifecycle posture, security features, surface classifications.'},
+    {ws:'modules-ws',    scene:'the-heartwood',     glyph:'gear',   title:'Modules',        desc:'Full tool inventory, feature flags, surface map.'},
+    {ws:'history-ws',    scene:'the-rivers-end',    glyph:'book',   title:'History',        desc:'Activity log, session info, build receipts.'},
+    {ws:'grove-ws',      scene:'the-grove',         glyph:'leaf',   title:'The Grove',      desc:'Speak directly to ikbi in the terminal. Type a goal — the engine builds.'}
+  ];
+  return `<div class="wks-console">
+    <div class="wks-hero">
+      <span class="wks-hero-mark" aria-hidden="true">${pehGlyph('gear')}</span>
+      <div>
+        <h2>Welcome to the Workshop</h2>
+        <p>ikbi is the build engine — methodical, evidence-based, precise. Every great structure starts with a solid foundation. Pick an area below, or tap a location on the map.</p>
       </div>
-      <div class="hw-body" id="hw-repo-doctor-body"></div>
     </div>
+    <h3 class="wks-section-title">Build engine areas</h3>
+    <div class="wks-cards">${cards.map((c)=>`
+      <button class="wks-card" type="button" onclick="pehHotspot('${c.ws}','${c.scene}')">
+        <span class="wks-card-glyph">${pehGlyph(c.glyph)}</span>
+        <span class="wks-card-title">${esc(c.title)}</span>
+        <span class="wks-card-desc">${esc(c.desc)}</span>
+      </button>`).join('')}</div>
+    <div class="wks-foot">THE BUILD ENGINE · ikbi · where code gets built</div>
+  </div>`;
+}
 
-    <!-- Spec Artifact -->
-    <div class="hw hidden" id="hw-spec-artifact" data-win="spec-artifact">
-      <div class="hw-head">
-        <span class="hw-title">Spec Artifact</span>
-        <div class="hw-actions">
-          <button class="hw-btn" onclick="Ikbui.refreshSpecs()" title="Refresh">↻</button>
-          <button class="hw-btn hw-min" data-action="minimize" title="Minimize">─</button>
-          <button class="hw-btn hw-close" data-action="close" title="Close">✕</button>
-        </div>
-      </div>
-      <div class="hw-body" id="hw-spec-artifact-body"></div>
-    </div>
+// ── Keyboard shortcuts ──────────────────────────────────────────────────
+let __pehKeysBound=false;
+function pehBindKeys(){
+  if(__pehKeysBound)return; __pehKeysBound=true;
+  document.addEventListener('keydown',(e)=>{
+    if(e.key==='Escape'&&state.pehverse.fastTravel){pehToggleFastTravel(false);return}
+    if(e.altKey&&(e.key==='t'||e.key==='T')){e.preventDefault();pehToggleFastTravel()}
+    if(e.altKey&&(e.key==='m'||e.key==='M')){e.preventDefault();pehToggleMode()}
+  });
+}
+pehBindKeys();
+pehInitProduct();
 
-    <!-- Build History -->
-    <div class="hw hidden" id="hw-build-history" data-win="build-history">
-      <div class="hw-head">
-        <span class="hw-title">Build History</span>
-        <div class="hw-actions">
-          <button class="hw-btn" onclick="Ikbui.refreshHistory()" title="Refresh">↻</button>
-          <button class="hw-btn hw-min" data-action="minimize" title="Minimize">─</button>
-          <button class="hw-btn hw-close" data-action="close" title="Close">✕</button>
-        </div>
-      </div>
-      <div class="hw-body" id="hw-build-history-body"></div>
-    </div>
+function render(){
+  if(state.pehverse.mode==='dashboard'&&!state.pehverse.workspaces.length&&!_dashAutoOpenDone){
+    _dashAutoOpenDone=true;
+    pehAutoOpenDashboard();
+  }
+  const deckMarkup=renderWorkshopConsole();
+  document.getElementById('app').innerHTML=renderPehverse(deckMarkup);
+}
 
-    <!-- Modules -->
-    <div class="hw hidden" id="hw-modules" data-win="modules">
-      <div class="hw-head">
-        <span class="hw-title">Modules</span>
-        <div class="hw-actions">
-          <button class="hw-btn" onclick="Ikbui.refreshModules()" title="Refresh">↻</button>
-          <button class="hw-btn hw-min" data-action="minimize" title="Minimize">─</button>
-          <button class="hw-btn hw-close" data-action="close" title="Close">✕</button>
-        </div>
-      </div>
-      <div class="hw-body" id="hw-modules-body"></div>
-    </div>
+// Expose handlers for inline onclick attributes.
+window.state=state;
+window.render=render;
+window.pehHotspotActivate=pehHotspotActivate;
+window.pehDismissBubble=pehDismissBubble;
+window.pehToggleFastTravel=pehToggleFastTravel;
+window.pehSetMode=pehSetMode;
+window.pehSetScene=pehSetScene;
+window.pehGoScene=pehGoScene;
+window.pehDevSwitchProduct=pehDevSwitchProduct;
+window.pehOpenWorkspace=pehOpenWorkspace;
+window.pehFocusWorkspace=pehFocusWorkspace;
+window.pehCloseWorkspace=pehCloseWorkspace;
+window.pehDockWorkspace=pehDockWorkspace;
+window.pehMinimizeWorkspace=pehMinimizeWorkspace;
+window.pehCloseAllWorkspaces=pehCloseAllWorkspaces;
+window.pehBackToMap=pehBackToMap;
+window.pehOpenRelatedLane=pehOpenRelatedLane;
+window.pehHotspot=pehHotspot;
 
-    <!-- Configuration -->
-    <div class="hw hidden" id="hw-config" data-win="config">
-      <div class="hw-head">
-        <span class="hw-title">Configuration</span>
-        <div class="hw-actions">
-          <button class="hw-btn" onclick="Ikbui.refreshConfig()" title="Refresh">↻</button>
-          <button class="hw-btn hw-min" data-action="minimize" title="Minimize">─</button>
-          <button class="hw-btn hw-close" data-action="close" title="Close">✕</button>
-        </div>
-      </div>
-      <div class="hw-body" id="hw-config-body"></div>
-    </div>
+// ══════════════════════════════════════════════════════════════════════
+// PEH FIRST-LAUNCH ONBOARDING OVERLAY
+// Warm guided tour led by Pehlichi. Checks localStorage for the
+// 'pehverse-onboarded' flag; shows the overlay on first visit.
+// After the tour or skip, sets the flag. A help button re-triggers.
+// ══════════════════════════════════════════════════════════════════════
 
-    <!-- Corrections Library -->
-    <div class="hw hidden" id="hw-corrections" data-win="corrections">
-      <div class="hw-head">
-        <span class="hw-title">Corrections</span>
-        <div class="hw-actions">
-          <button class="hw-btn" onclick="Ikbui.refreshCorrections()" title="Refresh">↻</button>
-          <button class="hw-btn hw-min" data-action="minimize" title="Minimize">─</button>
-          <button class="hw-btn hw-close" data-action="close" title="Close">✕</button>
-        </div>
-      </div>
-      <div class="hw-body" id="hw-corrections-body"></div>
-    </div>
-  </section>
-</div>
+var pehOnboard={
+  overlay:null,
+  _tourActive:false,
+  _timers:[],
 
+  isOnboarded:function(){
+    try{return localStorage.getItem('pehverse-onboarded')==='1'}catch(e){return false}
+  },
+  setOnboarded:function(){
+    try{localStorage.setItem('pehverse-onboarded','1')}catch(e){}
+  },
+
+  // ── Show the welcome overlay ──────────────────────────────────────
+  show:function(replay){
+    if(this.overlay)return;
+    var self=this;
+
+    var el=document.createElement('div');
+    el.className='peh-onboard-overlay';
+    el.setAttribute('role','dialog');
+    el.setAttribute('aria-modal','true');
+    el.setAttribute('aria-label','Welcome to the Workshop');
+
+    el.innerHTML=
+      '<div class="peh-onboard-card">'+
+        '<div class="peh-onboard-peh">'+
+          '<img src="assets/peh-guide.png" alt="Pehlichi" loading="eager">'+
+        '</div>'+
+        '<div class="peh-onboard-bubble">'+
+          '<span class="peh-onboard-name">Pehlichi · your guide</span>'+
+          '<p class="peh-onboard-text">'+
+            '<span class="halito">Halito!</span> My name is Pehlichi, but my friends call me Peh. '+
+            'I will be joining you on this new adventure. Would you like to get started?'+
+          '</p>'+
+          '<div class="peh-onboard-buttons">'+
+            '<button class="peh-onboard-btn peh-onboard-btn-primary" type="button" data-action="tour">'+
+              'Yes, show me around'+
+            '</button>'+
+            '<button class="peh-onboard-btn peh-onboard-btn-secondary" type="button" data-action="skip">'+
+              'Skip \u2014 I know what I\'m doing'+
+            '</button>'+
+          '</div>'+
+        '</div>'+
+      '</div>';
+
+    // Wire buttons
+    el.querySelector('[data-action="tour"]').onclick=function(){
+      self._startTour(el);
+    };
+    el.querySelector('[data-action="skip"]').onclick=function(){
+      self._dismiss(el);
+    };
+
+    // Escape key closes
+    el.addEventListener('keydown',function(e){
+      if(e.key==='Escape'){
+        e.preventDefault();
+        self._dismiss(el);
+      }
+    });
+
+    document.body.appendChild(el);
+    self.overlay=el;
+
+    // Focus the primary button for keyboard users
+    setTimeout(function(){
+      var btn=el.querySelector('[data-action="tour"]');
+      if(btn)btn.focus();
+    },500);
+  },
+
+  // ── Start the guided tour ─────────────────────────────────────────
+  _startTour:function(el){
+    var self=this;
+    self._tourActive=true;
+    self._clearTimers();
+
+    // Switch overlay to tour mode
+    el.className='peh-onboard-overlay tour-mode';
+    el.innerHTML=
+      '<div class="peh-onboard-tour-label">Guided tour in progress\u2026</div>'+
+      '<button class="peh-onboard-tour-skip" type="button">End tour</button>';
+
+    el.querySelector('.peh-onboard-tour-skip').onclick=function(){
+      self._endTour(el);
+    };
+
+    // Get the current scene's hotspots
+    var scene=pehCurrentScene();
+    if(!scene||!scene.hotspots||!scene.hotspots.length){
+      self._showTourComplete(el);
+      return;
+    }
+
+    var hotspots=scene.hotspots;
+    var i=0;
+
+    function visitNext(){
+      if(!self._tourActive||i>=hotspots.length){
+        self._showTourComplete(el);
+        return;
+      }
+      var h=hotspots[i];
+      i++;
+
+      // Show Peh greeting at this hotspot
+      pehSayGreeting(h,scene);
+
+      // Move to next after the bubble holds + fades
+      var delay=PEH_BUBBLE_HOLD_MS+PEH_BUBBLE_FADE_MS+400;
+      self._timers.push(setTimeout(visitNext,delay));
+    }
+
+    // Small initial delay to let the overlay transition finish
+    self._timers.push(setTimeout(visitNext,600));
+  },
+
+  // ── Tour complete ─────────────────────────────────────────────────
+  _showTourComplete:function(el){
+    var self=this;
+    self._clearTimers();
+
+    // Reset Peh position to scene default
+    var scene=pehCurrentScene();
+    if(scene&&scene.pehSlot){
+      state.pehverse.pehPosition=null;
+      render();
+    }
+
+    // Show completion bubble
+    var completionHotspot={
+      id:'onboard-complete',
+      x:49,y:48,
+      greeting:"You\u2019re all set! Click on any area to explore. I\u2019ll be here if you need me."
+    };
+    pehSayGreeting(completionHotspot,scene);
+
+    // Update overlay
+    el.innerHTML=
+      '<div class="peh-onboard-card">'+
+        '<div class="peh-onboard-peh">'+
+          '<img src="assets/peh-guide.png" alt="Pehlichi" loading="eager">'+
+        '</div>'+
+        '<div class="peh-onboard-bubble">'+
+          '<span class="peh-onboard-name">Pehlichi · your guide</span>'+
+          '<p class="peh-onboard-text">'+
+            'You\u2019re all set! Click on any glowing area to explore. '+
+            'I\u2019ll be right here if you need me. Yokehoke!'+
+          '</p>'+
+          '<div class="peh-onboard-buttons">'+
+            '<button class="peh-onboard-btn peh-onboard-btn-primary" type="button" data-action="done">'+
+              'Let\u2019s go!'+
+            '</button>'+
+          '</div>'+
+        '</div>'+
+      '</div>';
+
+    el.className='peh-onboard-overlay';
+    el.querySelector('[data-action="done"]').onclick=function(){
+      self._dismiss(el);
+    };
+    setTimeout(function(){
+      var btn=el.querySelector('[data-action="done"]');
+      if(btn)btn.focus();
+    },300);
+  },
+
+  // ── End tour early (skip during tour) ─────────────────────────────
+  _endTour:function(el){
+    this._tourActive=false;
+    this._clearTimers();
+    pehDismissBubble();
+    this._dismiss(el);
+  },
+
+  // ── Dismiss the overlay ───────────────────────────────────────────
+  _dismiss:function(el){
+    var self=this;
+    self._tourActive=false;
+    self._clearTimers();
+    self.setOnboarded();
+
+    el.classList.add('exiting');
+    setTimeout(function(){
+      if(el.parentNode)el.parentNode.removeChild(el);
+      self.overlay=null;
+    },360);
+  },
+
+  // ── Timer cleanup ─────────────────────────────────────────────────
+  _clearTimers:function(){
+    for(var i=0;i<this._timers.length;i++)clearTimeout(this._timers[i]);
+    this._timers=[];
+  },
+
+  // ── Re-trigger tour via help button ───────────────────────────────
+  addHelpButton:function(){
+    if(document.querySelector('.peh-onboard-help'))return;
+    var self=this;
+    var btn=document.createElement('button');
+    btn.className='peh-onboard-help';
+    btn.type='button';
+    btn.title='Replay Peh\u2019s guided tour';
+    btn.setAttribute('aria-label','Replay guided tour');
+    btn.innerHTML='\u2728';
+    btn.onclick=function(){
+      // Clear the flag so re-trigger is clean
+      try{localStorage.removeItem('pehverse-onboarded')}catch(e){}
+      self.show(true);
+    };
+    document.body.appendChild(btn);
+  }
+};
+
+window.pehOnboard=pehOnboard;
+
+// ── Boot ────────────────────────────────────────────────────────────────
+function boot(){
+  try{
+    render();
+  }catch(err){
+    const app=document.getElementById('app');
+    if(app)app.innerHTML='<div style="padding:24px;color:#f3ecdc;font-family:sans-serif">The build engine could not finish loading. <button onclick="boot()" style="margin-left:8px">Retry</button><pre style="color:#b6a079;white-space:pre-wrap">'+esc(String(err&&err.stack||err))+'</pre></div>';
+  }
+
+  // ── Peh onboarding: first-launch check ────────────────────────────
+  if(typeof pehOnboard!=='undefined'){
+    if(!pehOnboard.isOnboarded()){
+      // First visit — show the welcome overlay after a brief settle
+      setTimeout(function(){pehOnboard.show()},350);
+    }else{
+      // Returning user — add the help button for re-trigger
+      pehOnboard.addHelpButton();
+    }
+  }
+}
+window.boot=boot;
+boot();
+</script>
+<!-- ── Live backend layer (loaded AFTER the inline engine so its globals exist).
+     api.js → client · scenes.js → live workspace data · peh-guide.js → build log ·
+     app.js → glue (status dot, command bar, overrides). All pure vanilla JS. ── -->
 <script src="api.js"></script>
-<script src="peh-guide.js"></script>
 <script src="scenes.js"></script>
+<script src="peh-guide.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
