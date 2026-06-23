@@ -737,8 +737,13 @@ function readlineSource(getTurnController?: () => AbortController | undefined): 
 /**
  * The live `ikbi repl` command: a real ChatSession over stdin/stdout, persisted to disk.
  * Flags: `--continue` (resume the most-recent session) or `--resume <id>` (a specific one).
+ *
+ * `initialMessage` (GAP 1: REPL-as-default) seeds the session's FIRST turn — `ikbi fix the
+ * bug in auth.ts` opens the REPL pre-loaded with that prompt. On a TTY the session then
+ * continues interactively; on non-TTY stdin it runs the one turn and exits (same one-shot
+ * shape as piped input). When absent, piped stdin (if any) supplies the first message instead.
  */
-export async function liveRepl(argv: readonly string[] = []): Promise<void> {
+export async function liveRepl(argv: readonly string[] = [], initialMessage?: string): Promise<void> {
   const out = (s: string): void => void process.stdout.write(s);
   // `--max-sessions <n>` overrides the prune cap (BLOCKER-3); else the store uses IKBI_MAX_SESSIONS / default.
   const maxIdx = argv.indexOf("--max-sessions");
@@ -847,18 +852,20 @@ export async function liveRepl(argv: readonly string[] = []): Promise<void> {
     // Discovery is best-effort cosmetics — never let it block the session.
   }
 
-  // PIPED INPUT (CC parity): `cat file | ikbi repl` (or any non-TTY stdin) feeds the piped text as the
-  // FIRST message of the session. Drained before the readline source is created, so the interactive
-  // reader then sees EOF and the session exits after the one turn — a clean one-shot. No-op for a TTY.
-  const pipedFirst = (await readPipedStdin()).trim();
+  // FIRST MESSAGE: a bare-text invocation (`ikbi fix the bug`, GAP 1) seeds the opening turn
+  // directly; otherwise piped stdin (`cat file | ikbi repl`, CC parity) supplies it. Either way the
+  // text is returned as the FIRST `readLine()`, then the reader defers to the live source — so a TTY
+  // continues interactively while non-TTY stdin sees EOF and exits after the one turn (a clean one-shot).
+  const seeded = initialMessage?.trim();
+  const firstMessage = seeded !== undefined && seeded.length > 0 ? seeded : (await readPipedStdin()).trim();
 
   let turnController: AbortController | undefined;
   const src = readlineSource(() => turnController);
-  let pipedConsumed = false;
+  let firstConsumed = false;
   const readLine = async (): Promise<string | null> => {
-    if (!pipedConsumed && pipedFirst.length > 0) {
-      pipedConsumed = true;
-      return pipedFirst;
+    if (!firstConsumed && firstMessage.length > 0) {
+      firstConsumed = true;
+      return firstMessage;
     }
     return src.readLine();
   };
