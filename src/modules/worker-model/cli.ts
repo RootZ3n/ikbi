@@ -669,18 +669,24 @@ export function formatProgressEvent(e: { type: string; payload?: unknown }): str
 
 /** A concise, non-leaky result summary for the operator. Includes the run's total cost (USD). */
 function summarize(r: WorkerResult): string {
+  // CC parity: surface model, tool iterations, and files written in the JSON output.
+  const builder = r.roles.find((x) => x.role === "builder");
+  const bd = (builder?.detail ?? {}) as Record<string, unknown>;
+  const numTurns = typeof bd.toolRounds === "number" ? bd.toolRounds : undefined;
+  const model = typeof bd.model === "string" ? bd.model : undefined;
+  const filesWritten = Array.isArray(bd.filesWritten) ? bd.filesWritten : undefined;
   return `${JSON.stringify(
     {
       taskId: r.taskId,
       outcome: r.outcome,
       promoted: r.promoted,
       ...(r.workspaceId !== undefined ? { workspaceId: r.workspaceId } : {}),
+      ...(model !== undefined ? { model } : {}),
+      ...(numTurns !== undefined ? { num_turns: numTurns } : {}),
+      ...(filesWritten !== undefined ? { files_written: filesWritten } : {}),
       roles: r.roles.map((x) => ({ role: x.role, outcome: x.outcome })),
-      // Observability (E): which hardened/legacy paths actually ran, so the operator never has
-      // to inspect env/source to know the safety posture of THIS run.
       ...(r.verificationMode !== undefined ? { verification: r.verificationMode } : {}),
       ...(r.retrievalMode !== undefined ? { retrieval: r.retrievalMode } : {}),
-      // Cost visibility: sum of every model invocation this run made.
       cost_usd: r.costUsd ?? 0,
       ...(r.reason !== undefined ? { reason: r.reason } : {}),
     },
