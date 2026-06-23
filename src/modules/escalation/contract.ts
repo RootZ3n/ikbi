@@ -175,7 +175,7 @@ export interface EscalationWeights {
   readonly verificationFailed: number; // default 25
   readonly rejectedToolCalls: number; // default 10
   readonly benchmarkPassRate: number; // default 5
-  readonly builderFailed: number; // default 40
+  readonly builderFailed: number; // default 50
 }
 
 /** Configuration for the escalation engine. */

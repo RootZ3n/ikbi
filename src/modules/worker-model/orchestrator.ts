@@ -2155,6 +2155,14 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                   parentIdentity,
                 );
                 // Skip the pro escalation — cheap retry worked.
+                // KILL CHECKPOINT: the continue skips the role-boundary kill check at line 2311,
+                // so check here to obey a kill signal issued during the cheap retry.
+                const cheapRetryKill = await killHalt(task, parentIdentity, parentCtx);
+                if (cheapRetryKill !== undefined) {
+                  killedReason = cheapRetryKill;
+                  overall = "rejected";
+                  break; // eslint-disable-line no-labels -- exits the for-loop on kill
+                }
                 continue; // eslint-disable-line no-continue -- exits the escalation block; pipeline continues with critic
               }
 
