@@ -6,8 +6,17 @@ import { HELP_PAGES, helpTopics, helpForTopic, renderHelpPage } from "./help-pag
 // The work order requires a detailed page for each of these commands.
 const REQUIRED = ["build", "init", "models", "serve", "repl"] as const;
 
+// Julian's Finding B: high-traffic commands that previously had no help page.
+const FINDING_B = ["review", "agents", "mcp", "audit", "cost", "diff", "undo", "trust"] as const;
+
 test("every required command has a help page", () => {
   for (const cmd of REQUIRED) {
+    assert.ok(HELP_PAGES[cmd] !== undefined, `missing help page for ${cmd}`);
+  }
+});
+
+test("Finding B high-traffic commands all have help pages", () => {
+  for (const cmd of FINDING_B) {
     assert.ok(HELP_PAGES[cmd] !== undefined, `missing help page for ${cmd}`);
   }
 });

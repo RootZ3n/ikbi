@@ -6,6 +6,7 @@ import { test } from "node:test";
 
 import { pino } from "pino";
 
+import { log } from "../../core/log.js";
 import type { ModelRequest, ModelResponse } from "../../core/provider/contract.js";
 
 import type { EventBusSurface, EventInput, IkbiEvent } from "../../core/events/index.js";
@@ -1775,9 +1776,10 @@ test("Fix2: dirty-repo check skipped when reuseWorkspace is set (step-planner pa
 
 test("Fix3: warn when worktree has no project manifest", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ikbi-no-manifest-"));
+  // Finding G: the manifest warning now goes through the structured pino logger, not console.warn.
   const warnMessages: string[] = [];
-  const origWarn = console.warn;
-  console.warn = (...args: unknown[]) => { warnMessages.push(args.map(String).join(" ")); };
+  const origWarn = log.warn;
+  (log as { warn: unknown }).warn = (_obj: unknown, msg?: unknown) => { warnMessages.push(String(msg ?? _obj)); };
   try {
     const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
     const ws = fakeWorkspaces();
@@ -1788,7 +1790,7 @@ test("Fix3: warn when worktree has no project manifest", async () => {
     await orch.run(task, parentCtx);
     assert.ok(warnMessages.some((m) => m.includes("no project manifest")), "should warn when no manifest found in workspace");
   } finally {
-    console.warn = origWarn;
+    (log as { warn: unknown }).warn = origWarn;
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -1797,8 +1799,8 @@ test("Fix3: no warning when worktree has package.json", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ikbi-has-manifest-"));
   writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "t", version: "1.0.0" }));
   const warnMessages: string[] = [];
-  const origWarn = console.warn;
-  console.warn = (...args: unknown[]) => { warnMessages.push(args.map(String).join(" ")); };
+  const origWarn = log.warn;
+  (log as { warn: unknown }).warn = (_obj: unknown, msg?: unknown) => { warnMessages.push(String(msg ?? _obj)); };
   try {
     const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
     const ws = fakeWorkspaces();
@@ -1809,7 +1811,7 @@ test("Fix3: no warning when worktree has package.json", async () => {
     await orch.run(task, parentCtx);
     assert.ok(!warnMessages.some((m) => m.includes("no project manifest")), "no warning when package.json exists");
   } finally {
-    console.warn = origWarn;
+    (log as { warn: unknown }).warn = origWarn;
     rmSync(dir, { recursive: true, force: true });
   }
 });

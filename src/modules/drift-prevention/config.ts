@@ -12,8 +12,8 @@
  *                                          never cry drift on noise. Default 5.
  *   IKBI_DRIFT_PREVENTION_RECENT_WINDOW    how many recent outcomes = "recent". Default 20.
  *   IKBI_DRIFT_PREVENTION_POLICY           intervention on detected drift: "reportOnly"
- *                                          (default — log/emit only), "warn" (console.warn
- *                                          and continue), or "block" (check() throws a
+ *                                          (default — log/emit only), "warn" (structured
+ *                                          log warning and continue), or "block" (check() throws a
  *                                          DriftBlockedError). Invalid value ⇒ load throws.
  */
 

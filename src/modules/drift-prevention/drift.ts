@@ -6,12 +6,13 @@
  * It still WRITES nothing (no trust demotion, no agent pause, no gate). What it now DOES
  * on a detected drift is governed by the `DriftPolicy` seam, selected by config:
  *   - reportOnly (DEFAULT) — emit the event + return the report; take no action ("none").
- *   - warn                 — additionally `console.warn` the drift, then continue ("warned").
+ *   - warn                 — additionally log the drift via the structured logger, then continue ("warned").
  *   - block                — throw a DriftBlockedError carrying the drifted reports ("blocked").
  * The default is reportOnly, so existing read-only callers are unaffected; warn/block are
  * the operator's deliberate opt-in via IKBI_DRIFT_PREVENTION_POLICY.
  */
 
+import { log } from "../../core/log.js";
 import { events as coreEvents } from "../../core/events/index.js";
 import type { EventInput } from "../../core/events/index.js";
 import { receipts as coreReceipts } from "../../core/receipt/index.js";
@@ -153,7 +154,10 @@ export function createDriftPrevention(deps: DriftPreventionDeps = {}): DriftPrev
         //  - act:true, no kind (legacy)     → advisory only ("none"); never writes/throws.
         const decision = policy(report);
         if (decision.act && decision.kind === "warn") {
-          console.warn(`[drift] ${report.agent}/${report.operation}: ${report.reason}${decision.note !== undefined ? ` (${decision.note})` : ""}`);
+          log.warn(
+            { agent: report.agent, operation: report.operation, reason: report.reason, ...(decision.note !== undefined ? { note: decision.note } : {}) },
+            "drift: warned",
+          );
           action = "warned";
         } else if (decision.act && decision.kind === "block") {
           action = "blocked";

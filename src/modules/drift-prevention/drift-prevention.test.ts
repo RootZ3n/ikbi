@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import { log } from "../../core/log.js";
 import type { EventInput } from "../../core/events/index.js";
 import type { Receipt, ReceiptQuery } from "../../core/receipt/contract.js";
 import type { MemoryEntry } from "../lab-context-memory/index.js";
@@ -202,17 +203,19 @@ test("reportOnly: a drifted report is stamped action 'none' (advisory, no throw)
 });
 
 test("warn policy: a drifted report is stamped action 'warned' and check() still returns", async () => {
-  const warned: string[] = [];
-  const orig = console.warn;
-  console.warn = (...a: unknown[]) => void warned.push(a.join(" "));
+  // Finding G: the warning now goes through the structured pino logger, not console.warn.
+  const warned: Array<Record<string, unknown>> = [];
+  const orig = log.warn;
+  (log as { warn: unknown }).warn = (obj: Record<string, unknown>) => void warned.push(obj);
   try {
     const f = fakes([pattern("a", "op.x", 18, 20)], receiptsFor("a", "op.x", 2, 10));
     const reports = await mk({ labMemory: f.labMemory, receipts: f.receipts, config: { ...CFG, policy: "warn" } }).check({ agent: "a" });
     assert.equal(reports[0]?.action, "warned");
     assert.equal(warned.length, 1, "a warning was logged");
-    assert.match(warned[0] ?? "", /\[drift\] a\/op\.x/);
+    assert.equal(warned[0]?.agent, "a");
+    assert.equal(warned[0]?.operation, "op.x");
   } finally {
-    console.warn = orig;
+    (log as { warn: unknown }).warn = orig;
   }
 });
 

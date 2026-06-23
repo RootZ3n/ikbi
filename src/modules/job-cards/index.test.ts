@@ -10,7 +10,8 @@ import { test } from "node:test";
 
 import type { JobCard } from "./contract.js";
 import { type RunnerDeps } from "./runner.js";
-import { listCards, getCard, createCard, updateCard, deleteCard, listRuns, createRun, updateRun } from "./store.js";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { listCards, getCard, createCard, updateCard, deleteCard, listRuns, createRun, updateRun, assertSafeId } from "./store.js";
 import { BUILTINS, getBuiltin } from "./builtins.js";
 import { runCard } from "./runner.js";
 
@@ -193,6 +194,92 @@ test("deleteCard returns false for missing id", () => {
   const dir = tmpDir();
   try {
     assert.equal(deleteCard("nonexistent", dir), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── Path-traversal safety (GLM 5.2 LOW-3 / Bubbles) ────────────────────────
+
+test("assertSafeId rejects path-traversal and separators", () => {
+  assert.throws(() => assertSafeId("../evil"), /unsafe job card id/);
+  assert.throws(() => assertSafeId("a/b"), /unsafe job card id/);
+  assert.throws(() => assertSafeId("a\\b"), /unsafe job card id/);
+  assert.throws(() => assertSafeId(".."), /unsafe job card id/);
+  // A plain UUID-shaped id is accepted.
+  assert.doesNotThrow(() => assertSafeId("550e8400-e29b-41d4-a716-446655440000"));
+});
+
+test("getCard with a traversal id throws instead of escaping the store", () => {
+  const dir = tmpDir();
+  try {
+    assert.throws(() => getCard("../evil", dir), /unsafe job card id/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("updateRun with a traversal runId throws", () => {
+  const dir = tmpDir();
+  try {
+    createRun("card-1", dir);
+    assert.throws(() => updateRun("card-1", "../evil", { status: "failed" }, dir), /unsafe job card id/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("createRun with a traversal cardId throws", () => {
+  const dir = tmpDir();
+  try {
+    assert.throws(() => createRun("../escape", dir), /unsafe job card id/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── Atomic writes (GLM 5.2 MEDIUM-1) ───────────────────────────────────────
+
+test("createCard leaves no .tmp files in the store dir (atomic write)", () => {
+  const dir = tmpDir();
+  try {
+    createCard({
+      name: "Atomic",
+      description: "",
+      goalTemplate: "goal",
+      accessPolicy: "read-only",
+      guardrails: { maxFilesChanged: 0, protectedPaths: [], requireCleanWorktree: false },
+      verification: "skip",
+      rollback: "never",
+      schedule: "once",
+      minTrustTier: "provisional",
+    }, dir);
+    const leftover = readdirSync(dir).filter((f) => f.includes(".tmp."));
+    assert.deepEqual(leftover, [], "no temp files should remain after an atomic write");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the persisted card file is complete, valid JSON (rename is the commit point)", () => {
+  const dir = tmpDir();
+  try {
+    const card = createCard({
+      name: "Valid JSON",
+      description: "",
+      goalTemplate: "goal",
+      accessPolicy: "read-only",
+      guardrails: { maxFilesChanged: 0, protectedPaths: [], requireCleanWorktree: false },
+      verification: "skip",
+      rollback: "never",
+      schedule: "once",
+      minTrustTier: "provisional",
+    }, dir);
+    const path = join(dir, `${card.id}.json`);
+    assert.ok(existsSync(path));
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    assert.equal(parsed.id, card.id);
+    assert.equal(parsed.name, "Valid JSON");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

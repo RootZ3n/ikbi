@@ -59,7 +59,10 @@ registerRoutes("job-cards", (app: FastifyInstance) => {
       description: (body.description as string) ?? "",
       goalTemplate: body.goalTemplate as string,
       accessPolicy: (body.accessPolicy as "read-only" | "write-gated" | "write-auto") ?? "read-only",
-      guardrails: (body.guardrails as { maxFilesChanged: number; protectedPaths: readonly string[]; requireCleanWorktree: boolean }) ?? { maxFilesChanged: 0, protectedPaths: [], requireCleanWorktree: false },
+      // Default blast-radius cap: 50 changed files. `maxFilesChanged: 0` would mean "no limit"
+      // (Bubbles LOW-2) — never the safe default. A read-only card simply never writes; a
+      // write-* card without explicit guardrails is still bounded to 50 files.
+      guardrails: (body.guardrails as { maxFilesChanged: number; protectedPaths: readonly string[]; requireCleanWorktree: boolean }) ?? { maxFilesChanged: 50, protectedPaths: [], requireCleanWorktree: false },
       verification: (body.verification as "required" | "optional" | "skip") ?? "optional",
       rollback: (body.rollback as "on-failure" | "never" | "always") ?? "on-failure",
       schedule: (body.schedule as "once" | "loop") ?? "once",

@@ -19,6 +19,7 @@
  * singleton (which fail-closes without an egress guard).
  */
 
+import { log } from "../../core/log.js";
 import { autonomyForTier, type AutonomyGrant } from "../../core/trust/contract.js";
 import { asTier, clampTier, tierRank, TRUST_FLOOR } from "../../core/trust/index.js";
 import type { OutcomeStatus, RecordOutcomeInput, TrustDecision } from "../../core/trust/contract.js";
@@ -1415,7 +1416,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     if (existsSync(workspace.path)) {
       const MANIFESTS = ["package.json", "pnpm-workspace.yaml", "pyproject.toml", "Cargo.toml", "go.mod", "deno.json", "deno.jsonc", "project.godot"] as const;
       if (!MANIFESTS.some((m) => existsSync(join(workspace.path, m)))) {
-        console.warn(`[ikbi] workspace ${workspace.id}: no project manifest (package.json, pnpm-workspace.yaml, pyproject.toml, Cargo.toml, go.mod, deno.json, deno.jsonc, project.godot) found at ${workspace.path} — verification checks may fail`);
+        log.warn(
+          { workspaceId: workspace.id, path: workspace.path, manifests: MANIFESTS },
+          "worker-model: no project manifest found in workspace — verification checks may fail",
+        );
       }
     }
 

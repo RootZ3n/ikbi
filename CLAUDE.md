@@ -47,7 +47,7 @@ through governed-exec (allowlist + gate-wall + receipts).
 cd /pehverse/repos/ecosystem/ikbi
 pnpm install
 pnpm build                     # tsc -> dist/  (also typechecks *.test.ts)
-pnpm test                      # node:test runner — 2199 tests, all passing
+pnpm test                      # node:test runner — 2671 tests, all passing
 node dist/cli/index.js doctor  # pre-flight check
 node dist/cli/index.js repl    # interactive session
 ```

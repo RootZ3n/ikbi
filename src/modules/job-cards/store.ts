@@ -5,11 +5,18 @@
  * Uses simple file locking for concurrent access safety.
  */
 
-import { mkdirSync, readFileSync, writeFileSync, readdirSync, existsSync, unlinkSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, readdirSync, existsSync, unlinkSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import type { JobCard, JobCardRun, JobCardRunStatus } from "./contract.js";
+
+/** Reject ids that could escape the store directory (GLM 5.2 LOW-3 / Bubbles). */
+export function assertSafeId(id: string): void {
+  if (/[\\/]/.test(id) || id.includes("..")) {
+    throw new Error(`unsafe job card id: ${id}`);
+  }
+}
 
 /** Resolve the store directory. Overridable for tests. */
 export function resolveStoreDir(override?: string): string {
@@ -21,10 +28,12 @@ function ensureDir(dir: string): void {
 }
 
 function cardPath(storeDir: string, id: string): string {
+  assertSafeId(id);
   return join(storeDir, `${id}.json`);
 }
 
 function runsDir(storeDir: string, cardId: string): string {
+  assertSafeId(cardId);
   return join(storeDir, "runs", cardId);
 }
 
@@ -37,8 +46,11 @@ function readJson<T>(path: string): T | undefined {
   }
 }
 
+/** Atomic write: write to a temp file then rename (GLM 5.2 MEDIUM-1). */
 function writeJson(path: string, data: unknown): void {
-  writeFileSync(path, JSON.stringify(data, null, 2) + "\n", "utf8");
+  const tmp = `${path}.tmp.${process.pid}`;
+  writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n", "utf8");
+  renameSync(tmp, path);
 }
 
 // ── CRUD ─────────────────────────────────────────────────────────────────
@@ -114,6 +126,7 @@ export function updateRun(
   storeDir?: string,
 ): JobCardRun | undefined {
   const dir = resolveStoreDir(storeDir);
+  assertSafeId(runId);
   const p = join(runsDir(dir, cardId), `${runId}.json`);
   const existing = readJson<JobCardRun>(p);
   if (!existing) return undefined;
