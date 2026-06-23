@@ -93,9 +93,6 @@ const cognitionRouter = createCognitionRouter({ dispatch: dispatchCommand });
 function printUsage(argv: readonly string[] = []): void {
   const showAdvanced = argv.includes("--advanced");
   const allModuleCmds = commands.all().filter((c) => !BUILTINS.has(c.name));
-  const moduleCmds = showAdvanced
-    ? allModuleCmds
-    : allModuleCmds.filter((c) => (c.category ?? "core") === "core");
 
   if (showAdvanced) {
     const lines = [
@@ -134,35 +131,23 @@ function printUsage(argv: readonly string[] = []): void {
     );
     writeStdout(lines.join("\n"));
   } else {
+    // Focused default help: the handful of commands a first-time user actually needs.
+    // Everything else (repl/build flags, doctor, capabilities, workspaces, receipts,
+    // every module command) lives behind `ikbi help --advanced`. Deliberately does NOT
+    // enumerate the registered module commands — that breadth is what `--advanced` is for.
     const lines = [
       `ikbi v${config.version} — governed build/repair engine`,
       "",
-      "Usage: ikbi                Start interactive coding session",
-      "       ikbi \"fix bug\"      Start session with a prompt",
-      "       ikbi build <goal>   Headless build/repair",
-      "       ikbi init           First-run guided setup",
-      "       ikbi doctor         Check configuration health",
+      "  ikbi                      Start interactive REPL (default)",
+      "  ikbi init                 Guided first-run setup",
+      "  ikbi build <description>  Build/repair code",
+      "  ikbi models               Show model configuration",
+      "  ikbi serve                Start HTTP server",
+      "  ikbi help                 Show this help",
       "",
-      "Common commands:",
-      "  repl        Interactive session (default)",
-      "  build       Headless build/repair",
-      "  init        First-run guided setup",
-      "  doctor      Config health check + repair",
-      "  models      List/rank available models",
-      "  workspaces  Manage build workspaces",
+      "Type `ikbi help --advanced` for all commands and flags.",
+      "",
     ];
-    if (moduleCmds.length > 0) {
-      const width = Math.max(...moduleCmds.map((c) => c.name.length));
-      for (const c of moduleCmds) {
-        const usage = c.usage ? ` ${c.usage}` : "";
-        lines.push(`  ${(c.name + usage).padEnd(width + 11)}${c.summary}`);
-      }
-    }
-    lines.push(
-      "",
-      "Type `ikbi --help --advanced` for all commands and flags.",
-      "",
-    );
     writeStdout(lines.join("\n"));
   }
 }
@@ -205,18 +190,18 @@ const RECOMMENDED: RecommendProfile[] = [
 ];
 
 function printRecommendations(): void {
-  writeStdout("Blessed model configurations (ikbi models --recommend)\\n");
-  writeStdout("=====================================================\\n\\n");
+  writeStdout("Blessed model configurations (ikbi models --recommend)\n");
+  writeStdout("=====================================================\n\n");
   for (let i = 0; i < RECOMMENDED.length; i++) {
     const r = RECOMMENDED[i]!;
-    writeStdout(`[${i + 1}] ${r.label}\\n`);
-    writeStdout(`    Builder:    ${r.builder}\\n`);
-    writeStdout(`    Critic:     ${r.critic}\\n`);
-    if (r.fallback) writeStdout(`    Fallback:   ${r.fallback}\\n`);
-    writeStdout(`    Caveats:    ${r.caveats}\\n\\n`);
+    writeStdout(`[${i + 1}] ${r.label}\n`);
+    writeStdout(`    Builder:    ${r.builder}\n`);
+    writeStdout(`    Critic:     ${r.critic}\n`);
+    if (r.fallback) writeStdout(`    Fallback:   ${r.fallback}\n`);
+    writeStdout(`    Caveats:    ${r.caveats}\n\n`);
   }
-  writeStdout("Apply with: ikbi models --set-recommend <n>\\n");
-  writeStdout("  (writes IKBI_BUILDER_MODEL + IKBI_CRITIC_MODEL to .env)\\n");
+  writeStdout("Apply with: ikbi models --set-recommend <n>\n");
+  writeStdout("  (writes IKBI_BUILDER_MODEL + IKBI_CRITIC_MODEL to .env)\n");
 }
 
 function listModels(): void {

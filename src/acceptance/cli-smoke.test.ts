@@ -35,12 +35,16 @@ test("smoke: the built CLI exists (run `pnpm build` first)", () => {
   assert.ok(existsSync(ENTRY), `built CLI not found at ${ENTRY}`);
 });
 
-test("smoke: `ikbi help` shows core commands", () => {
+test("smoke: `ikbi help` shows the focused core commands (no startup-log leak)", () => {
   const r = runCli(["help"]);
   assert.equal(r.status, 0, `help exited ${r.status}\n${r.combined}`);
-  for (const cmd of ["repl", "build", "init", "doctor", "models", "workspaces"]) {
+  // The default help is intentionally tight (~6 commands); the long tail is behind --advanced.
+  for (const cmd of ["init", "build", "models", "serve", "help"]) {
     assert.match(r.stdout, new RegExp(`\\b${cmd}\\b`), `help lists "${cmd}"`);
   }
+  assert.match(r.stdout, /ikbi help --advanced/, "points to --advanced for the full list");
+  // Startup/config diagnostics must NOT leak into a user-facing command's output (even when piped).
+  assert.doesNotMatch(r.combined, /"level":"(info|debug|warn)"/, "no structured startup logs leaked");
   assert.ok(noStack(r.combined), "no stack trace");
 });
 

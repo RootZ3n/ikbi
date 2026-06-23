@@ -571,11 +571,13 @@ async function streamTurn(
   mode: ChatMode,
   turnOpts: Omit<TurnOptions, "onProgress">,
   out: (s: string) => void,
+  quiet: boolean = false,
 ): Promise<{ res: TurnResult; streamedProse: boolean }> {
   let spinnerShowing = false;
   let midLine = false; // prose was written without a trailing newline
   let printedAny = false;
-  const onProgress = (phase: string): void => {
+  // In `--quiet` the spinner is status chatter — skip it so only model prose reaches stdout.
+  const onProgress = quiet ? undefined : (phase: string): void => {
     // Move off any partial prose line first so the spinner's `\r` erase can't eat streamed text.
     if (midLine) { out("\n"); midLine = false; }
     out(`${SPINNER_CLEAR}${DIM}⟳ ${phase}${RESET}`);
@@ -588,7 +590,7 @@ async function streamTurn(
     printedAny = true;
     midLine = !s.endsWith("\n");
   };
-  const gen = session.sendStream!(msg, undefined, mode, { ...turnOpts, onProgress });
+  const gen = session.sendStream!(msg, undefined, mode, { ...turnOpts, ...(onProgress ? { onProgress } : {}) });
   let res: TurnResult;
   for (;;) {
     const next = await gen.next();
@@ -631,19 +633,21 @@ export async function runRepl(deps: ReplDeps): Promise<void> {
     confirmTool,
     quiet: deps.quiet ?? false,
   };
-  const modeLabel = ctx.quiet ? " (quiet)" : "";
-  deps.out(`ikbi repl — a conversational coding session${modeLabel}. Type /help for commands, /plan for read-only planning, /exit (or Ctrl-C) to quit.\n`);
-  if (deps.session.workdirWarning !== undefined) deps.out(`[workdir warning] ${deps.session.workdirWarning}\n`);
+  // `--quiet` ⇒ model-output-only: route the banner/workdir/prompt/tool/context chatter through
+  // `say` (a no-op when quiet), leaving only the model's prose on `deps.out`.
+  const say = (s: string): void => { if (!ctx.quiet) deps.out(s); };
+  say(`ikbi repl — a conversational coding session. Type /help for commands, /plan for read-only planning, /exit (or Ctrl-C) to quit.\n`);
+  if (deps.session.workdirWarning !== undefined) say(`[workdir warning] ${deps.session.workdirWarning}\n`);
   if (deps.session.workdirKind !== undefined && deps.session.worktree !== undefined) {
     const kind = deps.session.workdirKind;
     const descr =
       kind === "managed" ? `managed workspace off ${deps.session.targetRepo ?? "the repo"} — separate from the target until /apply; /discard drops it`
       : kind === "scratch" ? "scratch (non-promotable)"
       : "live-direct edits";
-    deps.out(`[workdir: ${deps.session.worktree} — ${descr}]\n`);
+    say(`[workdir: ${deps.session.worktree} — ${descr}]\n`);
   }
   for (;;) {
-    deps.out(prompt);
+    say(prompt);
     const line = await deps.readLine();
     if (line === null) break; // EOF / Ctrl-C / Ctrl-D
     const msg = line.trim();
@@ -675,13 +679,14 @@ export async function runRepl(deps: ReplDeps): Promise<void> {
     const baseOpts = { signal: controller.signal, permissionMode: ctx.permissionMode, confirm: ctx.confirmTool } as const;
     try {
       if (typeof ctx.session.sendStream === "function") {
-        const streamed = await streamTurn(ctx.session, msg, ctx.mode, baseOpts, deps.out);
+        const streamed = await streamTurn(ctx.session, msg, ctx.mode, baseOpts, deps.out, ctx.quiet);
         res = streamed.res;
         streamedProse = streamed.streamedProse;
       } else {
-        const onProgress = (phase: string): void => deps.out(`${SPINNER_CLEAR}${DIM}⟳ ${phase}${RESET}`);
-        res = await ctx.session.send(msg, undefined, ctx.mode, { ...baseOpts, onProgress });
-        deps.out(SPINNER_CLEAR); // clear the spinner line before printing the result
+        // Progress spinner is status chatter — suppressed in quiet mode.
+        const onProgress = ctx.quiet ? undefined : (phase: string): void => deps.out(`${SPINNER_CLEAR}${DIM}⟳ ${phase}${RESET}`);
+        res = await ctx.session.send(msg, undefined, ctx.mode, { ...baseOpts, ...(onProgress ? { onProgress } : {}) });
+        say(SPINNER_CLEAR); // clear the spinner line before printing the result
       }
     } catch (e) {
       deps.out(`${SPINNER_CLEAR}[error: ${errMsg(e)}]\n`);
@@ -689,17 +694,17 @@ export async function runRepl(deps: ReplDeps): Promise<void> {
     } finally {
       deps.onTurnController?.(undefined);
     }
-    if (res.tools.length > 0) deps.out(toolLine(res.tools));
-    renderToolDiffs(res.tools, deps.out); // FIX 3: colorized inline diffs for file mutations
+    if (res.tools.length > 0) say(toolLine(res.tools));
+    if (!ctx.quiet) renderToolDiffs(res.tools, deps.out); // FIX 3: colorized inline diffs for file mutations
     // The prose was already streamed live; only print it here when it wasn't (non-stream path, or a
     // synthetic [ikbi: …] reply that never produced content deltas).
     if (!streamedProse) deps.out(`${res.response}\n`);
     // Cache-hit segment for the context bar (FIX 7), when caching is active this session.
     const u = ctx.session.usage?.();
     const cachePct = ctx.session.cacheHitPercent?.() ?? (u !== undefined && (u.cachedTokens ?? 0) > 0 && u.tokensIn > 0 ? Math.round(((u.cachedTokens ?? 0) / u.tokensIn) * 100) : undefined);
-    deps.out(contextBar(res.contextPercent, cachePct));
+    say(contextBar(res.contextPercent, cachePct));
   }
-  deps.out("\nsession ended.\n");
+  say("\nsession ended.\n");
 }
 
 /** Bridge a readline interface to the `readLine()` pull model; resolves null on close/SIGINT. */
@@ -752,6 +757,10 @@ function readlineSource(getTurnController?: () => AbortController | undefined): 
 export async function liveRepl(argv: readonly string[] = [], initialMessage?: string): Promise<void> {
   const out = (s: string): void => void process.stdout.write(s);
   const quiet = argv.includes("--quiet");
+  // `--quiet` is model-output-only: suppress every status/diagnostic line (project overview,
+  // resume/fork notices) and let only the model's response reach stdout. Model prose still
+  // uses `out` directly; non-model chatter routes through `status`.
+  const status = (s: string): void => { if (!quiet) out(s); };
   // `--max-sessions <n>` overrides the prune cap (BLOCKER-3); else the store uses IKBI_MAX_SESSIONS / default.
   const maxIdx = argv.indexOf("--max-sessions");
   const maxArg = maxIdx >= 0 ? Number.parseInt(argv[maxIdx + 1] ?? "", 10) : Number.NaN;
@@ -824,7 +833,7 @@ export async function liveRepl(argv: readonly string[] = [], initialMessage?: st
     }
     try {
       session = await store.fork(originId, { autosave, memoryGovernor, invokeStream: invokeModelStream });
-      out(`Forked session ${originId} → ${session.id} (${session.messageCount()} messages, worktree: ${session.worktree})\n`);
+      status(`Forked session ${originId} → ${session.id} (${session.messageCount()} messages, worktree: ${session.worktree})\n`);
     } catch (e) {
       out(`[no session found to fork: ${originId} (${errMsg(e)})]\n`);
       return;
@@ -837,16 +846,16 @@ export async function liveRepl(argv: readonly string[] = [], initialMessage?: st
       return;
     }
     session = loaded;
-    out(`Resumed session ${session.id} (${session.messageCount()} messages, worktree: ${session.worktree})\n`);
+    status(`Resumed session ${session.id} (${session.messageCount()} messages, worktree: ${session.worktree})\n`);
   } else if (wantContinue) {
     const top = store.list()[0];
     const latest = top !== undefined ? await resume(top.id) : undefined;
     if (latest === undefined) {
-      out("[no prior session to continue — starting fresh]\n");
+      status("[no prior session to continue — starting fresh]\n");
       session = await newSession();
     } else {
       session = latest;
-      out(`Resumed session ${session.id} (${session.messageCount()} messages, worktree: ${session.worktree})\n`);
+      status(`Resumed session ${session.id} (${session.messageCount()} messages, worktree: ${session.worktree})\n`);
     }
   } else {
     session = await newSession();
@@ -854,7 +863,7 @@ export async function liveRepl(argv: readonly string[] = [], initialMessage?: st
 
   // PROJECT AUTO-DISCOVERY (FIX 2): a one-line overview of the worktree at startup.
   try {
-    out(formatOverview(discoverProject(session.worktree)));
+    status(formatOverview(discoverProject(session.worktree)));
   } catch {
     // Discovery is best-effort cosmetics — never let it block the session.
   }

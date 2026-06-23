@@ -22,13 +22,13 @@ interface ProviderStatus {
 }
 
 const KNOWN_PROVIDERS: Omit<ProviderStatus, "set">[] = [
-  { name: "anthropic", envVar: "ANTHROPIC_API_KEY" },
-  { name: "openai", envVar: "OPENAI_API_KEY" },
-  { name: "deepseek", envVar: "DEEPSEEK_API_KEY" },
-  { name: "openrouter", envVar: "OPENROUTER_API_KEY" },
-  { name: "google", envVar: "GOOGLE_API_KEY" },
-  { name: "groq", envVar: "GROQ_API_KEY" },
-  { name: "xai", envVar: "XAI_API_KEY" },
+  { name: "anthropic", envVar: "IKBI_ANTHROPIC_API_KEY" },
+  { name: "openai", envVar: "IKBI_OPENAI_API_KEY" },
+  { name: "deepseek", envVar: "IKBI_DEEPSEEK_API_KEY" },
+  { name: "openrouter", envVar: "IKBI_OPENROUTER_API_KEY" },
+  { name: "google", envVar: "IKBI_GOOGLE_API_KEY" },
+  { name: "groq", envVar: "IKBI_GROQ_API_KEY" },
+  { name: "xai", envVar: "IKBI_XAI_API_KEY" },
   { name: "ollama", envVar: "OLLAMA_HOST" },
 ];
 
@@ -148,7 +148,7 @@ export async function runInit(): Promise<void> {
 
   if (found.length === 0) {
     out("No API keys detected! You'll need at least one provider configured.\n");
-    out("Set an API key (e.g., export ANTHROPIC_API_KEY=xxx) and re-run `ikbi init`,\n");
+    out("Set an API key (e.g., export IKBI_ANTHROPIC_API_KEY=xxx) and re-run `ikbi init`,\n");
     out("or choose the 'Local Only' profile if you have Ollama running.\n\n");
   }
 

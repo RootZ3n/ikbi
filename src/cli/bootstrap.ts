@@ -127,6 +127,27 @@ export function enableDevKeysForInfoCommand(argv: readonly string[], env: NodeJS
 }
 
 /**
+ * Startup diagnostics (identity bootstrap, provider-roster load, etc.) are internal noise for
+ * a user running `ikbi`, `ikbi help`, `ikbi models`, or the REPL — yet they leak to stderr the
+ * moment stdout/stderr is a pipe (the TTY path is already `silent`; see core/log.ts). Default
+ * the log level to `silent` for user-facing CLI invocations so those commands are clean, and
+ * only surface logs when the operator opts in with `--verbose`/`--debug` (or pins
+ * `IKBI_LOG_LEVEL` themselves). The long-running `serve` service keeps its operational logs.
+ *
+ * Runs at the CLI entrypoint BEFORE `core/config`/`core/log` are imported, so the root logger
+ * is constructed at the resolved level and the import-time startup logs are suppressed too.
+ * Returns the level it set (or undefined when it deferred to the operator / serve).
+ */
+export function suppressCliLogsByDefault(argv: readonly string[], env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (env.IKBI_LOG_LEVEL?.trim()) return undefined; // operator already chose — never override
+  if (argv.includes("--debug")) { env.IKBI_LOG_LEVEL = "debug"; return "debug"; }
+  if (argv.includes("--verbose")) { env.IKBI_LOG_LEVEL = "info"; return "info"; }
+  if (argv[0] === "serve") return undefined; // a service — leave its operational logs at config level
+  env.IKBI_LOG_LEVEL = "silent";
+  return "silent";
+}
+
+/**
  * Short-lived CLI commands often exit immediately after printing. In some Node/pino
  * combinations, ordinary `process.stdout.write` output can be lost when stdout is a pipe
  * even though logger output has already flushed. Put stdio in blocking mode at the CLI
@@ -148,3 +169,4 @@ try {
   process.exit(1);
 }
 enableDevKeysForInfoCommand(process.argv.slice(2));
+suppressCliLogsByDefault(process.argv.slice(2));
