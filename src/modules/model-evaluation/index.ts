@@ -58,3 +58,23 @@ export type { BenchmarkVerifier } from "./evaluateBenchmark.js";
 // --- executable benchmark summary ---
 export { listExecutableBenchmarks, getExecutableBenchmarkSummary } from "./summary.js";
 export type { ExecutableBenchmarkSummary } from "./summary.js";
+
+// --- Luak benchmark adapter (competitive-build model selection) ---
+export {
+  DEFAULT_LUAK_PATH,
+  DEFAULT_LUAK_TIMEOUT_MS,
+  DEFAULT_LUAK_URL,
+  fetchLuakLeaderboard,
+  loadLuakAdapterConfig,
+  matchLuakEntry,
+  normalizeModelName,
+  parseLeaderboardEntries,
+  pickCheapestAboveThreshold,
+  rankCandidates,
+  scoreOfEntry,
+  type LuakAdapterConfig,
+  type LuakFetchResult,
+  type LuakLeaderboardEntry,
+  type RankCandidate,
+  type RosterModel,
+} from "./luak-adapter.js";

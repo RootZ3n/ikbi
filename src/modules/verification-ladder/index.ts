@@ -30,3 +30,19 @@ export {
 } from "./config.js";
 
 export { createVerificationLadder, isStubScript, verificationLadder } from "./implementation.js";
+
+// The optional HOWA TRUTHFULNESS RUNG — posts the build diff + model intent to Howa and
+// fails closed (RED) on a detected lie. OFF by default (IKBI_VERIFICATION_LADDER_HOWA_ENABLED).
+export {
+  DEFAULT_HOWA_PATH,
+  DEFAULT_HOWA_TIMEOUT_MS,
+  DEFAULT_HOWA_URL,
+  interpretHowaResponse,
+  loadHowaCheckConfig,
+  runHowaTruthfulnessCheck,
+  type FetchLike,
+  type HowaCheckConfig,
+  type HowaCheckInput,
+  type HowaCheckResult,
+  type HowaVerdict,
+} from "./howa-check.js";

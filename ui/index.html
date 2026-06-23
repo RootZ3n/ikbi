@@ -834,7 +834,10 @@ var pehOnboard={
             'I\u2019ll be right here if you need me. Yokehoke!'+
           '</p>'+
           '<div class="peh-onboard-buttons">'+
-            '<button class="peh-onboard-btn peh-onboard-btn-primary" type="button" data-action="done">'+
+            '<button class="peh-onboard-btn peh-onboard-btn-primary" type="button" data-action="first-build">'+
+              'Start your first build'+
+            '</button>'+
+            '<button class="peh-onboard-btn peh-onboard-btn-secondary" type="button" data-action="done">'+
               'Let\u2019s go!'+
             '</button>'+
           '</div>'+
@@ -842,6 +845,10 @@ var pehOnboard={
       '</div>';
 
     el.className='peh-onboard-overlay';
+    el.querySelector('[data-action="first-build"]').onclick=function(){
+      self._dismiss(el);
+      try{if(typeof window.ikbiStartFirstBuild==='function')window.ikbiStartFirstBuild();}catch(e){}
+    };
     el.querySelector('[data-action="done"]').onclick=function(){
       self._dismiss(el);
     };

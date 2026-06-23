@@ -49,6 +49,12 @@ export const DEFAULT_EGRESS_HOSTS: readonly string[] = Object.freeze([
   "api.xiaomimimo.com", // MiMo (mimo-v2.5 / mimo-v2.5-pro)
   "api.deepseek.com", // DeepSeek (deepseek-v4-pro / deepseek-v4-flash / deepseek-chat / deepseek-reasoner)
   "openrouter.ai", // OpenRouter (backup routes)
+  // NOTE — Howa truthfulness rung (src/modules/verification-ladder/howa-check.ts): the
+  // default Howa is a LOOPBACK service (http://127.0.0.1:18799), so it is intentionally NOT
+  // added here — a blanket "127.0.0.1" host entry would re-open the SSRF surface. To enable
+  // the rung, the operator adds Howa's host to IKBI_EGRESS_ALLOWLIST and (for a loopback Howa)
+  // its ip:port to IKBI_EGRESS_ALLOW_LOCAL — e.g. ALLOWLIST=...,127.0.0.1 ALLOW_LOCAL=127.0.0.1:18799,
+  // or, for a remote Howa, just add its hostname here / to ALLOWLIST.
 ]);
 
 export interface EgressConfig {

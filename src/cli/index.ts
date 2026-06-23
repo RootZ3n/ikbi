@@ -22,6 +22,12 @@ import "./bootstrap.js";
 import "../modules/index.js";
 import { config } from "../core/config.js";
 import { registry } from "../core/provider/index.js";
+import {
+  fetchLuakLeaderboard,
+  pickCheapestAboveThreshold,
+  rankCandidates,
+  type RosterModel,
+} from "../modules/model-evaluation/index.js";
 import { trust } from "../core/trust/index.js";
 import { commands } from "./registry.js";
 import { runDoctor, runDoctorFixCli } from "./doctor.js";
@@ -95,6 +101,7 @@ function printUsage(): void {
     "Commands:",
     "  version            Print the ikbi version",
     "  models [list]      List the model roster (id, role, cost, provider chain)",
+    "  models --rank      Rank the roster by Luak benchmark score (--min-score N: cheapest above bar)",
     "  providers [list]   List the registered providers",
     "  doctor             Report bootstrap config: what's set, what's missing for a build",
     "  doctor --fix       Repair common gaps (.env/state dirs/deps); --force reclaims stale + aged workspaces",
@@ -137,6 +144,71 @@ function listModels(): void {
   }
 }
 
+/** A blended $/Mtok for a roster model (the cheaper of the route/model cost), or undefined. */
+function blendedCost(m: ReturnType<typeof registry.listModels>[number]): number | undefined {
+  const rate = m.providers[0]?.cost ?? m.cost;
+  if (rate === undefined) return undefined;
+  return (rate.promptPerMTok + rate.completionPerMTok) / 2;
+}
+
+/** Map the provider registry's roster into the ranking adapter's RosterModel shape. */
+function rosterForRanking(): RosterModel[] {
+  return registry.listModels().map((m) => ({
+    id: m.id,
+    role: m.role,
+    costPerMTok: blendedCost(m),
+    providerModelIds: m.providers.map((r) => r.providerModelId),
+  }));
+}
+
+/**
+ * `ikbi models --rank` — pull Luak's leaderboard and rank the roster by measured quality, so
+ * cold model selection is benchmark-driven instead of hand-tuned. `--min-score N` additionally
+ * picks the CHEAPEST roster model at or above that quality bar (the competitive-race seed).
+ */
+async function runModelsRank(argv: readonly string[]): Promise<void> {
+  const roster = rosterForRanking();
+  if (roster.length === 0) {
+    writeStdout("(no models in roster)\n");
+    return;
+  }
+  const lb = await fetchLuakLeaderboard();
+  if (!lb.ok) {
+    writeStderr(`ikbi models --rank: ${lb.error}\n  (set IKBI_MODEL_EVALUATION_LUAK_URL if Luak is elsewhere; ensure its host is egress-allowlisted)\n`);
+    process.exitCode = 1;
+    return;
+  }
+  const ranked = rankCandidates(roster, lb.entries);
+  writeStdout(`Roster ranked by Luak benchmark score (${lb.entries.length} leaderboard row(s)):\n`);
+  let rank = 1;
+  for (const c of ranked) {
+    const role = c.role ? ` [${c.role}]` : "";
+    const score = typeof c.score === "number" ? c.score.toFixed(2) : "—  (no Luak data)";
+    const cost = typeof c.costPerMTok === "number" ? `  $${c.costPerMTok.toFixed(2)}/Mtok` : "";
+    const via = c.matched?.model ? `  via luak:${c.matched.model}` : "";
+    writeStdout(`  ${String(rank).padStart(2)}. ${c.id}${role}  score=${score}${cost}${via}\n`);
+    rank += 1;
+  }
+
+  // `--min-score N` → the cheapest model above the quality bar (per role when roles are set).
+  const idx = argv.indexOf("--min-score");
+  const minRaw = idx >= 0 ? argv[idx + 1] : undefined;
+  if (minRaw !== undefined) {
+    const min = Number(minRaw);
+    if (!Number.isFinite(min)) {
+      writeStderr(`ikbi models --rank: --min-score expects a number (got "${minRaw}")\n`);
+      process.exitCode = 1;
+      return;
+    }
+    const cheapest = pickCheapestAboveThreshold(ranked, min);
+    writeStdout(
+      cheapest !== undefined
+        ? `\nCheapest model with score ≥ ${min}: ${cheapest.id} (score=${cheapest.score?.toFixed(2)}${typeof cheapest.costPerMTok === "number" ? `, $${cheapest.costPerMTok.toFixed(2)}/Mtok` : ""})\n`
+        : `\nNo roster model has a Luak score ≥ ${min} — keep the static pick (IKBI_MODEL_BUILDER/etc.).\n`,
+    );
+  }
+}
+
 function listProviders(): void {
   const providers = registry.listProviders();
   if (providers.length === 0) {
@@ -173,6 +245,10 @@ async function run(argv: readonly string[]): Promise<void> {
       writeStdout(`${config.version}\n`);
       return;
     case "models":
+      if (argv.includes("--rank")) {
+        await runModelsRank(argv.slice(1));
+        return;
+      }
       listModels();
       return;
     case "providers":

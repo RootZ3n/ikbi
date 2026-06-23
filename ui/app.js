@@ -185,6 +185,29 @@
 
   window.IkbiApp = { runCommand: runCommand, ask: ask, pollHealth: pollHealth };
 
+  // Deep-link the onboarding tour's final step into a pre-filled first build: jump to
+  // the Grove, open its terminal, and seed the input with a sample goal so a beginner
+  // just adds their repo path and presses Enter. Closes the gap from "configured" to
+  // "first verified change."
+  window.ikbiStartFirstBuild = function (goal) {
+    goal = goal || 'add a one-line note to the README describing this project';
+    try {
+      if (typeof window.pehGoScene === 'function') window.pehGoScene('the-grove');
+      if (typeof window.pehOpenWorkspace === 'function') window.pehOpenWorkspace('grove-ws', { dock: 'fullscreen' });
+    } catch (e) { /* navigation best-effort */ }
+    var tries = 0;
+    (function fill() {
+      var inp = document.getElementById('grove-input');
+      if (inp) {
+        inp.value = goal + ' --repo ';
+        try { inp.focus(); var n = inp.value.length; inp.setSelectionRange(n, n); } catch (e) {}
+        if (window.IkbiGuide) IkbiGuide.log('First build ready in the Grove — add your repo path and press Enter.', 'note');
+        return;
+      }
+      if (tries++ < 25) setTimeout(fill, 80);
+    })();
+  };
+
   // ── 6. Floating ikbi Chat Agent ───────────────────────────────────────────
   var chatOpen = false;
   var chatDrawerEl = null;

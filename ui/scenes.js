@@ -30,6 +30,19 @@
   function stat(label, value) {
     return '<div class="peh-stat"><span class="peh-stat-v">' + esc(value) + '</span><span class="peh-stat-l">' + esc(label) + '</span></div>';
   }
+  // Receipt helpers — read ground truth (cost lives in metadata.costUsd).
+  function receiptCost(r) {
+    var c = r && r.metadata && r.metadata.costUsd;
+    return typeof c === 'number' ? c : 0;
+  }
+  function sumReceiptCost(rs) {
+    return rs.reduce(function (a, r) { return a + receiptCost(r); }, 0);
+  }
+  function usd(n) {
+    var v = Number(n);
+    return isFinite(v) ? '$' + v.toFixed(4) : '—';
+  }
+  function statusOf(r) { return (r && r.outcome && r.outcome.status) || '?'; }
   function section(title, content) {
     return '<div class="ikbi-ws-section"><p class="ikbi-ws-head">' + esc(title) + '</p>' + content + '</div>';
   }
@@ -189,34 +202,49 @@
     return html;
   }
 
-  // test-results — Test suite overview
+  // test-results — Live verification results from the durable receipt store (ground truth).
   async function rTestResults() {
     var c = await window.IkbiAPI.capabilities();
+    var rec = await window.IkbiAPI.receipts({ limit: 100 });
+    if (!c.ok && !rec.ok) return offline(rec.ok ? c : rec);
     var cd = (c.data) || {};
-    var features = cd.features || [];
     var tools = cd.tools || [];
+    var receipts = (rec.data && rec.data.receipts) || [];
+
+    var ok = receipts.filter(function (r) { return statusOf(r) === 'success'; }).length;
+    var fail = receipts.filter(function (r) { var s = statusOf(r); return s === 'failure' || s === 'rejected'; }).length;
+    var spend = sumReceiptCost(receipts);
 
     var html = '<div class="ikbi-ws">';
 
     html += '<div class="ikbi-test-stats">' +
-      '<div class="ikbi-test-stat"><span class="ikbi-test-stat-v">800+</span><span class="ikbi-test-stat-l">total tests</span></div>' +
-      '<div class="ikbi-test-stat"><span class="ikbi-test-stat-v">28+</span><span class="ikbi-test-stat-l">modules covered</span></div>' +
+      '<div class="ikbi-test-stat"><span class="ikbi-test-stat-v">' + esc(String(receipts.length)) + '</span><span class="ikbi-test-stat-l">recorded operations</span></div>' +
+      '<div class="ikbi-test-stat"><span class="ikbi-test-stat-v">' + esc(String(ok)) + '</span><span class="ikbi-test-stat-l">succeeded</span></div>' +
+      '<div class="ikbi-test-stat"><span class="ikbi-test-stat-v">' + esc(String(fail)) + '</span><span class="ikbi-test-stat-l">failed / rejected</span></div>' +
+      '<div class="ikbi-test-stat"><span class="ikbi-test-stat-v">' + esc(usd(spend)) + '</span><span class="ikbi-test-stat-l">total spend</span></div>' +
       '<div class="ikbi-test-stat"><span class="ikbi-test-stat-v">' + esc(String(tools.length || '?')) + '</span><span class="ikbi-test-stat-l">builder tools</span></div>' +
-      '<div class="ikbi-test-stat"><span class="ikbi-test-stat-v">' + esc(String(features.length || '?')) + '</span><span class="ikbi-test-stat-l">gated features</span></div>' +
       '</div>';
 
-    html += section('Test coverage note',
-      '<p class="ikbi-test-note">The test suite covers all 28+ modules via <code>pnpm test</code>. ' +
-      'Live pass/fail counts are not available over the HTTP API — run the suite in the terminal for real-time results.</p>'
-    );
+    if (receipts.length) {
+      var rows = receipts.slice().reverse().slice(0, 25).map(function (r) {
+        var s = statusOf(r);
+        var dot = s === 'success' ? 'on' : (s === 'failure' || s === 'rejected') ? 'off' : '';
+        var detail = (r.outcome && (r.outcome.detail || r.outcome.error)) || '';
+        return '<div class="ikbi-hist-item">' +
+          '<span class="ikbi-flag-dot ' + dot + '"></span>' +
+          '<span class="ikbi-hist-time">' + esc(timeStr(r.timestamp)) + '</span>' +
+          '<span class="ikbi-hist-text">' + esc(r.operation || 'op') + ' — ' + esc(s) +
+          (receiptCost(r) ? ' · ' + esc(usd(receiptCost(r))) : '') +
+          (detail ? ' · ' + esc(String(detail).slice(0, 80)) : '') + '</span></div>';
+      }).join('');
+      html += section('Recent verdicts — newest first', '<div class="ikbi-history-list">' + rows + '</div>');
+    } else {
+      html += section('Recent verdicts', '<p class="peh-live-empty">No receipts yet. Launch a build in the Grove to populate verified results here.</p>');
+    }
 
-    html += section('Actions',
-      '<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">' +
-      '<button class="ikbi-run-btn" type="button" ' +
-      'onclick="IkbiApp.runCommand(\'health\');IkbiGuide.toggle(true);IkbiGuide.log(\'Run: pnpm test\', \'note\')">' +
-      'Check engine</button>' +
-      '<span style="font-size:12px;color:var(--ink-dim)">Run <code style="font-family:var(--mono);font-size:11px;color:var(--peh-accent)">pnpm test</code> in a terminal for live results</span>' +
-      '</div>'
+    html += section('Note',
+      '<p class="ikbi-test-note">These are the engine\'s durable receipts (<code>/api/receipts</code>, also <code>ikbi receipts</code> / <code>ikbi cost</code>). ' +
+      'For the local source-test suite, run <code style="font-family:var(--mono);font-size:11px;color:var(--peh-accent)">pnpm test</code> in a terminal.</p>'
     );
 
     html += '</div>';
@@ -304,42 +332,70 @@
     return html;
   }
 
-  // history-ws — Activity log and session info
+  // history-ws — Real build history from the durable receipt store + timeline rollup.
   async function rHistoryWs() {
     var a = await window.IkbiAPI.agent();
-    var c = await window.IkbiAPI.capabilities();
+    var rec = await window.IkbiAPI.receipts({ limit: 50 });
+    var tl = await window.IkbiAPI.timeline({ period: 'day' });
     var ad = (a.data) || {};
-    var cd = (c.data) || {};
+    var receipts = (rec.data && rec.data.receipts) || [];
+    var buckets = (tl.data && tl.data.buckets) || [];
+
+    // Roll up build-level counts + spend from the timeline (task-grouped, agrees with summary).
+    var builds = 0, ok = 0, fail = 0, cost = 0;
+    buckets.forEach(function (b) {
+      builds += b.taskGroups || 0;
+      ok += b.taskSuccesses || 0;
+      fail += b.taskFailures || 0;
+      cost += b.totalCostUsd || 0;
+    });
+    // Fall back to receipt-level spend when the timeline route is unavailable.
+    if (!buckets.length && receipts.length) cost = sumReceiptCost(receipts);
 
     var html = '<div class="ikbi-ws">';
 
     html += '<div class="peh-stats">' +
       stat('status', ad.status || '—') +
       stat('uptime', ad.uptime != null ? ago(ad.uptime * 1000) : '—') +
-      stat('sessions', (cd.chatSessions && cd.chatSessions.persistence) ? cd.chatSessions.persistence : '—') +
-      stat('resumable', (cd.chatSessions && cd.chatSessions.resumable) ? 'yes' : 'no') +
+      stat('builds', builds || (receipts.length ? '—' : 0)) +
+      stat('passed', ok) +
+      stat('failed', fail) +
+      stat('spend', usd(cost)) +
       '</div>';
 
-    if (cd.chatSessions && cd.chatSessions.warning) {
-      html += section('Session note',
-        '<div class="peh-row"><span class="peh-row-m">' + esc(cd.chatSessions.warning) + '</span></div>'
-      );
-    }
-
-    var entries = (window.IkbiGuide && IkbiGuide.entries) ? IkbiGuide.entries() : [];
-    if (entries.length) {
-      html += section('Recent activity — ' + entries.length + ' events',
+    if (receipts.length) {
+      html += section('Build history — ' + receipts.length + ' receipt(s), newest first',
         '<div class="ikbi-history-list">' +
-        entries.slice().reverse().slice(0, 30).map(function (e) {
-          return '<div class="ikbi-hist-item k-' + esc(e.kind) + '">' +
-            '<span class="ikbi-hist-time">' + esc(timeStr(e.t)) + '</span>' +
-            '<span class="ikbi-hist-text">' + esc(e.text) + '</span></div>';
+        receipts.slice().reverse().slice(0, 40).map(function (r) {
+          var s = statusOf(r);
+          var dot = s === 'success' ? 'on' : (s === 'failure' || s === 'rejected') ? 'off' : '';
+          return '<div class="ikbi-hist-item">' +
+            '<span class="ikbi-flag-dot ' + dot + '"></span>' +
+            '<span class="ikbi-hist-time">' + esc(timeStr(r.timestamp)) + '</span>' +
+            '<span class="ikbi-hist-text">' + esc(r.operation || 'op') + ' — ' + esc(s) +
+            (receiptCost(r) ? ' · ' + esc(usd(receiptCost(r))) : '') +
+            (r.requestId ? ' · ' + esc(String(r.requestId).slice(0, 12)) : '') + '</span></div>';
         }).join('') + '</div>'
       );
     } else {
-      html += section('Activity log',
-        '<p class="peh-live-empty">No activity yet. Interact with the engine to see events here.</p>'
-      );
+      // No durable history yet — fall back to the in-browser session log so the panel is never empty.
+      var entries = (window.IkbiGuide && IkbiGuide.entries) ? IkbiGuide.entries() : [];
+      if (!rec.ok) {
+        html += section('Build history', offline(rec));
+      } else if (entries.length) {
+        html += section('Session activity (no durable receipts yet) — ' + entries.length + ' events',
+          '<div class="ikbi-history-list">' +
+          entries.slice().reverse().slice(0, 30).map(function (e) {
+            return '<div class="ikbi-hist-item k-' + esc(e.kind) + '">' +
+              '<span class="ikbi-hist-time">' + esc(timeStr(e.t)) + '</span>' +
+              '<span class="ikbi-hist-text">' + esc(e.text) + '</span></div>';
+          }).join('') + '</div>'
+        );
+      } else {
+        html += section('Build history',
+          '<p class="peh-live-empty">No builds recorded yet. Launch a build in the Grove — verdicts and spend will appear here from <code>/api/receipts</code>.</p>'
+        );
+      }
     }
 
     html += '</div>';
@@ -351,63 +407,150 @@
     return '<div class="grove-terminal">' +
       '<div class="grove-header">THE GROVE · ikbi terminal</div>' +
       '<div class="grove-messages" id="grove-msgs">' +
-        '<div class="grove-msg system">Welcome to the Grove. Type a goal and ikbi will build it.</div>' +
+        '<div class="grove-msg system">Welcome to the Grove. Type a goal + target repo to launch a real build, e.g. <code>add a /healthz route --repo /path/to/app</code>. Live per-role progress streams here. (Prefix with <code>?</code> to chat instead.)</div>' +
       '</div>' +
       '<div class="grove-input-wrap">' +
         '<span class="grove-prompt">❯</span>' +
-        '<input class="grove-input" type="text" id="grove-input" placeholder="State the goal..." ' +
+        '<input class="grove-input" type="text" id="grove-input" placeholder="State the goal…  (append --repo /abs/path)" ' +
           'onkeydown="if(event.key===\'Enter\'&&this.value.trim()){window.groveSend(this.value);this.value=\'\'}">' +
       '</div>' +
     '</div>';
+  }
+
+  // ── Build runner — submit a real /api/build task and stream live progress ──
+  // Appends terminal-style messages into `msgs` and renders per-role progress from
+  // the SSE stream. Shared by the Grove terminal and the Launch Pad build form, so
+  // the UI's centerpiece launches verifiable builds — not an ephemeral chat.
+  function buildMsg(msgs, cls, text) {
+    var el = document.createElement('div');
+    el.className = 'grove-msg ' + cls;
+    el.textContent = text;
+    msgs.appendChild(el);
+    msgs.scrollTop = msgs.scrollHeight;
+    return el;
+  }
+
+  // Pull an optional `--repo <path>` suffix out of a goal string. The path may be
+  // quoted; the remainder is the goal.
+  function parseGoalRepo(text) {
+    var repo = null;
+    var m = text.match(/\s--repo\s+("[^"]+"|'[^']+'|\S+)\s*$/);
+    if (m) {
+      repo = m[1].replace(/^["']|["']$/g, '');
+      text = text.slice(0, m.index);
+    }
+    return { goal: text.trim(), repo: repo };
+  }
+
+  function fmtCost(c) {
+    var n = Number(c);
+    return isFinite(n) ? '$' + n.toFixed(4) : '';
+  }
+
+  // Submit a build and stream its 5-role pipeline into `msgs` (a messages container).
+  window.ikbiRunBuild = async function (goal, repo, msgs) {
+    if (!msgs) return;
+    if (!goal) { buildMsg(msgs, 'system', 'State a goal to build.'); return; }
+    if (!repo) {
+      buildMsg(msgs, 'system', 'A build needs a target repo. Try:  ' + goal + ' --repo /abs/path  — or set window.IKBI_DEFAULT_REPO. ' +
+        '(The repo must be registered in state/repos.json or matched by IKBI_API_ALLOWED_REPOS.)');
+      return;
+    }
+    buildMsg(msgs, 'system', 'Submitting build → ' + repo);
+    if (window.IkbiGuide) IkbiGuide.log('Build: "' + goal + '" → ' + repo, 'you');
+
+    var sub = await window.IkbiAPI.build(goal, repo);
+    var taskId = sub.ok && sub.data ? (sub.data.taskId || sub.data.id) : null;
+    if (!taskId) {
+      var em = (sub.data && sub.data.error) ? sub.data.error : (sub.error || ('HTTP ' + sub.status));
+      if (sub.status === 401) em = 'Build requires IKBI_API_TOKEN — set window.IKBI_API_TOKEN.';
+      else if (sub.status === 503) em = 'Build unavailable — IKBI_OPERATOR_TOKEN / IKBI_WORKER_TOKEN not configured on the server.';
+      buildMsg(msgs, 'system', 'Build not accepted: ' + em);
+      return;
+    }
+    buildMsg(msgs, 'assistant', 'Build accepted — task ' + taskId + '. Streaming the scout→builder→critic→verifier→integrator pipeline…');
+
+    var roleEls = {};
+    function roleLine(role) {
+      if (!roleEls[role]) roleEls[role] = buildMsg(msgs, 'role', '▸ ' + role + ' — …');
+      return roleEls[role];
+    }
+
+    window.IkbiAPI.streamTask(taskId, {
+      onEvent: function (ev, data) {
+        data = data || {};
+        if (ev === 'role_started') {
+          roleLine(data.role).textContent = '▸ ' + data.role + (data.tier ? ' [' + data.tier + ']' : '') + ' — running…';
+        } else if (ev === 'tool_activity') {
+          roleLine('builder').textContent = '▸ builder — ' + (data.summary || 'working…');
+        } else if (ev === 'role_completed') {
+          var c = (data.cost != null) ? ' (' + fmtCost(data.cost) + ')' : '';
+          roleLine(data.role).textContent = '✓ ' + data.role + ' — ' + (data.outcome || 'done') + c;
+        } else if (ev === 'escalation') {
+          buildMsg(msgs, 'system', '⤴ escalation → ' + (data.to || '?') + (data.reason ? ' — ' + data.reason : ''));
+        } else if (ev === 'task_completed') {
+          var cost = (data.totalCost != null) ? ' · ' + fmtCost(data.totalCost) : '';
+          var ok = data.status === 'success';
+          buildMsg(msgs, ok ? 'assistant' : 'system', 'Build ' + (data.status || 'finished') + cost);
+          if (window.IkbiGuide) IkbiGuide.log('Build ' + (data.status || 'finished') + cost, ok ? 'ok' : 'warn');
+        } else if (ev === 'timeout') {
+          buildMsg(msgs, 'system', 'Stream idle — closed. Run `ikbi receipts` for the final verdict.');
+        }
+      },
+      onError: function (m) { buildMsg(msgs, 'system', 'Stream error: ' + m); },
+    });
+  };
+
+  // The Grove chat escape hatch — still talks to /chat for conversational queries
+  // (prefix a message with "?" or "chat:").
+  async function groveChat(text, msgs) {
+    var thinkingEl = buildMsg(msgs, 'system', 'ikbi is processing…');
+    try {
+      var result = await window.IkbiAPI.converse(text);
+      if (thinkingEl.parentNode) thinkingEl.parentNode.removeChild(thinkingEl);
+      if (result.ok && result.data) {
+        buildMsg(msgs, 'assistant', result.data.response || result.data.content || JSON.stringify(result.data));
+      } else if (result.status === 401 || result.status === 503) {
+        buildMsg(msgs, 'system', 'Chat requires IKBI_CHAT_TOKEN. Set it on the server to enable conversation.');
+      } else {
+        buildMsg(msgs, 'system', 'Error: ' + (result.error || 'No response from the engine. Is it running on :18796?'));
+      }
+    } catch (e) {
+      if (thinkingEl.parentNode) thinkingEl.parentNode.removeChild(thinkingEl);
+      buildMsg(msgs, 'system', 'Error: ' + ((e && e.message) || String(e)));
+    }
   }
 
   window.groveSend = async function (text) {
     if (!text || !text.trim()) return;
     var msgs = document.getElementById('grove-msgs');
     if (!msgs) return;
-
-    var userEl = document.createElement('div');
-    userEl.className = 'grove-msg user';
-    userEl.textContent = text;
-    msgs.appendChild(userEl);
-    msgs.scrollTop = msgs.scrollHeight;
-
-    var thinkingEl = document.createElement('div');
-    thinkingEl.className = 'grove-msg system';
-    thinkingEl.textContent = 'ikbi is processing…';
-    msgs.appendChild(thinkingEl);
-    msgs.scrollTop = msgs.scrollHeight;
-
-    try {
-      var result = await window.IkbiAPI.converse(text);
-      if (thinkingEl.parentNode) thinkingEl.parentNode.removeChild(thinkingEl);
-
-      if (result.ok && result.data) {
-        var response = result.data.response || result.data.content || JSON.stringify(result.data);
-        var respEl = document.createElement('div');
-        respEl.className = 'grove-msg assistant';
-        respEl.textContent = response;
-        msgs.appendChild(respEl);
-      } else if (result.status === 401 || result.status === 503) {
-        var authEl = document.createElement('div');
-        authEl.className = 'grove-msg system';
-        authEl.textContent = 'Chat requires IKBI_CHAT_TOKEN. Set it on the server to enable conversation.';
-        msgs.appendChild(authEl);
-      } else {
-        var errEl = document.createElement('div');
-        errEl.className = 'grove-msg system';
-        errEl.textContent = 'Error: ' + (result.error || 'No response from the engine. Is it running on :18796?');
-        msgs.appendChild(errEl);
-      }
-    } catch (e) {
-      if (thinkingEl.parentNode) thinkingEl.parentNode.removeChild(thinkingEl);
-      var catchEl = document.createElement('div');
-      catchEl.className = 'grove-msg system';
-      catchEl.textContent = 'Error: ' + ((e && e.message) || String(e));
-      msgs.appendChild(catchEl);
-    }
-    msgs.scrollTop = msgs.scrollHeight;
+    buildMsg(msgs, 'user', text);
+    // Explicit chat escape hatch: "?<msg>" or "chat: <msg>".
+    var chat = text.match(/^\s*(?:\?|chat:)\s*([\s\S]+)$/i);
+    if (chat) { await groveChat(chat[1].trim(), msgs); return; }
+    // Default: launch a verifiable build.
+    var pr = parseGoalRepo(text);
+    var repo = pr.repo || (typeof window !== 'undefined' && window.IKBI_DEFAULT_REPO) || null;
+    await window.ikbiRunBuild(pr.goal, repo, msgs);
   };
+
+  // Launch Pad (builder-ws) build form submit → the same streaming build runner.
+  function handleLaunchSubmit(e, defId) {
+    e.preventDefault();
+    var wrap = document.getElementById('ikbi-launch-' + defId);
+    if (!wrap) return false;
+    var goalEl = wrap.querySelector('.ikbi-launch-goal');
+    var repoEl = wrap.querySelector('.ikbi-launch-repo');
+    var msgs = document.getElementById('builder-build-msgs-' + defId);
+    var goal = goalEl ? goalEl.value.trim() : '';
+    var repo = repoEl ? repoEl.value.trim() : '';
+    if (!goal) { if (goalEl) goalEl.focus(); return false; }
+    if (!repo) repo = (typeof window !== 'undefined' && window.IKBI_DEFAULT_REPO) || '';
+    window.ikbiRunBuild(goal, repo, msgs);
+    if (goalEl) goalEl.value = '';
+    return false;
+  }
 
   window.groveClear = function () {
     var msgs = document.getElementById('grove-msgs');
@@ -428,6 +571,19 @@
   function getChatState(defId) {
     if (!chatState[defId]) chatState[defId] = { history: [], loading: false };
     return chatState[defId];
+  }
+
+  // Launch Pad — a real build launcher rendered above the builder workspace chat.
+  function builderLaunchHtml(defId) {
+    return '<div class="ikbi-launch" id="ikbi-launch-' + esc(defId) + '">' +
+      '<div class="ikbi-chat-head">Launch Pad — verifiable build</div>' +
+      '<form class="ikbi-launch-form" onsubmit="return IkbiScenes.handleLaunchSubmit(event,\'' + esc(defId) + '\')">' +
+      '<input class="ikbi-chat-input ikbi-launch-goal" type="text" placeholder="Goal — what should ikbi build?" autocomplete="off">' +
+      '<input class="ikbi-chat-input ikbi-launch-repo" type="text" placeholder="Repo — absolute path or registered name" autocomplete="off" spellcheck="false">' +
+      '<button class="ikbi-chat-send" type="submit">Launch build</button>' +
+      '</form>' +
+      '<div class="grove-messages ikbi-launch-msgs" id="builder-build-msgs-' + esc(defId) + '"></div>' +
+      '</div>';
   }
 
   function builderChatHtml(defId) {
@@ -581,7 +737,7 @@
     },
     'builder-ws': {
       fn: rBuilderWs,
-      extraHtml: builderChatHtml,
+      extraHtml: function (defId) { return builderLaunchHtml(defId) + builderChatHtml(defId); },
       postFill: function (defId) { renderChat(defId); },
       options: [['Refresh tools', "IkbiScenes.fill('builder-ws',true)"], ['Capabilities', "IkbiApp.runCommand('capabilities')"]]
     },
@@ -673,6 +829,7 @@
     fill: fill,
     sendChat: sendChat,
     handleChatSubmit: handleChatSubmit,
+    handleLaunchSubmit: handleLaunchSubmit,
     renderChat: renderChat,
   };
 })();

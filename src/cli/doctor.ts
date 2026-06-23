@@ -18,6 +18,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { config, type IkbiConfig } from "../core/config.js";
+import { loadRepoRegistry } from "../core/repo-registry.js";
 import type { ModelProvider } from "../core/provider/contract.js";
 import { registry as defaultRegistry } from "../core/provider/index.js";
 import type { ModelSpec } from "../core/provider/registry.js";
@@ -285,7 +286,15 @@ export interface DoctorFixInputs {
    * both are gated behind this single `--force` flag (Codex C4). Without it, they are only REPORTED.
    */
   readonly force?: boolean;
+  /**
+   * The registered-repo lister used to suggest a copy-pasteable first build. Defaults to the
+   * on-disk repo registry (`<stateRoot>/repos.json`); injectable so tests need no filesystem.
+   */
+  readonly repoLister?: { list(): ReadonlyArray<{ name: string; path: string }> };
 }
+
+/** A sample goal the FIRST-BUILD hint suggests — small, safe, and obviously verifiable. */
+export const FIRST_BUILD_SAMPLE_GOAL = "add a one-line note to the README describing this project";
 
 export interface DoctorFixResult {
   readonly lines: readonly string[];
@@ -457,6 +466,31 @@ export async function runDoctorFix(ports: DoctorFixPorts, inp: DoctorFixInputs =
       failures += 1;
       push(`  ${BAD} workspace reclamation failed: ${errMsg(err)}`);
     }
+  }
+
+  // --- 5. FIRST BUILD — turn "configured" into "first verified change" ------
+  // After the four security keys + build prerequisites are in place, a beginner still
+  // has no idea what to run. Emit a copy-pasteable `ikbi build` line targeting a real
+  // registered repo (so `--repo <name>` resolves), closing the gap to a first build.
+  push("");
+  push("FIRST BUILD");
+  try {
+    const repos = (inp.repoLister ?? loadRepoRegistry()).list();
+    if (repos.length > 0) {
+      const target = repos[0]!;
+      push(`  ${OK} ${repos.length} repo(s) registered. Kick off your first verified build:`);
+      push(`      ikbi build "${FIRST_BUILD_SAMPLE_GOAL}" --repo ${target.name}`);
+      if (repos.length > 1) {
+        push(`      (or any of: ${repos.map((r) => r.name).join(", ")})`);
+      }
+    } else {
+      push(`  ${WARN} no repos registered yet — register one, then build:`);
+      push(`      ikbi build "${FIRST_BUILD_SAMPLE_GOAL}" --repo /absolute/path/to/your/repo`);
+      push(`      (add a repo to ${join(cfg.stateRoot, "repos.json")} so you can use --repo <name>)`);
+    }
+  } catch (err) {
+    // Never let a registry read failure turn a successful repair run into a failure.
+    push(`  ${WARN} could not read the repo registry for a first-build hint: ${errMsg(err)}`);
   }
 
   // --- summary -------------------------------------------------------------

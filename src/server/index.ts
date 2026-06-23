@@ -17,7 +17,6 @@ import { existsSync } from "node:fs";
 import { config } from "../core/config.js";
 import { log } from "../core/log.js";
 import { trust } from "../core/trust/index.js";
-import { apiAuth } from "./auth.js";
 import { routes } from "./registry.js";
 
 /**
@@ -53,10 +52,6 @@ export function buildServer() {
     }
     void reply.code(status).send({ error: typeof maybe.message === "string" ? maybe.message : "bad request" });
   });
-
-  // Server-level auth: protect ALL /ikbi/* and /api/* routes with a single preHandler.
-  // Public endpoints (/health, /ready, /agent, /capabilities) are exempt inside apiAuth.
-  app.addHook("preHandler", apiAuth);
 
   // Liveness — the process is up and answering.
   app.get("/health", async () => {

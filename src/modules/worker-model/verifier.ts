@@ -60,6 +60,7 @@ import { runQualityChecks, type QualityResult } from "./quality-checks.js";
 // library-only consumers — no side effects at import; the default (legacy) path never calls them.
 import { projectIndex, type ProjectIndexData } from "../project-index/index.js";
 import { isStubScript, verificationLadder, type VerificationPlan } from "../verification-ladder/index.js";
+import { loadHowaCheckConfig, runHowaTruthfulnessCheck } from "../verification-ladder/howa-check.js";
 import { parseCheckOutput, type CheckTriage } from "../check-triage/index.js";
 import { resolveVerificationMode, type VerificationMode } from "./modes.js";
 import { type CorrectionAccess, NOOP_CORRECTIONS } from "./correction-application.js";
@@ -1120,13 +1121,41 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
         };
       }
 
+      // ── HOWA TRUTHFULNESS RUNG (optional; OFF by default) ───────────────────────────────
+      // The code is green. Now ask Howa whether the model's CLAIMS about what it did match the
+      // actual diff. A detected lie (or, fail-closed, an unreachable Howa) fails the build RED so
+      // a passing test suite can't launder a fabricated change. Enabled only when the operator sets
+      // IKBI_VERIFICATION_LADDER_HOWA_ENABLED, so the default verification path is unchanged.
+      const howaNote: string[] = [];
+      const howaCfg = loadHowaCheckConfig();
+      if (howaCfg.enabled) {
+        const builderSummary = rctx.priorResults?.find((r) => r.role === "builder")?.summary ?? "";
+        const intent = [rctx.task?.goal ?? "", builderSummary].filter((s) => s.length > 0).join("\n");
+        const howa = await runHowaTruthfulnessCheck(
+          { diff, intent, ...(rctx.task?.taskId !== undefined ? { taskId: rctx.task.taskId } : {}) },
+          howaCfg,
+        );
+        if (howa.status === "red") {
+          return {
+            role: "verifier", outcome: "failure",
+            summary: `verification RED (Howa truthfulness, scope ${plan.scope}): ${howa.reason}`,
+            detail: {
+              verdict: "fail", verificationMode, verificationScope: plan.scope, checks, triage: triages, stagesRun,
+              neutralPackages: plan.neutralPackages, howa,
+              receipts: [...baseReceipts, `ran stages: ${stagesRun.join(" → ")}`, `HOWA RED: ${howa.reason}`],
+            },
+          };
+        }
+        howaNote.push(`HOWA truthfulness: ${howa.verdict}${howa.status === "skipped" ? " (advisory/skipped)" : ""} — ${howa.reason}`);
+      }
+
       return {
         role: "verifier", outcome: "success",
         summary: `verification PASSED for scope "${plan.scope}" — ran ${checks.length} check(s) across [${stagesRun.join(" → ")}]${plan.neutralPackages.length > 0 ? `; ${plan.neutralPackages.length} neutral package(s) recorded (not counted green)` : ""}`,
         detail: {
           verdict: "pass", verificationMode, verificationScope: plan.scope, checks, triage: triages, stagesRun,
           neutralPackages: plan.neutralPackages,
-          receipts: [...baseReceipts, `ran stages: ${stagesRun.join(" → ")}`, ...neutralNote, `GREEN for scope: ${plan.scope}`],
+          receipts: [...baseReceipts, `ran stages: ${stagesRun.join(" → ")}`, ...neutralNote, ...howaNote, `GREEN for scope: ${plan.scope}`],
         },
       };
     }

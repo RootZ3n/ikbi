@@ -96,6 +96,105 @@
     capabilities: function (o) { return get('/capabilities', o); },
     // Chat endpoint — requires IKBI_CHAT_TOKEN Bearer auth.
     converse: function (message, o) { return post('/chat', { message: message }, o); },
+    // ── Build/repair task surface (the golden path) ───────────────────────
+    // Submit a build task. Resolves {ok,data:{taskId,...}} (202 on accept).
+    build: function (goal, repo, opts) {
+      opts = opts || {};
+      var body = { goal: goal, repo: repo };
+      if (opts.builderMode) body.builderMode = opts.builderMode;
+      if (opts.priority) body.priority = opts.priority;
+      return post('/api/build', body, opts);
+    },
+    // Submit a fix task.
+    fix: function (repo, opts) {
+      opts = opts || {};
+      var body = { repo: repo };
+      if (opts.check) body.check = opts.check;
+      if (opts.goal) body.goal = opts.goal;
+      if (opts.allowTestEdits != null) body.allowTestEdits = !!opts.allowTestEdits;
+      return post('/api/fix', body, opts);
+    },
+    // Read a task's status + result, or list recent tasks.
+    getTask: function (id, o) { return get('/api/tasks/' + encodeURIComponent(id), o); },
+    listTasks: function (o) {
+      o = o || {};
+      var q = o.limit != null ? '?limit=' + encodeURIComponent(o.limit) : '';
+      return get('/api/tasks' + q, o);
+    },
+    cancelTask: function (id, o) { return post('/api/tasks/' + encodeURIComponent(id) + '/cancel', null, o); },
+    // Durable build history + per-task spend (ground truth — replaces placeholders).
+    receipts: function (o) {
+      o = o || {};
+      var q = o.limit != null ? '?limit=' + encodeURIComponent(o.limit) : '';
+      return get('/api/receipts' + q, o);
+    },
+    timeline: function (o) {
+      o = o || {};
+      var q = o.period ? '?period=' + encodeURIComponent(o.period) : '';
+      return get('/api/timeline' + q, o);
+    },
+    // ── SSE task stream ───────────────────────────────────────────────────
+    // Subscribe to a task's live per-role progress. EventSource cannot send an
+    // Authorization header, so we stream with fetch + a manual SSE parser — that
+    // way a protected engine (IKBI_API_TOKEN set) still works. `handlers` is
+    // { onEvent(name,data), onError(msg), onClose() }. Returns an abort function.
+    streamTask: function (id, handlers) {
+      handlers = handlers || {};
+      var ctrl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+      var done = false;
+      function finish() { if (done) return; done = true; if (handlers.onClose) try { handlers.onClose(); } catch (e) {} }
+      (async function () {
+        var headers = { 'Accept': 'text/event-stream' };
+        if (typeof window !== 'undefined' && window.IKBI_API_TOKEN) {
+          headers['Authorization'] = 'Bearer ' + window.IKBI_API_TOKEN;
+        }
+        var res;
+        try {
+          res = await fetch(BASE + '/api/tasks/' + encodeURIComponent(id) + '/stream', {
+            method: 'GET', headers: headers, signal: ctrl ? ctrl.signal : undefined,
+          });
+        } catch (err) {
+          if (!done && handlers.onError) handlers.onError((err && err.message) || String(err));
+          finish();
+          return;
+        }
+        if (!res.ok || !res.body || !res.body.getReader) {
+          if (handlers.onError) handlers.onError(res && res.status ? ('HTTP ' + res.status) : 'stream unavailable');
+          finish();
+          return;
+        }
+        var reader = res.body.getReader();
+        var decoder = new TextDecoder();
+        var buf = '';
+        function dispatchFrame(frame) {
+          var ev = 'message', data = '';
+          frame.split(/\r?\n/).forEach(function (line) {
+            if (line.indexOf('event:') === 0) ev = line.slice(6).trim();
+            else if (line.indexOf('data:') === 0) data += line.slice(5).trim();
+          });
+          var parsed = null;
+          if (data) { try { parsed = JSON.parse(data); } catch (e) { parsed = data; } }
+          if (handlers.onEvent) handlers.onEvent(ev, parsed);
+        }
+        try {
+          for (;;) {
+            var chunk = await reader.read();
+            if (chunk.done) break;
+            buf += decoder.decode(chunk.value, { stream: true });
+            var idx;
+            while ((idx = buf.indexOf('\n\n')) !== -1) {
+              var frame = buf.slice(0, idx);
+              buf = buf.slice(idx + 2);
+              if (frame.trim()) dispatchFrame(frame);
+            }
+          }
+        } catch (err) {
+          if (!done && handlers.onError && !(err && err.name === 'AbortError')) handlers.onError((err && err.message) || String(err));
+        }
+        finish();
+      })();
+      return function abort() { if (ctrl) try { ctrl.abort(); } catch (e) {} finish(); };
+    },
     // Drop cached reads so the next call refetches.
     refresh: function () { cache.clear(); },
     _get: get,

@@ -382,6 +382,34 @@ test("doctor --fix is a NO-OP when everything is healthy (no repairs attempted, 
   assert.equal(r.exitCode, 0);
 });
 
+test("doctor --fix emits a copy-pasteable FIRST BUILD line for a registered repo", async () => {
+  const cfg = fixConfig();
+  const { ports } = fakeFixPorts(allHealthyPaths(cfg));
+  const r = await runDoctorFix(ports, {
+    config: cfg,
+    projectRoot: "/proj",
+    repoLister: { list: () => [{ name: "toba", path: "/repos/toba" }, { name: "ikbi", path: "/repos/ikbi" }] },
+  });
+  const text = r.lines.join("\n");
+  assert.match(text, /FIRST BUILD/);
+  assert.match(text, /ikbi build ".*" --repo toba/);
+  assert.match(text, /or any of: toba, ikbi/);
+  assert.equal(r.exitCode, 0);
+});
+
+test("doctor --fix FIRST BUILD falls back to guidance when no repos are registered", async () => {
+  const cfg = fixConfig();
+  const { ports } = fakeFixPorts(allHealthyPaths(cfg));
+  const r = await runDoctorFix(ports, {
+    config: cfg,
+    projectRoot: "/proj",
+    repoLister: { list: () => [] },
+  });
+  const text = r.lines.join("\n");
+  assert.match(text, /no repos registered yet/);
+  assert.match(text, /--repo \/absolute\/path\/to\/your\/repo/);
+});
+
 test("doctor --fix RUNS the detected package manager install for missing node_modules", async () => {
   const cfg = fixConfig();
   // node_modules MISSING; everything else present. Manager detected as npm.
