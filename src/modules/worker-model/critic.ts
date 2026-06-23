@@ -25,7 +25,7 @@ import { criticModel } from "./role-models.js";
 // The model id is CRITIC-tier and config-driven (see role-models.ts) — resolved at
 // request time so an operator's IKBI_MODEL_CRITIC takes effect without a roster alias.
 const CRITIC_TEMPERATURE = 0.0; // deterministic judgment
-const CRITIC_MAX_TOKENS = 2048;
+const CRITIC_MAX_TOKENS = 4096;
 const MAX_DIFF_CHARS = 36_000;
 const MAX_DIFF_FILES = 80;
 const MAX_LINES_PER_FILE = 80;
@@ -366,11 +366,28 @@ export function createCritic(deps: CriticDeps = {}): RoleFn {
 
       const response = await ctx.engine.invokeModel(request);
 
-      if (response.finishReason === "length" || response.finishReason === "content_filter") {
+      // finishReason=content_filter is a hard refusal — fail-closed (objective).
+      // finishReason=length is a model capability issue (same as parse failure below):
+      // the model ran out of output tokens trying to produce a verdict. Return a
+      // subjective FAIL so isRetryableCriticFail=true and the fix-loop/escalation fires.
+      if (response.finishReason === "content_filter") {
         return objectiveFail(`critic fail-closed: model response ended with finishReason=${response.finishReason}`, {
           finishReason: response.finishReason,
           diffStats: { filesChanged: diff.files.length, additions: diff.additions, deletions: diff.deletions, truncated: diff.truncated },
         });
+      }
+      if (response.finishReason === "length") {
+        return {
+          role: "critic",
+          outcome: "success",
+          summary: "critique verdict: FAIL",
+          detail: {
+            pass: false,
+            feedback: `critic response truncated (finishReason=length). The model could not complete its analysis with the available output tokens. A stronger model or higher token limit may succeed.`,
+            finishReason: response.finishReason,
+            diffStats: { filesChanged: diff.files.length, additions: diff.additions, deletions: diff.deletions, truncated: diff.truncated },
+          },
+        };
       }
 
       let parsed: ParsedVerdict;

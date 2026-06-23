@@ -23,6 +23,7 @@
  */
 
 import { createInterface } from "node:readline";
+import { fstatSync } from "node:fs";
 
 import { registerCommand } from "../../cli/registry.js";
 import { writeStderr, writeStdout } from "../../cli/io.js";
@@ -70,6 +71,29 @@ function promptUser(prompt: string): Promise<string> {
     rl.on("close", () => {
       if (!answered) resolve("");
     });
+  });
+}
+
+/**
+ * Read piped stdin to completion (CC parity: `cat file | ikbi build "…"`). Returns "" — never hangs —
+ * unless stdin is a PIPE or a redirected FILE, so an interactive TTY (or a test runner's non-piped
+ * descriptor) is left untouched. The fstat(0) gate is what makes this safe to call unconditionally:
+ * only a FIFO/regular-file descriptor is drained, both of which reach EOF on their own.
+ */
+export function readPipedStdin(stdin: NodeJS.ReadStream = process.stdin): Promise<string> {
+  return new Promise<string>((resolve) => {
+    try {
+      if (stdin.isTTY) return resolve("");
+      const st = fstatSync(0);
+      if (!st.isFIFO() && !st.isFile()) return resolve("");
+    } catch {
+      return resolve("");
+    }
+    let data = "";
+    stdin.setEncoding("utf8");
+    stdin.on("data", (c) => (data += c));
+    stdin.on("end", () => resolve(data));
+    stdin.on("error", () => resolve(data));
   });
 }
 
@@ -477,7 +501,7 @@ function detectWriteScope(goal: string): "all" | "new_only" | "none" {
  * every progress/diagnostic/hint/repair/cost line is routed to STDERR so a caller can pipe
  * stdout straight into a JSON parser without log noise interleaved (FIX 3).
  */
-export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbose?: boolean; cost?: boolean; yes?: boolean; json?: boolean; delegation?: string; noMemory?: boolean; memoryDiff?: boolean; check?: string; complexity?: "small" | "medium" | "large"; rest: string[] } {
+export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbose?: boolean; cost?: boolean; yes?: boolean; json?: boolean; delegation?: string; noMemory?: boolean; memoryDiff?: boolean; check?: string; maxBudgetUsd?: number; fallbackModel?: string; complexity?: "small" | "medium" | "large"; bare?: boolean; effort?: "low" | "medium" | "high" | "max"; fromPr?: number; rest: string[] } {
   const rest: string[] = [];
   let repo: string | undefined;
   let verbose = false;
@@ -488,7 +512,12 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
   let noMemory = false;
   let memoryDiff = false;
   let check: string | undefined;
+  let maxBudgetUsd: number | undefined;
+  let fallbackModel: string | undefined;
   let complexity: "small" | "medium" | "large" | undefined;
+  let bare = false;
+  let effort: "low" | "medium" | "high" | "max" | undefined;
+  let fromPr: number | undefined;
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i] as string;
     if (a === "--repo") {
@@ -518,6 +547,19 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
       i += 1;
     } else if (a.startsWith("--check=")) {
       check = a.slice("--check=".length);
+    } else if (a === "--max-budget-usd") {
+      const val = argv[i + 1];
+      const n = typeof val === "string" ? Number.parseFloat(val) : Number.NaN;
+      if (Number.isFinite(n) && n > 0) maxBudgetUsd = n;
+      i += 1;
+    } else if (a.startsWith("--max-budget-usd=")) {
+      const n = Number.parseFloat(a.slice("--max-budget-usd=".length));
+      if (Number.isFinite(n) && n > 0) maxBudgetUsd = n;
+    } else if (a === "--fallback-model") {
+      fallbackModel = argv[i + 1];
+      i += 1;
+    } else if (a.startsWith("--fallback-model=")) {
+      fallbackModel = a.slice("--fallback-model=".length);
     } else if (a === "--complexity") {
       const val = argv[i + 1];
       if (val === "small" || val === "medium" || val === "large") complexity = val;
@@ -525,11 +567,27 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
     } else if (a.startsWith("--complexity=")) {
       const val = a.slice("--complexity=".length);
       if (val === "small" || val === "medium" || val === "large") complexity = val;
+    } else if (a === "--bare") {
+      bare = true;
+    } else if (a === "--effort") {
+      const val = argv[i + 1];
+      if (val === "low" || val === "medium" || val === "high" || val === "max") effort = val;
+      i += 1;
+    } else if (a.startsWith("--effort=")) {
+      const val = a.slice("--effort=".length);
+      if (val === "low" || val === "medium" || val === "high" || val === "max") effort = val;
+    } else if (a === "--from-pr") {
+      const n = Number.parseInt(argv[i + 1] ?? "", 10);
+      if (Number.isInteger(n) && n > 0) fromPr = n;
+      i += 1;
+    } else if (a.startsWith("--from-pr=")) {
+      const n = Number.parseInt(a.slice("--from-pr=".length), 10);
+      if (Number.isInteger(n) && n > 0) fromPr = n;
     } else {
       rest.push(a);
     }
   }
-  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), ...(verbose ? { verbose } : {}), ...(cost ? { cost } : {}), ...(yes ? { yes } : {}), ...(json ? { json } : {}), ...(delegation !== undefined ? { delegation } : {}), ...(noMemory ? { noMemory } : {}), ...(memoryDiff ? { memoryDiff } : {}), ...(check !== undefined && check.trim().length > 0 ? { check } : {}), ...(complexity !== undefined ? { complexity } : {}), rest };
+  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), ...(verbose ? { verbose } : {}), ...(cost ? { cost } : {}), ...(yes ? { yes } : {}), ...(json ? { json } : {}), ...(delegation !== undefined ? { delegation } : {}), ...(noMemory ? { noMemory } : {}), ...(memoryDiff ? { memoryDiff } : {}), ...(check !== undefined && check.trim().length > 0 ? { check } : {}), ...(maxBudgetUsd !== undefined ? { maxBudgetUsd } : {}), ...(fallbackModel !== undefined ? { fallbackModel } : {}), ...(complexity !== undefined ? { complexity } : {}), ...(bare ? { bare } : {}), ...(effort !== undefined ? { effort } : {}), ...(fromPr !== undefined ? { fromPr } : {}), rest };
 }
 
 /**
@@ -814,12 +872,15 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
           "  --memory-diff     Show which project memory would be used, then exit (no build)\n" +
           "  --check \"<cmd>\"   Explicit verification command for a repo with no manifest\n" +
           "  --delegation <json>  Run from a delegation envelope (overrides goal + repo)\n" +
-          "  --complexity <level>  small | medium | large — large skips flash entirely (uses pro)\n",
+                    "  --fallback-model <m> Override the escalation mid-tier model (default from IKBI_ESCALATION_MID_MODEL)\n" +
+          "  --complexity <level>  small | medium | large — large skips flash entirely (uses pro)\n" +
+          "  --max-budget-usd <n>  Cap total API spend at $n (e.g. 0.50 = 50 cents). Budget exhausted = clean abort.\n" +
+          "                        Also settable via IKBI_MAX_BUDGET_USD env var.\n",
       );
       return;
     }
 
-    const { repo, verbose, cost, yes, delegation: delegationJson, noMemory, memoryDiff, check, complexity, rest } = parseBuildArgs(argv);
+    const { repo, verbose, cost, yes, delegation: delegationJson, noMemory, memoryDiff, check, maxBudgetUsd, fallbackModel, complexity, bare, effort, fromPr, rest } = parseBuildArgs(argv);
 
     // `--check "<cmd>"` declares an explicit verification command for a repo with no
     // recognizable manifest: convert it to the IKBI_CHECKS JSON the verifier reads and the
@@ -853,7 +914,10 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
 
     // Goal: delegation envelope objective takes precedence; fall back to argv goal.
     const rawGoal = envelope !== undefined ? envelope.objective : rest.join(" ").trim();
-    const goal = rawGoal;
+    // PIPED INPUT (CC parity): `cat file | ikbi build "analyze this"` prepends the piped text to the
+    // goal as context. When the goal is empty, the piped text becomes the goal. No-op for a TTY.
+    const pipedContext = (await readPipedStdin()).trim();
+    const goal = pipedContext.length > 0 ? `${pipedContext}\n\n${rawGoal}`.trim() : rawGoal;
     if (goal.length === 0) {
       err("ikbi: build needs a goal — usage: ikbi build <goal...> [--repo <path>]\n");
       setExit(1);
@@ -958,7 +1022,8 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
     // ── CONTEXT DISPLAY (verbose / --memory-diff) ────────────────────────────
     // Load project memory once here so we can (a) display it in verbose mode and
     // (b) pass it directly to the task (avoids a second disk read in the builder).
-    const projectMem: ProjectMemoryResult | undefined = noMemory === true ? undefined : loadProjectMemory(targetRepo);
+    // --bare implies --no-memory (skip project memory loading entirely).
+    const projectMem: ProjectMemoryResult | undefined = noMemory === true || bare === true ? undefined : loadProjectMemory(targetRepo);
     if (memoryDiff === true) {
       // --memory-diff: show what project memory would be used and exit without building.
       out(formatProjectMemoryContext(projectMem, true));
@@ -980,6 +1045,18 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       // the builder not to fall back to its own file load.
       ...(projectMem !== undefined ? { projectInstructions: projectMem.content } : {}),
       ...(noMemory === true ? { skipProjectMemory: true } : {}),
+      // Gap 5 (--bare): skip non-essential loading. Implies skipping project memory too.
+      ...(bare === true ? { bare: true, skipProjectMemory: true } : {}),
+      // Gap 6 (--effort): reasoning level forwarded to every role model call.
+      ...(effort !== undefined ? { effort } : {}),
+      // Gap 9 (--from-pr): check out a PR and run the pipeline against it.
+      ...(fromPr !== undefined ? { fromPr } : {}),
+      ...(maxBudgetUsd !== undefined ? { maxBudgetUsd } : {}),
+      // Also check IKBI_MAX_BUDGET_USD env var
+      ...(maxBudgetUsd === undefined && process.env.IKBI_MAX_BUDGET_USD ? (() => { const n = Number.parseFloat(process.env.IKBI_MAX_BUDGET_USD!); return Number.isFinite(n) && n > 0 ? { maxBudgetUsd: n } : {}; })() : {}),
+      ...(fallbackModel !== undefined ? { fallbackModel } : {}),
+      // Also check IKBI_FALLBACK_MODEL env var
+      ...(fallbackModel === undefined && process.env.IKBI_FALLBACK_MODEL ? (() => { const m = process.env.IKBI_FALLBACK_MODEL!.trim(); return m.length > 0 ? { fallbackModel: m } : {}; })() : {}),
     };
 
     // STEP-PLANNER: decompose complex goals into atomic steps for cheap models. Production uses ONLY

@@ -111,7 +111,7 @@ test("critic reads builder output and produces a PASS verdict (outcome success)"
   assert.equal(detail.diffStats.deletions, 1);
   assert.equal(calls[0]?.identity, ctx.identity, "ctx.identity rides the request");
   assert.equal(calls[0]?.model, criticModel(), "the model id is CONFIG-DRIVEN (critic tier), not a constant");
-  assert.equal(calls[0]?.maxTokens, 2048, "critic has enough output room for a structured review");
+  assert.equal(calls[0]?.maxTokens, 4096, "critic has enough output room for a structured review");
   assert.ok(calls[0]?.messages?.some((m) => m.untrusted === true && String(m.content).includes("Workspace diff")), "actual diff is provided as untrusted context");
 });
 

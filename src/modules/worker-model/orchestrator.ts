@@ -779,12 +779,22 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
    * competitive candidates) accumulates `response.cost.usd` into one running total. The
    * neutralization seam is passed through untouched. `cost()` reads the accumulated total.
    */
-  function makeCostingEngine(): { engine: RoleEngine; cost: () => number } {
+  function makeCostingEngine(maxBudgetUsd?: number): { engine: RoleEngine; cost: () => number } {
     let total = 0;
+    let budgetExhausted = false;
+    const budget = maxBudgetUsd;
     const costingEngine: RoleEngine = {
       invokeModel: async (request: ModelRequest): Promise<ModelResponse> => {
+        if (budgetExhausted) {
+          throw Object.assign(new Error(`budget exhausted: cumulative cost exceeded $${budget?.toFixed(4)} cap`), { code: "BUDGET_EXHAUSTED" });
+        }
         const r = await invokeModel(request);
         total += r.cost?.usd ?? 0;
+        if (budget !== undefined && total > budget && budget > 0) {
+          budgetExhausted = true;
+          const msg = `budget exhausted: cumulative cost $${total.toFixed(4)} exceeds $${budget.toFixed(4)} cap`;
+          throw Object.assign(new Error(msg), { code: "BUDGET_EXHAUSTED", costUsd: total, budgetUsd: budget });
+        }
         return r;
       },
       neutralizeUntrusted,
@@ -1405,7 +1415,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     );
 
     // Per-run costing engine: accumulates every model invocation's cost across all roles.
-    const { engine: runEngine, cost: runCost } = makeCostingEngine();
+    const { engine: runEngine, cost: runCost } = makeCostingEngine(task.maxBudgetUsd);
 
     const results: RoleResult[] = [];
     // Run-level escalation accumulator (ADDITIVE observability; never alters dispatch).
@@ -1915,7 +1925,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           verifierStillGreen &&
           isRetryableCriticFail(result)
         ) {
-          const midModel = escalationConfig.tierModels.mid[0];
+          const midModel = task.fallbackModel ?? escalationConfig.tierModels.mid[0];
           if (midModel !== undefined) {
             escalationAttempted = true;
             const rejectedDetail = (result.detail ?? {}) as Record<string, unknown>;
@@ -2077,7 +2087,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           decision.escalate &&
           decision.targetTier === "mid"
         ) {
-          const midModel = escalationConfig.tierModels.mid[0];
+          const midModel = task.fallbackModel ?? escalationConfig.tierModels.mid[0];
           if (midModel !== undefined) {
             const failedResult = result;
             const failedDetail = (failedResult.detail ?? {}) as Record<string, unknown>;
@@ -2322,6 +2332,31 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         }
       }
     } catch (err) {
+      // Budget exhausted is NOT an infrastructure failure — it's a controlled abort.
+      // Surface the cost so the operator can adjust and re-run.
+      const errCode = (err as { code?: string }).code;
+      if (errCode === "BUDGET_EXHAUSTED") {
+        const budgetErr = err as { costUsd?: number; budgetUsd?: number; message: string };
+        const costToReport = budgetErr.costUsd ?? runCost();
+        events.publish(
+          workerFailed.create(
+            { taskId: task.taskId, reason: budgetErr.message, workspaceId: workspace.id, ...(costToReport > 0 ? { costUsd: costToReport } : {}) },
+            { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } },
+          ),
+        );
+        if (retainFailedWorkspaces) await safeRetain(workspaces, workspace, budgetErr.message);
+        else await safeDiscard(workspaces, workspace);
+        return {
+          contractVersion: CONTRACT_VERSION,
+          taskId: task.taskId,
+          outcome: "rejected",
+          roles: results,
+          workspaceId: workspace.id,
+          promoted: false,
+          reason: budgetErr.message,
+          costUsd: costToReport,
+        };
+      }
       // Infrastructure failure mid-run (e.g. escalation guard): RETAIN the work for inspection
       // (Bug 2) instead of discarding it — the worktree may hold real progress. `ikbi clean`
       // reclaims it later. Falls back to discard when retention is off / unavailable.
@@ -2697,7 +2732,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     }
 
     // Per-run costing engine: accumulates model cost across the shared scout + every candidate.
-    const { engine: runEngine, cost: runCost } = makeCostingEngine();
+    const { engine: runEngine, cost: runCost } = makeCostingEngine(task.maxBudgetUsd);
 
     const handles: WorkspaceHandle[] = [];
     const rolesByWs = new Map<string, RoleResult[]>();
@@ -2959,7 +2994,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
    * engine is shared across every candidate + the shadow.
    */
   function makeTournamentEngine(task: WorkerTask, parentCtx: OperationContext, parentIdentity: AgentIdentity): TournamentEngine {
-    const { engine: runEngine, cost: runCost } = makeCostingEngine();
+    const { engine: runEngine, cost: runCost } = makeCostingEngine(task.maxBudgetUsd);
     // FIX 5: capture worker identity for trust recording (tournament mode).
     // The first spawned role carries the shared agent identity.
     let tournWorkerSpawned: SpawnedRole | undefined;

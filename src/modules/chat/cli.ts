@@ -22,7 +22,7 @@ import { createInterface } from "node:readline";
 import { registerCommand } from "../../cli/registry.js";
 import { config } from "../../core/config.js";
 import { registry, invokeModelStream } from "../../core/provider/index.js";
-import { colorizeDiff } from "../worker-model/cli.js";
+import { colorizeDiff, readPipedStdin } from "../worker-model/cli.js";
 import type { ChatMode, ChatToolActivity } from "./contract.js";
 import { discoverProject, formatOverview } from "./project-discovery.js";
 import { ChatSession, type ApplyResult, type DiscardOutcome, type PermissionMode, type PersistedSession, type RollbackResult, type StreamEvent, type TurnOptions, type WorkdirKind } from "./session.js";
@@ -800,8 +800,24 @@ export async function liveRepl(argv: readonly string[] = []): Promise<void> {
 
   let session: ChatSession;
   const resumeIdx = argv.indexOf("--resume");
+  const forkIdx = argv.indexOf("--fork");
   const wantContinue = argv.includes("--continue") || argv.includes("-c");
-  if (resumeIdx >= 0) {
+  if (forkIdx >= 0) {
+    // `--fork <id>`: clone an existing session's history into a NEW session (fresh id), leaving the
+    // origin untouched. The forked session is wired with the same autosave/governor/stream deps.
+    const originId = argv[forkIdx + 1];
+    if (originId === undefined || originId.startsWith("--")) {
+      out("[--fork needs a session id: ikbi repl --fork <id>]\n");
+      return;
+    }
+    try {
+      session = await store.fork(originId, { autosave, memoryGovernor, invokeStream: invokeModelStream });
+      out(`Forked session ${originId} → ${session.id} (${session.messageCount()} messages, worktree: ${session.worktree})\n`);
+    } catch (e) {
+      out(`[no session found to fork: ${originId} (${errMsg(e)})]\n`);
+      return;
+    }
+  } else if (resumeIdx >= 0) {
     const id = argv[resumeIdx + 1];
     const loaded = id !== undefined ? await resume(id) : undefined;
     if (loaded === undefined) {
@@ -831,10 +847,23 @@ export async function liveRepl(argv: readonly string[] = []): Promise<void> {
     // Discovery is best-effort cosmetics — never let it block the session.
   }
 
+  // PIPED INPUT (CC parity): `cat file | ikbi repl` (or any non-TTY stdin) feeds the piped text as the
+  // FIRST message of the session. Drained before the readline source is created, so the interactive
+  // reader then sees EOF and the session exits after the one turn — a clean one-shot. No-op for a TTY.
+  const pipedFirst = (await readPipedStdin()).trim();
+
   let turnController: AbortController | undefined;
   const src = readlineSource(() => turnController);
+  let pipedConsumed = false;
+  const readLine = async (): Promise<string | null> => {
+    if (!pipedConsumed && pipedFirst.length > 0) {
+      pipedConsumed = true;
+      return pipedFirst;
+    }
+    return src.readLine();
+  };
   try {
-    await runRepl({ session, store, newSession, readLine: src.readLine, out, onTurnController: (controller) => { turnController = controller; } });
+    await runRepl({ session, store, newSession, readLine, out, onTurnController: (controller) => { turnController = controller; } });
   } finally {
     src.close();
     // Release the session's MCP transports (spawned child processes), if any. Best-effort.
@@ -849,7 +878,7 @@ export async function liveRepl(argv: readonly string[] = []): Promise<void> {
 registerCommand({
   name: "repl",
   summary: "Start an interactive conversational session (multi-turn, tool-calling)",
-  usage: "ikbi repl [--continue | --resume <id>]",
+  usage: "ikbi repl [--continue | --resume <id> | --fork <id>]",
   run: (argv) => liveRepl(argv),
 });
 

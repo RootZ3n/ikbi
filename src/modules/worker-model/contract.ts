@@ -186,6 +186,18 @@ export interface WorkerTask {
    */
   readonly builderMode?: "agent" | "patch";
   /**
+   * Maximum USD budget for this task. When set, the costing engine will abort
+   * if cumulative model cost exceeds this threshold. Set via --max-budget-usd
+   * or IKBI_MAX_BUDGET_USD. Absent = no cap (default).
+   */
+  readonly maxBudgetUsd?: number;
+  /**
+   * Operator-specified fallback model for escalation. When the cheap (worker-tier) model
+   * fails, this model is tried next instead of the config default mid-tier model.
+   * Set via --fallback-model or IKBI_FALLBACK_MODEL. Absent = use config default.
+   */
+  readonly fallbackModel?: string;
+  /**
    * TOURNAMENT candidate models (the candidate-tournament decision #tournament). When present and
    * non-empty, the orchestrator runs a CANDIDATE TOURNAMENT instead of the single-workspace path:
    * each listed model independently attempts this task in its OWN isolated workspace, ikbi verifies
@@ -238,6 +250,54 @@ export interface WorkerTask {
    * Activated via `--no-memory` on the CLI. Default: false (project memory is loaded).
    */
   readonly skipProjectMemory?: boolean | undefined;
+  /**
+   * BARE / CI MODE (CC `--bare` parity): skip non-essential startup loading for a fast, hermetic run.
+   * When true the orchestrator skips project-memory injection, MCP tool discovery, and brain-tool
+   * registration — leaving only the core pipeline (scout → builder → verifier → critic → integrator).
+   * Set via `--bare`. Default: false (full feature loading). Implies project-memory skipping, so a
+   * bare run never reads CLAUDE.md/.ikbi even when `skipProjectMemory` is unset.
+   */
+  readonly bare?: boolean | undefined;
+  /**
+   * EFFORT / REASONING LEVEL (CC `--effort` parity): controls how much compute each role model spends.
+   * Maps to (temperature, maxTokens): low=0.7/1024, medium=0.3/2048, high=0.1/4096, max=0.0/8192.
+   * Set via `--effort <level>`. Absent = each role's own default temperature/token budget. See
+   * `effortModelParams` for the mapping the roles apply.
+   */
+  readonly effort?: "low" | "medium" | "high" | "max" | undefined;
+  /**
+   * PR REVIEW (CC `--from-pr` parity): a GitHub PR number to check out before running the pipeline.
+   * When set, the orchestrator runs `gh pr checkout <number>` in the allocated workspace (requires the
+   * `gh` CLI installed + authenticated) so the scout+builder pipeline operates on the PR's branch.
+   * Set via `--from-pr <n>`. Absent = run against the base branch as usual.
+   */
+  readonly fromPr?: number | undefined;
+}
+
+/** The (temperature, maxTokens) a given effort level maps to (CC `--effort` parity). */
+export interface EffortModelParams {
+  readonly temperature: number;
+  readonly maxTokens: number;
+}
+
+/**
+ * Map an effort level to model params (temperature + maxTokens). Returns undefined when `effort`
+ * is undefined, so a caller can spread-merge it only when an effort was actually requested and
+ * otherwise keep each role's own defaults. PURE.
+ */
+export function effortModelParams(effort: WorkerTask["effort"]): EffortModelParams | undefined {
+  switch (effort) {
+    case "low":
+      return { temperature: 0.7, maxTokens: 1024 };
+    case "medium":
+      return { temperature: 0.3, maxTokens: 2048 };
+    case "high":
+      return { temperature: 0.1, maxTokens: 4096 };
+    case "max":
+      return { temperature: 0.0, maxTokens: 8192 };
+    default:
+      return undefined;
+  }
 }
 
 /** The result a single role produces. */

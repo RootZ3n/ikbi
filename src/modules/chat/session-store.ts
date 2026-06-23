@@ -20,6 +20,7 @@
  *               once the directory grows past 1.5× the cap, so it never has to scan 500 files.
  */
 
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -352,6 +353,29 @@ export class PersistentSessionStore {
       log.warn({ err: e instanceof Error ? e.message : String(e), sessionId: id }, "chat-store: delete failed");
       return false;
     }
+  }
+
+  /**
+   * FORK a persisted session: clone its conversation (messages, worktree, model, memory snapshot)
+   * into a BRAND-NEW session with a fresh id and fresh `createdAt`/`lastUsedAt` timestamps, leaving
+   * the origin session file untouched. The fork is written to disk and a live ChatSession over it is
+   * returned (wired with the supplied `deps` — invoker/autosave/governor). Throws when the origin id
+   * does not resolve to a readable persisted session.
+   */
+  async fork(sessionId: string, deps: ChatSessionDeps = {}): Promise<ChatSession> {
+    const origin = this.loadState(sessionId);
+    if (origin === undefined) {
+      throw new Error(`fork: no session "${sessionId}" found to fork`);
+    }
+    const newId = randomUUID();
+    const now = Date.now();
+    // Clone every field of the origin, then stamp the new identity + lifecycle timestamps. The
+    // origin file is never rewritten — this only ever creates a new `<newId>.json`.
+    const forked: PersistedSession = { ...origin, id: newId, createdAt: now, lastUsedAt: now };
+    // Persist the fork verbatim (a fresh id has no lock contention).
+    await this.save({ id: newId, toPersisted: () => forked });
+    // Return a live session restored from the forked state, wired with the caller's deps.
+    return new ChatSession(newId, { ...deps, restore: forked });
   }
 
   /** Reconstruct the most-recently-used session, or undefined when none are persisted. */
