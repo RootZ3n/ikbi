@@ -31,6 +31,7 @@ import {
 import { trust } from "../core/trust/index.js";
 import { commands } from "./registry.js";
 import { runDoctor, runDoctorFixCli } from "./doctor.js";
+import { runInit } from "./init.js";
 import { runSelfRepair } from "../modules/self-repair/index.js";
 import { runCapabilities } from "./capabilities.js";
 import { postureLines } from "./posture.js";
@@ -56,7 +57,7 @@ import { createCognitionRouter } from "../modules/cognition-layer/index.js";
 import { liveRepl } from "../modules/chat/cli.js";
 
 /** Built-in command names — reserved, cannot be shadowed by a module command. */
-const BUILTINS = new Set(["version", "models", "providers", "doctor", "capabilities", "help"]);
+const BUILTINS = new Set(["version", "models", "providers", "init", "doctor", "capabilities", "help"]);
 
 /**
  * Does this arg list ask for a subcommand's help? (`--help`/`-h` anywhere in the args.)
@@ -104,6 +105,7 @@ function printUsage(): void {
     "  models [list]      List the model roster (id, role, cost, provider chain)",
     "  models --rank      Rank the roster by Luak benchmark score (--min-score N: cheapest above bar)",
     "  providers [list]   List the registered providers",
+    "  init               Guided first-run setup — detect keys, pick models, write config",
     "  doctor             Report bootstrap config: what's set, what's missing for a build",
     "  doctor --fix       Repair common gaps (.env/state dirs/deps); --force reclaims stale + aged workspaces",
     "  doctor --self-repair  Run the self-monitor; file a work order per problem found",
@@ -255,6 +257,20 @@ async function run(argv: readonly string[]): Promise<void> {
     case "providers":
       listProviders();
       return;
+    case "init": {
+      if (wantsHelp(argv.slice(1))) {
+        writeStdout(
+          "Usage: ikbi init\n\n" +
+            "Guided first-run setup: detects API keys, recommends model profiles,\n" +
+            "and writes a working .env and .ikbi/ config. Answer 2-3 prompts and\n" +
+            "ikbi is ready to use.\n\n" +
+            "Options: none (fully interactive)\n",
+        );
+        return;
+      }
+      await runInit();
+      return;
+    }
     case "doctor": {
       const doctorArgs = argv.slice(1);
       // `--help` prints usage and exits 0 — it must NOT run the report (which reads config).
