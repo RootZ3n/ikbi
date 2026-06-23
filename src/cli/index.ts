@@ -220,8 +220,6 @@ function printRecommendations(): void {
 }
 
 function listModels(): void {
-
-function listModels(): void {
   const models = registry.listModels();
   if (models.length === 0) {
     writeStdout("(no models in roster)\n");
@@ -518,3 +516,4 @@ run(process.argv.slice(2)).catch((err: unknown) => {
   writeStderr(`ikbi: ${err instanceof Error ? err.message : String(err)}\n`);
   process.exitCode = 1;
 });
+

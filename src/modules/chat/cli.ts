@@ -86,6 +86,8 @@ export interface ReplDeps {
   readonly newSession?: () => ReplSession | Promise<ReplSession>;
   /** Optional hook used by the live readline adapter to abort an in-flight turn on Ctrl-C. */
   readonly onTurnController?: (controller: AbortController | undefined) => void;
+  /** When true, suppress tool activity and only show the model's response (--quiet). */
+  readonly quiet?: boolean;
 }
 
 /** The mutable per-run state shared with every command handler. */
@@ -98,6 +100,8 @@ interface ReplContext {
   readonly out: (s: string) => void;
   readonly store: PersistentSessionStore | undefined;
   readonly newSession: (() => ReplSession | Promise<ReplSession>) | undefined;
+  /** When true, suppress tool activity and only show the model's response text. */
+  readonly quiet: boolean;
   /** Read ONE line and resolve true on an affirmative (y/yes) — used by `/reset`. */
   readonly confirm: () => Promise<boolean>;
   /** Read ONE line as a permission decision; default-NO ([y/N]) — used by `/permissions confirm`. */
@@ -625,8 +629,10 @@ export async function runRepl(deps: ReplDeps): Promise<void> {
     newSession: deps.newSession,
     confirm,
     confirmTool,
+    quiet: deps.quiet ?? false,
   };
-  deps.out("ikbi repl — a conversational coding session. Type /help for commands, /plan for read-only planning, /exit (or Ctrl-C) to quit.\n");
+  const modeLabel = ctx.quiet ? " (quiet)" : "";
+  deps.out(`ikbi repl — a conversational coding session${modeLabel}. Type /help for commands, /plan for read-only planning, /exit (or Ctrl-C) to quit.\n`);
   if (deps.session.workdirWarning !== undefined) deps.out(`[workdir warning] ${deps.session.workdirWarning}\n`);
   if (deps.session.workdirKind !== undefined && deps.session.worktree !== undefined) {
     const kind = deps.session.workdirKind;
@@ -663,7 +669,7 @@ export async function runRepl(deps: ReplDeps): Promise<void> {
     // STREAMING: when the session supports it, print the reply token-by-token as it arrives (the
     // clearest "this is responsive" signal). Otherwise fall back to request/response + spinner.
     let streamedProse = false;
-    // PROGRESS (FIX 4): a `\r`-overwriting spinner line while the (async) turn runs.
+    // PROGRESS (FIX 4): a `\r`-overwriting spinner line while the (async) turn runs (skipped in --quiet).
     const controller = new AbortController();
     deps.onTurnController?.(controller);
     const baseOpts = { signal: controller.signal, permissionMode: ctx.permissionMode, confirm: ctx.confirmTool } as const;
@@ -745,6 +751,7 @@ function readlineSource(getTurnController?: () => AbortController | undefined): 
  */
 export async function liveRepl(argv: readonly string[] = [], initialMessage?: string): Promise<void> {
   const out = (s: string): void => void process.stdout.write(s);
+  const quiet = argv.includes("--quiet");
   // `--max-sessions <n>` overrides the prune cap (BLOCKER-3); else the store uses IKBI_MAX_SESSIONS / default.
   const maxIdx = argv.indexOf("--max-sessions");
   const maxArg = maxIdx >= 0 ? Number.parseInt(argv[maxIdx + 1] ?? "", 10) : Number.NaN;
@@ -870,7 +877,7 @@ export async function liveRepl(argv: readonly string[] = [], initialMessage?: st
     return src.readLine();
   };
   try {
-    await runRepl({ session, store, newSession, readLine, out, onTurnController: (controller) => { turnController = controller; } });
+    await runRepl({ session, store, newSession, readLine, out, quiet, onTurnController: (controller) => { turnController = controller; } });
   } finally {
     src.close();
     // Release the session's MCP transports (spawned child processes), if any. Best-effort.
