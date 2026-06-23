@@ -33,11 +33,11 @@ import { isAbsolute, relative, resolve } from "node:path";
 import { toUntrustedMessage } from "../../core/injection/index.js";
 import type { ModelRequest } from "../../core/provider/contract.js";
 import type { WorkspaceHandle } from "../../core/workspace/contract.js";
-import type { CorrectionCategory, CorrectionProposeInput } from "../correction-library/contract.js";
+import type { CorrectionCategory, CorrectionEntry, CorrectionProposeInput } from "../correction-library/contract.js";
 import type { RoleFn, RoleResult } from "./contract.js";
 import { isExpectedManifestChange } from "./verifier.js";
 import { refuterModel } from "./role-models.js";
-import { type CorrectionAccess, indexByCategory, NOOP_CORRECTIONS } from "./correction-application.js";
+import { type CorrectionAccess, NOOP_CORRECTIONS } from "./correction-application.js";
 
 // ── Public shapes ──────────────────────────────────────────────────────────
 
@@ -480,14 +480,28 @@ function applyCorrectionsToRefutation(
   base: RefutationResult,
   corrections: CorrectionAccess,
 ): RefutationResult {
-  const byCategory = indexByCategory(corrections.listApproved());
-  if (byCategory.size === 0) return base;
+  // Index corrections by category AND check-id so a correction only suppresses findings
+  // from the SAME check, not every check that maps to the same category (GLM 5.2 HIGH-1).
+  const byCatAndCheck = new Map<string, Map<string, CorrectionEntry[]>>();
+  for (const c of corrections.listApproved()) {
+    // Extract the check-id prefix from the correction's finding text: "[check_id] evidence"
+    const checkMatch = /^\[([^\]]+)\]/.exec(c.finding ?? "");
+    const corrCheckId = checkMatch?.[1] ?? "unknown";
+    let catMap = byCatAndCheck.get(c.category);
+    if (!catMap) { catMap = new Map(); byCatAndCheck.set(c.category, catMap); }
+    let arr = catMap.get(corrCheckId);
+    if (!arr) { arr = []; catMap.set(corrCheckId, arr); }
+    arr.push(c);
+  }
+  if (byCatAndCheck.size === 0) return base;
 
   const applied = new Set<string>();
   const findings = base.findings.map((f): RefuterFinding => {
     if (f.passed) return f;
     const category = CHECK_TO_CATEGORY[f.check];
-    const match = category !== undefined ? byCategory.get(category)?.[0] : undefined;
+    const catMap = category !== undefined ? byCatAndCheck.get(category) : undefined;
+    // Match by BOTH category AND check-id (the correction must target the same check)
+    const match = catMap?.get(f.check)?.[0];
     if (match === undefined) return f;
     applied.add(match.id);
     return {

@@ -2,11 +2,18 @@
  * ikbi spec-artifact — file-backed spec storage.
  */
 
-import { mkdirSync, readFileSync, writeFileSync, readdirSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, readdirSync, existsSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import type { SpecArtifact, SpecCardFields, SpecStep } from "./contract.js";
+
+/** Reject ids that could escape the store directory (GLM 5.2 LOW-3). */
+function assertSafeId(id: string): void {
+  if (/[\\/]/.test(id) || id.includes("..")) {
+    throw new Error(`unsafe spec id: ${id}`);
+  }
+}
 
 export function resolveStoreDir(override?: string): string {
   return override ?? join(homedir(), ".ikbi", "specs");
@@ -17,6 +24,7 @@ function ensureDir(dir: string): void {
 }
 
 function specPath(storeDir: string, id: string): string {
+  assertSafeId(id);
   return join(storeDir, `${id}.json`);
 }
 
@@ -24,8 +32,11 @@ function readJson<T>(path: string): T | undefined {
   try { return JSON.parse(readFileSync(path, "utf8")) as T; } catch { return undefined; }
 }
 
+/** Atomic write: write to temp file then rename (GLM 5.2 MEDIUM-1). */
 function writeJson(path: string, data: unknown): void {
-  writeFileSync(path, JSON.stringify(data, null, 2) + "\n", "utf8");
+  const tmp = `${path}.tmp.${process.pid}`;
+  writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n", "utf8");
+  renameSync(tmp, path);
 }
 
 /**

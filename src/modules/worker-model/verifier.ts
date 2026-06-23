@@ -246,7 +246,7 @@ function expectedManifestCorrection(
   if (!REAL_TEST_RUNNERS.some((p) => p.test(newValue.trim()))) return undefined;
   const match = corrections
     .listApproved()
-    .find((c) => c.category === "expected_manifest_change" || c.category === "verification_forgery");
+    .find((c) => c.category === "expected_manifest_change");
   if (match === undefined) return undefined;
   corrections.recordApplied(match.id);
   return match;

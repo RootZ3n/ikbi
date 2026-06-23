@@ -102,7 +102,7 @@ registerRoutes("spec-artifact", (app: FastifyInstance) => {
   // Edit a spec (user can modify steps before execution)
   app.patch<{ Params: { id: string } }>("/ikbi/spec/:id", async (request, reply) => {
     const { id } = request.params;
-    const patch = request.body as Record<string, unknown>;
+    const body = request.body as Record<string, unknown>;
     const existing = getSpec(id);
     if (!existing) {
       void reply.code(404);
@@ -111,6 +111,20 @@ registerRoutes("spec-artifact", (app: FastifyInstance) => {
     if (existing.status !== "draft") {
       void reply.code(400);
       return { error: "can only edit specs in draft status" };
+    }
+    // Field allowlist: only user-editable fields (GLM 5.2 MEDIUM-2).
+    // Status/output/error are system-managed — rejecting them prevents forged completion.
+    const EDITABLE = new Set(["goal", "steps", "project", "scope", "rules", "outputFormat", "onConflict", "corrections", "maxCostUsd", "maxFilesChanged"]);
+    const BLOCKED = ["status", "output", "error", "id", "createdAt", "updatedAt"];
+    for (const key of BLOCKED) {
+      if (key in body) {
+        void reply.code(400);
+        return { error: `field "${key}" is not editable via PATCH` };
+      }
+    }
+    const patch: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(body)) {
+      if (EDITABLE.has(k)) patch[k] = v;
     }
     const updated = updateSpec(id, patch as Parameters<typeof updateSpec>[1]);
     return updated;
@@ -127,6 +141,11 @@ registerRoutes("spec-artifact", (app: FastifyInstance) => {
     if (spec.status === "executing") {
       void reply.code(409);
       return { error: "spec is already executing" };
+    }
+    // Block re-execution of terminal statuses (GLM 5.2 LOW-1).
+    if (spec.status === "completed" || spec.status === "failed" || spec.status === "not_implemented") {
+      void reply.code(409);
+      return { error: `spec is in terminal status "${spec.status}" — reset to draft first` };
     }
 
     // Mark as executing

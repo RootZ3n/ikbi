@@ -925,6 +925,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       if (detail.refuted !== true || !Array.isArray(detail.findings)) return;
       for (const f of detail.findings as RefuterFinding[]) {
         if (f.passed) continue;
+        // Only propose corrections for CRITICAL findings (GLM 5.2 MEDIUM-3).
+        // Warnings are operator-visible but not reusable lessons.
+        if (f.severity !== "critical") continue;
         proposeCorrection(proposalFromFinding(f, runId));
       }
     } catch {

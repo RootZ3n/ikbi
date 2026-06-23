@@ -6,11 +6,18 @@
  * every function takes an optional `storeDir` override so tests run in a temp dir.
  */
 
-import { mkdirSync, readFileSync, writeFileSync, readdirSync, existsSync, unlinkSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, readdirSync, existsSync, unlinkSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import type { CorrectionEntry, CorrectionFilter, CorrectionProposeInput } from "./contract.js";
+
+/** Reject ids that could escape the store directory (GLM 5.2 LOW-3). */
+function assertSafeId(id: string): void {
+  if (/[\\/]/.test(id) || id.includes("..")) {
+    throw new Error(`unsafe correction id: ${id}`);
+  }
+}
 
 /**
  * Resolve the store directory. Precedence: explicit `override` arg (store tests) →
@@ -29,6 +36,7 @@ function ensureDir(dir: string): void {
 }
 
 function entryPath(storeDir: string, id: string): string {
+  assertSafeId(id);
   return join(storeDir, `${id}.json`);
 }
 
@@ -40,8 +48,11 @@ function readJson<T>(path: string): T | undefined {
   }
 }
 
+/** Atomic write: write to temp file then rename (GLM 5.2 MEDIUM-1). */
 function writeJson(path: string, data: unknown): void {
-  writeFileSync(path, JSON.stringify(data, null, 2) + "\n", "utf8");
+  const tmp = `${path}.tmp.${process.pid}`;
+  writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n", "utf8");
+  renameSync(tmp, path);
 }
 
 /**

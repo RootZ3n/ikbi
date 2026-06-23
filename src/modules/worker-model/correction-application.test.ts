@@ -183,7 +183,7 @@ test("HIGH-2 REFUTER: an APPROVED test_weakening correction SUPPRESSES the findi
   const dir = mkdtempSync(join(tmpdir(), "ikbi-corr-refuter-"));
   try {
     const corr = createCorrection(
-      { category: "test_weakening", finding: "assertions removed", correction: "operator accepts this assertion refactor", regression: "r" },
+      { category: "test_weakening", finding: "[tests_not_weakened] assertions removed", correction: "operator accepts this assertion refactor", regression: "r" },
       dir,
     );
     approveCorrection(corr.id, dir);
