@@ -117,3 +117,68 @@ export function loadMcpServers(raw: string | undefined = configEnv.IKBI_MCP_SERV
 
 /** The process-wide configured MCP servers (parsed from `IKBI_MCP_SERVERS`). */
 export const mcpServers: readonly McpServerConfig[] = loadMcpServers();
+
+/**
+ * OAuth endpoints for a REMOTE MCP server, keyed by the server `name`. OPERATOR-controlled (like the
+ * server allowlist) — defines where `ikbi mcp auth <name>` runs the device-code flow. Parsed from
+ * `IKBI_MCP_OAUTH`, a JSON array of `{name, clientId, deviceAuthorizationEndpoint, tokenEndpoint,
+ * scopes?, clientSecret?}`. Absent/blank ⇒ `[]` (no OAuth servers).
+ */
+export interface McpOAuthConfig {
+  readonly name: string;
+  readonly clientId: string;
+  readonly deviceAuthorizationEndpoint: string;
+  readonly tokenEndpoint: string;
+  readonly clientSecret?: string;
+  readonly scopes?: readonly string[];
+}
+
+/** Parse `IKBI_MCP_OAUTH` (JSON array) into per-server OAuth configs. Lenient: bad entries skipped. */
+export function loadMcpOAuthConfigs(raw: string | undefined = configEnv.IKBI_MCP_OAUTH): readonly McpOAuthConfig[] {
+  const value = raw?.trim();
+  if (value === undefined || value.length === 0) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch (e) {
+    cfgLog.warn({ err: e instanceof Error ? e.message : String(e) }, "IKBI_MCP_OAUTH is not valid JSON — ignoring (no OAuth servers)");
+    return [];
+  }
+  if (!Array.isArray(parsed)) {
+    cfgLog.warn("IKBI_MCP_OAUTH must be a JSON array — ignoring (no OAuth servers)");
+    return [];
+  }
+  const out: McpOAuthConfig[] = [];
+  const seen = new Set<string>();
+  for (const item of parsed) {
+    if (typeof item !== "object" || item === null) continue;
+    const o = item as Record<string, unknown>;
+    const name = typeof o.name === "string" ? o.name.trim() : "";
+    const clientId = typeof o.clientId === "string" ? o.clientId.trim() : "";
+    const deviceAuthorizationEndpoint = typeof o.deviceAuthorizationEndpoint === "string" ? o.deviceAuthorizationEndpoint.trim() : "";
+    const tokenEndpoint = typeof o.tokenEndpoint === "string" ? o.tokenEndpoint.trim() : "";
+    if (name.length === 0 || clientId.length === 0 || deviceAuthorizationEndpoint.length === 0 || tokenEndpoint.length === 0) {
+      cfgLog.warn({ entry: o }, "IKBI_MCP_OAUTH entry missing name/clientId/deviceAuthorizationEndpoint/tokenEndpoint — skipping");
+      continue;
+    }
+    if (seen.has(name)) {
+      cfgLog.warn({ name }, "IKBI_MCP_OAUTH has a duplicate server name — skipping the later one");
+      continue;
+    }
+    seen.add(name);
+    const scopes = Array.isArray(o.scopes) ? o.scopes.filter((s): s is string => typeof s === "string") : undefined;
+    const clientSecret = typeof o.clientSecret === "string" && o.clientSecret.length > 0 ? o.clientSecret : undefined;
+    out.push(Object.freeze({
+      name,
+      clientId,
+      deviceAuthorizationEndpoint,
+      tokenEndpoint,
+      ...(clientSecret !== undefined ? { clientSecret } : {}),
+      ...(scopes !== undefined && scopes.length > 0 ? { scopes: Object.freeze([...scopes]) } : {}),
+    }));
+  }
+  return Object.freeze(out);
+}
+
+/** The process-wide configured remote-MCP OAuth servers (parsed from `IKBI_MCP_OAUTH`). */
+export const mcpOAuthConfigs: readonly McpOAuthConfig[] = loadMcpOAuthConfigs();

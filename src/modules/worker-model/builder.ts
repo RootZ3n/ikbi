@@ -74,6 +74,9 @@ import type { ScoutFinding } from "./scout.js";
 import { workerToolCallStalled } from "./events.js";
 import { interceptMemoryGovernor, type ToolExecutorDeps } from "./tool-executor.js";
 import { discoverMcpTools, type McpToolRegistry } from "../mcp-model-loop/registry.js";
+import { lspDiagnosticTool, runLspDiagnostic } from "../agent-tools/lsp-tools.js";
+import { notebookEditTool, runNotebookEdit } from "../agent-tools/notebook-tools.js";
+import { askUserTool, runAskUser } from "../agent-tools/ask-user.js";
 
 // ToolCallError now lives in builder-tools/confine.ts (shared by every builder tool);
 // re-exported here so existing importers (and tests) keep `import { ToolCallError } from "./builder.js"`.
@@ -193,6 +196,13 @@ export const TOOLS: readonly ModelTool[] = [
   delegateTaskTool,
   // Vision: analyze an image (screenshot/diagram/chart) via a multimodal message.
   visionAnalyzeTool,
+  // LSP: language-server-grade diagnostics (tsc/pyright/go vet/cargo check) — see your errors before done.
+  lspDiagnosticTool,
+  // Notebooks: read/modify/create/delete cells in a .ipynb file (code + markdown).
+  notebookEditTool,
+  // Clarify: ask the operator a question. In the non-interactive batch pipeline this fails SAFE
+  // (returns "proceed on your best assumption") rather than blocking — see runAskUser.
+  askUserTool,
   {
     // PROGRESSIVE DISCLOSURE: the scout brief shows finding TITLES only; this pulls the
     // full detail of ONE finding on demand, so a cheap model isn't handed everything at once.
@@ -993,6 +1003,23 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
           }
           return res.output;
         }
+        case "notebook_edit": {
+          // Cell-level .ipynb editing — confined like patch/multi_edit. read is read-only; the
+          // mutating ops (insert/edit/delete) honor write scope and feed the `done` read-back gate.
+          const op = typeof args.operation === "string" ? args.operation : "";
+          if (op !== "read" && (writeScope === "none" || writeScope === "new_only")) {
+            const targetPath = String(args.path ?? "");
+            rejectedToolCalls.push({ tool: "notebook_edit", path: targetPath, error: `write_scope is '${writeScope}' — cannot modify notebooks` });
+            return `ERROR: This task does not allow editing existing files like ${targetPath} — only notebook_edit 'read' is available.`;
+          }
+          const res = runNotebookEdit(worktreeReal, args);
+          if (res.rejection !== undefined) rejectedToolCalls.push(res.rejection);
+          if (res.wrote !== undefined) {
+            filesWritten.push(res.wrote);
+            checksStale = true; // a notebook edit invalidates any prior green until run_checks re-runs
+          }
+          return res.output;
+        }
         case "scout_detail":
           // PROGRESSIVE DISCLOSURE: return one finding's full detail. The text is derived from
           // scout output (model-generated from UNTRUSTED repo content) → it still flows through
@@ -1637,6 +1664,31 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
           } else if (call.name === "vision_analyze") {
             // Multimodal image analysis — async; the analysis is UNTRUSTED → chokepoint.
             const raw = await runVisionCall(call);
+            appendToolResult(raw, call);
+          } else if (call.name === "lsp_diagnostic") {
+            // Language-server-grade diagnostics through governed-exec — async; the compiler
+            // output is UNTRUSTED → it re-enters via the SAME neutralization chokepoint.
+            let lspArgs: Record<string, unknown>;
+            try {
+              lspArgs = JSON.parse(call.arguments && call.arguments.length > 0 ? call.arguments : "{}") as Record<string, unknown>;
+            } catch {
+              lspArgs = {};
+            }
+            const raw = await runLspDiagnostic(
+              { governedExec, worktreeReal, ...(deps.parentCtx !== undefined ? { parentCtx: deps.parentCtx } : {}) },
+              lspArgs,
+            );
+            appendToolResult(raw, call);
+          } else if (call.name === "ask_user") {
+            // Clarification — the batch pipeline has no interactive operator, so this fails SAFE
+            // (no stdin fallback, no ask callback) and tells the model to proceed; it never blocks.
+            let askArgs: Record<string, unknown>;
+            try {
+              askArgs = JSON.parse(call.arguments && call.arguments.length > 0 ? call.arguments : "{}") as Record<string, unknown>;
+            } catch {
+              askArgs = {};
+            }
+            const raw = await runAskUser({}, askArgs);
             appendToolResult(raw, call);
           } else if (BRAIN_TOOL_NAMES.has(call.name)) {
             // MEMORY GOVERNOR (shared chokepoint): brain_put to a governed surface becomes a

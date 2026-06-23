@@ -26,7 +26,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -76,6 +76,11 @@ import { terminalTool } from "../worker-model/builder-tools/terminal.js";
 import { parseTextToolCalls, textToolProtocolInstructions } from "../worker-model/builder-tools/text-tool-protocol.js";
 import { runVisionAnalyze, visionAnalyzeTool } from "../worker-model/builder-tools/vision-tool.js";
 import { runWebExtract, runWebSearch, webExtractTool, webSearchTool } from "../worker-model/builder-tools/web-tools.js";
+import { lspDiagnosticTool, runLspDiagnostic } from "../agent-tools/lsp-tools.js";
+import { notebookEditTool, runNotebookEdit } from "../agent-tools/notebook-tools.js";
+import { askUserTool, runAskUser } from "../agent-tools/ask-user.js";
+import type { AskUserFn } from "../cognition-layer/ask.js";
+import type { CustomAgent } from "../agent-router/agent-directory.js";
 import type { ChatToolActivity } from "./contract.js";
 import { SessionMemory, type MemorySnapshot } from "./memory.js";
 import { loadUserInstructions } from "./user-memory.js";
@@ -218,6 +223,11 @@ export const CHAT_TOOLS: readonly ModelTool[] = [
   webExtractTool,
   delegateTaskTool,
   visionAnalyzeTool,
+  // LSP: language-server-grade diagnostics (read-only) and cell-level notebook editing.
+  lspDiagnosticTool,
+  notebookEditTool,
+  // Clarify: ask the operator a question and wait for the answer (interactive in the REPL).
+  askUserTool,
   // Knowledge brain (gbrain): recall prior knowledge, synthesize across it, write findings back.
   ...BRAIN_TOOLS,
   // Parity with the builder's final three (adapted to chat — see the tool defs above).
@@ -238,6 +248,10 @@ const READ_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([
   "git_status",
   "git_diff",
   "git_log",
+  // LSP diagnostics are read-only inspection — safe in plan mode.
+  "lsp_diagnostic",
+  // Asking the operator a clarifying question mutates nothing — useful while planning too.
+  "ask_user",
 ]);
 
 /** Plan mode's tools: CHAT_TOOLS filtered to the read-only subset (no write/patch/terminal/delegate). */
@@ -386,6 +400,8 @@ const MUTATING_TOOL_NAMES: ReadonlySet<string> = new Set([
   "run_checks",
   "web_search",
   "web_extract",
+  // notebook_edit can insert/edit/delete cells (mutating); gated like the other writers.
+  "notebook_edit",
 ]);
 
 /**
@@ -419,6 +435,10 @@ export interface TurnOptions {
   readonly permissionMode?: PermissionMode;
   /** In "confirm" mode, asked before each mutating tool; resolve false to BLOCK it (FIX 5). */
   readonly confirm?: (tool: string, target: string) => Promise<boolean>;
+  /** The ask_user channel: puts a clarifying question to the operator and resolves their answer.
+   *  Wired by the REPL to the readline prompt. Absent ⇒ ask_user falls back to stdin on a TTY, else
+   *  returns "proceed" guidance (never blocks). */
+  readonly ask?: AskUserFn;
 }
 
 export interface ResolvedWorkdir {
@@ -438,7 +458,7 @@ export interface FileMutation {
   /** File content AFTER the mutation. */
   readonly afterContent: string;
   /** Which tool made it. */
-  readonly tool: "write_file" | "patch" | "multi_edit";
+  readonly tool: "write_file" | "patch" | "multi_edit" | "notebook_edit";
   readonly timestamp: number;
 }
 
@@ -782,6 +802,8 @@ export class ChatSession {
   private readonly userMsg: ModelMessage | undefined;
   /** The driver model id for this session — switchable at runtime via setModel (`/model`). */
   private model: string;
+  /** The active user-defined agent persona (`/agent <name>`), or undefined for the default assistant. */
+  private persona: CustomAgent | undefined;
   /** True while THIS round's tool calls were parsed from TEXT (no-native-tool-API model): their
    *  results feed back as user-role data, not tool-role (no real tool_call_id exists). */
   private emulatedRound = false;
@@ -1060,6 +1082,48 @@ export class ChatSession {
         const ok = !out.startsWith("ERROR");
         return { output: out, activity: { name: "vision_analyze", ok, ...(typeof args.image_url === "string" ? { summary: args.image_url.slice(0, 80) } : {}) } };
       }
+      case "lsp_diagnostic": {
+        // Language-server-grade diagnostics through governed-exec — read-only; the compiler
+        // output is UNTRUSTED → it re-enters via the caller's neutralization chokepoint.
+        const out = await runLspDiagnostic(
+          { governedExec, worktreeReal: this.worktree, ...(this.parentCtx !== undefined ? { parentCtx: this.parentCtx } : {}) },
+          args,
+        );
+        const ok = !out.startsWith("ERROR");
+        return { output: out, activity: { name: "lsp_diagnostic", ok, ...(typeof args.language === "string" ? { summary: args.language } : {}) } };
+      }
+      case "ask_user": {
+        // Put a clarifying question to the operator and wait for the answer. Interactive in the
+        // REPL (opts.ask); a non-TTY automation run with no channel gets "proceed" guidance, never
+        // a hang. The operator's reply is input → re-neutralized at the caller's chokepoint.
+        const out = await runAskUser(
+          {
+            ...(opts.ask !== undefined ? { ask: opts.ask } : {}),
+            allowStdinFallback: opts.ask === undefined && process.stdin.isTTY === true,
+          },
+          args,
+        );
+        const ok = !out.startsWith("ERROR");
+        return { output: out, activity: { name: "ask_user", ok, ...(typeof args.question === "string" ? { summary: args.question.slice(0, 60) } : {}) } };
+      }
+      case "notebook_edit": {
+        // Cell-level .ipynb editing — confined to the worktree. Mutating ops are permission-gated
+        // above (MUTATING_TOOL_NAMES). The result (read output especially) is UNTRUSTED → chokepoint.
+        // Snapshot before/after so /rollback can restore (or delete) the notebook accurately.
+        const full = typeof args.path === "string" ? `${this.worktree}/${args.path}` : undefined;
+        let before: string | null = null;
+        if (full !== undefined) {
+          try { before = readFileSync(full, "utf8"); } catch { before = null; }
+        }
+        const res = runNotebookEdit(this.worktree, args);
+        const ok = res.rejection === undefined;
+        if (ok && res.wrote !== undefined && full !== undefined) {
+          let after = "";
+          try { after = readFileSync(full, "utf8"); } catch { after = ""; }
+          this.recordMutation({ path: res.wrote, full, beforeContent: before, afterContent: after, tool: "notebook_edit", timestamp: Date.now() });
+        }
+        return { output: res.output, activity: { name: "notebook_edit", ok, ...(typeof args.operation === "string" ? { summary: `${args.operation}${res.wrote !== undefined ? ` ${res.wrote}` : ""}` } : {}) } };
+      }
       case "scout_detail": {
         // SAME scout-disclosure logic as the builder, over an empty findings set (chat runs no
         // scout phase). The text is derived from scout output → UNTRUSTED → goes through the chokepoint.
@@ -1203,6 +1267,10 @@ export class ChatSession {
     // envelope to the (per-turn) system message too — same per-turn-only treatment as plan mode.
     const sys0 = this.messages[0] as ModelMessage;
     let sysContent = sys0.content;
+    // CUSTOM AGENT PERSONA (`/agent <name>`): fold the persona's system prompt in for THIS turn.
+    // It is operator-authored config from `.ikbi/agents/`, so it rides as a trusted instruction
+    // (like CHAT_SYSTEM itself), never as untrusted data.
+    if (this.persona !== undefined) sysContent += `\n\nACTIVE AGENT PERSONA — "${this.persona.name}":\n${this.persona.systemPrompt}`;
     if (mode === "plan") sysContent += PLAN_SYSTEM_EXTENSION;
     if (toolInstructions !== undefined) sysContent += `\n\n${toolInstructions}`;
     const sys: ModelMessage = sysContent === sys0.content ? sys0 : { role: "system", content: sysContent };
@@ -1283,6 +1351,32 @@ export class ChatSession {
 
   setPermissionMode(mode: PermissionMode): void {
     this.permissionMode = mode;
+  }
+
+  /** The custom agent persona active for this session, if any (`/agent <name>`). */
+  currentPersona(): CustomAgent | undefined {
+    return this.persona;
+  }
+
+  /**
+   * Adopt (or clear, with undefined) a user-defined agent persona. The persona's system prompt is
+   * folded into the per-turn system message (operator-authored config, so trusted like CHAT_SYSTEM),
+   * its allowed-tool list narrows the active tools, and its model preference switches the driver
+   * model. Pass undefined to revert to the default assistant persona (the model is left as-is).
+   */
+  setPersona(persona: CustomAgent | undefined): void {
+    this.persona = persona;
+    if (persona?.modelPreference !== undefined && persona.modelPreference.length > 0) {
+      this.model = persona.modelPreference;
+    }
+  }
+
+  /** Narrow a tool list to the active persona's allowed-tool set (no persona / no list ⇒ unchanged). */
+  private applyPersonaTools(tools: readonly ModelTool[]): readonly ModelTool[] {
+    const allowed = this.persona?.allowedTools;
+    if (allowed === undefined || allowed.length === 0) return tools;
+    const allow = new Set(allowed);
+    return tools.filter((t) => allow.has(t.name));
   }
 
   /** True when this session edits inside a managed, promotable workspace (Phase 2). */
@@ -1617,7 +1711,7 @@ export class ChatSession {
     // mode. Best-effort — discovery failure leaves the built-in suite untouched.
     if (mode === "agent") await this.ensureMcpRegistry();
     // Plan mode runs the READ-ONLY tool subset; agent mode runs the full suite + any MCP tools.
-    const activeTools = mode === "plan" ? PLAN_TOOLS : [...CHAT_TOOLS, ...this.mcpToolsFor(mode)];
+    const activeTools = this.applyPersonaTools(mode === "plan" ? PLAN_TOOLS : [...CHAT_TOOLS, ...this.mcpToolsFor(mode)]);
     // TEXT TOOL PROTOCOL (cheap/local-model parity with the builder): a model with no native
     // function-calling API cannot emit structured tool_calls. Rather than hand it a tools array it
     // can't use (and watch it bare-stop), describe the tools + a strict JSON envelope in the system
@@ -1801,7 +1895,7 @@ export class ChatSession {
 
     // MCP TOOLS: discover (once) and expose the operator-configured MCP servers' tools in agent mode.
     if (mode === "agent") await this.ensureMcpRegistry();
-    const activeTools = mode === "plan" ? PLAN_TOOLS : [...CHAT_TOOLS, ...this.mcpToolsFor(mode)];
+    const activeTools = this.applyPersonaTools(mode === "plan" ? PLAN_TOOLS : [...CHAT_TOOLS, ...this.mcpToolsFor(mode)]);
     const emulateTools = getCapabilities(this.model).supports_tools === false;
     const toolsForModel = emulateTools ? [] : activeTools;
     const toolInstructions = emulateTools ? textToolProtocolInstructions(activeTools) : undefined;

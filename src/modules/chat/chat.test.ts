@@ -290,11 +290,13 @@ test("chat advertises the full builder tool suite to the model", async () => {
   const firstReq = requests[0] as { tools: Array<{ name: string }> };
   const names = firstReq.tools.map((t) => t.name);
   // FULL PARITY — all builder tools must be offered to the chat model.
-  // 18 original (incl. glob + multi_edit) + 4 brain tools (brain_search, brain_think, brain_put, brain_sync).
+  // 18 original (incl. glob + multi_edit) + 4 brain tools (brain_search, brain_think, brain_put,
+  // brain_sync) + 3 capability tools added by the Bubbles gap-closure: lsp_diagnostic,
+  // notebook_edit, ask_user.
   const ALL_TOOLS = [
     "read_file", "write_file", "list_dir", "search_files", "glob", "patch", "multi_edit", "terminal",
     "git_status", "git_diff", "git_log", "web_search", "web_extract", "delegate_task",
-    "vision_analyze",
+    "vision_analyze", "lsp_diagnostic", "notebook_edit", "ask_user",
     "brain_search", "brain_think", "brain_put", "brain_sync",
     "scout_detail", "run_checks", "done",
   ];

@@ -28,6 +28,8 @@ import { colorizeDiff, readPipedStdin } from "../worker-model/cli.js";
 import type { ChatMode, ChatToolActivity } from "./contract.js";
 import { discoverProject, formatOverview } from "./project-discovery.js";
 import { ChatSession, type ApplyResult, type DiscardOutcome, type PermissionMode, type PersistedSession, type RollbackResult, type StreamEvent, type TurnOptions, type WorkdirKind } from "./session.js";
+import { formatAskPrompt, type AskUserRequest } from "../cognition-layer/ask.js";
+import { findCustomAgent, loadCustomAgents, type CustomAgent } from "../agent-router/agent-directory.js";
 import { allocateSessionWorkspace, reconnectSessionWorkspace, resolveRepoTarget } from "./repl-workspace.js";
 import { persistentStore, PersistentSessionStore, sessionsDir } from "./session-store.js";
 import { createProductionGovernor } from "../memory-governor/create.js";
@@ -57,6 +59,9 @@ export interface ReplSession {
   setModel?(model: string): void;
   currentPermissionMode?(): PermissionMode;
   setPermissionMode?(mode: PermissionMode): void;
+  /** Custom agent persona (`/agent <name>`). Optional so a lightweight fake still satisfies ReplSession. */
+  currentPersona?(): CustomAgent | undefined;
+  setPersona?(persona: CustomAgent | undefined): void;
   pendingDiff?(): string;
   // Managed-workspace lifecycle (Phase 2). Optional so a lightweight fake still satisfies ReplSession.
   isManaged?(): boolean;
@@ -252,10 +257,44 @@ const COMMAND_LIST: readonly ReplCommand[] = [
   },
   {
     name: "agent",
-    description: "Switch to AGENT mode (full tool suite — changes applied)",
-    handler: (ctx) => {
+    description: "Switch to AGENT mode, or adopt a custom persona: /agent [<name> | list | default]",
+    usage: "/agent [<name> | list | default]",
+    handler: (ctx, args) => {
+      const arg = args.trim();
+      const repoRoot = ctx.session.targetRepo ?? ctx.session.worktree ?? process.cwd();
+      // No argument → the classic behavior: just (re)enter execution mode.
+      if (arg.length === 0) {
+        ctx.mode = "agent";
+        const active = ctx.session.currentPersona?.();
+        ctx.out(`[agent mode: full tool suite — changes will be applied.${active !== undefined ? ` persona: ${active.name}` : ""}]\n`);
+        return;
+      }
+      if (arg === "list") {
+        const { agents, dir } = loadCustomAgents(repoRoot);
+        if (agents.length === 0) ctx.out(`[no custom agents in ${dir} — define one as .ikbi/agents/<name>.yaml]\n`);
+        else ctx.out(`[custom agents: ${agents.map((a) => a.name).join(", ")} — switch with /agent <name>]\n`);
+        return;
+      }
+      if (ctx.session.setPersona === undefined) {
+        ctx.out("[this session does not support custom personas]\n");
+        return;
+      }
+      if (arg === "default" || arg === "none") {
+        ctx.session.setPersona(undefined);
+        ctx.mode = "agent";
+        ctx.out("[persona cleared — default assistant, agent mode]\n");
+        return;
+      }
+      const agent = findCustomAgent(repoRoot, arg);
+      if (agent === undefined) {
+        ctx.out(`[no agent named "${arg}" — run /agent list or 'ikbi agents' to see options]\n`);
+        return;
+      }
+      ctx.session.setPersona(agent);
       ctx.mode = "agent";
-      ctx.out("[agent mode: full tool suite — changes will be applied.]\n");
+      const tools = agent.allowedTools !== undefined && agent.allowedTools.length > 0 ? `${agent.allowedTools.length} tool(s)` : "all tools";
+      const model = agent.modelPreference !== undefined ? `, model ${agent.modelPreference}` : "";
+      ctx.out(`[persona "${agent.name}" active (${tools}${model}) — agent mode]\n`);
     },
   },
   {
@@ -627,6 +666,12 @@ export async function runRepl(deps: ReplDeps): Promise<void> {
     if (line === null) return false;
     return /^\s*y(es)?\s*$/i.test(line);
   };
+  // ask_user channel: render the question (+ options) and consume one line from the same input.
+  const askUser = async (req: AskUserRequest): Promise<string> => {
+    deps.out(formatAskPrompt(req));
+    const line = await deps.readLine();
+    return line === null ? "" : line.trim();
+  };
   const ctx: ReplContext = {
     session: deps.session,
     mode: "agent",
@@ -683,7 +728,7 @@ export async function runRepl(deps: ReplDeps): Promise<void> {
     // PROGRESS (FIX 4): a `\r`-overwriting spinner line while the (async) turn runs (skipped in --quiet).
     const controller = new AbortController();
     deps.onTurnController?.(controller);
-    const baseOpts = { signal: controller.signal, permissionMode: ctx.permissionMode, confirm: ctx.confirmTool } as const;
+    const baseOpts = { signal: controller.signal, permissionMode: ctx.permissionMode, confirm: ctx.confirmTool, ask: askUser } as const;
     try {
       if (typeof ctx.session.sendStream === "function") {
         const streamed = await streamTurn(ctx.session, msg, ctx.mode, baseOpts, deps.out, ctx.quiet);

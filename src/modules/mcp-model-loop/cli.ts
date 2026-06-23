@@ -94,6 +94,14 @@ export function createMcpCli(deps: McpCliDeps = {}) {
   const now = deps.now ?? Date.now;
 
   async function run(argv: readonly string[]): Promise<void> {
+    // SUBCOMMAND: `ikbi mcp auth …` runs the remote-server OAuth flow (device-code / token mgmt),
+    // a separate path from the stdio loop below. Lazy import keeps the auth code off the hot path.
+    if (argv[0] === "auth") {
+      const { createMcpAuthCli } = await import("../../cli/mcp-auth.js");
+      await createMcpAuthCli({ stdout: out, stderr: err, setExit, now }).run(argv.slice(1));
+      return;
+    }
+
     const { server, model, rest } = parseMcpArgs(argv);
     const goal = rest.join(" ").trim();
 
@@ -157,7 +165,7 @@ export function createMcpCli(deps: McpCliDeps = {}) {
 const liveMcp = createMcpCli();
 registerCommand({
   name: "mcp",
-  summary: "[experimental] standalone MCP model+tool loop (not yet wired into build/REPL)",
-  usage: 'ikbi mcp --server "<command [args...]>" <goal...> [--model <id>]',
+  summary: "[experimental] standalone MCP model+tool loop, plus `mcp auth <server>` for remote OAuth servers",
+  usage: 'ikbi mcp --server "<command [args...]>" <goal...> [--model <id>]  |  ikbi mcp auth <server>',
   run: (argv) => liveMcp.run(argv),
 });

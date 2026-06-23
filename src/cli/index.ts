@@ -51,6 +51,8 @@ import "./serve.js";
 import "./audit.js";
 import "./fix.js";
 import "./memory.js";
+import "./review.js";
+import "./agents.js";
 import { workspaces as coreWorkspaces } from "../core/workspace/index.js";
 // The DEFAULT router — no-args or bare text opens the interactive REPL (golden path).
 // The cognition-layer router is still available behind `--headless` for headless/CI use.

@@ -1,0 +1,115 @@
+/**
+ * ikbi LSP module — project language detection.
+ *
+ * Detection is config-first (a manifest is the strongest signal a project uses a language),
+ * with a shallow extension scan as a fallback so a config-less script directory is still
+ * covered. Pure, read-only, and bounded: it never recurses into dependency/build dirs and
+ * caps how many entries it scans, so detection on a huge tree stays cheap.
+ *
+ * Results are CACHED per project directory (the work order's "cache LSP instances per project
+ * directory") — detection is idempotent for a given tree and the cache is invalidated only by
+ * an explicit `clearDetectionCache()` (used by tests).
+ */
+
+import { existsSync, readdirSync } from "node:fs";
+import { join } from "node:path";
+
+import type { DetectedLanguage, LspLanguage } from "./contract.js";
+
+/** Config manifests that unambiguously mark a language at the project root. */
+const CONFIG_MARKERS: ReadonlyArray<{ readonly file: string; readonly language: LspLanguage }> = [
+  { file: "tsconfig.json", language: "typescript" },
+  { file: "jsconfig.json", language: "typescript" },
+  { file: "pyproject.toml", language: "python" },
+  { file: "setup.py", language: "python" },
+  { file: "setup.cfg", language: "python" },
+  { file: "requirements.txt", language: "python" },
+  { file: "go.mod", language: "go" },
+  { file: "Cargo.toml", language: "rust" },
+];
+
+/** File extensions that map to a language (the fallback signal when no manifest is present). */
+const EXTENSION_MARKERS: ReadonlyMap<string, LspLanguage> = new Map([
+  [".ts", "typescript"],
+  [".tsx", "typescript"],
+  [".mts", "typescript"],
+  [".cts", "typescript"],
+  [".py", "python"],
+  [".pyi", "python"],
+  [".go", "go"],
+  [".rs", "rust"],
+]);
+
+/** Directories never worth scanning for source extensions. */
+const SKIP_DIRS: ReadonlySet<string> = new Set([
+  "node_modules", ".git", "dist", "build", "target", ".next", ".cache", "vendor", "__pycache__", ".venv", "venv",
+]);
+
+/** Max directory entries scanned during the extension fallback (keeps detection cheap on huge trees). */
+const MAX_SCAN_ENTRIES = 2_000;
+
+const detectionCache = new Map<string, readonly DetectedLanguage[]>();
+
+/** Clear the per-directory detection cache (tests use this to avoid cross-test bleed). */
+export function clearDetectionCache(): void {
+  detectionCache.clear();
+}
+
+/**
+ * Detect which languages a project directory uses. Config manifests at the root win; if none
+ * are found, a bounded recursive extension scan supplies the fallback. The result is cached
+ * per directory. Ordering is stable: typescript, python, go, rust.
+ */
+export function detectLanguages(rootDir: string): readonly DetectedLanguage[] {
+  const cached = detectionCache.get(rootDir);
+  if (cached !== undefined) return cached;
+
+  const found = new Map<LspLanguage, string>();
+
+  // 1) Config-first: a root manifest is the strongest signal.
+  for (const marker of CONFIG_MARKERS) {
+    if (found.has(marker.language)) continue;
+    if (existsSync(join(rootDir, marker.file))) found.set(marker.language, marker.file);
+  }
+
+  // 2) Extension fallback (bounded) for languages no manifest revealed.
+  if (found.size < EXTENSION_MARKERS.size) {
+    scanExtensions(rootDir, found);
+  }
+
+  const ordered: LspLanguage[] = ["typescript", "python", "go", "rust"];
+  const result: DetectedLanguage[] = ordered
+    .filter((lang) => found.has(lang))
+    .map((lang) => ({ language: lang, marker: found.get(lang) as string }));
+
+  detectionCache.set(rootDir, result);
+  return result;
+}
+
+/** Bounded breadth-first extension scan; records the first matching file per language. */
+function scanExtensions(rootDir: string, found: Map<LspLanguage, string>): void {
+  const queue: string[] = [rootDir];
+  let scanned = 0;
+  while (queue.length > 0 && scanned < MAX_SCAN_ENTRIES) {
+    const dir = queue.shift() as string;
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      scanned += 1;
+      if (scanned >= MAX_SCAN_ENTRIES) break;
+      if (entry.isDirectory()) {
+        if (!SKIP_DIRS.has(entry.name) && !entry.name.startsWith(".")) queue.push(join(dir, entry.name));
+        continue;
+      }
+      const dot = entry.name.lastIndexOf(".");
+      if (dot < 0) continue;
+      const ext = entry.name.slice(dot);
+      const lang = EXTENSION_MARKERS.get(ext);
+      if (lang !== undefined && !found.has(lang)) found.set(lang, `*${ext}`);
+    }
+  }
+}

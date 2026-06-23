@@ -53,3 +53,14 @@ export {
   routerAnswered,
   type RouterEventPayload,
 } from "./events.js";
+export {
+  agentsDir,
+  loadCustomAgents,
+  findCustomAgent,
+  loadAgentFile,
+  validateAgent,
+  parseSimpleYaml,
+  type CustomAgent,
+  type AgentLoadError,
+  type AgentDirectoryResult,
+} from "./agent-directory.js";

@@ -43,3 +43,11 @@ export {
   type CognitionLayerConfig,
 } from "./config.js";
 export { cognitionDecided } from "./events.js";
+export {
+  clarificationRequest,
+  formatAskPrompt,
+  interpretAnswer,
+  MAX_ASK_OPTIONS,
+  type AskUserRequest,
+  type AskUserFn,
+} from "./ask.js";
