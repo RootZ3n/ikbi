@@ -28,7 +28,15 @@ export function register(): void {
 // Self-register on import so simply loading the module activates the floor.
 register();
 
-export { guardedFetch, createGuardedFetch, type GuardedFetchDeps } from "./guard.js";
+export {
+  guardedFetch,
+  createGuardedFetch,
+  isGuardResolved,
+  resetGuardedFetch,
+  setGuardBuilder,
+  restoreGuardBuilder,
+  type GuardedFetchDeps,
+} from "./guard.js";
 export { classifyIp, type IpVerdict } from "./ip.js";
 export { egressBlocked, egressLocalAllowed, type EgressBlockedPayload, type EgressBlockReason, type EgressLocalAllowedPayload } from "./events.js";
 export { egressConfig, loadEgressConfig, type EgressConfig } from "./config.js";

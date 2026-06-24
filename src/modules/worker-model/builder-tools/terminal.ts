@@ -71,10 +71,23 @@ export const terminalTool: ModelTool = {
 };
 
 /**
- * Tokenize a command line into a binary + argument array, honoring simple single-
- * and double-quoted spans (so `git commit -m "a b"` → ["git","commit","-m","a b"]).
- * This is NOT a shell: there is no globbing, variable expansion, piping, or
- * substitution — the tokens are handed verbatim to execFile via governed-exec.
+ * Tokenize a command line into a binary + argument array, honoring single- and double-quoted spans
+ * AND backslash escapes (so `git commit -m "a b"` → ["git","commit","-m","a b"], and
+ * `printf "%s" "a \"b\" c"` keeps the inner quotes). This is NOT a shell: there is no globbing,
+ * variable expansion, piping, or substitution — the tokens are handed verbatim to execFile via
+ * governed-exec.
+ *
+ * BACKSLASH ESCAPES (RC7):
+ *   • Unquoted: `\<ch>` → literal `<ch>` (so `\ ` is a literal space, `\"` a literal quote).
+ *   • Double-quoted: `\"` → `"` and `\\` → `\`; any other `\<ch>` is PRESERVED verbatim
+ *     (`"\d"` stays `\d`) — matching POSIX double-quote semantics so regexes survive.
+ *   • Single-quoted: `\'` → `'` and `\\` → `\`; any other `\<ch>` is PRESERVED verbatim
+ *     (`'\b'` stays `\b`). This is a deliberate, documented superset of POSIX single quotes
+ *     (which keep everything literal) so an inner single quote can be escaped without breaking
+ *     common backslash regex patterns.
+ *
+ * Throws on an UNTERMINATED quote (`"abc` or `'abc`) — a clear failure the caller surfaces, rather
+ * than silently shipping a half-parsed argument to exec.
  */
 export function tokenizeCommand(command: string): string[] {
   const tokens: string[] = [];
@@ -83,6 +96,30 @@ export function tokenizeCommand(command: string): string[] {
   let started = false; // distinguishes an empty quoted token "" from no token
   for (let i = 0; i < command.length; i += 1) {
     const ch = command[i];
+
+    if (ch === "\\") {
+      const next = command[i + 1];
+      if (next === undefined) {
+        // Trailing backslash with nothing to escape — keep it literal.
+        cur += "\\";
+        started = true;
+        continue;
+      }
+      if (quote === undefined) {
+        // Unquoted: backslash escapes any single character.
+        cur += next;
+      } else if (next === quote || next === "\\") {
+        // Inside quotes: a backslash only escapes the matching quote or another backslash.
+        cur += next;
+      } else {
+        // Any other escape inside quotes is preserved verbatim (regex backslashes survive).
+        cur += "\\" + next;
+      }
+      started = true;
+      i += 1;
+      continue;
+    }
+
     if (quote !== undefined) {
       if (ch === quote) quote = undefined;
       else cur += ch;
@@ -103,6 +140,9 @@ export function tokenizeCommand(command: string): string[] {
     }
     cur += ch;
     started = true;
+  }
+  if (quote !== undefined) {
+    throw new Error(`unterminated ${quote === '"' ? "double" : "single"} quote in command`);
   }
   if (started) tokens.push(cur);
   return tokens;
@@ -214,7 +254,12 @@ export async function runTerminal(
   if (deps.parentCtx === undefined) {
     return "ERROR: terminal is unavailable (no parent identity wired to authorize the governed command).";
   }
-  const tokens = tokenizeCommand(command);
+  let tokens: string[];
+  try {
+    tokens = tokenizeCommand(command);
+  } catch (e) {
+    return `ERROR: ${e instanceof Error ? e.message : String(e)} — quote the argument correctly and retry.`;
+  }
   const binary = tokens[0];
   if (binary === undefined || binary.length === 0) {
     return "ERROR: terminal could not parse a command from the input.";

@@ -1067,7 +1067,14 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
           return `ERROR: Use write_file to create new files instead — terminal commands that modify files are off for this task.`;
         }
       }
-      const tokens = tokenizeCommand(cmd);
+      let tokens: string[];
+      try {
+        tokens = tokenizeCommand(cmd);
+      } catch (e) {
+        const detail = e instanceof Error ? e.message : String(e);
+        rejectedToolCalls.push({ tool: "terminal", path: cmd.slice(0, 100), error: detail });
+        return `ERROR: ${detail} — quote the argument correctly and retry.`;
+      }
       const binary = tokens[0];
       const policyDeny = binary !== undefined ? commandPolicyDenyReason(binary, tokens.slice(1), `builder terminal: ${cmd.slice(0, 120)}`) : undefined;
       if (policyDeny !== undefined) {

@@ -144,6 +144,39 @@ test("tokenizeCommand: splits on whitespace and honors quotes", () => {
   assert.deepEqual(tokenizeCommand("echo 'x y'"), ["echo", "x y"]);
 });
 
+test("tokenizeCommand (RC7): escaped quotes inside double quotes", () => {
+  assert.deepEqual(tokenizeCommand('echo "hello \\"world\\""'), ["echo", 'hello "world"']);
+  // The whole quoted span with inner escaped quotes is one token.
+  assert.deepEqual(tokenizeCommand('printf "%s" "a \\"b\\" c"'), ["printf", "%s", 'a "b" c']);
+});
+
+test("tokenizeCommand (RC7): escaped quotes inside single quotes", () => {
+  assert.deepEqual(tokenizeCommand("echo 'hello \\'world\\''"), ["echo", "hello 'world'"]);
+});
+
+test("tokenizeCommand (RC7): escaped backslashes collapse (Windows-style path)", () => {
+  assert.deepEqual(tokenizeCommand('echo "path\\\\to\\\\file"'), ["echo", "path\\to\\file"]);
+});
+
+test("tokenizeCommand (RC7): regex backslashes inside quotes are preserved", () => {
+  // `\d` and `\b` are NOT valid quote/backslash escapes, so they survive verbatim.
+  assert.deepEqual(tokenizeCommand('grep "\\d+"'), ["grep", "\\d+"]);
+  assert.deepEqual(tokenizeCommand("grep '\\bword\\b'"), ["grep", "\\bword\\b"]);
+});
+
+test("tokenizeCommand (RC7): unquoted escape and mixed args with spaces", () => {
+  // Unquoted backslash escapes the next char (here, a literal space joins the token).
+  assert.deepEqual(tokenizeCommand("touch a\\ b"), ["touch", "a b"]);
+  assert.deepEqual(tokenizeCommand('git commit -m "fix: a \\"quoted\\" word" --amend'), [
+    "git", "commit", "-m", 'fix: a "quoted" word', "--amend",
+  ]);
+});
+
+test("tokenizeCommand (RC7): an unterminated quote fails clearly", () => {
+  assert.throws(() => tokenizeCommand('echo "unterminated'), /unterminated double quote/);
+  assert.throws(() => tokenizeCommand("echo 'nope"), /unterminated single quote/);
+});
+
 /** A governed exec spy: records the request, returns a scripted result. */
 function execSpy(result: ExecResult) {
   const calls: ExecRequest[] = [];

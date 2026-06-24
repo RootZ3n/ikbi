@@ -33,7 +33,7 @@ import { lookup } from "node:dns/promises";
 import { ProviderError } from "../../core/provider/contract.js";
 import type { FetchLike } from "../../core/provider/providers/openai-compatible.js";
 import { events } from "../../core/events/index.js";
-import { egressConfig } from "./config.js";
+import { loadEgressConfig } from "./config.js";
 import { egressBlocked, egressLocalAllowed, type EgressBlockedPayload, type EgressBlockReason, type EgressLocalAllowedPayload } from "./events.js";
 import { classifyIp } from "./ip.js";
 
@@ -197,7 +197,52 @@ export function createGuardedFetch(deps: GuardedFetchDeps): FetchLike {
 }
 
 /**
- * The process-wide guarded fetch the egress floor registers via the provider
- * fetch-guard seam. Built from the module's own config slice + real DNS/transport.
+ * The lazy builder for the process-wide guard. Re-reads the egress config each time it builds, so a
+ * runtime config change applied BEFORE the first outbound request is honored (the policy is bound at
+ * FIRST USE, not at module load). Exposed as a dependency-injection seam — tests substitute a stub
+ * via `setGuardBuilder`; production never overrides it. Fail-closed is unchanged: the built guard is
+ * the same default-deny SSRF floor (`createGuardedFetch` with real DNS/transport).
  */
-export const guardedFetch: FetchLike = createGuardedFetch({ allowlist: egressConfig.allowlist, localEndpoints: egressConfig.localEndpoints });
+function defaultGuardBuilder(): FetchLike {
+  const cfg = loadEgressConfig();
+  return createGuardedFetch({ allowlist: cfg.allowlist, localEndpoints: cfg.localEndpoints });
+}
+
+let guardBuilder: () => FetchLike = defaultGuardBuilder;
+let resolvedGuard: FetchLike | undefined;
+
+/**
+ * The process-wide guarded fetch the egress floor registers via the provider fetch-guard seam.
+ *
+ * RC8 — LAZY: the underlying guard (and the egress POLICY it binds: allowlist + local endpoints) is
+ * built on the FIRST call, then memoized. This stable function reference is what `register()` wires
+ * into the provider fetch-guard seam, so identity-based registration checks still hold. Merely
+ * importing the floor never snapshots a policy, and a config change before the first request is
+ * respected. Fail-closed is preserved — the first call still constructs the default-deny SSRF guard.
+ */
+export const guardedFetch: FetchLike = (input, init) => {
+  if (resolvedGuard === undefined) resolvedGuard = guardBuilder();
+  return resolvedGuard(input, init);
+};
+
+/** Whether the underlying guard has been built yet (proves laziness — exposed for tests). */
+export function isGuardResolved(): boolean {
+  return resolvedGuard !== undefined;
+}
+
+/** Drop the memoized guard so the next call rebuilds from the CURRENT config (tests/runtime reload). */
+export function resetGuardedFetch(): void {
+  resolvedGuard = undefined;
+}
+
+/** Override the lazy builder (DI seam for tests). Resets the memoized guard so the next call uses it. */
+export function setGuardBuilder(builder: () => FetchLike): void {
+  guardBuilder = builder;
+  resolvedGuard = undefined;
+}
+
+/** Restore the production builder + drop any memoized guard (test cleanup). */
+export function restoreGuardBuilder(): void {
+  guardBuilder = defaultGuardBuilder;
+  resolvedGuard = undefined;
+}
