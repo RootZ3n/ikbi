@@ -558,6 +558,78 @@ function progressPhase(call: ToolCall): string {
   return target.length > 0 && needsTarget ? `${verb} ${target}…` : `${verb}…`;
 }
 
+/** A user-facing notice for a model round that did NOT finish as a clean completion (RC2/RC3). */
+export interface FinishReasonNotice {
+  readonly reason: string;
+  /** A short, actionable warning prepended to the turn's reply. */
+  readonly warning: string;
+  /** The output may be truncated/censored — not a complete answer. */
+  readonly incomplete: boolean;
+  /** Re-sending the request is a safe, sensible recovery. */
+  readonly retryable: boolean;
+  /** A stream that stalled mid tool-call (the partial call was NOT executed). */
+  readonly stalledToolCall: boolean;
+}
+
+/**
+ * Classify a model round's finishReason into a user-facing notice when the output is NOT a clean
+ * completion (RC2 stalled stream, RC3 content filter, plus length truncation and provider error).
+ * Returns undefined for clean finishes (stop / tool_calls / unknown / undefined) so a normal
+ * completion is never decorated. `hadToolCalls` distinguishes a stream that stalled mid tool-call
+ * (finishReason=length WITH partial tool calls) from an ordinary truncated text answer.
+ */
+export function finishReasonNotice(finishReason: string | undefined, hadToolCalls: boolean): FinishReasonNotice | undefined {
+  switch (finishReason) {
+    case "content_filter":
+      return {
+        reason: "content_filter",
+        warning:
+          "⚠ ikbi: the model's response was flagged by a content/safety filter (finishReason=content_filter) — " +
+          "it may be censored or incomplete. Treat it with caution; rephrasing may help.",
+        incomplete: true,
+        retryable: true,
+        stalledToolCall: false,
+      };
+    case "length":
+      if (hadToolCalls) {
+        return {
+          reason: "length",
+          warning:
+            "⚠ ikbi: the stream stalled mid tool-call (finishReason=length) — the partial tool call was NOT executed " +
+            "and nothing was applied. Re-send your request.",
+          incomplete: true,
+          retryable: true,
+          stalledToolCall: true,
+        };
+      }
+      return {
+        reason: "length",
+        warning:
+          "⚠ ikbi: the response was truncated at the token limit (finishReason=length) — it may be incomplete. " +
+          "Ask the model to continue if the answer was cut off.",
+        incomplete: true,
+        retryable: true,
+        stalledToolCall: false,
+      };
+    case "error":
+      return {
+        reason: "error",
+        warning: "⚠ ikbi: the provider reported an error finish (finishReason=error) — the output may be incomplete.",
+        incomplete: true,
+        retryable: true,
+        stalledToolCall: false,
+      };
+    default:
+      return undefined; // stop / tool_calls / unknown / undefined — a clean completion
+  }
+}
+
+/** Prepend a finish-reason warning to a turn's reply (empty content ⇒ just the warning). */
+function withFinishNotice(content: string, notice: FinishReasonNotice | undefined): string {
+  if (notice === undefined) return content;
+  return content.length > 0 ? `${notice.warning}\n\n${content}` : notice.warning;
+}
+
 /** Resolve a governed parent identity from configured tokens; undefined ⇒ terminal fails closed. */
 function resolveParentCtx(sessionId: string): OperationContext | undefined {
   const token = config.identity.operatorToken ?? config.identity.workerToken;
@@ -1781,7 +1853,12 @@ export class ChatSession {
       this.messages.push({
         role: "assistant",
         content: response.content,
-        ...(response.toolCalls !== undefined && response.toolCalls.length > 0 ? { toolCalls: response.toolCalls } : {}),
+        // RC2: only round-trip tool calls when the model ACTUALLY finished a tool-call turn. A
+        // stream truncated mid tool-call (finishReason=length) leaves dangling partial calls with
+        // no matching result — persisting them would wedge the next request, so they are dropped.
+        ...(response.toolCalls !== undefined && response.toolCalls.length > 0 && response.finishReason === "tool_calls"
+          ? { toolCalls: response.toolCalls }
+          : {}),
       });
 
       // Resolve this round's tool calls: native structured calls when present; otherwise (only for
@@ -1812,15 +1889,19 @@ export class ChatSession {
         continue; // let the model read the (neutralized) results and continue
       }
 
-      // A normal completion (stop / length / anything non-tool) ends the turn.
+      // A completion that ended the turn without runnable tool calls. If the finishReason was NOT a
+      // clean stop (content-filter / truncation / stalled mid-tool-call / error), surface a warning
+      // and write a receipt — never silently treat a flagged finish as a normal answer (RC2/RC3).
+      const notice = finishReasonNotice(response.finishReason, (response.toolCalls?.length ?? 0) > 0);
+      if (notice !== undefined) await this.recordFinishReasonReceipt(notice, response.model);
       // Fold this turn's facts into memory: files/commands from tool activity, and the
       // assistant's reply as the turn's CONCLUSION (skipping synthetic ikbi error replies).
       this.memory.recordToolActivity(tools);
-      if (!response.content.startsWith("[ikbi:")) this.memory.recordDecision(response.content);
+      if (notice === undefined && !response.content.startsWith("[ikbi:")) this.memory.recordDecision(response.content);
       const contextPercent = this.contextPercent();
       // Context pressure VISIBILITY: warn when the conversation crosses 70% of the window.
       if (contextPercent > 70) log.warn({ sessionId: this.id, contextPercent }, "chat: context window pressure above 70%");
-      return { response: response.content, tools, cost: turnCost, contextPercent };
+      return { response: withFinishNotice(response.content, notice), tools, cost: turnCost, contextPercent };
     }
   }
 
@@ -1842,6 +1923,37 @@ export class ChatSession {
       }
     }
     return usd;
+  }
+
+  /**
+   * Write a durable receipt when a round finished with a flagged finishReason (RC2/RC3) — a stalled
+   * mid-tool-call stream, a content-filter, a truncation, or a provider error. Best-effort: a
+   * receipt-write failure must never mask the warning the user already sees. No partial action ran,
+   * so this records the EVENT (finishReason + flags), not any tool result.
+   */
+  private async recordFinishReasonReceipt(notice: FinishReasonNotice, model: string): Promise<void> {
+    try {
+      const store = (await import("../../core/receipt/index.js")).receipts;
+      await store.append(
+        {
+          operation: notice.stalledToolCall ? "chat.tool_call_stalled" : "chat.finish_reason_flagged",
+          outcome: { status: "partial", detail: notice.warning },
+          requestId: this.id,
+          metadata: {
+            sessionId: this.id,
+            finishReason: notice.reason,
+            stalledToolCall: notice.stalledToolCall,
+            incomplete: notice.incomplete,
+            retryable: notice.retryable,
+            model,
+          },
+          project: this.worktree,
+        },
+        this.identity,
+      );
+    } catch (e) {
+      log.warn({ err: errMsg(e), sessionId: this.id }, "chat: failed to write finish-reason receipt");
+    }
   }
 
   /**
@@ -1979,7 +2091,10 @@ export class ChatSession {
       this.messages.push({
         role: "assistant",
         content: round.content,
-        ...(round.toolCalls.length > 0 ? { toolCalls: round.toolCalls } : {}),
+        // RC2: only round-trip tool calls on a genuine tool-call finish. A stream truncated mid
+        // tool-call (finishReason=length) yields dangling partial calls that would wedge the next
+        // request — drop them so nothing partial is replayed.
+        ...(round.toolCalls.length > 0 && round.finishReason === "tool_calls" ? { toolCalls: round.toolCalls } : {}),
       });
 
       if (aborted) return finish("[ikbi: interrupted]");
@@ -2008,11 +2123,15 @@ export class ChatSession {
         continue; // let the model read the (neutralized) results and continue
       }
 
+      // Flagged finishReason (content-filter / truncation / stalled mid-tool-call / error): warn +
+      // receipt instead of silently returning a possibly-incomplete answer (RC2/RC3).
+      const notice = finishReasonNotice(round.finishReason, round.toolCalls.length > 0);
+      if (notice !== undefined) await this.recordFinishReasonReceipt(notice, this.model);
       this.memory.recordToolActivity(tools);
-      if (!round.content.startsWith("[ikbi:")) this.memory.recordDecision(round.content);
+      if (notice === undefined && !round.content.startsWith("[ikbi:")) this.memory.recordDecision(round.content);
       const contextPercent = this.contextPercent();
       if (contextPercent > 70) log.warn({ sessionId: this.id, contextPercent }, "chat: context window pressure above 70%");
-      return { response: round.content, tools, cost: turnCost, contextPercent };
+      return { response: withFinishNotice(round.content, notice), tools, cost: turnCost, contextPercent };
     }
   }
 }
