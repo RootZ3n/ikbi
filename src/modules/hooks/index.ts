@@ -17,6 +17,20 @@
  *   IKBI_PROJECT_DIR     — target repo path
  *   IKBI_TOOL_OUTPUT     — tool result string (PostToolUse only, truncated to 32KB)
  *
+ * ENV SCRUBBING (RC1 — fail-closed by default): a hook command does NOT inherit ikbi's full
+ * process environment. If it did, every operator-configured hook would receive whatever API keys,
+ * provider tokens, and OAuth secrets ikbi was started with. Instead a hook gets only:
+ *   1. a MINIMAL safe passthrough of process env (PATH/HOME/locale — see SAFE_ENV_PASSTHROUGH),
+ *   2. the IKBI_* context vars above,
+ *   3. anything the operator EXPLICITLY opts into, two ways:
+ *        • `passEnv: ["MY_SAFE_VAR"]` — forward named process-env vars (secret-like names are
+ *           refused even here; see isSecretEnvKey),
+ *        • `env: { "MY_VAR": "literal" }` — operator-authored literal key/values from their OWN
+ *           hooks.json (the escape hatch for a value a hook genuinely needs — never sourced from
+ *           ikbi's process env, so it cannot leak an inherited secret).
+ * Secret-shaped names (*_KEY / *_TOKEN / *_SECRET / *_PASSWORD, provider/OAuth/GitHub tokens)
+ * are never forwarded from the process environment by default.
+ *
  * PreToolUse SAFETY: a hook exiting 2 BLOCKS the tool. Exit 0 = allow. Other exits
  * logged but allowed (fail-open for misconfigured hooks).
  *
@@ -40,6 +54,17 @@ export interface HookConfig {
   readonly matcher?: string;
   /** Shell command to execute. */
   readonly command: string;
+  /**
+   * Literal env vars set for THIS hook's command — operator-authored in their own hooks.json and
+   * therefore intentional. Applied LAST, so they win over the passthrough/context. Use this (not
+   * `passEnv`) when a hook needs a value that resembles a secret. */
+  readonly env?: Readonly<Record<string, string>>;
+  /**
+   * Names of PROCESS-env vars to forward to this hook (opt-in). A safe widening of the minimal
+   * passthrough — but secret-like names (see isSecretEnvKey) are still REFUSED here, so `passEnv`
+   * can never re-expose an inherited API key/token. For a genuinely-needed secret value, use the
+   * literal `env` map instead. */
+  readonly passEnv?: readonly string[];
 }
 
 export interface HookContext {
@@ -64,6 +89,27 @@ export interface HookResult {
 
 const HOOK_TIMEOUT_MS = 30_000;
 const MAX_OUTPUT_LENGTH = 32_000;
+
+/**
+ * The MINIMAL set of process-env vars always forwarded to a hook command — just enough for a normal
+ * tool to run (a working PATH, a HOME, locale + temp dir). Deliberately small: a hook inherits NONE
+ * of ikbi's other environment, so API keys / provider tokens / OAuth secrets are never exposed.
+ */
+const SAFE_ENV_PASSTHROUGH: readonly string[] = [
+  "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE",
+  "LC_ALL", "LC_CTYPE", "TERM", "TZ", "TMPDIR", "TEMP", "TMP", "PWD", "HOSTNAME",
+];
+
+/**
+ * True when an env var NAME looks like a credential. Used to refuse forwarding secret-shaped vars
+ * from the process environment even when a hook explicitly lists them in `passEnv`. Covers the
+ * common shapes (*_KEY / *_TOKEN / *_SECRET / *_PASSWORD) plus provider, OAuth, GitHub, and
+ * session/cookie credential names. The escape hatch for a value a hook truly needs is the hook's
+ * literal `env` map (operator-authored, never sourced from ikbi's own environment).
+ */
+export function isSecretEnvKey(key: string): boolean {
+  return /(?:_KEY|_TOKEN|_SECRET|_PASSWORD|_PASSWD|_CREDENTIALS?|API[_-]?KEY|ACCESS[_-]?TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE[_-]?KEY|OAUTH|SESSION[_-]?TOKEN|COOKIE)/i.test(key);
+}
 
 function loadHookFile(path: string): HookConfig[] {
   try {
@@ -123,7 +169,10 @@ function hookMatches(hook: HookConfig, toolName: string): boolean {
 function runHookCommand(command: string, env: Record<string, string>): Promise<HookResult> {
   return new Promise((resolve) => {
     const child = execFile("/bin/sh", ["-c", command], {
-      env: { ...process.env, ...env },
+      // RC1: the SCRUBBED env only — NOT `{ ...process.env, ...env }`. `env` is the fully-built
+      // safe environment (minimal passthrough + IKBI_* context + explicit opt-ins). A hook never
+      // inherits ikbi's API keys / provider tokens.
+      env,
       timeout: HOOK_TIMEOUT_MS,
       maxBuffer: MAX_OUTPUT_LENGTH,
       encoding: "utf8",
@@ -166,14 +215,47 @@ function runHookCommand(command: string, env: Record<string, string>): Promise<H
 
 // ── Public API ─────────────────────────────────────────────────────────────
 
-function buildEnv(ctx: HookContext): Record<string, string> {
-  return {
-    IKBI_HOOK_TYPE: ctx.type,
-    ...(ctx.toolName !== undefined ? { IKBI_TOOL_NAME: ctx.toolName } : {}),
-    ...(ctx.toolInput !== undefined ? { IKBI_TOOL_INPUT: ctx.toolInput } : {}),
-    IKBI_PROJECT_DIR: ctx.projectDir,
-    ...(ctx.toolOutput !== undefined ? { IKBI_TOOL_OUTPUT: ctx.toolOutput.slice(0, MAX_OUTPUT_LENGTH) } : {}),
-  };
+/**
+ * Build the SCRUBBED environment a hook command runs with (RC1). Layered, last-wins:
+ *   1. minimal safe passthrough from process.env (SAFE_ENV_PASSTHROUGH, never secret-like),
+ *   2. operator opt-in `passEnv` forwards by name (secret-like names refused),
+ *   3. the documented IKBI_* context vars,
+ *   4. operator-authored literal `env` overrides (win over everything above).
+ * The full process environment is NEVER spread in — an inherited secret cannot reach a hook.
+ */
+export function buildHookEnv(ctx: HookContext, hook: Pick<HookConfig, "env" | "passEnv">): Record<string, string> {
+  const env: Record<string, string> = {};
+
+  // 1) Minimal safe passthrough (PATH/HOME/locale). Belt-and-suspenders: still skip secret-like.
+  for (const key of SAFE_ENV_PASSTHROUGH) {
+    const val = process.env[key];
+    if (val !== undefined && !isSecretEnvKey(key)) env[key] = val;
+  }
+
+  // 2) Operator opt-in forwards from the process env — by NAME, still refusing secret-like names.
+  if (Array.isArray(hook.passEnv)) {
+    for (const key of hook.passEnv) {
+      if (typeof key !== "string" || key.length === 0 || isSecretEnvKey(key)) continue;
+      const val = process.env[key];
+      if (val !== undefined) env[key] = val;
+    }
+  }
+
+  // 3) ikbi-provided context (the documented IKBI_* vars).
+  env.IKBI_HOOK_TYPE = ctx.type;
+  if (ctx.toolName !== undefined) env.IKBI_TOOL_NAME = ctx.toolName;
+  if (ctx.toolInput !== undefined) env.IKBI_TOOL_INPUT = ctx.toolInput;
+  env.IKBI_PROJECT_DIR = ctx.projectDir;
+  if (ctx.toolOutput !== undefined) env.IKBI_TOOL_OUTPUT = ctx.toolOutput.slice(0, MAX_OUTPUT_LENGTH);
+
+  // 4) Operator-authored literal overrides (their own hooks.json — intentional, never inherited).
+  if (hook.env !== null && typeof hook.env === "object") {
+    for (const [k, v] of Object.entries(hook.env)) {
+      if (typeof k === "string" && k.length > 0 && typeof v === "string") env[k] = v;
+    }
+  }
+
+  return env;
 }
 
 /** Run all matching hooks for a context. Returns results with allowed=false if any PreToolUse blocked. */
@@ -185,11 +267,11 @@ export async function fireHooks(
     (h) => h.type === ctx.type && (ctx.toolName === undefined || hookMatches(h, ctx.toolName ?? "*")),
   );
 
-  const env = buildEnv(ctx);
   const results: HookResult[] = [];
 
   for (const hook of matching) {
-    const result = await runHookCommand(hook.command, env);
+    // Env is built PER HOOK — each hook's own `env`/`passEnv` opt-ins apply only to it.
+    const result = await runHookCommand(hook.command, buildHookEnv(ctx, hook));
     results.push({ ...result, hook });
     // For PreToolUse, a blocked hook stops further hooks
     if (ctx.type === "PreToolUse" && !result.allowed) break;

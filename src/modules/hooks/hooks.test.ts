@@ -15,7 +15,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { fireHooks, fireStopHooks, loadHooks, type HookConfig, type HookContext } from "./index.js";
+import { buildHookEnv, fireHooks, fireStopHooks, isSecretEnvKey, loadHooks, type HookConfig, type HookContext } from "./index.js";
 
 function tmpDir(): string {
   return mkdtempSync(join(tmpdir(), "ikbi-hooks-"));
@@ -84,6 +84,104 @@ test("PreToolUse hook can read IKBI_TOOL_INPUT to decide whether to block", asyn
   assert.equal(blocked[0]!.allowed, false);
   const allowed = await fireHooks(hooks, preCtx({ toolInput: '{"path":"ok.txt"}' }));
   assert.equal(allowed[0]!.allowed, true);
+});
+
+// ── Env scrubbing (RC1) ─────────────────────────────────────────────────────────
+
+test("RC1: a hook does NOT inherit secret-like process env vars by default", async () => {
+  // Plant credential-shaped vars in the parent process env, then have the hook print them.
+  const planted = {
+    OPENAI_API_KEY: "sk-openai-leak",
+    ANTHROPIC_API_KEY: "sk-ant-leak",
+    GITHUB_TOKEN: "ghp_leak",
+    AWS_SECRET_ACCESS_KEY: "aws-leak",
+    DB_PASSWORD: "hunter2",
+    MY_OAUTH_TOKEN: "oauth-leak",
+    IKBI_OPERATOR_TOKEN: "operator-leak",
+  };
+  for (const [k, v] of Object.entries(planted)) process.env[k] = v;
+  try {
+    const hooks: HookConfig[] = [
+      { type: "PostToolUse", command: 'printf "%s|%s|%s|%s|%s|%s|%s" "$OPENAI_API_KEY" "$ANTHROPIC_API_KEY" "$GITHUB_TOKEN" "$AWS_SECRET_ACCESS_KEY" "$DB_PASSWORD" "$MY_OAUTH_TOKEN" "$IKBI_OPERATOR_TOKEN"' },
+    ];
+    const res = await fireHooks(hooks, { type: "PostToolUse", toolName: "Write", projectDir: "/tmp" });
+    // Every secret resolves to empty — none were forwarded into the hook subprocess.
+    assert.equal(res[0]!.stdout, "||||||");
+  } finally {
+    for (const k of Object.keys(planted)) delete process.env[k];
+  }
+});
+
+test("RC1: PATH is forwarded so a normal hook command can still run", () => {
+  const env = buildHookEnv({ type: "Stop", projectDir: "/tmp" }, {});
+  assert.equal(typeof env.PATH, "string");
+  assert.ok((env.PATH ?? "").length > 0, "PATH must be in the minimal passthrough");
+  // The IKBI_* context is always present.
+  assert.equal(env.IKBI_HOOK_TYPE, "Stop");
+  assert.equal(env.IKBI_PROJECT_DIR, "/tmp");
+});
+
+test("RC1: explicit literal `env` override reaches the hook (the safe escape hatch)", async () => {
+  const hooks: HookConfig[] = [
+    { type: "PostToolUse", command: 'printf "%s" "$MY_DEPLOY_FLAG"', env: { MY_DEPLOY_FLAG: "green" } },
+  ];
+  const res = await fireHooks(hooks, { type: "PostToolUse", toolName: "Write", projectDir: "/tmp" });
+  assert.equal(res[0]!.stdout, "green");
+});
+
+test("RC1: `passEnv` forwards a NAMED safe var, but refuses a secret-like name", async () => {
+  process.env.MY_SAFE_REGION = "us-east-1";
+  process.env.MY_SUPER_TOKEN = "should-not-leak";
+  try {
+    const hooks: HookConfig[] = [
+      {
+        type: "PostToolUse",
+        command: 'printf "%s|%s" "$MY_SAFE_REGION" "$MY_SUPER_TOKEN"',
+        passEnv: ["MY_SAFE_REGION", "MY_SUPER_TOKEN"],
+      },
+    ];
+    const res = await fireHooks(hooks, { type: "PostToolUse", toolName: "Write", projectDir: "/tmp" });
+    // Safe var forwarded; the *_TOKEN name is refused even though it was explicitly listed.
+    assert.equal(res[0]!.stdout, "us-east-1|");
+  } finally {
+    delete process.env.MY_SAFE_REGION;
+    delete process.env.MY_SUPER_TOKEN;
+  }
+});
+
+test("RC1: a literal `env` override wins over the IKBI_* context and passthrough", () => {
+  const env = buildHookEnv(
+    { type: "PostToolUse", toolName: "Write", projectDir: "/tmp" },
+    { env: { IKBI_PROJECT_DIR: "/override" } },
+  );
+  assert.equal(env.IKBI_PROJECT_DIR, "/override");
+});
+
+test("RC1: isSecretEnvKey flags credential shapes and clears benign ones", () => {
+  for (const k of ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GITHUB_TOKEN", "GH_TOKEN", "DB_PASSWORD", "X_SECRET", "AWS_SECRET_ACCESS_KEY", "SESSION_TOKEN", "MY_OAUTH"]) {
+    assert.ok(isSecretEnvKey(k), `${k} should be flagged secret-like`);
+  }
+  for (const k of ["PATH", "HOME", "LANG", "TZ", "MY_REGION", "BUILD_NUMBER"]) {
+    assert.ok(!isSecretEnvKey(k), `${k} should NOT be flagged`);
+  }
+});
+
+test("RC1: passEnv survives JSON config loading (round-trips through loadHooks)", () => {
+  const dir = tmpDir();
+  try {
+    mkdirSync(join(dir, ".ikbi"), { recursive: true });
+    writeFileSync(
+      join(dir, ".ikbi", "hooks.json"),
+      JSON.stringify([{ type: "PostToolUse", command: "true", passEnv: ["MY_REGION"], env: { FOO: "bar" } }]),
+    );
+    const loaded = loadHooks(dir);
+    const hook = loaded.find((h) => h.command === "true");
+    assert.ok(hook !== undefined);
+    assert.deepEqual(hook!.passEnv, ["MY_REGION"]);
+    assert.deepEqual(hook!.env, { FOO: "bar" });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ── Stop hooks ────────────────────────────────────────────────────────────────
