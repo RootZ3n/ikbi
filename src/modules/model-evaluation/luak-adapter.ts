@@ -137,6 +137,35 @@ export function rankCandidates(models: readonly RosterModel[], entries: readonly
     .map(({ c }) => c);
 }
 
+/** The inclusive bounds a `--min-score` value must fall within (Luak scores are normalized 0–1). */
+export const MIN_SCORE_LOWER = 0;
+export const MIN_SCORE_UPPER = 1;
+
+export type MinScoreResult =
+  | { readonly ok: true; readonly value: number }
+  | { readonly ok: false; readonly error: string };
+
+/**
+ * Validate a raw `--min-score` argument (RC4). Luak scores are normalized 0–1, so a value must be
+ * a finite number in [0, 1]. Rejects NaN / non-numbers, negatives, and over-max (the common 0–100
+ * mistake, e.g. `70`) with a clear, actionable message — instead of silently filtering everything.
+ */
+export function validateMinScore(raw: string | undefined): MinScoreResult {
+  if (raw === undefined || raw.trim().length === 0) {
+    return { ok: false, error: `--min-score expects a number between ${MIN_SCORE_LOWER} and ${MIN_SCORE_UPPER} (got no value)` };
+  }
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < MIN_SCORE_LOWER || value > MIN_SCORE_UPPER) {
+    return {
+      ok: false,
+      error:
+        `--min-score expects a number between ${MIN_SCORE_LOWER} and ${MIN_SCORE_UPPER} ` +
+        `(Luak scores are normalized 0–1; e.g. 0.7 for "70%"); got "${raw}"`,
+    };
+  }
+  return { ok: true, value };
+}
+
 /**
  * Pick the CHEAPEST candidate whose score meets `minScore`. Returns undefined when none qualify
  * (e.g. no Luak data, or every match is below threshold) — the caller falls back to the static pick.

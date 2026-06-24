@@ -26,6 +26,7 @@ import {
   fetchLuakLeaderboard,
   pickCheapestAboveThreshold,
   rankCandidates,
+  validateMinScore,
   type RosterModel,
 } from "../modules/model-evaluation/index.js";
 import { trust } from "../core/trust/index.js";
@@ -296,12 +297,16 @@ async function runModelsRank(argv: readonly string[]): Promise<void> {
   const idx = argv.indexOf("--min-score");
   const minRaw = idx >= 0 ? argv[idx + 1] : undefined;
   if (minRaw !== undefined) {
-    const min = Number(minRaw);
-    if (!Number.isFinite(min)) {
-      writeStderr(`ikbi models --rank: --min-score expects a number (got "${minRaw}")\n`);
+    // RC4: Luak scores are normalized 0–1 (e.g. reliability_score=0.91). Enforce the range
+    // explicitly — not just Number.isFinite — so a 0–100 mistake (e.g. `--min-score 70`) fails
+    // loudly with guidance instead of silently filtering everything out.
+    const parsed = validateMinScore(minRaw);
+    if (!parsed.ok) {
+      writeStderr(`ikbi models --rank: ${parsed.error}\n`);
       process.exitCode = 1;
       return;
     }
+    const min = parsed.value;
     const cheapest = pickCheapestAboveThreshold(ranked, min);
     writeStdout(
       cheapest !== undefined

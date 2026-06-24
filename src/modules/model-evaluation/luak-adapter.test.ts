@@ -13,6 +13,7 @@ import {
   pickCheapestAboveThreshold,
   rankCandidates,
   scoreOfEntry,
+  validateMinScore,
   type FetchLike,
   type LuakAdapterConfig,
   type LuakLeaderboardEntry,
@@ -66,6 +67,30 @@ test("pickCheapestAboveThreshold returns the cheapest qualifying model, or undef
   assert.equal(pickCheapestAboveThreshold(ranked, 0.8)?.id, "deepseek-v4-pro");
   // Nothing qualifies above 0.99.
   assert.equal(pickCheapestAboveThreshold(ranked, 0.99), undefined);
+});
+
+// ── --min-score validation (RC4) ────────────────────────────────────────────────
+
+test("RC4: validateMinScore accepts the inclusive bounds and an in-range value", () => {
+  for (const raw of ["0", "0.0", "0.5", "0.7", "1", "1.0"]) {
+    const r = validateMinScore(raw);
+    assert.ok(r.ok, `${raw} should be valid`);
+    assert.equal((r as { value: number }).value, Number(raw));
+  }
+});
+
+test("RC4: validateMinScore rejects negatives, over-max, and NaN/non-numbers", () => {
+  for (const raw of ["-0.1", "-1", "1.0001", "2", "70", "NaN", "abc", "", "  ", undefined]) {
+    const r = validateMinScore(raw);
+    assert.equal(r.ok, false, `${String(raw)} should be rejected`);
+    assert.match((r as { error: string }).error, /between 0 and 1/);
+  }
+});
+
+test("RC4: the 0–100 mistake (70) is rejected with guidance, not silently accepted", () => {
+  const r = validateMinScore("70");
+  assert.equal(r.ok, false);
+  assert.match((r as { error: string }).error, /normalized 0–1/);
 });
 
 test("parseLeaderboardEntries accepts {leaderboard:[]} and bare arrays", () => {
