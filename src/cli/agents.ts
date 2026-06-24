@@ -11,6 +11,7 @@
 
 import { registerCommand } from "./registry.js";
 import { writeStdout, writeStderr } from "./io.js";
+import { whatNextFooter } from "./what-next.js";
 import { loadCustomAgents, type AgentDirectoryResult } from "../modules/agent-router/agent-directory.js";
 
 export interface AgentsCliDeps {
@@ -85,8 +86,8 @@ export function createAgentsCli(deps: AgentsCliDeps = {}) {
         const desc = a.description !== undefined ? ` — ${a.description}` : "";
         out(`  • ${a.name} (${tools}${model})${desc}\n`);
       }
-      out(`\nSwitch in the REPL with: /agent <name>\n`);
     }
+    out(`${whatNextFooter("agents", { count: result.agents.length })}\n`);
     if (result.errors.length > 0) {
       err(`\n${result.errors.length} file(s) could not be loaded:\n`);
       for (const e of result.errors) err(`  ✗ ${e.file}: ${e.error}\n`);

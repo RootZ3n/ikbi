@@ -13,3 +13,9 @@ export {
   type FriendlyError,
   type TranslateOptions,
 } from "./translator.js";
+
+export {
+  SYSTEM_ERROR_CATALOG,
+  translateSystemError,
+  errorCode,
+} from "./user-facing.js";

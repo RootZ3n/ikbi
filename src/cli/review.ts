@@ -21,6 +21,7 @@ import { isAbsolute, join } from "node:path";
 
 import { registerCommand } from "./registry.js";
 import { writeStdout, writeStderr } from "./io.js";
+import { whatNextFooter } from "./what-next.js";
 import { config } from "../core/config.js";
 import { gatherFiles } from "../modules/worker-model/scout-files.js";
 import { formatReviewMarkdown, runReview, type ReviewOptions, type ReviewResult } from "../modules/worker-model/review.js";
@@ -175,6 +176,7 @@ export function createReviewCli(deps: ReviewCliDeps = {}) {
       out(`${JSON.stringify(result, null, 2)}\n`);
     } else {
       out(`${formatReviewMarkdown(result)}\n`);
+      out(`${whatNextFooter("review", { issues: result.comments.length })}\n`);
     }
     // A model failure that produced no review is a non-zero exit (so CI can gate on it).
     if (result.error !== undefined && result.comments.length === 0) setExit(1);

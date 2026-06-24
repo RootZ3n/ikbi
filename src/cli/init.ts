@@ -12,6 +12,8 @@ import { createInterface } from "node:readline";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { whatNextFooter } from "./what-next.js";
+
 
 // ── Provider key detection ──────────────────────────────────────────────
 
@@ -211,7 +213,8 @@ export async function runInit(): Promise<void> {
   out("  ikbi              Start an interactive coding session\n");
   out("  ikbi \"fix auth\"   Start a session with a prompt\n");
   out("  ikbi build \"...\"  Headless build/repair (CI/scripts)\n");
-  out("  ikbi doctor       Check configuration health\n\n");
+  out("  ikbi doctor       Check configuration health\n");
+  out(`${whatNextFooter("init")}\n`);
 
   rl.close();
 }

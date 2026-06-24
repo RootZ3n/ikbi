@@ -21,6 +21,19 @@ test("Finding B high-traffic commands all have help pages", () => {
   }
 });
 
+// Productization sprint Item 1: the remaining high-traffic commands now all have pages.
+const SPRINT_PAGES = [
+  "detect", "batch", "classify", "ask", "recover", "memory", "receipts", "summary",
+  "workspace", "workspaces", "clean", "repos", "setup", "capabilities", "providers",
+  "version", "kill", "kill-status", "unkill",
+] as const;
+
+test("sprint Item 1 commands all have help pages", () => {
+  for (const cmd of SPRINT_PAGES) {
+    assert.ok(HELP_PAGES[cmd] !== undefined, `missing help page for ${cmd}`);
+  }
+});
+
 test("each help page has a one-line description, usage, and examples", () => {
   for (const topic of helpTopics()) {
     const page = HELP_PAGES[topic]!;

@@ -285,6 +285,294 @@ export const HELP_PAGES: Readonly<Record<string, HelpPage>> = {
     ],
     seeAlso: ["doctor", "capabilities"],
   },
+  detect: {
+    name: "detect",
+    summary: "Auto-detect the project's language, framework, test runner, and build tool from its marker files. Read-only, offline.",
+    usage: "ikbi detect [--repo <dir>] [--json]",
+    flags: [
+      { flag: "--repo <dir>", desc: "Detect a different repo root (defaults to the current directory)." },
+      { flag: "--json", desc: "Emit a machine-readable detection result (for CI/tooling)." },
+    ],
+    examples: [
+      { cmd: "ikbi detect", desc: "Identify the current project's stack and tooling." },
+      { cmd: "ikbi detect --repo ../service --json", desc: "Detect another repo, JSON for scripts." },
+    ],
+    seeAlso: ["doctor", "audit", "repl"],
+  },
+  batch: {
+    name: "batch",
+    summary: "Decompose a large goal into ordered subtasks and build them in dependency order (the multi-step build path).",
+    usage: "ikbi batch <goal...> [--repo <path>] [--dry-run]",
+    flags: [
+      { flag: "<goal...>", desc: "The high-level goal to decompose into subtasks." },
+      { flag: "--repo <path>", desc: "Target repository (defaults to the current directory)." },
+      { flag: "--dry-run", desc: "Plan the subtasks and print the build order; build nothing." },
+    ],
+    examples: [
+      { cmd: "ikbi batch \"add auth: login, logout, session middleware\"", desc: "Plan + build a multi-part goal." },
+      { cmd: "ikbi batch \"migrate the API to v2\" --dry-run", desc: "Preview the decomposition without building." },
+    ],
+    seeAlso: ["build", "fix", "repl"],
+  },
+  classify: {
+    name: "classify",
+    summary: "Classify the intent of a message (the agent-router's read-only intent labeler) — build / fix / ask / chat.",
+    usage: "ikbi classify <message...>",
+    flags: [
+      { flag: "<message...>", desc: "The message whose intent to classify." },
+    ],
+    examples: [
+      { cmd: "ikbi classify \"why is the build failing?\"", desc: "See how the router would label this message." },
+    ],
+    seeAlso: ["ask", "build", "repl"],
+  },
+  ask: {
+    name: "ask",
+    summary: "Ask a question answered over lab memory (project knowledge + prior build context) — read-only, no edits.",
+    usage: "ikbi ask <question...> [--project <name>]",
+    flags: [
+      { flag: "<question...>", desc: "The question to answer from lab memory." },
+      { flag: "--project <name>", desc: "Scope the answer to a specific project's memory." },
+    ],
+    examples: [
+      { cmd: "ikbi ask \"how does the trust ladder work?\"", desc: "Answer from accumulated lab memory." },
+      { cmd: "ikbi ask \"what changed in auth last week?\" --project service", desc: "Scope to one project." },
+    ],
+    seeAlso: ["memory", "classify", "repl"],
+  },
+  recover: {
+    name: "recover",
+    summary: "Diagnose a broken capability and recommend which module should repair it (operator; non-executing — it never fixes).",
+    usage: "ikbi recover <capability> [--project <p>]",
+    flags: [
+      { flag: "<capability>", desc: "The capability to diagnose (e.g. a failing tool or role)." },
+      { flag: "--project <p>", desc: "Scope the diagnosis to a specific project." },
+    ],
+    examples: [
+      { cmd: "ikbi recover run_checks", desc: "Diagnose why the checks capability is broken and who should fix it." },
+    ],
+    seeAlso: ["doctor", "fix", "audit"],
+  },
+  memory: {
+    name: "memory",
+    summary: "Review and manage memory-governance proposals (brain pages, project files) — approve, reject, or inspect stats.",
+    usage: "ikbi memory [proposals [--all] | approve <id> | reject <id> | reject-all | stats]",
+    flags: [
+      { flag: "proposals [--all]", desc: "List pending memory proposals (--all includes resolved)." },
+      { flag: "approve <id>", desc: "Approve a proposal — commit it to memory." },
+      { flag: "reject <id>", desc: "Reject a single proposal." },
+      { flag: "reject-all", desc: "Reject every pending proposal." },
+      { flag: "stats", desc: "Show memory-governance counters." },
+    ],
+    examples: [
+      { cmd: "ikbi memory proposals", desc: "See what memory writes are awaiting approval." },
+      { cmd: "ikbi memory approve mp-abc123", desc: "Approve one proposal." },
+    ],
+    seeAlso: ["ask", "summary"],
+  },
+  receipts: {
+    name: "receipts",
+    summary: "Show receipt history — the durable record of what ran, what it cost, and whether it verified (with integrity checks).",
+    usage: "ikbi receipts [verify] [--task <id>] [--latest] [--failures] [--limit <n>]",
+    flags: [
+      { flag: "verify", desc: "Verify the integrity (MAC chain) of the receipt store." },
+      { flag: "--task <id>", desc: "Show only the receipts for one task." },
+      { flag: "--latest", desc: "Show only the most-recent receipt." },
+      { flag: "--failures", desc: "Show only failed runs." },
+      { flag: "--limit <n>", desc: "Cap the number of receipts shown." },
+    ],
+    examples: [
+      { cmd: "ikbi receipts --latest", desc: "Inspect the most recent run." },
+      { cmd: "ikbi receipts --failures --limit 10", desc: "The last 10 failures." },
+      { cmd: "ikbi receipts verify", desc: "Check the receipt store's integrity." },
+    ],
+    seeAlso: ["cost", "summary", "audit"],
+  },
+  summary: {
+    name: "summary",
+    summary: "A compact overview of recent build activity (last 24 hours by default) — counts, outcomes, and spend at a glance.",
+    usage: "ikbi summary [--days <n>]",
+    flags: [
+      { flag: "(no flag)", desc: "Summarize the last 24 hours." },
+      { flag: "--days <n>", desc: "Summarize the last n days instead." },
+    ],
+    examples: [
+      { cmd: "ikbi summary", desc: "What happened in the last day." },
+      { cmd: "ikbi summary --days 7", desc: "A week's overview." },
+    ],
+    seeAlso: ["receipts", "cost"],
+  },
+  workspace: {
+    name: "workspace",
+    summary: "List, discard, or bulk-clean build workspaces (the per-run isolated worktrees) — inspect work before it's promoted.",
+    usage: "ikbi workspace <ls | discard <id> | clean [--dry-run] [--retained] [--stale=N] [--force]>",
+    flags: [
+      { flag: "ls", desc: "List workspaces with their id, state, and target repo." },
+      { flag: "discard <id>", desc: "Drop a single workspace and its worktree." },
+      { flag: "clean", desc: "Bulk-reclaim terminal workspaces (dry-run unless flags say otherwise)." },
+      { flag: "--dry-run", desc: "With clean: show what would be reclaimed; remove nothing." },
+      { flag: "--force", desc: "With clean: also sweep retained work." },
+    ],
+    examples: [
+      { cmd: "ikbi workspace ls", desc: "List live workspaces." },
+      { cmd: "ikbi workspace discard ws-abc123", desc: "Drop one workspace." },
+      { cmd: "ikbi workspace clean --dry-run", desc: "Preview a bulk clean." },
+    ],
+    seeAlso: ["workspaces", "clean", "diff"],
+  },
+  workspaces: {
+    name: "workspaces",
+    summary: "Inspect and manage builder workspaces — list, inspect one in detail, or clean (dry-run by default).",
+    usage: "ikbi workspaces <list | inspect <id> | clean [--apply] [--force]>",
+    flags: [
+      { flag: "list", desc: "List all builder workspaces." },
+      { flag: "inspect <id>", desc: "Show one workspace's full detail (state, base, diff summary)." },
+      { flag: "clean [--apply]", desc: "Reclaim terminal workspaces — dry-run unless --apply is given." },
+      { flag: "--force", desc: "With clean --apply: also sweep retained work." },
+    ],
+    examples: [
+      { cmd: "ikbi workspaces list", desc: "List builder workspaces." },
+      { cmd: "ikbi workspaces inspect ws-abc123", desc: "Drill into one workspace." },
+      { cmd: "ikbi workspaces clean --apply", desc: "Reclaim terminal workspaces for real." },
+    ],
+    seeAlso: ["workspace", "clean", "diff"],
+  },
+  clean: {
+    name: "clean",
+    summary: "Reclaim orphaned worktrees left by terminal workspaces. Retained work is preserved unless --force sweeps it.",
+    usage: "ikbi clean [--force]",
+    flags: [
+      { flag: "(no flag)", desc: "Reclaim only safely-reclaimable orphaned worktrees." },
+      { flag: "--force", desc: "Also reclaim retained (kept-for-inspection) work — destructive." },
+    ],
+    examples: [
+      { cmd: "ikbi clean", desc: "Tidy up orphaned worktrees." },
+      { cmd: "ikbi clean --force", desc: "Also sweep retained work (irreversible)." },
+    ],
+    seeAlso: ["workspace", "workspaces", "doctor"],
+  },
+  repos: {
+    name: "repos",
+    summary: "List the registered Pehverse repos (from <stateRoot>/repos.json) — the names `--repo <name>` resolves against.",
+    usage: "ikbi repos",
+    flags: [],
+    examples: [
+      { cmd: "ikbi repos", desc: "List the repos you can target by name." },
+    ],
+    seeAlso: ["build", "fix", "audit"],
+  },
+  setup: {
+    name: "setup",
+    summary: "Install a global `ikbi` launcher (shell integration) so `ikbi` runs from any directory. Idempotent.",
+    usage: "ikbi setup",
+    flags: [],
+    examples: [
+      { cmd: "ikbi setup", desc: "Write the launcher to ~/.local/bin/ikbi and print any remaining PATH step." },
+    ],
+    seeAlso: ["init", "doctor"],
+  },
+  capabilities: {
+    name: "capabilities",
+    summary: "List the builder + chat tool inventory and the product posture — which surfaces are core vs experimental.",
+    usage: "ikbi capabilities",
+    flags: [],
+    examples: [
+      { cmd: "ikbi capabilities", desc: "See every tool the builder/chat expose and each surface's lifecycle guarantees." },
+    ],
+    seeAlso: ["doctor", "models"],
+  },
+  providers: {
+    name: "providers",
+    summary: "List the registered model providers (the backends a role model can route to).",
+    usage: "ikbi providers [list]",
+    flags: [
+      { flag: "(no flag)", desc: "List the registered providers by id." },
+    ],
+    examples: [
+      { cmd: "ikbi providers", desc: "See which providers are wired." },
+    ],
+    seeAlso: ["models", "init", "doctor"],
+  },
+  version: {
+    name: "version",
+    summary: "Print the ikbi version. Offline, no config load.",
+    usage: "ikbi version",
+    flags: [
+      { flag: "--version, -V", desc: "Aliases for `version`." },
+    ],
+    examples: [
+      { cmd: "ikbi version", desc: "Print the installed version." },
+    ],
+    seeAlso: ["doctor", "capabilities"],
+  },
+  kill: {
+    name: "kill",
+    summary: "Engage the engine kill-switch (operator) — latch a stop so new/active work is halted fail-closed.",
+    usage: "ikbi kill [--hard] [--agent <id> | --run <id>] [--note <text>]",
+    flags: [
+      { flag: "--hard", desc: "Hard stop — also interrupt in-flight work, not just new work." },
+      { flag: "--agent <id>", desc: "Scope the kill to a single agent." },
+      { flag: "--run <id>", desc: "Scope the kill to a single run." },
+      { flag: "--note <text>", desc: "Record a reason on the latch." },
+    ],
+    examples: [
+      { cmd: "ikbi kill --note \"prod incident\"", desc: "Latch a soft stop with a reason." },
+      { cmd: "ikbi kill --hard --run r-abc123", desc: "Hard-stop one run." },
+    ],
+    seeAlso: ["kill-status", "unkill"],
+  },
+  "kill-status": {
+    name: "kill-status",
+    summary: "Show the current kill-switch state — whether a latch is engaged, its scope, and its note.",
+    usage: "ikbi kill-status",
+    flags: [],
+    examples: [
+      { cmd: "ikbi kill-status", desc: "Check whether the engine is currently halted." },
+    ],
+    seeAlso: ["kill", "unkill"],
+  },
+  unkill: {
+    name: "unkill",
+    summary: "Clear the kill-switch latch (operator) — resume normal operation after a `kill`.",
+    usage: "ikbi unkill",
+    flags: [],
+    examples: [
+      { cmd: "ikbi unkill", desc: "Release the latch and resume work." },
+    ],
+    seeAlso: ["kill", "kill-status"],
+  },
+  spec: {
+    name: "spec",
+    summary: "Create, list, and inspect spec artifacts — editable plans (goal → reviewable steps) before a build runs.",
+    usage: "ikbi spec <create <goal...> | list | status <id> | show <id>>",
+    flags: [
+      { flag: "create <goal...>", desc: "Generate a draft spec from a goal (sensible defaults; offline decomposition)." },
+      { flag: "list", desc: "List all specs with id, status, and step count." },
+      { flag: "status <id>", desc: "Show one spec's status and step-by-step progress (plain language)." },
+      { flag: "show <id>", desc: "Alias for `status`." },
+    ],
+    examples: [
+      { cmd: "ikbi spec create \"add OAuth login\"", desc: "Generate a reviewable plan." },
+      { cmd: "ikbi spec list", desc: "See all specs and their status." },
+      { cmd: "ikbi spec status spec-abc123", desc: "Inspect one spec's progress." },
+    ],
+    seeAlso: ["batch", "build", "job-cards"],
+  },
+  "job-cards": {
+    name: "job-cards",
+    summary: "List and inspect job cards — reusable, guardrailed automations (goal template + access/verify/rollback policy).",
+    usage: "ikbi job-cards <list | show <id> | runs <id>>",
+    flags: [
+      { flag: "list", desc: "List all job cards (built-in + saved) with their policy." },
+      { flag: "show <id>", desc: "Show one card's policy and guardrails." },
+      { flag: "runs <id>", desc: "Show a card's recent run history with human-readable status." },
+    ],
+    examples: [
+      { cmd: "ikbi job-cards list", desc: "See every available automation." },
+      { cmd: "ikbi job-cards runs nightly-tests", desc: "Inspect a card's recent runs." },
+    ],
+    seeAlso: ["spec", "batch", "build"],
+  },
 };
 
 /** The set of commands that have a detailed help page. */

@@ -31,6 +31,8 @@ import {
 import { trust } from "../core/trust/index.js";
 import { commands } from "./registry.js";
 import { runDoctor, runDoctorFixCli } from "./doctor.js";
+import { runEnvironmentChecks, renderEnvironmentChecks } from "./doctor-env.js";
+import { whatNextFooter } from "./what-next.js";
 import { runInit } from "./init.js";
 import { runSelfRepair } from "../modules/self-repair/index.js";
 import { runCapabilities } from "./capabilities.js";
@@ -54,6 +56,9 @@ import "./memory.js";
 import "./review.js";
 import "./agents.js";
 import "./evaluate.js";
+import "./detect.js";
+import "./spec.js";
+import "./job-cards.js";
 import { workspaces as coreWorkspaces } from "../core/workspace/index.js";
 // The DEFAULT router — no-args or bare text opens the interactive REPL (golden path).
 // The cognition-layer router is still available behind `--headless` for headless/CI use.
@@ -424,10 +429,11 @@ async function run(argv: readonly string[]): Promise<void> {
       // `--help` prints usage and exits 0 — it must NOT run the report (which reads config).
       if (wantsHelp(doctorArgs)) {
         writeStdout(
-          "Usage: ikbi doctor [--fix] [--force] [--self-repair]\n\n" +
-            "Report bootstrap config: what's set, what's missing for a build, and how to fix each gap.\n" +
-            "Read-only by default (no identity, no network).\n\n" +
+          "Usage: ikbi doctor [--json] [--fix] [--force] [--self-repair]\n\n" +
+            "Report bootstrap config + host environment: what's set, what's missing for a build,\n" +
+            "and how to fix each gap. Read-only by default (no identity, no network).\n\n" +
             "Options:\n" +
+            "  --json         Emit a machine-readable health report (for CI)\n" +
             "  --fix          Repair common gaps (.env / state dirs / deps); creates/repairs only\n" +
             "  --force        With --fix, also reclaim stale + aged workspaces\n" +
             "  --self-repair  Run the self-monitor: health/test/workspace/dependency checks;\n" +
@@ -453,7 +459,30 @@ async function run(argv: readonly string[]): Promise<void> {
         if (code !== 0) process.exitCode = code;
         return;
       }
-      runInfo("doctor", () => writeStdout(`${runDoctor().lines.join("\n")}\n`));
+      runInfo("doctor", () => {
+        const report = runDoctor();
+        const env = runEnvironmentChecks();
+        // Total ✗ across config + environment for the footer (a not-ready config counts as ≥1
+        // even when the miss is a security blocker rather than a required-setting gap). This
+        // includes recommended-level warnings — worth fixing, but they don't block readiness.
+        const configBad = report.ready ? 0 : Math.max(report.missingRequired, 1);
+        const issues = configBad + env.issues;
+        // Readiness gates on REQUIRED failures only: a recommended warning (e.g. a missing
+        // project-local .ikbi/) is advisory, not a blocker for "ready to build".
+        const envRequiredBad = env.checks.filter((c) => !c.ok && c.level === "required").length;
+        if (doctorArgs.includes("--json")) {
+          writeStdout(`${JSON.stringify({
+            ready: report.ready && envRequiredBad === 0,
+            issues,
+            config: { ready: report.ready, missingRequired: report.missingRequired },
+            environment: env.checks,
+            detection: env.detection,
+          }, null, 2)}\n`);
+          return;
+        }
+        writeStdout(`${report.lines.join("\n")}\n\n${renderEnvironmentChecks(env.checks)}\n`);
+        writeStdout(`${whatNextFooter("doctor", { issues })}\n`);
+      });
       return;
     }
     case "capabilities":

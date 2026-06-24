@@ -235,6 +235,15 @@ export function createBatchPlanner(deps: BatchPlannerDeps = {}): BatchPlanner {
     levels.forEach((lvl, i) => lvl.forEach((id) => levelOf.set(id, i)));
     emit(batchDecomposed, { batchId, subtaskCount: subtasks.length, levelCount: levels.length }, identity);
 
+    // DRY RUN: report the plan and build nothing. Every subtask is `not-reached` (nothing ran),
+    // status is "completed" (the plan was produced successfully), and a reason marks it a preview.
+    if (input.dryRun === true) {
+      const planned = subtasks
+        .map((s) => ({ subtaskId: s.subtaskId, status: "not-reached" as const, level: levelOf.get(s.subtaskId) ?? -1, promoted: false }))
+        .sort((a, b) => (a.level !== b.level ? a.level - b.level : a.subtaskId < b.subtaskId ? -1 : 1));
+      return { batchId, status: "completed", plan, outcomes: planned, reason: "dry run — planned only, built nothing", promotedCount: 0 };
+    }
+
     // RUN LEVELS — parallel within a level, gated across levels.
     const outcomes = new Map<string, SubtaskOutcome>();
     let promotedCount = 0;

@@ -294,7 +294,23 @@ test("not killed ⇒ the batch proceeds normally (checkpoint transparent)", asyn
 test("`ikbi batch` is registered (no built-in collision); parseBatchArgs handles --repo", () => {
   assert.ok(commands.has("batch"));
   for (const b of ["version", "models", "providers", "help", "build"]) assert.notEqual(b, "batch");
-  assert.deepEqual(parseBatchArgs(["do", "it", "--repo", "/r"]), { repo: "/r", rest: ["do", "it"] });
+  assert.deepEqual(parseBatchArgs(["do", "it", "--repo", "/r"]), { repo: "/r", dryRun: false, rest: ["do", "it"] });
+  assert.deepEqual(parseBatchArgs(["do", "it", "--dry-run"]), { dryRun: true, rest: ["do", "it"] });
+});
+
+test("planAndRun --dry-run returns the plan and runs NO worker", async () => {
+  let ran = 0;
+  const runWorker = async (task: WorkerTask): Promise<WorkerResult> => {
+    ran += 1;
+    return { contractVersion: "1.0.0", taskId: task.taskId, outcome: "success", roles: [], workspaceId: "ws-x", promoted: true };
+  };
+  const r = await planner({ invokeModel: async () => modelResponse(PLAN), runWorker }).planAndRun({ ...input(makeCtx()), dryRun: true });
+  assert.equal(ran, 0, "no worker ran in dry-run");
+  assert.equal(r.status, "completed");
+  assert.equal(r.promotedCount, 0);
+  assert.equal(r.plan?.subtasks.length, 4);
+  assert.ok(r.outcomes.every((o) => o.status === "not-reached"), "every subtask is not-reached");
+  assert.match(r.reason ?? "", /dry run/i);
 });
 
 test("the batch command fails closed (friendly) with no operator token", () => {

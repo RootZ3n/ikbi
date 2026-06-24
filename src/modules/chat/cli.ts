@@ -27,6 +27,8 @@ import { registry, invokeModelStream } from "../../core/provider/index.js";
 import { colorizeDiff, readPipedStdin } from "../worker-model/cli.js";
 import type { ChatMode, ChatToolActivity } from "./contract.js";
 import { discoverProject, formatOverview } from "./project-discovery.js";
+import { detectLiveProject, summarize } from "../project-detection/index.js";
+import { whatNext } from "../../cli/what-next.js";
 import { ChatSession, type ApplyResult, type DiscardOutcome, type PermissionMode, type PersistedSession, type RollbackResult, type StreamEvent, type TurnOptions, type WorkdirKind } from "./session.js";
 import { formatAskPrompt, type AskUserRequest } from "../cognition-layer/ask.js";
 import { findCustomAgent, loadCustomAgents, type CustomAgent } from "../agent-router/agent-directory.js";
@@ -697,6 +699,21 @@ export async function runRepl(deps: ReplDeps): Promise<void> {
       : kind === "scratch" ? "scratch (non-promotable)"
       : "live-direct edits";
     say(`[workdir: ${deps.session.worktree} — ${descr}]\n`);
+  }
+  // PROJECT TYPE + suggested actions (REPL FIX): a one-line, marker-based read of the target
+  // repo (language/framework/tooling) plus a couple of next steps, so a first-time user lands
+  // with orientation instead of a bare prompt. Best-effort and offline — a detection failure is
+  // swallowed (never let it wedge the prompt). Suppressed under --quiet like the rest of the banner.
+  if (!ctx.quiet) {
+    try {
+      const root = deps.session.targetRepo ?? deps.session.worktree ?? process.cwd();
+      const detected = detectLiveProject(root);
+      if (detected.primaryLanguage !== undefined) {
+        say(`[project: ${summarize(detected)}]\n`);
+        const tips = whatNext("detect").slice(0, 3);
+        for (const t of tips) say(`  → ${t}\n`);
+      }
+    } catch { /* detection is best-effort — never block startup on it */ }
   }
   for (;;) {
     say(prompt);

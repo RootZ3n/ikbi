@@ -108,6 +108,12 @@ export interface BatchRunInput {
   readonly goal: string;
   readonly targetRepo: string;
   readonly baseBranch?: string;
+  /**
+   * DRY RUN: decompose + schedule + report the plan, but build NOTHING (no worker runs, no
+   * promotes). The result carries the validated plan with every subtask `not-reached` and a
+   * "completed" status, so a caller can preview the decomposition before committing to a build.
+   */
+  readonly dryRun?: boolean;
 }
 
 /** The batch-planner surface. */

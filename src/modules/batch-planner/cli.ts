@@ -28,10 +28,11 @@ function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-/** Parse a `--repo <path>` / `--repo=<path>` flag; the rest is the goal prose. */
-export function parseBatchArgs(argv: readonly string[]): { repo?: string; rest: string[] } {
+/** Parse `--repo <path>`/`--repo=<path>` and `--dry-run`; the rest is the goal prose. */
+export function parseBatchArgs(argv: readonly string[]): { repo?: string; dryRun: boolean; rest: string[] } {
   const rest: string[] = [];
   let repo: string | undefined;
+  let dryRun = false;
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i] as string;
     if (a === "--repo") {
@@ -39,11 +40,30 @@ export function parseBatchArgs(argv: readonly string[]): { repo?: string; rest: 
       i += 1;
     } else if (a.startsWith("--repo=")) {
       repo = a.slice("--repo=".length);
+    } else if (a === "--dry-run") {
+      dryRun = true;
     } else {
       rest.push(a);
     }
   }
-  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), rest };
+  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), dryRun, rest };
+}
+
+/** Human-readable plan preview for `--dry-run`: the dependency levels and their subtasks. */
+function renderDryRunPlan(r: BatchResult): string {
+  if (r.plan === undefined) return `(no plan — ${r.reason ?? "decomposition produced nothing"})\n`;
+  const byId = new Map(r.plan.subtasks.map((s) => [s.subtaskId, s]));
+  const lines: string[] = [];
+  lines.push(`Dry run — ${r.plan.subtasks.length} subtask(s) across ${r.plan.levels.length} dependency level(s). Nothing was built.`);
+  lines.push("");
+  r.plan.levels.forEach((level, i) => {
+    lines.push(`Level ${i} (${level.length === 1 ? "1 subtask" : `${level.length} subtasks, run in parallel`}):`);
+    for (const id of level) {
+      const st = byId.get(id);
+      lines.push(`  • ${id}: ${st?.goal ?? "(unknown)"}`);
+    }
+  });
+  return `${lines.join("\n")}\n`;
 }
 
 /** A concise, non-leaky batch summary (plan shape + per-subtask outcomes + status). */
@@ -92,10 +112,10 @@ export function createBatchCli(deps: BatchCliDeps = {}) {
   const cwd = deps.cwd ?? (() => process.cwd());
 
   async function batch(argv: readonly string[]): Promise<void> {
-    const { repo, rest } = parseBatchArgs(argv);
+    const { repo, dryRun, rest } = parseBatchArgs(argv);
     const goal = rest.join(" ").trim();
     if (goal.length === 0) {
-      err("ikbi: batch needs a goal — usage: ikbi batch <goal...> [--repo <path>]\n");
+      err("ikbi: batch needs a goal — usage: ikbi batch <goal...> [--repo <path>] [--dry-run]\n");
       setExit(1);
       return;
     }
@@ -105,8 +125,9 @@ export function createBatchCli(deps: BatchCliDeps = {}) {
       return;
     }
     // C2: batch runs governed worker builds — the worker credential is required, same as
-    // `ikbi build`. Fail closed before any decomposition/run.
-    if (workerToken === undefined || workerToken.length === 0) {
+    // `ikbi build`. Fail closed before any decomposition/run. (A --dry-run plans only and
+    // never runs a worker, so it does not require the worker credential.)
+    if (!dryRun && (workerToken === undefined || workerToken.length === 0)) {
       err("ikbi: no worker credential — set IKBI_WORKER_TOKEN (see the worker-agent bootstrap)\n");
       setExit(1);
       return;
@@ -122,8 +143,13 @@ export function createBatchCli(deps: BatchCliDeps = {}) {
 
     const ctx = beginOperation(who, { requestId: `batch-${now()}` });
     try {
-      const result = await planner.planAndRun({ parentCtx: ctx, goal, targetRepo: repo ?? cwd() });
-      out(summarize(result));
+      const result = await planner.planAndRun({ parentCtx: ctx, goal, targetRepo: repo ?? cwd(), ...(dryRun ? { dryRun: true } : {}) });
+      if (dryRun) {
+        out(renderDryRunPlan(result));
+        if (result.status === "completed") out("\nNext:\n  → Run the same command without --dry-run to build the plan.\n");
+      } else {
+        out(summarize(result));
+      }
       // A rejected/stopped batch is a clean reported outcome — exit non-zero so a script can detect it.
       if (result.status !== "completed") setExit(1);
     } catch (e) {
@@ -140,6 +166,6 @@ const live = createBatchCli();
 registerCommand({
   name: "batch",
   summary: "Decompose a large goal into subtasks and build them in dependency order",
-  usage: "ikbi batch <goal...> [--repo <path>]",
+  usage: "ikbi batch <goal...> [--repo <path>] [--dry-run]",
   run: (argv) => live.batch(argv),
 });

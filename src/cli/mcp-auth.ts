@@ -15,6 +15,7 @@
  */
 
 import { writeStdout, writeStderr } from "./io.js";
+import { whatNextFooter } from "./what-next.js";
 import { mcpOAuthConfigs, type McpOAuthConfig } from "../modules/mcp-model-loop/config.js";
 import {
   deviceCodeFlow as liveDeviceCodeFlow,
@@ -120,6 +121,7 @@ export function createMcpAuthCli(deps: McpAuthDeps = {}) {
     try {
       const token = await flow(serverCfg, onPrompt, { store, now });
       out(`\n✅ Authorized "${cfg.name}" (${token.tokenType}${token.refreshToken !== undefined ? ", refresh token stored" : ""}). Token saved.\n`);
+      out(`${whatNextFooter("mcp-auth")}\n`);
     } catch (e) {
       err(`\nikbi mcp auth: authorization failed: ${e instanceof Error ? e.message : String(e)}\n`);
       setExit(1);

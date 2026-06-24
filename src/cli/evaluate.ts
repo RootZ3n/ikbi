@@ -28,6 +28,7 @@ import { isAbsolute, join } from "node:path";
 
 import { registerCommand } from "./registry.js";
 import { writeStdout, writeStderr } from "./io.js";
+import { whatNextFooter } from "./what-next.js";
 import { config } from "../core/config.js";
 import {
   runCapabilityHarness,
@@ -332,6 +333,13 @@ export function createEvaluateCli(deps: EvaluateCliDeps = {}) {
         err(`evaluate: could not write routing: ${e instanceof Error ? e.message : String(e)}\n`);
         setExit(1);
       }
+    }
+
+    // "What next": point the operator at applying the routing. The winner is the first model
+    // whose harness recommends it for a real builder/critic role (not "not_recommended").
+    if (!args.json) {
+      const winner = cards.find((c) => c.recommended_role !== "not_recommended")?.model;
+      out(`${whatNextFooter("evaluate", winner !== undefined ? { winner } : {})}\n`);
     }
   }
 

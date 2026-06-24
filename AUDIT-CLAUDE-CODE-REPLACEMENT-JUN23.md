@@ -406,3 +406,21 @@ exposed."**
 
 The positioning after 1-2 weeks: **"A Claude Code replacement that
 proves itself cheaper via the same eval harness Claude Code can't run."**
+
+---
+
+## Verification Pass — Polish Sprint (2026-06-23, ae9b3ce)
+
+**Verified:** commit `ae9b3ce feat: polish sprint — ikbi evaluate CLI, 9 help pages, hook tests, job-cards hardening, logger cleanup` landed all five of my recommendations. Build clean, **2671/2671 tests passing** (was 2629, +42 new tests).
+
+| Fix | Recommendation | Status | Evidence |
+|---|---|---|---|
+| **1. `ikbi evaluate` CLI** | Finding A | **LANDED, end-to-end working** | `src/cli/evaluate.ts` (346 lines) + `evaluate.test.ts` (299 lines). Live: `ikbi evaluate` runs the capability-harness on 3 built-in fixtures across 4 modes, emits a markdown scorecard with a routing recommendation. Help page registered. `ikbi evaluate --models deepseek-v4-flash,claude-sonnet-4 --modes agent,patch` is the side-by-side comparison the user asked for. |
+| **2. Help pages × 9** | Finding B | **LANDED** | 16 help pages now (was 7). Added: evaluate, review, agents, mcp, audit, cost, diff, undo, trust. All verified with live `ikbi help <cmd>`. Remaining 14+ commands still uncovered but the highest-traffic ones are done. |
+| **3. Hook tests** | Finding C | **LANDED, 17 tests** | `src/modules/hooks/hooks.test.ts` (206 lines) covers exit-0 allow, exit-2 BLOCK, non-2 fail-open, SIGTERM/timeout fail-open, 32KB truncation, PostToolUse, Stop, config loading, matcher globbing, first-block short-circuit. The security-critical PreToolUse BLOCK semantics is now pinned. |
+| **4. `job-cards/store.ts` hardening** | Finding E | **LANDED, all 3** | `assertSafeId` exported + called in both `cardPath` and `runsDir` (path traversal). `writeJson` switched to `writeFileSync(tmp) + renameSync` (atomic). `maxFilesChanged` default `0` → `50` with explanatory comment. **Closes GLM 5.2 MEDIUM-1, GLM 5.2 LOW-3, and Bubbles LOW-2 in one diff.** |
+| **5. `console.warn` → `log.warn`** | Findings F + G | **LANDED** | `orchestrator.ts:1419` and `drift.ts:157` both converted. CLAUDE.md test count updated 2199 → 2671. One remaining `console.error` in `context-manager.ts:180` is a deliberate fallback when no logger is injected. |
+
+**Auth posture (Finding D):** Verified untouched per the operator's standing instruction. README/SECURITY posture remains "lab-only, you handle your own auth." The auth hook is still scoped to `/api/*` task routes only. No action needed.
+
+**New total: 2671/2671 tests passing, 0 audit findings open on the polish list, the comparison story has a CLI.**

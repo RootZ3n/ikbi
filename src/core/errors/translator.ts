@@ -10,7 +10,13 @@
  * module stays dependency-free — it never imports the provider/core singletons and so
  * can be used from any layer without an import cycle. The typed error classes it mirrors
  * live in `core/provider/contract.ts` (ProviderError/AllProvidersFailedError/ModelNotFoundError).
+ *
+ * For raw OS/SYSCALL errors (EACCES/ENOENT/ENOSPC/…) — the other half of "no stack traces in
+ * user output" — `translateError` falls back to the system-error catalog in `user-facing.ts`
+ * whenever its own provider-shaped classification comes up empty.
  */
+
+import { translateSystemError } from "./user-facing.js";
 
 /** The friendly buckets a raw error is mapped into. */
 export type ErrorCategory =
@@ -166,6 +172,15 @@ export function translateError(err: unknown, opts: TranslateOptions = {}): Frien
   const category = classifyError(err, opts);
   const technical = rawMessage(err);
   const provider = opts.provider ?? providerOf(err);
+
+  // Before the generic "Something went wrong", consult the OS/syscall catalog: a raw EACCES/
+  // ENOENT/ENOSPC should surface its specific cause + fix, never a stack trace. Only when our
+  // provider-shaped classification found nothing (category "unknown") so a real provider error
+  // keeps its richer, provider-aware message.
+  if (category === "unknown") {
+    const sys = translateSystemError(err);
+    if (sys !== undefined) return sys;
+  }
 
   switch (category) {
     case "model_timeout":
