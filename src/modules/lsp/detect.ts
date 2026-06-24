@@ -48,11 +48,49 @@ const SKIP_DIRS: ReadonlySet<string> = new Set([
 /** Max directory entries scanned during the extension fallback (keeps detection cheap on huge trees). */
 const MAX_SCAN_ENTRIES = 2_000;
 
+/**
+ * Max distinct project directories kept in the detection cache (RC5). A long-running server can see
+ * an unbounded number of project roots over its lifetime; without a cap the cache grows forever.
+ * Bounded LRU: on overflow the least-recently-used entry is evicted. Override with
+ * `IKBI_LSP_DETECT_CACHE_MAX` (positive integer); defaults to 256.
+ */
+const DETECTION_CACHE_MAX = ((): number => {
+  const raw = Number(process.env.IKBI_LSP_DETECT_CACHE_MAX);
+  return Number.isInteger(raw) && raw > 0 ? raw : 256;
+})();
+
+// Insertion order doubles as recency order (a Map preserves it): the FIRST key is the LRU victim,
+// and a read re-inserts its key to mark it most-recently-used.
 const detectionCache = new Map<string, readonly DetectedLanguage[]>();
 
 /** Clear the per-directory detection cache (tests use this to avoid cross-test bleed). */
 export function clearDetectionCache(): void {
   detectionCache.clear();
+}
+
+/** Current number of cached directories (exposed for tests asserting the cap holds). */
+export function detectionCacheSize(): number {
+  return detectionCache.size;
+}
+
+/** LRU read: return the cached value and bump it to most-recently-used, or undefined on a miss. */
+function cacheGet(dir: string): readonly DetectedLanguage[] | undefined {
+  const value = detectionCache.get(dir);
+  if (value === undefined) return undefined;
+  detectionCache.delete(dir);
+  detectionCache.set(dir, value);
+  return value;
+}
+
+/** LRU write: insert (most-recent), evicting the least-recently-used entry once over the cap. */
+function cacheSet(dir: string, value: readonly DetectedLanguage[]): void {
+  if (detectionCache.has(dir)) {
+    detectionCache.delete(dir);
+  } else if (detectionCache.size >= DETECTION_CACHE_MAX) {
+    const lru = detectionCache.keys().next().value;
+    if (lru !== undefined) detectionCache.delete(lru);
+  }
+  detectionCache.set(dir, value);
 }
 
 /**
@@ -61,7 +99,7 @@ export function clearDetectionCache(): void {
  * per directory. Ordering is stable: typescript, python, go, rust.
  */
 export function detectLanguages(rootDir: string): readonly DetectedLanguage[] {
-  const cached = detectionCache.get(rootDir);
+  const cached = cacheGet(rootDir);
   if (cached !== undefined) return cached;
 
   const found = new Map<LspLanguage, string>();
@@ -82,7 +120,7 @@ export function detectLanguages(rootDir: string): readonly DetectedLanguage[] {
     .filter((lang) => found.has(lang))
     .map((lang) => ({ language: lang, marker: found.get(lang) as string }));
 
-  detectionCache.set(rootDir, result);
+  cacheSet(rootDir, result);
   return result;
 }
 

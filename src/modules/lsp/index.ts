@@ -24,7 +24,7 @@ import { detectLanguages } from "./detect.js";
 import { parseCargo, parseGoVet, parsePyright, parseTsc } from "./parsers.js";
 
 export type { LspDiagnostic, LspDiagnosticReport, LspLanguage, LspRunResult, DetectedLanguage } from "./contract.js";
-export { detectLanguages, clearDetectionCache } from "./detect.js";
+export { detectLanguages, clearDetectionCache, detectionCacheSize } from "./detect.js";
 export { parseTsc, parsePyright, parseGoVet, parseCargo } from "./parsers.js";
 
 /** What the diagnostic runner needs: the governed executor + the run's identity. */

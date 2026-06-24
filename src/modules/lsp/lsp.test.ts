@@ -15,6 +15,7 @@ import {
   clearDetectionCache,
   countDiagnostics,
   detectLanguages,
+  detectionCacheSize,
   formatLspReport,
   parseCargo,
   parseGoVet,
@@ -70,6 +71,53 @@ test("detectLanguages: caches per directory (second call returns same ref)", () 
 test("detectLanguages: empty dir detects nothing", () => {
   const dir = tmp();
   assert.deepEqual(detectLanguages(dir), []);
+});
+
+// ---- cache cap (RC5) ----
+
+test("detectLanguages: cache is bounded and evicts the least-recently-used entry", () => {
+  clearDetectionCache();
+  // The default cap is 256. Detecting on non-existent dirs still caches an (empty) result,
+  // so we can overflow the cache without touching the filesystem.
+  const CAP = 256;
+  const overflow = CAP + 50;
+  for (let i = 0; i < overflow; i += 1) detectLanguages(`/ikbi-nonexistent-root/${i}`);
+  // The cap holds — the cache never grows past CAP regardless of how many roots were seen.
+  assert.ok(detectionCacheSize() <= CAP, `cache size ${detectionCacheSize()} must be <= ${CAP}`);
+  assert.equal(detectionCacheSize(), CAP);
+});
+
+test("detectLanguages: a cached result still works after eviction churn (content stays correct)", () => {
+  const dir = tmp(); // clears the cache
+  writeFileSync(join(dir, "tsconfig.json"), "{}");
+  detectLanguages(dir); // cache it
+  // Churn FAR more than the cap through OTHER directories — `dir` is eventually evicted (LRU) and
+  // re-detected on the next read. Either way the answer is correct: detection still works.
+  for (let i = 0; i < 300; i += 1) detectLanguages(`/ikbi-nonexistent-churn/${i}`);
+  const again = detectLanguages(dir);
+  assert.deepEqual(again.map((d) => d.language), ["typescript"]);
+  assert.ok(detectionCacheSize() <= 256, "cache stays bounded through the churn");
+});
+
+test("detectLanguages: an actively-used entry survives churn under the cap (same cached ref)", () => {
+  const dir = tmp(); // clears the cache
+  writeFileSync(join(dir, "tsconfig.json"), "{}");
+  const first = detectLanguages(dir);
+  // Churn fewer than the cap (256) through OTHER dirs; `dir` is never evicted, so a re-read returns
+  // the SAME cached reference (proving reads hit the cache rather than recompute).
+  for (let i = 0; i < 200; i += 1) detectLanguages(`/ikbi-nonexistent-warm/${i}`);
+  assert.equal(detectLanguages(dir), first, "the un-evicted entry is served from cache (same ref)");
+});
+
+test("detectLanguages: the LRU victim is re-detected (eviction actually frees the slot)", () => {
+  clearDetectionCache();
+  const victim = "/ikbi-nonexistent-victim/first";
+  detectLanguages(victim); // oldest entry
+  // Insert exactly CAP more distinct roots — this evicts `victim` (it was the LRU and never re-read).
+  for (let i = 0; i < 256; i += 1) detectLanguages(`/ikbi-nonexistent-fill/${i}`);
+  // Re-reading the victim is a cache MISS that recomputes + re-inserts, evicting a newer entry in turn.
+  detectLanguages(victim);
+  assert.equal(detectionCacheSize(), 256, "size stays pinned at the cap after re-detecting the victim");
 });
 
 // ---- parsers ----

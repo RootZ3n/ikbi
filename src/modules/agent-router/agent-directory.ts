@@ -48,6 +48,18 @@ export interface AgentDirectoryResult {
   readonly dir: string;
 }
 
+/**
+ * Max number of agent files (`*.yaml` / `*.yml` / `*.json`) scanned from one agents directory (RC6).
+ * A directory stuffed with thousands of persona files would make every `ikbi agents` / `/agent`
+ * lookup read + parse all of them. Over the limit, the scan fails CLEANLY (`AGENT_DIRECTORY_TOO_LARGE`)
+ * rather than silently loading an arbitrary subset. Override with `IKBI_AGENT_DIR_MAX_FILES`
+ * (positive integer); defaults to 100.
+ */
+export const MAX_AGENT_FILES = ((): number => {
+  const raw = Number(process.env.IKBI_AGENT_DIR_MAX_FILES);
+  return Number.isInteger(raw) && raw > 0 ? raw : 100;
+})();
+
 /** The conventional location of custom agents under a repo root. */
 export function agentsDir(repoRoot: string): string {
   return join(repoRoot, ".ikbi", "agents");
@@ -57,7 +69,7 @@ export function agentsDir(repoRoot: string): string {
  * Load all custom agents from `<repoRoot>/.ikbi/agents/`. Returns the valid agents plus a list of
  * per-file errors. A missing directory is not an error — it yields an empty result.
  */
-export function loadCustomAgents(repoRoot: string): AgentDirectoryResult {
+export function loadCustomAgents(repoRoot: string, maxFiles: number = MAX_AGENT_FILES): AgentDirectoryResult {
   const dir = agentsDir(repoRoot);
   if (!existsSync(dir)) return { agents: [], errors: [], dir };
 
@@ -66,6 +78,18 @@ export function loadCustomAgents(repoRoot: string): AgentDirectoryResult {
     names = readdirSync(dir).filter((n) => /\.(ya?ml|json)$/i.test(n)).sort();
   } catch (e) {
     return { agents: [], errors: [{ file: dir, error: `could not read directory: ${msg(e)}` }], dir };
+  }
+
+  // RC6: fail CLOSED on an oversized directory rather than silently loading an arbitrary subset.
+  if (names.length > maxFiles) {
+    return {
+      agents: [],
+      errors: [{
+        file: dir,
+        error: `AGENT_DIRECTORY_TOO_LARGE: ${names.length} agent files in "${dir}" exceeds the limit of ${maxFiles} (set IKBI_AGENT_DIR_MAX_FILES to change)`,
+      }],
+      dir,
+    };
   }
 
   const agents: CustomAgent[] = [];

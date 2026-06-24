@@ -8,7 +8,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { agentsDir, findCustomAgent, loadCustomAgents, parseSimpleYaml, validateAgent } from "./agent-directory.js";
+import { agentsDir, findCustomAgent, loadCustomAgents, MAX_AGENT_FILES, parseSimpleYaml, validateAgent } from "./agent-directory.js";
 
 function repoWithAgents(files: Record<string, string>): string {
   const repo = mkdtempSync(join(tmpdir(), "ikbi-agents-"));
@@ -63,6 +63,45 @@ test("loadCustomAgents: missing directory yields empty result, no error", () => 
   const res = loadCustomAgents(repo);
   assert.deepEqual(res.agents, []);
   assert.deepEqual(res.errors, []);
+});
+
+// ── Directory size limit (RC6) ──────────────────────────────────────────────────
+
+test("loadCustomAgents: a directory at the limit loads normally", () => {
+  const files: Record<string, string> = {};
+  for (let i = 0; i < 3; i += 1) files[`a${i}.json`] = JSON.stringify({ name: `a${i}`, system_prompt: "p" });
+  const repo = repoWithAgents(files);
+  const res = loadCustomAgents(repo, 3); // exactly at the limit
+  assert.equal(res.errors.length, 0);
+  assert.equal(res.agents.length, 3);
+});
+
+test("loadCustomAgents: a directory OVER the limit fails clearly and loads nothing", () => {
+  const files: Record<string, string> = {};
+  for (let i = 0; i < 4; i += 1) files[`a${i}.json`] = JSON.stringify({ name: `a${i}`, system_prompt: "p" });
+  const repo = repoWithAgents(files);
+  const res = loadCustomAgents(repo, 3); // 4 files, limit 3
+  assert.equal(res.agents.length, 0, "no partial load when over the limit");
+  assert.equal(res.errors.length, 1);
+  const err = res.errors[0]!;
+  assert.match(err.error, /AGENT_DIRECTORY_TOO_LARGE/);
+  assert.match(err.error, /limit of 3/);          // includes the limit
+  assert.equal(err.file, agentsDir(repo));          // includes the directory
+});
+
+test("loadCustomAgents: non-agent files do NOT count toward the limit", () => {
+  const files: Record<string, string> = {
+    "keep.json": JSON.stringify({ name: "keep", system_prompt: "p" }),
+  };
+  for (let i = 0; i < 50; i += 1) files[`notes${i}.txt`] = "ignore me"; // not yaml/json
+  const repo = repoWithAgents(files);
+  const res = loadCustomAgents(repo, 3); // only 1 agent file → under the limit
+  assert.equal(res.errors.length, 0);
+  assert.equal(res.agents.length, 1);
+});
+
+test("MAX_AGENT_FILES default is a sane positive number", () => {
+  assert.ok(Number.isInteger(MAX_AGENT_FILES) && MAX_AGENT_FILES > 0);
 });
 
 test("loadCustomAgents: a malformed file is reported, the rest still load", () => {
