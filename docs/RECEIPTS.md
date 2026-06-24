@@ -112,6 +112,14 @@ receipts: gap detected at seq 7 (found seq 8 after seq 5) — log may be corrupt
 | `workspace.discard` | Workspace discarded (worktree removed) |
 | `workspace.undo` | Undo of a promoted change |
 | `model.invoke` | Model API call (role model invocations) |
+| `worker.tool_call_stalled` | A builder stream stalled mid tool-call — the partial call was NOT executed (redacted: tool name + partial-arg byte count only) |
+| `chat.tool_call_stalled` | A chat (REPL) stream stalled mid tool-call — the partial call was NOT executed |
+| `chat.finish_reason_flagged` | A chat round finished with a flagged reason (e.g. `content_filter`, truncation) — output may be incomplete; the finishReason is in `metadata` |
+
+> **Mission Control note:** the three rows above were added in the RC-1 hardening pass.
+> They are ordinary append-only receipts (`outcome.status: "partial"`, no `changes`), so any
+> reader that tolerates unknown `operation` strings is unaffected; dashboards that enumerate
+> operations may want to add these to their legend.
 
 ## The `changes` array (reversibility hook)
 
