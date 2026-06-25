@@ -61,7 +61,7 @@ import { builder, createBuilder, MAX_TOOL_ITERATIONS } from "./builder.js";
 import { createPatchsmith } from "./patchsmith.js";
 import { runTournament } from "./tournament.js";
 import type { CandidateRun, CandidateSpec, ShadowVerification, TournamentEngine, TournamentEvent } from "./tournament.js";
-import { captureStreamedStdout, committedPackageJsonDiff, parseChecksEnv, parseTestCount, PROJECT_MANIFESTS, resolveChecks, resolveCheckTimeoutMs, workingTreePackageJsonDiff, workingTreePlanningDiff } from "./checks.js";
+import { captureStreamedStdout, classifyUnresolvableReason, committedPackageJsonDiff, parseChecksEnv, parseTestCount, PROJECT_MANIFESTS, resolveChecks, resolveCheckTimeoutMs, UNRESOLVABLE_NEXT_STEPS, type VerificationKind, workingTreePackageJsonDiff, workingTreePlanningDiff } from "./checks.js";
 import { builderModel, competitiveBuilderModels } from "./role-models.js";
 import { createCritic, critic } from "./critic.js";
 import { createRefuter, refuter, proposalFromFinding, type RefuterFinding } from "./refuter.js";
@@ -102,6 +102,7 @@ import {
   workerFixLoopCompleted,
   workerCriticFixLoopCompleted,
   workerEscalationRetried,
+  workerEscalationSuppressed,
 } from "./events.js";
 import { CONTRACT_VERSION, toOutcomeStatus, WorkerError, WORKER_ROLES } from "./contract.js";
 import { fireStopHooks } from "../hooks/index.js";
@@ -1360,13 +1361,36 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     ) {
       const diagnostic = diagnoseBareRepo(task.targetRepo);
       if (diagnostic !== undefined) {
+        // CLASSIFY: a no-manifest target is CHECKS_UNRESOLVABLE — fail closed with the structured
+        // verdict (NOT a model failure). This pre-allocation path already escalates nothing (it
+        // returns before any model call) and records no trust, satisfying the no-escalate /
+        // no-demote contract; the `verification` field + receipt make the classification explicit.
+        const concise = diagnostic.split("\n").slice(0, 2).join(" ");
         events.publish(
           workerFailed.create(
             { taskId: task.taskId, reason: diagnostic },
             { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } },
           ),
         );
-        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason: diagnostic };
+        await receipts.append(
+          {
+            operation: "worker.checks_unresolvable",
+            outcome: { status: "success", detail: `checks_unresolvable: ${concise}` },
+            requestId: task.taskId,
+            metadata: { taskId: task.taskId, targetRepo: task.targetRepo, verificationKind: "checks_unresolvable", reason: concise, escalated: false, trustPenalized: false, nextSteps: [...UNRESOLVABLE_NEXT_STEPS] },
+            project: task.targetRepo,
+          },
+          parentIdentity,
+        );
+        return {
+          contractVersion: CONTRACT_VERSION,
+          taskId: task.taskId,
+          outcome: "rejected",
+          roles: [],
+          promoted: false,
+          reason: diagnostic,
+          verification: { kind: "checks_unresolvable", reason: concise, nextSteps: [...UNRESOLVABLE_NEXT_STEPS] },
+        };
       }
     }
 
@@ -1460,6 +1484,23 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // pro (auto-escalation). This flag caps the cheap retry at one attempt so it never loops.
     let cheapModelRetryAttempted = false;
     let escalationRetryOutcome: WorkerResult["escalationRetry"];
+    // UNVERIFIABLE TARGET: set when the post-build worktree has NO derivable checks (no manifest,
+    // unsupported project, no IKBI_CHECKS). A stronger model cannot fix a missing verifier, so this
+    // SUPPRESSES escalation and the per-build trust penalty, and fails the run closed with an
+    // actionable diagnostic — never a misleading "model failed" + a wasted pro retry.
+    let checksUnverifiable: { kind: VerificationKind; reason: string } | undefined;
+    // Authoritative, post-build, mode-INDEPENDENT classifier: does the CURRENT worktree have a
+    // derivable verifier? Uses the SAME `resolveChecks` the verifier/builder use (which honors
+    // IKBI_CHECKS and the project-root guard), so a greenfield build that CREATED a manifest is
+    // resolvable, an explicit IKBI_CHECKS override is resolvable, and only a genuinely
+    // checks-less target classifies unverifiable. Off when the project-root guard is off (the
+    // default resolver always returns checks, so "unverifiable" is not a concept there).
+    const classifyUnverifiableTarget = (): { kind: VerificationKind; reason: string } | undefined => {
+      if (!enforceProjectRoot) return undefined;
+      const r = resolveChecks(workspace.path);
+      if (r.ok) return undefined;
+      return { kind: classifyUnresolvableReason(r.reason), reason: r.reason };
+    };
     let overall: WorkerResult["outcome"] = "success";
     let killedReason: string | undefined;
     // FIX A: capture a worker spawned identity for per-build trust recording.
@@ -2095,6 +2136,42 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           escalationOutcome = esc;
         }
 
+        // ── UNVERIFIABLE-TARGET ESCALATION SUPPRESSION (fail-closed, NO model swap) ───
+        // A builder failure on a target with NO derivable checks (no manifest, unsupported project,
+        // no IKBI_CHECKS) is NOT a model failure: a stronger model cannot make a missing verifier
+        // appear. Detect it authoritatively from the post-build worktree and SUPPRESS escalation
+        // entirely — no cheap retry, no pro swap. The run fails closed with an actionable diagnostic
+        // (attached at the terminal) and the per-build trust penalty is suppressed there too. This
+        // runs BEFORE the escalation gate, which then no-ops on `checksUnverifiable === undefined`.
+        if (
+          role === "builder" &&
+          (result.outcome === "failure" || escSignals.builderFailed) &&
+          checksUnverifiable === undefined
+        ) {
+          const unverifiable = classifyUnverifiableTarget();
+          if (unverifiable !== undefined) {
+            checksUnverifiable = unverifiable;
+            const failedDetail = (result.detail ?? {}) as Record<string, unknown>;
+            const failedModel = typeof failedDetail.model === "string" ? failedDetail.model : singleBuilderModel;
+            events.publish(
+              workerEscalationSuppressed.create(
+                { taskId: task.taskId, fromModel: failedModel, reason: unverifiable.reason, verificationKind: unverifiable.kind },
+                { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.escalation.suppressed", runId: task.taskId } },
+              ),
+            );
+            await receipts.append(
+              {
+                operation: "worker.escalation.suppressed",
+                outcome: { status: "success", detail: `escalation suppressed — ${unverifiable.kind}: ${unverifiable.reason}` },
+                requestId: task.taskId,
+                metadata: { taskId: task.taskId, workspaceId: workspace.id, fromModel: failedModel, verificationKind: unverifiable.kind, reason: unverifiable.reason, nextSteps: [...UNRESOLVABLE_NEXT_STEPS] },
+                project: task.targetRepo,
+              },
+              parentIdentity,
+            );
+          }
+        }
+
         // ── BUILD-MODE ESCALATION RETRY (the wired follow-up to observe-only) ─────────
         // DUAL-MODEL BUILDER PATTERN: flash attempt 1 → flash attempt 2 (cheap retry with
         // feedback) → pro (auto-escalation). The cheap model gets ONE retry before the mid-tier
@@ -2103,10 +2180,13 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         // The gate fires on EITHER `result.outcome === "failure"` OR `escSignals.builderFailed`
         // (which is set when the builder writes 0 files even if it called done). This closes
         // the gap where a cheap model produces nothing but the outcome gate blocked escalation.
+        // SUPPRESSED on an unverifiable target (`checksUnverifiable`): a stronger model cannot fix
+        // a missing manifest/verifier, so escalating would waste a paid pro run, guaranteed to fail.
         const decision = escObservation.decision;
         if (
           role === "builder" &&
           (result.outcome === "failure" || escSignals.builderFailed) &&
+          checksUnverifiable === undefined &&
           !escalationAttempted &&
           decision !== undefined &&
           decision.escalate &&
@@ -2397,6 +2477,14 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       throw err;
     }
 
+    // UNVERIFIABLE TARGET (authoritative, post-loop): if the run did not succeed, classify the
+    // worktree's verifiability NOW — while the workspace still exists on disk (the promote/discard
+    // terminals below may remove it, and resolveChecks reads the filesystem). Covers failure paths
+    // that did not pass through the builder escalation gate (e.g. a non-builder failure). Only when
+    // overall is non-success: a successful build is verifiable by definition. `??=` preserves any
+    // classification the escalation-suppression block already made.
+    if (overall !== "success") checksUnverifiable ??= classifyUnverifiableTarget();
+
     // Terminal: a KILL halted the run mid-loop ⇒ stop cleanly (NEVER promote a half-run),
     // surface the kill, return. The workspace is RETAINED (not discarded) so its partial work
     // survives for inspection — `ikbi workspace ls` shows it; `ikbi workspace discard <id>` or
@@ -2563,6 +2651,13 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       if (overall === "success") overall = "rejected";
     }
 
+    // UNVERIFIABLE-TARGET REASON: when the run failed closed because no checks could be derived,
+    // replace the generic role-outcome reason with a concise, actionable one. The full operator
+    // next-steps are carried on `verification` + rendered by the CLI; this keeps receipts readable.
+    if (checksUnverifiable !== undefined && overall !== "success") {
+      reason = `unverifiable target (${checksUnverifiable.kind}): ${checksUnverifiable.reason}`;
+    }
+
     // OBSERVABILITY (E): which paths ACTUALLY ran — the role's own report when present, else the
     // wired decision. Always present on the result so the CLI summary + receipts can show them.
     const ranVerificationMode = actualVerificationMode ?? verificationMode;
@@ -2578,6 +2673,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       verificationMode: ranVerificationMode,
       retrievalMode: ranRetrievalMode,
       costUsd: runCost(),
+      ...(checksUnverifiable !== undefined && overall !== "success"
+        ? { verification: { kind: checksUnverifiable.kind, reason: checksUnverifiable.reason, nextSteps: [...UNRESOLVABLE_NEXT_STEPS] } }
+        : {}),
       ...(escalationOutcome !== undefined ? { escalation: escalationOutcome } : {}),
       ...(escalationRetryOutcome !== undefined ? { escalationRetry: escalationRetryOutcome } : {}),
     };
@@ -2648,6 +2746,33 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       parentIdentity,
     );
 
+    // UNVERIFIABLE-TARGET CLASSIFICATION RECEIPT (post-build path, where the builder actually ran —
+    // the WO2 preflight path emits its own `worker.checks_unresolvable` and returns before here). One
+    // receipt that records the classification, reason, next steps, and that BOTH escalation and the
+    // trust penalty were suppressed — the single audit row that says "this was not a model failure".
+    if (checksUnverifiable !== undefined && overall !== "success") {
+      await receipts.append(
+        {
+          operation: "worker.checks_unresolvable",
+          outcome: { status: "success", detail: `${checksUnverifiable.kind}: ${checksUnverifiable.reason}` },
+          requestId: task.taskId,
+          metadata: {
+            taskId: task.taskId,
+            workspaceId: workspace.id,
+            targetRepo: task.targetRepo,
+            verificationKind: checksUnverifiable.kind,
+            reason: checksUnverifiable.reason,
+            escalationSuppressed: true,
+            trustSuppressed: true,
+            modelFailure: false,
+            nextSteps: [...UNRESOLVABLE_NEXT_STEPS],
+          },
+          project: task.targetRepo,
+        },
+        parentIdentity,
+      );
+    }
+
     // FIX A: record ONE trust outcome per BUILD (not per role). Uses the helper
     // which handles suppression for operator/governance decisions (Fix 1B).
     // FIX 4.2 backstop: if the build failed and ALL failures were performance-class
@@ -2656,7 +2781,15 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     let buildTrustStatus = toOutcomeStatus(overall);
     let buildTrustSuppressed = trustSuppressed;
     let buildTrustReason = trustSuppressReason;
-    if (overall === "failure" && !trustSuppressed) {
+    // UNVERIFIABLE TARGET: a fail-closed terminal because no checks could be derived is NOT a worker
+    // quality/code failure — the model could not have succeeded against a missing verifier. SUPPRESS
+    // the trust signal (no demotion, no consecutive-failure cascade) and receipt the reason. Wins
+    // over the performance-class backstop below (it is the more specific, non-model cause).
+    if (checksUnverifiable !== undefined && overall !== "success" && !buildTrustSuppressed) {
+      buildTrustSuppressed = true;
+      buildTrustReason = `verification ${checksUnverifiable.kind} (no derivable checks) — not a worker quality failure`;
+    }
+    if (checksUnverifiable === undefined && overall === "failure" && !trustSuppressed) {
       const failedRoles = results.filter((r) => r.outcome === "failure");
       const allPerformanceFailures = failedRoles.every((r) => {
         const d = (r.detail ?? {}) as Record<string, unknown>;

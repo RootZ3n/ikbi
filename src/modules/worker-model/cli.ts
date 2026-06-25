@@ -47,6 +47,7 @@ import { loadRepoRegistry } from "../../core/repo-registry.js";
 import type { CognitionDecision, CognitionLayer } from "../cognition-layer/contract.js";
 import { loadProjectMemory, type ProjectMemoryResult } from "./project-memory.js";
 import { isBuildTier, resolveTierPreset, BUILD_TIERS, type BuildTier } from "./tier-presets.js";
+import { unresolvableMessage } from "./checks.js";
 import { createProductionGovernor } from "../memory-governor/create.js";
 
 function errMsg(e: unknown): string {
@@ -183,6 +184,21 @@ export function formatFailureDetail(r: WorkerResult): string {
   const ranRoles = new Set(r.roles.map((x) => x.role));
   const skipped = ALL_ROLES.filter((role) => !ranRoles.has(role));
   if (skipped.length > 0) lines.push(`  Skipped: ${skipped.join(", ")} (not run)`);
+
+  // UNVERIFIABLE TARGET: a fail-closed terminal because ikbi could not DERIVE any checks (no
+  // manifest, unsupported project, no IKBI_CHECKS) — NOT a model/code failure. Render the actionable
+  // diagnostic FIRST and skip the generic role reason: the operator needs the "how to fix" steps,
+  // not a confusing "the builder failed". (Model escalation was deliberately suppressed on this run.)
+  if (r.verification !== undefined && (r.verification.kind === "checks_unresolvable" || r.verification.kind === "unsupported_project")) {
+    // The shared diagnostic: WHY (no runnable checks), that this is NOT a model failure (escalation
+    // suppressed because a stronger model cannot fix a missing verification contract), and HOW to fix.
+    for (const l of unresolvableMessage(r.verification.kind, r.verification.reason).split("\n")) {
+      lines.push(l.length > 0 ? `  ${l}` : "");
+    }
+    if (r.workspaceId !== undefined) lines.push(`  Workspace: ${r.workspaceId}`);
+    lines.push(`  Undo available: no (build was not promoted)`);
+    return `\n${lines.join("\n")}\n`;
+  }
 
   const reason = failedRole?.summary ?? r.reason;
   if (reason !== undefined && reason.trim().length > 0) {
@@ -696,6 +712,9 @@ function summarize(r: WorkerResult): string {
       roles: r.roles.map((x) => ({ role: x.role, outcome: x.outcome })),
       ...(r.verificationMode !== undefined ? { verification: r.verificationMode } : {}),
       ...(r.retrievalMode !== undefined ? { retrieval: r.retrievalMode } : {}),
+      // Structural fail-closed classification (no derivable checks). Distinct from `verification`
+      // (the MODE) — these say WHY the run failed closed and that escalation was suppressed.
+      ...(r.verification !== undefined ? { verification_kind: r.verification.kind, verification_reason: r.verification.reason, escalation_suppressed: true } : {}),
       cost_usd: r.costUsd ?? 0,
       ...(r.reason !== undefined ? { reason: r.reason } : {}),
     },

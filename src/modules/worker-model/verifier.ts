@@ -53,7 +53,7 @@ import type { GovernedExec } from "../governed-exec/index.js";
 // The check SET is the single shared definition (worker-model/checks.ts) — the SAME
 // constant the builder's in-loop run_checks imports, so the builder previews the
 // verifier's EXACT checks. Behavior here is unchanged; the constant just relocated.
-import { type CheckResult, type ChecksResolution, mapExec, parseChecksEnv, resolveCheckTimeoutMs, VERIFIER_CHECKS } from "./checks.js";
+import { type CheckResult, type ChecksResolution, classifyUnresolvableReason, mapExec, parseChecksEnv, resolveCheckTimeoutMs, UNRESOLVABLE_NEXT_STEPS, VERIFIER_CHECKS } from "./checks.js";
 import type { RoleFn, RoleResult } from "./contract.js";
 import { runQualityChecks, type QualityResult } from "./quality-checks.js";
 // LADDER MODE (opt-in, IKBI_VERIFY=ladder): package/impact-aware verification. These are
@@ -370,6 +370,22 @@ function untrusted(reason: string): RoleResult {
 /** A RED verdict — no valid project to check (wrong repo / no manifest). Fail-closed, never a vacuous pass. */
 function red(reason: string): RoleResult {
   return { role: "verifier", outcome: "failure", summary: reason, detail: { verdict: "fail", reason, checks: [] } };
+}
+
+/**
+ * An UNRESOLVABLE verdict — checks could not be DERIVED for this target (no manifest, no recognized
+ * project type, no runnable check command, no IKBI_CHECKS). Distinct from `red` (checks ran and
+ * failed): a stronger model cannot fix a MISSING verifier, so the orchestrator MUST NOT escalate on
+ * this verdict (it keys off `detail.verificationKind`). Fail-closed — never a vacuous pass. The
+ * summary keeps the "RED" marker so existing RED-fail-closed assertions still hold.
+ */
+function unresolvable(reason: string, kind: "checks_unresolvable" | "unsupported_project"): RoleResult {
+  return {
+    role: "verifier",
+    outcome: "failure",
+    summary: `verification RED (${kind}): ${reason}`,
+    detail: { verdict: "unresolvable", verificationKind: kind, reason, checks: [], nextSteps: [...UNRESOLVABLE_NEXT_STEPS] },
+  };
 }
 
 // Files whose modification can weaken verification (neuter tsconfig strictness, exclude broken
@@ -862,7 +878,7 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
     // NEVER pass vacuously by walking up into ikbi's workspace).
     const resolveChecks = deps.resolveChecks ?? ((): ChecksResolution => ({ ok: true, checks: VERIFIER_CHECKS, source: "default" }));
     const resolved = resolveChecks(ctx.workspace.path);
-    if (!resolved.ok) return red(`verification RED: ${resolved.reason}`);
+    if (!resolved.ok) return unresolvable(resolved.reason, classifyUnresolvableReason(resolved.reason));
     const checkSet = resolved.checks;
 
     // SAME per-check budget as the ladder path and the builder's run_checks — without it the
@@ -974,7 +990,7 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
 
       const configuredChecks = parseChecksEnv(runEnv.IKBI_CHECKS);
       if (configuredChecks === "malformed") {
-        return red("verification RED (ladder): IKBI_CHECKS is malformed (expected a non-empty JSON array of {name,command,args}); fix IKBI_CHECKS or unset it to use ladder planning");
+        return unresolvable("IKBI_CHECKS is malformed (expected a non-empty JSON array of {name,command,args}); fix IKBI_CHECKS or unset it to use ladder planning", "checks_unresolvable");
       }
 
       let plan: VerificationPlan;

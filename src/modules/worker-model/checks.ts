@@ -314,6 +314,78 @@ export function resolveChecks(worktreeReal: string, env: NodeJS.ProcessEnv = pro
 }
 
 /**
+ * VERIFICATION CLASSIFICATION — the load-bearing distinction this module exists to draw.
+ *
+ *   checks_green        checks were derived, ran, and PASSED.
+ *   checks_red          checks were derived and ran, but FAILED. A legitimate build/model failure
+ *                       that MAY enter the retry/escalation policy (a stronger model can fix red code).
+ *   checks_unresolvable ikbi could NOT derive or run any meaningful verifier — no manifest, no
+ *                       recognized project type, no runnable check command, no IKBI_CHECKS override.
+ *                       A stronger model cannot fix a MISSING manifest, so this MUST NOT escalate;
+ *                       it fails closed with an actionable diagnostic.
+ *   unsupported_project a project manifest exists but ikbi has no check set for it (e.g. bun-only,
+ *                       or a manifest type with no derivable checks). Same fail-closed, no-escalate
+ *                       handling as checks_unresolvable.
+ *   environment_missing a required tool/runtime was absent (reserved; classified elsewhere).
+ *   tool_limitation     the verification TOOL (not the project) could not parse/run the check.
+ */
+export type VerificationKind =
+  | "checks_green"
+  | "checks_red"
+  | "checks_unresolvable"
+  | "environment_missing"
+  | "tool_limitation"
+  | "unsupported_project";
+
+/**
+ * Classify a `resolveChecks` fail-closed reason (the `{ ok: false, reason }` branch) into the
+ * no-verifier verdict kind. A manifest that EXISTS but has no derivable check set (or an
+ * unsupported package manager) is UNSUPPORTED_PROJECT; the absence of any derivable verifier is
+ * CHECKS_UNRESOLVABLE. Both suppress escalation and fail closed — the split is for the diagnostic.
+ */
+export function classifyUnresolvableReason(reason: string): "checks_unresolvable" | "unsupported_project" {
+  if (/has a manifest but no recognized|not a supported package manager/i.test(reason)) {
+    return "unsupported_project";
+  }
+  return "checks_unresolvable";
+}
+
+/** Actionable operator next-steps shown when a target is unverifiable (no derivable checks). */
+export const UNRESOLVABLE_NEXT_STEPS: readonly string[] = [
+  "add a project manifest (package.json / pyproject.toml / Cargo.toml / go.mod / project.godot)",
+  "add a test/check script the verifier can run",
+  'set IKBI_CHECKS="<command>" to declare the checks explicitly',
+  "use an explicit bootstrap task if the goal is to initialize a project",
+];
+
+/**
+ * The standard fail-closed, OPERATOR-actionable diagnostic for an unverifiable target. Surfaced on
+ * the run result + receipt + CLI so the operator sees WHY the build failed closed (no runnable
+ * checks), that this is NOT a model failure (escalation was suppressed), and HOW to make the target
+ * verifiable. `kind` selects the "Detected" framing: UNSUPPORTED_PROJECT means a manifest WAS found
+ * but ikbi has no check set for it; CHECKS_UNRESOLVABLE means nothing verifiable was found at all.
+ */
+export function unresolvableMessage(kind: string, reason: string): string {
+  const detected =
+    kind === "unsupported_project"
+      ? ["a project manifest was found, but ikbi has no check set for this project type", `details: ${reason}`, "no IKBI_CHECKS override"]
+      : ["no recognized project manifest or verifier", "no runnable check script", "no IKBI_CHECKS override"];
+  return [
+    "ikbi could not verify this target because no runnable checks were found.",
+    "",
+    `Classification: ${kind}`,
+    "",
+    "Detected:",
+    ...detected.map((d) => `  - ${d}`),
+    "",
+    "This is not a model failure. Escalation was suppressed because a stronger model cannot fix a missing verification contract.",
+    "",
+    "Next steps:",
+    ...UNRESOLVABLE_NEXT_STEPS.map((s) => `  - ${s}`),
+  ].join("\n");
+}
+
+/**
  * The WORKING-TREE diff of package.json files vs base — what the script-integrity guard MUST
  * inspect. The verifier runs BEFORE the build is committed, so `git diff <baseRef>` (base vs the
  * current working tree) captures the builder's UNCOMMITTED edits to tracked package.json files,

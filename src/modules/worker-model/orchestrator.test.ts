@@ -2317,3 +2317,121 @@ test("refuter (enabled) proposes NO corrections when the build survives", async 
 
   assert.equal(proposals.length, 0, "a survived build files no corrections");
 });
+
+// ── UNVERIFIABLE TARGET: no derivable checks ⇒ NO escalation, NO trust demotion ──────────────────
+// A builder failure on a target whose worktree has NO derivable verifier (a manifest exists so the
+// WO2 pre-allocation fast-fail does NOT fire, but resolveChecks still fails closed — e.g. deno.json,
+// which has no ikbi check set) must NOT escalate to a stronger model: the model cannot conjure a
+// missing verifier. It fails closed with the CHECKS_UNRESOLVABLE/UNSUPPORTED_PROJECT classification
+// and the per-build trust penalty is suppressed (not a worker quality failure).
+
+test("unverifiable target (manifest, no derivable checks) + builder failure → NO escalation, classified, trust suppressed", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-unverif-orch-"));
+  try {
+    // deno.json: a recognized manifest (passes the WO2 fast-fail) with NO derivable ikbi check set.
+    writeFileSync(join(dir, "deno.json"), "{}");
+    const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+    const ws = fakeWorkspaces(true);
+    const handle = { ...ws.handle, path: dir };
+    const workspaces = { ...ws.workspaces, allocate: async () => handle };
+    const tr = fakeTrust();
+    const rc = fakeReceipts();
+    const bus = fakeBus();
+    const cap = capturingRoles();
+    const builderGoals: string[] = [];
+    const roles: Partial<Record<WorkerRole, RoleFn>> = {
+      ...cap.roles,
+      builder: async (ctx: RoleContext): Promise<RoleResult> => {
+        builderGoals.push(ctx.task.goal);
+        return { role: "builder", outcome: "failure", summary: "flash failed", detail: { filesWritten: ["hello.txt"] } };
+      },
+    };
+    const orch = createOrchestrator(
+      baseDeps({ resolveIdentity, roleClaim, roles, workspaces, trust: tr.trust, receipts: rc.receipts, events: bus.bus, enforceProjectRoot: true }),
+    );
+    const result = await orch.run({ taskId: "t-unverif-orch", targetRepo: dir, goal: "make a tiny change", fallbackModel: "deepseek-v4-pro" }, parentCtx);
+
+    // NO escalation: the builder ran exactly once — no cheap retry, no pro swap.
+    assert.equal(builderGoals.length, 1, "builder ran once — escalation suppressed");
+    assert.ok(!builderGoals.some((g) => g.includes("[retry]") || g.includes("[escalation]")), "no retry/escalation goal injected");
+    assert.equal(result.escalationRetry, undefined, "no escalationRetry was attempted");
+
+    // Classified as a structural fail-closed (NOT a model failure / NOT a success).
+    assert.equal(result.outcome, "failure", "fail-closed — never a success");
+    assert.equal(result.promoted, false);
+    assert.equal(result.verification?.kind, "unsupported_project", "deno.json → unsupported_project");
+    assert.ok((result.verification?.nextSteps?.length ?? 0) > 0, "actionable next steps surfaced");
+
+    // Observability: the suppression event fired.
+    assert.ok(bus.sent.some((e) => e.type === "worker.escalation.suppressed"), "emitted worker.escalation.suppressed");
+
+    // Trust: the worker was NOT demoted — recordOutcome was never called with a failure for it.
+    assert.ok(!tr.calls.some((c) => c.operation === "worker.build" && c.status === "failure"), "no worker.build failure recorded — trust not demoted");
+    assert.ok(rc.calls.some((c) => c.operation === "worker.checks_unresolvable"), "classification receipted (post-build path)");
+    assert.ok(rc.calls.some((c) => c.operation === "worker.trust.signal_suppressed"), "trust suppression receipted");
+    assert.ok(rc.calls.some((c) => c.operation === "worker.escalation.suppressed"), "escalation suppression receipted");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("RESOLVABLE target (real package.json) + builder failure → escalation STILL fires (regression guard)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-resolvable-orch-"));
+  try {
+    writeFileSync(join(dir, "package.json"), JSON.stringify({ name: "t", scripts: { test: "node --test" } }));
+    writeFileSync(join(dir, "pnpm-lock.yaml"), "lockfileVersion: 9\n");
+    const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+    const ws = fakeWorkspaces(true);
+    const handle = { ...ws.handle, path: dir };
+    const workspaces = { ...ws.workspaces, allocate: async () => handle };
+    const bus = fakeBus();
+    const cap = capturingRoles();
+    const builderGoals: string[] = [];
+    const roles: Partial<Record<WorkerRole, RoleFn>> = {
+      ...cap.roles,
+      builder: async (ctx: RoleContext): Promise<RoleResult> => {
+        builderGoals.push(ctx.task.goal);
+        // initial + cheap retry + escalated retry all fail — we only assert the escalation FIRED.
+        return { role: "builder", outcome: "failure", summary: "builder failed" };
+      },
+    };
+    const orch = createOrchestrator(
+      baseDeps({ resolveIdentity, roleClaim, roles, workspaces, events: bus.bus, enforceProjectRoot: true }),
+    );
+    const result = await orch.run({ taskId: "t-resolvable-orch", targetRepo: dir, goal: "fix the bug", fallbackModel: "deepseek-v4-pro" }, parentCtx);
+
+    assert.equal(result.verification, undefined, "a resolvable target is NOT classified unverifiable");
+    assert.equal(result.escalationRetry?.attempted, true, "escalation fired for a resolvable (red-eligible) target");
+    assert.equal(result.escalationRetry?.model, "deepseek-v4-pro");
+    assert.ok(builderGoals.some((g) => g.includes("[escalation]")), "the pro escalation actually ran");
+    assert.ok(!bus.sent.some((e) => e.type === "worker.escalation.suppressed"), "escalation was NOT suppressed");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("bare no-manifest target (WO2 fast-fail) carries the checks_unresolvable classification + receipt", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-wo2-classify-"));
+  try {
+    writeFileSync(join(dir, "hello.txt"), "hi\n"); // no manifest, no source-of-known-type
+    const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+    const ws = fakeWorkspaces(true);
+    const tr = fakeTrust();
+    const rc = fakeReceipts();
+    const bus = fakeBus();
+    const cap = capturingRoles();
+    const orch = createOrchestrator(
+      baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, workspaces: ws.workspaces, trust: tr.trust, receipts: rc.receipts, events: bus.bus, enforceProjectRoot: true }),
+    );
+    const result = await orch.run({ taskId: "t-wo2-classify", targetRepo: dir, goal: "make a tiny change" }, parentCtx);
+
+    assert.equal(result.outcome, "rejected");
+    assert.equal(cap.seen.length, 0, "no model role ran (zero API cost)");
+    assert.equal(result.verification?.kind, "checks_unresolvable", "structured classification on the fast-fail path");
+    assert.ok((result.verification?.nextSteps?.length ?? 0) > 0, "actionable next steps");
+    assert.ok(rc.calls.some((c) => c.operation === "worker.checks_unresolvable"), "classification receipted");
+    assert.ok(!tr.calls.some((c) => c.status === "failure"), "trust not demoted on a structural fail-closed");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

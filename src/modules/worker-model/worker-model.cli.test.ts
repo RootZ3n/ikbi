@@ -535,3 +535,44 @@ test("H5: multi-step plan is REFUSED (exit 1, nothing allocated/run) on a tier w
     assert.equal(tasks.length, 0, "no step was run — refused before any model call");
   });
 });
+
+test("an unverifiable-target failure renders the actionable 'no runnable checks' diagnostic (not a model-failure)", () => {
+  const unverifiableOrchestrator = {
+    run: async (task: WorkerTask): Promise<WorkerResult> => ({
+      contractVersion: "1.0.0",
+      taskId: task.taskId,
+      outcome: "failure" as const,
+      roles: [{ role: "builder" as const, outcome: "failure" as const, summary: "builder failed" }],
+      workspaceId: "ws-unverif",
+      promoted: false,
+      reason: "unverifiable target (checks_unresolvable): no recognizable project manifest",
+      verification: {
+        kind: "checks_unresolvable",
+        reason: "no recognizable project manifest at or above the worktree",
+        nextSteps: [
+          "add a project manifest (package.json / pyproject.toml / Cargo.toml / go.mod / project.godot)",
+          'run with IKBI_CHECKS="<command>" to declare the checks explicitly',
+        ],
+      },
+    }),
+  };
+  const cap2 = capture();
+  const cli = createWorkerCli({
+    orchestrator: unverifiableOrchestrator, resolveIdentity: makeResolver("trusted", "trusted"),
+    operatorToken: OPERATOR_TOKEN, workerToken: WORKER_TOKEN,
+    stdout: cap2.stdout, stderr: cap2.stderr, setExit: cap2.setExit, now: () => 1, cwd: () => "/repo",
+  });
+  return cli.build(["make a tiny change"]).then(() => {
+    assert.match(cap2.err, /could not verify this target because no runnable checks were found/, "explains WHY (no checks)");
+    assert.match(cap2.err, /Classification: checks_unresolvable/, "shows the classification");
+    assert.match(cap2.err, /Detected:/, "shows what was detected");
+    assert.match(cap2.err, /no recognized project manifest or verifier/, "detected: no manifest/verifier");
+    assert.match(cap2.err, /no IKBI_CHECKS override/, "detected: no IKBI_CHECKS");
+    assert.match(cap2.err, /Next steps:/, "lists actionable next steps");
+    assert.match(cap2.err, /IKBI_CHECKS="<command>"/, "one of the next steps is the explicit-check override");
+    assert.match(cap2.err, /This is not a model failure\. Escalation was suppressed because a stronger model cannot fix a missing verification contract\./, "states this was not a model failure + why escalation suppressed");
+    // stdout stays machine-readable JSON.
+    const summary = JSON.parse(cap2.out);
+    assert.equal(summary.outcome, "failure");
+  });
+});

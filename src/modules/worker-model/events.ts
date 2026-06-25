@@ -159,3 +159,13 @@ export const workerCriticFixLoopCompleted = defineEvent<{ taskId: string; retrie
 export const workerEscalationRetried = defineEvent<{ taskId: string; fromModel?: string; toModel: string; success: boolean }>(
   "worker.escalation.retried",
 );
+
+/**
+ * Build-mode escalation was DELIBERATELY suppressed: the target is unverifiable (no derivable
+ * checks) so a stronger model could not have helped. Distinct from `escalation.declined` (a
+ * score/cap decision) — this is the structural "no verifier" suppression that also fails the run
+ * closed with an actionable diagnostic and does not penalize trust.
+ */
+export const workerEscalationSuppressed = defineEvent<{ taskId: string; fromModel: string; reason: string; verificationKind: string }>(
+  "worker.escalation.suppressed",
+);

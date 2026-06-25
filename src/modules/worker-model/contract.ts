@@ -394,6 +394,21 @@ export interface WorkerResult {
     /** Whether the escalated builder retry converged (`success`); false ⇒ original failure stood. */
     readonly succeeded: boolean;
   };
+  /**
+   * Verification CLASSIFICATION for a fail-closed terminal — present when the build did not succeed
+   * BECAUSE checks could not be derived/run for the target (no manifest, unsupported project, no
+   * IKBI_CHECKS), NOT because the model/code failed. This is what the CLI renders as an actionable
+   * "no runnable checks" diagnostic, and what tells an operator the failure was structural (a stronger
+   * model would not have helped) — which is why model escalation was suppressed on this run.
+   */
+  readonly verification?: {
+    /** The verification verdict kind (e.g. "checks_unresolvable" | "unsupported_project"). */
+    readonly kind: string;
+    /** The fail-closed reason from check resolution (what was detected). */
+    readonly reason: string;
+    /** Operator-actionable next steps to make the target verifiable. */
+    readonly nextSteps?: readonly string[];
+  };
 }
 
 /**
