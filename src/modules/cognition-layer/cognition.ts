@@ -21,6 +21,8 @@ import { driftPrevention as coreDrift } from "../drift-prevention/index.js";
 import type { DriftReport } from "../drift-prevention/index.js";
 import { cognitionLayerConfig, COGNITION_MAX_TOKENS, COGNITION_MODEL, COGNITION_TEMPERATURE, type CognitionLayerConfig } from "./config.js";
 import { cognitionDecided } from "./events.js";
+import { runRuntimeTruthShadow, resolveRuntimeTruthMode } from "../runtime-truth-shadow/index.js";
+import type { RuntimeTruthReaderPort, RuntimeTruthMode } from "../runtime-truth-shadow/index.js";
 import {
   CognitionError,
   type CognitionDecision,
@@ -70,6 +72,14 @@ export interface CognitionLayerDeps {
   /** READ-ONLY drift detector (optional input to deliberation). Default: the live singleton. */
   readonly drift?: DriftReader;
   readonly publish?: (input: EventInput<unknown>) => void;
+  /**
+   * OPTIONAL Truth Firewall RuntimeTruthReader (a local port - no cross-repo import). When present
+   * AND shadow mode is active, its advisory summary is computed alongside the decision and logged
+   * for comparison; it NEVER changes the decision. Absent ⇒ no shadow run.
+   */
+  readonly runtimeTruth?: RuntimeTruthReaderPort;
+  /** OPTIONAL shadow-mode override (off|shadow). Default: resolved per-agent from IKBI_RUNTIME_TRUTH. */
+  readonly runtimeTruthMode?: RuntimeTruthMode;
 }
 
 async function lazyInvokeModel(request: ModelRequest): Promise<ModelResponse> {
@@ -152,6 +162,7 @@ export function createCognitionLayer(deps: CognitionLayerDeps = {}): CognitionLa
   const labMemory: LabMemoryReader = deps.labMemory ?? coreLabMemory;
   const drift: DriftReader = deps.drift ?? coreDrift;
   const publish = deps.publish ?? ((input: EventInput<unknown>) => void coreEvents.publish(input));
+  const runtimeTruth = deps.runtimeTruth;
 
   async function deliberate(input: CognitionInput): Promise<CognitionDecision> {
     if (!config.enabled) throw new CognitionError("disabled", "cognition-layer is disabled — refusing to deliberate");
@@ -200,6 +211,23 @@ export function createCognitionLayer(deps: CognitionLayerDeps = {}): CognitionLa
         { source: EVENT_SOURCE, attribution: { identity, operation: DELIBERATE_OPERATION } },
       ),
     );
+
+    // SHADOW (advisory-only): compute the Truth Firewall summary alongside the decision and log it
+    // for comparison. It is a no-op unless a reader is injected AND mode is shadow; it NEVER changes
+    // `decision`, never writes/approves/installs, and any failure is swallowed.
+    const runtimeTruthMode = deps.runtimeTruthMode ?? resolveRuntimeTruthMode(agentId);
+    await runRuntimeTruthShadow({
+      mode: runtimeTruthMode,
+      ...(runtimeTruth !== undefined ? { reader: runtimeTruth } : {}),
+      task: input.goal,
+      recentRefs: decision.memoryUsed,
+      decision: { decision: decision.decision, confidence: decision.confidence, recommendedModule: decision.recommendedNext?.module ?? null },
+      agentId,
+      ...(input.project !== undefined ? { project: input.project } : {}),
+      identity,
+      publish,
+    });
+
     return decision;
   }
 
