@@ -102,7 +102,10 @@ export function createGateWall(deps: GateWallDeps = {}): GateWall {
 
     // DECISION: a pure function of the grant — the action does NOT influence it.
     let governance: PromoteGovernance;
-    if (!config.enabled) {
+    // BYPASS: operator has explicitly opted out of approval gates.
+    if (config.bypass) {
+      governance = { allow: true, reason: `gate-wall bypass enabled — allowing all (${tier})`, gateId };
+    } else if (!config.enabled) {
       governance = { allow: false, reason: "gate-wall disabled — denying (fail-closed)", gateId };
     } else if (audit.kind === "exec") {
       const action = input.action;

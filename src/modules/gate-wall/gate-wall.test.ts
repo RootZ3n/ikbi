@@ -16,7 +16,7 @@ function harness(enabled = true) {
   const events: EventInput<GateEventPayload>[] = [];
   const receiptCalls: Array<{ input: Record<string, unknown>; identity: AgentIdentity }> = [];
   const gw = createGateWall({
-    config: { enabled },
+    config: { enabled, bypass: false },
     publish: (e) => events.push(e),
     receipts: {
       append: async (input, identity) => {
