@@ -46,6 +46,7 @@ import { createCognitionLayer } from "../cognition-layer/cognition.js";
 import { loadRepoRegistry } from "../../core/repo-registry.js";
 import type { CognitionDecision, CognitionLayer } from "../cognition-layer/contract.js";
 import { loadProjectMemory, type ProjectMemoryResult } from "./project-memory.js";
+import { isBuildTier, resolveTierPreset, BUILD_TIERS, type BuildTier } from "./tier-presets.js";
 import { createProductionGovernor } from "../memory-governor/create.js";
 
 function errMsg(e: unknown): string {
@@ -501,7 +502,7 @@ function detectWriteScope(goal: string): "all" | "new_only" | "none" {
  * every progress/diagnostic/hint/repair/cost line is routed to STDERR so a caller can pipe
  * stdout straight into a JSON parser without log noise interleaved (FIX 3).
  */
-export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbose?: boolean; cost?: boolean; yes?: boolean; json?: boolean; delegation?: string; noMemory?: boolean; memoryDiff?: boolean; check?: string; maxBudgetUsd?: number; fallbackModel?: string; complexity?: "small" | "medium" | "large"; bare?: boolean; effort?: "low" | "medium" | "high" | "max"; fromPr?: number; rest: string[] } {
+export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbose?: boolean; cost?: boolean; yes?: boolean; json?: boolean; delegation?: string; noMemory?: boolean; memoryDiff?: boolean; check?: string; maxBudgetUsd?: number; fallbackModel?: string; complexity?: "small" | "medium" | "large"; tier?: BuildTier; bare?: boolean; effort?: "low" | "medium" | "high" | "max"; fromPr?: number; rest: string[] } {
   const rest: string[] = [];
   let repo: string | undefined;
   let verbose = false;
@@ -515,6 +516,7 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
   let maxBudgetUsd: number | undefined;
   let fallbackModel: string | undefined;
   let complexity: "small" | "medium" | "large" | undefined;
+  let tier: BuildTier | undefined;
   let bare = false;
   let effort: "low" | "medium" | "high" | "max" | undefined;
   let fromPr: number | undefined;
@@ -567,6 +569,13 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
     } else if (a.startsWith("--complexity=")) {
       const val = a.slice("--complexity=".length);
       if (val === "small" || val === "medium" || val === "large") complexity = val;
+    } else if (a === "--tier") {
+      const val = argv[i + 1];
+      if (typeof val === "string" && isBuildTier(val)) tier = val;
+      i += 1;
+    } else if (a.startsWith("--tier=")) {
+      const val = a.slice("--tier=".length);
+      if (isBuildTier(val)) tier = val;
     } else if (a === "--bare") {
       bare = true;
     } else if (a === "--effort") {
@@ -587,7 +596,7 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
       rest.push(a);
     }
   }
-  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), ...(verbose ? { verbose } : {}), ...(cost ? { cost } : {}), ...(yes ? { yes } : {}), ...(json ? { json } : {}), ...(delegation !== undefined ? { delegation } : {}), ...(noMemory ? { noMemory } : {}), ...(memoryDiff ? { memoryDiff } : {}), ...(check !== undefined && check.trim().length > 0 ? { check } : {}), ...(maxBudgetUsd !== undefined ? { maxBudgetUsd } : {}), ...(fallbackModel !== undefined ? { fallbackModel } : {}), ...(complexity !== undefined ? { complexity } : {}), ...(bare ? { bare } : {}), ...(effort !== undefined ? { effort } : {}), ...(fromPr !== undefined ? { fromPr } : {}), rest };
+  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), ...(verbose ? { verbose } : {}), ...(cost ? { cost } : {}), ...(yes ? { yes } : {}), ...(json ? { json } : {}), ...(delegation !== undefined ? { delegation } : {}), ...(noMemory ? { noMemory } : {}), ...(memoryDiff ? { memoryDiff } : {}), ...(check !== undefined && check.trim().length > 0 ? { check } : {}), ...(maxBudgetUsd !== undefined ? { maxBudgetUsd } : {}), ...(fallbackModel !== undefined ? { fallbackModel } : {}), ...(complexity !== undefined ? { complexity } : {}), ...(tier !== undefined ? { tier } : {}), ...(bare ? { bare } : {}), ...(effort !== undefined ? { effort } : {}), ...(fromPr !== undefined ? { fromPr } : {}), rest };
 }
 
 /**
@@ -880,13 +889,27 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
           "  --delegation <json>  Run from a delegation envelope (overrides goal + repo)\n" +
                     "  --fallback-model <m> Override the escalation mid-tier model (default from IKBI_ESCALATION_MID_MODEL)\n" +
           "  --complexity <level>  small | medium | large — large skips flash entirely (uses pro)\n" +
+          "  --tier <name>     cheap | mid | frontier — preset builder+critic models per tier.\n" +
+          "                        cheap (flash+pro, auto-escalation ON); mid (glm-5.2+minimax-m3)\n" +
+          "                        and frontier (sonnet-4.6+gpt-5.5) run one builder, escalation OFF.\n" +
           "  --max-budget-usd <n>  Cap total API spend at $n (e.g. 0.50 = 50 cents). Budget exhausted = clean abort.\n" +
           "                        Also settable via IKBI_MAX_BUDGET_USD env var.\n",
       );
       return;
     }
 
-    const { repo, verbose, cost, yes, delegation: delegationJson, noMemory, memoryDiff, check, maxBudgetUsd, fallbackModel, complexity, bare, effort, fromPr, rest } = parseBuildArgs(argv);
+    const { repo, verbose, cost, yes, delegation: delegationJson, noMemory, memoryDiff, check, maxBudgetUsd, fallbackModel, complexity, tier, bare, effort, fromPr, rest } = parseBuildArgs(argv);
+
+    // `--tier` given a value parseBuildArgs couldn't match (e.g. `--tier turbo`) silently drops to
+    // undefined. Catch that here and fail closed with the valid set, rather than running an
+    // unintended default tier — an operator who typed --tier meant to pin the models.
+    const tierFlagIdx = argv.findIndex((a) => a === "--tier" || a.startsWith("--tier="));
+    if (tierFlagIdx >= 0 && tier === undefined) {
+      err(`ikbi: --tier: unknown tier — valid tiers are: ${BUILD_TIERS.join(", ")}\n`);
+      setExit(1);
+      return;
+    }
+    const tierPreset = tier !== undefined ? resolveTierPreset(tier) : undefined;
 
     // `--check "<cmd>"` declares an explicit verification command for a repo with no
     // recognizable manifest: convert it to the IKBI_CHECKS JSON the verifier reads and the
@@ -1063,7 +1086,32 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       ...(fallbackModel !== undefined ? { fallbackModel } : {}),
       // Also check IKBI_FALLBACK_MODEL env var
       ...(fallbackModel === undefined && process.env.IKBI_FALLBACK_MODEL ? (() => { const m = process.env.IKBI_FALLBACK_MODEL!.trim(); return m.length > 0 ? { fallbackModel: m } : {}; })() : {}),
+      // --tier preset: pin builder + critic models, and decide whether auto-escalation may fire.
+      // The cheap tier escalates ON to its fallback (deepseek-v4-pro); mid/frontier set
+      // escalationDisabled so a single capable builder fails closed instead of silently swapping
+      // models. An explicit --fallback-model / IKBI_FALLBACK_MODEL (handled above) wins over the
+      // tier's escalation target — so the tier fallback is only applied when none was set.
+      ...(tierPreset !== undefined
+        ? {
+            builderModelOverride: tierPreset.builderModel,
+            criticModelOverride: tierPreset.criticModel,
+            ...(tierPreset.escalation ? {} : { escalationDisabled: true }),
+            ...(tierPreset.fallbackModel !== undefined && fallbackModel === undefined && !process.env.IKBI_FALLBACK_MODEL
+              ? { fallbackModel: tierPreset.fallbackModel }
+              : {}),
+          }
+        : {}),
     };
+
+    // Surface the resolved tier so the operator sees which models will run and whether a failed
+    // builder will escalate (cheap) or fail closed (mid/frontier). Diagnostic → stderr, so it
+    // never pollutes a --json stdout contract.
+    if (tierPreset !== undefined) {
+      err(
+        `ikbi: tier=${tierPreset.tier} — builder=${tierPreset.builderModel}, critic=${tierPreset.criticModel}, ` +
+          `escalation=${tierPreset.escalation ? `ON → ${task.fallbackModel ?? tierPreset.fallbackModel ?? "mid"}` : "OFF (fail-closed)"}\n`,
+      );
+    }
 
     // STEP-PLANNER: decompose complex goals into atomic steps for cheap models. Production uses ONLY
     // the deterministic, zero-cost heuristic `decompose` — the model-based `decomposeWithModel`

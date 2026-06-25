@@ -198,6 +198,24 @@ export interface WorkerTask {
    */
   readonly fallbackModel?: string;
   /**
+   * TIER PRESET (`--tier`): force the BUILDER role's model for this run, overriding the config
+   * default and the `--complexity large` mid-tier bump. Set by a tier preset (see
+   * worker-model/tier-presets.ts). Absent = resolve the builder model the normal way.
+   */
+  readonly builderModelOverride?: string;
+  /**
+   * TIER PRESET (`--tier`): force the CRITIC role's model for this run, overriding the config
+   * default. Set by a tier preset. Absent = use the config critic model.
+   */
+  readonly criticModelOverride?: string;
+  /**
+   * TIER PRESET (`--tier mid|frontier`): suppress the orchestrator's auto-escalation (the cheap →
+   * mid builder retry). When true, a failed builder FAILS the run instead of silently retrying on
+   * a stronger model. The cheap tier leaves this unset (escalation ON). Absent = escalation as
+   * configured (IKBI_ESCALATION_ENABLED, default on).
+   */
+  readonly escalationDisabled?: boolean;
+  /**
    * TOURNAMENT candidate models (the candidate-tournament decision #tournament). When present and
    * non-empty, the orchestrator runs a CANDIDATE TOURNAMENT instead of the single-workspace path:
    * each listed model independently attempts this task in its OWN isolated workspace, ikbi verifies

@@ -348,7 +348,9 @@ export function createCritic(deps: CriticDeps = {}): RoleFn {
       };
 
       const request: ModelRequest = {
-        model: criticModel(),
+        // A --tier preset pins the critic model per-run (criticModelOverride); otherwise the
+        // configured critic model (IKBI_MODEL_CRITIC) is used.
+        model: ctx.task.criticModelOverride ?? criticModel(),
         temperature: CRITIC_TEMPERATURE,
         maxTokens: CRITIC_MAX_TOKENS,
         identity: ctx.identity, // the spawned, ceiling-clamped role identity (#10)

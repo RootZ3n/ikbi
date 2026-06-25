@@ -395,7 +395,11 @@ function observeEscalation(
 ): EscalationObservation {
   try {
     foldRoleSignals(role, result, acc, handoff);
-    if (!escalationConfig.enabled) return { summary: undefined, decision: undefined };
+    // Escalation is gated by the global toggle (IKBI_ESCALATION_ENABLED) AND the per-run tier:
+    // `--tier mid|frontier` sets escalationDisabled so a single capable builder fails closed
+    // rather than silently retrying on a different model. The signals are still folded above so
+    // the run's escalation observability (and any downstream report) stays accurate.
+    if (!escalationConfig.enabled || task.escalationDisabled === true) return { summary: undefined, decision: undefined };
     // Only the roles that carry escalation-relevant signal trigger an evaluation.
     if (role !== "builder" && role !== "critic" && role !== "verifier") return { summary: undefined, decision: undefined };
 
@@ -1308,8 +1312,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       throw new WorkerError("identity", "run requires an OperationContext carrying a validated identity");
     }
     const parentIdentity = parentCtx.identity.identity;
-    // --complexity large: override the builder model to the first mid-tier model, skipping flash entirely.
-    const effectiveBuilderModel = task.complexity === "large" ? (escalationConfig.tierModels.mid[0] ?? singleBuilderModel) : singleBuilderModel;
+    // Builder model resolution, highest precedence first:
+    //   1. --tier preset (builderModelOverride) — an explicit, operator-chosen tier builder.
+    //   2. --complexity large — bump straight to the mid-tier model, skipping flash.
+    //   3. the configured single builder model (default).
+    const effectiveBuilderModel =
+      task.builderModelOverride ?? (task.complexity === "large" ? (escalationConfig.tierModels.mid[0] ?? singleBuilderModel) : singleBuilderModel);
     armBudget(task); // start the whole-pipeline wall-clock deadline (covers every dispatch path)
     // Hand the (real) builder a mid-loop halt check so its loop stops promptly on a kill/budget
     // overrun. Reuses killHalt (kill-switch + budget); no-op for tests that inject a fake builder.
@@ -1571,9 +1579,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           priorResults: [...results],
           engine: runEngine,
         };
-        // --complexity large: skip the worker-tier builder entirely and start with the mid-tier
-        // model. This avoids wasting a flash attempt on repos known to be too large for cheap models.
-        const complexityModel = task.complexity === "large" ? escalationConfig.tierModels.mid[0] : undefined;
+        // Builder model override for the role dispatch (same precedence as effectiveBuilderModel):
+        // a --tier preset wins, else --complexity large bumps to the mid-tier model, else undefined
+        // (builderForModel falls back to the configured builder). Kept in sync with line ~1312.
+        const complexityModel = task.builderModelOverride ?? (task.complexity === "large" ? escalationConfig.tierModels.mid[0] : undefined);
         const roleFn = role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderForModel(parentCtx, complexityModel, resolveBuilderMode(task)) : role === "critic" ? criticFor() : role === "refuter" ? refuterFor() : roles[role];
         // H4: floor the verifier's role timeout at the per-check budget. Without this, a 300s role
         // timeout races against 600s checks — the role fails first, orphaning the still-running check.

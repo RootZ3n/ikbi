@@ -2062,6 +2062,61 @@ test("build-mode escalation: a failed escalated retry leaves the original failur
   assert.equal((lastRetried?.payload as { success: boolean } | undefined)?.success, false, "the retry event reports the failure");
 });
 
+// ── TIER PRESET: `--tier mid|frontier` sets escalationDisabled → a failed builder fails closed ──
+// The cheap tier auto-escalates a failed builder to a stronger model (the tests above). The mid and
+// frontier tiers run ONE capable builder and must NOT silently swap models on failure — they set
+// `escalationDisabled`, which makes observeEscalation return no decision, so the build-mode
+// escalation retry gate never fires. This pins that contract: same failing builder as the all-fail
+// test above, but with escalationDisabled the builder runs exactly ONCE and the run fails closed.
+test("tier preset: escalationDisabled suppresses the auto-escalation — a failed builder runs once and fails closed", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const bus = fakeBus();
+  const cap = capturingRoles();
+  let builderCalls = 0;
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    // Same failing builder as the all-fail escalation test, but escalationDisabled must stop the
+    // cheap-retry / pro-escalation machinery from ever spawning a second builder.
+    builder: async (_ctx: RoleContext): Promise<RoleResult> => {
+      builderCalls += 1;
+      return { role: "builder", outcome: "failure", summary: "mid builder failed", detail: { toolFormatErrors: [1, 2], retryCount: 3 } };
+    },
+  };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces, events: bus.bus }));
+  const result = await orch.run({ taskId: "t-tier-mid-noesc", targetRepo: "/repo", goal: "do the thing", escalationDisabled: true }, parentCtx);
+
+  assert.equal(builderCalls, 1, "with escalationDisabled the builder runs exactly once — no cheap retry, no pro escalation");
+  assert.equal(result.escalationRetry?.attempted ?? false, false, "no escalation was attempted");
+  assert.notEqual(result.outcome, "success", "the builder failure stands (fail-closed)");
+  assert.equal(result.promoted, false, "a failed build never promotes");
+  assert.equal(ws.calls.promote, 0, "no promote attempted");
+  const retried = bus.sent.filter((e) => e.type === "worker.escalation.retried");
+  assert.equal(retried.length, 0, "no escalation.retried events emitted when escalation is disabled");
+});
+
+// ── TIER PRESET: builderModelOverride is accepted and does not perturb a passing build ──
+// The override feeds effectiveBuilderModel/complexityModel (the same seam --complexity large uses),
+// so a tier build with an overridden builder model runs the normal pipeline to promotion. This is
+// a smoke guard that the new task field is threaded without breaking the happy path; the override's
+// value-routing is pinned by tier-presets.test.ts (parseBuildArgs + preset table).
+test("tier preset: builderModelOverride is accepted and the pipeline still promotes a green build", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const bus = fakeBus();
+  const cap = capturingRoles();
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    builder: async (_ctx: RoleContext): Promise<RoleResult> => ({ role: "builder", outcome: "success", summary: "built", detail: { filesWritten: ["a.ts"], checksRuns: 1 } }),
+  };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces, events: bus.bus }));
+  const result = await orch.run({ taskId: "t-tier-frontier-model", targetRepo: "/repo", goal: "do the thing", builderModelOverride: "sonnet-4.6", escalationDisabled: true }, parentCtx);
+
+  assert.equal(result.roles.find((r) => r.role === "builder")?.outcome, "success", "the builder ran under the override");
+  assert.equal(result.outcome, "success", "an overridden-builder green build promotes normally");
+  assert.equal(result.promoted, true);
+});
+
 // ── CRITIC-DRIVEN ESCALATION: a verifier-GREEN, critic-REJECTED build escalates to the mid tier ──
 // A build the cheap model gets past the VERIFIER but never past the CRITIC used to be a dead end:
 // the critic-fix loop retried the cheap model ONCE and, if it still failed, the build was discarded
