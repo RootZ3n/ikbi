@@ -50,6 +50,16 @@ export interface RuntimeTruthReaderPort {
   summarizeForCognition(task: string, recentRefs: readonly string[]): RuntimeTruthSummary | Promise<RuntimeTruthSummary>;
 }
 
+/**
+ * Builds a FRESH reader per deliberation (the staleness fix) from current memory for the given
+ * project/agent. Returns `null` when no reader can be built. Implementations MUST fail closed: a
+ * thrown error or `null` simply means no shadow run - the cognition decision is unaffected.
+ */
+export type RuntimeTruthReaderProvider = (
+  project: string | undefined,
+  agentId: string,
+) => RuntimeTruthReaderPort | null | Promise<RuntimeTruthReaderPort | null>;
+
 /** The cognition decision facts the shadow compares against (labels only - no goal/rationale text). */
 export interface ShadowDecisionRef {
   readonly decision: string;

@@ -19,6 +19,7 @@ export {
   type RuntimeTruthMode,
   type RuntimeTruthSummary,
   type RuntimeTruthReaderPort,
+  type RuntimeTruthReaderProvider,
   type ShadowDecisionRef,
   type RuntimeTruthShadowRecord,
 } from "./contract.js";

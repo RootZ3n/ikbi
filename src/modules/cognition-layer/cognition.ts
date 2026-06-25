@@ -22,7 +22,7 @@ import type { DriftReport } from "../drift-prevention/index.js";
 import { cognitionLayerConfig, COGNITION_MAX_TOKENS, COGNITION_MODEL, COGNITION_TEMPERATURE, type CognitionLayerConfig } from "./config.js";
 import { cognitionDecided } from "./events.js";
 import { runRuntimeTruthShadow, resolveRuntimeTruthMode } from "../runtime-truth-shadow/index.js";
-import type { RuntimeTruthReaderPort, RuntimeTruthMode } from "../runtime-truth-shadow/index.js";
+import type { RuntimeTruthReaderPort, RuntimeTruthReaderProvider, RuntimeTruthMode } from "../runtime-truth-shadow/index.js";
 import {
   CognitionError,
   type CognitionDecision,
@@ -78,6 +78,12 @@ export interface CognitionLayerDeps {
    * for comparison; it NEVER changes the decision. Absent ⇒ no shadow run.
    */
   readonly runtimeTruth?: RuntimeTruthReaderPort;
+  /**
+   * OPTIONAL provider that builds a FRESH reader per deliberation (the production path). Called ONLY
+   * in shadow mode and ONLY when no static `runtimeTruth` is set. Returning null or throwing fails
+   * closed (no shadow run; the decision is unaffected).
+   */
+  readonly runtimeTruthProvider?: RuntimeTruthReaderProvider;
   /** OPTIONAL shadow-mode override (off|shadow). Default: resolved per-agent from IKBI_RUNTIME_TRUTH. */
   readonly runtimeTruthMode?: RuntimeTruthMode;
 }
@@ -213,20 +219,32 @@ export function createCognitionLayer(deps: CognitionLayerDeps = {}): CognitionLa
     );
 
     // SHADOW (advisory-only): compute the Truth Firewall summary alongside the decision and log it
-    // for comparison. It is a no-op unless a reader is injected AND mode is shadow; it NEVER changes
+    // for comparison. It is a no-op unless a reader is available AND mode is shadow; it NEVER changes
     // `decision`, never writes/approves/installs, and any failure is swallowed.
     const runtimeTruthMode = deps.runtimeTruthMode ?? resolveRuntimeTruthMode(agentId);
-    await runRuntimeTruthShadow({
-      mode: runtimeTruthMode,
-      ...(runtimeTruth !== undefined ? { reader: runtimeTruth } : {}),
-      task: input.goal,
-      recentRefs: decision.memoryUsed,
-      decision: { decision: decision.decision, confidence: decision.confidence, recommendedModule: decision.recommendedNext?.module ?? null },
-      agentId,
-      ...(input.project !== undefined ? { project: input.project } : {}),
-      identity,
-      publish,
-    });
+    if (runtimeTruthMode === "shadow") {
+      // Resolve a reader: a static reader wins (back-compat); otherwise build a FRESH one per
+      // deliberation via the provider. A null/throwing provider fails closed → no shadow run.
+      let shadowReader: RuntimeTruthReaderPort | undefined = runtimeTruth;
+      if (shadowReader === undefined && deps.runtimeTruthProvider !== undefined) {
+        try {
+          shadowReader = (await deps.runtimeTruthProvider(input.project, agentId)) ?? undefined;
+        } catch {
+          shadowReader = undefined; // fail-closed: a broken provider must never affect deliberation
+        }
+      }
+      await runRuntimeTruthShadow({
+        mode: runtimeTruthMode,
+        ...(shadowReader !== undefined ? { reader: shadowReader } : {}),
+        task: input.goal,
+        recentRefs: decision.memoryUsed,
+        decision: { decision: decision.decision, confidence: decision.confidence, recommendedModule: decision.recommendedNext?.module ?? null },
+        agentId,
+        ...(input.project !== undefined ? { project: input.project } : {}),
+        identity,
+        publish,
+      });
+    }
 
     return decision;
   }

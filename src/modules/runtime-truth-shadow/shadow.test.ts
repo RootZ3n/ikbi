@@ -14,7 +14,7 @@ import type { NeutralizedContent, UntrustedContext } from "../../core/injection/
 import { createCognitionLayer, type ToUntrustedFn, type LabMemoryReader, type DriftReader } from "../cognition-layer/cognition.js";
 import type { CognitionLayerConfig } from "../cognition-layer/config.js";
 import { runRuntimeTruthShadow, resolveRuntimeTruthMode, parseRuntimeTruthMode } from "./index.js";
-import type { RuntimeTruthSummary, RuntimeTruthReaderPort } from "./index.js";
+import type { RuntimeTruthSummary, RuntimeTruthReaderPort, RuntimeTruthReaderProvider } from "./index.js";
 
 const HERE = new URL(".", import.meta.url).pathname; // src/modules/runtime-truth-shadow/
 const COG = new URL("../cognition-layer/cognition.ts", import.meta.url).pathname;
@@ -174,6 +174,94 @@ test("with shadow mode but no injected reader, only the normal cognition event i
   const types = cap.sent.map((e) => (e as { type?: string; name?: string }).type ?? (e as { name?: string }).name);
   assert.ok(types.includes("cognition.decided"));
   assert.ok(!types.includes("cognition.runtime_truth_shadow"));
+});
+
+// ── per-deliberation provider (Commit 1) ─────────────────────────────────────
+
+function eventTypes(sent: ReadonlyArray<unknown>): string[] {
+  return sent.map((e) => (e as { type?: string; name?: string }).type ?? (e as { name?: string }).name ?? "");
+}
+
+test("provider is NOT called when mode is off (non-shadow agent, no env)", async () => {
+  const cap = captureEvents();
+  let called = 0;
+  const provider: RuntimeTruthReaderProvider = () => { called++; return reader(advisory()); };
+  // agent "bubbles" → off by default; deliberateWith uses "ricky", so build a layer for bubbles.
+  const layer = createCognitionLayer({ config: CFG, invokeModel: async () => modelResponse(DECISION_JSON), neutralizeUntrusted: neutralize, toUntrustedMessage: toUntrusted, labMemory, drift: noDrift, publish: cap.publish, runtimeTruthMode: "off", runtimeTruthProvider: provider });
+  await layer.deliberate({ parentCtx: makeCtx("bubbles"), goal: "g", project: "demo" });
+  assert.equal(called, 0, "provider must not be consulted when off");
+  assert.ok(!eventTypes(cap.sent).includes("cognition.runtime_truth_shadow"));
+});
+
+test("provider IS called per deliberation when mode is shadow, and emits the shadow event", async () => {
+  const cap = captureEvents();
+  const seen: Array<{ project: string | undefined; agentId: string }> = [];
+  const provider: RuntimeTruthReaderProvider = (project, agentId) => { seen.push({ project, agentId }); return reader(advisory()); };
+  const dec = await deliberateWith({ publish: cap.publish, runtimeTruthMode: "shadow", runtimeTruthProvider: provider });
+  await deliberateWith({ publish: captureEvents().publish, runtimeTruthMode: "shadow", runtimeTruthProvider: provider });
+  assert.equal(seen.length, 2, "provider called once per deliberation");
+  assert.deepEqual(seen[0], { project: "demo", agentId: "ricky" });
+  assert.ok(eventTypes(cap.sent).includes("cognition.runtime_truth_shadow"));
+  assert.equal(dec.decision, "answer");
+});
+
+test("a THROWING provider fails closed — decision unchanged, no shadow event", async () => {
+  const cap = captureEvents();
+  const throwing: RuntimeTruthReaderProvider = () => { throw new Error("provider boom"); };
+  const withThrow = await deliberateWith({ publish: cap.publish, runtimeTruthMode: "shadow", runtimeTruthProvider: throwing });
+  const baseline = await deliberateWith({ publish: captureEvents().publish, runtimeTruthMode: "off" });
+  assert.deepEqual(withThrow, baseline, "throwing provider does not change the decision");
+  assert.ok(!eventTypes(cap.sent).includes("cognition.runtime_truth_shadow"));
+});
+
+test("a NULL provider result fails closed — decision unchanged, no shadow event", async () => {
+  const cap = captureEvents();
+  const nullProvider: RuntimeTruthReaderProvider = () => null;
+  const withNull = await deliberateWith({ publish: cap.publish, runtimeTruthMode: "shadow", runtimeTruthProvider: nullProvider });
+  const baseline = await deliberateWith({ publish: captureEvents().publish, runtimeTruthMode: "off" });
+  assert.deepEqual(withNull, baseline);
+  assert.ok(!eventTypes(cap.sent).includes("cognition.runtime_truth_shadow"));
+});
+
+test("provider path: non-advisory summary is rejected (no shadow event), decision unchanged", async () => {
+  const cap = captureEvents();
+  const badProvider: RuntimeTruthReaderProvider = () => reader({ ...advisory(), advisoryOnly: false });
+  const dec = await deliberateWith({ publish: cap.publish, runtimeTruthMode: "shadow", runtimeTruthProvider: badProvider });
+  assert.equal(dec.decision, "answer");
+  assert.ok(!eventTypes(cap.sent).includes("cognition.runtime_truth_shadow"));
+});
+
+test("decision is deep-equal with and without the provider (advisory-only)", async () => {
+  const without = await deliberateWith({ publish: captureEvents().publish, runtimeTruthMode: "off" });
+  const withProv = await deliberateWith({ publish: captureEvents().publish, runtimeTruthMode: "shadow", runtimeTruthProvider: () => reader(advisory()) });
+  assert.deepEqual(withProv, without);
+});
+
+test("static runtimeTruth still takes precedence over the provider (back-compat)", async () => {
+  const cap = captureEvents();
+  let providerCalled = 0;
+  const provider: RuntimeTruthReaderProvider = () => { providerCalled++; return reader(advisory()); };
+  await deliberateWith({ publish: cap.publish, runtimeTruthMode: "shadow", runtimeTruth: reader(advisory()), runtimeTruthProvider: provider });
+  assert.equal(providerCalled, 0, "static reader wins; provider not consulted");
+  assert.ok(eventTypes(cap.sent).includes("cognition.runtime_truth_shadow"));
+});
+
+test("Ricky default (no mode override) consults the provider; Bubbles/Julian do not", async () => {
+  for (const agent of ["ricky", "bubbles", "julian"]) {
+    const cap = captureEvents();
+    let called = 0;
+    const provider: RuntimeTruthReaderProvider = () => { called++; return reader(advisory()); };
+    const layer = createCognitionLayer({ config: CFG, invokeModel: async () => modelResponse(DECISION_JSON), neutralizeUntrusted: neutralize, toUntrustedMessage: toUntrusted, labMemory, drift: noDrift, publish: cap.publish, runtimeTruthProvider: provider });
+    // No runtimeTruthMode override and no env ⇒ resolveRuntimeTruthMode(agent) decides.
+    await layer.deliberate({ parentCtx: makeCtx(agent), goal: "g", project: "demo" });
+    if (agent === "ricky") {
+      assert.equal(called, 1, "ricky default shadow consults the provider");
+      assert.ok(eventTypes(cap.sent).includes("cognition.runtime_truth_shadow"));
+    } else {
+      assert.equal(called, 0, `${agent} stays off`);
+      assert.ok(!eventTypes(cap.sent).includes("cognition.runtime_truth_shadow"));
+    }
+  }
 });
 
 // ── boundary: ikbi imports the reader PORT only, never Truth Firewall ─────────
