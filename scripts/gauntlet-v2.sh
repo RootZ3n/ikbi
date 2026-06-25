@@ -3,7 +3,7 @@
 # Resets trust state between scenarios to prevent cascade.
 set -uo pipefail
 
-IKBI_DIR="/pehverse/repos/ikbi"
+IKBI_DIR="/pehverse/repos/ecosystem/ikbi"
 RESULTS_FILE="/tmp/gauntlet-results.txt"
 > "$RESULTS_FILE"
 
