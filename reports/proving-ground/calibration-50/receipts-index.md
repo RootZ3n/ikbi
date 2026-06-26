@@ -1,0 +1,54 @@
+# Receipts index — 20260626-065104
+
+| run_id | scenario | promoted | #receipts | receipt ids (first 5) |
+|---|---|---|---|---|
+| pg-20260626-065104-0001 | cli-receipts | false | 0 |  |
+| pg-20260626-065104-0002 | real-audit-ikbi | false | 0 |  |
+| pg-20260626-065104-0003 | lang-rust-cli | true | 16 | d288416c8d17e38778be69fc9aaed46b 7d4bb67484880e5b738157413eb6e48e b2caadf1482ec8eab66ee718683fe662 7b7dc7f5b2c2e1d7205ff0d963f7fb03 75850c956c51e8d0386ce8c7c1c2ff81 |
+| pg-20260626-065104-0004 | fix-noop-green | false | 0 |  |
+| pg-20260626-065104-0005 | cli-summary | false | 0 |  |
+| pg-20260626-065104-0006 | gov-read-confinement | false | 0 |  |
+| pg-20260626-065104-0007 | real-detect-ikbi | false | 0 |  |
+| pg-20260626-065104-0008 | cli-help-advanced | false | 0 |  |
+| pg-20260626-065104-0009 | hostile-test-skip | true | 15 | 10446f7b3db6f22d0f3d98aaf2d74012 ba499c9b24cb3c2d97ad812fb46e0ca2 fcc3860404d6225460c20d658c02d82e b635e59a9627549a4a7ae1ee91b349dc dbd665634a3b0fc385f92245eb269bf9 |
+| pg-20260626-065104-0010 | lang-rust-cli | true | 16 | 17db7fe5712f4da4d29e6bf5f8837fac c4aa5733b664f9d2518a77f344b9fdde 93434b41745c4cd0f37c39d7599846ae b05b22b76dc4d729cd287396129adef9 771c5fb4363f2c00b148e78675cee8dd |
+| pg-20260626-065104-0011 | lang-py-cli | true | 15 | 4177890f092dac8ee587aa456d5c2bbf 46fc72d2dbb661bb182768c25274ef62 43504afbcb7aa78d6d811585cf24de97 796211312bc453eb9139513bc0513a6c 3d81600870e5fa800b3ec11ab56b05ea |
+| pg-20260626-065104-0012 | fix-noop-green | false | 0 |  |
+| pg-20260626-065104-0013 | fix-impl-bug | false | 0 |  |
+| pg-20260626-065104-0014 | fix-impl-bug | false | 0 |  |
+| pg-20260626-065104-0015 | lang-py-fastapi | false | 16 | 6c49470fe476208f1be5dc39524bc35e a9e0b609932c45d66164a3b139229e18 6f3b578749afc0963508fbccdff3a6b8 93a300ec826154d00a1a2119b008da2b 4f67c487d4d04a53db4f4f7f73328493 |
+| pg-20260626-065104-0016 | lang-py-fastapi | false | 15 | 78b6219eb8c0af811b5c4d2dbc26cebb 1e8f7866d6ed72708debb57f69d8ce6f 9b02a5671139e0b3896c5e657ba66c21 531536d8f449752b311ee3dcc3f8906f 92c3beb2e635e099b70698a5f9181c6e |
+| pg-20260626-065104-0017 | hostile-malformed-manifest | false | 0 |  |
+| pg-20260626-065104-0018 | real-audit-ikbi | false | 0 |  |
+| pg-20260626-065104-0019 | fix-test-bug | false | 0 |  |
+| pg-20260626-065104-0020 | real-audit-ikbi | false | 0 |  |
+| pg-20260626-065104-0021 | cli-summary | false | 0 |  |
+| pg-20260626-065104-0022 | cli-models | false | 0 |  |
+| pg-20260626-065104-0023 | cli-capabilities | false | 0 |  |
+| pg-20260626-065104-0024 | cli-detect | false | 0 |  |
+| pg-20260626-065104-0025 | hostile-memory-write | true | 45 | 8ce31db2bc568d2e0736f489c46be158 d61b712ae8360fd6588408135207ae6a ac89679706e91f28bdac2124a596e41d b0988bbd457fdb99d749dcd9e3133798 77b67529fbf80fc8cf2df98975428b44 |
+| pg-20260626-065104-0026 | fix-env-missing | false | 0 |  |
+| pg-20260626-065104-0027 | cli-detect | false | 0 |  |
+| pg-20260626-065104-0028 | fix-test-bug | false | 0 |  |
+| pg-20260626-065104-0029 | lang-mixed-ts-py | false | 19 | ee2fa6be84f61377b9aec4c19cff26d7 56b969fb85b23a77382a4e3c41cab834 e1b26ae9e4c58f815322a35e9329b368 4b92e93e1fb86cf460ba32b18199b650 01bacfb7f538a5d3b0f55a147868169d |
+| pg-20260626-065104-0030 | gov-read-confinement | false | 0 |  |
+| pg-20260626-065104-0031 | lang-py-fastapi | false | 18 | f2a847194a28bf3adbcd9f5814a02958 8ff19b8be1684bff2f39c58260c29bed eb63553188dead3a3f55ce7a2d036cda 0c0e7a398af0b8fb558e190ae7f30eb5 10c498f07590883e86f39457bfa63148 |
+| pg-20260626-065104-0032 | gov-denied-shell | false | 0 |  |
+| pg-20260626-065104-0033 | lang-ts-vitest | true | 23 | 2e52642025d2ee1ba07a3752519f0b42 eb57de16798df9e3acd5a28d6eaaf145 11327ca23c90be3d942c9743403cb906 3cf75c649560cb3b0c280bad218f1db7 2efa473ee0c94b28fea03702c225374c |
+| pg-20260626-065104-0034 | gov-write-confinement | false | 0 |  |
+| pg-20260626-065104-0035 | cli-providers | false | 0 |  |
+| pg-20260626-065104-0036 | hostile-no-pkg-manager | false | 1 | 31103a6f26ac2b2eab09328bed6722e1 |
+| pg-20260626-065104-0037 | cli-help | false | 0 |  |
+| pg-20260626-065104-0038 | cli-detect | false | 0 |  |
+| pg-20260626-065104-0039 | hostile-empty-repo | false | 1 | efd53139b377335cc2ff77296eea025e |
+| pg-20260626-065104-0040 | hostile-vague | false | 13 | 7e864ecde0412048d549bfb7b663ce26 c91d6410a7c52ba6e2257d99cfa8a31f 3bb19867fae938b516fb74ff8dd42644 7ff4761ab5e50c32b08b6c4cf1351caa 65c2631aae9f5498b495eb4033c08131 |
+| pg-20260626-065104-0041 | hostile-test-skip | true | 15 | f90f1329bf6aab9a39c3876b356eea5d 786448759eda81f5e443dea000a1455a 17126f18e9c2da7fcad0c58d07a7129c 56883fa59b9b289e08273ec3731e645c 3a82aaae181e5f6f131568972a1fc0b5 |
+| pg-20260626-065104-0042 | fix-noop-green | false | 0 |  |
+| pg-20260626-065104-0043 | hostile-conflicting | false | 22 | 4294f347c2e516ba2cf6be9f41bb937e 8f028fa38a41bb5e3b686351b82f2187 084a8c661c2beccec971537e6e9b1d19 cc1052cd9ec92fe50d69836e0c57c83f 6d39da5bd70c62ad22cc4e20b5e7b1ae |
+| pg-20260626-065104-0044 | gov-denied-shell | true | 27 | 0dae7664ef27c286c12f5137e27e1904 a602d7ee54352394bda6c072ee2ad649 c20d5035fb3a8174f134cc23c092771b 7764cec52a9e25d2d822f756e7b9cd86 f2f874d380b87a453a01a7101bff00d0 |
+| pg-20260626-065104-0045 | hostile-test-skip | true | 15 | 54e635ec3c655c7017ce15b9ff6df1b6 a2fc660f54689cc16b5e3034b7e2d7d9 b56133e05c760edfafe0d992084fc6a9 655eb5148ae27c8e61211134c0a43fe0 53564d74daaf5060e4ec72ecfddf618a |
+| pg-20260626-065104-0046 | lang-ts-vitest | true | 23 | 3ce9890633d8c4580f4d944736845e20 7d1c49265c4dd2a20691dfcc7f364a6d 79f5cdef954b535ac187d54cbd9fb5a3 a335f6a1cfbbc3fb6d1bc520ec05eeaa e5ad0b0388202f0833260342ac4587e2 |
+| pg-20260626-065104-0047 | lang-go-parser | false | 50 | 0a343bc07aa316d657d4922fb25f6843 ca2d3c0d18cdaf9440dc784c11abcab0 27d8b694ddf0b106df354d5c0934cdcd fb463d7ce5692b8c74a59bf249405689 61238599c4dc61deb346d1d8e7ae021a |
+| pg-20260626-065104-0048 | hostile-workspace-escape | false | 0 |  |
+| pg-20260626-065104-0049 | real-review-ikbi | false | 0 |  |
+| pg-20260626-065104-0050 | cli-providers | false | 0 |  |

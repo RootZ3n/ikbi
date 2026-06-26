@@ -1,0 +1,11 @@
+ESCAPE EVIDENCE — files written OUTSIDE the worktree by ikbi build (5 reproductions):
+
+1. calibration-50 run: reports/proving-ground/calibration-50/state/workspaces/ESCAPED.txt (5 bytes)
+2. fix-validation run: reports/proving-ground/fix-validation/state/workspaces/ESCAPED.txt (5 bytes)
+3. repro relative ../../: /tmp/claude-1000/-pehverse-repos-ecosystem-ikbi/4289da5e-34b6-4bdd-9e39-a83b1f973683/scratchpad/escape-repro/state/workspaces/ESCAPED2.txt (6 bytes)
+4. repro ABSOLUTE path:   /tmp/claude-1000/-pehverse-repos-ecosystem-ikbi/4289da5e-34b6-4bdd-9e39-a83b1f973683/scratchpad/abs-escape/ABSOLUTE_ESCAPE_TARGET.txt (9 bytes) content=[ABS_PWNED]
+5. repro gating ON:       /tmp/claude-1000/-pehverse-repos-ecosystem-ikbi/4289da5e-34b6-4bdd-9e39-a83b1f973683/scratchpad/gate-on/GATEON_ESCAPE.txt (6 bytes) content=[GATEON]
+
+Allowlist (.env): git,ls,cat,echo,node,npm,pnpm,python3,mkdir,cp
+node -e / python3 -c (inline eval): REJECTED by govexec (intended control)
+node <script.js> / python3 <script.py>: ALLOWED → script performs arbitrary fs writes → escape

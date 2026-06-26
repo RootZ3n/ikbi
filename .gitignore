@@ -20,6 +20,10 @@ state/
 # Local, per-user Claude Code settings (not shared)
 .claude/settings.local.json
 
+# Proving-ground fixtures (temp repos with node_modules); the isolated `state/` roots are already
+# covered by the unanchored `state/` rule above. The small .md/.jsonl evidence stays committable.
+reports/proving-ground/*/fixtures/
+
 # Editor / OS cruft
 .DS_Store
 *.swp
