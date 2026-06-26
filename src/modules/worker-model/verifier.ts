@@ -1040,6 +1040,46 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
         const changedFiles = parseChangedFiles(planningDiff);
         plan = planFn({ data, changedFiles });
       }
+
+      // LADDER FULL-STAGE FALLBACK → LANGUAGE-NATIVE CHECKS. The impact planner derives the FULL stage
+      // from the project INDEX's package map, which models JS/TS packages (package.json scripts). A
+      // single-package non-JS target (a fresh Python/Rust/Go repo) indexes as ZERO packages, so the
+      // planner escalates to FULL but finds no root-package script and BLOCKS — even though resolveChecks
+      // KNOWS the language-native suite (pytest/cargo/go). Before honoring the block, consult resolveChecks:
+      //   • it derives a real check set  → run THOSE as the full stage (a genuine verification, never a
+      //                                     vacuous pass — the stage loop + triage still gate false-greens);
+      //   • it CANNOT derive checks      → the target is truly unverifiable → fail closed as unresolvable
+      //                                     (identical contract to the legacy path / unverifiable-target fix).
+      // A stub root test script (echo ok) keeps the block (detectStubTestScript) so this never launders a
+      // no-op into green. Only fires on an already-blocked plan, so it cannot loosen a normal scoped run.
+      if (plan.blocked && detectStubTestScript(worktree) === undefined) {
+        const resolveChecksFn = deps.resolveChecks ?? ((): ChecksResolution => ({ ok: true, checks: VERIFIER_CHECKS, source: "default" }));
+        const nativeChecks = resolveChecksFn(worktree);
+        if (!nativeChecks.ok) {
+          return unresolvable(nativeChecks.reason, classifyUnresolvableReason(nativeChecks.reason));
+        }
+        plan = {
+          status: "ok",
+          blocked: false,
+          blockReasons: [],
+          scope: "full",
+          escalateToFull: true,
+          escalationReasons: [...plan.escalationReasons, "ladder full stage underivable from index — fell back to language-native resolveChecks"],
+          affectedPackages: plan.affectedPackages,
+          affectedTests: plan.affectedTests,
+          neutralPackages: plan.neutralPackages,
+          stubScripts: plan.stubScripts,
+          stages: [{
+            stage: "full",
+            tasks: nativeChecks.checks.map((c) => ({
+              package: "", cwd: "", name: c.name, command: c.command, args: [...c.args],
+              scope: "full" as const, reason: "language-native full check (resolveChecks fallback)",
+            })),
+          }],
+          receipts: [...plan.receipts, "ladder full-stage fallback: ran language-native resolveChecks set"],
+        };
+      }
+
       const baseReceipts = [...plan.receipts, `check timeout: ${checkTimeoutMs}ms (per check, separate from the model role budget)`];
 
       if (plan.blocked) {

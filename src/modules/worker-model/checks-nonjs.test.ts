@@ -113,6 +113,19 @@ test("resolveChecks: JS/TS keeps existing pnpm behavior", () => {
   assert.ok(r.ok && r.checks[0]?.command === "pnpm", "JS still resolves to pnpm");
 });
 
+test("resolveChecks: a MIXED-LANGUAGE repo (package.json + pyproject.toml) picks a DETERMINISTIC plan (JS first), never unresolvable", () => {
+  // A target with both a JS manifest and a Python manifest must NOT fail closed as ambiguous and must
+  // NOT be classified unresolvable — it deterministically resolves to the JS check set (package.json is
+  // the strongest, first-checked signal). The Python side is verifiable via an explicit IKBI_CHECKS.
+  const wt = repo("mixed");
+  writeFileSync(join(wt, "package.json"), JSON.stringify({ name: "x", scripts: { test: "vitest run" } }));
+  writeFileSync(join(wt, "tsconfig.json"), JSON.stringify({ compilerOptions: { strict: true } }));
+  writeFileSync(join(wt, "pyproject.toml"), "[tool.pytest.ini_options]\naddopts = \"-q\"\n");
+  const r = resolveChecks(wt, NOENV);
+  assert.ok(r.ok, "a mixed-language repo is verifiable (not unresolvable)");
+  if (r.ok) assert.ok(r.checks.every((c) => c.command === "pnpm"), "deterministically resolves to the JS (pnpm) check set");
+});
+
 test("resolveChecks: a package-lock-only JS repo keeps npm behavior", () => {
   const wt = repo("js-npm");
   writeFileSync(join(wt, "package.json"), JSON.stringify({ name: "x" }));

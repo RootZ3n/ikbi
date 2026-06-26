@@ -885,6 +885,37 @@ test("AUTO-ACCEPT does NOT fire when the green is STALE (a write happened after 
   assert.equal(detail.doneClaim, undefined, "no completion claim when the green is stale");
 });
 
+// ── no_progress detector: meaningful writes reset it; only repeated no-op rounds trip it ──────────
+
+test("no_progress does NOT fire while the builder keeps writing files (each write resets the window)", async () => {
+  const dir = tmp();
+  // The model writes a file EVERY round (never done, never run_checks). Because each round makes a real
+  // write, the no-progress window (5 consecutive zero-write rounds) is never reached — the loop runs to
+  // MAX_TOOL_ITERATIONS instead of bailing early on a false "stuck". Real progress must never be punished.
+  const { engine } = mockEngine([writeResp("x.ts", "export const x = 1;\n")]); // repeated forever
+  const result = await run(makeCtx(dir, "verified", engine), greenExec());
+  const detail = result.detail as { stopReason: string; toolRounds: number };
+  assert.equal(detail.stopReason, "max_iterations", "continuous writes never trip no_progress");
+  assert.equal(detail.toolRounds, MAX_TOOL_ITERATIONS);
+});
+
+test("no_progress DOES fire after meaningful work then repeated no-op (read-only) rounds", async () => {
+  const dir = tmp();
+  // Write once (so totalFilesWritten > 0), then list_dir forever — no new writes, no run_checks, no
+  // done. After 5 consecutive zero-write rounds the no-progress detector trips. This is the FAKE-progress
+  // case the detector exists to catch (repeated reads with no new decision).
+  const { engine } = mockEngine([
+    writeResp("x.ts", "export const x = 1;\n"),
+    toolResp([call("list_dir", { path: "." })]), // repeats → no new writes
+  ]);
+  const result = await run(makeCtx(dir, "verified", engine), greenExec());
+  const detail = result.detail as { stopReason: string };
+  // greenExec is the default but run_checks is never called, so there is no green to auto-accept:
+  // the run terminates on the no-progress/stuck protocol stop and stays a failure.
+  assert.equal(result.outcome, "failure", "repeated no-op work is not success");
+  assert.match(detail.stopReason, /no_progress|stuck_detected/, "repeated no-op rounds trip the stuck detector");
+});
+
 test("AUTO-ACCEPT does NOT fire on a MODEL-FAILURE finish (content_filter) even with green, current writes → FAILURE", async () => {
   const dir = tmp();
   // Write a file, run_checks GREEN (current, non-stale), then the model's NEXT response comes back

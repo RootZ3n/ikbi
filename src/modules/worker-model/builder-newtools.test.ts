@@ -159,6 +159,28 @@ test("builder: a governed-exec terminal DENIAL is recorded as a policy violation
   assert.ok((detail.policyViolations ?? []).some((r) => r.tool === "terminal" && /denied/i.test(r.error)));
 });
 
+test("builder: a benign READ-ONLY PROBE denial (which) is recorded but is NOT a policy violation", async () => {
+  // Cheap models probe the environment constantly (which/env/pwd/…). A governed-exec ALLOWLIST denial
+  // of such a read-only metadata query is the governor correctly routing a harmless exploration —
+  // nothing executed, confinement held, no mutation, no egress. It must be RECORDED (observability)
+  // but must NOT taint the build as a policy violation, so an otherwise-verified build still promotes.
+  const dir = tmp();
+  const { engine } = mockEngine([
+    toolResp([call("terminal", { command: "which go" })]),
+    { ...base(), content: "continuing", finishReason: "stop" },
+  ]);
+  const exec = { run: async (): Promise<ExecResult> => ({ executed: false, denied: true, reason: "binary 'which' is not on the allowlist" }) };
+  const result = await createBuilder({ governedExec: exec, parentCtx: PARENT_CTX })(makeCtx(dir, "verified", engine));
+  const detail = result.detail as {
+    rejectedToolCalls?: Array<{ tool: string; error: string }>;
+    policyViolations?: Array<{ tool: string; error: string }>;
+  };
+  // Recorded as a rejected tool call (full observability)...
+  assert.ok((detail.rejectedToolCalls ?? []).some((r) => r.tool === "terminal" && /which/.test(r.error)), "the denied probe is still recorded");
+  // ...but NOT counted as a policy violation (the array the integrator's discard gate reads).
+  assert.equal((detail.policyViolations ?? []).length, 0, "a read-only probe denial does not taint promotion");
+});
+
 test("builder: terminal runs in the WORKTREE (cwd = realpath'd workspace, not the CLI cwd)", async () => {
   // Bug 1 regression: the terminal tool MUST execute governed commands in the builder's
   // worktree — the same canonical (realpath'd) root read_file/write_file confine against —

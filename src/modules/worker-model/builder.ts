@@ -586,11 +586,42 @@ function stallMessage(tools: readonly string[], attempt: number, max: number, wi
   return `${head}\n${action}\nIf this persists, check model provider stability.`;
 }
 
+/**
+ * READ-ONLY environment-PROBE binaries. A governed-exec allowlist denial of one of these is the
+ * governor correctly ROUTING a harmless metadata query (the model asking "where is X / what is the
+ * env" and being told "use your structured tools"): nothing executed, confinement held, no mutation,
+ * no egress, no privilege change. Cheap models probe the environment constantly, so treating such a
+ * denial as a promotion-tainting "out-of-policy action" discards otherwise-verified builds for an
+ * exploration the governor already neutralized. These denials are still recorded as rejected tool
+ * calls (observability) — they just are NOT boundary violations. Anything NOT on this list (curl/wget/
+ * nc/ssh/sudo/sh/bash/pip/git-push/…) remains tainting: egress, privilege, shell-escape, and mutating
+ * actions are exactly what the 3-eyes promotion gate must catch.
+ */
+const READ_ONLY_PROBE_BINARIES: ReadonlySet<string> = new Set([
+  "which", "type", "command", "hash", "env", "printenv", "pwd", "id", "whoami",
+  "uname", "hostname", "readlink", "realpath", "basename", "dirname", "locale", "tty", "date",
+]);
+
+/** The binary denied by a bare governed-exec ALLOWLIST denial, if `error` is exactly that (else undefined). */
+function deniedAllowlistBinary(error: string): string | undefined {
+  const m = /binary ['"]?([A-Za-z0-9_.+-]+)['"]? is not on the allowlist/i.exec(error);
+  return m?.[1]?.toLowerCase();
+}
+
 function isPolicyViolation(e: ToolCallError): boolean {
-  // "denied" covers a governed-exec allowlist denial / terminal path-confinement refusal — an
-  // attempted out-of-policy action, not a benign tool-format error (those say "malformed",
-  // "requires", "unknown tool", never "denied"), so the term does not over-match.
-  return /escape|write_scope|dependency directory|not allowed|only for verifier\/check|WRITE SCOPE VIOLATION|denied/i.test(e.error);
+  // GENUINE boundary breach — confinement/scope escape, write-scope violation, or an attempt to run
+  // arbitrary code through a package manager. These ALWAYS taint promotion, even when confinement held.
+  if (/escape|write_scope|dependency directory|not allowed|only for verifier\/check|WRITE SCOPE VIOLATION/i.test(e.error)) {
+    return true;
+  }
+  // A bare ALLOWLIST denial of a READ-ONLY environment probe (which/env/pwd/…) is benign governor
+  // routing — not a boundary violation. It must not discard an otherwise-verified build.
+  const probe = deniedAllowlistBinary(e.error);
+  if (probe !== undefined && READ_ONLY_PROBE_BINARIES.has(probe)) return false;
+  // Any other denial (a non-probe binary denied by the allowlist, a terminal path-confinement refusal,
+  // an egress/privilege attempt) is an attempted out-of-policy action — tainting. "denied" does not
+  // over-match benign tool-format errors (those say "malformed"/"requires"/"unknown tool", never "denied").
+  return /denied/i.test(e.error);
 }
 
 /** Build a checkable success condition from the goal (+ scout findings) — RAIL 1. Derived

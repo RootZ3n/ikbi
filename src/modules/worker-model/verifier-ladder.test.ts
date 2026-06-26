@@ -136,15 +136,41 @@ test("ladder: shared config change (tsconfig) escalates to full", async () => {
   assert.ok((detail(r).stagesRun as string[]).includes("full"));
 });
 
-test("ladder: a BLOCKED plan fails verification and runs no checks", async () => {
+test("ladder: a BLOCKED plan on a truly UNVERIFIABLE target fails closed and runs no checks", async () => {
+  // A blocked plan now consults resolveChecks for a language-native full-stage fallback. When the
+  // target is genuinely unverifiable (resolveChecks fails closed), the run fails CLOSED as
+  // checks_unresolvable and still executes NO checks — never a vacuous pass on a blocked plan.
   const data = mkData({ packages: [pkg("packages/a", {})], files: [file("packages/a/src/foo.ts")] }); // neutral, no root → blocked
   const ge = fakeGovernedExec();
-  const v = createVerifier({ governedExec: ge.exec, parentCtx: PCTX, diff: async () => diffOf(["packages/a/src/foo.ts"]), env: { IKBI_VERIFY: "ladder" }, index: { refresh: async () => ({ data }) } });
+  const v = createVerifier({
+    governedExec: ge.exec, parentCtx: PCTX, diff: async () => diffOf(["packages/a/src/foo.ts"]),
+    env: { IKBI_VERIFY: "ladder" }, index: { refresh: async () => ({ data }) },
+    resolveChecks: () => ({ ok: false, reason: "no recognizable project manifest at or above the worktree (/wt) — cannot verify (RED, never a vacuous pass)" }),
+  });
   const r = await v(makeCtx("/wt"));
   assert.equal(r.outcome, "failure");
-  assert.equal(detail(r).blocked, true);
-  assert.match(r.summary ?? "", /BLOCKED/);
-  assert.equal(ge.calls.length, 0, "no checks executed for a blocked plan");
+  assert.equal(detail(r).verdict, "unresolvable", "truly unverifiable → classified unresolvable (not a vacuous pass)");
+  assert.match(r.summary ?? "", /RED/);
+  assert.equal(ge.calls.length, 0, "no checks executed for an unverifiable blocked plan");
+});
+
+test("ladder: a BLOCKED plan FALLS BACK to language-native resolveChecks when the target IS verifiable", async () => {
+  // The index models JS packages; a single-package non-JS target indexes as zero packages → the planner
+  // escalates to FULL but finds no root script → BLOCKED. resolveChecks knows the language-native suite
+  // (e.g. pytest), so the full stage runs THOSE instead of hard-blocking a perfectly verifiable build.
+  const data = mkData({ packages: [pkg("packages/a", {})], files: [file("packages/a/src/foo.ts")] });
+  const ge = fakeGovernedExec(); // all checks pass (exit 0)
+  const v = createVerifier({
+    governedExec: ge.exec, parentCtx: PCTX, diff: async () => diffOf(["packages/a/src/foo.ts"]),
+    env: { IKBI_VERIFY: "ladder" }, index: { refresh: async () => ({ data }) },
+    resolveChecks: () => ({ ok: true, checks: [{ name: "test", command: "python3", args: ["-m", "pytest", "-q"] }], source: "default" }),
+  });
+  const r = await v(makeCtx("/wt"));
+  assert.equal(r.outcome, "success", "language-native checks ran and passed → GREEN");
+  assert.equal(detail(r).verificationScope, "full");
+  assert.equal(ge.calls.length, 1, "the fallback ran the resolveChecks set");
+  assert.equal(ge.calls[0]?.command, "python3");
+  assert.match(((detail(r).receipts as string[]) ?? []).join("\n"), /language-native resolveChecks/);
 });
 
 test("ladder: a failed nearest test FAILS FAST (no package/full) and surfaces triage", async () => {
