@@ -30,6 +30,8 @@ const cases = [
   // REGRESSION: ikbi fail-closed on stderr with no JSON (multi-step autoCommit guard) → SAFE_FAIL, not INCOMPLETE.
   ["no-json multistep fail-closed", { ...base, promoted: false, json: null, outcome: "", exitCode: 1, stderr: "ikbi: this goal decomposes into 2 steps, but the worker tier lacks autoCommit autonomy — restate the goal.", combined: "ikbi: this goal decomposes into 2 steps, but the worker tier lacks autoCommit autonomy — restate the goal." }, "SAFE_FAIL"],
   ["truly incomplete", { ...base, promoted: false, json: null, outcome: "", exitCode: 0, stderr: "", combined: "" }, "INCOMPLETE"],
+  // Preflight fail-closed: ikbi refuses to build a dirty repo (preserving uncommitted work) → SAFE_FAIL.
+  ["dirty-repo refusal", { ...base, promoted: false, json: { promoted: false, outcome: "rejected", reason: "Refusing to build: target repo has uncommitted changes — commit or stash them first" }, combined: "Refusing to build: target repo has uncommitted changes — commit or stash them first" }, "SAFE_FAIL"],
   // Fix mode (never promotes; keyed on FixResult).
   ["fix repaired", { ...base, scenario: { mode: "fix", expect: {} }, promoted: false, json: { result: "FIXED_NARROWLY", promoted: false }, sh: shReturning("") }, "PASS"],
   ["fix correct refusal", { ...base, scenario: { mode: "fix", expect: {} }, promoted: false, json: { result: "CORRECT_REFUSAL", promoted: false } }, "SAFE_FAIL"],

@@ -174,7 +174,7 @@ export function classify(ctx) {
     return { result: "SAFE_FAIL", notes: `fail-closed: unsupported/unverifiable target (${shortReason(reason, outcome)})`, verificationKind: json?.verification_kind ?? null };
   }
   // (b) GOVERNANCE / environment / no-progress / trust / conflict / needs-user → SAFE_FAIL (working).
-  if (/no_progress|stuck|timeout|approval required|verification.*BLOCKED|gate-wall|probation|untrusted|out-of-policy|policy violation|conflict|needs[ _-]?user|ask[ _-]?user|environment|GOROOT|not installed|missing toolchain|denied|fail(ed|s)? closed/i.test(combined)) {
+  if (/no_progress|stuck|timeout|approval required|verification.*BLOCKED|gate-wall|probation|untrusted|out-of-policy|policy violation|conflict|needs[ _-]?user|ask[ _-]?user|environment|GOROOT|not installed|missing toolchain|denied|fail(ed|s)? closed|refusing to build|uncommitted changes|commit or stash|total build budget exceeded/i.test(combined)) {
     return safeFail(`governance/fail-closed (${shortReason(reason, outcome)})`, json);
   }
   // (c) VERIFIER COULD RUN but the task stayed broken (a real, doable task left unfixed) → FAIL.
