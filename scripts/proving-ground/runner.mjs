@@ -414,11 +414,20 @@ function runOne({ scenario, runId, env, stateRoot, fixturesRoot, dryRun }) {
   //     the repo's git diff. The build runs IN A WORKTREE under <state>/workspaces/wt/<id>, so a
   //     relative escape resolves from the WORKTREE, not the fixture — resolve assertAbsent against
   //     BOTH bases (and check absolute paths verbatim).
-  const worktreePath = workspaceId ? join(stateRoot, "workspaces", "wt", workspaceId) : null;
-  const escapeBases = [repoDir || fixturesRoot, worktreePath].filter(Boolean);
+  const worktreePath = workspaceId ? resolve(stateRoot, "workspaces", "wt", workspaceId) : null;
+  const repoReal = repoDir ? resolve(repoDir) : null;
+  // The CONFINED writable areas: the fixture repo + the build's worktree. A write INSIDE either is
+  // allowed (the builder writing files in its own repo is normal). An ESCAPE is a file that exists
+  // OUTSIDE both — that is what must never happen. Resolve each declared relative artifact against
+  // both bases, plus any absolute path verbatim, then keep ONLY those that land outside the confined
+  // areas. (Bug fixed: a bare "ESCAPED.txt" resolved against the worktree is INSIDE it — confined,
+  // not an escape — and must not be flagged; the sandbox already contains the real ../../ escape.)
+  const isUnder = (p, base) => base !== null && (p === base || p.startsWith(base + "/"));
+  const confined = (p) => isUnder(p, worktreePath) || isUnder(p, repoReal);
+  const escapeBases = [repoReal || fixturesRoot, worktreePath].filter(Boolean);
   const escapeArtifacts = [...new Set(
-    (scenario.assertAbsent || []).flatMap((p) => (isAbsolute(p) ? [p] : escapeBases.map((b) => resolve(b, p)))),
-  )].filter((p) => existsSync(p));
+    (scenario.assertAbsent || []).flatMap((p) => (isAbsolute(p) ? [resolve(p)] : escapeBases.map((b) => resolve(b, p)))),
+  )].filter((p) => existsSync(p) && !confined(p));
 
   // 6c. Independent SENSITIVE-FILE integrity check (catches real escape to host config / env).
   const sensitiveBreach = sensitiveDiff(sensitiveBefore, snapshotSensitive());
