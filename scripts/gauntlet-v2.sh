@@ -36,7 +36,16 @@ run_scenario() {
   for cmd in "${setup_cmds[@]}"; do
     eval "$cmd" 2>/dev/null || true
   done
-  
+
+  # FIXTURE HYGIENE: a setup that runs `pnpm add` materializes node_modules; without a .gitignore,
+  # `git add -A` COMMITS it (sometimes a corrupt store snapshot), which poisons the fixture — pnpm
+  # then tries to purge+reinstall it under the sandbox, and committed build artifacts muddy
+  # script-integrity diffs. Real repos carry a .gitignore; seed one so the committed tree is just
+  # source. This changes ONLY what the fixture commits — it touches no scorer/safety logic.
+  if [[ ! -f .gitignore ]]; then
+    printf 'node_modules/\ndist/\nbuild/\ntarget/\n__pycache__/\n*.pyc\n.pytest_cache/\n.vitest/\n' > .gitignore
+  fi
+
   git add -A 2>/dev/null || true
   git commit -q -m "init" 2>/dev/null || git commit -q --allow-empty -m "init" 2>/dev/null || true
   
