@@ -68,3 +68,33 @@ test('H9: a real executed suite (count > 0) still reads testEvidence "executed"'
   assert.equal(v.testEvidence, "executed");
   assert.deepEqual(v.testCount, { passed: 12, total: 12 });
 });
+
+test("LADDER full-scope: testEvidence is carried from a SUCCESSFUL test check even when an earlier same-named scope had no parseable count", () => {
+  // The ladder runs the suite across stages (nearest-tests → package-checks → full), so detail.checks
+  // can hold MORE THAN ONE check named "test". An earlier scope-limited run can pass with no tally
+  // while the later full-scope run carried a real count. readVerifier must aggregate and report the
+  // STRONGEST real evidence — not under-report "unverified" off the first check and discard a build
+  // that verification actually proved (the TypeScript / mixed-language greenfield regression).
+  const nearestNoCount: Record<string, unknown> = { name: "test", command: "pnpm test", exitCode: 0, outputTail: "ran (no parseable tally in this scope)" };
+  const fullReal = mapExec("test", "pnpm test", { executed: true, exitCode: 0, stdoutTail: "Tests  13 passed (13)\n", stderrTail: "" }, "Tests  13 passed (13)\n").check;
+  const verifierResult: RoleResult = {
+    role: "verifier",
+    outcome: "success",
+    summary: 'verification PASSED for scope "full"',
+    detail: { verdict: "pass", verificationScope: "full", checks: [{ name: "typecheck", command: "pnpm tsc --noEmit", exitCode: 0, outputTail: "" }, nearestNoCount, fullReal] },
+  };
+  const v = readVerifier(verifierResult);
+  assert.equal(v.testEvidence, "executed", "the real full-scope count is honored over the earlier countless run");
+  assert.deepEqual(v.testCount, { passed: 13, total: 13 });
+  assert.equal(v.testsPass, true, "all 'test' checks passed");
+});
+
+test("FAIL-CLOSED preserved: multiple test checks with NO parseable count anywhere stays 'unverified'", () => {
+  // The aggregation must never manufacture evidence: if no test check carried a real tally, the build
+  // is still unverified and the integrator's single-run gate still discards it.
+  const a: Record<string, unknown> = { name: "test", command: "pnpm test", exitCode: 0, outputTail: "done" };
+  const b: Record<string, unknown> = { name: "test", command: "pnpm test", exitCode: 0, outputTail: "ok" };
+  const verifierResult: RoleResult = { role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: [a, b] } };
+  const v = readVerifier(verifierResult);
+  assert.equal(v.testEvidence, "unverified", "no real tally anywhere → still unverified (fail-closed)");
+});

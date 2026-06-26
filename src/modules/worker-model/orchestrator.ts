@@ -3278,30 +3278,43 @@ export function readVerifier(verifierResult: RoleResult | undefined): { typechec
   const checks = Array.isArray(detail.checks) ? (detail.checks as Array<Record<string, unknown>>) : [];
   const find = (name: string) => checks.find((c) => c.name === name);
   const typecheck = find("typecheck");
-  const test = find("test");
   const verdict = detail.verdict;
   const authoritativePass = verdict === "pass" && verifierResult.outcome === "success";
   const typecheckPass = typecheck !== undefined ? typecheck.exitCode === 0 : authoritativePass;
-  const testsPass = test !== undefined ? test.exitCode === 0 : authoritativePass;
-  // Prefer the testCount STAMPED by mapExec from the FULL check output — robust to outputTail
-  // truncation (a "# tests 0" marker emitted EARLY in a verbose passing run is pushed out of the
-  // bounded tail, so re-parsing the tail here would miss it and read "unverified" instead of "zero").
-  // Fall back to parsing the tail only for legacy verifier results that predate the stamped field.
-  const rawCount = test?.testCount;
-  const stampedCount =
-    typeof rawCount === "object" && rawCount !== null &&
-    typeof (rawCount as { passed?: unknown }).passed === "number" &&
-    typeof (rawCount as { total?: unknown }).total === "number"
-      ? { passed: (rawCount as { passed: number }).passed, total: (rawCount as { total: number }).total }
-      : undefined;
-  const testCount = stampedCount ?? (test !== undefined && typeof test.outputTail === "string" ? parseTestCount(test.outputTail) : undefined);
+
+  // Extract a test count from a single check: the mapExec-STAMPED count (robust to outputTail
+  // truncation) first, else a parse of the bounded tail (legacy results that predate the stamp).
+  const countOf = (c: Record<string, unknown> | undefined): { passed: number; total: number } | undefined => {
+    if (c === undefined) return undefined;
+    const raw = c.testCount;
+    if (
+      typeof raw === "object" && raw !== null &&
+      typeof (raw as { passed?: unknown }).passed === "number" &&
+      typeof (raw as { total?: unknown }).total === "number"
+    ) {
+      return { passed: (raw as { passed: number }).passed, total: (raw as { total: number }).total };
+    }
+    return typeof c.outputTail === "string" ? parseTestCount(c.outputTail) : undefined;
+  };
+
+  // AGGREGATE TEST EVIDENCE ACROSS EVERY "test" CHECK. The ladder runs the suite across stages
+  // (nearest-tests → package-checks → full), so there can be MORE THAN ONE check named "test". A
+  // scope-limited earlier run can pass with no parseable tally while a later SUCCESSFUL full-scope
+  // run carried a real count — keying evidence off only the first "test" check then under-reports it
+  // as "unverified" and the integrator discards a build that verification actually proved. So carry
+  // the STRONGEST real evidence any successful test check produced. This NEVER manufactures a count:
+  // with no real tally anywhere it still reports unverified/absent and the fail-closed gate holds.
+  const testChecks = checks.filter((c) => c.name === "test");
+  const testsPass = testChecks.length > 0 ? testChecks.every((c) => c.exitCode === 0) : authoritativePass;
+  const testCounts = testChecks.map((c) => countOf(c)).filter((x): x is { passed: number; total: number } => x !== undefined);
+  // Prefer a count from a check that actually ran tests (total>0); else any count (e.g. a real 0).
+  const testCount = testCounts.find((c) => c.total > 0) ?? testCounts[0];
   // Finding D — TEST-EXECUTION EVIDENCE: distinguish a REAL executed suite from a passing command
-  // that proved nothing, so the judge cannot score them identically. A passing "test" check with a
-  // parsed count>0 is "executed"; a parsed count of 0 is "zero" (a runner that ran nothing); a pass
-  // with no parseable count is "unverified" (e.g. `echo done` — exit 0 but no test tally); NO "test"
-  // check at all (only custom checks like `ci`) is "absent". This is an objective, deterministic fact.
+  // that proved nothing. A "test" check with a parsed count>0 is "executed"; a count of 0 is "zero"
+  // (a runner that ran nothing); a pass with no parseable count anywhere is "unverified" (e.g. `echo
+  // done`); NO "test" check at all (only custom checks like `ci`) is "absent".
   let testEvidence: "executed" | "zero" | "unverified" | "absent";
-  if (test === undefined) {
+  if (testChecks.length === 0) {
     testEvidence = "absent";
   } else if (testCount !== undefined) {
     testEvidence = testCount.total > 0 ? "executed" : "zero";

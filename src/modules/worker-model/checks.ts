@@ -566,6 +566,13 @@ export function tail(s: string, max: number): string {
  * stuck "unverified" (which would fail the C1 gate even when tests really ran and passed).
  */
 export function parseTestCount(output: string): { passed: number; total: number } | undefined {
+  // STRIP ANSI COLOR CODES FIRST. Under governed-exec, vitest (and other runners) color their summary
+  // even on a non-TTY, so the escape sequences sit BETWEEN the tokens — e.g.
+  // "\x1b[2m Tests \x1b[22m \x1b[1m\x1b[32m12 passed\x1b[39m\x1b[90m (12)" — which breaks the \s+
+  // anchors in every pattern below and yields NO count (testEvidence "unverified" → a real, green
+  // build gets discarded for "no test evidence"). Stripping makes colored and plain output parse alike.
+  // eslint-disable-next-line no-control-regex
+  output = output.replace(/\x1b\[[0-9;]*m/g, "");
   // node:test: "# tests N" / "# pass N" (the two markers can be far apart in the stream).
   const nodeTests = /# tests (\d+)/.exec(output);
   const nodePass = /# pass (\d+)/.exec(output);

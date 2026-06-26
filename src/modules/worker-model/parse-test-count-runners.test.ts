@@ -25,6 +25,14 @@ test("parseTestCount: vitest full summary block", () => {
   assert.deepEqual(parseTestCount(out), { passed: 3, total: 3 });
 });
 
+test("parseTestCount: ANSI-COLORED vitest summary (governed-exec emits color even on a non-TTY)", () => {
+  // The exact byte shape governed-exec captures from vitest — escape codes BETWEEN the tokens. Before
+  // stripping, the \s+ anchors failed across the codes and the count was lost → a real green build read
+  // "unverified" and was discarded. This is the TypeScript / mixed-language greenfield regression.
+  const ansi = "\x1b[2m      Tests \x1b[22m \x1b[1m\x1b[32m12 passed\x1b[39m\x1b[22m\x1b[90m (12)\x1b[39m";
+  assert.deepEqual(parseTestCount(ansi), { passed: 12, total: 12 });
+});
+
 test("parseTestCount: jest 'Tests:       3 passed, 3 total'", () => {
   assert.deepEqual(parseTestCount("Tests:       3 passed, 3 total"), { passed: 3, total: 3 });
 });
