@@ -43,6 +43,13 @@ export interface ExecRequest {
   /** Working directory for the command. */
   readonly cwd?: string;
   /**
+   * The WORKTREE ROOT this command runs against — the single host directory the OS sandbox keeps
+   * WRITABLE (everything else is read-only). When absent the sandbox falls back to `cwd`. Builder /
+   * verifier callers pass the realpath'd worktree so a risky subprocess (an interpreter running a
+   * helper script) cannot write outside it — closing F1. See modules/governed-exec/sandbox.ts.
+   */
+  readonly worktreeRoot?: string;
+  /**
    * Optional LIVE OUTPUT SINK (SG-1): when provided, the command's stdout/stderr are STREAMED
    * to this callback chunk-by-chunk as they arrive (so a user sees long check output live),
    * instead of only the buffered tail at the end. The returned `ExecResult` still carries the

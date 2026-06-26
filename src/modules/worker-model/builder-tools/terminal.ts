@@ -295,6 +295,7 @@ export async function runTerminal(
         command: binary,
         args: rest,
         cwd: worktreeDir,
+        worktreeRoot: worktreeDir, // the OS sandbox keeps ONLY this writable (F1)
         purpose: `builder terminal (background): ${command.slice(0, 120)}`,
         background: true,
       });
@@ -305,6 +306,7 @@ export async function runTerminal(
       command: binary,
       args: rest,
       cwd: worktreeDir,
+      worktreeRoot: worktreeDir, // the OS sandbox keeps ONLY this writable (F1)
       purpose: `builder terminal: ${command.slice(0, 120)}`,
       timeoutMs,
     });

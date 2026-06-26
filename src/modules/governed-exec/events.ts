@@ -31,6 +31,10 @@ export interface GovExecEventPayload {
   readonly dryRun?: boolean;
   /** True when the command was spawned as a detached BACKGROUND job (no wait, no timeout). */
   readonly background?: boolean;
+  /** Sandbox mode applied to this exec: "bwrap" (confined), "none" (safe cmd), or absent. */
+  readonly sandbox?: "bwrap" | "none" | "unavailable";
+  /** Risk classification kind (interpreter/package-install/…/safe) when computed. */
+  readonly risk?: string;
 }
 
 /** Emitted when an execution is requested (before any gate/run). */

@@ -58,3 +58,16 @@ export {
   govexecFailed,
   type GovExecEventPayload,
 } from "./events.js";
+export {
+  classifyCommandRisk,
+  detectSandbox,
+  resetSandboxAvailabilityCache,
+  buildBwrapArgs,
+  wrapWithSandbox,
+  DEFAULT_SANDBOX_MODE,
+  type SandboxMode,
+  type SandboxConfig,
+  type SandboxPlan,
+  type SandboxAvailability,
+  type CommandRisk,
+} from "./sandbox.js";

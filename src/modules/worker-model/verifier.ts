@@ -896,6 +896,7 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
         command: c.command,
         args: [...c.args],
         cwd: ctx.workspace.path,
+        worktreeRoot: ctx.workspace.path, // OS sandbox keeps the worktree writable, host read-only (F1)
         purpose: `verifier check: ${c.name}`,
         timeoutMs: legacyCheckTimeoutMs,
         // STREAMING path: a verbose suite emitting >maxBuffer (8MB) to stdout makes the buffered
@@ -1115,6 +1116,7 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
             command: task.command,
             args: [...task.args],
             cwd: task.cwd === "" ? worktree : join(worktree, task.cwd),
+            worktreeRoot: worktree, // OS sandbox keeps the whole worktree writable (not just the pkg subdir) (F1)
             purpose: `verifier[ladder:${task.scope}] ${task.name} (${task.package || "(root)"})`,
             timeoutMs: checkTimeoutMs,
             // STREAMING path (bounded capture, no kill) so a >maxBuffer verbose suite keeps its real

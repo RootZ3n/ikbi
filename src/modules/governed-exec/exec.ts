@@ -57,6 +57,13 @@ import type {
 } from "./contract.js";
 import { commandPolicyDenyReason } from "./policy.js";
 import { createJobManager, type JobManager } from "./jobs.js";
+import {
+  classifyCommandRisk,
+  detectSandbox,
+  wrapWithSandbox,
+  type SandboxAvailability,
+  type SandboxPlan,
+} from "./sandbox.js";
 
 const EVENT_SOURCE = "governed-exec";
 const EXEC_OPERATION = "govexec.run";
@@ -66,12 +73,18 @@ const FETCH_OPERATION = "govexec.fetch";
 export type ExecFileFn = (
   binary: string,
   args: readonly string[],
-  opts: { cwd?: string; timeout: number; maxBuffer: number; env: NodeJS.ProcessEnv },
+  opts: { cwd?: string; timeout: number; maxBuffer: number; env: NodeJS.ProcessEnv; sandbox?: SandboxPlan },
 ) => Promise<{ stdout: string; stderr: string }>;
 
 const promisifiedExecFile = promisify(nodeExecFile);
-const defaultExecFile: ExecFileFn = (binary, args, opts) =>
-  promisifiedExecFile(binary, args as string[], opts);
+// DEFAULT impl: when a bwrap sandbox plan is attached, wrap the command so its filesystem syscalls
+// are OS-confined to the worktree (F1). An INJECTED execFile (tests) never reaches here, so the
+// security rewrite only happens on the real execution path.
+const defaultExecFile: ExecFileFn = (binary, args, opts) => {
+  const w = wrapWithSandbox(opts.sandbox, binary, args);
+  const { sandbox: _sandbox, ...rest } = opts;
+  return promisifiedExecFile(w.binary, w.args as string[], rest);
+};
 
 /**
  * The STREAMING exec primitive (SG-1): spawns the command and forwards each stdout/stderr
@@ -82,14 +95,16 @@ const defaultExecFile: ExecFileFn = (binary, args, opts) =>
 export type ExecFileStreamFn = (
   binary: string,
   args: readonly string[],
-  opts: { cwd?: string; timeout: number; maxBuffer: number; env: NodeJS.ProcessEnv },
+  opts: { cwd?: string; timeout: number; maxBuffer: number; env: NodeJS.ProcessEnv; sandbox?: SandboxPlan },
   onOutput: (chunk: string, stream: "stdout" | "stderr") => void,
 ) => Promise<{ stdout: string; stderr: string; code: number }>;
 
-/** Default streaming impl over node `spawn` (array args, no shell). Bounds capture at maxBuffer. */
+/** Default streaming impl over node `spawn` (array args, no shell). Bounds capture at maxBuffer.
+ *  Applies the OS sandbox (F1) on the real execution path when a bwrap plan is attached. */
 const defaultExecFileStream: ExecFileStreamFn = (binary, args, opts, onOutput) =>
   new Promise((resolveP) => {
-    const child = nodeSpawn(binary, args as string[], {
+    const w = wrapWithSandbox(opts.sandbox, binary, args);
+    const child = nodeSpawn(w.binary, w.args as string[], {
       ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
       env: opts.env,
       detached: true, // own process group — lets us kill the entire tree, not just the direct child
@@ -143,6 +158,12 @@ export interface GovernedExecDeps {
   /** The STREAMING exec primitive (used when a request sets `onOutput`). Default: node spawn. */
   readonly execFileStream?: ExecFileStreamFn;
   /**
+   * Probe for the OS sandbox (F1). Default: the cached bubblewrap probe (`detectSandbox`). Tests
+   * substitute a fake to exercise the available / unavailable (fail-closed) paths deterministically
+   * without depending on the host having bwrap.
+   */
+  readonly sandboxAvailability?: () => SandboxAvailability;
+  /**
    * The BACKGROUND job manager (used when a request sets `background:true`). Default: a fresh
    * manager wired to node's detached spawn + process-group kill, bounded by `config.maxBuffer`.
    * Tests substitute a fake-spawn manager to exercise the lifecycle without real processes.
@@ -179,6 +200,30 @@ function scrubbedEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
+/**
+ * Build the sandbox audit fields for an exec receipt: the sandbox event + mode, the risk
+ * classification, the writable worktree mount, whether the network was kept, and whether the
+ * command was blocked. NEVER carries args/secrets — only the binary-level facts. The `worktree`
+ * path is the operator's own worktree dir (already present in receipts as the cwd/project).
+ */
+function sandboxMetadata(
+  event: "sandbox.enabled" | "sandbox.unavailable" | "risky_command_blocked",
+  mode: "bwrap" | "unavailable",
+  risk: { kind: string; needsNetwork: boolean },
+  worktree: string | undefined,
+  blocked: boolean,
+): Record<string, unknown> {
+  return {
+    action: "exec",
+    sandbox: mode,
+    sandboxEvent: event,
+    risk: risk.kind,
+    networkAllowed: risk.needsNetwork,
+    blocked,
+    ...(worktree !== undefined ? { worktree } : {}),
+  };
+}
+
 function forbiddenEvalReason(command: string, args: readonly string[]): string | undefined {
   if (command === "node" && args.some((a) => a === "-e" || a === "--eval" || a === "-p" || a === "--print")) {
     return "node code-eval flags are not allowed by governed-exec";
@@ -197,6 +242,7 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
   const publish = deps.publish ?? ((input: EventInput<GovExecEventPayload>) => void coreEvents.publish(input));
   const execFile = deps.execFile ?? defaultExecFile;
   const execFileStream = deps.execFileStream ?? defaultExecFileStream;
+  const sandboxAvailability = deps.sandboxAvailability ?? (() => detectSandbox());
   const jobManager = deps.jobManager ?? createJobManager({ maxBuffer: config.maxBuffer, killGraceMs: config.jobKillGraceMs });
   const allowlist = new Set(config.allowlist);
   // Lazy: resolving the egress guard at construction would throw if egress is not yet
@@ -283,6 +329,69 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
     });
     if (!governance.allow) return deny(governance.reason ?? "gate-wall denied the command", false);
 
+    // (5b) OS SANDBOX ENFORCEMENT (F1). The allowlist + gate-wall cleared WHICH binary may run; this
+    // step decides HOW it runs. A RISKY command (an interpreter / package script / toolchain / write
+    // tool — anything that can execute project code or write files) MUST run inside the bubblewrap
+    // sandbox, where only the worktree + an ephemeral tmpfs are writable. Argv/path validation alone
+    // is structurally insufficient (F1): a helper script run via `node`/`python3` performs its own
+    // filesystem syscalls, which argv checks never see. If the sandbox is unavailable we FAIL CLOSED.
+    const risk = classifyCommandRisk(command, args);
+    let sandboxPlan: SandboxPlan | undefined;
+    let sandboxLabel: "bwrap" | "none" | "unavailable" = "none";
+    const sandboxWritableRoot = request.worktreeRoot ?? cwd;
+    if (risk.risky && config.sandbox.mode !== "off") {
+      const avail = sandboxAvailability();
+      if (avail.available) {
+        sandboxPlan = {
+          mode: "bwrap",
+          ...(sandboxWritableRoot !== undefined ? { writableRoot: sandboxWritableRoot } : {}),
+          ...(cwd !== undefined ? { cwd } : {}),
+          networkAllowed: risk.needsNetwork,
+          risk,
+        };
+        sandboxLabel = "bwrap";
+        emit(govexecExecuted, { ...base, allow: true, sandbox: "bwrap", risk: risk.kind }, identity, EXEC_OPERATION, requestId);
+        await receipt(
+          EXEC_OPERATION,
+          identity,
+          { status: "success", detail: `sandbox enabled (bwrap) for ${command} [${risk.kind}]` },
+          sandboxMetadata("sandbox.enabled", "bwrap", risk, sandboxWritableRoot, false),
+          requestId,
+          cwd,
+        );
+      } else if (config.sandbox.trustedLocalOverride) {
+        // EXPLICIT, NOISY, DEFAULT-OFF override (IKBI_GOVERNED_EXEC_TRUSTED_LOCAL=true): the operator
+        // accepts running this risky command UNSANDBOXED on a host without a working sandbox. Loudly
+        // receipted; NOT a silent default.
+        sandboxLabel = "unavailable";
+        emit(govexecExecuted, { ...base, allow: true, sandbox: "unavailable", risk: risk.kind, reason: "trusted-local override: running risky command unsandboxed" }, identity, EXEC_OPERATION, requestId);
+        await receipt(
+          EXEC_OPERATION,
+          identity,
+          { status: "success", detail: `SANDBOX UNAVAILABLE — running ${command} [${risk.kind}] UNSANDBOXED via trusted-local override (${avail.reason ?? "no sandbox"})` },
+          sandboxMetadata("sandbox.unavailable", "unavailable", risk, sandboxWritableRoot, false),
+          requestId,
+          cwd,
+        );
+      } else {
+        // FAIL CLOSED — refuse to run project code without OS-level confinement.
+        const reason =
+          `ikbi refused to run project code (${command} [${risk.kind}]) because the governed-exec sandbox is unavailable ` +
+          `(${avail.reason ?? "no sandbox"}). This command could write outside the worktree without OS-level confinement. ` +
+          `Install/enable bubblewrap or set IKBI_GOVERNED_EXEC_TRUSTED_LOCAL=true for an explicit trusted-local override.`;
+        emit(govexecDenied, { ...base, reason, allow: false, sandbox: "unavailable", risk: risk.kind }, identity, EXEC_OPERATION, requestId);
+        await receipt(
+          EXEC_OPERATION,
+          identity,
+          { status: "rejected", error: reason },
+          sandboxMetadata("risky_command_blocked", "unavailable", risk, sandboxWritableRoot, true),
+          requestId,
+          cwd,
+        );
+        return { executed: false, denied: true, reason };
+      }
+    }
+
     // (6) dryRun ⇒ report intent + the allow decision; execute NOTHING.
     if (parentCtx.dryRun === true) {
       const reason = `dry-run: would exec ${sudo ? "sudo " : ""}${command} (${argCount} args)`;
@@ -303,18 +412,20 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
     // only the wait + the wall-clock timeout are dropped (a dev server / watch must run until killed).
     // Output is captured for incremental polling via `readJobOutput`; the receipt records the handle.
     if (request.background === true) {
+      // Sandbox-wrap a risky background command too — a detached `node script.js` must be confined.
+      const wrapped = wrapWithSandbox(sandboxPlan, command, args);
       const { jobId, pid } = jobManager.spawn({
-        command,
-        args,
+        command: wrapped.binary,
+        args: wrapped.args,
         ...(cwd !== undefined ? { cwd } : {}),
         env: scrubbedEnv(),
       });
-      emit(govexecExecuted, { ...base, allow: true, background: true }, identity, EXEC_OPERATION, requestId);
+      emit(govexecExecuted, { ...base, allow: true, background: true, sandbox: sandboxLabel, risk: risk.kind }, identity, EXEC_OPERATION, requestId);
       await receipt(
         EXEC_OPERATION,
         identity,
         { status: "success", detail: `exec ${command} → background job ${jobId}` },
-        { action: "exec", command, argCount, sudo, allow: true, background: true, jobId },
+        { action: "exec", command, argCount, sudo, allow: true, background: true, jobId, sandbox: sandboxLabel, risk: risk.kind },
         requestId,
         cwd,
       );
@@ -328,22 +439,23 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
     // STREAMING path (SG-1): when the caller wants live output, spawn and forward each chunk.
     // The receipt/result still carry only the BOUNDED tail — truncation is for the record, not
     // the live view. A non-zero exit is reported, never thrown.
+    const sbx = { sandbox: sandboxLabel, risk: risk.kind };
     if (request.onOutput !== undefined) {
       const { stdout, stderr, code } = await execFileStream(
         command,
         args,
-        { ...(cwd !== undefined ? { cwd } : {}), timeout: effectiveTimeout, maxBuffer: config.maxBuffer, env: scrubbedEnv() },
+        { ...(cwd !== undefined ? { cwd } : {}), timeout: effectiveTimeout, maxBuffer: config.maxBuffer, env: scrubbedEnv(), ...(sandboxPlan !== undefined ? { sandbox: sandboxPlan } : {}) },
         request.onOutput,
       );
       if (code === 0) {
-        emit(govexecExecuted, { ...base, allow: true, exitCode: 0 }, identity, EXEC_OPERATION, requestId);
-        await receipt(EXEC_OPERATION, identity, { status: "success", detail: `exec ${command} ok` }, { action: "exec", command, argCount, sudo, allow: true, exitCode: 0 }, requestId, cwd);
+        emit(govexecExecuted, { ...base, allow: true, exitCode: 0, ...sbx }, identity, EXEC_OPERATION, requestId);
+        await receipt(EXEC_OPERATION, identity, { status: "success", detail: `exec ${command} ok` }, { action: "exec", command, argCount, sudo, allow: true, exitCode: 0, ...sbx }, requestId, cwd);
         return { executed: true, exitCode: 0, stdoutTail: tail(stdout), stderrTail: tail(stderr) };
       }
       // Code 124 is the conventional timeout-kill exit code (set by the streaming impl).
       const reason = code === 124 ? `command timed out after ${effectiveTimeout}ms (killed)` : `command exited ${code}`;
-      emit(govexecFailed, { ...base, allow: true, exitCode: code, reason }, identity, EXEC_OPERATION, requestId);
-      await receipt(EXEC_OPERATION, identity, { status: "failure", error: reason, code: String(code) }, { action: "exec", command, argCount, sudo, allow: true, exitCode: code }, requestId, cwd);
+      emit(govexecFailed, { ...base, allow: true, exitCode: code, reason, ...sbx }, identity, EXEC_OPERATION, requestId);
+      await receipt(EXEC_OPERATION, identity, { status: "failure", error: reason, code: String(code) }, { action: "exec", command, argCount, sudo, allow: true, exitCode: code, ...sbx }, requestId, cwd);
       return { executed: true, exitCode: code, reason, stdoutTail: tail(stdout), stderrTail: tail(stderr) };
     }
     try {
@@ -352,13 +464,14 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
         timeout: effectiveTimeout,
         maxBuffer: config.maxBuffer,
         env: scrubbedEnv(),
+        ...(sandboxPlan !== undefined ? { sandbox: sandboxPlan } : {}),
       });
-      emit(govexecExecuted, { ...base, allow: true, exitCode: 0 }, identity, EXEC_OPERATION, requestId);
+      emit(govexecExecuted, { ...base, allow: true, exitCode: 0, ...sbx }, identity, EXEC_OPERATION, requestId);
       await receipt(
         EXEC_OPERATION,
         identity,
         { status: "success", detail: `exec ${command} ok` },
-        { action: "exec", command, argCount, sudo, allow: true, exitCode: 0 },
+        { action: "exec", command, argCount, sudo, allow: true, exitCode: 0, ...sbx },
         requestId,
         cwd,
       );
@@ -367,12 +480,12 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
       const e = err as { code?: number | string; stdout?: string; stderr?: string };
       const exitCode = typeof e.code === "number" ? e.code : 1;
       const reason = `command exited ${exitCode}`;
-      emit(govexecFailed, { ...base, allow: true, exitCode, reason }, identity, EXEC_OPERATION, requestId);
+      emit(govexecFailed, { ...base, allow: true, exitCode, reason, ...sbx }, identity, EXEC_OPERATION, requestId);
       await receipt(
         EXEC_OPERATION,
         identity,
         { status: "failure", error: reason, code: String(exitCode) },
-        { action: "exec", command, argCount, sudo, allow: true, exitCode },
+        { action: "exec", command, argCount, sudo, allow: true, exitCode, ...sbx },
         requestId,
         cwd,
       );

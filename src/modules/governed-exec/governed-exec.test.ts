@@ -29,7 +29,10 @@ function makeCtx(tier: string, opts: { dryRun?: boolean } = {}): OperationContex
 }
 
 function cfg(allowlist: string[], enabled = true): GovernedExecConfig {
-  return { enabled, allowlist, execTimeoutMs: 1000, maxBuffer: 1_000_000, networkTimeoutMs: 1000, jobKillGraceMs: 5000 };
+  // sandbox OFF for these unit tests: they exercise gating/allowlist/policy with an INJECTED
+  // execFile, not real OS-sandboxed execution (covered by sandbox.test.ts + the F1 integration
+  // tests). The `sandbox` field is a contract addition (F1) — see config.ts / sandbox.ts.
+  return { enabled, allowlist, execTimeoutMs: 1000, maxBuffer: 1_000_000, networkTimeoutMs: 1000, jobKillGraceMs: 5000, sandbox: { mode: "off", trustedLocalOverride: false } };
 }
 
 function fakeExecFile(result: { stdout: string; stderr: string } = { stdout: "out", stderr: "" }) {

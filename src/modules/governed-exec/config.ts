@@ -13,6 +13,7 @@
  */
 
 import { moduleEnv } from "../../core/module-config.js";
+import { DEFAULT_SANDBOX_MODE, type SandboxConfig, type SandboxMode } from "./sandbox.js";
 
 const env = moduleEnv("governed-exec");
 
@@ -72,6 +73,19 @@ export interface GovernedExecConfig {
   readonly networkTimeoutMs: number;
   /** Grace (ms) between SIGTERM and SIGKILL when killing a background job. */
   readonly jobKillGraceMs: number;
+  /**
+   * OS-LEVEL SANDBOX policy for risky subprocesses (F1). `auto` (default) sandboxes risky commands
+   * via bubblewrap when it works and FAILS CLOSED (denies) when it does not; `required` additionally
+   * treats a missing sandbox as a hard error; `off` disables sandboxing (NOT for production — unit
+   * tests / non-Linux dev only). See sandbox.ts.
+   */
+  readonly sandbox: SandboxConfig;
+}
+
+/** Parse the sandbox mode env (`auto` | `off` | `required`), defaulting to the safe `auto`. */
+function parseSandboxMode(raw: string | undefined): SandboxMode {
+  const v = (raw ?? "").trim().toLowerCase();
+  return v === "off" || v === "required" || v === "auto" ? v : DEFAULT_SANDBOX_MODE;
 }
 
 /**
@@ -95,6 +109,11 @@ export function loadGovernedExecConfig(reader = env): GovernedExecConfig {
     maxBuffer: reader.int("MAX_BUFFER", DEFAULT_MAX_BUFFER, { min: 1 }),
     networkTimeoutMs: reader.int("NETWORK_TIMEOUT_MS", DEFAULT_NETWORK_TIMEOUT_MS, { min: 1 }),
     jobKillGraceMs: reader.int("JOB_KILL_GRACE_MS", DEFAULT_JOB_KILL_GRACE_MS, { min: 1 }),
+    sandbox: Object.freeze({
+      mode: parseSandboxMode(reader.str("SANDBOX")),
+      // IKBI_GOVERNED_EXEC_TRUSTED_LOCAL — explicit, default-OFF override; see SandboxConfig.
+      trustedLocalOverride: reader.bool("TRUSTED_LOCAL", false),
+    }),
   });
 }
 

@@ -23,7 +23,7 @@ function makeCtx(tier = "verified"): OperationContext {
   });
   return beginOperation(resolver.resolve({ token: "caller-secret" }), { requestId: "req-1" });
 }
-const cfg = (allowlist: string[]): GovernedExecConfig => ({ enabled: true, allowlist, execTimeoutMs: 300, maxBuffer: 1_000_000, networkTimeoutMs: 5000, jobKillGraceMs: 5000 });
+const cfg = (allowlist: string[]): GovernedExecConfig => ({ enabled: true, allowlist, execTimeoutMs: 300, maxBuffer: 1_000_000, networkTimeoutMs: 5000, jobKillGraceMs: 5000, sandbox: { mode: "off", trustedLocalOverride: false } });
 const gate = () => createGateWall({ receipts: { append: async () => ({}) }, publish: () => {} });
 const noReceipts = { append: async () => ({}) };
 
