@@ -1,0 +1,32 @@
+================ UGLY-MACHINE SMOKE (clean node:22) ================
+--- 1. fresh clone (export): ikbi + its sibling velum, NO node_modules ---
+OK: no node_modules (fresh)
+node v22.23.1
+pnpm 11.9.0
+--- 2. bwrap ABSENT? ---
+OK: bwrap ABSENT (fail-closed path)
+--- 3. fresh pnpm install (proves onboarding; no warmed store) ---
+* 1 dependencies were added: velum-ai@file:../velum
+
+tsx present: NO
+--- 4. doctor ---
+bash: line 20: node_modules/.bin/tsx: No such file or directory
+(doctor non-zero)
+--- 5. typecheck ---
+Done in 1.2s using pnpm v11.9.0
+$ tsc -p tsconfig.json --noEmit
+typecheck exit=0
+--- 6. sandbox/F1 + depinstall tests (bwrap ABSENT → fail-closed paths) ---
+# tests 29
+# pass 24
+# fail 0
+# skipped 5
+--- 7. install bubblewrap, re-test (bwrap PRESENT → escape contained) ---
+bwrap installed: bubblewrap 0.8.0
+  probe: can bwrap run here?
+  bwrap WORKS in container
+# tests 17
+# pass 17
+# fail 0
+# skipped 0
+================ UGLY-MACHINE DONE ================

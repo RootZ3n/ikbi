@@ -85,6 +85,13 @@ Be honest with yourself about these before trusting a run.
   never unsafe. Run the gauntlet/proof sequentially or off-peak for a representative pass rate.
 - **Adversarial / denied goals burn the builder's round/budget** before failing closed (set
   `IKBI_WORKER_MODEL_TOTAL_BUDGET_MS` to bound it). Safe, but slow.
+- **The repo is NOT self-contained for a fresh public clone.** `package.json` depends on a local
+  sibling `velum-ai@file:../velum`. On the reference machine `../velum` is present, so `pnpm install`,
+  typecheck, tests, and builds all work. A *truly* fresh clone on a machine WITHOUT the sibling cannot
+  `pnpm install` (only `velum-ai` resolves; the rest never install). Surfaced by the ugly-machine test
+  (clean `node:22` container): with the velum sibling copied in, install + typecheck + all sandbox/F1
+  tests pass; without it, install is incomplete. **Blocks public release** until velum is published
+  (or vendored). Does NOT block Jeff's local use.
 - **Public/shared use is NOT validated**: onboarding, install on heterogeneous machines, support
   boundaries, and multi-tenant isolation are open. See PUBLIC_RC_NOT_YET.
 
