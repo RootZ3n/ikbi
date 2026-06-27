@@ -15,6 +15,13 @@ capability is granted rather than assumed. Concretely:
   built-in trust HMAC key or token-hash pepper unless `IKBI_ALLOW_INSECURE_DEV_KEYS=true`
   is set explicitly for development (the refusal fires at config load, before the
   trust and identity modules construct).
+- **Project code → OS-sandboxed (Linux bubblewrap).** Risky governed-exec commands
+  (interpreters, package scripts, toolchains, write tools) and dependency installs run
+  inside `bwrap`: only the worktree (+ the package store/cache + an ephemeral `/tmp`) is
+  writable, the rest of the host is read-only, and network is denied unless policy allows.
+  Package lifecycle scripts are off by default (`--ignore-scripts`). When the sandbox is
+  unavailable, risky execution FAILS CLOSED (no unsafe default; explicit `*_TRUSTED_LOCAL`
+  override only). See `docs/RC1-RELEASE.md` for requirements, limitations, and the operator guide.
 - **Network egress → default-deny.** No host is reachable unless it is on the egress
   allowlist, and every resolved IP is validated against internal ranges before connect.
   The allowlist mechanism is default-deny; the *shipped default* is non-empty (the
