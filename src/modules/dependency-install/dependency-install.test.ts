@@ -35,7 +35,10 @@ const WORKSPACE: WorkspaceHandle = {
 const NPM_REGISTRY = "https://registry.npmjs.org/";
 
 function cfg(over: Partial<DependencyInstallConfig> = {}): DependencyInstallConfig {
-  return { enabled: true, registryAllowlist: [NPM_REGISTRY], defaultPackageManager: "pnpm", installTimeoutMs: 1000, maxBuffer: 1_000_000, ...over };
+  // sandbox OFF by default for the unit tests (they inject execFile and assert on the raw command,
+  // not real bwrap execution — sandbox enforcement is covered by the new sandbox tests). Scripts are
+  // OFF (the production default → `--ignore-scripts`), a contract addition (F1 install hardening).
+  return { enabled: true, registryAllowlist: [NPM_REGISTRY], defaultPackageManager: "pnpm", installTimeoutMs: 1000, maxBuffer: 1_000_000, allowScripts: false, sandboxMode: "off", sandboxTrustedLocalOverride: false, ...over };
 }
 
 function fakeExecFile(result: { stdout: string; stderr: string } = { stdout: "deps installed", stderr: "" }) {
@@ -195,7 +198,8 @@ test("execFile is called with (pm, argsArray) and NO shell option", async () => 
   const di = createDependencyInstall({ config: cfg(), gateWall: capturingGate().gateWall, execFile: ex.fn, readLockfile: fakeLockfile().fn, receipts: fakeReceipts().receipts, publish: () => {} });
 
   await di.run({ parentCtx: makeCtx("verified"), workspace: WORKSPACE });
-  assert.deepEqual(ex.calls[0]?.args, ["install", "--frozen-lockfile", "--registry", NPM_REGISTRY]);
+  // Scripts are disabled by default (F1 install hardening) → `--ignore-scripts` is part of the args.
+  assert.deepEqual(ex.calls[0]?.args, ["install", "--frozen-lockfile", "--ignore-scripts", "--registry", NPM_REGISTRY]);
   assert.ok(!("shell" in (ex.calls[0]?.opts ?? {})), "no shell option");
   assert.equal(ex.calls[0]?.opts.cwd, WORKSPACE.path, "scoped to the workspace worktree");
 });

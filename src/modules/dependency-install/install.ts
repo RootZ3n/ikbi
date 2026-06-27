@@ -38,6 +38,13 @@ import { receipts as coreReceipts } from "../../core/receipt/index.js";
 import type { ReceiptInput } from "../../core/receipt/contract.js";
 import { asTier, autonomyForTier, TRUST_FLOOR } from "../../core/trust/index.js";
 import { gateWall as coreGateWall, type GateWall } from "../gate-wall/index.js";
+import {
+  buildBwrapArgs,
+  detectSandbox,
+  packageManagerStoreDirs,
+  type SandboxAvailability,
+  type SandboxPlan,
+} from "../governed-exec/sandbox.js";
 import { dependencyInstallConfig, OUTPUT_TAIL_CHARS, type DependencyInstallConfig } from "./config.js";
 import {
   depinstallCompleted,
@@ -67,11 +74,20 @@ const PM_SPECS: Readonly<Record<PackageManager, PmSpec>> = Object.freeze({
 export type ExecFileFn = (
   binary: string,
   args: readonly string[],
-  opts: { cwd?: string; timeout: number; maxBuffer: number },
+  opts: { cwd?: string; timeout: number; maxBuffer: number; sandbox?: SandboxPlan },
 ) => Promise<{ stdout: string; stderr: string }>;
 
 const promisifiedExecFile = promisify(nodeExecFile);
-const defaultExecFile: ExecFileFn = (binary, args, opts) => promisifiedExecFile(binary, args as string[], opts);
+// DEFAULT impl: when a bwrap sandbox plan is attached, run the install INSIDE the sandbox so even a
+// postinstall script (if scripts are explicitly enabled) cannot write outside {worktree, store/cache,
+// tmpfs}. An INJECTED execFile (tests) never reaches here, so the security wrap is only on the real path.
+const defaultExecFile: ExecFileFn = (binary, args, opts) => {
+  const { sandbox, ...rest } = opts;
+  if (sandbox !== undefined && sandbox.mode === "bwrap") {
+    return promisifiedExecFile("bwrap", buildBwrapArgs(sandbox, binary, args) as string[], rest);
+  }
+  return promisifiedExecFile(binary, args as string[], rest);
+};
 
 /** Reads a lockfile's contents, or undefined when absent/unreadable. Tests substitute this. */
 export type ReadLockfileFn = (workspacePath: string, lockfileName: string) => string | undefined;
@@ -91,6 +107,10 @@ export interface DependencyInstallDeps {
   readonly publish?: (input: EventInput<DepInstallEventPayload>) => void;
   readonly execFile?: ExecFileFn;
   readonly readLockfile?: ReadLockfileFn;
+  /** Probe for the OS sandbox. Default: the cached bubblewrap probe. Tests substitute it. */
+  readonly sandboxAvailability?: () => SandboxAvailability;
+  /** The package-manager store/cache dirs to keep writable in the sandbox. Default: derived from $HOME. */
+  readonly storeDirs?: () => string[];
 }
 
 function tail(s: string): string {
@@ -109,6 +129,8 @@ export function createDependencyInstall(deps: DependencyInstallDeps = {}): Depen
   const publish = deps.publish ?? ((input: EventInput<DepInstallEventPayload>) => void coreEvents.publish(input));
   const execFile = deps.execFile ?? defaultExecFile;
   const readLockfile = deps.readLockfile ?? defaultReadLockfile;
+  const sandboxAvailability = deps.sandboxAvailability ?? (() => detectSandbox());
+  const storeDirs = deps.storeDirs ?? (() => packageManagerStoreDirs());
   const allowlist = new Set(config.registryAllowlist);
 
   function emit(
@@ -201,9 +223,64 @@ export function createDependencyInstall(deps: DependencyInstallDeps = {}): Depen
     }
     const lockfileHash = sha256(lockfileContents);
 
+    // (5b) SCRIPT POLICY: a package lifecycle script (postinstall) is arbitrary code execution — the
+    // F1 escape vector applied to install. Disable scripts by default (`--ignore-scripts`); only an
+    // explicit `allowScripts` opt-in runs them, and then ONLY inside the sandbox (enforced below).
+    const allowScripts = config.allowScripts;
+    const scriptPolicy = allowScripts ? "scripts-allowed" : "ignore-scripts";
+    const installArgs = [...spec.args, ...(allowScripts ? [] : ["--ignore-scripts"]), "--registry", registry];
+
+    // (5c) OS SANDBOX for the install subprocess. Even with scripts disabled the package manager runs
+    // as node; with scripts enabled a postinstall is untrusted code. Run install inside bwrap so its
+    // writes are confined to {worktree, store/cache, ephemeral tmpfs}; the rest of the host is
+    // read-only. FAIL CLOSED when scripts are enabled but no sandbox exists (no unsafe default).
+    let sandboxPlan: SandboxPlan | undefined;
+    let sandboxLabel: "bwrap" | "none" | "unavailable" = "none";
+    if (config.sandboxMode !== "off") {
+      const avail = sandboxAvailability();
+      if (avail.available) {
+        sandboxPlan = {
+          mode: "bwrap",
+          writableRoot: workspace.path,
+          cwd: workspace.path,
+          networkAllowed: true, // install must reach the allowlisted registry
+          extraWritable: storeDirs(),
+          risk: { risky: true, kind: "package-install", needsNetwork: true, reason: "dependency install" },
+        };
+        sandboxLabel = "bwrap";
+      } else if (config.sandboxMode === "required" || (allowScripts && !config.sandboxTrustedLocalOverride)) {
+        // FAIL CLOSED: either strict `required` mode, or scripts would run untrusted code without OS
+        // confinement and no trusted-local override was set.
+        const reason =
+          `dependency-install refused: ${allowScripts ? "package scripts are enabled but " : ""}the OS sandbox is unavailable ` +
+          `(${avail.reason ?? "no sandbox"})${allowScripts ? " — a postinstall could write outside the worktree" : ""}. ` +
+          `Install bubblewrap, keep scripts disabled (default), or set IKBI_DEPENDENCY_INSTALL_TRUSTED_LOCAL=true.`;
+        emit(depinstallFailed, { ...base, registry, reason }, identity, requestId);
+        await receipt(
+          identity,
+          { status: "rejected", error: reason },
+          { action: "exec", packageManager: pm, mode: spec.mode, registry, lockfileHash, sandbox: "unavailable", scriptPolicy, networkPolicy: "registry-only", blocked: true },
+          undefined,
+          requestId,
+          workspace.id,
+        );
+        return { installed: false, denied: true, reason, lockfileHash, registry, mode: spec.mode };
+      } else {
+        // Sandbox unavailable but SAFE: scripts are disabled (no untrusted code runs). Proceed
+        // UNSANDBOXED and record it honestly. (Trusted-local override for the allowScripts case also
+        // lands here.)
+        sandboxLabel = "unavailable";
+      }
+    }
+    const sandboxMeta = {
+      sandbox: sandboxLabel,
+      scriptPolicy,
+      networkPolicy: "registry-only",
+      ...(sandboxLabel === "bwrap" ? { writableMounts: ["<worktree>", ...storeDirs()] } : {}),
+    };
+
     // (6) GATE-WALL — before any execution.
     const grant = autonomyForTier(asTier(identity.trustTier ?? TRUST_FLOOR, TRUST_FLOOR));
-    const installArgs = [...spec.args, "--registry", registry];
     const governance = await gateWall.evaluate({
       grant,
       action: { kind: "exec", command: pm, args: installArgs, sudo: false, purpose: "dependency install" },
@@ -214,7 +291,7 @@ export function createDependencyInstall(deps: DependencyInstallDeps = {}): Depen
       await receipt(
         identity,
         { status: "rejected", error: governance.reason ?? "gate-wall denied the install" },
-        { action: "exec", packageManager: pm, mode: spec.mode, registry, lockfileHash, allow: false },
+        { action: "exec", packageManager: pm, mode: spec.mode, registry, lockfileHash, allow: false, ...sandboxMeta },
         undefined,
         requestId,
         workspace.id,
@@ -229,7 +306,7 @@ export function createDependencyInstall(deps: DependencyInstallDeps = {}): Depen
       await receipt(
         identity,
         { status: "success", detail: reason },
-        { action: "exec", packageManager: pm, mode: spec.mode, registry, lockfileHash, dryRun: true },
+        { action: "exec", packageManager: pm, mode: spec.mode, registry, lockfileHash, dryRun: true, ...sandboxMeta },
         undefined,
         requestId,
         workspace.id,
@@ -237,18 +314,19 @@ export function createDependencyInstall(deps: DependencyInstallDeps = {}): Depen
       return { installed: false, reason, lockfileHash, registry, mode: spec.mode };
     }
 
-    // (8) EXECUTE — array args, NO shell, in the workspace worktree. (9) rich receipt.
+    // (8) EXECUTE — array args, NO shell, in the workspace worktree, inside the OS sandbox when
+    // available. (9) rich receipt recording the sandbox / script / network policy.
     const changes: ReceiptInput["changes"] = [
-      { kind: "exec", target: pm, summary: `${pm} ${spec.mode} --registry ${registry}` },
+      { kind: "exec", target: pm, summary: `${pm} ${spec.mode} ${scriptPolicy} --registry ${registry}` },
       { kind: "file", target: "node_modules", summary: `installed from ${spec.lockfile} (sha256 ${lockfileHash.slice(0, 12)}…)` },
     ];
     try {
-      const { stdout, stderr } = await execFile(pm, installArgs, { cwd: workspace.path, timeout: config.installTimeoutMs, maxBuffer: config.maxBuffer });
-      emit(depinstallCompleted, { ...base, registry, allow: true, exitCode: 0 }, identity, requestId);
+      const { stdout, stderr } = await execFile(pm, installArgs, { cwd: workspace.path, timeout: config.installTimeoutMs, maxBuffer: config.maxBuffer, ...(sandboxPlan !== undefined ? { sandbox: sandboxPlan } : {}) });
+      emit(depinstallCompleted, { ...base, registry, allow: true, exitCode: 0, sandbox: sandboxLabel }, identity, requestId);
       await receipt(
         identity,
         { status: "success", detail: `${pm} ${spec.mode} ok` },
-        { action: "exec", packageManager: pm, mode: spec.mode, registry, lockfileHash, exitCode: 0 },
+        { action: "exec", packageManager: pm, mode: spec.mode, registry, lockfileHash, exitCode: 0, ...sandboxMeta },
         changes,
         requestId,
         workspace.id,
@@ -258,11 +336,11 @@ export function createDependencyInstall(deps: DependencyInstallDeps = {}): Depen
       const e = err as { code?: number | string; stdout?: string; stderr?: string };
       const exitCode = typeof e.code === "number" ? e.code : 1;
       const reason = `install exited ${exitCode}`;
-      emit(depinstallFailed, { ...base, registry, allow: true, exitCode, reason }, identity, requestId);
+      emit(depinstallFailed, { ...base, registry, allow: true, exitCode, reason, sandbox: sandboxLabel }, identity, requestId);
       await receipt(
         identity,
         { status: "failure", error: reason, code: String(exitCode) },
-        { action: "exec", packageManager: pm, mode: spec.mode, registry, lockfileHash, exitCode },
+        { action: "exec", packageManager: pm, mode: spec.mode, registry, lockfileHash, exitCode, ...sandboxMeta },
         undefined,
         requestId,
         workspace.id,

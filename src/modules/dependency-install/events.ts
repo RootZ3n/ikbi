@@ -25,6 +25,8 @@ export interface DepInstallEventPayload {
   readonly reason?: string;
   /** True when reported under dry-run (nothing executed). */
   readonly dryRun?: boolean;
+  /** OS-sandbox mode applied to the install subprocess: "bwrap" | "none" | "unavailable". */
+  readonly sandbox?: "bwrap" | "none" | "unavailable";
 }
 
 /** Emitted when an install is requested (before any gate/exec). */

@@ -21,7 +21,12 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
+
+/** existsSync that never throws (e.g. on EACCES of an intermediate dir). */
+function existsSyncSafe(p: string): boolean {
+  try { return existsSync(p); } catch { return false; }
+}
 
 /** How the operator wants risky commands sandboxed. */
 export type SandboxMode = "auto" | "off" | "required";
@@ -145,6 +150,38 @@ export interface SandboxPlan {
   readonly cwd?: string;
   readonly networkAllowed: boolean;
   readonly risk: CommandRisk;
+  /**
+   * EXTRA writable host paths beyond the worktree — used ONLY by dependency-install for the package
+   * manager's store/cache dirs (an isolated/cache area), so a frozen install can fetch+hardlink. The
+   * rest of the host stays read-only, so a postinstall script still cannot write ~/.bashrc, /etc,
+   * /pehverse, repo parents, or ../../X. Each existing dir is bound read-write; non-existent ones are
+   * skipped (bwrap cannot bind a missing source).
+   */
+  readonly extraWritable?: readonly string[];
+}
+
+/**
+ * The package-manager store/cache dirs that an install must be able to write (fetch + hardlink),
+ * derived from the real $HOME. Binding ONLY these writable (everything else read-only) lets a frozen
+ * install proceed while still containing any postinstall script to {worktree, store/cache, tmpfs}.
+ * Honors the standard env overrides operators set. Returns absolute paths (existence is checked at
+ * bind time).
+ */
+export function packageManagerStoreDirs(env: NodeJS.ProcessEnv = process.env): string[] {
+  const home = env.HOME ?? "";
+  const dirs = [
+    env.PNPM_HOME,
+    env.npm_config_store_dir,
+    env.npm_config_cache,
+    env.XDG_DATA_HOME ? `${env.XDG_DATA_HOME}/pnpm` : undefined,
+    env.XDG_CACHE_HOME ? `${env.XDG_CACHE_HOME}` : undefined,
+    home ? `${home}/.local/share/pnpm` : undefined,
+    home ? `${home}/.cache/pnpm` : undefined,
+    home ? `${home}/.cache/node` : undefined,
+    home ? `${home}/.npm` : undefined,
+    home ? `${home}/.local/state/pnpm` : undefined,
+  ].filter((d): d is string => typeof d === "string" && d.length > 0);
+  return [...new Set(dirs)];
 }
 
 /**
@@ -176,6 +213,13 @@ export function buildBwrapArgs(plan: SandboxPlan, command: string, args: readonl
   ];
   if (writableRoot !== undefined) {
     a.push("--bind", writableRoot, writableRoot);
+  }
+  // Extra writable mounts (dependency-install's store/cache only). Bind each that EXISTS read-write,
+  // skipping the worktree (already bound) and any missing dir (bwrap fails on a missing bind source).
+  for (const raw of plan.extraWritable ?? []) {
+    const p = canonical(raw);
+    if (p === writableRoot || (writableRoot !== undefined && p.startsWith(writableRoot + "/"))) continue;
+    if (existsSyncSafe(p)) a.push("--bind", p, p);
   }
   if (chdir !== undefined) {
     a.push("--chdir", chdir);

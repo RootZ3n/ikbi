@@ -44,10 +44,26 @@ export interface DependencyInstallConfig {
   readonly defaultPackageManager: PackageManager;
   readonly installTimeoutMs: number;
   readonly maxBuffer: number;
+  /**
+   * Run package lifecycle scripts (preinstall/install/postinstall)? DEFAULT FALSE ⇒ `--ignore-scripts`
+   * — a postinstall is arbitrary code execution (the F1 escape vector), so it is OFF by default. When
+   * true, scripts run but ONLY inside the bwrap sandbox; with the sandbox unavailable an install that
+   * would run scripts FAILS CLOSED unless `sandboxTrustedLocalOverride` is set.
+   */
+  readonly allowScripts: boolean;
+  /** OS-sandbox policy for the install subprocess: `auto` (default) | `off` | `required`. */
+  readonly sandboxMode: "auto" | "off" | "required";
+  /** Explicit, default-OFF override: when scripts are allowed but no sandbox exists, run anyway (noisy). */
+  readonly sandboxTrustedLocalOverride: boolean;
 }
 
 function asPackageManager(v: string | undefined): PackageManager {
   return v === "npm" ? "npm" : "pnpm";
+}
+
+function asSandboxMode(v: string | undefined): "auto" | "off" | "required" {
+  const s = (v ?? "").trim().toLowerCase();
+  return s === "off" || s === "required" ? s : "auto";
 }
 
 /** Load the dependency-install config slice from `IKBI_DEPENDENCY_INSTALL_*`. */
@@ -58,6 +74,9 @@ export function loadDependencyInstallConfig(reader = env): DependencyInstallConf
     defaultPackageManager: asPackageManager(reader.str("PACKAGE_MANAGER")),
     installTimeoutMs: reader.int("TIMEOUT_MS", DEFAULT_INSTALL_TIMEOUT_MS, { min: 1 }),
     maxBuffer: reader.int("MAX_BUFFER", DEFAULT_MAX_BUFFER, { min: 1 }),
+    allowScripts: reader.bool("ALLOW_SCRIPTS", false),
+    sandboxMode: asSandboxMode(reader.str("SANDBOX")),
+    sandboxTrustedLocalOverride: reader.bool("TRUSTED_LOCAL", false),
   });
 }
 
