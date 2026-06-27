@@ -84,6 +84,24 @@ test("info commands with no trust keys get the dev-keys opt-in (so config can lo
   }
 });
 
+test("`--version`/`-V` (flag form) get the dev-keys opt-in so a fresh shell can print the version", () => {
+  for (const argv of [["--version"], ["-V"]]) {
+    const env: NodeJS.ProcessEnv = {};
+    assert.equal(enableDevKeysForInfoCommand(argv, env), true, `enabled for ${argv.join(" ")}`);
+    assert.equal(env.IKBI_ALLOW_INSECURE_DEV_KEYS, "true");
+  }
+});
+
+test("`<command> --help`/`--version` ANYWHERE in argv is treated as read-only info", () => {
+  // The help/version flag follows a NON-info leading command (build/memory/fix) — a fresh-shell
+  // stranger must still be able to read usage / the version without setting trust keys first.
+  for (const argv of [["build", "--help"], ["memory", "--help"], ["fix", "-h"], ["build", "--version"]]) {
+    const env: NodeJS.ProcessEnv = {};
+    assert.equal(enableDevKeysForInfoCommand(argv, env), true, `enabled for ${argv.join(" ")}`);
+    assert.equal(env.IKBI_ALLOW_INSECURE_DEV_KEYS, "true");
+  }
+});
+
 test("a real build/batch is NOT auto-opted-in (production guard stays)", () => {
   for (const cmd of ["build", "batch", "mcp", "undo"]) {
     const env: NodeJS.ProcessEnv = {};

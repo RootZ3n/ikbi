@@ -99,6 +99,8 @@ export const INFO_COMMANDS: ReadonlySet<string> = new Set([
   "--help",
   "-h",
   "version",
+  "--version", // the flag form (`ikbi --version`) — pure info, no trust ops
+  "-V", //        short flag form
   "models",
   "providers",
   "capabilities",
@@ -108,6 +110,18 @@ export const INFO_COMMANDS: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Does this arg list ask for help or the version, ANYWHERE in argv? `ikbi build --help`,
+ * `ikbi memory --help`, and `ikbi --version` are all pure read-only info — they print usage /
+ * the version and return BEFORE any trust operation — regardless of the leading command. A
+ * fresh-shell stranger must be able to run them without setting trust keys, so they too get the
+ * dev-keys opt-in (the production guard still fires for a REAL `ikbi build <goal>`, which carries
+ * no help/version flag).
+ */
+function wantsHelpOrVersion(argv: readonly string[]): boolean {
+  return argv.some((a) => a === "--help" || a === "-h" || a === "--version" || a === "-V");
+}
+
+/**
  * For a read-only INFO command with no real trust keys set, enable the built-in dev-keys opt-in
  * so `core/config` LOADS (instead of the startup guard throwing a raw stack at import). Scoped
  * strictly to info commands — a real build/batch still gets the production guard. Returns true
@@ -115,7 +129,10 @@ export const INFO_COMMANDS: ReadonlySet<string> = new Set([
  */
 export function enableDevKeysForInfoCommand(argv: readonly string[], env: NodeJS.ProcessEnv = process.env): boolean {
   const cmd = argv[0];
-  const isInfo = cmd === undefined || INFO_COMMANDS.has(cmd);
+  // Info iff: bare `ikbi` (REPL cold-start), a known read-only command, OR a help/version flag
+  // appears anywhere (`<cmd> --help`, `ikbi --version`). The last clause is what lets a fresh-shell
+  // stranger run `ikbi build --help` / `ikbi --version` without first setting trust keys.
+  const isInfo = cmd === undefined || INFO_COMMANDS.has(cmd) || wantsHelpOrVersion(argv);
   if (!isInfo) return false;
   if (env.IKBI_ALLOW_INSECURE_DEV_KEYS !== undefined) return false; // operator already chose
   // Treat blank strings as missing too — config.ts:optStr() treats them as undefined,

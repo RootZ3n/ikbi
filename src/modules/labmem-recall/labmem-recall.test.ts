@@ -11,7 +11,7 @@
  * adapter caches the labmem module.)
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { test } from "node:test";
@@ -25,6 +25,17 @@ const REAL_LABMEM = process.env["LABMEM_REAL"] ?? (() => {
   for (let i = 0; i < 12; i++) { if (basename(d) === "ecosystem") return join(d, "lab-memory", "labmem"); const p = dirname(d); if (p === d) break; d = p; }
   return join(process.cwd(), "lab-memory", "labmem");
 })();
+
+// labmem is an OPTIONAL external integration (lab-utilities/lab-memory/labmem). It is NOT
+// vendored into ikbi: its tree carries private lab DATA and ships no public license, so it
+// cannot be redistributed in a public clone. This POSITIVE test needs labmem's built CODE
+// present; when it is absent (a fresh public clone) we SKIP rather than fail — the adapter's
+// absent-path contract (LabmemUnavailable, no raw crash) is pinned separately in
+// labmem-recall-unavailable.test.ts. Set LABMEM_ROOT/LABMEM_REAL to a built labmem to run it.
+const LABMEM_AVAILABLE = existsSync(join(REAL_LABMEM, "dist/index.js"));
+const skipReason = LABMEM_AVAILABLE
+  ? undefined
+  : `labmem code not found at ${REAL_LABMEM}/dist/index.js — optional external integration; set LABMEM_ROOT/LABMEM_REAL to run (absent-path covered by labmem-recall-unavailable.test.ts)`;
 
 // Non-literal path → the typechecker treats the imported module as `any`.
 async function labmem(): Promise<unknown> {
@@ -41,7 +52,7 @@ async function seed(root: string): Promise<void> {
   store.addMemory({ ...base, id: "foreign-secret", scope: "agent", namespace: "other-agent", shared: false, memoryType: "semantic", title: "Foreign secret delta", description: "another agent private", body: "delta" });
 }
 
-test("recallForIkbi returns shared + own + project memory and hides other agents private memory", async () => {
+test("recallForIkbi returns shared + own + project memory and hides other agents private memory", { skip: skipReason }, async () => {
   const prev = process.env["LABMEM_ROOT"];
   process.env["LABMEM_ROOT"] = REAL_LABMEM; // code import source
   const root = mkdtempSync(join(tmpdir(), "labmem-ikbi-recall-")); // isolated data root
