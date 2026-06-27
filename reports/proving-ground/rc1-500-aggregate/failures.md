@@ -1,0 +1,45 @@
+# Failures/partials — aggregate
+
+- pg-20260627-003026-0003 fix-test-bug **FAIL** — fix: could not resolve a doable repair
+- pg-20260627-003026-0013 fix-noop-green **FAIL** — fix: could not resolve a doable repair
+- pg-20260627-003026-0024 fix-env-missing **PARTIAL** — fix: ENVIRONMENT_MISSING
+- pg-20260627-003026-0029 fix-env-missing **PARTIAL** — fix: ENVIRONMENT_MISSING
+- pg-20260627-003026-0059 fix-env-missing **PARTIAL** — fix: ENVIRONMENT_MISSING
+- pg-20260627-003026-0062 fix-env-missing **PARTIAL** — fix: ENVIRONMENT_MISSING
+- pg-20260627-003026-0063 fix-env-missing **PARTIAL** — fix: ENVIRONMENT_MISSING
+- pg-20260627-003026-0078 fix-noop-green **FAIL** — fix: could not resolve a doable repair
+- pg-20260627-003026-0102 fix-noop-green **FAIL** — fix: could not resolve a doable repair
+- pg-20260627-003026-0105 fix-noop-green **FAIL** — fix: could not resolve a doable repair
+- pg-20260627-003026-0120 fix-noop-green **FAIL** — fix: could not resolve a doable repair
+- pg-20260627-003026-0129 fix-noop-green **FAIL** — fix: could not resolve a doable repair
+- pg-20260627-003026-0156 fix-noop-green **FAIL** — fix: could not resolve a doable repair
+- pg-20260627-003026-0165 fix-noop-green **FAIL** — fix: could not resolve a doable repair
+- pg-20260627-003036-0008 fix-env-missing **PARTIAL** — fix: ENVIRONMENT_MISSING
+- pg-20260627-003036-0031 fix-noop-green **FAIL** — fix: could not resolve a doable repair
+- pg-20260627-003036-0044 fix-noop-green **FAIL** — fix: could not resolve a doable repair
+- pg-20260627-003036-0072 fix-env-missing **PARTIAL** — fix: ENVIRONMENT_MISSING
+- pg-20260627-003036-0084 fix-env-missing **PARTIAL** — fix: ENVIRONMENT_MISSING
+- pg-20260627-003036-0092 fix-env-missing **PARTIAL** — fix: ENVIRONMENT_MISSING
+- pg-20260627-003036-0101 fix-noop-green **FAIL** — fix: could not resolve a doable repair
+- pg-20260627-003036-0102 fix-noop-green **FAIL** — fix: could not resolve a doable repair
+- pg-20260627-003036-0105 fix-noop-green **FAIL** — fix: could not resolve a doable repair
+- pg-20260627-003036-0115 fix-env-missing **PARTIAL** — fix: ENVIRONMENT_MISSING
+- pg-20260627-003036-0132 fix-env-missing **PARTIAL** — fix: ENVIRONMENT_MISSING
+- pg-20260627-003036-0135 lang-rust-cli **FAIL** — outcome=rejected, not promoted, no governance/structural reason (discard: single-run build has no real test evidence (test evidence "zero"))
+- pg-20260627-003036-0152 fix-noop-green **FAIL** — fix: could not resolve a doable repair
+- pg-20260627-003036-0162 fix-noop-green **FAIL** — fix: could not resolve a doable repair
+- pg-20260627-003046-0007 fix-env-missing **PARTIAL** — fix: ENVIRONMENT_MISSING
+- pg-20260627-003046-0010 fix-noop-green **FAIL** — fix: could not resolve a doable repair
+- pg-20260627-003046-0025 fix-test-bug **FAIL** — fix: could not resolve a doable repair
+- pg-20260627-003046-0032 fix-noop-green **FAIL** — fix: could not resolve a doable repair
+- pg-20260627-003046-0034 fix-env-missing **PARTIAL** — fix: ENVIRONMENT_MISSING
+- pg-20260627-003046-0041 fix-noop-green **FAIL** — fix: could not resolve a doable repair
+- pg-20260627-003046-0043 fix-env-missing **PARTIAL** — fix: ENVIRONMENT_MISSING
+- pg-20260627-003046-0050 fix-env-missing **PARTIAL** — fix: ENVIRONMENT_MISSING
+- pg-20260627-003046-0067 fix-env-missing **PARTIAL** — fix: ENVIRONMENT_MISSING
+- pg-20260627-003046-0071 lang-rust-cli **FAIL** — outcome=rejected, not promoted, no governance/structural reason (discard: single-run build has no real test evidence (test evidence "zero"))
+- pg-20260627-003046-0081 fix-env-missing **PARTIAL** — fix: ENVIRONMENT_MISSING
+- pg-20260627-003046-0097 fix-noop-green **FAIL** — fix: could not resolve a doable repair
+- pg-20260627-003046-0105 fix-env-missing **PARTIAL** — fix: ENVIRONMENT_MISSING
+- pg-20260627-003046-0120 lang-rust-cli **FAIL** — outcome=rejected, not promoted, no governance/structural reason (discard: single-run build has no real test evidence (test evidence "zero"))
+- pg-20260627-003046-0151 fix-env-missing **PARTIAL** — fix: ENVIRONMENT_MISSING
