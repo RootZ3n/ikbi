@@ -1,0 +1,56 @@
+# Velum configuration — example
+# AI Privacy & Injection Defense
+# Copy to velum.config.yaml and edit. Every field is optional except where noted.
+
+# Master switch. When false, Velum passes ALL input/output through untouched.
+enabled: true
+
+# Default PII handling level for any module without an explicit override:
+#   1 = Observe  — detect + log only, text is unchanged
+#   2 = Redact   — replace PII with reversible typed placeholders (e.g. [EMAIL_1]);
+#                  a placeholder map is returned so you can restore values after
+#                  the model responds
+#   3 = Sanitize — strip PII to [REDACTED] (NOT reversible)
+defaultPiiLevel: 1
+
+# Credential buffer time-to-live, in milliseconds. Credentials extracted from
+# user input live here (single-use) so tools can consume them without the model
+# ever seeing the value. Default: 300000 (5 minutes).
+credentialBufferTtlMs: 300000
+
+# Extra terms that must NEVER be redacted as credentials (case-insensitive,
+# substring match). Add your own product/service/tool names here to prevent
+# false positives. These are merged with Velum's built-in safe list.
+neverRedact:
+  - myproduct
+  - myservice
+
+# Optional audit log (JSONL). When set, Velum can append decision records here.
+# auditLogPath: ./state/velum-audit.jsonl
+
+# Optional receipts directory (JSONL, one file per day).
+# receiptsDir: ./state/receipts
+
+# Per-module PII level overrides, keyed by module / route name. Useful when one
+# surface (e.g. an external chat endpoint) needs stronger redaction than an
+# internal-only tool.
+modules:
+  chat:
+    piiLevel: 2
+  internal:
+    piiLevel: 1
+
+# ── Custom patterns ──────────────────────────────────────────────────────────
+# Custom detection patterns can't be expressed in YAML (they contain RegExp).
+# Register them programmatically instead:
+#
+#   import { createVelum } from "velum-ai";
+#   const velum = createVelum({
+#     customPatterns: [{
+#       name: "acme_token",
+#       pattern: /ACME-[A-Z0-9]{20,}/g,
+#       category: "credential",   // credential | injection | pii | policy
+#       severity: "block",        // block | review | warn
+#       description: "Acme API token",
+#     }],
+#   });

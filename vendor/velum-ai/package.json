@@ -1,0 +1,67 @@
+{
+  "name": "velum-ai",
+  "version": "0.2.2",
+  "description": "AI Privacy & Injection Defense — prompt-injection classification, three-stage trust guard, PII masking, and a short-lived credential buffer. Zero dependencies.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "velum": "dist/cli/index.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./adapters/fastify": {
+      "types": "./dist/adapters/fastify.d.ts",
+      "import": "./dist/adapters/fastify.js",
+      "default": "./dist/adapters/fastify.js"
+    },
+    "./adapters/express": {
+      "types": "./dist/adapters/express.d.ts",
+      "import": "./dist/adapters/express.js",
+      "default": "./dist/adapters/express.js"
+    },
+    "./adapters/generic": {
+      "types": "./dist/adapters/generic.d.ts",
+      "import": "./dist/adapters/generic.js",
+      "default": "./dist/adapters/generic.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "velum.config.example.yaml",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "tsx --test tests/*.test.ts",
+    "example": "tsx examples/quickstart.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "ai",
+    "security",
+    "prompt-injection",
+    "pii",
+    "privacy",
+    "redaction",
+    "credentials",
+    "secrets",
+    "llm",
+    "guard"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.22.0",
+    "typescript": "^5.5.0"
+  }
+}
