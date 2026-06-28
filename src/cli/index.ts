@@ -33,6 +33,7 @@ import { trust } from "../core/trust/index.js";
 import { commands } from "./registry.js";
 import { runDoctor, runDoctorFixCli } from "./doctor.js";
 import { runEnvironmentChecks, renderEnvironmentChecks } from "./doctor-env.js";
+import { runSandboxChecks, renderSandboxChecks } from "./doctor-sandbox.js";
 import { whatNextFooter } from "./what-next.js";
 import { runInit } from "./init.js";
 import { runSelfRepair } from "../modules/self-repair/index.js";
@@ -467,25 +468,32 @@ async function run(argv: readonly string[]): Promise<void> {
       runInfo("doctor", () => {
         const report = runDoctor();
         const env = runEnvironmentChecks();
-        // Total ✗ across config + environment for the footer (a not-ready config counts as ≥1
-        // even when the miss is a security blocker rather than a required-setting gap). This
+        // PLATFORM & SANDBOX: the first-run "can this host run risky code safely?" half — OS,
+        // bubblewrap (real probe), sandbox mode, trusted-local overrides, and the concrete
+        // prediction of whether risky execution/installs will run, fail closed, or need an override.
+        const sandbox = runSandboxChecks();
+        // Total ✗ across config + environment + sandbox for the footer (a not-ready config counts
+        // as ≥1 even when the miss is a security blocker rather than a required-setting gap). This
         // includes recommended-level warnings — worth fixing, but they don't block readiness.
         const configBad = report.ready ? 0 : Math.max(report.missingRequired, 1);
-        const issues = configBad + env.issues;
+        const issues = configBad + env.issues + sandbox.issues;
         // Readiness gates on REQUIRED failures only: a recommended warning (e.g. a missing
-        // project-local .ikbi/) is advisory, not a blocker for "ready to build".
+        // project-local .ikbi/, or non-Linux where risky code fails closed) is advisory, not a
+        // blocker for "ready to build".
         const envRequiredBad = env.checks.filter((c) => !c.ok && c.level === "required").length;
+        const sandboxRequiredBad = sandbox.checks.filter((c) => !c.ok && c.level === "required").length;
         if (doctorArgs.includes("--json")) {
           writeStdout(`${JSON.stringify({
-            ready: report.ready && envRequiredBad === 0,
+            ready: report.ready && envRequiredBad === 0 && sandboxRequiredBad === 0,
             issues,
             config: { ready: report.ready, missingRequired: report.missingRequired },
             environment: env.checks,
+            sandbox: sandbox.checks,
             detection: env.detection,
           }, null, 2)}\n`);
           return;
         }
-        writeStdout(`${report.lines.join("\n")}\n\n${renderEnvironmentChecks(env.checks)}\n`);
+        writeStdout(`${report.lines.join("\n")}\n\n${renderEnvironmentChecks(env.checks)}\n\n${renderSandboxChecks(sandbox.checks)}\n`);
         writeStdout(`${whatNextFooter("doctor", { issues })}\n`);
       });
       return;
