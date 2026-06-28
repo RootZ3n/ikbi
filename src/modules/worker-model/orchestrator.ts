@@ -206,7 +206,8 @@ async function installWorkspaceDeps(
       const relPath = spec.slice(5); // remove "file:" prefix
       const absTarget = join(workspace.targetRepo, relPath);
       // Use basename to avoid relPath's ".." escaping the worktree parent.
-      // e.g. "../velum" → symlink at wt/velum → points to /pehverse/repos/ecosystem/velum
+      // e.g. a target repo with "some-pkg": "file:../some-pkg" → symlink at wt/some-pkg
+      // pointing at the resolved sibling so the isolated-worktree install can find it.
       const symlinkPath = join(worktreeParent, basename(absTarget));
       if (!existsSync(symlinkPath) && existsSync(absTarget)) {
         mkdirSync(join(symlinkPath, ".."), { recursive: true });

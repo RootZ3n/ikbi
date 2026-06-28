@@ -12,6 +12,10 @@
     "sourceMap": true,
     "declaration": true,
     "declarationMap": true,
+    /* Strip comments from emitted JS/d.ts — they are non-functional at runtime and keep
+       internal doc-block references (e.g. illustrative absolute paths) out of the published
+       package. Tests run from src via tsx, so this only affects the shipped dist/ artifact. */
+    "removeComments": true,
 
     /* Strictness — everything typed */
     "strict": true,

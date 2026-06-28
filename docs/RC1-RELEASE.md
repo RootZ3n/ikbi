@@ -35,7 +35,7 @@ installs**). That code is confined at the **OS level** with Linux **bubblewrap**
 For every **risky** command (interpreters `node`/`python3`/…, package scripts, toolchains, write
 tools) and for **dependency install**:
 - **Only the worktree** (and, for installs, the package **store/cache** + an ephemeral `/tmp`) is
-  **writable**. The entire rest of the host — real `$HOME`, `~/.ikbi`, `/pehverse`, repo parents,
+  **writable**. The entire rest of the host — real `$HOME`, `~/.ikbi`, repo parents,
   `/etc`, any absolute path — is bound **read-only**. A write to them fails hard (EROFS); a relative
   `../../x` from the worktree resolves into that read-only area ⇒ also EROFS; an absolute `/tmp/x`
   goes to a private tmpfs that vanishes on exit.
