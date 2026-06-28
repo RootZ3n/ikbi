@@ -1,9 +1,22 @@
 # ikbi — RC1 Release & Operator Guide
 
-Status label: **RC1_READY_FOR_JEFF** (personal, trusted, single-operator use) · **PUBLIC_RC_NOT_YET**.
+Status label: **RC1_READY_FOR_JEFF** (personal, trusted, single-operator use) ·
+**PUBLIC_RC_READY (candidate)** — the public blockers (self-containment, first-run UX, docs, public
+smoke, no-bwrap fail-closed) are resolved; see the [Public RC](#public-rc-candidate) note.
 
-Do not read this as "ready for everyone." Read the [Known Limitations](#known-limitations) and the
-[label definitions](#release-labels) before relying on it.
+Do not read this as "ready for everyone." Read the [Known Limitations](#known-limitations),
+[docs/KNOWN-LIMITATIONS.md](KNOWN-LIMITATIONS.md), and the [label definitions](#release-labels)
+before relying on it.
+
+<a name="public-rc-candidate"></a>
+### Public RC candidate — what changed since RC1-for-Jeff
+- `velum-ai` **vendored** in-repo ⇒ a fresh clone installs with no sibling repos.
+- `ikbi --version` / `<cmd> --help` work on a cold shell (no trust keys) without crashing.
+- `ikbi doctor` gained a **PLATFORM & SANDBOX** first-run report (OS, bubblewrap probe, sandbox mode,
+  trusted-local override, risky-exec/install prediction).
+- `pnpm public:smoke` — a fast, API-key-free sanity + safety check.
+- Public docs: README, INSTALL, SECURITY (threat model), SUPPORT, KNOWN-LIMITATIONS, CHANGELOG.
+- Reproduce: `pnpm install && pnpm build && pnpm public:smoke && pnpm test`.
 
 ---
 
@@ -85,15 +98,19 @@ Be honest with yourself about these before trusting a run.
   never unsafe. Run the gauntlet/proof sequentially or off-peak for a representative pass rate.
 - **Adversarial / denied goals burn the builder's round/budget** before failing closed (set
   `IKBI_WORKER_MODEL_TOTAL_BUDGET_MS` to bound it). Safe, but slow.
-- **The repo is NOT self-contained for a fresh public clone.** `package.json` depends on a local
-  sibling `velum-ai@file:../velum`. On the reference machine `../velum` is present, so `pnpm install`,
-  typecheck, tests, and builds all work. A *truly* fresh clone on a machine WITHOUT the sibling cannot
-  `pnpm install` (only `velum-ai` resolves; the rest never install). Surfaced by the ugly-machine test
-  (clean `node:22` container): with the velum sibling copied in, install + typecheck + all sandbox/F1
-  tests pass; without it, install is incomplete. **Blocks public release** until velum is published
-  (or vendored). Does NOT block Jeff's local use.
-- **Public/shared use is NOT validated**: onboarding, install on heterogeneous machines, support
-  boundaries, and multi-tenant isolation are open. See PUBLIC_RC_NOT_YET.
+- **~~The repo is NOT self-contained for a fresh public clone.~~ RESOLVED.** `velum-ai` is now
+  **vendored** at `vendor/velum-ai` (MIT, zero-dependency) and referenced via `file:./vendor/velum-ai`.
+  A fresh clone with no sibling repos installs, typechecks, builds, and tests (2857 pass / 1 skip —
+  the optional labmem integration). Verified by a clean `git clone` into a velum-free directory.
+- **labmem (shared-memory recall) is an OPTIONAL external integration** — not bundled (private data +
+  no public license). Absent ⇒ graceful `LabmemUnavailable`; ikbi is fully functional. Set
+  `LABMEM_ROOT` to a built labmem to enable it.
+- **Cross-distro ugly-machine coverage is partial.** The supported Linux+bwrap path and the
+  no-bwrap fail-closed path are exercised (reference Fedora host + clean Debian/`node:22` container);
+  broad coverage across every distro is not yet complete. See [KNOWN-LIMITATIONS](KNOWN-LIMITATIONS.md).
+- **Public/shared use is partially validated**: self-contained install, first-run doctor UX, public
+  smoke, and the no-bwrap fail-closed path are done; broad heterogeneous-machine onboarding,
+  long-term support guarantees, and multi-tenant isolation remain open.
 
 ---
 

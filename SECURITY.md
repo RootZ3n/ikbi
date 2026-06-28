@@ -90,3 +90,71 @@ multiple isolated trust domains (multi-tenant governance) inside a single proces
 explicitly **out of scope** and is **not a supported configuration**. Isolation
 between trust domains is achieved by running separate processes, each with its own
 keys, operator, and state root.
+
+---
+
+## Threat model
+
+ikbi's primary threat is the **code it runs on your behalf**: model-authored helper scripts,
+project test suites, package lifecycle scripts, and toolchains — any of which may be buggy,
+adversarial (a poisoned dependency / injected goal), or simply wrong. The design assumes the
+*operator* is trusted and writing their own goals on a machine they control; it does **not** assume
+the *executed code* is trustworthy.
+
+**In scope (defended):**
+
+- **Filesystem escape from a build.** Risky subprocesses run under bubblewrap with only the worktree
+  writable and the entire host read-only — no escape via `..`, an absolute path, or a helper script
+  (the F1 fix). See `docs/RC1-RELEASE.md` §1 and `src/modules/governed-exec/sandbox.ts`.
+- **Dependency-install code execution.** Installs run sandboxed; lifecycle scripts off by default
+  (`--ignore-scripts`); script-enabled installs without a sandbox fail closed.
+- **Command surface.** Every shell command goes through governed-exec: a default-deny **allowlist** +
+  **gate-wall** + **receipts**; `<mgr> run …` and code-eval flags (`-e`/`-c`) are policy-denied even
+  for allowlisted binaries.
+- **Prompt-injection / untrusted content.** Every tool RESULT re-enters the model only through the
+  **neutralization chokepoint**; the bundled velum middleware adds PII masking + injection defense on
+  the HTTP surface.
+- **Network egress.** Default-deny allowlist; every resolved IP validated against internal ranges
+  before connect (DNS-rebind TOCTOU residual documented above).
+- **Trust forgery / self-promotion.** Trust state is MAC-protected and rejected if forged; unknown /
+  cold trust starts at the floor; default keys refuse to start.
+- **False promotion.** A build promotes only on a ladder-verified pass (stub detection,
+  no-vacuous-green, scope stamps); every promotion is receipted; test-weakening and vacuous green are
+  caught before promotion.
+
+**Out of scope (NOT defended — your responsibility):**
+
+- **Network exposure.** No built-in authentication, authorization, or rate-limiting. Binding ikbi to
+  a public interface and securing it is entirely the operator's responsibility.
+- **A malicious operator.** The operator is the trust root; ikbi defends the operator from the code
+  it runs, not the machine from the operator.
+- **Risky execution without the OS sandbox.** On non-Linux / no-userns hosts the sandbox is
+  unavailable; ikbi fails closed rather than pretending to contain code.
+- **Subprocess-initiated network during installs** is not routed through the in-process egress guard
+  (compensated by registry allowlist + frozen lockfile + receipts). See KNOWN-LIMITATIONS.
+- **Multi-tenant isolation** within one process (see above).
+
+## The trusted-local override (read before using)
+
+`IKBI_GOVERNED_EXEC_TRUSTED_LOCAL=true` and `IKBI_DEPENDENCY_INSTALL_TRUSTED_LOCAL=true` make ikbi run
+risky work **UNSANDBOXED** when no bubblewrap is available, instead of failing closed. They are
+**default-OFF**, and every such run is loudly receipted (`sandbox=unavailable`, risk-classified).
+Use them **only** on a trusted single-operator box you fully control, for goals you wrote yourself —
+**never** for untrusted/delegated goals or repos. `ikbi doctor` surfaces these overrides as warnings
+when they are on. This is a deliberate escape hatch, not a vulnerability.
+
+## Receipts
+
+Every governed action (exec, install, fetch) and every promotion writes a **receipt** to
+`<stateRoot>/receipts`. Receipts carry the `sandbox` backend (`bwrap`/`none`/`unavailable`), the
+`scriptPolicy`, the `networkPolicy`, and the writable mounts actually applied — so you can audit, after
+the fact, exactly how a piece of code was contained. Inspect with `ikbi receipts --latest` /
+`--task <id>`. They are an operational log, not a tamper-proof ledger; protect the state directory
+accordingly.
+
+## Reporting a vulnerability
+
+**Do not open a public issue for a security vulnerability.** Report it privately to the maintainer
+(see the repository's GitHub page). Include a reproduction and the relevant receipts. Highest-severity
+classes: a sandbox-containment escape on a Linux+bwrap host, a promotion-gate bypass, an egress-guard
+bypass, and trust-state forgery. See [SUPPORT.md](SUPPORT.md) for what is in/out of scope.
