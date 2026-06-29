@@ -1,17 +1,51 @@
-# ikbi — a governed build/repair engine for cheap & local models
-
-> **⚠️ LAB-ONLY DEFAULT — AUTHENTICATION IS YOUR RESPONSIBILITY**
+> **⚠️ LAB-ONLY PRODUCT — AUTHENTICATION IS YOUR RESPONSIBILITY**
 >
-> ikbi is designed for **local / lab use**. It binds to `localhost` by default and is meant
-> to run behind Tailscale, a VPN, or a private network. **If you expose any service to the
-> public internet, YOU are responsible for securing it** — there is no built-in auth, rate
-> limiting, or access control, and that is a design decision, not a bug. Expose at your own risk.
+> This tool is designed for **local/lab use only**. It binds to localhost by default
+> and is meant to run behind Tailscale, a VPN, or on a private network.
+>
+> **If you expose any service to the public internet, YOU are responsible for
+> securing it.** No authentication, rate-limiting, or access control will be added
+> to this product. That is not a bug — it is a design decision.
+>
+> Expose at your own risk.
+
+# ikbi
+
+A governed AI coding agent that makes cheap and local models trustworthy.
+
+```bash
+npm install ikbi
+```
+
+## What is this?
+
+ikbi is a Claude Code alternative that works with **cheap and local models** — not just frontier APIs. It's a build/repair engine that sandboxes, verifies, and governs everything the AI does, so a weaker model can be trusted to write real code.
+
+**Key ideas:**
+- **Sandboxed execution** — code runs inside a Linux bubblewrap sandbox (only the worktree is writable, network denied by default).
+- **Evidence-based verification** — a build only promotes when real checks pass (typecheck + tests), with stub-detection and no false-green protection.
+- **Governed execution** — every shell command goes through an allowlist + gate-wall + receipts. Every model output is neutralized before re-entering the loop.
+- **Earned trust** — capability is granted, not assumed. Unknown agents start at the floor.
+- **Auditable receipts** — every governed action and promotion is recorded.
+
+It runs as a long-running **service** (localhost/Tailscale) or as a **CLI**.
+
+## What is Peh?
+
+[Peh](https://github.com/RootZ3n/peh) is an open-source AI ecosystem — a family of tools for building, running, and governing AI agents. ikbi is one piece of that ecosystem. Other siblings:
+
+| Project | What it does |
+|---|---|
+| [velum](https://github.com/RootZ3n/velum) | AI runtime / orchestration layer |
+| [kokuli](https://github.com/RootZ3n/kokuli) | Model routing and provider abstraction |
+| [nusika](https://github.com/RootZ3n/nusika) | Evaluation and benchmarking |
+| [luak](https://github.com/RootZ3n/luak) | Sandbox and execution governance |
+
+---
 
 **Status:** `PUBLIC_RC_READY` (candidate) — see [Release status](#release-status).
 The supported configuration is **Linux with bubblewrap**. Other platforms run in a reduced,
 fail-closed mode (see [What ikbi is not](#what-ikbi-is-not)).
-
----
 
 ## What ikbi is
 

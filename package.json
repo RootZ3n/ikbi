@@ -5,6 +5,15 @@
   "type": "module",
   "author": "Jeffrey Miller",
   "license": "MIT",
+  "author": "RootZ3n <rootz3n@proton.me>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/RootZ3n/ikbi.git"
+  },
+  "homepage": "https://github.com/RootZ3n/ikbi#readme",
+  "bugs": {
+    "url": "https://github.com/RootZ3n/ikbi/issues"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/RootZ3n/ikbi.git"
@@ -51,6 +60,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "prepublishOnly": "npm run build",
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
