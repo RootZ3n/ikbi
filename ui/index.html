@@ -113,8 +113,32 @@ const WORKSPACE_REGISTRY={
   'trust-ws':         {product:'ikbi', title:'Trust & Safety',      kind:'live', dock:'fullscreen', peh:'shield'},
   'modules-ws':       {product:'ikbi', title:'Modules',             kind:'live', dock:'fullscreen', peh:'gear'},
   'history-ws':       {product:'ikbi', title:'History',             kind:'live', dock:'fullscreen', peh:'book'},
-  'grove-ws':         {product:'ikbi', title:'The Grove',           kind:'live', dock:'fullscreen', peh:'leaf'}
+  'grove-ws':         {product:'ikbi', title:'The Grove',           kind:'live', dock:'fullscreen', peh:'leaf'},
+  'job-cards-ws':     {product:'ikbi', title:'Job Cards',           kind:'live', dock:'fullscreen', peh:'book'},
+  'repo-doctor-ws':   {product:'ikbi', title:'Repo Doctor',         kind:'live', dock:'fullscreen', peh:'signal'},
+  'spec-artifact-ws': {product:'ikbi', title:'Spec Artifact',       kind:'live', dock:'fullscreen', peh:'star'},
+  'corrections-ws':   {product:'ikbi', title:'Corrections',         kind:'live', dock:'fullscreen', peh:'tools'}
 };
+
+// ── PANEL_META — keyed by ikbi defId. Marks which windows are console-class
+//    (dense → get the ⤢ Console expander + a compact glance card when small)
+//    vs glance-only, and supplies the floating-window solo size. priority
+//    orders the Voltron dashboard wall. (See the Pehverse rollout map.)
+const PANEL_META={
+  'engine-status':    {role:'status',      priority:1,  console:true,  solo:{w:'min(560px,52vw)', h:'70%'}},
+  'builder-ws':       {role:'config',      priority:2,  console:true,  solo:{w:'min(580px,54vw)', h:'74%'}},
+  'grove-ws':         {role:'results',     priority:3,  console:true,  solo:{w:'min(640px,58vw)', h:'76%'}},
+  'test-results':     {role:'results',     priority:4,  console:true,  solo:{w:'min(540px,50vw)', h:'68%'}},
+  'trust-ws':         {role:'status',      priority:5,  console:true,  solo:{w:'min(520px,48vw)', h:'66%'}},
+  'modules-ws':       {role:'metrics',     priority:6,  console:true,  solo:{w:'min(540px,50vw)', h:'66%'}},
+  'history-ws':       {role:'results',     priority:7,  console:true,  solo:{w:'min(540px,50vw)', h:'66%'}},
+  'job-cards-ws':     {role:'config',      priority:8,  console:true,  solo:{w:'min(480px,46vw)', h:'60%'}},
+  'spec-artifact-ws': {role:'config',      priority:9,  console:true,  solo:{w:'min(480px,46vw)', h:'60%'}},
+  'corrections-ws':   {role:'metrics',     priority:10, console:true,  solo:{w:'min(480px,46vw)', h:'60%'}},
+  'repo-doctor-ws':   {role:'diagnostics', priority:11, console:false, solo:{w:'min(460px,44vw)', h:'52%'}}
+};
+function pehPanelMeta(defId){return PANEL_META[defId]||{}}
+if(typeof window!=='undefined')window.pehPanelMeta=pehPanelMeta;
 
 // ── Registry lookups ───────────────────────────────────────────────────
 function pehProduct(id){return PRODUCT_REGISTRY.find((p)=>p.id===id)||null}
@@ -147,6 +171,13 @@ function pehActiveProduct(){
   return (p&&p.status==='public')?p:pehProduct(PEH_DEFAULT_PRODUCT);
 }
 function pehActiveProductId(){const p=pehActiveProduct();return p?p.id:PEH_DEFAULT_PRODUCT}
+// Single source for "Peh's portrait for the active product". Each product ships
+// its own mascotArt in PRODUCT_REGISTRY; everything that draws Peh reads through
+// here so a product swap re-skins Peh in one place. Mirrored onto window so the
+// live layer (app.js / peh-guide.js) can reach it too.
+const PEH_MASCOT_FALLBACK='assets/peh-guide.png';
+function pehMascotSrc(){const p=pehActiveProduct();return (p&&p.mascotArt)||PEH_MASCOT_FALLBACK;}
+if(typeof window!=='undefined')window.pehMascotSrc=pehMascotSrc;
 function pehCurrentScene(){
   const p=pehActiveProduct(); if(!p)return null;
   const sid=state.pehverse.scene||p.defaultScene;
@@ -195,23 +226,60 @@ function pehDevSwitchProduct(productId){
   try{localStorage.setItem('pehverse-product',p.id);if(state.pehverse.scene)localStorage.setItem('pehverse-scene',state.pehverse.scene)}catch(e){}
   render();
 }
-var _dashAutoOpenDone=false;
-function pehAutoOpenDashboard(){
-  // INTENTIONALLY DISABLED — opening all workspaces at once floods the screen.
-  // Users should click a hotspot or use fast travel to open specific workspaces.
-  // The workspace chooser (pehWorkspaceChooser) handles the empty state.
-}
+// Mode flip is a TRANSFORMATION, not a swap: dashboard mode assembles the full
+// Voltron wall (pehEnsureAllOpen), the map returns CLEAN (no stacked windows).
+// The morph is done with the View Transitions API so each panel carries a stable
+// view-transition-name and the browser animates window⇄tile.
 function pehSetMode(mode){
   if(mode!=='immersive'&&mode!=='dashboard')return;
-  state.pehverse.mode=mode;
-  localStorage.setItem('pehverse-mode',mode);
-  if(mode==='immersive'){
-    // Close all workspaces when entering immersive — show the clean world map
-    state.pehverse.workspaces=[];
+  pehMorph(()=>{
+    state.pehverse.mode=mode;
+    if(mode==='dashboard')pehEnsureAllOpen();      // dashboard assembles the full cockpit
+    else{state.pehverse.workspaces=[];}            // Map returns CLEAN — no stacked windows
     state.pehverse.focus=null;
+    try{localStorage.setItem('pehverse-mode',mode)}catch(e){}
+    render();
+  });
+}
+// Run a state change inside a View Transition when available; otherwise apply it.
+function pehMorph(fn){
+  try{ if(typeof document!=='undefined'&&typeof document.startViewTransition==='function'){ document.startViewTransition(fn); return; } }catch(e){}
+  fn();
+}
+// The product's dashboard panels, ordered by PANEL_META.priority.
+function pehProductPanelIds(){
+  return Object.keys(PANEL_META)
+    .filter((id)=>{const d=WORKSPACE_REGISTRY[id];return d&&pehWorkspaceBelongsToActive(d);})
+    .sort((a,b)=>(pehPanelMeta(a).priority||99)-(pehPanelMeta(b).priority||99));
+}
+function pehHotspotForPanel(defId){
+  for(const s of pehScenes(pehActiveProductId())){
+    const h=(s.hotspots||[]).find((x)=>x.workspace===defId);
+    if(h)return h;
   }
-  if(mode==='dashboard'){_dashAutoOpenDone=false;}
-  render();
+  return null;
+}
+// Open every product panel not already open, seeding each window's position from
+// its hotspot so the reverse morph (dashboard → map) scatters them back home.
+function pehEnsureAllOpen(){
+  for(const id of pehProductPanelIds()){
+    if(state.pehverse.workspaces.find((w)=>w.defId===id))continue;
+    const def=WORKSPACE_REGISTRY[id]||{};
+    const ws={uid:'ws'+(++state.pehverse.wsSeq),defId:id,dock:(def.dock||'right'),min:false};
+    const h=pehHotspotForPanel(id);
+    if(h){ws.x=h.x;ws.y=h.y;}
+    state.pehverse.workspaces.push(ws);
+  }
+}
+// Pack-tight row plan: split n tiles into balanced rows so the wall fills with
+// no holes. n=11 → [4,4,3]; n=4 → [2,2]; n=2 → [2]; n=1 → [1].
+function pehPackRows(n){
+  if(n<=1)return[n];
+  const cols=Math.ceil(Math.sqrt(n));
+  const rows=Math.ceil(n/cols);
+  const base=Math.floor(n/rows), extra=n%rows;
+  const out=[]; for(let r=0;r<rows;r++)out.push(base+(r<extra?1:0));
+  return out;
 }
 function pehToggleMode(){pehSetMode(state.pehverse.mode==='immersive'?'dashboard':'immersive')}
 function pehToggleFastTravel(force){
@@ -235,6 +303,20 @@ function pehOpenWorkspace(defId,opts){
   }
   ws.min=false;
   pehFocusWorkspace(ws.uid,true);
+  render();
+}
+// Open a workspace window positioned at a specific map location (x/y %).
+// Called when a hotspot pin is clicked so the panel pops up next to Peh.
+// De-dupes: if already open, just focus it (don't move it back).
+function pehOpenWorkspaceAt(defId,x,y){
+  const def=pehWorkspaceDef(defId); if(!def)return;
+  if(!pehWorkspaceBelongsToActive(def))return;
+  let ws=state.pehverse.workspaces.find((w)=>w.defId===defId);
+  if(ws){pehFocusWorkspace(ws.uid);return}
+  const sx=x!=null?x:50, sy=y!=null?y:50;
+  ws={uid:'ws'+(++state.pehverse.wsSeq),defId,x:sx,y:sy,min:false};
+  state.pehverse.workspaces.push(ws);
+  state.pehverse.focus=ws.uid;
   render();
 }
 
@@ -297,11 +379,21 @@ function pehHotspot(defId,sceneId){
 function pehHotspotActivate(sceneId,hotspotId){
   const scene=pehScene(pehActiveProductId(),sceneId);
   const hotspot=scene&&scene.hotspots?scene.hotspots.find((h)=>h.id===hotspotId):null;
-  if(hotspot)pehSayGreeting(hotspot,scene);
+  if(!hotspot)return;
+  // Peh greets at the hotspot FIRST, then — after a short beat — the workspace
+  // pops up as a movable window beside the pin (or we travel to a sub-scene).
+  pehSayGreeting(hotspot,scene);
   setTimeout(()=>{
-    if(!hotspot)return;
-    if(hotspot.workspace)pehHotspot(hotspot.workspace,hotspot.scene);
-    else if(hotspot.scene)pehSetScene(hotspot.scene);
+    if(hotspot.workspace){
+      if(hotspot.scene&&pehScene(pehActiveProductId(),hotspot.scene)){
+        state.pehverse.scene=hotspot.scene;state.pehverse.pehPosition=null;
+        try{localStorage.setItem('pehverse-scene',hotspot.scene)}catch(e){}
+      }
+      state.pehverse.pehPopUp={x:hotspot.x,y:hotspot.y};
+      pehOpenWorkspaceAt(hotspot.workspace,hotspot.x,hotspot.y);
+    }else if(hotspot.scene){
+      pehSetScene(hotspot.scene);
+    }
   },300);
 }
 function pehFocusWorkspace(uid,skipRender){
@@ -370,7 +462,7 @@ function pehSlotMarkup(slot,opts){
   const pos=inline?'' : `left:${slot.x}%;top:${slot.y}%;`;
   const anchor=slot.anchor||'center';
   return `<div class="peh-slot peh-slot-${anchor} ${inline?'peh-slot-inline':''} ${o.glow?'glow':''}" style="${pos}" data-variant="${esc(variant)}" data-anchor="${esc(anchor)}" title="Peh — your guide (${esc(variant)})" aria-label="Peh — ${esc(variant)}">
-    <span class="peh-slot-medallion" aria-hidden="true"><img src="assets/peh-guide.png" alt="" loading="lazy" width="100%" height="100%"></span>
+    <span class="peh-slot-medallion" aria-hidden="true"><img src="${esc(pehMascotSrc())}" alt="" loading="lazy" width="100%" height="100%"></span>
     ${inline?'':'<span class="peh-slot-tag">Peh</span>'}
   </div>`;
 }
@@ -398,9 +490,18 @@ function renderPehBubble(){
 }
 function renderPehGuide(product){
   return `<figure class="peh-guide" aria-hidden="true">
-    <span class="peh-guide-frame"><img class="peh-guide-img" src="assets/peh-guide.png" alt="" loading="lazy"></span>
+    <span class="peh-guide-frame"><img class="peh-guide-img" src="${esc(pehMascotSrc())}" alt="" loading="lazy"></span>
     <figcaption class="peh-guide-cap"><b>Peh</b><i>your guide</i></figcaption>
   </figure>`;
+}
+// Peh mascot pop-up — appears at the clicked hotspot with a bounce. Stays until
+// another hotspot is clicked. Pointer-events:none so it never blocks the window.
+function renderPehPopUp(){
+  const pop=state.pehverse.pehPopUp;
+  if(!pop)return'';
+  return `<div class="peh-popup" style="left:${pop.x}%;top:${pop.y}%">
+    <img class="peh-popup-img" src="${esc(pehMascotSrc())}" alt="Peh">
+  </div>`;
 }
 
 // ── PehverseShell: top-level renderer ──────────────────────────────────
@@ -434,13 +535,15 @@ function renderPehTopBar(product,scene){
   </header>`;
 }
 
+// Two canonical views, one stage. Dashboard mode hands off to the merged
+// Voltron wall (DashboardSurface); immersive mode is the map with movable
+// windows popping up at their hotspots.
 function renderPehStage(product,scene,deckMarkup){
-  return state.pehverse.mode==='dashboard'
-    ? renderPehDashboard(product,scene,deckMarkup)
-    : renderPehImmersive(product,scene,deckMarkup);
+  if(state.pehverse.mode==='dashboard')return renderDashboardSurface(product,scene,deckMarkup);
+  return renderPehMap(product,scene,deckMarkup);
 }
 
-function renderPehImmersive(product,scene,deckMarkup){
+function renderPehMap(product,scene,deckMarkup){
   return `<div class="peh-scene" data-scene="${scene?scene.id:''}">
     <div class="peh-scene-atmos" aria-hidden="true"></div>
     <div class="peh-scene-caption">
@@ -453,26 +556,170 @@ function renderPehImmersive(product,scene,deckMarkup){
     ${renderPehGuide(product)}
     ${renderHotspotLayer(scene)}
     ${renderPehWaypoints(product,scene)}
-    ${renderWorkspaceOverlays(deckMarkup)}
+    ${renderWorkspaceWindows(deckMarkup)}
+    ${renderPehPopUp()}
   </div>`;
 }
 
-function renderPehDashboard(product,scene,deckMarkup){
-  // grove-ws (the terminal) always sorts first so it pins to the top of the grid.
-  const open=state.pehverse.workspaces.slice().sort((a,b)=>{
-    const ag=a.defId==='grove-ws'?0:1, bg=b.defId==='grove-ws'?0:1;
-    return ag-bg;
-  });
-  const grid=open.length
-    ? open.map((w)=>renderWorkspaceTile(w,deckMarkup)).join('')
-    : pehWorkspaceChooser(product);
-  return `<div class="peh-dash">
-    <div class="peh-dash-head">
-      <div class="peh-dash-here">${scene&&scene.pehSlot?pehSlotMarkup(scene.pehSlot,{inline:true}):''}<span class="peh-scene-tag">${esc(product.displayName)}</span><h1>${esc(scene?scene.title:product.displayName)}</h1><p>${esc(scene?scene.desc:product.blurb)}</p></div>
-      ${renderPehWaypoints(product,scene)}
-    </div>
-    <div class="peh-grid ${open.length>1?'multi':''}">${grid}</div>
+// ── Positioned workspace windows (map overlay) — movable, draggable ────
+// Each open workspace renders as a draggable panel pinned beside its hotspot.
+// Console-class panels carry a ⤢ Console button that expands the window into a
+// large centred workspace. view-transition-name ties the window to its tile.
+function renderWorkspaceWindows(deckMarkup){
+  const open=state.pehverse.workspaces;
+  if(!open.length)return'';
+  return `<div class="peh-ws-windows">${open.map((w)=>{
+    const def=pehWorkspaceDef(w.defId)||{};
+    const meta=pehPanelMeta(w.defId);
+    const solo=meta.solo||{};
+    const x=w.x!=null?w.x:50;
+    const y=w.y!=null?w.y:50;
+    const focused=state.pehverse.focus===w.uid;
+    const z=focused?25:15;
+    const isConsoleClass=!!meta.console;
+    const consoleOn=isConsoleClass&&w.console;
+    let wStyle,hStyle,posStyle;
+    if(consoleOn){
+      wStyle='width:min(1040px,94vw)';
+      hStyle=';height:min(82vh,720px);max-height:calc(100% - 18px)';
+      posStyle='left:50%;top:50%;transform:translate(-50%,-50%);right:auto;bottom:auto';
+    }else{
+      wStyle=solo.w?`width:${solo.w}`:'width:min(460px,44vw)';
+      hStyle=';max-height:calc(100% - 28px)';
+      if(w.moved){
+        posStyle=`left:${x}%;top:${y}%`;
+      }else{
+        const hPos=x<50?'left:14px;right:auto':'right:14px;left:auto';
+        const vPos=y<50?'top:14px;bottom:auto':'bottom:14px;top:auto';
+        posStyle=`${hPos};${vPos}`;
+      }
+    }
+    const consoleBtn=isConsoleClass?`<button class="peh-ws-console" type="button" title="${consoleOn?'Shrink to card':'Open the full console'}" aria-label="${consoleOn?'Shrink to card':'Open the full console'}" onclick="event.stopPropagation();pehToggleConsole('${w.uid}')">${consoleOn?'▢ Card':'⤢ Console'}</button>`:'';
+    return `<div class="peh-ws-window solo ${focused?'focused':''} ${consoleOn?'console':''}" data-uid="${w.uid}" style="${posStyle};z-index:${z};${wStyle}${hStyle};view-transition-name:peh-panel-${w.defId}" onmousedown="pehFocusWorkspace('${w.uid}')">
+      <div class="peh-ws-header" onmousedown="event.stopPropagation();pehDragStart(event,'${w.uid}')">
+        <span class="peh-ws-glyph">${pehGlyph(def.peh)}</span>
+        <span class="peh-ws-title">${esc(def.title||w.defId)}</span>
+        ${consoleBtn}
+        <button class="peh-ws-close" onclick="event.stopPropagation();pehCloseWorkspace('${w.uid}')">×</button>
+      </div>
+      <div class="peh-ws-body">${pehWorkspaceBody(w,deckMarkup)}</div>
+    </div>`;
+  }).join('')}</div>`;
+}
+
+// ── Drag handling for workspace windows ─────────────────────────────────
+let __pehDrag=null;
+function pehDragStart(e,uid){
+  e.preventDefault();e.stopPropagation();
+  if(e.target.closest('.peh-ws-close,.peh-ws-console'))return;
+  const win=e.target.closest('.peh-ws-window');if(!win)return;
+  const scene=win.closest('.peh-scene');if(!scene)return;
+  pehFocusWorkspace(uid,true);
+  __pehDrag={uid,win,scene,startMouseX:e.clientX,startMouseY:e.clientY,startWinX:win.offsetLeft,startWinY:win.offsetTop};
+  document.addEventListener('mousemove',pehDragMove);
+  document.addEventListener('mouseup',pehDragEnd);
+}
+function pehDragMove(e){
+  if(!__pehDrag)return;
+  const dx=e.clientX-__pehDrag.startMouseX;
+  const dy=e.clientY-__pehDrag.startMouseY;
+  __pehDrag.win.style.left=(__pehDrag.startWinX+dx)+'px';
+  __pehDrag.win.style.top=(__pehDrag.startWinY+dy)+'px';
+}
+function pehDragEnd(e){
+  if(!__pehDrag)return;
+  const ws=state.pehverse.workspaces.find((w)=>w.uid===__pehDrag.uid);
+  if(ws){
+    const sceneRect=__pehDrag.scene.getBoundingClientRect();
+    const winRect=__pehDrag.win.getBoundingClientRect();
+    ws.x=((winRect.left-sceneRect.left)/sceneRect.width)*100;
+    ws.y=((winRect.top-sceneRect.top)/sceneRect.height)*100;
+    ws.moved=true;
+  }
+  __pehDrag=null;
+  document.removeEventListener('mousemove',pehDragMove);
+  document.removeEventListener('mouseup',pehDragEnd);
+  render();
+}
+function pehToggleConsole(uid){
+  const ws=state.pehverse.workspaces.find((w)=>w.uid===uid); if(!ws)return;
+  pehFocusWorkspace(uid,true);
+  pehMorph(()=>{ ws.console=!ws.console; render(); });
+}
+
+// ── Compact tile widgets (Voltron wall summaries) ───────────────────────
+function pehScoreCls(n){return n>=80?'teal':n>=55?'orange':'red';}
+function pehDashMeter(label,value,unit,pct,cls){
+  const w=Math.max(0,Math.min(100,Number(pct)||0));
+  return `<div class="vital pd-meter"><div class="v-label">${esc(label)}</div><div class="v-readout ${cls||''}">${esc(String(value))}${unit?`<span class="v-unit">${esc(unit)}</span>`:''}</div><div class="v-bar"><div class="v-fill ${cls||''}" style="width:${w}%"></div></div></div>`;
+}
+function pehDashStat(label,value,cls){
+  return `<div class="pd-stat"><span class="pd-stat-label">${esc(label)}</span><span class="pd-stat-value ${cls||''}">${esc(String(value))}</span></div>`;
+}
+function pehDashEmpty(msg){return `<div class="pd-empty">${esc(msg||'No signal yet')}</div>`;}
+function pehOpenDetailBtn(defId,label){
+  return `<button class="pd-open" type="button" onclick="pehOpenSolo('${defId}')">${esc(label||'Open detail')} →</button>`;
+}
+
+// ── DashboardSurface — the merged Voltron wall over the open windows ────
+// In this mode panels are children of this surface, not floating windows: tiles
+// pack into balanced hole-free rows (pehPackRows) and share a view-transition-
+// name with their window, so the browser morphs window⇄tile when the mode flips.
+function renderDashboardSurface(product,scene,deckMarkup){
+  const open=state.pehverse.workspaces.filter((w)=>!w.min&&WORKSPACE_REGISTRY[w.defId]);
+  if(!open.length)return `<div class="peh-dash-surface" data-mode="dashboard" role="group" aria-label="${esc(product.displayName)} Workshop Grid">
+    <header class="peh-dash-bar">
+      <button class="peh-backmap" type="button" onclick="pehSetMode('immersive')"><span aria-hidden="true">‹</span> Map</button>
+      <span class="peh-dash-bar-title">${esc(product.displayName)} · Workshop Grid</span>
+    </header>
+    <div style="flex:1 1 auto;display:flex;align-items:center;justify-content:center;color:var(--ink-dim);font-style:italic;text-align:center;padding:24px">All panels are closed — <button type="button" class="peh-backmap" style="margin:0 6px" onclick="pehSetMode('immersive')">return to the map</button> to reopen hotspots.</div>
   </div>`;
+  const rows=pehPackRows(open.length);
+  let i=0;
+  const wall=rows.map((count)=>{
+    let cells='';
+    for(let k=0;k<count;k++){const w=open[i++];if(w)cells+=renderTransformingPanel(w.defId,'dashboard',deckMarkup);}
+    return `<div class="peh-dash-row">${cells}</div>`;
+  }).join('');
+  return `<div class="peh-dash-surface" data-mode="dashboard" role="group" aria-label="${esc(product.displayName)} Workshop Grid">
+    <header class="peh-dash-bar">
+      <button class="peh-backmap" type="button" title="Back to the map" aria-label="Back to the world map" onclick="pehSetMode('immersive')"><span aria-hidden="true">‹</span> Map</button>
+      <span class="peh-dash-bar-title">${esc(product.displayName)} · Workshop Grid</span>
+      <span class="peh-dash-bar-tag">${open.length} panel${open.length===1?'':'s'}</span>
+    </header>
+    <div class="peh-dash-wall peh-dash-wall-flex">${wall}</div>
+  </div>`;
+}
+// One panel as a borderless Voltron tile. The body flows through pehWorkspaceBody
+// (which app.js overrides to inject live data) using a synthetic console:false
+// window, so the tile renders the compact/live glance of each panel.
+function renderTransformingPanel(defId,mode,deckMarkup){
+  const def=WORKSPACE_REGISTRY[defId]||{};
+  const meta=pehPanelMeta(defId);
+  if(mode==='dashboard'){
+    const w={uid:'dash-'+defId,defId,console:false,dash:true};
+    return `<section class="peh-dash-tile role-${esc(meta.role||'panel')}" style="view-transition-name:peh-panel-${esc(defId)}" data-panel="${esc(defId)}" aria-label="${esc(def.title||defId)}">
+      <header class="peh-dash-tile-head">
+        <span class="peh-dash-tile-glyph">${pehGlyph(def.peh)}</span>
+        <span class="peh-dash-tile-title">${esc(def.title||defId)}</span>
+        <button class="peh-dash-open" type="button" title="Open ${esc(def.title||defId)}" aria-label="Open ${esc(def.title||defId)}" onclick="pehOpenSolo('${esc(defId)}')">⤢</button>
+      </header>
+      <div class="peh-dash-tile-body">${pehWorkspaceBody(w,deckMarkup)}</div>
+    </section>`;
+  }
+  return '';
+}
+// Open a single panel in SOLO mode from a dashboard tile: leave the wall, return
+// to the map, and pop the panel up beside its own hotspot.
+function pehOpenSolo(defId){
+  const def=pehWorkspaceDef(defId);if(!def)return;
+  state.pehverse.mode='immersive';
+  try{localStorage.setItem('pehverse-mode','immersive')}catch(e){}
+  state.pehverse.workspaces=[];
+  state.pehverse.focus=null;
+  const h=pehHotspotForPanel(defId);
+  if(h){state.pehverse.pehPopUp={x:h.x,y:h.y};pehOpenWorkspaceAt(defId,h.x,h.y);}
+  else{pehOpenWorkspaceAt(defId);}
 }
 
 // ── HotspotLayer ───────────────────────────────────────────────────────
@@ -494,44 +741,12 @@ function renderPehWaypoints(product,scene){
   return `<nav class="peh-waypoints" aria-label="${esc(product.displayName)} areas">${scenes.map((s)=>`<button type="button" class="peh-waypoint ${scene&&s.id===scene.id?'active':''}" aria-current="${scene&&s.id===scene.id?'true':'false'}" onclick="pehSetScene('${s.id}')">${esc(s.title)}</button>`).join('')}</nav>`;
 }
 
-// ── WorkspaceManager: panel + tile + body renderers ────────────────────
-function renderWorkspaceOverlays(deckMarkup){
-  const open=state.pehverse.workspaces;
-  if(!open.length)return'';
-  let ws=open.find((w)=>w.uid===state.pehverse.focus)||open[open.length-1];
-  if(ws.min)return'';
-  return `<div class="peh-overlays">${renderWorkspacePanel(ws,deckMarkup)}</div>`;
-}
-function renderWorkspacePanel(w,deckMarkup){
-  const def=pehWorkspaceDef(w.defId)||{};
-  const focused=state.pehverse.focus===w.uid;
-  return `<section class="peh-panel dock-${w.dock} ${focused?'focused':''} ${w.min?'min':''}" data-uid="${w.uid}" onmousedown="pehFocusWorkspace('${w.uid}')" aria-label="${esc(def.title||w.defId)} workspace">
-    ${renderWorkspaceHeader(w,def,false)}
-    <div class="peh-panel-body">${w.min?'':pehWorkspaceBody(w,deckMarkup)}</div>
-  </section>`;
-}
-function renderWorkspaceTile(w,deckMarkup){
-  const def=pehWorkspaceDef(w.defId)||{};
-  return `<section class="peh-tile ${state.pehverse.focus===w.uid?'focused':''}" data-uid="${w.uid}" data-def="${esc(w.defId)}" onmousedown="pehFocusWorkspace('${w.uid}')" aria-label="${esc(def.title||w.defId)} workspace">
-    ${renderWorkspaceHeader(w,def,true)}
-    <div class="peh-panel-body">${pehWorkspaceBody(w,deckMarkup)}</div>
-  </section>`;
-}
-function renderWorkspaceHeader(w,def,isTile){
-  const kindTag=(def.kind==='lane'||def.kind==='live')?'LIVE':def.kind==='deck'?'CONSOLE':'PLACEHOLDER';
-  const dockBtn=(d,glyph,label)=>`<button class="peh-dockbtn ${w.dock===d?'on':''}" type="button" title="Dock ${label}" aria-label="Dock ${label}" onmousedown="event.stopPropagation()" onclick="event.stopPropagation();pehDockWorkspace('${w.uid}','${d}')">${glyph}</button>`;
-  return `<header class="peh-panel-head">
-    ${isTile?'':`<button class="peh-backmap" type="button" title="Back to the map" aria-label="Back to the map" onmousedown="event.stopPropagation()" onclick="event.stopPropagation();pehBackToMap('${w.uid}')"><span aria-hidden="true">‹</span> Map</button>`}
-    <span class="peh-panel-glyph">${pehGlyph(def.peh)}</span>
-    <span class="peh-panel-title">${esc(def.title||w.defId)}</span>
-    <span class="peh-panel-kind k-${kindTag.toLowerCase()}">${kindTag}</span>
-    <span class="peh-panel-ctrls">
-      ${isTile?'':dockBtn('right','⫼','right')+dockBtn('bottom','▭','bottom')+dockBtn('fullscreen','⛶','full')}
-      <button class="peh-dockbtn" type="button" title="Minimize" aria-label="Minimize" onmousedown="event.stopPropagation()" onclick="event.stopPropagation();pehMinimizeWorkspace('${w.uid}')">—</button>
-      <button class="peh-dockbtn close" type="button" title="Close" aria-label="Close" onmousedown="event.stopPropagation()" onclick="event.stopPropagation();pehCloseWorkspace('${w.uid}')">×</button>
-    </span>
-  </header>`;
-}
+// ── WorkspaceManager: body renderer ────────────────────────────────────
+// The inline body handles the deck console + placeholder. app.js loads AFTER
+// this and WRAPS pehWorkspaceBody so any live (IkbiScenes) defId injects real
+// backend data — in a compact glance when small, the full console when expanded
+// (w.console). renderWorkspaceWindows + renderDashboardSurface both call through
+// here, so live content flows to floating windows AND Voltron tiles.
 function pehWorkspaceBody(w,deckMarkup){
   const def=pehWorkspaceDef(w.defId); if(!def)return'';
   if(def.kind==='deck')return `<div class="peh-deck-wrap">${deckMarkup}</div>`;
@@ -544,24 +759,6 @@ function pehPlaceholderBody(def){
     ${def.relatedTab?`<button class="button secondary" type="button" onclick="pehOpenRelatedLane('${def.relatedTab}')">Open ${esc(TAB_CONFIG[def.relatedTab]?TAB_CONFIG[def.relatedTab].label:def.relatedTab)} overview</button>`:''}
     <div class="peh-ph-tag">PLACEHOLDER · coming soon</div>
   </div>`;
-}
-
-function pehProductWorkspaces(productId){
-  return Object.keys(WORKSPACE_REGISTRY).filter((id)=>{
-    const d=WORKSPACE_REGISTRY[id];
-    return d.product===productId||d.product==null;
-  });
-}
-function pehWorkspaceChooser(product){
-  const defs=pehProductWorkspaces(product.id);
-  return `<div class="peh-chooser">${defs.map((id)=>{
-    const d=WORKSPACE_REGISTRY[id];
-    return `<button class="peh-choice" type="button" onclick="pehOpenWorkspace('${id}')">
-      <span class="peh-choice-glyph">${pehGlyph(d.peh)}</span>
-      <span class="peh-choice-title">${esc(d.title)}</span>
-      <span class="peh-choice-kind">${d.kind==='lane'?'live lane':d.kind==='deck'?'console':'placeholder'}</span>
-    </button>`;
-  }).join('')}</div>`;
 }
 
 // ── Taskbar ────────────────────────────────────────────────────────────
@@ -647,12 +844,11 @@ function pehBindKeys(){
 }
 pehBindKeys();
 pehInitProduct();
+// If the persisted mode is dashboard, assemble the Voltron wall BEFORE the first
+// render — otherwise the dashboard surface shows the empty-cockpit prompt.
+if(state.pehverse.mode==='dashboard')pehEnsureAllOpen();
 
 function render(){
-  if(state.pehverse.mode==='dashboard'&&!state.pehverse.workspaces.length&&!_dashAutoOpenDone){
-    _dashAutoOpenDone=true;
-    pehAutoOpenDashboard();
-  }
   const deckMarkup=renderWorkshopConsole();
   document.getElementById('app').innerHTML=renderPehverse(deckMarkup);
 }
@@ -676,6 +872,13 @@ window.pehCloseAllWorkspaces=pehCloseAllWorkspaces;
 window.pehBackToMap=pehBackToMap;
 window.pehOpenRelatedLane=pehOpenRelatedLane;
 window.pehHotspot=pehHotspot;
+window.pehToggleMode=pehToggleMode;
+window.pehOpenWorkspaceAt=pehOpenWorkspaceAt;
+window.pehOpenSolo=pehOpenSolo;
+window.pehToggleConsole=pehToggleConsole;
+window.pehDragStart=pehDragStart;
+window.pehDragMove=pehDragMove;
+window.pehDragEnd=pehDragEnd;
 
 // ══════════════════════════════════════════════════════════════════════
 // PEH FIRST-LAUNCH ONBOARDING OVERLAY
@@ -710,7 +913,7 @@ var pehOnboard={
     el.innerHTML=
       '<div class="peh-onboard-card">'+
         '<div class="peh-onboard-peh">'+
-          '<img src="assets/peh-guide.png" alt="Pehlichi" loading="eager">'+
+          '<img src="'+(typeof pehMascotSrc==="function"?pehMascotSrc():"assets/peh-guide.png")+'" alt="Pehlichi" loading="eager">'+
         '</div>'+
         '<div class="peh-onboard-bubble">'+
           '<span class="peh-onboard-name">Pehlichi · your guide</span>'+
@@ -825,7 +1028,7 @@ var pehOnboard={
     el.innerHTML=
       '<div class="peh-onboard-card">'+
         '<div class="peh-onboard-peh">'+
-          '<img src="assets/peh-guide.png" alt="Pehlichi" loading="eager">'+
+          '<img src="'+(typeof pehMascotSrc==="function"?pehMascotSrc():"assets/peh-guide.png")+'" alt="Pehlichi" loading="eager">'+
         '</div>'+
         '<div class="peh-onboard-bubble">'+
           '<span class="peh-onboard-name">Pehlichi · your guide</span>'+

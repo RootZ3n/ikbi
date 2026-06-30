@@ -1322,3 +1322,194 @@ button{font-family:inherit}
 .ikbi-launch-form .ikbi-launch-repo{flex:1 1 160px}
 .ikbi-launch-msgs{max-height:260px;overflow:auto}
 .grove-msg.role{color:var(--peh-accent,#7fd1c4);font-family:var(--mono,monospace);font-size:12px;white-space:pre-wrap}
+
+/* ══════════════════════════════════════════════════════════════════════
+   PEHVERSE MODERN SHELL — movable floating windows + Voltron pack-tight
+   dashboard with FLIP morph. Ported from luak's shell (generic, theme-
+   neutral; colour flows from --peh-accent / structural vars). The ikbi
+   reskin (amber/gold wood + parchment) lives in the .peh-product-ikbi
+   block further down. This REPLACES the earlier docked-panel / CSS-grid
+   render layer (.peh-overlays/.peh-panel/.peh-tile/.peh-grid/.peh-dash —
+   now unused).
+   ══════════════════════════════════════════════════════════════════════ */
+
+/* ── Movable workspace windows (map overlay) ─────────────────────────── */
+.peh-ws-windows{position:absolute;inset:0;z-index:10;pointer-events:none;overflow:visible}
+.peh-ws-window{
+  position:absolute;width:min(460px,44vw);max-height:calc(100% - 28px);
+  pointer-events:auto;display:flex;flex-direction:column;
+  border-radius:14px;overflow:hidden;
+  background:linear-gradient(180deg,rgba(22,18,52,.97),rgba(12,10,26,.97));
+  border:1px solid var(--border-subtle);
+  box-shadow:0 14px 44px rgba(0,0,0,.55);
+  transition:box-shadow .15s,border-color .15s;
+}
+.peh-ws-window.focused{
+  border-color:color-mix(in srgb,var(--peh-accent) 60%,var(--border-subtle));
+  box-shadow:0 14px 44px rgba(0,0,0,.55),0 0 24px color-mix(in srgb,var(--peh-accent) 20%,transparent);
+}
+.peh-ws-header{
+  display:flex;align-items:center;gap:7px;padding:8px 10px;
+  background:rgba(217,119,6,.10);border-bottom:1px solid var(--border-subtle);
+  cursor:grab;user-select:none;flex-shrink:0;
+}
+.peh-ws-header:active{cursor:grabbing}
+.peh-ws-glyph{color:var(--peh-accent);display:inline-flex;flex:0 0 auto}
+.peh-ws-glyph svg{width:17px;height:17px}
+.peh-ws-title{flex:1 1 auto;min-width:0;font-size:13px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.peh-ws-console{
+  appearance:none;flex:0 0 auto;cursor:pointer;font-size:11px;font-weight:700;
+  letter-spacing:.03em;padding:4px 9px;border-radius:8px;border:1px solid var(--border-subtle);
+  background:transparent;color:var(--peh-accent);
+}
+.peh-ws-console:hover{border-color:var(--peh-accent);filter:brightness(1.15)}
+.peh-ws-close{
+  appearance:none;border:1px solid transparent;background:transparent;color:var(--ink-dim);
+  font:inherit;font-size:16px;line-height:1;width:24px;height:24px;border-radius:7px;cursor:pointer;
+  display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;
+}
+.peh-ws-close:hover{background:rgba(236,72,153,.22);color:#fff}
+.peh-ws-body{flex:1 1 auto;min-height:0;overflow:auto;padding:6px;-webkit-overflow-scrolling:touch}
+/* Expanded console — large centred workspace. */
+.peh-ws-window.console{max-width:none}
+.peh-ws-window.console .peh-ws-body{padding:0;display:flex;flex:1 1 auto;min-height:0;overflow:hidden}
+/* Console scroll fix: the wraps that hold tall content MUST be the scrollers,
+   or 1000px+ of content gets clipped with no way to reach the rest. */
+.peh-ws-window.console .peh-ws-body>.peh-lane-wrap,
+.peh-ws-window.console .peh-ws-body>.peh-deck-wrap,
+.peh-ws-window.console .peh-ws-body>.peh-ph,
+.peh-ws-window.console .peh-ws-body>.peh-live,
+.peh-ws-window.console .peh-ws-body>.grove-terminal,
+.peh-ws-window.console .peh-ws-body>.ikbi-ws{flex:1 1 auto;min-width:0;min-height:0;overflow:auto}
+
+/* ── Compact glance card (small console-class window / Voltron tile) ──── */
+.peh-live-summary{gap:8px}
+.peh-live-glance{display:flex;flex-direction:column;gap:8px}
+.peh-glance-hint{font-size:11px;letter-spacing:.03em;color:var(--ink-dim);font-style:italic}
+
+/* ── Peh mascot pop-up (bounces in at the clicked hotspot) ───────────── */
+.peh-popup{position:absolute;z-index:30;pointer-events:none;transform:translate(-50%,-100%);animation:pehBounce .5s cubic-bezier(.34,1.56,.64,1) both}
+.peh-popup-img{width:82px;height:82px;object-fit:contain;filter:drop-shadow(0 4px 12px rgba(0,0,0,.5))}
+@keyframes pehBounce{
+  0%{transform:translate(-50%,-100%) scale(0);opacity:0}
+  60%{transform:translate(-50%,-100%) scale(1.15);opacity:1}
+  100%{transform:translate(-50%,-100%) scale(1);opacity:1}
+}
+
+/* ── DashboardSurface — the Voltron pack-tight wall ──────────────────── */
+.peh-dash-surface{
+  flex:1 1 auto;min-height:0;display:flex;flex-direction:column;padding:12px;gap:10px;overflow:hidden;
+  background:
+    radial-gradient(120% 80% at 50% -10%,color-mix(in srgb,var(--peh-accent) 12%,transparent),transparent 60%),
+    linear-gradient(180deg,rgba(10,8,22,.55),rgba(8,6,18,.85));
+}
+.peh-dash-bar{flex:0 0 auto;display:flex;align-items:center;gap:12px;padding:2px 4px}
+.peh-dash-bar-title{font-weight:800;font-size:14px;letter-spacing:.04em;color:var(--ink)}
+.peh-dash-bar-tag{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-dim)}
+.peh-dash-wall{
+  flex:1 1 auto;min-height:0;display:grid;gap:1px;background:var(--border-subtle);
+  border:1px solid var(--border-subtle);border-radius:16px;box-shadow:var(--shadow-panel,0 18px 60px rgba(0,0,0,.55));overflow:hidden;
+}
+.peh-dash-wall-flex{display:flex;flex-direction:column;gap:1px}
+.peh-dash-row{display:flex;flex:1 1 0;gap:1px;min-height:0}
+.peh-dash-wall-flex .peh-dash-tile{flex:1 1 0;min-width:0}
+.peh-dash-tile{display:flex;flex-direction:column;min-width:0;min-height:0;background:var(--bg-card,rgba(22,18,52,.96));border:0;border-radius:0;box-shadow:none;overflow:hidden}
+.peh-dash-tile-head{flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border-subtle);background:linear-gradient(180deg,rgba(255,255,255,.035),transparent)}
+.peh-dash-tile-glyph{color:var(--peh-accent);display:inline-flex;flex:0 0 auto}
+.peh-dash-tile-title{flex:1 1 auto;min-width:0;font-weight:700;font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.peh-dash-open{flex:0 0 auto;border:1px solid var(--border-subtle);background:transparent;color:var(--ink-soft);border-radius:7px;cursor:pointer;font-size:12px;line-height:1;padding:3px 6px;transition:.14s}
+.peh-dash-open:hover{border-color:var(--peh-accent);color:var(--ink)}
+/* ikbi tiles carry full live content, so they DO scroll (luak's compact tiles
+   never do). Keeps the grove terminal / builder form reachable inside a tile. */
+.peh-dash-tile-body{flex:1 1 auto;min-height:0;overflow:auto;padding:10px 12px;display:flex;flex-direction:column;gap:8px}
+.peh-dash-tile.role-status{border-top:2px solid color-mix(in srgb,var(--peh-accent) 70%,transparent)}
+.peh-dash-tile.role-results{border-top:2px solid color-mix(in srgb,var(--peh-accent) 45%,transparent)}
+.peh-dash-tile.role-config{border-top:2px solid color-mix(in srgb,var(--peh-accent2,#4ecdc4) 50%,transparent)}
+.peh-dash-tile.role-metrics{border-top:2px solid color-mix(in srgb,var(--peh-accent) 35%,transparent)}
+.peh-dash-tile.role-diagnostics{border-top:2px solid color-mix(in srgb,var(--success) 50%,transparent)}
+
+/* Compact tile widgets (used by the glance summaries / fallbacks). */
+.pd-col{display:flex;flex-direction:column;gap:8px;min-height:0}
+.pd-stat{display:flex;align-items:baseline;justify-content:space-between;gap:10px;padding:5px 0;border-bottom:1px dashed var(--border-subtle)}
+.pd-stat:last-child{border-bottom:0}
+.pd-stat-label{font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-dim)}
+.pd-stat-value{font-weight:800;font-size:15px;color:var(--ink)}
+.pd-stat-value.teal{color:var(--success,#34d399)}
+.pd-stat-value.orange{color:var(--orange,#fb923c)}
+.pd-stat-value.red{color:var(--red,#f87171)}
+.pd-note{font-size:11px;line-height:1.4;color:var(--ink-dim)}
+.pd-empty{margin:auto;color:var(--ink-dim);font-size:12px;letter-spacing:.04em;text-align:center}
+.pd-open{margin-top:auto;align-self:flex-start;border:1px solid var(--border-subtle);background:transparent;color:var(--ink-soft);border-radius:8px;cursor:pointer;font-size:11px;letter-spacing:.04em;padding:5px 9px;transition:.14s}
+.pd-open:hover{border-color:var(--peh-accent);color:var(--ink)}
+
+/* Make the window⇄tile merge a glide, not a snap. */
+::view-transition-group(*){animation-duration:.5s;animation-timing-function:cubic-bezier(.22,1,.36,1)}
+@media (prefers-reduced-motion:reduce){::view-transition-group(*){animation-duration:.01ms}}
+
+@media (max-width:880px){
+  .peh-dash-surface{overflow:auto}
+  .peh-dash-wall{display:flex;flex-direction:column;border-radius:14px}
+  .peh-dash-tile{min-height:200px}
+  .peh-ws-window:not(.console){width:min(92vw,460px)}
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+   IKBI RESKIN — amber/gold wood frame + parchment for the modern shell.
+   Scoped to .peh-product-ikbi only; never touches signal colours.
+   ══════════════════════════════════════════════════════════════════════ */
+.peh-product-ikbi .peh-ws-window{
+  background:linear-gradient(180deg,rgba(61,43,31,.97),rgba(26,18,10,.98));
+  border:1px solid var(--ikbi-amber-dk);
+  box-shadow:0 14px 44px rgba(0,0,0,.6),0 0 0 1px rgba(232,197,90,.12) inset;
+}
+.peh-product-ikbi .peh-ws-window.focused{border-color:var(--ikbi-gold)}
+.peh-product-ikbi .peh-ws-header{
+  background:linear-gradient(180deg,rgba(92,64,51,.85),rgba(61,43,31,.7));
+  border-bottom:1px solid var(--ikbi-amber-dk);
+}
+.peh-product-ikbi .peh-ws-title{font-family:var(--ikbi-display);letter-spacing:.04em;color:var(--ikbi-cream)}
+.peh-product-ikbi .peh-ws-glyph{color:var(--ikbi-gold)}
+.peh-product-ikbi .peh-ws-console{border-color:var(--ikbi-amber-dk);color:var(--ikbi-gold);font-family:var(--ikbi-display)}
+.peh-product-ikbi .peh-ws-console:hover{border-color:var(--ikbi-gold);color:var(--ikbi-amber-hi)}
+.peh-product-ikbi .peh-popup-img{filter:drop-shadow(0 0 8px rgba(212,168,67,.5)) drop-shadow(0 4px 12px rgba(0,0,0,.5))}
+
+.peh-product-ikbi .peh-dash-surface{
+  background:
+    radial-gradient(120% 80% at 50% -10%,color-mix(in srgb,var(--ikbi-gold) 14%,transparent),transparent 60%),
+    linear-gradient(180deg,rgba(26,18,10,.6),rgba(13,26,20,.82));
+}
+.peh-product-ikbi .peh-dash-wall{
+  background:var(--ikbi-amber-dk);border:2px solid var(--ikbi-gold);
+  box-shadow:0 22px 70px rgba(0,0,0,.65),0 0 0 1px rgba(232,197,90,.15) inset;
+}
+.peh-product-ikbi .peh-dash-tile{background:linear-gradient(180deg,rgba(61,43,31,.96),rgba(26,18,10,.97))}
+.peh-product-ikbi .peh-dash-tile-head{background:linear-gradient(180deg,rgba(92,64,51,.55),transparent);border-bottom:1px solid var(--ikbi-amber-dk)}
+.peh-product-ikbi .peh-dash-tile-title{font-family:var(--ikbi-display);color:var(--ikbi-cream)}
+.peh-product-ikbi .peh-dash-tile-glyph{color:var(--ikbi-gold)}
+.peh-product-ikbi .peh-dash-open{border-color:var(--ikbi-amber-dk);color:var(--ikbi-cream)}
+.peh-product-ikbi .peh-dash-open:hover{border-color:var(--ikbi-gold);color:var(--ikbi-amber-hi)}
+.peh-product-ikbi .peh-dash-bar-title{font-family:var(--ikbi-display);color:var(--ikbi-amber-hi)}
+.peh-product-ikbi .peh-dash-bar-tag{color:var(--ikbi-amber-dk)}
+.peh-product-ikbi .peh-dash-surface .peh-backmap{border-color:var(--ikbi-amber-dk);color:var(--ikbi-cream)}
+
+/* ── Themed always-visible scrollbars inside workspace windows + tiles ──
+   Chromium's 0-px overlay scrollbars read as "cut off"; force a classic
+   amber/gold bar so a scrollable console clearly scrolls. Webkit only —
+   the Firefox standard props are gated below so they don't suppress it. */
+.peh-product-ikbi .peh-ws-window ::-webkit-scrollbar,
+.peh-product-ikbi .peh-dash-tile-body::-webkit-scrollbar,
+.peh-product-ikbi .peh-dash-tile-body *::-webkit-scrollbar{width:12px;height:12px}
+.peh-product-ikbi .peh-ws-window ::-webkit-scrollbar-track,
+.peh-product-ikbi .peh-dash-tile-body::-webkit-scrollbar-track,
+.peh-product-ikbi .peh-dash-tile-body *::-webkit-scrollbar-track{background:rgba(26,18,10,.5)}
+.peh-product-ikbi .peh-ws-window ::-webkit-scrollbar-thumb,
+.peh-product-ikbi .peh-dash-tile-body::-webkit-scrollbar-thumb,
+.peh-product-ikbi .peh-dash-tile-body *::-webkit-scrollbar-thumb{background:linear-gradient(180deg,var(--ikbi-gold),var(--ikbi-amber-dk));border-radius:8px;border:2px solid rgba(26,18,10,.5);background-clip:padding-box}
+.peh-product-ikbi .peh-ws-window ::-webkit-scrollbar-thumb:hover,
+.peh-product-ikbi .peh-dash-tile-body::-webkit-scrollbar-thumb:hover,
+.peh-product-ikbi .peh-dash-tile-body *::-webkit-scrollbar-thumb:hover{background:var(--ikbi-amber-hi);background-clip:padding-box;border:2px solid rgba(26,18,10,.5)}
+.peh-product-ikbi .peh-ws-window ::-webkit-scrollbar-corner{background:transparent}
+@-moz-document url-prefix(){
+  .peh-product-ikbi .peh-ws-window *,
+  .peh-product-ikbi .peh-dash-tile-body *{scrollbar-width:thin;scrollbar-color:var(--ikbi-amber-dk) rgba(26,18,10,.5)}
+}

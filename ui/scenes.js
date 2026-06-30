@@ -794,33 +794,61 @@
     }).join('') + '</div>';
   }
 
+  // Panels that have a meaningful at-a-glance card (a headline stat strip). When
+  // rendered as a compact card or Voltron tile we show only that strip. Panels
+  // NOT listed (grove-ws terminal, builder-ws launch/chat, repo-doctor CTA)
+  // always render in full so their interactive content keeps working.
+  var GLANCE = {
+    'console': 1, 'engine-status': 1, 'modules-ws': 1, 'trust-ws': 1,
+    'test-results': 1, 'history-ws': 1, 'job-cards-ws': 1,
+    'spec-artifact-ws': 1, 'corrections-ws': 1
+  };
+  function isGlance(defId, summary) { return !!(summary && GLANCE[defId]); }
+
+  // Reduce a full rendered panel to its headline stat strip for the glance card.
+  function glanceHtml(html) {
+    try {
+      var t = document.createElement('div');
+      t.innerHTML = html;
+      var pick = t.querySelector('.peh-live-off, .peh-stats, .ikbi-test-stats');
+      if (pick) {
+        return '<div class="peh-live-glance">' + pick.outerHTML +
+          '<div class="peh-glance-hint">Open the console for the full report →</div></div>';
+      }
+    } catch (e) { /* fall through to full html */ }
+    return html;
+  }
+
   // ── liveContainer ────────────────────────────────────────────────────────
-  function liveContainer(defId) {
+  function liveContainer(defId, summary) {
     var cfg = MAP[defId];
-    var extra = (cfg && cfg.extraHtml) ? cfg.extraHtml(defId) : '';
-    return '<div class="peh-live" id="peh-live-' + esc(defId) + '">' +
-      optionRow(defId) +
+    var glance = isGlance(defId, summary);
+    var extra = (!glance && cfg && cfg.extraHtml) ? cfg.extraHtml(defId) : '';
+    return '<div class="peh-live' + (glance ? ' peh-live-summary' : '') + '" id="peh-live-' + esc(defId) + '">' +
+      (glance ? '' : optionRow(defId)) +
       '<div class="peh-live-body"><div class="peh-live-loading">Loading… <span class="peh-live-spin"></span></div></div>' +
       extra +
       '</div>';
   }
 
   // ── fill ─────────────────────────────────────────────────────────────────
-  async function fill(defId, fresh) {
+  async function fill(defId, fresh, summary) {
     var cfg = MAP[defId];
     if (!cfg) return;
     if (fresh) window.IkbiAPI.refresh();
     var host = document.getElementById('peh-live-' + defId);
     if (!host) return;
+    var glance = isGlance(defId, summary);
     var body = host.querySelector('.peh-live-body');
     if (fresh && body) body.innerHTML = '<div class="peh-live-loading">Refreshing… <span class="peh-live-spin"></span></div>';
     var html;
     try { html = await cfg.fn(); } catch (e) { html = offline({ error: (e && e.message) || String(e) }); }
+    if (glance) html = glanceHtml(html);
     host = document.getElementById('peh-live-' + defId);
     if (!host) return;
     body = host.querySelector('.peh-live-body');
     if (body) body.innerHTML = html;
-    if (cfg.postFill) cfg.postFill(defId);
+    if (!glance && cfg.postFill) cfg.postFill(defId);
   }
 
   window.IkbiScenes = {

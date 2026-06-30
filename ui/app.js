@@ -18,8 +18,13 @@
     var def = (typeof pehWorkspaceDef === 'function') ? pehWorkspaceDef(w.defId) : null;
     if (def && def.kind === 'deck') return _origBody(w, deckMarkup);
     if (window.IkbiScenes && IkbiScenes.has(w.defId)) {
-      setTimeout(function () { IkbiScenes.fill(w.defId); }, 0);
-      return IkbiScenes.liveContainer(w.defId);
+      // Card⇄console split: a console-class panel that isn't expanded (and every
+      // Voltron dashboard tile, which passes console:false) renders a COMPACT
+      // glance; the full console renders when the window is expanded (w.console).
+      var meta = (typeof window.pehPanelMeta === 'function') ? window.pehPanelMeta(w.defId) : {};
+      var summary = !!(meta && meta.console) && !w.console;
+      setTimeout(function () { IkbiScenes.fill(w.defId, false, summary); }, 0);
+      return IkbiScenes.liveContainer(w.defId, summary);
     }
     return _origBody(w, deckMarkup);
   };
