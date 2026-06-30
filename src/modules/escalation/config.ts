@@ -10,10 +10,10 @@
  *     SCHEMA_FAILURES 15 · RETRY_COUNT 10 · SCOUT_SCORE 10 · CONTEXT_PRESSURE 5
  *     CRITIC_REJECTED 20 · VERIFICATION_FAILED 25 · REJECTED_TOOL_CALLS 10 · BENCHMARK_PASS_RATE 5
  *
- *   Tier rosters (comma-separated; the retry picks the FIRST entry):
- *     IKBI_ESCALATION_WORKER_MODELS    Default deepseek-v4-flash,mimo-v2.5,minimax-m3
- *     IKBI_ESCALATION_MID_MODELS       Default deepseek-v4-pro,mimo-v2.5-pro
- *     IKBI_ESCALATION_FRONTIER_MODELS  Default gpt-5.5,opus-4.8
+ *   Tier rosters (comma-separated; price-bracketed, attempted cost-ascending within a tier):
+ *     IKBI_ESCALATION_WORKER_MODELS    Default deepseek-v4-flash,mimo-v2.5
+ *     IKBI_ESCALATION_MID_MODELS       Default mimo-v2.5-pro,deepseek-v4-pro,minimax-m3,glm-5.2
+ *     IKBI_ESCALATION_FRONTIER_MODELS  Default sonnet-4.6,opus-4.8,gpt-5.5
  */
 
 import { moduleEnv } from "../../core/module-config.js";
@@ -37,9 +37,19 @@ export const DEFAULT_WEIGHTS: EscalationWeights = Object.freeze({
   builderFailed: 50,
 });
 
-export const DEFAULT_WORKER_MODELS = ["deepseek-v4-flash", "mimo-v2.5", "minimax-m3"] as const;
-export const DEFAULT_MID_MODELS = ["deepseek-v4-pro", "mimo-v2.5-pro"] as const;
-export const DEFAULT_FRONTIER_MODELS = ["gpt-5.5", "opus-4.8"] as const;
+// Tiers are bracketed by PRICE (the cheapest-that-can-do-the-job principle); within a tier the
+// cascade attempts models cost-ascending, with reasoning-quality (Luak) as the tie-break, and
+// only escalates to a higher tier once the current one is exhausted. Roster order below IS the
+// attempt order until live cost data is wired (then cost-asc governs).
+//   worker   — the truly-cheap pre-pass (~$0.42 blended): flash, then mimo-v2.5.
+//   mid      — the bang-for-buck cluster, tried before any frontier spend: the pro pair first
+//              (mimo-v2.5-pro ahead of deepseek-v4-pro — both $0.435/$0.87, Luak ranks Mimo
+//              ~21% higher), then minimax-m3 (effective ~$1.50), then glm-5.2 (~$5.80). mid[0]
+//              is also the single-swap build-mode escalation target, so it must be a pro.
+//   frontier — break-glass gated, cost-ascending: sonnet-4.6 → opus-4.8 → gpt-5.5.
+export const DEFAULT_WORKER_MODELS = ["deepseek-v4-flash", "mimo-v2.5"] as const;
+export const DEFAULT_MID_MODELS = ["mimo-v2.5-pro", "deepseek-v4-pro", "minimax-m3", "glm-5.2"] as const;
+export const DEFAULT_FRONTIER_MODELS = ["sonnet-4.6", "opus-4.8", "gpt-5.5"] as const;
 
 export function loadEscalationConfig(reader = env): EscalationConfig {
   const weights: EscalationWeights = Object.freeze({

@@ -263,10 +263,24 @@ test("identity: ctx.identity rides EVERY invokeModel call (by reference, across 
 
 // ── autonomy honoring ──────────────────────────────────────────────────────
 
-test("autonomy: requiresApproval (probation) → rejected, no model call, no write", async () => {
+test("autonomy: ladder-as-gate-wall — probation (sandboxed) BUILDS under the ladder, not refused", async () => {
   const dir = tmp();
   const { engine, requests } = mockEngine([toolResp([call("write_file", { path: "a.txt", content: "x" })]), stopResp()]);
+  // probation ⇒ requiresApproval:true but sandboxed:true. Old behavior refused outright; now the
+  // build proceeds (worktree-local, ladder-gated, no auto-commit), so a demoted agent can earn back trust.
   const result = await run(makeCtx(dir, "probation", engine));
+  assert.ok(requests.length >= 1, "proceeded to the model loop (no longer blocked at the autonomy gate)");
+  assert.ok(existsSync(join(dir, "a.txt")), "wrote in the sandbox worktree");
+  assert.notEqual((result.detail as { approvalRequired?: boolean }).approvalRequired, true, "not an approval rejection");
+});
+
+test("autonomy: requiresApproval WITHOUT a sandbox → fail-closed rejected, no model call, no write", async () => {
+  const dir = tmp();
+  const { engine, requests } = mockEngine([toolResp([call("write_file", { path: "a.txt", content: "x" })]), stopResp()]);
+  // The unsafe combination the current tier→autonomy mapping never produces, but the guard must hold.
+  const base = makeCtx(dir, "probation", engine);
+  const ctx: RoleContext = { ...base, autonomy: { ...base.autonomy, sandboxed: false } };
+  const result = await run(ctx);
   assert.equal(result.outcome, "rejected");
   assert.equal(requests.length, 0, "did not proceed to the model loop");
   assert.equal((result.detail as { approvalRequired: boolean }).approvalRequired, true);

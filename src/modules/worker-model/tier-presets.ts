@@ -51,7 +51,7 @@ export const TIER_PRESETS: Readonly<Record<BuildTier, TierPreset>> = Object.free
     builderModel: "deepseek-v4-flash",
     criticModel: "deepseek-v4-pro",
     escalation: true,
-    fallbackModel: "deepseek-v4-pro",
+    fallbackModel: "mimo-v2.5-pro",
   }),
   mid: Object.freeze({
     tier: "mid",

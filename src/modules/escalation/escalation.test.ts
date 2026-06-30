@@ -157,8 +157,8 @@ test("policy — tier ladder + thresholds", () => {
   assert.equal(thresholdFor("worker", escalationConfig), 50);
   assert.equal(thresholdFor("mid", escalationConfig), 70);
   assert.equal(thresholdFor("frontier", escalationConfig), undefined);
-  assert.equal(modelFor("mid", escalationConfig), "deepseek-v4-pro");
-  assert.equal(modelFor("frontier", escalationConfig), "gpt-5.5");
+  assert.equal(modelFor("mid", escalationConfig), "mimo-v2.5-pro");
+  assert.equal(modelFor("frontier", escalationConfig), "sonnet-4.6");
 });
 
 function score(total: number): EscalationScore {
@@ -170,7 +170,7 @@ test("policy — worker→mid is automatic at/above threshold (no approval)", ()
   assert.equal(at.escalate, true);
   assert.equal(at.targetTier, "mid");
   assert.equal(at.requiresApproval, false, "worker→mid never needs a human");
-  assert.equal(at.targetModel, "deepseek-v4-pro");
+  assert.equal(at.targetModel, "mimo-v2.5-pro");
   assert.equal(at.score.shouldEscalate, true);
 });
 
@@ -186,7 +186,7 @@ test("policy — mid→frontier ALWAYS requires approval", () => {
   assert.equal(d.escalate, true);
   assert.equal(d.targetTier, "frontier");
   assert.equal(d.requiresApproval, true, "INVARIANT: frontier transitions are gated");
-  assert.equal(d.targetModel, "gpt-5.5");
+  assert.equal(d.targetModel, "sonnet-4.6");
 });
 
 test("policy — frontier is the top tier (cannot escalate)", () => {
@@ -220,7 +220,7 @@ test("engine — worker→mid auto-escalates and builds a handoff", () => {
   assert.equal(decision.escalate, true);
   assert.equal(decision.targetTier, "mid");
   assert.equal(decision.requiresApproval, false);
-  assert.equal(decision.targetModel, "deepseek-v4-pro");
+  assert.equal(decision.targetModel, "mimo-v2.5-pro");
   const h = decision.handoffContext;
   if (h === undefined) throw new Error("expected a handoff");
   assert.equal(h.goal, "make the tests pass");
@@ -245,7 +245,7 @@ test("engine — mid→frontier escalates but flags approval", () => {
   assert.equal(decision.escalate, true);
   assert.equal(decision.targetTier, "frontier");
   assert.equal(decision.requiresApproval, true);
-  assert.equal(decision.targetModel, "gpt-5.5");
+  assert.equal(decision.targetModel, "sonnet-4.6");
 });
 
 test("engine — a clean attempt does not escalate", () => {
@@ -344,7 +344,7 @@ test("break-glass — the briefing surfaces tier, model, score, and cost", () =>
   const text = presentBreakGlass({ taskId: "T1", decision: frontierDecision(), estimatedCostUsd: 1.25 });
   assert.ok(/BREAK-GLASS/.test(text));
   assert.ok(/FRONTIER/.test(text));
-  assert.ok(/gpt-5\.5/.test(text), "target model shown");
+  assert.ok(/sonnet-4\.6/.test(text), "target model shown");
   assert.ok(/\$1\.25/.test(text), "estimated cost shown");
   assert.ok(/score 70\/100/.test(text), "score breakdown shown");
 });
@@ -365,7 +365,10 @@ test("config — defaults match the three-tier spec", () => {
   assert.equal(escalationConfig.workerToMidThreshold, 50);
   assert.equal(escalationConfig.midToFrontierThreshold, 70);
   assert.equal(escalationConfig.maxEscalations, 2);
-  assert.deepEqual([...escalationConfig.tierModels.worker], ["deepseek-v4-flash", "mimo-v2.5", "minimax-m3"]);
-  assert.deepEqual([...escalationConfig.tierModels.mid], ["deepseek-v4-pro", "mimo-v2.5-pro"]);
-  assert.deepEqual([...escalationConfig.tierModels.frontier], ["gpt-5.5", "opus-4.8"]);
+  assert.deepEqual([...escalationConfig.tierModels.worker], ["deepseek-v4-flash", "mimo-v2.5"]);
+  assert.deepEqual(
+    [...escalationConfig.tierModels.mid],
+    ["mimo-v2.5-pro", "deepseek-v4-pro", "minimax-m3", "glm-5.2"],
+  );
+  assert.deepEqual([...escalationConfig.tierModels.frontier], ["sonnet-4.6", "opus-4.8", "gpt-5.5"]);
 });

@@ -1935,7 +1935,7 @@ test("WO2: the fast-fail is PRODUCTION-only — a non-enforceProjectRoot orchest
 // UNIQUE taskId to avoid sharing per-task escalation history. A builder failure whose detail
 // carries `toolFormatErrors` (schemaFailures) + `retryCount` folds to a score of 50, exactly the
 // default worker→mid threshold — so the engine recommends escalating to the mid tier, whose first
-// model is "deepseek-v4-pro". Both the cheap attempt and the escalated retry route through the same
+// model is "mimo-v2.5-pro". Both the cheap attempt and the escalated retry route through the same
 // injected `roles.builder` (builderForModel returns the injected role); the retry is distinguished
 // by the "[escalation]" handoff prose spliced into its goal.
 
@@ -1970,18 +1970,18 @@ test("build-mode escalation: builder succeeds with 0 files → cheap retry → p
   assert.equal(builderGoals.length, 3, "builder ran three times: silent success + cheap retry + one escalated retry");
   assert.match(builderGoals[1] ?? "", /\[retry\]/, "the cheap retry carried retry context");
   assert.match(builderGoals[2] ?? "", /\[escalation\]/, "the escalated retry carried the escalation handoff context");
-  assert.match(builderGoals[2] ?? "", /deepseek-v4-pro/, "the handoff names the escalated model");
+  assert.match(builderGoals[2] ?? "", /mimo-v2.5-pro/, "the handoff names the escalated model");
   assert.ok(result.escalationRetry, "escalationRetry surfaced on the result");
   assert.equal(result.escalationRetry?.attempted, true);
   assert.equal(result.escalationRetry?.succeeded, true, "the escalated retry converged");
-  assert.equal(result.escalationRetry?.model, "deepseek-v4-pro", "ran on the first model of the mid tier (pro)");
+  assert.equal(result.escalationRetry?.model, "mimo-v2.5-pro", "ran on the first model of the mid tier (pro)");
   assert.equal(result.outcome, "success", "the escalated build verified and promoted like a first-try green build");
   assert.equal(result.promoted, true);
   assert.equal(ws.calls.promote, 1, "promoted the escalated work");
   const retried = bus.sent.filter((e) => e.type === "worker.escalation.retried");
   assert.ok(retried.length >= 2, "both cheap retry and pro escalation events emitted");
   const proRetried = retried[retried.length - 1];
-  assert.equal((proRetried?.payload as { toModel: string; success: boolean } | undefined)?.toModel, "deepseek-v4-pro");
+  assert.equal((proRetried?.payload as { toModel: string; success: boolean } | undefined)?.toModel, "mimo-v2.5-pro");
   assert.equal((proRetried?.payload as { success: boolean } | undefined)?.success, true);
 });
 
@@ -2016,18 +2016,18 @@ test("build-mode escalation: builder fails on the cheap tier → cheap retry →
   assert.equal(builderGoals.length, 3, "builder ran three times: cheap attempt + cheap retry + one escalated retry");
   assert.match(builderGoals[1] ?? "", /\[retry\]/, "the cheap retry carried retry context");
   assert.match(builderGoals[2] ?? "", /\[escalation\]/, "the escalated retry carried the escalation handoff context");
-  assert.match(builderGoals[2] ?? "", /deepseek-v4-pro/, "the handoff names the escalated model");
+  assert.match(builderGoals[2] ?? "", /mimo-v2.5-pro/, "the handoff names the escalated model");
   assert.ok(result.escalationRetry, "escalationRetry surfaced on the result");
   assert.equal(result.escalationRetry?.attempted, true);
   assert.equal(result.escalationRetry?.succeeded, true, "the escalated retry converged");
-  assert.equal(result.escalationRetry?.model, "deepseek-v4-pro", "ran on the first model of the mid tier (pro)");
+  assert.equal(result.escalationRetry?.model, "mimo-v2.5-pro", "ran on the first model of the mid tier (pro)");
   assert.equal(result.outcome, "success", "the escalated build verified and promoted like a first-try green build");
   assert.equal(result.promoted, true);
   assert.equal(ws.calls.promote, 1, "promoted the escalated work");
   const retried = bus.sent.filter((e) => e.type === "worker.escalation.retried");
   assert.ok(retried.length >= 2, "both cheap retry and pro escalation events emitted");
   const proRetried = retried[retried.length - 1];
-  assert.equal((proRetried?.payload as { toModel: string; success: boolean } | undefined)?.toModel, "deepseek-v4-pro");
+  assert.equal((proRetried?.payload as { toModel: string; success: boolean } | undefined)?.toModel, "mimo-v2.5-pro");
   assert.equal((proRetried?.payload as { success: boolean } | undefined)?.success, true);
 });
 
@@ -2052,7 +2052,7 @@ test("build-mode escalation: a failed escalated retry leaves the original failur
   assert.equal(builderCalls, 3, "flash attempt + cheap retry + one escalated retry — escalationAttempted prevents an escalation loop");
   assert.equal(result.escalationRetry?.attempted, true);
   assert.equal(result.escalationRetry?.succeeded, false, "the escalated retry also failed");
-  assert.equal(result.escalationRetry?.model, "deepseek-v4-pro");
+  assert.equal(result.escalationRetry?.model, "mimo-v2.5-pro");
   assert.notEqual(result.outcome, "success", "the original failure stands (fail-closed)");
   assert.equal(result.promoted, false, "a failed build never promotes");
   assert.equal(ws.calls.promote, 0, "no promote attempted after a failed escalated retry");
@@ -2122,7 +2122,7 @@ test("tier preset: builderModelOverride is accepted and the pipeline still promo
 // the critic-fix loop retried the cheap model ONCE and, if it still failed, the build was discarded
 // with the strong critic's feedback wasted. The signal-scored escalation engine cannot rescue it
 // (a critic rejection alone scores below the worker→mid threshold), so this is a DETERMINISTIC,
-// fix-loop-exhaustion-driven escalation: swap the builder to the mid model (deepseek-v4-pro) once,
+// fix-loop-exhaustion-driven escalation: swap the builder to the mid model (mimo-v2.5-pro) once,
 // re-verify, re-critique, and promote IFF the stronger model finally satisfies the critic.
 
 test("critic-driven escalation: a verifier-GREEN build the cheap model can't get past the critic escalates to the mid tier and converges → promote", async () => {
@@ -2153,19 +2153,19 @@ test("critic-driven escalation: a verifier-GREEN build the cheap model can't get
   assert.equal(calls.critic, 3, "cheap critique + cheap re-critique + escalated critique");
   // The escalated build carried the handoff context naming the mid model + the critic's feedback.
   assert.match(builderGoals[2] ?? "", /\[escalation\]/, "the escalated build carried the handoff context");
-  assert.match(builderGoals[2] ?? "", /deepseek-v4-pro/, "the handoff names the escalated mid model");
+  assert.match(builderGoals[2] ?? "", /mimo-v2.5-pro/, "the handoff names the escalated mid model");
   assert.match(builderGoals[2] ?? "", /missed the spec/, "the handoff relays the critic's feedback the cheap model could not satisfy");
   assert.ok(result.escalationRetry, "escalationRetry surfaced on the result");
   assert.equal(result.escalationRetry?.attempted, true);
   assert.equal(result.escalationRetry?.succeeded, true, "the escalated build finally satisfied the critic");
-  assert.equal(result.escalationRetry?.model, "deepseek-v4-pro", "ran on the first model of the mid tier (pro)");
+  assert.equal(result.escalationRetry?.model, "mimo-v2.5-pro", "ran on the first model of the mid tier (pro)");
   const critic = result.roles.find((r) => r.role === "critic");
   assert.equal((critic?.detail as { pass: boolean }).pass, true, "the escalated PASS critique is the final critic result");
   assert.equal(result.outcome, "success", "the escalated build verified, critic-passed, and promoted");
   assert.equal(ws.calls.promote, 1, "promoted the escalated work");
   const retried = bus.sent.find((e) => e.type === "worker.escalation.retried");
   assert.ok(retried, "worker.escalation.retried event emitted");
-  assert.equal((retried?.payload as { toModel: string } | undefined)?.toModel, "deepseek-v4-pro");
+  assert.equal((retried?.payload as { toModel: string } | undefined)?.toModel, "mimo-v2.5-pro");
   assert.equal((retried?.payload as { success: boolean } | undefined)?.success, true);
 });
 
@@ -2190,7 +2190,7 @@ test("critic-driven escalation: a still-rejected escalated build leaves the orig
   assert.equal(calls.critic, 3, "cheap critique + cheap re-critique + escalated critique — never a fourth");
   assert.equal(result.escalationRetry?.attempted, true);
   assert.equal(result.escalationRetry?.succeeded, false, "the escalated build also failed the critic");
-  assert.equal(result.escalationRetry?.model, "deepseek-v4-pro");
+  assert.equal(result.escalationRetry?.model, "mimo-v2.5-pro");
   assert.notEqual(result.outcome, "success", "the original critic FAIL stands → discard (fail-closed)");
   assert.equal(ws.calls.promote, 0, "a critic-rejected build never promotes, escalated or not");
   const retried = bus.sent.find((e) => e.type === "worker.escalation.retried");
@@ -2349,7 +2349,7 @@ test("unverifiable target (manifest, no derivable checks) + builder failure → 
     const orch = createOrchestrator(
       baseDeps({ resolveIdentity, roleClaim, roles, workspaces, trust: tr.trust, receipts: rc.receipts, events: bus.bus, enforceProjectRoot: true }),
     );
-    const result = await orch.run({ taskId: "t-unverif-orch", targetRepo: dir, goal: "make a tiny change", fallbackModel: "deepseek-v4-pro" }, parentCtx);
+    const result = await orch.run({ taskId: "t-unverif-orch", targetRepo: dir, goal: "make a tiny change", fallbackModel: "mimo-v2.5-pro" }, parentCtx);
 
     // NO escalation: the builder ran exactly once — no cheap retry, no pro swap.
     assert.equal(builderGoals.length, 1, "builder ran once — escalation suppressed");
@@ -2398,11 +2398,11 @@ test("RESOLVABLE target (real package.json) + builder failure → escalation STI
     const orch = createOrchestrator(
       baseDeps({ resolveIdentity, roleClaim, roles, workspaces, events: bus.bus, enforceProjectRoot: true }),
     );
-    const result = await orch.run({ taskId: "t-resolvable-orch", targetRepo: dir, goal: "fix the bug", fallbackModel: "deepseek-v4-pro" }, parentCtx);
+    const result = await orch.run({ taskId: "t-resolvable-orch", targetRepo: dir, goal: "fix the bug", fallbackModel: "mimo-v2.5-pro" }, parentCtx);
 
     assert.equal(result.verification, undefined, "a resolvable target is NOT classified unverifiable");
     assert.equal(result.escalationRetry?.attempted, true, "escalation fired for a resolvable (red-eligible) target");
-    assert.equal(result.escalationRetry?.model, "deepseek-v4-pro");
+    assert.equal(result.escalationRetry?.model, "mimo-v2.5-pro");
     assert.ok(builderGoals.some((g) => g.includes("[escalation]")), "the pro escalation actually ran");
     assert.ok(!bus.sent.some((e) => e.type === "worker.escalation.suppressed"), "escalation was NOT suppressed");
   } finally {

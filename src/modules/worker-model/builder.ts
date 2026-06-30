@@ -734,16 +734,22 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
   // required separately (gate-wall authorization needs it); the fallback supplies ONLY the executor.
   const governedExec = deps.governedExec ?? lazyGovernedExec();
   return async (ctx) => {
-  // AUTONOMY — advisory this pass; STRUCTURAL enforcement lands with gate-wall (P1).
-  // GATE-WALL SEAM ↓ : the gate-wall module will plug in here to grant/deny based on
-  // policy + an approval signal. Until it exists, a tier that requiresApproval CANNOT
-  // proceed to irreversible workspace writes — fail closed (return rejected). Flagged
-  // for the 3rd eye: this is advisory honoring, not yet an enforced boundary.
-  if (ctx.autonomy.requiresApproval) {
+  // LADDER-AS-GATE-WALL (P1, implemented). A tier that requiresApproval (probation/untrusted)
+  // may still BUILD — but only when its writes are CONFINED to an isolated sandbox worktree.
+  // This breaks the old deadlock: previously such a tier hit "gate-wall not yet available —
+  // refusing to write", so a demoted agent could never produce the verified successes that
+  // climb it back, and a human had to reset trust by hand. Proceeding is SAFE because PROMOTION
+  // stays triple-gated downstream — the verification ladder must be green, the orchestrator's
+  // promote gate-wall must authorize, and autoCommit is false (RETAIN, never auto-promote) — so
+  // the build is reversible (worktree-local) and the ladder itself is the gate-wall: evidence,
+  // not a tier, earns promotion. We still fail CLOSED for the one unsafe combination — approval
+  // required WITHOUT a sandbox (not produced by the current tier→autonomy mapping, but guarded
+  // so a future unsandboxed-approval tier can never silently write the real tree).
+  if (ctx.autonomy.requiresApproval && !ctx.autonomy.sandboxed) {
     return {
       role: "builder",
       outcome: "rejected",
-      summary: `approval required (tier "${ctx.autonomy.tier}") — gate-wall not yet available; refusing to write`,
+      summary: `approval required (tier "${ctx.autonomy.tier}") WITHOUT a sandbox — refusing to write (fail-closed)`,
       detail: {
         approvalRequired: true,
         tier: ctx.autonomy.tier,

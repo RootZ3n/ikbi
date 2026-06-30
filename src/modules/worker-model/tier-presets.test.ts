@@ -15,7 +15,7 @@ test("tier presets: cheap = flash builder + pro critic, escalation ON to pro", (
   assert.equal(cheap.builderModel, "deepseek-v4-flash");
   assert.equal(cheap.criticModel, "deepseek-v4-pro");
   assert.equal(cheap.escalation, true, "cheap tier auto-escalates");
-  assert.equal(cheap.fallbackModel, "deepseek-v4-pro", "cheap escalates to the pro model");
+  assert.equal(cheap.fallbackModel, "mimo-v2.5-pro", "cheap escalates to the preferred pro (mid[0], Mimo first)");
 });
 
 test("tier presets: mid = glm-5.2 builder + minimax-m3 critic, escalation OFF (no fallback)", () => {
