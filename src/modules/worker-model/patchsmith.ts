@@ -388,12 +388,15 @@ function buildContextBody(args: {
  */
 export function createPatchsmith(deps: PatchsmithDeps = {}): RoleFn {
   return async (ctx) => {
-    // Mirror the agent builder's approval gate: a tier that requiresApproval cannot write.
-    if (ctx.autonomy.requiresApproval) {
+    // LADDER-AS-GATE-WALL (parity with the agent builder): a tier that requiresApproval may still
+    // patch — but only when CONFINED to the sandbox worktree (patchsmith applies the diff in the
+    // managed worktree and runs verification, so promotion stays evidence-gated downstream). Refuse
+    // ONLY the unsafe combination — approval required WITHOUT a sandbox — fail-closed.
+    if (ctx.autonomy.requiresApproval && !ctx.autonomy.sandboxed) {
       return {
         role: "builder",
         outcome: "rejected",
-        summary: `approval required (tier "${ctx.autonomy.tier}") — patchsmith refusing to write`,
+        summary: `approval required (tier "${ctx.autonomy.tier}") WITHOUT a sandbox — patchsmith refusing to write (fail-closed)`,
         detail: { builderMode: "patch", filesSupplied: [], filesChanged: [], patchAttempts: 0, repairAttempts: 0, verificationResult: "blocked", stopReason: "approval_required" },
       };
     }

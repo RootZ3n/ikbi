@@ -182,15 +182,27 @@ test("patchsmith: repair attempt receives the verifier output", async () => {
   assert.match(repairText, /verification FAILED/i);
 });
 
-test("patchsmith: a tier requiring approval refuses to write", async () => {
+test("patchsmith: ladder-as-gate-wall — probation (sandboxed) patches under the ladder, not refused", async () => {
   const dir = tmp();
   mkdirp(dir, "src");
   writeFileSync(join(dir, "src/math.ts"), "export function add(a: number, b: number): number {\n  return a - b;\n}\n");
   const { engine, requests } = mockEngine([textResp(GOOD_DIFF)]);
-  // "probation" tier requiresApproval — patchsmith must refuse before invoking the model.
+  // probation ⇒ requiresApproval:true but sandboxed:true — proceeds (worktree-local, ladder-gated, no auto-commit).
   const result = await createPatchsmith({ governedExec: greenExec(), parentCtx: PARENT_CTX, resolveChecks: oneCheck() })(makeCtx(dir, "probation", engine));
+  assert.ok(requests.length >= 1, "proceeded to the model (no longer blocked at the autonomy gate)");
+  assert.notEqual((result.detail as { stopReason?: string }).stopReason, "approval_required", "not an approval rejection");
+});
+
+test("patchsmith: requiresApproval WITHOUT a sandbox → fail-closed, no model call", async () => {
+  const dir = tmp();
+  mkdirp(dir, "src");
+  writeFileSync(join(dir, "src/math.ts"), "export function add(a: number, b: number): number {\n  return a - b;\n}\n");
+  const { engine, requests } = mockEngine([textResp(GOOD_DIFF)]);
+  const baseCtx = makeCtx(dir, "probation", engine);
+  const ctx: RoleContext = { ...baseCtx, autonomy: { ...baseCtx.autonomy, sandboxed: false } };
+  const result = await createPatchsmith({ governedExec: greenExec(), parentCtx: PARENT_CTX, resolveChecks: oneCheck() })(ctx);
   assert.equal(result.outcome, "rejected");
-  assert.equal(requests.length, 0, "no model call when approval is required");
+  assert.equal(requests.length, 0, "no model call when approval is required without a sandbox");
 });
 
 // ── helpers ──
