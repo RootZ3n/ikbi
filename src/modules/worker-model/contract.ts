@@ -216,6 +216,14 @@ export interface WorkerTask {
    */
   readonly escalationDisabled?: boolean;
   /**
+   * Authorize the recovery loop to cross into the FRONTIER once the worker+mid pool is exhausted:
+   * ONE bounded consult (a tool-free frontier call over an evidence-dense packet) whose unified
+   * diff is applied in the worktree and ladder-verified like any build. GATED OFF by default —
+   * unattended, recovery stops at the mid ceiling. Set via `--escalate` / a frontier budget. This
+   * is the "auto through mid, frontier gated" line; promotion stays gated, so a bad patch fails closed.
+   */
+  readonly allowFrontierConsult?: boolean;
+  /**
    * TOURNAMENT candidate models (the candidate-tournament decision #tournament). When present and
    * non-empty, the orchestrator runs a CANDIDATE TOURNAMENT instead of the single-workspace path:
    * each listed model independently attempts this task in its OWN isolated workspace, ikbi verifies

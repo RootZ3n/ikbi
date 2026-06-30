@@ -56,6 +56,8 @@ import type { EscalationSignals, EscalationDecision } from "../escalation/index.
 import { decideRecovery } from "../recovery/index.js";
 import type { RecoveryAttempt } from "../recovery/index.js";
 import { rosterFromIds } from "../model-router/index.js";
+import { applyConsultPatch } from "./consult-apply.js";
+import type { ApplyConsultPatchInput, ApplyConsultPatchResult } from "./consult-apply.js";
 
 import type { ExecRequest, GovernedExec } from "../governed-exec/index.js";
 import type { DependencyInstall } from "../dependency-install/contract.js";
@@ -523,6 +525,8 @@ export interface OrchestratorDeps {
   readonly receipts?: { append: (input: unknown, identity: AgentIdentity) => Promise<unknown> };
   readonly events?: EventBusSurface;
   readonly invokeModel?: (request: ModelRequest) => Promise<ModelResponse>;
+  /** The recovery loop's frontier executor (consult patch → apply). Default: the real applyConsultPatch. Injectable for tests. */
+  readonly applyConsultPatch?: (input: ApplyConsultPatchInput) => Promise<ApplyConsultPatchResult>;
   readonly neutralizeUntrusted?: RoleEngine["neutralizeUntrusted"];
   /** Role implementations (default: the five stubs). Tests override to drive outcomes. */
   readonly roles?: Partial<Record<WorkerRole, RoleFn>>;
@@ -2332,14 +2336,69 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 attempts: recAttempts,
                 tierRosters: recoveryRosters,
                 autoCeiling: "mid",
-                frontierAuthorized: false, // frontier consult is a gated follow-up (needs the apply+re-verify path)
+                // Frontier (consult) crossing is authorized only by --escalate / a frontier budget.
+                frontierAuthorized: task.allowFrontierConsult === true,
                 startTier: seedTier,
                 // An operator's --fallback-model is honored as the FIRST pick (still up the ladder);
                 // once tried, the sweep continues cheapest-first through the rest of the pool.
                 ...(task.fallbackModel !== undefined ? { requestedModel: task.fallbackModel } : {}),
               });
-              if (action.kind !== "attempt") {
-                break; // terminate (exhausted | needs-authorization). Consult is gated this pass.
+              if (action.kind === "terminate") {
+                break; // exhausted | needs-authorization — original failure stands.
+              }
+              if (action.kind === "consult") {
+                // FRONTIER STEP (authorized): ONE bounded consult patch, applied in the worktree; the
+                // pipeline verifier (below) gates it like any build. Opus advises via a diff — no tool loop.
+                const triedSummary = recAttempts.map((a) => ({ role: "builder", summary: `${a.tier}/${a.model}`, outcome: a.outcome === "green" ? "verified green" : "failed" }));
+                let applyRes: ApplyConsultPatchResult;
+                try {
+                  applyRes = await (deps.applyConsultPatch ?? applyConsultPatch)({
+                    workspacePath: workspace.path,
+                    request: {
+                      question: `Cheaper models exhausted the worker+mid pool on this task. Provide the minimal fix as a unified diff.`,
+                      identity: parentIdentity,
+                      goal: task.goal,
+                      ...(handoff?.verificationDetails !== undefined ? { failingChecks: handoff.verificationDetails } : {}),
+                      triedAndFailed: triedSummary,
+                    },
+                  });
+                } catch (e) {
+                  applyRes = { applied: false, filesChanged: [], error: e instanceof Error ? e.message : String(e) };
+                }
+                const consultModelId = applyRes.modelId ?? "frontier:consult";
+                lastSwapModel = consultModelId;
+                events.publish(
+                  workerEscalationRetried.create(
+                    { taskId: task.taskId, fromModel: failedModel, toModel: consultModelId, success: applyRes.applied },
+                    { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.escalation.consult", runId: task.taskId } },
+                  ),
+                );
+                await receipts.append(
+                  {
+                    operation: "worker.escalation.consult",
+                    outcome: { status: applyRes.applied ? "success" : "failure", ...(applyRes.error !== undefined ? { detail: applyRes.error } : {}) },
+                    requestId: task.taskId,
+                    metadata: { taskId: task.taskId, workspaceId: workspace.id, model: consultModelId, applied: applyRes.applied, filesChanged: applyRes.filesChanged.length, ...(applyRes.stopReason !== undefined ? { stopReason: applyRes.stopReason } : {}), costUsd: runCost() },
+                    project: task.targetRepo,
+                  },
+                  parentIdentity,
+                );
+                recAttempts.push({ tier: "frontier", model: consultModelId, outcome: applyRes.applied ? "green" : "fail" });
+                if (applyRes.applied) {
+                  // Splice a success builder result so the pipeline verifier validates the applied diff.
+                  const synth: RoleResult = {
+                    role: "builder",
+                    outcome: "success",
+                    summary: `frontier consult patch applied by ${consultModelId} (${applyRes.filesChanged.length} file(s))`,
+                    detail: { model: consultModelId, escalated: true, consult: true, filesWritten: [...applyRes.filesChanged] },
+                  };
+                  const builderIdx = results.lastIndexOf(failedResult);
+                  if (builderIdx >= 0) results[builderIdx] = synth;
+                  result = synth;
+                  recovered = true;
+                  break;
+                }
+                continue; // frontier attempt recorded; decideRecovery now terminates exhausted
               }
               const swapModel = action.model;
               lastSwapModel = swapModel;

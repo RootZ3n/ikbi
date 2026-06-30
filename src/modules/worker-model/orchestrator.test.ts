@@ -2062,6 +2062,52 @@ test("build-mode escalation: a failed escalated retry leaves the original failur
   assert.equal((lastRetried?.payload as { success: boolean } | undefined)?.success, false, "the retry event reports the failure");
 });
 
+test("build-mode escalation: frontier consult (authorized) recovers after the worker+mid pool is exhausted", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const bus = fakeBus();
+  const cap = capturingRoles();
+  let consultCalls = 0;
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    builder: async (): Promise<RoleResult> => ({ role: "builder", outcome: "failure", summary: "pool model failed", detail: { toolFormatErrors: [1, 2], retryCount: 3 } }),
+  };
+  const applyConsultPatch = async () => {
+    consultCalls += 1;
+    return { applied: true, filesChanged: ["src/new.ts"], modelId: "opus-4.8" };
+  };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces, events: bus.bus, applyConsultPatch }));
+  const result = await orch.run({ taskId: "t-frontier-ok", targetRepo: "/repo", goal: "do the thing", allowFrontierConsult: true }, parentCtx);
+
+  assert.equal(consultCalls, 1, "the frontier consult fired exactly once, after the worker+mid pool was exhausted");
+  assert.equal(result.outcome, "success", "the applied frontier patch verified and promoted");
+  assert.equal(result.promoted, true);
+  const consultEvents = bus.sent.filter((e) => e.type === "worker.escalation.retried" && (e.payload as { toModel?: string }).toModel === "opus-4.8");
+  assert.ok(consultEvents.length >= 1, "a consult escalation event named the frontier model");
+});
+
+test("build-mode escalation: frontier consult NOT called when unauthorized (gated by default)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const bus = fakeBus();
+  const cap = capturingRoles();
+  let consultCalls = 0;
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    builder: async (): Promise<RoleResult> => ({ role: "builder", outcome: "failure", summary: "pool model failed", detail: { toolFormatErrors: [1, 2], retryCount: 3 } }),
+  };
+  const applyConsultPatch = async () => {
+    consultCalls += 1;
+    return { applied: true, filesChanged: [], modelId: "opus-4.8" };
+  };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces, events: bus.bus, applyConsultPatch }));
+  // no allowFrontierConsult → frontier stays gated
+  const result = await orch.run({ taskId: "t-frontier-gated", targetRepo: "/repo", goal: "do the thing" }, parentCtx);
+
+  assert.equal(consultCalls, 0, "frontier consult is gated — never called without authorization");
+  assert.notEqual(result.outcome, "success", "the original failure stands (fail-closed at the mid ceiling)");
+});
+
 // ── TIER PRESET: `--tier mid|frontier` sets escalationDisabled → a failed builder fails closed ──
 // The cheap tier auto-escalates a failed builder to a stronger model (the tests above). The mid and
 // frontier tiers run ONE capable builder and must NOT silently swap models on failure — they set
