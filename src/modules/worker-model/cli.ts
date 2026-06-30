@@ -518,7 +518,7 @@ function detectWriteScope(goal: string): "all" | "new_only" | "none" {
  * every progress/diagnostic/hint/repair/cost line is routed to STDERR so a caller can pipe
  * stdout straight into a JSON parser without log noise interleaved (FIX 3).
  */
-export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbose?: boolean; cost?: boolean; yes?: boolean; json?: boolean; delegation?: string; noMemory?: boolean; memoryDiff?: boolean; check?: string; maxBudgetUsd?: number; fallbackModel?: string; complexity?: "small" | "medium" | "large"; tier?: BuildTier; bare?: boolean; effort?: "low" | "medium" | "high" | "max"; fromPr?: number; rest: string[] } {
+export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbose?: boolean; cost?: boolean; yes?: boolean; json?: boolean; delegation?: string; noMemory?: boolean; memoryDiff?: boolean; check?: string; maxBudgetUsd?: number; fallbackModel?: string; complexity?: "small" | "medium" | "large"; tier?: BuildTier; bare?: boolean; effort?: "low" | "medium" | "high" | "max"; fromPr?: number; escalate?: boolean; rest: string[] } {
   const rest: string[] = [];
   let repo: string | undefined;
   let verbose = false;
@@ -528,6 +528,7 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
   let delegation: string | undefined;
   let noMemory = false;
   let memoryDiff = false;
+  let escalate = false;
   let check: string | undefined;
   let maxBudgetUsd: number | undefined;
   let fallbackModel: string | undefined;
@@ -608,11 +609,13 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
     } else if (a.startsWith("--from-pr=")) {
       const n = Number.parseInt(a.slice("--from-pr=".length), 10);
       if (Number.isInteger(n) && n > 0) fromPr = n;
+    } else if (a === "--escalate") {
+      escalate = true;
     } else {
       rest.push(a);
     }
   }
-  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), ...(verbose ? { verbose } : {}), ...(cost ? { cost } : {}), ...(yes ? { yes } : {}), ...(json ? { json } : {}), ...(delegation !== undefined ? { delegation } : {}), ...(noMemory ? { noMemory } : {}), ...(memoryDiff ? { memoryDiff } : {}), ...(check !== undefined && check.trim().length > 0 ? { check } : {}), ...(maxBudgetUsd !== undefined ? { maxBudgetUsd } : {}), ...(fallbackModel !== undefined ? { fallbackModel } : {}), ...(complexity !== undefined ? { complexity } : {}), ...(tier !== undefined ? { tier } : {}), ...(bare ? { bare } : {}), ...(effort !== undefined ? { effort } : {}), ...(fromPr !== undefined ? { fromPr } : {}), rest };
+  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), ...(verbose ? { verbose } : {}), ...(cost ? { cost } : {}), ...(yes ? { yes } : {}), ...(json ? { json } : {}), ...(delegation !== undefined ? { delegation } : {}), ...(noMemory ? { noMemory } : {}), ...(memoryDiff ? { memoryDiff } : {}), ...(check !== undefined && check.trim().length > 0 ? { check } : {}), ...(maxBudgetUsd !== undefined ? { maxBudgetUsd } : {}), ...(fallbackModel !== undefined ? { fallbackModel } : {}), ...(complexity !== undefined ? { complexity } : {}), ...(tier !== undefined ? { tier } : {}), ...(bare ? { bare } : {}), ...(effort !== undefined ? { effort } : {}), ...(fromPr !== undefined ? { fromPr } : {}), ...(escalate ? { escalate } : {}), rest };
 }
 
 /**
@@ -905,6 +908,7 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
           "  --no-memory       Do not load project memory (CLAUDE.md / AGENTS.md / .ikbi/)\n" +
           "  --memory-diff     Show which project memory would be used, then exit (no build)\n" +
           "  --check \"<cmd>\"   Explicit verification command for a repo with no manifest\n" +
+          "  --escalate        Authorize a frontier consult (Opus-tier patch, ladder-verified) if the cheap+mid pool is exhausted\n" +
           "  --delegation <json>  Run from a delegation envelope (overrides goal + repo)\n" +
                     "  --fallback-model <m> Override the escalation mid-tier model (default from IKBI_ESCALATION_MID_MODEL)\n" +
           "  --complexity <level>  small | medium | large — large skips flash entirely (uses pro)\n" +
@@ -917,7 +921,7 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       return;
     }
 
-    const { repo, verbose, cost, yes, delegation: delegationJson, noMemory, memoryDiff, check, maxBudgetUsd, fallbackModel, complexity, tier, bare, effort, fromPr, rest } = parseBuildArgs(argv);
+    const { repo, verbose, cost, yes, delegation: delegationJson, noMemory, memoryDiff, check, maxBudgetUsd, fallbackModel, complexity, tier, bare, effort, fromPr, escalate, rest } = parseBuildArgs(argv);
 
     // `--tier` given a value parseBuildArgs couldn't match (e.g. `--tier turbo`) silently drops to
     // undefined. Catch that here and fail closed with the valid set, rather than running an
@@ -1105,6 +1109,9 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       ...(fallbackModel !== undefined ? { fallbackModel } : {}),
       // Also check IKBI_FALLBACK_MODEL env var
       ...(fallbackModel === undefined && process.env.IKBI_FALLBACK_MODEL ? (() => { const m = process.env.IKBI_FALLBACK_MODEL!.trim(); return m.length > 0 ? { fallbackModel: m } : {}; })() : {}),
+      // --escalate / IKBI_ALLOW_FRONTIER_CONSULT: authorize the recovery loop to cross into the
+      // frontier (one bounded consult patch, ladder-verified) once the worker+mid pool is exhausted.
+      ...(escalate === true || /^(1|true|yes|on)$/i.test((process.env.IKBI_ALLOW_FRONTIER_CONSULT ?? "").trim()) ? { allowFrontierConsult: true } : {}),
       // --tier preset: pin builder + critic models, and decide whether auto-escalation may fire.
       // The cheap tier escalates ON to its fallback (deepseek-v4-pro); mid/frontier set
       // escalationDisabled so a single capable builder fails closed instead of silently swapping

@@ -146,6 +146,11 @@ test("parseBuildArgs extracts --repo and leaves the goal", () => {
   assert.deepEqual(parseBuildArgs(["just", "a", "goal"]), { rest: ["just", "a", "goal"] });
 });
 
+test("parseBuildArgs parses --escalate (authorize the frontier consult)", () => {
+  assert.deepEqual(parseBuildArgs(["fix", "it", "--escalate"]), { escalate: true, rest: ["fix", "it"] });
+  assert.deepEqual(parseBuildArgs(["fix", "it"]).escalate, undefined, "frontier authorization is off by default");
+});
+
 test("parseBuildArgs parses --yes / -y (skip the Socratic interview)", () => {
   assert.deepEqual(parseBuildArgs(["fix", "it", "--yes"]), { yes: true, rest: ["fix", "it"] });
   assert.deepEqual(parseBuildArgs(["fix", "it", "-y"]), { yes: true, rest: ["fix", "it"] });
