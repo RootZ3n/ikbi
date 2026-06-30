@@ -54,6 +54,7 @@ import "./workspaces.js";
 import "./serve.js";
 import "./audit.js";
 import "./fix.js";
+import "./consult.js";
 import "./memory.js";
 import "./review.js";
 import "./agents.js";
