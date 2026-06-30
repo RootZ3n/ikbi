@@ -22,6 +22,7 @@
  */
 
 import { randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
 import { access, mkdir } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import type { Logger } from "pino";
@@ -173,7 +174,16 @@ export class WorkspaceManager {
         this.invalidatePreloadCache();
         await this.preload();
         if (this.live.size >= this.max) {
-          throw new WorkspaceError("limit", `workspace limit reached (${this.max}); cannot allocate`);
+          // SELF-HEAL: a crashed/killed run can strand its workspace in `allocated`, leaking the
+          // bound forever (no terminal transition, so `clean`/`reclaim` never reach it). Before
+          // failing, reap ABANDONED active records: a held per-workspace lock means a LIVE process
+          // owns the workspace (the established liveness contract — see RECLAIM_WS_TIMEOUT_MS), so
+          // those are skipped; only lock-free records are reconciled terminal and dropped from the
+          // bound. Repo-independent, so it heals even when the target repo is gone.
+          await this.reapAbandoned();
+          if (this.live.size >= this.max) {
+            throw new WorkspaceError("limit", `workspace limit reached (${this.max}); cannot allocate`);
+          }
         }
       }
       const baseBranch = opts.baseBranch ?? (await currentBranch(opts.targetRepo));
@@ -491,6 +501,41 @@ export class WorkspaceManager {
       this.log.info({ event: "workspace_reclaimed", targetRepo, ...result }, "reclaimed abandoned workspaces");
       return result;
     });
+  }
+
+  /**
+   * Reap ORPHANED active records (any repo) so a crashed/killed run can't leak the bound forever.
+   * The ONLY signal used is worktree-gone: a live workspace ALWAYS has its worktree on disk, so an
+   * active-state record whose worktree directory has vanished is unambiguously dead — and this is
+   * repo-independent (heals even when the target repo itself is gone). We deliberately do NOT reap
+   * on the lock-free signal alone: a just-allocated, LIVE workspace is lock-free between operations
+   * (only held DURING ops), so lock-free ≠ abandoned. The orphan is still reconciled under its own
+   * lock to avoid racing a concurrent teardown. No files are deleted. Returns the number reaped.
+   */
+  private async reapAbandoned(): Promise<number> {
+    let reaped = 0;
+    for (const id of await this.store.list()) {
+      const rec = await this.store.get(id).catch(() => undefined);
+      if (rec === undefined) continue;
+      if (rec.state !== "allocating" && rec.state !== "allocated" && rec.state !== "promoting") continue;
+      if (existsSync(rec.path)) continue; // worktree present ⇒ possibly LIVE ⇒ never auto-reap
+      try {
+        await this.locks.withLock(
+          this.wsKey(id),
+          async () => {
+            await this.store.put(id, { ...rec, state: "failed", updatedAt: this.now(), note: "reclaimed: orphan worktree (self-heal on allocate limit)" });
+            this.live.delete(id);
+            reaped += 1;
+          },
+          { timeoutMs: RECLAIM_WS_TIMEOUT_MS },
+        );
+      } catch (err) {
+        if (err instanceof SubstrateError && err.kind === "lock_timeout") continue; // racing teardown → skip
+        this.log.debug({ event: "workspace_reap_skip", workspaceId: id, err: String(err) }, "skipped a record during self-heal reap");
+      }
+    }
+    if (reaped > 0) this.log.info({ event: "workspace_reaped_orphans", reaped, bound: this.max }, "self-heal reaped orphan workspaces on allocate limit");
+    return reaped;
   }
 
   liveCount(): number {

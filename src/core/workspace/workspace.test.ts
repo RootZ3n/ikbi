@@ -117,6 +117,36 @@ test("allocation is BOUNDED (cannot exhaust disk)", async () => {
   }
 });
 
+test("allocate SELF-HEALS an orphaned slot — a crashed run's worktree vanished but its record leaked the bound", async () => {
+  const repo = await makeRepo();
+  const { mgr, root } = makeManager({ max: 2 });
+  try {
+    const a = await mgr.allocate({ targetRepo: repo, identity: ID });
+    await mgr.allocate({ targetRepo: repo, identity: ID });
+    // Simulate a crashed/killed run: its worktree directory is gone, but the record stays
+    // "allocated" — permanently leaking the slot. (A live workspace would still have its worktree.)
+    await rm(a.path, { recursive: true, force: true });
+    // At the bound, the next allocate must reap the ORPHAN and succeed (not reject with "limit").
+    const c = await mgr.allocate({ targetRepo: repo, identity: ID });
+    assert.ok(c.id && c.id !== a.id, "allocate succeeded by self-healing the orphaned slot");
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
+test("allocate does NOT reap a slot whose worktree still exists (never false-reap a live slot)", async () => {
+  const repo = await makeRepo();
+  const { mgr, root } = makeManager({ max: 2 });
+  try {
+    await mgr.allocate({ targetRepo: repo, identity: ID });
+    await mgr.allocate({ targetRepo: repo, identity: ID });
+    // Both worktrees present (the live case): the bound MUST still hold — orphan-only reap never frees these.
+    await assert.rejects(mgr.allocate({ targetRepo: repo, identity: ID }), (e: unknown) => e instanceof WorkspaceError && e.kind === "limit");
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
 test("promote (fast-forward): the result lands on the target branch atomically", async () => {
   const repo = await makeRepo();
   const { mgr, root } = makeManager();
