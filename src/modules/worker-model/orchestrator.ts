@@ -53,6 +53,9 @@ import {
   escalationDeclined,
 } from "../escalation/index.js";
 import type { EscalationSignals, EscalationDecision } from "../escalation/index.js";
+import { decideRecovery } from "../recovery/index.js";
+import type { RecoveryAttempt } from "../recovery/index.js";
+import { rosterFromIds } from "../model-router/index.js";
 
 import type { ExecRequest, GovernedExec } from "../governed-exec/index.js";
 import type { DependencyInstall } from "../dependency-install/contract.js";
@@ -2304,93 +2307,133 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               // failed result. The cheap retry's failure is recorded in receipts for audit.
             }
 
-            // ── STEP 2: PRO ESCALATION — swap to mid-tier model ──────────────
-            // The cheap model failed twice (initial + cheap retry). Now escalate to pro.
+            // ── STEP 2+: POOL SWEEP — call upon worker+mid models, UP THE LADDER ─────────
+            // The cheap model failed (initial + cheap retry). Now sweep the worker+mid POOL via the
+            // recovery policy instead of a single mid[0] swap: try the cheapest eligible untried
+            // model, never below the floor (up the ladder), until a build converges or the pool is
+            // exhausted. The FRONTIER (consult) is gated — unattended, recovery stops at the mid
+            // ceiling and the original failure stands with a clear needs-authorization reason; the
+            // verification ladder still gates promotion downstream exactly as before.
             escalationAttempted = true;
-            // Reuse failedResult/failedModel from the cheap retry section above.
-            // The escalated model gets the original goal PLUS what the cheap attempt got wrong (the
-            // handoff's score breakdown, the builder's own failure summary, and any verifier/critic
-            // detail already gathered). This is the handoff context the decision computed.
+            const recoveryRosters = {
+              worker: rosterFromIds(escalationConfig.tierModels.worker),
+              mid: rosterFromIds(escalationConfig.tierModels.mid),
+              frontier: rosterFromIds(escalationConfig.tierModels.frontier),
+            };
+            const seedTier =
+              (["worker", "mid", "frontier"] as const).find((t) => escalationConfig.tierModels[t].includes(failedModel)) ?? "worker";
+            const recAttempts: RecoveryAttempt[] = [{ tier: seedTier, model: failedModel, outcome: "fail" }];
             const handoff = decision.handoffContext;
-            const escalatedGoal = [
-              task.goal,
-              "",
-              `[escalation] A cheaper model (${failedModel}) failed this task and it was escalated to you (${midModel}).`,
-              ...(handoff !== undefined ? [`Reason: ${handoff.escalationReason}.`] : []),
-              ...(failedResult.summary !== undefined ? [`Previous attempt outcome: ${failedResult.summary}`] : []),
-              ...(handoff?.verificationDetails !== undefined ? [`Verification failure: ${handoff.verificationDetails}`] : []),
-              ...(handoff?.criticFeedback !== undefined ? [`Critic feedback: ${handoff.criticFeedback}`] : []),
-              "Fix what the previous attempt got wrong; do not repeat it.",
-            ].join("\n");
+            let recovered = false;
+            let lastSwapModel = failedModel;
 
-            // Fresh role identity for the retry (clamped under the parent ceiling, like every role —
-            // escalation swaps the MODEL, never the trust tier).
-            const escalatedSpawn = spawnRole("builder", parentCtx);
-            events.publish(
-              workerRoleDispatched.create(
-                { taskId: task.taskId, role: "builder", ...(escalatedSpawn.identity.trustTier !== undefined ? { tier: escalatedSpawn.identity.trustTier } : {}) },
-                { source: EVENT_SOURCE, attribution: { identity: escalatedSpawn.identity, operation: "worker.role.builder", runId: task.taskId } },
-              ),
-            );
-            const escalatedBuilder = builderForModel(parentCtx, midModel, resolveBuilderMode(task));
-            const escalatedCtx: RoleContext = {
-              task: { ...task, goal: escalatedGoal },
-              role: "builder",
-              identity: escalatedSpawn.identity,
-              autonomy: escalatedSpawn.autonomy,
-              workspace,
-              priorResults: [...results],
-              engine: runEngine,
-            };
-            const costBeforeRetry = runCost();
-            let escalatedResult = await runRoleFn("builder", escalatedBuilder, escalatedCtx);
-            const retryCost = runCost() - costBeforeRetry;
-            // Stamp the escalated model (+ a marker) so the cost breakdown + audit show this builder
-            // ran on the mid tier, not the cheap one.
-            escalatedResult = {
-              ...escalatedResult,
-              detail: { ...((escalatedResult.detail as Record<string, unknown> | undefined) ?? {}), ...(retryCost > 0 ? { costUsd: retryCost } : {}), model: midModel, escalated: true },
-            };
-            const retrySucceeded = escalatedResult.outcome === "success";
-            events.publish(
-              workerRoleCompleted.create(
-                { taskId: task.taskId, role: "builder", outcome: escalatedResult.outcome, ...(retryCost > 0 ? { costUsd: retryCost } : {}) },
-                { source: EVENT_SOURCE, attribution: { identity: escalatedSpawn.identity, operation: "worker.role.builder", runId: task.taskId } },
-              ),
-            );
-            events.publish(
-              workerEscalationRetried.create(
-                { taskId: task.taskId, fromModel: failedModel, toModel: midModel, success: retrySucceeded },
-                { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.escalation.retry", runId: task.taskId } },
-              ),
-            );
-            await recordRole(task, workspace, escalatedSpawn, escalatedResult, retryCost, midModel, true);
-            await receipts.append(
-              {
-                operation: "worker.escalation.retry",
-                outcome: { status: retrySucceeded ? "success" : "failure" },
-                requestId: task.taskId,
-                metadata: { taskId: task.taskId, workspaceId: workspace.id, fromModel: failedModel, toModel: midModel, success: retrySucceeded, costUsd: runCost() },
-                project: task.targetRepo,
-              },
-              parentIdentity,
-            );
-            escalationRetryOutcome = { attempted: true, model: midModel, succeeded: retrySucceeded };
+            for (;;) {
+              const action = decideRecovery({
+                attempts: recAttempts,
+                tierRosters: recoveryRosters,
+                autoCeiling: "mid",
+                frontierAuthorized: false, // frontier consult is a gated follow-up (needs the apply+re-verify path)
+                startTier: seedTier,
+                // An operator's --fallback-model is honored as the FIRST pick (still up the ladder);
+                // once tried, the sweep continues cheapest-first through the rest of the pool.
+                ...(task.fallbackModel !== undefined ? { requestedModel: task.fallbackModel } : {}),
+              });
+              if (action.kind !== "attempt") {
+                break; // terminate (exhausted | needs-authorization). Consult is gated this pass.
+              }
+              const swapModel = action.model;
+              lastSwapModel = swapModel;
+              const priorFails = recAttempts.filter((a) => a.outcome === "fail").map((a) => a.model);
+              // The escalated model gets the original goal PLUS what the prior attempts got wrong.
+              const escalatedGoal = [
+                task.goal,
+                "",
+                `[escalation] Cheaper models (${priorFails.join(", ")}) failed this task and it was escalated to you (${swapModel}).`,
+                ...(handoff !== undefined ? [`Reason: ${handoff.escalationReason}.`] : []),
+                ...(failedResult.summary !== undefined ? [`Previous attempt outcome: ${failedResult.summary}`] : []),
+                ...(handoff?.verificationDetails !== undefined ? [`Verification failure: ${handoff.verificationDetails}`] : []),
+                ...(handoff?.criticFeedback !== undefined ? [`Critic feedback: ${handoff.criticFeedback}`] : []),
+                "Fix what the previous attempt got wrong; do not repeat it.",
+              ].join("\n");
 
-            if (retrySucceeded) {
-              // The escalated build converged — its result REPLACES the failed builder entry so the
-              // integrator (and the run's roles array) reflect the work that actually landed, and the
-              // pipeline continues to the verifier. A FAILED retry is NOT spliced: the original failure
-              // result stands (fail-closed) and the short-circuit below breaks the run.
-              const builderIdx = results.lastIndexOf(failedResult);
-              if (builderIdx >= 0) results[builderIdx] = escalatedResult;
-              result = escalatedResult;
-            } else if (result.outcome === "success") {
-              // SILENT SUCCESS + FAILED ESCALATION: the original builder called done but wrote 0
-              // files, and the escalated retry also failed. Without this, the pipeline would continue
-              // with the original "success" result, bypassing the short-circuit. Force the result to
-              // failure so the short-circuit breaks the pipeline.
-              result = { ...result, outcome: "failure" as const, summary: `escalation to ${midModel} failed after silent success (0 files written)` };
+              // Fresh role identity per attempt (clamped under the parent ceiling, like every role —
+              // escalation swaps the MODEL, never the trust tier).
+              const escalatedSpawn = spawnRole("builder", parentCtx);
+              events.publish(
+                workerRoleDispatched.create(
+                  { taskId: task.taskId, role: "builder", ...(escalatedSpawn.identity.trustTier !== undefined ? { tier: escalatedSpawn.identity.trustTier } : {}) },
+                  { source: EVENT_SOURCE, attribution: { identity: escalatedSpawn.identity, operation: "worker.role.builder", runId: task.taskId } },
+                ),
+              );
+              const escalatedBuilder = builderForModel(parentCtx, swapModel, resolveBuilderMode(task));
+              const escalatedCtx: RoleContext = {
+                task: { ...task, goal: escalatedGoal },
+                role: "builder",
+                identity: escalatedSpawn.identity,
+                autonomy: escalatedSpawn.autonomy,
+                workspace,
+                priorResults: [...results],
+                engine: runEngine,
+              };
+              const costBeforeRetry = runCost();
+              let escalatedResult = await runRoleFn("builder", escalatedBuilder, escalatedCtx);
+              const retryCost = runCost() - costBeforeRetry;
+              // Stamp the escalated model (+ a marker) so the cost breakdown + audit show which model ran.
+              escalatedResult = {
+                ...escalatedResult,
+                detail: { ...((escalatedResult.detail as Record<string, unknown> | undefined) ?? {}), ...(retryCost > 0 ? { costUsd: retryCost } : {}), model: swapModel, escalated: true },
+              };
+              const swapSucceeded = escalatedResult.outcome === "success";
+              events.publish(
+                workerRoleCompleted.create(
+                  { taskId: task.taskId, role: "builder", outcome: escalatedResult.outcome, ...(retryCost > 0 ? { costUsd: retryCost } : {}) },
+                  { source: EVENT_SOURCE, attribution: { identity: escalatedSpawn.identity, operation: "worker.role.builder", runId: task.taskId } },
+                ),
+              );
+              events.publish(
+                workerEscalationRetried.create(
+                  { taskId: task.taskId, fromModel: failedModel, toModel: swapModel, success: swapSucceeded },
+                  { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.escalation.retry", runId: task.taskId } },
+                ),
+              );
+              await recordRole(task, workspace, escalatedSpawn, escalatedResult, retryCost, swapModel, true);
+              await receipts.append(
+                {
+                  operation: "worker.escalation.retry",
+                  outcome: { status: swapSucceeded ? "success" : "failure" },
+                  requestId: task.taskId,
+                  metadata: { taskId: task.taskId, workspaceId: workspace.id, fromModel: failedModel, toModel: swapModel, success: swapSucceeded, costUsd: runCost() },
+                  project: task.targetRepo,
+                },
+                parentIdentity,
+              );
+              recAttempts.push({ tier: action.tier, model: swapModel, outcome: swapSucceeded ? "green" : "fail" });
+
+              if (swapSucceeded) {
+                // Converged — REPLACE the failed builder entry so the integrator + roles array reflect
+                // the work that landed; the pipeline continues to the verifier (the ladder still gates).
+                const builderIdx = results.lastIndexOf(failedResult);
+                if (builderIdx >= 0) results[builderIdx] = escalatedResult;
+                result = escalatedResult;
+                recovered = true;
+                break;
+              }
+
+              // Failed attempt — obey a kill signal before paying for the next pool model.
+              const sweepKill = await killHalt(task, parentIdentity, parentCtx);
+              if (sweepKill !== undefined) {
+                killedReason = sweepKill;
+                overall = "rejected";
+                break;
+              }
+            }
+
+            escalationRetryOutcome = { attempted: true, model: lastSwapModel, succeeded: recovered };
+
+            if (!recovered && killedReason === undefined && result.outcome === "success") {
+              // SILENT SUCCESS + EXHAUSTED SWEEP: the original builder called done but wrote 0 files
+              // and no pool model converged. Force failure so the short-circuit breaks the pipeline.
+              result = { ...result, outcome: "failure" as const, summary: `escalation across the worker+mid pool did not converge (last: ${lastSwapModel})` };
               const builderIdx = results.lastIndexOf(failedResult);
               if (builderIdx >= 0) results[builderIdx] = result;
             }
