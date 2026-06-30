@@ -211,8 +211,17 @@ export async function runTournament(
   const verdict = engine.judge(runs.map((r) => r.candidate));
   await engine.emit({ kind: "judged", candidateCount: runs.length, winnerWorkspaceId: verdict.winner?.workspaceId ?? null });
 
+  // Discard each candidate workspace AT MOST ONCE — losing candidates are freed early (before the
+  // shadow allocation) and these helpers run again on the success/failure paths, so dedup to avoid
+  // double-teardown (and a doubled discard receipt).
+  const discarded = new Set<string>();
+  const discardCandidate = async (ws: WorkspaceHandle): Promise<void> => {
+    if (discarded.has(ws.id)) return;
+    discarded.add(ws.id);
+    await engine.discard(ws);
+  };
   const discardAll = async (): Promise<void> => {
-    for (const r of runs) await engine.discard(r.workspace);
+    for (const r of runs) await discardCandidate(r.workspace);
   };
   /** Retain the judge's top-ranked (or first) candidate for inspection, discard the rest. */
   const retainBest = async (reason: string): Promise<string | undefined> => {
@@ -223,7 +232,7 @@ export async function runTournament(
       return undefined;
     }
     await engine.retain(keep.workspace, reason);
-    for (const r of runs) if (r.workspace.id !== keep.workspace.id) await engine.discard(r.workspace);
+    for (const r of runs) if (r.workspace.id !== keep.workspace.id) await discardCandidate(r.workspace);
     return keep.workspace.id;
   };
 
@@ -239,6 +248,16 @@ export async function runTournament(
   const winnerComposite = verdict.winner.composite;
   const winner = runs.find((r) => r.workspace.id === winnerId)!;
   const winnerRef = { run: winner, composite: winnerComposite };
+
+  // Free the LOSING candidate worktrees NOW, before allocating the shadow. The winner's diff is
+  // already captured (winner.diff), so the losers are dead weight — and holding all N candidates
+  // while requesting an (N+1)th shadow STARVES the shadow against the workspace bound (the peak
+  // would otherwise be N+1 live worktrees). Discarding the losers drops the peak to 2 (winner +
+  // shadow), so the shadow can always allocate. The winner is kept so retainBest() can still
+  // preserve it for inspection on a downstream (shadow/apply/verify) failure.
+  for (const r of runs) {
+    if (r.workspace.id !== winnerId) await discardCandidate(r.workspace);
+  }
 
   // 3. SHADOW REPLAY — allocate a CLEAN workspace from the same base ref and apply the winner's diff.
   const shadowKill = await engine.killed();

@@ -248,6 +248,35 @@ test("tournament: shadow workspace replay — winner's diff applied to a CLEAN w
   assert.deepEqual([...calls.discard].sort(), ["c0", "c1"]);
 });
 
+test("tournament: frees losing candidates BEFORE allocating the shadow (no N+1 starvation against the workspace bound)", async () => {
+  const { engine } = fakeEngine({
+    scripts: {
+      a: { candidate: { ...buildCandidate("x"), diffLines: 5 }, diff: "winner" },
+      b: { candidate: { ...buildCandidate("x"), diffLines: 50 }, diff: "l1" },
+      c: { candidate: { ...buildCandidate("x"), diffLines: 60 }, diff: "l2" },
+    },
+  });
+  // Trace allocate/discard ordering to prove the shadow is requested only AFTER the losers are freed.
+  const trace: string[] = [];
+  const wrapped: TournamentEngine = {
+    ...engine,
+    allocate: async (label) => {
+      const w = await engine.allocate(label);
+      if (w !== null) trace.push(`alloc:${label.includes("shadow") ? "shadow" : w.id}`);
+      return w;
+    },
+    discard: async (ws) => {
+      trace.push(`discard:${ws.id}`);
+      return engine.discard(ws);
+    },
+  };
+  await runTournament(task, ctx(), specs("a", "b", "c"), wrapped);
+  const shadowIdx = trace.indexOf("alloc:shadow");
+  assert.ok(shadowIdx > 0, "the shadow was allocated");
+  const loserDiscardsBeforeShadow = trace.slice(0, shadowIdx).filter((t) => t.startsWith("discard:c")).length;
+  assert.equal(loserDiscardsBeforeShadow, 2, "both losing candidates were freed before the shadow allocation (peak = winner + shadow, not N+1)");
+});
+
 // ── 6. SHADOW VERIFICATION FAILURE FAILS THE TOURNAMENT ──────────────────────
 
 test("tournament: shadow verification failure fails the tournament (no fallback to other candidates)", async () => {
