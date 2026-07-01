@@ -72,10 +72,10 @@ const SCENE_REGISTRY={
       {id:'hw-status',   label:'Engine Status',    x:49, y:38, workspace:'engine-status',  greeting:"The heartbeat of the engine — status, tools, features. Everything you need, at a glance."},
       {id:'hw-builder',  label:'Builder',          x:20, y:26, workspace:'builder-ws',     greeting:"Pick up the chisel — builder tools, provider model, and a direct line to the engine."},
       {id:'hw-launch',   label:'Launch Pad',       x:17, y:67, workspace:'builder-ws',     greeting:"The water is clear — time to build something new."},
-      {id:'hw-grove',    label:'The Grove',        x:48, y:15, scene:'the-grove',          greeting:"The Grove — where you speak directly to the engine. Type a goal, and ikbi builds."},
+      {id:'hw-grove',    label:'The Grove',        x:48, y:15, workspace:'grove-ws',        greeting:"The Grove — where you speak directly to the engine. Type a goal, and ikbi builds."},
       {id:'hw-modules',  label:'Modules',          x:83, y:41, workspace:'modules-ws',     greeting:"28 modules, each a stone in the ring. Let's check their health."},
-      {id:'hw-flame',    label:'The Sacred Flame', x:77, y:73, scene:'the-sacred-flame',   greeting:"The Sacred Flame — every build tested here. 800 trials, each one a rite."},
-      {id:'hw-river',    label:"The River's End",  x:78, y:18, scene:'the-rivers-end',     greeting:"The River's End — where all builds arrive. History and receipts."},
+      {id:'hw-flame',    label:'The Sacred Flame', x:77, y:73, workspace:'test-results',    greeting:"The Sacred Flame — every build tested here. 800 trials, each one a rite."},
+      {id:'hw-river',    label:"The River's End",  x:78, y:18, workspace:'history-ws',      greeting:"The River's End — where all builds arrive. History and receipts."},
       {id:'hw-jobs',     label:'Job Cards',        x:35, y:75, workspace:'job-cards-ws',   greeting:"Job Cards — reusable build recipes. Every task, a card. Every card, a plan."},
       {id:'hw-doctor',   label:'Repo Doctor',      x:65, y:75, workspace:'repo-doctor-ws', greeting:"The Doctor sees all. Let me scan the repo and find what ails it."},
       {id:'hw-specs',    label:'Spec Artifact',    x:35, y:25, workspace:'spec-artifact-ws', greeting:"Specs — the blueprints before the build. Every great structure starts with a plan."},
@@ -380,21 +380,16 @@ function pehHotspotActivate(sceneId,hotspotId){
   const scene=pehScene(pehActiveProductId(),sceneId);
   const hotspot=scene&&scene.hotspots?scene.hotspots.find((h)=>h.id===hotspotId):null;
   if(!hotspot)return;
-  // Peh greets at the hotspot FIRST, then — after a short beat — the workspace
-  // pops up as a movable window beside the pin (or we travel to a sub-scene).
+  // Peh greets at the hotspot and the workspace opens AS A MOVABLE WINDOW pinned
+  // beside the pin — the map STAYS PUT (the luak model). The other hotspots never
+  // disappear; we do NOT travel to a sub-scene. Pure scene hotspots still travel.
   pehSayGreeting(hotspot,scene);
-  setTimeout(()=>{
-    if(hotspot.workspace){
-      if(hotspot.scene&&pehScene(pehActiveProductId(),hotspot.scene)){
-        state.pehverse.scene=hotspot.scene;state.pehverse.pehPosition=null;
-        try{localStorage.setItem('pehverse-scene',hotspot.scene)}catch(e){}
-      }
-      state.pehverse.pehPopUp={x:hotspot.x,y:hotspot.y};
-      pehOpenWorkspaceAt(hotspot.workspace,hotspot.x,hotspot.y);
-    }else if(hotspot.scene){
-      pehSetScene(hotspot.scene);
-    }
-  },300);
+  if(hotspot.workspace){
+    state.pehverse.pehPopUp={x:hotspot.x,y:hotspot.y};
+    pehOpenWorkspaceAt(hotspot.workspace,hotspot.x,hotspot.y);
+  }else if(hotspot.scene){
+    pehSetScene(hotspot.scene);
+  }
 }
 function pehFocusWorkspace(uid,skipRender){
   const ws=state.pehverse.workspaces.find((w)=>w.uid===uid);
@@ -481,7 +476,7 @@ function renderPehBubble(){
   return `<div class="peh-bubble-layer" aria-hidden="false">
     <div class="peh-bubble peh-bubble-anchor-${esc(b.anchor)} ${phaseClass}" style="left:${b.x}%;top:${b.y}%" role="status" title="Dismiss" onclick="pehDismissBubble()">
       <div class="peh-bubble-content">
-        <span class="peh-bubble-name">ikbi</span>
+        <span class="peh-bubble-name">Peh</span>
         <p class="peh-bubble-text">${esc(b.text)}</p>
       </div>
       <div class="peh-bubble-tail" aria-hidden="true"></div>
@@ -551,13 +546,10 @@ function renderPehMap(product,scene,deckMarkup){
       <h1 class="peh-scene-title">${esc(scene?scene.title:product.displayName)}</h1>
       <p class="peh-scene-desc">${esc(scene?scene.desc:product.blurb)}</p>
     </div>
-    ${renderPehSlot(scene)}
-    ${renderPehBubble()}
-    ${renderPehGuide(product)}
     ${renderHotspotLayer(scene)}
-    ${renderPehWaypoints(product,scene)}
     ${renderWorkspaceWindows(deckMarkup)}
     ${renderPehPopUp()}
+    ${renderPehBubble()}
   </div>`;
 }
 
