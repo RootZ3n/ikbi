@@ -967,12 +967,16 @@ export async function liveRepl(
   // with zero setup; a user's .ikbi/agents/ override of the same name wins. Best-effort — a missing
   // persona never blocks the session.
   if (opts?.persona !== undefined && opts.persona.length > 0 && session.setPersona !== undefined) {
-    const agent = findCustomAgent(process.cwd(), opts.persona);
+    // Look up the persona in the SESSION's repo, not process.cwd() — `ikbi peh --repo <path>` chose
+    // that repo, and a repo-local `.ikbi/agents/<name>` override of Pehlichi must win there (a built-in
+    // still resolves with zero setup). Using cwd silently ignored the override when --repo pointed
+    // elsewhere. `workingRepo` is the same target used for the greeting and any launched build.
+    const workingRepo = session.targetRepo ?? baseDir;
+    const agent = findCustomAgent(workingRepo, opts.persona);
     if (agent !== undefined) {
       session.setPersona(agent);
       if (opts.model !== undefined && opts.model.length > 0 && session.setModel !== undefined) session.setModel(opts.model);
       const model = session.currentModel !== undefined ? session.currentModel() : (opts.model ?? agent.modelPreference ?? "?");
-      const workingRepo = session.targetRepo ?? baseDir;
       status(opts.greeting ?? `\n🐿️  You're with ${agent.name} — ${agent.description ?? "ikbi's guide"} [model: ${model} · repo: ${workingRepo}].\n   Ask about ikbi, or tell ${agent.name} what you want to build and he'll help shape the goal (and run it, with your OK). Reopen with \`ikbi peh --repo <path>\` to work elsewhere. Type /exit to leave.\n\n`);
     } else {
       status(`[persona "${opts.persona}" not found — starting the default assistant]\n`);

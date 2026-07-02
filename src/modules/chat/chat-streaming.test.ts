@@ -94,6 +94,29 @@ test("sendStream appends the assistant turn to history (multi-turn round-trips)"
   assert.ok(session.messageCount() > before, "history grew across streamed turns");
 });
 
+test("sendStream compacts BETWEEN single-round turns (streaming path parity with send)", async () => {
+  // Regression: the streaming loop only compacted BEFORE the model call, which is a no-op at a turn
+  // boundary (a freshly-appended user message is still trailing → maybeAutoCompact skips it). So a
+  // session of single-round streaming turns never compacted and could grow past the window. The fix
+  // adds a post-response compaction, mirroring the non-streaming path.
+  const big = "lorem ipsum ".repeat(1700); // ≈5.1k tokens
+  const reply = "response text ".repeat(1200); // large reply → pushes pressure over threshold
+  const { invokeStream } = scriptStream([
+    [{ content: reply, finishReason: "stop", usage: { promptTokens: 10, completionTokens: 3, totalTokens: 13 } }],
+  ]);
+  // mistral-tiny → an 8k window, so a large single-round exchange crosses the 80% threshold.
+  const session = new ChatSession("s-stream-compact", { worktree: tmp(), invokeStream, model: "mistral-tiny" });
+
+  // Turn 1: single round (no tools). Its large reply pushes pressure high; the post-response
+  // compaction must fire — the whole point of the fix (there is no second round to trigger it).
+  const p1: string[] = [];
+  await drain(session.sendStream(big, undefined, "agent", { onProgress: (p) => p1.push(p) }));
+  const compactIdx = p1.indexOf("Compacting context…");
+  const thinkIdx = p1.indexOf("Thinking…");
+  assert.ok(compactIdx >= 0, "the streaming path compacts after a single-round turn crosses the threshold");
+  assert.ok(compactIdx > thinkIdx, "compaction fires AFTER the model responds, never before (between-turns only)");
+});
+
 test("the REPL prints streamed content live via sendStream", async () => {
   const { invokeStream } = scriptStream([[{ content: "hello " }, { content: "world", finishReason: "stop" }]]);
   const session = new ChatSession("s-repl-stream", { worktree: tmp(), invokeStream });

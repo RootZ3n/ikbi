@@ -1124,7 +1124,13 @@ export class ChatSession {
     const permissionMode = opts.permissionMode ?? this.permissionMode;
     const sideEffectConfirmed = (call.name === "terminal" || call.name === "delegate_task" || call.name === "launch_build") && opts.confirm !== undefined;
     if (sideEffectConfirmed) {
-      const target = call.name === "launch_build" && typeof args.goal === "string" ? `build: "${args.goal}"`
+      // launch_build promotes to a REAL repo — surface WHICH one in the confirmation. The tool may be
+      // handed an explicit `repo` that differs from the session's, so show the EFFECTIVE target (the
+      // same resolution runLaunchBuild uses): the operator must see the repo they're approving, not
+      // just the goal, or a build could silently land against a repo they never intended.
+      const launchRepo = typeof args.repo === "string" && args.repo.trim().length > 0 ? args.repo.trim() : this.targetRepo;
+      const target = call.name === "launch_build" && typeof args.goal === "string"
+        ? `build: "${args.goal}" in ${launchRepo ?? "(no repo — will be refused)"}`
         : typeof args.command === "string" ? args.command : typeof args.task === "string" ? args.task : "";
       const allowed = await opts.confirm(call.name, `${target}${target.length > 0 ? " " : ""}(rollback cannot cover terminal/sub-agent side effects)`);
       if (!allowed) {
@@ -2396,6 +2402,12 @@ export class ChatSession {
           this.emulatedRound = true;
         }
       }
+
+      // AUTO-COMPACT (between-turns): also compact after the model responds — mirrors the non-streaming
+      // path. The pre-call site (top of loop) is a no-op at a turn boundary because a freshly-appended
+      // user message is still trailing (maybeAutoCompact skips that); without this post-response call a
+      // session of single-round streaming turns would NEVER compact and could grow past the window.
+      await this.maybeAutoCompact(opts);
 
       if (roundToolCalls !== undefined) {
         // Read-only calls run in parallel; mutating calls serialize. Results append in order.

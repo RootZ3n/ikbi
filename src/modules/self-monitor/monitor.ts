@@ -45,58 +45,98 @@ const bool = (v: unknown): boolean | undefined => (typeof v === "boolean" ? v : 
 
 /** Aggregate a digest from receipts. `limit` bounds the failures list (default: all). */
 export function buildDigest(receipts: readonly ReceiptLike[], opts: { readonly limit?: number } = {}): MonitorDigest {
-  // Cross-reference the verificationKind recorded on the separate checks_unresolvable receipt.
+  // FIRST PASS: index the checks_unresolvable receipts (they cross-reference the run summary's
+  // verificationKind) AND record which taskIds already have a run summary. A build that reaches the
+  // verifier writes a run.summary and — if the target was unverifiable — also a checks_unresolvable
+  // receipt; those are surfaced via the summary. But the WO2 preflight/kill-switch fast-fails RETURN
+  // before any run.summary is written (orchestrator.ts) — their ONLY receipt is checks_unresolvable.
+  // Counting only run.summary would silently drop exactly those harness-suspect builds — the ones the
+  // monitor exists to catch. So a checks_unresolvable receipt with NO matching summary is surfaced too.
   const vkByTask = new Map<string, string>();
+  const summaryTaskIds = new Set<string>();
   for (const r of receipts) {
     if (r.operation === "worker.checks_unresolvable") {
       const t = str(r.requestId) ?? str(r.metadata?.taskId);
       const vk = str(r.metadata?.verificationKind);
       if (t !== undefined && vk !== undefined) vkByTask.set(t, vk);
+    } else if (r.operation === "worker.run.summary") {
+      const t = str(r.requestId) ?? str(r.metadata?.taskId);
+      if (t !== undefined) summaryTaskIds.add(t);
     }
   }
 
-  const summaries = receipts.filter((r) => r.operation === "worker.run.summary");
   const records: BuildRecord[] = [];
   const bySignal: Record<string, number> = {};
+  let total = 0;
   let promoted = 0;
   let harnessSuspect = 0;
 
-  for (const r of summaries) {
+  const account = (record: BuildRecord): void => {
+    if (record.classification.category === "none") { promoted += 1; return; }
+    if (record.classification.harnessSuspect) harnessSuspect += 1;
+    bySignal[record.classification.signal] = (bySignal[record.classification.signal] ?? 0) + 1;
+    records.push(record);
+  };
+
+  // SECOND PASS: chronological, so `records` is already in append order (reversed once at the end for
+  // most-recent-first). Both surfaces — the run summary and the standalone fast-fail — are handled here.
+  for (const r of receipts) {
     const m = r.metadata ?? {};
-    const taskId = str(r.requestId) ?? str(m.taskId) ?? "?";
-    const verificationResult = str(m.verificationResult);
-    const reason = str(r.outcome?.detail);
-    const promotedVal = bool(m.promoted);
-    const vk = vkByTask.get(taskId);
-    const outcome: BuildOutcome = {
-      outcome: str(m.outcome) ?? str(r.outcome?.status) ?? "unknown",
-      ...(promotedVal !== undefined ? { promoted: promotedVal } : {}),
-      ...(reason !== undefined ? { reason } : {}),
-      ...(vk !== undefined ? { verificationKind: vk } : {}),
-      // The run summary records the verifier's outcome; the classifier uses it (e.g. policy_taint).
-      ...(verificationResult !== undefined ? { roles: [{ role: "verifier", outcome: verificationResult }] } : {}),
-    };
-    const classification = classifyBuildFailure(outcome);
-    if (classification.category === "none") { promoted += 1; continue; }
-    if (classification.harnessSuspect) harnessSuspect += 1;
-    bySignal[classification.signal] = (bySignal[classification.signal] ?? 0) + 1;
-    const targetRepo = str(m.targetRepo);
-    const model = str(m.model);
-    const costUsd = num(m.costUsd);
-    records.push({
-      taskId,
-      ...(targetRepo !== undefined ? { targetRepo } : {}),
-      ...(model !== undefined ? { model } : {}),
-      ...(costUsd !== undefined ? { costUsd } : {}),
-      ...(r.time !== undefined ? { time: r.time } : {}),
-      outcome,
-      classification,
-    });
+    if (r.operation === "worker.run.summary") {
+      total += 1;
+      const taskId = str(r.requestId) ?? str(m.taskId) ?? "?";
+      const verificationResult = str(m.verificationResult);
+      const reason = str(r.outcome?.detail);
+      const promotedVal = bool(m.promoted);
+      const vk = vkByTask.get(taskId);
+      const outcome: BuildOutcome = {
+        outcome: str(m.outcome) ?? str(r.outcome?.status) ?? "unknown",
+        ...(promotedVal !== undefined ? { promoted: promotedVal } : {}),
+        ...(reason !== undefined ? { reason } : {}),
+        ...(vk !== undefined ? { verificationKind: vk } : {}),
+        // The run summary records the verifier's outcome; the classifier uses it (e.g. policy_taint).
+        ...(verificationResult !== undefined ? { roles: [{ role: "verifier", outcome: verificationResult }] } : {}),
+      };
+      const targetRepo = str(m.targetRepo);
+      const model = str(m.model);
+      const costUsd = num(m.costUsd);
+      account({
+        taskId,
+        ...(targetRepo !== undefined ? { targetRepo } : {}),
+        ...(model !== undefined ? { model } : {}),
+        ...(costUsd !== undefined ? { costUsd } : {}),
+        ...(r.time !== undefined ? { time: r.time } : {}),
+        outcome,
+        classification: classifyBuildFailure(outcome),
+      });
+    } else if (r.operation === "worker.checks_unresolvable") {
+      const taskId = str(r.requestId) ?? str(m.taskId) ?? "?";
+      // Skip when the build also wrote a run summary — it is already surfaced (and richer) via that.
+      if (summaryTaskIds.has(taskId)) continue;
+      // A standalone fast-fail: no run summary was ever written. Reconstruct the outcome as a rejected
+      // build with its classification kind so it is counted AND classified (harness-suspect).
+      total += 1;
+      const vk = str(m.verificationKind);
+      const reason = str(m.reason) ?? str(r.outcome?.detail);
+      const outcome: BuildOutcome = {
+        outcome: "rejected",
+        ...(vk !== undefined ? { verificationKind: vk } : {}),
+        ...(reason !== undefined ? { reason } : {}),
+      };
+      const targetRepo = str(m.targetRepo);
+      account({
+        taskId,
+        ...(targetRepo !== undefined ? { targetRepo } : {}),
+        ...(r.time !== undefined ? { time: r.time } : {}),
+        outcome,
+        classification: classifyBuildFailure(outcome),
+      });
+    }
   }
 
   records.reverse(); // receipts append in order → most-recent failure first
   const failures = opts.limit !== undefined ? records.slice(0, opts.limit) : records;
-  return { total: summaries.length, promoted, failed: records.length, harnessSuspect, bySignal, failures };
+  return { total, promoted, failed: records.length, harnessSuspect, bySignal, failures };
 }
 
 /** Render a digest as a plain-language report (for `ikbi monitor` and for Peh to relay). */

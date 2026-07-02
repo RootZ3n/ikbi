@@ -14,6 +14,7 @@ import "../egress/index.js";
 
 import type { ModelResponse, ToolCall } from "../../core/provider/contract.js";
 import { boundDiff, ChatSession, computeLineDiff, errorRecoveryHint } from "./session.js";
+import type { SessionWorkspace } from "./session.js";
 
 type Invoke = ConstructorParameters<typeof ChatSession>[1] extends { invoke?: infer F } ? F : never;
 
@@ -150,6 +151,34 @@ test("FIX5: confirm mode allows the tool when the operator accepts", async () =>
   const res = await s.send("write it", undefined, "agent", { permissionMode: "confirm", confirm: async () => true });
   assert.equal(res.tools.find((t) => t.name === "write_file")?.ok, true);
   assert.equal(readFileSync(join(dir, "ok.ts"), "utf8"), "yes\n");
+});
+
+test("launch_build confirmation discloses the EFFECTIVE target repo, not just the goal", async () => {
+  // A minimal managed workspace so the session has a targetRepo (the build's default landing site).
+  const stubWorkspace = (targetRepo: string): SessionWorkspace => ({
+    id: "lb-ws", path: wt(), targetRepo, baseBranch: "main", baseRef: "HEAD",
+    diff: async () => "", commit: async () => true,
+    promote: async () => ({ ok: false, reason: "test" }) as unknown as Awaited<ReturnType<SessionWorkspace["promote"]>>,
+    discard: async () => ({ removed: true }) as unknown as Awaited<ReturnType<SessionWorkspace["discard"]>>,
+    verify: async () => ({ ok: false } as unknown as Awaited<ReturnType<SessionWorkspace["verify"]>>),
+  });
+
+  // Default: the session's target repo is shown so the operator sees where the build lands.
+  const invoke = queued([toolTurn(call("launch_build", { goal: "add a test" })), stop("ok")]);
+  const s = new ChatSession("lb-1", { invoke, workspace: stubWorkspace("/repos/session-repo") });
+  let target = "";
+  await s.send("build it", undefined, "agent", { permissionMode: "confirm", confirm: async (_t, x) => { target = x; return false; } });
+  assert.match(target, /add a test/, "the goal is disclosed");
+  assert.match(target, /\/repos\/session-repo/, "the effective target repo is disclosed");
+
+  // An explicit `repo` arg that differs from the session repo must be the one shown — a build could
+  // otherwise silently land against a repo the operator never intended.
+  const invoke2 = queued([toolTurn(call("launch_build", { goal: "add a test", repo: "/repos/OTHER" })), stop("ok")]);
+  const s2 = new ChatSession("lb-2", { invoke: invoke2, workspace: stubWorkspace("/repos/session-repo") });
+  let target2 = "";
+  await s2.send("build elsewhere", undefined, "agent", { permissionMode: "confirm", confirm: async (_t, x) => { target2 = x; return false; } });
+  assert.match(target2, /\/repos\/OTHER/, "the explicit repo override is what the operator approves");
+  assert.doesNotMatch(target2, /session-repo/, "the session repo is NOT shown when an override is given");
 });
 
 // ── FIX 7: prompt-cache counters ────────────────────────────────────────────────
