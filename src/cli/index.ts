@@ -48,6 +48,7 @@ import "./receipts.js";
 import "./summary.js";
 import "./cost.js";
 import "./monitor.js";
+import "./heal.js";
 import "./undo.js";
 import "./clean.js";
 import "./workspace.js";
