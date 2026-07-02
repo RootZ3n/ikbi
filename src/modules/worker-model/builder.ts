@@ -602,25 +602,47 @@ const READ_ONLY_PROBE_BINARIES: ReadonlySet<string> = new Set([
   "uname", "hostname", "readlink", "realpath", "basename", "dirname", "locale", "tty", "date",
 ]);
 
+/**
+ * Binaries whose ATTEMPTED use is a red flag even when the allowlist blocked it (confinement held).
+ * A cheap builder reaching for the network, a raw shell, privilege escalation, or a destructive tool
+ * is a genuine out-of-policy signal that must taint promotion — regardless of trust context. Anything
+ * NOT here and NOT a read-only probe is a benign dev/build tool (tsc, yarn, npx, make, eslint, …) the
+ * model improvised: the governor already blocked it with no effect, so it must NOT discard an
+ * otherwise-verified build in a trusted-local setup.
+ */
+const DANGEROUS_DENIED_BINARIES: ReadonlySet<string> = new Set([
+  "curl", "wget", "ssh", "scp", "sftp", "rsync", "nc", "ncat", "netcat", "telnet", "ftp", "socat",
+  "bash", "sh", "zsh", "dash", "ksh", "fish", "csh", "tcsh",
+  "sudo", "su", "doas", "pkexec",
+  "rm", "rmdir", "dd", "mkfs", "shred", "chmod", "chown", "chgrp", "mv", "kill", "pkill", "killall",
+  "eval", "exec", "xargs", "chroot", "mount", "umount", "systemctl", "crontab", "at",
+]);
+
 /** The binary denied by a bare governed-exec ALLOWLIST denial, if `error` is exactly that (else undefined). */
 function deniedAllowlistBinary(error: string): string | undefined {
   const m = /binary ['"]?([A-Za-z0-9_.+-]+)['"]? is not on the allowlist/i.exec(error);
   return m?.[1]?.toLowerCase();
 }
 
-function isPolicyViolation(e: ToolCallError): boolean {
+export function isPolicyViolation(e: ToolCallError): boolean {
   // GENUINE boundary breach — confinement/scope escape, write-scope violation, or an attempt to run
   // arbitrary code through a package manager. These ALWAYS taint promotion, even when confinement held.
   if (/escape|write_scope|dependency directory|not allowed|only for verifier\/check|WRITE SCOPE VIOLATION/i.test(e.error)) {
     return true;
   }
-  // A bare ALLOWLIST denial of a READ-ONLY environment probe (which/env/pwd/…) is benign governor
-  // routing — not a boundary violation. It must not discard an otherwise-verified build.
-  const probe = deniedAllowlistBinary(e.error);
-  if (probe !== undefined && READ_ONLY_PROBE_BINARIES.has(probe)) return false;
-  // Any other denial (a non-probe binary denied by the allowlist, a terminal path-confinement refusal,
-  // an egress/privilege attempt) is an attempted out-of-policy action — tainting. "denied" does not
-  // over-match benign tool-format errors (those say "malformed"/"requires"/"unknown tool", never "denied").
+  // A bare ALLOWLIST denial means the governor BLOCKED the command — it never ran (confinement held).
+  // Classify by intent: a read-only probe (which/env/pwd) or a benign dev/build tool the model
+  // improvised (tsc/yarn/npx/make/…) is benign routing and must NOT discard an otherwise-verified,
+  // clean build in a trusted-local context. A reach for the network, a raw shell, privilege
+  // escalation, or a destructive tool STILL taints even when blocked — that intent is the red flag.
+  const denied = deniedAllowlistBinary(e.error);
+  if (denied !== undefined) {
+    if (READ_ONLY_PROBE_BINARIES.has(denied)) return false; // benign environment probe
+    if (DANGEROUS_DENIED_BINARIES.has(denied)) return true; // network / shell / privilege / destructive
+    return false; // benign dev/build tool the model improvised — blocked, no effect, no boundary crossed
+  }
+  // A /denied/ that is NOT a bare allowlist-binary denial (a terminal path-confinement refusal, an
+  // egress/privilege attempt) still taints — those are genuine boundary breaches, not benign routing.
   return /denied/i.test(e.error);
 }
 

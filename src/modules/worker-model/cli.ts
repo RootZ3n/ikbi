@@ -625,10 +625,47 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
  * verify a repo that has no recognizable manifest (e.g. a bare loose-source repo), overriding the
  * fast-fail manifest detection with an explicit command. NEVER model-chosen.
  */
+/** Classify a check stage by its command so the verifier reads it correctly. The verifier keys
+ *  test-EXECUTION evidence off a check NAMED "test" and typecheck off one named "typecheck"
+ *  (see readVerifier); an operator `--check "pnpm test"` named the generic "check" is otherwise
+ *  invisible as test evidence and a real, passing build is discarded ("test evidence absent"). */
+function classifyCheckName(cmdLower: string): "test" | "typecheck" | "check" {
+  if (
+    /--test\b/.test(cmdLower) ||
+    /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test\b/.test(cmdLower) ||
+    /\b(?:vitest|jest|pytest|mocha|ava)\b/.test(cmdLower) ||
+    /\bgo\b[^\n]*\btest\b/.test(cmdLower)
+  ) {
+    return "test";
+  }
+  if (/\btsc\b/.test(cmdLower) || /\btypecheck\b/.test(cmdLower)) return "typecheck";
+  return "check";
+}
+
 export function checkToIkbiChecksJson(raw: string): string | undefined {
-  const toks = raw.trim().split(/\s+/).filter((t) => t.length > 0);
-  if (toks.length === 0) return undefined;
-  return JSON.stringify([{ name: "check", command: toks[0], args: toks.slice(1) }]);
+  // COMPOUND CHECKS: governed-exec runs array-args with NO shell, so a literal "&&" can never
+  // execute — a compile-then-test idiom ("pnpm exec tsc && node --test dist") tokenized as ONE
+  // command would hand "&&" to the binary and be rejected. Split on "&&" into SEQUENTIAL
+  // single-command checks (each still array-args, each allowlisted), run in order, all must pass.
+  // Each stage is NAMED by what it does (test/typecheck/check) so the verifier's test-evidence and
+  // typecheck gates recognize an operator-declared check — otherwise a passing `--check "pnpm test"`
+  // is filed as a nameless "check" and the promote gate discards a real green as "test evidence absent".
+  const stages = raw.split("&&").map((s) => s.trim()).filter((s) => s.length > 0);
+  let genericSeq = 0;
+  const checks = stages
+    .map((stage) => {
+      const toks = stage.split(/\s+/).filter((t) => t.length > 0);
+      if (toks.length === 0) return undefined;
+      const kind = classifyCheckName(stage.toLowerCase());
+      // Disambiguate multiple GENERIC stages ("check1"/"check2"); "test"/"typecheck" keep their
+      // meaningful names (the verifier reads evidence off those exact names, and it aggregates
+      // repeats, so duplicates there are harmless).
+      const name: string = kind === "check" && stages.length > 1 ? `check${(genericSeq += 1)}` : kind;
+      return { name, command: toks[0] as string, args: toks.slice(1) };
+    })
+    .filter((c): c is { name: string; command: string; args: string[] } => c !== undefined);
+  if (checks.length === 0) return undefined;
+  return JSON.stringify(checks);
 }
 
 /** Render a worker `worker.*` progress event into a concise human line (for `--verbose`). PURE. */
