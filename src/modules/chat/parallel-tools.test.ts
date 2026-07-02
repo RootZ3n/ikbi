@@ -97,3 +97,35 @@ test("a failing tool in a round still yields a matching result (no dangling tool
   assert.equal(res.tools?.[0]?.ok, true);
   assert.equal(res.tools?.[1]?.ok, false);
 });
+
+test("read-only tools after a mutating tool wait for the mutation (barrier)", async () => {
+  // The round is: write_file(c.txt), read_file(c.txt).
+  // With the barrier fix, the read MUST happen after the write, so the read sees the new content.
+  const seen: ModelMessage[][] = [];
+  let i = 0;
+  const invoke = (async (req: { messages?: readonly ModelMessage[] }) => {
+    seen.push([...(req.messages ?? [])]);
+    i += 1;
+    if (i === 1) {
+      return toolRound([
+        { name: "write_file", args: { path: "c.txt", content: "NEW_CONTENT" } },
+        { name: "read_file", args: { path: "c.txt" } },
+      ]);
+    }
+    return stop("done");
+  }) as unknown as Invoke;
+
+  const dir = wt(); // already has c.txt with CCC_content
+  const s = new ChatSession("par-barrier", { invoke, worktree: dir });
+  const res = await s.send("write then read c");
+
+  assert.equal(res.tools?.length, 2);
+  assert.equal(res.tools?.[0]?.ok, true);
+  assert.equal(res.tools?.[1]?.ok, true);
+  // The second model request should show the read_file result containing NEW_CONTENT
+  // (not the stale CCC_content), proving the barrier enforced write-before-read.
+  const secondReq = seen[1] ?? [];
+  const serialized = secondReq.map((m) => m.content).join("\n");
+  assert.ok(serialized.includes("NEW_CONTENT"), "read_file saw the NEW_CONTENT written by write_file");
+  assert.ok(!serialized.includes("CCC_content"), "read_file did NOT see the stale CCC_content");
+});

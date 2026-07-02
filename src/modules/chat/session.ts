@@ -763,6 +763,8 @@ export interface PersistedSession {
   readonly targetRepo?: string;
   readonly baseBranch?: string;
   readonly baseRef?: string;
+  /** Persistent shell working directory (worktree-relative); carried across resume. */
+  readonly shellCwd?: string;
 }
 
 /** Per-session injectable dependencies (production defaults: real invokeModel, configured workdir). */
@@ -994,6 +996,7 @@ export class ChatSession {
     this.cachedTokens = restore?.cachedTokens ?? 0;
     this.cacheSavedUsd = restore?.cacheSavedUsd ?? 0;
     this.permissionMode = restore?.permissionMode ?? deps.permissionMode ?? "auto";
+    this.shellCwd = restore?.shellCwd ?? ".";
     this.fileHistory.push(...(restore?.fileHistory ?? []));
     // PROJECT MEMORY: load the workspace's CLAUDE.md/AGENTS.md (missing ⇒ undefined, no crash)
     // and carry it as a neutralized, isolated UNTRUSTED message (the chokepoint — never bypassed).
@@ -1756,6 +1759,7 @@ export class ChatSession {
       ...(this.targetRepo !== undefined ? { targetRepo: this.targetRepo } : {}),
       ...(this.baseBranch !== undefined ? { baseBranch: this.baseBranch } : {}),
       ...(this.baseRef !== undefined ? { baseRef: this.baseRef } : {}),
+      ...(this.shellCwd !== "." ? { shellCwd: this.shellCwd } : {}),
     };
   }
 
@@ -1915,22 +1919,34 @@ export class ChatSession {
       }
     };
 
-    // Launch read-only calls immediately; chain mutating calls so at most one runs at a time,
-    // preserving their relative order. Both feed the same indexed result slots.
-    const pending: Promise<void>[] = [];
-    let mutatingChain: Promise<void> = Promise.resolve();
+    // BATCHED EXECUTION: segment the round into batches.  A contiguous run of read-only
+    // tools forms one parallel batch.  Any mutating/stateful tool forms a single-serial batch
+    // AND acts as a barrier — every tool AFTER it (even read-only) must wait until the mutation
+    // completes.  This prevents read-after-write races like [write_file(a), read_file(a)].
+    type Batch = { parallel: boolean; items: Array<{ idx: number; call: ToolCall }> };
+    const batches: Batch[] = [];
+    let current: Batch | undefined;
     for (let i = 0; i < n; i += 1) {
       const call = roundToolCalls[i];
       if (call === undefined) continue;
-      const idx = i;
-      if (this.isParallelSafe(call.name)) {
-        pending.push(runOne(idx, call));
+      const safe = this.isParallelSafe(call.name);
+      if (current === undefined || current.parallel !== safe) {
+        // Start a new batch when the parallelism category changes (or this is the first tool).
+        current = { parallel: safe, items: [] };
+        batches.push(current);
+      }
+      current.items.push({ idx: i, call });
+    }
+    // Execute batches sequentially; within each read-only batch, run tools in parallel.
+    for (const batch of batches) {
+      if (batch.parallel) {
+        await Promise.all(batch.items.map((item) => runOne(item.idx, item.call)));
       } else {
-        mutatingChain = mutatingChain.then(() => runOne(idx, call));
-        pending.push(mutatingChain);
+        for (const item of batch.items) {
+          await runOne(item.idx, item.call);
+        }
       }
     }
-    await Promise.all(pending);
     if (opts.signal?.aborted) return true;
 
     // Append every result in the model's call order — the chokepoint neutralizes each one.
@@ -2057,6 +2073,10 @@ export class ChatSession {
           this.emulatedRound = true;
         }
       }
+
+      // AUTO-COMPACT (between-turns): also compact after the model responds, so single-round
+      // turns (model returns stop immediately) get compacted before the next user message.
+      await this.maybeAutoCompact(opts);
 
       if (roundToolCalls !== undefined) {
         // Read-only calls run in parallel; mutating calls serialize. Results append in order.

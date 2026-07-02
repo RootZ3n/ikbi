@@ -477,6 +477,14 @@ export class AnthropicProvider implements ModelProvider {
           if (delta !== undefined) yield delta;
         }
       }
+      // Flush any remaining buffered content (tail without trailing newline).
+      if (buffer.length > 0) {
+        const { events } = parseSseBuffer(buffer);
+        for (const ev of events) {
+          const delta = toDelta(parse(ev));
+          if (delta !== undefined) yield delta;
+        }
+      }
     } finally {
       try {
         await reader.cancel();

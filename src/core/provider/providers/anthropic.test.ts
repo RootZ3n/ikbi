@@ -222,3 +222,26 @@ test("streams typed SSE events into content + tool call + usage", async () => {
   assert.equal(final.usage.promptTokens, 12);
   assert.equal(final.usage.completionTokens, 7);
 });
+
+test("flushes tail buffer content when stream ends without trailing newline", async () => {
+  // Split the last SSE frame so it has no trailing newline — the tail flush must still yield it.
+  const frames = [
+    `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { usage: { input_tokens: 5, output_tokens: 1 } } })}\n\n`,
+    `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`,
+    `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Hello" } })}\n\n`,
+    // message_delta WITHOUT a trailing newline — simulates a server that omits the final \n
+    `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 3 } })}\n`,
+    // no trailing newline — buffer has leftover content when stream ends
+  ];
+  const p = new AnthropicProvider({ id: "anthropic", baseUrl: "https://x/v1", apiKey: "sk", fetchImpl: streamFetch(frames) });
+  const stream = await p.invokeStream(invocation());
+
+  const acc = new StreamAccumulator();
+  for await (const d of stream) acc.push(d);
+  const final = acc.result();
+  assert.equal(final.content, "Hello");
+  assert.equal(final.finishReason, "stop");
+  assert.ok(final.usage);
+  assert.equal(final.usage.promptTokens, 5);
+  assert.equal(final.usage.completionTokens, 3);
+});

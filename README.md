@@ -27,8 +27,11 @@ ikbi is a Claude Code alternative that works with **cheap and local models** —
 - **Governed execution** — every shell command goes through an allowlist + gate-wall + receipts. Every model output is neutralized before re-entering the loop.
 - **Earned trust** — capability is granted, not assumed. Unknown agents start at the floor.
 - **Auditable receipts** — every governed action and promotion is recorded.
+- **Any model, natively** — cheap/local models (DeepSeek, MiMo, GLM, local Ollama) run through the OpenAI-compatible client; frontier models run through **native adapters** — Anthropic via the real `/messages` API with `tool_use` blocks and **prompt caching**. Point a model id at the right provider and it drives the loop.
 
 It runs as a long-running **service** (localhost/Tailscale) or as a **CLI**.
+
+**The interactive REPL is a full agentic loop.** `ikbi repl` runs tools the way a modern coding agent does: read-only tools **execute in parallel** within a turn (writes stay serialized and governed), the conversation **auto-compacts** when the context window fills, and the `terminal` tool keeps a **persistent working directory** (`cd` sticks across commands, confined to the worktree). With a frontier model set as the driver, the loop is the harness — not the bottleneck.
 
 ## What is Peh?
 
