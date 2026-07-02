@@ -102,6 +102,17 @@ test("VECTOR A scope — a typecheck legitimately runs zero tests and STILL pass
   assert.equal(r.passed, true, "tsc is not a test check — zero-test floor does not apply");
 });
 
+test("VECTOR C — `node --test dist/` phantom dir pass (`ok 1 - dist`) is NOT a pass", () => {
+  const r = parseCheckOutput({ name: "test", command: "node --test dist/", exitCode: 0, stdout: "TAP version 13\nok 1 - dist\n1..1\n# tests 1\n# pass 1\n# fail 0\n" });
+  assert.equal(r.passed, false, "the only 'test' is the directory path — nothing real ran → not a pass");
+  assert.ok(/phantom|bare directory|vacuous/i.test(r.errorSummary));
+});
+
+test("VECTOR C scope — a REAL node:test run (named tests, not paths) still passes", () => {
+  const r = parseCheckOutput({ name: "test", command: "node --test dist/*.test.js", exitCode: 0, stdout: "TAP version 13\nok 1 - detects pnpm when a lock file is present\nok 2 - returns unknown when no lock file\n1..2\n# tests 2\n# pass 2\n# fail 0\n" });
+  assert.equal(r.passed, true, "real named tests ran → genuine pass, not flagged as phantom");
+});
+
 test("VECTOR B — exit 0 but parsed failures (exit-swallowing script) is NOT a pass", () => {
   const r = parseCheckOutput({ name: "test", command: "vitest run; echo done", exitCode: 0, stdout: "RUN  v1.0\nFAIL  src/math.test.ts > adds\n ✗ adds 3ms\ndone\n" });
   assert.equal(r.passed, false, "exit 0 with real failures parsed → fail closed");
