@@ -32,6 +32,8 @@ import { whatNext } from "../../cli/what-next.js";
 import { ChatSession, type ApplyResult, type DiscardOutcome, type PermissionMode, type PersistedSession, type RollbackResult, type StreamEvent, type TurnOptions, type WorkdirKind } from "./session.js";
 import { formatAskPrompt, type AskUserRequest } from "../cognition-layer/ask.js";
 import { findCustomAgent, loadAllAgents, type CustomAgent } from "../agent-router/agent-directory.js";
+import { resolve } from "node:path";
+import { existsSync } from "node:fs";
 import { allocateSessionWorkspace, reconnectSessionWorkspace, resolveRepoTarget } from "./repl-workspace.js";
 import { persistentStore, PersistentSessionStore, sessionsDir } from "./session-store.js";
 import { createProductionGovernor } from "../memory-governor/create.js";
@@ -853,6 +855,16 @@ export async function liveRepl(
   const force = argv.includes("--force");
   const autosave = (s: ChatSession): Promise<void> => store.save(s, { force });
   const scratch = argv.includes("--scratch");
+  // REPO SELECTION (`ikbi peh --repo <path>` / `ikbi repl --repo <path>`): choose WHICH repo the
+  // session works in — Peh inspects it and any build targets it. Default: the current directory.
+  const repoIdx = argv.indexOf("--repo");
+  const repoArg = repoIdx >= 0 ? argv[repoIdx + 1] : undefined;
+  const selectedRepo = repoArg !== undefined && repoArg.length > 0 && !repoArg.startsWith("--") ? resolve(repoArg) : undefined;
+  if (selectedRepo !== undefined && !existsSync(selectedRepo)) {
+    out(`[--repo path does not exist: ${selectedRepo}]\n`);
+    return;
+  }
+  const baseDir = selectedRepo ?? process.cwd();
 
   // MEMORY GOVERNOR: intercepts governed writes (CLAUDE.md, .ikbi/*, brain pages) into
   // operator-reviewed proposals. Constructed once for the REPL session, shared across
@@ -877,10 +889,10 @@ export async function liveRepl(
     // default applies only when the operator has NOT pinned a workdir.
     const explicitWorkdir = process.env.IKBI_CHAT_WORKDIR;
     if (!scratch && explicitWorkdir !== undefined && explicitWorkdir.trim().length > 0) {
-      return new ChatSession(id, { autosave, cwd: process.cwd(), permissionMode: "confirm", memoryGovernor, invokeStream: invokeModelStream, makeContextManager });
+      return new ChatSession(id, { autosave, cwd: baseDir, permissionMode: "confirm", memoryGovernor, invokeStream: invokeModelStream, makeContextManager });
     }
     if (!scratch) {
-      const target = resolveRepoTarget(process.cwd());
+      const target = resolveRepoTarget(baseDir);
       if (target !== undefined) {
         try {
           const ws = await allocateSessionWorkspace({ targetRepo: target, sessionId: id });
@@ -890,7 +902,7 @@ export async function liveRepl(
         }
       }
     }
-    return new ChatSession(id, { autosave, cwd: process.cwd(), scratch: true, permissionMode: "confirm", memoryGovernor, invokeStream: invokeModelStream, makeContextManager });
+    return new ChatSession(id, { autosave, cwd: baseDir, scratch: true, permissionMode: "confirm", memoryGovernor, invokeStream: invokeModelStream, makeContextManager });
   };
 
   /** Resume a persisted session, reconnecting its managed workspace when one was recorded. */
@@ -960,7 +972,8 @@ export async function liveRepl(
       session.setPersona(agent);
       if (opts.model !== undefined && opts.model.length > 0 && session.setModel !== undefined) session.setModel(opts.model);
       const model = session.currentModel !== undefined ? session.currentModel() : (opts.model ?? agent.modelPreference ?? "?");
-      status(opts.greeting ?? `\n🐿️  You're with ${agent.name} — ${agent.description ?? "ikbi's guide"} [model: ${model}].\n   Ask about ikbi, or tell ${agent.name} what you want to build and he'll help shape the goal. Type /exit to leave.\n\n`);
+      const workingRepo = session.targetRepo ?? baseDir;
+      status(opts.greeting ?? `\n🐿️  You're with ${agent.name} — ${agent.description ?? "ikbi's guide"} [model: ${model} · repo: ${workingRepo}].\n   Ask about ikbi, or tell ${agent.name} what you want to build and he'll help shape the goal (and run it, with your OK). Reopen with \`ikbi peh --repo <path>\` to work elsewhere. Type /exit to leave.\n\n`);
     } else {
       status(`[persona "${opts.persona}" not found — starting the default assistant]\n`);
     }

@@ -34,14 +34,13 @@ test("runCapabilities surfaces a parity MISMATCH in both directions", () => {
   assert.match(r.lines.join("\n"), /Parity: MISMATCH — builder-only: \[scout_detail\]; chat-only: \[vision_analyze\]\./);
 });
 
-test("the LIVE builder and chat tool sets are in parity at exactly 25 tools", () => {
-  // Defaults read the real TOOLS / CHAT_TOOLS arrays — the audit's invariant, pinned.
-  // 18 original (incl. glob + multi_edit) + 4 brain tools (brain_search, brain_think, brain_put,
-  // brain_sync) + 3 capability tools added by the Bubbles gap-closure: lsp_diagnostic,
-  // notebook_edit, ask_user.
+test("chat is a SUPERSET of the builder suite: 25 builder tools + the chat-only launch_build", () => {
+  // Defaults read the real TOOLS / CHAT_TOOLS arrays. The 25 builder tools are ALL offered in chat;
+  // launch_build is CHAT-ONLY on purpose — a persona (Peh) can launch a governed build, but the
+  // builder role must never launch a nested build. So: no builder-only tool, exactly one chat-only.
   const r = runCapabilities();
   assert.equal(r.builder.length, 25, "builder declares 25 tools");
-  assert.equal(r.chat.length, 25, "chat declares 25 tools");
-  assert.deepEqual(r.builderOnly, [], "no builder-only tool (full chat parity)");
-  assert.deepEqual(r.chatOnly, [], "no chat-only tool");
+  assert.equal(r.chat.length, 26, "chat declares 25 builder tools + launch_build");
+  assert.deepEqual(r.builderOnly, [], "chat advertises the full builder suite (no builder-only tool)");
+  assert.deepEqual(r.chatOnly, ["launch_build"], "launch_build is the one chat-only tool");
 });

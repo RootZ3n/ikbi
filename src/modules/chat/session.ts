@@ -79,6 +79,7 @@ import { runWebExtract, runWebSearch, webExtractTool, webSearchTool } from "../w
 import { lspDiagnosticTool, runLspDiagnostic } from "../agent-tools/lsp-tools.js";
 import { notebookEditTool, runNotebookEdit } from "../agent-tools/notebook-tools.js";
 import { askUserTool, runAskUser } from "../agent-tools/ask-user.js";
+import { launchBuildTool, runLaunchBuild } from "../agent-tools/launch-build.js";
 import type { AskUserFn } from "../cognition-layer/ask.js";
 import type { CustomAgent } from "../agent-router/agent-directory.js";
 import type { ChatToolActivity } from "./contract.js";
@@ -269,6 +270,8 @@ export const CHAT_TOOLS: readonly ModelTool[] = [
   notebookEditTool,
   // Clarify: ask the operator a question and wait for the answer (interactive in the REPL).
   askUserTool,
+  // Launch a REAL governed ikbi build (confirm-gated) — the guide's bridge from drafting to doing.
+  launchBuildTool,
   // Knowledge brain (gbrain): recall prior knowledge, synthesize across it, write findings back.
   ...BRAIN_TOOLS,
   // Parity with the builder's final three (adapted to chat — see the tool defs above).
@@ -443,6 +446,9 @@ const MUTATING_TOOL_NAMES: ReadonlySet<string> = new Set([
   "web_extract",
   // notebook_edit can insert/edit/delete cells (mutating); gated like the other writers.
   "notebook_edit",
+  // launch_build runs a REAL governed build that can promote to the target repo — a side effect
+  // rollback cannot cover, so it is confirm-gated like terminal (a build never launches unapproved).
+  "launch_build",
 ]);
 
 /**
@@ -1111,9 +1117,10 @@ export class ChatSession {
     // PERMISSION GATE (FIX 5): in "readonly" mode block every mutating tool; in "confirm" mode ask
     // the operator first and BLOCK on a decline. "auto" (the default) lets everything through.
     const permissionMode = opts.permissionMode ?? this.permissionMode;
-    const sideEffectConfirmed = (call.name === "terminal" || call.name === "delegate_task") && opts.confirm !== undefined;
+    const sideEffectConfirmed = (call.name === "terminal" || call.name === "delegate_task" || call.name === "launch_build") && opts.confirm !== undefined;
     if (sideEffectConfirmed) {
-      const target = typeof args.command === "string" ? args.command : typeof args.task === "string" ? args.task : "";
+      const target = call.name === "launch_build" && typeof args.goal === "string" ? `build: "${args.goal}"`
+        : typeof args.command === "string" ? args.command : typeof args.task === "string" ? args.task : "";
       const allowed = await opts.confirm(call.name, `${target}${target.length > 0 ? " " : ""}(rollback cannot cover terminal/sub-agent side effects)`);
       if (!allowed) {
         return { output: `ERROR: ${call.name} was DENIED by the operator. Rollback cannot cover terminal/sub-agent side effects.`, activity: { name: call.name, ok: false, summary: "denied" } };
@@ -1131,7 +1138,7 @@ export class ChatSession {
       // CONFIRM MODE + DELEGATE (M5): a single parent approval cannot govern a sub-agent's own
       // unconfirmed tool loop (it runs with full write access and no confirm callback). So in
       // "confirm" mode delegate_task is unavailable outright — switch to "auto" to delegate.
-      if ((call.name === "delegate_task" || call.name === "terminal") && !sideEffectConfirmed) {
+      if ((call.name === "delegate_task" || call.name === "terminal" || call.name === "launch_build") && !sideEffectConfirmed) {
         return { output: `ERROR: ${call.name} requires an interactive confirmation because rollback cannot cover its side effects.`, activity: { name: call.name, ok: false, summary: "confirmation required" } };
       }
       const allowed = sideEffectConfirmed ? true : opts.confirm !== undefined ? await opts.confirm(call.name, target) : false;
@@ -1228,6 +1235,17 @@ export class ChatSession {
         );
         const ok = !out.startsWith("ERROR");
         return { output: out, activity: { name: "ask_user", ok, ...(typeof args.question === "string" ? { summary: args.question.slice(0, 60) } : {}) } };
+      }
+      case "launch_build": {
+        // Peh's bridge from drafting to doing: run the REAL governed `ikbi build` on the session's
+        // selected repo (this.targetRepo) via the same CLI, so every guard applies. Confirm-gated
+        // above — never reaches here without operator approval. Output is UNTRUSTED → chokepoint.
+        const res = await runLaunchBuild(args, {
+          repo: this.targetRepo,
+          cliEntry: process.argv[1] ?? "",
+          execPath: process.execPath,
+        });
+        return { output: res.output, activity: { name: "launch_build", ok: res.ok, summary: res.summary } };
       }
       case "notebook_edit": {
         // Cell-level .ipynb editing — confined to the worktree. Mutating ops are permission-gated
