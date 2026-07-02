@@ -34,7 +34,7 @@ const sample: AgentDirectoryResult = {
 test("list: shows all agents with tool/model summary", () => {
   const cap = capture();
   createAgentsCli({ ...cap, load: () => sample }).run([]);
-  assert.match(cap.out, /Custom agents \(2\)/);
+  assert.match(cap.out, /Agents \(2\)/);
   assert.match(cap.out, /reviewer \(2 tool\(s\), model deepseek-v4-pro\) — code reviewer/);
   assert.match(cap.out, /writer \(all tools\)/);
   assert.match(cap.out, /\/agent <name>/);

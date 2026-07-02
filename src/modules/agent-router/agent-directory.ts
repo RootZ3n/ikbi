@@ -65,6 +65,60 @@ export function agentsDir(repoRoot: string): string {
   return join(repoRoot, ".ikbi", "agents");
 }
 
+// ── BUILT-IN AGENTS (shipped WITH ikbi; no .ikbi/agents/ setup required) ─────────────────────────
+
+/** The tools a conversational, teaching persona uses: inspect + ask, never edit. Mirrors plan mode. */
+const TEACHING_READONLY_TOOLS: readonly string[] = [
+  "read_file", "list_dir", "search_files", "glob", "git_status", "git_diff", "git_log", "lsp_diagnostic", "ask_user",
+];
+
+/**
+ * PEHLICHI — "Peh" — the built-in teaching guide and the face of ikbi. A user talks to Peh to learn
+ * how ikbi works and to turn a fuzzy idea into a clear, buildable goal. Peh is read-only for now
+ * (inspects + teaches + drafts the command); a launch-build capability lands separately. Peh runs on
+ * its OWN model (default deepseek-v4-pro), decoupled from the build roster and overridable per session.
+ */
+const PEHLICHI: CustomAgent = {
+  name: "Pehlichi",
+  description: "Peh — ikbi's teaching guide. Learn ikbi and shape a clear build goal together.",
+  modelPreference: "deepseek-v4-pro",
+  allowedTools: TEACHING_READONLY_TOOLS,
+  source: "builtin",
+  systemPrompt: [
+    'You are Pehlichi — "Peh" for short — the friendly guide and the face of ikbi.',
+    "",
+    'ikbi (Choctaw: "to build") is a governed AI coding agent that builds and repairs code, designed to work well even with small, cheap, or local models. Your job is to make ikbi approachable: teach people how to use it, and help them turn a fuzzy idea into a clear, buildable goal.',
+    "",
+    "WHO YOU HELP: often complete beginners. Be warm, patient, and plain-spoken. Explain any jargon. Short paragraphs. Encourage — never condescend.",
+    "",
+    "WHAT YOU DO:",
+    "1. Explain ikbi — what it does (build / fix / verify code, only promoting changes that pass real verification), and its main commands: `ikbi build \"<goal>\" --repo <path>`, `ikbi fix`, `ikbi repl`, `ikbi doctor`.",
+    "2. Help the user craft a GOOD build goal. A good goal is specific and verifiable. Draw it out of them:",
+    "   - WHAT do you want built or fixed? (concrete)",
+    "   - WHERE — which repo or files? You may inspect the repo read-only to ground your advice.",
+    "   - What does SUCCESS look like? (a test passes, a feature works, an error is gone)",
+    "   - Any CONSTRAINTS? (don't touch X, keep it small, use a certain library)",
+    "   Then write the goal for them as a ready-to-run command, e.g.:",
+    '       ikbi build "add a /health endpoint that returns 200, with a test for it" --repo .',
+    "3. Answer honestly about what ikbi can and cannot do. If a task is likely too big for a small model, say so and help find a smaller first step — ikbi is honest about its limits, and so are you.",
+    "",
+    "HOW YOU WORK:",
+    "- You are READ-ONLY: you inspect (read files, list, search) and teach and ask questions. You do NOT edit code or run builds yourself — you hand the user the exact command to run.",
+    "- Keep goals SMALL and clearly scoped; ikbi does best with well-defined tasks. If a request is large, break it into a first small step together.",
+    "- When you inspect a repo, use what you find to make your advice concrete — name the real files, the detected language, the test command.",
+    "",
+    "Be the guide you would have wanted on day one: kind, clear, and genuinely useful.",
+  ].join("\n"),
+};
+
+/** All personas that ship WITH ikbi. Custom `.ikbi/agents/` entries of the same name override these. */
+const BUILTIN_AGENTS: readonly CustomAgent[] = [PEHLICHI];
+
+/** The personas bundled with ikbi (available with zero setup). */
+export function getBuiltinAgents(): readonly CustomAgent[] {
+  return BUILTIN_AGENTS;
+}
+
 /**
  * Load all custom agents from `<repoRoot>/.ikbi/agents/`. Returns the valid agents plus a list of
  * per-file errors. A missing directory is not an error — it yields an empty result.
@@ -112,10 +166,24 @@ export function loadCustomAgents(repoRoot: string, maxFiles: number = MAX_AGENT_
   return { agents, errors, dir };
 }
 
-/** Find one custom agent by name (case-insensitive). Returns undefined when absent. */
+/**
+ * Load BUILT-IN + custom agents merged by name. Built-ins are the base; a custom `.ikbi/agents/`
+ * entry with the same name OVERRIDES its built-in (a team can re-skin Pehlichi). Custom-vs-custom
+ * duplicate errors from loadCustomAgents are preserved. This is what the REPL `/agent` command and
+ * `ikbi agents` read, so a bundled persona like Pehlichi is available with zero setup.
+ */
+export function loadAllAgents(repoRoot: string, maxFiles: number = MAX_AGENT_FILES): AgentDirectoryResult {
+  const custom = loadCustomAgents(repoRoot, maxFiles);
+  const byName = new Map<string, CustomAgent>();
+  for (const b of getBuiltinAgents()) byName.set(b.name.toLowerCase(), b);
+  for (const c of custom.agents) byName.set(c.name.toLowerCase(), c); // custom overrides built-in
+  return { agents: [...byName.values()], errors: custom.errors, dir: custom.dir };
+}
+
+/** Find one agent by name (case-insensitive), built-in or custom. Returns undefined when absent. */
 export function findCustomAgent(repoRoot: string, name: string): CustomAgent | undefined {
   const target = name.trim().toLowerCase();
-  return loadCustomAgents(repoRoot).agents.find((a) => a.name.toLowerCase() === target);
+  return loadAllAgents(repoRoot).agents.find((a) => a.name.toLowerCase() === target);
 }
 
 /** Load + validate a single agent file. */

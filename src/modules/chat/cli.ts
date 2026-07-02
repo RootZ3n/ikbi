@@ -31,7 +31,7 @@ import { detectLiveProject, summarize } from "../project-detection/index.js";
 import { whatNext } from "../../cli/what-next.js";
 import { ChatSession, type ApplyResult, type DiscardOutcome, type PermissionMode, type PersistedSession, type RollbackResult, type StreamEvent, type TurnOptions, type WorkdirKind } from "./session.js";
 import { formatAskPrompt, type AskUserRequest } from "../cognition-layer/ask.js";
-import { findCustomAgent, loadCustomAgents, type CustomAgent } from "../agent-router/agent-directory.js";
+import { findCustomAgent, loadAllAgents, type CustomAgent } from "../agent-router/agent-directory.js";
 import { allocateSessionWorkspace, reconnectSessionWorkspace, resolveRepoTarget } from "./repl-workspace.js";
 import { persistentStore, PersistentSessionStore, sessionsDir } from "./session-store.js";
 import { createProductionGovernor } from "../memory-governor/create.js";
@@ -272,9 +272,9 @@ const COMMAND_LIST: readonly ReplCommand[] = [
         return;
       }
       if (arg === "list") {
-        const { agents, dir } = loadCustomAgents(repoRoot);
-        if (agents.length === 0) ctx.out(`[no custom agents in ${dir} — define one as .ikbi/agents/<name>.yaml]\n`);
-        else ctx.out(`[custom agents: ${agents.map((a) => a.name).join(", ")} — switch with /agent <name>]\n`);
+        const { agents } = loadAllAgents(repoRoot);
+        if (agents.length === 0) ctx.out(`[no agents available — define one as .ikbi/agents/<name>.yaml]\n`);
+        else ctx.out(`[agents: ${agents.map((a) => a.name).join(", ")} — switch with /agent <name>]\n`);
         return;
       }
       if (ctx.session.setPersona === undefined) {

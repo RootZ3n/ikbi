@@ -12,7 +12,7 @@
 import { registerCommand } from "./registry.js";
 import { writeStdout, writeStderr } from "./io.js";
 import { whatNextFooter } from "./what-next.js";
-import { loadCustomAgents, type AgentDirectoryResult } from "../modules/agent-router/agent-directory.js";
+import { loadAllAgents, type AgentDirectoryResult } from "../modules/agent-router/agent-directory.js";
 
 export interface AgentsCliDeps {
   readonly stdout?: (s: string) => void;
@@ -43,7 +43,7 @@ export function createAgentsCli(deps: AgentsCliDeps = {}) {
   const out = deps.stdout ?? writeStdout;
   const err = deps.stderr ?? writeStderr;
   const setExit = deps.setExit ?? ((c: number) => void (process.exitCode = c));
-  const load = deps.load ?? loadCustomAgents;
+  const load = deps.load ?? loadAllAgents;
 
   function run(argv: readonly string[]): void {
     const args = parseArgs(argv);
@@ -79,12 +79,13 @@ export function createAgentsCli(deps: AgentsCliDeps = {}) {
       out(`No custom agents found in ${result.dir}\n`);
       out(`Define one by creating ${result.dir}/<name>.yaml with name, system_prompt, allowed_tools, model_preference.\n`);
     } else {
-      out(`Custom agents (${result.agents.length}) in ${result.dir}:\n`);
+      out(`Agents (${result.agents.length}) — built-in + custom from ${result.dir}:\n`);
       for (const a of result.agents) {
         const tools = a.allowedTools !== undefined && a.allowedTools.length > 0 ? `${a.allowedTools.length} tool(s)` : "all tools";
         const model = a.modelPreference !== undefined ? `, model ${a.modelPreference}` : "";
+        const tag = a.source === "builtin" ? " [built-in]" : "";
         const desc = a.description !== undefined ? ` — ${a.description}` : "";
-        out(`  • ${a.name} (${tools}${model})${desc}\n`);
+        out(`  • ${a.name}${tag} (${tools}${model})${desc}\n`);
       }
     }
     out(`${whatNextFooter("agents", { count: result.agents.length })}\n`);

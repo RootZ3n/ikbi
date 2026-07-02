@@ -60,7 +60,9 @@ test("/agent list shows available personas; /agent default clears", async () => 
   const session = new ChatSession("persona2", { invoke: (async () => stop("ok")) as never, worktree: wt });
   let out = "";
   await runRepl({ session, readLine: lines(["/agent reviewer", "/agent list", "/agent default", "/exit"]), out: (s) => { out += s; } });
-  assert.match(out, /custom agents: reviewer/);
+  // The list now merges built-in agents (e.g. Pehlichi) with the custom "reviewer".
+  assert.match(out, /agents:.*reviewer/);
+  assert.match(out, /Pehlichi/);
   assert.match(out, /persona cleared/);
   assert.equal(session.currentPersona(), undefined);
 });

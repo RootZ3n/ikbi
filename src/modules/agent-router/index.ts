@@ -56,6 +56,8 @@ export {
 export {
   agentsDir,
   loadCustomAgents,
+  loadAllAgents,
+  getBuiltinAgents,
   findCustomAgent,
   loadAgentFile,
   validateAgent,
