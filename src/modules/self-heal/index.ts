@@ -15,6 +15,22 @@
 export { decideDisposition } from "./policy.js";
 export { runSelfHeal } from "./driver.js";
 export {
+  composeExecutors,
+  liveSelfHealIo,
+  buildFixTask,
+  buildAdviceMessages,
+  parseNumstat,
+  parseDeleted,
+  toCandidateFix,
+  toBuildCandidate,
+  judgePassed,
+  toJudgeResult,
+  type SelfHealIo,
+  type DiffStat,
+  type SelfHealExecutorOptions,
+  type LiveSelfHealDeps,
+} from "./executors.js";
+export {
   CONTRACT_VERSION,
   type SelfHealDisposition,
   type CandidateFix,
