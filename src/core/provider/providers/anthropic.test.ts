@@ -84,6 +84,18 @@ test("hits /messages with x-api-key + anthropic-version and parses text + usage"
   assert.deepEqual(body.messages, [{ role: "user", content: [{ type: "text", text: "hi" }] }]);
 });
 
+test("honors a caller-supplied maxTokens (not pinned to the 4096 default)", async () => {
+  const { fetchImpl, captured } = jsonFetch(200, {
+    content: [{ type: "text", text: "ok" }],
+    stop_reason: "end_turn",
+    usage: { input_tokens: 1, output_tokens: 1 },
+  });
+  const p = new AnthropicProvider({ id: "anthropic", baseUrl: "https://x/v1", apiKey: "sk", fetchImpl });
+  await p.invoke(invocation({ maxTokens: 32000 }));
+  const body = JSON.parse(captured.init?.body ?? "{}") as { max_tokens: number };
+  assert.equal(body.max_tokens, 32000);
+});
+
 test("hoists system messages to top-level system[] with a cache breakpoint", async () => {
   const { fetchImpl, captured } = jsonFetch(200, {
     content: [{ type: "text", text: "ok" }],
@@ -154,7 +166,198 @@ test("round-trips tool_use (assistant) and tool_result (tool) blocks", async () 
   assert.equal(body.messages[1]?.role, "assistant");
   assert.deepEqual(body.messages[1]?.content, [{ type: "tool_use", id: "tu_1", name: "read_file", input: { path: "a.ts" } }]);
   assert.equal(body.messages[2]?.role, "user");
-  assert.deepEqual(body.messages[2]?.content, [{ type: "tool_result", tool_use_id: "tu_1", content: "file contents" }]);
+  // The LAST message carries the incremental conversation-cache breakpoint (3-message conversation).
+  assert.deepEqual(body.messages[2]?.content, [
+    { type: "tool_result", tool_use_id: "tu_1", content: "file contents", cache_control: { type: "ephemeral" } },
+  ]);
+});
+
+test("marks a FAILED tool_result with is_error and caches the conversation prefix", async () => {
+  const { fetchImpl, captured } = jsonFetch(200, {
+    content: [{ type: "text", text: "ok" }],
+    stop_reason: "end_turn",
+    usage: { input_tokens: 1, output_tokens: 1 },
+  });
+  const messages: ModelMessage[] = [
+    { role: "user", content: "run the build" },
+    { role: "assistant", content: "", toolCalls: [{ id: "tu_2", name: "terminal", arguments: "{}" }] },
+    { role: "tool", content: "ERROR: build failed", toolCallId: "tu_2", isError: true },
+  ];
+  const p = new AnthropicProvider({ id: "anthropic", baseUrl: "https://x/v1", apiKey: "sk", fetchImpl });
+  await p.invoke(invocation({ messages }));
+  const body = JSON.parse(captured.init?.body ?? "{}") as { messages: Array<{ content: Array<Record<string, unknown>> }> };
+  const result = body.messages[2]?.content[0];
+  assert.equal(result?.is_error, true);
+  assert.equal(result?.type, "tool_result");
+  assert.deepEqual(result?.cache_control, { type: "ephemeral" }); // last message → cache breakpoint
+});
+
+test("a SUCCESSFUL tool_result omits is_error", async () => {
+  const { fetchImpl, captured } = jsonFetch(200, {
+    content: [{ type: "text", text: "ok" }],
+    stop_reason: "end_turn",
+    usage: { input_tokens: 1, output_tokens: 1 },
+  });
+  const messages: ModelMessage[] = [
+    { role: "user", content: "read a" },
+    { role: "assistant", content: "", toolCalls: [{ id: "tu_3", name: "read_file", arguments: "{}" }] },
+    { role: "tool", content: "file body", toolCallId: "tu_3" }, // no isError
+  ];
+  const p = new AnthropicProvider({ id: "anthropic", baseUrl: "https://x/v1", apiKey: "sk", fetchImpl });
+  await p.invoke(invocation({ messages }));
+  const body = JSON.parse(captured.init?.body ?? "{}") as { messages: Array<{ content: Array<Record<string, unknown>> }> };
+  const result = body.messages[2]?.content[0];
+  assert.equal("is_error" in (result ?? {}), false);
+});
+
+test("single-shot prompt is NOT conversation-cached (no breakpoint on a 1-message convo)", async () => {
+  const { fetchImpl, captured } = jsonFetch(200, {
+    content: [{ type: "text", text: "ok" }],
+    stop_reason: "end_turn",
+    usage: { input_tokens: 1, output_tokens: 1 },
+  });
+  const p = new AnthropicProvider({ id: "anthropic", baseUrl: "https://x/v1", apiKey: "sk", fetchImpl });
+  await p.invoke(invocation()); // prompt "hi" → a single user message
+  const body = JSON.parse(captured.init?.body ?? "{}") as { messages: Array<{ content: Array<Record<string, unknown>> }> };
+  assert.equal("cache_control" in (body.messages[0]?.content[0] ?? {}), false);
+});
+
+test("conversationCache=false disables the conversation breakpoint", async () => {
+  const { fetchImpl, captured } = jsonFetch(200, {
+    content: [{ type: "text", text: "ok" }],
+    stop_reason: "end_turn",
+    usage: { input_tokens: 1, output_tokens: 1 },
+  });
+  const messages: ModelMessage[] = [
+    { role: "user", content: "a" },
+    { role: "assistant", content: "b" },
+    { role: "user", content: "c" },
+  ];
+  const p = new AnthropicProvider({ id: "anthropic", baseUrl: "https://x/v1", apiKey: "sk", fetchImpl, conversationCache: false });
+  await p.invoke(invocation({ messages }));
+  const body = JSON.parse(captured.init?.body ?? "{}") as { messages: Array<{ content: Array<Record<string, unknown>> }> };
+  assert.equal("cache_control" in (body.messages[2]?.content[0] ?? {}), false);
+});
+
+test("extended thinking: sends the thinking param, bumps max_tokens above budget, drops temperature", async () => {
+  const { fetchImpl, captured } = jsonFetch(200, {
+    content: [{ type: "text", text: "ok" }],
+    stop_reason: "end_turn",
+    usage: { input_tokens: 1, output_tokens: 1 },
+  });
+  const p = new AnthropicProvider({ id: "anthropic", baseUrl: "https://x/v1", apiKey: "sk", fetchImpl });
+  await p.invoke(invocation({ thinking: { budgetTokens: 8000 }, maxTokens: 4096, temperature: 0.4 }));
+  const body = JSON.parse(captured.init?.body ?? "{}") as { thinking: unknown; max_tokens: number; temperature?: number };
+  assert.deepEqual(body.thinking, { type: "enabled", budget_tokens: 8000 });
+  assert.ok(body.max_tokens > 8000, "max_tokens must exceed the thinking budget");
+  assert.equal(body.temperature, undefined, "temperature is forbidden while thinking");
+});
+
+test("extended thinking OFF by default: no thinking param, temperature preserved", async () => {
+  const { fetchImpl, captured } = jsonFetch(200, {
+    content: [{ type: "text", text: "ok" }],
+    stop_reason: "end_turn",
+    usage: { input_tokens: 1, output_tokens: 1 },
+  });
+  const p = new AnthropicProvider({ id: "anthropic", baseUrl: "https://x/v1", apiKey: "sk", fetchImpl });
+  await p.invoke(invocation({ temperature: 0.4 }));
+  const body = JSON.parse(captured.init?.body ?? "{}") as { thinking?: unknown; temperature?: number };
+  assert.equal("thinking" in body, false);
+  assert.equal(body.temperature, 0.4);
+});
+
+test("parses response thinking blocks into reasoning + reasoningSignature", async () => {
+  const { fetchImpl } = jsonFetch(200, {
+    content: [
+      { type: "thinking", thinking: "let me reason about this", signature: "sig-abc123" },
+      { type: "text", text: "the answer" },
+    ],
+    stop_reason: "end_turn",
+    usage: { input_tokens: 5, output_tokens: 6 },
+  });
+  const p = new AnthropicProvider({ id: "anthropic", baseUrl: "https://x/v1", apiKey: "sk", fetchImpl });
+  const r = await p.invoke(invocation());
+  assert.equal(r.reasoning, "let me reason about this");
+  assert.equal(r.reasoningSignature, "sig-abc123");
+  assert.equal(r.content, "the answer");
+});
+
+test("round-trips a signed thinking block: assistant.reasoning → a `thinking` block emitted FIRST", async () => {
+  const { fetchImpl, captured } = jsonFetch(200, {
+    content: [{ type: "text", text: "ok" }],
+    stop_reason: "end_turn",
+    usage: { input_tokens: 1, output_tokens: 1 },
+  });
+  const messages: ModelMessage[] = [
+    { role: "user", content: "solve it" },
+    {
+      role: "assistant",
+      content: "working on it",
+      reasoning: "prior thinking",
+      reasoningSignature: "sig-xyz",
+      toolCalls: [{ id: "tu_1", name: "read_file", arguments: "{}" }],
+    },
+    { role: "tool", content: "data", toolCallId: "tu_1" },
+  ];
+  const p = new AnthropicProvider({ id: "anthropic", baseUrl: "https://x/v1", apiKey: "sk", fetchImpl });
+  await p.invoke(invocation({ messages }));
+  const body = JSON.parse(captured.init?.body ?? "{}") as { messages: Array<{ content: Array<Record<string, unknown>> }> };
+  const assistantBlocks = body.messages[1]?.content ?? [];
+  // The thinking block must be FIRST, verbatim (text + signature), before text and tool_use.
+  assert.deepEqual(assistantBlocks[0], { type: "thinking", thinking: "prior thinking", signature: "sig-xyz" });
+  assert.equal((assistantBlocks[1] as Record<string, unknown>)?.type, "text");
+  assert.equal((assistantBlocks[2] as Record<string, unknown>)?.type, "tool_use");
+});
+
+test("does NOT emit a thinking block when the signature is missing (would be rejected)", async () => {
+  const { fetchImpl, captured } = jsonFetch(200, {
+    content: [{ type: "text", text: "ok" }],
+    stop_reason: "end_turn",
+    usage: { input_tokens: 1, output_tokens: 1 },
+  });
+  const messages: ModelMessage[] = [
+    { role: "user", content: "x" },
+    { role: "assistant", content: "y", reasoning: "unsigned thinking" }, // no signature
+    { role: "user", content: "z" },
+  ];
+  const p = new AnthropicProvider({ id: "anthropic", baseUrl: "https://x/v1", apiKey: "sk", fetchImpl });
+  await p.invoke(invocation({ messages }));
+  const body = JSON.parse(captured.init?.body ?? "{}") as { messages: Array<{ content: Array<Record<string, unknown>> }> };
+  const assistantBlocks = body.messages[1]?.content ?? [];
+  assert.ok(!assistantBlocks.some((b) => b.type === "thinking"), "no unsigned thinking block on the wire");
+});
+
+test("streams thinking_delta + signature_delta into reasoning + reasoningSignature", async () => {
+  const frames = [
+    `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { usage: { input_tokens: 3, output_tokens: 1 } } })}\n\n`,
+    `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "thinking" } })}\n\n`,
+    `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "step one " } })}\n\n`,
+    `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "step two" } })}\n\n`,
+    `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "sig-stream" } })}\n\n`,
+    `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 1, content_block: { type: "text", text: "" } })}\n\n`,
+    `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "final answer" } })}\n\n`,
+    `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 9 } })}\n\n`,
+  ];
+  const p = new AnthropicProvider({ id: "anthropic", baseUrl: "https://x/v1", apiKey: "sk", fetchImpl: streamFetch(frames) });
+  const stream = await p.invokeStream(invocation());
+  const acc = new StreamAccumulator();
+  for await (const d of stream) acc.push(d);
+  const final = acc.result();
+  assert.equal(final.reasoning, "step one step two");
+  assert.equal(final.reasoningSignature, "sig-stream");
+  assert.equal(final.content, "final answer");
+});
+
+test("maps pause_turn to a clean stop (safe degradation for an unreachable server-tool path)", async () => {
+  const { fetchImpl } = jsonFetch(200, {
+    content: [{ type: "text", text: "partial" }],
+    stop_reason: "pause_turn",
+    usage: { input_tokens: 1, output_tokens: 1 },
+  });
+  const p = new AnthropicProvider({ id: "anthropic", baseUrl: "https://x/v1", apiKey: "sk", fetchImpl });
+  const r = await p.invoke(invocation());
+  assert.equal(r.finishReason, "stop");
+  assert.equal(r.content, "partial");
 });
 
 test("maps cache-read tokens into promptTokens + cachedTokens", async () => {

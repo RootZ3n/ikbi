@@ -25,8 +25,10 @@ test("the registry lists all 8 frozen contracts with versions", () => {
   //  - identity 1.1.0 — the `OperationContext.dryRun` seam (Step S).
   //  - provider 1.2.0 — the fetch-guard seam (1.1.0) + multimodal `parts` (1.2.0).
   //  - provider 1.3.0 — the fetch-guard seam (1.1.0) + multimodal `parts` (1.2.0) + streaming deltas (1.3.0).
+  //  - provider 1.4.0 — + tool_result is_error, opt-in extended-thinking budget, and reasoning/signature
+  //    round-trip fields (all additive/optional).
   const VERSIONS: Record<string, string> = {
-    provider: "1.3.0",
+    provider: "1.4.0",
     injection: "1.0.0",
     identity: "1.1.0",
     substrate: "1.0.0",

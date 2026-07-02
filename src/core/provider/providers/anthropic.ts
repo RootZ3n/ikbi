@@ -48,7 +48,18 @@ export interface AnthropicOptions {
   readonly maxErrorDetail?: number;
   /** Override the pinned API version (tests / forward-compat). */
   readonly anthropicVersion?: string;
+  /**
+   * Incrementally cache the CONVERSATION prefix (not just system + tools) by marking a
+   * cache breakpoint on the last message of each request. Each turn/tool-round then reuses
+   * the previous request's message prefix at the cheap cache-read rate — the big lever for
+   * long agentic sessions. Default ON; disable via the constructor or IKBI_ANTHROPIC_CONVERSATION_CACHE=0.
+   */
+  readonly conversationCache?: boolean;
 }
+
+/** Anthropic's minimum cacheable prefix; a breakpoint below this is ignored by the API (no charge).
+ *  We still gate the conversation breakpoint on message COUNT so single-shot prompts are byte-unchanged. */
+const CONVERSATION_CACHE_MIN_MESSAGES = 2;
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null;
@@ -78,6 +89,13 @@ function mapStopReason(raw: unknown): FinishReason {
   switch (raw) {
     case "end_turn":
     case "stop_sequence":
+      return "stop";
+    // `pause_turn` is emitted ONLY when Anthropic pauses a long-running turn that uses SERVER-SIDE
+    // tools (web_search_20250305, code_execution, computer_use, …). ikbi never sends those — every
+    // ikbi tool is a CLIENT-SIDE custom tool — so pause_turn is unreachable on this wire. Should it
+    // ever appear, mapping it to "stop" is the safe degradation: the turn ends cleanly with whatever
+    // content accumulated (no crash, no orphaned tool_use). We deliberately do NOT widen the frozen
+    // FinishReason vocabulary with a dedicated "continue" state for a path this client cannot trigger.
     case "pause_turn":
       return "stop";
     case "max_tokens":
@@ -168,12 +186,22 @@ function toAnthropicPayload(messages: readonly ModelMessage[]): {
           type: "tool_result",
           tool_use_id: m.toolCallId ?? "",
           content: m.content,
+          // Propagate a FAILED tool into the native error channel so the model can tell a real
+          // failure from error-shaped prose. Only emitted when the caller marked it (default omitted).
+          ...(m.isError === true ? { is_error: true } : {}),
         },
       ]);
       continue;
     }
     if (m.role === "assistant") {
       const blocks: Array<Record<string, unknown>> = [];
+      // EXTENDED THINKING ROUND-TRIP: when this assistant turn reasoned, Anthropic requires the signed
+      // `thinking` block be replayed VERBATIM and FIRST (before text/tool_use) so the model can resume a
+      // tool-using turn. Only emitted when BOTH the text and its signature survived (an unsigned block
+      // would be rejected). The text is the model's own output, carried un-neutralized to stay byte-exact.
+      if (typeof m.reasoning === "string" && m.reasoning.length > 0 && typeof m.reasoningSignature === "string" && m.reasoningSignature.length > 0) {
+        blocks.push({ type: "thinking", thinking: m.reasoning, signature: m.reasoningSignature });
+      }
       if (m.content.length > 0) blocks.push({ type: "text", text: m.content });
       if (m.toolCalls !== undefined) {
         for (const tc of m.toolCalls) {
@@ -209,6 +237,7 @@ export class AnthropicProvider implements ModelProvider {
   private readonly fetchImpl: FetchLike;
   private readonly maxErrorDetail: number;
   private readonly anthropicVersion: string;
+  private readonly conversationCache: boolean;
 
   constructor(opts: AnthropicOptions) {
     this.id = opts.id;
@@ -216,6 +245,9 @@ export class AnthropicProvider implements ModelProvider {
     this.apiKey = opts.apiKey;
     this.maxErrorDetail = opts.maxErrorDetail ?? DEFAULT_MAX_ERROR_DETAIL;
     this.anthropicVersion = opts.anthropicVersion ?? ANTHROPIC_VERSION;
+    // Default ON; an explicit constructor value wins, else the env kill-switch, else true.
+    this.conversationCache =
+      opts.conversationCache ?? process.env.IKBI_ANTHROPIC_CONVERSATION_CACHE !== "0";
     // Same fail-closed egress chokepoint as every other provider: an explicit
     // fetchImpl (tests) wins; otherwise resolve the process-wide guarded fetch,
     // which throws if the egress floor has not loaded. Never raw globalThis.fetch.
@@ -247,13 +279,35 @@ export class AnthropicProvider implements ModelProvider {
       req.messages ?? (req.prompt !== undefined ? [{ role: "user", content: req.prompt }] : []);
     const { system, messages } = toAnthropicPayload(src);
 
+    // INCREMENTAL CONVERSATION CACHE: mark the last message so this request's whole message prefix is
+    // cached; the next request (next tool-round / next turn) reads it back cheaply. Gated on a real
+    // multi-message conversation so single-shot prompts stay byte-identical. This is separate from the
+    // system + tool-schema breakpoints (a stable prefix) — together up to 3 of Anthropic's 4 allowed.
+    if (this.conversationCache && messages.length >= CONVERSATION_CACHE_MIN_MESSAGES) {
+      const lastMsg = messages[messages.length - 1];
+      const lastBlock = lastMsg?.content[lastMsg.content.length - 1];
+      if (lastBlock !== undefined) lastBlock.cache_control = CACHE_CONTROL;
+    }
+
+    // EXTENDED THINKING (opt-in): enable the reasoning budget. Anthropic requires max_tokens > budget
+    // and forbids a custom temperature while thinking, so we bump max_tokens above the budget and drop
+    // temperature. A non-positive/absent budget leaves the request byte-identical to the non-thinking path.
+    const thinkingBudget =
+      req.thinking !== undefined && Number.isInteger(req.thinking.budgetTokens) && req.thinking.budgetTokens > 0
+        ? req.thinking.budgetTokens
+        : 0;
+    let maxTokens = req.maxTokens ?? DEFAULT_MAX_TOKENS;
+    if (thinkingBudget > 0 && maxTokens <= thinkingBudget) maxTokens = thinkingBudget + DEFAULT_MAX_TOKENS;
+
     const body: Record<string, unknown> = {
       model: inv.providerModelId,
-      max_tokens: req.maxTokens ?? DEFAULT_MAX_TOKENS,
+      max_tokens: maxTokens,
       messages,
     };
     if (system.length > 0) body.system = system;
-    if (req.temperature !== undefined) body.temperature = req.temperature;
+    // Temperature is incompatible with thinking; only send it when thinking is off.
+    if (req.temperature !== undefined && thinkingBudget === 0) body.temperature = req.temperature;
+    if (thinkingBudget > 0) body.thinking = { type: "enabled", budget_tokens: thinkingBudget };
     if (req.tools !== undefined && req.tools.length > 0) {
       const tools = req.tools.map((t) => ({
         name: t.name,
@@ -326,10 +380,15 @@ export class AnthropicProvider implements ModelProvider {
     if (!Array.isArray(contentBlocks)) throw badResponse(this.id, "content is not an array", usage);
 
     let contentText = "";
+    let reasoningText = "";
+    let reasoningSignature: string | undefined;
     const toolCalls: ToolCall[] = [];
     for (const block of contentBlocks) {
       if (!isRecord(block)) continue;
-      if (block.type === "text" && typeof block.text === "string") {
+      if (block.type === "thinking") {
+        if (typeof block.thinking === "string") reasoningText += block.thinking;
+        if (typeof block.signature === "string") reasoningSignature = block.signature;
+      } else if (block.type === "text" && typeof block.text === "string") {
         contentText += block.text;
       } else if (block.type === "tool_use") {
         if (typeof block.name !== "string" || block.name.length === 0) {
@@ -347,6 +406,8 @@ export class AnthropicProvider implements ModelProvider {
       content: contentText,
       finishReason: mapStopReason(parsed.stop_reason),
       usage,
+      ...(reasoningText.length > 0 ? { reasoning: reasoningText } : {}),
+      ...(reasoningSignature !== undefined ? { reasoningSignature } : {}),
       ...(toolCalls.length > 0 ? { toolCalls } : {}),
     };
     return result;
@@ -423,6 +484,13 @@ export class AnthropicProvider implements ModelProvider {
           const delta = isRecord(ev.delta) ? ev.delta : {};
           if (delta.type === "text_delta" && typeof delta.text === "string" && delta.text.length > 0) {
             return { content: delta.text };
+          }
+          // Extended thinking streams as `thinking_delta` (text) then a final `signature_delta`.
+          if (delta.type === "thinking_delta" && typeof delta.thinking === "string" && delta.thinking.length > 0) {
+            return { reasoning: delta.thinking };
+          }
+          if (delta.type === "signature_delta" && typeof delta.signature === "string" && delta.signature.length > 0) {
+            return { reasoningSignature: delta.signature };
           }
           if (delta.type === "input_json_delta" && typeof delta.partial_json === "string") {
             const toolIndex = toolIndexByBlock.get(idx) ?? idx;

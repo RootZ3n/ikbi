@@ -14,6 +14,10 @@ import type { FinishReason, StreamDelta, TokenUsage, ToolCall } from "./contract
 /** The fully-assembled result of consuming a stream — mirrors the non-streaming fields. */
 export interface AccumulatedResponse {
   readonly content: string;
+  /** ADDITIVE (1.4.0): accumulated extended-thinking text, if the stream carried any. */
+  readonly reasoning?: string;
+  /** ADDITIVE (1.4.0): the reasoning block's opaque signature, for verbatim round-trip. */
+  readonly reasoningSignature?: string;
   readonly toolCalls: readonly ToolCall[];
   readonly finishReason: FinishReason;
   readonly usage?: TokenUsage;
@@ -28,6 +32,8 @@ interface ToolCallParts {
 
 export class StreamAccumulator {
   private content = "";
+  private reasoning = "";
+  private reasoningSignature: string | undefined;
   private finishReason: FinishReason = "unknown";
   private usage: TokenUsage | undefined;
   /** Tool-call fragments keyed by their streaming `index`, assembled in first-seen order. */
@@ -37,6 +43,8 @@ export class StreamAccumulator {
   /** Fold one delta into the running state. */
   push(delta: StreamDelta): void {
     if (delta.content !== undefined) this.content += delta.content;
+    if (delta.reasoning !== undefined) this.reasoning += delta.reasoning;
+    if (delta.reasoningSignature !== undefined) this.reasoningSignature = delta.reasoningSignature;
     if (delta.finishReason !== undefined) this.finishReason = delta.finishReason;
     if (delta.usage !== undefined) this.usage = delta.usage;
     if (delta.toolCalls !== undefined) {
@@ -70,6 +78,8 @@ export class StreamAccumulator {
       this.finishReason === "unknown" && toolCalls.length > 0 ? "tool_calls" : this.finishReason;
     return {
       content: this.content,
+      ...(this.reasoning.length > 0 ? { reasoning: this.reasoning } : {}),
+      ...(this.reasoningSignature !== undefined ? { reasoningSignature: this.reasoningSignature } : {}),
       toolCalls,
       finishReason,
       ...(this.usage !== undefined ? { usage: this.usage } : {}),

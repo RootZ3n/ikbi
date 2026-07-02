@@ -90,8 +90,11 @@ test("auto-compaction does not fire when the last message is an unanswered user 
   // This is the correct behavior: compact between turns, not while waiting for the model.
   const p2: string[] = [];
   await s.send("continue", undefined, "agent", { onProgress: (p) => p2.push(p) });
-  // The key invariant: the session completed successfully (no crash from compacting
-  // while user message was unanswered).
-  assert.ok(p2.includes("Compacting context…") || !p2.includes("Compacting context…"),
-    "turn 2 completed (compaction may or may not fire depending on context after model reply)");
+  // REAL INVARIANT (replaces the former tautology): compaction MUST fire during turn 2 (pressure is
+  // high), and it MUST fire AFTER the model call — never before, while the user message is unanswered.
+  const compactIdx = p2.indexOf("Compacting context…");
+  const thinkIdx = p2.indexOf("Thinking…");
+  assert.ok(compactIdx >= 0, "auto-compaction fires during turn 2 (between turns)");
+  assert.ok(thinkIdx >= 0, "the model was called in turn 2");
+  assert.ok(compactIdx > thinkIdx, "compaction fires AFTER the model responds, not while the user message is unanswered");
 });

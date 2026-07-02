@@ -34,6 +34,12 @@ export interface ModelCapabilities {
   readonly reasoning_level: ReasoningLevel;
   /** Rough latency class. */
   readonly speed_class: SpeedClass;
+  /**
+   * ADDITIVE: whether the model supports Anthropic-style EXTENDED THINKING (a reasoning budget with
+   * signed thinking blocks). Optional; absent ⇒ treat as false. Gates whether the chat loop offers the
+   * opt-in thinking budget, so an unsupported model gracefully never receives a `thinking` request.
+   */
+  readonly supports_thinking?: boolean;
 }
 
 /**
@@ -68,7 +74,15 @@ const FAMILY_PATTERNS: ReadonlyArray<{ readonly match: RegExp; readonly caps: Mo
   { match: /deepseek.*(reason|r1)/i, caps: { context_window: 65_536, supports_tools: false, reasoning_level: "high", speed_class: "slow" } },
   { match: /deepseek/i, caps: { context_window: 65_536, supports_tools: true, reasoning_level: "medium", speed_class: "medium" } },
   { match: /gpt-4o|gpt-4\.1|o[134]/i, caps: { context_window: 128_000, supports_tools: true, reasoning_level: "high", speed_class: "medium" } },
+  // Frontier LOGICAL ids used in the roster (opus-4.8, sonnet-4.6) don't contain the word "claude",
+  // so they must be classified by family here — otherwise they'd fall through to FALLBACK
+  // (supports_tools:false, ctx 8192), forcing text-tool emulation and an 8k window on a 200k model.
+  { match: /(^|[^a-z])(opus|sonnet)[-.]?4/i, caps: { context_window: 200_000, supports_tools: true, reasoning_level: "high", speed_class: "medium", supports_thinking: true } },
+  { match: /haiku/i, caps: { context_window: 200_000, supports_tools: true, reasoning_level: "medium", speed_class: "fast" } },
+  { match: /(claude-)?(opus|sonnet)/i, caps: { context_window: 200_000, supports_tools: true, reasoning_level: "high", speed_class: "medium", supports_thinking: true } },
   { match: /claude/i, caps: { context_window: 200_000, supports_tools: true, reasoning_level: "high", speed_class: "medium" } },
+  { match: /gpt-5/i, caps: { context_window: 200_000, supports_tools: true, reasoning_level: "high", speed_class: "medium" } },
+  { match: /glm-\d/i, caps: { context_window: 128_000, supports_tools: true, reasoning_level: "medium", speed_class: "medium" } },
   { match: /minimax/i, caps: { context_window: 131_072, supports_tools: true, reasoning_level: "high", speed_class: "medium" } },
   { match: /qwen/i, caps: { context_window: 32_768, supports_tools: false, reasoning_level: "medium", speed_class: "fast" } },
   { match: /(llama|gemma|phi|mistral|mixtral)/i, caps: { context_window: 8_192, supports_tools: false, reasoning_level: "low", speed_class: "fast" } },
@@ -80,7 +94,8 @@ function hasOverride(o: Partial<ModelCapabilities> | undefined): o is Partial<Mo
     typeof o.context_window === "number" ||
     typeof o.supports_tools === "boolean" ||
     o.reasoning_level !== undefined ||
-    o.speed_class !== undefined
+    o.speed_class !== undefined ||
+    typeof o.supports_thinking === "boolean"
   );
 }
 
@@ -107,6 +122,7 @@ export function getCapabilities(modelId: string, override?: Partial<ModelCapabil
     supports_tools: typeof override.supports_tools === "boolean" ? override.supports_tools : base.supports_tools,
     reasoning_level: override.reasoning_level ?? base.reasoning_level,
     speed_class: override.speed_class ?? base.speed_class,
+    ...((typeof override.supports_thinking === "boolean" ? override.supports_thinking : base.supports_thinking) ? { supports_thinking: true } : {}),
   };
 }
 

@@ -196,15 +196,15 @@ const RECOMMENDED: RecommendProfile[] = [
   },
   {
     label: "Balanced",
-    builder: "claude-sonnet-4",
+    builder: "sonnet-4.6",
     critic: "deepseek-v4-pro",
     fallback: "deepseek-v4-pro",
     caveats: "Best quality-to-price. Recommended for daily use. Critic catches most issues.",
   },
   {
     label: "Max Quality",
-    builder: "claude-opus-4",
-    critic: "claude-sonnet-4",
+    builder: "opus-4.8",
+    critic: "sonnet-4.6",
     caveats: "Strongest models. Best for complex multi-file refactors. Higher cost and latency.",
   },
   {

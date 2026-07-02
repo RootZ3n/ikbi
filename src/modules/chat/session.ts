@@ -89,8 +89,37 @@ const log = childLogger("chat");
 
 /** Hard cap on model rounds per turn — the tool loop can never run forever. */
 const MAX_TOOL_ITERATIONS = 16;
-/** Generation cap per round. */
-const MAX_TOKENS = 4096;
+/**
+ * Generation cap per round (Anthropic `max_tokens`). 4096 is a safe default for every model, but
+ * a frontier driver (opus) can emit far more, and a large single-file write can truncate at 4096
+ * (finishReason=length). Overridable via IKBI_CHAT_MAX_TOKENS. We do NOT silently raise the default
+ * — a too-high cap on a small-window model wastes budget and risks context overflow — so the value
+ * is operator-chosen and clamped to a sane range. Out-of-range / non-numeric input falls back to 4096.
+ */
+export const MAX_TOKENS_DEFAULT = 4096;
+export const MAX_TOKENS_CEILING = 64_000;
+/** Resolve the per-round generation cap from an env value. Non-numeric / out-of-range input falls
+ *  back to the safe default (never silently uses a bad value). Exported for tests. */
+export function resolveChatMaxTokens(raw: string | undefined): number {
+  if (raw === undefined) return MAX_TOKENS_DEFAULT;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 256 || n > MAX_TOKENS_CEILING) return MAX_TOKENS_DEFAULT;
+  return n;
+}
+const MAX_TOKENS = resolveChatMaxTokens(process.env.IKBI_CHAT_MAX_TOKENS);
+/**
+ * Opt-in EXTENDED THINKING budget (tokens). 0 (default) = OFF — the model never receives a thinking
+ * request. When >0 AND the driver model advertises supports_thinking, the chat loop asks the model to
+ * reason within this budget before answering. Off by default, per the fail-closed posture; a bad value
+ * disables it rather than guessing. Anthropic's minimum thinking budget is 1024. Exported for tests.
+ */
+export function resolveThinkingBudget(raw: string | undefined): number {
+  if (raw === undefined) return 0;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 1024 || n >= MAX_TOKENS_CEILING) return 0;
+  return n;
+}
+const THINKING_BUDGET = resolveThinkingBudget(process.env.IKBI_CHAT_THINKING_BUDGET);
 /** Conversational temperature (warmer than the builder's 0.0 — this is dialogue, not edits). */
 const TEMPERATURE = 0.4;
 /** Max concurrent sessions kept in memory (LRU-evicted beyond this). */
@@ -1393,15 +1422,19 @@ export class ChatSession {
     return `Checks ${allPass ? "ALL PASS" : "FAILED"}:\n${lines.join("\n---\n")}`;
   }
 
-  /** The neutralization chokepoint: a tool result becomes a message ONLY through here. */
-  private appendToolResult(raw: string, call: ToolCall): void {
+  /** The neutralization chokepoint: a tool result becomes a message ONLY through here.
+   *  `isError` marks a FAILED tool (activity.ok === false) so the native Anthropic path can set the
+   *  `tool_result.is_error` flag — letting the model distinguish a real failure from a tool that
+   *  merely returned error-shaped prose. Providers without an error channel ignore the flag. */
+  private appendToolResult(raw: string, call: ToolCall, isError = false): void {
     const safe = neutralizeUntrusted(raw, { source: "mcp_result", identity: this.identity, origin: call.name });
     // Emulated (text-protocol) rounds have no real tool_call_id to attach a tool-role message to —
     // feed the (still-neutralized) result back as a user-role data message instead. Mirrors builder.
+    // (A user-role carrier has no tool_result block, so is_error does not apply there.)
     this.messages.push(
       this.emulatedRound
         ? toUntrustedMessage(safe, { role: "user" })
-        : toUntrustedMessage(safe, { role: "tool", toolCallId: call.id }),
+        : { ...toUntrustedMessage(safe, { role: "tool", toolCallId: call.id }), ...(isError ? { isError: true } : {}) },
     );
   }
 
@@ -1495,6 +1528,13 @@ export class ChatSession {
   /** Switch the driver model for subsequent turns (`/model <name>`). */
   setModel(model: string): void {
     this.model = model;
+  }
+
+  /** The per-request extended-thinking field, or {} when off. Enabled only when the operator set a
+   *  budget AND the CURRENT driver model advertises thinking support (graceful fallback otherwise). */
+  private thinkingRequest(): { thinking: { budgetTokens: number } } | Record<string, never> {
+    if (THINKING_BUDGET <= 0) return {};
+    return getCapabilities(this.model).supports_thinking === true ? { thinking: { budgetTokens: THINKING_BUDGET } } : {};
   }
 
   currentPermissionMode(): PermissionMode {
@@ -1813,6 +1853,13 @@ export class ChatSession {
   private async maybeAutoCompact(opts: TurnOptions): Promise<void> {
     if (AUTO_COMPACT_PERCENT <= 0) return; // disabled
     if (this.messages.length <= this.lastAutoCompactCount) return; // nothing new since last compaction
+    // BETWEEN-TURNS ONLY: never compact while a freshly-appended user message is still awaiting its
+    // response. The pre-model-call site fires this right after pushing the user turn; compacting there
+    // would summarize history in the middle of forming a turn (and burn a compaction the imminent model
+    // call makes moot). We let the model reply first, then the post-response call (trailing = assistant)
+    // compacts between turns. Native tool rounds trail with a "tool" result, so mid-loop growth still
+    // compacts pre-call; only the "user awaiting reply" boundary is skipped.
+    if (this.messages[this.messages.length - 1]?.role === "user") return;
     if (this.contextPercent() < AUTO_COMPACT_PERCENT) return;
     opts.onProgress?.("Compacting context…");
     try {
@@ -1957,7 +2004,8 @@ export class ChatSession {
       const output = outputs[i];
       if (activity !== undefined) tools.push(activity);
       // ERROR HINTS (FIX 9): append a one-line recovery hint to a failed tool's output.
-      if (output !== undefined) this.appendToolResult(withErrorHint(output), call);
+      // Propagate the failure into tool_result.is_error (native Anthropic) via the activity's ok flag.
+      if (output !== undefined) this.appendToolResult(withErrorHint(output), call, activity?.ok === false);
     }
     return false;
   }
@@ -2026,6 +2074,7 @@ export class ChatSession {
           identity: this.identity,
           messages: this.viewWithMemory(memMsg, mode, toolInstructions),
           tools: toolsForModel,
+          ...this.thinkingRequest(),
         });
       } catch (e) {
         this.memory.recordToolActivity(tools);
@@ -2056,6 +2105,11 @@ export class ChatSession {
         // no matching result — persisting them would wedge the next request, so they are dropped.
         ...(response.toolCalls !== undefined && response.toolCalls.length > 0 && response.finishReason === "tool_calls"
           ? { toolCalls: response.toolCalls }
+          : {}),
+        // THINKING ROUND-TRIP: carry the signed thinking block so the next request replays it (required
+        // when the turn used tools). Only when BOTH text + signature survived — an unsigned block is rejected.
+        ...(typeof response.reasoning === "string" && response.reasoning.length > 0 && typeof response.reasoningSignature === "string"
+          ? { reasoning: response.reasoning, reasoningSignature: response.reasoningSignature }
           : {}),
       });
 
@@ -2236,6 +2290,7 @@ export class ChatSession {
         identity: this.identity,
         messages: this.viewWithMemory(memMsg, mode, toolInstructions),
         tools: toolsForModel,
+        ...this.thinkingRequest(),
       };
       const acc = new StreamAccumulator();
       let aborted = false;
@@ -2292,6 +2347,10 @@ export class ChatSession {
         // tool-call (finishReason=length) yields dangling partial calls that would wedge the next
         // request — drop them so nothing partial is replayed.
         ...(round.toolCalls.length > 0 && round.finishReason === "tool_calls" ? { toolCalls: round.toolCalls } : {}),
+        // THINKING ROUND-TRIP (streaming): replay the signed thinking block on the next request.
+        ...(typeof round.reasoning === "string" && round.reasoning.length > 0 && typeof round.reasoningSignature === "string"
+          ? { reasoning: round.reasoning, reasoningSignature: round.reasoningSignature }
+          : {}),
       });
 
       if (aborted) return finish("[ikbi: interrupted]");

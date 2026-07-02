@@ -154,7 +154,7 @@ export const HELP_PAGES: Readonly<Record<string, HelpPage>> = {
     ],
     examples: [
       { cmd: "ikbi evaluate", desc: "Score the configured builder on the default fixtures." },
-      { cmd: "ikbi evaluate --models deepseek-v4-flash,claude-sonnet-4 --modes agent,patch", desc: "Side-by-side on two models." },
+      { cmd: "ikbi evaluate --models deepseek-v4-flash,sonnet-4.6 --modes agent,patch", desc: "Side-by-side on two models." },
       { cmd: "ikbi evaluate --fixture .ikbi/fixtures/auth.json --json", desc: "Custom fixtures, JSON for CI." },
     ],
     seeAlso: ["models", "build", "providers"],
@@ -221,7 +221,7 @@ export const HELP_PAGES: Readonly<Record<string, HelpPage>> = {
     ],
     examples: [
       { cmd: "ikbi audit .", desc: "Snapshot the current repo." },
-      { cmd: "ikbi audit ../service --compare deepseek-v4-flash,claude-sonnet-4", desc: "Adversarial model compare." },
+      { cmd: "ikbi audit ../service --compare deepseek-v4-flash,sonnet-4.6", desc: "Adversarial model compare." },
     ],
     seeAlso: ["review", "receipts", "doctor"],
   },

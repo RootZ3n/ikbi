@@ -66,6 +66,8 @@ function resultToDelta(result: ProviderResult): StreamDelta {
   }));
   return {
     ...(result.content.length > 0 ? { content: result.content } : {}),
+    ...(result.reasoning !== undefined ? { reasoning: result.reasoning } : {}),
+    ...(result.reasoningSignature !== undefined ? { reasoningSignature: result.reasoningSignature } : {}),
     ...(toolCalls.length > 0 ? { toolCalls } : {}),
     finishReason: result.finishReason,
     usage: result.usage,
@@ -501,6 +503,7 @@ export class ProviderInvoker {
       providerModelId: route.providerModelId,
       content: result.content,
       ...(result.reasoning !== undefined ? { reasoning: result.reasoning } : {}),
+      ...(result.reasoningSignature !== undefined ? { reasoningSignature: result.reasoningSignature } : {}),
       ...(toolCalls && toolCalls.length > 0 ? { toolCalls } : {}),
       finishReason: result.finishReason,
       usage: result.usage,

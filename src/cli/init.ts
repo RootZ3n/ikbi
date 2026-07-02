@@ -63,7 +63,7 @@ const RECOMMENDATIONS: Record<string, Recommendation> = {
   balanced: {
     label: "Balanced",
     desc: "Best quality-to-price ratio — recommended for daily use",
-    builder: "claude-sonnet-4",
+    builder: "sonnet-4.6",
     critic: "deepseek-v4-pro",
     fallback: "deepseek-v4-pro",
     cost: "~$0.50/task",
@@ -71,8 +71,8 @@ const RECOMMENDATIONS: Record<string, Recommendation> = {
   quality: {
     label: "Max Quality",
     desc: "Strongest models available — for complex, multi-file refactors",
-    builder: "claude-opus-4",
-    critic: "claude-sonnet-4",
+    builder: "opus-4.8",
+    critic: "sonnet-4.6",
     cost: "~$2.00/task",
   },
   local: {
