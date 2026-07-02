@@ -80,6 +80,7 @@ import { lspDiagnosticTool, runLspDiagnostic } from "../agent-tools/lsp-tools.js
 import { notebookEditTool, runNotebookEdit } from "../agent-tools/notebook-tools.js";
 import { askUserTool, runAskUser } from "../agent-tools/ask-user.js";
 import { launchBuildTool, runLaunchBuild } from "../agent-tools/launch-build.js";
+import { buildReportTool, runBuildReport } from "../self-monitor/build-report-tool.js";
 import type { AskUserFn } from "../cognition-layer/ask.js";
 import type { CustomAgent } from "../agent-router/agent-directory.js";
 import type { ChatToolActivity } from "./contract.js";
@@ -272,6 +273,8 @@ export const CHAT_TOOLS: readonly ModelTool[] = [
   askUserTool,
   // Launch a REAL governed ikbi build (confirm-gated) — the guide's bridge from drafting to doing.
   launchBuildTool,
+  // Report on recent builds (read-only) — the guide watches builds and flags harness-suspect failures.
+  buildReportTool,
   // Knowledge brain (gbrain): recall prior knowledge, synthesize across it, write findings back.
   ...BRAIN_TOOLS,
   // Parity with the builder's final three (adapted to chat — see the tool defs above).
@@ -296,6 +299,8 @@ const READ_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([
   "lsp_diagnostic",
   // Asking the operator a clarifying question mutates nothing — useful while planning too.
   "ask_user",
+  // build_report only READS the receipt log — safe in plan mode, never gated.
+  "build_report",
 ]);
 
 /** Plan mode's tools: CHAT_TOOLS filtered to the read-only subset (no write/patch/terminal/delegate). */
@@ -1235,6 +1240,12 @@ export class ChatSession {
         );
         const ok = !out.startsWith("ERROR");
         return { output: out, activity: { name: "ask_user", ok, ...(typeof args.question === "string" ? { summary: args.question.slice(0, 60) } : {}) } };
+      }
+      case "build_report": {
+        // Read-only build watch: classify recent builds (harness-suspect vs model). Output is a
+        // digest built from ikbi's OWN receipts (trusted), but re-enters via the chokepoint anyway.
+        const out = await runBuildReport(args);
+        return { output: out, activity: { name: "build_report", ok: true, summary: "build report" } };
       }
       case "launch_build": {
         // Peh's bridge from drafting to doing: run the REAL governed `ikbi build` on the session's

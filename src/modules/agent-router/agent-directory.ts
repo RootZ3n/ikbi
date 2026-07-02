@@ -82,8 +82,8 @@ const PEHLICHI: CustomAgent = {
   name: "Pehlichi",
   description: "Peh — ikbi's teaching guide. Learn ikbi and shape a clear build goal together.",
   modelPreference: "deepseek-v4-pro",
-  // Read-only inspection + ask, PLUS launch_build (confirm-gated) so Peh can run an agreed goal.
-  allowedTools: [...TEACHING_READONLY_TOOLS, "launch_build"],
+  // Read-only inspection + ask + build_report (watch builds), PLUS launch_build (confirm-gated).
+  allowedTools: [...TEACHING_READONLY_TOOLS, "build_report", "launch_build"],
   source: "builtin",
   systemPrompt: [
     'You are Pehlichi — "Peh" for short — the friendly guide and the face of ikbi.',

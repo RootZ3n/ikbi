@@ -303,9 +303,11 @@ test("chat advertises the full builder tool suite to the model", async () => {
   for (const t of ALL_TOOLS) {
     assert.ok(names.includes(t), `chat advertises ${t}`);
   }
-  // Plus the CHAT-ONLY launch_build (a persona can launch a governed build; the builder role cannot).
+  // Plus the CHAT-ONLY tools: launch_build (a persona can launch a governed build) + build_report
+  // (the guide watches builds). The builder role has neither.
   assert.ok(names.includes("launch_build"), "chat advertises the chat-only launch_build");
-  assert.equal(new Set(names).size, ALL_TOOLS.length + 1, "chat = the builder suite + launch_build");
+  assert.ok(names.includes("build_report"), "chat advertises the chat-only build_report");
+  assert.equal(new Set(names).size, ALL_TOOLS.length + 2, "chat = the builder suite + launch_build + build_report");
 });
 
 test("send: scout_detail reports no findings (chat runs no scout phase)", async () => {

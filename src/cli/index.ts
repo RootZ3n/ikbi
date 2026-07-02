@@ -47,6 +47,7 @@ import { helpForTopic } from "./help-pages.js";
 import "./receipts.js";
 import "./summary.js";
 import "./cost.js";
+import "./monitor.js";
 import "./undo.js";
 import "./clean.js";
 import "./workspace.js";

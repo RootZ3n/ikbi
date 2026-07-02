@@ -40,7 +40,7 @@ test("chat is a SUPERSET of the builder suite: 25 builder tools + the chat-only 
   // builder role must never launch a nested build. So: no builder-only tool, exactly one chat-only.
   const r = runCapabilities();
   assert.equal(r.builder.length, 25, "builder declares 25 tools");
-  assert.equal(r.chat.length, 26, "chat declares 25 builder tools + launch_build");
+  assert.equal(r.chat.length, 27, "chat declares 25 builder tools + launch_build + build_report");
   assert.deepEqual(r.builderOnly, [], "chat advertises the full builder suite (no builder-only tool)");
-  assert.deepEqual(r.chatOnly, ["launch_build"], "launch_build is the one chat-only tool");
+  assert.deepEqual([...r.chatOnly].sort(), ["build_report", "launch_build"], "the chat-only tools: build_report (watch) + launch_build (act)");
 });
