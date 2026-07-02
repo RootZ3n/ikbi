@@ -32,6 +32,14 @@ test("a blocked DANGEROUS binary still taints (network / shell / privilege / des
   }
 });
 
+test("a BLOCKED write in a read-only verify pass does not taint (benign, no effect)", () => {
+  assert.equal(isPolicyViolation({ tool: "write_file", path: "src/x.ts", error: "write_scope is 'none' — read-only mode" }), false);
+});
+
+test("a new-file-only OVERWRITE attempt on an existing file still taints", () => {
+  assert.equal(isPolicyViolation({ tool: "write_file", path: "src/x.ts", error: "write_scope is 'new_only' — cannot modify existing file" }), true);
+});
+
 test("genuine boundary breaches always taint", () => {
   assert.equal(isPolicyViolation({ tool: "write_file", error: 'path "../x" escapes the worktree' }), true);
   assert.equal(isPolicyViolation({ tool: "write_file", error: "WRITE SCOPE VIOLATION: outside declared scope" }), true);

@@ -625,7 +625,13 @@ function deniedAllowlistBinary(error: string): string | undefined {
 }
 
 export function isPolicyViolation(e: ToolCallError): boolean {
-  // GENUINE boundary breach — confinement/scope escape, write-scope violation, or an attempt to run
+  // READ-ONLY VERIFY PASS: the multi-step final pass runs with writeScope="none". A cheap builder
+  // naturally tries to improve its own work; the scope guard BLOCKS the write (no effect). Tainting
+  // that blocked attempt discarded builds that otherwise verified green. The scope guard is the real
+  // control, so a blocked read-only-mode write is benign in a trusted-local context and must not
+  // discard a clean build. (A "new_only" overwrite attempt on an EXISTING file still taints below.)
+  if (/write_scope is 'none'|read-only mode/i.test(e.error)) return false;
+  // GENUINE boundary breach — confinement/scope escape, new-file-only overwrite, or an attempt to run
   // arbitrary code through a package manager. These ALWAYS taint promotion, even when confinement held.
   if (/escape|write_scope|dependency directory|not allowed|only for verifier\/check|WRITE SCOPE VIOLATION/i.test(e.error)) {
     return true;
