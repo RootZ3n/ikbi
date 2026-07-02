@@ -877,8 +877,23 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
           (writeScope === "new_only"
             ? "You may ONLY create NEW files. Do NOT modify any existing file — read_file to inspect, but write_file/patch on an existing file is FORBIDDEN and will be rejected."
             : "You are in READ-ONLY mode. Do NOT write or patch any file.");
+    // INTERMEDIATE STEP: on a decomposed plan, intermediate steps set skipVerifier/skipPromote — the
+    // project is deliberately incomplete until the LAST step, and the final pass runs the real checks.
+    // Without this the builder's "run_checks must be green before done" RAIL is unsatisfiable for a
+    // partial step (e.g. a types-only step can't compile+test yet), so a cheap model spins to
+    // no_progress and the whole multi-step build evaporates. Relax the gate for THIS step only: write
+    // the scoped files, then done — full verification is deferred to the final step. Safe because an
+    // intermediate step never promotes; the final writeScope="none" pass verifies the accumulated tree.
+    const intermediateStepAddendum =
+      ctx.task.skipVerifier === true
+        ? "\n\nINTERMEDIATE STEP (part of a larger multi-step plan): the project is INTENTIONALLY INCOMPLETE " +
+          "at this step — later steps add the rest and the FULL checks run only at the END. Do NOT expect " +
+          "run_checks to be green now; a partial project will not compile or test yet. The `done` tool's " +
+          "\"run_checks must be green first\" requirement does NOT apply to this intermediate step — ignore it " +
+          "here. Write THIS step's files, optionally sanity-check, then call done."
+        : "";
     const messages: ModelMessage[] = [
-      { role: "system", content: BUILDER_SYSTEM + writeScopeAddendum + primaryTargetsAddendum(targetFiles) },
+      { role: "system", content: BUILDER_SYSTEM + writeScopeAddendum + intermediateStepAddendum + primaryTargetsAddendum(targetFiles) },
       ...(projectInstructions !== undefined
         ? [untrusted(`Project instructions from the target repo (CLAUDE.md/AGENTS.md/IKBI.md/.ikbi/) — honor these conventions where they apply:\n${projectInstructions}`, "project_instructions")]
         : []),
