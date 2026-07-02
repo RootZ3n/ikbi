@@ -43,6 +43,8 @@ const okResult: SelfHealResult = {
   verdict: { disposition: "applied", verified: true, requiresHuman: false, requiresOpusReview: false, reasons: ["verified and low blast-radius"] },
   failure: { taskId: "t1", classification: { category: "harness", harnessSuspect: true, signal: "checks_unresolvable", evidence: "no manifest" }, targetRepo: "/repos/ikbi" },
   candidate: { produced: true, changedFiles: ["src/x.ts"], branch: "ikbi/ws/1" },
+  suite: { green: true, testCount: 3070 },
+  judge: { pass: true },
   blastRadius: { severity: "low", reasons: [], requiresHuman: false, requiresOpusReview: false, autoApplyEligible: true },
   reason: "self-heal t1: auto-applied to a branch",
 };
@@ -105,7 +107,32 @@ test("--run (enabled + --yes) invokes the loop and prints the disposition", asyn
   assert.equal(seen?.targetRepo, "/repos/ikbi");
   assert.match(c.out, /APPLIED to a branch/);
   assert.match(c.out, /ikbi\/ws\/1/);
+  assert.match(c.out, /suite: green \(3070 tests\)/, "the gate's test count is surfaced for audit");
+  assert.match(c.out, /judge: pass/);
   assert.equal(c.exit, 0, "a landed fix is a success exit");
+});
+
+test("--candidates lists self-heal branches (label-filtered, excludes discarded)", async () => {
+  const c = cap();
+  const records = [
+    { id: "ws-a", targetRepo: "/repos/ikbi", baseBranch: "main", baseRef: "r", scratchBranch: "ikbi/ws/ws-a", path: "/wt/ws-a", identity: { agentId: "x", trustTier: "trusted" }, state: "allocated", createdAt: 1, updatedAt: 1, label: "self-heal:t1" },
+    { id: "ws-b", targetRepo: "/repos/ikbi", baseBranch: "main", baseRef: "r", scratchBranch: "ikbi/ws/ws-b", path: "/wt/ws-b", identity: { agentId: "x", trustTier: "trusted" }, state: "discarded", createdAt: 2, updatedAt: 2, label: "self-heal:t2" },
+    { id: "ws-c", targetRepo: "/repos/other", baseBranch: "main", baseRef: "r", scratchBranch: "ikbi/ws/ws-c", path: "/wt/ws-c", identity: { agentId: "x", trustTier: "trusted" }, state: "allocated", createdAt: 3, updatedAt: 3, label: "worker:build-9" },
+  ];
+  const cli = createHealCli({ workspaces: { list: async () => records as never }, stdout: c.stdout, stderr: c.stderr, setExit: c.setExit });
+  await cli.run(["--candidates"]);
+  assert.match(c.out, /ikbi\/ws\/ws-a/, "the live self-heal candidate is listed");
+  assert.match(c.out, /healed t1/);
+  assert.doesNotMatch(c.out, /ws-b/, "a discarded candidate is excluded");
+  assert.doesNotMatch(c.out, /ws-c/, "a non-self-heal (worker) workspace is excluded");
+  assert.match(c.out, /ikbi workspace discard/, "points at the existing prune surface");
+});
+
+test("--candidates with none pending says so", async () => {
+  const c = cap();
+  const cli = createHealCli({ workspaces: { list: async () => [] }, stdout: c.stdout, stderr: c.stderr, setExit: c.setExit });
+  await cli.run(["--candidates"]);
+  assert.match(c.out, /nothing pending review/i);
 });
 
 test("--run with an unknown task id errors", async () => {

@@ -3,9 +3,8 @@
   "version": "0.1.0-rc.1",
   "description": "ikbi (Choctaw: \"to build\") — the build/repair engine for a lab of agents. A localhost/Tailscale-reachable system service.",
   "type": "module",
-  "author": "Jeffrey Miller",
-  "license": "MIT",
   "author": "RootZ3n <rootz3n@proton.me>",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/RootZ3n/ikbi.git"
@@ -14,11 +13,6 @@
   "bugs": {
     "url": "https://github.com/RootZ3n/ikbi/issues"
   },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/RootZ3n/ikbi.git"
-  },
-  "homepage": "https://github.com/RootZ3n/ikbi#readme",
   "keywords": [
     "build-engine",
     "agent-orchestration",

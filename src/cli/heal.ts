@@ -17,6 +17,8 @@ import { writeStdout, writeStderr } from "./io.js";
 import { config } from "../core/config.js";
 import { receipts as coreReceipts } from "../core/receipt/index.js";
 import type { ReceiptStore } from "../core/receipt/index.js";
+import { workspaces as coreWorkspaces } from "../core/workspace/index.js";
+import type { WorkspaceRecord } from "../core/workspace/contract.js";
 import { beginOperation, resolveIdentity as coreResolveIdentity } from "../core/identity/index.js";
 import type { ValidatedIdentity } from "../core/identity/index.js";
 import { buildDigest, type ReceiptLike } from "../modules/self-monitor/monitor.js";
@@ -36,10 +38,16 @@ export interface HealCliDeps {
   readonly operatorToken?: string | undefined;
   /** The `IKBI_SELFHEAL_ENABLE` opt-in value (default: the process env). */
   readonly enabled?: string | undefined;
+  /** Workspace manager (for `--candidates`, listing self-heal's leftover branches). */
+  readonly workspaces?: { list(): Promise<WorkspaceRecord[]> };
 }
+
+/** The workspace label prefix self-heal stamps on every candidate workspace it allocates. */
+const SELF_HEAL_LABEL_PREFIX = "self-heal:";
 
 const USAGE =
   "Usage: ikbi heal [--days <n>] [--limit <n>]                 (preview harness-suspect failures)\n" +
+  "       ikbi heal --candidates                               (list self-heal branches awaiting review)\n" +
   "       ikbi heal --task <id> --run [--tier mid|frontier] --yes   (attempt a real self-heal)\n";
 
 export function createHealCli(deps: HealCliDeps = {}) {
@@ -51,6 +59,29 @@ export function createHealCli(deps: HealCliDeps = {}) {
   const resolveIdentity = deps.resolveIdentity ?? coreResolveIdentity;
   const operatorToken = "operatorToken" in deps ? deps.operatorToken : config.identity.operatorToken;
   const enabled = "enabled" in deps ? deps.enabled : process.env.IKBI_SELFHEAL_ENABLE;
+  const workspaces = deps.workspaces ?? coreWorkspaces;
+
+  async function candidates(): Promise<void> {
+    // Self-heal leaves each candidate on its OWN branch (skipPromote — never merged) for review; over
+    // time these accumulate. List them so the operator can review/merge — or drop one with
+    // `ikbi workspace discard <id>` (reuses the existing lifecycle surface; no separate prune here).
+    let records: WorkspaceRecord[];
+    try {
+      records = (await workspaces.list()).filter((r) => (r.label ?? "").startsWith(SELF_HEAL_LABEL_PREFIX) && r.state !== "discarded");
+    } catch (e) {
+      err(`ikbi heal --candidates: could not list workspaces: ${e instanceof Error ? e.message : String(e)}\n`);
+      setExit(1);
+      return;
+    }
+    if (records.length === 0) { out("No self-heal candidate branches — nothing pending review.\n"); return; }
+    out(`${records.length} self-heal candidate branch(es) awaiting review:\n\n`);
+    for (const r of records.sort((a, b) => a.createdAt - b.createdAt)) {
+      const healed = (r.label ?? "").slice(SELF_HEAL_LABEL_PREFIX.length);
+      out(`• ${r.scratchBranch} [${r.state}] — healed ${healed} in ${r.targetRepo}\n`);
+      out(`    worktree: ${r.path}\n`);
+    }
+    out(`\nReview a branch and merge it, or drop one:  ikbi workspace discard <id>\n`);
+  }
 
   async function harnessFailures(days: number, limit: number): Promise<BuildRecord[]> {
     const fromTime = Number.isFinite(days) && days > 0 ? nowMs() - days * 24 * 60 * 60 * 1000 : undefined;
@@ -130,6 +161,7 @@ export function createHealCli(deps: HealCliDeps = {}) {
     const testCountBefore = tcbRaw !== undefined && Number.isFinite(Number(tcbRaw)) ? Number(tcbRaw) : undefined;
 
     try {
+      if (argv.includes("--candidates")) { await candidates(); return; }
       if (argv.includes("--run")) {
         if (task === undefined || task.length === 0) { err(`ikbi heal: --run requires --task <id>.\n${USAGE}`); setExit(1); return; }
         await attempt(task, tier, testCountBefore, argv.includes("--yes"));
@@ -161,7 +193,12 @@ export function formatHealResult(r: SelfHealResult): string {
     lines.push(`  branch: ${r.candidate.branch}`);
   }
   if (r.blastRadius !== undefined) lines.push(`  blast-radius: ${r.blastRadius.severity}`);
-  if (r.suite !== undefined && !r.suite.green && r.suite.summary !== undefined) lines.push(`  suite: ${r.suite.summary}`);
+  if (r.suite !== undefined) {
+    // Surface the gate's test count so a run is auditable — you can see the suite actually ran.
+    if (r.suite.green) lines.push(`  suite: green${r.suite.testCount !== undefined ? ` (${r.suite.testCount} tests)` : " (count unparsed)"}`);
+    else lines.push(`  suite: FAILED${r.suite.summary !== undefined ? ` — ${r.suite.summary}` : ""}`);
+  }
+  if (r.judge !== undefined) lines.push(`  judge: ${r.judge.pass ? "pass" : `reject${r.judge.reason !== undefined ? ` (${r.judge.reason})` : ""}`}`);
   if (r.advice !== undefined) lines.push(`\n  Opus advises:\n  ${r.advice.split("\n").join("\n  ")}`);
   return lines.join("\n");
 }
@@ -216,6 +253,10 @@ function defaultRunHeal(
             signal: failure.classification.signal,
             ...(result.blastRadius !== undefined ? { blastRadius: result.blastRadius.severity } : {}),
             ...(result.candidate?.branch !== undefined ? { branch: result.candidate.branch } : {}),
+            // Audit trail: the gate's outcome + test count, so a receipt proves the suite ran.
+            ...(result.suite !== undefined ? { suiteGreen: result.suite.green } : {}),
+            ...(result.suite?.testCount !== undefined ? { suiteTestCount: result.suite.testCount } : {}),
+            ...(result.judge !== undefined ? { judgePass: result.judge.pass } : {}),
           },
         }, identity);
       },
