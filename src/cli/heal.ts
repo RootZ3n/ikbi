@@ -181,20 +181,27 @@ function defaultRunHeal(
     }
     const who = resolveIdentity({ token: operatorToken });
     const ctx = beginOperation(who, { requestId: `heal-${failure.taskId}-${nowRequestSuffix()}` });
-    const [{ composeExecutors, liveSelfHealIo, runSelfHeal }, { runWorker }, { workspaces }, { deterministicJudge }, { invokeModel }, { receipts }] = await Promise.all([
+    const [{ composeExecutors, liveSelfHealIo, runSelfHeal }, { createProductionWorker }, { workspaces }, { deterministicJudge }, { invokeModel }, { receipts }] = await Promise.all([
       import("../modules/self-heal/index.js"),
-      import("../modules/worker-model/index.js"),
+      import("../modules/worker-model/cli.js"),
       import("../core/workspace/index.js"),
       import("../modules/deterministic-judge/judge.js"),
       import("../core/provider/index.js"),
       import("../core/receipt/index.js"),
     ]);
+    // The build needs a PRODUCTION orchestrator (roleClaim → worker-role credentials for scout/builder/
+    // …); the bare runWorker default has none and cannot spawn roles. skipPromote:true means the wired
+    // gate-wall is never reached, so nothing promotes — the candidate stays isolated on its branch.
+    if (config.identity.workerToken === undefined || config.identity.workerToken.length === 0) {
+      throw new Error("no worker token (IKBI_WORKER_TOKEN) — self-heal needs it to spawn the build's worker roles");
+    }
+    const worker = createProductionWorker({ workerToken: config.identity.workerToken });
     const adviceModel = process.env.IKBI_SELFHEAL_ADVICE_MODEL ?? process.env.IKBI_PEH_MODEL ?? "opus-4.8";
     const io = liveSelfHealIo({
       identity: who.identity,
       parentCtx: ctx,
       allocate: (targetRepo) => workspaces.allocate({ targetRepo, identity: who.identity, label: `self-heal:${failure.taskId}` }),
-      runWorker,
+      runWorker: worker.run,
       judge: (candidates) => deterministicJudge.judge(candidates),
       invokeAdvice: async (messages) => (await invokeModel({ model: adviceModel, identity: who.identity, messages: [...messages] })).content,
       appendReceipt: async (result, identity) => {
