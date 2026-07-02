@@ -74,6 +74,12 @@ export interface ToolExecutorDeps {
   readonly jobs?: JobControl;
   /** The run's validated identity — authorizes governed terminal / brain_sync. Absent ⇒ those fail closed. */
   readonly parentCtx?: OperationContext;
+  /**
+   * PERSISTENT SHELL cwd for `terminal`: a worktree-relative subdirectory the command runs in (the
+   * caller's `cd` state). Absent/"." ⇒ the worktree root — the builder never sets it, so its
+   * behavior is unchanged. Re-confined inside the terminal tool as defense-in-depth.
+   */
+  readonly terminalCwd?: string;
 }
 
 /**
@@ -316,6 +322,7 @@ export async function executeTool(deps: ToolExecutorDeps, call: ToolCall): Promi
           governedExec: deps.governedExec,
           ...(deps.jobs !== undefined ? { jobs: deps.jobs } : {}),
           ...(deps.parentCtx !== undefined ? { parentCtx: deps.parentCtx } : {}),
+          ...(deps.terminalCwd !== undefined ? { cwdSubdir: deps.terminalCwd } : {}),
         },
         worktreeReal,
         args,

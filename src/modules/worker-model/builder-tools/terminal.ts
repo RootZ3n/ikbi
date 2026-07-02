@@ -42,6 +42,14 @@ export interface TerminalDeps {
   readonly jobs?: JobControl;
   /** The run's validated OperationContext. Absent ⇒ the tool fails closed (cannot authorize). */
   readonly parentCtx?: OperationContext;
+  /**
+   * PERSISTENT SHELL cwd: a worktree-relative subdirectory the command runs IN (the session's
+   * `cd` state). Absent/"." ⇒ the worktree root, exactly as before — so the builder and every
+   * existing caller are byte-unchanged. It only relocates the command's cwd; the OS sandbox's
+   * single writable root stays the whole worktree, and the value is re-confined here as
+   * defense-in-depth (a subdir that escapes the tree is ignored).
+   */
+  readonly cwdSubdir?: string;
 }
 
 /** Default terminal timeout (ms) — generous enough for installs/test suites. */
@@ -286,6 +294,13 @@ export async function runTerminal(
   // (governed-exec SIGKILLs the whole process group at the timeout — no orphaned processes).
   const requested = typeof args.timeout_ms === "number" && Number.isFinite(args.timeout_ms) ? args.timeout_ms : undefined;
   const timeoutMs = Math.min(MAX_TERMINAL_TIMEOUT_MS, Math.max(1_000, requested ?? DEFAULT_TERMINAL_TIMEOUT_MS));
+  // PERSISTENT SHELL: run in the session's `cd` subdirectory when set (re-confined under the
+  // worktree). Absent/"." keeps the historical cwd = worktree root.
+  let runCwd = worktreeDir;
+  if (typeof deps.cwdSubdir === "string" && deps.cwdSubdir.length > 0 && deps.cwdSubdir !== ".") {
+    const confined = confinePath(worktreeDir, deps.cwdSubdir);
+    if (confined.ok) runCwd = confined.full;
+  }
   try {
     // BACKGROUND: spawn detached (no timeout) and return the job handle. Still routes through the
     // SAME governed-exec run() — gate-wall + allowlist + policy + receipt — only the wait is dropped.
@@ -294,7 +309,7 @@ export async function runTerminal(
         parentCtx: deps.parentCtx,
         command: binary,
         args: rest,
-        cwd: worktreeDir,
+        cwd: runCwd,
         worktreeRoot: worktreeDir, // the OS sandbox keeps ONLY this writable (F1)
         purpose: `builder terminal (background): ${command.slice(0, 120)}`,
         background: true,
@@ -305,7 +320,7 @@ export async function runTerminal(
       parentCtx: deps.parentCtx,
       command: binary,
       args: rest,
-      cwd: worktreeDir,
+      cwd: runCwd,
       worktreeRoot: worktreeDir, // the OS sandbox keeps ONLY this writable (F1)
       purpose: `builder terminal: ${command.slice(0, 120)}`,
       timeoutMs,

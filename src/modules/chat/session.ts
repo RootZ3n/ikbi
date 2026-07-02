@@ -26,9 +26,9 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 
 import { config } from "../../core/config.js";
@@ -72,7 +72,7 @@ import { patchTool } from "../worker-model/builder-tools/patch.js";
 import { multiEditTool } from "../worker-model/builder-tools/multi-edit.js";
 import { globTool } from "../worker-model/builder-tools/glob.js";
 import { searchFilesTool } from "../worker-model/builder-tools/search-files.js";
-import { terminalTool } from "../worker-model/builder-tools/terminal.js";
+import { terminalTool, tokenizeCommand } from "../worker-model/builder-tools/terminal.js";
 import { parseTextToolCalls, textToolProtocolInstructions } from "../worker-model/builder-tools/text-tool-protocol.js";
 import { runVisionAnalyze, visionAnalyzeTool } from "../worker-model/builder-tools/vision-tool.js";
 import { runWebExtract, runWebSearch, webExtractTool, webSearchTool } from "../worker-model/builder-tools/web-tools.js";
@@ -97,6 +97,18 @@ const TEMPERATURE = 0.4;
 const MAX_SESSIONS = 100;
 /** Max images a single turn may carry (the operator paste cap). */
 const MAX_TURN_IMAGES = 8;
+/**
+ * Auto-compact the conversation when context pressure reaches this percent of the model's window —
+ * the equivalent of Claude Code compacting a full context instead of waiting for a manual `/compact`.
+ * Overridable via IKBI_CHAT_AUTO_COMPACT_PERCENT; 0 (or an out-of-range value clamps to default) —
+ * set to 0 to disable and keep the manual-only behavior.
+ */
+const AUTO_COMPACT_PERCENT = ((): number => {
+  const raw = process.env.IKBI_CHAT_AUTO_COMPACT_PERCENT;
+  if (raw === undefined) return 80;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 && n <= 100 ? n : 80;
+})();
 
 /**
  * Build the OPERATOR-pasted image parts for a turn. Each entry must be a data-URL
@@ -125,7 +137,7 @@ const CHAT_SYSTEM =
   "- search_files — locate code with ripgrep before you change it.\n" +
   "- patch — make a surgical, exact, unique find-and-replace edit (prefer this for small changes).\n" +
   "- write_file — create a file or rewrite it wholesale.\n" +
-  "- terminal — run an allowlisted shell command through ikbi's GOVERNED executor.\n" +
+  "- terminal — run an allowlisted shell command through ikbi's GOVERNED executor. `cd <dir>` persists: it sets the working directory for your later terminal commands this session (confined to the worktree).\n" +
   "- git_status / git_diff / git_log — read-only git inspection of the worktree (see what changed).\n" +
   "- web_search / web_extract — research documentation, Stack Overflow, etc. (read-only).\n" +
   "- delegate_task — hand an independent, self-contained subtask to a focused sub-agent.\n" +
@@ -879,6 +891,13 @@ export class ChatSession {
   /** True while THIS round's tool calls were parsed from TEXT (no-native-tool-API model): their
    *  results feed back as user-role data, not tool-role (no real tool_call_id exists). */
   private emulatedRound = false;
+  /** Message count at the last auto-compaction — auto-compact only re-fires once the conversation
+   *  has grown past this, so a single turn never re-summarizes the same history repeatedly. */
+  private lastAutoCompactCount = 0;
+  /** PERSISTENT SHELL: the terminal tool's working directory, worktree-relative ("." = root).
+   *  Updated by a `cd` command and carried across terminal calls for the life of the session, so
+   *  `cd src` then `ls` behaves like a real shell instead of every command starting at the root. */
+  private shellCwd = ".";
   /** When the session was first created (carried across resume, for `/status`). */
   readonly createdAt: number;
   /** Last-touched timestamp (for LRU eviction). */
@@ -1238,11 +1257,69 @@ export class ChatSession {
    * confinement / memory-governor / execution machinery — the same governance chokepoint the
    * builder shares. Mutations are recorded here for /rollback, and a colorizable diff is attached.
    */
+  /**
+   * Recognize a STANDALONE `cd` command and return its target (a bare `cd` → "" = worktree root).
+   * Returns undefined for anything that is not a simple `cd` — a compound (`cd x && y`), a multi-arg
+   * form, or a non-cd command — so those fall through to the real executor unchanged.
+   */
+  private parseCdCommand(raw: unknown): string | undefined {
+    if (typeof raw !== "string") return undefined;
+    let tokens: string[];
+    try {
+      tokens = tokenizeCommand(raw.trim());
+    } catch {
+      return undefined;
+    }
+    if (tokens[0] !== "cd") return undefined;
+    if (tokens.length > 2) return undefined; // compound / multi-arg — not a simple cd
+    return tokens.length === 2 ? (tokens[1] ?? "") : "";
+  }
+
+  /**
+   * Resolve a `cd` target against the CURRENT shell cwd, confined to the worktree. Returns the new
+   * worktree-relative directory or a denial. An escape (absolute path, `..` past the root, or a
+   * symlink leaving the tree) and a non-directory target are both refused — the terminal tool can
+   * never be walked out of the managed workspace via `cd`.
+   */
+  private resolveShellCwd(target: string): { ok: true; rel: string } | { ok: false; error: string } {
+    const combined = target.length === 0 ? this.shellCwd : join(this.shellCwd, target);
+    const abs = resolve(this.worktree, combined);
+    let rel = relative(this.worktree, abs);
+    if (rel.startsWith("..") || isAbsolute(rel)) return { ok: false, error: `'${target}' escapes the worktree` };
+    // Realpath the target so a symlink whose destination leaves the tree is caught too.
+    try {
+      const real = realpathSync(abs);
+      const realRel = relative(this.worktree, real);
+      if (realRel.startsWith("..") || isAbsolute(realRel)) return { ok: false, error: `'${target}' escapes the worktree` };
+      if (!statSync(real).isDirectory()) return { ok: false, error: `'${target}' is not a directory` };
+      rel = realRel;
+    } catch {
+      return { ok: false, error: `no such directory '${target}'` };
+    }
+    return { ok: true, rel: rel.length === 0 ? "." : rel };
+  }
+
   private async runSharedExecutorTool(call: ToolCall, args: Record<string, unknown>): Promise<{ output: string; activity: ChatToolActivity }> {
+    // PERSISTENT SHELL: intercept a bare `cd` so it updates the session's working directory instead
+    // of hitting the (shell-less) executor, which cannot run `cd`. Other terminal commands then run
+    // in that directory. This is the one bit of shell statefulness a per-command sandbox can offer.
+    if (call.name === "terminal") {
+      const cd = this.parseCdCommand(args.command);
+      if (cd !== undefined) {
+        const resolved = this.resolveShellCwd(cd);
+        if (!resolved.ok) {
+          return { output: `ERROR: cd: ${resolved.error}`, activity: { name: "terminal", ok: false, summary: "cd denied" } };
+        }
+        this.shellCwd = resolved.rel;
+        const shown = resolved.rel === "." ? "the worktree root" : resolved.rel;
+        return { output: `cwd is now ${shown}`, activity: { name: "terminal", ok: true, summary: `cd ${resolved.rel}` } };
+      }
+    }
     const deps: ToolExecutorDeps = {
       worktreeReal: this.worktree,
       agentId: this.identity.agentId,
       governedExec,
+      ...(this.shellCwd !== "." ? { terminalCwd: this.shellCwd } : {}),
       // BACKGROUND jobs: the SAME governed-exec singleton runs commands, so its job manager can
       // poll/kill a `terminal background:true` job. Without this the tool advertises background
       // mode the executor can never reach.
@@ -1723,6 +1800,32 @@ export class ChatSession {
     return { before, after: this.messages.length, compressed };
   }
 
+  /**
+   * AUTOMATIC compaction: when context pressure crosses AUTO_COMPACT_PERCENT, compact before the next
+   * model call — the between-turns behavior Claude Code has, so a long session never hard-overflows
+   * the window while waiting for a manual `/compact`. Deduped on message growth (never re-summarizes
+   * the same history in a loop) and best-effort (a failure is logged, never blocks the turn).
+   */
+  private async maybeAutoCompact(opts: TurnOptions): Promise<void> {
+    if (AUTO_COMPACT_PERCENT <= 0) return; // disabled
+    if (this.messages.length <= this.lastAutoCompactCount) return; // nothing new since last compaction
+    if (this.contextPercent() < AUTO_COMPACT_PERCENT) return;
+    opts.onProgress?.("Compacting context…");
+    try {
+      const res = await this.compact();
+      // Mark even a no-op compaction so we don't retry every iteration; growth re-arms it.
+      this.lastAutoCompactCount = this.messages.length;
+      if (res.compressed) {
+        log.info(
+          { sessionId: this.id, before: res.before, after: res.after, contextPercent: this.contextPercent() },
+          "chat: auto-compacted context",
+        );
+      }
+    } catch (e) {
+      log.warn({ err: errMsg(e), sessionId: this.id }, "chat: auto-compaction failed");
+    }
+  }
+
   /** Replace the whole conversation with a fresh start (a hard `/reset` of in-place history). */
   clearHistory(): void {
     this.messages = [{ role: "system", content: CHAT_SYSTEM }];
@@ -1764,6 +1867,83 @@ export class ChatSession {
       }
     }
     return result;
+  }
+
+  /** A tool call is parallel-safe when it only READS (no worktree writes, no exec, no egress, no
+   *  operator prompt). Reads run concurrently; everything else is serialized. `ask_user` is read-only
+   *  but interactive, so it is excluded — two clarifying prompts must never race. */
+  private isParallelSafe(name: string): boolean {
+    return READ_ONLY_TOOL_NAMES.has(name) && name !== "ask_user";
+  }
+
+  /**
+   * Execute one round's tool calls and append their (neutralized) results IN ORDER.
+   *
+   * Read-only tools run CONCURRENTLY — the parallelism Claude Code has and the load-bearing
+   * change here: when a round reads five files, all five reads are in flight at once instead of
+   * five serial model-blocking round-trips. Any mutating/stateful tool (write, patch, terminal,
+   * delegate, run_checks, MCP, …) is serialized against the OTHER mutating tools via a chain, so
+   * governance, receipts, and worktree writes keep their sequential guarantees and never race.
+   *
+   * Results are ALWAYS appended through the neutralization chokepoint in the model's original call
+   * order — `tool_result` must line up with `tool_use` for the native Anthropic path. Every call
+   * gets a result even if its tool threw (a synthesized error result), so a failed tool never
+   * leaves a dangling tool_use that would wedge the next request. Returns true if the turn was
+   * aborted, so the caller can return its own interrupted result.
+   */
+  private async executeToolRound(
+    roundToolCalls: readonly ToolCall[],
+    mode: ChatMode,
+    opts: TurnOptions,
+    tools: ChatToolActivity[],
+  ): Promise<boolean> {
+    if (opts.signal?.aborted) return true;
+    const n = roundToolCalls.length;
+    const outputs = new Array<string | undefined>(n);
+    const activities = new Array<ChatToolActivity | undefined>(n);
+
+    const runOne = async (idx: number, call: ToolCall): Promise<void> => {
+      opts.onProgress?.(progressPhase(call));
+      try {
+        const { output, activity } = await this.runTool(call, mode, opts);
+        outputs[idx] = output;
+        activities[idx] = activity;
+      } catch (e) {
+        // A thrown tool still needs a matching result so the tool_use is answered.
+        outputs[idx] = `ERROR: ${call.name} failed: ${errMsg(e)}`;
+        activities[idx] = { name: call.name, ok: false, summary: `failed: ${errMsg(e)}` };
+      }
+    };
+
+    // Launch read-only calls immediately; chain mutating calls so at most one runs at a time,
+    // preserving their relative order. Both feed the same indexed result slots.
+    const pending: Promise<void>[] = [];
+    let mutatingChain: Promise<void> = Promise.resolve();
+    for (let i = 0; i < n; i += 1) {
+      const call = roundToolCalls[i];
+      if (call === undefined) continue;
+      const idx = i;
+      if (this.isParallelSafe(call.name)) {
+        pending.push(runOne(idx, call));
+      } else {
+        mutatingChain = mutatingChain.then(() => runOne(idx, call));
+        pending.push(mutatingChain);
+      }
+    }
+    await Promise.all(pending);
+    if (opts.signal?.aborted) return true;
+
+    // Append every result in the model's call order — the chokepoint neutralizes each one.
+    for (let i = 0; i < n; i += 1) {
+      const call = roundToolCalls[i];
+      if (call === undefined) continue;
+      const activity = activities[i];
+      const output = outputs[i];
+      if (activity !== undefined) tools.push(activity);
+      // ERROR HINTS (FIX 9): append a one-line recovery hint to a failed tool's output.
+      if (output !== undefined) this.appendToolResult(withErrorHint(output), call);
+    }
+    return false;
   }
 
   private async runTurn(
@@ -1816,6 +1996,8 @@ export class ChatSession {
         return { response: "[ikbi: reached the tool-iteration limit for this turn — try narrowing the request.]", tools, cost: turnCost, contextPercent: this.contextPercent() };
       }
 
+      // AUTO-COMPACT: relieve context pressure before the model call (between-turns + mid-loop growth).
+      await this.maybeAutoCompact(opts);
       // PROGRESS (FIX 4): signal the "thinking" phase before the (possibly slow) model call.
       opts.onProgress?.("Thinking…");
       if (opts.signal?.aborted) return interrupted();
@@ -1877,15 +2059,8 @@ export class ChatSession {
       }
 
       if (roundToolCalls !== undefined) {
-        for (const call of roundToolCalls) {
-          if (opts.signal?.aborted) return interrupted();
-          // PROGRESS (FIX 4): name the tool (and a short target) as the spinner phase.
-          opts.onProgress?.(progressPhase(call));
-          const { output, activity } = await this.runTool(call, mode, opts);
-          tools.push(activity);
-          // ERROR HINTS (FIX 9): append a one-line recovery hint to a failed tool's output.
-          this.appendToolResult(withErrorHint(output), call); // chokepoint: neutralize + append
-        }
+        // Read-only calls run in parallel; mutating calls serialize. Results append in order.
+        if (await this.executeToolRound(roundToolCalls, mode, opts, tools)) return interrupted();
         continue; // let the model read the (neutralized) results and continue
       }
 
@@ -2026,6 +2201,8 @@ export class ChatSession {
         return finish("[ikbi: reached the tool-iteration limit for this turn — try narrowing the request.]");
       }
 
+      // AUTO-COMPACT: relieve context pressure before the model call (between-turns + mid-loop growth).
+      await this.maybeAutoCompact(opts);
       opts.onProgress?.("Thinking…");
       if (opts.signal?.aborted) return finish("[ikbi: interrupted]");
 
@@ -2113,13 +2290,8 @@ export class ChatSession {
       }
 
       if (roundToolCalls !== undefined) {
-        for (const call of roundToolCalls) {
-          if (opts.signal?.aborted) return finish("[ikbi: interrupted]");
-          opts.onProgress?.(progressPhase(call));
-          const { output, activity } = await this.runTool(call, mode, opts);
-          tools.push(activity);
-          this.appendToolResult(withErrorHint(output), call); // chokepoint: neutralize + append
-        }
+        // Read-only calls run in parallel; mutating calls serialize. Results append in order.
+        if (await this.executeToolRound(roundToolCalls, mode, opts, tools)) return finish("[ikbi: interrupted]");
         continue; // let the model read the (neutralized) results and continue
       }
 

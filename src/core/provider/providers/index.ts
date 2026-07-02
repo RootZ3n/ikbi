@@ -8,6 +8,7 @@
 
 import type { OpenRouterEndpointConfig, ProviderEndpointConfig } from "../../config.js";
 import type { ModelProvider } from "../contract.js";
+import { AnthropicProvider } from "./anthropic.js";
 import { type FetchLike, OpenAICompatibleProvider } from "./openai-compatible.js";
 
 export const MIMO_PROVIDER_ID = "mimo";
@@ -73,10 +74,10 @@ export function createOpenAIProvider(cfg: ProviderEndpointConfig, fetchImpl?: Fe
   });
 }
 
-/** Build the Anthropic provider endpoint config (OpenAI-compatible proxy shape; native Anthropic API requires a dedicated adapter). */
+/** Build the NATIVE Anthropic provider (real `/messages` API: tool_use blocks, system prompt, prompt caching). */
 export const ANTHROPIC_PROVIDER_ID = "anthropic";
 export function createAnthropicProvider(cfg: ProviderEndpointConfig, fetchImpl?: FetchLike): ModelProvider {
-  return new OpenAICompatibleProvider({
+  return new AnthropicProvider({
     id: ANTHROPIC_PROVIDER_ID,
     baseUrl: cfg.baseUrl,
     apiKey: cfg.apiKey,
@@ -141,3 +142,4 @@ export function createTogetherProvider(cfg: ProviderEndpointConfig, fetchImpl?: 
 }
 
 export { OpenAICompatibleProvider, type FetchLike } from "./openai-compatible.js";
+export { AnthropicProvider } from "./anthropic.js";

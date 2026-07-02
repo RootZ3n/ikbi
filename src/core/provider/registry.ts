@@ -12,6 +12,7 @@ import { readFileSync } from "node:fs";
 
 import type { ModelCapabilities, ReasoningLevel, SpeedClass } from "./capabilities.js";
 import type { CostRate, ModelProvider } from "./contract.js";
+import { AnthropicProvider } from "./providers/anthropic.js";
 import { OpenAICompatibleProvider } from "./providers/openai-compatible.js";
 
 /** One step in a model's ordered fallback chain: which provider, what model id to send. */
@@ -268,8 +269,18 @@ function parseModelSpec(v: unknown, source: string): ModelSpec {
 function parseProviderEntry(v: unknown, source: string): ModelProvider {
   const r = asRecord(v, "provider", source);
   const kind = r.kind ?? "openai-compatible";
-  if (kind !== "openai-compatible") {
+  if (kind !== "openai-compatible" && kind !== "anthropic") {
     throw new Error(`Provider roster ${source}: unsupported provider kind "${String(kind)}"`);
+  }
+  // NATIVE Anthropic: the real /messages API (tool_use blocks, system prompt, prompt caching).
+  // It has no keyless/extraBody/tokenField knobs — those are OpenAI-shim concepts.
+  if (kind === "anthropic") {
+    const apiKeyA = typeof r.apiKey === "string" ? r.apiKey : undefined;
+    return new AnthropicProvider({
+      id: asString(r.id, "provider.id", source),
+      baseUrl: asString(r.baseUrl, "provider.baseUrl", source),
+      apiKey: apiKeyA,
+    });
   }
   const headersRaw = r.headers;
   const extraHeaders: Record<string, string> = {};
