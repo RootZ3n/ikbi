@@ -832,7 +832,11 @@ function readlineSource(getTurnController?: () => AbortController | undefined): 
  * continues interactively; on non-TTY stdin it runs the one turn and exits (same one-shot
  * shape as piped input). When absent, piped stdin (if any) supplies the first message instead.
  */
-export async function liveRepl(argv: readonly string[] = [], initialMessage?: string): Promise<void> {
+export async function liveRepl(
+  argv: readonly string[] = [],
+  initialMessage?: string,
+  opts?: { readonly persona?: string; readonly model?: string; readonly greeting?: string },
+): Promise<void> {
   const out = (s: string): void => void process.stdout.write(s);
   const quiet = argv.includes("--quiet");
   // `--verbose`/`--debug` opt into raw technical detail (+stack) on translated error messages.
@@ -946,6 +950,22 @@ export async function liveRepl(argv: readonly string[] = [], initialMessage?: st
     session = await newSession();
   }
 
+  // STARTING PERSONA (e.g. `ikbi peh` adopts Pehlichi): find + adopt the requested agent and set its
+  // model, so the user lands directly in a session with the guide. Built-in agents (Pehlichi) resolve
+  // with zero setup; a user's .ikbi/agents/ override of the same name wins. Best-effort — a missing
+  // persona never blocks the session.
+  if (opts?.persona !== undefined && opts.persona.length > 0 && session.setPersona !== undefined) {
+    const agent = findCustomAgent(process.cwd(), opts.persona);
+    if (agent !== undefined) {
+      session.setPersona(agent);
+      if (opts.model !== undefined && opts.model.length > 0 && session.setModel !== undefined) session.setModel(opts.model);
+      const model = session.currentModel !== undefined ? session.currentModel() : (opts.model ?? agent.modelPreference ?? "?");
+      status(opts.greeting ?? `\n🐿️  You're with ${agent.name} — ${agent.description ?? "ikbi's guide"} [model: ${model}].\n   Ask about ikbi, or tell ${agent.name} what you want to build and he'll help shape the goal. Type /exit to leave.\n\n`);
+    } else {
+      status(`[persona "${opts.persona}" not found — starting the default assistant]\n`);
+    }
+  }
+
   // PROJECT AUTO-DISCOVERY (FIX 2): a one-line overview of the worktree at startup.
   try {
     status(formatOverview(discoverProject(session.worktree)));
@@ -988,6 +1008,31 @@ registerCommand({
   summary: "Start an interactive conversational session (multi-turn, tool-calling)",
   usage: "ikbi repl [--continue | --resume <id> | --fork <id>]",
   run: (argv) => liveRepl(argv),
+});
+
+/**
+ * Resolve the model PEHLICHI runs on. Peh has his OWN brain, separate from the build roster and easy
+ * to change: `ikbi peh --model <id>` for a one-off, else IKBI_PEH_MODEL, else the default pro model.
+ * The model id resolves through the roster/registry, so pointing it at a model on a different provider
+ * (edit providers.json) changes Peh's provider too — one knob for model, the roster for provider.
+ */
+export function resolvePehModel(argv: readonly string[] = []): string {
+  const flagIdx = argv.indexOf("--model");
+  const flag = flagIdx >= 0 ? argv[flagIdx + 1] : undefined;
+  if (flag !== undefined && flag.length > 0 && !flag.startsWith("--")) return flag;
+  const env = process.env.IKBI_PEH_MODEL?.trim();
+  return env !== undefined && env.length > 0 ? env : "deepseek-v4-pro";
+}
+
+/**
+ * `ikbi peh` — the front door. Drops the user straight into a session with PEHLICHI ("Peh"), ikbi's
+ * teaching guide, on Peh's own model (see resolvePehModel). This is the face a new user meets first.
+ */
+registerCommand({
+  name: "peh",
+  summary: "Talk to Pehlichi — ikbi's teaching guide: learn ikbi and shape a build goal together",
+  usage: "ikbi peh [--model <id>] [--continue | --resume <id>]",
+  run: (argv) => liveRepl(argv, undefined, { persona: "Pehlichi", model: resolvePehModel(argv) }),
 });
 
 /**
