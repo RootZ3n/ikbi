@@ -21,6 +21,7 @@ export {
   buildAdviceMessages,
   parseNumstat,
   parseDeleted,
+  mergeDiffStat,
   toCandidateFix,
   toBuildCandidate,
   judgePassed,

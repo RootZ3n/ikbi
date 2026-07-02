@@ -76,6 +76,16 @@ test("verified + guard-path candidate (meta-rule) → awaiting-authorization AND
   assert.equal(res.advice, "Opus: proceed with caution.");
 });
 
+test("advice is BEST-EFFORT: a failing advisory call degrades to a note, keeps the disposition", async () => {
+  // The advice model may be a stub/unreachable (roster-dependent). A throw must NOT discard the
+  // verified awaiting-authorization result — the human still needs to see the fix.
+  const { ex } = fakeExecutors({ candidate: { produced: true, changedFiles: ["src/modules/gate-wall/index.ts"], linesChanged: 8, branch: "b" } });
+  const throwing: SelfHealExecutors = { ...ex, opusAdvise: async () => { throw new Error("stub provider: opus-4.8 not backed"); } };
+  const res = await runSelfHeal({ failure: failure(harnessCls) }, throwing);
+  assert.equal(res.verdict.disposition, "awaiting-authorization", "the verified disposition survives a failed advisory");
+  assert.match(res.advice ?? "", /advice unavailable: .*not backed/);
+});
+
 test("suite fails → diagnosed-proposal, never applied, no Opus advice", async () => {
   const { ex, calls } = fakeExecutors({ suite: { green: false, testCount: 3030, summary: "2 failing" } });
   const res = await runSelfHeal({ failure: failure(harnessCls) }, ex);

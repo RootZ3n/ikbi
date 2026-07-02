@@ -15,6 +15,7 @@ import {
   buildAdviceMessages,
   buildFixTask,
   composeExecutors,
+  mergeDiffStat,
   parseDeleted,
   parseNumstat,
   toBuildCandidate,
@@ -52,6 +53,16 @@ test("parseNumstat sums added+removed and collects files (handles binary '-' row
 test("parseDeleted extracts only D-status paths", () => {
   assert.deepEqual(parseDeleted("D\tsrc/gone.ts\nD\ttest/old.test.ts\n"), ["src/gone.ts", "test/old.test.ts"]);
   assert.deepEqual(parseDeleted(""), []);
+});
+
+test("mergeDiffStat: a deleted file lands ONLY in deletedFiles (not double-counted in changedFiles)", () => {
+  // git shows a deletion in BOTH numstat and name-status; blast-radius must not count it twice.
+  const numstat = "1\t0\tsrc/new.ts\n2\t0\tREADME.md\n0\t21\tLICENSE\n";
+  const nameStatusD = "D\tLICENSE\n";
+  const stat = mergeDiffStat(numstat, nameStatusD);
+  assert.deepEqual(stat.changedFiles, ["src/new.ts", "README.md"], "LICENSE is excluded from changed");
+  assert.deepEqual(stat.deletedFiles, ["LICENSE"]);
+  assert.equal(stat.linesChanged, 1 + 2 + 21);
 });
 
 test("toCandidateFix: produced iff any changed file; carries branch + workspace id", () => {

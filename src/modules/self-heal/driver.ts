@@ -89,10 +89,16 @@ export async function runSelfHeal(input: SelfHealDriverInput, ex: SelfHealExecut
   });
 
   // STEP 4 — Opus advises ONLY when the disposition asks for it (verified + high/max). Advisory only:
-  // it never changes the disposition — the human reads it and decides.
+  // it never changes the disposition — the human reads it and decides. BEST-EFFORT: the advice model
+  // may be a stub or unreachable (its availability depends on the operator's roster); a failed advisory
+  // call must NEVER discard the verified disposition — degrade to a note and keep the result.
   let advice: string | undefined;
   if (verdict.requiresOpusReview) {
-    advice = await ex.opusAdvise({ failure, candidate, blastRadius });
+    try {
+      advice = await ex.opusAdvise({ failure, candidate, blastRadius });
+    } catch (e) {
+      advice = `(advice unavailable: ${e instanceof Error ? e.message : String(e)})`;
+    }
   }
 
   const result: SelfHealResult = {

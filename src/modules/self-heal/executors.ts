@@ -13,6 +13,8 @@
  */
 
 import { spawn } from "node:child_process";
+import { existsSync, symlinkSync } from "node:fs";
+import { join } from "node:path";
 
 import type { AgentIdentity } from "../../core/identity/contract.js";
 import type { OperationContext } from "../../core/identity/index.js";
@@ -129,6 +131,18 @@ export function parseDeleted(output: string): string[] {
     if (m !== null) deleted.push(m[1] as string);
   }
   return deleted;
+}
+
+/**
+ * Merge the two git views into a clean DiffStat. A deleted file shows up in BOTH numstat (as a change)
+ * and name-status; keep it ONLY in deletedFiles so assessBlastRadius's `[...changed, ...deleted]` never
+ * double-counts it (which would inflate breadth and over-raise severity). changedFiles = added/modified.
+ */
+export function mergeDiffStat(numstatOut: string, nameStatusDOut: string): DiffStat {
+  const { changedFiles, linesChanged } = parseNumstat(numstatOut);
+  const deletedFiles = parseDeleted(nameStatusDOut);
+  const deletedSet = new Set(deletedFiles);
+  return { changedFiles: changedFiles.filter((f) => !deletedSet.has(f)), deletedFiles, linesChanged };
 }
 
 /** Combine a DiffStat + workspace into the CandidateFix the driver gates. produced = any change. */
@@ -271,7 +285,7 @@ export interface LiveSelfHealDeps {
   /** Run a git command in a worktree, returning stdout. */
   readonly execGit?: (cwd: string, args: readonly string[]) => Promise<string>;
   /** Run the ikbi suite (`pnpm build` + `pnpm test`) in a worktree, returning {code, output}. */
-  readonly runSuiteProcess?: (cwd: string) => Promise<{ code: number; output: string }>;
+  readonly runSuiteProcess?: (cwd: string, targetRepo: string) => Promise<{ code: number; output: string }>;
   /** The deterministic judge (default: the singleton). */
   readonly judge: (candidates: readonly BuildCandidate[]) => DetJudgeResult;
   /** Invoke the advisory model (default: invokeModel with the configured advice model). */
@@ -289,14 +303,14 @@ export function liveSelfHealIo(deps: LiveSelfHealDeps): SelfHealIo {
     build: (task) => deps.runWorker(task, deps.parentCtx),
     readDiff: async (handle) => {
       // Stage everything (including untracked new files) so the diff vs the isolation base is complete.
+      // Validated: `git add -A && git diff --cached <baseRef>` captures added, modified, and deleted.
       await execGit(handle.path, ["add", "-A"]);
       const numstat = await execGit(handle.path, ["diff", "--cached", handle.baseRef, "--numstat"]);
       const nameStatus = await execGit(handle.path, ["diff", "--cached", handle.baseRef, "--name-status", "--diff-filter=D"]);
-      const { changedFiles, linesChanged } = parseNumstat(numstat);
-      return { changedFiles, deletedFiles: parseDeleted(nameStatus), linesChanged };
+      return mergeDiffStat(numstat, nameStatus);
     },
     runSuite: async (handle) => {
-      const { code, output } = await runSuiteProcess(handle.path);
+      const { code, output } = await runSuiteProcess(handle.path, handle.targetRepo);
       const parsed = parseTestCountSafe(output);
       const green = code === 0;
       return {
@@ -326,7 +340,16 @@ function defaultExecGit(cwd: string, args: readonly string[]): Promise<string> {
   });
 }
 
-function defaultRunSuite(cwd: string): Promise<{ code: number; output: string }> {
+function defaultRunSuite(cwd: string, targetRepo: string): Promise<{ code: number; output: string }> {
+  // A fresh git worktree has NO node_modules (deps are gitignored) — validated: `pnpm build` fails
+  // "tsc not found". Self-heal targets ikbi against (near-)identical deps, so symlink the target repo's
+  // node_modules into the worktree: `tsc`/`tsx` then resolve and the full build+test runs. (A fix that
+  // changes deps/lockfile would want a real install; that is a rare harness-fix case — noted, not run.)
+  try {
+    const src = join(targetRepo, "node_modules");
+    const dst = join(cwd, "node_modules");
+    if (existsSync(src) && !existsSync(dst)) symlinkSync(src, dst, "dir");
+  } catch { /* best-effort: if the link fails the suite fails loudly below, which is the safe outcome */ }
   return new Promise((resolve) => {
     // Build (typecheck) then test, sharing one shell so a build failure short-circuits the suite.
     const child = spawn("sh", ["-c", "pnpm build && pnpm test"], {
