@@ -197,6 +197,28 @@ describe("step-planner", () => {
       assert.equal(plan.steps[0]?.goal, goal, "the original goal is preserved unchanged");
     });
 
+    it("regroups a multi-file goal so each step is a COMPLETE action-led task (no mid-task fragments)", () => {
+      // Real Bokahli multi-file case that fragmented into 5 steps (2 of them fragments — "exports a
+      // function greet(...)" and "capitalized name,") and was then discarded by the whole-build
+      // critic. The goal has THREE genuine tasks (Add greeter / add names / write tests); the intra-
+      // task "and"s ("imports X and exports Y", "trimmed and capitalized") must NOT open new steps.
+      const goal =
+        "Add a src/greeter.ts module that imports formatName from ./names.js and exports a function " +
+        "greet(name: string): string returning a greeting, and add a src/names.ts module that exports " +
+        "function formatName(raw: string): string returning a trimmed and capitalized name, and write " +
+        "node:test files for both modules";
+      const plan = decompose(goal);
+      assert.equal(plan.decomposed, true, "three genuine action-led tasks → a real decomposition");
+      assert.equal(plan.steps.length, 3, "exactly three coherent steps, not five fragments");
+      // Every step must OPEN with an imperative action verb — proof no fragment leads a step.
+      for (const s of plan.steps) {
+        assert.match(s.goal, /^(?:add|write)\b/i, `step must start with an action verb: "${s.goal.slice(0, 40)}"`);
+      }
+      // The greeter step keeps its "exports greet()" continuation; the names step keeps "capitalized".
+      assert.match(plan.steps[0]?.goal ?? "", /greeter\.ts.*exports a function greet/is, "greeter task stays whole");
+      assert.match(plan.steps[1]?.goal ?? "", /names\.ts.*capitalized name/is, "names task stays whole");
+    });
+
     it("STILL counts a real imperative verb followed by an object (not a paren) as action-led", () => {
       // Guard the fix's boundary: "generate a report" (verb + object) is a genuine task opener and
       // must still count, so a legitimately multi-task goal is not accidentally suppressed.

@@ -159,11 +159,19 @@ function looksMultiTask(goal: string, parts: readonly string[]): boolean {
   return wordCount >= MIN_MULTITASK_WORDS;
 }
 
+/** A raw split of the goal + whether it came from an explicit NUMBERED list (which must not be
+ *  regrouped — the user's own numbering is authoritative). Conjunction/semicolon splits are
+ *  regrouped by `groupByActionLead` so each step is a complete task, not a mid-task fragment. */
+interface GoalSplit {
+  readonly parts: string[];
+  readonly numbered: boolean;
+}
+
 /**
  * Split a goal on conjunctions and punctuation into sub-goals.
  * Tries multiple delimiters in order of specificity.
  */
-function splitGoal(goal: string): string[] {
+function splitGoal(goal: string): GoalSplit {
   // All delimiter splits below are located in the code-masked view, so a separator that lives
   // inside a `()[]{}`/backtick code span (a TS type's `;`, a union's `|`, a signature's `,`) is
   // never treated as a task boundary. Pieces are still sliced from the ORIGINAL goal.
@@ -173,32 +181,56 @@ function splitGoal(goal: string): string[] {
   // view (so "0..1" inside a code span cannot masquerade as a list) but extracted from the original.
   const numbered = masked.match(/\b\d+[.)]\s*.+/g);
   if (numbered && numbered.length >= 2) {
-    return goal
-      .match(/\b\d+[.)]\s*.+/g)!
-      .map((s) => s.replace(/^\d+[.)]\s*/, "").trim())
-      .filter(Boolean);
+    return {
+      parts: goal
+        .match(/\b\d+[.)]\s*.+/g)!
+        .map((s) => s.replace(/^\d+[.)]\s*/, "").trim())
+        .filter(Boolean),
+      numbered: true,
+    };
   }
 
   // Try "and" splitting: "do X and do Y and do Z"
   // Only split on "and" that separates independent clauses (not "read and write")
   const andParts = splitByMask(goal, masked, /\s+and\s+(?=[a-z])/i);
   if (andParts.length >= 2 && andParts.every((p) => p.length > 10)) {
-    return andParts.map((s) => s.trim()).filter(Boolean);
+    return { parts: andParts.map((s) => s.trim()).filter(Boolean), numbered: false };
   }
 
   // Try comma+conjunction: "do X, also Y, plus Z"
   const commaParts = splitByMask(goal, masked, /,\s*(?:also|then|additionally|plus|and)\s+/i);
   if (commaParts.length >= 2 && commaParts.every((p) => p.length > 10)) {
-    return commaParts.map((s) => s.trim()).filter(Boolean);
+    return { parts: commaParts.map((s) => s.trim()).filter(Boolean), numbered: false };
   }
 
   // Try semicolons: "do X; do Y; do Z" (only semicolons OUTSIDE code spans reach here).
   const semiParts = splitByMask(goal, masked, /\s*;\s*/);
   if (semiParts.length >= 2 && semiParts.every((p) => p.length > 10)) {
-    return semiParts.map((s) => s.trim()).filter(Boolean);
+    return { parts: semiParts.map((s) => s.trim()).filter(Boolean), numbered: false };
   }
 
-  return [goal];
+  return { parts: [goal], numbered: false };
+}
+
+/**
+ * Regroup conjunction-split clauses so each group BEGINS at an imperative action verb. A clause that
+ * does NOT open with an action verb is a CONTINUATION of the preceding task ("...and exports greet()",
+ * "...and capitalized name") and is merged back into it. Without this, a single multi-file task whose
+ * prose contains intra-task "and"s ("imports X and exports Y") fragments into incoherent sub-steps —
+ * the exact failure that decomposed one greeter/names goal into 5 pieces (2 of them fragments), built
+ * green per-step, then got discarded by the whole-build critic. `looksMultiTask` already gated on
+ * ≥2 action-led clauses, so grouping here recovers exactly those genuine tasks, each with its full
+ * description. Callers fall back to the raw parts if grouping would collapse below 2 groups.
+ */
+function groupByActionLead(parts: readonly string[]): string[] {
+  const groups: string[] = [];
+  for (const part of parts) {
+    const trimmed = part.trim();
+    if (trimmed.length === 0) continue;
+    if (groups.length === 0 || ACTION_VERB.test(trimmed)) groups.push(trimmed);
+    else groups[groups.length - 1] = `${groups[groups.length - 1]} and ${trimmed}`;
+  }
+  return groups;
 }
 
 /**
@@ -230,7 +262,7 @@ export function decompose(goal: string): StepPlan {
   }
 
   // Complex goal — try to split.
-  const parts = splitGoal(goal);
+  const { parts, numbered } = splitGoal(goal);
   // OVER-TRIGGER GUARD (Issue 2): a split into < 2 parts, OR a split that lacks genuine
   // multi-task evidence (a short goal whose only signal is "and" twice), is NOT a real
   // decomposition — pass through as a single step rather than spawning spurious sub-steps.
@@ -244,12 +276,21 @@ export function decompose(goal: string): StepPlan {
     };
   }
 
-  const steps: Step[] = parts.slice(0, MAX_STEPS).map((part, i) => ({
+  // A NUMBERED list is explicit user structure — keep each item as its own step. A conjunction/
+  // semicolon split is REGROUPED so each step begins at an action verb (mid-task continuations like
+  // "...and exports greet()" merge into their parent task) — this is what keeps a multi-file goal
+  // from fragmenting into incoherent sub-steps. If regrouping collapses below 2 groups (e.g. a
+  // sequencer split whose clauses are not action-led), fall back to the raw parts so an intended
+  // multi-step goal is not flattened.
+  const grouped = numbered ? parts : groupByActionLead(parts);
+  const stepGoals = grouped.length >= 2 ? grouped : parts;
+
+  const steps: Step[] = stepGoals.slice(0, MAX_STEPS).map((part, i, arr) => ({
     index: i + 1,
     goal: part,
     targetFiles: extractPaths(part),
     // L4: verificationHint is RESERVED metadata — no caller consumes it yet (see Step.verificationHint).
-    ...(i === parts.length - 1 ? { verificationHint: "run pnpm test to verify all changes" } : {}),
+    ...(i === arr.length - 1 ? { verificationHint: "run pnpm test to verify all changes" } : {}),
   }));
 
   return {
