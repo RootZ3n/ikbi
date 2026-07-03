@@ -1413,6 +1413,19 @@ button{font-family:inherit}
 .peh-dash-wall-flex{display:flex;flex-direction:column;gap:1px}
 .peh-dash-row{display:flex;flex:1 1 0;gap:1px;min-height:0}
 .peh-dash-wall-flex .peh-dash-tile{flex:1 1 0;min-width:0}
+
+/* Mobile: the packed wall becomes a single scrolling column of cards.
+   Below the breakpoint the rows dissolve (display:contents) so every tile
+   flows straight into the wall's flex column at full width instead of being
+   squeezed side-by-side; tall full-content tiles cap at 80vh and keep their
+   own internal scroll, so no single card dominates the page. Placed AFTER the
+   flex-wall rules so it wins the cascade at equal specificity. */
+@media (max-width:880px){
+  .peh-dash-surface{overflow-y:auto;overflow-x:hidden}
+  .peh-dash-wall-flex{flex:0 0 auto}
+  .peh-dash-row{display:contents}
+  .peh-dash-wall-flex .peh-dash-tile{flex:0 0 auto;min-width:0;min-height:200px;max-height:80vh}
+}
 .peh-dash-tile{display:flex;flex-direction:column;min-width:0;min-height:0;background:var(--bg-card,rgba(22,18,52,.96));border:0;border-radius:0;box-shadow:none;overflow:hidden}
 .peh-dash-tile-head{flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border-subtle);background:linear-gradient(180deg,rgba(255,255,255,.035),transparent)}
 .peh-dash-tile-glyph{color:var(--peh-accent);display:inline-flex;flex:0 0 auto}
