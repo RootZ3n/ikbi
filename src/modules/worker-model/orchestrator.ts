@@ -707,6 +707,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   const retrievalMode = resolveRetrievalMode(modeEnv, { production: enforceProjectRoot });
   // Bug 2: retain (don't discard) a FAILED build's workspace so its work survives for inspection.
   const retainFailedWorkspaces = config.retainFailedWorkspaces ?? true;
+  // TRUST LADDER (default OFF): earned-trust tier governance for building. OFF ⇒ build outcomes never
+  // move the worker's tier (no demotion) AND verified-green work promotes regardless of tier. ON only
+  // when explicitly enabled (IKBI_WORKER_MODEL_TRUST_LADDER=true). Safety controls are independent.
+  const trustLadderActive = config.trustLadder === true;
   const requestApproval = deps.requestApproval; // SG-10 human-approval gate (undefined ⇒ no gate)
 
   // H3: enforce a per-role WALL-CLOCK timeout. Only the builder self-checks between model calls;
@@ -1051,7 +1055,14 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       spawnedFrom: parent.agentId,
       ...(parent.sessionId !== undefined ? { sessionId: parent.sessionId } : {}),
     });
-    return { identity, kind: resolved.kind, autonomy: autonomyForTier(effectiveTier), validated: resolved };
+    // TRUST LADDER (default OFF for building): the trust tier must not GATE building. With the ladder
+    // off, verified-green work promotes regardless of tier — force autoCommit on. Everything else is
+    // left exactly as the tier dictates: `sandboxed`/`gateLevel` (execution confinement, enforced by
+    // governed-exec + the OS sandbox) AND `requiresApproval` (the SG-10 human gate) are UNCHANGED, so
+    // this lifts only the promotion friction, never a safety or operator control.
+    const grant = autonomyForTier(effectiveTier);
+    const autonomy: AutonomyGrant = trustLadderActive ? grant : { ...grant, autoCommit: true };
+    return { identity, kind: resolved.kind, autonomy, validated: resolved };
   }
 
   /** Record a role's outcome to receipts. Trust recording is opt-in (skipTrust=true skips it). */
@@ -1150,7 +1161,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // FIX A: per-build trust recording. When skipTrust is set, trust is recorded ONCE
     // after the build completes (worker.build) instead of per-role (worker.role.*).
     // This eliminates the cascade where one failed build = 3-4 consecutive failures.
-    if (skipTrust) return;
+    // TRUST LADDER OFF (default): build outcomes never move the worker's trust tier — skip the
+    // per-role trust signal entirely (the role receipt above still records the outcome for audit).
+    if (skipTrust || !trustLadderActive) return;
 
     if (suppressTrustSignal) {
       // EXPLICIT, auditable receipt for the autonomy decision: trust is deliberately left
@@ -1205,6 +1218,24 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     reason?: string,
   ): Promise<void> {
     if (workerSpawned === undefined) return;
+    // TRUST LADDER OFF (default): a build outcome must NOT move the worker's trust tier. Write one
+    // auditable receipt recording that the ladder was disabled (so the trail explains why trust did
+    // not move) and skip trust.recordOutcome entirely — no demotion, no promotion-streak. This is the
+    // fix for harness-caused demotion (an over-decomposition artifact or a blocked no-effect probe
+    // classified as a policy violation must never strip a worker's autonomy during building).
+    if (!trustLadderActive) {
+      await receipts.append(
+        {
+          operation: "worker.trust.ladder_disabled",
+          outcome: { status: "success", detail: `trust ladder OFF — build outcome "${status}" did not move worker trust (set IKBI_WORKER_MODEL_TRUST_LADDER=true to enable earned-trust demotion/promotion).${reason !== undefined ? ` (${reason})` : ""}` },
+          requestId: taskId,
+          metadata: { agentId: workerSpawned.identity.agentId, buildStatus: status, ...(reason !== undefined ? { reason } : {}) },
+          project: targetRepo,
+        },
+        workerSpawned.identity,
+      );
+      return;
+    }
     if (suppress) {
       await receipts.append(
         {

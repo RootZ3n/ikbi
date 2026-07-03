@@ -1926,6 +1926,16 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
 
     const policyViolations = rejectedToolCalls.filter(isPolicyViolation);
     const toolFormatErrors = rejectedToolCalls.filter((e) => !isPolicyViolation(e));
+    // OBSERVABILITY: a single policy violation DISCARDS an otherwise-verified build at the integrator
+    // gate, yet the discard reason only ever reported a COUNT ("attempted 1 out-of-policy tool call")
+    // — never WHICH call. That made a discard un-auditable without a costly --verbose re-run. Log the
+    // offending tool + error (command already truncated to 100 chars in `path`) so the trail is complete.
+    if (policyViolations.length > 0) {
+      log.warn(
+        { policyViolations: policyViolations.map((v) => ({ tool: v.tool, error: v.error, ...(v.path !== undefined ? { path: v.path } : {}) })) },
+        "builder recorded out-of-policy tool call(s) — these taint promotion at the integrator gate",
+      );
+    }
     const outcome = classifyOutcome(stopReason);
     let summary =
       `builder ${outcome} after ${toolRounds} tool round(s) (stop: ${stopReason}); ` +

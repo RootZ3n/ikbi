@@ -209,10 +209,11 @@ test("competitive: a candidate that never reaches a successful verifier is NOT c
 });
 
 test("competitive: a non-autoCommit tier (verified) commits NO candidate (autonomy respected)", async () => {
+  // Tier-gated autoCommit is LADDER machinery (opt-in; default OFF for building), so enable it here.
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("verified", "verified");
   const ws = compWorkspaces();
   const cap = compRoles(() => ({ typecheck: 0, test: 0 }));
-  const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: cap.roles }));
+  const orch = createOrchestrator(deps({ config: { ...COMP, trustLadder: true }, resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: cap.roles }));
   await orch.run(task, parentCtx);
   assert.equal(ws.committed.length, 0, "verified tier → autoCommit false → no candidate committed");
 });

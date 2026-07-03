@@ -34,30 +34,96 @@ function actionLedClauseCount(parts: readonly string[]): number {
 }
 
 /**
- * STRONG structural separators — unambiguous multi-task markers (numbered/ordered lists,
- * semicolon-separated clauses, or explicit sequencer words after a comma). When present, the
- * split is a real decomposition regardless of length. The weaker "and …and" conjunction signal
- * does NOT count here — that is exactly the over-trigger this guard exists to suppress.
+ * Length-preserving mask of "code-literal" spans so their punctuation never registers as a task
+ * separator. Everything strictly INSIDE `(...)`, `[...]`, `{...}`, or a `` `backtick` `` span is
+ * replaced with a space; the delimiters themselves are kept. A TypeScript return type
+ * `{ a: number; b: string }`, a union `('a' | 'b' | 'c')`, or an inline `foo; bar` therefore
+ * contributes NO semicolons / commas / "and"s to the heuristics below. Unbalanced openers mask to
+ * end-of-string. The result is the same UTF-16 length as the input, so callers can locate a real
+ * delimiter in the masked string and slice the ORIGINAL at the same index (see `splitByMask`).
+ *
+ * This is the fix for goals that carry code in their prose (e.g. "export function f(): { a; b }"):
+ * before it, a TS type's `;` looked like a multi-task separator and fragmented one goal into many.
+ */
+export function maskCodeSpans(goal: string): string {
+  const chars = goal.split(""); // UTF-16 code units → indices align with RegExp match indices
+  let depth = 0;
+  let inTick = false;
+  for (let i = 0; i < chars.length; i += 1) {
+    const ch = chars[i]!;
+    if (inTick) {
+      if (ch === "`") inTick = false;
+      else chars[i] = " ";
+      continue;
+    }
+    if (ch === "`") {
+      inTick = true;
+      continue;
+    }
+    if (ch === "(" || ch === "[" || ch === "{") {
+      depth += 1;
+      continue;
+    }
+    if (ch === ")" || ch === "]" || ch === "}") {
+      if (depth > 0) depth -= 1;
+      continue;
+    }
+    if (depth > 0) chars[i] = " ";
+  }
+  return chars.join("");
+}
+
+/**
+ * Split `original` at every match of `sep` that falls OUTSIDE a code-literal span — the matches are
+ * located in the equal-length `masked` string (where in-code delimiters have become spaces) and the
+ * pieces are sliced from `original` so bracketed content survives verbatim. Mirrors `String.split`:
+ * the delimiter is removed and the pieces are returned untrimmed.
+ */
+function splitByMask(original: string, masked: string, sep: RegExp): string[] {
+  const re = new RegExp(sep.source, sep.flags.includes("g") ? sep.flags : `${sep.flags}g`);
+  const parts: string[] = [];
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(masked)) !== null) {
+    if (m[0].length === 0) {
+      re.lastIndex += 1; // guard against a zero-width match spinning forever
+      continue;
+    }
+    parts.push(original.slice(last, m.index));
+    last = m.index + m[0].length;
+  }
+  parts.push(original.slice(last));
+  return parts;
+}
+
+/**
+ * STRONG structural separators — unambiguous multi-task markers (numbered/ordered lists or explicit
+ * sequencer words after a comma). When present, the split is a real decomposition regardless of
+ * length. Two signals are DELIBERATELY excluded here:
+ *   - the weaker "and …and" conjunction — the classic over-trigger this guard suppresses;
+ *   - semicolons — code literals (a TS type `{ a: number; b: string }`) use them freely, so a
+ *     semicolon alone must NOT authorize a split. A semicolon-separated goal can still decompose,
+ *     but only when corroborated by ≥2 action-led clauses (see `looksMultiTask`).
+ * Detection runs on the code-masked goal so punctuation inside `()[]{}`/backticks never counts.
  */
 function hasStrongSeparator(goal: string): boolean {
+  const masked = maskCodeSpans(goal);
   // Numbered/ordered list: "1. ... 2. ..." or "1) ... 2) ...".
-  if ((goal.match(/\b\d+[.)]\s*.+/g) ?? []).length >= 2) return true;
+  if ((masked.match(/\b\d+[.)]\s*.+/g) ?? []).length >= 2) return true;
   // Explicit sequencers introduced by a comma: "do X, also Y", "do X, then Y, plus Z".
-  if (/,\s*(?:also|then|additionally|plus)\s+/i.test(goal)) return true;
-  // Semicolon-separated clauses (each substantial).
-  if (goal.split(/\s*;\s*/).filter((p) => p.trim().length > 10).length >= 2) return true;
+  if (/,\s*(?:also|then|additionally|plus)\s+/i.test(masked)) return true;
   return false;
 }
 
 /**
  * SENTENCE BOUNDARY — a softer ordering signal than `hasStrongSeparator`: explicit sequencer
  * words (first / then / finally / next / lastly / afterwards) that mark genuinely SEPARATE,
- * ordered sub-tasks. (Semicolons and numbered lists are STRONG separators handled by
- * `hasStrongSeparator`; this catches the "first do X then do Y" shape that lacks punctuation.)
- * Without any such boundary, a long run of "and"s is most likely ONE verbose sentence.
+ * ordered sub-tasks. (Numbered lists are a STRONG separator handled by `hasStrongSeparator`; this
+ * catches the "first do X then do Y" shape that lacks punctuation.) Without any such boundary, a
+ * long run of "and"s is most likely ONE verbose sentence.
  */
 function hasSentenceBoundary(goal: string): boolean {
-  return /\b(?:first|then|finally|next|lastly|afterwards)\b/i.test(goal);
+  return /\b(?:first|then|finally|next|lastly|afterwards)\b/i.test(maskCodeSpans(goal));
 }
 
 /**
@@ -65,13 +131,16 @@ function hasSentenceBoundary(goal: string): boolean {
  * description merely contains "and" twice — and verbose single tasks are often LONG, so a pure
  * word-count gate does not save them. Only treat a split as a genuine decomposition when there is
  * real evidence of multiple INDEPENDENT tasks:
- *   1. a STRONG structural separator (numbered list / semicolons / comma+sequencer), OR
+ *   1. a STRONG structural separator (numbered list / comma+sequencer), OR
  *   2. ≥2 clauses that each open with an imperative action verb (genuine independent tasks), OR
  *   3. a clear SENTENCE BOUNDARY (sequencer words) *and* the goal clears the word-count FLOOR.
  *
- * The word count is a FLOOR (a necessary minimum), never the sole gate: a goal with NO semicolons,
- * NO numbered list, and NO sequencer words requires ≥2 action-led clauses to split, no matter how
- * long it is. This is the core of the Codex fix — length alone no longer authorizes a split.
+ * The word count is a FLOOR (a necessary minimum), never the sole gate: a goal with NO strong
+ * separator and NO sequencer words requires ≥2 action-led clauses to split, no matter how long it
+ * is. Semicolons alone are NOT a strong separator (code literals use them freely) — a
+ * semicolon-delimited goal still needs ≥2 action-led clauses via case (2). This, plus the code-span
+ * masking in `maskCodeSpans`, is what keeps a single-imperative goal that carries TypeScript
+ * signatures ("export function f(): { a; b }") from fragmenting into spurious steps.
  */
 function looksMultiTask(goal: string, parts: readonly string[]): boolean {
   if (hasStrongSeparator(goal)) return true;
@@ -89,27 +158,36 @@ function looksMultiTask(goal: string, parts: readonly string[]): boolean {
  * Tries multiple delimiters in order of specificity.
  */
 function splitGoal(goal: string): string[] {
-  // Try numbered list: "1. do X\n2. do Y" or "1) do X\n2) do Y"
-  const numbered = goal.match(/\b\d+[.)]\s*.+/g);
+  // All delimiter splits below are located in the code-masked view, so a separator that lives
+  // inside a `()[]{}`/backtick code span (a TS type's `;`, a union's `|`, a signature's `,`) is
+  // never treated as a task boundary. Pieces are still sliced from the ORIGINAL goal.
+  const masked = maskCodeSpans(goal);
+
+  // Try numbered list: "1. do X\n2. do Y" or "1) do X\n2) do Y". Markers are matched on the masked
+  // view (so "0..1" inside a code span cannot masquerade as a list) but extracted from the original.
+  const numbered = masked.match(/\b\d+[.)]\s*.+/g);
   if (numbered && numbered.length >= 2) {
-    return numbered.map((s) => s.replace(/^\d+[.)]\s*/, "").trim()).filter(Boolean);
+    return goal
+      .match(/\b\d+[.)]\s*.+/g)!
+      .map((s) => s.replace(/^\d+[.)]\s*/, "").trim())
+      .filter(Boolean);
   }
 
   // Try "and" splitting: "do X and do Y and do Z"
   // Only split on "and" that separates independent clauses (not "read and write")
-  const andParts = goal.split(/\s+and\s+(?=[a-z])/i);
+  const andParts = splitByMask(goal, masked, /\s+and\s+(?=[a-z])/i);
   if (andParts.length >= 2 && andParts.every((p) => p.length > 10)) {
     return andParts.map((s) => s.trim()).filter(Boolean);
   }
 
   // Try comma+conjunction: "do X, also Y, plus Z"
-  const commaParts = goal.split(/,\s*(?:also|then|additionally|plus|and)\s+/i);
+  const commaParts = splitByMask(goal, masked, /,\s*(?:also|then|additionally|plus|and)\s+/i);
   if (commaParts.length >= 2 && commaParts.every((p) => p.length > 10)) {
     return commaParts.map((s) => s.trim()).filter(Boolean);
   }
 
-  // Try semicolons: "do X; do Y; do Z"
-  const semiParts = goal.split(/\s*;\s*/);
+  // Try semicolons: "do X; do Y; do Z" (only semicolons OUTSIDE code spans reach here).
+  const semiParts = splitByMask(goal, masked, /\s*;\s*/);
   if (semiParts.length >= 2 && semiParts.every((p) => p.length > 10)) {
     return semiParts.map((s) => s.trim()).filter(Boolean);
   }

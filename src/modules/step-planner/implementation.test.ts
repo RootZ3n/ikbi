@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { decompose, decomposeWithModel, complexityScore } from "./implementation.js";
+import { decompose, decomposeWithModel, complexityScore, maskCodeSpans } from "./implementation.js";
 import { COMPLEX_THRESHOLD } from "./config.js";
 
 describe("step-planner", () => {
@@ -146,6 +146,67 @@ describe("step-planner", () => {
       const plan = decompose("Add a logout button and update the navbar styles and write a test for it");
       assert.equal(plan.decomposed, true, "action-led clauses are a real decomposition");
       assert.ok(plan.steps.length >= 2);
+    });
+
+    // ── CODE-LITERAL REGRESSION: a single-imperative goal that carries TS syntax must NOT split ──
+
+    it("does NOT decompose a single-imperative goal whose prose carries TypeScript literals", () => {
+      // The Bokahli-pilot case: ONE task (add a module), but the goal quotes a return type with
+      // semicolons `{ insideLine: boolean; score: number; reasons: string[] }` and a union
+      // `('deterministic' | 'partial' | 'none')`. Before the fix the in-code `;` tripped
+      // `hasStrongSeparator`, authorizing an "and"-split into ~6 spurious fragments. It must now
+      // stay a single step: only the opening clause is action-led ("Add ..."), the rest describe
+      // parts of the same deliverable.
+      const goal =
+        "Add a pure deterministic envelope classifier in src/envelope.ts: export an EnvelopeInput " +
+        "interface with fields taskShape ('single-function' | 'multi-function' | 'cross-module'), " +
+        "specClarity (number 0..1), filesChanged (number), contextTokens (number), and verifiability " +
+        "('deterministic' | 'partial' | 'none'); and export function envelope(input: EnvelopeInput): " +
+        "{ insideLine: boolean; score: number; reasons: string[] } that scores whether the task fits " +
+        "a small model's proven envelope and returns read-only reasons with no mutation";
+      const plan = decompose(goal);
+      assert.equal(plan.decomposed, false, "a code-carrying single task must not fragment");
+      assert.equal(plan.steps.length, 1, "stays a single step");
+      assert.equal(plan.steps[0]?.goal, goal, "the original goal is preserved unchanged");
+    });
+
+    it("STILL decomposes a semicolon-delimited goal when each clause is action-led", () => {
+      // Positive control: semicolons are no longer a STRONG separator on their own, but a genuine
+      // multi-task list whose clauses each open with an action verb must still split (rescued by
+      // the action-led-clause count, not by the semicolons themselves).
+      const plan = decompose(
+        "Add function X to src/a.ts; add a test for X in tests/a.test.ts; update the README with usage",
+      );
+      assert.equal(plan.decomposed, true, "action-led semicolon clauses are a real decomposition");
+      assert.ok(plan.steps.length >= 2);
+    });
+
+    it("does NOT split on a semicolon that lives inside a type literal", () => {
+      // A single task whose ONLY semicolons are inside a `{ ... }` type — masking removes them, so
+      // there is no separator at all and the goal passes through untouched.
+      const goal = "Update the parse() signature in src/parse.ts to return { ok: boolean; value: string }";
+      const plan = decompose(goal);
+      assert.equal(plan.decomposed, false, "in-type semicolons are not task separators");
+      assert.equal(plan.steps.length, 1);
+      assert.equal(plan.steps[0]?.goal, goal);
+    });
+  });
+
+  describe("maskCodeSpans", () => {
+    it("is length-preserving and blanks code-span interiors while keeping delimiters", () => {
+      const input = "f(a; b) and g[x, y] and `co;de`";
+      const masked = maskCodeSpans(input);
+      assert.equal(masked.length, input.length, "same UTF-16 length so indices map back to the original");
+      // Brackets/backticks themselves stay; their interiors become spaces (no `;` or `,` survive).
+      assert.equal(masked.includes(";"), false, "in-code semicolons are masked away");
+      assert.equal(masked.includes(","), false, "in-code commas are masked away");
+      assert.ok(masked.includes(" and "), "prose between code spans is untouched");
+      assert.ok(masked.startsWith("f("), "opening delimiter is preserved");
+    });
+
+    it("leaves a goal with no code spans unchanged", () => {
+      const plain = "Add X and add Y; then update Z";
+      assert.equal(maskCodeSpans(plain), plain);
     });
   });
 

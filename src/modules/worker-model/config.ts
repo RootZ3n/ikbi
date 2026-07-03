@@ -15,6 +15,11 @@
  *                                    `run` is byte-identical to single-workspace behavior.
  *   IKBI_WORKER_MODEL_COMPETITIVE_N    candidate count when competitive. Default 2, bounded
  *                                    [MIN_COMPETITIVE_N, MAX_COMPETITIVE_N].
+ *   IKBI_WORKER_MODEL_TRUST_LADDER   on/off. DEFAULT OFF — the earned-trust tier ladder
+ *                                    (demotion + tier-gated autoCommit) is opt-in governance;
+ *                                    off, build outcomes never move trust and verified-green work
+ *                                    promotes regardless of tier. Safety controls (sandbox, gate-wall,
+ *                                    neutralization) are unaffected. See `trustLadder` below.
  *   IKBI_WORKER_MODEL_RETAIN_FAILED_WORKSPACES  on/off. DEFAULT ON — when a build FAILS
  *                                    (timeout, tool rejection, non-converging loop), the
  *                                    workspace is RETAINED (worktree kept on disk) instead of
@@ -118,6 +123,19 @@ export interface WorkerModelConfig {
    */
   readonly penalizeTimeouts?: boolean;
   /**
+   * TRUST LADDER for building. DEFAULT OFF. The earned-trust tier system (promotion/demotion +
+   * tier-gated autoCommit) is GOVERNANCE, not a safety control — and for the local cheap-model build
+   * workflow it mostly gets in the way: a single harness-caused rejection (an over-decomposition
+   * artifact, a blocked no-effect probe classified as a policy violation) demotes the worker a full
+   * tier, which then BLOCKS promotion of later verified-green work. With the ladder OFF (default):
+   *   - build outcomes do NOT move the worker's trust tier (no demotion, no promotion-streak);
+   *   - verified-green work promotes regardless of tier (autoCommit forced on, approval gate dropped).
+   * What the toggle does NOT touch — these are SAFETY, always on: the OS/bubblewrap sandbox, the
+   * governed-exec allowlist + gate-wall, worktree confinement, and untrusted-content NEUTRALIZATION
+   * (injection defense). Set IKBI_WORKER_MODEL_TRUST_LADDER=true to restore the earned-trust ladder.
+   */
+  readonly trustLadder?: boolean;
+  /**
    * Iterative fix loop: after the builder succeeds, run the verifier and feed
    * test failures back to the builder for automatic fixing. DEFAULT OFF (opt-in).
    * Set IKBI_WORKER_MODEL_FIX_LOOP=true to enable.
@@ -181,6 +199,7 @@ export function loadWorkerModelConfig(reader = env): WorkerModelConfig {
     competitiveN: reader.int("COMPETITIVE_N", DEFAULT_COMPETITIVE_N, { min: MIN_COMPETITIVE_N, max: MAX_COMPETITIVE_N }),
     retainFailedWorkspaces: reader.bool("RETAIN_FAILED_WORKSPACES", true),
     penalizeTimeouts: reader.bool("PENALIZE_TIMEOUTS", false),
+    trustLadder: reader.bool("TRUST_LADDER", false),
     fixLoop: reader.bool("FIX_LOOP", false),
     criticFixLoop: reader.bool("CRITIC_FIX_LOOP", false),
     skipCriticOnRed: reader.bool("SKIP_CRITIC_ON_RED", true),

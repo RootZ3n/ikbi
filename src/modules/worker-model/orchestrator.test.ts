@@ -159,7 +159,10 @@ function capturingRoles(outcomeFor: (role: WorkerRole) => WorkerOutcome = () => 
   return { seen, roles };
 }
 
-const ENABLED = { enabled: true, roleTimeoutMs: 1000, maxConcurrentRuns: 1 };
+// trustLadder: true — this suite exercises the earned-trust LADDER machinery (tier-gated autoCommit,
+// demotion, timeout-suppression). The ladder is opt-in (default OFF for building), so these tests
+// enable it explicitly. Ladder-OFF default behavior is covered by dedicated tests (see below).
+const ENABLED = { enabled: true, roleTimeoutMs: 1000, maxConcurrentRuns: 1, trustLadder: true };
 const task: WorkerTask = { taskId: "t-1", targetRepo: "/repo", goal: "do the thing" };
 
 /** An ALLOWING gate-wall — the wired/governed path (production wires the real gate-wall). */
@@ -337,6 +340,41 @@ test("verified-good but non-autoCommit tier: RETAIN + actionable reason, never a
   assert.match(result.reason ?? "", /BLOCKED/i, "says promotion was blocked");
   assert.match(result.reason ?? "", /autoCommit/, "gives the exact reason (no autoCommit autonomy)");
   assert.match(result.reason ?? "", /ikbi trust grant .+ trusted/, "gives the exact operator command");
+});
+
+// ── TRUST LADDER OFF (default for building): tier does not gate promotion; outcomes don't demote ──
+
+test("TRUST LADDER OFF (default): a verified-tier build PROMOTES — autoCommit is forced, not tier-gated", async () => {
+  // Same setup as the ladder-ON "NO COMMIT for a non-autoCommit tier" test, but with the ladder OFF
+  // (the build default). The verified tier no longer blocks promotion: autoCommit is forced on, the
+  // verified-green work is committed and promoted. This is the fix for "verified tier lacks autoCommit
+  // autonomy" blocking a green build during the pilot.
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("verified", "verified");
+  const ws = fakeWorkspaces(true);
+  const cap = capturingRoles();
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, workspaces: ws.workspaces, config: { ...ENABLED, trustLadder: false } }));
+  const result = await orch.run(task, parentCtx);
+  assert.equal(ws.calls.commit.length, 1, "ladder off: verified-green work IS committed (autoCommit forced)");
+  assert.equal(ws.calls.promote, 1, "ladder off: the build promotes regardless of tier");
+  assert.equal(result.promoted, true, "the verified work landed");
+});
+
+test("TRUST LADDER OFF (default): a REAL failure does NOT move trust — a ladder_disabled receipt is written instead", async () => {
+  // With the ladder OFF, NO build outcome (even a genuine verification failure) calls trust.recordOutcome
+  // — so a harness-caused rejection can never demote the worker and strip its autonomy. An auditable
+  // `worker.trust.ladder_disabled` receipt records that the outcome was seen but deliberately not counted.
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const cap = capturingRoles();
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    verifier: async () => ({ role: "verifier", outcome: "failure", summary: "checks failed", detail: { verdict: "fail", checks: [{ name: "test", exitCode: 1 }] } }),
+  };
+  const tr = capturingTrust();
+  const rc = fakeReceipts();
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, trust: tr.trust, receipts: rc.receipts, config: { ...ENABLED, trustLadder: false } }));
+  await orch.run(task, parentCtx);
+  assert.equal(tr.calls.length, 0, "ladder off: trust.recordOutcome is NEVER called for a build outcome");
+  assert.ok(rc.calls.some((c) => c.operation === "worker.trust.ladder_disabled"), "an auditable ladder_disabled receipt is written");
 });
 
 // ── ISSUE 1: performance failures (timeouts) are separated from trust demotion ───
