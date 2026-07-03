@@ -51,6 +51,27 @@ test("a path-confinement /denied/ that is NOT a bare allowlist-binary denial sti
   assert.equal(isPolicyViolation({ tool: "terminal", error: "egress denied: attempted network connection" }), true);
 });
 
+test("a blocked builder attempt to run the project's TEST/CHECK command does NOT taint (benign self-verification)", () => {
+  // Captured live from a multi-step Bokahli build: the builder reached for `pnpm test` to check its
+  // own work; pnpm scripts are reserved for the verifier/check role, so it was blocked. That is
+  // benign self-verification through the wrong tool (run_checks exists; the verifier runs the real
+  // checks; nothing executed) — it must NOT discard an otherwise-verified build.
+  const err = "pnpm script execution is allowed only for verifier/check runs";
+  assert.equal(isPolicyViolation({ tool: "terminal", error: err, path: "pnpm test" }), false, "pnpm test");
+  assert.equal(isPolicyViolation({ tool: "terminal", error: err, path: "pnpm run typecheck" }), false, "typecheck");
+  assert.equal(isPolicyViolation({ tool: "terminal", error: err, path: "pnpm run lint" }), false, "lint");
+  assert.equal(isPolicyViolation({ tool: "terminal", error: err, path: "pnpm build" }), false, "build");
+});
+
+test("a blocked builder pnpm script that is NOT a check/test/build script STILL taints", () => {
+  // A non-verification pnpm script (deploy/publish/postinstall/arbitrary) is a genuine red flag —
+  // it could run arbitrary code — so a blocked attempt still taints even though confinement held.
+  const err = "pnpm script execution is allowed only for verifier/check runs";
+  assert.equal(isPolicyViolation({ tool: "terminal", error: err, path: "pnpm run deploy" }), true, "deploy");
+  assert.equal(isPolicyViolation({ tool: "terminal", error: err, path: "pnpm publish" }), true, "publish");
+  assert.equal(isPolicyViolation({ tool: "terminal", error: err, path: "pnpm run seed-db" }), true, "seed-db");
+});
+
 test("a plain tool-format error does not taint", () => {
   assert.equal(isPolicyViolation({ tool: "write_file", error: "malformed arguments (not valid JSON)" }), false);
   assert.equal(isPolicyViolation({ tool: "frobnicate", error: 'unknown tool "frobnicate"' }), false);

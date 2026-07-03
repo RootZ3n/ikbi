@@ -630,8 +630,23 @@ export function isPolicyViolation(e: ToolCallError): boolean {
   // control, so a blocked read-only-mode write is benign in a trusted-local context and must not
   // discard a clean build. (A "new_only" overwrite attempt on an EXISTING file still taints below.)
   if (/write_scope is 'none'|read-only mode/i.test(e.error)) return false;
+  // BENIGN SELF-VERIFICATION: a builder that reaches for the project's TEST/CHECK command via terminal
+  // ("pnpm test", "pnpm run typecheck", …) is blocked because pnpm scripts are reserved for the
+  // verifier/check role — but that is the model trying to VERIFY its own work through the wrong tool.
+  // It has `run_checks` for exactly this, the verifier runs the real checks regardless, and the
+  // governor already blocked the call (nothing executed). Like a blocked `tsc`/`npx` probe, a blocked
+  // CHECK-script call must NOT discard an otherwise-verified build (it fires intermittently on cheap
+  // models and was silently tanking green multi-step builds). A pnpm script that is NOT a recognised
+  // check/test/build/lint script (deploy/publish/postinstall/arbitrary) STILL taints — that intent is
+  // the real red flag. Classification is by the COMMAND (e.path), not the generic denial string.
+  if (/pnpm script execution is allowed only for verifier\/check/i.test(e.error)) {
+    const cmd = (e.path ?? "").toLowerCase();
+    return !/\b(test|tests|check|checks|lint|typecheck|type-check|tsc|build|vitest|jest|coverage|verify|ci)\b/.test(cmd);
+  }
   // GENUINE boundary breach — confinement/scope escape, new-file-only overwrite, or an attempt to run
   // arbitrary code through a package manager. These ALWAYS taint promotion, even when confinement held.
+  // ("only for verifier/check" still taints here — the benign CHECK-script case was already returned
+  // above; what reaches here is e.g. a general terminal-role restriction, which remains a red flag.)
   if (/escape|write_scope|dependency directory|not allowed|only for verifier\/check|WRITE SCOPE VIOLATION/i.test(e.error)) {
     return true;
   }
