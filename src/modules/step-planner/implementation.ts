@@ -25,8 +25,14 @@ export function complexityScore(goal: string): number {
  * Imperative action verbs that open a genuine independent task ("Add X", "update the README").
  * A split clause that does NOT start with one of these is most likely a continuation of a single
  * sentence ("...gracefully handles expired sessions"), not a separate task.
+ *
+ * The trailing `(?!\s*\()` excludes a verb used as a CODE IDENTIFIER — a function-call clause like
+ * "generate(prompt, options) does POST ..." opens with the method name `generate`, which collides
+ * with the imperative verb "generate". Requiring the verb NOT be immediately followed by `(` keeps
+ * an API description ("...and generate(x) returns y") from being miscounted as a second independent
+ * task and spuriously authorizing a decomposition. "generate a report" (verb + object) still counts.
  */
-const ACTION_VERB = /^(?:add|create|implement|build|write|update|modify|change|fix|refactor|remove|delete|drop|rename|move|extract|introduce|replace|migrate|document|test|wire|expose|register|configure|install|generate|setup|set up|support|enable|disable)\b/i;
+const ACTION_VERB = /^(?:add|create|implement|build|write|update|modify|change|fix|refactor|remove|delete|drop|rename|move|extract|introduce|replace|migrate|document|test|wire|expose|register|configure|install|generate|setup|set up|support|enable|disable)\b(?!\s*\()/i;
 
 /** How many of the split clauses open with an imperative action verb (a genuine-task signal). */
 function actionLedClauseCount(parts: readonly string[]): number {

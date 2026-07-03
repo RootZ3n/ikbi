@@ -181,6 +181,30 @@ describe("step-planner", () => {
       assert.ok(plan.steps.length >= 2);
     });
 
+    it("does NOT decompose a single-imperative goal that describes an API method whose name is an action verb", () => {
+      // Real Bokahli-pilot case: ONE task (add an adapter), but its prose describes a `generate(...)`
+      // method — "generate" is both the method name AND an imperative verb. Before the fix, the
+      // "generate(prompt, options) does POST ..." clause counted as a second action-led task alongside
+      // "Add ...", authorizing a spurious 6-way split. A `verb(` function-call form must NOT count.
+      const goal =
+        "Add an Ollama model adapter in src/ollama.ts that implements ModelAdapter: export " +
+        "createOllamaAdapter(opts) with a host and an injectable fetch, where listModels() does GET " +
+        "{host}/api/tags and maps the response to ModelInfo and generate(prompt, options) does POST " +
+        "{host}/api/generate with body { model, prompt, stream: false } and returns the parsed response";
+      const plan = decompose(goal);
+      assert.equal(plan.decomposed, false, "an API description with a verb-named method is one task");
+      assert.equal(plan.steps.length, 1, "stays a single step");
+      assert.equal(plan.steps[0]?.goal, goal, "the original goal is preserved unchanged");
+    });
+
+    it("STILL counts a real imperative verb followed by an object (not a paren) as action-led", () => {
+      // Guard the fix's boundary: "generate a report" (verb + object) is a genuine task opener and
+      // must still count, so a legitimately multi-task goal is not accidentally suppressed.
+      const plan = decompose("Add a config loader and generate a default config file and write a test");
+      assert.equal(plan.decomposed, true, "verb+object clauses are still real independent tasks");
+      assert.ok(plan.steps.length >= 2);
+    });
+
     it("does NOT split on a semicolon that lives inside a type literal", () => {
       // A single task whose ONLY semicolons are inside a `{ ... }` type — masking removes them, so
       // there is no separator at all and the goal passes through untouched.
