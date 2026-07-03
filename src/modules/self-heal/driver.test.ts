@@ -11,11 +11,11 @@ import { runSelfHeal } from "./driver.js";
 import type { CandidateFix, JudgeResult, SelfHealExecutors, SelfHealFailure, SelfHealResult, SuiteResult } from "./contract.js";
 
 const harnessCls: FailureClassification = {
-  category: "harness", harnessSuspect: true, signal: "checks_unresolvable",
+  category: "harness", harnessSuspect: true, selfHealable: false, signal: "checks_unresolvable",
   evidence: "no verification contract", suggestedAction: "add a manifest",
 };
 const modelCls: FailureClassification = {
-  category: "model", harnessSuspect: false, signal: "failure", evidence: "the model wrote something wrong",
+  category: "model", harnessSuspect: false, selfHealable: false, signal: "failure", evidence: "the model wrote something wrong",
 };
 
 const failure = (cls: FailureClassification): SelfHealFailure => ({

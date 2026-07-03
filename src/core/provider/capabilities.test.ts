@@ -64,16 +64,18 @@ test("a roster ModelSpec can declare a capabilities override, parsed and resolva
         id: "local-tiny",
         cost: { promptPerMTok: 0, completionPerMTok: 0 },
         providers: [{ provider: "p", providerModelId: "local-tiny" }],
-        capabilities: { context_window: 2_048, supports_tools: false, reasoning_level: "low", speed_class: "fast" },
+        capabilities: { context_window: 2_048, supports_tools: false, supports_thinking: true, reasoning_level: "low", speed_class: "fast" },
       },
     ],
   });
   const override = reg.capabilitiesFor("local-tiny");
   assert.equal(override?.context_window, 2_048);
   assert.equal(override?.supports_tools, false);
+  assert.equal(override?.supports_thinking, true);
   const resolved = getCapabilities("local-tiny", override);
   assert.equal(resolved.context_window, 2_048);
   assert.equal(resolved.supports_tools, false);
+  assert.equal(resolved.supports_thinking, true);
 });
 
 test("the roster rejects an invalid capability field (fail loud)", () => {

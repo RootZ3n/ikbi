@@ -148,7 +148,7 @@ export function mergeDiffStat(numstatOut: string, nameStatusDOut: string): DiffS
 /** Combine a DiffStat + workspace into the CandidateFix the driver gates. produced = any change. */
 export function toCandidateFix(diff: DiffStat, handle: WorkspaceHandle, buildReason?: string): CandidateFix {
   return {
-    produced: diff.changedFiles.length > 0,
+    produced: diff.changedFiles.length > 0 || diff.deletedFiles.length > 0,
     changedFiles: diff.changedFiles,
     ...(diff.deletedFiles.length > 0 ? { deletedFiles: diff.deletedFiles } : {}),
     linesChanged: diff.linesChanged,

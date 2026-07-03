@@ -29,37 +29,39 @@ function mockSpawn(stdout: string, code: number, sink?: { args?: readonly string
 const throwingSpawn = (() => { throw new Error("spawn should not be called"); }) as unknown as typeof SpawnType;
 
 test("a missing goal errors and never spawns", async () => {
-  const r = await runLaunchBuild({}, { repo: "/x", cliEntry: "cli", execPath: "node", spawnFn: throwingSpawn });
+  const r = await runLaunchBuild({}, { sessionRepo: "/x", cliEntry: "cli", execPath: "node", spawnFn: throwingSpawn });
   assert.equal(r.ok, false);
   assert.match(r.output, /needs a non-empty 'goal'/);
 });
 
-test("no target repo (session + arg both absent) errors and never spawns", async () => {
-  const r = await runLaunchBuild({ goal: "do x" }, { repo: undefined, cliEntry: "cli", execPath: "node", spawnFn: throwingSpawn });
+test("no target repo errors and never spawns", async () => {
+  const r = await runLaunchBuild({ goal: "do x" }, { sessionRepo: undefined, cliEntry: "cli", execPath: "node", spawnFn: throwingSpawn });
   assert.equal(r.ok, false);
   assert.match(r.output, /no target repo/);
 });
 
 test("a promoted build → ok + promoted summary; goal is a single argv element (no shell)", async () => {
   const sink: { args?: readonly string[] } = {};
+  const warnings: string[] = [];
   const spawnFn = mockSpawn('scout...\n"promoted": true\nUndo available: yes\nikbi undo build-9\n', 0, sink);
-  const r = await runLaunchBuild({ goal: "add a health test", repo: "/repo/x" }, { repo: "/session/repo", cliEntry: "/dist/cli.js", execPath: "node", spawnFn });
+  const r = await runLaunchBuild({ goal: "add a health test", repo: "/repo/x" }, { sessionRepo: "/session/repo", cliEntry: "/dist/cli.js", execPath: "node", spawnFn, warn: (m) => warnings.push(m) });
   assert.equal(r.ok, true);
   assert.match(r.summary, /promoted/);
-  // The explicit repo arg overrides the session repo; the goal rides as ONE argv item, unescaped.
-  assert.deepEqual([...(sink.args ?? [])].slice(0, 6), ["/dist/cli.js", "build", "add a health test", "--repo", "/repo/x", "--yes"]);
+  // The stale explicit repo arg is ignored; the goal rides as ONE argv item, unescaped.
+  assert.deepEqual([...(sink.args ?? [])].slice(0, 6), ["/dist/cli.js", "build", "add a health test", "--repo", "/session/repo", "--yes"]);
+  assert.match(warnings.join("\n"), /ignoring model-supplied repo/);
 });
 
-test("falls back to the session repo when no repo arg is given", async () => {
+test("uses the session repo when no repo arg is given", async () => {
   const sink: { args?: readonly string[] } = {};
   const spawnFn = mockSpawn("Build REJECTED\n", 0, sink);
-  await runLaunchBuild({ goal: "x" }, { repo: "/session/repo", cliEntry: "cli", execPath: "node", spawnFn });
+  await runLaunchBuild({ goal: "x" }, { sessionRepo: "/session/repo", cliEntry: "cli", execPath: "node", spawnFn });
   assert.equal((sink.args ?? [])[4], "/session/repo");
 });
 
 test("a non-zero exit → not ok, not promoted", async () => {
   const spawnFn = mockSpawn("Build FAILED — builder\n", 1);
-  const r = await runLaunchBuild({ goal: "x" }, { repo: "/session/repo", cliEntry: "cli", execPath: "node", spawnFn });
+  const r = await runLaunchBuild({ goal: "x" }, { sessionRepo: "/session/repo", cliEntry: "cli", execPath: "node", spawnFn });
   assert.equal(r.ok, false);
   assert.doesNotMatch(r.summary, /promoted/);
 });

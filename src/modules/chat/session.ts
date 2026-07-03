@@ -1124,11 +1124,9 @@ export class ChatSession {
     const permissionMode = opts.permissionMode ?? this.permissionMode;
     const sideEffectConfirmed = (call.name === "terminal" || call.name === "delegate_task" || call.name === "launch_build") && opts.confirm !== undefined;
     if (sideEffectConfirmed) {
-      // launch_build promotes to a REAL repo — surface WHICH one in the confirmation. The tool may be
-      // handed an explicit `repo` that differs from the session's, so show the EFFECTIVE target (the
-      // same resolution runLaunchBuild uses): the operator must see the repo they're approving, not
-      // just the goal, or a build could silently land against a repo they never intended.
-      const launchRepo = typeof args.repo === "string" && args.repo.trim().length > 0 ? args.repo.trim() : this.targetRepo;
+      // launch_build promotes to a REAL repo — surface WHICH one in the confirmation. The repo is
+      // always the session repo; stale model-supplied `repo` args are ignored by runLaunchBuild.
+      const launchRepo = this.targetRepo;
       const target = call.name === "launch_build" && typeof args.goal === "string"
         ? `build: "${args.goal}" in ${launchRepo ?? "(no repo — will be refused)"}`
         : typeof args.command === "string" ? args.command : typeof args.task === "string" ? args.task : "";
@@ -1258,7 +1256,7 @@ export class ChatSession {
         // selected repo (this.targetRepo) via the same CLI, so every guard applies. Confirm-gated
         // above — never reaches here without operator approval. Output is UNTRUSTED → chokepoint.
         const res = await runLaunchBuild(args, {
-          repo: this.targetRepo,
+          sessionRepo: this.targetRepo,
           cliEntry: process.argv[1] ?? "",
           execPath: process.execPath,
         });

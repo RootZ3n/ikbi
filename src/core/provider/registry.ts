@@ -204,6 +204,10 @@ function parseCapabilitiesMaybe(v: unknown, source: string): Partial<ModelCapabi
     if (typeof r.supports_tools !== "boolean") throw new Error(`Provider roster ${source}: capabilities.supports_tools must be a boolean`);
     caps.supports_tools = r.supports_tools;
   }
+  if (r.supports_thinking !== undefined) {
+    if (typeof r.supports_thinking !== "boolean") throw new Error(`Provider roster ${source}: capabilities.supports_thinking must be a boolean`);
+    caps.supports_thinking = r.supports_thinking;
+  }
   if (r.reasoning_level !== undefined) {
     if (typeof r.reasoning_level !== "string" || !REASONING_LEVELS.has(r.reasoning_level)) {
       throw new Error(`Provider roster ${source}: capabilities.reasoning_level must be one of low|medium|high`);

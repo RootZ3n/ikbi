@@ -32,7 +32,7 @@ const handle = (over: Partial<WorkspaceHandle> = {}): WorkspaceHandle => ({
 });
 
 const harnessCls: FailureClassification = {
-  category: "harness", harnessSuspect: true, signal: "checks_unresolvable",
+  category: "harness", harnessSuspect: true, selfHealable: false, signal: "checks_unresolvable",
   evidence: "no verification contract", suggestedAction: "add a manifest",
 };
 const failure: SelfHealFailure = { taskId: "t1", classification: harnessCls, targetRepo: "/repos/ikbi", reason: "no manifest" };
@@ -71,6 +71,12 @@ test("toCandidateFix: produced iff any changed file; carries branch + workspace 
   assert.equal(c.branch, "ikbi/ws/ws-1");
   assert.equal(c.workspaceId, "ws-1");
   assert.equal(toCandidateFix({ changedFiles: [], deletedFiles: [], linesChanged: 0 }, handle()).produced, false);
+});
+
+test("toCandidateFix: deletion-only diffs count as produced", () => {
+  const c = toCandidateFix({ changedFiles: [], deletedFiles: ["src/old.ts"], linesChanged: 12 }, handle());
+  assert.equal(c.produced, true);
+  assert.deepEqual(c.deletedFiles, ["src/old.ts"]);
 });
 
 test("buildFixTask: skipPromote + reuseWorkspace + tier models + no-test-drop in the goal", () => {

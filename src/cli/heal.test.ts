@@ -7,11 +7,19 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { Receipt, ReceiptQuery } from "../core/receipt/index.js";
-import { createHealCli } from "./heal.js";
+import { createHealCli, SELF_HEAL_REPO } from "./heal.js";
 import type { SelfHealFailure, SelfHealResult } from "../modules/self-heal/index.js";
 
-/** A worker.run.summary receipt that classifies as harness-suspect (checks_unresolvable). */
-function harnessReceipt(taskId: string, repo = "/repos/ikbi"): Receipt {
+/** A worker.run.summary receipt that classifies as self-healable harness-suspect (test_evidence). */
+function harnessReceipt(taskId: string, repo = SELF_HEAL_REPO): Receipt {
+  return {
+    operation: "worker.run.summary", requestId: taskId,
+    outcome: { status: "rejected", detail: "Verification ran zero tests." },
+    metadata: { taskId, outcome: "rejected", targetRepo: repo },
+  } as unknown as Receipt;
+}
+/** A harness-suspect receipt that requires operator/config action, not code self-heal. */
+function configGateReceipt(taskId: string, repo = SELF_HEAL_REPO): Receipt {
   return {
     operation: "worker.run.summary", requestId: taskId,
     outcome: { status: "rejected", detail: "No project manifest or verifier detected." },
@@ -41,7 +49,7 @@ function cap() {
 
 const okResult: SelfHealResult = {
   verdict: { disposition: "applied", verified: true, requiresHuman: false, requiresOpusReview: false, reasons: ["verified and low blast-radius"] },
-  failure: { taskId: "t1", classification: { category: "harness", harnessSuspect: true, signal: "checks_unresolvable", evidence: "no manifest" }, targetRepo: "/repos/ikbi" },
+  failure: { taskId: "t1", classification: { category: "harness", harnessSuspect: true, selfHealable: true, signal: "test_evidence", evidence: "zero tests" }, targetRepo: SELF_HEAL_REPO },
   candidate: { produced: true, changedFiles: ["src/x.ts"], branch: "ikbi/ws/1" },
   suite: { green: true, testCount: 3070 },
   judge: { pass: true },
@@ -104,12 +112,66 @@ test("--run (enabled + --yes) invokes the loop and prints the disposition", asyn
   });
   await cli.run(["--task", "t1", "--run", "--yes"]);
   assert.equal(seen?.taskId, "t1");
-  assert.equal(seen?.targetRepo, "/repos/ikbi");
+  assert.equal(seen?.targetRepo, SELF_HEAL_REPO);
   assert.match(c.out, /APPLIED to a branch/);
   assert.match(c.out, /ikbi\/ws\/1/);
   assert.match(c.out, /suite: green \(3070 tests\)/, "the gate's test count is surfaced for audit");
   assert.match(c.out, /judge: pass/);
   assert.equal(c.exit, 0, "a landed fix is a success exit");
+});
+
+test("--run refuses operator/config harness signals that are not self-healable", async () => {
+  const c = cap();
+  let invoked = false;
+  const cli = createHealCli({
+    receipts: harness([configGateReceipt("t1")]), enabled: "true",
+    runHeal: async () => { invoked = true; return okResult; },
+    stdout: c.stdout, stderr: c.stderr, setExit: c.setExit,
+  });
+  await cli.run(["--task", "t1", "--run", "--yes"]);
+  assert.equal(invoked, false);
+  assert.match(c.err, /not self-healable|operator action/);
+  assert.equal(c.exit, 1);
+});
+
+test("--run refuses an external target repo unless the dangerous override is explicit", async () => {
+  const c = cap();
+  let invoked = false;
+  const cli = createHealCli({
+    receipts: harness([harnessReceipt("t1", "/repos/other")]), enabled: "true",
+    runHeal: async () => { invoked = true; return okResult; },
+    stdout: c.stdout, stderr: c.stderr, setExit: c.setExit,
+  });
+  await cli.run(["--task", "t1", "--run", "--yes"]);
+  assert.equal(invoked, false);
+  assert.match(c.err, /restricted to the ikbi repo/);
+  assert.equal(c.exit, 1);
+});
+
+test("--run can target an external repo only with --unsafe-allow-external-repo", async () => {
+  const c = cap();
+  let seen: SelfHealFailure | undefined;
+  const cli = createHealCli({
+    receipts: harness([harnessReceipt("t1", "/repos/other")]), enabled: "true",
+    runHeal: async (f) => { seen = f; return okResult; },
+    stdout: c.stdout, stderr: c.stderr, setExit: c.setExit,
+  });
+  await cli.run(["--task", "t1", "--run", "--yes", "--unsafe-allow-external-repo"]);
+  assert.equal(seen?.targetRepo, "/repos/other");
+  assert.equal(c.exit, 0);
+});
+
+test("preview keeps external and non-healable harness suspects visible but marked skipped", async () => {
+  const c = cap();
+  const cli = createHealCli({
+    receipts: harness([harnessReceipt("external", "/repos/other"), configGateReceipt("config")]),
+    stdout: c.stdout, stderr: c.stderr, setExit: c.setExit,
+  });
+  await cli.run([]);
+  assert.match(c.out, /external/);
+  assert.match(c.out, /skipped: external repo/);
+  assert.match(c.out, /config/);
+  assert.match(c.out, /not self-healable/);
 });
 
 test("--candidates lists self-heal branches (label-filtered, excludes discarded)", async () => {

@@ -24,7 +24,6 @@ export const launchBuildTool: ModelTool = {
     type: "object",
     properties: {
       goal: { type: "string", description: "The concrete, verifiable goal — what to build or fix (a single well-scoped task)." },
-      repo: { type: "string", description: "Absolute path to the target repo. Defaults to the repo this session is working in." },
     },
     required: ["goal"],
   },
@@ -49,18 +48,22 @@ const LAUNCH_BUILD_TIMEOUT_MS = 10 * 60_000;
 export async function runLaunchBuild(
   args: { readonly goal?: unknown; readonly repo?: unknown },
   ctx: {
-    readonly repo: string | undefined;
+    readonly sessionRepo: string | undefined;
     readonly cliEntry: string;
     readonly execPath: string;
     readonly spawnFn?: typeof spawn;
     readonly timeoutMs?: number;
+    readonly warn?: (message: string) => void;
   },
 ): Promise<LaunchBuildResult> {
   const goal = typeof args.goal === "string" ? args.goal.trim() : "";
   if (goal.length === 0) {
     return { ok: false, output: "ERROR: launch_build needs a non-empty 'goal' (what to build or fix).", summary: "no goal" };
   }
-  const repo = typeof args.repo === "string" && args.repo.trim().length > 0 ? args.repo.trim() : ctx.repo;
+  if (Object.prototype.hasOwnProperty.call(args, "repo")) {
+    (ctx.warn ?? console.warn)("launch_build: ignoring model-supplied repo; using the session repo");
+  }
+  const repo = ctx.sessionRepo;
   if (repo === undefined || repo.length === 0) {
     return {
       ok: false,

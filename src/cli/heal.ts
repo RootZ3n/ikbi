@@ -14,6 +14,7 @@
 
 import { registerCommand } from "./registry.js";
 import { writeStdout, writeStderr } from "./io.js";
+import { fileURLToPath } from "node:url";
 import { config } from "../core/config.js";
 import { receipts as coreReceipts } from "../core/receipt/index.js";
 import type { ReceiptStore } from "../core/receipt/index.js";
@@ -44,11 +45,14 @@ export interface HealCliDeps {
 
 /** The workspace label prefix self-heal stamps on every candidate workspace it allocates. */
 const SELF_HEAL_LABEL_PREFIX = "self-heal:";
+/** Self-heal is restricted to this repo by default; external targets require an explicit unsafe flag. */
+export const SELF_HEAL_REPO = fileURLToPath(new URL("../..", import.meta.url)).replace(/\/$/, "");
 
 const USAGE =
   "Usage: ikbi heal [--days <n>] [--limit <n>]                 (preview harness-suspect failures)\n" +
   "       ikbi heal --candidates                               (list self-heal branches awaiting review)\n" +
-  "       ikbi heal --task <id> --run [--tier mid|frontier] --yes   (attempt a real self-heal)\n";
+  "       ikbi heal --task <id> --run [--tier mid|frontier] --yes [--unsafe-allow-external-repo]\n" +
+  "                                                               (attempt a real self-heal; unsafe flag allows non-ikbi repos)\n";
 
 export function createHealCli(deps: HealCliDeps = {}) {
   const store = deps.receipts ?? coreReceipts;
@@ -97,14 +101,18 @@ export function createHealCli(deps: HealCliDeps = {}) {
     }
     out(`${records.length} harness-suspect failure(s) — candidates for self-heal:\n\n`);
     for (const r of records) {
-      out(`• ${r.taskId} [${r.classification.signal}]${r.targetRepo !== undefined ? ` (${r.targetRepo})` : " (no repo — cannot heal)"}\n`);
+      const notes: string[] = [];
+      if (r.targetRepo === undefined) notes.push("skipped: no repo");
+      else if (r.targetRepo !== SELF_HEAL_REPO) notes.push("skipped: external repo");
+      if (!r.classification.selfHealable) notes.push("not self-healable");
+      out(`• ${r.taskId} [${r.classification.signal}]${r.targetRepo !== undefined ? ` (${r.targetRepo})` : " (no repo — cannot heal)"}${notes.length > 0 ? ` — ${notes.join(", ")}` : ""}\n`);
       out(`    ${r.classification.evidence}\n`);
     }
     out(`\nTo attempt a fix:  ikbi heal --task <id> --run --yes\n`);
     out(`(Requires IKBI_SELFHEAL_ENABLE=true. The fix lands on a BRANCH for you to review — never on main.)\n`);
   }
 
-  async function attempt(taskId: string, tier: BuildTier, testCountBefore: number | undefined, yes: boolean): Promise<void> {
+  async function attempt(taskId: string, tier: BuildTier, testCountBefore: number | undefined, yes: boolean, unsafeAllowExternalRepo: boolean): Promise<void> {
     const records = await harnessFailures(365, 200);
     const record = records.find((r) => r.taskId === taskId);
     if (record === undefined) {
@@ -114,6 +122,16 @@ export function createHealCli(deps: HealCliDeps = {}) {
     }
     if (record.targetRepo === undefined) {
       err(`ikbi heal: failure "${taskId}" has no target repo recorded — cannot heal it.\n`);
+      setExit(1);
+      return;
+    }
+    if (!record.classification.selfHealable) {
+      err(`ikbi heal: failure "${taskId}" is harness-suspect but not self-healable (${record.classification.signal}); operator action is required.\n`);
+      setExit(1);
+      return;
+    }
+    if (record.targetRepo !== SELF_HEAL_REPO && !unsafeAllowExternalRepo) {
+      err(`ikbi heal: self-heal is restricted to the ikbi repo (${SELF_HEAL_REPO}); refusing external repo ${record.targetRepo}. Use --unsafe-allow-external-repo only if you accept that risk.\n`);
       setExit(1);
       return;
     }
@@ -164,7 +182,7 @@ export function createHealCli(deps: HealCliDeps = {}) {
       if (argv.includes("--candidates")) { await candidates(); return; }
       if (argv.includes("--run")) {
         if (task === undefined || task.length === 0) { err(`ikbi heal: --run requires --task <id>.\n${USAGE}`); setExit(1); return; }
-        await attempt(task, tier, testCountBefore, argv.includes("--yes"));
+        await attempt(task, tier, testCountBefore, argv.includes("--yes"), argv.includes("--unsafe-allow-external-repo"));
         return;
       }
       preview(await harnessFailures(days, limit));

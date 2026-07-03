@@ -171,14 +171,14 @@ test("launch_build confirmation discloses the EFFECTIVE target repo, not just th
   assert.match(target, /add a test/, "the goal is disclosed");
   assert.match(target, /\/repos\/session-repo/, "the effective target repo is disclosed");
 
-  // An explicit `repo` arg that differs from the session repo must be the one shown — a build could
-  // otherwise silently land against a repo the operator never intended.
+  // A stale explicit `repo` arg that differs from the session repo is ignored; the session repo is
+  // what the operator approves and what runLaunchBuild uses.
   const invoke2 = queued([toolTurn(call("launch_build", { goal: "add a test", repo: "/repos/OTHER" })), stop("ok")]);
   const s2 = new ChatSession("lb-2", { invoke: invoke2, workspace: stubWorkspace("/repos/session-repo") });
   let target2 = "";
   await s2.send("build elsewhere", undefined, "agent", { permissionMode: "confirm", confirm: async (_t, x) => { target2 = x; return false; } });
-  assert.match(target2, /\/repos\/OTHER/, "the explicit repo override is what the operator approves");
-  assert.doesNotMatch(target2, /session-repo/, "the session repo is NOT shown when an override is given");
+  assert.match(target2, /\/repos\/session-repo/, "the session repo is what the operator approves");
+  assert.doesNotMatch(target2, /\/repos\/OTHER/, "the stale repo arg is not shown as the target");
 });
 
 // ── FIX 7: prompt-cache counters ────────────────────────────────────────────────

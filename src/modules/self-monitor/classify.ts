@@ -28,6 +28,8 @@ export interface FailureClassification {
   readonly category: FailureCategory;
   /** True when this failure is likely the HARNESS's doing, not the model's. Gates the self-heal loop. */
   readonly harnessSuspect: boolean;
+  /** True only when self-heal should spend a build attempting a code fix. Operator/config gates are false. */
+  readonly selfHealable: boolean;
   /** A short, stable label for the signature (e.g. "checks_unresolvable", "trust_gate"). */
   readonly signal: string;
   /** Plain-language explanation for a report. */
@@ -36,8 +38,8 @@ export interface FailureClassification {
   readonly suggestedAction?: string;
 }
 
-function harness(signal: string, evidence: string, suggestedAction: string): FailureClassification {
-  return { category: "harness", harnessSuspect: true, signal, evidence, suggestedAction };
+function harness(signal: string, evidence: string, suggestedAction: string, selfHealable = true): FailureClassification {
+  return { category: "harness", harnessSuspect: true, selfHealable, signal, evidence, suggestedAction };
 }
 
 /**
@@ -52,7 +54,7 @@ export function classifyBuildFailure(o: BuildOutcome): FailureClassification {
 
   // A clean, promoted build is not a failure.
   if (o.outcome === "success" && o.promoted !== false) {
-    return { category: "none", harnessSuspect: false, signal: "promoted", evidence: o.reason ?? "build promoted" };
+    return { category: "none", harnessSuspect: false, selfHealable: false, signal: "promoted", evidence: o.reason ?? "build promoted" };
   }
 
   // ── HARNESS signatures (a gate/config issue — not the model) ───────────────────────────────────
@@ -60,20 +62,23 @@ export function classifyBuildFailure(o: BuildOutcome): FailureClassification {
   if (vk === "checks_unresolvable" || /no project manifest|no runnable check|checks_unresolvable|verification contract/.test(reason)) {
     return harness("checks_unresolvable",
       "No verification contract — ikbi found no manifest/checks to verify against (a greenfield or config gap, not the model).",
-      "Add a project manifest (package.json / pyproject.toml / Cargo.toml / go.mod), or pass an explicit --check \"<cmd>\".");
+      "Add a project manifest (package.json / pyproject.toml / Cargo.toml / go.mod), or pass an explicit --check \"<cmd>\".",
+      false);
   }
   // The build tried to change its own verification command; the anti-cheat blocked it. The check is
   // operator-owned by design, so this is an operator fix, not a model failure.
   if (/verification untrusted|modified package\.json script|builder modified.*\btest\b|stub(bed)? (script|hook)/.test(reason)) {
     return harness("verification_command_locked",
       "The build tried to change the verification command; ikbi's anti-cheat blocked it (the check is operator-owned).",
-      "Fix the test/check script yourself as the operator, then re-run — a model may not edit what verifies it.");
+      "Fix the test/check script yourself as the operator, then re-run — a model may not edit what verifies it.",
+      false);
   }
   // Trust gate: a fresh/demoted worker tier cannot LAND the build (no autoCommit autonomy).
   if (/lacks autocommit|autocommit autonomy|\btier "?(probation|verified)"?|trust grant|worker tier|grant the worker/.test(reason)) {
     return harness("trust_gate",
       "The worker's trust tier can't land the build (no autoCommit) — a trust-config gate, not the model.",
-      "Run `ikbi trust grant worker trusted`, then re-run the build.");
+      "Run `ikbi trust grant worker trusted`, then re-run the build.",
+      false);
   }
   // Test-evidence / phantom pass: verification could not count REAL test execution.
   if (/test evidence.{0,4}(absent|unverified)|phantom|node --test.*(bare )?dir|ran zero tests/.test(reason)) {
@@ -90,17 +95,17 @@ export function classifyBuildFailure(o: BuildOutcome): FailureClassification {
 
   // ── MODEL / performance (the model ran out of moves — trust is NOT penalized) ───────────────────
   if (o.stopReason === "no_progress" || o.stopReason === "stuck_detected" || /\bno_progress\b|\bstuck_detected\b/.test(reason)) {
-    return { category: "model", harnessSuspect: false, signal: "no_progress",
+    return { category: "model", harnessSuspect: false, selfHealable: false, signal: "no_progress",
       evidence: "The model ran out of productive moves (a performance limit; ikbi does not penalize trust for it).",
       suggestedAction: "Narrow the goal or try a stronger model tier; if the step was un-greenable, suspect the harness." };
   }
 
   // ── Genuine failure with real verification — likely the model's output ─────────────────────────
   if (o.outcome === "failure" || o.outcome === "rejected" || o.outcome === "partial") {
-    return { category: "model", harnessSuspect: false, signal: "failure",
+    return { category: "model", harnessSuspect: false, selfHealable: false, signal: "failure",
       evidence: o.reason ?? "the build did not complete or verify",
       suggestedAction: "Inspect the diff/receipt; if the model wrote something wrong, refine the goal." };
   }
 
-  return { category: "unknown", harnessSuspect: false, signal: "unknown", evidence: o.reason ?? "unclassified outcome" };
+  return { category: "unknown", harnessSuspect: false, selfHealable: false, signal: "unknown", evidence: o.reason ?? "unclassified outcome" };
 }
