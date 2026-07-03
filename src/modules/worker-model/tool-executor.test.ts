@@ -15,7 +15,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -96,6 +96,18 @@ test("executeTool: write_file to a normal path writes through the governor untou
   assert.equal(res.ok, true);
   assert.match(res.output, /wrote \d+ bytes to src\/x\.ts/);
   assert.equal(readFileSync(join(root, "src/x.ts"), "utf8"), "export const x = 1;\n");
+});
+
+test("executeTool: write_file rejects a symlink escape and does not write outside the worktree", async () => {
+  const root = worktree();
+  const outside = worktree();
+  symlinkSync(outside, join(root, "escape"), "dir");
+
+  const res = await executeTool(baseDeps(root), call("write_file", { path: "escape/pwned.txt", content: "owned\n" }));
+
+  assert.equal(res.ok, false);
+  assert.match(res.output, /escapes the worktree|symlink|write failed/);
+  assert.equal(existsSync(join(outside, "pwned.txt")), false, "outside target was not written");
 });
 
 // ── 3 + 4. patch / multi_edit to a governed surface → proposal ───────────────

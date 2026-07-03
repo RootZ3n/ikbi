@@ -1,6 +1,9 @@
 /**
  * ikbi runtime-truth-shadow - the shadow runner.
  *
+ * This "shadow" is an advisory cognition comparison, not a filesystem workspace. Workspace
+ * isolation and promotion are implemented by `src/core/workspace/manager.ts`.
+ *
  * `runRuntimeTruthShadow` computes a Truth Firewall RuntimeTruthReader summary ALONGSIDE a cognition
  * decision and emits a `cognition.runtime_truth_shadow` event for comparison. It is a no-op unless
  * mode is `shadow` AND a reader is injected. It NEVER returns anything that changes the decision,

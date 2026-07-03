@@ -91,7 +91,8 @@ interface FakeOpts {
   readonly failAllocate?: (label: string) => boolean;
   readonly applyResult?: { applied: boolean; reason?: string };
   readonly shadowResult?: ShadowVerification;
-  readonly promoteResult?: { promoted: boolean; reason?: string; conflicts?: readonly string[] };
+  readonly promoteResult?: { promoted: boolean; reason?: string; conflicts?: readonly string[]; receiptStatus?: "recorded" | "failed" };
+  readonly throwModels?: ReadonlySet<string>;
   readonly killReason?: string;
 }
 
@@ -120,6 +121,7 @@ function fakeEngine(opts: FakeOpts) {
       // Record how many prior candidate runs exist at call time — proves NO cross-candidate state
       // is threaded in: the engine receives only (task, its own workspace, its own spec).
       calls.runCandidate.push({ wsId: ws.id, spec, sawRuns: calls.runCandidate.length });
+      if (opts.throwModels?.has(spec.model) === true) throw new Error(`boom from ${spec.model}`);
       const s = opts.scripts[spec.model];
       assert.ok(s !== undefined, `script for model ${spec.model}`);
       const builderOk = s.builderOk ?? true;
@@ -332,6 +334,50 @@ test("tournament: full receipts — every candidate + winner + shadow result rec
   assert.equal(rec.shadow.verified, true);
   assert.equal(rec.shadow.workspaceId, "shadow");
   assert.equal(rec.promoted, true);
+});
+
+test("tournament: candidate exception is retained, receipted, emitted failed, and remaining candidates continue", async () => {
+  const { engine, calls } = fakeEngine({
+    scripts: { good: { candidate: { ...buildCandidate("x"), diffLines: 5 }, diff: "winner" } },
+    throwModels: new Set(["bad"]),
+  });
+  const r = await runTournament(task, ctx(), specs("bad", "good"), engine);
+
+  assert.equal(r.outcome, "success");
+  assert.equal(r.promoted, true);
+  assert.deepEqual(calls.retain.map((x) => x.wsId), ["c0"], "the throwing candidate workspace is retained for inspection");
+  assert.ok(calls.events.some((e) => e.kind === "failed" && e.workspaceId === "c0" && /boom from bad/.test(e.reason)));
+  const rec = calls.receipts[0]!;
+  const failed = rec.candidates.find((c) => c.model === "bad");
+  assert.equal(failed?.verified, false);
+  assert.match(failed?.failureReason ?? "", /boom from bad/);
+  assert.ok(rec.candidates.some((c) => c.model === "good"), "the successful candidate is still receipted");
+});
+
+test("tournament: all candidate exceptions fail closed with a receipt and no shadow", async () => {
+  const { engine, calls } = fakeEngine({
+    scripts: {},
+    throwModels: new Set(["bad", "worse"]),
+  });
+  const r = await runTournament(task, ctx(), specs("bad", "worse"), engine);
+
+  assert.equal(r.outcome, "rejected");
+  assert.equal(r.promoted, false);
+  assert.match(r.reason ?? "", /all candidate runs failed/);
+  assert.equal(calls.allocate.filter((l) => l.includes("shadow")).length, 0);
+  assert.equal(calls.receipts.length, 1);
+  assert.equal(calls.receipts[0]!.candidates.length, 2);
+});
+
+test("tournament: promote receiptStatus is surfaced in WorkerResult metadata", async () => {
+  const { engine } = fakeEngine({
+    scripts: { a: { candidate: { ...buildCandidate("x") }, diff: "winner" } },
+    promoteResult: { promoted: true, receiptStatus: "failed" },
+  });
+  const r = await runTournament(task, ctx(), specs("a"), engine);
+
+  assert.equal(r.promoted, true);
+  assert.equal(r.metadata?.receiptStatus, "failed");
 });
 
 // ── extra UNIT: winner's diff that cannot apply fails closed ──────────────────

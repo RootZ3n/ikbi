@@ -3316,7 +3316,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       return { pass, roles: [verifierResult], ...(pass ? {} : { reason: verifierResult.summary ?? "shadow verifier did not pass" }) };
     };
 
-    const promote = async (t: WorkerTask, ws: WorkspaceHandle, roleResults: readonly RoleResult[], composite: number): Promise<{ promoted: boolean; reason?: string; conflicts?: readonly string[] }> => {
+    const promote = async (t: WorkerTask, ws: WorkspaceHandle, roleResults: readonly RoleResult[], composite: number): Promise<{ promoted: boolean; reason?: string; conflicts?: readonly string[]; receiptStatus?: "recorded" | "failed" }> => {
       // H5 FAIL-CLOSED: a promote REQUIRES gate-wall authorization — no gate-wall ⇒ DENY.
       if (gateWall === undefined) return { promoted: false, reason: "gate-wall not wired — promote denied (fail-closed)" };
       const governanceGrant = autonomyForTier(asTier(parentIdentity.trustTier ?? TRUST_FLOOR, TRUST_FLOOR));
@@ -3328,10 +3328,14 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         message: `worker-model (tournament): ${t.goal}`,
         requestId: t.taskId,
       });
+      if (result.promoted && result.receiptStatus === "failed") {
+        log.warn({ workspaceId: ws.id, taskId: t.taskId, receiptStatus: result.receiptStatus }, "tournament promote landed but receipt append failed");
+      }
       return {
         promoted: result.promoted,
         ...(result.reason !== undefined ? { reason: result.reason } : {}),
         ...(result.conflicts !== undefined ? { conflicts: result.conflicts } : {}),
+        ...(result.receiptStatus !== undefined ? { receiptStatus: result.receiptStatus } : {}),
       };
     };
 

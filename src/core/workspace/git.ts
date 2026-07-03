@@ -42,8 +42,18 @@ export async function isGitRepo(repo: string): Promise<boolean> {
 }
 
 export async function currentBranch(repo: string): Promise<string> {
-  const r = await runGit(repo, ["rev-parse", "--abbrev-ref", "HEAD"]);
-  return r.stdout.trim();
+  const symbolic = await runGit(repo, ["symbolic-ref", "--quiet", "--short", "HEAD"], { okCodes: [1] });
+  if (symbolic.code === 0) return symbolic.stdout.trim();
+
+  const abbreviated = await runGit(repo, ["rev-parse", "--abbrev-ref", "HEAD"], { okCodes: [128] }).catch(() => undefined);
+  const head = abbreviated?.stdout.trim();
+  if (head === "HEAD" || symbolic.code === 1) {
+    throw new WorkspaceError(
+      "config",
+      "target repository is in detached HEAD; pass an explicit baseBranch so workspace promotion has a real target branch",
+    );
+  }
+  throw new WorkspaceError("config", "could not resolve the target repository's current branch; pass an explicit baseBranch");
 }
 
 export async function revParse(repo: string, ref: string): Promise<string> {

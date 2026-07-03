@@ -31,8 +31,7 @@
  * chokepoint before it re-enters the model. This module only produces; it never neutralizes.
  */
 
-import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { readFileSync, readdirSync } from "node:fs";
 
 import type { OperationContext } from "../../core/identity/index.js";
 import type { GbrainBridge } from "../../core/gbrain-bridge.js";
@@ -40,7 +39,7 @@ import type { GovernedExec } from "../governed-exec/index.js";
 import type { ToolCall } from "../../core/provider/index.js";
 import type { MemoryGovernor } from "../memory-governor/contract.js";
 import { isGovernedPath } from "../memory-governor/guard.js";
-import { confinePath, type ToolCallError } from "./builder-tools/confine.js";
+import { confinePath, writeConfinedFile, type ToolCallError } from "./builder-tools/confine.js";
 import { runSearchFiles } from "./builder-tools/search-files.js";
 import { runGlob } from "./builder-tools/glob.js";
 import { runPatch } from "./builder-tools/patch.js";
@@ -266,8 +265,7 @@ export async function executeTool(deps: ToolExecutorDeps, call: ToolCall): Promi
       let before: string | null = null;
       try { before = readFileSync(c.full, "utf8"); } catch { before = null; }
       try {
-        mkdirSync(dirname(c.full), { recursive: true });
-        writeFileSync(c.full, content, "utf8");
+        writeConfinedFile(worktreeReal, c, content);
         return { output: `wrote ${Buffer.byteLength(content, "utf8")} bytes to ${c.rel}`, ok: true, wrote: c.rel, rel: c.rel, full: c.full, before, after: content };
       } catch (e) {
         return { output: `ERROR: write failed: ${errMsg(e)}`, ok: false, rel: c.rel, full: c.full };

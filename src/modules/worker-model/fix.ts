@@ -22,15 +22,15 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
+import { join } from "node:path";
 
 import { neutralizeUntrusted, toUntrustedMessage } from "../../core/injection/index.js";
 import type { NeutralizedContent, UntrustedContext } from "../../core/injection/contract.js";
 import type { AgentIdentity, ModelMessage, ModelRequest, ModelResponse } from "../../core/provider/contract.js";
 import { resolveChecks } from "./checks.js";
 import { parseCheckOutput } from "../check-triage/index.js";
-import { confinePath } from "./builder-tools/confine.js";
+import { confinePath, writeConfinedFile } from "./builder-tools/confine.js";
 import { antiCheatCheck, isTestFile, type FileChange } from "./fix-anti-cheat.js";
 import { diagnoseFailure, type Diagnosis, type DiagnosisFile } from "./fix-diagnosis.js";
 import { FixReceiptBuilder, type FixReceipt, type FixResult, type ParsedOutcomes } from "./fix-receipt.js";
@@ -237,8 +237,7 @@ function fsReadFile(repo: string, rel: string): string | null {
 function fsWriteFile(repo: string, rel: string, content: string): void {
   const c = confinePath(realpathSync(repo), rel);
   if (!c.ok) throw new Error(c.error);
-  mkdirSync(dirname(c.full), { recursive: true });
-  writeFileSync(c.full, content, "utf8");
+  writeConfinedFile(realpathSync(repo), c, content);
 }
 
 /** Default HEAD resolution (read-only). */

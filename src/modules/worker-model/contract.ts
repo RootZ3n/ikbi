@@ -350,6 +350,8 @@ export interface WorkerResult {
   readonly promoted: boolean;
   /** Human reason on a non-success / partial terminal. */
   readonly reason?: string;
+  /** Free-form run metadata for non-contract-critical observability. Never secrets. */
+  readonly metadata?: Readonly<Record<string, unknown>>;
   /**
    * Which verification path actually ran this run: "ladder" (HARDENED — stub detection,
    * no-vacuous-green, scope-stamped) or "legacy". Surfaced so an operator never has to inspect

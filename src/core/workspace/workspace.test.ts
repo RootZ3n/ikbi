@@ -83,6 +83,24 @@ test("allocate creates an isolated worktree; work in it does not touch main", as
   }
 });
 
+test("allocate without baseBranch rejects detached HEAD instead of promoting through a branch named HEAD", async () => {
+  const repo = await makeRepo();
+  const { mgr, root } = makeManager();
+  try {
+    await runGit(repo, ["checkout", "--quiet", "--detach", "HEAD"]);
+    await assert.rejects(
+      mgr.allocate({ targetRepo: repo, identity: ID }),
+      (e: unknown) => e instanceof WorkspaceError && e.kind === "config" && /detached HEAD|baseBranch/.test(e.message),
+    );
+
+    const ws = await mgr.allocate({ targetRepo: repo, identity: ID, baseBranch: "main" });
+    assert.equal(ws.baseBranch, "main", "an explicit branch remains valid from detached HEAD");
+    assert.equal((await listBranches(repo, "HEAD")).includes("HEAD"), false, "no accidental local branch named HEAD");
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
 test("multiple workspaces coexist in isolation (concurrency-ready)", async () => {
   const repo = await makeRepo();
   const { mgr, root } = makeManager();

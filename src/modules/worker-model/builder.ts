@@ -36,8 +36,7 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 
 import { configEnv } from "../../core/config.js";
 import { events } from "../../core/events/index.js";
@@ -50,7 +49,7 @@ import { parseCheckOutput } from "../check-triage/index.js";
 import type { GovernedExec } from "../governed-exec/index.js";
 import { gbrainBridge } from "../../core/gbrain-bridge.js";
 import { BRAIN_TOOLS, BRAIN_TOOL_NAMES, runBrainTool } from "./builder-tools/brain-tools.js";
-import { confinePath, type ToolCallError } from "./builder-tools/confine.js";
+import { confinePath, writeConfinedFile, type ToolCallError } from "./builder-tools/confine.js";
 import { fireHooks, loadHooks } from "../hooks/index.js";
 import { delegateTaskTool, runDelegateTask } from "./builder-tools/delegate.js";
 import { gitDiffTool, gitLogTool, gitStatusTool, GIT_TOOL_NAMES, runGitTool } from "./builder-tools/git-tools.js";
@@ -1013,8 +1012,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
           log.info({ path: c.rel, writeScope, exists: existsSync(c.full) }, "write_file ALLOWED");
           const content = typeof args.content === "string" ? args.content : "";
           try {
-            mkdirSync(dirname(c.full), { recursive: true });
-            writeFileSync(c.full, content, "utf8");
+            writeConfinedFile(worktreeReal, c, content);
             filesWritten.push(c.rel);
             checksStale = true; // PRINCIPLE 4(b): the green (if any) is now stale until run_checks re-runs
             return `wrote ${Buffer.byteLength(content, "utf8")} bytes to ${c.rel}`;

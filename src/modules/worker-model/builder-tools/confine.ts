@@ -12,7 +12,7 @@
  */
 
 import { dirname, isAbsolute, relative, resolve } from "node:path";
-import { realpathSync } from "node:fs";
+import { closeSync, constants, lstatSync, mkdirSync, openSync, realpathSync, writeFileSync } from "node:fs";
 
 /** A tool call that was rejected (bad path / bad args / unknown tool). Lives in the role detail. */
 export interface ToolCallError {
@@ -58,6 +58,41 @@ export function confinePath(worktreeReal: string, arg: unknown): Confined {
     return { ok: false, error: `path "${arg}" escapes the worktree via symlink` };
   }
   return { ok: true, full: resolved, rel: relative(worktreeReal, resolved) || "." };
+}
+
+/**
+ * Write a file after revalidating confinement immediately before the mutating open.
+ *
+ * This closes the practical symlink escape for `write_file`: mkdir can create the parent, then an
+ * attacker with concurrent worktree access could replace that parent or final path with a symlink
+ * between the earlier `confinePath` check and `writeFileSync`. We re-check the parent realpath,
+ * reject a final symlink, and open with O_NOFOLLOW where the platform exposes it.
+ *
+ * Residual TOCTOU risk: POSIX path traversal is still not a single kernel-level "open beneath root"
+ * operation in Node. A same-UID attacker racing parent replacement at exactly the open boundary can
+ * only be fully eliminated with openat2/RESOLVE_BENEATH-style APIs or an OS sandbox.
+ */
+export function writeConfinedFile(worktreeReal: string, confined: Extract<Confined, { ok: true }>, content: string): void {
+  mkdirSync(dirname(confined.full), { recursive: true });
+  if (!isUnder(worktreeReal, realExistingAncestor(confined.full))) {
+    throw new Error(`path "${confined.rel}" escapes the worktree via symlink`);
+  }
+  try {
+    if (lstatSync(confined.full).isSymbolicLink()) {
+      throw new Error(`path "${confined.rel}" escapes the worktree via symlink`);
+    }
+  } catch (err) {
+    const code = (err as { code?: string }).code;
+    if (code !== "ENOENT") throw err;
+  }
+
+  const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+  const fd = openSync(confined.full, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | noFollow, 0o666);
+  try {
+    writeFileSync(fd, content, "utf8");
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /**

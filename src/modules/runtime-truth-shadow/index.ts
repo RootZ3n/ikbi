@@ -1,6 +1,10 @@
 /**
  * ikbi runtime-truth-shadow - module entrypoint.
  *
+ * Despite the name, this module does not allocate filesystem shadow workspaces and is not part of
+ * promotion isolation. It emits cognition telemetry only. For actual isolated worktrees and shadow
+ * promotion mechanics, use `src/core/workspace/`.
+ *
  * Pins the FROZEN-CORE contract it builds against (events) so drift throws at load. It registers no
  * CLI command and no load-time subscription; it runs ON DEMAND from the cognition layer in shadow
  * mode only, so it needs no modules-barrel entry.
