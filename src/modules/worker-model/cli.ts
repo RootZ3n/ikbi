@@ -1273,7 +1273,10 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
         // SINGLE-STEP: run directly.
         result = await orchestrator.run(task, ctx);
       }
-      if (sub !== undefined) await eventBus.flush(); // drain the progress lines before the summary
+      // Drain progress lines before the summary — time-bounded and best-effort so a stuck
+      // subscriber drain can never suppress the result envelope below (a promoted build that
+      // prints nothing reads as a failure and invites a duplicate re-run).
+      if (sub !== undefined) await flushBestEffort(eventBus, 2000);
       // A gate denial / non-promote is a CLEAN outcome (printed), not an error.
       out(summarize(result));
       // ISSUE 3: surface the repair report (root cause / files / rationale / tests) when present.
@@ -1309,6 +1312,29 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
   }
 
   return { build };
+}
+
+/**
+ * Await the event-bus drain, but never longer than `ms`, and never throw.
+ *
+ * The result envelope (JSON summary / cost / diff / next-hints) is printed AFTER the drain so
+ * progress lines land first. But a stuck or never-resolving subscriber drain must NEVER suppress
+ * that envelope: a build that promoted but printed nothing looks like a failure and invites a
+ * duplicate re-run. This bounds the drain by wall-clock and swallows any drain error so the
+ * caller always proceeds to print the result.
+ */
+export async function flushBestEffort(bus: { flush(): Promise<void> }, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, ms);
+  });
+  try {
+    await Promise.race([bus.flush(), timeout]);
+  } catch {
+    /* the drain is best-effort — never let it block or fail the result envelope */
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 // Register the LIVE command at import time (the modules barrel triggers this).
