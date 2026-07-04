@@ -48,6 +48,7 @@ import type { BuildCandidate, JudgeResult } from "../deterministic-judge/index.j
 import {
   escalationConfig,
   escalationEngine,
+  configureEscalationResolver,
   escalationEvaluated,
   escalationTriggered,
   escalationDeclined,
@@ -634,6 +635,29 @@ const DEFAULT_ROLES: Record<WorkerRole, RoleFn> = { scout, builder, critic, veri
 async function lazyInvokeModel(request: ModelRequest): Promise<ModelResponse> {
   const mod = await import("../../core/provider/index.js");
   return mod.invokeModel(request);
+}
+
+/**
+ * Wire the escalation engine's "is this model wired?" resolver from the provider registry —
+ * ONCE, lazily, via the same dynamic import as `lazyInvokeModel` (so the provider singleton
+ * is never constructed at module load, before the egress-fetch-guard floor registers). After
+ * this runs, the escalation cascade skips unwired/stub tier models in favor of a live one.
+ */
+let escalationResolverWired = false;
+async function ensureEscalationResolver(): Promise<void> {
+  if (escalationResolverWired) return;
+  try {
+    const { registry } = await import("../../core/provider/index.js");
+    configureEscalationResolver((modelId) => {
+      const spec = registry.getModel(modelId);
+      return spec !== undefined && spec.providers.some((route) => registry.getProvider(route.provider) !== undefined);
+    });
+    escalationResolverWired = true; // only latch on success, so a properly-loaded run can still wire it
+  } catch {
+    // The provider registry isn't constructible yet (e.g. a unit test that hasn't loaded the egress
+    // floor). Wiring is best-effort hardening — leave the resolver unset (cascade behaves as before,
+    // preferring roster[0]) and retry on the next run. Never fail a build over this.
+  }
 }
 
 /** The promote/discard decision read from the integrator's result. */
@@ -1352,6 +1376,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       throw new WorkerError("identity", "run requires an OperationContext carrying a validated identity");
     }
     const parentIdentity = parentCtx.identity.identity;
+    // Wire the escalation resolver (once) so the tier cascade skips unwired/stub models — done
+    // here, in the async build entry, where the egress floor + provider registry are fully loaded.
+    await ensureEscalationResolver();
     // Builder model resolution, highest precedence first:
     //   1. --tier preset (builderModelOverride) — an explicit, operator-chosen tier builder.
     //   2. --complexity large — bump straight to the mid-tier model, skipping flash.

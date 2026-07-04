@@ -60,7 +60,8 @@ export type { PolicyOutcome } from "./policy.js";
 export { buildHandoff, escalationReason, formatScoreBreakdown } from "./handoff.js";
 
 // --- engine ---
-export { createEscalationEngine, escalationEngine } from "./engine.js";
+export { createEscalationEngine, escalationEngine, configureEscalationResolver } from "./engine.js";
+export type { EscalationEngineDeps } from "./engine.js";
 
 // --- break-glass ---
 export { createBreakGlass, presentBreakGlass, DENY_BY_DEFAULT } from "./break-glass.js";

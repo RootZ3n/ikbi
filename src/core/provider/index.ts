@@ -94,6 +94,9 @@ function buildDefaultRegistry(): ModelRegistry {
     // minimax-m3: real provider now wired via providers.json
     // gpt-5.5: real provider now wired via providers.json (OpenAI)
     // opus-4.8: stub entry so the escalation roster resolves; real calls fail gracefully.
+    // The escalation cascade (policy.modelFor + the registry-backed resolver in escalation/engine)
+    // now SKIPS this stub when a wired model exists in the same tier, so it never dead-ends an
+    // escalation — wire a real Anthropic route in providers.json to make opus-4.8 a live target.
     {
       id: "opus-4.8",
       role: "critic",
