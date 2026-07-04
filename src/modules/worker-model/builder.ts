@@ -41,6 +41,7 @@ import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { configEnv } from "../../core/config.js";
 import { classifyError } from "../../core/errors/index.js";
 import { events } from "../../core/events/index.js";
+import { preStartParallelReads } from "./tool-parallel.js";
 import type { OperationContext } from "../../core/identity/index.js";
 import { toUntrustedMessage } from "../../core/injection/index.js";
 import { childLogger } from "../../core/log.js";
@@ -1694,6 +1695,16 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       if (roundToolCalls !== undefined) {
         toolRounds += 1;
         let terminated = false;
+        // PARALLEL DISPATCH: worktree-INDEPENDENT async read tools (web research, vision) that the
+        // model emitted together in one round run CONCURRENTLY — pre-started here, then awaited in
+        // call order in the serial loop below so results still append deterministically. See
+        // tool-parallel.ts for why only these fully-external tools are parallelized (no write↔read
+        // race, no reordered side effects); everything else stays strictly serial.
+        const parallelDispatch = preStartParallelReads(
+          roundToolCalls,
+          (c) => WEB_TOOL_NAMES.has(c.name) || c.name === "vision_analyze",
+          (c) => (WEB_TOOL_NAMES.has(c.name) ? runWebCall(c) : runVisionCall(c)),
+        );
         // DELIBERATE DUPLICATION (YELLOW / Issue 3): this per-tool dispatch chain re-implements the
         // confine→govern→execute core of the shared `executeTool` (tool-executor.ts — the CANONICAL
         // path for the chat surface). It is kept separate ON PURPOSE: the builder folds each tool's
@@ -1749,8 +1760,9 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
             appendToolResult(raw, call);
           } else if (WEB_TOOL_NAMES.has(call.name)) {
             // Web research through the egress SSRF guard — async; output is UNTRUSTED internet
-            // content, neutralized by the chokepoint.
-            const raw = await runWebCall(call);
+            // content, neutralized by the chokepoint. Run concurrently with sibling web/vision calls
+            // in this round when one was pre-started above (awaited here, in call order).
+            const raw = await (parallelDispatch.get(call) ?? runWebCall(call));
             appendToolResult(raw, call);
           } else if (call.name === "delegate_task") {
             // Sub-agent delegation — async; its result is UNTRUSTED to the parent → chokepoint.
@@ -1765,8 +1777,9 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
             }
             appendToolResult(raw, call);
           } else if (call.name === "vision_analyze") {
-            // Multimodal image analysis — async; the analysis is UNTRUSTED → chokepoint.
-            const raw = await runVisionCall(call);
+            // Multimodal image analysis — async; the analysis is UNTRUSTED → chokepoint. Runs
+            // concurrently with sibling web/vision calls in this round (pre-started above).
+            const raw = await (parallelDispatch.get(call) ?? runVisionCall(call));
             appendToolResult(raw, call);
           } else if (call.name === "lsp_diagnostic") {
             // Language-server-grade diagnostics through governed-exec — async; the compiler
