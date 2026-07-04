@@ -69,6 +69,8 @@ import { runTournament } from "./tournament.js";
 import type { CandidateRun, CandidateSpec, ShadowVerification, TournamentEngine, TournamentEvent } from "./tournament.js";
 import { captureStreamedStdout, classifyUnresolvableReason, committedPackageJsonDiff, parseChecksEnv, parseTestCount, PROJECT_MANIFESTS, resolveChecks, resolveCheckTimeoutMs, UNRESOLVABLE_NEXT_STEPS, type VerificationKind, workingTreePackageJsonDiff, workingTreePlanningDiff } from "./checks.js";
 import { builderModel, competitiveBuilderModels } from "./role-models.js";
+import { estimatePromptTokens, contextExceedsWindow } from "./context-preflight.js";
+import { getCapabilities } from "../../core/provider/capabilities.js";
 import { createCritic, critic } from "./critic.js";
 import { createRefuter, refuter, proposalFromFinding, type RefuterFinding } from "./refuter.js";
 import { liveCorrectionAccess } from "./correction-application.js";
@@ -125,6 +127,15 @@ import type {
 } from "./contract.js";
 
 const EVENT_SOURCE = "worker-model";
+
+/**
+ * Pre-flight context threshold: bump the builder to a bigger-window model when the KNOWN base
+ * context (goal + project instructions + scout brief) already exceeds this fraction of the worker
+ * model's window. High (0.7) on purpose — it estimates only the pre-loop base (runtime file reads
+ * aren't counted), so it upgrades only when the size is unmistakable, never on a task the cheap
+ * model could have handled. The reactive on-overflow escalation is the backstop for the rest.
+ */
+const CONTEXT_PREFLIGHT_FRACTION = 0.7;
 
 /** A mutable signal accumulator folded across roles within one run (see observeEscalation). */
 interface MutableEscalationSignals {
@@ -1394,7 +1405,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     //   1. --tier preset (builderModelOverride) — an explicit, operator-chosen tier builder.
     //   2. --complexity large — bump straight to the mid-tier model, skipping flash.
     //   3. the configured single builder model (default).
-    const effectiveBuilderModel =
+    // `let` so the pre-flight context-size check (below, once the scout brief is known) can bump it
+    // to a bigger-window model — keeping cost attribution + the recorded model consistent with the
+    // model the builder actually runs on.
+    let effectiveBuilderModel =
       task.builderModelOverride ?? (task.complexity === "large" ? (escalationConfig.tierModels.mid[0] ?? singleBuilderModel) : singleBuilderModel);
     armBudget(task); // start the whole-pipeline wall-clock deadline (covers every dispatch path)
     // Hand the (real) builder a mid-loop halt check so its loop stops promptly on a kill/budget
@@ -1715,7 +1729,33 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         // Builder model override for the role dispatch (same precedence as effectiveBuilderModel):
         // a --tier preset wins, else --complexity large bumps to the mid-tier model, else undefined
         // (builderForModel falls back to the configured builder). Kept in sync with line ~1312.
-        const complexityModel = task.builderModelOverride ?? (task.complexity === "large" ? escalationConfig.tierModels.mid[0] : undefined);
+        let complexityModel = task.builderModelOverride ?? (task.complexity === "large" ? escalationConfig.tierModels.mid[0] : undefined);
+        // PRE-FLIGHT CONTEXT SIZE (proactive): the scout has run, so its brief is known. If the base
+        // builder context (goal + project instructions + scout brief) already fills most of the worker
+        // model's window, start the builder on a bigger-window mid model instead of burning a doomed
+        // cheap attempt that would only overflow (the reactive on-overflow path would then recover it).
+        // Only bumps UP, never overrides an explicit --tier/--complexity choice or a disabled cascade.
+        if (role === "builder" && complexityModel === undefined && task.escalationDisabled !== true) {
+          const scoutResult = results.find((r) => r.role === "scout");
+          const brief = typeof (scoutResult?.detail as Record<string, unknown> | undefined)?.brief === "string"
+            ? ((scoutResult!.detail as Record<string, unknown>).brief as string)
+            : undefined;
+          const estTokens = estimatePromptTokens([task.goal, task.projectInstructions, brief]);
+          const workerWindow = getCapabilities(singleBuilderModel).context_window;
+          if (contextExceedsWindow(estTokens, workerWindow, CONTEXT_PREFLIGHT_FRACTION)) {
+            const midModel = escalationConfig.tierModels.mid[0];
+            if (midModel !== undefined && midModel !== singleBuilderModel) {
+              complexityModel = midModel;
+              effectiveBuilderModel = midModel; // keep cost attribution + the recorded model consistent
+              events.publish(
+                workerRoleDispatched.create(
+                  { taskId: task.taskId, role: "builder" },
+                  { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.preflight_context_escalation", runId: task.taskId } },
+                ),
+              );
+            }
+          }
+        }
         const roleFn = role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderForModel(parentCtx, complexityModel, resolveBuilderMode(task)) : role === "critic" ? criticFor() : role === "refuter" ? refuterFor() : roles[role];
         // H4: floor the verifier's role timeout at the per-check budget. Without this, a 300s role
         // timeout races against 600s checks — the role fails first, orphaning the still-running check.

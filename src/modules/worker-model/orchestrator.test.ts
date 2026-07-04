@@ -1954,6 +1954,42 @@ test("GREENFIELD: a LOOSE-SOURCE target (no manifest) STILL fast-fails even with
   }
 });
 
+const preflightOp = (e: unknown): boolean =>
+  (e as { attribution?: { operation?: string } }).attribution?.operation === "worker.preflight_context_escalation";
+
+test("PRE-FLIGHT CONTEXT: a large scout brief pre-escalates the builder to a bigger-window model before a doomed cheap attempt", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const bus = fakeBus();
+  const cap = capturingRoles();
+  // A scout brief that ≈ fills a 32k worker window: 120k chars ≈ 30k tokens > 0.7 * 32768 (≈22.9k).
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    scout: async () => ({ role: "scout", outcome: "success", summary: "s", detail: { brief: "x".repeat(120_000) } }),
+  };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces, events: bus.bus, builderModel: "mimo-v2.5" }));
+  const result = await orch.run({ taskId: "t-preflight-big", targetRepo: "/repo", goal: "build the big thing" }, parentCtx);
+
+  assert.ok(bus.sent.some(preflightOp), "pre-flight bumped the builder up when the base context already fills the worker window");
+  assert.equal(result.outcome, "success", "the build still ran the full pipeline (bumped, not blocked)");
+});
+
+test("PRE-FLIGHT CONTEXT: a small brief keeps the builder on the cheap model (no needless upgrade)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const bus = fakeBus();
+  const cap = capturingRoles();
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    scout: async () => ({ role: "scout", outcome: "success", summary: "s", detail: { brief: "x".repeat(4_000) } }),
+  };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces, events: bus.bus, builderModel: "mimo-v2.5" }));
+  const result = await orch.run({ taskId: "t-preflight-small", targetRepo: "/repo", goal: "small task" }, parentCtx);
+
+  assert.ok(!bus.sent.some(preflightOp), "no pre-flight bump for a small base context (no needless upgrade)");
+  assert.equal(result.outcome, "success");
+});
+
 test("WO2: a repo WITH a manifest proceeds through the normal flow (no regression)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ikbi-wo2-manifest-"));
   try {
