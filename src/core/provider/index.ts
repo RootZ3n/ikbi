@@ -10,7 +10,7 @@ import { config } from "../config.js";
 import { childLogger } from "../log.js";
 import { wrapModelInvocation } from "./invoke-wrapper.js";
 import { computeCost, ProviderInvoker } from "./invoke.js";
-import { getCapabilities, type ModelCapabilities } from "./capabilities.js";
+import { getCapabilities, findUnclassifiedModels, FALLBACK_CAPABILITIES, type ModelCapabilities } from "./capabilities.js";
 import type { Cost, CostRate, ModelRequest, ModelResponse, ModelStream, TokenUsage } from "./contract.js";
 import {
   createDeepseekProvider,
@@ -127,6 +127,21 @@ function buildDefaultRegistry(): ModelRegistry {
   } catch (err) {
     log.error({ err, file: pc.rosterFile }, "failed to load provider roster file");
     throw err;
+  }
+
+  // Silent-degradation guard: a roster model whose id matches no capability table/pattern
+  // and carries no explicit override resolves to the conservative fallback (small window,
+  // no native tools). On a large-context model that is a ~25× context loss driven silently.
+  // Warn LOUDLY at startup (not fatal — a stub/escalation-tier id may legitimately be
+  // unwired) so the misconfiguration surfaces here, not mid-build. Also reported by `doctor`.
+  const unclassified = findUnclassifiedModels(reg.listModels());
+  if (unclassified.length > 0) {
+    log.warn(
+      { models: unclassified.map((u) => u.id), fallbackWindow: FALLBACK_CAPABILITIES.context_window },
+      "roster models are unclassified and silently degrade to the fallback capability profile " +
+        `(${FALLBACK_CAPABILITIES.context_window}-token window, no native tools) — add a family pattern in ` +
+        "capabilities.ts or an explicit `capabilities` override in the roster so a large-context model isn't driven at 8k",
+    );
   }
   return reg;
 }

@@ -21,6 +21,7 @@ import { config, type IkbiConfig } from "../core/config.js";
 import { loadRepoRegistry } from "../core/repo-registry.js";
 import type { ModelProvider } from "../core/provider/contract.js";
 import { registry as defaultRegistry } from "../core/provider/index.js";
+import { findUnclassifiedModels, FALLBACK_CAPABILITIES } from "../core/provider/capabilities.js";
 import type { ModelSpec } from "../core/provider/registry.js";
 import { workspaces as coreWorkspaces } from "../core/workspace/index.js";
 import { egressConfig } from "../modules/egress/config.js";
@@ -40,6 +41,9 @@ import { postureLines, productPosture } from "./posture.js";
 export interface DoctorRegistry {
   getModel: (id: string) => ModelSpec | undefined;
   getProvider: (id: string) => ModelProvider | undefined;
+  /** All roster models — for the silent-degradation capability check. Optional so test
+   *  fakes needn't provide it (the check is skipped, reported as unchecked, when absent). */
+  listModels?: () => ModelSpec[];
 }
 
 /** The inputs doctor reads — all default to the process-wide singletons; injectable for tests. */
@@ -201,6 +205,27 @@ export function runDoctor(inp: DoctorInputs = {}): DoctorResult {
   push(`  ${OK} IKBI_MODEL_CRITIC  = ${criticId}   (critic)`);
   if (competitive !== undefined && competitive.length > 0) {
     push(`  ${OK} IKBI_COMPETITIVE_MODELS = ${competitive.join(", ")}   (head-to-head shootout)`);
+  }
+
+  // --- MODEL CAPABILITIES (silent-degradation guard) -----------------------
+  // A roster model whose id matches no capability table/pattern and carries no explicit
+  // override silently resolves to the conservative fallback (8k window, no native tools).
+  // On a large-context model that is a ~25× context loss driven silently — surface it here,
+  // actionably, so it's caught in doctor rather than one failed build at a time.
+  push("");
+  push("MODEL CAPABILITIES");
+  const allModels = reg.listModels?.() ?? [];
+  if (reg.listModels === undefined) {
+    push(`  ${WARN} registry does not expose a model list — capability classification not checked`);
+  } else {
+    const degraded = findUnclassifiedModels(allModels);
+    if (degraded.length === 0) {
+      push(`  ${OK} all ${allModels.length} roster model(s) classified (none silently degrade to ${FALLBACK_CAPABILITIES.context_window}-token/no-tools)`);
+    } else {
+      for (const d of degraded) {
+        push(`  ${WARN} '${d.id}' is unclassified → silently degrades to a ${d.contextWindow}-token window, no native tools — add a family pattern in capabilities.ts or a roster \`capabilities\` override`);
+      }
+    }
   }
 
   // --- STATE ---------------------------------------------------------------

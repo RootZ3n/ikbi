@@ -127,6 +127,50 @@ export function getCapabilities(modelId: string, override?: Partial<ModelCapabil
 }
 
 /**
+ * True iff `modelId` is classified by the exact-id table or a family pattern — i.e.
+ * `getCapabilities` will NOT fall through to the conservative FALLBACK profile for it.
+ */
+export function isModelClassified(modelId: string): boolean {
+  if (KNOWN_CAPABILITIES[modelId] !== undefined) return true;
+  return FAMILY_PATTERNS.some((p) => p.match.test(modelId));
+}
+
+/** A roster model that silently degrades to the conservative fallback capability profile. */
+export interface UnclassifiedModel {
+  readonly id: string;
+  /** The (small) context window it silently resolves to. */
+  readonly contextWindow: number;
+}
+
+/**
+ * Find roster models that SILENTLY degrade to the conservative fallback (an 8k window,
+ * no native tools) because neither the exact table, a family pattern, nor an explicit
+ * roster capability override classifies them.
+ *
+ * An operator who genuinely runs a small local model declares `capabilities` explicitly
+ * (which suppresses the flag); an UNclassified frontier id here means a large-context
+ * model is being driven at 8k — the silent ~25× context loss this guard catches at
+ * startup / in `doctor`, rather than one failed build at a time. A model is treated as
+ * intentionally-configured (NOT flagged) when its override sets either `context_window`
+ * or `supports_tools` — the two fields the fallback degrades.
+ */
+export function findUnclassifiedModels(
+  models: ReadonlyArray<{ readonly id: string; readonly capabilities?: Partial<ModelCapabilities> }>,
+): UnclassifiedModel[] {
+  const out: UnclassifiedModel[] = [];
+  for (const m of models) {
+    if (isModelClassified(m.id)) continue;
+    const ov = m.capabilities;
+    const intentional =
+      ov !== undefined &&
+      ((typeof ov.context_window === "number" && ov.context_window > 0) || typeof ov.supports_tools === "boolean");
+    if (intentional) continue;
+    out.push({ id: m.id, contextWindow: getCapabilities(m.id, ov).context_window });
+  }
+  return out;
+}
+
+/**
  * Adapt a desired completion-token budget to a model's context window: never ask
  * for more than `fraction` of the window (leaving room for the prompt), and never
  * below a small floor. Used by the builder so a small-context cheap model isn't

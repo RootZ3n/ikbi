@@ -10,6 +10,7 @@ import "../modules/egress/index.js";
 
 import { loadConfig } from "../core/config.js";
 import type { ModelProvider } from "../core/provider/contract.js";
+import type { ModelSpec } from "../core/provider/registry.js";
 import { detectPackageManager, envTemplate, runDoctor, runDoctorFix, type DoctorFixPorts, type DoctorInputs, type DoctorRegistry } from "./doctor.js";
 
 /**
@@ -17,11 +18,20 @@ import { detectPackageManager, envTemplate, runDoctor, runDoctorFix, type Doctor
  * `registered` is the set of provider ids that are actually declared. A model
  * "resolves" iff it exists AND some route's provider is registered.
  */
-function fakeRegistry(models: Record<string, string[]>, registered: string[]): DoctorRegistry {
+function fakeRegistry(
+  models: Record<string, string[]>,
+  registered: string[],
+  caps: Record<string, { context_window?: number; supports_tools?: boolean }> = {},
+): DoctorRegistry {
   const provs = new Set(registered);
+  const specOf = (id: string): ModelSpec | undefined =>
+    models[id]
+      ? { id, providers: models[id].map((p) => ({ provider: p, providerModelId: id })), ...(caps[id] ? { capabilities: caps[id] } : {}) }
+      : undefined;
   return {
-    getModel: (id) => (models[id] ? { id, providers: models[id].map((p) => ({ provider: p, providerModelId: id })) } : undefined),
+    getModel: (id) => specOf(id),
     getProvider: (id) => (provs.has(id) ? ({ id } as unknown as ModelProvider) : undefined),
+    listModels: () => Object.keys(models).map((id) => specOf(id)!).filter(Boolean),
   };
 }
 
@@ -209,6 +219,48 @@ test("doctor SHOWS the competitive shootout list and resolution-CHECKS each race
   assert.match(text, /IKBI_COMPETITIVE_MODELS = mimo-v2\.5, qwen3:14b/, "the shootout list is shown");
   assert.match(text, /✗ the competitive model 'qwen3:14b' doesn't resolve to a registered provider/, "the unwired racer is flagged by name");
   assert.equal(r.ready, false, "an unresolvable competitive racer blocks readiness");
+});
+
+// ── MODEL CAPABILITIES: silent-degradation guard ────────────────────────────
+
+test("doctor REPORTS all roster models classified when none silently degrade", () => {
+  const r = runDoctor(
+    readyInputs({
+      registry: fakeRegistry({ "mimo-v2.5": ["mimo"], "opus-4.8": ["anthropic"], "deepseek-v4-pro": ["deepseek"] }, ["mimo", "anthropic", "deepseek"]),
+    }),
+  );
+  const text = r.lines.join("\n");
+  assert.match(text, /MODEL CAPABILITIES/);
+  assert.match(text, /✓ all 3 roster model\(s\) classified/, "classified frontier logical ids (opus-4.8) count as classified");
+  assert.equal(r.ready, true, "the capability check is advisory — it does not block readiness");
+});
+
+test("doctor FLAGS a roster model that silently degrades to the 8k/no-tools fallback", () => {
+  const r = runDoctor(
+    readyInputs({
+      // "mystery-frontier-x" matches no table/pattern and carries no override → silent 8k.
+      registry: fakeRegistry({ "mimo-v2.5": ["mimo"], "mystery-frontier-x": ["custom"], "deepseek-v4-pro": ["deepseek"] }, ["mimo", "custom", "deepseek"]),
+    }),
+  );
+  const text = r.lines.join("\n");
+  assert.match(text, /⚠ 'mystery-frontier-x' is unclassified → silently degrades to a 8192-token window/, "the degraded model is named with the fix");
+  assert.equal(r.ready, true, "advisory — surfaced loudly but not a readiness blocker");
+});
+
+test("doctor does NOT flag a small local model with an explicit capabilities override", () => {
+  const r = runDoctor(
+    readyInputs({
+      // An operator running a genuine small local model declares it explicitly → intentional, not flagged.
+      registry: fakeRegistry(
+        { "mimo-v2.5": ["mimo"], "local-tiny": ["ollama"], "deepseek-v4-pro": ["deepseek"] },
+        ["mimo", "ollama", "deepseek"],
+        { "local-tiny": { context_window: 8_192, supports_tools: false } },
+      ),
+    }),
+  );
+  const text = r.lines.join("\n");
+  assert.doesNotMatch(text, /'local-tiny' is unclassified/, "an explicit override signals intent — no false alarm");
+  assert.match(text, /✓ all 3 roster model\(s\) classified/);
 });
 
 // ── SAFETY POSTURE: verification + retrieval mode reporting (the hardening patch) ────────────
