@@ -413,8 +413,9 @@ test("INJECTION SIGNAL: a chokepoint block on a tool result is recorded in the r
     },
   };
   // ENABLED has trustLadder: true, so the per-role recordOutcome fires (the demotion path is live).
-  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, trust, receipts }));
-  await orch.run(task, parentCtx);
+  const ws = fakeWorkspaces(true);
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, trust, receipts, workspaces: ws.workspaces }));
+  const result = await orch.run(task, parentCtx);
 
   // Durable audit: the builder role receipt records the detected injection regardless of the ladder.
   const builderReceipt = appended.find((a) => a.operation === "worker.role.builder");
@@ -423,6 +424,37 @@ test("INJECTION SIGNAL: a chokepoint block on a tool result is recorded in the r
   // carries signals.injection so the trust rules can set the non-recoverable flag.
   const buildTrust = trustCalls.find((c) => c.operation === "worker.build");
   assert.ok(buildTrust?.injection, "the per-build recordOutcome received signals.injection — detection reaches enforcement");
+  // IN-RUN PROMOTE BLOCK (the real teeth): the OFFENDING build must NOT promote — even though every
+  // role (incl. the stubbed integrator) approved — regardless of the trust ladder.
+  assert.equal(result.promoted, false, "an injection-detected build is fail-closed — it does not promote");
+  assert.equal(ws.calls.promote, 0, "nothing was promoted");
+  assert.match(result.reason ?? "", /injection/i, "the discard reason names the injection");
+});
+
+test("POLICY TAINT: attempt 1 taints (out-of-policy call) then a clean retry — the tainted build must NOT promote", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const cap = capturingRoles();
+  let attempt = 0;
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    builder: async (ctx: RoleContext): Promise<RoleResult> => {
+      attempt += 1;
+      // Attempt 1: writes files AND attempts an out-of-policy tool call (taint), then fails → triggers retry.
+      if (!ctx.task.goal.includes("[retry]") && !ctx.task.goal.includes("[escalation]")) {
+        return { role: "builder", outcome: "failure", summary: "flailed after an out-of-policy call", detail: { filesWritten: ["a.ts"], policyViolations: [{ tool: "terminal", error: "blocked: pnpm run deploy" }], toolFormatErrors: [1, 2] } };
+      }
+      // The retry finishes CLEAN (no policy violations) — but the earlier taint must still block promote.
+      return { role: "builder", outcome: "success", summary: "clean retry", detail: { filesWritten: ["a.ts"], policyViolations: [] } };
+    },
+  };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces }));
+  const result = await orch.run({ taskId: "t-taint", targetRepo: "/repo", goal: "do the thing" }, parentCtx);
+
+  assert.ok(attempt >= 2, "the retry path ran (attempt 1 tainted+failed, then a clean retry)");
+  assert.equal(result.promoted, false, "a clean retry cannot launder attempt 1's policy taint — fail-closed");
+  assert.equal(ws.calls.promote, 0, "nothing promoted");
+  assert.match(result.reason ?? "", /out-of-policy|taint/i, "the discard reason names the taint");
 });
 
 test("ISSUE 1: a builder TIMEOUT does NOT feed the trust signal (no demotion) and writes an explicit suppression receipt", async () => {

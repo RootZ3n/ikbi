@@ -50,6 +50,20 @@ test("all gates pass → decision promote (outcome success, approving evaluation
   assert.match(rationaleOf(r), /builder wrote 2 file/);
 });
 
+test("frontier-consult synthetic builder result (policyViolations: []) PROMOTES — the recovery is reachable", async () => {
+  // A frontier consult applies a diff (no tool loop), spliced as a synthetic builder result. It must
+  // carry policyViolations: [] so the fail-closed policy gate reads "clean" instead of "cannot confirm"
+  // and discarding every authorized recovery. This pins that the consult shape actually promotes.
+  const consult: RoleResult = {
+    role: "builder",
+    outcome: "success",
+    summary: "frontier consult patch applied",
+    detail: { model: "opus-4.8", escalated: true, consult: true, filesWritten: ["a.ts"], policyViolations: [] },
+  };
+  const r = await integrator(ctxWith([consult, criticPass, verifierPass]));
+  assert.equal(decisionOf(r), "promote", "the consult recovery is not spuriously discarded by the policy gate");
+});
+
 test("critic pass=false → discard (outcome still success — the integrator decided)", async () => {
   const r = await integrator(ctxWith([builderOk, { role: "critic", outcome: "success", summary: "c", detail: { pass: false } }, verifierPass]));
   assert.equal(r.outcome, "success", "outcome=success means 'decided', not 'promote'");

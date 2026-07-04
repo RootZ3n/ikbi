@@ -790,8 +790,16 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   // INJECTION SIGNAL (per-run): set by recordRole when the neutralization chokepoint blocked a tool
   // result in ANY role this build. Read by recordBuildTrust to attribute it to the per-build trust
   // outcome (trust is recorded per-build, not per-role — FIX A), so the NON-RECOVERABLE injection
-  // flag is set when the ladder is active. Reset at every run entry; builds are serial (like activeCheckHalt).
+  // flag is set when the ladder is active. ALSO a fail-closed IN-RUN promote gate (below) so the
+  // OFFENDING build cannot promote — the trust demotion only affects FUTURE builds and is off by
+  // default. Reset at every run entry; builds are serial (like activeCheckHalt).
   let injectionDetectedThisBuild = false;
+  // POLICY-TAINT (per-run): set by recordRole when ANY builder ATTEMPT this build attempted an
+  // out-of-policy tool call. recordRole records the INITIAL builder BEFORE the retry/escalation
+  // blocks replace its result, so a later clean retry cannot LAUNDER the taint (the tainted
+  // attempt's writes may still be on disk in the shared worktree). A fail-closed in-run promote gate
+  // reads it, mirroring the auto-verify-rescue policy guard across every retry path.
+  let policyTaintedThisBuild = false;
 
   async function runRoleFn(role: WorkerRole, roleFn: RoleFn, ctx: RoleContext, timeoutOverrideMs?: number): Promise<RoleResult> {
     const effectiveTimeout = timeoutOverrideMs ?? roleTimeoutMs;
@@ -1189,8 +1197,16 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // rules set the NON-RECOVERABLE injection flag — the marketed defense, wired detection→enforcement.
     const injectionDetected = ((result.detail ?? {}) as Record<string, unknown>).injectionDetected === true;
     if (injectionDetected) {
-      injectionDetectedThisBuild = true; // carried to the per-build trust outcome (recordBuildTrust)
+      injectionDetectedThisBuild = true; // carried to the per-build trust outcome + the in-run promote gate
       log.warn({ role: result.role, taskId: task.taskId, agentId: spawned.identity.agentId }, "INJECTION DETECTED — chokepoint blocked a tool result; recorded as a trust signal");
+    }
+    // POLICY TAINT: a builder attempt that tried an out-of-policy tool call taints the whole build —
+    // captured HERE (recordRole runs on the INITIAL builder before any retry replaces its result), so
+    // a later clean retry can't launder it. Attempt-level, not the final integrator view.
+    if (result.role === "builder") {
+      const bd = (result.detail ?? {}) as Record<string, unknown>;
+      const pv = Array.isArray(bd.policyViolations) ? bd.policyViolations : [];
+      if (pv.length > 0) policyTaintedThisBuild = true;
     }
 
     await receipts.append(
@@ -1419,6 +1435,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     }
     const parentIdentity = parentCtx.identity.identity;
     injectionDetectedThisBuild = false; // reset the per-run injection flag (builds are serial)
+    policyTaintedThisBuild = false; // reset the per-run policy-taint flag
     // Wire the escalation resolver (once) so the tier cascade skips unwired/stub models — done
     // here, in the async build entry, where the egress floor + provider registry are fully loaded.
     await ensureEscalationResolver();
@@ -2559,7 +2576,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                     role: "builder",
                     outcome: "success",
                     summary: `frontier consult patch applied by ${consultModelId} (${applyRes.filesChanged.length} file(s))`,
-                    detail: { model: consultModelId, escalated: true, consult: true, filesWritten: [...applyRes.filesChanged] },
+                    // policyViolations: [] is TRUTHFUL — the consult path is a diff apply (applyConsultPatch),
+                    // not a builder tool loop, so no tool-call policy could be violated. Without it the
+                    // integrator's fail-closed policy gate reads `undefined` ("cannot confirm clean") and
+                    // discards every authorized frontier recovery — making the feature structurally unreachable.
+                    detail: { model: consultModelId, escalated: true, consult: true, filesWritten: [...applyRes.filesChanged], policyViolations: [] },
                   };
                   const builderIdx = results.lastIndexOf(failedResult);
                   if (builderIdx >= 0) results[builderIdx] = synth;
@@ -2835,7 +2856,20 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // returned an affirmative, well-formed promote decision; anything else discards
     // (fail-closed). If a role hard-failed, the loop broke before the integrator ran,
     // so its result is absent → fail-closed discard. That composition is intentional.
-    const decision = readIntegratorDecision(results.find((r) => r.role === "integrator"));
+    let decision = readIntegratorDecision(results.find((r) => r.role === "integrator"));
+    // FAIL-CLOSED IN-RUN GATES (enforced on THIS build's promote, independent of the trust ladder):
+    //  (1) INJECTION: the neutralization chokepoint blocked a tool result in some role this build —
+    //      the "injection blocks promotion" defense, enforced HERE. The trust-ladder demotion only
+    //      affects FUTURE builds and is off by default, so it cannot block the OFFENDING build.
+    //  (2) POLICY TAINT: some builder ATTEMPT this build tried an out-of-policy tool call. A later
+    //      clean retry cannot launder it — the tainted attempt's writes may still be on disk in the
+    //      shared worktree. Mirrors the auto-verify-rescue policy guard, applied to every retry path.
+    // Both are genuine gate failures (not operator/governance decisions) → trust is NOT suppressed.
+    if (decision.promote && injectionDetectedThisBuild) {
+      decision = { ...decision, promote: false, rationale: "discard: prompt-injection detected by the neutralization chokepoint during this build (fail-closed — the injected build must not promote)" };
+    } else if (decision.promote && policyTaintedThisBuild) {
+      decision = { ...decision, promote: false, rationale: "discard: an out-of-policy tool call was attempted during this build; the taint carries across retries (fail-closed)" };
+    }
     let promoted = false;
     let reason: string | undefined;
     // SG-10 HUMAN-APPROVAL GATE (opt-in): the build is VERIFIED and the integrator approved —
