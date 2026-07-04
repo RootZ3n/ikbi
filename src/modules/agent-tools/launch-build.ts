@@ -54,6 +54,9 @@ export async function runLaunchBuild(
     readonly spawnFn?: typeof spawn;
     readonly timeoutMs?: number;
     readonly warn?: (message: string) => void;
+    /** The operator's standing instructions (~/.ikbi/instructions.md), threaded to the build so a
+     *  Peh-launched build honors the same baseline preferences the chat session does. */
+    readonly standingInstructions?: string;
   },
 ): Promise<LaunchBuildResult> {
   const goal = typeof args.goal === "string" ? args.goal.trim() : "";
@@ -73,6 +76,11 @@ export async function runLaunchBuild(
   }
   const spawnFn = ctx.spawnFn ?? spawn;
   const cmdArgs = [ctx.cliEntry, "build", goal, "--repo", repo, "--yes", "--tier", "cheap", "--cost"];
+  // Standing instructions travel to the build via the environment (never argv/goal — no injection,
+  // no pollution of the goal string the step-planner decomposes). `ikbi build` folds a non-empty
+  // IKBI_BUILD_EXTRA_INSTRUCTIONS into the build's project instructions for every role.
+  const instructions = typeof ctx.standingInstructions === "string" ? ctx.standingInstructions.trim() : "";
+  const childEnv = instructions.length > 0 ? { ...process.env, IKBI_BUILD_EXTRA_INSTRUCTIONS: instructions } : process.env;
 
   let out = "";
   const code = await new Promise<number>((resolvePromise) => {
@@ -80,7 +88,7 @@ export async function runLaunchBuild(
     const finish = (c: number): void => { if (!settled) { settled = true; resolvePromise(c); } };
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawnFn(ctx.execPath, cmdArgs, { stdio: ["ignore", "pipe", "pipe"] });
+      child = spawnFn(ctx.execPath, cmdArgs, { stdio: ["ignore", "pipe", "pipe"], env: childEnv });
     } catch (e) {
       out += `spawn failed: ${e instanceof Error ? e.message : String(e)}`;
       finish(1);

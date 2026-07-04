@@ -1127,9 +1127,23 @@ export class ChatSession {
       // launch_build promotes to a REAL repo — surface WHICH one in the confirmation. The repo is
       // always the session repo; stale model-supplied `repo` args are ignored by runLaunchBuild.
       const launchRepo = this.targetRepo;
-      const target = call.name === "launch_build" && typeof args.goal === "string"
+      let target = call.name === "launch_build" && typeof args.goal === "string"
         ? `build: "${args.goal}" in ${launchRepo ?? "(no repo — will be refused)"}`
         : typeof args.command === "string" ? args.command : typeof args.task === "string" ? args.task : "";
+      // CONFIRM WITH THE PLAN: before the user approves a launch_build, show HOW the goal decomposes
+      // (the same zero-cost heuristic `ikbi build` runs internally) so "discuss → confirm → it works"
+      // surfaces the plan at the decision point — not a black box. Best-effort; a planning hiccup
+      // never blocks the confirmation.
+      if (call.name === "launch_build" && typeof args.goal === "string") {
+        try {
+          const { decompose } = await import("../step-planner/index.js");
+          const plan = decompose(args.goal);
+          if (plan.decomposed && plan.steps.length > 1) {
+            const steps = plan.steps.map((s) => `  ${s.index}. ${s.goal}`).join("\n");
+            target += `\nPlan (${plan.steps.length} steps):\n${steps}`;
+          }
+        } catch { /* planning is advisory — never block the confirm on it */ }
+      }
       const allowed = await opts.confirm(call.name, `${target}${target.length > 0 ? " " : ""}(rollback cannot cover terminal/sub-agent side effects)`);
       if (!allowed) {
         return { output: `ERROR: ${call.name} was DENIED by the operator. Rollback cannot cover terminal/sub-agent side effects.`, activity: { name: call.name, ok: false, summary: "denied" } };
@@ -1259,6 +1273,9 @@ export class ChatSession {
           sessionRepo: this.targetRepo,
           cliEntry: process.argv[1] ?? "",
           execPath: process.execPath,
+          // Thread the operator's standing instructions to the build so a Peh-launched build honors
+          // the same baseline preferences this session does (passed via env inside runLaunchBuild).
+          ...(loadUserInstructions()?.content !== undefined ? { standingInstructions: loadUserInstructions()!.content } : {}),
         });
         return { output: res.output, activity: { name: "launch_build", ok: res.ok, summary: res.summary } };
       }

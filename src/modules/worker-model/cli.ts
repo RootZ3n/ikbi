@@ -1138,8 +1138,17 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       ...(complexity !== undefined ? { complexity } : {}),
       // Pass pre-loaded memory content so the builder doesn't re-read the disk.
       // When --no-memory is set, projectMem is undefined; skipProjectMemory tells
-      // the builder not to fall back to its own file load.
-      ...(projectMem !== undefined ? { projectInstructions: projectMem.content } : {}),
+      // the builder not to fall back to its own file load. IKBI_BUILD_EXTRA_INSTRUCTIONS
+      // (set by the Peh launch_build path) carries the operator's standing instructions so a
+      // conversation-launched build honors the same baseline preferences the chat session does.
+      ...((() => {
+        const extra = (process.env.IKBI_BUILD_EXTRA_INSTRUCTIONS ?? "").trim();
+        const parts = [
+          projectMem?.content,
+          extra.length > 0 ? `Operator standing instructions — honor these across this build:\n${extra}` : undefined,
+        ].filter((s): s is string => typeof s === "string" && s.length > 0);
+        return parts.length > 0 ? { projectInstructions: parts.join("\n\n") } : {};
+      })()),
       ...(noMemory === true ? { skipProjectMemory: true } : {}),
       // Gap 5 (--bare): skip non-essential loading. Implies skipping project memory too.
       ...(bare === true ? { bare: true, skipProjectMemory: true } : {}),
