@@ -278,14 +278,25 @@ export function decompose(goal: string): StepPlan {
 
   // A NUMBERED list is explicit user structure — keep each item as its own step. A conjunction/
   // semicolon split is REGROUPED so each step begins at an action verb (mid-task continuations like
-  // "...and exports greet()" merge into their parent task) — this is what keeps a multi-file goal
-  // from fragmenting into incoherent sub-steps. If regrouping collapses below 2 groups (e.g. a
-  // sequencer split whose clauses are not action-led), fall back to the raw parts so an intended
-  // multi-step goal is not flattened.
+  // "...and exports greet()" merge into their parent task) — this keeps a multi-file goal from
+  // fragmenting into incoherent sub-steps.
   const grouped = numbered ? parts : groupByActionLead(parts);
-  const stepGoals = grouped.length >= 2 ? grouped : parts;
 
-  const steps: Step[] = stepGoals.slice(0, MAX_STEPS).map((part, i, arr) => ({
+  // Grouping is the FINAL arbiter of the step count. If it collapses below 2 groups, the goal is ONE
+  // cohesive action-led task whose prose merely contains an incidental sequencer or "and" (e.g. "Add
+  // session.ts that ... calls X; then Y, and returns Z") — NOT a second task. Build it in a single
+  // pass (the builder handles multi-part / multi-file goals coherently — proven on cohesive 4-file
+  // goals) instead of fragmenting on misaligned "and" boundaries, which produced stuck sub-steps.
+  if (grouped.length < 2) {
+    return {
+      originalGoal: goal,
+      steps: [{ index: 1, goal, targetFiles: extractPaths(goal) }],
+      source: "heuristic",
+      decomposed: false,
+    };
+  }
+
+  const steps: Step[] = grouped.slice(0, MAX_STEPS).map((part, i, arr) => ({
     index: i + 1,
     goal: part,
     targetFiles: extractPaths(part),

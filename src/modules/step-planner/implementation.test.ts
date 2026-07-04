@@ -219,6 +219,23 @@ describe("step-planner", () => {
       assert.match(plan.steps[1]?.goal ?? "", /names\.ts.*capitalized name/is, "names task stays whole");
     });
 
+    it("does NOT fragment a single-task goal whose prose has an incidental sequencer + 'and's", () => {
+      // Real Bokahli case: ONE task (add session.ts + its test) that decomposed into 6 stuck
+      // fragments. Its prose contains a ", then" sequencer (authorizing a split attempt) and several
+      // intra-task "and"s, but only "Add" is action-led — so grouping collapses to one task. That
+      // must yield a SINGLE step of the whole goal, NOT the raw fragments (the old fallback bug).
+      const goal =
+        "Add a session orchestrator in src/session.ts that imports decideAttempt from ./gate.js and " +
+        "runBuild from ./build.js: export async function runSession(adapter, input) that first calls " +
+        "decideAttempt(input); when it declines it returns attempted false and never calls the adapter, " +
+        "otherwise it awaits runBuild to generate the code, then measureRun to produce the report, and " +
+        "returns attempted true with the code and report";
+      const plan = decompose(goal);
+      assert.equal(plan.decomposed, false, "one action-led task → a single cohesive step");
+      assert.equal(plan.steps.length, 1, "not fragmented into sub-steps");
+      assert.equal(plan.steps[0]?.goal, goal, "the whole goal is built in one pass");
+    });
+
     it("STILL counts a real imperative verb followed by an object (not a paren) as action-led", () => {
       // Guard the fix's boundary: "generate a report" (verb + object) is a genuine task opener and
       // must still count, so a legitimately multi-task goal is not accidentally suppressed.
