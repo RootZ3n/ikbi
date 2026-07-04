@@ -1906,6 +1906,43 @@ test("WO2: an EMPTY repo (no manifest, no source) FAST-FAILS with 'empty or unre
   }
 });
 
+test("GREENFIELD: an EMPTY target with allowGreenfieldScaffold PROCEEDS (builder scaffolds) instead of fast-failing", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-greenfield-"));
+  try {
+    const h = bareRepoHarness();
+    const result = await h.orch.run(
+      { taskId: "t-greenfield", targetRepo: dir, goal: "create a new TypeScript CLI", allowGreenfieldScaffold: true },
+      h.parentCtx,
+    );
+    // Did NOT fast-fail: roles ran and a workspace was allocated — the builder gets to scaffold.
+    assert.notEqual(result.outcome, "rejected", "an empty greenfield target with the flag is NOT pre-flight rejected");
+    assert.ok(h.cap.seen.length > 0, "roles were dispatched (the builder can scaffold a manifest + tests)");
+    assert.ok(h.ws.calls.allocate.length > 0, "a workspace was allocated for the scaffold build");
+    assert.ok(h.sent.some((e) => e.type === "worker.role.dispatched"), "emits the greenfield scaffold dispatch");
+    assert.ok(!h.sent.some((e) => e.type === "worker.failed"), "no pre-flight checks_unresolvable failure");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("GREENFIELD: a LOOSE-SOURCE target (no manifest) STILL fast-fails even with the flag — only EMPTY qualifies", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-greenfield-loose-"));
+  try {
+    writeFileSync(join(dir, "hello.js"), "console.log('hi');\n");
+    const h = bareRepoHarness();
+    const result = await h.orch.run(
+      { taskId: "t-greenfield-loose", targetRepo: dir, goal: "do the thing", allowGreenfieldScaffold: true },
+      h.parentCtx,
+    );
+    // Loose source without a manifest is NOT greenfield-empty — the flag does not bypass the reject.
+    assert.equal(result.outcome, "rejected", "loose source without a manifest still fast-fails (adding a manifest is the operator's call)");
+    assert.equal(h.cap.seen.length, 0, "no roles ran");
+    assert.match(result.reason ?? "", /No project manifest or verifier detected/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("WO2: a repo WITH a manifest proceeds through the normal flow (no regression)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ikbi-wo2-manifest-"));
   try {

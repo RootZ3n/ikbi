@@ -254,6 +254,16 @@ export interface WorkerTask {
    */
   readonly skipVerifier?: boolean;
   /**
+   * GREENFIELD SCAFFOLD (opt-in): when the target is a genuinely EMPTY repo (no manifest, no
+   * source), allow the build to proceed so the builder can scaffold a verifiable project (a
+   * manifest + tests) instead of fast-failing the unverifiable-target check before the builder
+   * runs. Verification is resolved POST-build from the populated workspace, and promotion STILL
+   * requires a green verify — a build that fails to produce a verifiable project simply does not
+   * promote. Only an EMPTY target qualifies; loose source without a manifest still fast-fails.
+   * The CLI auto-sets this for an empty target; default undefined keeps the fail-closed reject.
+   */
+  readonly allowGreenfieldScaffold?: boolean;
+  /**
    * REPO COMPLEXITY HINT: when "large", the orchestrator skips the worker-tier (flash)
    * builder entirely and starts with the mid-tier (pro) model. Avoids wasting a flash
    * attempt on repos that are known to be too large for cheap models. Default: undefined

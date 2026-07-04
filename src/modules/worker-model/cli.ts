@@ -23,7 +23,8 @@
  */
 
 import { createInterface } from "node:readline";
-import { fstatSync } from "node:fs";
+import { existsSync, fstatSync } from "node:fs";
+import { join as pathJoin } from "node:path";
 
 import { registerCommand } from "../../cli/registry.js";
 import { writeStderr, writeStdout } from "../../cli/io.js";
@@ -47,7 +48,7 @@ import { loadRepoRegistry } from "../../core/repo-registry.js";
 import type { CognitionDecision, CognitionLayer } from "../cognition-layer/contract.js";
 import { loadProjectMemory, type ProjectMemoryResult } from "./project-memory.js";
 import { isBuildTier, resolveTierPreset, BUILD_TIERS, type BuildTier } from "./tier-presets.js";
-import { unresolvableMessage } from "./checks.js";
+import { PROJECT_MANIFESTS, unresolvableMessage } from "./checks.js";
 import { createProductionGovernor } from "../memory-governor/create.js";
 
 function errMsg(e: unknown): string {
@@ -1127,6 +1128,12 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       targetRepo,
       goal: finalGoal,
       writeScope: detectWriteScope(finalGoal),
+      // GREENFIELD: when the target has no project manifest at its root, opt this build into
+      // greenfield scaffolding. The orchestrator only acts on it when the target is genuinely
+      // EMPTY (no source either) — letting the builder scaffold a verifiable project instead of
+      // fast-failing before it runs. A target WITH a manifest never sets this (normal flow); a
+      // loose-source-no-manifest target sets it but the orchestrator still fast-fails (not empty).
+      ...(!PROJECT_MANIFESTS.some((m) => existsSync(pathJoin(targetRepo, m))) ? { allowGreenfieldScaffold: true } : {}),
       ...(envelope !== undefined ? { originAgent: envelope.originAgent } : {}),
       ...(complexity !== undefined ? { complexity } : {}),
       // Pass pre-loaded memory content so the builder doesn't re-read the disk.

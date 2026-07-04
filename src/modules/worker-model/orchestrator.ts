@@ -256,15 +256,23 @@ const DIAGNOSTIC_SKIP_DIRS: ReadonlySet<string> = new Set([
   ".git", "node_modules", "dist", "build", "out", "target", ".venv", "venv", "__pycache__", ".ikbi",
 ]);
 
+/** A bare-repo diagnosis: the actionable message plus whether the target is EMPTY (greenfield). */
+interface BareRepoDiagnosis {
+  readonly message: string;
+  /** True when the target has NO manifest AND no source files — a greenfield scaffold candidate
+   *  (vs. loose source without a manifest, which is an existing project missing its manifest). */
+  readonly greenfield: boolean;
+}
+
 /**
- * Diagnose a target repo that cannot be verified. Returns an actionable message when the repo
- * root has NO recognizable project manifest (mirrors `resolveChecks`, which requires a manifest
- * AT the worktree root), or `undefined` when a manifest exists (normal flow) or the path is
- * unreadable (fail-open — let workspace allocation surface the real error). Best-effort and
- * never throws: a bounded, depth-limited walk summarizes whatever source files ARE present so
- * the operator sees what ikbi saw.
+ * Diagnose a target repo that cannot be verified. Returns an actionable message (+ whether the
+ * target is greenfield-empty) when the repo root has NO recognizable project manifest (mirrors
+ * `resolveChecks`, which requires a manifest AT the worktree root), or `undefined` when a manifest
+ * exists (normal flow) or the path is unreadable (fail-open — let workspace allocation surface the
+ * real error). Best-effort and never throws: a bounded, depth-limited walk summarizes whatever
+ * source files ARE present so the operator sees what ikbi saw.
  */
-function diagnoseBareRepo(root: string): string | undefined {
+function diagnoseBareRepo(root: string): BareRepoDiagnosis | undefined {
   // A recognizable manifest AT the root is exactly what resolveChecks needs (root === worktree).
   if (PROJECT_MANIFESTS.some((m) => existsSync(join(root, m)))) return undefined;
   if (!existsSync(root)) return undefined; // unreadable — fail-open
@@ -304,14 +312,17 @@ function diagnoseBareRepo(root: string): string | undefined {
           .map(([ext, n]) => `${n} ${ext}`)
           .join(", ");
 
-  return [
-    "No project manifest or verifier detected.",
-    `Detected files: ${summary}`,
-    "Suggested next steps:",
-    "  - Initialize a package manifest (e.g., `pnpm init`, `cargo init`)",
-    '  - Provide an explicit check command: `ikbi build <repo> --check "python -m pytest"`',
-    '  - Use `ikbi fix <repo> --check "<command>"` for fix mode',
-  ].join("\n");
+  return {
+    greenfield: totalFiles === 0,
+    message: [
+      "No project manifest or verifier detected.",
+      `Detected files: ${summary}`,
+      "Suggested next steps:",
+      "  - Initialize a package manifest (e.g., `pnpm init`, `cargo init`)",
+      '  - Provide an explicit check command: `ikbi build <repo> --check "python -m pytest"`',
+      '  - Use `ikbi fix <repo> --check "<command>"` for fix mode',
+    ].join("\n"),
+  };
 }
 
 /** True when the operator declared an explicit, well-formed check override (IKBI_CHECKS). */
@@ -1426,15 +1437,30 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       !hasExplicitChecks(modeEnv)
     ) {
       const diagnostic = diagnoseBareRepo(task.targetRepo);
-      if (diagnostic !== undefined) {
+      // GREENFIELD SCAFFOLD (opt-in via task.allowGreenfieldScaffold): an EMPTY target (no manifest,
+      // no source) is a from-scratch project the builder can make verifiable by scaffolding a manifest
+      // + tests. Rather than reject before the builder runs, let it proceed — verification is resolved
+      // POST-build from the now-populated workspace, and promotion STILL requires a green verify (a
+      // build that fails to produce a verifiable project simply doesn't promote; the post-build
+      // classifyUnverifiableTarget path handles it). Only a genuinely EMPTY target qualifies: loose
+      // source without a manifest still fast-fails (adding a manifest there is the operator's call).
+      if (diagnostic !== undefined && diagnostic.greenfield && task.allowGreenfieldScaffold === true) {
+        events.publish(
+          workerRoleDispatched.create(
+            { taskId: task.taskId, role: "builder" },
+            { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.greenfield_scaffold", runId: task.taskId } },
+          ),
+        );
+        // fall through to the normal build flow — the builder scaffolds; the verifier gates promotion.
+      } else if (diagnostic !== undefined) {
         // CLASSIFY: a no-manifest target is CHECKS_UNRESOLVABLE — fail closed with the structured
         // verdict (NOT a model failure). This pre-allocation path already escalates nothing (it
         // returns before any model call) and records no trust, satisfying the no-escalate /
         // no-demote contract; the `verification` field + receipt make the classification explicit.
-        const concise = diagnostic.split("\n").slice(0, 2).join(" ");
+        const concise = diagnostic.message.split("\n").slice(0, 2).join(" ");
         events.publish(
           workerFailed.create(
-            { taskId: task.taskId, reason: diagnostic },
+            { taskId: task.taskId, reason: diagnostic.message },
             { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } },
           ),
         );
@@ -1454,7 +1480,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           outcome: "rejected",
           roles: [],
           promoted: false,
-          reason: diagnostic,
+          reason: diagnostic.message,
           verification: { kind: "checks_unresolvable", reason: concise, nextSteps: [...UNRESOLVABLE_NEXT_STEPS] },
         };
       }
