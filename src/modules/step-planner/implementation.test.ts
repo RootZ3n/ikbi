@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { decompose, decomposeWithModel, complexityScore, maskCodeSpans } from "./implementation.js";
+import { decompose, decomposeWithModel, decomposeAdaptive, complexityScore, maskCodeSpans } from "./implementation.js";
 import { COMPLEX_THRESHOLD } from "./config.js";
 
 describe("step-planner", () => {
@@ -317,20 +317,59 @@ describe("step-planner", () => {
       assert.equal(plan.steps.length, 2);
     });
 
-    // ── M5: DORMANT in production — documents intent so the strategy is not mistaken for dead code ──
-    it("DORMANT: is intentionally NOT wired into the production build path (heuristic-only)", () => {
-      // The `ikbi build` CLI imports ONLY `decompose` from the step-planner barrel and never calls
-      // `decomposeWithModel` — the production planner is deterministic and zero-cost by design. This
-      // test pins that intent: `decomposeWithModel` is retained + tested as a ready opt-in strategy,
-      // not abandoned. If a future change wires it into production, update this assertion accordingly.
+    // ── OPT-IN in production: the model strategy is now reachable via decomposeAdaptive behind a flag ──
+    it("is wired via decomposeAdaptive behind IKBI_STEP_PLANNER_MODEL — never called directly, zero-cost by default", () => {
+      // The `ikbi build` CLI now uses `decomposeAdaptive` (which calls the model strategy only when
+      // the operator opts in AND the heuristic is uncertain); it still never calls `decomposeWithModel`
+      // DIRECTLY. This pins the new contract: opt-in, gated, heuristic-first.
       const cliSource = readFileSync(new URL("../worker-model/cli.ts", import.meta.url), "utf8");
-      assert.equal(
-        cliSource.includes("decomposeWithModel("),
-        false,
-        "production cli.ts must not CALL decomposeWithModel — it is a dormant strategy",
-      );
-      // And the function still exists + is exported (retained, not removed).
-      assert.equal(typeof decomposeWithModel, "function", "the dormant strategy is retained for later opt-in");
+      assert.equal(cliSource.includes("decomposeWithModel("), false, "cli.ts calls the adaptive wrapper, not decomposeWithModel directly");
+      assert.ok(cliSource.includes("decomposeAdaptive("), "cli.ts uses the adaptive planner");
+      assert.ok(cliSource.includes("IKBI_STEP_PLANNER_MODEL"), "the model second pass is gated behind the opt-in flag");
+    });
+  });
+
+  describe("decomposeAdaptive", () => {
+    it("with NO invoker is byte-identical to the heuristic (zero-cost default)", async () => {
+      const goal = "Add a function to src/foo.ts, then add a test, then update the README";
+      assert.deepEqual(await decomposeAdaptive(goal), decompose(goal));
+    });
+
+    it("does NOT call the model when the heuristic is confident (below the step cap) and forceModel is off", async () => {
+      let called = false;
+      const invokeModel = async (): Promise<string> => { called = true; return "[]"; };
+      const plan = await decomposeAdaptive("Add one function to src/foo.ts", { invokeModel });
+      assert.equal(called, false, "a confident, un-saturated heuristic never spends a model call");
+      assert.equal(plan.source, "heuristic");
+    });
+
+    it("forceModel uses the model plan when it is a strictly richer decomposition", async () => {
+      const invokeModel = async (): Promise<string> =>
+        JSON.stringify([
+          { goal: "Step A", targetFiles: ["a.ts"] },
+          { goal: "Step B", targetFiles: ["b.ts"] },
+          { goal: "Step C", targetFiles: ["c.ts"] },
+        ]);
+      const plan = await decomposeAdaptive("do the thing", { invokeModel, forceModel: true });
+      assert.equal(plan.source, "model");
+      assert.equal(plan.steps.length, 3);
+    });
+
+    it("forceModel keeps the heuristic when the model plan is NOT richer (never regress to fewer steps)", async () => {
+      const goal = "Add a function to src/foo.ts, then add a test, then update the README, then bump the version";
+      const heuristicSteps = decompose(goal).steps.length;
+      // Model returns only 2 steps — not richer than the multi-step heuristic → keep heuristic.
+      const invokeModel = async (): Promise<string> => JSON.stringify([{ goal: "one" }, { goal: "two" }]);
+      const plan = await decomposeAdaptive(goal, { invokeModel, forceModel: true });
+      if (heuristicSteps > 2) {
+        assert.equal(plan.source, "heuristic", "a model plan with fewer steps than the heuristic is not preferred");
+      }
+    });
+
+    it("falls back to the heuristic when the forced model call throws", async () => {
+      const invokeModel = async (): Promise<string> => { throw new Error("model down"); };
+      const plan = await decomposeAdaptive("do the thing", { invokeModel, forceModel: true });
+      assert.equal(plan.source, "heuristic");
     });
   });
 });

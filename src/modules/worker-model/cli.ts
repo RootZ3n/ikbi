@@ -1196,8 +1196,23 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
     // the deterministic, zero-cost heuristic `decompose` — the model-based `decomposeWithModel`
     // strategy is intentionally DORMANT (not wired here) so the planner never spends a model call;
     // see step-planner/implementation.ts for the rationale and how to opt in later.
-    const { decompose } = await import("../step-planner/index.js");
-    const stepPlan = decompose(finalGoal);
+    const { decomposeAdaptive } = await import("../step-planner/index.js");
+    // OPT-IN (IKBI_STEP_PLANNER_MODEL): thread a model invoker so the planner can use a model
+    // second pass when the zero-cost heuristic is uncertain (it saturated the step cap). Off by
+    // default — the heuristic stays free. The provider is imported lazily (never at module load).
+    const useModelPlanner = /^(1|true|yes|on)$/i.test((process.env.IKBI_STEP_PLANNER_MODEL ?? "").trim());
+    const stepPlan = await decomposeAdaptive(
+      finalGoal,
+      useModelPlanner
+        ? {
+            invokeModel: async (prompt: string): Promise<string> => {
+              const { invokeModel } = await import("../../core/provider/index.js");
+              const res = await invokeModel({ model: config.provider.defaultModels.driver, messages: [{ role: "user", content: prompt }], temperature: 0.2, identity: who.identity });
+              return typeof res.content === "string" ? res.content : "";
+            },
+          }
+        : {},
+    );
 
     // SG-5: with --verbose, stream the build's structured progress events (per-role start/end,
     // builder tool activity, verification status) live as they fire.

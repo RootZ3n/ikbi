@@ -361,3 +361,35 @@ export async function decomposeWithModel(
     return decompose(goal);
   }
 }
+
+/** Options for {@link decomposeAdaptive}. */
+export interface AdaptiveDecomposeOpts {
+  /** Model invoker for the model strategy. When absent, ONLY the zero-cost heuristic runs. */
+  readonly invokeModel?: (prompt: string) => Promise<string>;
+  /** Force the model strategy even when the heuristic looks confident. Default false. */
+  readonly forceModel?: boolean;
+}
+
+/**
+ * Decompose adaptively — the wiring that makes the model strategy usable without abandoning the
+ * zero-cost default. Runs the heuristic `decompose` first; when a model invoker is supplied AND the
+ * heuristic looks UNCERTAIN (it hit the MAX_STEPS cap, so the goal likely has more atomic steps than
+ * the heuristic could express) OR `forceModel` is set, it runs `decomposeWithModel` and PREFERS a
+ * richer decomposition (strictly more steps). Any model failure falls back to the heuristic.
+ *
+ * Cost contract: with NO invoker this is byte-identical to `decompose` (no model call) — so the
+ * production default (worker-model/cli.ts) stays free until an operator opts in (IKBI_STEP_PLANNER_MODEL).
+ */
+export async function decomposeAdaptive(goal: string, opts: AdaptiveDecomposeOpts = {}): Promise<StepPlan> {
+  const heuristic = decompose(goal);
+  if (opts.invokeModel === undefined) return heuristic;
+  // The heuristic is least reliable when it saturates the step cap: it truncates at MAX_STEPS, so a
+  // goal with more atomic steps is under-represented. That (or an explicit force) is when the model
+  // second pass earns its cost.
+  const uncertain = heuristic.steps.length >= MAX_STEPS;
+  if (!opts.forceModel && !uncertain) return heuristic;
+  const model = await decomposeWithModel(goal, opts.invokeModel);
+  // Prefer the model plan ONLY when it is a genuinely richer decomposition — never regress to fewer
+  // steps than the heuristic already found.
+  return model.decomposed && model.steps.length > heuristic.steps.length ? model : heuristic;
+}
