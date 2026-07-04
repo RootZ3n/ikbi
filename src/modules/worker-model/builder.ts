@@ -631,15 +631,17 @@ export function isPolicyViolation(e: ToolCallError): boolean {
   // discard a clean build. (A "new_only" overwrite attempt on an EXISTING file still taints below.)
   if (/write_scope is 'none'|read-only mode/i.test(e.error)) return false;
   // BENIGN SELF-VERIFICATION: a builder that reaches for the project's TEST/CHECK command via terminal
-  // ("pnpm test", "pnpm run typecheck", …) is blocked because pnpm scripts are reserved for the
-  // verifier/check role — but that is the model trying to VERIFY its own work through the wrong tool.
-  // It has `run_checks` for exactly this, the verifier runs the real checks regardless, and the
-  // governor already blocked the call (nothing executed). Like a blocked `tsc`/`npx` probe, a blocked
-  // CHECK-script call must NOT discard an otherwise-verified build (it fires intermittently on cheap
-  // models and was silently tanking green multi-step builds). A pnpm script that is NOT a recognised
-  // check/test/build/lint script (deploy/publish/postinstall/arbitrary) STILL taints — that intent is
-  // the real red flag. Classification is by the COMMAND (e.path), not the generic denial string.
-  if (/pnpm script execution is allowed only for verifier\/check/i.test(e.error)) {
+  // ("pnpm test", "npx tsc --noEmit", "yarn build", …) is blocked because package-manager script
+  // RUNNERS (pnpm/npm/npx/yarn/bun) are reserved for the verifier/check role — but that is the model
+  // trying to VERIFY its own work through the wrong tool. It has `run_checks` for exactly this, the
+  // verifier runs the real checks regardless, and the governor already blocked the call (nothing
+  // executed). Like a blocked `tsc`/probe, a blocked CHECK-script call must NOT discard an otherwise-
+  // verified build (it fires intermittently on cheap models and silently tanked green builds — seen
+  // for both `pnpm test` and `npx tsc`). A runner invocation that is NOT a recognised
+  // check/test/build/lint command (deploy/publish/postinstall/arbitrary) STILL taints — that intent is
+  // the real red flag. Match ANY runner's denial (the shared "script execution is allowed only for
+  // verifier/check" suffix) and classify by the COMMAND (e.path), not the runner prefix.
+  if (/script execution is allowed only for verifier\/check/i.test(e.error)) {
     const cmd = (e.path ?? "").toLowerCase();
     return !/\b(test|tests|check|checks|lint|typecheck|type-check|tsc|build|vitest|jest|coverage|verify|ci)\b/.test(cmd);
   }

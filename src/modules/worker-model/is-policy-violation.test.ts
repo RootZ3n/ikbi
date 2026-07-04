@@ -61,6 +61,11 @@ test("a blocked builder attempt to run the project's TEST/CHECK command does NOT
   assert.equal(isPolicyViolation({ tool: "terminal", error: err, path: "pnpm run typecheck" }), false, "typecheck");
   assert.equal(isPolicyViolation({ tool: "terminal", error: err, path: "pnpm run lint" }), false, "lint");
   assert.equal(isPolicyViolation({ tool: "terminal", error: err, path: "pnpm build" }), false, "build");
+  // ANY runner's check-command denial is benign, not just pnpm (captured live from an osapa build:
+  // the builder ran `npx tsc --noEmit` to typecheck and it was tainting).
+  assert.equal(isPolicyViolation({ tool: "terminal", error: "npx script execution is allowed only for verifier/check runs", path: "npx tsc --noEmit" }), false, "npx tsc");
+  assert.equal(isPolicyViolation({ tool: "terminal", error: "yarn script execution is allowed only for verifier/check runs", path: "yarn test" }), false, "yarn test");
+  assert.equal(isPolicyViolation({ tool: "terminal", error: "bunx script execution is allowed only for verifier/check runs", path: "bunx tsc" }), false, "bunx tsc");
 });
 
 test("a blocked builder pnpm script that is NOT a check/test/build script STILL taints", () => {
