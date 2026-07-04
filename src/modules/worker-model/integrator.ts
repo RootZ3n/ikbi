@@ -145,7 +145,20 @@ export const integrator: RoleFn = async (ctx) => {
       else failures.push("builder wrote no files");
     } else if (!noPolicyViolations) {
       if (policyViolations === undefined) failures.push("builder did not report tool-call policy status (cannot confirm clean)");
-      else failures.push(`builder attempted ${policyViolations.length} out-of-policy tool call(s)`);
+      else {
+        // NAME the offending call(s) in the discard reason itself, so a taint is auditable from the
+        // final output (which does not show the per-tool builder logs) without a costly --verbose
+        // re-run — e.g. `... 1 out-of-policy tool call(s): terminal \`pnpm run deploy\``.
+        const named = policyViolations
+          .map((v) => {
+            const o = (v ?? {}) as { tool?: unknown; path?: unknown; error?: unknown };
+            const tool = typeof o.tool === "string" ? o.tool : "tool";
+            const where = typeof o.path === "string" && o.path.length > 0 ? ` \`${o.path}\`` : "";
+            return `${tool}${where}`;
+          })
+          .join(", ");
+        failures.push(`builder attempted ${policyViolations.length} out-of-policy tool call(s): ${named}`);
+      }
     }
     if (!criticPass) failures.push(critic === undefined ? "no critic result" : "critic pass=false");
     if (!verifierPass) failures.push(verifier === undefined ? "no verifier result" : "verifier verdict=fail");
