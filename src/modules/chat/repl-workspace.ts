@@ -15,6 +15,7 @@
 import { execFileSync } from "node:child_process";
 
 import type { OperationContext } from "../../core/identity/index.js";
+import { neutralizeUntrusted } from "../../core/injection/index.js";
 import type { AgentIdentity } from "../../core/provider/contract.js";
 import { autonomyForTier } from "../../core/trust/contract.js";
 import { asTier, TRUST_FLOOR } from "../../core/trust/index.js";
@@ -62,7 +63,10 @@ function buildVerifierContext(handle: WorkspaceHandle, sessionId: string): RoleC
       invokeModel: async () => {
         throw new Error("verifier never invokes a model");
       },
-      neutralizeUntrusted: ((c: string) => c) as never,
+      // The REAL chokepoint, not an identity stub: the verifier does not route untrusted content to a
+      // model today, but wiring the genuine neutralizer means the invariant cannot silently rot if it
+      // ever does (a stub would have no-op'd the scan/wrap/defang).
+      neutralizeUntrusted,
     },
   } as unknown as RoleContext;
 }

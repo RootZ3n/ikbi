@@ -787,6 +787,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   // iteration granularity on a kill or budget overrun. Set at run() entry; builds are serial.
   let activeCheckHalt: (() => Promise<{ halt: boolean; reason?: string }>) | undefined;
 
+  // INJECTION SIGNAL (per-run): set by recordRole when the neutralization chokepoint blocked a tool
+  // result in ANY role this build. Read by recordBuildTrust to attribute it to the per-build trust
+  // outcome (trust is recorded per-build, not per-role — FIX A), so the NON-RECOVERABLE injection
+  // flag is set when the ladder is active. Reset at every run entry; builds are serial (like activeCheckHalt).
+  let injectionDetectedThisBuild = false;
+
   async function runRoleFn(role: WorkerRole, roleFn: RoleFn, ctx: RoleContext, timeoutOverrideMs?: number): Promise<RoleResult> {
     const effectiveTimeout = timeoutOverrideMs ?? roleTimeoutMs;
     if (!(effectiveTimeout > 0)) return roleFn(ctx);
@@ -1177,6 +1183,15 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // role receipt so the run-level audit trail records that stalls happened, alongside the
     // per-stall receipts the builder writes at detection time.
     const toolCallStalls = (result.detail as Record<string, unknown> | undefined)?.toolCallStalls;
+    // INJECTION SIGNAL: the neutralization chokepoint returned a `block` verdict on a tool result
+    // this role. It is ALWAYS recorded in the role receipt below (durable audit, independent of the
+    // trust ladder) and, when the ladder is active, attributed as signals.injection so the trust
+    // rules set the NON-RECOVERABLE injection flag — the marketed defense, wired detection→enforcement.
+    const injectionDetected = ((result.detail ?? {}) as Record<string, unknown>).injectionDetected === true;
+    if (injectionDetected) {
+      injectionDetectedThisBuild = true; // carried to the per-build trust outcome (recordBuildTrust)
+      log.warn({ role: result.role, taskId: task.taskId, agentId: spawned.identity.agentId }, "INJECTION DETECTED — chokepoint blocked a tool result; recorded as a trust signal");
+    }
 
     await receipts.append(
       {
@@ -1198,6 +1213,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           ...(doneClaim?.fixRationale !== undefined ? { fixRationale: doneClaim.fixRationale } : {}),
           ...(Array.isArray(filesWritten) ? { filesChanged: filesWritten } : {}),
           ...(Array.isArray(toolCallStalls) && toolCallStalls.length > 0 ? { toolCallStalls } : {}),
+          ...(injectionDetected ? { injectionDetected: true } : {}),
         },
         project: task.targetRepo,
       },
@@ -1240,6 +1256,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         defaultTrustTier: spawned.identity.trustTier ?? TRUST_FLOOR,
         operation,
         status,
+        ...(injectionDetected ? { signals: { injection: true } } : {}),
       },
       spawned.validated,
     );
@@ -1302,6 +1319,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         defaultTrustTier: workerSpawned.identity.trustTier ?? TRUST_FLOOR,
         operation: "worker.build",
         status,
+        // Attribute a chokepoint-detected injection (any role this build) to the trust outcome — the
+        // trust rules then set the NON-RECOVERABLE injection flag that blocks promotion while flagged.
+        ...(injectionDetectedThisBuild ? { signals: { injection: true } } : {}),
       },
       workerSpawned.validated,
     );
@@ -1398,6 +1418,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       throw new WorkerError("identity", "run requires an OperationContext carrying a validated identity");
     }
     const parentIdentity = parentCtx.identity.identity;
+    injectionDetectedThisBuild = false; // reset the per-run injection flag (builds are serial)
     // Wire the escalation resolver (once) so the tier cascade skips unwired/stub models — done
     // here, in the async build entry, where the egress floor + provider registry are fully loaded.
     await ensureEscalationResolver();

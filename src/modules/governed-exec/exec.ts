@@ -197,6 +197,17 @@ function scrubbedEnv(): NodeJS.ProcessEnv {
       if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) && process.env[key] !== undefined) env[key] = process.env[key];
     }
   }
+  // GIT HARDENING (defense-in-depth): governed builds run git inside worktrees of UNTRUSTED target
+  // repos, whose shared .git can carry hooks / a hostile core.hooksPath. ikbi must NEVER execute
+  // repo-supplied hook code. Neutralize it for every governed-exec git command via config env, which
+  // has higher precedence than any config FILE (so it overrides an attacker's repo core.hooksPath):
+  // point core.hooksPath at /dev/null ⇒ git finds no hooks to run, and ignore /etc/gitconfig. The
+  // operator's GLOBAL config is deliberately left intact so `git commit` still resolves an author.
+  // Harmless to non-git commands (they ignore these variables).
+  env.GIT_CONFIG_NOSYSTEM = "1";
+  env.GIT_CONFIG_COUNT = "1";
+  env.GIT_CONFIG_KEY_0 = "core.hooksPath";
+  env.GIT_CONFIG_VALUE_0 = "/dev/null";
   return env;
 }
 
@@ -339,7 +350,23 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
     let sandboxPlan: SandboxPlan | undefined;
     let sandboxLabel: "bwrap" | "none" | "unavailable" = "none";
     const sandboxWritableRoot = request.worktreeRoot ?? cwd;
-    if (risk.risky && config.sandbox.mode !== "off") {
+    if (risk.risky && config.sandbox.mode === "off") {
+      // EXPLICIT off (IKBI_GOVERNED_EXEC_SANDBOX=off): the operator disabled OS confinement. A risky
+      // command (a helper interpreter that does its own filesystem syscalls) then runs UNSANDBOXED and
+      // could write outside the worktree — the F1 escape. This is NOT a silent skip: it is LOUDLY
+      // receipted exactly like the trusted-local override, so "off" can never masquerade as safe in the
+      // audit trail. `off` is a dev/CI convenience, never a production posture.
+      sandboxLabel = "unavailable";
+      emit(govexecExecuted, { ...base, allow: true, sandbox: "unavailable", risk: risk.kind, reason: "sandbox mode=off: running risky command unsandboxed" }, identity, EXEC_OPERATION, requestId);
+      await receipt(
+        EXEC_OPERATION,
+        identity,
+        { status: "success", detail: `SANDBOX OFF — running ${command} [${risk.kind}] UNSANDBOXED (IKBI_GOVERNED_EXEC_SANDBOX=off; not a production posture)` },
+        sandboxMetadata("sandbox.unavailable", "unavailable", risk, sandboxWritableRoot, false),
+        requestId,
+        cwd,
+      );
+    } else if (risk.risky) {
       const avail = sandboxAvailability();
       if (avail.available) {
         sandboxPlan = {

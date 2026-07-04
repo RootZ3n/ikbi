@@ -813,6 +813,11 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
   const filesRead: string[] = [];
   const rejectedToolCalls: ToolCallError[] = [];
   let neutralizedCount = 0;
+  // INJECTION SIGNAL: set when the neutralization chokepoint returns a `block` verdict on any tool
+  // result this build. Surfaced on the result detail so the orchestrator records it as a trust signal
+  // (signals.injection) — the non-recoverable injection flag the trust ladder acts on. Without this
+  // the chokepoint's `block` recommendation was dead: detected-and-wrapped, but never attributed.
+  let injectionDetected = false;
   let toolRounds = 0;
   let iterations = 0; // total model rounds (tool rounds + corrective turns) — bounds the loop
   let bareStops = 0; // RAIL 3: times the model stopped without a valid done (corrective turns)
@@ -1304,6 +1309,9 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         origin: call.name,
       });
       neutralizedCount += 1;
+      // The chokepoint scanned + wrapped this untrusted result. A `block` verdict (high-confidence
+      // injection) is a first-class trust signal — record it so it reaches recordOutcome, not just the log.
+      if (safe.blocked) injectionDetected = true;
       // Emulated (text-protocol) rounds have no real tool_call_id to attach a tool-role message
       // to — feed the (still-neutralized) result back as a user-role data message instead.
       messages.push(
@@ -1992,6 +2000,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         ...(lastChecks !== undefined ? { lastChecks } : {}),
         stopReason,
         neutralizedCount,
+        ...(injectionDetected ? { injectionDetected: true } : {}),
         rejectedToolCalls,
         policyViolations,
         toolFormatErrors,
@@ -2017,7 +2026,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       role: "builder",
       outcome: "failure",
       summary: `builder failed: ${errMsg(err)}`,
-      detail: { filesWritten, filesRead, toolRounds, stopReason: overflowed ? "context_overflow" : stopReason, neutralizedCount, rejectedToolCalls, policyViolations: rejectedToolCalls.filter(isPolicyViolation), toolFormatErrors: rejectedToolCalls.filter((e) => !isPolicyViolation(e)) },
+      detail: { filesWritten, filesRead, toolRounds, stopReason: overflowed ? "context_overflow" : stopReason, neutralizedCount, ...(injectionDetected ? { injectionDetected: true } : {}), rejectedToolCalls, policyViolations: rejectedToolCalls.filter(isPolicyViolation), toolFormatErrors: rejectedToolCalls.filter((e) => !isPolicyViolation(e)) },
     };
   } finally {
     // Tear down any MCP transports (spawned child processes) — once, on every exit path. Best-effort.

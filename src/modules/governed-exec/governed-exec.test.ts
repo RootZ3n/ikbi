@@ -249,13 +249,35 @@ test("exec children receive a scrubbed env allowlist only", async () => {
     const ex = fakeExecFile();
     const ge = createGovernedExec({ config: cfg(["echo"]), gateWall: capturingGate().gateWall, execFile: ex.fn, receipts: fakeReceipts().receipts, publish: () => {} });
     await ge.run({ parentCtx: makeCtx("verified"), command: "echo", args: ["hi"] });
-    assert.deepEqual(ex.calls[0]?.opts.env, { PATH: "/usr/bin", HOME: "/home/test", LANG: "C.UTF-8" });
+    const childEnv = (ex.calls[0]?.opts.env ?? {}) as NodeJS.ProcessEnv;
+    // The allowlisted host vars pass through; the process SECRET does NOT leak (the security property).
+    assert.equal(childEnv.PATH, "/usr/bin");
+    assert.equal(childEnv.HOME, "/home/test");
+    assert.equal(childEnv.LANG, "C.UTF-8");
+    assert.equal(childEnv.IKBI_SECRET_TEST_VALUE, undefined, "process secrets must not leak into the child env");
+    // Git hardening is injected for EVERY governed command (harmless to non-git): repo hooks disabled,
+    // system git config ignored. (Constant flags, not host secrets.)
+    assert.equal(childEnv.GIT_CONFIG_NOSYSTEM, "1");
+    assert.equal(childEnv.GIT_CONFIG_KEY_0, "core.hooksPath");
+    assert.equal(childEnv.GIT_CONFIG_VALUE_0, "/dev/null");
   } finally {
     if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
     if (oldHome === undefined) delete process.env.HOME; else process.env.HOME = oldHome;
     if (oldLang === undefined) delete process.env.LANG; else process.env.LANG = oldLang;
     if (oldSecret === undefined) delete process.env.IKBI_SECRET_TEST_VALUE; else process.env.IKBI_SECRET_TEST_VALUE = oldSecret;
   }
+});
+
+test("F2: a risky command under sandbox mode=off runs but is LOUDLY receipted (never a silent skip)", async () => {
+  const ex = fakeExecFile();
+  const rc = fakeReceipts();
+  // cfg() sets sandbox.mode "off"; python3 is a risky interpreter (does its own filesystem syscalls).
+  const ge = createGovernedExec({ config: cfg(["python3"]), gateWall: capturingGate().gateWall, execFile: ex.fn, receipts: rc.receipts, publish: () => {} });
+  const r = await ge.run({ parentCtx: makeCtx("verified"), command: "python3", args: ["script.py"] });
+  assert.equal(r.executed, true, "mode=off still runs the command (unsandboxed)");
+  // The unsandboxed run is recorded loudly — 'off' cannot masquerade as safe in the audit trail.
+  const loud = rc.calls.some((c) => /SANDBOX OFF/.test((c.input.outcome as { detail?: string }).detail ?? ""));
+  assert.ok(loud, "a loud 'SANDBOX OFF' receipt is written for the risky unsandboxed command");
 });
 
 test("operator-allowed interpreters still reject direct code-eval flags", async () => {

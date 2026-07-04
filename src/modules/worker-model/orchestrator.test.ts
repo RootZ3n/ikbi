@@ -393,6 +393,38 @@ function capturingTrust() {
   return { trust, calls };
 }
 
+test("INJECTION SIGNAL: a chokepoint block on a tool result is recorded in the role receipt AND attributed to trust (detection→enforcement)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const cap = capturingRoles();
+  // The builder reports that the neutralization chokepoint blocked a tool result this run.
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    builder: async () => ({ role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["a.ts"], injectionDetected: true, rejectedToolCalls: [] } }),
+  };
+  // Local captures: role receipt metadata (ladder-independent audit) + recordOutcome signals (ladder on).
+  const appended: Array<{ operation: string; metadata: Record<string, unknown> }> = [];
+  const receipts = { append: async (input: unknown): Promise<unknown> => { const i = input as { operation: string; metadata?: Record<string, unknown> }; appended.push({ operation: i.operation, metadata: i.metadata ?? {} }); return {}; } };
+  const trustCalls: Array<{ operation: string; injection: boolean }> = [];
+  const trust = {
+    recordOutcome: async (i: { agentId: string; defaultTrustTier: string; operation: string; status: string; signals?: { injection?: boolean } }): Promise<TrustDecision> => {
+      trustCalls.push({ operation: i.operation, injection: i.signals?.injection === true });
+      const t = asTier(i.defaultTrustTier, TRUST_FLOOR);
+      return { agentId: i.agentId, tier: t, previousTier: t, autonomy: autonomyForTier(t) };
+    },
+  };
+  // ENABLED has trustLadder: true, so the per-role recordOutcome fires (the demotion path is live).
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, trust, receipts }));
+  await orch.run(task, parentCtx);
+
+  // Durable audit: the builder role receipt records the detected injection regardless of the ladder.
+  const builderReceipt = appended.find((a) => a.operation === "worker.role.builder");
+  assert.equal(builderReceipt?.metadata.injectionDetected, true, "the role receipt records the chokepoint block (always-on audit)");
+  // Enforcement: trust is recorded PER-BUILD (FIX A). With the ladder active, the per-build outcome
+  // carries signals.injection so the trust rules can set the non-recoverable flag.
+  const buildTrust = trustCalls.find((c) => c.operation === "worker.build");
+  assert.ok(buildTrust?.injection, "the per-build recordOutcome received signals.injection — detection reaches enforcement");
+});
+
 test("ISSUE 1: a builder TIMEOUT does NOT feed the trust signal (no demotion) and writes an explicit suppression receipt", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
   const roles: Partial<Record<WorkerRole, RoleFn>> = {
