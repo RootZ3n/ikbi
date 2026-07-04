@@ -57,6 +57,8 @@ export interface DoctorInputs {
   readonly registry?: DoctorRegistry;
   /** Env source for verification/retrieval mode reporting (tests inject). Default: process.env. */
   readonly env?: NodeJS.ProcessEnv;
+  /** Whether the earned-trust ladder is active. Default: workerModelConfig.trustLadder. */
+  readonly trustLadder?: boolean;
 }
 
 export interface DoctorResult {
@@ -227,6 +229,28 @@ export function runDoctor(inp: DoctorInputs = {}): DoctorResult {
       }
     }
   }
+
+  // --- PROMOTION POSTURE (will a self-build auto-promote, or stall on trust gating?) ---
+  // The operator's #1 "no-babysit" question: when I run a build, does verified-green work LAND,
+  // or does it stall on trust gating? Make the answer explicit rather than discovered on a stalled run.
+  push("");
+  push("PROMOTION POSTURE");
+  const trustLadderOn = inp.trustLadder ?? workerModelConfig.trustLadder === true;
+  const workerTier = cfg.identity.workerTrustTier;
+  if (!trustLadderOn) {
+    push(`  ${OK} trust ladder OFF (default) — verified-green work AUTO-PROMOTES regardless of tier (autoCommit forced on); build outcomes never move worker trust`);
+  } else {
+    const tier = workerTier.toLowerCase();
+    if (tier === "trusted" || tier === "operator") {
+      push(`  ${OK} trust ladder ON + worker tier '${workerTier}' — auto-commits with no approval gate (self-builds promote)`);
+    } else if (tier === "verified") {
+      push(`  ${WARN} trust ladder ON + worker tier '${workerTier}' — verified work is RETAINED but NOT landed (no autoCommit). Set IKBI_WORKER_TRUST_TIER=trusted or disable the ladder (unset IKBI_WORKER_MODEL_TRUST_LADDER).`);
+    } else {
+      // probation / untrusted / anything unknown → fail-closed: gate-wall DENIES promotion.
+      push(`  ${WARN} trust ladder ON + worker tier '${workerTier}' — self-builds will STALL at promote (gate-wall fail-closed, requires approval). Set IKBI_WORKER_TRUST_TIER=trusted or disable the ladder (unset IKBI_WORKER_MODEL_TRUST_LADDER).`);
+    }
+  }
+  push(`  · worker trust tier = ${workerTier} (IKBI_WORKER_TRUST_TIER)`);
 
   // --- STATE ---------------------------------------------------------------
   push("");

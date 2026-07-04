@@ -263,6 +263,40 @@ test("doctor does NOT flag a small local model with an explicit capabilities ove
   assert.match(text, /✓ all 3 roster model\(s\) classified/);
 });
 
+// ── PROMOTION POSTURE: will a self-build auto-promote, or stall on trust gating? ─────────────
+
+test("doctor REPORTS auto-promote posture when the trust ladder is OFF (the default)", () => {
+  const r = runDoctor(readyInputs({ trustLadder: false }));
+  const text = r.lines.join("\n");
+  assert.match(text, /PROMOTION POSTURE/);
+  assert.match(text, /✓ trust ladder OFF \(default\) — verified-green work AUTO-PROMOTES/);
+  assert.equal(r.ready, true);
+});
+
+test("doctor WARNS that self-builds STALL when the ladder is ON and the worker tier is probation", () => {
+  const r = runDoctor(
+    readyInputs({
+      trustLadder: true,
+      config: loadConfig({
+        IKBI_OPERATOR_TOKEN: "op-secret-strong-value",
+        IKBI_WORKER_TOKEN: "worker-secret-strong-value",
+        IKBI_TRUST_HMAC_KEY: "a-real-hmac-key",
+        IKBI_IDENTITY_TOKEN_SALT: "a-real-salt",
+        IKBI_WORKER_TRUST_TIER: "probation",
+      }),
+    }),
+  );
+  const text = r.lines.join("\n");
+  assert.match(text, /⚠ trust ladder ON \+ worker tier 'probation' — self-builds will STALL at promote/);
+  assert.match(text, /worker trust tier = probation/);
+});
+
+test("doctor confirms the auto-commit path when the ladder is ON and the worker is trusted", () => {
+  const r = runDoctor(readyInputs({ trustLadder: true })); // default worker tier is 'trusted'
+  const text = r.lines.join("\n");
+  assert.match(text, /✓ trust ladder ON \+ worker tier 'trusted' — auto-commits with no approval gate/);
+});
+
 // ── SAFETY POSTURE: verification + retrieval mode reporting (the hardening patch) ────────────
 
 test("F3/F4: doctor REPORTS the verification + retrieval modes (HARDENED by default, no env)", () => {
