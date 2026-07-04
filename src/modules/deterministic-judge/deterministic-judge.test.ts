@@ -42,6 +42,23 @@ test("a typecheck-failing candidate is disqualified even with otherwise PERFECT 
   assert.match(v?.overrideReason ?? "", /typecheck/);
 });
 
+test("a NO-WORK candidate (0 files, 0 diff) is disqualified — a do-nothing cannot outscore real work", () => {
+  // The exact competitive-mode trap: on an already-green base repo, a do-nothing candidate inherits
+  // typecheckPass/testsPass AND maxes the files+diff families (0/max ⇒ 1.0). Without the override it
+  // would OUTSCORE and discard the candidate that actually did the verified work.
+  const noop = cand({ workspaceId: "did-nothing", filesWritten: 0, diffLines: 0, toolRounds: 0, testCount: { passed: 10, total: 10 } });
+  const real = cand({ workspaceId: "did-the-work", filesWritten: 4, diffLines: 250, toolRounds: 8, testCount: { passed: 10, total: 10 } });
+  const r = newJudge().judge([noop, real]);
+  assert.equal(r.winner?.workspaceId, "did-the-work", "the real-work candidate wins");
+  const v = r.ranking.find((x) => x.workspaceId === "did-nothing");
+  assert.equal(v?.disqualified, true);
+  assert.match(v?.overrideReason ?? "", /no work/i);
+  // A candidate with 0 files but a real diff (modified existing files) is NOT disqualified.
+  const modifiedOnly = cand({ workspaceId: "modified", filesWritten: 0, diffLines: 120 });
+  const r2 = newJudge().judge([modifiedOnly]);
+  assert.equal(r2.ranking.find((x) => x.workspaceId === "modified")?.disqualified, false, "0 files but a real diff is real work");
+});
+
 test("testsPass:false and rejectedToolCalls>0 each disqualify (override reasons surfaced)", () => {
   const r = newJudge().judge([
     cand({ workspaceId: "a", testsPass: false }),
@@ -60,14 +77,18 @@ test("weights sum to exactly 1.0 (Luak invariant)", () => {
   assert.ok(Math.abs(sum - 1) < 1e-9, `family weights must sum to 1.0 (got ${sum})`);
 });
 
-test("a perfect candidate scores composite 1.0; the better-signal candidate wins", () => {
-  const perfect = cand({ workspaceId: "perfect", testCount: { passed: 5, total: 5 }, toolRounds: 0, diffLines: 0, filesWritten: 0, stopReason: "stop" });
+test("a strong-signal real-work candidate beats a worse one (a no-op can no longer game composite 1.0)", () => {
+  // Composite 1.0 requires 0 files AND 0 diff (the families score 0/max ⇒ 1.0) — but that is a NO-OP,
+  // now disqualified. So the perfect-composite scenario is intentionally unreachable by legitimate
+  // work; what remains is the real contract: a strong-signal candidate with REAL work beats a worse one.
+  const strong = cand({ workspaceId: "strong", testCount: { passed: 5, total: 5 }, toolRounds: 1, diffLines: 20, filesWritten: 2, stopReason: "stop" });
   const worse = cand({ workspaceId: "worse", testCount: { passed: 3, total: 5 }, toolRounds: 18, diffLines: 1500, filesWritten: 40, stopReason: "max_iterations" });
-  const r = newJudge().judge([worse, perfect]);
-  assert.equal(r.winner?.workspaceId, "perfect");
-  assert.ok(Math.abs((r.winner?.composite ?? 0) - 1.0) < 1e-9, "all-best signals ⇒ composite 1.0");
+  const r = newJudge().judge([worse, strong]);
+  assert.equal(r.winner?.workspaceId, "strong");
+  const strongComposite = r.winner?.composite ?? 0;
   const worseComposite = r.ranking.find((x) => x.workspaceId === "worse")?.composite ?? 1;
-  assert.ok(worseComposite < 1.0, "the worse candidate scores below the perfect one");
+  assert.ok(strongComposite > worseComposite, "the stronger-signal candidate scores higher");
+  assert.ok(strongComposite > 0.5 && strongComposite < 1.0, "real work scores high but not the no-op's gamed 1.0");
 });
 
 test("among survivors, more passing tests wins (all else equal)", () => {

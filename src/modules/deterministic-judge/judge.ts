@@ -83,6 +83,16 @@ export function defaultOverrides(): JudgeOverride[] {
       disqualifies: (c) => c.rejectedToolCalls > 0,
       reason: (c) => `${c.rejectedToolCalls} rejected tool call(s) — attempted out-of-policy action`,
     },
+    {
+      id: "no-work",
+      label: "no-work",
+      // A candidate that wrote 0 files AND produced 0 (or unknown) diff did NO work. Without this it
+      // would MAX the files+diff families (0/max ⇒ score 1.0) and — on a repo that is already green —
+      // inherit testsPass/typecheckPass from the untouched base, letting a do-nothing candidate OUTSCORE
+      // and DISCARD candidates with real, verified changes. A shootout must never crown a no-op.
+      disqualifies: (c) => c.filesWritten === 0 && (c.diffLines ?? 0) === 0,
+      reason: () => "no work produced (0 files written, 0 diff) — a do-nothing candidate cannot win",
+    },
   ];
 }
 

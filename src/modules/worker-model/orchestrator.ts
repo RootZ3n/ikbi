@@ -801,6 +801,16 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   // reads it, mirroring the auto-verify-rescue policy guard across every retry path.
   let policyTaintedThisBuild = false;
 
+  // Accumulate a builder attempt's security signals (injection / policy taint) into the per-run flags.
+  // recordRole does this for the roles it records; RETRY builders that bypass recordRole (the
+  // critic-fix loop, the verifier-driven fix loop, the critic-driven escalation) call this directly so
+  // an injection/taint on a RETRY still reaches the fail-closed in-run promote gate.
+  const noteBuilderSignals = (r: RoleResult): void => {
+    const d = (r.detail ?? {}) as Record<string, unknown>;
+    if (d.injectionDetected === true) injectionDetectedThisBuild = true;
+    if (Array.isArray(d.policyViolations) && d.policyViolations.length > 0) policyTaintedThisBuild = true;
+  };
+
   async function runRoleFn(role: WorkerRole, roleFn: RoleFn, ctx: RoleContext, timeoutOverrideMs?: number): Promise<RoleResult> {
     const effectiveTimeout = timeoutOverrideMs ?? roleTimeoutMs;
     if (!(effectiveTimeout > 0)) return roleFn(ctx);
@@ -1543,7 +1553,13 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // a clean shadow workspace, re-verify, then take the existing promote path. Takes precedence
     // over competitive. Byte-unchanged when no candidate models are configured.
     const taskCandidates = task.candidates !== undefined && task.candidates.length > 0 ? task.candidates : candidateModelList;
-    if (taskCandidates.length > 0) {
+    // STEP-PLANNER GUARD: a step that REUSES a shared workspace, or skips promote/verify (an
+    // intermediate or final step of a multi-step plan), MUST take the single-workspace path — the
+    // tournament/competitive paths allocate FRESH worktrees and would ABANDON the accumulated work,
+    // run the verifier against a deliberately-partial project (guaranteed red), and could even try to
+    // promote mid-plan. So a multi-step build never enters those modes even when their env is set.
+    const isStepPlannerStep = task.reuseWorkspace !== undefined || task.skipPromote === true || task.skipVerifier === true;
+    if (!isStepPlannerStep && taskCandidates.length > 0) {
       const mode = resolveBuilderMode(task);
       const specs: CandidateSpec[] = taskCandidates.slice(0, MAX_CANDIDATE_MODELS).map((model) => ({ model, mode }));
       return runTournament(task, parentCtx, specs, makeTournamentEngine(task, parentCtx, parentIdentity));
@@ -1551,7 +1567,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 
     // COMPETITIVE BUILD MODE (default OFF). When on, take the N-workspace path and
     // return; otherwise fall through to the single-workspace path below — BYTE-UNCHANGED.
-    if (config.competitive === true) {
+    if (!isStepPlannerStep && config.competitive === true) {
       // N reconciliation: a competitive MODEL LIST means race exactly the listed models —
       // one candidate per model, capped at MAX_COMPETITIVE_N. No list ⇒ competitiveN
       // candidates all on the single builder model (the old workspace-isolation behavior).
@@ -1838,9 +1854,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         const roleCost = runCost() - costBeforeRole;
         // Stamp into detail (open shape) so the CLI post-build breakdown can read it without
         // changing the WorkerResult contract. Also stamp the model on the builder role.
-        if (roleCost > 0) {
+        // Stamp the builder's model UNCONDITIONALLY (not only when cost>0) — a free/local provider
+        // reports roleCost 0, and an unstamped model made downstream paths (the recovery seed,
+        // the cheap-retry attribution) fall back to the default instead of the model that actually ran.
+        if (roleCost > 0 || role === "builder") {
           const prevDetail = (result.detail as Record<string, unknown> | undefined) ?? {};
-          result = { ...result, detail: { ...prevDetail, costUsd: roleCost, ...(role === "builder" ? { model: effectiveBuilderModel } : {}) } };
+          result = { ...result, detail: { ...prevDetail, ...(roleCost > 0 ? { costUsd: roleCost } : {}), ...(role === "builder" ? { model: effectiveBuilderModel } : {}) } };
           results[results.length - 1] = result;
         }
         events.publish(
@@ -1850,7 +1869,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           ),
         );
 
-        await recordRole(task, workspace, spawned, result, roleCost, effectiveBuilderModel, true);
+        // Attribute the builder's model ONLY to the builder role — scout/critic/verifier/refuter run
+        // their OWN models, so recording the builder's model on their receipts is an audit lie.
+        await recordRole(task, workspace, spawned, result, roleCost, role === "builder" ? effectiveBuilderModel : undefined, true);
 
         // SG-5 PROGRESS: structured per-role detail beyond start/end — builder tool activity
         // and the verifier's verdict — so `--verbose` can show what each phase actually did.
@@ -1933,7 +1954,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 priorResults: [...results],
                 engine: runEngine,
               };
-              return runRoleFn("builder", fixBuilderFn, fixCtx);
+              const br = await runRoleFn("builder", fixBuilderFn, fixCtx);
+              noteBuilderSignals(br); // injection/taint on a verifier-driven fix retry must reach the promote gate
+              return br;
             },
           });
 
@@ -2059,7 +2082,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 priorResults: [...carriedPrior],
                 engine: runEngine,
               };
-              return runRoleFn("builder", builderFor(parentCtx, resolveBuilderMode(task)), fixCtx);
+              const br = await runRoleFn("builder", builderFor(parentCtx, resolveBuilderMode(task)), fixCtx);
+              noteBuilderSignals(br); // injection/taint on a critic-fix retry must reach the promote gate
+              return br;
             },
             verifier: async (builderResult: RoleResult) => {
               const verifyCtx: RoleContext = {
@@ -2326,7 +2351,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           if (unverifiable !== undefined) {
             checksUnverifiable = unverifiable;
             const failedDetail = (result.detail ?? {}) as Record<string, unknown>;
-            const failedModel = typeof failedDetail.model === "string" ? failedDetail.model : singleBuilderModel;
+            const failedModel = typeof failedDetail.model === "string" ? failedDetail.model : effectiveBuilderModel;
             events.publish(
               workerEscalationSuppressed.create(
                 { taskId: task.taskId, fromModel: failedModel, reason: unverifiable.reason, verificationKind: unverifiable.kind },
@@ -2370,7 +2395,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           if (midModel !== undefined) {
             const failedResult = result;
             const failedDetail = (failedResult.detail ?? {}) as Record<string, unknown>;
-            const failedModel = typeof failedDetail.model === "string" ? failedDetail.model : singleBuilderModel;
+            const failedModel = typeof failedDetail.model === "string" ? failedDetail.model : effectiveBuilderModel;
             // CONTEXT-OVERFLOW: the builder's prompt exceeded the current model's window. Re-running the
             // SAME small window with an even LONGER prompt (goal + failure feedback) is guaranteed to
             // overflow again, so SKIP the cheap same-model retry and go straight to the pool sweep, which
@@ -2408,7 +2433,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                   { source: EVENT_SOURCE, attribution: { identity: cheapRetrySpawn.identity, operation: "worker.role.builder", runId: task.taskId } },
                 ),
               );
-              const cheapRetryBuilder = builderForModel(parentCtx, undefined, resolveBuilderMode(task));
+              // Retry on the SAME model that actually failed (effectiveBuilderModel reflects any
+              // pre-flight/--complexity bump) — NOT the default. Passing `undefined` would drop a
+              // bumped mid builder back to the weaker default, so "same-model retry" would silently
+              // retry a WEAKER model than the one that failed (a behavior bug + an audit lie).
+              const cheapRetryBuilder = builderForModel(parentCtx, effectiveBuilderModel, resolveBuilderMode(task));
               const cheapRetryCtx: RoleContext = {
                 task: { ...task, goal: cheapRetryGoal },
                 role: "builder",
@@ -3242,8 +3271,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       const scoutResult = await dispatchRole("scout", scoutSpawn, task, handles[0]!, [], parentCtx, runEngine, undefined, runCost);
       // FIX 5: capture worker identity for trust recording (competitive mode).
       // The first spawned role carries the shared agent identity — subsequent roles
-      // assert the same identity (Fix 6 invariant), so one capture suffices.
-      const compWorkerSpawned: SpawnedRole = scoutSpawn;
+      // assert the same identity (Fix 6 invariant), so one capture suffices. ASSIGN the
+      // outer binding (declared before the try) — a `const` here would SHADOW it, leaving the
+      // catch-path's recordBuildTrust with `undefined` (no trust outcome, no audit receipt).
+      compWorkerSpawned = scoutSpawn;
 
       // 3. builder + verifier PER workspace (sequential in v1; parallelism is a future
       //    optimization). Each builder writes into ITS worktree; each verifier checks ITS
@@ -3260,6 +3291,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           await recordBuildTrust("rejected", compWorkerSpawned, task.taskId, task.targetRepo, true, killReason);
           return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: rolesByWs.get(handles[0]?.id ?? "") ?? [], ...(handles[0] !== undefined ? { workspaceId: handles[0].id } : {}), promoted: false, reason: killReason };
         }
+        // DEPENDENCY INSTALL (per candidate): each candidate has its OWN fresh worktree with no
+        // node_modules. Without this, its builder's in-loop run_checks and the verifier both fail with
+        // "command not found" / "Cannot find module" → every candidate is disqualified and competitive
+        // mode systematically fails on any repo needing installs. Mirrors the single-run + tournament paths.
+        await installWorkspaceDeps(ws, parentCtx, deps.dependencyInstall);
         // HEAD-TO-HEAD: candidate ci races its OWN model (the Nth listed model, or the single
         // builder model as fallback) in its OWN worktree — each with the full run_checks rail.
         const candidateModel = competitiveModelList?.[ci] ?? singleBuilderModel;
