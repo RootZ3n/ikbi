@@ -21,6 +21,7 @@ import { tierRank, TRUST_FLOOR } from "../../core/trust/index.js";
 import type { DiscardResult, PromoteGovernance, PromoteResult, WorkspaceEvaluation, WorkspaceHandle } from "../../core/workspace/contract.js";
 import { createOrchestrator, type OrchestratorDeps } from "./orchestrator.js";
 import { integrator as realIntegrator } from "./integrator.js";
+import { escalationConfig } from "../escalation/index.js";
 import {
   WORKER_ROLES,
   WorkerError,
@@ -2067,6 +2068,48 @@ test("build-mode escalation: builder fails on the cheap tier → cheap retry →
   const proRetried = retried[retried.length - 1];
   assert.equal((proRetried?.payload as { toModel: string; success: boolean } | undefined)?.toModel, "deepseek-v4-flash");
   assert.equal((proRetried?.payload as { success: boolean } | undefined)?.success, true);
+});
+
+test("build-mode escalation: a CONTEXT-OVERFLOW skips the futile cheap same-model retry and escalates straight to a bigger-window mid model", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const bus = fakeBus();
+  const cap = capturingRoles();
+  const builderGoals: string[] = [];
+  let cheapRetried = false;
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    builder: async (ctx: RoleContext): Promise<RoleResult> => {
+      builderGoals.push(ctx.task.goal);
+      // The cheap-retry path (STEP 1) splices "[retry]" into the goal; the pool sweep splices "[escalation]".
+      if (ctx.task.goal.includes("[retry]")) {
+        cheapRetried = true;
+        return { role: "builder", outcome: "failure", summary: "cheap retry also failed" };
+      }
+      if (ctx.task.goal.includes("[escalation]")) {
+        return { role: "builder", outcome: "success", summary: "the bigger-window model fit the context" };
+      }
+      // Initial cheap attempt: FAIL with the context-overflow marker (the builder's classified error).
+      return { role: "builder", outcome: "failure", summary: "builder failed: context window exceeded", detail: { stopReason: "context_overflow" } };
+    },
+  };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces, events: bus.bus }));
+  const result = await orch.run({ taskId: "t-esc-overflow", targetRepo: "/repo", goal: "do the thing" }, parentCtx);
+
+  assert.equal(cheapRetried, false, "the futile cheap same-model retry is SKIPPED on a context overflow");
+  assert.ok(!builderGoals.some((g) => g.includes("[retry]")), "no [retry] same-model attempt was made");
+  assert.equal(builderGoals.length, 2, "builder ran twice: overflow attempt + bigger-window escalation (no wasted cheap retry)");
+  assert.match(builderGoals[1] ?? "", /\[escalation\]/, "went straight to the escalation handoff");
+  // The sweep seeded at the mid tier (bigger window), skipping the small-window worker pool.
+  const escModel = result.escalationRetry?.model;
+  assert.ok(escModel !== undefined && !escalationConfig.tierModels.worker.includes(escModel), `escalated to a bigger-window model outside the worker pool (got ${escModel})`);
+  assert.ok(escalationConfig.tierModels.mid.includes(escModel!), `the swept model is a mid-tier model (got ${escModel})`);
+  assert.equal(result.escalationRetry?.succeeded, true, "the bigger-window model recovered the overflow");
+  assert.equal(result.outcome, "success");
+  assert.equal(result.promoted, true);
+  // The skip is observable: a cheap_retry event notes it was skipped for context overflow.
+  const skipEvent = bus.sent.find((e) => e.type === "worker.escalation.retried" && /cheap retry skipped — context overflow/.test((e.payload as { toModel?: string }).toModel ?? ""));
+  assert.ok(skipEvent, "emitted an observable 'cheap retry skipped — context overflow' event");
 });
 
 test("build-mode escalation: a failed escalated retry leaves the original failure standing (fail-closed, flash → cheap retry → pro — all fail)", async () => {

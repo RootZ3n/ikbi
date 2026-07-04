@@ -2263,11 +2263,26 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             const failedResult = result;
             const failedDetail = (failedResult.detail ?? {}) as Record<string, unknown>;
             const failedModel = typeof failedDetail.model === "string" ? failedDetail.model : singleBuilderModel;
+            // CONTEXT-OVERFLOW: the builder's prompt exceeded the current model's window. Re-running the
+            // SAME small window with an even LONGER prompt (goal + failure feedback) is guaranteed to
+            // overflow again, so SKIP the cheap same-model retry and go straight to the pool sweep, which
+            // escalates up the ladder to a larger-window model. Turns a permanent overflow-fail into recovery.
+            const failedOnOverflow = failedDetail.stopReason === "context_overflow";
+            if (failedOnOverflow && !cheapModelRetryAttempted) {
+              cheapModelRetryAttempted = true; // consume the cheap-retry slot without spending a doomed call
+              events.publish(
+                workerEscalationRetried.create(
+                  { taskId: task.taskId, fromModel: failedModel, toModel: `${failedModel} (cheap retry skipped — context overflow)`, success: false },
+                  { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.cheap_retry", runId: task.taskId } },
+                ),
+              );
+            }
 
             // ── STEP 1: CHEAP RETRY — same model, with failure feedback ──────
             // Before escalating to the mid-tier model, give the cheap model ONE more chance
             // with the failure context. This implements: flash → flash retry → pro.
             // Fires on ANY builder struggle: explicit failure OR silent success with 0 files.
+            // Skipped for a context-overflow (handled just above — a bigger window is what's needed).
             if (!cheapModelRetryAttempted) {
               cheapModelRetryAttempted = true;
               const cheapRetryGoal = [
@@ -2384,6 +2399,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             };
             const seedTier =
               (["worker", "mid", "frontier"] as const).find((t) => escalationConfig.tierModels[t].includes(failedModel)) ?? "worker";
+            // A CONTEXT-OVERFLOW needs a bigger WINDOW, not a cheaper same-tier model — start the sweep
+            // at the mid tier so it skips the small-window worker pool (which would just overflow again).
+            // recoveryFloor takes max(attempt tiers, startTier), so the accurate worker seed below is not
+            // dragged down; the mid start simply raises the floor to bigger-window models.
+            const sweepStartTier = failedOnOverflow && seedTier === "worker" ? "mid" : seedTier;
             const recAttempts: RecoveryAttempt[] = [{ tier: seedTier, model: failedModel, outcome: "fail" }];
             const handoff = decision.handoffContext;
             let recovered = false;
@@ -2396,7 +2416,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 autoCeiling: "mid",
                 // Frontier (consult) crossing is authorized only by --escalate / a frontier budget.
                 frontierAuthorized: task.allowFrontierConsult === true,
-                startTier: seedTier,
+                startTier: sweepStartTier,
                 // An operator's --fallback-model is honored as the FIRST pick (still up the ladder);
                 // once tried, the sweep continues cheapest-first through the rest of the pool.
                 ...(task.fallbackModel !== undefined ? { requestedModel: task.fallbackModel } : {}),

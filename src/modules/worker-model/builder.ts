@@ -39,6 +39,7 @@ import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 
 import { configEnv } from "../../core/config.js";
+import { classifyError } from "../../core/errors/index.js";
 import { events } from "../../core/events/index.js";
 import type { OperationContext } from "../../core/identity/index.js";
 import { toUntrustedMessage } from "../../core/injection/index.js";
@@ -1994,12 +1995,16 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       },
     };
   } catch (err) {
-    // IO / model failure: report at the role boundary, never throw past it.
+    // IO / model failure: report at the role boundary, never throw past it. Classify the error so a
+    // CONTEXT-OVERFLOW is distinguishable downstream: the orchestrator escalates it straight to a
+    // larger-window model rather than futilely retrying the SAME small window with an even longer
+    // prompt (the failed context + retry feedback). Non-overflow errors keep the loop's stopReason.
+    const overflowed = classifyError(err) === "context_overflow";
     return {
       role: "builder",
       outcome: "failure",
       summary: `builder failed: ${errMsg(err)}`,
-      detail: { filesWritten, filesRead, toolRounds, stopReason, neutralizedCount, rejectedToolCalls, policyViolations: rejectedToolCalls.filter(isPolicyViolation), toolFormatErrors: rejectedToolCalls.filter((e) => !isPolicyViolation(e)) },
+      detail: { filesWritten, filesRead, toolRounds, stopReason: overflowed ? "context_overflow" : stopReason, neutralizedCount, rejectedToolCalls, policyViolations: rejectedToolCalls.filter(isPolicyViolation), toolFormatErrors: rejectedToolCalls.filter((e) => !isPolicyViolation(e)) },
     };
   } finally {
     // Tear down any MCP transports (spawned child processes) — once, on every exit path. Best-effort.
