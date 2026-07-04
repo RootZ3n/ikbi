@@ -1930,11 +1930,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           const criticFailVerdict = ((result.detail ?? {}) as Record<string, unknown>).pass === false;
           const subConditions = {
             criticFixLoopEnabled: config.criticFixLoop === true,
+            withinBudget: !budgetExceeded(task),
             notAlreadyAttempted: !criticFixAttempted,
             verifierPassedForCriticGate,
             isRetryableCriticFail: isRetryableCriticFail(result),
           };
-          const willFire = subConditions.criticFixLoopEnabled && subConditions.notAlreadyAttempted && subConditions.verifierPassedForCriticGate && subConditions.isRetryableCriticFail;
+          const willFire = subConditions.criticFixLoopEnabled && subConditions.withinBudget && subConditions.notAlreadyAttempted && subConditions.verifierPassedForCriticGate && subConditions.isRetryableCriticFail;
           if (criticFailVerdict && !willFire) {
             await receipts.append(
               {
@@ -1954,7 +1955,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             );
           }
         }
-        if (role === "critic" && config.criticFixLoop && !criticFixAttempted && verifierPassedForCriticGate && isRetryableCriticFail(result)) {
+        // BUDGET GUARD (critic-fix is ON by default): the loop spends another builder+verifier+critic
+        // round, so don't even START it once the whole-build wall-clock deadline is blown — the run is
+        // already condemned to halt. (The per-call dollar budget independently hard-stops runaway spend.)
+        if (role === "critic" && config.criticFixLoop && !budgetExceeded(task) && !criticFixAttempted && verifierPassedForCriticGate && isRetryableCriticFail(result)) {
           criticFixAttempted = true;
           // The prior results the re-run roles inherit: everything EXCEPT the stale builder /
           // verifier / critic, which are replaced with their fresh results as produced.

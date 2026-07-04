@@ -22,6 +22,8 @@ import type { DiscardResult, PromoteGovernance, PromoteResult, WorkspaceEvaluati
 import { createOrchestrator, type OrchestratorDeps } from "./orchestrator.js";
 import { integrator as realIntegrator } from "./integrator.js";
 import { escalationConfig } from "../escalation/index.js";
+import { loadWorkerModelConfig } from "./config.js";
+import { moduleEnv } from "../../core/module-config.js";
 import {
   WORKER_ROLES,
   WorkerError,
@@ -1559,11 +1561,11 @@ test("ISSUE 1: the critic-driven retry is capped at ONE, then escalates ONCE, th
   assert.equal(ws.calls.promote, 0, "nothing promoted");
 });
 
-test("ISSUE 1: with criticFixLoop OFF (default), a critic FAIL does NOT retry — original discard behavior", async () => {
+test("ISSUE 1: with criticFixLoop explicitly OFF, a critic FAIL does NOT retry — original discard behavior", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
   const ws = fakeWorkspaces(true);
   const cf = criticFixRoles();
-  // config without criticFixLoop → default off.
+  // config with criticFixLoop unset → treated as off (the injected config governs, not the module default).
   const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cf.roles, workspaces: ws.workspaces }));
   const result = await orch.run(task, parentCtx);
 
@@ -1571,6 +1573,15 @@ test("ISSUE 1: with criticFixLoop OFF (default), a critic FAIL does NOT retry �
   assert.equal(cf.calls.critic, 1, "critic ran exactly once");
   assert.notEqual(result.outcome, "success", "the single FAIL verdict discards as before");
   assert.equal(ws.calls.promote, 0, "nothing promoted");
+});
+
+test("ISSUE 1: the PRODUCTION default for criticFixLoop is ON (an off-goal-but-green build earns one corrective pass)", () => {
+  // The module config default (not the test-injected config) — a fresh env yields criticFixLoop ON.
+  const cfg = loadWorkerModelConfig(moduleEnv("worker-model", {}));
+  assert.equal(cfg.criticFixLoop, true, "critic-fix loop defaults ON — fixable off-goal-green work is not silently discarded");
+  // And it remains explicitly disableable.
+  const off = loadWorkerModelConfig(moduleEnv("worker-model", { IKBI_WORKER_MODEL_CRITIC_FIX_LOOP: "false" }));
+  assert.equal(off.criticFixLoop, false, "IKBI_WORKER_MODEL_CRITIC_FIX_LOOP=false still disables it");
 });
 
 test("ISSUE 1 (gate): a RED verifier + critic FAIL does NOT trigger the critic fix loop — no subjective-feedback retry", async () => {

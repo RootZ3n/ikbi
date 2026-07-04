@@ -146,8 +146,10 @@ export interface WorkerModelConfig {
    * objectively green but semantically wrong / off-goal), feed the critic's feedback back to the
    * builder as a fix goal, re-verify, and re-critique ONCE. Distinct from the verifier-driven
    * `fixLoop` (which retries on red checks) — this catches what objective checks cannot. Capped
-   * at a single retry (subjective feedback must not loop forever). DEFAULT OFF (opt-in). Set
-   * IKBI_WORKER_MODEL_CRITIC_FIX_LOOP=true to enable.
+   * at a single retry (subjective feedback must not loop forever). DEFAULT ON: an off-goal-but-green
+   * build is FIXABLE work that would otherwise be discarded, so one corrective pass earns it — the
+   * "no-babysit" default. Contained by the budget guards (the wall-clock deadline gates whether it
+   * fires; the per-call dollar budget hard-stops runaway spend). Set IKBI_WORKER_MODEL_CRITIC_FIX_LOOP=false to disable.
    */
   readonly criticFixLoop?: boolean;
   /**
@@ -201,7 +203,7 @@ export function loadWorkerModelConfig(reader = env): WorkerModelConfig {
     penalizeTimeouts: reader.bool("PENALIZE_TIMEOUTS", false),
     trustLadder: reader.bool("TRUST_LADDER", false),
     fixLoop: reader.bool("FIX_LOOP", false),
-    criticFixLoop: reader.bool("CRITIC_FIX_LOOP", false),
+    criticFixLoop: reader.bool("CRITIC_FIX_LOOP", true),
     skipCriticOnRed: reader.bool("SKIP_CRITIC_ON_RED", true),
     enableRefuter: reader.bool("ENABLE_REFUTER", false),
     builderMode: loadBuilderMode(),
