@@ -66,6 +66,7 @@ import "./review.js";
 import "./agents.js";
 import "./evaluate.js";
 import "./detect.js";
+import "./health.js";
 import "./spec.js";
 import "./job-cards.js";
 import { workspaces as coreWorkspaces } from "../core/workspace/index.js";
