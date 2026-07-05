@@ -2650,11 +2650,13 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 } catch (e) {
                   applyRes = { applied: false, filesChanged: [], error: e instanceof Error ? e.message : String(e) };
                 }
-                // Gap B: the frontier consult uses the RAW provider, NOT the run's costing engine — so
-                // fold its spend into the run total BEFORE the receipt below reads runCost(). Otherwise
-                // the (typically most expensive) frontier call is invisible to `ikbi cost`, the run
-                // summary, and the budget cap that later role calls check against.
-                if (applyRes.consult?.cost?.usd !== undefined) addRunCost(applyRes.consult.cost.usd);
+                // Gap B / A2: the frontier consult uses the RAW provider, NOT the run's costing engine.
+                // Its spend must be (a) reflected in this receipt's costUsd, (b) folded into the run total
+                // for `ikbi cost` + the budget cap, and (c) recorded on the receipt EVEN IF folding it
+                // trips the cap. So compute the cost, write the receipt with the consult-inclusive total
+                // FIRST, THEN fold+enforce — the BUDGET_EXHAUSTED throw (A2) can no longer skip this
+                // receipt, and the spend is still counted in the terminal summary the abort writes.
+                const consultUsd = applyRes.consult?.cost?.usd ?? 0;
                 const consultModelId = applyRes.modelId ?? "frontier:consult";
                 lastSwapModel = consultModelId;
                 events.publish(
@@ -2668,11 +2670,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                     operation: "worker.escalation.consult",
                     outcome: { status: applyRes.applied ? "success" : "failure", ...(applyRes.error !== undefined ? { detail: applyRes.error } : {}) },
                     requestId: task.taskId,
-                    metadata: { taskId: task.taskId, workspaceId: workspace.id, model: consultModelId, applied: applyRes.applied, filesChanged: applyRes.filesChanged.length, ...(applyRes.stopReason !== undefined ? { stopReason: applyRes.stopReason } : {}), costUsd: runCost() },
+                    metadata: { taskId: task.taskId, workspaceId: workspace.id, model: consultModelId, applied: applyRes.applied, filesChanged: applyRes.filesChanged.length, ...(applyRes.stopReason !== undefined ? { stopReason: applyRes.stopReason } : {}), costUsd: runCost() + consultUsd },
                     project: task.targetRepo,
                   },
                   parentIdentity,
                 );
+                if (consultUsd > 0) addRunCost(consultUsd); // fold + enforce the cap AFTER the receipt is durable (may throw BUDGET_EXHAUSTED)
                 recAttempts.push({ tier: "frontier", model: consultModelId, outcome: applyRes.applied ? "green" : "fail" });
                 if (applyRes.applied) {
                   // Splice a success builder result so the pipeline verifier validates the applied diff.

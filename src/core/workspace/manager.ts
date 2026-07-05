@@ -139,24 +139,30 @@ export class WorkspaceManager {
   }
 
   private async doPreload(): Promise<number> {
-    let loaded = 0;
+    // A3: build a FRESH view from the durable store, then swap it in — do NOT merely ADD to this.live.
+    // An add-only refresh picks up cross-process ADDITIONS (fixing the C-A2 overflow) but never sheds
+    // cross-process REMOVALS: when a peer process (the documented CLI+server coexistence) promotes or
+    // discards a workspace, the entry this process previously loaded lingers forever, inflating
+    // this.live.size into a FALSE "workspace limit reached" that reapAbandoned (it scans the store, not
+    // this.live) cannot heal. Rebuilding from the store drops any entry now absent/terminal there.
+    const rebuilt = new Map<string, WorkspaceRecord>();
     for (const id of await this.store.list()) {
       const rec = await this.store.get(id).catch(() => undefined);
       if (rec === undefined) continue;
       if (rec.state === "promoting") {
         await this.reconcilePromoting(rec);
         const after = await this.store.get(id).catch(() => undefined);
-        if (after && (after.state === "allocated" || after.state === "allocating")) {
-          this.live.set(id, after);
-          loaded += 1;
-        }
+        if (after && (after.state === "allocated" || after.state === "allocating")) rebuilt.set(id, after);
       } else if (rec.state === "allocating" || rec.state === "allocated") {
-        this.live.set(id, rec);
-        loaded += 1;
+        rebuilt.set(id, rec);
       }
     }
-    this.log.info({ event: "workspace_preloaded", loaded, bound: this.max }, "preloaded workspace registry");
-    return loaded;
+    // Atomic swap: clear + repopulate with NO await in between, so no other async op ever observes a
+    // partial map (JS is single-threaded; interleaving happens only at await points).
+    this.live.clear();
+    for (const [id, rec] of rebuilt) this.live.set(id, rec);
+    this.log.info({ event: "workspace_preloaded", loaded: rebuilt.size, bound: this.max }, "preloaded workspace registry");
+    return rebuilt.size;
   }
 
   // ---- allocate (record-then-resource, bounded, serialized) ----

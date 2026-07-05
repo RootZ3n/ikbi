@@ -28,6 +28,9 @@ test("F1: the LEGITIMATE verifier/check runners (trusted prefixes) are still all
   assert.equal(commandPolicyDenyReason("pnpm", ["run", "typecheck"], "builder check: typecheck"), undefined);
   assert.equal(commandPolicyDenyReason("pnpm", ["run", "lint"], "patchsmith check: lint"), undefined);
   assert.equal(commandPolicyDenyReason("pnpm", ["test"], "verifier[ladder:impact] test (root)"), undefined);
+  // A1 (regression): the CHAT REPL's run_checks uses "chat check:" — it MUST be allowed, else the
+  // default `pnpm test` check is denied on every chat session (the F1 anchoring dropped this prefix).
+  assert.equal(commandPolicyDenyReason("pnpm", ["test"], "chat check: test"), undefined, "chat run_checks is allowed");
 });
 
 test("F2: pnpm/yarn dlx and create (run a fetched remote package) are gated like run", () => {

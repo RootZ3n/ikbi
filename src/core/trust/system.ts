@@ -242,6 +242,13 @@ export class TrustSystem implements TrustTierResolver {
           // The existing doc failed integrity — refuse to build trust on a forged base.
           throw new TrustError("state", `trust state for "${agentId}" failed integrity verification`);
         }
+        // A4/F3: bind the doc to its storage key on the WRITE path too — a MAC-valid doc for a DIFFERENT
+        // agent (renamed onto this key) is authentic but MISPLACED. applyOutcome would carry its planted
+        // tier into this agent's new state and poison the cache, elevating the victim. Reject fail-closed
+        // (the loadState read-path binding alone left this write-path replay open).
+        if (cur !== undefined && cur.agentId !== agentId) {
+          throw new TrustError("state", `trust state for "${agentId}" is bound to a different agent ("${cur.agentId}") — cross-agent replay rejected`);
+        }
         previousTier = cur?.tier ?? previousTier;
         const result = applyOutcome(cur, effectiveInput, opts);
         transition = result.transition;
@@ -317,6 +324,10 @@ export class TrustSystem implements TrustTierResolver {
     let newState: TrustState | undefined;
     const persisted = await this.store.update(docKey(input.agentId), (cur) => {
       const verified = cur === undefined ? undefined : verifyUnwrap(this.key, cur);
+      // A4/F3: bind the doc to its storage key — reject a MAC-valid doc for a different agent (replay).
+      if (verified !== undefined && verified.agentId !== input.agentId) {
+        throw new TrustError("state", `trust state for "${input.agentId}" is bound to a different agent ("${verified.agentId}") — cross-agent replay rejected`);
+      }
       // No prior state => create at the FLOOR, NOT the caller-supplied tier (reset is
       // flag-clearing, never a tier grant). An existing state keeps its earned tier.
       const base = verified ?? freshState({ ...input, defaultTrustTier: TRUST_FLOOR }, now);
@@ -376,6 +387,10 @@ export class TrustSystem implements TrustTierResolver {
       if (cur !== undefined && verified === undefined) {
         // Refuse to grant on top of a forged/corrupt base (fail-closed).
         throw new TrustError("state", `trust state for "${input.agentId}" failed integrity verification`);
+      }
+      // A4/F3: bind the doc to its storage key — reject a MAC-valid doc for a different agent (replay).
+      if (verified !== undefined && verified.agentId !== input.agentId) {
+        throw new TrustError("state", `trust state for "${input.agentId}" is bound to a different agent ("${verified.agentId}") — cross-agent replay rejected`);
       }
       const base = verified ?? freshState(input, now);
       // A never-seen worker is effectively at the cold FLOOR before the grant — that

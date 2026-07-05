@@ -178,6 +178,24 @@ test("H6: allocate reaps a slot whose worktree EXISTS but whose OWNER PROCESS is
   }
 });
 
+test("A3: a cross-process REMOVAL is shed on re-preload — no false 'workspace limit reached'", async () => {
+  const repo = await makeRepo();
+  const root = join(tmpdir(), `ikbi-ws-shed-${randomBytes(8).toString("hex")}`);
+  const a = makeManager({ root, max: 1 });
+  const b = makeManager({ root, max: 1 });
+  try {
+    const wsA = await a.mgr.allocate({ targetRepo: repo, identity: ID });
+    // Peer process B discards it — the shared durable record goes terminal — but A's in-memory `live`
+    // still holds the (now-stale) entry. A fresh allocate by A must SUCCEED: the in-lock REBUILD sheds
+    // the shed entry instead of the add-only refresh keeping it and falsely reporting "limit reached".
+    await b.mgr.discard(wsA);
+    const wsA2 = await a.mgr.allocate({ targetRepo: repo, identity: ID });
+    assert.ok(wsA2.id && wsA2.id !== wsA.id, "A reused the slot the peer freed (no phantom-count wedge)");
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
 test("C-A2: the cap holds across processes even when the second process has a STALE preloaded count", async () => {
   const repo = await makeRepo();
   const root = join(tmpdir(), `ikbi-ws-shared-${randomBytes(8).toString("hex")}`);

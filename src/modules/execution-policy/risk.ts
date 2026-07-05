@@ -27,7 +27,12 @@ const PM_COMMANDS = new Set(["npm", "pnpm", "npx", "yarn"]);
  */
 function isVerifierPurpose(purpose: string | undefined): boolean {
   if (purpose === undefined) return false;
-  return /^(patchsmith|builder|verifier) check:/i.test(purpose) || /^verifier\[ladder:/i.test(purpose);
+  // The COMPLETE set of trusted check-runner prefixes (builder run_checks, verifier, patchsmith, and the
+  // CHAT REPL's run_checks — session.ts `chat check:`) plus the ladder executor. `chat` MUST be here: the
+  // chat REPL's default `test` check is `pnpm test`, which the package-script gate would otherwise DENY on
+  // every session (regression from the F1 anchoring). None of these are forgeable — the model's terminal
+  // purpose is `builder terminal: <cmd>`, which matches no trusted prefix.
+  return /^(patchsmith|builder|verifier|chat) check:/i.test(purpose) || /^verifier\[ladder:/i.test(purpose);
 }
 
 /**
