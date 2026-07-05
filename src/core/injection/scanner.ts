@@ -55,7 +55,17 @@ const RULES: readonly Rule[] = [
     severity: "high",
     confidence: 0.7,
     description: "attempt to reassign the model's role/persona",
-    pattern: /\byou\s+are\s+now\b[^\n]{0,40}/gi,
+    // Require an actual IDENTITY-reassignment target after "you are now", not merely any words. The bare
+    // `you are now <anything>` form fired on benign STATE descriptions ("you are now running", "you are
+    // now connected/ready/viewing") that appear routinely in ordinary source, reports, and status text —
+    // and a single high-confidence match on a file the BUILDER read back fail-closed an otherwise-green
+    // build. Real role-confusion attacks reassign the model's identity: an article + role ("a/an/the
+    // <role>"), a persona/mode ("in developer mode", named jailbreaks like DAN), a freedom adjective
+    // (unrestricted/uncensored/jailbroken/…), or "acting/operating/functioning as". Those stay caught;
+    // benign "you are now <verb-ing/preposition>" state phrases no longer do. Defense-in-depth is intact
+    // (new_instructions, pretend_act_as, instruction_override, fence isolation still apply).
+    pattern:
+      /\byou\s+are\s+now\s+(?:an?\s|the\s|in\s+\S+\s+mode\b|free\b|unrestricted\b|unlimited\b|uncensored\b|unfiltered\b|unchained\b|unbound\b|unlocked\b|unbounded\b|jailbroken\b|liberated\b|operating\s+as\b|acting\s+as\b|functioning\s+as\b|role-?playing\b|pretending\b|impersonating\b|DAN\b|STAN\b|AIM\b)[^\n]{0,40}/gi,
   },
   {
     id: "new_instructions",
