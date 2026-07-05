@@ -959,7 +959,9 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       return;
     }
 
-    const { repo, verbose, cost, yes, delegation: delegationJson, noMemory, memoryDiff, check, maxBudgetUsd, fallbackModel, complexity, tier, bare, effort, fromPr, escalate, rest } = parseBuildArgs(argv);
+    const { repo, verbose, cost, yes, json, delegation: delegationJson, noMemory, memoryDiff, check, maxBudgetUsd, fallbackModel, complexity, tier, bare, effort, fromPr, escalate, rest } = parseBuildArgs(argv);
+    // H3: in --json mode, step-planner PROGRESS lines go to stderr so stdout carries ONLY the result JSON.
+    const progress = json === true ? err : out;
 
     // `--tier` given a value parseBuildArgs couldn't match (e.g. `--tier turbo`) silently drops to
     // undefined. Catch that here and fail closed with the valid set, rather than running an
@@ -1239,7 +1241,7 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
         }
         // MULTI-STEP: allocate ONE workspace, run all steps in it, final verify + promote.
         // This is the shared-workspace step planner — changes accumulate across steps.
-        out(`  ↳ decomposed into ${stepPlan.steps.length} steps\n`);
+        progress(`  ↳ decomposed into ${stepPlan.steps.length} steps\n`);
         const sharedWorkspace = await stepWorkspaces.allocate({
           targetRepo,
           identity: who.identity,
@@ -1248,7 +1250,7 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
         let stepsOk = true;
         let lastResult: WorkerResult | undefined;
         for (const step of stepPlan.steps) {
-          out(`  → step ${step.index}/${stepPlan.steps.length}: ${step.goal}\n`);
+          progress(`  → step ${step.index}/${stepPlan.steps.length}: ${step.goal}\n`);
           const stepTask: WorkerTask = {
             taskId: `${id}:step${step.index}`,
             targetRepo,
@@ -1266,16 +1268,16 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
           };
           lastResult = await orchestrator.run(stepTask, ctx);
           if (lastResult.outcome !== "success") {
-            out(`  ✗ step ${step.index} failed: ${lastResult.reason ?? lastResult.outcome}\n`);
+            progress(`  ✗ step ${step.index} failed: ${lastResult.reason ?? lastResult.outcome}\n`);
             stepsOk = false;
             result = lastResult;
             break;
           }
-          out(`  ✓ step ${step.index} passed\n`);
+          progress(`  ✓ step ${step.index} passed\n`);
         }
         if (stepsOk) {
           // All steps passed — run full verification + promote on the accumulated workspace.
-          out(`  → final verification + promote\n`);
+          progress(`  → final verification + promote\n`);
           const finalTask: WorkerTask = {
             taskId: `${id}:verify`,
             targetRepo,
@@ -1308,19 +1310,39 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       // subscriber drain can never suppress the result envelope below (a promoted build that
       // prints nothing reads as a failure and invites a duplicate re-run).
       if (sub !== undefined) await flushBestEffort(eventBus, 2000);
-      // A gate denial / non-promote is a CLEAN outcome (printed), not an error.
-      out(summarize(result));
-      // ISSUE 3: surface the repair report (root cause / files / rationale / tests) when present.
-      out(formatRepairNarrative(result));
-      // --cost: print a per-role cost breakdown after the build.
-      if (cost === true) out(formatCostBreakdown(result));
-      // SG-2: after the run, show a one-line diff summary of what changed (best-effort).
-      if (result.workspaceId !== undefined) await printDiffSummary(result.workspaceId);
-      // Operator experience: failure details + next-command hints on STDERR (not stdout, which
-      // stays machine-readable JSON). All non-success outcomes get failure detail; all outcomes
-      // get next-command hints.
+      if (json === true) {
+        // H3: --json now HONORED — stdout carries ONLY the machine-readable result envelope; ALL
+        // narrative, cost, diff, and hints go to stderr so `ikbi build --json | jq` is a real contract.
+        const jsonResult = {
+          taskId: result.taskId,
+          outcome: result.outcome,
+          promoted: result.promoted,
+          ...(result.workspaceId !== undefined ? { workspaceId: result.workspaceId } : {}),
+          ...(result.costUsd !== undefined ? { costUsd: result.costUsd } : {}),
+          ...(result.reason !== undefined ? { reason: result.reason } : {}),
+          ...(result.verification !== undefined ? { verification: result.verification } : {}),
+        };
+        out(`${JSON.stringify(jsonResult)}\n`);
+        err(summarize(result));
+        err(formatRepairNarrative(result));
+        if (cost === true) err(formatCostBreakdown(result));
+      } else {
+        // A gate denial / non-promote is a CLEAN outcome (printed), not an error.
+        out(summarize(result));
+        // ISSUE 3: surface the repair report (root cause / files / rationale / tests) when present.
+        out(formatRepairNarrative(result));
+        // --cost: print a per-role cost breakdown after the build.
+        if (cost === true) out(formatCostBreakdown(result));
+        // SG-2: after the run, show a one-line diff summary of what changed (best-effort).
+        if (result.workspaceId !== undefined) await printDiffSummary(result.workspaceId);
+      }
+      // Operator experience: failure details + next-command hints on STDERR. All non-success outcomes
+      // get failure detail; all outcomes get next-command hints.
       if (result.outcome !== "success") err(formatFailureDetail(result));
       err(formatNextHints(result));
+      // H2: a rejected/failed/non-promoted build must exit NON-ZERO (consistent with `ikbi fix` and
+      // `ikbi batch`) so `ikbi build "…" --repo . && deploy` never deploys on a build that did not land.
+      if (result.outcome !== "success") setExit(1);
     } catch (e) {
       err(`ikbi: build failed: ${errMsg(e)}\n`);
       setExit(1);

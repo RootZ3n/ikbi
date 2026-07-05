@@ -258,13 +258,43 @@ test("a gate-denied promote (probation parent) surfaces a discarded/partial outc
   const cli = createWorkerCli({ orchestrator, resolveIdentity, operatorToken: OPERATOR_TOKEN, workerToken: WORKER_TOKEN, stdout: cap2.stdout, stderr: cap2.stderr, setExit: cap2.setExit, now: () => 1, cwd: () => "/repo" });
 
   return cli.build(["ship", "it"]).then(() => {
-    assert.equal(cap2.exit, undefined, "a gate denial is NOT a crash");
+    // H2: a rejected build exits NON-ZERO (so `ikbi build && deploy` won't deploy) — but CLEANLY,
+    // via setExit(1), not a thrown crash. (Was previously exit undefined.)
+    assert.equal(cap2.exit, 1, "a gate denial exits 1 (not promoted), cleanly — not a crash");
     // Phase 2: rejected outcomes now emit failure detail + next hints on stderr.
     assert.match(cap2.err, /Build REJECTED/, "rejected outcome emits failure detail on stderr");
     assert.equal(gateDecision()?.allow, false, "the real gate-wall DENIED the probation promote");
     const summary = JSON.parse(cap2.out);
     assert.equal(summary.promoted, false, "not promoted");
     assert.notEqual(summary.outcome, "success");
+  });
+});
+
+test("H2/H3: --json emits ONLY the result JSON on stdout, narrative on stderr, and a failure exits 1", () => {
+  const failOrchestrator = {
+    run: async (task: WorkerTask): Promise<WorkerResult> => ({
+      contractVersion: "1.0.0", taskId: task.taskId, outcome: "failure" as const,
+      roles: [{ role: "builder" as const, outcome: "failure" as const, summary: "compile error", detail: { filesWritten: ["a.ts"] } }],
+      workspaceId: "ws-json", promoted: false, reason: "compile error",
+    }),
+  };
+  const cap2 = capture();
+  const cli = createWorkerCli({
+    orchestrator: failOrchestrator, resolveIdentity: makeResolver("trusted", "trusted"),
+    operatorToken: OPERATOR_TOKEN, workerToken: WORKER_TOKEN,
+    stdout: cap2.stdout, stderr: cap2.stderr, setExit: cap2.setExit, now: () => 1, cwd: () => "/repo",
+  });
+  return cli.build(["--json", "fix it"]).then(() => {
+    // stdout is a single clean JSON object — `ikbi build --json | jq` works.
+    const parsed = JSON.parse(cap2.out.trim());
+    assert.equal(parsed.outcome, "failure");
+    assert.equal(parsed.promoted, false);
+    assert.equal(parsed.reason, "compile error");
+    // Narrative / hints went to stderr, not stdout.
+    assert.doesNotMatch(cap2.out, /Build FAILED|→ next|builder/, "stdout carries no narrative");
+    assert.match(cap2.err, /Build FAILED/, "the narrative is on stderr");
+    // H2: a non-success build exits non-zero.
+    assert.equal(cap2.exit, 1, "a failed build exits 1");
   });
 });
 
