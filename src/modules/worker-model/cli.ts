@@ -964,7 +964,8 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
           "  --escalate        Authorize a frontier consult (Opus-tier patch, ladder-verified) if the cheap+mid pool is exhausted\n" +
           "  --delegation <json>  Run from a delegation envelope (overrides goal + repo)\n" +
                     "  --fallback-model <m> Override the escalation mid-tier model (default from IKBI_ESCALATION_MID_MODEL)\n" +
-          "  --complexity <level>  small | medium | large — large skips flash entirely (uses pro)\n" +
+          "  --complexity <level>  small | medium | large — large skips flash (uses pro) AND extends the\n" +
+          "                        builder's wall-clock budget so a big scaffold isn't cut off mid-tree\n" +
           "  --tier <name>     cheap | mid | frontier — preset builder+critic models per tier.\n" +
           "                        cheap (flash+pro, auto-escalation ON); mid (glm-5.2+minimax-m3)\n" +
           "                        and frontier (sonnet-4.6+gpt-5.5) run one builder, escalation OFF.\n" +
@@ -1278,6 +1279,9 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
             targetRepo,
             goal: step.goal,
             writeScope: detectWriteScope(step.goal),
+            // Propagate --complexity so each building step inherits the large-build model tier AND the
+            // scaled builder wall-clock (a decomposed large goal can still have large individual steps).
+            ...(complexity !== undefined ? { complexity } : {}),
             reuseWorkspace: sharedWorkspace,
             skipPromote: true,
             // Skip verifier on ALL intermediate steps — the project is incomplete

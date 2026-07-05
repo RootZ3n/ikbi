@@ -86,6 +86,8 @@ import {
   MAX_CANDIDATE_MODELS,
   MAX_COMPETITIVE_N,
   MIN_COMPETITIVE_N,
+  resolveBuilderTimeoutMs,
+  resolveTotalBudgetMs,
   workerModelConfig,
   type WorkerModelConfig,
 } from "./config.js";
@@ -797,7 +799,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   const totalBudgetMs = config.totalBudgetMs ?? 0;
   const buildDeadlines = new WeakMap<WorkerTask, number>();
   function armBudget(task: WorkerTask): void {
-    if (totalBudgetMs > 0 && !buildDeadlines.has(task)) buildDeadlines.set(task, nowMs() + totalBudgetMs);
+    // Scale the whole-pipeline ceiling for a --complexity large build so the scaled builder role (plus
+    // the usual roles + any retry) fits inside it rather than tripping the total budget mid-run.
+    const budgetMs = resolveTotalBudgetMs(totalBudgetMs, task.complexity);
+    if (budgetMs > 0 && !buildDeadlines.has(task)) buildDeadlines.set(task, nowMs() + budgetMs);
   }
   function budgetExceeded(task: WorkerTask): boolean {
     const deadline = buildDeadlines.get(task);
@@ -833,7 +838,13 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   };
 
   async function runRoleFn(role: WorkerRole, roleFn: RoleFn, ctx: RoleContext, timeoutOverrideMs?: number): Promise<RoleResult> {
-    const effectiveTimeout = timeoutOverrideMs ?? roleTimeoutMs;
+    // The BUILDER role's per-role race honors the --complexity-large wall-clock bump (same resolver the
+    // builder self-bounds with), so a large greenfield scaffold isn't cut off at the base 5-min timeout.
+    // Applied here — the one chokepoint every builder dispatch (main + fix/escalation retries) flows
+    // through — so every builder call site inherits the scaled deadline without threading it manually.
+    // An explicit override (the verifier's check-floored timeout) still wins.
+    const roleBaseTimeout = role === "builder" ? resolveBuilderTimeoutMs(roleTimeoutMs, ctx.task.complexity) : roleTimeoutMs;
+    const effectiveTimeout = timeoutOverrideMs ?? roleBaseTimeout;
     if (!(effectiveTimeout > 0)) return roleFn(ctx);
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<RoleResult>((resolve) => {

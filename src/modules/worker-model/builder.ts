@@ -65,7 +65,7 @@ import { commandPolicyDenyReason } from "../governed-exec/policy.js";
 import { runVisionAnalyze, visionAnalyzeTool } from "./builder-tools/vision-tool.js";
 import { runWebExtract, runWebSearch, webExtractTool, webSearchTool, WEB_TOOL_NAMES } from "./builder-tools/web-tools.js";
 import { type CheckResult, type ChecksResolution, mapExec, resolveCheckTimeoutMs, VERIFIER_CHECKS } from "./checks.js";
-import { workerModelConfig } from "./config.js";
+import { LARGE_COMPLEXITY_TIMEOUT_FACTOR, resolveBuilderTimeoutMs, workerModelConfig } from "./config.js";
 import { estimateTokens, maybeCompress } from "./context-manager.js";
 import { ContextLayer } from "./context-layer.js";
 import type { RoleFn, RoleResult, WorkerOutcome } from "./contract.js";
@@ -112,6 +112,17 @@ function resolveMaxToolIterations(): number {
 
 /** Hard cap on model rounds — IKBI_MAX_TOOL_ITERATIONS overrides the default (40). */
 export const MAX_TOOL_ITERATIONS = resolveMaxToolIterations();
+
+/**
+ * The effective round cap for a task. A `--complexity large` build (greenfield scaffold, many files)
+ * needs more model rounds than a focused edit — the SAME failure class as the wall-clock cut-off: a
+ * legitimately large build hitting a ceiling mid-tree with 75% written and nothing landed. Scaled by
+ * the shared {@link LARGE_COMPLEXITY_TIMEOUT_FACTOR} so the round cap and the wall-clock budget move
+ * together; every other complexity is unchanged. Operators still tune the base via IKBI_MAX_TOOL_ITERATIONS.
+ */
+export function effectiveMaxIterations(complexity?: "small" | "medium" | "large"): number {
+  return complexity === "large" ? MAX_TOOL_ITERATIONS * LARGE_COMPLEXITY_TIMEOUT_FACTOR : MAX_TOOL_ITERATIONS;
+}
 /**
  * WO4 — STREAM-STALL RECOVERY. Max number of stalls (the initial stall + its retries)
  * tolerated within a single build before terminating cleanly with `tool_call_stalled`.
@@ -859,8 +870,13 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       agentId: ctx.identity.agentId,
       ...(deps.memoryGovernor !== undefined ? { memoryGovernor: deps.memoryGovernor } : {}),
     };
-    const timeoutMs = workerModelConfig.roleTimeoutMs; // builder self-bounds; the
-    // orchestrator does NOT enforce a per-role timeout yet (noted for the 3rd eye).
+    // Builder self-bounds its loop against a wall-clock budget. A `--complexity large` build gets a
+    // scaled budget (resolveBuilderTimeoutMs) so a big greenfield scaffold isn't cut off mid-tree; the
+    // orchestrator's per-role race uses the SAME resolver, so both agree on the deadline.
+    const timeoutMs = resolveBuilderTimeoutMs(workerModelConfig.roleTimeoutMs, ctx.task.complexity);
+    // Round cap scales with the SAME large-build knob as the wall-clock, so a big scaffold isn't cut
+    // off by whichever ceiling it reaches first.
+    const maxIterations = effectiveMaxIterations(ctx.task.complexity);
     const startedAt = Date.now();
 
     // C4: the goal (user-supplied) and the prior-role results (model-derived — a
@@ -1512,7 +1528,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
     // turns), so a model that keeps bare-stopping can never spin forever. ---
     for (;;) {
       iterations += 1;
-      if (iterations > MAX_TOOL_ITERATIONS) {
+      if (iterations > maxIterations) {
         stopReason = "max_iterations";
         break;
       }
@@ -1609,7 +1625,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       if (stall !== undefined) {
         toolCallStalls += 1;
         const willRetry =
-          toolCallStalls < MAX_TOOL_CALL_STALLS && iterations < MAX_TOOL_ITERATIONS && Date.now() - startedAt <= timeoutMs;
+          toolCallStalls < MAX_TOOL_CALL_STALLS && iterations < maxIterations && Date.now() - startedAt <= timeoutMs;
         stallRecords.push({ tools: stall.tools, partialArgBytes: stall.partialArgBytes, attempt: toolCallStalls, willRetry });
         events.publish(
           workerToolCallStalled.create(

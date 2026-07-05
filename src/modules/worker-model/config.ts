@@ -78,6 +78,38 @@ export const DEFAULT_ROLE_TIMEOUT_MS = 300_000; // 5 minutes
  * every role boundary (the same checkpoints as the kill-switch). 0 disables.
  */
 export const DEFAULT_TOTAL_BUDGET_MS = 1_800_000; // 30 minutes
+/**
+ * Wall-clock MULTIPLIER applied to a `--complexity large` build's BUILDER role (and, so the longer
+ * builder actually fits, to the whole-pipeline budget). A large build — a greenfield scaffold or a
+ * many-file feature — legitimately needs more wall-clock than a focused edit: the osapa whole-project
+ * build wrote 34 files / 3025 lines and was still ~75% done when the base 5-minute role timeout fired,
+ * discarding a nearly-complete tree. The bump applies ONLY to the builder role (the one doing the long
+ * generative work) and ONLY when `complexity === "large"`; every other role and complexity is unchanged.
+ * The base is a NAMED knob, not a heuristic — the operator still opts into "large" explicitly (the same
+ * flag that bumps the builder to the mid tier), so this never silently lengthens an ordinary build.
+ */
+export const LARGE_COMPLEXITY_TIMEOUT_FACTOR = 3;
+
+/**
+ * The BUILDER role's effective wall-clock timeout (ms) for a task: the base `roleTimeoutMs`, scaled by
+ * {@link LARGE_COMPLEXITY_TIMEOUT_FACTOR} when the task is `--complexity large`. A disabled guard
+ * (base ≤ 0, meaning "no per-role timeout") stays disabled — scaling zero would be meaningless.
+ */
+export function resolveBuilderTimeoutMs(baseRoleTimeoutMs: number, complexity?: "small" | "medium" | "large"): number {
+  if (!(baseRoleTimeoutMs > 0)) return baseRoleTimeoutMs;
+  return complexity === "large" ? baseRoleTimeoutMs * LARGE_COMPLEXITY_TIMEOUT_FACTOR : baseRoleTimeoutMs;
+}
+
+/**
+ * The WHOLE-PIPELINE wall-clock budget (ms) for a task: the base `totalBudgetMs`, scaled by
+ * {@link LARGE_COMPLEXITY_TIMEOUT_FACTOR} when the task is `--complexity large` — so the scaled builder
+ * role (plus the usual scout/critic/verifier/integrator and any retry) can run to completion inside it
+ * rather than tripping the total ceiling. A disabled budget (base ≤ 0) stays disabled.
+ */
+export function resolveTotalBudgetMs(baseTotalBudgetMs: number, complexity?: "small" | "medium" | "large"): number {
+  if (!(baseTotalBudgetMs > 0)) return baseTotalBudgetMs;
+  return complexity === "large" ? baseTotalBudgetMs * LARGE_COMPLEXITY_TIMEOUT_FACTOR : baseTotalBudgetMs;
+}
 /** Default concurrent-run cap (concurrency feature deferred; safe default 1). */
 export const DEFAULT_MAX_CONCURRENT_RUNS = 1;
 /** Competitive candidate count: default + bounds (≥2 to be a competition; small cap on cost/disk). */
