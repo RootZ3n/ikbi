@@ -868,7 +868,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
    * competitive candidates) accumulates `response.cost.usd` into one running total. The
    * neutralization seam is passed through untouched. `cost()` reads the accumulated total.
    */
-  function makeCostingEngine(maxBudgetUsd?: number, effort?: "low" | "medium" | "high" | "max"): { engine: RoleEngine; cost: () => number } {
+  function makeCostingEngine(maxBudgetUsd?: number, effort?: "low" | "medium" | "high" | "max"): { engine: RoleEngine; cost: () => number; addCost: (usd: number) => void } {
     let total = 0;
     let budgetExhausted = false;
     const budget = maxBudgetUsd;
@@ -897,7 +897,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       },
       neutralizeUntrusted,
     };
-    return { engine: costingEngine, cost: () => total };
+    // Gap B: fold a cost incurred OUTSIDE this engine (e.g. the frontier consult, which uses the raw
+    // provider) into the run total, so runCost() — and every receipt/summary that reports it — includes
+    // it, and a later role call sees the higher total when checking the budget cap.
+    return { engine: costingEngine, cost: () => total, addCost: (usd: number) => { total += Math.max(0, usd); } };
   }
 
   /**
@@ -1623,7 +1626,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     );
 
     // Per-run costing engine: accumulates every model invocation's cost across all roles.
-    const { engine: runEngine, cost: runCost } = makeCostingEngine(task.maxBudgetUsd, task.effort);
+    const { engine: runEngine, cost: runCost, addCost: addRunCost } = makeCostingEngine(task.maxBudgetUsd, task.effort);
 
     const results: RoleResult[] = [];
     // Run-level escalation accumulator (ADDITIVE observability; never alters dispatch).
@@ -1689,6 +1692,39 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // run result + completion event always carry which path actually ran.
     let actualVerificationMode: string | undefined;
     let actualRetrievalMode: string | undefined;
+
+    // H4/Gap A: every TERMINATED build must write ONE authoritative cost receipt — `ikbi cost`
+    // reads the run-summary's costUsd, so a build that ABORTS (budget exhausted, kill, infra failure)
+    // and returns/throws before the normal summary below would leave its spend uncounted. The abort
+    // branches call this to emit a minimal terminal summary. Best-effort: a receipt failure here must
+    // never mask the abort we're already handling. (`aborted: true` distinguishes it in the trail.)
+    const writeTerminalCostSummary = async (outcome: WorkerResult["outcome"], costUsd: number, detail: string): Promise<void> => {
+      try {
+        await receipts.append(
+          {
+            operation: "worker.run.summary",
+            outcome: { status: toOutcomeStatus(outcome), detail },
+            requestId: task.taskId,
+            metadata: {
+              taskId: task.taskId,
+              workspaceId: workspace.id,
+              targetBranch: workspace.baseBranch,
+              targetRepo: task.targetRepo,
+              outcome,
+              promoted: false,
+              model: singleBuilderModel,
+              costUsd,
+              aborted: true,
+              ...(task.originAgent !== undefined ? { originAgent: task.originAgent } : {}),
+            },
+            project: task.targetRepo,
+          },
+          parentIdentity,
+        );
+      } catch {
+        /* a terminal-summary receipt failure must not mask the abort being handled */
+      }
+    };
 
     try {
       // ── DEPENDENCY INSTALL: ensure node_modules exists before running checks ──
@@ -2580,6 +2616,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 } catch (e) {
                   applyRes = { applied: false, filesChanged: [], error: e instanceof Error ? e.message : String(e) };
                 }
+                // Gap B: the frontier consult uses the RAW provider, NOT the run's costing engine — so
+                // fold its spend into the run total BEFORE the receipt below reads runCost(). Otherwise
+                // the (typically most expensive) frontier call is invisible to `ikbi cost`, the run
+                // summary, and the budget cap that later role calls check against.
+                if (applyRes.consult?.cost?.usd !== undefined) addRunCost(applyRes.consult.cost.usd);
                 const consultModelId = applyRes.modelId ?? "frontier:consult";
                 lastSwapModel = consultModelId;
                 events.publish(
@@ -2773,6 +2814,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         );
         if (retainFailedWorkspaces) await safeRetain(workspaces, workspace, budgetErr.message);
         else await safeDiscard(workspaces, workspace);
+        await writeTerminalCostSummary("rejected", costToReport, budgetErr.message); // Gap A: budget-abort spend is counted
         return {
           contractVersion: CONTRACT_VERSION,
           taskId: task.taskId,
@@ -2796,6 +2838,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } },
         ),
       );
+      await writeTerminalCostSummary("failure", runCost(), `infrastructure failure: ${reason}`); // Gap A: spend-so-far is counted even on a throw
       throw err;
     }
 
@@ -2826,6 +2869,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         ),
       );
       fireStopHooks(hooks, task.targetRepo).catch(() => {});
+      await writeTerminalCostSummary("rejected", runCost(), `interrupted: ${killedReason}`); // Gap A: mid-run kill spend is counted
       return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: results, workspaceId: workspace.id, promoted: false, reason: killedReason };
     }
 
