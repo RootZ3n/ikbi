@@ -211,7 +211,7 @@ export class WorkspaceManager {
       const path = this.resolveWorktreePath(id); // validates id + confines path
       const scratchBranch = SCRATCH_BRANCH_PREFIX + id;
 
-      return this.locks.withLock(this.wsKey(id), async () => {
+      return this.withWorkspaceLock(id, async () => {
         const ts = this.now();
         const base: WorkspaceRecord = {
           id,
@@ -289,8 +289,8 @@ export class WorkspaceManager {
 
     const repo = handle.targetRepo;
     const ref = `refs/heads/${handle.baseBranch}`;
-    // ws-id lock OUTER, target-branch lock INNER (consistent order).
-    return this.locks.withLock(this.wsKey(handle.id), async () => {
+    // ws-id lock OUTER, target-branch lock INNER (consistent order). Cross-process via withWorkspaceLock.
+    return this.withWorkspaceLock(handle.id, async () => {
       const rec = await this.store.get(handle.id);
       if (rec === undefined || rec.state !== "allocated") {
         throw new WorkspaceError("invalid_state", `workspace ${handle.id} is not in a promotable state`);
@@ -396,13 +396,13 @@ export class WorkspaceManager {
         );
         return result;
       }, { file: this.lockFile(branchLockKey) });
-    }, { file: this.lockFile(this.wsKey(handle.id)) }); // CROSS-PROCESS promote lock: a peer's preload can't reconcile a live promote
+    });
   }
 
   // ---- discard (per-ws lock; terminal-promoted preserved) ----
 
   async discard(handle: WorkspaceHandle): Promise<DiscardResult> {
-    return this.locks.withLock(this.wsKey(handle.id), async () => {
+    return this.withWorkspaceLock(handle.id, async () => {
       await removeWorktree(handle.targetRepo, handle.path);
       await pruneWorktrees(handle.targetRepo);
       await deleteBranch(handle.targetRepo, handle.scratchBranch);
@@ -435,7 +435,7 @@ export class WorkspaceManager {
    * already-terminal record (no-op beyond a note refresh).
    */
   async retain(handle: WorkspaceHandle, reason: string): Promise<DiscardResult> {
-    return this.locks.withLock(this.wsKey(handle.id), async () => {
+    return this.withWorkspaceLock(handle.id, async () => {
       const rec = await this.store.get(handle.id);
       if (rec === undefined) {
         this.live.delete(handle.id);
@@ -503,8 +503,8 @@ export class WorkspaceManager {
         if (rec === undefined || rec.targetRepo !== targetRepo) continue;
         if (rec.state !== "allocating" && rec.state !== "allocated" && rec.state !== "promoting") continue;
         try {
-          await this.locks.withLock(
-            this.wsKey(id),
+          await this.withWorkspaceLock(
+            id,
             async () => {
               const did = await this.reclaimOne(rec, livePaths);
               if (did) recordsReconciled += 1;
@@ -569,8 +569,8 @@ export class WorkspaceManager {
       const ownerDead = worktreePresent && this.isOwnerDead(rec);
       if (worktreePresent && !ownerDead) continue; // present + (live or unverifiable) ⇒ never auto-reap
       try {
-        await this.locks.withLock(
-          this.wsKey(id),
+        await this.withWorkspaceLock(
+          id,
           async () => {
             // A dead-owner record with a lingering worktree: remove the worktree + branch, then mark it.
             if (ownerDead) await this.removeWorktreeDir(rec).catch(() => undefined);
@@ -684,8 +684,8 @@ export class WorkspaceManager {
         continue;
       }
       try {
-        await this.locks.withLock(
-          this.wsKey(id),
+        await this.withWorkspaceLock(
+          id,
           async () => {
             await removeWorktree(rec.targetRepo, rec.path).catch(() => undefined);
             await pruneWorktrees(rec.targetRepo).catch(() => undefined);
@@ -738,6 +738,20 @@ export class WorkspaceManager {
    */
   private lockFile(key: string): string {
     return join(this.root, "locks", `${createHash("sha1").update(key).digest("hex").slice(0, 16)}.lock`);
+  }
+
+  /**
+   * Acquire the CROSS-PROCESS per-workspace lock (in-process mutex + file lock) for `id` and run `fn`.
+   * EVERY per-workspace lifecycle transition — allocate, promote, discard, retain, reclaim, reap, clean,
+   * preload-reconcile — goes through this ONE method, so the lock is cross-process EVERYWHERE and a peer
+   * process can never mutate/reconcile a workspace another process is promoting. There is deliberately no
+   * in-process-only variant to forget (the gap that let `reclaim`/cleanup reconcile a live promote).
+   */
+  private withWorkspaceLock<T>(id: string, fn: () => Promise<T>, opts?: { timeoutMs?: number }): Promise<T> {
+    return this.locks.withLock(this.wsKey(id), fn, {
+      file: this.lockFile(this.wsKey(id)),
+      ...(opts?.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+    });
   }
 
   private resolveWorktreePath(id: string): string {
@@ -793,14 +807,14 @@ export class WorkspaceManager {
    */
   private async reconcileIfUnlocked(id: string, rec: WorkspaceRecord): Promise<WorkspaceRecord | undefined> {
     try {
-      return await this.locks.withLock(
-        this.wsKey(id),
+      return await this.withWorkspaceLock(
+        id,
         async () => {
           const fresh = await this.store.get(id).catch(() => undefined);
           if (fresh?.state === "promoting") await this.reconcilePromoting(fresh);
           return (await this.store.get(id).catch(() => undefined)) ?? rec;
         },
-        { file: this.lockFile(this.wsKey(id)), timeoutMs: RECLAIM_WS_TIMEOUT_MS },
+        { timeoutMs: RECLAIM_WS_TIMEOUT_MS },
       );
     } catch (err) {
       if (err instanceof SubstrateError && err.kind === "lock_timeout") return undefined; // live promoter holds it

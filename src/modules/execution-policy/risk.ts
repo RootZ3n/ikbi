@@ -26,7 +26,7 @@ const PM_RUN_SUBCOMMANDS = new Set(["run", "run-script", "test", "start", "exec"
  * Non-script yarn subcommands. yarn runs an IMPLICIT script for `yarn <name>` when <name> is not a
  * builtin (`yarn build` ≡ `yarn run build`), so any yarn first-positional NOT in this set is gated —
  * unknown ⇒ gated (fail-closed). Over-gating a rare builtin only affects model TERMINAL commands, since
- * verifier/check runs carry a trusted purpose and bypass the gate entirely.
+ * verifier/check runs set the structured `verifier` flag and bypass the gate entirely.
  */
 const SAFE_YARN_SUBCOMMANDS = new Set([
   "install", "add", "remove", "up", "upgrade", "why", "list", "info", "config", "dedupe", "import",
@@ -45,7 +45,7 @@ function pmRedirectFlag(args: readonly string[]): boolean {
  * SECURITY (F1 v2): scans ALL pre-`--` tokens for a run-class subcommand rather than only the first
  * positional — an option VALUE can otherwise HIDE the subcommand (`pnpm --loglevel x run evil`,
  * `pnpm --dir . run evil`). Over-approximates (a benign token equal to a run-class word is gated), which
- * is fail-closed and only affects model terminal commands (checks bypass via a trusted purpose).
+ * is fail-closed and only affects model terminal commands (a check-runner sets `verifier` and is allowed).
  */
 function isPackageScriptRun(command: string, args: readonly string[]): boolean {
   if (!PM_COMMANDS.has(command)) return false;

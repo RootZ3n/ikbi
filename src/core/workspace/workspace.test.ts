@@ -201,6 +201,28 @@ test("round-3 #4: a peer's LIVE promote (its cross-process lock HELD) is not rec
   }
 });
 
+test("verify: reclaim() does NOT reconcile a LIVE promote held by a peer (cross-process wsKey lock)", async () => {
+  const repo = await makeRepo();
+  const root = join(tmpdir(), `ikbi-ws-reclaim-${randomBytes(8).toString("hex")}`);
+  const a = makeManager({ root, max: 3 });
+  const b = makeManager({ root, max: 3 });
+  try {
+    const ws1 = await a.mgr.allocate({ targetRepo: repo, identity: ID });
+    const rec = await a.store.get(ws1.id);
+    await a.store.put(ws1.id, { ...rec!, state: "promoting" });
+    // A peer holds the workspace's cross-process lock (a live promote).
+    const wsLockPath = join(root, "locks", `${createHash("sha1").update(`workspace:ws:${ws1.id}`).digest("hex").slice(0, 16)}.lock`);
+    const held = await acquireFileLock(wsLockPath, 1000, { logger: silent, staleMs: 30_000 });
+    // `ikbi clean` / doctor cleanup on the OTHER process runs reclaim — it must respect the lock and skip.
+    await b.mgr.reclaim(repo);
+    const after = await b.store.get(ws1.id);
+    assert.equal(after?.state, "promoting", "reclaim left the live promote intact (respected the cross-process lock)");
+    await held();
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
 test("round-3 #4b: a CRASHED promote (lock FREE) IS reconciled at boot preload", async () => {
   const repo = await makeRepo();
   const root = join(tmpdir(), `ikbi-ws-crash-${randomBytes(8).toString("hex")}`);
