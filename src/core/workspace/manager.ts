@@ -150,22 +150,18 @@ export class WorkspaceManager {
       const rec = await this.store.get(id).catch(() => undefined);
       if (rec === undefined) continue;
       if (rec.state === "promoting") {
-        // Codex round-3 #4: reconciling a `promoting` record REVERTS/duplicates a promote — safe ONLY for a
-        // CRASHED promote, never a LIVE one. Two guards: (a) never reconcile during an ALLOCATE bound-
-        // refresh (`reconcile` = false); (b) never reconcile a promote whose OWNER is still alive — a
-        // peer's in-flight cross-process promote (its ws/branch lock is in-process, so this process holds
-        // no lock on it). Only a provably-dead owner (crash) is reconciled; a live/unverifiable owner is
-        // counted as an active slot and left untouched. A legacy record with no owner stamp keeps the old
-        // reconcile-on-boot behavior.
-        const ownerStamped = rec.ownerPid !== undefined && rec.ownerHost !== undefined;
-        const ownerGone = ownerStamped ? this.isOwnerDead(rec) : true;
-        if (!reconcile || !ownerGone) {
+        // Reconciling a `promoting` record REVERTS/duplicates a promote — safe ONLY for a CRASHED promote,
+        // never a LIVE one. Liveness is decided by the workspace's CROSS-PROCESS lock (a live promote holds
+        // it; the lock layer's stale-recovery frees it for a DEAD holder): we ONLY reconcile if we can
+        // ACQUIRE that lock. A held lock (live peer promote) ⇒ skip and count the slot as active. Never
+        // reconcile during an ALLOCATE bound-refresh (`reconcile` = false) — that path only counts.
+        if (!reconcile) {
           rebuilt.set(id, rec);
           continue;
         }
-        await this.reconcilePromoting(rec);
-        const after = await this.store.get(id).catch(() => undefined);
-        if (after && (after.state === "allocated" || after.state === "allocating")) rebuilt.set(id, after);
+        const after = await this.reconcileIfUnlocked(id, rec);
+        if (after !== undefined && (after.state === "allocated" || after.state === "allocating")) rebuilt.set(id, after);
+        else if (after === undefined) rebuilt.set(id, rec); // couldn't take the lock (live promoter) ⇒ count as active
       } else if (rec.state === "allocating" || rec.state === "allocated") {
         rebuilt.set(id, rec);
       }
@@ -400,7 +396,7 @@ export class WorkspaceManager {
         );
         return result;
       }, { file: this.lockFile(branchLockKey) });
-    });
+    }, { file: this.lockFile(this.wsKey(handle.id)) }); // CROSS-PROCESS promote lock: a peer's preload can't reconcile a live promote
   }
 
   // ---- discard (per-ws lock; terminal-promoted preserved) ----
@@ -788,6 +784,31 @@ export class WorkspaceManager {
    * CAS landed => mark promoted (a landed mutation is always recorded); otherwise
    * it did not land => revert to allocated (promotable again).
    */
+  /**
+   * Reconcile a promoting record ONLY if its CROSS-PROCESS workspace lock is free — i.e. the promoter is
+   * gone (crashed; the lock layer's stale-recovery frees a dead holder's lock ~instantly). Returns the
+   * post-reconcile record, or `undefined` when a LIVE promoter still holds the lock (the caller then
+   * leaves the promote alone and counts the slot as active). Re-reads under the lock so a promote that
+   * finished between the store.list() and the lock is handled correctly, not double-reconciled.
+   */
+  private async reconcileIfUnlocked(id: string, rec: WorkspaceRecord): Promise<WorkspaceRecord | undefined> {
+    try {
+      return await this.locks.withLock(
+        this.wsKey(id),
+        async () => {
+          const fresh = await this.store.get(id).catch(() => undefined);
+          if (fresh?.state === "promoting") await this.reconcilePromoting(fresh);
+          return (await this.store.get(id).catch(() => undefined)) ?? rec;
+        },
+        { file: this.lockFile(this.wsKey(id)), timeoutMs: RECLAIM_WS_TIMEOUT_MS },
+      );
+    } catch (err) {
+      if (err instanceof SubstrateError && err.kind === "lock_timeout") return undefined; // live promoter holds it
+      this.log.debug({ event: "workspace_reconcile_skip", workspaceId: id, err: String(err) }, "skipped a promote reconcile during preload");
+      return undefined;
+    }
+  }
+
   private async reconcilePromoting(rec: WorkspaceRecord): Promise<void> {
     const intent = rec.promoteIntent;
     if (intent === undefined) {

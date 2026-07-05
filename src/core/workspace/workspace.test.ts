@@ -178,22 +178,44 @@ test("H6: allocate reaps a slot whose worktree EXISTS but whose OWNER PROCESS is
   }
 });
 
-test("round-3 #4: an allocate bound-refresh does NOT reconcile a peer's in-flight 'promoting' record", async () => {
+test("round-3 #4: a peer's LIVE promote (its cross-process lock HELD) is not reconciled by a preload", async () => {
   const repo = await makeRepo();
   const root = join(tmpdir(), `ikbi-ws-nrec-${randomBytes(8).toString("hex")}`);
   const a = makeManager({ root, max: 3 });
   const b = makeManager({ root, max: 3 });
   try {
     const ws1 = await a.mgr.allocate({ targetRepo: repo, identity: ID });
-    // Simulate a PEER's in-flight promote: flip the durable record to "promoting" (as promote() does
-    // between intent-write and CAS). With no promoteIntent, a reconcile would REVERT it to "allocated".
+    // Simulate a PEER's IN-FLIGHT promote: the durable record is "promoting" AND the workspace's cross-
+    // process lock is HELD (as promote() now does). A reconcile must NOT touch it (it would revert/dupe).
     const rec = await a.store.get(ws1.id);
     await a.store.put(ws1.id, { ...rec!, state: "promoting" });
-    // B allocates — its bound-refresh must COUNT ws1 toward the cap but NOT reconcile/revert it (it holds
-    // only ALLOC_LOCK, not ws1's workspace/branch lock).
+    const wsLockPath = join(root, "locks", `${createHash("sha1").update(`workspace:ws:${ws1.id}`).digest("hex").slice(0, 16)}.lock`);
+    const held = await acquireFileLock(wsLockPath, 1000, { logger: silent, staleMs: 30_000 });
+    // B allocates while the promote lock is held → its boot reconcile can't acquire the lock → skips ws1.
     await b.mgr.allocate({ targetRepo: repo, identity: ID });
     const after = await b.store.get(ws1.id);
-    assert.equal(after?.state, "promoting", "the peer's in-flight promote was left intact, not reconciled");
+    assert.equal(after?.state, "promoting", "the live promote (lock held) was left intact, not reconciled");
+    await held();
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
+test("round-3 #4b: a CRASHED promote (lock FREE) IS reconciled at boot preload", async () => {
+  const repo = await makeRepo();
+  const root = join(tmpdir(), `ikbi-ws-crash-${randomBytes(8).toString("hex")}`);
+  const a = makeManager({ root, max: 3 });
+  const b = makeManager({ root, max: 3 });
+  try {
+    const ws1 = await a.mgr.allocate({ targetRepo: repo, identity: ID });
+    // A promoting record with NO holder (the promoter crashed) and no promoteIntent ⇒ a boot preload
+    // acquires the (free) lock and reconciles it back to "allocated" (promotable again). This is the
+    // healing the lock-free path must still perform.
+    const rec = await a.store.get(ws1.id);
+    await a.store.put(ws1.id, { ...rec!, state: "promoting" });
+    await b.mgr.preload(); // B's boot preload reconciles the crashed promote
+    const after = await b.store.get(ws1.id);
+    assert.equal(after?.state, "allocated", "a crashed (lock-free) promote is healed back to allocated");
   } finally {
     await cleanup(repo, root);
   }
