@@ -121,6 +121,23 @@ test("cost: aggregates total, builds, and average across receipts", async () => 
   assert.match(cap.out, /Average cost\/build:\s+\$0\.0040/);
 });
 
+test("H4: a build's total is the AUTHORITATIVE run-summary cost, not the inflated sum of every receipt", async () => {
+  const receipts = [
+    rec({ seq: 1, operation: "worker.role.scout", status: "success", requestId: "t-1", costUsd: 0.001, model: "mimo-v2.5" }),
+    rec({ seq: 2, operation: "worker.role.builder", status: "success", requestId: "t-1", costUsd: 0.003, model: "mimo-v2.5" }),
+    // A retry receipt stamps a CUMULATIVE cost (the double-count source):
+    rec({ seq: 3, operation: "worker.critic_fix_loop", status: "success", requestId: "t-1", costUsd: 0.006 }),
+    // The run-summary carries the AUTHORITATIVE cumulative total for the build:
+    rec({ seq: 4, operation: "worker.run.summary", status: "success", requestId: "t-1", costUsd: 0.006 }),
+  ];
+  const cap = capture();
+  await createCostCli({ receipts: store(receipts).receipts, now: () => NOW, stdout: cap.stdout }).cost([]);
+  // The old per-receipt sum would be 0.001+0.003+0.006+0.006 = $0.0160 (2.6x). The honest total is the
+  // run-summary's $0.0060.
+  assert.match(cap.out, /Total cost:\s+\$0\.0060/, "total is the authoritative per-task cost, not the inflated sum");
+  assert.match(cap.out, /Builds:\s+1/);
+});
+
 test("cost: per-model breakdown sums cost by model", async () => {
   const receipts = [
     rec({ seq: 1, operation: "worker.role.scout", status: "success", requestId: "t-1", costUsd: 0.001, model: "mimo-v2.5" }),
