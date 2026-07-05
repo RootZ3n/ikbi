@@ -65,6 +65,25 @@ const rec = (status: RecordOutcomeInput["status"], op = "build", signals?: { inj
   ...(signals ? { signals } : {}),
 });
 
+test("F3: a genuine trusted doc for ANOTHER agent, placed at a victim's storage key, is REJECTED", async () => {
+  const { wrap } = await import("./mac.js");
+  const dir = await tmp();
+  try {
+    const { trust, store } = makeTrust(dir);
+    // A MAC-valid trusted doc for "attacker-x" (authentic — signed with the real KEY).
+    const foreign = wrap(KEY, { agentId: "attacker-x", tier: "trusted", grantedAt: 1000 } as never);
+    // Copy/rename it onto the VICTIM's storage key (docKey = sha256(agentId)). The MAC still verifies.
+    const victimKey = createHash("sha256").update("builder-3", "utf8").digest("hex");
+    await store.put(victimKey, foreign);
+    // loadState must bind the doc to its key and REJECT the mismatch (fail-closed), not return "trusted".
+    const loaded = await trust.loadState("builder-3");
+    assert.equal(loaded, undefined, "a foreign trusted doc cannot be replayed onto another agent's key");
+    assert.equal(trust.resolve(AGENT), "untrusted", "the victim stays at the fail-closed floor, not elevated");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("resolve returns the EARNED tier after preload", async () => {
   const dir = await tmp();
   try {

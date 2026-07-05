@@ -170,22 +170,23 @@ export class WorkspaceManager {
     // BOUND check + slot create must serialize across processes — otherwise two processes each read
     // count = max-1, both pass the limit gate, and both allocate (bound overflow).
     return this.locks.withLock(ALLOC_LOCK, async () => {
+      // C-A2: refresh the live Map from the DURABLE store INSIDE the lock, BEFORE the bound check. The
+      // preload above the lock can be STALE — another process may have allocated while we waited on the
+      // cross-process file lock — and deciding the bound on that stale count let two processes each pass a
+      // max-1 gate and overflow (the lock serialized the WRITES but not the DECISION). A fresh read here
+      // always sees the other process's just-persisted record, so the bound decision uses shared state.
+      this.invalidatePreloadCache();
+      await this.preload();
       if (this.live.size >= this.max) {
-        // Refresh the live Map from the persistent store before failing — another
-        // process may have discarded workspaces since our last preload (Bubbles LOW-2).
-        this.invalidatePreloadCache();
-        await this.preload();
+        // SELF-HEAL: a crashed/killed run can strand its workspace in `allocated`, leaking the
+        // bound forever (no terminal transition, so `clean`/`reclaim` never reach it). Before
+        // failing, reap ABANDONED active records: a held per-workspace lock means a LIVE process
+        // owns the workspace (the established liveness contract — see RECLAIM_WS_TIMEOUT_MS), so
+        // those are skipped; only lock-free records are reconciled terminal and dropped from the
+        // bound. Repo-independent, so it heals even when the target repo is gone.
+        await this.reapAbandoned();
         if (this.live.size >= this.max) {
-          // SELF-HEAL: a crashed/killed run can strand its workspace in `allocated`, leaking the
-          // bound forever (no terminal transition, so `clean`/`reclaim` never reach it). Before
-          // failing, reap ABANDONED active records: a held per-workspace lock means a LIVE process
-          // owns the workspace (the established liveness contract — see RECLAIM_WS_TIMEOUT_MS), so
-          // those are skipped; only lock-free records are reconciled terminal and dropped from the
-          // bound. Repo-independent, so it heals even when the target repo is gone.
-          await this.reapAbandoned();
-          if (this.live.size >= this.max) {
-            throw new WorkspaceError("limit", `workspace limit reached (${this.max}); cannot allocate`);
-          }
+          throw new WorkspaceError("limit", `workspace limit reached (${this.max}); cannot allocate`);
         }
       }
       const baseBranch = opts.baseBranch ?? (await currentBranch(opts.targetRepo));

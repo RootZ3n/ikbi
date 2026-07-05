@@ -434,6 +434,15 @@ export class TrustSystem implements TrustTierResolver {
       this.log.error({ event: "trust_state_rejected", agentId }, "trust state failed integrity (forged/corrupt); fail-closed to floor");
       return undefined;
     }
+    // F3: the MAC proves the doc is AUTHENTIC but NOT that it belongs to THIS agentId. A genuine trusted
+    // doc for another agent, copied/renamed onto this agent's docKey file, still verifies — so bind the
+    // doc to its storage key here and reject a mismatch (fail-closed to floor). Without this, an attacker
+    // with write access to the trust dir + any valid trusted doc could replay it to elevate a victim id.
+    if (state.agentId !== agentId) {
+      this.failedClosed.add(agentId);
+      this.log.error({ event: "trust_state_agent_mismatch", agentId, docAgentId: state.agentId }, "trust doc agentId does not match its storage key (cross-agent replay attempt); fail-closed to floor");
+      return undefined;
+    }
     this.cache.set(agentId, state);
     this.checked.add(agentId);
     this.failedClosed.delete(agentId);

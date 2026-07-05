@@ -920,8 +920,21 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     };
     // Gap B: fold a cost incurred OUTSIDE this engine (e.g. the frontier consult, which uses the raw
     // provider) into the run total, so runCost() — and every receipt/summary that reports it — includes
-    // it, and a later role call sees the higher total when checking the budget cap.
-    return { engine: costingEngine, cost: () => total, addCost: (usd: number) => { total += Math.max(0, usd); } };
+    // it. C-A3: and ENFORCE the budget cap on that external cost the same way invokeModel does — throw
+    // BUDGET_EXHAUSTED when it pushes the run over, rather than deferring enforcement to the NEXT role
+    // call (which may never happen: a consult that lands the fix and finishes could otherwise promote
+    // over budget). The throw propagates to the run's budget-abort handler.
+    const addCost = (usd: number): void => {
+      total += Math.max(0, usd);
+      if (budget !== undefined && total > budget && budget > 0) {
+        budgetExhausted = true;
+        throw Object.assign(
+          new Error(`budget exhausted: cumulative cost $${total.toFixed(4)} exceeds $${budget.toFixed(4)} cap`),
+          { code: "BUDGET_EXHAUSTED", costUsd: total, budgetUsd: budget },
+        );
+      }
+    };
+    return { engine: costingEngine, cost: () => total, addCost };
   }
 
   /**
@@ -1719,7 +1732,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // and returns/throws before the normal summary below would leave its spend uncounted. The abort
     // branches call this to emit a minimal terminal summary. Best-effort: a receipt failure here must
     // never mask the abort we're already handling. (`aborted: true` distinguishes it in the trail.)
-    const writeTerminalCostSummary = async (outcome: WorkerResult["outcome"], costUsd: number, detail: string): Promise<void> => {
+    const writeTerminalCostSummary = async (outcome: WorkerResult["outcome"], costUsd: number, detail: string, aborted = true): Promise<void> => {
       try {
         await receipts.append(
           {
@@ -1735,7 +1748,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               promoted: false,
               model: singleBuilderModel,
               costUsd,
-              aborted: true,
+              aborted,
               ...(task.originAgent !== undefined ? { originAgent: task.originAgent } : {}),
             },
             project: task.targetRepo,
@@ -1743,7 +1756,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           parentIdentity,
         );
       } catch {
-        /* a terminal-summary receipt failure must not mask the abort being handled */
+        /* a terminal-summary receipt failure must not mask the outcome being handled */
       }
     };
 
@@ -2929,6 +2942,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       // The worker did verified-good work; it just can't autoCommit. Record the
       // success so it can EARN trust toward the autoCommit tier.
       await recordBuildTrust("success", workerSpawned, task.taskId, task.targetRepo, false);
+      // C-A4: this is a CLEAN non-promoting terminal (verified-good, tier lacks autoCommit) — write the
+      // authoritative run-summary so `ikbi cost` groups by IT (not by summing the run's per-role/retry
+      // receipts, which would double-count the cumulative-stamped ones). aborted:false — it did not abort.
+      await writeTerminalCostSummary("partial", runCost(), reason ?? "verified-good; autoCommit tier gate", false);
       return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "partial", roles: results, workspaceId: workspace.id, promoted: false, reason, costUsd: runCost() };
     }
 
@@ -2942,6 +2959,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } },
         ),
       );
+      // C-A4: a step-planner step is a clean non-promoting terminal — write the authoritative run-summary
+      // so its spend is grouped by IT, not double-counted by summing the step's per-role/retry receipts.
+      await writeTerminalCostSummary(overall, runCost(), `step completed (skipPromote) with outcome "${overall}"`, false);
       return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: overall, roles: results, workspaceId: workspace.id, promoted: false, ...(overall !== "success" ? { reason: `step completed with outcome "${overall}"` } : {}), costUsd: runCost() };
     }
 

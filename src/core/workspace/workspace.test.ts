@@ -178,6 +178,31 @@ test("H6: allocate reaps a slot whose worktree EXISTS but whose OWNER PROCESS is
   }
 });
 
+test("C-A2: the cap holds across processes even when the second process has a STALE preloaded count", async () => {
+  const repo = await makeRepo();
+  const root = join(tmpdir(), `ikbi-ws-shared-${randomBytes(8).toString("hex")}`);
+  // Two managers over the SAME root ⇒ shared durable registry + shared cross-process lock file, but
+  // SEPARATE in-memory `live` Maps (this is exactly the CLI-vs-service / two-CLI situation).
+  const a = makeManager({ root, max: 1 });
+  const b = makeManager({ root, max: 1 });
+  try {
+    // Process B preloads while nothing is allocated — its live count is a STALE 0.
+    await b.mgr.preload();
+    // Process A allocates the one permitted slot (persists a record B's in-memory Map doesn't know about).
+    const wsA = await a.mgr.allocate({ targetRepo: repo, identity: ID });
+    assert.ok(wsA.id, "A got the single slot");
+    // B — with its stale live.size = 0 — must STILL be refused: the in-lock refresh reads A's record.
+    // (Before the fix, B skipped the refresh because 0 < max and allocated a SECOND workspace.)
+    await assert.rejects(
+      b.mgr.allocate({ targetRepo: repo, identity: ID }),
+      (e: unknown) => e instanceof WorkspaceError && e.kind === "limit",
+      "the second process cannot exceed the cap with a stale count",
+    );
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
 test("#3: allocate takes a CROSS-PROCESS file lock — an alloc lock held by 'another process' blocks it", async () => {
   const repo = await makeRepo();
   const { mgr, root } = makeManager({ max: 2, timeoutMs: 250 }); // short timeout so the block is quick
