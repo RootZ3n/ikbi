@@ -140,7 +140,7 @@ test("ikbi undo recovers from the durable promote record when the receipt is mis
       stderr: (s) => out.push(s),
       setExit: (c) => { exit = c; },
     });
-    await undo.undo([landed]); // by promoted commit sha
+    await undo.undo([landed, "--yes"]); // by promoted commit sha (--yes: confirm the destructive revert)
 
     assert.equal(exit, 0, `undo succeeded; output: ${out.join("")}`);
     const restored = await revParse(repo, "main");

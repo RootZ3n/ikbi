@@ -28,7 +28,7 @@ export interface UndoGit {
   worktreeForBranch(repo: string, branch: string): Promise<string | undefined>;
   isWorktreeClean(worktreePath: string): Promise<boolean>;
   updateRefCas(repo: string, ref: string, newSha: string, oldSha: string): Promise<void>;
-  syncWorktreeToRef(worktreePath: string, ref: string): Promise<void>;
+  syncWorktreeToRef(worktreePath: string, ref: string): Promise<{ stashed: boolean }>;
   /** Optional: compute the diff between two refs (used for preview before revert). */
   gitDiff?(repo: string, fromRef: string, toRef: string): Promise<string>;
 }
@@ -41,6 +41,9 @@ export interface UndoCliDeps {
   readonly stdout?: (s: string) => void;
   readonly stderr?: (s: string) => void;
   readonly setExit?: (code: number) => void;
+  /** Current working directory (injectable for tests) — scopes `--latest` to the repo the operator
+   *  is actually in, so `ikbi undo --latest` in repo A can never revert a promote in repo B. */
+  readonly cwd?: () => string;
   /**
    * The durable workspace registry — undo's RECOVERY source when the normal promote receipt is
    * missing (PROMOTED_BUT_RECEIPT_FAILED). A landed promote always writes a `promoted` record with
@@ -89,6 +92,12 @@ export function createUndoCli(deps: UndoCliDeps = {}) {
   const out = deps.stdout ?? ((s: string) => void process.stdout.write(s));
   const err = deps.stderr ?? ((s: string) => void process.stderr.write(s));
   const setExit = deps.setExit ?? ((c: number) => void (process.exitCode = c));
+  const cwd = deps.cwd ?? (() => process.cwd());
+  // True when `dir` is inside (or equal to) `repo` — used to scope `--latest` to the operator's repo.
+  const cwdInRepo = (repo: string): boolean => {
+    const d = cwd();
+    return d === repo || d.startsWith(repo.endsWith("/") ? repo : `${repo}/`);
+  };
 
   function operator(): AgentIdentity | undefined {
     if (operatorToken === undefined || operatorToken.length === 0) {
@@ -106,11 +115,15 @@ export function createUndoCli(deps: UndoCliDeps = {}) {
   }
 
   async function undo(argv: readonly string[]): Promise<void> {
-    const useLatest = argv[0] === "--latest";
-    const idArg = useLatest ? undefined : argv[0];
+    // A destructive revert must be CONFIRMED (undo has no interactive prompt here, so `--yes`/`-y`
+    // is the explicit gate). Strip it before reading the positional target.
+    const yes = argv.includes("--yes") || argv.includes("-y");
+    const positional = argv.filter((a) => a !== "--yes" && a !== "-y");
+    const useLatest = positional[0] === "--latest";
+    const idArg = useLatest ? undefined : positional[0];
 
     if (!useLatest && (idArg === undefined || idArg.length === 0)) {
-      err("ikbi undo: a receipt id or promoted commit is required — usage: ikbi undo <receipt-id|commit|--latest>\n");
+      err("ikbi undo: a receipt id or promoted commit is required — usage: ikbi undo <receipt-id|commit|--latest> [--yes]\n");
       setExit(1);
       return;
     }
@@ -197,6 +210,14 @@ export function createUndoCli(deps: UndoCliDeps = {}) {
 
     out(`Safe to revert: branch is at the promoted commit${wt !== undefined ? ", worktree is clean" : ""}\n\n`);
 
+    // CONFIRMATION GATE: a revert moves a branch and resets a working tree — destructive and easy to
+    // fire by accident (especially `--latest`). Require an explicit `--yes`; without it, show the
+    // preview above and STOP. Non-interactive-safe (no prompt to hang on a closed stdin).
+    if (!yes) {
+      out(`This will REVERT the promotion above (move ${branch} back to ${short(beforeRef)}).\nRe-run with --yes to proceed:  ikbi undo ${useLatest ? "--latest" : idArg} --yes\n`);
+      return;
+    }
+
     try {
       await git.updateRefCas(repo, `refs/heads/${branch}`, beforeRef, afterRef); // after → before, atomically
       if (wt !== undefined) await git.syncWorktreeToRef(wt, beforeRef); // working tree back to the prior ref
@@ -227,6 +248,13 @@ export function createUndoCli(deps: UndoCliDeps = {}) {
     const all = await receipts.query();
     const promotes = all
       .filter((r) => r.operation === "workspace.promote" && r.outcome.status === "success" && stateChange(r) !== undefined)
+      // SCOPE to the operator's current repo: `--latest` must never revert the globally-latest promote
+      // in a DIFFERENT repo (an operator in repo A undoing repo B's landing, sight-unseen).
+      .filter((r) => {
+        const t = stateChange(r)!.target;
+        const repo = t.slice(0, t.lastIndexOf("#"));
+        return repo.length > 0 && cwdInRepo(repo);
+      })
       .sort((a, b) => b.seq - a.seq);
     const latest = promotes[0];
     if (latest === undefined) return undefined;

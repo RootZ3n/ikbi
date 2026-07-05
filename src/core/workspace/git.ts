@@ -231,7 +231,8 @@ export async function isWorktreeClean(worktreePath: string): Promise<boolean> {
  * preserved in the worktree's stash list — the late work is never lost, only set aside — and the
  * reset then proceeds against a clean tree. The operator recovers it with `git stash pop`.
  */
-export async function syncWorktreeToRef(worktreePath: string, ref: string): Promise<void> {
+export async function syncWorktreeToRef(worktreePath: string, ref: string): Promise<{ stashed: boolean }> {
+  let stashed = false;
   if (!(await isWorktreeClean(worktreePath))) {
     await runGit(worktreePath, [
       "stash",
@@ -241,6 +242,11 @@ export async function syncWorktreeToRef(worktreePath: string, ref: string): Prom
       "-m",
       `ikbi: auto-stashed late uncommitted work before promote-sync to ${ref}`,
     ]);
+    stashed = true;
   }
   await runGit(worktreePath, ["reset", "--hard", "--quiet", ref]);
+  // Report whether a stash was created so the caller can LOUDLY tell the operator their working tree
+  // was reset and their uncommitted work set aside (recover with `git stash pop`) — a crash-reconcile
+  // that silently resets the user's checkout is a nasty surprise, even though nothing is lost.
+  return { stashed };
 }

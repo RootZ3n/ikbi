@@ -762,7 +762,18 @@ export class WorkspaceManager {
     const landed = targetHead === intent.afterRef && (await isAncestor(rec.targetRepo, intent.beforeRef, intent.afterRef).catch(() => false));
     if (landed) {
       const checkedOutPath = await worktreeForBranch(rec.targetRepo, rec.baseBranch).catch(() => undefined);
-      if (checkedOutPath !== undefined) await syncWorktreeToRef(checkedOutPath, intent.afterRef);
+      if (checkedOutPath !== undefined) {
+        const sync = await syncWorktreeToRef(checkedOutPath, intent.afterRef);
+        if (sync.stashed) {
+          // The operator had uncommitted work in their checkout when a crashed promote is reconciled
+          // on this startup. It is STASHED (not lost), but resetting their tree unannounced is a nasty
+          // surprise — warn LOUDLY with the recovery command instead of only a debug log.
+          this.log.warn(
+            { event: "workspace_reconcile_stashed_user_work", workspaceId: rec.id, checkout: checkedOutPath },
+            `reconcile of a crashed promote reset ${checkedOutPath} to the landed commit and STASHED your uncommitted work — recover it with \`git -C ${checkedOutPath} stash pop\``,
+          );
+        }
+      }
       const promoted: WorkspaceRecord = { ...rec, state: "promoted", promotedTo: intent.afterRef, updatedAt: this.now(), note: "reconciled: promote landed" };
       await this.store.put(rec.id, promoted);
       this.live.delete(rec.id);
