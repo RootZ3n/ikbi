@@ -654,6 +654,33 @@ function deniedAllowlistBinary(error: string): string | undefined {
   return m?.[1]?.toLowerCase();
 }
 
+/**
+ * A denied `rm`/`rmdir` is BENIGN scratch cleanup — NOT a destructive red flag — when every target is a
+ * plain worktree-relative path. A cheap builder has no delete tool, so it improvises `rm scratch.ts` to
+ * remove its own debug/scratch files (this session: `rm src/debug_assess.ts src/run_test.ts` discarded a
+ * fully green build). The governor already blocked it (no effect), the verifier already confirmed the
+ * tree green, and the sandbox confines any real delete to the worktree — so a prevented in-worktree rm
+ * is ordinary build behavior, judged by EFFECT (none), like a denied `mv`. A rm that reaches OUTSIDE the
+ * tree (absolute/home path), at/above the root (`.`/`..`/parent traversal), or via a glob is a genuine
+ * red flag and STILL taints. Unparseable command ⇒ fail-closed (taint). Data/device destroyers
+ * (dd/mkfs/shred) and system tools (chmod/mount/systemctl/…) are NEVER normal cleanup and stay tainting.
+ */
+function isBenignWorktreeCleanup(command: string | undefined): boolean {
+  if (command === undefined) return false; // cannot inspect the targets → fail-closed
+  const toks = command.trim().split(/\s+/);
+  const bin = toks[0]?.toLowerCase();
+  if (bin !== "rm" && bin !== "rmdir") return false;
+  const targets = toks.slice(1).filter((t) => !t.startsWith("-")); // flags don't decide danger; the target does
+  if (targets.length === 0) return false; // only flags / no explicit target → not obviously benign
+  return targets.every((t) => {
+    if (t.startsWith("/") || t.startsWith("~")) return false; // absolute / home — outside the worktree
+    if (t === "." || t === "..") return false; // the worktree root or its parent
+    if (t.split("/").some((seg) => seg === "..")) return false; // any parent traversal
+    if (/[*?[\]]/.test(t)) return false; // a glob could match more than intended
+    return true; // a plain worktree-relative path — its own scratch/generated file
+  });
+}
+
 export function isPolicyViolation(e: ToolCallError): boolean {
   // READ-ONLY VERIFY PASS: the multi-step final pass runs with writeScope="none". A cheap builder
   // naturally tries to improve its own work; the scope guard BLOCKS the write (no effect). Tainting
@@ -691,6 +718,9 @@ export function isPolicyViolation(e: ToolCallError): boolean {
   const denied = deniedAllowlistBinary(e.error);
   if (denied !== undefined) {
     if (READ_ONLY_PROBE_BINARIES.has(denied)) return false; // benign environment probe
+    // Benign in-worktree scratch cleanup (denied rm/rmdir of worktree-relative paths): no effect, tree
+    // already verified, confined by the sandbox — ordinary build behavior, not a destructive red flag.
+    if ((denied === "rm" || denied === "rmdir") && isBenignWorktreeCleanup(e.path)) return false;
     if (DANGEROUS_DENIED_BINARIES.has(denied)) return true; // network / shell / privilege / destructive
     return false; // benign dev/build tool the model improvised — blocked, no effect, no boundary crossed
   }

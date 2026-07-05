@@ -43,6 +43,29 @@ test("a blocked `mv` (rename inside the worktree) does NOT taint, but data-destr
   }
 });
 
+const deniedCmd = (bin: string, command: string): ToolCallError => ({ tool: "terminal", path: command, error: `binary '${bin}' is not on the allowlist (denied)` });
+
+test("a blocked `rm` of WORKTREE-RELATIVE scratch files does NOT taint (benign cleanup, no effect)", () => {
+  // REGRESSION (bokahli run 2): the builder made scratch files, improvised `rm src/debug_assess.ts
+  // src/run_test.ts` to clean up (no delete tool), the governor blocked it (no effect), and the ATTEMPT
+  // discarded an all-5-roles-green build. Deleting its own worktree files is ordinary build behavior.
+  assert.equal(isPolicyViolation(deniedCmd("rm", "rm src/debug_assess.ts src/run_test.ts")), false);
+  assert.equal(isPolicyViolation(deniedCmd("rm", "rm -f tmp/scratch.ts")), false);
+  assert.equal(isPolicyViolation(deniedCmd("rm", "rm -rf build")), false, "removing a scratch dir it made is benign");
+  assert.equal(isPolicyViolation(deniedCmd("rmdir", "rmdir src/empty")), false);
+});
+
+test("a blocked `rm` reaching OUTSIDE the worktree / at the root / via a glob STILL taints", () => {
+  for (const cmd of ["rm -rf /", "rm -rf ~", "rm ../secret.ts", "rm /etc/passwd", "rm src/../../x", "rm *", "rm src/*.ts", "rm .", "rm -rf .."]) {
+    assert.equal(isPolicyViolation(deniedCmd("rm", cmd)), true, `\`${cmd}\` must taint (dangerous target)`);
+  }
+  // an unparseable / target-less rm fails closed (taints)
+  assert.equal(isPolicyViolation(deniedCmd("rm", "rm")), true);
+  assert.equal(isPolicyViolation(deniedCmd("rm", "rm -rf")), true);
+  // data/device destroyers are never benign cleanup even with a worktree path
+  assert.equal(isPolicyViolation(deniedCmd("dd", "dd if=/dev/zero of=src/x")), true);
+});
+
 test("a BLOCKED write in a read-only verify pass does not taint (benign, no effect)", () => {
   assert.equal(isPolicyViolation({ tool: "write_file", path: "src/x.ts", error: "write_scope is 'none' — read-only mode" }), false);
 });
