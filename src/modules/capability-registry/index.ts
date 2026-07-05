@@ -2,10 +2,13 @@
  * ikbi capability-registry consumer — the in-repo binding to the lab's shared
  * capability registry (L6 autonomy safety layer, req #1).
  *
- * Status: DORMANT — This module is built but not yet wired into production.
+ * @status dormant (library-only) — This module is built but not yet wired into production.
  * It will be activated when ikbi needs to advertise its capabilities to agents
  * (e.g., for inter-agent delegation, tool discovery, or governed unattended
- * execution). Do not delete.
+ * execution). Do not delete. Verified unreached at runtime by the reachability
+ * self-coverage harness (scripts/proving-ground/reachability.mjs); this canonical label
+ * is what the reachability guard (src/modules/reachability-guard.test.ts) checks so the
+ * dormancy is explicit rather than a silent phantom.
  *
  * ikbi stays STANDALONE: this module does not import a shared package. It consumes
  * the shared registry as DATA (the JSON contract at lab-capability/registry.json,

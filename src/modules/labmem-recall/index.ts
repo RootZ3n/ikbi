@@ -14,6 +14,13 @@
  * We dynamic-import labmem's BUILT dist (ikbi runs compiled `node dist/`), so this
  * works without tsx. A missing/unbuilt labmem yields a clear LabmemUnavailable
  * error rather than crashing the caller.
+ *
+ * @status dormant (library-only) — no importer, no barrel entry, no CLI command or route yet.
+ * Verified unreached at runtime by the reachability self-coverage harness
+ * (scripts/proving-ground/reachability.mjs). This label is what the reachability guard
+ * (src/modules/reachability-guard.test.ts) checks so the dormancy is explicit, not a
+ * silent phantom. Wire an entrypoint (barrel + a recall command) or remove it — do not
+ * leave it declared-but-unwired without this label.
  */
 
 import { basename, dirname, join } from "node:path";

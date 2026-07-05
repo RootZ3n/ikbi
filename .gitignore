@@ -24,6 +24,9 @@ state/
 # Proving-ground fixtures (temp repos with node_modules); the isolated `state/` roots are already
 # covered by the unanchored `state/` rule above. The small .md/.jsonl evidence stays committable.
 reports/proving-ground/*/fixtures/
+# Reachability harness work dir (coverage dumps, isolated state, fixtures) — ephemeral.
+# The committed evidence is scripts/proving-ground/REACHABILITY-REPORT.md.
+reports/proving-ground/reachability/
 
 # Editor / OS cruft
 .DS_Store

@@ -71,3 +71,38 @@ node scripts/proving-ground/runner.mjs --plan burnin --shared-trust
   Godot verifier) — that is correct fail-closed behavior, classified `SAFE_FAIL`, not an ikbi bug.
 - `real_project` scenarios are **read-only** (`audit` / `review` / `detect`) so the proving ground
   never promotes into a real repo.
+
+## Runtime-reachability self-coverage (anti-phantom audit)
+
+`reachability.mjs` answers a different question than the gauntlet: **which declared engine
+modules actually EXECUTE in a live flow, and which are phantoms** — declared/tested but never
+run. Unit tests prove a module works in isolation; code audits review files that exist; neither
+proves a module is reached. Grep is worse — it gave false confidence three separate times in the
+audit that motivated this (it missed relative barrel imports and mislabeled live modules).
+
+The ground-truth signal here is **V8 code coverage per surface, minus a construction floor**
+(the CLI loaded doing nothing). What executes ABOVE the floor is genuine operation, not
+import-time singleton construction. Coverage catches what receipts miss — e.g. `drift.check()`
+runs on every build but writes no receipt, so a receipt-only audit wrongly called it dead.
+
+```bash
+pnpm build                                        # coverage maps dist/ → src/modules
+node scripts/proving-ground/reachability.mjs all  # exercises 30 surfaces under coverage (spends model tokens on build/fix/batch/…)
+node scripts/proving-ground/reach-report.mjs --check   # classify + write REACHABILITY-REPORT.md; exit 1 on any true orphan
+# cheaper subsets:
+node scripts/proving-ground/reachability.mjs free   # no-model diagnostics only
+node scripts/proving-ground/reachability.mjs extra  # the per-command surfaces (mostly free)
+```
+
+Surfaces run against `dist/` (not tsx) so coverage URLs map 1:1 to `src/modules/<X>`. The
+server surface uses an in-process `buildServer()` + `app.inject()` probe (`server-probe.mjs`)
+to reach the HTTP route handlers the CLI can't touch — it imports the module barrel first,
+exactly as `ikbi serve` does, or the routes 404. Modules are classified LIVE-BUILD /
+LIVE-COGNITION / LIVE-COMMAND / DIAGNOSTIC-ONLY (reached at runtime) or, for the not-reached,
+CONDITIONAL (a live importer whose trigger wasn't exercised) / DORMANT-LABELED (`@status`) /
+TRUE-ORPHAN (wired nowhere). See `REACHABILITY-REPORT.md` for the current snapshot.
+
+**The cheap floor** — `src/modules/reachability-guard.test.ts` runs on every `pnpm test`: every
+module dir must have a non-test importer OR an `@status dormant/library-only` label. It cannot
+prove execution (that's the harness above) but it fails the instant a new declared-but-unwired
+module appears — so a phantom can never slip in silently again.
