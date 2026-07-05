@@ -31,6 +31,7 @@ import {
 } from "../modules/model-evaluation/index.js";
 import { trust } from "../core/trust/index.js";
 import { commands } from "./registry.js";
+import { suggestCommand } from "./suggest.js";
 import { runDoctor, runDoctorFixCli } from "./doctor.js";
 import { runEnvironmentChecks, renderEnvironmentChecks } from "./doctor-env.js";
 import { runSandboxChecks, renderSandboxChecks } from "./doctor-sandbox.js";
@@ -76,6 +77,11 @@ import { liveRepl } from "../modules/chat/cli.js";
 
 /** Built-in command names — reserved, cannot be shadowed by a module command. */
 const BUILTINS = new Set(["version", "models", "providers", "init", "doctor", "capabilities", "help"]);
+
+/** Known command names for the "did you mean" suggester (built-ins + repl + registered modules). */
+function knownCommandNames(): string[] {
+  return [...BUILTINS, "repl", ...commands.all().map((c) => c.name)];
+}
 
 /**
  * Does this arg list ask for a subcommand's help? (`--help`/`-h` anywhere in the args.)
@@ -551,6 +557,20 @@ async function run(argv: readonly string[]): Promise<void> {
       const moduleCmd = commands.get(cmd);
       if (moduleCmd !== undefined) {
         await moduleCmd.run(argv.slice(1));
+        return;
+      }
+      // LOW (typo help): a MISTYPED command otherwise silently opens the REPL with the typo as its first
+      // chat message. When the first token is a close typo of a known command AND the invocation looks
+      // like a command attempt (a lone token, or followed by --flags — prose has neither), suggest the
+      // correction and exit non-zero instead of doing the surprising thing. Ambiguous prose still seeds
+      // the REPL as before.
+      // A trailing flag is a strong "I meant a command" signal → allow a looser (≤2) typo match; a lone
+      // bare word could be REPL prose, so require a tighter (≤1) match to avoid hijacking it.
+      const hasFlags = argv.slice(1).some((a) => a.startsWith("-"));
+      const suggestion = (argv.length === 1 || hasFlags) ? suggestCommand(cmd, knownCommandNames(), hasFlags ? 2 : 1) : undefined;
+      if (suggestion !== undefined) {
+        writeStderr(`ikbi: unknown command "${cmd}". Did you mean \`ikbi ${suggestion}\`?\n(Run \`ikbi help\` for the command list, or \`ikbi repl\` to start a chat.)\n`);
+        process.exitCode = 1;
         return;
       }
       // GOLDEN PATH: not a known command ⇒ launch the interactive REPL.

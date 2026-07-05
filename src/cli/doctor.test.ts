@@ -62,6 +62,20 @@ function readyInputs(over: Partial<DoctorInputs> = {}): DoctorInputs {
   };
 }
 
+test("LOW: doctor shows CONFIG SOURCES — .env file vs shell export vs built-in default", () => {
+  const r = runDoctor(readyInputs({
+    // IKBI_MODEL_BUILDER supplied by the shell (present in env, absent from the provenance map);
+    // IKBI_MODEL_CRITIC supplied by a .env file; IKBI_BIND_HOST supplied by neither (default).
+    env: { ...DEV_ENV, IKBI_MODEL_BUILDER: "shell-model", IKBI_MODEL_CRITIC: "dotenv-critic" },
+    dotenvProvenance: new Map([["IKBI_MODEL_CRITIC", "/proj/.env"]]),
+  }));
+  const text = r.lines.join("\n");
+  assert.match(text, /CONFIG SOURCES/);
+  assert.match(text, /IKBI_MODEL_BUILDER\s+shell export/, "a shell-set var is attributed to the shell");
+  assert.match(text, /IKBI_MODEL_CRITIC\s+\.env \(\/proj\/\.env\)/, "a .env-set var names its file");
+  assert.match(text, /IKBI_BIND_HOST\s+built-in default/, "an unset var is a built-in default");
+});
+
 test("doctor REPORTS MISSING required settings and ends NOT ready (cold start)", () => {
   const r = runDoctor({
     config: loadConfig(DEV_ENV), // no build credentials set; dev key opt-in only lets config load

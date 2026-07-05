@@ -35,6 +35,7 @@ import {
   safetyPosture,
 } from "../modules/worker-model/modes.js";
 import { writeStdout } from "./io.js";
+import { getDotenvProvenance as liveDotenvProvenance } from "./bootstrap.js";
 import { postureLines, productPosture } from "./posture.js";
 
 /** The read-only registry surface doctor needs to check role-model resolution. */
@@ -59,6 +60,8 @@ export interface DoctorInputs {
   readonly env?: NodeJS.ProcessEnv;
   /** Whether the earned-trust ladder is active. Default: workerModelConfig.trustLadder. */
   readonly trustLadder?: boolean;
+  /** key → .env file that supplied it (config-precedence display). Default: the live bootstrap map. */
+  readonly dotenvProvenance?: ReadonlyMap<string, string>;
 }
 
 export interface DoctorResult {
@@ -275,6 +278,26 @@ export function runDoctor(inp: DoctorInputs = {}): DoctorResult {
   push(`  ${OK} IKBI_STATE_ROOT    = ${cfg.stateRoot}`);
   push(`  ${OK} trust dir          = ${cfg.trust.dir}`);
   push(`  ${OK} roster file        = ${cfg.provider.rosterFile}`);
+
+  // --- CONFIG SOURCES (LOW: precedence visibility) -------------------------
+  // Show WHERE each important setting's value came from — a .env file (which one), a shell export, or a
+  // built-in default — so a surprising config ("why THAT model / bind host?") is diagnosable. Values are
+  // NOT printed (tokens/keys stay secret); only the source is.
+  const provenance = inp.dotenvProvenance ?? liveDotenvProvenance();
+  const sourceOf = (key: string): string => {
+    const file = provenance.get(key);
+    if (file !== undefined) return `.env (${file})`;
+    const v = env[key];
+    return v !== undefined && v.length > 0 ? "shell export" : "built-in default";
+  };
+  const TRACKED_VARS = [
+    "IKBI_MODEL_BUILDER", "IKBI_MODEL_CRITIC", "IKBI_MODEL_DRIVER",
+    "IKBI_BIND_HOST", "IKBI_API_TOKEN", "IKBI_OPERATOR_TOKEN", "IKBI_WORKER_TOKEN",
+    "IKBI_EGRESS_ALLOWLIST", "IKBI_GOVERNED_EXEC_ALLOWLIST", "IKBI_GOVERNED_EXEC_SANDBOX",
+  ];
+  push("");
+  push("CONFIG SOURCES (where each setting's value came from — precedence: shell > .env > default)");
+  for (const key of TRACKED_VARS) push(`  ${key.padEnd(30)} ${sourceOf(key)}`);
 
   // --- SUMMARY -------------------------------------------------------------
   // A security blocker (insecure default key, no dev opt-in) is fatal to readiness
