@@ -1439,6 +1439,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   async function maybeAutoVerifyRescueBuilderResult(
     builderResult: RoleResult,
     runVerifier: () => Promise<RoleResult>,
+    // OPTIONAL last-mile fixer. Invoked ONLY when the rescue verifier is RED. It runs a bounded fix
+    // pass with the configured fixer model (a DIFFERENT model than the builder) on the same workspace,
+    // then re-verifies, and reports whether it closed the checks. Absent ⇒ a red verifier is terminal
+    // (unchanged behavior). See config.fixerModel.
+    runFixer?: (redVerify: RoleResult) => Promise<{ fixed: boolean; verify: RoleResult }>,
   ): Promise<{ result: RoleResult; rescueVerify?: RoleResult }> {
     // Guard: only rescue builder failures.
     if (builderResult.role !== "builder" || builderResult.outcome !== "failure") {
@@ -1473,7 +1478,40 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       };
       return { result: rescued, rescueVerify };
     }
-    // Verifier RED: the original failure stands. Stamp the attempt for observability.
+
+    // Verifier RED. A cheap builder often writes the WHOLE project then can't close the last errors it
+    // left (it floundered re-reading and tripped no_progress). If a dedicated FIXER is configured, give
+    // that DIFFERENT model ONE bounded pass to repair the red checks on the same worktree — the
+    // automatic form of the staged, verify-between-modules oversight a human used to provide.
+    if (runFixer !== undefined) {
+      const fix = await runFixer(rescueVerify);
+      if (fix.fixed) {
+        const rescued: RoleResult = {
+          ...builderResult,
+          outcome: "success",
+          summary: `${builderResult.summary}; fixer rescue: ${config.fixerModel} closed the red checks after ${builderStop}`,
+          detail: {
+            ...bd,
+            fixerRescue: true,
+            fixerModel: config.fixerModel,
+            originalBuilderStop: builderStop,
+            filesWritten: bd.filesWritten,
+            rescueVerificationResult: "pass",
+          },
+        };
+        return { result: rescued, rescueVerify: fix.verify };
+      }
+      // The fixer could not close it either — original failure stands, stamp both attempts.
+      return {
+        result: {
+          ...builderResult,
+          detail: { ...bd, autoVerifyRescueAttempted: true, fixerRescueAttempted: true, fixerModel: config.fixerModel, rescueVerificationResult: "fail" },
+        },
+        rescueVerify: fix.verify,
+      };
+    }
+
+    // Verifier RED, no fixer: the original failure stands. Stamp the attempt for observability.
     return {
       result: {
         ...builderResult,
@@ -1916,7 +1954,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         // ── AUTO-VERIFY RESCUE: builder wrote files but NEVER ran checks ──────────
         // Delegated to maybeAutoVerifyRescueBuilderResult (shared with competitive/tournament).
         if (role === "builder") {
-          const rescue = await maybeAutoVerifyRescueBuilderResult(result, async () => {
+          const runRescueVerifier = async (): Promise<RoleResult> => {
             const rescueCtx: RoleContext = {
               task, role: "verifier",
               identity: spawned.identity,
@@ -1926,7 +1964,51 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               engine: runEngine,
             };
             return runRoleFn("verifier", verifierFor(parentCtx), rescueCtx, Math.max(roleTimeoutMs, resolveCheckTimeoutMs(modeEnv)));
-          });
+          };
+          // LAST-MILE FIXER: when the rescue verifier is RED, hand the red checks to the configured
+          // fixer model (a DIFFERENT model — e.g. deepseek builds, mimo-v2.5-pro fixes) for ONE bounded
+          // repair pass on the SAME worktree, then re-verify. Cost rolls into this builder role's
+          // roleCost (computed after the rescue, below). Only wired on the primary single-build path.
+          const fixerModel = config.fixerModel;
+          const runFixer = fixerModel
+            ? async (redVerify: RoleResult): Promise<{ fixed: boolean; verify: RoleResult }> => {
+                void redVerify; // the fixer runs run_checks itself to see the live errors
+                const fixSpawn = spawnRole("builder", parentCtx);
+                const fixGoal = [
+                  task.goal,
+                  "",
+                  "[FIX PASS] The project is already written but `run_checks` is RED. Do NOT rewrite working code or start over.",
+                  "Run run_checks, read the SPECIFIC errors it reports, and change ONLY what is needed to make every check pass.",
+                  "Iterate tightly: fix a file, run_checks, repeat until green, then call done.",
+                ].join("\n");
+                events.publish(
+                  workerRoleDispatched.create(
+                    { taskId: task.taskId, role: "builder", ...(fixSpawn.identity.trustTier !== undefined ? { tier: fixSpawn.identity.trustTier } : {}) },
+                    { source: EVENT_SOURCE, attribution: { identity: fixSpawn.identity, operation: "worker.role.fixer", runId: task.taskId } },
+                  ),
+                );
+                const fixCtx: RoleContext = {
+                  task: { ...task, goal: fixGoal, writeScope: "all" },
+                  role: "builder",
+                  identity: fixSpawn.identity,
+                  autonomy: fixSpawn.autonomy,
+                  workspace,
+                  priorResults: [...results],
+                  engine: runEngine,
+                };
+                const fixResult = await runRoleFn("builder", builderForModel(parentCtx, fixerModel, resolveBuilderMode(task)), fixCtx);
+                events.publish(
+                  workerRoleCompleted.create(
+                    { taskId: task.taskId, role: "builder", outcome: fixResult.outcome },
+                    { source: EVENT_SOURCE, attribution: { identity: fixSpawn.identity, operation: "worker.role.fixer", runId: task.taskId } },
+                  ),
+                );
+                noteBuilderSignals(fixResult); // a fixer taint/injection reaches the fail-closed promote gate
+                const verify = await runRescueVerifier();
+                return { fixed: verify.outcome === "success", verify };
+              }
+            : undefined;
+          const rescue = await maybeAutoVerifyRescueBuilderResult(result, runRescueVerifier, runFixer);
           result = rescue.result;
           results[results.length - 1] = result;
         }

@@ -174,6 +174,20 @@ export interface WorkerModelConfig {
    */
   readonly fixLoop?: boolean;
   /**
+   * DEDICATED FIXER model for the last mile. When a builder terminates on a PROTOCOL stop
+   * (no_progress / max_iterations / timeout / stuck_detected) having written files, the auto-verify
+   * rescue runs the real checks; if they are RED, a cheap builder often can't close the final errors
+   * it left (it wrote the whole project then floundered re-reading). If a fixer model is set, ikbi runs
+   * ONE bounded fix pass with THAT model on the same workspace — it runs run_checks, reads the errors,
+   * and repairs them — then re-verifies. On GREEN the build is rescued; on RED the original failure
+   * stands. This is the automatic form of the staged, verify-between-modules oversight a human used to
+   * provide. A DIFFERENT model than the builder is the point (model-diversity as a harness advantage:
+   * e.g. deepseek builds, mimo-v2.5-pro fixes). Empty/unset ⇒ no fixer pass (default). Set
+   * IKBI_WORKER_MODEL_FIXER_MODEL=<model-id> to enable. Optional in the type so pre-existing config
+   * literals stay valid; the loader always sets it.
+   */
+  readonly fixerModel?: string;
+  /**
    * Critic-driven fix loop: when the CRITIC returns a subjective FAIL verdict (the build is
    * objectively green but semantically wrong / off-goal), feed the critic's feedback back to the
    * builder as a fix goal, re-verify, and re-critique ONCE. Distinct from the verifier-driven
@@ -224,6 +238,7 @@ export interface WorkerModelConfig {
 
 /** Load the worker-model config slice from `IKBI_WORKER_MODEL_*`. */
 export function loadWorkerModelConfig(reader = env): WorkerModelConfig {
+  const fixerModel = reader.str("FIXER_MODEL");
   return Object.freeze({
     enabled: reader.bool("ENABLED", false),
     roleTimeoutMs: reader.int("ROLE_TIMEOUT_MS", DEFAULT_ROLE_TIMEOUT_MS, { min: 1 }),
@@ -235,6 +250,7 @@ export function loadWorkerModelConfig(reader = env): WorkerModelConfig {
     penalizeTimeouts: reader.bool("PENALIZE_TIMEOUTS", false),
     trustLadder: reader.bool("TRUST_LADDER", false),
     fixLoop: reader.bool("FIX_LOOP", false),
+    ...(fixerModel !== undefined ? { fixerModel } : {}),
     criticFixLoop: reader.bool("CRITIC_FIX_LOOP", true),
     skipCriticOnRed: reader.bool("SKIP_CRITIC_ON_RED", true),
     enableRefuter: reader.bool("ENABLE_REFUTER", false),
