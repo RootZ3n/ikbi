@@ -486,7 +486,7 @@ export function createProductionWorker(
  * "new_only" to prevent the builder from over-writing existing files.
  * This is a heuristic — the goal text is the only signal available at dispatch time.
  */
-function detectWriteScope(goal: string): "all" | "new_only" | "none" {
+export function detectWriteScope(goal: string): "all" | "new_only" | "none" {
   const lower = goal.toLowerCase();
   // Pure read/audit/analysis patterns → new_only (create docs/reports, don't modify code)
   const docPatterns = [
@@ -501,6 +501,14 @@ function detectWriteScope(goal: string): "all" | "new_only" | "none" {
   const createPatterns = [
     /\bfix\b/, /\badd\b/, /\bimplement\b/, /\brefactor\b/, /\bupdate\b/,
     /\brebuild\b/, /\bcreate\s+(?:a\s+)?(?:skill|module|feature|utility|endpoint|component)\b/,
+    // A CONSTRUCTION goal — "build the complete X", "scaffold a Y", "build all of Z". Anchored on an
+    // article/quantifier after the verb so it fires on a real build task but NOT on an audit goal that
+    // merely names a "build pipeline". Building a whole project needs write-all: the builder scaffolds
+    // files then MODIFIES the ones it just created as it iterates — new_only walls it off mid-build,
+    // and the block loop reads as no-progress → stuck_detected. This is checked BEFORE docPatterns, so
+    // a phrase like "read-only by default" (describing the TARGET software, not the build task —
+    // straight out of a spec) can no longer misroute a build goal to new_only.
+    /\b(?:build|scaffold)\s+(?:the\s+|a\s+|an\s+|all\s+(?:of\s+)?|complete\s+|entire\s+|whole\s+|out\s+)/,
   ];
   // If explicitly told not to modify, honor it
   if (/\bdo\s+not\s+modify\b/i.test(goal) || /\bdon'?t\s+modify\b/i.test(goal)) return "new_only";
