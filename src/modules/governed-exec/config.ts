@@ -35,6 +35,10 @@ const env = moduleEnv("governed-exec");
  * The `IKBI_GOVERNED_EXEC_ALLOWLIST` env override is ADDITIVE (see `loadGovernedExecConfig`):
  * it ADDS to these defaults rather than replacing them, so an operator who allows extra
  * binaries (e.g. `python3,mkdir`) does NOT lose the safe defaults the builder relies on.
+ * (Contrast the EGRESS allowlist, which REPLACES its defaults so egress can be tightened below
+ * them; the divergence is deliberate — a builder binary must never be droppable, an egress host
+ * must be. The shared `+defaults` token means "include the built-ins" on BOTH lists: it opts INTO
+ * additive on egress, and is an accepted no-op here since exec is already additive.)
  */
 export const DEFAULT_ALLOWLIST: readonly string[] = Object.freeze([
   // version control
@@ -94,9 +98,15 @@ function parseSandboxMode(raw: string | undefined): SandboxMode {
  * of replacing them, so essential builder binaries (git/ls/cat/echo/...) survive an override
  * like `IKBI_GOVERNED_EXEC_ALLOWLIST=python3,mkdir`. An empty/absent override leaves exactly
  * the defaults.
+ *
+ * `+defaults` is accepted and IGNORED here (filtered out) — the defaults are ALWAYS included on
+ * this list, so the token is a documented no-op that keeps the SYNTAX consistent with the egress
+ * allowlist (where `+defaults` opts INTO the built-ins). Filtering it also prevents a literal
+ * "+defaults" from being registered as a bogus allowed binary name.
  */
 function mergeAllowlist(overrides: readonly string[]): readonly string[] {
-  return Object.freeze([...new Set([...DEFAULT_ALLOWLIST, ...overrides])]);
+  const extra = overrides.filter((b) => b.trim().toLowerCase() !== "+defaults");
+  return Object.freeze([...new Set([...DEFAULT_ALLOWLIST, ...extra])]);
 }
 
 /** Load the governed-exec config slice from `IKBI_GOVERNED_EXEC_*`. */

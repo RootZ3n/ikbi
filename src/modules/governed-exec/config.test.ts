@@ -35,6 +35,14 @@ test("ALLOWLIST override is ADDITIVE — defaults are preserved, new binaries ap
   assert.deepEqual([...cfg.allowlist], [...DEFAULT_ALLOWLIST, "node", "mkdir", "cp"]);
 });
 
+test("#12: `+defaults` is a documented no-op here — filtered out, NOT registered as a bogus binary", () => {
+  const cfg = loadGovernedExecConfig(reader({ IKBI_GOVERNED_EXEC_ALLOWLIST: "+defaults,python3" }));
+  assert.equal(cfg.allowlist.includes("+defaults"), false, "the sentinel is not a runnable binary");
+  assert.ok(cfg.allowlist.includes("python3"), "the real binary is still added");
+  // exec is always additive, so `+defaults,python3` resolves identically to `python3`.
+  assert.deepEqual([...cfg.allowlist], [...loadGovernedExecConfig(reader({ IKBI_GOVERNED_EXEC_ALLOWLIST: "python3" })).allowlist]);
+});
+
 test("dangerous interpreters and file dumpers are not default-allowed", () => {
   const cfg = loadGovernedExecConfig(reader({}));
   // node and cat remain operator opt-in — node can eval arbitrary code, cat dumps secrets.
