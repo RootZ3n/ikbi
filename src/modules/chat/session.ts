@@ -1948,7 +1948,8 @@ export class ChatSession {
       () => this.sendUnlocked(userMessage, images, mode, opts),
     );
     this.turnQueue = next.catch(() => undefined);
-    return next;
+    // Gap C: record this turn's spend to the receipt log (best-effort; never fails the turn).
+    return next.then(async (r) => { await this.recordTurnCostReceipt(r.cost); return r; });
   }
 
   private async sendUnlocked(
@@ -2230,6 +2231,30 @@ export class ChatSession {
    * receipt-write failure must never mask the warning the user already sees. No partial action ran,
    * so this records the EVENT (finishReason + flags), not any tool result.
    */
+  /**
+   * H4/Gap C: write ONE cost receipt per turn so `ikbi repl` spend — previously tracked only in
+   * session memory (`/cost`) and invisible to `ikbi cost` — is counted. Per-TURN (not cumulative) so
+   * repeated writes over a session sum correctly instead of double-counting. Zero-cost turns are skipped.
+   */
+  private async recordTurnCostReceipt(costUsd: number): Promise<void> {
+    if (!(costUsd > 0)) return;
+    try {
+      const store = (await import("../../core/receipt/index.js")).receipts;
+      await store.append(
+        {
+          operation: "chat.turn",
+          outcome: { status: "success" },
+          requestId: this.id,
+          metadata: { sessionId: this.id, taskId: this.id, model: this.model, costUsd, kind: "chat" },
+          project: this.worktree,
+        },
+        this.identity,
+      );
+    } catch (e) {
+      log.warn({ err: errMsg(e), sessionId: this.id }, "chat: failed to write turn cost receipt");
+    }
+  }
+
   private async recordFinishReasonReceipt(notice: FinishReasonNotice, model: string): Promise<void> {
     try {
       const store = (await import("../../core/receipt/index.js")).receipts;
@@ -2284,6 +2309,7 @@ export class ChatSession {
           log.warn({ err: errMsg(e), sessionId: this.id }, "chat: autosave failed");
         }
       }
+      await this.recordTurnCostReceipt(result.cost); // Gap C: streamed turns are counted too
       return result;
     } finally {
       release();

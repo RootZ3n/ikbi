@@ -148,6 +148,11 @@ export interface FixDeps {
   readonly modelId?: string;
   /** Identity for model calls. Default: a fix-role identity. */
   readonly identity?: AgentIdentity;
+  /**
+   * H4/Gap C: receipt sink for the ONE fix cost-summary receipt (so `ikbi fix` spend is visible to
+   * `ikbi cost`). Default: the live receipt store (lazy). Pass a fake / omit in tests to capture or skip.
+   */
+  readonly receipts?: { append: (input: unknown, identity: AgentIdentity) => Promise<unknown> };
 }
 
 export interface FixOutcome {
@@ -284,6 +289,48 @@ function refusalResult(d: Diagnosis, allowTestEdits: boolean): FixResult | undef
  * surfaces as a SAFE_FAIL/UNRESOLVED outcome with a complete receipt. Never promotes.
  */
 export async function runFixPipeline(opts: FixOptions, deps: FixDeps): Promise<FixOutcome> {
+  // H4/Gap C: wrap the model seam to ACCUMULATE this fix run's spend, then write ONE cost receipt so
+  // `ikbi fix` (previously invisible) is counted by `ikbi cost`. The pipeline body has many terminal
+  // returns, so accounting here — around it — is the clean seam that covers every exit path.
+  const baseInvoke = deps.invokeModel ?? (async (req: ModelRequest) => (await import("../../core/provider/index.js")).invokeModel(req));
+  let fixCostUsd = 0;
+  const costingInvoke = async (req: ModelRequest): Promise<ModelResponse> => {
+    const r = await baseInvoke(req);
+    fixCostUsd += r.cost?.usd ?? 0;
+    return r;
+  };
+  const outcome = await runFixPipelineInner(opts, { ...deps, invokeModel: costingInvoke });
+  try {
+    const receipts = deps.receipts ?? (await import("../../core/receipt/index.js")).receipts;
+    const identity = deps.identity ?? DEFAULT_IDENTITY;
+    // Distinct per-run id (fix has no task id) so separate fixes on the same repo don't merge into one
+    // group in `ikbi cost`.
+    const fixRunId = `fix:${opts.repo}:${(deps.now ?? (() => new Date().toISOString()))()}`;
+    await receipts.append(
+      {
+        operation: "worker.fix.summary",
+        outcome: { status: outcome.result === "FIXED_NARROWLY" || outcome.result === "CORRECT_REFUSAL" ? "success" : "failure", detail: outcome.result },
+        requestId: fixRunId,
+        metadata: {
+          taskId: fixRunId,
+          targetRepo: opts.repo,
+          outcome: outcome.result,
+          promoted: outcome.promoted,
+          model: deps.modelId ?? builderModel(),
+          costUsd: fixCostUsd,
+          kind: "fix",
+        },
+        project: opts.repo,
+      },
+      identity,
+    );
+  } catch {
+    /* a cost-receipt failure must never fail the fix itself */
+  }
+  return outcome;
+}
+
+async function runFixPipelineInner(opts: FixOptions, deps: FixDeps): Promise<FixOutcome> {
   const check = opts.check ?? defaultFixCheckFor(opts.repo);
   const allowTestEdits = opts.allowTestEdits ?? false;
   const allowConfigEdits = opts.allowConfigEdits ?? false;

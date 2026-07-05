@@ -139,6 +139,39 @@ test("fix: implementation_bug — diagnoses the code, patches it, result FIXED_N
   assert.deepEqual(model.stages, ["diagnose", "patch"]);
 });
 
+test("H4/Gap C: a fix run writes ONE worker.fix.summary receipt with the ACCUMULATED model cost", async () => {
+  const repo = makeRepo({
+    "calculator.py": "def add(a, b):\n    return a - b\n",
+    "test_calculator.py": "def test_add():\n    assert add(2, 3) == 5\n",
+  });
+  const runCheck = async (r: string): Promise<CheckRun> => {
+    const code = readFileSync(join(r, "calculator.py"), "utf8");
+    return code.includes("a + b") ? { exitCode: 0, output: PASSING_OUTPUT } : { exitCode: 1, output: failingOutput("-1", "5") };
+  };
+  // Each model call costs $0.01 — the fix makes two (diagnose + patch), so the receipt must total $0.02.
+  const withCost = (content: string): ModelResponse => ({ ...modelResponse(content), cost: { usd: 0.01, promptUsd: 0.01, cachedUsd: 0, completionUsd: 0, rate: { promptPerMTok: 0, completionPerMTok: 0 } } });
+  const invokeModel = async (req: ModelRequest): Promise<ModelResponse> => {
+    const stage = (req.metadata as Record<string, unknown> | undefined)?.fixStage;
+    if (stage === "diagnose") return withCost(JSON.stringify({ category: "implementation_bug", confidence: 0.95, evidence: "add returns a-b but should be a+b", affectedFiles: ["calculator.py"] }));
+    if (stage === "patch") return withCost("--- a/calculator.py\n+++ b/calculator.py\n@@ -1,2 +1,2 @@\n def add(a, b):\n-    return a - b\n+    return a + b\n");
+    return withCost("");
+  };
+  const appended: Array<{ operation: string; metadata?: Record<string, unknown> }> = [];
+  const receipts = { append: async (i: unknown): Promise<unknown> => { appended.push(i as { operation: string }); return {}; } };
+
+  const outcome = await runFixPipeline(
+    { repo, check: CHECK },
+    { runCheck, invokeModel, receipts, candidateFiles: candidates(repo, [{ path: "calculator.py", isTest: false }, { path: "test_calculator.py", isTest: true }]), ...STABLE_DEPS },
+  );
+
+  assert.equal(outcome.result, "FIXED_NARROWLY");
+  const summary = appended.find((a) => a.operation === "worker.fix.summary");
+  assert.ok(summary !== undefined, "a fix run writes a cost-summary receipt (was invisible to `ikbi cost`)");
+  assert.ok(Math.abs((summary!.metadata?.costUsd as number) - 0.02) < 1e-9, "cost is the sum of BOTH model calls ($0.02)");
+  assert.equal(summary!.metadata?.kind, "fix");
+  assert.equal(summary!.metadata?.outcome, "FIXED_NARROWLY");
+});
+
 // ────────────────────────────────────────────────────────────────────────────────
 // Fixture B: test_bug → CORRECT_REFUSAL (no --allow-test-edits)
 // ────────────────────────────────────────────────────────────────────────────────

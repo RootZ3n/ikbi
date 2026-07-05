@@ -137,6 +137,32 @@ test("RC3: a content_filter finish surfaces a warning and records the finish rea
   assert.equal(rec!.metadata?.finishReason, "content_filter");
 });
 
+test("H4/Gap C: a chat turn with cost writes a chat.turn cost receipt (visible to `ikbi cost`)", async () => {
+  const dir = tmp();
+  const paid: ModelResponse = {
+    ...base(), content: "done", finishReason: "stop",
+    cost: { usd: 0.02, promptUsd: 0.02, cachedUsd: 0, completionUsd: 0, rate: { promptPerMTok: 0, completionPerMTok: 0 } },
+  };
+  const { invoke } = scripted([paid]);
+  const s = new ChatSession("gapc-chat-cost", { invoke, worktree: dir });
+  await s.send("do the thing");
+
+  const recs = await receipts.query({ operation: "chat.turn" });
+  const rec = recs.find((r) => r.requestId === "gapc-chat-cost");
+  assert.ok(rec, "a chat.turn cost receipt was written (chat spend was invisible to `ikbi cost`)");
+  assert.equal(rec!.metadata?.costUsd, 0.02, "the turn's spend is recorded");
+  assert.equal(rec!.metadata?.kind, "chat");
+});
+
+test("H4/Gap C: a ZERO-cost turn writes NO receipt (no noise)", async () => {
+  const dir = tmp();
+  const { invoke } = scripted([{ ...base(), content: "free", finishReason: "stop" }]); // base() cost.usd = 0
+  const s = new ChatSession("gapc-chat-free", { invoke, worktree: dir });
+  await s.send("do the thing");
+  const recs = await receipts.query({ operation: "chat.turn" });
+  assert.equal(recs.find((r) => r.requestId === "gapc-chat-free"), undefined, "a zero-cost turn is not receipted");
+});
+
 test("RC3: a normal stop completion is unaffected (no warning, no receipt noise)", async () => {
   const dir = tmp();
   const { invoke } = scripted([{ ...base(), content: "Plain clean answer.", finishReason: "stop" }]);
