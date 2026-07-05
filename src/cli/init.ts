@@ -101,10 +101,10 @@ function generateEnvFile(rec: Recommendation, providers: ProviderStatus[]): stri
 
   lines.push("");
   lines.push("# Builder model (primary)");
-  lines.push(`IKBI_BUILDER_MODEL=${rec.builder}`);
+  lines.push(`IKBI_MODEL_BUILDER=${rec.builder}`); // C2a: the canonical key config.ts reads (was IKBI_BUILDER_MODEL — read by nothing)
   lines.push("");
   lines.push("# Critic model (verification)");
-  lines.push(`IKBI_CRITIC_MODEL=${rec.critic}`);
+  lines.push(`IKBI_MODEL_CRITIC=${rec.critic}`);
   if (rec.fallback) {
     lines.push("");
     lines.push("# Fallback model (when primary fails)");

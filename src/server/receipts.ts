@@ -15,6 +15,7 @@ import type { FastifyInstance } from "fastify";
 import { receipts as coreReceipts } from "../core/receipt/index.js";
 import type { Receipt, ReceiptQuery } from "../core/receipt/index.js";
 import { registerRoutes } from "./registry.js";
+import { apiAuth } from "./auth.js";
 
 /** The read surface these routes need (injectable for tests). */
 export interface ReceiptReader {
@@ -33,6 +34,10 @@ function taskIdOf(r: Receipt): string | undefined {
 /** Build the route registrar. Pass a store for testing; production uses the core singleton. */
 export function createReceiptsRouteRegistrar(store: ReceiptReader = coreReceipts): (app: FastifyInstance) => void {
   return (app: FastifyInstance) => {
+    // C3: enforce the SHARED bearer guard on this encapsulated registrar. Without it, receipts —
+    // which leak build goals, agent ids, absolute file paths, and costs — were reachable UNAUTHENTICATED
+    // even when IKBI_API_TOKEN was set (the tasks registrar's hook only covered tasks routes).
+    app.addHook("preHandler", apiAuth);
     app.get<{ Querystring: { limit?: string; task?: string; agent?: string } }>(
       "/api/receipts",
       async (request) => {

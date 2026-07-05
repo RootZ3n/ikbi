@@ -37,6 +37,9 @@ import { runSandboxChecks, renderSandboxChecks } from "./doctor-sandbox.js";
 import { whatNextFooter } from "./what-next.js";
 import { runInit } from "./init.js";
 import { runSelfRepair } from "../modules/self-repair/index.js";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { runCapabilities } from "./capabilities.js";
 import { postureLines } from "./posture.js";
 import { writeStderr, writeStdout } from "./io.js";
@@ -229,7 +232,7 @@ function printRecommendations(): void {
     writeStdout(`    Caveats:    ${r.caveats}\n\n`);
   }
   writeStdout("Apply with: ikbi models --set-recommend <n>\n");
-  writeStdout("  (writes IKBI_BUILDER_MODEL + IKBI_CRITIC_MODEL to .env)\n");
+  writeStdout("  (writes IKBI_MODEL_BUILDER + IKBI_MODEL_CRITIC to .env)\n");
 }
 
 function listModels(): void {
@@ -391,16 +394,19 @@ async function run(argv: readonly string[]): Promise<void> {
           return;
         }
         const r = RECOMMENDED[n - 1]!;
-        const envPath = require("node:path").join(process.cwd(), ".env");
-        const { existsSync, readFileSync, writeFileSync } = require("node:fs");
+        // C2b: static imports — `require` is undefined in this ESM module, so the old code threw
+        // ReferenceError hidden behind "Something went wrong". C2a: write the CANONICAL env keys the
+        // config actually reads (IKBI_MODEL_BUILDER/IKBI_MODEL_CRITIC) — the old IKBI_BUILDER_MODEL/
+        // IKBI_CRITIC_MODEL names are read by nothing, so a build silently kept the hardcoded default.
+        const envPath = join(process.cwd(), ".env");
         let env = existsSync(envPath) ? readFileSync(envPath, "utf-8") : "";
         const append = (key: string, val: string): void => {
           const re = new RegExp(`^${key}=.*$`, "m");
           if (re.test(env)) env = env.replace(re, `${key}=${val}`);
           else env += `\n${key}=${val}\n`;
         };
-        append("IKBI_BUILDER_MODEL", r.builder);
-        append("IKBI_CRITIC_MODEL", r.critic);
+        append("IKBI_MODEL_BUILDER", r.builder);
+        append("IKBI_MODEL_CRITIC", r.critic);
         if (r.fallback) append("IKBI_FALLBACK_MODEL", r.fallback);
         writeFileSync(envPath, env);
         writeStdout(`Applied profile [${n}] ${r.label} to ${envPath}\n`);
@@ -527,12 +533,19 @@ async function run(argv: readonly string[]): Promise<void> {
       // never block on durable state, and dispatch straight to the handler (which prints
       // its usage and returns). This is what keeps `ikbi build --help` fast and offline.
       const sawHelp = wantsHelp(argv.slice(1));
-      if (!sawHelp) {
-        // STARTUP PRELOAD (the cold-start on-ramp): warm the trust cache from durable state
-        // BEFORE any command resolves worker trust, then prune receipts. Skipped for the
-        // pure-info builtins above (no trust path) and for subcommand --help.
-        await coldStartPreload();
+      if (sawHelp) {
+        // C1 (SAFETY): NEVER dispatch a subcommand `--help` to its handler. Several DESTRUCTIVE
+        // commands do not intercept it and would EXECUTE — `kill --help` engages the engine-wide kill
+        // switch, `clean --help` deletes worktrees, `trust promote --help` promotes, `batch/ask --help`
+        // spend money. Answer help CENTRALLY from the help pages and RETURN; a command with no page
+        // gets a safe usage pointer and is never run. (Info builtins above print their own help.)
+        const page = helpForTopic(cmd);
+        writeStdout(page !== undefined ? `${page}\n` : `No detailed help for "${cmd}". Run \`ikbi help\` for the command list, or \`ikbi help <topic>\`.\n`);
+        return;
       }
+      // STARTUP PRELOAD (the cold-start on-ramp): warm the trust cache from durable state
+      // BEFORE any command resolves worker trust, then prune receipts.
+      await coldStartPreload();
       // Module commands compose via the command-registrar seam. Built-ins above
       // take precedence (a module cannot shadow a core command).
       const moduleCmd = commands.get(cmd);

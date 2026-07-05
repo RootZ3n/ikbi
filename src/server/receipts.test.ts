@@ -11,6 +11,7 @@ import type { Receipt, ReceiptQuery } from "../core/receipt/index.js";
 import { buildServer } from "./index.js";
 import { registerRoutes, routes } from "./registry.js";
 import { createReceiptsRouteRegistrar } from "./receipts.js";
+import { createTimelineRouteRegistrar } from "./timeline.js";
 
 // createReceiptsRouteRegistrar is imported from receipts.ts, which fires registerRoutes("receipts", ...)
 // at module scope. beforeEach clears the registry so each test registers a fresh mock-store version.
@@ -107,6 +108,26 @@ test("GET /api/receipts returns all fixtures with default limit=50", async () =>
     assert.equal(body.receipts[body.receipts.length - 1]!.seq, 4);
   } finally {
     await app.close();
+  }
+});
+
+test("C3: /api/receipts + /api/timeline REQUIRE the bearer token when IKBI_API_TOKEN is set", async () => {
+  setup();
+  registerRoutes("timeline", createTimelineRouteRegistrar({ query: async () => [] }));
+  const saved = process.env.IKBI_API_TOKEN;
+  process.env.IKBI_API_TOKEN = "secret-token";
+  const app = buildServer();
+  await app.ready();
+  try {
+    // No credential ⇒ 401 on BOTH receipt-derived endpoints (they leak goals, paths, ids, costs).
+    assert.equal((await app.inject({ method: "GET", url: "/api/receipts" })).statusCode, 401, "receipts rejects no-auth");
+    assert.equal((await app.inject({ method: "GET", url: "/api/timeline" })).statusCode, 401, "timeline rejects no-auth");
+    // A valid bearer is accepted.
+    const ok = await app.inject({ method: "GET", url: "/api/receipts", headers: { authorization: "Bearer secret-token" } });
+    assert.equal(ok.statusCode, 200, "a valid bearer is accepted");
+  } finally {
+    await app.close();
+    if (saved === undefined) delete process.env.IKBI_API_TOKEN; else process.env.IKBI_API_TOKEN = saved;
   }
 });
 
