@@ -22,15 +22,17 @@ function fakeRegistry(
   models: Record<string, string[]>,
   registered: string[],
   caps: Record<string, { context_window?: number; supports_tools?: boolean }> = {},
+  unready: string[] = [], // provider ids that are registered but report ready()===false (no API key)
 ): DoctorRegistry {
   const provs = new Set(registered);
+  const unreadySet = new Set(unready);
   const specOf = (id: string): ModelSpec | undefined =>
     models[id]
       ? { id, providers: models[id].map((p) => ({ provider: p, providerModelId: id })), ...(caps[id] ? { capabilities: caps[id] } : {}) }
       : undefined;
   return {
     getModel: (id) => specOf(id),
-    getProvider: (id) => (provs.has(id) ? ({ id } as unknown as ModelProvider) : undefined),
+    getProvider: (id) => (provs.has(id) ? ({ id, ready: () => !unreadySet.has(id) } as unknown as ModelProvider) : undefined),
     listModels: () => Object.keys(models).map((id) => specOf(id)!).filter(Boolean),
   };
 }
@@ -77,7 +79,7 @@ test("doctor REPORTS MISSING required settings and ends NOT ready (cold start)",
   assert.match(text, /✗ IKBI_WORKER_MODEL_ENABLED/);
   assert.match(text, /export IKBI_WORKER_MODEL_ENABLED=true/);
   assert.match(text, /✗ IKBI_GOVERNED_EXEC_ALLOWLIST/);
-  assert.match(text, /✗ the driver model 'mimo-v2.5' and builder model 'mimo-v2.5' and critic model 'deepseek-v4-pro' don't resolve to a registered provider/);
+  assert.match(text, /✗ the driver model 'mimo-v2.5' and builder model 'mimo-v2.5' and critic model 'deepseek-v4-pro' aren't usable \(no registered provider\)/);
   assert.match(text, /NOT ready — 5 required settings missing/);
 });
 
@@ -91,13 +93,13 @@ test("ROSTER PROVIDER SEEN: role models resolving via a roster provider (no env 
     }),
   );
   const text = r.lines.join("\n");
-  assert.match(text, /✓ provider — all role models resolve \(driver 'mimo-v2.5', builder 'mimo-v2.5', critic 'deepseek-v4-pro'\)/);
+  assert.match(text, /✓ provider — all role models resolve to a usable provider \(driver 'mimo-v2.5', builder 'mimo-v2.5', critic 'deepseek-v4-pro'\)/);
   assert.equal(r.ready, true, "a roster setup that just ran a build is correctly reported ready");
 });
 
 test("BUILT-IN KEY STILL WORKS: models resolving via a built-in keyed provider ⇒ ✓ (regression)", () => {
   const r = runDoctor(readyInputs({ registry: fakeRegistry({ "mimo-v2.5": ["mimo"], "deepseek-v4-pro": ["deepseek"] }, ["mimo", "openrouter", "deepseek"]) }));
-  assert.match(r.lines.join("\n"), /✓ provider — all role models resolve/);
+  assert.match(r.lines.join("\n"), /✓ provider — all role models resolve to a usable provider/);
   assert.equal(r.ready, true);
 });
 
@@ -109,9 +111,23 @@ test("UNRESOLVABLE MODEL FLAGGED: a driver model with no registered provider ⇒
     }),
   );
   const text = r.lines.join("\n");
-  assert.match(text, /✗ the driver model 'mimo-v2.5' and builder model 'mimo-v2.5' don't resolve to a registered provider — add a provider entry/);
+  assert.match(text, /✗ the driver model 'mimo-v2.5' and builder model 'mimo-v2.5' aren't usable \(no registered provider\) — add a provider entry/);
   assert.equal(r.ready, false);
   assert.match(text, /NOT ready — 1 required setting missing/);
+});
+
+test("H1: a provider REGISTERED but with NO API KEY (ready()===false) is NOT ready — doctor names the key gap", () => {
+  // The exact bug: doctor said "ready to build" with zero keys, then the build died mid-pipeline.
+  // Here mimo is registered but unkeyed (ready false); deepseek is keyed.
+  const r = runDoctor(
+    readyInputs({
+      registry: fakeRegistry({ "mimo-v2.5": ["mimo"], "deepseek-v4-pro": ["deepseek"] }, ["mimo", "deepseek"], {}, ["mimo"]),
+    }),
+  );
+  const text = r.lines.join("\n");
+  assert.equal(r.ready, false, "an unkeyed role-model provider is NOT ready (no longer a false green)");
+  assert.match(text, /provider registered but NO API KEY/, "the message names the key gap, not a bogus 'no provider'");
+  assert.match(text, /set the provider API key/, "the fix is actionable");
 });
 
 test("WHICH MODEL FLAGGED: driver resolves but critic doesn't ⇒ the CRITIC model is named specifically", () => {
@@ -121,7 +137,7 @@ test("WHICH MODEL FLAGGED: driver resolves but critic doesn't ⇒ the CRITIC mod
     }),
   );
   const text = r.lines.join("\n");
-  assert.match(text, /✗ the critic model 'deepseek-v4-pro' doesn't resolve to a registered provider/);
+  assert.match(text, /✗ the critic model 'deepseek-v4-pro' isn't usable \(no registered provider\)/);
   assert.doesNotMatch(text, /driver model 'mimo-v2.5' (?:and|doesn't)/, "the resolving driver is NOT flagged");
   assert.equal(r.ready, false);
 });
@@ -217,7 +233,7 @@ test("doctor SHOWS the competitive shootout list and resolution-CHECKS each race
   );
   const text = r.lines.join("\n");
   assert.match(text, /IKBI_COMPETITIVE_MODELS = mimo-v2\.5, qwen3:14b/, "the shootout list is shown");
-  assert.match(text, /✗ the competitive model 'qwen3:14b' doesn't resolve to a registered provider/, "the unwired racer is flagged by name");
+  assert.match(text, /✗ the competitive model 'qwen3:14b' isn't usable \(no registered provider\)/, "the unwired racer is flagged by name");
   assert.equal(r.ready, false, "an unresolvable competitive racer blocks readiness");
 });
 

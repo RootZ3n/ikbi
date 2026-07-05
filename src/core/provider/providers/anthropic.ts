@@ -258,6 +258,11 @@ export class AnthropicProvider implements ModelProvider {
     this.fetchImpl = opts.fetchImpl ?? resolveFetchGuard();
   }
 
+  /** USABLE iff an API key is configured (the native Anthropic adapter is never keyless). */
+  ready(): boolean {
+    return this.apiKey !== undefined && this.apiKey.length > 0;
+  }
+
   private ensureAuth(): void {
     if (this.apiKey === undefined || this.apiKey.length === 0) {
       throw new ProviderError(`Provider "${this.id}" has no API key configured`, {

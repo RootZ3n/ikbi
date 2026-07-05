@@ -347,6 +347,11 @@ export class OpenAICompatibleProvider implements ModelProvider {
     this.fetchImpl = opts.fetchImpl ?? resolveFetchGuard();
   }
 
+  /** USABLE iff keyless or a non-empty API key is configured (mirrors the ensureAuth fail-closed). */
+  ready(): boolean {
+    return this.keyless || (this.apiKey !== undefined && this.apiKey.length > 0);
+  }
+
   /** Fail closed when a keyed provider has no API key (a keyless one needs none). */
   private ensureAuth(): void {
     if (!this.keyless && (this.apiKey === undefined || this.apiKey.length === 0)) {

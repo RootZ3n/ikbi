@@ -100,26 +100,43 @@ export function runDoctor(inp: DoctorInputs = {}): DoctorResult {
   const builderId = cfg.provider.defaultModels.builder;
   const criticId = cfg.provider.defaultModels.critic;
   const competitive = cfg.provider.defaultModels.competitiveModels;
-  const resolves = (spec: ModelSpec | undefined): boolean =>
-    spec !== undefined && spec.providers.some((route) => reg.getProvider(route.provider) !== undefined);
+  // H1: KEY-AWARE resolution. The old check was purely structural (is a provider id registered?) — but
+  // every provider registers even with no API key, so doctor said "ready to build" and the build then
+  // died mid-pipeline for want of a key. Now a model resolves only when a route reaches a provider that
+  // is actually USABLE (keyless, or a key configured — via provider.ready()). We distinguish "no
+  // provider registered" from "provider registered but NO API KEY" so the fix is actionable.
+  const resolveStatus = (spec: ModelSpec | undefined): "ok" | "no-provider" | "no-key" => {
+    if (spec === undefined) return "no-provider";
+    let sawProvider = false;
+    for (const route of spec.providers) {
+      const p = reg.getProvider(route.provider);
+      if (p === undefined) continue;
+      sawProvider = true;
+      if (p.ready === undefined || p.ready()) return "ok"; // ready (or a fake without ready ⇒ assume ok)
+    }
+    return sawProvider ? "no-key" : "no-provider";
+  };
   // ALL configured models must resolve: scout(driver) + builder + critic + every
   // competitive-list model (the shootout — the operator needs to know if a racer isn't wired).
-  const modelChecks: Array<{ label: string; id: string; ok: boolean }> = [
-    { label: "driver model", id: driverId, ok: resolves(reg.getModel(driverId)) },
-    { label: "builder model", id: builderId, ok: resolves(reg.getModel(builderId)) },
-    { label: "critic model", id: criticId, ok: resolves(reg.getModel(criticId)) },
-    ...(competitive ?? []).map((id) => ({ label: "competitive model", id, ok: resolves(reg.getModel(id)) })),
+  const modelChecks: Array<{ label: string; id: string; ok: boolean; status: "ok" | "no-provider" | "no-key" }> = [
+    { label: "driver model", id: driverId, status: resolveStatus(reg.getModel(driverId)), ok: resolveStatus(reg.getModel(driverId)) === "ok" },
+    { label: "builder model", id: builderId, status: resolveStatus(reg.getModel(builderId)), ok: resolveStatus(reg.getModel(builderId)) === "ok" },
+    { label: "critic model", id: criticId, status: resolveStatus(reg.getModel(criticId)), ok: resolveStatus(reg.getModel(criticId)) === "ok" },
+    ...(competitive ?? []).map((id) => ({ label: "competitive model", id, status: resolveStatus(reg.getModel(id)), ok: resolveStatus(reg.getModel(id)) === "ok" })),
   ];
   const broken = modelChecks.filter((m) => !m.ok);
-  // Structural check: do role models resolve to registered providers? (checked via `broken` above)
+  // Do role models resolve to a USABLE (registered + keyed/keyless) provider? (checked via `broken`)
   const providerEntry = broken.length === 0
-    ? { ok: true, label: `provider — all role models resolve (driver '${driverId}', builder '${builderId}', critic '${criticId}'${competitive ? `, competitive ${competitive.map((m) => `'${m}'`).join(", ")}` : ""})`, fix: "" }
+    ? { ok: true, label: `provider — all role models resolve to a usable provider (driver '${driverId}', builder '${builderId}', critic '${criticId}'${competitive ? `, competitive ${competitive.map((m) => `'${m}'`).join(", ")}` : ""})`, fix: "" }
     : (() => {
-        const verb = broken.length > 1 ? "don't" : "doesn't";
+        const needsKey = broken.filter((m) => m.status === "no-key");
+        const verb = broken.length > 1 ? "aren't" : "isn't";
         return {
           ok: false,
-          label: `the ${broken.map((m) => `${m.label} '${m.id}'`).join(" and ")} ${verb} resolve to a registered provider`,
-          fix: "add a provider entry in the roster (providers.json) for it, or set a provider API key",
+          label: `the ${broken.map((m) => `${m.label} '${m.id}'`).join(" and ")} ${verb} usable (${needsKey.length > 0 ? "provider registered but NO API KEY" : "no registered provider"})`,
+          fix: needsKey.length > 0
+            ? `set the provider API key for ${needsKey.map((m) => `'${m.id}'`).join(", ")} (e.g. IKBI_<PROVIDER>_API_KEY) — the provider is registered but has no key, so the build would die mid-pipeline`
+            : "add a provider entry in the roster (providers.json) for it, or set a provider API key",
         };
       })();
 

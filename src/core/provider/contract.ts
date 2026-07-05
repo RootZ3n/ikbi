@@ -384,6 +384,13 @@ export type ModelStream = AsyncIterable<StreamDelta>;
 export interface ModelProvider {
   /** Stable provider id, e.g. "mimo", "openrouter". */
   readonly id: string;
+  /**
+   * ADDITIVE (OPTIONAL): is this provider actually USABLE — i.e. keyless, or configured with an API
+   * key? A registered-but-keyless-and-keyRequiring provider will fail-closed at invoke, so `doctor`
+   * reads this to avoid green-lighting a build that dies mid-pipeline for want of a key. Providers
+   * that omit it are assumed ready (back-compat) — doctor then falls back to its structural check.
+   */
+  ready?(): boolean;
   /** Perform a single invocation. MUST throw `ProviderError` on failure. */
   invoke(invocation: ProviderInvocation): Promise<ProviderResult>;
   /**
