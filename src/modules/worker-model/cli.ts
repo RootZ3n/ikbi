@@ -519,8 +519,15 @@ function detectWriteScope(goal: string): "all" | "new_only" | "none" {
  * every progress/diagnostic/hint/repair/cost line is routed to STDERR so a caller can pipe
  * stdout straight into a JSON parser without log noise interleaved (FIX 3).
  */
-export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbose?: boolean; cost?: boolean; yes?: boolean; json?: boolean; delegation?: string; noMemory?: boolean; memoryDiff?: boolean; check?: string; maxBudgetUsd?: number; fallbackModel?: string; complexity?: "small" | "medium" | "large"; tier?: BuildTier; bare?: boolean; effort?: "low" | "medium" | "high" | "max"; fromPr?: number; escalate?: boolean; rest: string[] } {
+export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbose?: boolean; cost?: boolean; yes?: boolean; json?: boolean; delegation?: string; noMemory?: boolean; memoryDiff?: boolean; check?: string; maxBudgetUsd?: number; fallbackModel?: string; complexity?: "small" | "medium" | "large"; tier?: BuildTier; bare?: boolean; effort?: "low" | "medium" | "high" | "max"; fromPr?: number; escalate?: boolean; unknownFlags: string[]; rest: string[] } {
   const rest: string[] = [];
+  // #9: unknown FLAG-LIKE tokens (a typo'd `--no-promote`, `--dry-run`, `--modle=x`) were silently
+  // folded into the GOAL prose — the flag did nothing and the operator never knew. Collect them so the
+  // handler can reject with a clear message. A real goal is a single quoted argv element (it never
+  // arrives as a lone `--foo` token), so a lone dash-prefixed unknown is a typo, not goal text. `--`
+  // is the explicit end-of-options separator: everything after it is goal text, dashes and all.
+  const unknownFlags: string[] = [];
+  let endOfFlags = false;
   let repo: string | undefined;
   let verbose = false;
   let cost = false;
@@ -540,7 +547,13 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
   let fromPr: number | undefined;
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i] as string;
-    if (a === "--repo") {
+    if (endOfFlags) {
+      rest.push(a);
+      continue;
+    }
+    if (a === "--") {
+      endOfFlags = true; // everything after this is goal text, never parsed as a flag
+    } else if (a === "--repo") {
       repo = argv[i + 1];
       i += 1;
     } else if (a.startsWith("--repo=")) {
@@ -612,11 +625,13 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
       if (Number.isInteger(n) && n > 0) fromPr = n;
     } else if (a === "--escalate") {
       escalate = true;
+    } else if (a.length > 1 && a.startsWith("-")) {
+      unknownFlags.push(a); // a lone dash-prefixed token we don't recognize ⇒ a typo'd flag, not goal text
     } else {
       rest.push(a);
     }
   }
-  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), ...(verbose ? { verbose } : {}), ...(cost ? { cost } : {}), ...(yes ? { yes } : {}), ...(json ? { json } : {}), ...(delegation !== undefined ? { delegation } : {}), ...(noMemory ? { noMemory } : {}), ...(memoryDiff ? { memoryDiff } : {}), ...(check !== undefined && check.trim().length > 0 ? { check } : {}), ...(maxBudgetUsd !== undefined ? { maxBudgetUsd } : {}), ...(fallbackModel !== undefined ? { fallbackModel } : {}), ...(complexity !== undefined ? { complexity } : {}), ...(tier !== undefined ? { tier } : {}), ...(bare ? { bare } : {}), ...(effort !== undefined ? { effort } : {}), ...(fromPr !== undefined ? { fromPr } : {}), ...(escalate ? { escalate } : {}), rest };
+  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), ...(verbose ? { verbose } : {}), ...(cost ? { cost } : {}), ...(yes ? { yes } : {}), ...(json ? { json } : {}), ...(delegation !== undefined ? { delegation } : {}), ...(noMemory ? { noMemory } : {}), ...(memoryDiff ? { memoryDiff } : {}), ...(check !== undefined && check.trim().length > 0 ? { check } : {}), ...(maxBudgetUsd !== undefined ? { maxBudgetUsd } : {}), ...(fallbackModel !== undefined ? { fallbackModel } : {}), ...(complexity !== undefined ? { complexity } : {}), ...(tier !== undefined ? { tier } : {}), ...(bare ? { bare } : {}), ...(effort !== undefined ? { effort } : {}), ...(fromPr !== undefined ? { fromPr } : {}), ...(escalate ? { escalate } : {}), unknownFlags, rest };
 }
 
 /**
@@ -959,7 +974,14 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       return;
     }
 
-    const { repo, verbose, cost, yes, json, delegation: delegationJson, noMemory, memoryDiff, check, maxBudgetUsd, fallbackModel, complexity, tier, bare, effort, fromPr, escalate, rest } = parseBuildArgs(argv);
+    const { repo, verbose, cost, yes, json, delegation: delegationJson, noMemory, memoryDiff, check, maxBudgetUsd, fallbackModel, complexity, tier, bare, effort, fromPr, escalate, unknownFlags, rest } = parseBuildArgs(argv);
+    // #9: reject typo'd/unknown flags instead of silently folding them into the build goal (where they
+    // do nothing). A legit goal that really needs a leading dash goes after `--`.
+    if (unknownFlags.length > 0) {
+      err(`ikbi build: unknown option${unknownFlags.length > 1 ? "s" : ""}: ${unknownFlags.join(", ")} — run \`ikbi build --help\`. (Goal text with a leading dash goes after \`--\`.)\n`);
+      setExit(1);
+      return;
+    }
     // H3: in --json mode, step-planner PROGRESS lines go to stderr so stdout carries ONLY the result JSON.
     const progress = json === true ? err : out;
 

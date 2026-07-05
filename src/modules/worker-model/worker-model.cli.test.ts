@@ -141,23 +141,30 @@ test("productionRoleClaim returns the worker token for ALL roles; throws fail-cl
 });
 
 test("parseBuildArgs extracts --repo and leaves the goal", () => {
-  assert.deepEqual(parseBuildArgs(["fix", "the", "bug", "--repo", "/r"]), { repo: "/r", rest: ["fix", "the", "bug"] });
-  assert.deepEqual(parseBuildArgs(["g", "--repo=/x"]), { repo: "/x", rest: ["g"] });
-  assert.deepEqual(parseBuildArgs(["just", "a", "goal"]), { rest: ["just", "a", "goal"] });
+  assert.deepEqual(parseBuildArgs(["fix", "the", "bug", "--repo", "/r"]), { repo: "/r", unknownFlags: [], rest: ["fix", "the", "bug"] });
+  assert.deepEqual(parseBuildArgs(["g", "--repo=/x"]), { repo: "/x", unknownFlags: [], rest: ["g"] });
+  assert.deepEqual(parseBuildArgs(["just", "a", "goal"]), { unknownFlags: [], rest: ["just", "a", "goal"] });
 });
 
 test("parseBuildArgs parses --escalate (authorize the frontier consult)", () => {
-  assert.deepEqual(parseBuildArgs(["fix", "it", "--escalate"]), { escalate: true, rest: ["fix", "it"] });
+  assert.deepEqual(parseBuildArgs(["fix", "it", "--escalate"]), { escalate: true, unknownFlags: [], rest: ["fix", "it"] });
   assert.deepEqual(parseBuildArgs(["fix", "it"]).escalate, undefined, "frontier authorization is off by default");
 });
 
 test("parseBuildArgs parses --yes / -y (skip the Socratic interview)", () => {
-  assert.deepEqual(parseBuildArgs(["fix", "it", "--yes"]), { yes: true, rest: ["fix", "it"] });
-  assert.deepEqual(parseBuildArgs(["fix", "it", "-y"]), { yes: true, rest: ["fix", "it"] });
+  assert.deepEqual(parseBuildArgs(["fix", "it", "--yes"]), { yes: true, unknownFlags: [], rest: ["fix", "it"] });
+  assert.deepEqual(parseBuildArgs(["fix", "it", "-y"]), { yes: true, unknownFlags: [], rest: ["fix", "it"] });
   // absent ⇒ no `yes` key (so callers see undefined, the interview default)
-  assert.deepEqual(parseBuildArgs(["fix", "it"]), { rest: ["fix", "it"] });
+  assert.deepEqual(parseBuildArgs(["fix", "it"]), { unknownFlags: [], rest: ["fix", "it"] });
   // composes with the other flags
-  assert.deepEqual(parseBuildArgs(["g", "--repo=/x", "-y", "--cost"]), { repo: "/x", cost: true, yes: true, rest: ["g"] });
+  assert.deepEqual(parseBuildArgs(["g", "--repo=/x", "-y", "--cost"]), { repo: "/x", cost: true, yes: true, unknownFlags: [], rest: ["g"] });
+});
+
+test("#9: parseBuildArgs COLLECTS unknown flags (not folded into the goal) and honors `--` end-of-options", () => {
+  // A typo'd flag is captured, not swallowed into the goal.
+  assert.deepEqual(parseBuildArgs(["fix", "it", "--no-promote"]), { unknownFlags: ["--no-promote"], rest: ["fix", "it"] });
+  // `--` ends option parsing: a genuine leading-dash goal token survives as text.
+  assert.deepEqual(parseBuildArgs(["--", "--weird-goal-token"]), { unknownFlags: [], rest: ["--weird-goal-token"] });
 });
 
 // ── --yes SKIPS the blocking Socratic interview (Fix 1) ──────────────────────
