@@ -131,6 +131,17 @@ export function effectiveMaxIterations(complexity?: "small" | "medium" | "large"
  * loop forever.
  */
 const MAX_TOOL_CALL_STALLS = 3;
+/**
+ * GRADUATED NO-PROGRESS GOVERNOR — the intra-build "keep the cheap model in line" seam. Once the
+ * builder has written SOMETHING, a run of zero-write rounds means it is reading/looping instead of
+ * producing (the classic cheap-model failure: it wrote most of the project, then wandered while trying
+ * to close the last errors). Rather than KILLING on the first sign — which discarded near-complete
+ * builds mid-fix — the loop first NUDGES the model back to writing at NUDGE_AT, and only terminates
+ * as `no_progress` if it STILL hasn't produced by KILL_AT. The next escalation rung after termination
+ * is the auto-verify rescue + the last-mile fixer (a DIFFERENT model).
+ */
+const NO_PROGRESS_NUDGE_AT = 5;
+const NO_PROGRESS_KILL_AT = 9;
 /** Max bytes returned by read_file (untrusted content is bounded before the model). */
 const MAX_READ_BYTES = 32_000;
 /** Max entries returned by list_dir. */
@@ -851,6 +862,8 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
   const stallRecords: StallRecord[] = []; // WO4: per-stall observations surfaced on the result + receipt
   const filesWrittenPerRound: number[] = []; // EARLY STOP: tracks new files written each tool-round iteration
   let consecutiveRejectedToolRounds = 0;
+  let consecutiveZeroWriteRounds = 0; // GRADUATED NO-PROGRESS: rounds since the last file write
+  let noProgressNudged = false; // whether the model has been nudged in the current zero-write streak
   let emulatedToolRound = false; // this round's tool calls came from TEXT (no native tool API) → feed results back as user, not tool-role
   // MCP TOOLS: operator-configured MCP servers' tools, discovered once at builder start and
   // exposed alongside the built-in suite. Declared out here so the finally always tears the
@@ -1902,10 +1915,36 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         // rounds produced no new writes, it may be stuck. Only fires when the builder has
         // previously demonstrated write activity (excludes pure-read exploration rounds).
         const totalFilesWritten = filesWrittenPerRound.reduce((a, b) => a + b, 0);
-        const recentFileWrites = filesWrittenPerRound.slice(-5);
-        if (totalFilesWritten > 0 && recentFileWrites.length >= 5 && recentFileWrites.every((n) => n === 0)) {
-          stopReason = "no_progress";
-          break;
+        // GRADUATED NO-PROGRESS GOVERNOR: track the zero-write streak. A round that writes resets the
+        // streak (and clears the nudge). Once the builder has produced something, a long zero-write run
+        // means it is investigating/looping instead of editing.
+        if (newFilesThisRound > 0) {
+          consecutiveZeroWriteRounds = 0;
+          noProgressNudged = false;
+        } else {
+          consecutiveZeroWriteRounds += 1;
+        }
+        if (totalFilesWritten > 0 && consecutiveZeroWriteRounds >= NO_PROGRESS_NUDGE_AT) {
+          if (!noProgressNudged) {
+            // KEEP IT IN LINE: nudge the model back to producing before terminating. Restate the goal /
+            // targets / last-check state and demand a concrete edit or a run_checks — not another read.
+            noProgressNudged = true;
+            messages.push({
+              role: "user",
+              content:
+                `You have done ${consecutiveZeroWriteRounds} rounds without writing a file — you are reading or looping, ` +
+                "not making progress. Act NOW: either make the concrete change with write_file / patch / multi_edit, or call " +
+                "run_checks to see the current errors and then fix them. Do NOT read another file first.\n\n" +
+                buildContextReminder({ goal: ctx.task.goal, targetFiles, filesWritten, ...(lastChecks !== undefined ? { lastChecks } : {}) }),
+            });
+            continue; // give the model a chance to course-correct before we terminate
+          }
+          if (consecutiveZeroWriteRounds >= NO_PROGRESS_KILL_AT) {
+            // The nudge did not take — terminate. The auto-verify rescue + last-mile fixer (a different
+            // model) is the next rung; a red-but-near-complete tree is not discarded outright.
+            stopReason = "no_progress";
+            break;
+          }
         }
         continue; // keep looping while the model wants tools / has not validly done
       }

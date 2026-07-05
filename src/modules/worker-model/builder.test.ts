@@ -1164,3 +1164,43 @@ test("WO4: a stall writes a durable receipt with REDACTED stall info (no partial
   assert.ok(!JSON.stringify(stallReceipt!.input).includes(SECRET), "the receipt must not leak the partial argument content");
   assert.equal(stallReceipt!.identity.agentId, "worker-1", "the receipt is attributed to the run identity");
 });
+
+// ── GRADUATED NO-PROGRESS GOVERNOR — nudge the cheap model back to producing before killing ──
+test("graduated no-progress: the builder is NUDGED (not killed) at 5 zero-write rounds, kills only if it persists", async () => {
+  const dir = tmp();
+  // Round 1 writes a file (so the governor is armed); then the model only READS for many rounds.
+  // Old behavior: killed at 5 zero-write rounds. New: nudged at 5, killed at 9.
+  const reads = Array.from({ length: 9 }, () => toolResp([call("read_file", { path: "a.ts" })]));
+  const { engine, requests } = mockEngine([
+    writeResp("a.ts", "export const x = 1;\n"),
+    ...reads,
+    doneResp(["a.ts"]), // never reached — the governor terminates first
+  ]);
+  const res = await run(makeCtx(dir, "trusted", engine));
+
+  const detail = (res.detail ?? {}) as Record<string, unknown>;
+  assert.equal(res.outcome, "failure");
+  assert.equal(detail.stopReason, "no_progress", "eventually terminates as no_progress");
+  // The NUDGE fired: a corrective message was injected into the conversation before termination.
+  assert.ok(
+    requests.some((r) => JSON.stringify(r.messages).includes("without writing a file")),
+    "the model was nudged back to producing",
+  );
+  // It did NOT kill at the old 5-round threshold — the nudge bought it ~4 more rounds (kill at 9).
+  assert.ok(requests.length >= 9, `the run continued past the old kill point (saw ${requests.length} rounds)`);
+});
+
+test("graduated no-progress: a WRITE after the nudge clears the streak (recovery, no kill)", async () => {
+  const dir = tmp();
+  // 1 write, 6 reads (crosses the nudge at 5), then a WRITE (recovery) → run_checks green → done.
+  const { engine } = mockEngine([
+    writeResp("a.ts", "export const x = 1;\n"),
+    ...Array.from({ length: 6 }, () => toolResp([call("read_file", { path: "a.ts" })])),
+    writeResp("b.ts", "export const y = 2;\n"), // recovery write resets the zero-write streak
+    runChecksResp(),
+    doneResp(["a.ts", "b.ts"]),
+  ]);
+  const res = await run(makeCtx(dir, "trusted", engine)); // greenExec ⇒ run_checks passes
+
+  assert.notEqual((res.detail as Record<string, unknown>)?.stopReason, "no_progress", "recovered — not a no_progress kill");
+});
