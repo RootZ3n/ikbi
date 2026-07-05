@@ -66,6 +66,27 @@ function isSuccessNoop(seg: string): boolean {
   );
 }
 
+/**
+ * A TEST script that is inline node code (`node -e|--eval|-p|--print <code>`) is fabricating its own
+ * stdout + exit — it can print `# tests 3 / # pass 3` and exit 0 without running a single real test,
+ * forging "executed" evidence past the stub guard (which only catches an EMPTY `node -e ''`). Trustworthy
+ * test evidence can never come from inline code. Kept SEPARATE from `isStubScript` because an inline-eval
+ * CUSTOM check may be legitimate; a project's `test` script that is inline eval is not.
+ */
+export function isInlineEvalTestScript(body: string): boolean {
+  const s = stripShellComment(body).trim();
+  // node -p / --print ALWAYS prints its expression — it can print fabricated `# tests N` markers, so
+  // an inline-print test script is always a fake runner.
+  if (/(?:^|&&|\|\||;|\s)node\s+(?:-p|--print)\b/i.test(s)) return true;
+  // node -e / --eval is a forgery risk ONLY when it WRITES output (that is the mechanism: printing
+  // fake test markers). A bare `node -e 'process.exit(0)'` prints nothing and forges no evidence — the
+  // test-evidence gate already blocks a silent vacuous exit-0, so it need not trip this guard.
+  return (
+    /(?:^|&&|\|\||;|\s)node\s+(?:-e|--eval)\b/i.test(s) &&
+    /console\.\w+|process\.(?:stdout|stderr)|\bwrite(?:Sync)?\b|\bprint\b/i.test(s)
+  );
+}
+
 export function isStubScript(body: string): boolean {
   const s = stripShellComment(body);
   if (s.length === 0) return true;
@@ -228,7 +249,7 @@ export function createVerificationLadder(cfg: VerificationLadderConfig = verific
     const nearest: CheckTask[] = [];
     for (const pkg of runnablePkgs) {
       if (typeof pkg.scripts.test !== "string" || pkg.scripts.test.length === 0) continue;
-      if (!trustTrivial && isStubScript(pkg.scripts.test)) continue;
+      if (!trustTrivial && (isStubScript(pkg.scripts.test) || isInlineEvalTestScript(pkg.scripts.test))) continue; // stub OR inline-eval fake runner → not real verification
       const testsInPkg = [...affectedTests].filter((t) => packageOf(t, rootsDescByLen) === pkg.root).sort();
       if (testsInPkg.length === 0) continue;
       const { command, args } = toCommand(pkg.manager, "test");
