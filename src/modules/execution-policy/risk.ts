@@ -32,20 +32,54 @@ function isVerifierPurpose(purpose: string | undefined): boolean {
   // chat REPL's default `test` check is `pnpm test`, which the package-script gate would otherwise DENY on
   // every session (regression from the F1 anchoring). None of these are forgeable — the model's terminal
   // purpose is `builder terminal: <cmd>`, which matches no trusted prefix.
-  return /^(patchsmith|builder|verifier|chat) check:/i.test(purpose) || /^verifier\[ladder:/i.test(purpose);
+  return /^(patchsmith|builder|verifier|chat|fix) check:/i.test(purpose) || /^verifier\[ladder:/i.test(purpose);
 }
 
 /**
- * Does this run+execute a package script or a fetched remote package (as opposed to installing deps)?
- * SECURITY (F2): `dlx`/`create` (pnpm/yarn) — like `npx` — DOWNLOAD AND RUN an arbitrary remote package
- * (and the sandbox runs that class WITH network), so they are strictly more dangerous than `run` yet were
- * unlisted here and thus allowed unconditionally. They are now gated exactly like `run`/`exec`.
+ * Package-manager subcommands that RUN a script or a FETCHED remote package (vs installing declared deps).
+ * Any of these = model-authored or remote code execution — gated to trusted check-runners only.
+ * SECURITY (F2): `dlx`/`create` DOWNLOAD AND RUN a remote package (sandbox runs that class WITH network).
+ * `run-script` is npm's alias for `run`; `init` runs a `create-*` initializer (== `create`).
+ */
+const PM_RUN_SUBCOMMANDS = new Set(["run", "run-script", "test", "start", "exec", "x", "dlx", "create", "init"]);
+
+/**
+ * Non-script yarn subcommands. yarn runs an IMPLICIT script for `yarn <name>` when <name> is not a
+ * builtin (`yarn build` ≡ `yarn run build`), so any yarn first-positional NOT in this set is gated —
+ * unknown ⇒ gated (fail-closed). Over-gating a rare builtin only affects model TERMINAL commands, since
+ * verifier/check runs carry a trusted purpose and bypass the gate entirely.
+ */
+const SAFE_YARN_SUBCOMMANDS = new Set([
+  "install", "add", "remove", "up", "upgrade", "why", "list", "info", "config", "dedupe", "import",
+  "link", "unlink", "pack", "audit", "bin", "cache", "outdated", "licenses", "policies", "plugin",
+  "set", "workspace", "workspaces", "versions", "version", "node", "global", "help",
+]);
+
+/** PM flags that REDIRECT where/how the command runs — a worktree-escape AND they hide the subcommand
+ *  from any positional parse. Denied outright; legitimate verifier checks never use them. */
+function pmRedirectFlag(args: readonly string[]): boolean {
+  return args.some((a) => /^(--dir|--cwd|--prefix|--global-dir|--workspace-root|--config|--configdir|-C)(=|$)/i.test(a));
+}
+
+/**
+ * Does this run+execute a package script or a fetched remote package (vs installing deps)?
+ * SECURITY (F1 v2): scans ALL pre-`--` tokens for a run-class subcommand rather than only the first
+ * positional — an option VALUE can otherwise HIDE the subcommand (`pnpm --loglevel x run evil`,
+ * `pnpm --dir . run evil`). Over-approximates (a benign token equal to a run-class word is gated), which
+ * is fail-closed and only affects model terminal commands (checks bypass via a trusted purpose).
  */
 function isPackageScriptRun(command: string, args: readonly string[]): boolean {
   if (!PM_COMMANDS.has(command)) return false;
-  const first = args.find((a) => !a.startsWith("-"));
-  if (command === "npx") return first !== undefined;
-  return first === "run" || first === "test" || first === "start" || first === "exec" || first === "x" || first === "dlx" || first === "create";
+  const stop = args.indexOf("--"); // tokens after `--` are the script's own args, not pm subcommands
+  const scan = stop >= 0 ? args.slice(0, stop) : args;
+  const positional = (a: string): boolean => !a.startsWith("-");
+  if (command === "npx") return scan.some(positional); // npx <anything> downloads + runs a package
+  if (scan.some((a) => positional(a) && PM_RUN_SUBCOMMANDS.has(a))) return true;
+  if (command === "yarn") {
+    const first = scan.find(positional);
+    if (first !== undefined && !SAFE_YARN_SUBCOMMANDS.has(first)) return true; // yarn implicit script
+  }
+  return false;
 }
 
 function gitSubcommand(args: readonly string[]): string | undefined {
@@ -99,6 +133,11 @@ export function commandPolicyDenyReason(command: string, args: readonly string[]
   // find -exec/-execdir/-ok/-fprintf/-fprint/-delete execute arbitrary binaries or write files.
   if (command === "find" && findHasExecOrWrite(args)) {
     return "find exec/write flags are not allowed";
+  }
+  // A package manager's directory/config redirect flags let it operate OUTSIDE the worktree and hide the
+  // subcommand from the script-run parse — denied outright (legit verifier checks never use them).
+  if (PM_COMMANDS.has(command) && pmRedirectFlag(args)) {
+    return `${command} directory/config redirect flags are not allowed (worktree escape)`;
   }
   if (isPackageScriptRun(command, args) && !isVerifierPurpose(purpose)) {
     return `${command} script execution is allowed only for verifier/check runs`;

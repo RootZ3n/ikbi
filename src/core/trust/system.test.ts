@@ -84,6 +84,23 @@ test("F3: a genuine trusted doc for ANOTHER agent, placed at a victim's storage 
   }
 });
 
+test("round-3 #3: preload IGNORES a MAC-valid doc placed at a NON-canonical key (misplaced/planted)", async () => {
+  const { wrap } = await import("./mac.js");
+  const dir = await tmp();
+  try {
+    const { trust, store } = makeTrust(dir);
+    // A genuine trusted doc for "attacker-x" placed under the WRONG store key (not sha256("attacker-x")).
+    const wrongKey = createHash("sha256").update("some-other-slot", "utf8").digest("hex");
+    await store.put(wrongKey, wrap(KEY, { agentId: "attacker-x", tier: "trusted", grantedAt: 1000 } as never));
+    const { rejected } = await trust.preload();
+    assert.ok(rejected >= 1, "the misplaced doc was rejected, not loaded");
+    // attacker-x must NOT be cached as trusted from a doc found at the wrong key.
+    assert.equal(trust.resolve({ agentId: "attacker-x", kind: "agent", defaultTrustTier: "untrusted" } as TrustTierInput), "untrusted");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("A4: a planted foreign trusted doc cannot elevate a victim via the recordOutcome WRITE path", async () => {
   const { wrap } = await import("./mac.js");
   const dir = await tmp();

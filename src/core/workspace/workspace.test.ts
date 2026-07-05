@@ -178,6 +178,27 @@ test("H6: allocate reaps a slot whose worktree EXISTS but whose OWNER PROCESS is
   }
 });
 
+test("round-3 #4: an allocate bound-refresh does NOT reconcile a peer's in-flight 'promoting' record", async () => {
+  const repo = await makeRepo();
+  const root = join(tmpdir(), `ikbi-ws-nrec-${randomBytes(8).toString("hex")}`);
+  const a = makeManager({ root, max: 3 });
+  const b = makeManager({ root, max: 3 });
+  try {
+    const ws1 = await a.mgr.allocate({ targetRepo: repo, identity: ID });
+    // Simulate a PEER's in-flight promote: flip the durable record to "promoting" (as promote() does
+    // between intent-write and CAS). With no promoteIntent, a reconcile would REVERT it to "allocated".
+    const rec = await a.store.get(ws1.id);
+    await a.store.put(ws1.id, { ...rec!, state: "promoting" });
+    // B allocates — its bound-refresh must COUNT ws1 toward the cap but NOT reconcile/revert it (it holds
+    // only ALLOC_LOCK, not ws1's workspace/branch lock).
+    await b.mgr.allocate({ targetRepo: repo, identity: ID });
+    const after = await b.store.get(ws1.id);
+    assert.equal(after?.state, "promoting", "the peer's in-flight promote was left intact, not reconciled");
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
 test("A3: a cross-process REMOVAL is shed on re-preload — no false 'workspace limit reached'", async () => {
   const repo = await makeRepo();
   const root = join(tmpdir(), `ikbi-ws-shed-${randomBytes(8).toString("hex")}`);

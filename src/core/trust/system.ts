@@ -178,6 +178,16 @@ export class TrustSystem implements TrustTierResolver {
         rejected += 1;
         continue;
       }
+      // F3/A4: bind the doc to its storage key here too. preload caches by the doc's EMBEDDED agentId,
+      // so a MAC-valid doc sitting at a NON-canonical key (a copied/stale doc an attacker placed under
+      // any store id) would seed the cache for its embedded agent — bypassing the docKey binding that
+      // loadState enforces (loadState only ever reads docKey(agentId)). Only accept a doc found at its
+      // OWN canonical key; a mismatch is a misplaced/planted copy and is rejected (fail-closed).
+      if (id !== docKey(state.agentId)) {
+        rejected += 1;
+        this.log.error({ event: "trust_state_misplaced", storeKey: id, docAgentId: state.agentId }, "trust doc at a non-canonical key (misplaced/planted); ignored");
+        continue;
+      }
       this.cache.set(state.agentId, state);
       this.checked.add(state.agentId);
       loaded += 1;

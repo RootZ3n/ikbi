@@ -43,4 +43,32 @@ test("F2: pnpm/yarn dlx and create (run a fetched remote package) are gated like
 
 test("non-script package commands (install) are not caught by the script gate", () => {
   assert.equal(commandPolicyDenyReason("pnpm", ["install"], terminalPurpose("pnpm install")), undefined);
+  assert.equal(commandPolicyDenyReason("pnpm", ["add", "lodash"], terminalPurpose("pnpm add lodash")), undefined);
+  assert.equal(commandPolicyDenyReason("yarn", ["install"], terminalPurpose("yarn install")), undefined);
+});
+
+test("round-3 #1: an option VALUE cannot hide the run subcommand from the gate", () => {
+  // The bypass: `--dir .` / `--loglevel x` put a positional before `run`, so a first-positional check
+  // saw the value, not `run`. Scanning all tokens closes it.
+  assert.match(commandPolicyDenyReason("pnpm", ["--dir", ".", "run", "evil"], terminalPurpose("pnpm --dir . run evil")) ?? "", /redirect flags|script execution/);
+  assert.match(commandPolicyDenyReason("pnpm", ["--loglevel", "silent", "run", "evil"], terminalPurpose("x")) ?? "", /script execution is allowed only/);
+  assert.match(commandPolicyDenyReason("npm", ["--prefix", ".", "run", "evil"], terminalPurpose("x")) ?? "", /redirect flags|script execution/);
+});
+
+test("round-3 #1: dir/config redirect flags are denied outright (worktree escape)", () => {
+  assert.match(commandPolicyDenyReason("pnpm", ["--dir", "/etc", "install"], terminalPurpose("x")) ?? "", /redirect flags/);
+  assert.match(commandPolicyDenyReason("yarn", ["--cwd", "/tmp", "install"], terminalPurpose("x")) ?? "", /redirect flags/);
+});
+
+test("round-3 #1: yarn IMPLICIT script + npm run-script/init are gated", () => {
+  assert.match(commandPolicyDenyReason("yarn", ["build"], terminalPurpose("yarn build")) ?? "", /script execution is allowed only/);
+  assert.match(commandPolicyDenyReason("yarn", ["evil"], terminalPurpose("yarn evil")) ?? "", /script execution is allowed only/);
+  assert.match(commandPolicyDenyReason("npm", ["run-script", "evil"], terminalPurpose("x")) ?? "", /script execution is allowed only/);
+  assert.match(commandPolicyDenyReason("npm", ["init", "evil"], terminalPurpose("x")) ?? "", /script execution is allowed only/);
+  // a verifier check via yarn still passes (trusted purpose bypasses the gate)
+  assert.equal(commandPolicyDenyReason("yarn", ["test"], "verifier check: test"), undefined);
+});
+
+test("round-3 #2: `ikbi fix` / server-fix use `fix check:` — a legitimate trusted prefix", () => {
+  assert.equal(commandPolicyDenyReason("pnpm", ["test"], "fix check: pnpm test"), undefined, "fix-mode checks are allowed");
 });

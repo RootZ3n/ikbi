@@ -138,7 +138,7 @@ export class WorkspaceManager {
     delete this.initPromise;
   }
 
-  private async doPreload(): Promise<number> {
+  private async doPreload(reconcile = true): Promise<number> {
     // A3: build a FRESH view from the durable store, then swap it in — do NOT merely ADD to this.live.
     // An add-only refresh picks up cross-process ADDITIONS (fixing the C-A2 overflow) but never sheds
     // cross-process REMOVALS: when a peer process (the documented CLI+server coexistence) promotes or
@@ -150,6 +150,19 @@ export class WorkspaceManager {
       const rec = await this.store.get(id).catch(() => undefined);
       if (rec === undefined) continue;
       if (rec.state === "promoting") {
+        // Codex round-3 #4: reconciling a `promoting` record REVERTS/duplicates a promote — safe ONLY for a
+        // CRASHED promote, never a LIVE one. Two guards: (a) never reconcile during an ALLOCATE bound-
+        // refresh (`reconcile` = false); (b) never reconcile a promote whose OWNER is still alive — a
+        // peer's in-flight cross-process promote (its ws/branch lock is in-process, so this process holds
+        // no lock on it). Only a provably-dead owner (crash) is reconciled; a live/unverifiable owner is
+        // counted as an active slot and left untouched. A legacy record with no owner stamp keeps the old
+        // reconcile-on-boot behavior.
+        const ownerStamped = rec.ownerPid !== undefined && rec.ownerHost !== undefined;
+        const ownerGone = ownerStamped ? this.isOwnerDead(rec) : true;
+        if (!reconcile || !ownerGone) {
+          rebuilt.set(id, rec);
+          continue;
+        }
         await this.reconcilePromoting(rec);
         const after = await this.store.get(id).catch(() => undefined);
         if (after && (after.state === "allocated" || after.state === "allocating")) rebuilt.set(id, after);
@@ -181,8 +194,9 @@ export class WorkspaceManager {
       // cross-process file lock — and deciding the bound on that stale count let two processes each pass a
       // max-1 gate and overflow (the lock serialized the WRITES but not the DECISION). A fresh read here
       // always sees the other process's just-persisted record, so the bound decision uses shared state.
+      // reconcile=false (Codex round-3): a bound-refresh must NOT reconcile a peer's in-flight promote.
       this.invalidatePreloadCache();
-      await this.preload();
+      await this.doPreload(false);
       if (this.live.size >= this.max) {
         // SELF-HEAL: a crashed/killed run can strand its workspace in `allocated`, leaking the
         // bound forever (no terminal transition, so `clean`/`reclaim` never reach it). Before
