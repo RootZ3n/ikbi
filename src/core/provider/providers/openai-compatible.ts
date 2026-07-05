@@ -284,7 +284,7 @@ function parseToolCallDeltas(raw: readonly unknown[], provider: string): ToolCal
  */
 function parseStreamChunk(parsed: unknown, provider: string): StreamDelta {
   if (!isRecord(parsed)) throw badResponse(provider, "stream chunk is not an object");
-  const out: { content?: string; toolCalls?: ToolCallDelta[]; finishReason?: FinishReason; usage?: TokenUsage } = {};
+  const out: { content?: string; reasoning?: string; toolCalls?: ToolCallDelta[]; finishReason?: FinishReason; usage?: TokenUsage } = {};
   // Usage commonly arrives on a trailing chunk whose `choices` is empty (stream_options.include_usage).
   if (isRecord(parsed.usage)) out.usage = parseUsage(parsed.usage, provider);
   const choices = parsed.choices;
@@ -305,6 +305,11 @@ function parseStreamChunk(parsed: unknown, provider: string): StreamDelta {
         const tcs = parseToolCallDeltas(delta.tool_calls, provider);
         if (tcs.length > 0) out.toolCalls = tcs;
       }
+      // DeepSeek-R1 / MiMo-style reasoning streams as `reasoning_content` (distinct from content). The
+      // non-streaming path already maps it; without this the STREAMED path drops all reasoning — and a
+      // long reasoning-only phase yields zero content deltas (compounding the idle-stall risk).
+      const rc = delta.reasoning_content;
+      if (typeof rc === "string" && rc.length > 0) out.reasoning = rc;
     }
     if (choice.finish_reason !== undefined && choice.finish_reason !== null) {
       out.finishReason = mapFinishReason(choice.finish_reason);

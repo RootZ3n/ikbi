@@ -205,6 +205,10 @@ function toAnthropicPayload(messages: readonly ModelMessage[]): {
       if (m.content.length > 0) blocks.push({ type: "text", text: m.content });
       if (m.toolCalls !== undefined) {
         for (const tc of m.toolCalls) {
+          // Replaying a PRIOR turn's tool call: Anthropic requires `input` to be valid JSON. If a
+          // historical call's arguments are unparseable, {} is the only safe fallback — the tool has
+          // ALREADY run (this is context replay, not execution), and failing loud here would break the
+          // whole conversation over stale history. Deliberate, not a silent data bug.
           let input: unknown = {};
           try {
             input = tc.arguments.length > 0 ? JSON.parse(tc.arguments) : {};

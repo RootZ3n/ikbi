@@ -11,7 +11,8 @@
  * REQUIRED but no runnable full checks can be derived, the plan is BLOCKED (status:"blocked" + a
  * non-runnable blocking marker) — it must NEVER yield a passable empty full stage.
  *
- * @status dormant (library-only); nothing executes or wires this yet.
+ * @status PRODUCTION-WIRED — the hardened default. The verifier runs the ladder when
+ *   IKBI_VERIFY=ladder or via the production mode resolution (see verifier.ts / worker-model/modes).
  */
 
 import type { ProjectIndexData } from "../project-index/index.js";

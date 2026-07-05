@@ -73,12 +73,14 @@ const FAMILY_PATTERNS: ReadonlyArray<{ readonly match: RegExp; readonly caps: Mo
   { match: /mimo/i, caps: { context_window: 32_768, supports_tools: true, reasoning_level: "medium", speed_class: "fast" } },
   { match: /deepseek.*(reason|r1)/i, caps: { context_window: 65_536, supports_tools: false, reasoning_level: "high", speed_class: "slow" } },
   { match: /deepseek/i, caps: { context_window: 65_536, supports_tools: true, reasoning_level: "medium", speed_class: "medium" } },
-  { match: /gpt-4o|gpt-4\.1|o[134]/i, caps: { context_window: 128_000, supports_tools: true, reasoning_level: "high", speed_class: "medium" } },
+  // `o[134]` is ANCHORED (\bo[134]\b): unanchored, it matched "o1/o3/o4" as a substring of any id
+  // (e.g. a custom "yolo3-*") and mis-profiled it as a 128k OpenAI reasoning model.
+  { match: /gpt-4o|gpt-4\.1|\bo[134]\b/i, caps: { context_window: 128_000, supports_tools: true, reasoning_level: "high", speed_class: "medium" } },
   // Frontier LOGICAL ids used in the roster (opus-4.8, sonnet-4.6) don't contain the word "claude",
   // so they must be classified by family here — otherwise they'd fall through to FALLBACK
   // (supports_tools:false, ctx 8192), forcing text-tool emulation and an 8k window on a 200k model.
   { match: /(^|[^a-z])(opus|sonnet)[-.]?4/i, caps: { context_window: 200_000, supports_tools: true, reasoning_level: "high", speed_class: "medium", supports_thinking: true } },
-  { match: /haiku/i, caps: { context_window: 200_000, supports_tools: true, reasoning_level: "medium", speed_class: "fast" } },
+  { match: /haiku/i, caps: { context_window: 200_000, supports_tools: true, reasoning_level: "medium", speed_class: "fast", supports_thinking: true } },
   { match: /(claude-)?(opus|sonnet)/i, caps: { context_window: 200_000, supports_tools: true, reasoning_level: "high", speed_class: "medium", supports_thinking: true } },
   { match: /claude/i, caps: { context_window: 200_000, supports_tools: true, reasoning_level: "high", speed_class: "medium" } },
   { match: /gpt-5/i, caps: { context_window: 200_000, supports_tools: true, reasoning_level: "high", speed_class: "medium" } },

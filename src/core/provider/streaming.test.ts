@@ -79,6 +79,51 @@ test("invokeStream parses content deltas, finish reason, and trailing usage", as
   assert.equal(r.toolCalls.length, 0);
 });
 
+test("B5: tool calls present with finish_reason 'stop' are still treated as a tool round", async () => {
+  // A nonconforming backend reports "stop" while emitting a tool call. The action must NOT be dropped.
+  const acc = new StreamAccumulator();
+  acc.push({ toolCalls: [{ index: 0, id: "c1", name: "read_file", arguments: '{"path":"a.ts"}' }] });
+  acc.push({ finishReason: "stop" });
+  const r = acc.result();
+  assert.equal(r.finishReason, "tool_calls", "any emitted tool call ⇒ finishReason inferred as tool_calls");
+  assert.equal(r.toolCalls.length, 1);
+  assert.equal(r.toolCalls[0]!.name, "read_file");
+});
+
+test("B6: streamed reasoning_content is captured (not dropped)", async () => {
+  const chunks = [
+    `data: {"choices":[{"delta":{"reasoning_content":"thinking..."}}]}\n\n`,
+    `data: {"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]}\n\n`,
+    `data: [DONE]\n\n`,
+  ];
+  const p = new OpenAICompatibleProvider({ id: "mimo", baseUrl: "https://x/v1", apiKey: "k", fetchImpl: streamFetch(chunks) });
+  const acc = new StreamAccumulator();
+  for (const d of await collect(await p.invokeStream(invocation()))) acc.push(d);
+  const r = acc.result();
+  assert.equal(r.content, "answer");
+  assert.equal(r.reasoning, "thinking...", "reasoning_content is accumulated on the streamed path");
+});
+
+test("B7: two distinct calls mis-indexed to 0 (separate chunks, no index) do NOT collide", async () => {
+  const acc = new StreamAccumulator();
+  // Both complete calls arrive without an explicit index → both fall back to 0.
+  acc.push({ toolCalls: [{ index: 0, id: "c1", name: "read_file", arguments: '{"path":"a"}' }] });
+  acc.push({ toolCalls: [{ index: 0, id: "c2", name: "write_file", arguments: '{"path":"b"}' }] });
+  const r = acc.result();
+  assert.equal(r.toolCalls.length, 2, "the differing id routes the second call to a fresh slot");
+  assert.deepEqual(r.toolCalls.map((c) => c.name).sort(), ["read_file", "write_file"]);
+  assert.equal(r.toolCalls.find((c) => c.id === "c2")?.arguments, '{"path":"b"}', "arguments are not concatenated across calls");
+});
+
+test("B7: genuine fragments of ONE call (same index, continued args) still merge", async () => {
+  const acc = new StreamAccumulator();
+  acc.push({ toolCalls: [{ index: 0, id: "c1", name: "read_file", arguments: '{"pa' }] });
+  acc.push({ toolCalls: [{ index: 0, arguments: 'th":"a"}' }] });
+  const r = acc.result();
+  assert.equal(r.toolCalls.length, 1, "same-index fragments assemble into one call");
+  assert.equal(r.toolCalls[0]!.arguments, '{"path":"a"}');
+});
+
 test("invokeStream tolerates frames split across network chunks", async () => {
   // The same two-frame payload, but sliced mid-frame and mid-newline.
   const chunks = [`data: {"choices":[{"delta":{"con`, `tent":"AB"}}]}\n\ndata: {"choices":[{"delta":{"content":"CD"}}]}`, `\n\ndata: [DONE]\n\n`];

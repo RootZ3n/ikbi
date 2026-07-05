@@ -39,6 +39,9 @@ export class StreamAccumulator {
   /** Tool-call fragments keyed by their streaming `index`, assembled in first-seen order. */
   private readonly parts = new Map<number, ToolCallParts>();
   private readonly order: number[] = [];
+  /** Synthetic index counter for mis-indexed distinct calls (B7) — starts high to avoid colliding
+   *  with a backend's real 0-based indices. */
+  private synthetic = 1_000_000;
 
   /** Fold one delta into the running state. */
   push(delta: StreamDelta): void {
@@ -49,11 +52,21 @@ export class StreamAccumulator {
     if (delta.usage !== undefined) this.usage = delta.usage;
     if (delta.toolCalls !== undefined) {
       for (const tc of delta.toolCalls) {
-        let acc = this.parts.get(tc.index);
+        // B7: a delta carrying an id that DIFFERS from the id already accumulated at this index is a
+        // DISTINCT call the backend mis-indexed (e.g. two complete calls sent in separate chunks both
+        // WITHOUT an explicit index → both fall back to 0). Route it to a fresh slot instead of merging,
+        // which would overwrite the name and concatenate two unrelated argument blobs into one garbled
+        // call executed under the wrong name. A normal fragment continuation (same id, or no id) merges.
+        let idx = tc.index;
+        const existing = this.parts.get(idx);
+        if (existing?.id !== undefined && tc.id !== undefined && tc.id !== existing.id) {
+          idx = this.synthetic++;
+        }
+        let acc = this.parts.get(idx);
         if (acc === undefined) {
           acc = { name: "", arguments: "" };
-          this.parts.set(tc.index, acc);
-          this.order.push(tc.index);
+          this.parts.set(idx, acc);
+          this.order.push(idx);
         }
         if (tc.id !== undefined) acc.id = tc.id;
         if (tc.name !== undefined) acc.name = tc.name;
@@ -73,9 +86,13 @@ export class StreamAccumulator {
       .map((idx) => this.parts.get(idx))
       .filter((v): v is ToolCallParts => v !== undefined && v.name.length > 0)
       .map((v, i) => ({ id: v.id ?? `call_${i}`, name: v.name, arguments: v.arguments }));
-    // Some providers omit finish_reason on the tool-call chunk; infer it when calls were emitted.
+    // Some providers omit OR MISREPORT finish_reason on the tool-call chunk — "unknown", or even
+    // "stop" with tool calls present (older Ollama, some gateways/vLLM). If ANY tool call was emitted
+    // the model's intent IS a tool call, so infer "tool_calls" regardless of the raw reason — otherwise
+    // the builder/chat loops (which key on finishReason === "tool_calls") silently DROP the action and
+    // treat it as a bare stop ("the harness, not the model" failure).
     const finishReason: FinishReason =
-      this.finishReason === "unknown" && toolCalls.length > 0 ? "tool_calls" : this.finishReason;
+      toolCalls.length > 0 && this.finishReason !== "tool_calls" ? "tool_calls" : this.finishReason;
     return {
       content: this.content,
       ...(this.reasoning.length > 0 ? { reasoning: this.reasoning } : {}),

@@ -379,9 +379,36 @@ export class ProviderInvoker {
       attempts.push({ provider: route.provider, providerModelId: route.providerModelId, outcome: "success", latencyMs: this.now() - t0 });
       this.log.info({ event: "model_stream_started", model: request.model, provider: route.provider, providerModelId: route.providerModelId, agentId: request.identity.agentId, fellBack: isFallback }, "model stream started");
       try {
-        // Delegation propagates consumer `.return()`/`.throw()` into the provider stream so its
-        // own cleanup (reader cancel) runs; the controller.abort() is belt-and-suspenders.
-        yield* stream;
+        // IDLE WATCHDOG: race each chunk against `timeoutMs`. A provider that stops sending bytes with
+        // the socket open would otherwise hang forever here — no timer armed the controller, so the
+        // flagship REPL could never break out of a stalled stream. On an idle gap we abort the provider
+        // stream (best-effort via the signal) AND break the loop ourselves (robust even if the provider
+        // ignores the signal), failing the call cleanly instead of wedging. Delegation of the consumer's
+        // `.return()` still runs the provider's own cleanup via the iterator return below.
+        const iterator = stream[Symbol.asyncIterator]();
+        try {
+          for (;;) {
+            const nextP = iterator.next();
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            const idle = new Promise<"idle">((resolve) => { timer = setTimeout(() => resolve("idle"), timeoutMs); });
+            let res: IteratorResult<StreamDelta> | "idle";
+            try {
+              res = await Promise.race([nextP, idle]);
+            } finally {
+              if (timer !== undefined) clearTimeout(timer);
+            }
+            if (res === "idle") {
+              nextP.catch(() => { /* abandoned chunk — swallow its eventual rejection */ });
+              controller.abort();
+              this.log.warn({ event: "model_stream_idle_timeout", model: request.model, provider: route.provider, timeoutMs }, "model stream idle — no data within timeout; aborting");
+              throw new ProviderError(`model stream idle for ${timeoutMs}ms (no data) — aborted`, { kind: "timeout", provider: route.provider, retriable: true });
+            }
+            if (res.done) break;
+            yield res.value;
+          }
+        } finally {
+          await iterator.return?.();
+        }
       } finally {
         controller.abort();
       }
