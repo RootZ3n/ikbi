@@ -488,6 +488,24 @@ function isLoopback(host: string): boolean {
   return LOOPBACK_HOSTS.has(host.trim().toLowerCase());
 }
 
+/**
+ * #1 (fail-closed on EXPOSURE): assert it is safe to BIND `bindHost`. A non-loopback bind exposes the
+ * /api surface — which starts real builds and streams receipts (goals, paths, costs) — to the network.
+ * Unlike /chat (which refuses OPEN without IKBI_CHAT_TOKEN), /api runs OPEN when IKBI_API_TOKEN is unset
+ * (deliberate local-single-user trust), which is safe ONLY on loopback. So a public bind additionally
+ * REQUIRES IKBI_API_TOKEN. Called at SERVER STARTUP only (not config load) — a public-bind env must not
+ * break offline commands like `ikbi help`, which expose nothing. Throws when the bind would be unsafe.
+ */
+export function assertBindAuthorized(bindHost: string, env: NodeJS.ProcessEnv = process.env): void {
+  if (isLoopback(bindHost)) return; // loopback: open is fine (local trust)
+  if ((env.IKBI_API_TOKEN ?? "").trim().length === 0) {
+    throw new Error(
+      `Refusing to bind non-loopback host "${bindHost}" without IKBI_API_TOKEN set — the /api surface ` +
+        `(builds + receipts) would be reachable UNAUTHENTICATED. Set IKBI_API_TOKEN, or bind 127.0.0.1.`,
+    );
+  }
+}
+
 function loadConfig(env: NodeJS.ProcessEnv = process.env): IkbiConfig {
   const port = parsePort(env.IKBI_PORT, DEFAULT_PORT);
   const bindHost = (env.IKBI_BIND_HOST ?? DEFAULT_BIND_HOST).trim();

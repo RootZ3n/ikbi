@@ -14,7 +14,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { existsSync } from "node:fs";
 
-import { config } from "../core/config.js";
+import { config, assertBindAuthorized } from "../core/config.js";
 import { log } from "../core/log.js";
 import { trust } from "../core/trust/index.js";
 import { routes } from "./registry.js";
@@ -152,6 +152,9 @@ export async function startServer(options?: { port?: number }) {
   // broken roster surfaces at boot rather than silently degrading every request.
   await trust.preload();
   const port = options?.port ?? config.port;
+  // #1: fail closed if we're about to expose /api on a non-loopback interface with no API token.
+  // Enforced HERE (at bind), not at config load, so offline commands with a public-bind env still run.
+  assertBindAuthorized(config.bindHost);
   await app.listen({ host: config.bindHost, port });
   setReady(true);
   log.info(
