@@ -14,16 +14,33 @@
 
 const PM_COMMANDS = new Set(["npm", "pnpm", "npx", "yarn"]);
 
+/**
+ * Is this purpose from a TRUSTED verifier/check code path (which is permitted to run package scripts),
+ * as opposed to a model-initiated `terminal` command?
+ *
+ * SECURITY (F1): this MUST anchor on a fixed prefix the model cannot produce — it used to be a substring
+ * test `/\b(check|verifier)\b/`, but the `terminal` tool builds its purpose as `builder terminal: <the
+ * model's own command>`, so the model unlocked arbitrary `pnpm run <script>` execution merely by putting
+ * the word "check" in its command line. The legitimate runners use a hardcoded `<role> check:` prefix
+ * (builder `run_checks`, verifier, patchsmith) or `verifier[ladder:...]`; the model's `builder terminal:`
+ * prefix matches NEITHER, so a command's text can no longer forge verifier authority.
+ */
 function isVerifierPurpose(purpose: string | undefined): boolean {
   if (purpose === undefined) return false;
-  return /\b(check|verifier)\b/i.test(purpose);
+  return /^(patchsmith|builder|verifier) check:/i.test(purpose) || /^verifier\[ladder:/i.test(purpose);
 }
 
+/**
+ * Does this run+execute a package script or a fetched remote package (as opposed to installing deps)?
+ * SECURITY (F2): `dlx`/`create` (pnpm/yarn) — like `npx` — DOWNLOAD AND RUN an arbitrary remote package
+ * (and the sandbox runs that class WITH network), so they are strictly more dangerous than `run` yet were
+ * unlisted here and thus allowed unconditionally. They are now gated exactly like `run`/`exec`.
+ */
 function isPackageScriptRun(command: string, args: readonly string[]): boolean {
   if (!PM_COMMANDS.has(command)) return false;
   const first = args.find((a) => !a.startsWith("-"));
   if (command === "npx") return first !== undefined;
-  return first === "run" || first === "test" || first === "start" || first === "exec" || first === "x";
+  return first === "run" || first === "test" || first === "start" || first === "exec" || first === "x" || first === "dlx" || first === "create";
 }
 
 function gitSubcommand(args: readonly string[]): string | undefined {

@@ -164,6 +164,47 @@ test("competitive OFF ⇒ single-workspace path (one allocate), unchanged behavi
   assert.equal(ws.allocated.length, 1, "single mode allocates exactly ONE workspace");
 });
 
+// ── C-A1: injection/policy-taint fail-closed gate for the competitive winner ──
+
+// The TAINTED candidate (ws0) is the only one that PASSES verification, so it is unambiguously the
+// winner — leaving the fail-closed taint gate as the ONLY thing that can stop its promote. ws1 fails.
+function taintedWinnerRoles(taintDetail: Record<string, unknown>): Partial<Record<WorkerRole, RoleFn>> {
+  return {
+    scout: async () => ({ role: "scout", outcome: "success", summary: "s" }),
+    builder: async (ctx: RoleContext) => ({
+      role: "builder", outcome: "success", summary: "b",
+      detail: { toolRounds: 2, filesWritten: ["a.ts"], rejectedToolCalls: [], stopReason: "stop", ...(ctx.workspace.id === "ws0" ? taintDetail : {}) },
+    }),
+    verifier: async (ctx: RoleContext) => ({
+      role: "verifier", outcome: "success", summary: "v",
+      // ws0 passes; ws1 has a failing test ⇒ disqualified ⇒ ws0 is the sole winner.
+      detail: { verdict: ctx.workspace.id === "ws0" ? "pass" : "fail", checks: checks(0, ctx.workspace.id === "ws0" ? 0 : 1, 10) },
+    }),
+  };
+}
+
+test("C-A1: a competitive winner whose build had prompt-injection is NOT promoted (fail-closed)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = compWorkspaces();
+  const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: taintedWinnerRoles({ injectionDetected: true }) }));
+  const r = await orch.run(task, parentCtx);
+  assert.equal(r.promoted, false, "an injected winner must NOT promote");
+  assert.equal(r.outcome, "rejected");
+  assert.deepEqual(ws.promoted, [], "nothing was promoted");
+  assert.match(r.reason ?? "", /injection/i, "the reason names the fail-closed injection gate");
+});
+
+test("C-A1: a competitive candidate that attempted an out-of-policy tool call is NOT promoted", async () => {
+  // Policy taint is ALSO caught upstream (the judge disqualifies a policy-violating candidate); the taint
+  // gate is the backstop. Either way the property holds: a policy-tainted build never promotes.
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = compWorkspaces();
+  const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: taintedWinnerRoles({ policyViolations: ["terminal: pnpm run evil"] }) }));
+  const r = await orch.run(task, parentCtx);
+  assert.equal(r.promoted, false, "a policy-tainted build must NOT promote");
+  assert.deepEqual(ws.promoted, [], "nothing was promoted");
+});
+
 // ── COMPETITIVE WINNER: best promoted, losers discarded, no leak ─────────────
 
 test("competitive: the better candidate wins — winner promoted, loser discarded, no leaked workspace", async () => {

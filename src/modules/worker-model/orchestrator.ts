@@ -696,6 +696,27 @@ interface IntegratorDecision {
  * malformed/non-approving evaluation all fall to DISCARD. Never throws on
  * malformed detail (it is an open `Record<string, unknown>`).
  */
+/**
+ * C-A1 (fail-closed): the injection / policy-taint promote gate must cover EVERY promote path. The
+ * single-run path checks run-global flags; competitive & tournament race independent candidates in
+ * SEPARATE worktrees and only the WINNER promotes — so the winner's OWN role details are the right thing
+ * to inspect (a tainted loser is discarded regardless, and a run-global flag would false-block a clean
+ * winner). Returns a discard reason when the winner's build was injected or attempted an out-of-policy
+ * tool call, else undefined.
+ */
+function winnerTaintReason(roles: readonly RoleResult[]): string | undefined {
+  for (const r of roles) {
+    const d = r.detail as Record<string, unknown> | undefined;
+    if (d?.injectionDetected === true) {
+      return "prompt-injection detected by the neutralization chokepoint during the winning candidate's build (fail-closed — must not promote)";
+    }
+    if (Array.isArray(d?.policyViolations) && d.policyViolations.length > 0) {
+      return "an out-of-policy tool call was attempted during the winning candidate's build (fail-closed — must not promote)";
+    }
+  }
+  return undefined;
+}
+
 function readIntegratorDecision(integ: RoleResult | undefined): IntegratorDecision {
   const deny = (rationale?: string): IntegratorDecision => ({
     promote: false,
@@ -3426,6 +3447,15 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         await recordBuildTrust("rejected", compWorkerSpawned, task.taskId, task.targetRepo, true, reason);
         return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: winnerRoles, workspaceId: retained.retained?.id ?? winner.id, promoted: false, reason: retained.reason, costUsd: runCost() };
       }
+      // C-A1: fail-closed injection/policy-taint gate for the competitive winner (parity with single-run).
+      const compTaint = winnerTaintReason(winnerRoles);
+      if (compTaint !== undefined) {
+        const retained = await retainCompetitiveFailure(compTaint, winner.id);
+        events.publish(workerCompetitiveCompleted.create({ taskId: task.taskId, candidateCount: n, winnerWorkspaceId: winner.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
+        events.publish(workerFailed.create({ taskId: task.taskId, reason: retained.reason, workspaceId: retained.retained?.id ?? winner.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
+        await recordBuildTrust("rejected", compWorkerSpawned, task.taskId, task.targetRepo, false, compTaint); // NOT suppressed — a genuine gate failure
+        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: winnerRoles, workspaceId: retained.retained?.id ?? winner.id, promoted: false, reason: retained.reason, costUsd: runCost() };
+      }
       const promote = await workspaces.promote(winner, {
         evaluation: { approved: true, score: verdict.winner.composite, evaluatorId: "deterministic-judge" },
         governance,
@@ -3605,6 +3635,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       const governanceGrant = autonomyForTier(asTier(parentIdentity.trustTier ?? TRUST_FLOOR, TRUST_FLOOR));
       const governance: PromoteGovernance = await gateWall.evaluate({ grant: governanceGrant, action: { kind: "promote", task: t, results: [...roleResults] }, identity: parentIdentity });
       if (!governance.allow) return { promoted: false, reason: governance.reason ?? "gate-wall denied promotion" };
+      // C-A1: fail-closed injection/policy-taint gate for the tournament winner (parity with single-run).
+      const tourTaint = winnerTaintReason(roleResults);
+      if (tourTaint !== undefined) return { promoted: false, reason: `discard: ${tourTaint}` };
       const result = await workspaces.promote(ws, {
         evaluation: { approved: true, score: composite, evaluatorId: "deterministic-judge" },
         governance,
