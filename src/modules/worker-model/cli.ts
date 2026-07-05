@@ -1340,6 +1340,16 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
         // SINGLE-STEP: run directly.
         result = await orchestrator.run(task, ctx);
       }
+      // BASELINE (drift-prevention's reference): fold THIS run's receipts into the durable,
+      // cumulative per-(agent, operation) success-rate baseline — the reference drift-prevention
+      // compares a recent window against to detect a reliability decline. Without this the baseline
+      // is never written and drift is structurally inert (the value-ablation finding). Best-effort +
+      // idempotent (projectFromReceipts merges via a high-water seq); patternsOnly keeps it to the
+      // aggregate. A failure here must NEVER affect a completed build.
+      try {
+        const { labMemory } = await import("../lab-context-memory/index.js");
+        await labMemory.projectFromReceipts({ identity: ctx.identity, project: targetRepo, patternsOnly: true });
+      } catch { /* baseline update is advisory — never break a completed build */ }
       // Drain progress lines before the summary — time-bounded and best-effort so a stuck
       // subscriber drain can never suppress the result envelope below (a promoted build that
       // prints nothing reads as a failure and invites a duplicate re-run).

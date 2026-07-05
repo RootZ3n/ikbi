@@ -42,3 +42,24 @@ This quantifies the original instinct ("we got lucky without it"): drift-prevent
 reportOnly and baseline-starved. To earn its place it needs the first-class-governor rework — a
 live baseline (persisted patterns) and an intervention policy beyond reportOnly. The graduated
 no-progress governor (commit f7b386c) is the intra-build seed of that.
+
+## Rework — persisted baseline (increment 1, landed)
+
+The root cause of "realistic value ≈ 0" was mechanical: the `pattern` baseline drift reads was
+**never written** — `projectFromReceipts` (the writer) was called nowhere in production, so
+`check()` always found no baseline. Fixed:
+
+1. **Cumulative, prune-proof baseline** — `projectFromReceipts` now MERGES success/failure counts
+   into the existing `pattern` via a per-pattern high-water `lastSeq` (idempotent across
+   re-projection) instead of overwriting from the current query window. The baseline is now the
+   durable *established normal* that survives receipt pruning and can diverge from the recent
+   window (`memory.ts`).
+2. **Wired to build completion** — after every `ikbi build` (success or failure), the run's
+   receipts are folded into the baseline (`worker-model/cli.ts`, `patternsOnly`, best-effort).
+3. **End-to-end proof** — `drift-prevention/baseline-integration.test.ts`: with no baseline drift
+   is silent (the old inert behavior); after projecting a reliable history then collapsing,
+   `drift.check()` DETECTS the decline (baseline 1.0 vs recent 0.0, `major`).
+
+So the value path is now live: drift accumulates a real reference across builds and will fire on a
+genuine reliability decline. Still reportOnly by default (advisory) — turning detection into
+intervention (warn/block policy on the build path) is the next increment.

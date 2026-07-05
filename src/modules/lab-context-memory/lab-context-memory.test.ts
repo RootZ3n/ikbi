@@ -181,6 +181,35 @@ test("pattern projection aggregates success/failure per (agent, project, operati
   assert.equal(pattern?.value.successes, 2);
   assert.equal(pattern?.value.failures, 1);
   assert.equal(pattern?.value.lastOutcome, "success");
+  assert.equal(pattern?.value.lastSeq, 3, "high-water seq is recorded for incremental accumulation");
+});
+
+test("pattern projection ACCUMULATES across projections + is idempotent (durable baseline, not overwrite)", async () => {
+  const { ikbi } = identities();
+  const ms = memStore();
+  // Build 1: 5 successes (seq 1..5). Baseline established at 100%.
+  const list: Receipt[] = [1, 2, 3, 4, 5].map((seq) => receipt({ seq, operation: "build.run", outcome: { status: "success" } }));
+  const rc = fakeReceipts(list);
+  const mem = createLabMemory({ config: cfg(), store: ms.store, receipts: rc.receipts, publish: () => {}, now: () => 1000 });
+  await mem.projectFromReceipts({ identity: ikbi });
+  const p1 = [...ms.m.values()].find((e) => e.kind === "pattern" && e.key === "op-build.run");
+  assert.equal(p1?.value.total, 5);
+  assert.equal(p1?.value.successes, 5);
+
+  // Re-projecting the SAME receipts must NOT double-count (idempotent via lastSeq).
+  await mem.projectFromReceipts({ identity: ikbi });
+  const p1b = [...ms.m.values()].find((e) => e.kind === "pattern" && e.key === "op-build.run");
+  assert.equal(p1b?.value.total, 5, "same receipts re-projected → baseline unchanged");
+
+  // Build 2 appends 3 failures (seq 6..8). Baseline ACCUMULATES: 5 succ + 3 fail = 8 total.
+  list.push(...[6, 7, 8].map((seq) => receipt({ seq, operation: "build.run", outcome: { status: "failure" } })));
+  await mem.projectFromReceipts({ identity: ikbi });
+  const p2 = [...ms.m.values()].find((e) => e.kind === "pattern" && e.key === "op-build.run");
+  assert.equal(p2?.value.total, 8, "baseline accumulated across builds");
+  assert.equal(p2?.value.successes, 5);
+  assert.equal(p2?.value.failures, 3);
+  assert.equal(p2?.value.lastOutcome, "failure");
+  assert.equal(p2?.value.lastSeq, 8);
 });
 
 // ── query scoping ────────────────────────────────────────────────────────────

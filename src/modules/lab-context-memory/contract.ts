@@ -116,4 +116,10 @@ export interface ProjectFromReceiptsOptions {
   readonly project?: string;
   readonly agent?: string;
   readonly fromSeq?: number;
+  /**
+   * Project ONLY the cumulative success/failure `pattern` baselines, skipping the per-receipt
+   * `activity` rows. Used by the build-completion baseline hook — it needs only the drift baseline
+   * (one aggregate per agent/operation), not an activity row per receipt, so it stays cheap.
+   */
+  readonly patternsOnly?: boolean;
 }

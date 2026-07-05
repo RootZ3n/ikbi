@@ -52,6 +52,11 @@ function makeId(project: string, agent: string, kind: MemoryKind, key: string): 
   return `${slug(project)}:${slug(agent)}:${slug(kind)}:${slug(key)}`;
 }
 
+/** Coerce a persisted numeric field (patterns hold counts) to a finite number, else the default. */
+function asCount(v: unknown, dflt: number): number {
+  return typeof v === "number" && Number.isFinite(v) ? v : dflt;
+}
+
 /** Minimal read-seam surface this module needs from the receipt store. */
 interface ReceiptReadSeam {
   query(filter?: ReceiptQuery): Promise<Receipt[]>;
@@ -162,10 +167,13 @@ export function createLabMemory(deps: LabMemoryDeps = {}): LabMemory {
 
     let projected = 0;
     // activity entries — one per receipt, attributed to the RECEIPT's agent (cross-agent).
-    for (const r of found) {
-      const project = r.project ?? "(unscoped)";
-      await upsert({ project, agent: r.identity.agentId, kind: "activity", key: `seq-${r.seq}`, value: redactActivity(r), sourceReceiptSeq: r.seq });
-      projected += 1;
+    // Skipped when patternsOnly (the build-completion baseline hook wants only the drift baseline).
+    if (opts.patternsOnly !== true) {
+      for (const r of found) {
+        const project = r.project ?? "(unscoped)";
+        await upsert({ project, agent: r.identity.agentId, kind: "activity", key: `seq-${r.seq}`, value: redactActivity(r), sourceReceiptSeq: r.seq });
+        projected += 1;
+      }
     }
 
     // pattern entries — success/failure rates per (agent, project, operation).
@@ -178,11 +186,26 @@ export function createLabMemory(deps: LabMemoryDeps = {}): LabMemory {
       groups.set(k, g);
     }
     for (const g of groups.values()) {
-      const total = g.receipts.length;
-      const successes = g.receipts.filter((x) => x.outcome.status === "success").length;
-      const failures = total - successes;
-      const lastOutcome = g.receipts[g.receipts.length - 1]?.outcome.status ?? "unknown";
-      await upsert({ project: g.project, agent: g.agent, kind: "pattern", key: `op-${g.operation}`, value: { operation: g.operation, successes, failures, total, lastOutcome } });
+      // CUMULATIVE baseline: a `pattern` entry is the durable, established success rate for
+      // (agent, project, operation) — it MUST survive receipt pruning and MUST NOT be diluted
+      // by re-projecting the same receipts. So we MERGE only outcomes newer than the pattern's
+      // high-water `lastSeq` into the existing counts (idempotent across repeated projections),
+      // rather than overwriting from the current query window. This is what makes drift's
+      // baseline diverge from its recent-window and detect a real decline.
+      const id = makeId(g.project, g.agent, "pattern", `op-${g.operation}`);
+      const prev = await store.get(id);
+      const pv = (prev?.value ?? {}) as Record<string, unknown>;
+      const prevLastSeq = asCount(pv.lastSeq, -1);
+      const fresh = g.receipts.filter((r) => r.seq > prevLastSeq).sort((a, b) => a.seq - b.seq);
+      if (fresh.length === 0) continue; // nothing new for this operation — baseline unchanged
+      const addSucc = fresh.filter((x) => x.outcome.status === "success").length;
+      const successes = asCount(pv.successes, 0) + addSucc;
+      const failures = asCount(pv.failures, 0) + (fresh.length - addSucc);
+      const lastReceipt = fresh[fresh.length - 1] as Receipt;
+      await upsert({
+        project: g.project, agent: g.agent, kind: "pattern", key: `op-${g.operation}`,
+        value: { operation: g.operation, successes, failures, total: successes + failures, lastOutcome: lastReceipt.outcome.status, lastSeq: lastReceipt.seq },
+      });
       projected += 1;
     }
 
