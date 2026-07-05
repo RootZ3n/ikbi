@@ -621,12 +621,19 @@ const READ_ONLY_PROBE_BINARIES: ReadonlySet<string> = new Set([
  * NOT here and NOT a read-only probe is a benign dev/build tool (tsc, yarn, npx, make, eslint, …) the
  * model improvised: the governor already blocked it with no effect, so it must NOT discard an
  * otherwise-verified build in a trusted-local setup.
+ *
+ * `mv` is deliberately NOT here. Renaming/moving a source file inside the confined worktree is ordinary
+ * build behavior a cheap model naturally reaches for (it has no rename tool, so it improvises `mv a b`);
+ * the governor already blocked it with no effect, and the sandbox + worktree confinement bound any real
+ * move. Tainting a denied `mv` discarded fully-verified builds (the model renamed one file, got denied,
+ * and the whole green tree was thrown away). DATA-DESTROYING tools (rm/rmdir/dd/mkfs/shred) stay — those
+ * are a genuine red flag; a rename is not.
  */
 const DANGEROUS_DENIED_BINARIES: ReadonlySet<string> = new Set([
   "curl", "wget", "ssh", "scp", "sftp", "rsync", "nc", "ncat", "netcat", "telnet", "ftp", "socat",
   "bash", "sh", "zsh", "dash", "ksh", "fish", "csh", "tcsh",
   "sudo", "su", "doas", "pkexec",
-  "rm", "rmdir", "dd", "mkfs", "shred", "chmod", "chown", "chgrp", "mv", "kill", "pkill", "killall",
+  "rm", "rmdir", "dd", "mkfs", "shred", "chmod", "chown", "chgrp", "kill", "pkill", "killall",
   "eval", "exec", "xargs", "chroot", "mount", "umount", "systemctl", "crontab", "at",
 ]);
 

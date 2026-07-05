@@ -32,6 +32,17 @@ test("a blocked DANGEROUS binary still taints (network / shell / privilege / des
   }
 });
 
+test("a blocked `mv` (rename inside the worktree) does NOT taint, but data-destroying tools still do", () => {
+  // REGRESSION: `mv` was grouped with rm/dd/shred and tainted promotion. A cheap builder with no rename
+  // tool improvises `mv a b` to reorganize its OWN files; the governor blocks it (no effect) and the
+  // sandbox bounds any move. One denied `mv` discarded a fully-verified osapa build. Renaming is not a
+  // red flag — data destruction is, so those stay tainting.
+  assert.equal(isPolicyViolation(denied("mv")), false, "a denied rename must not discard a green build");
+  for (const bin of ["rm", "rmdir", "dd", "mkfs", "shred"]) {
+    assert.equal(isPolicyViolation(denied(bin)), true, `${bin} (data-destroying) must still taint`);
+  }
+});
+
 test("a BLOCKED write in a read-only verify pass does not taint (benign, no effect)", () => {
   assert.equal(isPolicyViolation({ tool: "write_file", path: "src/x.ts", error: "write_scope is 'none' — read-only mode" }), false);
 });
