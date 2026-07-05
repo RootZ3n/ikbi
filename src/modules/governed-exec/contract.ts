@@ -38,8 +38,16 @@ export interface ExecRequest {
   readonly args: readonly string[];
   /** Whether to run under sudo — ALWAYS gated regardless of tier. */
   readonly sudo?: boolean;
-  /** Optional human purpose for the audit trail. */
+  /** Optional human purpose for the audit trail (NOT a security signal — see `verifier`). */
   readonly purpose?: string;
+  /**
+   * STRUCTURED AUTHORITY: `true` iff this request originates from a TRUSTED check-runner code path
+   * (the verifier, builder/chat `run_checks`, patchsmith, `ikbi fix`) that is permitted to run package
+   * SCRIPTS (`pnpm test`, etc.). A model-initiated `terminal` command MUST leave this false/absent — the
+   * model supplies only a command string and cannot set this flag, so command TEXT can never grant
+   * script-execution authority (replaces the old, forgeable purpose-prefix parsing). See execution-policy.
+   */
+  readonly verifier?: boolean;
   /** Working directory for the command. */
   readonly cwd?: string;
   /**

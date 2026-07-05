@@ -15,27 +15,6 @@
 const PM_COMMANDS = new Set(["npm", "pnpm", "npx", "yarn"]);
 
 /**
- * Is this purpose from a TRUSTED verifier/check code path (which is permitted to run package scripts),
- * as opposed to a model-initiated `terminal` command?
- *
- * SECURITY (F1): this MUST anchor on a fixed prefix the model cannot produce — it used to be a substring
- * test `/\b(check|verifier)\b/`, but the `terminal` tool builds its purpose as `builder terminal: <the
- * model's own command>`, so the model unlocked arbitrary `pnpm run <script>` execution merely by putting
- * the word "check" in its command line. The legitimate runners use a hardcoded `<role> check:` prefix
- * (builder `run_checks`, verifier, patchsmith) or `verifier[ladder:...]`; the model's `builder terminal:`
- * prefix matches NEITHER, so a command's text can no longer forge verifier authority.
- */
-function isVerifierPurpose(purpose: string | undefined): boolean {
-  if (purpose === undefined) return false;
-  // The COMPLETE set of trusted check-runner prefixes (builder run_checks, verifier, patchsmith, and the
-  // CHAT REPL's run_checks — session.ts `chat check:`) plus the ladder executor. `chat` MUST be here: the
-  // chat REPL's default `test` check is `pnpm test`, which the package-script gate would otherwise DENY on
-  // every session (regression from the F1 anchoring). None of these are forgeable — the model's terminal
-  // purpose is `builder terminal: <cmd>`, which matches no trusted prefix.
-  return /^(patchsmith|builder|verifier|chat|fix) check:/i.test(purpose) || /^verifier\[ladder:/i.test(purpose);
-}
-
-/**
  * Package-manager subcommands that RUN a script or a FETCHED remote package (vs installing declared deps).
  * Any of these = model-authored or remote code execution — gated to trusted check-runners only.
  * SECURITY (F2): `dlx`/`create` DOWNLOAD AND RUN a remote package (sandbox runs that class WITH network).
@@ -117,8 +96,16 @@ function findHasExecOrWrite(args: readonly string[]): boolean {
  *
  * The policy is STRICTER than the binary allowlist: even an allowlisted binary
  * (e.g. `git`) can be denied for dangerous subcommands/flags.
+ *
+ * AUTHORITY (structural fix): whether the caller may run a package SCRIPT is decided by the STRUCTURED
+ * `opts.verifier` flag — a boolean the trusted check-runner code paths set on their ExecRequest/gated
+ * action, and which a model-initiated `terminal` command CANNOT set (the model only supplies a command
+ * string). This replaces the old, fragile approach of parsing a free-text `purpose` for a trusted prefix,
+ * which (a) let a model forge authority by putting "check" in its command and (b) kept silently breaking
+ * legitimate check paths whenever a new prefix wasn't allow-listed. A command's TEXT can no longer grant
+ * itself script-execution authority.
  */
-export function commandPolicyDenyReason(command: string, args: readonly string[], purpose?: string): string | undefined {
+export function commandPolicyDenyReason(command: string, args: readonly string[], opts?: { verifier?: boolean }): string | undefined {
   if (command === "git") {
     // Deny ALL git flags that redirect the working directory, config, or exec path.
     // -c sets git config for one invocation (including alias.* which runs shell commands).
@@ -139,7 +126,7 @@ export function commandPolicyDenyReason(command: string, args: readonly string[]
   if (PM_COMMANDS.has(command) && pmRedirectFlag(args)) {
     return `${command} directory/config redirect flags are not allowed (worktree escape)`;
   }
-  if (isPackageScriptRun(command, args) && !isVerifierPurpose(purpose)) {
+  if (isPackageScriptRun(command, args) && opts?.verifier !== true) {
     return `${command} script execution is allowed only for verifier/check runs`;
   }
   return undefined;

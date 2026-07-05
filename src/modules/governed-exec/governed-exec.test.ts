@@ -172,7 +172,7 @@ test("package-manager scripts are allowed for verifier/check purposes", async ()
   const gate = capturingGate();
   const ge = createGovernedExec({ config: cfg(["pnpm"]), gateWall: gate.gateWall, execFile: ex.fn, receipts: fakeReceipts().receipts, publish: () => {} });
 
-  const r = await ge.run({ parentCtx: makeCtx("verified"), command: "pnpm", args: ["test"], purpose: "verifier check: test" });
+  const r = await ge.run({ parentCtx: makeCtx("verified"), command: "pnpm", args: ["test"], verifier: true, purpose: "verifier check: test" });
   assert.equal(r.executed, true);
   assert.equal(ex.calls.length, 1);
   assert.equal(gate.inputs.length, 1);

@@ -1456,6 +1456,7 @@ export class ChatSession {
         command: c.command,
         args: [...c.args],
         cwd: this.worktree,
+        verifier: true, // chat run_checks: trusted check-runner (runs the PROJECT's checks, not model input)
         purpose: `chat check: ${c.name}`,
         timeoutMs: checkTimeoutMs,
       });

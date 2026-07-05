@@ -109,7 +109,7 @@ export function createGateWall(deps: GateWallDeps = {}): GateWall {
       governance = { allow: false, reason: "gate-wall disabled — denying (fail-closed)", gateId };
     } else if (audit.kind === "exec") {
       const action = input.action;
-      const reason = action.kind === "exec" ? commandPolicyDenyReason(action.command, action.args, action.purpose) : undefined;
+      const reason = action.kind === "exec" ? commandPolicyDenyReason(action.command, action.args, { verifier: action.verifier === true }) : undefined;
       if (reason !== undefined) governance = { allow: false, reason: `${reason} — denying (fail-closed)`, gateId };
       else if (input.grant.requiresApproval) {
         governance = {

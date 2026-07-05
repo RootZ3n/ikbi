@@ -304,7 +304,7 @@ export class TaskService {
     const { governedExec } = await import("../modules/governed-exec/index.js");
     const timeoutMs = resolveCheckTimeoutMs();
     const runCheck = async (repoPath: string, check: FixCheckCommand) => {
-      const res = await governedExec.run({ parentCtx: ctx, command: check.command, args: [...check.args], cwd: repoPath, purpose: `fix check: ${check.command} ${check.args.join(" ")}`.trim(), timeoutMs });
+      const res = await governedExec.run({ parentCtx: ctx, command: check.command, args: [...check.args], cwd: repoPath, verifier: true, purpose: `fix check: ${check.command} ${check.args.join(" ")}`.trim(), timeoutMs });
       const output = `${res.stdoutTail ?? ""}${res.stderrTail ?? ""}`;
       if (res.denied === true) return { exitCode: 126, output: `GOVERNED-EXEC DENIED: ${res.reason ?? "command refused"}\n${output}` };
       if (!res.executed) return { exitCode: 1, output: `check did not execute: ${res.reason ?? "unknown"}\n${output}` };

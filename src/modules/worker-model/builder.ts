@@ -1178,7 +1178,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         return `ERROR: ${detail} — quote the argument correctly and retry.`;
       }
       const binary = tokens[0];
-      const policyDeny = binary !== undefined ? commandPolicyDenyReason(binary, tokens.slice(1), `builder terminal: ${cmd.slice(0, 120)}`) : undefined;
+      const policyDeny = binary !== undefined ? commandPolicyDenyReason(binary, tokens.slice(1), { verifier: false }) : undefined; // model terminal
       if (policyDeny !== undefined) {
         rejectedToolCalls.push({ tool: "terminal", path: cmd.slice(0, 100), error: policyDeny });
         return `DENIED: ${policyDeny}`;
@@ -1441,6 +1441,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
           command: c.command,
           args: [...c.args],
           cwd: ctx.workspace.path,
+          verifier: true, // run_checks: trusted check-runner (runs the PLANNED checks, not model input)
           purpose: `builder check: ${c.name}`,
           timeoutMs: checkTimeoutMs,
         });

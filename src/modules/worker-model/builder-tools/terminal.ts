@@ -287,7 +287,7 @@ export async function runTerminal(
       return `DENIED: path '${escape}' escapes the managed workspace — read tools are confined to the worktree`;
     }
   }
-  const policyDeny = commandPolicyDenyReason(binary, rest, `builder terminal: ${command.slice(0, 120)}`);
+  const policyDeny = commandPolicyDenyReason(binary, rest, { verifier: false }); // model terminal — never a check-runner
   if (policyDeny !== undefined) return `DENIED: ${policyDeny}`;
   // Model-facing timeout: a daily driver must be able to run a slow install / test suite past
   // the governed default. Clamp to a hard ceiling so a wedged command can never run unbounded

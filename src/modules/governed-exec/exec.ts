@@ -328,14 +328,16 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
     if (!allowlist.has(command)) return deny(`binary "${command}" is not on the allowlist`);
     const evalDeny = forbiddenEvalReason(command, args);
     if (evalDeny !== undefined) return deny(evalDeny);
-    const policyDeny = commandPolicyDenyReason(command, args, request.purpose);
+    const policyDeny = commandPolicyDenyReason(command, args, { verifier: request.verifier === true });
     if (policyDeny !== undefined) return deny(policyDeny);
 
-    // (4) the caller's grant. (5) GATE-WALL — sudo is part of the gated action.
+    // (4) the caller's grant. (5) GATE-WALL — sudo is part of the gated action. The `verifier` authority
+    // flag is carried INTO the gated action so the gate-wall's own policy re-check agrees (both layers
+    // read the structured flag, never the free-text purpose).
     const grant = autonomyForTier(asTier(identity.trustTier ?? TRUST_FLOOR, TRUST_FLOOR));
     const governance = await gateWall.evaluate({
       grant,
-      action: { kind: "exec", command, args, sudo, ...(request.purpose !== undefined ? { purpose: request.purpose } : {}) },
+      action: { kind: "exec", command, args, sudo, verifier: request.verifier === true, ...(request.purpose !== undefined ? { purpose: request.purpose } : {}) },
       identity,
     });
     if (!governance.allow) return deny(governance.reason ?? "gate-wall denied the command", false);
