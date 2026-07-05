@@ -194,15 +194,17 @@ test("C-A1: a competitive winner whose build had prompt-injection is NOT promote
   assert.match(r.reason ?? "", /injection/i, "the reason names the fail-closed injection gate");
 });
 
-test("C-A1: a competitive candidate that attempted an out-of-policy tool call is NOT promoted", async () => {
-  // Policy taint is ALSO caught upstream (the judge disqualifies a policy-violating candidate); the taint
-  // gate is the backstop. Either way the property holds: a policy-tainted build never promotes.
+test("C-A1: a competitive candidate that attempted a PREVENTED out-of-policy call is STILL promotable (judge by effect)", async () => {
+  // JUDGE BY EFFECT, NOT INTENT: a blocked (prevented) tool attempt had no effect — the governor
+  // stopped it. ws0 is verifier-green with a blocked `pnpm run evil`; it is a recorded warning + a
+  // ranking penalty, NOT a disqualifier or a discard, so the green winner still promotes. (The INJECTION
+  // gate — a distinct, content-hijack defense — is unaffected and still blocks; see the sibling test.)
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
   const ws = compWorkspaces();
   const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: taintedWinnerRoles({ policyViolations: ["terminal: pnpm run evil"] }) }));
   const r = await orch.run(task, parentCtx);
-  assert.equal(r.promoted, false, "a policy-tainted build must NOT promote");
-  assert.deepEqual(ws.promoted, [], "nothing was promoted");
+  assert.equal(r.promoted, true, "a prevented attempt does not block a verifier-green competitive winner");
+  assert.deepEqual(ws.promoted, ["ws0"], "the green winner promoted despite the blocked attempt");
 });
 
 // ── COMPETITIVE WINNER: best promoted, losers discarded, no leak ─────────────

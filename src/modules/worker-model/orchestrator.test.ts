@@ -431,7 +431,7 @@ test("INJECTION SIGNAL: a chokepoint block on a tool result is recorded in the r
   assert.match(result.reason ?? "", /injection/i, "the discard reason names the injection");
 });
 
-test("POLICY TAINT: attempt 1 taints (out-of-policy call) then a clean retry — the tainted build must NOT promote", async () => {
+test("POLICY TAINT: a PREVENTED out-of-policy attempt does NOT discard a verified-green build (judge by effect)", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
   const ws = fakeWorkspaces(true);
   const cap = capturingRoles();
@@ -440,21 +440,22 @@ test("POLICY TAINT: attempt 1 taints (out-of-policy call) then a clean retry —
     ...cap.roles,
     builder: async (ctx: RoleContext): Promise<RoleResult> => {
       attempt += 1;
-      // Attempt 1: writes files AND attempts an out-of-policy tool call (taint), then fails → triggers retry.
+      // Attempt 1: writes files AND attempts a BLOCKED out-of-policy tool call (a prevented attempt —
+      // the governor rejected it, no effect), then fails → triggers a retry.
       if (!ctx.task.goal.includes("[retry]") && !ctx.task.goal.includes("[escalation]")) {
-        return { role: "builder", outcome: "failure", summary: "flailed after an out-of-policy call", detail: { filesWritten: ["a.ts"], policyViolations: [{ tool: "terminal", error: "blocked: pnpm run deploy" }], toolFormatErrors: [1, 2] } };
+        return { role: "builder", outcome: "failure", summary: "flailed after a blocked call", detail: { filesWritten: ["a.ts"], policyViolations: [{ tool: "terminal", error: "blocked: pnpm run deploy" }], toolFormatErrors: [1, 2] } };
       }
-      // The retry finishes CLEAN (no policy violations) — but the earlier taint must still block promote.
+      // The retry finishes CLEAN and green. EFFECT, NOT INTENT: the earlier PREVENTED attempt (blocked,
+      // no effect) is a recorded warning + learning signal, NOT a discard — the verified-green build promotes.
       return { role: "builder", outcome: "success", summary: "clean retry", detail: { filesWritten: ["a.ts"], policyViolations: [] } };
     },
   };
   const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces }));
   const result = await orch.run({ taskId: "t-taint", targetRepo: "/repo", goal: "do the thing" }, parentCtx);
 
-  assert.ok(attempt >= 2, "the retry path ran (attempt 1 tainted+failed, then a clean retry)");
-  assert.equal(result.promoted, false, "a clean retry cannot launder attempt 1's policy taint — fail-closed");
-  assert.equal(ws.calls.promote, 0, "nothing promoted");
-  assert.match(result.reason ?? "", /out-of-policy|taint/i, "the discard reason names the taint");
+  assert.ok(attempt >= 2, "the retry path ran (attempt 1 attempted a blocked call + failed, then a clean retry)");
+  assert.equal(result.promoted, true, "a PREVENTED attempt does not discard a verified-green build — it promotes");
+  assert.equal(ws.calls.promote, 1, "the green build promoted");
 });
 
 test("ISSUE 1: a builder TIMEOUT does NOT feed the trust signal (no demotion) and writes an explicit suppression receipt", async () => {
@@ -684,25 +685,28 @@ test("AUTO-VERIFY RESCUE: NOT triggered when checks already ran, or when no file
   }
 });
 
-// ── AUTO-VERIFY RESCUE: policy violation blocks rescue ─────────────────────
-test("AUTO-VERIFY RESCUE: a builder with policy violations is NOT rescued even on protocol termination", async () => {
+// ── AUTO-VERIFY RESCUE: a PREVENTED policy attempt does NOT block rescue (judge by effect) ─────────
+test("AUTO-VERIFY RESCUE: a PREVENTED (blocked) policy attempt does NOT block rescue — the governor already prevented it", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
   const cap = capturingRoles();
   let verifierRuns = 0;
   const roles: Partial<Record<WorkerRole, RoleFn>> = {
     ...cap.roles,
+    // The model reached for a destructive command; the governor BLOCKED it (a prevented attempt — no
+    // effect). Judge by effect, not intent: this is a recorded warning, not a reason to discard work
+    // the verifier passes on the real worktree.
     builder: async () => ({
       role: "builder", outcome: "failure", summary: "no_progress",
-      detail: { stopReason: "no_progress", filesWritten: ["a.ts"], checksRuns: 0, rejectedToolCalls: [], policyViolations: [{ kind: "unsafe_command", command: "rm -rf /" }] },
+      detail: { stopReason: "no_progress", filesWritten: ["a.ts"], checksRuns: 0, rejectedToolCalls: [], policyViolations: [{ tool: "terminal", error: "blocked: rm -rf /" }] },
     }),
     verifier: async (ctx) => { verifierRuns += 1; return cap.roles.verifier!(ctx); },
   };
   const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles }));
   const result = await orch.run(task, parentCtx);
 
-  assert.equal(result.roles.find((r) => r.role === "builder")?.outcome, "failure", "policy violation blocks rescue");
-  assert.equal(verifierRuns, 0, "no rescue verifier when policy violations exist");
-  assert.equal(result.promoted, false, "nothing with policy violations promotes");
+  assert.ok(verifierRuns >= 1, "the rescue verifier runs despite the prevented (blocked) attempt");
+  assert.equal(result.roles.find((r) => r.role === "builder")?.outcome, "success", "the verified-green build is rescued");
+  assert.equal(result.promoted, true, "a prevented attempt does not block promotion of verified work");
 });
 
 // ── AUTO-VERIFY RESCUE: receipt stamps rescue details ─────────────────────

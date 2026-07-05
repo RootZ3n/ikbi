@@ -59,15 +59,19 @@ test("a NO-WORK candidate (0 files, 0 diff) is disqualified — a do-nothing can
   assert.equal(r2.ranking.find((x) => x.workspaceId === "modified")?.disqualified, false, "0 files but a real diff is real work");
 });
 
-test("testsPass:false and rejectedToolCalls>0 each disqualify (override reasons surfaced)", () => {
+test("testsPass:false disqualifies; a PREVENTED (rejected) tool call does NOT — it ranks lower, not out", () => {
   const r = newJudge().judge([
     cand({ workspaceId: "a", testsPass: false }),
     cand({ workspaceId: "b", rejectedToolCalls: 2 }),
     cand({ workspaceId: "c" }),
   ]);
+  // The clean candidate wins; "b" (a blocked attempt) is NOT disqualified but loses the tie to "c".
   assert.equal(r.winner?.workspaceId, "c");
+  // A real failure (tests) still disqualifies.
   assert.match(r.ranking.find((x) => x.workspaceId === "a")?.overrideReason ?? "", /tests/);
-  assert.match(r.ranking.find((x) => x.workspaceId === "b")?.overrideReason ?? "", /rejected/);
+  // A prevented attempt is a recorded warning + ranking penalty, NOT a disqualification (judge by effect).
+  const b = r.ranking.find((x) => x.workspaceId === "b");
+  assert.notEqual(b?.disqualified, true, "a prevented (blocked) tool call does not disqualify a candidate");
 });
 
 // ── LAYER 2: weighted ranking + composite math ───────────────────────────────

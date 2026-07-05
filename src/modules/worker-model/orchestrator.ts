@@ -712,9 +712,10 @@ function winnerTaintReason(roles: readonly RoleResult[]): string | undefined {
     if (d?.injectionDetected === true) {
       return "prompt-injection detected by the neutralization chokepoint during the winning candidate's build (fail-closed — must not promote)";
     }
-    if (Array.isArray(d?.policyViolations) && d.policyViolations.length > 0) {
-      return "an out-of-policy tool call was attempted during the winning candidate's build (fail-closed — must not promote)";
-    }
+    // NB: a PREVENTED (rejected) out-of-policy tool ATTEMPT does NOT taint the winner. Judge by effect,
+    // not intent — the governor blocked it (no effect) and the candidate was verified green. It is a
+    // recorded warning + learning signal, not a discard (see the single-build promote gate). Only an
+    // EFFECTIVE breach (a control failure that landed) would discard, and that is a separate alarm.
   }
   return undefined;
 }
@@ -1452,14 +1453,17 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     const bd = (builderResult.detail ?? {}) as Record<string, unknown>;
     const builderStop = typeof bd.stopReason === "string" ? bd.stopReason : "";
     const builderFilesWritten = Array.isArray(bd.filesWritten) ? bd.filesWritten.length : 0;
-    const policyViolations = Array.isArray(bd.policyViolations) ? bd.policyViolations : [];
 
     // Guard: only protocol terminations, not model-failure stops.
     if (!RESCUABLE_TERMINATIONS.has(builderStop)) return { result: builderResult };
     // Guard: must have files on disk to verify.
     if (builderFilesWritten <= 0) return { result: builderResult };
-    // Guard: fail closed on any unsafe policy violation.
-    if (policyViolations.length > 0) return { result: builderResult };
+    // JUDGE BY EFFECT, NOT INTENT: a policy violation in ikbi is a PREVENTED (rejected) tool call — the
+    // governor/sandbox blocked it, so it had NO effect. A prevented attempt is evidence the governor
+    // WORKED; it must NOT block the rescue/fixer from running the REAL verifier on the actual worktree.
+    // (An EFFECTIVE breach — a sandbox/egress/confinement FAILURE that actually landed — is a separate,
+    // higher-severity alarm, not a rejected tool call, and never reaches here.) The prevented attempt is
+    // still recorded on the builder receipt as a warning + learning signal.
 
     // Run the real verifier against the current workspace.
     const rescueVerify = await runVerifier();
@@ -3067,18 +3071,28 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // (fail-closed). If a role hard-failed, the loop broke before the integrator ran,
     // so its result is absent → fail-closed discard. That composition is intentional.
     let decision = readIntegratorDecision(results.find((r) => r.role === "integrator"));
-    // FAIL-CLOSED IN-RUN GATES (enforced on THIS build's promote, independent of the trust ladder):
-    //  (1) INJECTION: the neutralization chokepoint blocked a tool result in some role this build —
-    //      the "injection blocks promotion" defense, enforced HERE. The trust-ladder demotion only
-    //      affects FUTURE builds and is off by default, so it cannot block the OFFENDING build.
-    //  (2) POLICY TAINT: some builder ATTEMPT this build tried an out-of-policy tool call. A later
-    //      clean retry cannot launder it — the tainted attempt's writes may still be on disk in the
-    //      shared worktree. Mirrors the auto-verify-rescue policy guard, applied to every retry path.
-    // Both are genuine gate failures (not operator/governance decisions) → trust is NOT suppressed.
+    // FAIL-CLOSED IN-RUN GATE (enforced on THIS build's promote, independent of the trust ladder):
+    //  INJECTION: the neutralization chokepoint blocked a tool result in some role this build — the
+    //  "injection blocks promotion" defense, enforced HERE. The trust-ladder demotion only affects
+    //  FUTURE builds and is off by default, so it cannot block the OFFENDING build. This is a genuine
+    //  gate failure (not an operator/governance decision) → trust is NOT suppressed.
     if (decision.promote && injectionDetectedThisBuild) {
       decision = { ...decision, promote: false, rationale: "discard: prompt-injection detected by the neutralization chokepoint during this build (fail-closed — the injected build must not promote)" };
     } else if (decision.promote && policyTaintedThisBuild) {
-      decision = { ...decision, promote: false, rationale: "discard: an out-of-policy tool call was attempted during this build; the taint carries across retries (fail-closed)" };
+      // JUDGE BY EFFECT, NOT INTENT. A policy violation in ikbi is a PREVENTED (rejected) tool call —
+      // the governor/sandbox blocked it, so it had NO effect, and the verifier passed on the real
+      // worktree. A prevented attempt is evidence the governor WORKED, not that the build is bad. It is
+      // recorded as a warning + learning signal (the builder receipt / detail.policyViolations carry it,
+      // and self-heal can adapt the prompt/context), and it feeds a small trust delta — but it does NOT
+      // discard a verified-green build. Only an EFFECTIVE breach (a control FAILURE that actually landed
+      // — sandbox escape, egress leak, out-of-workspace write, receipt tampering) discards, and those
+      // surface as separate higher-severity alarms, not as rejected tool calls. Cheap models improvise
+      // blocked commands routinely; discarding green work over a prevented attempt measures obedience,
+      // not engineering, and would collapse the autonomous success rate for reasons unrelated to code.
+      log.warn(
+        { taskId: task.taskId, workspaceId: workspace.id },
+        "promote proceeds despite a PREVENTED (blocked) out-of-policy attempt — recorded as a learning signal, not a discard (judge by effect, not intent)",
+      );
     }
     let promoted = false;
     let reason: string | undefined;

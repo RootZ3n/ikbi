@@ -612,26 +612,30 @@ test("e2e: tournament rescues a builder that wrote files but hit no_progress —
   assert.equal((builder?.detail as Record<string, unknown> | undefined)?.autoVerifyRescue, true, "tournament rescue stamp present");
 });
 
-test("e2e: tournament does NOT rescue a builder with policy violations — candidate fails", async () => {
+test("e2e: tournament PROMOTES a candidate despite a PREVENTED policy attempt (judge by effect, not intent)", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities();
   const ws = tourWorkspaces();
   let verifierRuns = 0;
   const roles: Partial<Record<WorkerRole, RoleFn>> = {
     scout: async () => ({ role: "scout", outcome: "success", summary: "s" }),
+    // The model reached for a destructive command; the governor BLOCKED it (a prevented attempt — no
+    // effect). The candidate wrote files + hit no_progress. Judge by effect: the prevented attempt is a
+    // recorded warning, not a reason to fail an otherwise verifier-green candidate.
     builder: async () => ({
       role: "builder", outcome: "failure", summary: "no_progress",
-      detail: { stopReason: "no_progress", filesWritten: ["a.ts"], checksRuns: 0, rejectedToolCalls: [], policyViolations: [{ kind: "unsafe" }], toolRounds: 10 },
+      detail: { stopReason: "no_progress", filesWritten: ["a.ts"], checksRuns: 0, rejectedToolCalls: [], policyViolations: [{ tool: "terminal", error: "blocked: rm -rf /" }], toolRounds: 10 },
     }),
-    verifier: async () => { verifierRuns += 1; return { role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: [] } }; },
+    verifier: async () => { verifierRuns += 1; return { role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: [{ name: "typecheck", command: "tsc", exitCode: 0, outputTail: "" }, { name: "test", command: "test", exitCode: 0, outputTail: "# tests 10\n# pass 10\n" }] } }; },
   };
   const orch = createOrchestrator(tourDeps({
     resolveIdentity, roleClaim, workspaces: ws.workspaces, roles,
     candidateModels: ["flash-model"],
+    applyDiff: async () => ({ applied: true }),
   }));
 
   const r = await orch.run(task, parentCtx);
 
-  assert.equal(r.outcome, "rejected", "tournament rejects when rescue is blocked by policy violations");
-  assert.equal(r.promoted, false);
-  assert.equal(verifierRuns, 0, "no rescue verifier when policy violations block rescue");
+  assert.equal(r.outcome, "success", r.reason);
+  assert.equal(r.promoted, true, "a prevented policy attempt does not block the tournament winner");
+  assert.ok(verifierRuns >= 2, `rescue + shadow verifier ran (got ${verifierRuns})`);
 });

@@ -77,12 +77,13 @@ export function defaultOverrides(): JudgeOverride[] {
       disqualifies: (c) => c.testsPass === false,
       reason: () => "tests failed (pnpm test non-zero) — failing tests are worthless",
     },
-    {
-      id: "rejected-tool-calls",
-      label: "rejected-tool-calls",
-      disqualifies: (c) => c.rejectedToolCalls > 0,
-      reason: (c) => `${c.rejectedToolCalls} rejected tool call(s) — attempted out-of-policy action`,
-    },
+    // NB: rejected (PREVENTED) tool calls are NOT a disqualifier. Judge by effect, not intent — a
+    // rejected call was BLOCKED by the governor (no effect), so it is a recorded warning + a mild
+    // RANKING penalty (see the `better` tie-break: fewer rejected calls wins a tie), not grounds to
+    // discard a candidate the verifier passed. Discarding a verified-green candidate over a prevented
+    // attempt measures obedience, not engineering — and would let a flukier-but-timid candidate beat a
+    // stronger one that merely improvised a blocked command. Only EFFECTIVE breaches (control failures
+    // that landed) would disqualify, and those never appear as a rejected tool call.
     {
       id: "no-work",
       label: "no-work",
@@ -162,6 +163,10 @@ export function createDeterministicJudge(deps: DeterministicJudgeDeps = {}): Det
     // Tie-break, in order: tests score (desc) → toolRounds (asc) → diffLines (asc) →
     // workspaceId (lexically smallest). The last guarantees a stable, identical winner.
     if (a.testsScore !== b.testsScore) return a.testsScore > b.testsScore;
+    // A candidate with FEWER prevented (rejected) tool calls wins a tie — the "additive taint" ranking
+    // signal (cleaner conduct is preferred), without disqualifying a verified candidate that improvised
+    // a blocked command.
+    if (a.c.rejectedToolCalls !== b.c.rejectedToolCalls) return a.c.rejectedToolCalls < b.c.rejectedToolCalls;
     if (a.c.toolRounds !== b.c.toolRounds) return a.c.toolRounds < b.c.toolRounds;
     const ad = a.c.diffLines ?? Number.POSITIVE_INFINITY;
     const bd = b.c.diffLines ?? Number.POSITIVE_INFINITY;
