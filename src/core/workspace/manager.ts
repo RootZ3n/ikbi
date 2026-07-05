@@ -23,6 +23,7 @@
 
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
+import { hostname } from "node:os";
 import { access, mkdir } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import type { Logger } from "pino";
@@ -205,6 +206,9 @@ export class WorkspaceManager {
           state: "allocating",
           createdAt: ts,
           updatedAt: ts,
+          // H6: stamp the owning process so a crashed build's leaked record can be reaped by pid.
+          ownerPid: process.pid,
+          ownerHost: hostname(),
           ...(opts.label !== undefined ? { label: opts.label } : {}),
         };
         // 1. INTENT record before any resource (crash here => reclaimable, no orphan).
@@ -512,18 +516,46 @@ export class WorkspaceManager {
    * (only held DURING ops), so lock-free ≠ abandoned. The orphan is still reconciled under its own
    * lock to avoid racing a concurrent teardown. No files are deleted. Returns the number reaped.
    */
+  /**
+   * H6: is this record's OWNING process provably dead? True only when the record was stamped with an
+   * `ownerPid`/`ownerHost` (this manager's stamps), the host matches ours (a pid on another host is
+   * unknowable), and `process.kill(pid, 0)` reports the process no longer exists (ESRCH). A live pid,
+   * a foreign host, or an unstamped (legacy) record all return false — we never reap something we can't
+   * prove is dead. Guards against reaping OUR OWN pid (a concurrent allocate in this same process).
+   */
+  private isOwnerDead(rec: WorkspaceRecord): boolean {
+    if (rec.ownerPid === undefined || rec.ownerHost !== hostname()) return false;
+    if (rec.ownerPid === process.pid) return false; // our own live process
+    try {
+      process.kill(rec.ownerPid, 0); // signal 0 = existence check; no-op if alive
+      return false; // still running
+    } catch (err) {
+      // ESRCH = no such process (dead). EPERM = alive but not ours to signal (treat as alive, safe).
+      return (err as NodeJS.ErrnoException).code === "ESRCH";
+    }
+  }
+
   private async reapAbandoned(): Promise<number> {
     let reaped = 0;
     for (const id of await this.store.list()) {
       const rec = await this.store.get(id).catch(() => undefined);
       if (rec === undefined) continue;
       if (rec.state !== "allocating" && rec.state !== "allocated" && rec.state !== "promoting") continue;
-      if (existsSync(rec.path)) continue; // worktree present ⇒ possibly LIVE ⇒ never auto-reap
+      // H6: a worktree still on disk usually means LIVE — but a crashed build (SIGKILL/OOM/power loss)
+      // leaves the worktree present with its owner process DEAD. If we can prove the owner is dead
+      // (same host, pid no longer running) we reap it too — else N crashes wedge the workspace cap with
+      // no recovery. A present worktree whose owner we CANNOT verify (other host / no pid) is left alone.
+      const worktreePresent = existsSync(rec.path);
+      const ownerDead = worktreePresent && this.isOwnerDead(rec);
+      if (worktreePresent && !ownerDead) continue; // present + (live or unverifiable) ⇒ never auto-reap
       try {
         await this.locks.withLock(
           this.wsKey(id),
           async () => {
-            await this.store.put(id, { ...rec, state: "failed", updatedAt: this.now(), note: "reclaimed: orphan worktree (self-heal on allocate limit)" });
+            // A dead-owner record with a lingering worktree: remove the worktree + branch, then mark it.
+            if (ownerDead) await this.removeWorktreeDir(rec).catch(() => undefined);
+            const note = ownerDead ? "reclaimed: owner process dead (crash self-heal)" : "reclaimed: orphan worktree (self-heal on allocate limit)";
+            await this.store.put(id, { ...rec, state: "failed", updatedAt: this.now(), note });
             this.live.delete(id);
             reaped += 1;
           },

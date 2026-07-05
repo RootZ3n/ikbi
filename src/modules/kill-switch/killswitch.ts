@@ -90,6 +90,9 @@ export interface KillSwitchDeps {
   readonly now?: () => number;
   /** Warm the durable latch from the store at construction (default true; tests set false). */
   readonly subscribe?: boolean;
+  /** H5: max age (ms) of the in-memory latch before isKilled re-reads the durable store, so a
+   *  long-running loop SEES a kill engaged AFTER it started. Default 2000; 0 ⇒ re-read every check. */
+  readonly reloadTtlMs?: number;
 }
 
 /** Build the kill-switch. Defaults wire the live substrate + seam. */
@@ -100,30 +103,39 @@ export function createKillSwitch(deps: KillSwitchDeps = {}): KillSwitch {
   const publish = deps.publish ?? ((input: EventInput<unknown>) => void coreEvents.publish(input));
   const now = deps.now ?? Date.now;
 
+  const reloadTtlMs = deps.reloadTtlMs ?? 2000;
   let signals: KillSignal[] = [];
   let loaded = false;
+  let lastLoadedAt = 0;
   let loadPromise: Promise<void> | undefined;
 
   async function ensureLoaded(): Promise<void> {
-    if (loaded) return;
-    if (loadPromise === undefined) {
-      loadPromise = (async () => {
-        try {
-          const s = await store.get(LATCH_ID);
-          // A successful read returning undefined is a genuine "no latch" (not killed).
-          signals = s !== undefined ? [...s.signals] : [];
-        } catch (err) {
-          // FAIL CLOSED (blocker 4): an UNREADABLE latch (store error / corruption) must
-          // NOT be silently treated as "not killed" — that would let a killed engine
-          // forget it was killed. Assume an engine-scope soft kill (prevent new work) +
-          // emit a LOUD event, until an operator clears or a restart recovers the read.
-          signals = [UNREADABLE_LATCH_KILL];
-          emit(killswitchUnreadable, { why: err instanceof Error ? err.message : String(err) });
-        }
-        loaded = true;
-      })();
+    // H5: the durable latch is the SOLE source of truth, so a long-running loop must SEE a kill
+    // engaged AFTER it started — the in-memory copy is refreshed on a short TTL, not warmed ONCE at
+    // boot and never re-read (which made `ikbi kill` a no-op against the very build you'd use it on).
+    if (loaded && now() - lastLoadedAt < reloadTtlMs) return; // fresh enough
+    if (loadPromise !== undefined) { await loadPromise; return; } // a read is already in flight
+    loadPromise = (async () => {
+      try {
+        const s = await store.get(LATCH_ID);
+        // A successful read returning undefined is a genuine "no latch" (not killed).
+        signals = s !== undefined ? [...s.signals] : [];
+      } catch (err) {
+        // FAIL CLOSED (blocker 4): an UNREADABLE latch (store error / corruption) must
+        // NOT be silently treated as "not killed" — that would let a killed engine
+        // forget it was killed. Assume an engine-scope soft kill (prevent new work) +
+        // emit a LOUD event, until an operator clears or a restart recovers the read.
+        signals = [UNREADABLE_LATCH_KILL];
+        emit(killswitchUnreadable, { why: err instanceof Error ? err.message : String(err) });
+      }
+      loaded = true;
+      lastLoadedAt = now();
+    })();
+    try {
+      await loadPromise;
+    } finally {
+      loadPromise = undefined; // clear so the NEXT stale check can trigger a fresh re-read
     }
-    await loadPromise;
   }
 
   async function persist(): Promise<void> {

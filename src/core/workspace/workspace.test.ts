@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { access, mkdtemp, rm, rmdir, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { existsSync } from "node:fs";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
@@ -147,6 +148,30 @@ test("allocate SELF-HEALS an orphaned slot — a crashed run's worktree vanished
     // At the bound, the next allocate must reap the ORPHAN and succeed (not reject with "limit").
     const c = await mgr.allocate({ targetRepo: repo, identity: ID });
     assert.ok(c.id && c.id !== a.id, "allocate succeeded by self-healing the orphaned slot");
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
+test("H6: allocate reaps a slot whose worktree EXISTS but whose OWNER PROCESS is dead (crash self-heal)", async () => {
+  const repo = await makeRepo();
+  const { mgr, root, store } = makeManager({ max: 2 });
+  try {
+    const a = await mgr.allocate({ targetRepo: repo, identity: ID });
+    await mgr.allocate({ targetRepo: repo, identity: ID });
+    // Simulate a build that CRASHED (SIGKILL / OOM): its worktree is still on disk, but its owner pid
+    // is dead. Rewrite the record's ownerPid to a pid that cannot exist (above any realistic pid_max).
+    const rec = await store.get(a.id);
+    assert.ok(rec);
+    const deadPid = 2_000_000_000;
+    assert.throws(() => process.kill(deadPid, 0), "sanity: the fake owner pid is genuinely dead");
+    await store.put(a.id, { ...rec!, ownerPid: deadPid, ownerHost: hostname() });
+    assert.ok(existsSync(a.path), "the crashed build's worktree is still on disk");
+    // At the bound, the next allocate must reap the DEAD-OWNER slot (previously unreapable → wedged
+    // at the cap with no recovery) and succeed.
+    const c = await mgr.allocate({ targetRepo: repo, identity: ID });
+    assert.ok(c.id && c.id !== a.id, "allocate self-healed the dead-owner slot");
+    assert.ok(!existsSync(a.path), "the dead owner's lingering worktree was removed");
   } finally {
     await cleanup(repo, root);
   }

@@ -589,6 +589,22 @@ process.on("SIGINT", () => {
     .catch(() => process.exit(130));
 });
 
+// H6: SIGTERM (systemd stop / `kill <pid>` / orchestrator shutdown) got NO handler — a mid-build
+// SIGTERM left the ALLOCATED record + worktree behind with no retain, leaking the slot. Mirror SIGINT:
+// retain live workspaces so the work survives and the record is a clean `failed` (reapable), then exit
+// 143 (128+SIGTERM). Best-effort and time-bounded — a stuck retain must never block shutdown forever.
+let terminating = false;
+process.on("SIGTERM", () => {
+  if (terminating) process.exit(143);
+  terminating = true;
+  const forceExit = setTimeout(() => process.exit(143), 3000);
+  forceExit.unref?.();
+  void coreWorkspaces
+    .retainAllLive("terminated by SIGTERM")
+    .then(() => process.exit(143))
+    .catch(() => process.exit(143));
+});
+
 run(process.argv.slice(2)).catch((err: unknown) => {
   // A broken pipe (reader closed early — e.g. `ikbi models | head`) is normal, not a failure:
   // exit quietly rather than translating it into a confusing "something went wrong".

@@ -64,6 +64,20 @@ test("an operator-tier identity CAN engage an operator kill (latch set, seam pub
   assert.equal((await ks.isKilled({})).killed, true);
 });
 
+test("H5: a kill engaged AFTER the switch warmed is SEEN (durable latch re-read on TTL)", async () => {
+  const ms = memStore();
+  // Switch A = a long-running build/server that warmed its (empty) latch at boot. reloadTtlMs 0 ⇒
+  // re-read the durable store on every check. (The old code loaded once and NEVER re-read.)
+  const a = mk({ store: ms.store, reloadTtlMs: 0 });
+  assert.equal((await a.isKilled({})).killed, false, "not killed yet — warmed empty at boot");
+  // Switch B = the operator's `ikbi kill` in ANOTHER process, writing the shared durable latch.
+  const b = mk({ store: ms.store, publishKill: publishKillSpy().publishKill });
+  await b.kill(engineKill, OPERATOR());
+  assert.ok(ms.m.get("state")?.signals.length, "the durable latch was written by the other process");
+  // Switch A must now SEE the kill it did not know about at boot — the emergency halt actually halts.
+  assert.equal((await a.isKilled({})).killed, true, "the running process sees a kill engaged after it started");
+});
+
 test("a NON-operator attempting an operator kill is REJECTED — not published, not latched", async () => {
   const ms = memStore();
   const pk = publishKillSpy();

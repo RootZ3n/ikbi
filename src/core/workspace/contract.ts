@@ -97,6 +97,15 @@ export interface WorkspaceRecord extends WorkspaceHandle {
    */
   readonly receiptStatus?: "recorded" | "failed";
   readonly note?: string;
+  /**
+   * H6: the OS process + host that OWNS this allocation. Stamped at allocate so a crashed build
+   * (SIGKILL / OOM / power loss) that left an `allocated`/`allocating` record with its worktree still
+   * on disk can be safely reaped: on the SAME host, if `ownerPid` is no longer a running process, the
+   * record is abandoned (never a live build) and its slot + worktree are reclaimed. A live process's
+   * pid is alive, so it is never reaped. Absent on old records (treated as not-pid-verifiable).
+   */
+  readonly ownerPid?: number;
+  readonly ownerHost?: string;
 }
 
 export interface AllocateOptions {
