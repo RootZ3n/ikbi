@@ -50,7 +50,8 @@
     "!vendor/velum-ai/src/**",
     "!vendor/velum-ai/tests/**",
     "!vendor/velum-ai/examples/**",
-    "!vendor/velum-ai/**/*.map"
+    "!vendor/velum-ai/**/*.map",
+    "ui/"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",

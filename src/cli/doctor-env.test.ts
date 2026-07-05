@@ -53,7 +53,7 @@ test("old Node fails the required check with a fix", () => {
   const node = byId(checks, "node");
   assert.equal(node.ok, false);
   assert.equal(node.level, "required");
-  assert.match(node.fix ?? "", /Node 18/);
+  assert.match(node.fix ?? "", /Node 22/);
 });
 
 test("no package manager is a required failure", () => {
@@ -95,5 +95,5 @@ test("renderEnvironmentChecks marks ✗ for failed required checks and prints fi
   const out = renderEnvironmentChecks(checks);
   assert.match(out, /ENVIRONMENT/);
   assert.match(out, /✗ Node\.js/);
-  assert.match(out, /→ ikbi needs Node 18/);
+  assert.match(out, /→ ikbi needs Node 22/);
 });

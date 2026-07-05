@@ -127,7 +127,15 @@ function ensureDotIkbi(projectDir: string): string {
 
 async function prompt(rl: ReturnType<typeof createInterface>, question: string): Promise<string> {
   return new Promise((resolve) => {
-    rl.question(question, (answer: string) => resolve(answer.trim()));
+    // Resolve on EOF/close too (non-interactive stdin, `ikbi init < /dev/null`, a closed pipe):
+    // otherwise the question callback never fires and init HANGS FOREVER. An empty answer takes the
+    // safe default (the [Y/n] confirm treats empty as its default; other prompts fall back cleanly).
+    const onClose = (): void => resolve("");
+    rl.once("close", onClose);
+    rl.question(question, (answer: string) => {
+      rl.off("close", onClose);
+      resolve(answer.trim());
+    });
   });
 }
 
