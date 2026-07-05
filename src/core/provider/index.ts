@@ -25,7 +25,6 @@ import {
   createMistralProvider,
   createTogetherProvider,
   DEEPSEEK_PROVIDER_ID,
-  MINIMAX_PROVIDER_ID,
   MIMO_PROVIDER_ID,
   OPENROUTER_PROVIDER_ID,
 } from "./providers/index.js";
@@ -40,8 +39,9 @@ const log = childLogger("provider");
  */
 const STUB_PROVIDER_ID = "stub";
 
-/** Build the default registry: built-in roster + configured providers, then the roster file. */
-function buildDefaultRegistry(): ModelRegistry {
+/** Build the default registry: built-in roster + configured providers, then the roster file.
+ *  Exported for tests that pin the built-in default routes (before any roster file overrides). */
+export function buildDefaultRegistry(): ModelRegistry {
   const pc = config.provider;
   const { driver, critic } = pc.defaultModels;
 
@@ -59,9 +59,16 @@ function buildDefaultRegistry(): ModelRegistry {
     {
       id: critic,
       role: "critic",
+      // Route the default critic / mid-tier model (deepseek-v4-pro) to the REAL DeepSeek endpoint —
+      // the same provider the deepseek-v4-flash driver uses, and the route proven to carry a large
+      // build. It is NOT routed to MiniMax: that placeholder route dead-ended EVERY --complexity-large
+      // build (the mid tier bumps the builder to this model) with `minimax=permanent_error` whenever
+      // the roster file was absent — a config-shaped footgun that failed the run before a line was
+      // written. DeepSeek is the working route and minimax is not needed here. Cost is a placeholder
+      // (the roster file overrides it with the real per-Mtok rate when present).
       cost: { promptPerMTok: 0.5, completionPerMTok: 1.5 },
       providers: [
-        { provider: MINIMAX_PROVIDER_ID, providerModelId: "MiniMax-M1" },
+        { provider: DEEPSEEK_PROVIDER_ID, providerModelId: critic },
       ],
     },
     // DeepSeek direct models — usable out of the box once IKBI_DEEPSEEK_API_KEY is set.
