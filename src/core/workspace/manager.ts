@@ -21,7 +21,7 @@
  *   Same-workspace lifecycle ops therefore serialize (no interleaved teardown).
  */
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { hostname } from "node:os";
 import { access, mkdir } from "node:fs/promises";
@@ -166,8 +166,9 @@ export class WorkspaceManager {
       throw new WorkspaceError("config", `target is not a git repository: ${opts.targetRepo}`);
     }
     await this.preload();
-    // Cross-process file lock: CLI + server share the same workspace store,
-    // so the allocation check + create must be serialized across processes.
+    // Cross-process file lock: CLI + server share the same workspace store, so the allocation
+    // BOUND check + slot create must serialize across processes — otherwise two processes each read
+    // count = max-1, both pass the limit gate, and both allocate (bound overflow).
     return this.locks.withLock(ALLOC_LOCK, async () => {
       if (this.live.size >= this.max) {
         // Refresh the live Map from the persistent store before failing — another
@@ -238,7 +239,7 @@ export class WorkspaceManager {
         this.log.info({ event: "workspace_allocated", workspaceId: id, targetRepo: opts.targetRepo, baseBranch, agentId: opts.identity.agentId }, "workspace allocated");
         return allocated;
       });
-    });
+    }, { file: this.lockFile(ALLOC_LOCK) });
   }
 
   async commit(handle: WorkspaceHandle, message: string): Promise<boolean> {
@@ -277,7 +278,8 @@ export class WorkspaceManager {
       if (rec === undefined || rec.state !== "allocated") {
         throw new WorkspaceError("invalid_state", `workspace ${handle.id} is not in a promotable state`);
       }
-      return this.locks.withLock(`workspace:branch:${repo}:${handle.baseBranch}`, async () => {
+      const branchLockKey = `workspace:branch:${repo}:${handle.baseBranch}`;
+      return this.locks.withLock(branchLockKey, async () => {
         const targetHead = await revParse(repo, handle.baseBranch);
         const scratchHead = await revParse(repo, handle.scratchBranch);
 
@@ -376,7 +378,7 @@ export class WorkspaceManager {
           this.log.warn({ err: e instanceof Error ? e.message : String(e), workspaceId: handle.id }, "post-promote worktree cleanup failed (non-fatal)"),
         );
         return result;
-      });
+      }, { file: this.lockFile(branchLockKey) });
     });
   }
 
@@ -460,7 +462,8 @@ export class WorkspaceManager {
   // ---- reclaim (respects the per-workspace lock; skips active) ----
 
   async reclaim(targetRepo: string): Promise<ReclaimResult> {
-    return this.locks.withLock(`workspace:reclaim:${targetRepo}`, async () => {
+    const reclaimKey = `workspace:reclaim:${targetRepo}`;
+    return this.locks.withLock(reclaimKey, async () => {
       const before = (await listWorktrees(targetRepo)).length;
       await pruneWorktrees(targetRepo);
       const worktrees = await listWorktrees(targetRepo);
@@ -504,7 +507,7 @@ export class WorkspaceManager {
       this.events?.publish(WorkspaceEvents.reclaimed.create({ targetRepo, branchesDeleted, recordsReconciled }, { source: "workspace" }));
       this.log.info({ event: "workspace_reclaimed", targetRepo, ...result }, "reclaimed abandoned workspaces");
       return result;
-    });
+    }, { file: this.lockFile(reclaimKey) });
   }
 
   /**
@@ -705,6 +708,19 @@ export class WorkspaceManager {
 
   private wsKey(id: string): string {
     return `workspace:ws:${id}`;
+  }
+
+  /**
+   * #3: cross-process lock-file path for a SHARED-STATE orchestration lock key, under `<root>/locks`.
+   * The in-process mutex only serializes async tasks WITHIN one Node process, but the CLI and the
+   * service (or two CLI invocations) share this workspace root — so the allocation-bound check, a
+   * shared-branch promote, and a repo reclaim pass need an OS-level lock too. The key is SHA-1 hashed
+   * (repo paths carry slashes and vary in length) into a short, safe, collision-resistant filename;
+   * all processes on the same host + workspace root derive the SAME path and thus serialize.
+   * (Per-workspace RECORD writes are already cross-process-safe via the store's `crossProcess: true`.)
+   */
+  private lockFile(key: string): string {
+    return join(this.root, "locks", `${createHash("sha1").update(key).digest("hex").slice(0, 16)}.lock`);
   }
 
   private resolveWorktreePath(id: string): string {

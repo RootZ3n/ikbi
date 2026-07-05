@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { access, mkdtemp, rm, rmdir, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
@@ -12,7 +12,8 @@ import { EventBus } from "../events/bus.js";
 import type { IkbiEvent } from "../events/contract.js";
 import type { AgentIdentity } from "../provider/contract.js";
 import type { ReceiptInput } from "../receipt/contract.js";
-import { LockManager } from "../substrate/lock.js";
+import { acquireFileLock, LockManager } from "../substrate/lock.js";
+import { SubstrateError } from "../substrate/contract.js";
 import { DocumentStore } from "../substrate/store.js";
 import { SCRATCH_BRANCH_PREFIX, type WorkspaceRecord, WorkspaceError } from "./contract.js";
 import { listBranches, runGit } from "./git.js";
@@ -42,9 +43,9 @@ async function makeRepo(): Promise<string> {
   return repo;
 }
 
-function makeManager(opts?: { root?: string; max?: number; events?: EventBus; receipts?: WorkspaceReceiptSink; idGen?: () => string }) {
+function makeManager(opts?: { root?: string; max?: number; events?: EventBus; receipts?: WorkspaceReceiptSink; idGen?: () => string; timeoutMs?: number }) {
   const root = opts?.root ?? join(tmpdir(), `ikbi-ws-${randomBytes(8).toString("hex")}`);
-  const locks = new LockManager({ logger: silent, defaultTimeoutMs: 5000, defaultStaleMs: 30_000 });
+  const locks = new LockManager({ logger: silent, defaultTimeoutMs: opts?.timeoutMs ?? 5000, defaultStaleMs: 30_000 });
   const store = new DocumentStore<WorkspaceRecord>({ dir: join(root, "registry"), locks, logger: silent, fsync: false });
   const mgr = new WorkspaceManager({
     root,
@@ -172,6 +173,29 @@ test("H6: allocate reaps a slot whose worktree EXISTS but whose OWNER PROCESS is
     const c = await mgr.allocate({ targetRepo: repo, identity: ID });
     assert.ok(c.id && c.id !== a.id, "allocate self-healed the dead-owner slot");
     assert.ok(!existsSync(a.path), "the dead owner's lingering worktree was removed");
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
+test("#3: allocate takes a CROSS-PROCESS file lock — an alloc lock held by 'another process' blocks it", async () => {
+  const repo = await makeRepo();
+  const { mgr, root } = makeManager({ max: 2, timeoutMs: 250 }); // short timeout so the block is quick
+  try {
+    // Mirror WorkspaceManager.lockFile("workspace:alloc") — the path all processes on this root derive.
+    const allocLockPath = join(root, "locks", `${createHash("sha1").update("workspace:alloc").digest("hex").slice(0, 16)}.lock`);
+    // Simulate ANOTHER OS process holding the allocation lock (the in-process mutex can't see it).
+    const heldByOther = await acquireFileLock(allocLockPath, 1000, { logger: silent, staleMs: 30_000 });
+    // Our allocate must fail closed — it cannot acquire the cross-process lock while it's held.
+    await assert.rejects(
+      mgr.allocate({ targetRepo: repo, identity: ID }),
+      (e: unknown) => e instanceof SubstrateError && e.kind === "lock_timeout",
+      "allocate blocks on the cross-process alloc lock",
+    );
+    await heldByOther(); // the other process releases
+    // Now it proceeds — proving the file lock (not just the in-process mutex) gated it.
+    const a = await mgr.allocate({ targetRepo: repo, identity: ID });
+    assert.ok(a.id, "allocate succeeds once the cross-process lock is free");
   } finally {
     await cleanup(repo, root);
   }
