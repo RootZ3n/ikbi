@@ -152,6 +152,13 @@ This completes the four-dimension arc for the two modules influence flagged: rea
 prove PRESENCE, influence scores STEERING, and ablation quantifies VALUE. The pattern is reusable —
 point `influence.mjs` at a corpus, take its `passive`/`latent` modules, and ablate each one.
 
+**Non-bypassed influence proof:** `gate-influence-proof.mjs` answers "is `passive` a real verdict or a
+blind spot?" — it drives the REAL gate-wall with `bypass=false` over a mixed-trust workload (untrusted
+delegate + policy-denied operator actions), captures the authentic `gate.evaluate` receipts, and runs
+`computeInfluence` on them: gate-wall scores **pivotal** (21 denials of 59). So `passive` on the
+bypassed corpora is accurate, not a measurement gap. Deterministic + free; unit-tested against the real
+compiled gate (`gate-influence-proof.test.mjs`, 8 cases). → `GATE-INFLUENCE-PROOF.md`.
+
 **Roll-up:** `runtime-truth.mjs` composes the two receipt-based dimensions (influence + gate-wall
 value) over a single `receipts.ndjson` into one presence→steering→value table + a one-line verdict,
 so a fresh `ikbi build` can be graded end-to-end in one command:
