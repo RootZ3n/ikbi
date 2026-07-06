@@ -1955,66 +1955,86 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           fileRefuterCorrections(result, task.taskId);
         }
 
-        // ── AUTO-VERIFY RESCUE: builder wrote files but NEVER ran checks ──────────
-        // Delegated to maybeAutoVerifyRescueBuilderResult (shared with competitive/tournament).
-        if (role === "builder") {
-          const runRescueVerifier = async (): Promise<RoleResult> => {
-            const rescueCtx: RoleContext = {
-              task, role: "verifier",
-              identity: spawned.identity,
-              autonomy: spawned.autonomy,
+        // ── LAST-MILE FIXER MACHINERY (shared by the builder-stop rescue AND the verifier-fail rescue) ──
+        // The configured fixer model (a DIFFERENT model than the builder — e.g. deepseek builds,
+        // mimo-v2.5-pro fixes) gets ONE bounded repair pass on the SAME worktree, then a re-verify.
+        const makeRescueVerifier = (rescueSpawn: SpawnedRole) => async (): Promise<RoleResult> => {
+          const rescueCtx: RoleContext = { task, role: "verifier", identity: rescueSpawn.identity, autonomy: rescueSpawn.autonomy, workspace, priorResults: [...results], engine: runEngine };
+          return runRoleFn("verifier", verifierFor(parentCtx), rescueCtx, Math.max(roleTimeoutMs, resolveCheckTimeoutMs(modeEnv)));
+        };
+        const makeRunFixer = (runRescueVerifier: () => Promise<RoleResult>): ((redVerify: RoleResult) => Promise<{ fixed: boolean; verify: RoleResult }>) | undefined => {
+          const fixerModel = config.fixerModel;
+          if (!fixerModel) return undefined;
+          return async (redVerify: RoleResult): Promise<{ fixed: boolean; verify: RoleResult }> => {
+            void redVerify; // the fixer runs run_checks itself to see the live errors
+            const fixSpawn = spawnRole("builder", parentCtx);
+            const fixGoal = [
+              task.goal,
+              "",
+              "[FIX PASS] The project is already written but `run_checks` is RED. Do NOT rewrite working code or start over.",
+              "Run run_checks, read the SPECIFIC errors it reports, and change ONLY what is needed to make every check pass.",
+              "Iterate tightly: fix a file, run_checks, repeat until green, then call done.",
+            ].join("\n");
+            events.publish(
+              workerRoleDispatched.create(
+                { taskId: task.taskId, role: "builder", ...(fixSpawn.identity.trustTier !== undefined ? { tier: fixSpawn.identity.trustTier } : {}) },
+                { source: EVENT_SOURCE, attribution: { identity: fixSpawn.identity, operation: "worker.role.fixer", runId: task.taskId } },
+              ),
+            );
+            const fixCtx: RoleContext = {
+              task: { ...task, goal: fixGoal, writeScope: "all" },
+              role: "builder",
+              identity: fixSpawn.identity,
+              autonomy: fixSpawn.autonomy,
               workspace,
               priorResults: [...results],
               engine: runEngine,
             };
-            return runRoleFn("verifier", verifierFor(parentCtx), rescueCtx, Math.max(roleTimeoutMs, resolveCheckTimeoutMs(modeEnv)));
+            const fixResult = await runRoleFn("builder", builderForModel(parentCtx, fixerModel, resolveBuilderMode(task)), fixCtx);
+            events.publish(
+              workerRoleCompleted.create(
+                { taskId: task.taskId, role: "builder", outcome: fixResult.outcome },
+                { source: EVENT_SOURCE, attribution: { identity: fixSpawn.identity, operation: "worker.role.fixer", runId: task.taskId } },
+              ),
+            );
+            noteBuilderSignals(fixResult); // a fixer taint/injection reaches the fail-closed promote gate
+            const verify = await runRescueVerifier();
+            return { fixed: verify.outcome === "success", verify };
           };
-          // LAST-MILE FIXER: when the rescue verifier is RED, hand the red checks to the configured
-          // fixer model (a DIFFERENT model — e.g. deepseek builds, mimo-v2.5-pro fixes) for ONE bounded
-          // repair pass on the SAME worktree, then re-verify. Cost rolls into this builder role's
-          // roleCost (computed after the rescue, below). Only wired on the primary single-build path.
-          const fixerModel = config.fixerModel;
-          const runFixer = fixerModel
-            ? async (redVerify: RoleResult): Promise<{ fixed: boolean; verify: RoleResult }> => {
-                void redVerify; // the fixer runs run_checks itself to see the live errors
-                const fixSpawn = spawnRole("builder", parentCtx);
-                const fixGoal = [
-                  task.goal,
-                  "",
-                  "[FIX PASS] The project is already written but `run_checks` is RED. Do NOT rewrite working code or start over.",
-                  "Run run_checks, read the SPECIFIC errors it reports, and change ONLY what is needed to make every check pass.",
-                  "Iterate tightly: fix a file, run_checks, repeat until green, then call done.",
-                ].join("\n");
-                events.publish(
-                  workerRoleDispatched.create(
-                    { taskId: task.taskId, role: "builder", ...(fixSpawn.identity.trustTier !== undefined ? { tier: fixSpawn.identity.trustTier } : {}) },
-                    { source: EVENT_SOURCE, attribution: { identity: fixSpawn.identity, operation: "worker.role.fixer", runId: task.taskId } },
-                  ),
-                );
-                const fixCtx: RoleContext = {
-                  task: { ...task, goal: fixGoal, writeScope: "all" },
-                  role: "builder",
-                  identity: fixSpawn.identity,
-                  autonomy: fixSpawn.autonomy,
-                  workspace,
-                  priorResults: [...results],
-                  engine: runEngine,
-                };
-                const fixResult = await runRoleFn("builder", builderForModel(parentCtx, fixerModel, resolveBuilderMode(task)), fixCtx);
-                events.publish(
-                  workerRoleCompleted.create(
-                    { taskId: task.taskId, role: "builder", outcome: fixResult.outcome },
-                    { source: EVENT_SOURCE, attribution: { identity: fixSpawn.identity, operation: "worker.role.fixer", runId: task.taskId } },
-                  ),
-                );
-                noteBuilderSignals(fixResult); // a fixer taint/injection reaches the fail-closed promote gate
-                const verify = await runRescueVerifier();
-                return { fixed: verify.outcome === "success", verify };
-              }
-            : undefined;
-          const rescue = await maybeAutoVerifyRescueBuilderResult(result, runRescueVerifier, runFixer);
+        };
+
+        // ── AUTO-VERIFY RESCUE: builder wrote files but hit a protocol stop before run_checks ──
+        // Delegated to maybeAutoVerifyRescueBuilderResult (shared with competitive/tournament).
+        // Rescue verifier reuses the builder's spawn (unchanged behavior).
+        if (role === "builder") {
+          const runRescueVerifier = makeRescueVerifier(spawned);
+          const rescue = await maybeAutoVerifyRescueBuilderResult(result, runRescueVerifier, makeRunFixer(runRescueVerifier));
           result = rescue.result;
           results[results.length - 1] = result;
+        }
+
+        // ── FIXER-ON-VERIFIER-FAIL RESCUE: the builder declared SUCCESS but the MAIN verifier caught a
+        // FIXABLE red check (e.g. one leftover TS error). Without this, that build is discarded
+        // (skip-critic-on-red → integrator discard) with a ~$0.01 fixer pass in reach — the last-mile
+        // fixer above only fires on builder PROTOCOL-STOPS, never on a verifier catch after builder
+        // success. Give the fixer model ONE bounded pass + re-verify HERE, at the verifier boundary, so
+        // the critic/integrator see a GREEN verifier when it works (and an unchanged RED one when it does
+        // not). Fail-closed: only genuine, fixable check failures are retried (not injection / unresolvable
+        // / skipped), and a still-red re-verify leaves the original failure to discard as before.
+        if (role === "verifier" && isFixableVerifierFailure(result)) {
+          const runFixer = makeRunFixer(makeRescueVerifier(spawnRole("verifier", parentCtx)));
+          if (runFixer !== undefined) {
+            const fix = await runFixer(result);
+            const vd = (result.detail as Record<string, unknown> | undefined) ?? {};
+            result = fix.fixed
+              ? {
+                  ...fix.verify,
+                  summary: `${fix.verify.summary}; fixer rescue: ${config.fixerModel} closed a verifier-caught red check`,
+                  detail: { ...((fix.verify.detail as Record<string, unknown> | undefined) ?? {}), fixerRescue: true, fixerModel: config.fixerModel, fixerTrigger: "verifier_fail", rescueVerificationResult: "pass" },
+                }
+              : { ...result, detail: { ...vd, fixerRescueAttempted: true, fixerModel: config.fixerModel, fixerTrigger: "verifier_fail", rescueVerificationResult: "fail" } };
+            results[results.length - 1] = result;
+          }
         }
 
         // Per-role cost: compute once after rescue (rescue verifier calls count against builder).
@@ -3821,6 +3841,24 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   }
 
   return { run, spawnRole };
+}
+
+/**
+ * Whether a RED verifier result is a GENUINE, FIXABLE check failure worth handing to the last-mile
+ * fixer (a leftover typecheck/test error the builder declared success on). Excludes cases a fixer
+ * cannot or must not "repair around": injection (content hijack — a security signal, never fixed),
+ * a skipped verifier (nothing ran), and checks_unresolvable (no meaningful verifier to satisfy). A
+ * permissive positive (a failed typecheck or failed tests) is safe because the fixer + re-verify is
+ * the real gate — a still-red re-verify simply leaves the original failure to discard.
+ */
+export function isFixableVerifierFailure(verifierResult: RoleResult): boolean {
+  if (verifierResult.role !== "verifier" || verifierResult.outcome === "success") return false;
+  const d = (verifierResult.detail ?? {}) as Record<string, unknown>;
+  if (d.injectionDetected === true) return false;
+  if (d.verdict === "skipped" || d.skipped === true) return false;
+  if (d.verificationKind === "checks_unresolvable") return false;
+  const v = readVerifier(verifierResult);
+  return v.typecheckPass === false || v.testsPass === false;
 }
 
 /** Parse the verifier's check results into the candidate's pass flags + (best-effort) test count. */

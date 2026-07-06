@@ -99,6 +99,53 @@ test("fixer rescue: a no_progress builder with RED checks is rescued to promote 
   assert.equal(ws.calls.promote, 1);
 });
 
+// A builder that SUCCEEDS (declares done), but the MAIN verifier catches a fixable red check on its
+// first pass and is GREEN after the fixer's repair pass — the run-9 shape (builder-success + verifier-red).
+function verifierFailRoles() {
+  const calls = { builder: 0, verifier: 0 };
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {};
+  for (const r of WORKER_ROLES) {
+    roles[r] = async () => {
+      if (r === "builder") { calls.builder += 1; return { role: r, outcome: "success", summary: "built", detail: { filesWritten: ["src/a.ts"], policyViolations: [] } }; }
+      // GREEN only once the FIXER has run (a 2nd builder pass); RED otherwise — so the verifier's
+      // greenness is caused by the fixer, isolating the verifier-fail rescue path from any other re-verify.
+      if (r === "verifier") { calls.verifier += 1; return calls.builder >= 2 ? { role: r, outcome: "success", summary: "run_checks GREEN" } : { role: r, outcome: "failure", summary: "run_checks RED (1 type error)" }; }
+      if (r === "integrator") return { role: r, outcome: "success", summary: r, detail: { decision: "promote", evaluation: { approved: true } } };
+      return { role: r, outcome: "success", summary: r };
+    };
+  }
+  return { roles, calls };
+}
+
+test("fixer-on-verifier-fail: a builder-SUCCESS build whose MAIN verifier catches a fixable red check is rescued to promote", async () => {
+  const ids = makeIdentities();
+  const ws = fakeWorkspaces();
+  const roles = verifierFailRoles();
+  const orch = orchestratorWith("mimo-v2.5-pro", roles.roles, { ws, ids });
+
+  const r = await orch.run(task, ids.parentCtx);
+
+  assert.ok(roles.calls.builder >= 2, `the fixer ran a second builder pass; saw ${roles.calls.builder}`);
+  assert.equal(r.outcome, "success", "the verifier-caught red check was closed by the fixer");
+  assert.equal(r.promoted, true);
+  assert.equal(ws.calls.promote, 1);
+});
+
+test("fixer-on-verifier-fail: with NO fixer configured, the rescue does NOT run (no second builder pass, no re-verify)", async () => {
+  const ids = makeIdentities();
+  const ws = fakeWorkspaces();
+  const roles = verifierFailRoles();
+  const orch = orchestratorWith(undefined, roles.roles, { ws, ids });
+
+  await orch.run(task, ids.parentCtx);
+
+  // The verifier-fail rescue only runs when a fixer is configured — absent it, there is no second
+  // builder pass and the verifier is not re-run. (Promotion gating on the red verdict is exercised by
+  // the integrator's own tests; this mock integrator approves unconditionally.)
+  assert.equal(roles.calls.builder, 1, "no fixer ⇒ no second builder pass");
+  assert.equal(roles.calls.verifier, 1, "no fixer ⇒ the verifier is not re-run");
+});
+
 test("fixer rescue: with NO fixer configured, the same RED build is NOT rescued (stays failed)", async () => {
   const ids = makeIdentities();
   const ws = fakeWorkspaces();
