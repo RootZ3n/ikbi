@@ -195,6 +195,15 @@ export function packageManagerStoreDirs(env: NodeJS.ProcessEnv = process.env): s
  */
 const TOOLCHAIN_SANDBOX_ENV: Readonly<Record<string, ReadonlyArray<readonly [string, string]>>> = {
   go: [["GOCACHE", "/tmp/.gocache"], ["GOPATH", "/tmp/.gopath"]],
+  // .NET writes NuGet packages (~/.nuget) and first-run/telemetry sentinels (~/.dotnet) into a
+  // read-only HOME; without these redirects even `dotnet run` throws in DotnetFirstTimeUseConfigurer.
+  // NuGet restore fetches into the writable tmpfs over the shared net; telemetry/logo writes are off.
+  dotnet: [
+    ["NUGET_PACKAGES", "/tmp/.nuget"],
+    ["DOTNET_CLI_HOME", "/tmp/.dotnet"],
+    ["DOTNET_CLI_TELEMETRY_OPTOUT", "1"],
+    ["DOTNET_NOLOGO", "1"],
+  ],
 };
 
 /** The `--setenv` cache redirects a given binary needs to build inside the read-only-home sandbox. */

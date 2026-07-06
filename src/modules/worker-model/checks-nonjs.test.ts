@@ -108,6 +108,26 @@ test("resolveChecks: unittest is detected in a tests/ subdir too", () => {
   assert.ok(r.ok && r.checks.some((c) => c.args.includes("unittest")));
 });
 
+test("resolveChecks: a .NET repo (*.csproj) gets NATIVE `dotnet test` checks", () => {
+  const wt = repo("dotnet-proj");
+  writeFileSync(join(wt, "Calc.csproj"), "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>");
+  writeFileSync(join(wt, "CalcTests.cs"), "// tests");
+  const r = resolveChecks(wt, NOENV);
+  assert.ok(r.ok, "a .csproj project resolves (does not fail closed)");
+  if (r.ok) {
+    assert.equal(r.checks[0]?.command, "dotnet");
+    assert.ok(r.checks[0]?.args.includes("test"), "runs dotnet test");
+  }
+});
+
+test("resolveChecks: a .NET solution in a subdir is detected too (.sln one level down)", () => {
+  const wt = repo("dotnet-sln");
+  mkdirSync(join(wt, "src"));
+  writeFileSync(join(wt, "src", "App.sln"), "Microsoft Visual Studio Solution File");
+  const r = resolveChecks(wt, NOENV);
+  assert.ok(r.ok && r.checks.some((c) => c.command === "dotnet"));
+});
+
 test("resolveChecks: a Python repo with NO test runner FAILS CLOSED with guidance (not pnpm)", () => {
   const wt = repo("py-bare");
   writeFileSync(join(wt, "pyproject.toml"), "[project]\nname = \"x\"\nversion = \"0.1.0\"\n");

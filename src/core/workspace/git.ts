@@ -131,6 +131,7 @@ const DEFAULT_GITIGNORE = [
   "node_modules/",                // Node
   "__pycache__/", "*.pyc", ".venv/", "*.egg-info/", // Python
   "*.class", "*.jar",             // JVM (javac output / packaged artifacts)
+  "bin/", "obj/",                 // .NET (build output + NuGet restore intermediates)
   ".DS_Store",
   "",
 ].join("\n");

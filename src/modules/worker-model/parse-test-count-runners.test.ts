@@ -94,6 +94,11 @@ test("parseTestCount: cargo MULTI-SECTION output (lib + empty bin + doc-tests) â
   assert.deepEqual(parseTestCount(cargo), { passed: 17, total: 17 });
 });
 
+test("parseTestCount: .NET VSTest 'Passed! - Failed: F, Passed: P, Skipped: S, Total: T'", () => {
+  assert.deepEqual(parseTestCount("Passed!  - Failed:     0, Passed:     6, Skipped:     0, Total:     6, Duration: 12 ms"), { passed: 6, total: 6 });
+  assert.deepEqual(parseTestCount("Failed!  - Failed:     2, Passed:     3, Skipped:     1, Total:     6, Duration: 9 ms"), { passed: 3, total: 6 });
+});
+
 test("parseTestCount: JVM 'Tests run: N, Failures: F, Errors: E' (JUnit / Maven Surefire / hand-rolled)", () => {
   assert.deepEqual(parseTestCount("Tests run: 7, Failures: 0, Errors: 0"), { passed: 7, total: 7 });
   assert.deepEqual(parseTestCount("Tests run: 10, Failures: 2, Errors: 1, Skipped: 0"), { passed: 7, total: 10 });

@@ -123,6 +123,14 @@ test("buildBwrapArgs: a non-Go toolchain (cargo) gets NO GOCACHE redirect (cargo
   assert.ok(!a.includes("GOCACHE"), "no Go env leaks onto a cargo invocation");
 });
 
+test("buildBwrapArgs: a `dotnet` command redirects NuGet + CLI-home to the writable tmpfs (read-only HOME breaks dotnet's first-run)", () => {
+  const plan: SandboxPlan = { mode: "bwrap", writableRoot: "/work/wt", cwd: "/work/wt", networkAllowed: true, risk: classifyCommandRisk("dotnet", ["test"]) };
+  const a = buildBwrapArgs(plan, "dotnet", ["test"]);
+  const np = a.indexOf("NUGET_PACKAGES");
+  assert.ok(np >= 0 && a[np - 1] === "--setenv" && (a[np + 1] ?? "").startsWith("/tmp/"), "NUGET_PACKAGES redirected under /tmp");
+  assert.ok(a.includes("DOTNET_CLI_HOME") && a.includes("DOTNET_CLI_TELEMETRY_OPTOUT"), "CLI home + telemetry-optout set");
+});
+
 test("buildBwrapArgs: --share-net is added ONLY when network is explicitly allowed", () => {
   const plan: SandboxPlan = { mode: "bwrap", writableRoot: "/w", networkAllowed: true, risk: classifyCommandRisk("pnpm", ["install"]) };
   assert.ok(buildBwrapArgs(plan, "pnpm", ["install"]).includes("--share-net"));

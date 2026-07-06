@@ -68,6 +68,10 @@ const PYTHON_PYTEST_CHECKS: readonly Check[] = [{ name: "test", command: "python
  *  closed) and its default discovery pattern is `test*.py`, which the detection below matches. */
 const PYTHON_UNITTEST_CHECKS: readonly Check[] = [{ name: "test", command: "python3", args: ["-m", "unittest", "discover", "-v"] }];
 
+/** .NET native checks — `dotnet test` restores (into the sandbox's writable NuGet cache over the
+ *  shared net), builds, and runs the test projects a .sln / .csproj declares. */
+const DOTNET_CHECKS: readonly Check[] = [{ name: "test", command: "dotnet", args: ["test", "--nologo", "-v", "q"] }];
+
 /** Godot headless syntax check (Godot 4.x — lightweight, no test framework needed). */
 const GODOT_HEADLESS_CHECKS: readonly Check[] = [{ name: "check", command: "godot", args: ["--headless", "--quit"] }];
 
@@ -135,6 +139,18 @@ function detectPythonChecks(projectRoot: string): ChecksResolution {
       `Python project at ${projectRoot} has no detectable test runner (no pytest/tox config, no test*.py files) — refusing to invent checks. ` +
       `Set IKBI_CHECKS to declare them, e.g. IKBI_CHECKS='[{"name":"test","command":"python3","args":["-m","pytest"]}]' (RED until configured).`,
   };
+}
+
+/** True iff a .NET project/solution file exists at the root or one level down — the `dotnet test` signal. */
+function hasDotnetProject(projectRoot: string): boolean {
+  const rx = /\.(csproj|fsproj|sln)$/i;
+  const scan = (dir: string): boolean => {
+    try { return readdirSync(dir, { withFileTypes: true }).some((e) => e.isFile() && rx.test(e.name)); } catch { return false; }
+  };
+  if (scan(projectRoot)) return true;
+  try {
+    return readdirSync(projectRoot, { withFileTypes: true }).some((e) => e.isDirectory() && !e.name.startsWith(".") && scan(join(projectRoot, e.name)));
+  } catch { return false; }
 }
 
 /** True iff `test*.py` files exist at the root or inside a `tests/` dir — the unittest discovery signal. */
@@ -311,6 +327,11 @@ export function resolveChecks(worktreeReal: string, env: NodeJS.ProcessEnv = pro
   const wt = resolve(worktreeReal);
   const root = resolveProjectRoot(wt);
   if (root === undefined) {
+    // .NET / C#: project files are glob-named (Foo.csproj / Foo.sln), not a fixed manifest, so the
+    // walk-up misses them. `dotnet test` restores + builds + runs the declared test projects (NuGet
+    // fetched into the sandbox's writable cache over the shared net). A vacuous run ("No test is
+    // available" / "Total: 0") yields no parseable count ⇒ testEvidence unverified/zero ⇒ still discarded.
+    if (hasDotnetProject(wt)) return { ok: true, checks: DOTNET_CHECKS, source: "default" };
     // LOOSE-SOURCE PYTHON: no manifest, but `test*.py` files exist ⇒ stdlib unittest. A cheap model
     // scaffolding a small Python CLI usually writes just `foo.py` + `test_foo.py` (no pyproject.toml);
     // manifest-only detection would fail-close it. unittest is a REAL, deterministic runner keyed off a
@@ -638,6 +659,13 @@ export function parseTestCount(output: string): { passed: number; total: number 
   const goFail = (output.match(/^FAIL\s+/gm) || []).length;
   if (goOk > 0 || goFail > 0) {
     return { passed: goOk, total: goOk + goFail };
+  }
+
+  // .NET VSTest (`dotnet test`): "Passed! - Failed: F, Passed: P, Skipped: S, Total: T, Duration: ..."
+  // (or "Failed! - ..." on failure). Total is authoritative; passed is P (Total − Failed − Skipped).
+  const vstest = /(?:Passed|Failed)!\s*-\s*Failed:\s*(\d+),\s*Passed:\s*(\d+),\s*Skipped:\s*(\d+),\s*Total:\s*(\d+)/i.exec(output);
+  if (vstest !== null) {
+    return { passed: Number(vstest[2]), total: Number(vstest[4]) };
   }
 
   // JVM (JUnit / Maven Surefire / Gradle): "Tests run: N, Failures: F, Errors: E[, Skipped: S]".

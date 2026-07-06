@@ -53,7 +53,7 @@ export const DEFAULT_ALLOWLIST: readonly string[] = Object.freeze([
   // language-native toolchains (REQUIRED for multi-language verification). cargo/go/python3/javac/java
   // run project-owned code by design — the governed-exec policy layer blocks dangerous flags/patterns,
   // and the OS sandbox confines their filesystem writes to the worktree.
-  "cargo", "go", "python3", "godot", "javac", "java",
+  "cargo", "go", "python3", "godot", "javac", "java", "dotnet",
 ]);
 
 /** Per-command wall-clock cap. NOTE: applies to FOREGROUND commands only — a background job (spawned
