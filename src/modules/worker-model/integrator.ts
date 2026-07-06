@@ -36,6 +36,7 @@
  */
 
 import type { RoleFn, RoleResult } from "./contract.js";
+import { workerModelConfig, DEFAULT_PREVENTED_REVIEW_THRESHOLD } from "./config.js";
 
 /** Safe accessor for a role result's open detail bag. */
 function detailOf(result: RoleResult | undefined): Record<string, unknown> {
@@ -95,7 +96,21 @@ export const integrator: RoleFn = async (ctx) => {
     // forge a landed change — the workspace manager's promote downgrades a zero-diff promote to noop.
     const builderOk =
       builder?.outcome === "success" && (filesWritten.length > 0 || accumulatedPass || noChangeRequired);
-    const noPolicyViolations = policyViolations !== undefined && policyViolations.length === 0;
+    // EFFECT-BASED PROMOTE GATE: a policy violation in ikbi is a PREVENTED (governor-BLOCKED) tool call
+    // — it never ran, the sandbox held, and the verifier passed on the real worktree. Judging by EFFECT
+    // (the architect's directive), a prevented attempt is a recorded RISK SIGNAL, not a discard: one
+    // blocked improvisation (rm / node -e / pnpm --dir — the cheap model's self-verify goofs) must NOT
+    // throw away a verified-green build. Two guards remain: (1) FAIL-CLOSED on an ABSENT policy field —
+    // we cannot confirm the builder even reported its tool-call status; (2) escalate to REVIEW (do not
+    // silently promote) once prevented attempts reach a threshold — repetition is a stronger signal.
+    // EFFECTIVE breaches that LAND (sandbox escape, egress leak, out-of-workspace write, receipt
+    // tampering) are separate higher-severity alarms enforced by the orchestrator's in-run gates and are
+    // never rejected tool calls, so they never reach here.
+    const policyConfirmed = policyViolations !== undefined;
+    const preventedCount = policyConfirmed ? policyViolations.length : 0;
+    const reviewThreshold = workerModelConfig.preventedReviewThreshold ?? DEFAULT_PREVENTED_REVIEW_THRESHOLD;
+    const withinRiskBudget = policyConfirmed && preventedCount < reviewThreshold;
+    const policyNote = preventedCount > 0 ? `${preventedCount} PREVENTED policy attempt(s) recorded as risk signal (no effect)` : "no policy violations";
     const criticPass = detailOf(critic).pass === true;
     const verifierPass = detailOf(verifier).verdict === "pass";
 
@@ -114,18 +129,27 @@ export const integrator: RoleFn = async (ctx) => {
     const testEvidence = detailOf(verifier).testEvidence;
     const testEvidenceOk = accumulatedPass || testEvidence === "executed";
 
-    if (builderOk && noPolicyViolations && criticPass && verifierPass && testEvidenceOk && !refuterRefuted) {
+    if (builderOk && policyConfirmed && withinRiskBudget && criticPass && verifierPass && testEvidenceOk && !refuterRefuted) {
       const rationale =
         accumulatedPass && filesWritten.length === 0
-          ? "promote: accumulated multi-step build (this pass wrote 0 files — prior steps did the work), no policy violations, critic pass, verifier pass"
+          ? `promote: accumulated multi-step build (this pass wrote 0 files — prior steps did the work), ${policyNote}, critic pass, verifier pass`
           : noChangeRequired && filesWritten.length === 0
-            ? "promote: no-change build (goal already satisfied — builder declared noChangeRequired, 0 files written), no policy violations, critic pass, verifier pass"
-            : `promote: builder wrote ${filesWritten.length} file(s), no policy violations, critic pass, verifier pass`;
+            ? `promote: no-change build (goal already satisfied — builder declared noChangeRequired, 0 files written), ${policyNote}, critic pass, verifier pass`
+            : `promote: builder wrote ${filesWritten.length} file(s), ${policyNote}, critic pass, verifier pass`;
       return {
         role: "integrator",
         outcome: "success", // "did its job" — the verdict is in detail.decision
         summary: rationale,
-        detail: { decision: "promote", rationale, evaluation: { approved: true } },
+        detail: {
+          decision: "promote",
+          rationale,
+          evaluation: { approved: true },
+          // RISK SIGNAL: prevented attempts promoted-with-warning are recorded (not erased) so severity
+          // can accrue over time — the receipt/audit trail carries what was blocked and that it had no effect.
+          ...(preventedCount > 0
+            ? { preventedViolations: policyViolations, preventedCount, riskSignal: { kind: "prevented_policy_attempt", effect: "none", promotionImpact: "warning", count: preventedCount } }
+            : {}),
+        },
       };
     }
 
@@ -143,22 +167,23 @@ export const integrator: RoleFn = async (ctx) => {
       if (builder === undefined) failures.push("no builder result");
       else if (builder.outcome !== "success") failures.push(`builder outcome "${builder.outcome}"`);
       else failures.push("builder wrote no files");
-    } else if (!noPolicyViolations) {
-      if (policyViolations === undefined) failures.push("builder did not report tool-call policy status (cannot confirm clean)");
-      else {
-        // NAME the offending call(s) in the discard reason itself, so a taint is auditable from the
-        // final output (which does not show the per-tool builder logs) without a costly --verbose
-        // re-run — e.g. `... 1 out-of-policy tool call(s): terminal \`pnpm run deploy\``.
-        const named = policyViolations
-          .map((v) => {
-            const o = (v ?? {}) as { tool?: unknown; path?: unknown; error?: unknown };
-            const tool = typeof o.tool === "string" ? o.tool : "tool";
-            const where = typeof o.path === "string" && o.path.length > 0 ? ` \`${o.path}\`` : "";
-            return `${tool}${where}`;
-          })
-          .join(", ");
-        failures.push(`builder attempted ${policyViolations.length} out-of-policy tool call(s): ${named}`);
-      }
+    } else if (!policyConfirmed) {
+      // FAIL-CLOSED: the builder did not report its tool-call status, so we cannot confirm no EFFECTIVE
+      // breach landed. (A PRESENT-but-non-empty list of PREVENTED attempts does NOT reach here — that
+      // promotes-with-warning above; only an ABSENT field, or crossing the review threshold, discards.)
+      failures.push("builder did not report tool-call policy status (cannot confirm clean)");
+    } else if (!withinRiskBudget) {
+      // REVIEW (not a quality discard): prevented attempts crossed the threshold. NAME the offending
+      // call(s) so the risk is auditable from the final output without a --verbose re-run.
+      const named = policyViolations
+        .map((v) => {
+          const o = (v ?? {}) as { tool?: unknown; path?: unknown; error?: unknown };
+          const tool = typeof o.tool === "string" ? o.tool : "tool";
+          const where = typeof o.path === "string" && o.path.length > 0 ? ` \`${o.path}\`` : "";
+          return `${tool}${where}`;
+        })
+        .join(", ");
+      failures.push(`requires review: ${preventedCount} prevented policy attempt(s) reached the review threshold (${reviewThreshold}) — held for human review, not auto-promoted: ${named}`);
     }
     if (!criticPass) failures.push(critic === undefined ? "no critic result" : "critic pass=false");
     if (!verifierPass) failures.push(verifier === undefined ? "no verifier result" : "verifier verdict=fail");
@@ -174,11 +199,19 @@ export const integrator: RoleFn = async (ctx) => {
     }
 
     const rationale = `discard: ${failures.join("; ")}`;
+    const overThreshold = policyConfirmed && !withinRiskBudget;
     return {
       role: "integrator",
       outcome: "success", // it reached a decision — discard is a valid, successful decision
       summary: rationale,
-      detail: { decision: "discard", rationale, evaluation: { approved: false } },
+      detail: {
+        decision: "discard",
+        rationale,
+        evaluation: { approved: false },
+        // A review-hold is a RISK escalation, not a code-quality failure — mark it so trust/audit can
+        // distinguish "too many prevented attempts, needs a human" from "the build was actually broken".
+        ...(overThreshold ? { requiresReview: true, preventedCount, preventedViolations: policyViolations } : {}),
+      },
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

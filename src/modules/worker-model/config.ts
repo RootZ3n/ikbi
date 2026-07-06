@@ -70,6 +70,8 @@ export function loadCandidateModels(env: NodeJS.ProcessEnv = configEnv): readonl
 
 /** Default per-role wall-clock budget (ms) — a named constant, not a magic number. */
 export const DEFAULT_ROLE_TIMEOUT_MS = 300_000; // 5 minutes
+/** Default count of PREVENTED policy attempts before a build escalates to review instead of promoting. */
+export const DEFAULT_PREVENTED_REVIEW_THRESHOLD = 10;
 /**
  * Default WHOLE-PIPELINE wall-clock ceiling (ms). Per-role timeouts bound each role, but
  * a run does scout→builder→critic→verifier→integrator with retry/rescue and competitive/
@@ -211,6 +213,15 @@ export interface WorkerModelConfig {
    */
   readonly skipCriticOnRed?: boolean;
   /**
+   * EFFECT-BASED promote gate — the number of PREVENTED policy attempts a single build may accumulate
+   * before it escalates to REVIEW instead of auto-promoting. A prevented attempt (a governor-BLOCKED
+   * tool call — no effect) is a recorded RISK SIGNAL, not a discard: one blocked improvisation (rm,
+   * node -e, pnpm --dir) must not throw away a verified-green build. But repetition is a stronger
+   * signal — at/above this count the build is held for human review rather than silently promoted.
+   * DEFAULT 10. IKBI_WORKER_MODEL_PREVENTED_REVIEW_THRESHOLD to tune.
+   */
+  readonly preventedReviewThreshold?: number;
+  /**
    * Enable the adversarial REFUTER gate (runs after the critic, before the integrator). It runs a
    * fixed refutation checklist that tries to PROVE the build is broken/lying; a single critical
    * finding refutes the build and the orchestrator files PROPOSED corrections from the findings.
@@ -253,6 +264,7 @@ export function loadWorkerModelConfig(reader = env): WorkerModelConfig {
     ...(fixerModel !== undefined ? { fixerModel } : {}),
     criticFixLoop: reader.bool("CRITIC_FIX_LOOP", true),
     skipCriticOnRed: reader.bool("SKIP_CRITIC_ON_RED", true),
+    preventedReviewThreshold: reader.int("PREVENTED_REVIEW_THRESHOLD", DEFAULT_PREVENTED_REVIEW_THRESHOLD, { min: 1 }),
     enableRefuter: reader.bool("ENABLE_REFUTER", false),
     builderMode: loadBuilderMode(),
     candidateModels: loadCandidateModels(),

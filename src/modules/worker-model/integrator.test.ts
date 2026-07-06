@@ -181,14 +181,20 @@ test("a required prior result absent → discard (fail-closed)", async () => {
   assert.equal(decisionOf(await integrator(ctxWith([]))), "discard"); // nothing
 });
 
-test("non-empty rejectedToolCalls forces DISCARD even when every other gate is green (3-eyes ruling)", async () => {
-  // builder success + files written + critic pass + verifier pass, but the builder
-  // ATTEMPTED an out-of-policy tool call → promotion must not normalize that.
-  const builderWithRejects: RoleResult = { role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["a.ts"], rejectedToolCalls: [{ tool: "write_file", error: "escape" }] } };
+test("EFFECT-BASED: a PREVENTED (blocked) tool call PROMOTES with a recorded risk signal, not a discard", async () => {
+  // builder success + files + critic pass + verifier pass, and the builder ATTEMPTED one out-of-policy
+  // tool call the governor BLOCKED (no effect, sandbox held). Judging by EFFECT, a prevented attempt is
+  // an auditable RISK SIGNAL, not a discard — it must not throw away a verified-green build.
+  const builderWithRejects: RoleResult = { role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["a.ts"], policyViolations: [{ tool: "terminal", path: 'node -e "…"', error: "code execution is not allowed" }] } };
   const r = await integrator(ctxWith([builderWithRejects, criticPass, verifierPass]));
   assert.equal(r.outcome, "success", "the integrator still reached a decision");
-  assert.equal(decisionOf(r), "discard", "a rejected tool call blocks promote");
-  assert.match(rationaleOf(r), /attempted 1 out-of-policy tool call/);
+  assert.equal(decisionOf(r), "promote", "a prevented attempt does not block promote (judge by effect)");
+  assert.match(rationaleOf(r), /1 PREVENTED policy attempt/);
+  const d = r.detail as Record<string, unknown>;
+  assert.equal(d.preventedCount, 1, "the risk signal is recorded, not erased");
+  const risk = d.riskSignal as Record<string, unknown> | undefined;
+  assert.equal(risk?.effect, "none");
+  assert.equal(risk?.promotionImpact, "warning");
 });
 
 test("empty rejectedToolCalls with all gates green → promote", async () => {
@@ -227,16 +233,39 @@ test("PRODUCTION FIELD: empty policyViolations (the builder's filtered set) → 
   assert.match(rationaleOf(r), /no policy violations/);
 });
 
-test("PRODUCTION FIELD: non-empty policyViolations forces discard even when rejectedToolCalls is empty", async () => {
-  // The filtered field is the authority: a true boundary violation blocks promote regardless of
-  // the raw field. (The reverse fallback — only rejectedToolCalls present — is covered above.)
+test("PRODUCTION FIELD: a non-empty policyViolations promotes-with-risk-signal (prevented, no effect), not discard", async () => {
+  // The filtered field is the authority. A prevented boundary attempt (blocked) is a recorded risk
+  // signal — it no longer discards a verified-green build (the whack-a-mole of rm/mv/node-e ends here).
   const builderProd: RoleResult = {
     role: "builder", outcome: "success", summary: "b",
-    detail: { filesWritten: ["a.ts"], policyViolations: [{ tool: "write_file", error: "escape" }], rejectedToolCalls: [] },
+    detail: { filesWritten: ["a.ts"], policyViolations: [{ tool: "terminal", path: "rm -rf /", error: "not allowed" }], rejectedToolCalls: [] },
   };
   const r = await integrator(ctxWith([builderProd, criticPass, verifierPass]));
-  assert.equal(decisionOf(r), "discard");
-  assert.match(rationaleOf(r), /attempted 1 out-of-policy tool call/);
+  assert.equal(decisionOf(r), "promote");
+  const d = r.detail as Record<string, unknown>;
+  assert.equal(d.preventedCount, 1);
+  assert.equal((d.preventedViolations as unknown[] | undefined)?.length, 1, "the blocked attempt is preserved for the audit trail");
+});
+
+test("REVIEW THRESHOLD: prevented attempts at/above the threshold escalate to review (held, not silently promoted)", async () => {
+  // One blocked improvisation is a warning; MANY in one run is a stronger signal → require a human,
+  // do not auto-promote. (Default threshold is 10.)
+  const many = Array.from({ length: 10 }, (_, i) => ({ tool: "terminal", path: `node -e attempt ${i}`, error: "not allowed" }));
+  const builderMany: RoleResult = { role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["a.ts"], policyViolations: many } };
+  const r = await integrator(ctxWith([builderMany, criticPass, verifierPass]));
+  assert.equal(decisionOf(r), "discard", "over the threshold → held for review, not promoted");
+  assert.match(rationaleOf(r), /requires review/);
+  const d = r.detail as Record<string, unknown>;
+  assert.equal(d.requiresReview, true, "marked as a review-hold, distinct from a code-quality failure");
+  assert.equal(d.preventedCount, 10);
+});
+
+test("REVIEW THRESHOLD: just UNDER the threshold still promotes (with the risk signal)", async () => {
+  const nine = Array.from({ length: 9 }, (_, i) => ({ tool: "terminal", path: `node -e attempt ${i}`, error: "not allowed" }));
+  const builderNine: RoleResult = { role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["a.ts"], policyViolations: nine } };
+  const r = await integrator(ctxWith([builderNine, criticPass, verifierPass]));
+  assert.equal(decisionOf(r), "promote");
+  assert.equal((r.detail as Record<string, unknown>).preventedCount, 9);
 });
 
 test("MULTI-GATE: critic AND verifier both reject → rationale names BOTH failing gates", async () => {
