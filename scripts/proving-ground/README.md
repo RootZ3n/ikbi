@@ -133,6 +133,21 @@ deeper cut at "does this code EARN its place?":
    interdiction lives downstream in `governed-exec` (allowlist/policy/sandbox `rejected`), and
    gate-wall ran in bypass. **[DONE]**
 4. **Value / ablation** — *would the outcome change if it didn't exist?* Run with the module
-   stubbed, diff promote/verdict/quality. `ablate-drift.mjs` + `ABLATION-DRIFT.md` did this for
-   drift-prevention (finding: structurally inert until the first-class-governor rework — now
-   partially addressed by the build-path drift governor). **[DONE for drift]**
+   stubbed, diff promote/verdict/quality. Two subjects done:
+   - `ablate-drift.mjs` + `ABLATION-DRIFT.md` — drift-prevention (finding: structurally inert until
+     the first-class-governor rework — now partially addressed by the build-path drift governor).
+   - `ablate-gate-wall.mjs` + `ABLATION-GATE-WALL.md` — gate-wall, aimed by influence's `passive`
+     verdict. gate-wall's decision is a PURE function of the grant, so the counterfactual is
+     DETERMINISTIC + FREE (no model calls). PART A: over the receipt corpus gate-wall denied 0 of
+     2,155 evaluations (100% bypass-driven) ⇒ **realized value zero** (allow-constant == ablated).
+     PART B (real gate ON vs allow-all OFF): teeth in **3/7** scenarios — low-trust `requiresApproval`
+     grants, a narrow exec-policy set (`git push`), and package-script gating unless verifier-
+     authorized; NO teeth for dangerous commands (`rm -rf /`, `curl | bash`) — that interdiction is
+     governed-exec's job (scored `pivotal` by influence). Verdict: **not vestigial but narrow** —
+     zero value for a single trusted operator in bypass, real value for delegated/untrusted use.
+     PART A is PURE + unit-tested by `ablate-gate-wall.test.mjs`.
+   **[DONE for drift + gate-wall]**
+
+This completes the four-dimension arc for the two modules influence flagged: reachability→frequency
+prove PRESENCE, influence scores STEERING, and ablation quantifies VALUE. The pattern is reusable —
+point `influence.mjs` at a corpus, take its `passive`/`latent` modules, and ablate each one.

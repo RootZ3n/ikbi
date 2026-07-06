@@ -19,7 +19,7 @@
  *   1. reachability (cov-analyze/reach-report) — was it executed?          [DONE]
  *   2. FREQUENCY (this file)                    — how often / how broadly?  [DONE]
  *   3. influence (influence.mjs)                — did it change a decision? [DONE]
- *   4. value / ablation (ablate-drift)          — would the outcome change? [DONE for drift]
+ *   4. value/ablation (ablate-drift, ablate-gate-wall) — would it change? [DONE drift+gate-wall]
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
