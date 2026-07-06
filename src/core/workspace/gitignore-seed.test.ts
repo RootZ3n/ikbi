@@ -47,6 +47,27 @@ test("commitAll seeds a .gitignore that excludes target/ when the repo has none"
   }
 });
 
+test("commitAll excludes a newly-added compiled binary (extensionless, e.g. `go build` output)", async () => {
+  const repo = await freshRepo();
+  try {
+    await writeFile(join(repo, "main.go"), "package main\nfunc main() {}\n");
+    await writeFile(join(repo, "go.mod"), "module ex\n\ngo 1.22\n");
+    // an ELF binary named after the module (what `go build` drops) + a legit shell script (also exec)
+    await writeFile(join(repo, "app"), Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00]));
+    await writeFile(join(repo, "run.sh"), "#!/bin/sh\necho hi\n");
+
+    const committed = await commitAll(repo, "build: go app");
+    assert.equal(committed, true);
+
+    const tracked = (await runGit(repo, ["ls-files"])).stdout.split("\n").filter(Boolean);
+    assert.ok(tracked.includes("main.go") && tracked.includes("go.mod"), "source + manifest committed");
+    assert.ok(!tracked.includes("app"), "the ELF binary is NOT committed");
+    assert.ok(tracked.includes("run.sh"), "a shell script (text, not ELF) IS committed — only binaries are dropped");
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
 test("commitAll NEVER overwrites an existing .gitignore", async () => {
   const repo = await freshRepo();
   try {

@@ -8,6 +8,7 @@
  */
 
 import { execFile } from "node:child_process";
+import { closeSync, openSync, readSync } from "node:fs";
 import { access, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -159,6 +160,37 @@ async function seedDefaultGitignoreIfAbsent(worktreePath: string): Promise<void>
   }
 }
 
+/** True iff `path` begins with the ELF magic (\x7fELF) — a compiled binary (Go/C/Rust exe, .o, .so).
+ *  Reads only the first 4 bytes; a shell script or any text file is never ELF, so this never misfires. */
+function isElfBinary(path: string): boolean {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, "r");
+    const buf = Buffer.alloc(4);
+    if (readSync(fd, buf, 0, 4, 0) < 4) return false;
+    return buf[0] === 0x7f && buf[1] === 0x45 && buf[2] === 0x4c && buf[3] === 0x46;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) try { closeSync(fd); } catch { /* ignore */ }
+  }
+}
+
+/**
+ * Un-stage newly-ADDED compiled binaries a build dropped in the worktree (e.g. `go build` → an
+ * extensionless `./modulename`, or a C `a.out`). Directory-based ignores (target/, bin/, obj/) miss
+ * these because they land at the root with no extension, so .gitignore can't catch them generically.
+ * ELF magic is the reliable signal. `--diff-filter=A` scopes this to NEW files only, so a binary a repo
+ * legitimately tracks (and the build merely rebuilt) is left staged.
+ */
+async function unstageAddedBinaries(worktreePath: string): Promise<void> {
+  const added = (await runGit(worktreePath, ["diff", "--cached", "--name-only", "--diff-filter=A"])).stdout
+    .split("\n").map((s) => s.trim()).filter((s) => s.length > 0);
+  for (const rel of added) {
+    if (isElfBinary(join(worktreePath, rel))) await runGit(worktreePath, ["reset", "--quiet", "--", rel]);
+  }
+}
+
 /** Stage everything and commit in a worktree. Returns false if there was nothing to commit. */
 export async function commitAll(worktreePath: string, message: string): Promise<boolean> {
   // Detect changes BEFORE seeding, so a genuine no-op build lands nothing (and we never write a
@@ -170,8 +202,11 @@ export async function commitAll(worktreePath: string, message: string): Promise<
   // node_modules/, …) are excluded from the `add -A` below instead of committed as artifacts.
   await seedDefaultGitignoreIfAbsent(worktreePath);
   await runGit(worktreePath, ["add", "-A"]);
-  const status = await runGit(worktreePath, ["status", "--porcelain"]);
-  if (status.stdout.trim().length === 0) return false;
+  // Drop extensionless compiled binaries that slipped past the dir-based ignores (e.g. a `go build` exe).
+  await unstageAddedBinaries(worktreePath);
+  // Re-check what's actually STAGED (a build whose only output was an unstaged binary lands nothing).
+  const staged = await runGit(worktreePath, ["diff", "--cached", "--name-only"]);
+  if (staged.stdout.trim().length === 0) return false;
   await runGit(worktreePath, ["commit", "--quiet", "-m", message]);
   return true;
 }
