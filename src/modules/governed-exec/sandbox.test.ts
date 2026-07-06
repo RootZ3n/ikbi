@@ -123,6 +123,16 @@ test("buildBwrapArgs: a non-Go toolchain (cargo) gets NO GOCACHE redirect (cargo
   assert.ok(!a.includes("GOCACHE"), "no Go env leaks onto a cargo invocation");
 });
 
+test("buildBwrapArgs: `mvn` redirects the local repo (MAVEN_OPTS) and `gradle` redirects GRADLE_USER_HOME into the tmpfs", () => {
+  const plan = (cmd: string): SandboxPlan => ({ mode: "bwrap", writableRoot: "/w", cwd: "/w", networkAllowed: true, risk: classifyCommandRisk(cmd, ["test"]) });
+  const mvn = buildBwrapArgs(plan("mvn"), "mvn", ["test"]);
+  const mo = mvn.indexOf("MAVEN_OPTS");
+  assert.ok(mo >= 0 && mvn[mo - 1] === "--setenv" && (mvn[mo + 1] ?? "").includes("maven.repo.local"), "MAVEN_OPTS sets a redirected local repo");
+  const gradle = buildBwrapArgs(plan("gradle"), "gradle", ["test"]);
+  const gh = gradle.indexOf("GRADLE_USER_HOME");
+  assert.ok(gh >= 0 && gradle[gh - 1] === "--setenv" && (gradle[gh + 1] ?? "").startsWith("/tmp/"), "GRADLE_USER_HOME redirected under /tmp");
+});
+
 test("buildBwrapArgs: a `dotnet` command redirects NuGet + CLI-home to the writable tmpfs (read-only HOME breaks dotnet's first-run)", () => {
   const plan: SandboxPlan = { mode: "bwrap", writableRoot: "/work/wt", cwd: "/work/wt", networkAllowed: true, risk: classifyCommandRisk("dotnet", ["test"]) };
   const a = buildBwrapArgs(plan, "dotnet", ["test"]);

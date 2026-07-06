@@ -132,6 +132,7 @@ const DEFAULT_GITIGNORE = [
   "__pycache__/", "*.pyc", ".venv/", "*.egg-info/", // Python
   "*.class", "*.jar",             // JVM (javac output / packaged artifacts)
   "bin/", "obj/",                 // .NET (build output + NuGet restore intermediates)
+  "build/", ".gradle/",           // Gradle (target/ above covers Maven)
   ".DS_Store",
   "",
 ].join("\n");

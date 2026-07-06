@@ -204,6 +204,11 @@ const TOOLCHAIN_SANDBOX_ENV: Readonly<Record<string, ReadonlyArray<readonly [str
     ["DOTNET_CLI_TELEMETRY_OPTOUT", "1"],
     ["DOTNET_NOLOGO", "1"],
   ],
+  // Maven's local repo (~/.m2) is in the read-only HOME; redirect it into the writable tmpfs (deps
+  // fetch from Central over the shared net). MAVEN_OPTS carries the -D as a JVM system property.
+  mvn: [["MAVEN_OPTS", "-Dmaven.repo.local=/tmp/.m2"]],
+  // Gradle's home (~/.gradle: caches, wrapper, downloaded deps) is in the read-only HOME; redirect it.
+  gradle: [["GRADLE_USER_HOME", "/tmp/.gradle"]],
 };
 
 /** The `--setenv` cache redirects a given binary needs to build inside the read-only-home sandbox. */

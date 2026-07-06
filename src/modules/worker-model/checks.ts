@@ -13,6 +13,7 @@
 
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import type { ExecResult } from "../governed-exec/index.js";
 
@@ -71,6 +72,25 @@ const PYTHON_UNITTEST_CHECKS: readonly Check[] = [{ name: "test", command: "pyth
 /** .NET native checks — `dotnet test` restores (into the sandbox's writable NuGet cache over the
  *  shared net), builds, and runs the test projects a .sln / .csproj declares. */
 const DOTNET_CHECKS: readonly Check[] = [{ name: "test", command: "dotnet", args: ["test", "--nologo", "-v", "q"] }];
+
+/** Maven native checks — `mvn test` (NOT `-q`, which hides the Surefire "Tests run:" summary the
+ *  evidence gate reads). Deps + plugins fetch from Central over the shared net into the sandbox's
+ *  redirected local repo (/tmp/.m2 via MAVEN_OPTS). */
+const MAVEN_CHECKS: readonly Check[] = [{ name: "test", command: "mvn", args: ["test"] }];
+
+/** Absolute path to the ikbi-shipped Gradle init script (resolved from this module, works under both
+ *  tsx/src and compiled dist since both sit 3 dirs below the repo root). */
+const GRADLE_INIT_SCRIPT = fileURLToPath(new URL("../../../assets/gradle-test-summary.init.gradle", import.meta.url));
+
+/** Gradle native checks — Gradle prints NO test count on success and caches tasks UP-TO-DATE, so a
+ *  passing build would read "no test evidence". `--rerun-tasks` forces execution and the shipped
+ *  `--init-script` emits a JUnit-style summary the evidence gate parses. `--no-daemon`/`--console=plain`
+ *  keep output clean and non-persistent in the sandbox. */
+const GRADLE_CHECKS: readonly Check[] = [{
+  name: "test",
+  command: "gradle",
+  args: ["test", "--rerun-tasks", "--no-daemon", "--console=plain", "--init-script", GRADLE_INIT_SCRIPT],
+}];
 
 /** Godot headless syntax check (Godot 4.x — lightweight, no test framework needed). */
 const GODOT_HEADLESS_CHECKS: readonly Check[] = [{ name: "check", command: "godot", args: ["--headless", "--quit"] }];
@@ -225,6 +245,10 @@ function detectChecksForProject(projectRoot: string): ChecksResolution {
   }
   if (rootHas(projectRoot, "Cargo.toml")) return { ok: true, checks: RUST_CHECKS, source: "default" };
   if (rootHas(projectRoot, "go.mod")) return { ok: true, checks: GO_CHECKS, source: "default" };
+  if (rootHas(projectRoot, "pom.xml")) return { ok: true, checks: MAVEN_CHECKS, source: "default" };
+  if (rootHas(projectRoot, "build.gradle") || rootHas(projectRoot, "build.gradle.kts") || rootHas(projectRoot, "settings.gradle") || rootHas(projectRoot, "settings.gradle.kts")) {
+    return { ok: true, checks: GRADLE_CHECKS, source: "default" };
+  }
   if (rootHas(projectRoot, "pyproject.toml") || rootHas(projectRoot, "setup.py") || rootHas(projectRoot, "setup.cfg")) {
     return detectPythonChecks(projectRoot);
   }
@@ -257,6 +281,11 @@ export const PROJECT_MANIFESTS: readonly string[] = [
   "pnpm-workspace.yaml",
   "Cargo.toml",
   "go.mod",
+  "pom.xml",
+  "build.gradle",
+  "build.gradle.kts",
+  "settings.gradle",
+  "settings.gradle.kts",
   "pyproject.toml",
   "deno.json",
   "deno.jsonc",
