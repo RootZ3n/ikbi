@@ -146,6 +146,42 @@ test("fixer-on-verifier-fail: with NO fixer configured, the rescue does NOT run 
   assert.equal(roles.calls.verifier, 1, "no fixer ⇒ the verifier is not re-run");
 });
 
+// A CLEAN green build whose builder ATTEMPTED one PREVENTED (blocked) tool call. Uses the REAL
+// integrator (not overridden) so the effect-based gate + risk-telemetry summary are exercised end-to-end.
+function preventedAttemptRoles() {
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {};
+  for (const r of WORKER_ROLES) {
+    if (r === "integrator") continue; // use the real integrator (effect-based gate)
+    roles[r] = async () => {
+      if (r === "builder") return { role: r, outcome: "success", summary: "built", detail: { filesWritten: ["a.ts"], policyViolations: [{ tool: "terminal", path: 'node -e "require(\'./x\')"', error: "code execution is not allowed" }] } };
+      if (r === "verifier") return { role: r, outcome: "success", summary: "green", detail: { verdict: "pass", checks: [{ name: "test", exitCode: 0, testCount: { passed: 3, total: 3 }, outputTail: "3 passing" }] } };
+      if (r === "critic") return { role: r, outcome: "success", summary: "c", detail: { pass: true } };
+      return { role: r, outcome: "success", summary: r };
+    };
+  }
+  return roles;
+}
+
+test("effect-based gate + telemetry: a PREVENTED attempt promotes AND records preventedCount on the run summary", async () => {
+  const ids = makeIdentities();
+  const ws = fakeWorkspaces();
+  const summaries: Array<{ metadata?: Record<string, unknown> }> = [];
+  const capturingReceipts = { append: async (i: unknown): Promise<unknown> => { const rec = i as { operation?: string; metadata?: Record<string, unknown> }; if (rec.operation === "worker.run.summary") summaries.push(rec); return {}; } };
+  const orch = createOrchestrator({
+    config: { enabled: true, roleTimeoutMs: 5000, maxConcurrentRuns: 1, totalBudgetMs: 0 },
+    resolveIdentity: ids.resolveIdentity, roleClaim: ids.roleClaim, roles: preventedAttemptRoles(),
+    workspaces: ws.workspaces, trust: fakeTrust(), receipts: capturingReceipts,
+    events: noopBus() as unknown as NonNullable<OrchestratorDeps["events"]>, gateWall: allowGate, invokeModel: async () => { throw new Error("unused"); }, killCheck: async () => ({ killed: false }),
+  });
+
+  const r = await orch.run(task, ids.parentCtx);
+
+  assert.equal(r.promoted, true, "a prevented attempt no longer blocks promote (judge by effect)");
+  const meta = summaries.at(-1)?.metadata ?? {};
+  assert.equal(meta.preventedCount, 1, "the run summary records the prevented attempt (passive risk telemetry)");
+  assert.ok(Array.isArray(meta.preventedCommands) && /node -e/.test(meta.preventedCommands[0]), "the command shape is recorded for later analysis");
+});
+
 test("fixer rescue: with NO fixer configured, the same RED build is NOT rescued (stays failed)", async () => {
   const ids = makeIdentities();
   const ws = fakeWorkspaces();

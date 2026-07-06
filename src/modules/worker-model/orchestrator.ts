@@ -3275,6 +3275,25 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // model, cost, verification result, and promotion result — enabling `receipts --task` to
     // show a complete picture without inspecting individual role receipts.
     const verifierResult = results.find((r) => r.role === "verifier");
+    // PASSIVE RISK TELEMETRY: record this build's PREVENTED policy attempts (count + command shapes)
+    // on the run summary EVERY build writes. Prevented attempts no longer discard (effect-based gate),
+    // but recording them here means risk evidence accrues on ordinary usage — no dedicated (paid)
+    // observation campaign is ever needed to answer "which prevented behaviours are normal cheap-model
+    // noise vs. patterns that predict bad outcomes?" before designing graduated trust scoring.
+    const builderForRisk = results.find((r) => r.role === "builder");
+    const preventedViolations = ((): Array<Record<string, unknown>> => {
+      const d = (builderForRisk?.detail ?? {}) as Record<string, unknown>;
+      const pv = Array.isArray(d.policyViolations) ? d.policyViolations : Array.isArray(d.rejectedToolCalls) ? d.rejectedToolCalls : [];
+      return pv as Array<Record<string, unknown>>;
+    })();
+    const preventedCommands = preventedViolations
+      .map((v) => {
+        const tool = typeof v.tool === "string" ? v.tool : "tool";
+        const path = typeof v.path === "string" ? v.path : "";
+        return path ? `${tool}:${path}` : tool;
+      })
+      .slice(0, 20);
+    const requiresReview = ((results.find((r) => r.role === "integrator")?.detail ?? {}) as Record<string, unknown>).requiresReview === true;
     await receipts.append(
       {
         operation: "worker.run.summary",
@@ -3292,6 +3311,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           verificationResult: verifierResult !== undefined ? verifierResult.outcome : "not_run",
           verificationMode: ranVerificationMode,
           retrievalMode: ranRetrievalMode,
+          ...(preventedViolations.length > 0 ? { preventedCount: preventedViolations.length, preventedCommands, requiresReview } : {}),
           ...(task.originAgent !== undefined ? { originAgent: task.originAgent } : {}),
         },
         project: task.targetRepo,
