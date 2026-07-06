@@ -108,6 +108,21 @@ test("buildBwrapArgs: host read-only, worktree writable, net denied by default, 
   assert.ok(!a.includes("HOME"), "HOME is not overridden — the real home is bound read-only for tool discovery");
 });
 
+test("buildBwrapArgs: a `go` command gets GOCACHE/GOPATH redirected to the writable tmpfs (read-only HOME would block go's cache)", () => {
+  const plan: SandboxPlan = { mode: "bwrap", writableRoot: "/work/wt", cwd: "/work/wt", networkAllowed: true, risk: classifyCommandRisk("go", ["test", "./..."]) };
+  const a = buildBwrapArgs(plan, "go", ["test", "./..."]);
+  const gc = a.indexOf("GOCACHE");
+  assert.ok(gc >= 0 && a[gc - 1] === "--setenv" && (a[gc + 1] ?? "").startsWith("/tmp/"), "GOCACHE redirected under /tmp via --setenv");
+  const gp = a.indexOf("GOPATH");
+  assert.ok(gp >= 0 && a[gp - 1] === "--setenv" && (a[gp + 1] ?? "").startsWith("/tmp/"), "GOPATH redirected under /tmp via --setenv");
+});
+
+test("buildBwrapArgs: a non-Go toolchain (cargo) gets NO GOCACHE redirect (cargo caches in-worktree)", () => {
+  const plan: SandboxPlan = { mode: "bwrap", writableRoot: "/work/wt", cwd: "/work/wt", networkAllowed: true, risk: classifyCommandRisk("cargo", ["test"]) };
+  const a = buildBwrapArgs(plan, "cargo", ["test"]);
+  assert.ok(!a.includes("GOCACHE"), "no Go env leaks onto a cargo invocation");
+});
+
 test("buildBwrapArgs: --share-net is added ONLY when network is explicitly allowed", () => {
   const plan: SandboxPlan = { mode: "bwrap", writableRoot: "/w", networkAllowed: true, risk: classifyCommandRisk("pnpm", ["install"]) };
   assert.ok(buildBwrapArgs(plan, "pnpm", ["install"]).includes("--share-net"));

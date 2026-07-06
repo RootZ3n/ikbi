@@ -185,6 +185,24 @@ export function packageManagerStoreDirs(env: NodeJS.ProcessEnv = process.env): s
 }
 
 /**
+ * Per-toolchain env redirects so a sandboxed build writes its CACHE to the in-sandbox tmpfs (/tmp)
+ * instead of the read-only real $HOME. Go's `GOCACHE` (~/.cache/go-build) and `GOPATH` (~/go) live in
+ * HOME, which the sandbox binds READ-ONLY — so a sandboxed `go test` fails with the misleading
+ * "package testing is not in std" (actually a cache-write EROFS) unless these are redirected. /tmp is
+ * a fresh tmpfs bound writable and `go` creates these dirs on demand. Ephemeral (no cache reuse across
+ * builds — a few seconds to recompile std) but correct and host-clean. Unlike Rust, whose build
+ * output lands in the in-worktree `target/`, Go has no in-worktree cache, so this redirect is required.
+ */
+const TOOLCHAIN_SANDBOX_ENV: Readonly<Record<string, ReadonlyArray<readonly [string, string]>>> = {
+  go: [["GOCACHE", "/tmp/.gocache"], ["GOPATH", "/tmp/.gopath"]],
+};
+
+/** The `--setenv` cache redirects a given binary needs to build inside the read-only-home sandbox. */
+export function toolchainSandboxEnv(command: string): ReadonlyArray<readonly [string, string]> {
+  return TOOLCHAIN_SANDBOX_ENV[basename(command)] ?? [];
+}
+
+/**
  * Construct the bwrap argv that wraps `command args` under the worktree-confinement policy:
  *   • the entire host is bound READ-ONLY (`--ro-bind / /`) — the real $HOME, ~/.ikbi, /pehverse,
  *     /etc, repo parents, and ANY absolute path are read-only, so a write to them fails hard
@@ -224,6 +242,9 @@ export function buildBwrapArgs(plan: SandboxPlan, command: string, args: readonl
   if (chdir !== undefined) {
     a.push("--chdir", chdir);
   }
+  // Redirect toolchain caches (e.g. Go's GOCACHE/GOPATH) to the writable tmpfs — else a read-only
+  // HOME makes `go test` fail to write its build cache. No-op for toolchains that cache in-worktree.
+  for (const [k, v] of toolchainSandboxEnv(command)) a.push("--setenv", k, v);
   a.push("--unshare-all");
   if (plan.networkAllowed) a.push("--share-net");
   a.push("--die-with-parent", "--new-session", "--", command, ...args);
