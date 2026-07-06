@@ -39,6 +39,7 @@ import type { AutonomyGrant } from "../../core/trust/contract.js";
 import { events as coreEvents } from "../../core/events/index.js";
 import type { EventBusSurface } from "../../core/events/index.js";
 import { gateWall as coreGateWall, type GateWall } from "../gate-wall/index.js";
+import { driftPrevention as coreDriftPrevention } from "../drift-prevention/index.js";
 import type { ExecRequest, ExecResult } from "../governed-exec/index.js";
 import { createOrchestrator } from "./orchestrator.js";
 import { WorkerError, validateDelegationEnvelope, type DelegationEnvelope, type WorkerResult, type WorkerRole, type WorkerTask } from "./contract.js";
@@ -478,7 +479,10 @@ export function createProductionWorker(
   // COOPERATIVE per-run cancellation seam: the orchestrator already checks killCheck before
   // start + at each role boundary (target.runId === task.taskId), so a cancelled task stops
   // cleanly (discard, no half-promote). Absent ⇒ the live kill-switch default (unchanged).
-  return createOrchestrator({ roleClaim: productionRoleClaim(opts.workerToken), gateWall: opts.gateWall ?? coreGateWall, governedExec, workspaces: coreWorkspaces, enforceProjectRoot: true, ...(opts.onExecOutput !== undefined ? { onExecOutput: opts.onExecOutput } : {}), ...(opts.requestApproval !== undefined ? { requestApproval: opts.requestApproval } : {}), ...(opts.memoryGovernor !== undefined ? { memoryGovernor: opts.memoryGovernor } : {}), ...(opts.killCheck !== undefined ? { killCheck: opts.killCheck } : {}) });
+  // DRIFT GOVERNOR (step 3): wire the live drift detector so the build path becomes a reliability
+  // governor. The drift POLICY (IKBI_DRIFT_PREVENTION_POLICY, default reportOnly) decides whether a
+  // detected drift is advisory (default), warns, or blocks — so production wiring is safe by default.
+  return createOrchestrator({ roleClaim: productionRoleClaim(opts.workerToken), gateWall: opts.gateWall ?? coreGateWall, governedExec, workspaces: coreWorkspaces, driftGovernor: coreDriftPrevention, enforceProjectRoot: true, ...(opts.onExecOutput !== undefined ? { onExecOutput: opts.onExecOutput } : {}), ...(opts.requestApproval !== undefined ? { requestApproval: opts.requestApproval } : {}), ...(opts.memoryGovernor !== undefined ? { memoryGovernor: opts.memoryGovernor } : {}), ...(opts.killCheck !== undefined ? { killCheck: opts.killCheck } : {}) });
 }
 
 /**

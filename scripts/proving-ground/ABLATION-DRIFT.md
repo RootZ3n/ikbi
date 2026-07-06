@@ -60,10 +60,15 @@ The root cause of "realistic value ≈ 0" was mechanical: the `pattern` baseline
    is silent (the old inert behavior); after projecting a reliable history then collapsing,
    `drift.check()` DETECTS the decline (baseline 1.0 vs recent 0.0, `major`).
 
-So the value path is now WIRED on the write side: the baseline accumulates a real reference across
-builds. Two honest caveats remain (do not overstate liveness): (1) the READ side — `drift.check()` — is
-still consumed only by niche surfaces (`ikbi recover` and the `--headless` bare-goal cognition path,
-labeled experimental), NOT on or after the build path, so a decline is only surfaced if an operator runs
-those; (2) it is reportOnly by default (advisory). Turning detection into intervention on the build path
-(warn/block, and calling `check()` where a build can act on it) is the next increment — until then the
-baseline is real but the alarm nobody reads.
+So the value path is now WIRED on BOTH sides. WRITE side: the baseline accumulates a real reference
+across builds. READ side (step 3): `drift.check()` is now a first-class GOVERNOR on the build path — the
+production worker (`createProductionWorker`) consults it for the builder agent's reliability on the
+project BEFORE any paid role runs, and acts per the drift policy:
+  - reportOnly (DEFAULT) — advisory: the drifted operations are recorded on the run-summary receipt
+    (`driftedOperations`) and the build proceeds unchanged.
+  - warn — additionally logs the drift; the build proceeds.
+  - block — REFUSES the build at zero API cost (a `worker.run.drift_blocked` receipt + rejected result),
+    so a degraded agent stops burning spend until a human investigates.
+It is FAIL-OPEN: a drift READ error never breaks a build (drift is advisory infrastructure). One honest
+caveat remains: the default policy is reportOnly (advisory) — warn/block are the operator's deliberate
+opt-in via `IKBI_DRIFT_PREVENTION_POLICY`. The baseline is real AND now read where a build can act on it.

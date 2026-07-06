@@ -56,6 +56,8 @@ import {
 import type { EscalationSignals, EscalationDecision } from "../escalation/index.js";
 import { decideRecovery } from "../recovery/index.js";
 import type { RecoveryAttempt } from "../recovery/index.js";
+import { DriftBlockedError } from "../drift-prevention/index.js";
+import type { DriftPrevention, DriftReport } from "../drift-prevention/index.js";
 import { rosterFromIds } from "../model-router/index.js";
 import { applyConsultPatch } from "./consult-apply.js";
 import type { ApplyConsultPatchInput, ApplyConsultPatchResult } from "./consult-apply.js";
@@ -129,6 +131,9 @@ import type {
 } from "./contract.js";
 
 const EVENT_SOURCE = "worker-model";
+/** The receipt operation a builder role writes (`worker.role.builder`) — the drift baseline key the
+ *  build-path governor consults for builder reliability. Kept in sync with recordRole's operation. */
+const BUILDER_OPERATION = "worker.role.builder";
 
 /**
  * Pre-flight context threshold: bump the builder to a bigger-window model when the KNOWN base
@@ -642,6 +647,18 @@ export interface OrchestratorDeps {
    * Absent ⇒ no interception (backward compatible).
    */
   readonly memoryGovernor?: import("../memory-governor/contract.js").MemoryGovernor;
+  /**
+   * Drift GOVERNOR — the reliability watchdog on the BUILD PATH (step 3). Before spending on any
+   * paid role, it reads the builder agent's durable baseline vs. its recent success rate for this
+   * project and, per the drift POLICY (IKBI_DRIFT_PREVENTION_POLICY):
+   *   - reportOnly (default) ⇒ advisory: emit + attach a note; the build proceeds unchanged.
+   *   - warn ⇒ log + attach a warning note; the build proceeds.
+   *   - block ⇒ REFUSE the build at zero API cost (a degraded agent must not keep burning spend).
+   * Absent ⇒ no build-path governor (backward compatible; tests + bare orchestrators unaffected).
+   * Wired to the live singleton by `createProductionWorker`. Fail-OPEN: a drift READ error never
+   * breaks a build — drift is advisory infrastructure, not a correctness gate.
+   */
+  readonly driftGovernor?: DriftPrevention;
 }
 
 /** A role identity spawned under the parent ceiling (#10). */
@@ -766,6 +783,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   const invokeModel = deps.invokeModel ?? lazyInvokeModel;
   const neutralizeUntrusted = deps.neutralizeUntrusted ?? coreNeutralize;
   const gateWall = deps.gateWall; // optional in the type — absent → promote DENIED fail-closed (H5)
+  const driftGovernor = deps.driftGovernor; // absent → no build-path drift governor (backward compatible)
   const judge = deps.judge ?? deterministicJudge; // competitive-mode scorer (pure, no model)
   const enforceProjectRoot = deps.enforceProjectRoot ?? false; // Fix 1/2 guard — production-only (off in tests)
   // HARDENED-BY-DEFAULT (production): the verification + retrieval modes this run wires. The
@@ -810,6 +828,32 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     return deadline !== undefined && nowMs() > deadline;
   }
 
+  /**
+   * BUILD-PATH DRIFT GOVERNOR (step 3). Consult the wired drift detector for the builder agent's
+   * reliability on this project, BEFORE any paid role runs. Returns the drifted reports for advisory
+   * attachment, plus a `blockReason` when the drift "block" policy fired (the caller turns that into a
+   * zero-cost rejection). FAIL-OPEN: any drift READ error is swallowed (empty result) — drift is
+   * advisory infrastructure and must never break a build. Only the drift POLICY (block) refuses, and
+   * only on genuine detected drift. Caller has already checked driftGovernor !== undefined.
+   */
+  async function checkBuildDrift(task: WorkerTask, builderAgentId: string): Promise<{ reports: DriftReport[]; blockReason?: string }> {
+    try {
+      const reports = (await driftGovernor!.check({ agent: builderAgentId, operation: BUILDER_OPERATION, project: task.targetRepo })).filter((r) => r.drifted);
+      return { reports };
+    } catch (err) {
+      if (err instanceof DriftBlockedError) {
+        const detail = err.reports
+          .map((r) => `${r.operation} recent ${Math.round(r.recentRate * 100)}% vs baseline ${Math.round(r.baselineRate * 100)}% (${r.severity ?? "minor"})`)
+          .join("; ");
+        const blockReason = `Refusing to build: builder reliability has drifted for this project — ${detail}. Held under the drift "block" policy; investigate the degradation or set IKBI_DRIFT_PREVENTION_POLICY=warn to proceed.`;
+        return { reports: [...err.reports], blockReason };
+      }
+      // Any OTHER error → fail open. A drift read failure must never break a build.
+      log.debug({ taskId: task.taskId, err: err instanceof Error ? err.message : String(err) }, "drift governor read failed — proceeding (fail-open)");
+      return { reports: [] };
+    }
+  }
+
   // The active run's mid-loop halt check, handed to the (real) builder so its loop can stop at
   // iteration granularity on a kill or budget overrun. Set at run() entry; builds are serial.
   let activeCheckHalt: (() => Promise<{ halt: boolean; reason?: string }>) | undefined;
@@ -834,6 +878,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   // telemetry, so they accrue as evidence even on failed runs that never reach the integrator. Reset at
   // every run entry; builds are serial (like injectionDetectedThisBuild / policyTaintedThisBuild).
   let fixerPreventedThisBuild: Array<Record<string, unknown>> = [];
+  // BUILD-PATH DRIFT (per-run, step 3): the advisory drifted reports the build-path governor surfaced
+  // for THIS build (reportOnly/warn policies). Recorded on the run-summary receipt so the reliability
+  // signal is auditable without a separate query. A "block" outcome never reaches here — it rejects the
+  // build at entry before any role runs. Reset at every run entry; builds are serial.
+  let buildDriftReports: DriftReport[] = [];
 
   // Accumulate a builder attempt's security signals (injection / policy taint) into the per-run flags.
   // recordRole does this for the roles it records; RETRY builders that bypass recordRole (the
@@ -1555,6 +1604,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     injectionDetectedThisBuild = false; // reset the per-run injection flag (builds are serial)
     policyTaintedThisBuild = false; // reset the per-run policy-taint flag
     fixerPreventedThisBuild = []; // reset the per-run off-books fixer prevented-attempt accumulator
+    buildDriftReports = []; // reset the per-run build-path drift advisory reports
     // Wire the escalation resolver (once) so the tier cascade skips unwired/stub models — done
     // here, in the async build entry, where the egress floor + provider registry are fully loaded.
     await ensureEscalationResolver();
@@ -1586,6 +1636,35 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         const reason = `Refusing to build: ${dirtyReason}`;
         events.publish(workerFailed.create({ taskId: task.taskId, reason }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } }));
         return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason };
+      }
+    }
+
+    // BUILD-PATH DRIFT GOVERNOR (step 3): turn drift DETECTION into INTERVENTION on the build path.
+    // Before spending on any paid role, consult the drift detector for the builder agent's reliability
+    // on THIS project. Skipped on a reuseWorkspace step (a mid-chain step-planner pass — the governor
+    // fires on the first/standalone build, like the dirty check) and when no governor is wired.
+    // FAIL-OPEN by construction (see checkBuildDrift): a drift READ error never blocks a build; only a
+    // deliberate "block" policy on genuine detected drift refuses — at zero API cost.
+    if (task.reuseWorkspace === undefined && driftGovernor !== undefined) {
+      const builderAgentId = spawnRole("builder", parentCtx).identity.agentId;
+      const drift = await checkBuildDrift(task, builderAgentId);
+      buildDriftReports = drift.reports;
+      if (drift.blockReason !== undefined) {
+        events.publish(workerFailed.create({ taskId: task.taskId, reason: drift.blockReason }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } }));
+        await receipts.append(
+          {
+            operation: "worker.run.drift_blocked",
+            outcome: { status: "rejected", detail: drift.blockReason },
+            requestId: task.taskId,
+            metadata: { taskId: task.taskId, agentId: builderAgentId, targetRepo: task.targetRepo, driftedOperations: drift.reports.map((r) => r.operation) },
+            project: task.targetRepo,
+          },
+          parentIdentity,
+        );
+        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason: drift.blockReason };
+      }
+      if (buildDriftReports.length > 0) {
+        log.warn({ taskId: task.taskId, agentId: builderAgentId, drifted: buildDriftReports.map((r) => `${r.operation} ${Math.round(r.recentRate * 100)}%<${Math.round(r.baselineRate * 100)}%`) }, "drift governor: builder reliability drifted for this project — proceeding (advisory)");
       }
     }
 
@@ -3361,6 +3440,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           verificationMode: ranVerificationMode,
           retrievalMode: ranRetrievalMode,
           ...(allPrevented.length > 0 ? { preventedCount: notablePrevented.length, allPreventedCount: allPrevented.length, highRiskCount, preventedCommands, requiresReview } : {}),
+          // BUILD-PATH DRIFT (step 3): the advisory drifted operations the governor surfaced (reportOnly/warn).
+          ...(buildDriftReports.length > 0 ? { driftedOperations: buildDriftReports.map((r) => ({ operation: r.operation, recentRate: r.recentRate, baselineRate: r.baselineRate, severity: r.severity ?? "minor" })) } : {}),
           ...(task.originAgent !== undefined ? { originAgent: task.originAgent } : {}),
         },
         project: task.targetRepo,
