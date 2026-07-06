@@ -106,3 +106,24 @@ TRUE-ORPHAN (wired nowhere). See `REACHABILITY-REPORT.md` for the current snapsh
 module dir must have a non-test importer OR an `@status dormant/library-only` label. It cannot
 prove execution (that's the harness above) but it fails the instant a new declared-but-unwired
 module appears — so a phantom can never slip in silently again.
+
+## Dimensions of runtime truth (beyond reachability)
+
+Reachability is only the first of four questions you can ask about a module at runtime. Each is a
+deeper cut at "does this code EARN its place?":
+
+1. **Reachability** — *was it executed?* `cov-analyze.mjs` + `reach-report.mjs` (V8 coverage minus
+   a construction floor). **[DONE]**
+2. **Frequency** — *how OFTEN / how BROADLY is it used?* `frequency.mjs` aggregates the per-surface
+   operational matrix (`results.json`) into a breadth band per module — ubiquitous / common /
+   narrow / single / unused — plus op-fn intensity (max/avg). A `single`/`unused` module is the
+   first hint a module may not earn its place. PURE over `results.json` (no re-run); unit-tested by
+   `frequency.test.mjs`. Run: `node scripts/proving-ground/frequency.mjs` (reads the last
+   reachability `results.json`, writes `FREQUENCY-REPORT.md`). **[DONE]**
+3. **Influence** — *did its output change a DECISION?* (did a module's result flip a branch / gate /
+   route). Needs decision-point instrumentation correlating module events with branch outcomes.
+   **[roadmap]**
+4. **Value / ablation** — *would the outcome change if it didn't exist?* Run with the module
+   stubbed, diff promote/verdict/quality. `ablate-drift.mjs` + `ABLATION-DRIFT.md` did this for
+   drift-prevention (finding: structurally inert until the first-class-governor rework — now
+   partially addressed by the build-path drift governor). **[DONE for drift]**
