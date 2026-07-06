@@ -2026,6 +2026,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           if (runFixer !== undefined) {
             const fix = await runFixer(result);
             const vd = (result.detail as Record<string, unknown> | undefined) ?? {};
+            // Observability: the fixer's builder pass runs via runRoleFn WITHOUT recordRole (like the
+            // builder-stop fixer), so it writes no receipt — log the rescue outcome so it is auditable.
+            log.warn({ taskId: task.taskId, fixerModel: config.fixerModel, fixed: fix.fixed, trigger: "verifier_fail" }, fix.fixed ? "fixer rescue: closed a verifier-caught red check" : "fixer rescue: could not close the verifier-caught red check");
             result = fix.fixed
               ? {
                   ...fix.verify,
