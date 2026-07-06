@@ -30,7 +30,7 @@
 
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -55,8 +55,15 @@ const moduleNames = readdirSync(modulesDir, { withFileTypes: true })
 const allSourceFiles = walkTs(srcDir);
 const importSpec = /(?:from|import)\s*\(?\s*["']([^"']+)["']/g;
 
-/** Any non-test file OUTSIDE `mod/` whose import specifier resolves into `mod/`. */
+/**
+ * Any non-test file OUTSIDE `mod/` whose import specifier RESOLVES into `src/modules/<mod>/`.
+ * A RELATIVE specifier is resolved against the importing file so it must land in the module dir — a
+ * bare substring match would false-wire a module that merely shares a core dir's name (e.g. a module
+ * `trust` credited to `../../core/trust/…`). A non-relative specifier is matched on `modules/<mod>/`.
+ */
+const modulesRoot = join(srcDir, "modules");
 function hasNonTestImporter(mod: string): string | null {
+  const modDir = join(modulesRoot, mod);
   for (const file of allSourceFiles) {
     if (file.includes(`/modules/${mod}/`)) continue;
     const src = readFileSync(file, "utf8");
@@ -64,7 +71,10 @@ function hasNonTestImporter(mod: string): string | null {
     let m: RegExpExecArray | null;
     while ((m = importSpec.exec(src)) !== null) {
       const spec = m[1] ?? "";
-      if (spec.includes(`/${mod}/`) || spec.endsWith(`/${mod}`)) return file.replace(srcDir, "src/");
+      const lands = spec.startsWith(".")
+        ? resolve(dirname(file), spec).startsWith(modDir + "/") || resolve(dirname(file), spec) === modDir
+        : spec.includes(`/modules/${mod}/`) || spec.endsWith(`/modules/${mod}`);
+      if (lands) return file.replace(srcDir, "src/");
     }
   }
   return null;

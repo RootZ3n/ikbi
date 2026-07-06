@@ -674,8 +674,9 @@ function isBenignWorktreeCleanup(command: string | undefined): boolean {
   if (targets.length === 0) return false; // only flags / no explicit target → not obviously benign
   return targets.every((t) => {
     if (t.startsWith("/") || t.startsWith("~")) return false; // absolute / home — outside the worktree
-    if (t === "." || t === "..") return false; // the worktree root or its parent
-    if (t.split("/").some((seg) => seg === "..")) return false; // any parent traversal
+    const norm = t.replace(/\/+$/, ""); // ignore a trailing slash so `./` and `..` normalize
+    if (norm === "" || norm === "." || norm === "..") return false; // the worktree root or its parent
+    if (norm.split("/").some((seg) => seg === "..")) return false; // any parent traversal (a leading `./` is fine)
     if (/[*?[\]]/.test(t)) return false; // a glob could match more than intended
     return true; // a plain worktree-relative path — its own scratch/generated file
   });

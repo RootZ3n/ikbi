@@ -60,6 +60,10 @@ The root cause of "realistic value ≈ 0" was mechanical: the `pattern` baseline
    is silent (the old inert behavior); after projecting a reliable history then collapsing,
    `drift.check()` DETECTS the decline (baseline 1.0 vs recent 0.0, `major`).
 
-So the value path is now live: drift accumulates a real reference across builds and will fire on a
-genuine reliability decline. Still reportOnly by default (advisory) — turning detection into
-intervention (warn/block policy on the build path) is the next increment.
+So the value path is now WIRED on the write side: the baseline accumulates a real reference across
+builds. Two honest caveats remain (do not overstate liveness): (1) the READ side — `drift.check()` — is
+still consumed only by niche surfaces (`ikbi recover` and the `--headless` bare-goal cognition path,
+labeled experimental), NOT on or after the build path, so a decline is only surfaced if an operator runs
+those; (2) it is reportOnly by default (advisory). Turning detection into intervention on the build path
+(warn/block, and calling `check()` where a build can act on it) is the next increment — until then the
+baseline is real but the alarm nobody reads.

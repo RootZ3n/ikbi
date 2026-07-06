@@ -36,7 +36,29 @@
  */
 
 import type { RoleFn, RoleResult } from "./contract.js";
-import { workerModelConfig, DEFAULT_PREVENTED_REVIEW_THRESHOLD } from "./config.js";
+import { workerModelConfig, DEFAULT_PREVENTED_REVIEW_THRESHOLD, DEFAULT_PREVENTED_HIGH_RISK_REVIEW_THRESHOLD } from "./config.js";
+
+/**
+ * HIGH-RISK prevented-attempt classifier: network / shell-escape / privilege / system reaches. Intent
+ * still matters even when the governor blocked it — a repeated reach for the network or a root shell is
+ * a red flag a single blocked `node -e` self-verify is not, so these escalate to review far faster. We
+ * classify from the recorded command/error text (a prevented terminal call carries the command in
+ * `path` and the binary in `error`). NOT high-risk: code-eval self-verify (node/python -e), dev/build
+ * tools, benign cleanup — those are the ordinary cheap-model noise the effect-based gate stopped punishing.
+ */
+const HIGH_RISK_BINARIES: ReadonlySet<string> = new Set([
+  "curl", "wget", "ssh", "scp", "sftp", "rsync", "nc", "ncat", "netcat", "telnet", "ftp", "socat",
+  "bash", "sh", "zsh", "dash", "ksh", "sudo", "su", "doas", "pkexec", "chroot", "mount", "umount", "systemctl", "crontab",
+]);
+function isHighRiskPrevented(v: unknown): boolean {
+  const o = (v ?? {}) as { path?: unknown; error?: unknown };
+  // The governor names the denied binary in its error ("binary 'curl' is not on the allowlist") — the
+  // precise signal. Fall back to the first token of the recorded command. Matching the BINARY (not any
+  // substring of the path) avoids false-flagging a file that merely contains "sh"/"nc" in its name.
+  const err = typeof o.error === "string" ? /binary ['"]?([A-Za-z0-9_.+-]+)/i.exec(o.error) : null;
+  const bin = (err?.[1] ?? (typeof o.path === "string" ? o.path.trim().split(/\s+/)[0] ?? "" : "")).toLowerCase();
+  return HIGH_RISK_BINARIES.has(bin);
+}
 
 /** Safe accessor for a role result's open detail bag. */
 function detailOf(result: RoleResult | undefined): Record<string, unknown> {
@@ -108,9 +130,13 @@ export const integrator: RoleFn = async (ctx) => {
     // never rejected tool calls, so they never reach here.
     const policyConfirmed = policyViolations !== undefined;
     const preventedCount = policyConfirmed ? policyViolations.length : 0;
+    const highRiskCount = policyConfirmed ? policyViolations.filter(isHighRiskPrevented).length : 0;
     const reviewThreshold = workerModelConfig.preventedReviewThreshold ?? DEFAULT_PREVENTED_REVIEW_THRESHOLD;
-    const withinRiskBudget = policyConfirmed && preventedCount < reviewThreshold;
-    const policyNote = preventedCount > 0 ? `${preventedCount} PREVENTED policy attempt(s) recorded as risk signal (no effect)` : "no policy violations";
+    const highRiskThreshold = workerModelConfig.preventedHighRiskReviewThreshold ?? DEFAULT_PREVENTED_HIGH_RISK_REVIEW_THRESHOLD;
+    // SEVERITY-TIERED: high-risk reaches (network/shell/privilege) escalate to review at a MUCH lower
+    // count than ordinary blocked improvisations — intent still matters even when the governor blocked it.
+    const withinRiskBudget = policyConfirmed && preventedCount < reviewThreshold && highRiskCount < highRiskThreshold;
+    const policyNote = preventedCount > 0 ? `${preventedCount} PREVENTED policy attempt(s)${highRiskCount > 0 ? ` (${highRiskCount} high-risk)` : ""} recorded as risk signal (no effect)` : "no policy violations";
     const criticPass = detailOf(critic).pass === true;
     const verifierPass = detailOf(verifier).verdict === "pass";
 
@@ -147,7 +173,7 @@ export const integrator: RoleFn = async (ctx) => {
           // RISK SIGNAL: prevented attempts promoted-with-warning are recorded (not erased) so severity
           // can accrue over time — the receipt/audit trail carries what was blocked and that it had no effect.
           ...(preventedCount > 0
-            ? { preventedViolations: policyViolations, preventedCount, riskSignal: { kind: "prevented_policy_attempt", effect: "none", promotionImpact: "warning", count: preventedCount } }
+            ? { preventedViolations: policyViolations, preventedCount, highRiskCount, riskSignal: { kind: "prevented_policy_attempt", effect: "none", promotionImpact: "warning", count: preventedCount, highRiskCount } }
             : {}),
         },
       };
@@ -183,7 +209,10 @@ export const integrator: RoleFn = async (ctx) => {
           return `${tool}${where}`;
         })
         .join(", ");
-      failures.push(`requires review: ${preventedCount} prevented policy attempt(s) reached the review threshold (${reviewThreshold}) — held for human review, not auto-promoted: ${named}`);
+      const which = highRiskCount >= highRiskThreshold
+        ? `${highRiskCount} HIGH-RISK (network/shell/privilege) prevented attempt(s) reached the high-risk review threshold (${highRiskThreshold})`
+        : `${preventedCount} prevented policy attempt(s) reached the review threshold (${reviewThreshold})`;
+      failures.push(`requires review: ${which} — held for human review, not auto-promoted: ${named}`);
     }
     if (!criticPass) failures.push(critic === undefined ? "no critic result" : "critic pass=false");
     if (!verifierPass) failures.push(verifier === undefined ? "no verifier result" : "verifier verdict=fail");
@@ -210,7 +239,7 @@ export const integrator: RoleFn = async (ctx) => {
         evaluation: { approved: false },
         // A review-hold is a RISK escalation, not a code-quality failure — mark it so trust/audit can
         // distinguish "too many prevented attempts, needs a human" from "the build was actually broken".
-        ...(overThreshold ? { requiresReview: true, preventedCount, preventedViolations: policyViolations } : {}),
+        ...(overThreshold ? { requiresReview: true, preventedCount, highRiskCount, preventedViolations: policyViolations } : {}),
       },
     };
   } catch (err) {

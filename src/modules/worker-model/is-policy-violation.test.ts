@@ -56,7 +56,7 @@ test("a blocked `rm` of WORKTREE-RELATIVE scratch files does NOT taint (benign c
 });
 
 test("a blocked `rm` reaching OUTSIDE the worktree / at the root / via a glob STILL taints", () => {
-  for (const cmd of ["rm -rf /", "rm -rf ~", "rm ../secret.ts", "rm /etc/passwd", "rm src/../../x", "rm *", "rm src/*.ts", "rm .", "rm -rf .."]) {
+  for (const cmd of ["rm -rf /", "rm -rf ~", "rm ../secret.ts", "rm /etc/passwd", "rm src/../../x", "rm *", "rm src/*.ts", "rm .", "rm -rf ..", "rm -rf ./", "rm ./", "rm src/..", "rm a/../.."]) {
     assert.equal(isPolicyViolation(deniedCmd("rm", cmd)), true, `\`${cmd}\` must taint (dangerous target)`);
   }
   // an unparseable / target-less rm fails closed (taints)

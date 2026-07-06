@@ -72,6 +72,8 @@ export function loadCandidateModels(env: NodeJS.ProcessEnv = configEnv): readonl
 export const DEFAULT_ROLE_TIMEOUT_MS = 300_000; // 5 minutes
 /** Default count of PREVENTED policy attempts before a build escalates to review instead of promoting. */
 export const DEFAULT_PREVENTED_REVIEW_THRESHOLD = 10;
+/** Default count of HIGH-RISK (network/shell/privilege) prevented attempts before escalating to review. */
+export const DEFAULT_PREVENTED_HIGH_RISK_REVIEW_THRESHOLD = 2;
 /**
  * Default WHOLE-PIPELINE wall-clock ceiling (ms). Per-role timeouts bound each role, but
  * a run does scout→builder→critic→verifier→integrator with retry/rescue and competitive/
@@ -222,6 +224,14 @@ export interface WorkerModelConfig {
    */
   readonly preventedReviewThreshold?: number;
   /**
+   * A SEVERITY-tiered companion to preventedReviewThreshold: the count of HIGH-RISK prevented attempts
+   * (network / shell-escape / privilege — curl/ssh/sudo/bash/…) that escalates to REVIEW. Intent still
+   * matters: one blocked `node -e` self-verify is noise (normal threshold), but repeated blocked reaches
+   * for the network or a root shell are a red flag even when prevented, so they escalate far faster.
+   * DEFAULT 2. IKBI_WORKER_MODEL_PREVENTED_HIGH_RISK_REVIEW_THRESHOLD to tune.
+   */
+  readonly preventedHighRiskReviewThreshold?: number;
+  /**
    * Enable the adversarial REFUTER gate (runs after the critic, before the integrator). It runs a
    * fixed refutation checklist that tries to PROVE the build is broken/lying; a single critical
    * finding refutes the build and the orchestrator files PROPOSED corrections from the findings.
@@ -265,6 +275,7 @@ export function loadWorkerModelConfig(reader = env): WorkerModelConfig {
     criticFixLoop: reader.bool("CRITIC_FIX_LOOP", true),
     skipCriticOnRed: reader.bool("SKIP_CRITIC_ON_RED", true),
     preventedReviewThreshold: reader.int("PREVENTED_REVIEW_THRESHOLD", DEFAULT_PREVENTED_REVIEW_THRESHOLD, { min: 1 }),
+    preventedHighRiskReviewThreshold: reader.int("PREVENTED_HIGH_RISK_REVIEW_THRESHOLD", DEFAULT_PREVENTED_HIGH_RISK_REVIEW_THRESHOLD, { min: 1 }),
     enableRefuter: reader.bool("ENABLE_REFUTER", false),
     builderMode: loadBuilderMode(),
     candidateModels: loadCandidateModels(),

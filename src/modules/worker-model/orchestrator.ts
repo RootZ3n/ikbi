@@ -1982,7 +1982,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               ),
             );
             const fixCtx: RoleContext = {
-              task: { ...task, goal: fixGoal, writeScope: "all" },
+              // Preserve the task's declared write scope — a fix pass must NOT silently widen a
+              // `new_only`/`none` task to full write access just because one check went red.
+              task: { ...task, goal: fixGoal, writeScope: task.writeScope ?? "all" },
               role: "builder",
               identity: fixSpawn.identity,
               autonomy: fixSpawn.autonomy,
@@ -3280,20 +3282,22 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // but recording them here means risk evidence accrues on ordinary usage — no dedicated (paid)
     // observation campaign is ever needed to answer "which prevented behaviours are normal cheap-model
     // noise vs. patterns that predict bad outcomes?" before designing graduated trust scoring.
-    const builderForRisk = results.find((r) => r.role === "builder");
-    const preventedViolations = ((): Array<Record<string, unknown>> => {
-      const d = (builderForRisk?.detail ?? {}) as Record<string, unknown>;
-      const pv = Array.isArray(d.policyViolations) ? d.policyViolations : Array.isArray(d.rejectedToolCalls) ? d.rejectedToolCalls : [];
-      return pv as Array<Record<string, unknown>>;
-    })();
-    const preventedCommands = preventedViolations
+    const riskDetail = (results.find((r) => r.role === "builder")?.detail ?? {}) as Record<string, unknown>;
+    const notablePrevented = Array.isArray(riskDetail.policyViolations) ? (riskDetail.policyViolations as Array<Record<string, unknown>>) : [];
+    // For EVIDENCE, record the FULLER raw set (rejectedToolCalls — includes the benign-reclassified rm/mv/
+    // probes filtered out of policyViolations) so the risk histogram is not blind to exactly the behaviours
+    // the effect-based gate reclassified. `preventedCount` stays the NOTABLE count (what the threshold uses).
+    const allPrevented = Array.isArray(riskDetail.rejectedToolCalls) ? (riskDetail.rejectedToolCalls as Array<Record<string, unknown>>) : notablePrevented;
+    const preventedCommands = allPrevented
       .map((v) => {
         const tool = typeof v.tool === "string" ? v.tool : "tool";
         const path = typeof v.path === "string" ? v.path : "";
         return path ? `${tool}:${path}` : tool;
       })
-      .slice(0, 20);
-    const requiresReview = ((results.find((r) => r.role === "integrator")?.detail ?? {}) as Record<string, unknown>).requiresReview === true;
+      .slice(0, 30);
+    const integratorDetail = (results.find((r) => r.role === "integrator")?.detail ?? {}) as Record<string, unknown>;
+    const requiresReview = integratorDetail.requiresReview === true;
+    const highRiskCount = typeof integratorDetail.highRiskCount === "number" ? integratorDetail.highRiskCount : 0;
     await receipts.append(
       {
         operation: "worker.run.summary",
@@ -3311,7 +3315,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           verificationResult: verifierResult !== undefined ? verifierResult.outcome : "not_run",
           verificationMode: ranVerificationMode,
           retrievalMode: ranRetrievalMode,
-          ...(preventedViolations.length > 0 ? { preventedCount: preventedViolations.length, preventedCommands, requiresReview } : {}),
+          ...(allPrevented.length > 0 ? { preventedCount: notablePrevented.length, allPreventedCount: allPrevented.length, highRiskCount, preventedCommands, requiresReview } : {}),
           ...(task.originAgent !== undefined ? { originAgent: task.originAgent } : {}),
         },
         project: task.targetRepo,
