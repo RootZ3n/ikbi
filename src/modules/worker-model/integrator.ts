@@ -129,8 +129,20 @@ export const integrator: RoleFn = async (ctx) => {
     // tampering) are separate higher-severity alarms enforced by the orchestrator's in-run gates and are
     // never rejected tool calls, so they never reach here.
     const policyConfirmed = policyViolations !== undefined;
-    const preventedCount = policyConfirmed ? policyViolations.length : 0;
-    const highRiskCount = policyConfirmed ? policyViolations.filter(isHighRiskPrevented).length : 0;
+    // FIXER-PASS PREVENTED ATTEMPTS (A2/D3): the last-mile fixer runs a SECOND builder pass off-books
+    // (no recordRole; its result never enters `results`), so its blocked out-of-policy attempts are
+    // invisible to the integrator's `builder` result. The orchestrator threads them onto the builder
+    // detail as `fixerPreventedViolations` (kept SEPARATE from the builder's own `policyViolations` for
+    // provenance). Fold them into the RISK ACCOUNTING — the review threshold and the recorded risk
+    // signal — so a fixer that racks up blocked curl/ssh attempts cannot promote unreviewed/unrecorded.
+    const fixerPreventedViolations = Array.isArray(builderDetail.fixerPreventedViolations)
+      ? builderDetail.fixerPreventedViolations
+      : [];
+    // The COMBINED prevented set that drives the threshold + telemetry. Only meaningful once the builder
+    // confirmed its policy status (policyConfirmed); an absent field is fail-closed below regardless.
+    const preventedForRisk = policyConfirmed ? [...policyViolations, ...fixerPreventedViolations] : [];
+    const preventedCount = preventedForRisk.length;
+    const highRiskCount = preventedForRisk.filter(isHighRiskPrevented).length;
     const reviewThreshold = workerModelConfig.preventedReviewThreshold ?? DEFAULT_PREVENTED_REVIEW_THRESHOLD;
     const highRiskThreshold = workerModelConfig.preventedHighRiskReviewThreshold ?? DEFAULT_PREVENTED_HIGH_RISK_REVIEW_THRESHOLD;
     // SEVERITY-TIERED: high-risk reaches (network/shell/privilege) escalate to review at a MUCH lower
@@ -173,7 +185,7 @@ export const integrator: RoleFn = async (ctx) => {
           // RISK SIGNAL: prevented attempts promoted-with-warning are recorded (not erased) so severity
           // can accrue over time — the receipt/audit trail carries what was blocked and that it had no effect.
           ...(preventedCount > 0
-            ? { preventedViolations: policyViolations, preventedCount, highRiskCount, riskSignal: { kind: "prevented_policy_attempt", effect: "none", promotionImpact: "warning", count: preventedCount, highRiskCount } }
+            ? { preventedViolations: preventedForRisk, ...(fixerPreventedViolations.length > 0 ? { fixerPreventedViolations } : {}), preventedCount, highRiskCount, riskSignal: { kind: "prevented_policy_attempt", effect: "none", promotionImpact: "warning", count: preventedCount, highRiskCount } }
             : {}),
         },
       };
@@ -201,7 +213,7 @@ export const integrator: RoleFn = async (ctx) => {
     } else if (!withinRiskBudget) {
       // REVIEW (not a quality discard): prevented attempts crossed the threshold. NAME the offending
       // call(s) so the risk is auditable from the final output without a --verbose re-run.
-      const named = policyViolations
+      const named = preventedForRisk
         .map((v) => {
           const o = (v ?? {}) as { tool?: unknown; path?: unknown; error?: unknown };
           const tool = typeof o.tool === "string" ? o.tool : "tool";
@@ -239,7 +251,7 @@ export const integrator: RoleFn = async (ctx) => {
         evaluation: { approved: false },
         // A review-hold is a RISK escalation, not a code-quality failure — mark it so trust/audit can
         // distinguish "too many prevented attempts, needs a human" from "the build was actually broken".
-        ...(overThreshold ? { requiresReview: true, preventedCount, highRiskCount, preventedViolations: policyViolations } : {}),
+        ...(overThreshold ? { requiresReview: true, preventedCount, highRiskCount, preventedViolations: preventedForRisk, ...(fixerPreventedViolations.length > 0 ? { fixerPreventedViolations } : {}) } : {}),
       },
     };
   } catch (err) {

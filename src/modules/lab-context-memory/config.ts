@@ -13,6 +13,11 @@
  *                                    override to point at a SHARED lab location that
  *                                    other agents (the Mechanic, Peh, …) also use — NOT
  *                                    ikbi-private. The override always wins.
+ *   IKBI_LAB_CONTEXT_MEMORY_STORE_SCOPE  identifies the receipt-store seq space for the
+ *                                    drift baseline's per-store high-water (C1). DEFAULT: a
+ *                                    short hash of the engine state root. Override only when
+ *                                    two installs deliberately share BOTH the lab-memory dir
+ *                                    AND one receipt store (rare) and must count as one scope.
  *   IKBI_LAB_CONTEXT_MEMORY_MAX_RECEIPTS_PER_PROJECTION  cap per projection run.
  *   IKBI_LAB_CONTEXT_MEMORY_MAX_VALUE_BYTES  cap on a single record()'s serialized
  *                                    value (H7). DURABLE shared memory holds SUMMARIES,
@@ -20,6 +25,7 @@
  *                                    (the caller must summarize), never silently stored.
  */
 
+import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 
 import { config } from "../../core/config.js";
@@ -34,6 +40,15 @@ const env = moduleEnv("lab-context-memory");
  * override repoints it at a shared lab location when other agents wire in.
  */
 export const DEFAULT_MEMORY_DIR = resolve(config.stateRoot, "lab-context-memory");
+/**
+ * Identifies the receipt-store SEQ SPACE this install projects from (drift baseline C1). The lab-memory
+ * dir can be REPOINTED at a location SHARED across installs (the env override above), but each install's
+ * receipts live under its OWN `stateRoot` with an INDEPENDENT monotonic `seq` counter. The drift
+ * baseline's per-operation high-water mark is tracked PER store scope — otherwise a second install's low
+ * seqs would be silently dropped as "already projected" (or conflated) against the first install's mark.
+ * Default: a short stable hash of the engine state root (one stateRoot ⇒ one receipt store ⇒ one scope).
+ */
+export const DEFAULT_STORE_SCOPE = createHash("sha256").update(config.stateRoot).digest("hex").slice(0, 12);
 /** Cap on receipts read per projection run (bounded work). */
 export const DEFAULT_MAX_RECEIPTS_PER_PROJECTION = 1_000;
 /**
@@ -48,6 +63,8 @@ export interface LabContextMemoryConfig {
   readonly enabled: boolean;
   /** The shared lab-memory store directory. */
   readonly memoryDir: string;
+  /** Identifies the receipt-store seq space for the drift baseline's per-store high-water mark (C1). */
+  readonly storeScope: string;
   readonly maxReceiptsPerProjection: number;
   /** Max serialized bytes of a single record()'s value (over-cap ⇒ rejected fail-closed). */
   readonly maxValueBytes: number;
@@ -58,6 +75,7 @@ export function loadLabContextMemoryConfig(reader = env): LabContextMemoryConfig
   return Object.freeze({
     enabled: reader.bool("ENABLED", true),
     memoryDir: reader.path("DIR", DEFAULT_MEMORY_DIR),
+    storeScope: reader.str("STORE_SCOPE", DEFAULT_STORE_SCOPE),
     maxReceiptsPerProjection: reader.int("MAX_RECEIPTS_PER_PROJECTION", DEFAULT_MAX_RECEIPTS_PER_PROJECTION, { min: 1 }),
     maxValueBytes: reader.int("MAX_VALUE_BYTES", DEFAULT_MAX_VALUE_BYTES, { min: 1 }),
   });

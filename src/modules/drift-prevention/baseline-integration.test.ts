@@ -70,7 +70,7 @@ function receiptStore() {
   return { receipts, append };
 }
 
-const memCfg: LabContextMemoryConfig = { enabled: true, memoryDir: "/unused", maxReceiptsPerProjection: 1000, maxValueBytes: 16_384 };
+const memCfg: LabContextMemoryConfig = { enabled: true, memoryDir: "/unused", storeScope: "test-scope", maxReceiptsPerProjection: 1000, maxValueBytes: 16_384 };
 const driftCfg: DriftPreventionConfig = { enabled: true, driftThreshold: 0.2, minSampleSize: 5, recentWindow: 20, policy: "reportOnly" };
 
 test("persisted-baseline rework: projection builds a baseline that drift reads to detect a decline", async () => {

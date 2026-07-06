@@ -14,6 +14,8 @@
  * Durable via a substrate DocumentStore (concurrency-safe, keyed by entry id).
  */
 
+import { createHash } from "node:crypto";
+
 import { createDocumentStore } from "../../core/substrate/index.js";
 import { isValidatedIdentity } from "../../core/identity/index.js";
 import type { ValidatedIdentity } from "../../core/identity/index.js";
@@ -41,15 +43,31 @@ const RECORD_OPERATION = "labmem.record";
 /** Entry ids permit ":" (the component separator) on top of the store's safe charset. */
 const MEMORY_ID_PATTERN = /^[A-Za-z0-9._:-]{1,200}$/;
 
-/** Sanitize an id component to the safe charset (filesystem + traversal safe). */
-function slug(s: string): string {
-  const out = s.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 48);
+/** Sanitize an id component to the safe charset (filesystem + traversal safe), capped for readability. */
+function slug(s: string, cap = 32): string {
+  const out = s.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, cap);
   return out.length > 0 ? out : "_";
 }
 
-/** Deterministic, traversal-safe entry id (same components ⇒ same id ⇒ upsert). */
+/**
+ * Short stable hash of the FULL (untruncated) id tuple. The readable slug prefix truncates and collapses
+ * to a safe charset, so two long/similar components (e.g. two repo paths sharing a 32-char prefix, or
+ * differing only by a stripped character) would map to the SAME slug — silently MERGING two distinct
+ * baselines. The hash suffix is computed over the untruncated raw components, so distinct tuples always
+ * get distinct ids (drift baseline C2). Length-prefixed so components cannot alias across boundaries
+ * (["a","bc"] and ["ab","c"] hash differently — no forbidden separator char needed).
+ */
+function idHash(parts: readonly string[]): string {
+  return createHash("sha256").update(parts.map((p) => `${p.length}:${p}`).join("")).digest("hex").slice(0, 12);
+}
+
+/**
+ * Deterministic, traversal-safe entry id: a READABLE slug prefix + a collision-resistant hash of the
+ * FULL untruncated components. Same components ⇒ same id ⇒ upsert; components that merely share a slug
+ * prefix get DIFFERENT hashes ⇒ never collide (C2). Well under the store's 200-char id cap.
+ */
 function makeId(project: string, agent: string, kind: MemoryKind, key: string): string {
-  return `${slug(project)}:${slug(agent)}:${slug(kind)}:${slug(key)}`;
+  return `${slug(project)}:${slug(agent)}:${slug(kind)}:${slug(key)}:${idHash([project, agent, kind, key])}`;
 }
 
 /** Coerce a persisted numeric field (patterns hold counts) to a finite number, else the default. */
@@ -195,16 +213,33 @@ export function createLabMemory(deps: LabMemoryDeps = {}): LabMemory {
       const id = makeId(g.project, g.agent, "pattern", `op-${g.operation}`);
       const prev = await store.get(id);
       const pv = (prev?.value ?? {}) as Record<string, unknown>;
-      const prevLastSeq = asCount(pv.lastSeq, -1);
+      // PER-STORE HIGH-WATER (drift baseline C1): `seq` is monotonic only WITHIN one receipt store, but
+      // the lab-memory dir can be SHARED across installs with INDEPENDENT seq spaces. A single scalar
+      // high-water would drop a second install's low seqs as "already projected" (or double-count on
+      // overlap). Track the high-water PER store scope; the accumulated counts stay MERGED (one baseline
+      // per operation, so drift's read side is unchanged). Legacy entries carried a scalar `lastSeq`;
+      // seed THIS scope's mark from it so a pre-scoping baseline upgrades in place without re-counting.
+      const storeScope = config.storeScope;
+      const hasMap = typeof pv.lastSeqByStore === "object" && pv.lastSeqByStore !== null;
+      const prevByStore = hasMap ? (pv.lastSeqByStore as Record<string, unknown>) : {};
+      const lastSeqByStore: Record<string, number> = {};
+      for (const [k, v] of Object.entries(prevByStore)) lastSeqByStore[k] = asCount(v, -1);
+      // This scope's mark if it has one; else -1 for a NEW scope on an already-scoped entry. Only when NO
+      // map exists yet (a pre-scoping legacy entry, first upgrade) do we seed from the scalar `lastSeq` —
+      // otherwise a second install's fresh scope would wrongly inherit the first install's scalar mark.
+      const prevLastSeq = storeScope in lastSeqByStore ? lastSeqByStore[storeScope]! : hasMap ? -1 : asCount(pv.lastSeq, -1);
       const fresh = g.receipts.filter((r) => r.seq > prevLastSeq).sort((a, b) => a.seq - b.seq);
-      if (fresh.length === 0) continue; // nothing new for this operation — baseline unchanged
+      if (fresh.length === 0) continue; // nothing new for this operation in THIS store — baseline unchanged
       const addSucc = fresh.filter((x) => x.outcome.status === "success").length;
       const successes = asCount(pv.successes, 0) + addSucc;
       const failures = asCount(pv.failures, 0) + (fresh.length - addSucc);
       const lastReceipt = fresh[fresh.length - 1] as Receipt;
+      lastSeqByStore[storeScope] = lastReceipt.seq;
       await upsert({
         project: g.project, agent: g.agent, kind: "pattern", key: `op-${g.operation}`,
-        value: { operation: g.operation, successes, failures, total: successes + failures, lastOutcome: lastReceipt.outcome.status, lastSeq: lastReceipt.seq },
+        // `lastSeq` retained for back-compat/observability (the max across scopes for THIS write);
+        // `lastSeqByStore` is the authoritative per-store high-water the freshness gate reads.
+        value: { operation: g.operation, successes, failures, total: successes + failures, lastOutcome: lastReceipt.outcome.status, lastSeq: lastReceipt.seq, lastSeqByStore },
       });
       projected += 1;
     }

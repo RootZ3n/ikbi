@@ -827,6 +827,13 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   // attempt's writes may still be on disk in the shared worktree). A fail-closed in-run promote gate
   // reads it, mirroring the auto-verify-rescue policy guard across every retry path.
   let policyTaintedThisBuild = false;
+  // FIXER PREVENTED ATTEMPTS (per-run, A2/D3): the off-books last-mile FIXER pass's PREVENTED
+  // (governor-blocked) out-of-policy attempts. The fixer bypasses recordRole and its result never enters
+  // `results`, so these are collected here and (a) stamped onto the builder result before the integrator
+  // dispatches, feeding the review threshold + risk signal; (b) read directly by the run-summary risk
+  // telemetry, so they accrue as evidence even on failed runs that never reach the integrator. Reset at
+  // every run entry; builds are serial (like injectionDetectedThisBuild / policyTaintedThisBuild).
+  let fixerPreventedThisBuild: Array<Record<string, unknown>> = [];
 
   // Accumulate a builder attempt's security signals (injection / policy taint) into the per-run flags.
   // recordRole does this for the roles it records; RETRY builders that bypass recordRole (the
@@ -836,6 +843,17 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     const d = (r.detail ?? {}) as Record<string, unknown>;
     if (d.injectionDetected === true) injectionDetectedThisBuild = true;
     if (Array.isArray(d.policyViolations) && d.policyViolations.length > 0) policyTaintedThisBuild = true;
+  };
+
+  // The raw PREVENTED (governor-blocked) tool attempts a builder attempt recorded. Mirrors the
+  // integrator's source-of-truth precedence: the reclassified `policyViolations` set if present, else
+  // the fuller raw `rejectedToolCalls` set. Used to thread an off-books FIXER pass's prevented attempts
+  // into run-level risk accounting (A2/D3).
+  const preventedAttemptsOf = (r: RoleResult): Array<Record<string, unknown>> => {
+    const d = (r.detail ?? {}) as Record<string, unknown>;
+    if (Array.isArray(d.policyViolations)) return d.policyViolations as Array<Record<string, unknown>>;
+    if (Array.isArray(d.rejectedToolCalls)) return d.rejectedToolCalls as Array<Record<string, unknown>>;
+    return [];
   };
 
   async function runRoleFn(role: WorkerRole, roleFn: RoleFn, ctx: RoleContext, timeoutOverrideMs?: number): Promise<RoleResult> {
@@ -1536,6 +1554,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     const parentIdentity = parentCtx.identity.identity;
     injectionDetectedThisBuild = false; // reset the per-run injection flag (builds are serial)
     policyTaintedThisBuild = false; // reset the per-run policy-taint flag
+    fixerPreventedThisBuild = []; // reset the per-run off-books fixer prevented-attempt accumulator
     // Wire the escalation resolver (once) so the tier cascade skips unwired/stub models — done
     // here, in the async build entry, where the egress floor + provider registry are fully loaded.
     await ensureEscalationResolver();
@@ -1894,6 +1913,19 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           ),
         );
 
+        // A2/D3: before the integrator judges, fold any off-books FIXER prevented attempts onto the
+        // builder result so the integrator's review threshold + risk signal account for them (the fixer
+        // ran during the builder/verifier roles, both of which have now passed). Provenance-preserved:
+        // stamped as a SEPARATE `fixerPreventedViolations` field, not merged into the builder's own set.
+        if (role === "integrator" && fixerPreventedThisBuild.length > 0) {
+          const bIdx = results.findIndex((r) => r.role === "builder");
+          const builderRole = bIdx >= 0 ? results[bIdx] : undefined;
+          if (builderRole !== undefined) {
+            const bd = (builderRole.detail ?? {}) as Record<string, unknown>;
+            results[bIdx] = { ...builderRole, detail: { ...bd, fixerPreventedViolations: [...fixerPreventedThisBuild] } };
+          }
+        }
+
         const ctx: RoleContext = {
           task,
           role,
@@ -2000,6 +2032,14 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               ),
             );
             noteBuilderSignals(fixResult); // a fixer taint/injection reaches the fail-closed promote gate
+            // A2/D3: thread the fixer pass's PREVENTED (governor-blocked) attempts into run-level risk
+            // accounting. The fixer runs off-books — no recordRole, its result never enters `results` — so
+            // without this its blocked out-of-policy attempts are INVISIBLE to the integrator's review
+            // threshold AND the run-summary risk telemetry. Accumulate them here; they are stamped onto the
+            // builder result before the integrator dispatches (so the review threshold sees them) and read
+            // directly by the run-summary telemetry (so they accrue as risk evidence even on FAILED runs
+            // that never reach the integrator). Kept SEPARATE from the builder's own prevented set.
+            fixerPreventedThisBuild.push(...preventedAttemptsOf(fixResult));
             const verify = await runRescueVerifier();
             return { fixed: verify.outcome === "success", verify };
           };
@@ -3283,11 +3323,16 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // observation campaign is ever needed to answer "which prevented behaviours are normal cheap-model
     // noise vs. patterns that predict bad outcomes?" before designing graduated trust scoring.
     const riskDetail = (results.find((r) => r.role === "builder")?.detail ?? {}) as Record<string, unknown>;
-    const notablePrevented = Array.isArray(riskDetail.policyViolations) ? (riskDetail.policyViolations as Array<Record<string, unknown>>) : [];
+    // A2/D3: the off-books FIXER pass's prevented attempts (accumulated across the run). Merge them into
+    // BOTH the notable and the fuller raw set so the passive risk telemetry is not blind to what a fixer
+    // pass tried and the governor blocked — read the accumulator directly so a FAILED run that never
+    // reached the integrator (no builder-result stamp) still records its fixer attempts as evidence.
+    const fixerPrevented = fixerPreventedThisBuild;
+    const notablePrevented = [...(Array.isArray(riskDetail.policyViolations) ? (riskDetail.policyViolations as Array<Record<string, unknown>>) : []), ...fixerPrevented];
     // For EVIDENCE, record the FULLER raw set (rejectedToolCalls — includes the benign-reclassified rm/mv/
     // probes filtered out of policyViolations) so the risk histogram is not blind to exactly the behaviours
     // the effect-based gate reclassified. `preventedCount` stays the NOTABLE count (what the threshold uses).
-    const allPrevented = Array.isArray(riskDetail.rejectedToolCalls) ? (riskDetail.rejectedToolCalls as Array<Record<string, unknown>>) : notablePrevented;
+    const allPrevented = [...(Array.isArray(riskDetail.rejectedToolCalls) ? (riskDetail.rejectedToolCalls as Array<Record<string, unknown>>) : (Array.isArray(riskDetail.policyViolations) ? (riskDetail.policyViolations as Array<Record<string, unknown>>) : [])), ...fixerPrevented];
     const preventedCommands = allPrevented
       .map((v) => {
         const tool = typeof v.tool === "string" ? v.tool : "tool";

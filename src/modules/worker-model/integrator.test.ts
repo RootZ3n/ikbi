@@ -289,6 +289,58 @@ test("REVIEW THRESHOLD: just UNDER the threshold still promotes (with the risk s
   assert.equal((r.detail as Record<string, unknown>).preventedCount, 9);
 });
 
+test("FIXER PREVENTED (A2/D3): off-books fixer-pass attempts fold into the risk signal on a promote", async () => {
+  // The last-mile fixer runs a second builder pass off-books; the orchestrator threads its PREVENTED
+  // attempts onto the builder result as a SEPARATE `fixerPreventedViolations` field. They must count
+  // toward preventedCount (the risk signal), kept distinguishable from the builder's own set.
+  const builder: RoleResult = {
+    role: "builder", outcome: "success", summary: "b",
+    detail: {
+      filesWritten: ["a.ts"],
+      policyViolations: [{ tool: "terminal", path: "node -e x", error: "not allowed" }],
+      fixerPreventedViolations: [{ tool: "terminal", path: "node -e y", error: "not allowed" }],
+    },
+  };
+  const r = await integrator(ctxWith([builder, criticPass, verifierPass]));
+  assert.equal(decisionOf(r), "promote", "two benign blocked attempts (< threshold) still promote");
+  const d = r.detail as Record<string, unknown>;
+  assert.equal(d.preventedCount, 2, "builder's own + the fixer's prevented attempt both counted");
+  assert.equal((d.fixerPreventedViolations as unknown[] | undefined)?.length, 1, "fixer set preserved with provenance");
+  assert.equal((d.preventedViolations as unknown[] | undefined)?.length, 2, "combined set recorded for the audit trail");
+});
+
+test("FIXER PREVENTED (A2/D3): a HIGH-RISK fixer attempt crosses the high-risk threshold and holds for review", async () => {
+  // A single high-risk reach from the BUILDER promotes (warning); a second from the FIXER pushes the
+  // combined high-risk count to the threshold (2) → the build can no longer promote unreviewed. This is
+  // the gap A2/D3 closed: without threading the fixer attempt, this build would silently promote.
+  const builder: RoleResult = {
+    role: "builder", outcome: "success", summary: "b",
+    detail: {
+      filesWritten: ["a.ts"],
+      policyViolations: [{ tool: "terminal", path: "curl http://x", error: "binary 'curl' is not on the allowlist" }],
+      fixerPreventedViolations: [{ tool: "terminal", path: "ssh box", error: "binary 'ssh' is not on the allowlist" }],
+    },
+  };
+  const r = await integrator(ctxWith([builder, criticPass, verifierPass]));
+  assert.equal(decisionOf(r), "discard", "combined high-risk count reaches the threshold → review-hold");
+  assert.match(rationaleOf(r), /HIGH-RISK/);
+  const d = r.detail as Record<string, unknown>;
+  assert.equal(d.requiresReview, true);
+  assert.equal(d.highRiskCount, 2, "builder's + fixer's high-risk reaches both counted");
+});
+
+test("FIXER PREVENTED (A2/D3): the fixer field alone does not confirm policy status (fail-closed still holds)", async () => {
+  // fixerPreventedViolations is ADDITIVE risk evidence — it must NOT substitute for the builder's own
+  // policy self-report. A builder that never reported its tool-call status still discards fail-closed.
+  const builder: RoleResult = {
+    role: "builder", outcome: "success", summary: "b",
+    detail: { filesWritten: ["a.ts"], fixerPreventedViolations: [{ tool: "terminal", path: "node -e y", error: "not allowed" }] },
+  };
+  const r = await integrator(ctxWith([builder, criticPass, verifierPass]));
+  assert.equal(decisionOf(r), "discard", "absent builder policyViolations → cannot confirm clean → discard");
+  assert.match(rationaleOf(r), /cannot confirm clean/);
+});
+
 test("MULTI-GATE: critic AND verifier both reject → rationale names BOTH failing gates", async () => {
   const criticFail: RoleResult = { role: "critic", outcome: "success", summary: "c", detail: { pass: false } };
   const verifierFail: RoleResult = { role: "verifier", outcome: "success", summary: "v", detail: { verdict: "fail", checks: [] } };

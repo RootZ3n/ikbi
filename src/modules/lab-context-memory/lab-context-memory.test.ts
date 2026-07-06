@@ -40,7 +40,7 @@ function identities() {
 }
 
 function cfg(over: Partial<LabContextMemoryConfig> = {}): LabContextMemoryConfig {
-  return { enabled: true, memoryDir: "/unused-in-fake-store", maxReceiptsPerProjection: 1000, maxValueBytes: 16_384, ...over };
+  return { enabled: true, memoryDir: "/unused-in-fake-store", storeScope: "test-scope", maxReceiptsPerProjection: 1000, maxValueBytes: 16_384, ...over };
 }
 
 /** An in-memory MemoryStore (the API proof; a real DocumentStore round-trip is tested separately). */
@@ -212,6 +212,59 @@ test("pattern projection ACCUMULATES across projections + is idempotent (durable
   assert.equal(p2?.value.lastSeq, 8);
 });
 
+test("C1: two installs SHARING the lab-memory dir keep PER-STORE high-water marks — a second store's low seqs are NOT dropped", async () => {
+  const { ikbi } = identities();
+  const ms = memStore(); // ONE shared lab-memory dir, two installs projecting into it.
+  // Install A: its receipt store has seqs 1..5 (all success). Baseline established at 100%.
+  const memA = createLabMemory({ config: cfg({ storeScope: "install-A" }), store: ms.store, receipts: fakeReceipts([1, 2, 3, 4, 5].map((seq) => receipt({ seq, operation: "build.run", outcome: { status: "success" } }))).receipts, publish: () => {}, now: () => 1000 });
+  // Install B: an INDEPENDENT receipt store whose seqs restart at 1..3 (all failure). Under a single
+  // scalar high-water these low seqs (≤ A's mark of 5) would be silently dropped — the C1 bug.
+  const memB = createLabMemory({ config: cfg({ storeScope: "install-B" }), store: ms.store, receipts: fakeReceipts([1, 2, 3].map((seq) => receipt({ seq, operation: "build.run", outcome: { status: "failure" } }))).receipts, publish: () => {}, now: () => 1000 });
+
+  await memA.projectFromReceipts({ identity: ikbi });
+  const pA = [...ms.m.values()].find((e) => e.kind === "pattern" && e.key === "op-build.run");
+  assert.equal(pA?.value.total, 5, "install A's baseline");
+
+  await memB.projectFromReceipts({ identity: ikbi });
+  const p = [...ms.m.values()].find((e) => e.kind === "pattern" && e.key === "op-build.run");
+  assert.equal(p?.value.total, 8, "install B's low seqs accrued (NOT dropped) → 5 + 3 = 8");
+  assert.equal(p?.value.successes, 5);
+  assert.equal(p?.value.failures, 3);
+  const byStore = p?.value.lastSeqByStore as Record<string, number>;
+  assert.equal(byStore["install-A"], 5, "A's high-water tracked independently");
+  assert.equal(byStore["install-B"], 3, "B's high-water tracked independently");
+
+  // Idempotent per store: re-projecting B's same receipts adds nothing (its own mark now gates them).
+  await memB.projectFromReceipts({ identity: ikbi });
+  const p2 = [...ms.m.values()].find((e) => e.kind === "pattern" && e.key === "op-build.run");
+  assert.equal(p2?.value.total, 8, "re-projecting B is idempotent against B's own high-water");
+});
+
+test("C2: two long project paths sharing a 32-char slug prefix get DISTINCT baseline entries (no collision)", async () => {
+  const { ikbi } = identities();
+  const ms = memStore();
+  // A shared prefix well over the 32-char slug cap; the paths differ only in the SUFFIX.
+  const prefix = "/home/user/projects/really-long-shared-prefix-directory/";
+  const projA = `${prefix}alpha`;
+  const projB = `${prefix}beta`;
+  const rc = fakeReceipts([
+    receipt({ seq: 1, project: projA, operation: "build.run", outcome: { status: "success" } }),
+    receipt({ seq: 2, project: projB, operation: "build.run", outcome: { status: "failure" } }),
+  ]);
+  const mem = createLabMemory({ config: cfg(), store: ms.store, receipts: rc.receipts, publish: () => {}, now: () => 1000 });
+
+  await mem.projectFromReceipts({ identity: ikbi });
+
+  const patterns = [...ms.m.values()].filter((e) => e.kind === "pattern");
+  assert.equal(patterns.length, 2, "the two long paths did NOT collide into one shared baseline");
+  assert.equal(new Set(patterns.map((e) => e.id)).size, 2, "distinct ids (the hash suffix disambiguates the truncated slug prefix)");
+  // Fields (not the id) drive drift's reads — each path's baseline is intact and separately queryable.
+  const a = (await mem.byProject(projA)).find((e) => e.kind === "pattern");
+  const b = (await mem.byProject(projB)).find((e) => e.kind === "pattern");
+  assert.equal(a?.value.successes, 1, "alpha's baseline");
+  assert.equal(b?.value.failures, 1, "beta's baseline — not merged into alpha");
+});
+
 // ── query scoping ────────────────────────────────────────────────────────────
 
 test("byAgent scopes to one agent; query filters by project/agent/kind/key", async () => {
@@ -374,6 +427,7 @@ test("IKBI_LAB_CONTEXT_MEMORY_DIR override still wins (operator points at a shar
   const reader = {
     bool: (_s: string, fb: boolean) => fb,
     int: (_s: string, fb: number) => fb,
+    str: (_s: string, fb: string) => fb,
     path: (_s: string, _fb: string) => "/srv/lab/shared-memory",
   } as unknown as Parameters<typeof loadLabContextMemoryConfig>[0];
   const cfg = loadLabContextMemoryConfig(reader);

