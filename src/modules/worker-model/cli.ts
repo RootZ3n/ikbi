@@ -23,8 +23,8 @@
  */
 
 import { createInterface } from "node:readline";
-import { existsSync, fstatSync } from "node:fs";
-import { join as pathJoin } from "node:path";
+import { existsSync, fstatSync, readFileSync } from "node:fs";
+import { isAbsolute, join as pathJoin, resolve as pathResolve } from "node:path";
 
 import { registerCommand } from "../../cli/registry.js";
 import { writeStderr, writeStdout } from "../../cli/io.js";
@@ -490,6 +490,37 @@ export function createProductionWorker(
  * "new_only" to prevent the builder from over-writing existing files.
  * This is a heuristic — the goal text is the only signal available at dispatch time.
  */
+/**
+ * Resolve the requested SCOPE.md into an ordered scope plan (staged build). `scope` is the parsed
+ * `--scope` value: "" (bare flag ⇒ auto-detect the default file names at the repo root) or an
+ * explicit path (relative resolves against cwd, then the repo). Returns undefined when staging was
+ * not requested, the file is missing, or it parses to zero stages — the caller then falls back to
+ * the normal heuristic/single build. `notFound` carries a message for the EXPLICIT-path case so the
+ * caller can fail loudly (the operator asked for a specific file that isn't there).
+ */
+export async function loadScopePlan(
+  scope: string | undefined,
+  repo: string,
+): Promise<{ plan?: import("../scope-plan/index.js").ScopePlan; notFound?: string }> {
+  if (scope === undefined) return {}; // staging not requested
+  const { parseScopePlan, DEFAULT_SCOPE_FILES } = await import("../scope-plan/index.js");
+  const candidates =
+    scope.length > 0
+      ? [isAbsolute(scope) ? scope : pathResolve(process.cwd(), scope), pathJoin(repo, scope)]
+      : DEFAULT_SCOPE_FILES.map((f) => pathJoin(repo, f));
+  for (const path of candidates) {
+    if (!existsSync(path)) continue;
+    try {
+      const plan = parseScopePlan(readFileSync(path, "utf8"));
+      if (plan.stages.length > 0) return { plan };
+      return { notFound: `scope file ${path} has no recognizable stages (numbered list, bullets, or ## headings)` };
+    } catch (e) {
+      return { notFound: `could not read scope file ${path}: ${e instanceof Error ? e.message : String(e)}` };
+    }
+  }
+  return { notFound: scope.length > 0 ? `scope file not found: ${scope}` : `no SCOPE.md found at the repo root (${DEFAULT_SCOPE_FILES.join(", ")})` };
+}
+
 export function detectWriteScope(goal: string): "all" | "new_only" | "none" {
   const lower = goal.toLowerCase();
   // Pure read/audit/analysis patterns → new_only (create docs/reports, don't modify code)
@@ -531,7 +562,7 @@ export function detectWriteScope(goal: string): "all" | "new_only" | "none" {
  * every progress/diagnostic/hint/repair/cost line is routed to STDERR so a caller can pipe
  * stdout straight into a JSON parser without log noise interleaved (FIX 3).
  */
-export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbose?: boolean; cost?: boolean; yes?: boolean; json?: boolean; delegation?: string; noMemory?: boolean; memoryDiff?: boolean; check?: string; maxBudgetUsd?: number; fallbackModel?: string; complexity?: "small" | "medium" | "large"; tier?: BuildTier; bare?: boolean; effort?: "low" | "medium" | "high" | "max"; fromPr?: number; escalate?: boolean; unknownFlags: string[]; rest: string[] } {
+export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbose?: boolean; cost?: boolean; yes?: boolean; json?: boolean; delegation?: string; noMemory?: boolean; memoryDiff?: boolean; check?: string; maxBudgetUsd?: number; fallbackModel?: string; complexity?: "small" | "medium" | "large"; tier?: BuildTier; scope?: string; bare?: boolean; effort?: "low" | "medium" | "high" | "max"; fromPr?: number; escalate?: boolean; unknownFlags: string[]; rest: string[] } {
   const rest: string[] = [];
   // #9: unknown FLAG-LIKE tokens (a typo'd `--no-promote`, `--dry-run`, `--modle=x`) were silently
   // folded into the GOAL prose — the flag did nothing and the operator never knew. Collect them so the
@@ -554,6 +585,9 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
   let fallbackModel: string | undefined;
   let complexity: "small" | "medium" | "large" | undefined;
   let tier: BuildTier | undefined;
+  // STAGED BUILD (scope-plan): undefined ⇒ not requested (heuristic path unchanged); "" ⇒ bare
+  // `--scope` (auto-detect SCOPE.md at the repo root); a path ⇒ `--scope=<path>` (explicit file).
+  let scope: string | undefined;
   let bare = false;
   let effort: "low" | "medium" | "high" | "max" | undefined;
   let fromPr: number | undefined;
@@ -619,6 +653,10 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
     } else if (a.startsWith("--tier=")) {
       const val = a.slice("--tier=".length);
       if (isBuildTier(val)) tier = val;
+    } else if (a === "--scope") {
+      scope = ""; // bare flag ⇒ auto-detect SCOPE.md at the repo root (does NOT consume the goal)
+    } else if (a.startsWith("--scope=")) {
+      scope = a.slice("--scope=".length);
     } else if (a === "--bare") {
       bare = true;
     } else if (a === "--effort") {
@@ -643,7 +681,7 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
       rest.push(a);
     }
   }
-  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), ...(verbose ? { verbose } : {}), ...(cost ? { cost } : {}), ...(yes ? { yes } : {}), ...(json ? { json } : {}), ...(delegation !== undefined ? { delegation } : {}), ...(noMemory ? { noMemory } : {}), ...(memoryDiff ? { memoryDiff } : {}), ...(check !== undefined && check.trim().length > 0 ? { check } : {}), ...(maxBudgetUsd !== undefined ? { maxBudgetUsd } : {}), ...(fallbackModel !== undefined ? { fallbackModel } : {}), ...(complexity !== undefined ? { complexity } : {}), ...(tier !== undefined ? { tier } : {}), ...(bare ? { bare } : {}), ...(effort !== undefined ? { effort } : {}), ...(fromPr !== undefined ? { fromPr } : {}), ...(escalate ? { escalate } : {}), unknownFlags, rest };
+  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), ...(verbose ? { verbose } : {}), ...(cost ? { cost } : {}), ...(yes ? { yes } : {}), ...(json ? { json } : {}), ...(delegation !== undefined ? { delegation } : {}), ...(noMemory ? { noMemory } : {}), ...(memoryDiff ? { memoryDiff } : {}), ...(check !== undefined && check.trim().length > 0 ? { check } : {}), ...(maxBudgetUsd !== undefined ? { maxBudgetUsd } : {}), ...(fallbackModel !== undefined ? { fallbackModel } : {}), ...(complexity !== undefined ? { complexity } : {}), ...(tier !== undefined ? { tier } : {}), ...(scope !== undefined ? { scope } : {}), ...(bare ? { bare } : {}), ...(effort !== undefined ? { effort } : {}), ...(fromPr !== undefined ? { fromPr } : {}), ...(escalate ? { escalate } : {}), unknownFlags, rest };
 }
 
 /**
@@ -978,6 +1016,9 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
                     "  --fallback-model <m> Override the escalation mid-tier model (default from IKBI_ESCALATION_MID_MODEL)\n" +
           "  --complexity <level>  small | medium | large — large skips flash (uses pro) AND extends the\n" +
           "                        builder's wall-clock budget so a big scaffold isn't cut off mid-tree\n" +
+          "  --scope[=<path>]  Staged build from an author-ordered SCOPE.md (bare = SCOPE.md at repo root).\n" +
+          "                        Each ordered stage is one small builder pass (accumulate → verify+promote);\n" +
+          "                        mark a stage `(verify)` to verify it mid-build. Overrides heuristic decomposition.\n" +
           "  --tier <name>     cheap | mid | frontier — preset builder+critic models per tier.\n" +
           "                        cheap (flash+pro, auto-escalation ON); mid (glm-5.2+minimax-m3)\n" +
           "                        and frontier (sonnet-4.6+gpt-5.5) run one builder, escalation OFF.\n" +
@@ -987,7 +1028,7 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       return;
     }
 
-    const { repo, verbose, cost, yes, json, delegation: delegationJson, noMemory, memoryDiff, check, maxBudgetUsd, fallbackModel, complexity, tier, bare, effort, fromPr, escalate, unknownFlags, rest } = parseBuildArgs(argv);
+    const { repo, verbose, cost, yes, json, delegation: delegationJson, noMemory, memoryDiff, check, maxBudgetUsd, fallbackModel, complexity, tier, scope, bare, effort, fromPr, escalate, unknownFlags, rest } = parseBuildArgs(argv);
     // #9: reject typo'd/unknown flags instead of silently folding them into the build goal (where they
     // do nothing). A legit goal that really needs a leading dash goes after `--`.
     if (unknownFlags.length > 0) {
@@ -1251,13 +1292,36 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
         : {},
     );
 
+    // STAGED BUILD (scope-plan, step 4): an explicit author-ordered SCOPE.md OVERRIDES heuristic
+    // decomposition — the reliability path for a BIG greenfield build the goal-string heuristic
+    // cannot decompose. Each stage is one SMALL builder pass through the SAME shared-workspace
+    // machinery (accumulate → final verify/promote); a `(verify)`-marked stage verifies mid-build
+    // so a broken foundation is caught early. Requested via `--scope`; absent ⇒ heuristic, unchanged.
+    const scopeResult = await loadScopePlan(scope, targetRepo);
+    if (scope !== undefined && scopeResult.plan === undefined) {
+      err(`ikbi: --scope requested but ${scopeResult.notFound}\n`);
+      setExit(1);
+      return;
+    }
+    // The normalized ordered stage list the multi-step block runs. A scope plan (≥2 stages) wins;
+    // else the heuristic step plan (verify:false — heuristic steps only verify at the final pass).
+    type BuildStage = { index: number; goal: string; targetFiles?: readonly string[]; verify: boolean };
+    const usingScope = scopeResult.plan !== undefined && scopeResult.plan.stages.length > 1;
+    if (scopeResult.plan !== undefined && scopeResult.plan.stages.length === 1) {
+      progress("  ↳ scope file has a single stage — running as a normal single build\n");
+    }
+    const buildStages: BuildStage[] = usingScope
+      ? scopeResult.plan!.stages.map((s) => ({ index: s.index, goal: s.goal, ...(s.targetFiles !== undefined ? { targetFiles: s.targetFiles } : {}), verify: s.verify }))
+      : stepPlan.steps.map((s) => ({ index: s.index, goal: s.goal, ...(s.targetFiles !== undefined ? { targetFiles: s.targetFiles } : {}), verify: false }));
+    const multiStage = usingScope || (stepPlan.decomposed && stepPlan.steps.length > 1);
+
     // SG-5: with --verbose, stream the build's structured progress events (per-role start/end,
     // builder tool activity, verification status) live as they fire.
     const sub = verbose === true ? eventBus.subscribe({ typePrefix: "worker." }, (e) => out(formatProgressEvent(e))) : undefined;
     try {
       let result: WorkerResult;
 
-      if (stepPlan.decomposed && stepPlan.steps.length > 1) {
+      if (multiStage) {
         // H5: a multi-step plan only LANDS on a tier with autoCommit autonomy. Intermediate
         // steps set skipPromote (they never commit), and the final step's commit is gated on
         // autoCommit — so on a non-autoCommit tier (verified/probation/untrusted) every green
@@ -1267,16 +1331,17 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
         const canLand = orchestrator.spawnRole?.("builder", ctx).autonomy.autoCommit ?? true;
         if (!canLand) {
           err(
-            `ikbi: this goal decomposes into ${stepPlan.steps.length} steps, but the worker tier lacks autoCommit autonomy — ` +
-              `intermediate steps never commit and the accumulated work would evaporate to "partial" (nothing lands). ` +
-              `Grant the worker the "trusted" tier and re-run, or restate the goal so it runs as a single step.\n`,
+            `ikbi: this build runs as ${buildStages.length} ${usingScope ? "stages" : "steps"}, but the worker tier lacks autoCommit autonomy — ` +
+              `intermediate ${usingScope ? "stages" : "steps"} never commit and the accumulated work would evaporate to "partial" (nothing lands). ` +
+              `Grant the worker the "trusted" tier and re-run, or restate the goal so it runs as a single ${usingScope ? "stage" : "step"}.\n`,
           );
           setExit(1);
           return;
         }
-        // MULTI-STEP: allocate ONE workspace, run all steps in it, final verify + promote.
-        // This is the shared-workspace step planner — changes accumulate across steps.
-        progress(`  ↳ decomposed into ${stepPlan.steps.length} steps\n`);
+        // MULTI-STAGE: allocate ONE workspace, run all stages in it, final verify + promote.
+        // This is the shared-workspace accumulator — changes accumulate across stages.
+        const unit = usingScope ? "stage" : "step";
+        progress(usingScope ? `  ↳ staged build: ${buildStages.length} stages from SCOPE.md\n` : `  ↳ decomposed into ${buildStages.length} steps\n`);
         const sharedWorkspace = await stepWorkspaces.allocate({
           targetRepo,
           identity: who.identity,
@@ -1284,34 +1349,35 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
         });
         let stepsOk = true;
         let lastResult: WorkerResult | undefined;
-        for (const step of stepPlan.steps) {
-          progress(`  → step ${step.index}/${stepPlan.steps.length}: ${step.goal}\n`);
+        for (const step of buildStages) {
+          progress(`  → ${unit} ${step.index}/${buildStages.length}: ${step.goal}${step.verify ? " (verify)" : ""}\n`);
           const stepTask: WorkerTask = {
             taskId: `${id}:step${step.index}`,
             targetRepo,
             goal: step.goal,
             writeScope: detectWriteScope(step.goal),
-            // Propagate --complexity so each building step inherits the large-build model tier AND the
-            // scaled builder wall-clock (a decomposed large goal can still have large individual steps).
+            // Propagate --complexity so each building stage inherits the large-build model tier AND the
+            // scaled builder wall-clock (a decomposed large goal can still have large individual stages).
             ...(complexity !== undefined ? { complexity } : {}),
             reuseWorkspace: sharedWorkspace,
             skipPromote: true,
-            // Skip verifier on ALL intermediate steps — the project is incomplete
-            // until the last step runs. The final verify pass handles verification.
-            skipVerifier: true,
-            // Skip the critic too: on an intermediate (skipPromote) step its verdict is
-            // discarded, so the paid model call buys nothing. The final pass critiques the
-            // accumulated work against the full goal.
+            // Intermediate stages skip the verifier by default — the project is incomplete until the
+            // last stage, so a mid-build verify would fail on not-yet-built imports. A scope stage the
+            // author marked `(verify)` OPTS IN: it verifies the accumulated state so a broken foundation
+            // is caught EARLY (the stage fails, the build stops) instead of after every later stage ran.
+            skipVerifier: !step.verify,
+            // Skip the critic on intermediate stages: on a skipPromote stage its verdict is discarded,
+            // so the paid model call buys nothing. The final pass critiques the accumulated work.
             skipCritic: true,
           };
           lastResult = await orchestrator.run(stepTask, ctx);
           if (lastResult.outcome !== "success") {
-            progress(`  ✗ step ${step.index} failed: ${lastResult.reason ?? lastResult.outcome}\n`);
+            progress(`  ✗ ${unit} ${step.index} failed: ${lastResult.reason ?? lastResult.outcome}\n`);
             stepsOk = false;
             result = lastResult;
             break;
           }
-          progress(`  ✓ step ${step.index} passed\n`);
+          progress(`  ✓ ${unit} ${step.index} passed\n`);
         }
         if (stepsOk) {
           // All steps passed — run full verification + promote on the accumulated workspace.
@@ -1319,7 +1385,7 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
           const finalTask: WorkerTask = {
             taskId: `${id}:verify`,
             targetRepo,
-            goal: `Verify all changes from the multi-step plan: ${finalGoal}`,
+            goal: `Verify all changes from the ${usingScope ? "staged build" : "multi-step plan"}: ${finalGoal}`,
             reuseWorkspace: sharedWorkspace,
             // H4: the final pass VERIFIES the accumulated work — it must not MODIFY it. writeScope
             // "none" blocks the builder from writing/patching/shell-writing any file, so a cheap
