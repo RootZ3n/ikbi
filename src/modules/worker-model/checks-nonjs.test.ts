@@ -86,6 +86,28 @@ test("resolveChecks: a Python repo with pytest config gets pytest checks", () =>
   }
 });
 
+test("resolveChecks: a stdlib Python repo (test*.py, no pytest) gets NATIVE unittest checks", () => {
+  const wt = repo("py-unittest");
+  writeFileSync(join(wt, "rpn.py"), "def evaluate(e):\n    return 0\n");
+  writeFileSync(join(wt, "test_rpn.py"), "import unittest\nclass T(unittest.TestCase):\n    def test_x(self): self.assertEqual(1, 1)\n");
+  const r = resolveChecks(wt, NOENV);
+  assert.ok(r.ok, "stdlib unittest project resolves (does not fail closed)");
+  if (r.ok) {
+    assert.equal(r.checks[0]?.command, "python3");
+    assert.ok(r.checks[0]?.args.includes("unittest"), "runs unittest, not pytest");
+    assert.ok(!r.checks.some((c) => c.args.includes("pytest")), "no pytest (needs pip/network)");
+  }
+});
+
+test("resolveChecks: unittest is detected in a tests/ subdir too", () => {
+  const wt = repo("py-unittest-dir");
+  writeFileSync(join(wt, "app.py"), "x = 1\n");
+  mkdirSync(join(wt, "tests"));
+  writeFileSync(join(wt, "tests", "test_app.py"), "import unittest\nclass T(unittest.TestCase):\n    def test_x(self): pass\n");
+  const r = resolveChecks(wt, NOENV);
+  assert.ok(r.ok && r.checks.some((c) => c.args.includes("unittest")));
+});
+
 test("resolveChecks: a Python repo with NO test runner FAILS CLOSED with guidance (not pnpm)", () => {
   const wt = repo("py-bare");
   writeFileSync(join(wt, "pyproject.toml"), "[project]\nname = \"x\"\nversion = \"0.1.0\"\n");

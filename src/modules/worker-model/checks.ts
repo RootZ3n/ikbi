@@ -63,6 +63,11 @@ const GO_CHECKS: readonly Check[] = [
 /** Python native checks (pytest) — only emitted when a pytest signal is detected (else fail closed). */
 const PYTHON_PYTEST_CHECKS: readonly Check[] = [{ name: "test", command: "python3", args: ["-m", "pytest", "-q"] }];
 
+/** Python STDLIB checks (unittest) — emitted when `test*.py` files exist but no pytest signal does.
+ *  unittest is stdlib (no pip/network, so it runs inside the sandbox where pytest install fails
+ *  closed) and its default discovery pattern is `test*.py`, which the detection below matches. */
+const PYTHON_UNITTEST_CHECKS: readonly Check[] = [{ name: "test", command: "python3", args: ["-m", "unittest", "discover", "-v"] }];
+
 /** Godot headless syntax check (Godot 4.x — lightweight, no test framework needed). */
 const GODOT_HEADLESS_CHECKS: readonly Check[] = [{ name: "check", command: "godot", args: ["--headless", "--quit"] }];
 
@@ -118,12 +123,30 @@ function detectPythonChecks(projectRoot: string): ChecksResolution {
     }
   }
   if (pytestSignal) return { ok: true, checks: PYTHON_PYTEST_CHECKS, source: "default" };
+  // STDLIB FALLBACK: no pytest signal, but `test*.py` files exist (unittest's default discovery
+  // pattern) ⇒ run `python3 -m unittest discover`. This is a REAL runner keyed off a real signal, not
+  // an invented one: with no matching test files unittest prints "Ran 0 tests" ⇒ testEvidence "zero"
+  // ⇒ the gate still discards. pytest needs pip/network (fails closed in the sandbox), so unittest is
+  // the only stdlib Python path that actually runs there.
+  if (hasUnittestFiles(projectRoot)) return { ok: true, checks: PYTHON_UNITTEST_CHECKS, source: "default" };
   return {
     ok: false,
     reason:
-      `Python project at ${projectRoot} has no detectable test runner (no pytest/tox config) — refusing to invent checks. ` +
+      `Python project at ${projectRoot} has no detectable test runner (no pytest/tox config, no test*.py files) — refusing to invent checks. ` +
       `Set IKBI_CHECKS to declare them, e.g. IKBI_CHECKS='[{"name":"test","command":"python3","args":["-m","pytest"]}]' (RED until configured).`,
   };
+}
+
+/** True iff `test*.py` files exist at the root or inside a `tests/` dir — the unittest discovery signal. */
+function hasUnittestFiles(projectRoot: string): boolean {
+  const scan = (dir: string): boolean => {
+    try {
+      return readdirSync(dir, { withFileTypes: true }).some((e) => e.isFile() && /^test.*\.py$/i.test(e.name));
+    } catch {
+      return false;
+    }
+  };
+  return scan(projectRoot) || scan(join(projectRoot, "tests"));
 }
 
 /**
@@ -288,6 +311,12 @@ export function resolveChecks(worktreeReal: string, env: NodeJS.ProcessEnv = pro
   const wt = resolve(worktreeReal);
   const root = resolveProjectRoot(wt);
   if (root === undefined) {
+    // LOOSE-SOURCE PYTHON: no manifest, but `test*.py` files exist ⇒ stdlib unittest. A cheap model
+    // scaffolding a small Python CLI usually writes just `foo.py` + `test_foo.py` (no pyproject.toml);
+    // manifest-only detection would fail-close it. unittest is a REAL, deterministic runner keyed off a
+    // specific signal (not invented) and runs in the sandbox (stdlib, no pip); a no-match run prints
+    // "Ran 0 tests" ⇒ testEvidence zero ⇒ still discarded. So this never manufactures a vacuous pass.
+    if (hasUnittestFiles(wt)) return { ok: true, checks: PYTHON_UNITTEST_CHECKS, source: "default" };
     // Give a more actionable message when we can detect the language without a manifest.
     if (hasJsTsFiles(wt)) {
       return {
@@ -609,6 +638,19 @@ export function parseTestCount(output: string): { passed: number; total: number 
   const goFail = (output.match(/^FAIL\s+/gm) || []).length;
   if (goOk > 0 || goFail > 0) {
     return { passed: goOk, total: goOk + goFail };
+  }
+
+  // python unittest: "Ran N tests in X.XXXs" then "OK" (all pass) or "FAILED (failures=F, errors=E)".
+  // unittest prints no per-status count, so total comes from "Ran N" and failures are subtracted from
+  // the FAILED(...) breakdown. A vacuous "Ran 0 tests" ⇒ total 0 ⇒ testEvidence "zero" (the gate still
+  // discards a suite that ran nothing) — so recognizing this format never manufactures evidence.
+  const unittestRan = /Ran\s+(\d+)\s+tests?\s+in\s+[\d.]+s/.exec(output);
+  if (unittestRan !== null) {
+    const total = Number(unittestRan[1]);
+    const failedBlock = /FAILED\s*\(([^)]*)\)/.exec(output);
+    let failed = 0;
+    for (const m of (failedBlock?.[1] ?? "").matchAll(/(?:failures|errors)=(\d+)/g)) failed += Number(m[1]);
+    return { passed: Math.max(0, total - failed), total };
   }
 
   // Generic "N passing/passed ... M total/tests" (mocha-style and friends). LAST — it is the greedy

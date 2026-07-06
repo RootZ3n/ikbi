@@ -699,8 +699,9 @@ function classifyCheckName(cmdLower: string): "test" | "typecheck" | "check" {
   if (
     /--test\b/.test(cmdLower) ||
     /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test\b/.test(cmdLower) ||
-    /\b(?:vitest|jest|pytest|mocha|ava)\b/.test(cmdLower) ||
-    /\bgo\b[^\n]*\btest\b/.test(cmdLower)
+    /\b(?:vitest|jest|pytest|mocha|ava|unittest)\b/.test(cmdLower) ||
+    /\bgo\b[^\n]*\btest\b/.test(cmdLower) ||
+    /\bcargo\b[^\n]*\btest\b/.test(cmdLower)
   ) {
     return "test";
   }

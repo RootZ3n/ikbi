@@ -94,6 +94,30 @@ test("parseTestCount: cargo MULTI-SECTION output (lib + empty bin + doc-tests) �
   assert.deepEqual(parseTestCount(cargo), { passed: 17, total: 17 });
 });
 
+test("parseTestCount: python unittest 'Ran N tests ... OK' (stdlib, sandbox-runnable)", () => {
+  const ok = [
+    "test_addition (test_rpn.TestRPN.test_addition) ... ok",
+    "test_division (test_rpn.TestRPN.test_division) ... ok",
+    "",
+    "----------------------------------------------------------------------",
+    "Ran 9 tests in 0.000s",
+    "",
+    "OK",
+  ].join("\n");
+  assert.deepEqual(parseTestCount(ok), { passed: 9, total: 9 });
+});
+
+test("parseTestCount: python unittest FAILED subtracts failures+errors", () => {
+  assert.deepEqual(parseTestCount("Ran 5 tests in 0.001s\n\nFAILED (failures=1, errors=1)"), { passed: 3, total: 5 });
+  assert.deepEqual(parseTestCount("Ran 4 tests in 0.001s\n\nFAILED (failures=2)"), { passed: 2, total: 4 });
+});
+
+test("parseTestCount: python unittest 'Ran 0 tests' is vacuous ⇒ total 0 (gate discards)", () => {
+  // A discover run that matched nothing prints "Ran 0 tests ... OK" — green but vacuous. total:0 ⇒
+  // readVerifier scores testEvidence "zero" ⇒ the single-run gate refuses to promote. Anti-vacuous.
+  assert.deepEqual(parseTestCount("Ran 0 tests in 0.000s\n\nOK"), { passed: 0, total: 0 });
+});
+
 test("parseTestCount: go test ok/FAIL lines", () => {
   const output = [
     "ok  \tgithub.com/user/pkg1\t0.123s",

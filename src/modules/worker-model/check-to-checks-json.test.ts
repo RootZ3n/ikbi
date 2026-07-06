@@ -20,6 +20,16 @@ test("a bare test command is named \"test\" (so the verifier counts it as test e
   assert.deepEqual(parse("npm run test"), [{ name: "test", command: "npm", args: ["run", "test"] }]);
 });
 
+test("python3 -m unittest is named \"test\" (stdlib Python evidence)", () => {
+  assert.deepEqual(parse("python3 -m unittest discover -v"), [
+    { name: "test", command: "python3", args: ["-m", "unittest", "discover", "-v"] },
+  ]);
+});
+
+test("cargo test is named \"test\"", () => {
+  assert.equal(parse("cargo test")[0]?.name, "test");
+});
+
 test("a tsc command is named \"typecheck\"", () => {
   assert.deepEqual(parse("pnpm exec tsc -p tsconfig.json"), [
     { name: "typecheck", command: "pnpm", args: ["exec", "tsc", "-p", "tsconfig.json"] },
