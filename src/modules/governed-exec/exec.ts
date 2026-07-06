@@ -60,6 +60,7 @@ import { createJobManager, type JobManager } from "./jobs.js";
 import {
   classifyCommandRisk,
   detectSandbox,
+  toolchainCacheWritable,
   wrapWithSandbox,
   type SandboxAvailability,
   type SandboxPlan,
@@ -371,12 +372,16 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
     } else if (risk.risky) {
       const avail = sandboxAvailability();
       if (avail.available) {
+        // Bind the persistent, ikbi-owned toolchain cache writable (Go/.NET/Maven/Gradle) so deps +
+        // compiled std are reused across builds instead of re-fetched into a throwaway tmpfs each run.
+        const extraWritable = toolchainCacheWritable(command);
         sandboxPlan = {
           mode: "bwrap",
           ...(sandboxWritableRoot !== undefined ? { writableRoot: sandboxWritableRoot } : {}),
           ...(cwd !== undefined ? { cwd } : {}),
           networkAllowed: risk.needsNetwork,
           risk,
+          ...(extraWritable.length > 0 ? { extraWritable } : {}),
         };
         sandboxLabel = "bwrap";
         emit(govexecExecuted, { ...base, allow: true, sandbox: "bwrap", risk: risk.kind }, identity, EXEC_OPERATION, requestId);
