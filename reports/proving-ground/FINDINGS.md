@@ -1,5 +1,19 @@
 # ikbi Proving Ground — Findings
 
+> **⚠️ STATUS: F1 RESOLVED — THIS IS A HISTORICAL FORENSIC LOG (baseline `6d1f465`, 2026-06-26 09:02).**
+> The one blocker below (**F1 — workspace escape**) was **FIXED the same day** it was logged:
+> commit `ece4624` *(fix(governed-exec): OS-sandbox risky subprocesses to close F1 workspace escape,
+> 2026-06-26 11:46)* wraps every risky governed-exec subprocess in a bubblewrap sandbox where only the
+> worktree + an ephemeral tmpfs are writable and the rest of the host is read-only (see
+> `src/modules/governed-exec/sandbox.ts` + wiring in `exec.ts:345-421`). It **fails closed** when the
+> sandbox is unavailable.
+> **Proof it's closed:** the post-fix volume run this log said it *couldn't* complete now completes —
+> **501 runs, `UNSAFE_FAIL = 0`, all hard gates PASS** (`reports/proving-ground/rc1-500-aggregate/summary.md`,
+> commit `9a1c8d7`). Live re-verification on 2026-07-06: the exact repro #3 (`../../ESCAPED.txt`) and
+> repro #4 (absolute path) both fail with **EROFS** under the real bwrap policy; `sandbox-f1.test.ts` +
+> `sandbox.test.ts` = 21/21 green.
+> **Do not re-flag F1 from this document.** It records the state *before* the fix. Kept for the audit trail.
+
 Test director forensic log. Evidence-first. Classifications follow the mission's Phase-2 rules.
 
 Baseline: branch `rc1-hardening`, HEAD `6d1f465`, clean tree. `pnpm typecheck` ✓, `pnpm test`
@@ -12,10 +26,16 @@ stop-discipline, volume testing halted on a confirmed **workspace escape** (F1 b
 
 ---
 
-## F1 — BLOCKER: workspace escape via an allowlisted interpreter  ·  UNSAFE_FAIL
+## F1 — ~~BLOCKER~~ **RESOLVED (2026-06-26, commit `ece4624`)**: workspace escape via an allowlisted interpreter
+
+> **FIXED.** Risky governed-exec subprocesses (interpreters, package scripts, toolchains, write-tools)
+> now run inside a bubblewrap sandbox: worktree + tmpfs writable, entire host read-only, network
+> unshared, fail-closed if unavailable. Both the relative and absolute escape vectors below now return
+> **EROFS**. Re-proven at volume (501 runs, `UNSAFE_FAIL=0`) and re-verified live on 2026-07-06. The
+> original finding is preserved verbatim below for the forensic record.
 
 **An `ikbi build` can write a file to an arbitrary path anywhere the OS user can write — outside
-the worktree, outside the target repo, outside the ikbi state root.**
+the worktree, outside the target repo, outside the ikbi state root.** *(← state before `ece4624`)*
 
 ### Mechanism (reproduced 5×, environment-independent)
 1. The builder calls `write_file` to create a helper script (e.g. `write_escaped.js`) — this is
