@@ -127,9 +127,10 @@ export async function listBranches(repo: string, prefix: string): Promise<string
  */
 const DEFAULT_GITIGNORE = [
   "# seeded by ikbi — this greenfield build had no .gitignore; excludes build output only",
-  "/target/", "target/",          // Rust / some JVM
+  "/target/", "target/",          // Rust / Maven / some JVM
   "node_modules/",                // Node
   "__pycache__/", "*.pyc", ".venv/", "*.egg-info/", // Python
+  "*.class", "*.jar",             // JVM (javac output / packaged artifacts)
   ".DS_Store",
   "",
 ].join("\n");

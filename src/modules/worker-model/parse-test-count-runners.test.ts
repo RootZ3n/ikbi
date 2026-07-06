@@ -94,6 +94,12 @@ test("parseTestCount: cargo MULTI-SECTION output (lib + empty bin + doc-tests) â
   assert.deepEqual(parseTestCount(cargo), { passed: 17, total: 17 });
 });
 
+test("parseTestCount: JVM 'Tests run: N, Failures: F, Errors: E' (JUnit / Maven Surefire / hand-rolled)", () => {
+  assert.deepEqual(parseTestCount("Tests run: 7, Failures: 0, Errors: 0"), { passed: 7, total: 7 });
+  assert.deepEqual(parseTestCount("Tests run: 10, Failures: 2, Errors: 1, Skipped: 0"), { passed: 7, total: 10 });
+  assert.deepEqual(parseTestCount("[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0\n[INFO] BUILD SUCCESS"), { passed: 3, total: 3 });
+});
+
 test("parseTestCount: python unittest 'Ran N tests ... OK' (stdlib, sandbox-runnable)", () => {
   const ok = [
     "test_addition (test_rpn.TestRPN.test_addition) ... ok",

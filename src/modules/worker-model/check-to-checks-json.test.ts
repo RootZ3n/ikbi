@@ -30,6 +30,13 @@ test("cargo test is named \"test\"", () => {
   assert.equal(parse("cargo test")[0]?.name, "test");
 });
 
+test("JVM checks are named correctly: javac→typecheck, java *Test→test, mvn/gradle test→test", () => {
+  assert.equal(parse("javac App.java AppTest.java")[0]?.name, "typecheck");
+  assert.equal(parse("java AppTest")[0]?.name, "test");
+  assert.equal(parse("mvn -q test")[0]?.name, "test");
+  assert.equal(parse("gradle test")[0]?.name, "test");
+});
+
 test("a tsc command is named \"typecheck\"", () => {
   assert.deepEqual(parse("pnpm exec tsc -p tsconfig.json"), [
     { name: "typecheck", command: "pnpm", args: ["exec", "tsc", "-p", "tsconfig.json"] },

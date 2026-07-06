@@ -640,6 +640,16 @@ export function parseTestCount(output: string): { passed: number; total: number 
     return { passed: goOk, total: goOk + goFail };
   }
 
+  // JVM (JUnit / Maven Surefire / Gradle): "Tests run: N, Failures: F, Errors: E[, Skipped: S]".
+  // The canonical JVM summary — a hand-rolled `main` test, JUnit's ConsoleLauncher, and `mvn test` all
+  // print it. passed = run − failures − errors (skipped are neither pass nor fail; they stay in total).
+  const junit = /Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+)/i.exec(output);
+  if (junit !== null) {
+    const total = Number(junit[1]);
+    const passed = Math.max(0, total - Number(junit[2]) - Number(junit[3]));
+    return { passed, total };
+  }
+
   // python unittest: "Ran N tests in X.XXXs" then "OK" (all pass) or "FAILED (failures=F, errors=E)".
   // unittest prints no per-status count, so total comes from "Ran N" and failures are subtracted from
   // the FAILED(...) breakdown. A vacuous "Ran 0 tests" ⇒ total 0 ⇒ testEvidence "zero" (the gate still

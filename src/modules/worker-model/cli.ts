@@ -701,11 +701,13 @@ function classifyCheckName(cmdLower: string): "test" | "typecheck" | "check" {
     /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test\b/.test(cmdLower) ||
     /\b(?:vitest|jest|pytest|mocha|ava|unittest)\b/.test(cmdLower) ||
     /\bgo\b[^\n]*\btest\b/.test(cmdLower) ||
-    /\bcargo\b[^\n]*\btest\b/.test(cmdLower)
+    /\bcargo\b[^\n]*\btest\b/.test(cmdLower) ||
+    /\b(?:mvn|maven|gradle)\b[^\n]*\btest\b/.test(cmdLower) || // JVM build tools
+    /^\s*java\s+\S*test/.test(cmdLower)                        // `java` runner on a *Test class (NOT `javac`, NOT a *.java arg)
   ) {
     return "test";
   }
-  if (/\btsc\b/.test(cmdLower) || /\btypecheck\b/.test(cmdLower)) return "typecheck";
+  if (/\btsc\b/.test(cmdLower) || /\btypecheck\b/.test(cmdLower) || /\bjavac\b/.test(cmdLower)) return "typecheck";
   return "check";
 }
 

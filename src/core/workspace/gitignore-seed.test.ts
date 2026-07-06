@@ -41,6 +41,7 @@ test("commitAll seeds a .gitignore that excludes target/ when the repo has none"
     const gi = await readFile(join(repo, ".gitignore"), "utf8");
     assert.match(gi, /target\//);
     assert.match(gi, /node_modules\//);
+    assert.match(gi, /\*\.class/, "JVM .class output is excluded (Java artifact hygiene)");
   } finally {
     await rm(repo, { recursive: true, force: true });
   }
