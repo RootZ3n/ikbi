@@ -151,3 +151,9 @@ deeper cut at "does this code EARN its place?":
 This completes the four-dimension arc for the two modules influence flagged: reachability→frequency
 prove PRESENCE, influence scores STEERING, and ablation quantifies VALUE. The pattern is reusable —
 point `influence.mjs` at a corpus, take its `passive`/`latent` modules, and ablate each one.
+
+**Roll-up:** `runtime-truth.mjs` composes the two receipt-based dimensions (influence + gate-wall
+value) over a single `receipts.ndjson` into one presence→steering→value table + a one-line verdict,
+so a fresh `ikbi build` can be graded end-to-end in one command:
+`node scripts/proving-ground/runtime-truth.mjs <state/receipts/receipts.ndjson>` → `RUNTIME-TRUTH.md`.
+Unit-tested by `runtime-truth.test.mjs` (composition is pure; the CLI injects the real dist gate).
