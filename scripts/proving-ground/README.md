@@ -121,8 +121,17 @@ deeper cut at "does this code EARN its place?":
    `frequency.test.mjs`. Run: `node scripts/proving-ground/frequency.mjs` (reads the last
    reachability `results.json`, writes `FREQUENCY-REPORT.md`). **[DONE]**
 3. **Influence** — *did its output change a DECISION?* (did a module's result flip a branch / gate /
-   route). Needs decision-point instrumentation correlating module events with branch outcomes.
-   **[roadmap]**
+   route). `influence.mjs` reads the decision-bearing **receipt stream** (the outcome reachability
+   discards) and, per a decision catalog (gate `allow`, govexec `rejected`, promote, trust
+   `transition`, verifier `failure`, drift block), attributes each decision to its owning module and
+   measures how often that module's output took the flow OFF the default path — banding it
+   pivotal / active / passive / latent. `passive` (authority that never bit) and `latent` are the
+   ablation entry points for dimension 4. PURE over parsed receipts; unit-tested by
+   `influence.test.mjs`. Run: `node scripts/proving-ground/influence.mjs [receipts.ndjson]` (defaults
+   to `$IKBI_STATE_ROOT/receipts/receipts.ndjson`, writes `INFLUENCE-REPORT.md`). First real finding:
+   across every corpus **gate-wall is `passive` (0 denials of 11k+ evaluations)** — command
+   interdiction lives downstream in `governed-exec` (allowlist/policy/sandbox `rejected`), and
+   gate-wall ran in bypass. **[DONE]**
 4. **Value / ablation** — *would the outcome change if it didn't exist?* Run with the module
    stubbed, diff promote/verdict/quality. `ablate-drift.mjs` + `ABLATION-DRIFT.md` did this for
    drift-prevention (finding: structurally inert until the first-class-governor rework — now

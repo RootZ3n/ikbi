@@ -18,7 +18,7 @@
  * The dimensions of runtime truth, in order of depth:
  *   1. reachability (cov-analyze/reach-report) — was it executed?          [DONE]
  *   2. FREQUENCY (this file)                    — how often / how broadly?  [DONE]
- *   3. influence                                — did it change a decision? [roadmap]
+ *   3. influence (influence.mjs)                — did it change a decision? [DONE]
  *   4. value / ablation (ablate-drift)          — would the outcome change? [DONE for drift]
  */
 import { readFileSync, writeFileSync } from "node:fs";
