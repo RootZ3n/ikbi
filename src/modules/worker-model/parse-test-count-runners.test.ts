@@ -66,6 +66,34 @@ test("parseTestCount: cargo test simpler form 'test result: ok. N passed'", () =
   assert.deepEqual(parseTestCount("test result: ok. 8 passed"), { passed: 8, total: 8 });
 });
 
+test("parseTestCount: cargo MULTI-SECTION output (lib + empty bin + doc-tests) — the Rust greenfield regression", () => {
+  // A real `cargo test` on a lib+bin crate prints THREE result blocks: the lib tests (the real ones),
+  // then the bin's "running 0 tests", then doc-tests. The greedy generic matcher used to bridge the
+  // lib's "17 passed" to the bin's "running 0 tests" and return total:0 ⇒ testEvidence "zero" ⇒ a
+  // fully-tested Rust build was DISCARDED (found live: the roman-numeral E2E build). The precise cargo
+  // matcher must win: 17 real passing tests, total 17.
+  const cargo = [
+    "     Running unittests src/lib.rs (target/debug/deps/roman-3a303b11c2f23ca8)",
+    "",
+    "running 17 tests",
+    "test tests::to_roman_1 ... ok",
+    "test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+    "",
+    "     Running unittests src/main.rs (target/debug/deps/roman-12d997bc85f6ed2b)",
+    "",
+    "running 0 tests",
+    "",
+    "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+    "",
+    "   Doc-tests roman",
+    "",
+    "running 0 tests",
+    "",
+    "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+  ].join("\n");
+  assert.deepEqual(parseTestCount(cargo), { passed: 17, total: 17 });
+});
+
 test("parseTestCount: go test ok/FAIL lines", () => {
   const output = [
     "ok  \tgithub.com/user/pkg1\t0.123s",

@@ -588,11 +588,6 @@ export function parseTestCount(output: string): { passed: number; total: number 
   const jest = /Tests:\s+(\d+)\s+passed.*?(\d+)\s+total/.exec(output);
   if (jest !== null) return { passed: Number(jest[1]), total: Number(jest[2]) };
 
-  // Generic "N passing/passed ... M total/tests" (mocha-style and friends).
-  const generic = /(\d+)\s+(?:passing|passed)[\s\S]*?(\d+)\s+(?:total|tests)/.exec(output);
-  if (generic !== null) return { passed: Number(generic[1]), total: Number(generic[2]) };
-
-
   // pytest: "N passed in X.XXs" or "N passed, M failed in X.XXs" (passed count only)
   const pytest = /(\d+)\s+passed(?:,\s+\d+\s+\w+)*\s+in\s+[\d.]+s/.exec(output);
   if (pytest !== null) { const n = Number(pytest[1]); return { passed: n, total: n }; }
@@ -615,6 +610,15 @@ export function parseTestCount(output: string): { passed: number; total: number 
   if (goOk > 0 || goFail > 0) {
     return { passed: goOk, total: goOk + goFail };
   }
+
+  // Generic "N passing/passed ... M total/tests" (mocha-style and friends). LAST — it is the greedy
+  // fallback: `[\s\S]*?` bridges across lines, so on a multi-section runner (e.g. cargo, which prints
+  // a "test result: ok. 17 passed" block then a trailing "running 0 tests" section for the bin/doc
+  // targets) it wrongly pairs "17 passed" with the later "0 tests" and yields total:0 ⇒ testEvidence
+  // "zero" ⇒ a fully-tested build is discarded. Trying it only AFTER the precise runners above lets
+  // cargo/pytest/go win with their real count; the generic shape remains for mocha-likes.
+  const generic = /(\d+)\s+(?:passing|passed)[\s\S]*?(\d+)\s+(?:total|tests)/.exec(output);
+  if (generic !== null) return { passed: Number(generic[1]), total: Number(generic[2]) };
 
   return undefined;
 }
