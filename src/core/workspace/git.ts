@@ -8,6 +8,8 @@
  */
 
 import { execFile } from "node:child_process";
+import { access, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { promisify } from "node:util";
 
 import { WorkspaceError } from "./contract.js";
@@ -118,8 +120,52 @@ export async function listBranches(repo: string, prefix: string): Promise<string
   return r.stdout.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
 }
 
+/**
+ * Universal build-OUTPUT dirs no repo wants committed. Every entry is a build artifact, never source
+ * — so seeding these can only prevent junk, never hide the builder's work. Kept deliberately narrow
+ * (no `dist/`/`build/`, which some repos DO track as source) so the seed is unambiguous.
+ */
+const DEFAULT_GITIGNORE = [
+  "# seeded by ikbi — this greenfield build had no .gitignore; excludes build output only",
+  "/target/", "target/",          // Rust / some JVM
+  "node_modules/",                // Node
+  "__pycache__/", "*.pyc", ".venv/", "*.egg-info/", // Python
+  ".DS_Store",
+  "",
+].join("\n");
+
+/**
+ * If a worktree has NO `.gitignore`, seed a minimal one covering universal build-output dirs before
+ * we stage. Without this, a greenfield build that runs a toolchain (e.g. `cargo test` → `target/`,
+ * `npm i` → `node_modules/`) commits hundreds of artifact files on promote (the O3 papercut). NEVER
+ * overwrites an existing `.gitignore` (respects the operator's), and is best-effort: any failure
+ * leaves the original `git add -A` behavior untouched.
+ */
+async function seedDefaultGitignoreIfAbsent(worktreePath: string): Promise<void> {
+  const gitignorePath = join(worktreePath, ".gitignore");
+  try {
+    await access(gitignorePath);
+    return; // exists — leave it exactly as the operator/build left it
+  } catch {
+    // absent — fall through to seed
+  }
+  try {
+    await writeFile(gitignorePath, DEFAULT_GITIGNORE, { flag: "wx" }); // wx: never clobber a race-created file
+  } catch {
+    // best-effort — a failure just means we stage as before
+  }
+}
+
 /** Stage everything and commit in a worktree. Returns false if there was nothing to commit. */
 export async function commitAll(worktreePath: string, message: string): Promise<boolean> {
+  // Detect changes BEFORE seeding, so a genuine no-op build lands nothing (and we never write a
+  // spurious .gitignore into an otherwise-unchanged repo). `status --porcelain` sees untracked files
+  // (e.g. `?? target/`) too, so this is a faithful "did the build change anything?" check.
+  const pre = await runGit(worktreePath, ["status", "--porcelain"]);
+  if (pre.stdout.trim().length === 0) return false;
+  // There ARE changes ⇒ seed a default .gitignore (if absent) so build-output dirs (target/,
+  // node_modules/, …) are excluded from the `add -A` below instead of committed as artifacts.
+  await seedDefaultGitignoreIfAbsent(worktreePath);
   await runGit(worktreePath, ["add", "-A"]);
   const status = await runGit(worktreePath, ["status", "--porcelain"]);
   if (status.stdout.trim().length === 0) return false;
