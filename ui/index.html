@@ -41,6 +41,9 @@ const state={
     product:'ikbi',
     scene:localStorage.getItem('pehverse-scene')||null,
     mode:localStorage.getItem('pehverse-mode')||'dashboard',
+    // GROVE-ONLY: mobile-first — show ONLY Peh's terminal, hide the card wall/map. Defaults ON for
+    // narrow (mobile) screens; a stored preference wins. Toggle via the top-bar Grove/Immersive/Dashboard.
+    groveOnly:(localStorage.getItem('pehverse-grove-only')||((typeof window!=='undefined'&&window.innerWidth&&window.innerWidth<=820)?'1':'0'))==='1',
     workspaces:[],
     focus:null,
     fastTravel:false,
@@ -507,7 +510,7 @@ function renderPehverse(deckMarkup){
   const product=pehActiveProduct();
   const scene=pehCurrentScene();
   const styleVars=`--peh-accent:${product.accent};--peh-accent2:${product.accent2||product.accent}`;
-  return `<div class="peh-shell peh-mode-${pv.mode} peh-product-${product.id}" data-product="${product.id}" style="${styleVars}">
+  return `<div class="peh-shell peh-mode-${pv.mode} peh-product-${product.id}${pv.groveOnly?' peh-grove-only-mode':''}" data-product="${product.id}" style="${styleVars}">
     ${renderPehTopBar(product,scene)}
     <div class="peh-stage">${renderPehStage(product,scene,deckMarkup)}</div>
     ${renderPehTaskbar()}
@@ -526,8 +529,9 @@ function renderPehTopBar(product,scene){
       <span class="peh-travel-cta">Fast travel</span>
     </button>
     <div class="peh-mode-toggle" role="group" aria-label="View mode (Alt+M to toggle)">
-      <button type="button" class="${pv.mode==='immersive'?'active':''}" aria-pressed="${pv.mode==='immersive'}" onclick="pehSetMode('immersive')">Immersive</button>
-      <button type="button" class="${pv.mode==='dashboard'?'active':''}" aria-pressed="${pv.mode==='dashboard'}" onclick="pehSetMode('dashboard')">Dashboard</button>
+      <button type="button" class="${pv.groveOnly?'active':''}" aria-pressed="${!!pv.groveOnly}" onclick="pehSetGroveOnly(true)">Grove</button>
+      <button type="button" class="${!pv.groveOnly&&pv.mode==='immersive'?'active':''}" aria-pressed="${!pv.groveOnly&&pv.mode==='immersive'}" onclick="pehSetGroveOnly(false);pehSetMode('immersive')">Immersive</button>
+      <button type="button" class="${!pv.groveOnly&&pv.mode==='dashboard'?'active':''}" aria-pressed="${!pv.groveOnly&&pv.mode==='dashboard'}" onclick="pehSetGroveOnly(false);pehSetMode('dashboard')">Dashboard</button>
     </div>
   </header>`;
 }
@@ -536,8 +540,20 @@ function renderPehTopBar(product,scene){
 // Voltron wall (DashboardSurface); immersive mode is the map with movable
 // windows popping up at their hotspots.
 function renderPehStage(product,scene,deckMarkup){
+  if(state.pehverse.groveOnly)return renderGroveOnly();
   if(state.pehverse.mode==='dashboard')return renderDashboardSurface(product,scene,deckMarkup);
   return renderPehMap(product,scene,deckMarkup);
+}
+// GROVE-ONLY: the mobile-first view — just Peh's terminal, full-screen, nothing else. The other
+// panels are one tap away via the top-bar toggle (Immersive/Dashboard).
+function renderGroveOnly(){
+  const body=(typeof window.pehWorkspaceBody==='function')?window.pehWorkspaceBody({defId:'grove-ws',console:true},''):'';
+  return `<div class="peh-grove-only">${body}</div>`;
+}
+function pehSetGroveOnly(v){
+  state.pehverse.groveOnly=!!v;
+  try{localStorage.setItem('pehverse-grove-only',v?'1':'0')}catch(e){}
+  render();
 }
 
 function renderPehMap(product,scene,deckMarkup){
@@ -854,6 +870,7 @@ window.pehHotspotActivate=pehHotspotActivate;
 window.pehDismissBubble=pehDismissBubble;
 window.pehToggleFastTravel=pehToggleFastTravel;
 window.pehSetMode=pehSetMode;
+window.pehSetGroveOnly=pehSetGroveOnly;
 window.pehSetScene=pehSetScene;
 window.pehGoScene=pehGoScene;
 window.pehDevSwitchProduct=pehDevSwitchProduct;
