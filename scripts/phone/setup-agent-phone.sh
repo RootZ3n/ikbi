@@ -77,12 +77,16 @@ warn "Android will still eventually kill the agent in the background."
 mkdir -p "$HOME/.termux/boot"
 cat > "$HOME/.termux/boot/start-ikbi.sh" <<BOOT
 #!$PREFIX/bin/bash
+# SUPERVISED autostart: Android reaps SSH-spawned processes, so the server MUST be launched from this
+# Termux:Boot context. The while-loop auto-restarts it if Android kills it. Guarded so it's harmless
+# before ikbi is deployed to ~/ikbi-agent.
 termux-wake-lock
 sshd                                   # restore remote (SSH) access on boot
-[ -x "\$HOME/ikbi-agent/run-ikbi.sh" ] && { cd "\$HOME/ikbi-agent"; setsid nohup bash run-ikbi.sh serve >serve.log 2>&1 </dev/null & }
+[ -x "\$HOME/ikbi-agent/run-ikbi.sh" ] && setsid bash -c 'while true; do bash "\$HOME/ikbi-agent/run-ikbi.sh" serve >>"\$HOME/ikbi-agent/serve.log" 2>&1; sleep 3; done' </dev/null >/dev/null 2>&1 &
 BOOT
 chmod +x "$HOME/.termux/boot/start-ikbi.sh"
 say "Boot auto-start written (~/.termux/boot/start-ikbi.sh) — install + open Termux:Boot once to arm it."
+say "To start now without a reboot, run this IN an open Termux session (not over SSH): bash ~/.termux/boot/start-ikbi.sh"
 
 # ── 5. verify the Termux:API bridge is really wired ───────────────────────────
 say "Verifying the Termux:API hardware bridge…"
