@@ -125,9 +125,9 @@ const WORKSPACE_REGISTRY={
 //    vs glance-only, and supplies the floating-window solo size. priority
 //    orders the Voltron dashboard wall. (See the Pehverse rollout map.)
 const PANEL_META={
-  'engine-status':    {role:'status',      priority:1,  console:true,  solo:{w:'min(560px,52vw)', h:'70%'}},
-  'builder-ws':       {role:'config',      priority:2,  console:true,  solo:{w:'min(580px,54vw)', h:'74%'}},
-  'grove-ws':         {role:'results',     priority:3,  console:true,  solo:{w:'min(640px,58vw)', h:'76%'}},
+  'grove-ws':         {role:'results',     priority:1,  console:true,  solo:{w:'min(640px,58vw)', h:'76%'}},
+  'engine-status':    {role:'status',      priority:2,  console:true,  solo:{w:'min(560px,52vw)', h:'70%'}},
+  'builder-ws':       {role:'config',      priority:3,  console:true,  solo:{w:'min(580px,54vw)', h:'74%'}},
   'test-results':     {role:'results',     priority:4,  console:true,  solo:{w:'min(540px,50vw)', h:'68%'}},
   'trust-ws':         {role:'status',      priority:5,  console:true,  solo:{w:'min(520px,48vw)', h:'66%'}},
   'modules-ws':       {role:'metrics',     priority:6,  console:true,  solo:{w:'min(540px,50vw)', h:'66%'}},
