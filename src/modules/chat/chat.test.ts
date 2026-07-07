@@ -310,7 +310,7 @@ test("chat advertises the full builder tool suite to the model", async () => {
   // Plus Pehlichi's governed device body — the 8 phone_* tools (Termux:API). Chat-only: the
   // code-building role never holds a camera/mic.
   const PHONE_TOOLS_EXPECTED = [
-    "phone_take_photo", "phone_record_audio", "phone_read_sensor", "phone_location",
+    "phone_take_photo", "phone_record_audio", "phone_read_sensor", "phone_read_text", "phone_location",
     "phone_battery", "phone_speak", "phone_notify", "phone_torch",
   ];
   for (const t of PHONE_TOOLS_EXPECTED) {

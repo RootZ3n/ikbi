@@ -21,6 +21,7 @@ import {
   runPhoneLocation,
   runPhoneNotify,
   runPhoneReadSensor,
+  runPhoneReadText,
   runPhoneRecordAudio,
   runPhoneSpeak,
   runPhoneTakePhoto,
@@ -135,6 +136,26 @@ test("phone_read_sensor: no sensor (or 'list') enumerates with -l", async () => 
   const explicit = await runPhoneReadSensor(deps(spy, wt), { sensor: "list" });
   assert.deepEqual(spy.calls[1]?.args, ["-l"]);
   assert.match(explicit, /Available sensors/);
+});
+
+// ── read_text (OCR) ────────────────────────────────────────────────────────────
+
+test("phone_read_text: OCRs a confined image path via `tesseract <path> stdout`, echoing the text", async () => {
+  const wt = worktree();
+  const spy = execSpy({ executed: true, exitCode: 0, stdoutTail: "How do I improve my homelab?" });
+  const out = await runPhoneReadText(deps(spy, wt), { path: "phone-captures/upload-1.png" });
+  assert.equal(spy.calls[0]?.command, "tesseract");
+  assert.equal(spy.calls[0]?.args[1], "stdout");
+  assert.ok(spy.calls[0]?.args[0]?.startsWith(wt), "the image path is confined under the worktree");
+  assert.match(out, /improve my homelab/);
+});
+
+test("phone_read_text: a path escaping the worktree is refused and never runs", async () => {
+  const wt = worktree();
+  const spy = execSpy();
+  const out = await runPhoneReadText(deps(spy, wt), { path: "../secret.png" });
+  assert.match(out, /ERROR/);
+  assert.equal(spy.calls.length, 0);
 });
 
 // ── location / battery ────────────────────────────────────────────────────────

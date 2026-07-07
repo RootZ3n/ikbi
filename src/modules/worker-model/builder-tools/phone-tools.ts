@@ -240,11 +240,25 @@ export const phoneTorchTool: ModelTool = {
   },
 };
 
+export const phoneReadTextTool: ModelTool = {
+  name: "phone_read_text",
+  description:
+    "Extract text from an image using FAST on-device OCR (tesseract). Best for SCREENSHOTS, documents, receipts, or any text-heavy image — far faster and cheaper than vision_analyze. Give a working-directory-relative image path (e.g. an uploaded screenshot). Returns the recognized text.",
+  parameters: {
+    type: "object",
+    properties: {
+      path: { type: "string", description: "Working-directory-relative path to the image to read (e.g. 'phone-captures/upload-1.png')." },
+    },
+    required: ["path"],
+  },
+};
+
 /** Every phone tool definition — spread into the chat/builder tool arrays. */
 export const PHONE_TOOLS: readonly ModelTool[] = [
   phoneTakePhotoTool,
   phoneRecordAudioTool,
   phoneReadSensorTool,
+  phoneReadTextTool,
   phoneLocationTool,
   phoneBatteryTool,
   phoneSpeakTool,
@@ -331,6 +345,18 @@ export async function runPhoneTorch(deps: PhoneDeps, args: Record<string, unknow
   const on = args.on !== false; // default ON
   const r = await execPhone(deps, deps.parentCtx, "termux-torch", [on ? "on" : "off"], `phone_torch (${on ? "on" : "off"})`);
   return formatPhoneResult(r, `Torch ${on ? "ON" : "OFF"}.`);
+}
+
+export async function runPhoneReadText(deps: PhoneDeps, args: Record<string, unknown>): Promise<string> {
+  if (deps.parentCtx === undefined) return NO_IDENTITY;
+  const path = str(args.path);
+  if (path === "") return "ERROR: phone_read_text requires a non-empty 'path'";
+  const c = confinePath(deps.worktreeReal, path);
+  if (!c.ok) return `ERROR: ${c.error}`;
+  // `tesseract <image> stdout` prints the recognized text to stdout. The OCR'd text is UNTRUSTED
+  // (an image can carry adversarial text) → the caller re-neutralizes it at the chokepoint.
+  const r = await execPhone(deps, deps.parentCtx, "tesseract", [c.full, "stdout"], `phone_read_text (${c.rel})`);
+  return formatPhoneResult(r, `Text extracted from ${c.rel}:`, { includeStdout: true });
 }
 
 /**

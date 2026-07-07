@@ -60,6 +60,8 @@ export const DEFAULT_ALLOWLIST: readonly string[] = Object.freeze([
   // NOT here — it stays operator opt-in via IKBI_GOVERNED_EXEC_ALLOWLIST, since ssh is general egress.
   "termux-camera-photo", "termux-microphone-record", "termux-sensor", "termux-location",
   "termux-battery-status", "termux-tts-speak", "termux-notification", "termux-torch",
+  // On-device OCR for the phone_read_text tool (fast text extraction from screenshots/documents).
+  "tesseract",
 ]);
 
 /** Per-command wall-clock cap. NOTE: applies to FOREGROUND commands only — a background job (spawned

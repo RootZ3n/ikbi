@@ -82,6 +82,7 @@ import {
   runPhoneLocation,
   runPhoneNotify,
   runPhoneReadSensor,
+  runPhoneReadText,
   runPhoneRecordAudio,
   runPhoneSpeak,
   runPhoneTakePhoto,
@@ -197,7 +198,7 @@ function stageImageMessage(userMessage: string, images: readonly string[] | unde
   const refs = persistTurnImages(images, worktreeReal);
   if (refs.length === 0) return userMessage;
   const list = refs.map((r) => `"${r}"`).join(", ");
-  return `${userMessage}\n\n[The operator attached ${refs.length} image(s): ${list}. Use the vision_analyze tool on each (image_url = the path or URL) to view it, then answer based on what you see.]`;
+  return `${userMessage}\n\n[The operator attached ${refs.length} image(s): ${list}. If an image is a SCREENSHOT/document/text, call phone_read_text on its path for fast OCR; if it is a photo/scene, call vision_analyze. Then answer based on what you read or see.]`;
 }
 
 const CHAT_SYSTEM =
@@ -1455,6 +1456,7 @@ export class ChatSession {
       case "phone_take_photo": out = await runPhoneTakePhoto(deps, args); break;
       case "phone_record_audio": out = await runPhoneRecordAudio(deps, args); break;
       case "phone_read_sensor": out = await runPhoneReadSensor(deps, args); break;
+      case "phone_read_text": out = await runPhoneReadText(deps, args); break;
       case "phone_location": out = await runPhoneLocation(deps, args); break;
       case "phone_battery": out = await runPhoneBattery(deps, args); break;
       case "phone_speak": out = await runPhoneSpeak(deps, args); break;

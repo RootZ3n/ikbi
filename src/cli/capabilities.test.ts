@@ -42,14 +42,14 @@ test("chat is a SUPERSET of the builder suite: 25 builder tools + the chat-only 
   // So: no builder-only tool, and exactly ten chat-only.
   const r = runCapabilities();
   assert.equal(r.builder.length, 25, "builder declares 25 tools");
-  assert.equal(r.chat.length, 35, "chat = 25 builder tools + launch_build + build_report + 8 phone_* tools");
+  assert.equal(r.chat.length, 36, "chat = 25 builder tools + launch_build + build_report + 9 phone_* tools");
   assert.deepEqual(r.builderOnly, [], "chat advertises the full builder suite (no builder-only tool)");
   assert.deepEqual(
     [...r.chatOnly].sort(),
     [
       "build_report", "launch_build",
       "phone_battery", "phone_location", "phone_notify", "phone_read_sensor",
-      "phone_record_audio", "phone_speak", "phone_take_photo", "phone_torch",
+      "phone_read_text", "phone_record_audio", "phone_speak", "phone_take_photo", "phone_torch",
     ],
     "the chat-only tools: build_report (watch) + launch_build (act) + the phone_* body",
   );
