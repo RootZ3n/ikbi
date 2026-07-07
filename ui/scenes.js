@@ -415,6 +415,7 @@
           'onkeydown="if(event.key===\'Enter\'&&this.value.trim()){window.groveSend(this.value);this.value=\'\'}">' +
         '<input type="file" id="grove-file" accept="image/*" style="display:none" onchange="window.groveAttach(this)">' +
         '<button type="button" class="grove-attach" title="Attach a photo for Peh to see (vision)" onclick="document.getElementById(\'grove-file\').click()">📎</button>' +
+        '<button type="button" class="grove-mic" id="grove-mic" title="Talk to Peh (voice)" onclick="window.groveMic(this)">🎤</button>' +
       '</div>' +
     '</div>';
   }
@@ -574,6 +575,43 @@
     reader.onload = function () { window.groveSendImage(reader.result, caption, file.name); };
     reader.onerror = function () { var m = document.getElementById('grove-msgs'); if (m) buildMsg(m, 'system', 'Could not read that image.'); };
     reader.readAsDataURL(file);
+  };
+
+  // Voice-in: browser speech-to-text (Web Speech API). Tap to talk; interim text shows live in the
+  // input; when you stop, the transcript is sent to Peh as CHAT. Tap again while listening to stop.
+  window.groveMic = function (btn) {
+    var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    var msgs = document.getElementById('grove-msgs');
+    if (!SR) { if (msgs) buildMsg(msgs, 'system', 'Voice input isn\'t supported in this browser.'); return; }
+    if (window._groveRec) { try { window._groveRec.stop(); } catch (e) {} return; } // toggle off
+    var inp = document.getElementById('grove-input');
+    var rec = new SR();
+    rec.lang = 'en-US';
+    rec.interimResults = true;
+    rec.continuous = false;
+    window._groveRec = rec;
+    if (btn) btn.classList.add('listening');
+    var finalText = '';
+    rec.onresult = function (e) {
+      var interim = '';
+      for (var i = e.resultIndex; i < e.results.length; i++) {
+        var t = e.results[i][0].transcript;
+        if (e.results[i].isFinal) finalText += t; else interim += t;
+      }
+      if (inp) inp.value = (finalText + interim);
+    };
+    rec.onerror = function (e) {
+      if (msgs && e && e.error === 'not-allowed') buildMsg(msgs, 'system', 'Microphone permission is needed for voice — allow it in the browser.');
+    };
+    rec.onend = function () {
+      window._groveRec = null;
+      if (btn) btn.classList.remove('listening');
+      var text = (inp && inp.value.trim()) || finalText.trim();
+      if (inp) inp.value = '';
+      var m = document.getElementById('grove-msgs');
+      if (text && m) { buildMsg(m, 'user', '🎤 ' + text); groveChat(text, m); }
+    };
+    try { rec.start(); } catch (e) { window._groveRec = null; if (btn) btn.classList.remove('listening'); }
   };
 
   // Launch Pad (builder-ws) build form submit → the same streaming build runner.

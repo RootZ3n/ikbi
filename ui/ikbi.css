@@ -1537,3 +1537,9 @@ button{font-family:inherit}
 .peh-grove-only .grove-messages{flex:1 1 auto;min-height:0;overflow-y:auto}
 .peh-grove-only .grove-input-wrap{flex:0 0 auto}
 .peh-grove-only .peh-live-options{flex:0 0 auto}
+
+/* Grove input actions — attach + voice */
+.grove-attach,.grove-mic{background:transparent;border:0;cursor:pointer;font-size:19px;line-height:1;padding:4px 7px;opacity:.85;border-radius:8px}
+.grove-attach:hover,.grove-mic:hover{opacity:1;background:rgba(255,255,255,.06)}
+.grove-mic.listening{opacity:1;animation:grove-mic-pulse 1s ease-in-out infinite}
+@keyframes grove-mic-pulse{0%,100%{transform:scale(1);filter:none}50%{transform:scale(1.18);filter:drop-shadow(0 0 7px #e05a5a)}}
