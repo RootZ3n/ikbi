@@ -416,6 +416,7 @@
         '<input type="file" id="grove-file" accept="image/*" style="display:none" onchange="window.groveAttach(this)">' +
         '<button type="button" class="grove-attach" title="Attach a photo for Peh to see (vision)" onclick="document.getElementById(\'grove-file\').click()">📎</button>' +
         '<button type="button" class="grove-mic" id="grove-mic" title="Talk to Peh (voice)" onclick="window.groveMic(this)">🎤</button>' +
+        '<button type="button" class="grove-voice" id="grove-voice" title="Peh speaks replies (tap to mute)" onclick="window.groveVoiceToggle(this)">🔊</button>' +
       '</div>' +
     '</div>';
   }
@@ -512,7 +513,9 @@
       var result = await window.IkbiAPI.converse(text, images && images.length ? { images: images } : undefined);
       if (thinkingEl.parentNode) thinkingEl.parentNode.removeChild(thinkingEl);
       if (result.ok && result.data) {
-        buildMsg(msgs, 'assistant', result.data.response || result.data.content || JSON.stringify(result.data));
+        var reply = result.data.response || result.data.content || JSON.stringify(result.data);
+        buildMsg(msgs, 'assistant', reply);
+        if (typeof window.groveSpeak === 'function') window.groveSpeak(reply);
       } else if (result.status === 401 || result.status === 503) {
         buildMsg(msgs, 'system', 'Chat requires IKBI_CHAT_TOKEN. Set it on the server to enable conversation.');
       } else {
@@ -612,6 +615,58 @@
       if (text && m) { buildMsg(m, 'user', '🎤 ' + text); groveChat(text, m); }
     };
     try { rec.start(); } catch (e) { window._groveRec = null; if (btn) btn.classList.remove('listening'); }
+  };
+
+  // Voice-OUT: Peh speaks his replies aloud (Web Speech Synthesis). Peh is a scientist stuck in a
+  // squirrel brain → a MALE voice, a touch lower pitch, brisk rate. Toggle with the 🔊 button.
+  var pehVoiceOn = true;
+  var pehVoice = null;
+  function pickPehVoice() {
+    if (!('speechSynthesis' in window)) return null;
+    var voices = window.speechSynthesis.getVoices() || [];
+    var en = voices.filter(function (v) { return /^en([-_]|$)/i.test(v.lang || ''); });
+    var pool = en.length ? en : voices;
+    var male = pool.filter(function (v) { return /male/i.test(v.name || '') && !/female/i.test(v.name || ''); });
+    if (male.length) return male[0];
+    // Known male voice names across Android/Chrome/desktop TTS engines.
+    var known = ['Google UK English Male', 'Microsoft David', 'David', 'Daniel', 'Alex', 'Fred', 'Rishi', 'Arthur', 'en-gb-x-gbb', 'en-us-x-iom', 'en-us-x-iol', 'en-us-x-tpd'];
+    for (var i = 0; i < known.length; i++) {
+      for (var j = 0; j < pool.length; j++) { if ((pool[j].name || '').indexOf(known[i]) !== -1) return pool[j]; }
+    }
+    return pool[0] || null;
+  }
+  if ('speechSynthesis' in window) {
+    try { pehVoice = pickPehVoice(); window.speechSynthesis.onvoiceschanged = function () { pehVoice = pickPehVoice(); }; } catch (e) {}
+  }
+  function speechClean(t) {
+    return String(t || '')
+      .replace(/```[\s\S]*?```/g, '. (code omitted) ')
+      .replace(/`([^`]*)`/g, '$1')
+      .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+      .replace(/[*_#>~|]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+  window.groveSpeak = function (text) {
+    if (!pehVoiceOn || !('speechSynthesis' in window)) return;
+    var clean = speechClean(text);
+    if (!clean) return;
+    if (clean.length > 1200) clean = clean.slice(0, 1200);
+    try {
+      window.speechSynthesis.cancel();
+      var u = new SpeechSynthesisUtterance(clean);
+      if (!pehVoice) pehVoice = pickPehVoice();
+      if (pehVoice) u.voice = pehVoice;
+      u.lang = (pehVoice && pehVoice.lang) || 'en-US';
+      u.pitch = 0.9;   // a touch lower = the scientist, not the squirrel
+      u.rate = 1.03;   // brisk, alert
+      window.speechSynthesis.speak(u);
+    } catch (e) {}
+  };
+  window.groveVoiceToggle = function (btn) {
+    pehVoiceOn = !pehVoiceOn;
+    if (!pehVoiceOn && 'speechSynthesis' in window) { try { window.speechSynthesis.cancel(); } catch (e) {} }
+    if (btn) { btn.textContent = pehVoiceOn ? '🔊' : '🔇'; btn.title = pehVoiceOn ? 'Peh speaks replies (tap to mute)' : 'Peh muted (tap to unmute)'; }
   };
 
   // Launch Pad (builder-ws) build form submit → the same streaming build runner.
