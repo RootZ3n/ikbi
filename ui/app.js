@@ -316,6 +316,37 @@
   window.toggleIkbiChat = toggleIkbiChat;
   window.sendIkbiChat = sendIkbiChat;
 
+  // ── PWA: "Share → Peh" (Web Share Target) ─────────────────────────────────
+  // Register the service worker (so an installed Peh appears in Android's share sheet) and, when
+  // launched via a share, pull the shared image out of the cache and hand it to Peh in the Grove.
+  function initPWA() {
+    if ('serviceWorker' in navigator) {
+      try { navigator.serviceWorker.register('sw.js'); } catch (e) {}
+    }
+    if (/[?&]shared=1/.test(location.search)) {
+      try { history.replaceState(null, '', location.pathname); } catch (e) {}
+      handleSharedImage();
+    }
+  }
+  async function handleSharedImage() {
+    try {
+      if (!('caches' in window)) return;
+      var cache = await caches.open('peh-shared');
+      var resp = await cache.match('shared-image');
+      if (!resp) return;
+      var blob = await resp.blob();
+      await cache.delete('shared-image');
+      var dataUrl = await new Promise(function (res, rej) {
+        var r = new FileReader(); r.onload = function () { res(r.result); }; r.onerror = rej; r.readAsDataURL(blob);
+      });
+      if (typeof window.pehGoScene === 'function') window.pehGoScene('the-grove');
+      if (typeof window.pehOpenWorkspace === 'function') window.pehOpenWorkspace('grove-ws', { dock: 'fullscreen' });
+      setTimeout(function () {
+        if (typeof window.groveSendImage === 'function') window.groveSendImage(dataUrl, 'Read or describe this, then we can discuss it.', 'shared');
+      }, 450);
+    } catch (e) { /* best-effort */ }
+  }
+
   // ── Boot ──────────────────────────────────────────────────────────────────
   function start() {
     if (window.IkbiGuide) IkbiGuide.init();
@@ -326,6 +357,7 @@
     if (typeof window.render === 'function') { try { window.render(); } catch (e) {} }
     pollHealth();
     setInterval(function () { pollHealth(); }, 12000);
+    initPWA();
   }
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', start);

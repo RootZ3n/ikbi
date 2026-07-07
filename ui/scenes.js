@@ -539,38 +539,40 @@
 
   // Attach a photo from the device → Peh sees it via vision_analyze (the configured vision model).
   // Uses whatever is typed in the grove input as the caption/question, else asks for a description.
+  // Send an image (data-URL) to Peh: downscale to a vision-friendly size, then converse. Shared by
+  // the 📎 attach button AND the Android "Share → Peh" handler (window.groveSendImage).
+  window.groveSendImage = function (dataUrl, caption, label) {
+    var msgs = document.getElementById('grove-msgs');
+    if (!msgs || !dataUrl) return;
+    var cap = (caption && caption.trim()) || 'Read or describe this image.';
+    var img = new Image();
+    img.onload = function () {
+      var max = 1568, w = img.width, h = img.height;
+      if (w > max || h > max) { if (w >= h) { h = Math.round(h * max / w); w = max; } else { w = Math.round(w * max / h); h = max; } }
+      var out;
+      try {
+        var canvas = document.createElement('canvas');
+        canvas.width = w; canvas.height = h;
+        canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+        out = canvas.toDataURL('image/jpeg', 0.85);
+      } catch (e) { out = dataUrl; }
+      buildMsg(msgs, 'user', '📷 ' + (label || 'image') + ' — “' + cap + '”');
+      groveChat(cap, msgs, [out]);
+    };
+    img.onerror = function () { buildMsg(msgs, 'system', 'Could not load that image.'); };
+    img.src = dataUrl;
+  };
+
   window.groveAttach = function (input) {
     var file = input && input.files && input.files[0];
     input.value = '';
     if (!file) return;
-    var msgs = document.getElementById('grove-msgs');
-    if (!msgs) return;
     var inp = document.getElementById('grove-input');
-    var caption = (inp && inp.value.trim()) || 'Describe what you see in this image.';
+    var caption = (inp && inp.value.trim()) || '';
     if (inp) inp.value = '';
     var reader = new FileReader();
-    reader.onload = function () {
-      var img = new Image();
-      img.onload = function () {
-        // Downscale to a vision-friendly size (keeps the upload small; models don't need full-res).
-        var max = 1568, w = img.width, h = img.height;
-        if (w > max || h > max) {
-          if (w >= h) { h = Math.round(h * max / w); w = max; } else { w = Math.round(w * max / h); h = max; }
-        }
-        var dataUrl;
-        try {
-          var canvas = document.createElement('canvas');
-          canvas.width = w; canvas.height = h;
-          canvas.getContext('2d').drawImage(img, 0, 0, w, h);
-          dataUrl = canvas.toDataURL('image/jpeg', 0.85);
-        } catch (e) { dataUrl = reader.result; }
-        buildMsg(msgs, 'user', '📷 ' + file.name + ' — “' + caption + '”');
-        groveChat(caption, msgs, [dataUrl]);
-      };
-      img.onerror = function () { buildMsg(msgs, 'system', 'Could not load that image.'); };
-      img.src = reader.result;
-    };
-    reader.onerror = function () { buildMsg(msgs, 'system', 'Could not read that image.'); };
+    reader.onload = function () { window.groveSendImage(reader.result, caption, file.name); };
+    reader.onerror = function () { var m = document.getElementById('grove-msgs'); if (m) buildMsg(m, 'system', 'Could not read that image.'); };
     reader.readAsDataURL(file);
   };
 
