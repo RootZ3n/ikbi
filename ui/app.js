@@ -339,11 +339,24 @@
       var dataUrl = await new Promise(function (res, rej) {
         var r = new FileReader(); r.onload = function () { res(r.result); }; r.onerror = rej; r.readAsDataURL(blob);
       });
-      if (typeof window.pehGoScene === 'function') window.pehGoScene('the-grove');
-      if (typeof window.pehOpenWorkspace === 'function') window.pehOpenWorkspace('grove-ws', { dock: 'fullscreen' });
-      setTimeout(function () {
-        if (typeof window.groveSendImage === 'function') window.groveSendImage(dataUrl, 'Read or describe this, then we can discuss it.', 'shared');
-      }, 450);
+      // Bring the Grove FULL-SCREEN to the foreground and send. Retry across the cold share-launch
+      // boot so the conversation is actually visible (not posted to an off-screen/tiled grove).
+      var tries = 0;
+      (function openAndSend() {
+        tries++;
+        try {
+          if (typeof window.pehSetMode === 'function') window.pehSetMode('immersive');
+          if (typeof window.pehGoScene === 'function') window.pehGoScene('the-grove');
+          if (typeof window.pehOpenWorkspace === 'function') window.pehOpenWorkspace('grove-ws', { dock: 'fullscreen' });
+        } catch (e) {}
+        var msgs = document.getElementById('grove-msgs');
+        if (msgs && typeof window.groveSendImage === 'function') {
+          window.groveSendImage(dataUrl, 'Read or describe this, then we can discuss it.', 'shared');
+          try { msgs.scrollTop = msgs.scrollHeight; } catch (e) {}
+          return;
+        }
+        if (tries < 15) setTimeout(openAndSend, 400);
+      })();
     } catch (e) { /* best-effort */ }
   }
 
