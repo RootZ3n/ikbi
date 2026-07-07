@@ -417,6 +417,7 @@
         '<button type="button" class="grove-attach" title="Attach a photo for Peh to see (vision)" onclick="document.getElementById(\'grove-file\').click()">📎</button>' +
         '<button type="button" class="grove-mic" id="grove-mic" title="Talk to Peh (voice)" onclick="window.groveMic(this)">🎤</button>' +
         '<button type="button" class="grove-voice" id="grove-voice" title="Peh speaks replies (tap to mute)" onclick="window.groveVoiceToggle(this)">🔊</button>' +
+        '<button type="button" class="grove-voicepick-btn" title="Choose Peh\'s voice" onclick="window.groveVoicePick()">⚙</button>' +
       '</div>' +
     '</div>';
   }
@@ -624,6 +625,8 @@
   function pickPehVoice() {
     if (!('speechSynthesis' in window)) return null;
     var voices = window.speechSynthesis.getVoices() || [];
+    var saved = null; try { saved = localStorage.getItem('peh-voice-name'); } catch (e) {}
+    if (saved) { for (var s = 0; s < voices.length; s++) { if (voices[s].name === saved) return voices[s]; } }
     var en = voices.filter(function (v) { return /^en([-_]|$)/i.test(v.lang || ''); });
     var pool = en.length ? en : voices;
     var male = pool.filter(function (v) { return /male/i.test(v.name || '') && !/female/i.test(v.name || ''); });
@@ -658,7 +661,7 @@
       if (!pehVoice) pehVoice = pickPehVoice();
       if (pehVoice) u.voice = pehVoice;
       u.lang = (pehVoice && pehVoice.lang) || 'en-US';
-      u.pitch = 0.9;   // a touch lower = the scientist, not the squirrel
+      u.pitch = 0.75;  // deeper = the scientist, not the squirrel
       u.rate = 1.03;   // brisk, alert
       window.speechSynthesis.speak(u);
     } catch (e) {}
@@ -667,6 +670,46 @@
     pehVoiceOn = !pehVoiceOn;
     if (!pehVoiceOn && 'speechSynthesis' in window) { try { window.speechSynthesis.cancel(); } catch (e) {} }
     if (btn) { btn.textContent = pehVoiceOn ? '🔊' : '🔇'; btn.title = pehVoiceOn ? 'Peh speaks replies (tap to mute)' : 'Peh muted (tap to unmute)'; }
+  };
+
+  // Voice PICKER: choose exactly which installed voice is Peh (persisted). Also surfaces what's
+  // available so you can tell if a male voice is even installed (else add one in Android TTS settings).
+  function pehEsc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
+  window.groveVoicePick = function () {
+    if (!('speechSynthesis' in window)) return;
+    var voices = window.speechSynthesis.getVoices() || [];
+    var msgs = document.getElementById('grove-msgs');
+    if (!voices.length) { if (msgs) buildMsg(msgs, 'system', 'No speech voices are installed. Add one in Android Settings → System → Languages & input → Text-to-speech.'); return; }
+    var existing = document.querySelector('.grove-voicepick'); if (existing) existing.remove();
+    var saved = null; try { saved = localStorage.getItem('peh-voice-name'); } catch (e) {}
+    var opts = '';
+    for (var i = 0; i < voices.length; i++) {
+      var sel = (voices[i].name === saved) ? ' selected' : '';
+      opts += '<option value="' + i + '"' + sel + '>' + pehEsc(voices[i].name) + ' · ' + pehEsc(voices[i].lang) + '</option>';
+    }
+    var wrap = document.createElement('div');
+    wrap.className = 'grove-voicepick';
+    wrap.innerHTML =
+      '<div class="grove-voicepick-card">' +
+      '<div class="grove-voicepick-title">Choose Peh’s voice</div>' +
+      '<select id="grove-voice-sel" class="grove-voicepick-sel">' + opts + '</select>' +
+      '<div class="grove-voicepick-hint">' + voices.length + ' voice(s) installed. No male one? Add voices in Android Text-to-speech settings, then reopen.</div>' +
+      '<div class="grove-voicepick-actions">' +
+      '<button type="button" class="grove-voicepick-use" onclick="window.groveVoiceUse()">Use &amp; test</button>' +
+      '<button type="button" class="grove-voicepick-close" onclick="var w=this.closest(\'.grove-voicepick\');if(w)w.remove()">Close</button>' +
+      '</div></div>';
+    document.body.appendChild(wrap);
+  };
+  window.groveVoiceUse = function () {
+    var sel = document.getElementById('grove-voice-sel'); if (!sel) return;
+    var voices = window.speechSynthesis.getVoices() || [];
+    var v = voices[parseInt(sel.value, 10)];
+    if (v) {
+      pehVoice = v;
+      try { localStorage.setItem('peh-voice-name', v.name); } catch (e) {}
+      pehVoiceOn = true;
+      window.groveSpeak('Voice set. I am Peh — a scientist, currently residing in a squirrel.');
+    }
   };
 
   // Launch Pad (builder-ws) build form submit → the same streaming build runner.
