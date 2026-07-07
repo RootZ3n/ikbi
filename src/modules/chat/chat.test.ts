@@ -307,7 +307,16 @@ test("chat advertises the full builder tool suite to the model", async () => {
   // (the guide watches builds). The builder role has neither.
   assert.ok(names.includes("launch_build"), "chat advertises the chat-only launch_build");
   assert.ok(names.includes("build_report"), "chat advertises the chat-only build_report");
-  assert.equal(new Set(names).size, ALL_TOOLS.length + 2, "chat = the builder suite + launch_build + build_report");
+  // Plus Pehlichi's governed device body — the 8 phone_* tools (Termux:API). Chat-only: the
+  // code-building role never holds a camera/mic.
+  const PHONE_TOOLS_EXPECTED = [
+    "phone_take_photo", "phone_record_audio", "phone_read_sensor", "phone_location",
+    "phone_battery", "phone_speak", "phone_notify", "phone_torch",
+  ];
+  for (const t of PHONE_TOOLS_EXPECTED) {
+    assert.ok(names.includes(t), `chat advertises the phone tool ${t}`);
+  }
+  assert.equal(new Set(names).size, ALL_TOOLS.length + 2 + PHONE_TOOLS_EXPECTED.length, "chat = the builder suite + launch_build + build_report + the phone_* body");
 });
 
 test("send: scout_detail reports no findings (chat runs no scout phase)", async () => {

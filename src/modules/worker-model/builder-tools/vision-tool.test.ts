@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import type { AgentIdentity, ModelRequest, ModelResponse } from "../../../core/provider/contract.js";
-import { runVisionAnalyze, visionAnalyzeTool, type VisionDeps } from "./vision-tool.js";
+import { resolveVisionModel, runVisionAnalyze, visionAnalyzeTool, type VisionDeps } from "./vision-tool.js";
 
 const tmp = (): string => realpathSync(mkdtempSync(join(tmpdir(), "ikbi-vision-")));
 const IDENTITY: AgentIdentity = { agentId: "w", functionalRole: "builder", trustTier: "verified", spawnedFrom: "p" };
@@ -95,4 +95,10 @@ test("a non-http(s), non-local scheme (e.g. file:) is rejected", async () => {
   const out = await runVisionAnalyze(d, { image_url: "file:///etc/passwd", question: "?" });
   assert.match(out, /unsupported image source/);
   assert.equal(requests.length, 0);
+});
+
+test("resolveVisionModel: IKBI_VISION_MODEL overrides the chat model; unset falls back", () => {
+  assert.equal(resolveVisionModel({}, "deepseek-v4-flash"), "deepseek-v4-flash");
+  assert.equal(resolveVisionModel({ IKBI_VISION_MODEL: "  " }, "deepseek-v4-flash"), "deepseek-v4-flash");
+  assert.equal(resolveVisionModel({ IKBI_VISION_MODEL: "mimo-v2.5" }, "deepseek-v4-flash"), "mimo-v2.5");
 });

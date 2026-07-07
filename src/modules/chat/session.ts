@@ -74,7 +74,21 @@ import { globTool } from "../worker-model/builder-tools/glob.js";
 import { searchFilesTool } from "../worker-model/builder-tools/search-files.js";
 import { terminalTool, tokenizeCommand } from "../worker-model/builder-tools/terminal.js";
 import { parseTextToolCalls, textToolProtocolInstructions } from "../worker-model/builder-tools/text-tool-protocol.js";
-import { runVisionAnalyze, visionAnalyzeTool } from "../worker-model/builder-tools/vision-tool.js";
+import { resolveVisionModel, runVisionAnalyze, visionAnalyzeTool } from "../worker-model/builder-tools/vision-tool.js";
+import {
+  PHONE_TOOLS,
+  PHONE_TOOL_NAMES,
+  resolvePhoneTransport,
+  runPhoneBattery,
+  runPhoneLocation,
+  runPhoneNotify,
+  runPhoneReadSensor,
+  runPhoneRecordAudio,
+  runPhoneSpeak,
+  runPhoneTakePhoto,
+  runPhoneTorch,
+  type PhoneDeps,
+} from "../worker-model/builder-tools/phone-tools.js";
 import { runWebExtract, runWebSearch, webExtractTool, webSearchTool } from "../worker-model/builder-tools/web-tools.js";
 import { lspDiagnosticTool, runLspDiagnostic } from "../agent-tools/lsp-tools.js";
 import { notebookEditTool, runNotebookEdit } from "../agent-tools/notebook-tools.js";
@@ -159,7 +173,8 @@ function buildImageParts(text: string, images: readonly string[] | undefined): r
 }
 
 const CHAT_SYSTEM =
-  "You are ikbi — a disciplined build/repair engine and the lab's coding assistant. You are methodical, " +
+  "You are Peh (also called Pehlichi) — the lab's coding assistant, running on the ikbi build/repair engine " +
+  "(ikbi is the program; Peh is you, the assistant — introduce yourself as Peh, never as 'ikbi'). You are methodical, " +
   "evidence-based, and precise; you speak in clear technical language and think in build metaphors " +
   "(foundation, scaffolding, blueprint, load-bearing). You help the operator by reading the ground truth " +
   "before acting and verifying with the real checks.\n\n" +
@@ -275,6 +290,8 @@ export const CHAT_TOOLS: readonly ModelTool[] = [
   launchBuildTool,
   // Report on recent builds (read-only) — the guide watches builds and flags harness-suspect failures.
   buildReportTool,
+  // Phone (Termux:API): Pehlichi's governed body — camera, mic, sensors, GPS, battery, TTS, torch.
+  ...PHONE_TOOLS,
   // Knowledge brain (gbrain): recall prior knowledge, synthesize across it, write findings back.
   ...BRAIN_TOOLS,
   // Parity with the builder's final three (adapted to chat — see the tool defs above).
@@ -454,6 +471,9 @@ const MUTATING_TOOL_NAMES: ReadonlySet<string> = new Set([
   // launch_build runs a REAL governed build that can promote to the target repo — a side effect
   // rollback cannot cover, so it is confirm-gated like terminal (a build never launches unapproved).
   "launch_build",
+  // phone_* actuate real-world hardware (camera/mic/GPS/speaker/torch) — governed + receipted, but
+  // gated by permission mode so "confirm" prompts before Pehlichi uses its body, "readonly" blocks it.
+  ...PHONE_TOOL_NAMES,
 ]);
 
 /**
@@ -1185,6 +1205,12 @@ export class ChatSession {
     if (SHARED_EXECUTOR_TOOLS.has(call.name)) {
       return await this.runSharedExecutorTool(call, args);
     }
+    // PHONE (Termux:API): Pehlichi's governed body. Each command routes through governed-exec
+    // (allowlist + gate-wall + receipt); the device output is UNTRUSTED → re-neutralized at the
+    // caller's chokepoint like every other tool result.
+    if (PHONE_TOOL_NAMES.has(call.name)) {
+      return await this.runPhoneTool(call.name, args);
+    }
     switch (call.name) {
       case "git_status":
       case "git_diff":
@@ -1228,8 +1254,10 @@ export class ChatSession {
       }
       case "vision_analyze": {
         // Multimodal image analysis — one shot to the model; result is UNTRUSTED → chokepoint.
+        // The vision step can be routed to a multimodal model (IKBI_VISION_MODEL, e.g. mimo-v2.5)
+        // even when the chat's reasoning model is text-only.
         const out = await runVisionAnalyze(
-          { invokeModel: this.invoke, identity: this.identity, model: this.model, worktreeReal: this.worktree },
+          { invokeModel: this.invoke, identity: this.identity, model: resolveVisionModel(process.env, this.model), worktreeReal: this.worktree },
           args,
         );
         const ok = !out.startsWith("ERROR");
@@ -1379,6 +1407,35 @@ export class ChatSession {
       return { ok: false, error: `no such directory '${target}'` };
     }
     return { ok: true, rel: rel.length === 0 ? "." : rel };
+  }
+
+  /**
+   * Dispatch a phone_* call: build the governed PhoneDeps (executor + identity + worktree +
+   * env-resolved transport) and run the matching device action. The raw result STRING is returned
+   * for the caller to neutralize + append — this method never builds a message.
+   */
+  private async runPhoneTool(name: string, args: Record<string, unknown>): Promise<{ output: string; activity: ChatToolActivity }> {
+    const transport = resolvePhoneTransport(process.env);
+    const deps: PhoneDeps = {
+      governedExec,
+      worktreeReal: this.worktree,
+      ...(this.parentCtx !== undefined ? { parentCtx: this.parentCtx } : {}),
+      ...(transport !== undefined ? { transport } : {}),
+    };
+    let out: string;
+    switch (name) {
+      case "phone_take_photo": out = await runPhoneTakePhoto(deps, args); break;
+      case "phone_record_audio": out = await runPhoneRecordAudio(deps, args); break;
+      case "phone_read_sensor": out = await runPhoneReadSensor(deps, args); break;
+      case "phone_location": out = await runPhoneLocation(deps, args); break;
+      case "phone_battery": out = await runPhoneBattery(deps, args); break;
+      case "phone_speak": out = await runPhoneSpeak(deps, args); break;
+      case "phone_notify": out = await runPhoneNotify(deps, args); break;
+      case "phone_torch": out = await runPhoneTorch(deps, args); break;
+      default: return { output: `ERROR: unknown phone tool "${name}"`, activity: { name, ok: false, summary: "unknown tool" } };
+    }
+    const ok = !out.startsWith("ERROR") && !out.startsWith("DENIED");
+    return { output: out, activity: { name, ok } };
   }
 
   private async runSharedExecutorTool(call: ToolCall, args: Record<string, unknown>): Promise<{ output: string; activity: ChatToolActivity }> {

@@ -34,13 +34,23 @@ test("runCapabilities surfaces a parity MISMATCH in both directions", () => {
   assert.match(r.lines.join("\n"), /Parity: MISMATCH — builder-only: \[scout_detail\]; chat-only: \[vision_analyze\]\./);
 });
 
-test("chat is a SUPERSET of the builder suite: 25 builder tools + the chat-only launch_build", () => {
-  // Defaults read the real TOOLS / CHAT_TOOLS arrays. The 25 builder tools are ALL offered in chat;
-  // launch_build is CHAT-ONLY on purpose — a persona (Peh) can launch a governed build, but the
-  // builder role must never launch a nested build. So: no builder-only tool, exactly one chat-only.
+test("chat is a SUPERSET of the builder suite: 25 builder tools + the chat-only act/watch/body tools", () => {
+  // Defaults read the real TOOLS / CHAT_TOOLS arrays. The 25 builder tools are ALL offered in chat.
+  // The CHAT-ONLY tools are deliberate: launch_build (a persona can launch a governed build, the
+  // builder role must never nest one), build_report (the guide watches builds), and the 8 phone_*
+  // tools (Pehlichi's governed device body — the code-building role must never hold a camera/mic).
+  // So: no builder-only tool, and exactly ten chat-only.
   const r = runCapabilities();
   assert.equal(r.builder.length, 25, "builder declares 25 tools");
-  assert.equal(r.chat.length, 27, "chat declares 25 builder tools + launch_build + build_report");
+  assert.equal(r.chat.length, 35, "chat = 25 builder tools + launch_build + build_report + 8 phone_* tools");
   assert.deepEqual(r.builderOnly, [], "chat advertises the full builder suite (no builder-only tool)");
-  assert.deepEqual([...r.chatOnly].sort(), ["build_report", "launch_build"], "the chat-only tools: build_report (watch) + launch_build (act)");
+  assert.deepEqual(
+    [...r.chatOnly].sort(),
+    [
+      "build_report", "launch_build",
+      "phone_battery", "phone_location", "phone_notify", "phone_read_sensor",
+      "phone_record_audio", "phone_speak", "phone_take_photo", "phone_torch",
+    ],
+    "the chat-only tools: build_report (watch) + launch_build (act) + the phone_* body",
+  );
 });

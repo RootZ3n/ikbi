@@ -54,6 +54,12 @@ export const DEFAULT_ALLOWLIST: readonly string[] = Object.freeze([
   // run project-owned code by design — the governed-exec policy layer blocks dangerous flags/patterns,
   // and the OS sandbox confines their filesystem writes to the worktree.
   "cargo", "go", "python3", "godot", "javac", "java", "dotnet", "mvn", "gradle",
+  // Android device body (Termux:API) — the phone_* tool group. INERT off-device (these binaries
+  // exist only inside Termux on a phone), so default-allowing them is safe; each still passes the
+  // gate-wall + policy + receipt path. NOTE: `ssh` (the REMOTE PC→phone transport) is deliberately
+  // NOT here — it stays operator opt-in via IKBI_GOVERNED_EXEC_ALLOWLIST, since ssh is general egress.
+  "termux-camera-photo", "termux-microphone-record", "termux-sensor", "termux-location",
+  "termux-battery-status", "termux-tts-speak", "termux-notification", "termux-torch",
 ]);
 
 /** Per-command wall-clock cap. NOTE: applies to FOREGROUND commands only — a background job (spawned
