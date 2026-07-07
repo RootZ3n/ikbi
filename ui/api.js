@@ -94,8 +94,13 @@
     ready: function (o) { return get('/ready', o); },
     agent: function (o) { return get('/agent', o); },
     capabilities: function (o) { return get('/capabilities', o); },
-    // Chat endpoint — requires IKBI_CHAT_TOKEN Bearer auth.
-    converse: function (message, o) { return post('/chat', { message: message }, o); },
+    // Chat endpoint — requires IKBI_CHAT_TOKEN Bearer auth. `o.images` (data-URLs / http URLs) are
+    // attached so the server can route them to the vision model (vision_analyze).
+    converse: function (message, o) {
+      var body = { message: message };
+      if (o && o.images && o.images.length) body.images = o.images;
+      return post('/chat', body, o);
+    },
     // ── Build/repair task surface (the golden path) ───────────────────────
     // Submit a build task. Resolves {ok,data:{taskId,...}} (202 on accept).
     build: function (goal, repo, opts) {

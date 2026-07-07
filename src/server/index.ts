@@ -37,6 +37,9 @@ export function buildServer() {
     // Reuse our structured root logger rather than letting Fastify spin up its own.
     loggerInstance: log,
     disableRequestLogging: false,
+    // Allow image uploads on /chat (data-URL photos exceed Fastify's 1 MB default). Default 16 MB;
+    // override via IKBI_MAX_BODY_BYTES. The /chat images cap (max 8) bounds the worst case.
+    bodyLimit: Number(process.env.IKBI_MAX_BODY_BYTES) > 0 ? Number(process.env.IKBI_MAX_BODY_BYTES) : 16 * 1024 * 1024,
   });
 
   // Velum: AI privacy/injection defense middleware

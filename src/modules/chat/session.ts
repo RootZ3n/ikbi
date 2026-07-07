@@ -42,7 +42,6 @@ import {
   priceUsage,
   StreamAccumulator,
   type AgentIdentity,
-  type ContentPart,
   type Cost,
   type ModelMessage,
   type ModelResponse,
@@ -156,20 +155,49 @@ const AUTO_COMPACT_PERCENT = ((): number => {
 })();
 
 /**
- * Build the OPERATOR-pasted image parts for a turn. Each entry must be a data-URL
- * (`data:image/...;base64,...`) or an http(s) URL; anything else is dropped. These come
- * from the operator (the trusted message channel), so they ride on the trusted user turn —
- * the model sees them inline. Returns undefined when there are no usable images.
+ * Persist this turn's operator-attached images so the DEDICATED vision model can view them via the
+ * vision_analyze tool (cheap and model-agnostic — it works even when the chat model is text-only,
+ * and keeps image understanding on the configured IKBI_VISION_MODEL, e.g. mimo-v2.5). A data-URL
+ * image is decoded and written under the worktree's phone-captures/; an http(s) URL passes through
+ * as a reference. Returns the reference list (worktree-relative paths and URLs).
  */
-function buildImageParts(text: string, images: readonly string[] | undefined): readonly ContentPart[] | undefined {
-  if (images === undefined || images.length === 0) return undefined;
-  const urls = images
-    .filter((u): u is string => typeof u === "string")
-    .map((u) => u.trim())
-    .filter((u) => /^data:image\/[a-z0-9.+-]+;base64,/i.test(u) || /^https?:\/\//i.test(u))
-    .slice(0, MAX_TURN_IMAGES);
-  if (urls.length === 0) return undefined;
-  return [{ type: "text", text }, ...urls.map((url) => ({ type: "image_url" as const, image_url: { url } }))];
+function persistTurnImages(images: readonly string[] | undefined, worktreeReal: string): string[] {
+  if (images === undefined || images.length === 0) return [];
+  const refs: string[] = [];
+  let seq = 0;
+  for (const raw of images.slice(0, MAX_TURN_IMAGES)) {
+    if (typeof raw !== "string") continue;
+    const u = raw.trim();
+    const m = /^data:image\/([a-z0-9.+-]+);base64,(.+)$/i.exec(u);
+    if (m !== null) {
+      seq += 1;
+      const sub = (m[1] ?? "").toLowerCase();
+      const ext = sub === "jpeg" ? "jpg" : /^[a-z0-9]+$/.test(sub) ? sub : "img";
+      const rel = `phone-captures/upload-${seq}.${ext}`;
+      try {
+        mkdirSync(join(worktreeReal, "phone-captures"), { recursive: true });
+        writeFileSync(join(worktreeReal, rel), Buffer.from(m[2] ?? "", "base64"));
+        refs.push(rel);
+      } catch {
+        /* skip an image we can't write */
+      }
+    } else if (/^https?:\/\//i.test(u)) {
+      refs.push(u);
+    }
+  }
+  return refs;
+}
+
+/**
+ * Stage this turn's attached images and return the user message augmented with a steering note so
+ * the model views each image through vision_analyze — routing image understanding to the dedicated,
+ * cost-controlled vision model. Returns the message unchanged when there are no usable images.
+ */
+function stageImageMessage(userMessage: string, images: readonly string[] | undefined, worktreeReal: string): string {
+  const refs = persistTurnImages(images, worktreeReal);
+  if (refs.length === 0) return userMessage;
+  const list = refs.map((r) => `"${r}"`).join(", ");
+  return `${userMessage}\n\n[The operator attached ${refs.length} image(s): ${list}. Use the vision_analyze tool on each (image_url = the path or URL) to view it, then answer based on what you see.]`;
 }
 
 const CHAT_SYSTEM =
@@ -2154,10 +2182,11 @@ export class ChatSession {
     const memMsg = memSummary.length > 0
       ? toUntrustedMessage(neutralizeUntrusted(memSummary, { source: "external", identity: this.identity, origin: "chat_memory" }), { role: "user" })
       : undefined;
-    // Operator-pasted images ride as multimodal `parts` on this (trusted) user turn; `content`
-    // stays the text (the flattened fallback + what memory/neutralization elsewhere reads).
-    const imageParts = buildImageParts(userMessage, images);
-    this.messages.push({ role: "user", content: userMessage, ...(imageParts !== undefined ? { parts: imageParts } : {}) });
+    // Operator-attached images are persisted to the worktree and the message is steered to
+    // vision_analyze (the dedicated, cost-controlled vision model) — so image understanding works
+    // even with a text-only chat model, instead of parts a non-multimodal model would reject.
+    const stagedMessage = stageImageMessage(userMessage, images, this.worktree);
+    this.messages.push({ role: "user", content: stagedMessage });
     const tools: ChatToolActivity[] = [];
 
     let iterations = 0;
@@ -2398,8 +2427,8 @@ export class ChatSession {
     const memMsg = memSummary.length > 0
       ? toUntrustedMessage(neutralizeUntrusted(memSummary, { source: "external", identity: this.identity, origin: "chat_memory" }), { role: "user" })
       : undefined;
-    const imageParts = buildImageParts(userMessage, images);
-    this.messages.push({ role: "user", content: userMessage, ...(imageParts !== undefined ? { parts: imageParts } : {}) });
+    const stagedMessage = stageImageMessage(userMessage, images, this.worktree);
+    this.messages.push({ role: "user", content: stagedMessage });
 
     let iterations = 0;
     for (;;) {

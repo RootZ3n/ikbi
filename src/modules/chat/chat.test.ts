@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
@@ -358,20 +358,22 @@ test("send: run_checks fails closed when no parent identity is wired", async () 
   assert.equal(tools[0]?.ok, false, "no identity ⇒ checks are not ALL PASS (fail closed)");
 });
 
-test("send: operator-pasted images attach to the user turn as multimodal parts", async () => {
+test("send: operator-attached images are persisted + steered to vision_analyze (not attached to the chat model)", async () => {
   const { invoke, requests } = scripted([stop("I see a red pixel.")]);
-  const s = new ChatSession("s-vision", { invoke, worktree: tmp() });
+  const wt = tmp();
+  const s = new ChatSession("s-vision", { invoke, worktree: wt });
   const dataUrl = "data:image/png;base64,AAAA";
   const { response } = await s.send("what is in this image?", [dataUrl, "https://example.com/x.png", "not-an-image"]);
   assert.match(response, /red pixel/);
-  const sent = (requests[0] as { messages: Array<{ role: string; content: string; parts?: Array<{ type: string; image_url?: { url: string } }> }> }).messages;
-  const userMsg = sent.find((m) => m.role === "user" && m.parts !== undefined);
-  assert.ok(userMsg, "the user turn carries multimodal parts");
-  assert.equal(userMsg!.content, "what is in this image?", "content keeps the text fallback");
-  // text part + the two VALID image urls (the bogus 'not-an-image' is dropped).
-  assert.equal(userMsg!.parts!.length, 3);
-  assert.deepEqual(userMsg!.parts!.map((p) => p.type), ["text", "image_url", "image_url"]);
-  assert.equal(userMsg!.parts![1]?.image_url?.url, dataUrl);
+  const sent = (requests[0] as { messages: Array<{ role: string; content: string; parts?: unknown }> }).messages;
+  const userMsg = sent.find((m) => m.role === "user" && /vision_analyze/.test(m.content));
+  assert.ok(userMsg, "the user turn is steered to vision_analyze");
+  assert.equal(userMsg!.parts, undefined, "no multimodal parts are attached to the (possibly text-only) chat model");
+  assert.match(userMsg!.content, /what is in this image\?/, "the operator's text is preserved");
+  // the data-URL image is decoded to a worktree file; the http URL passes through; the bogus one is dropped.
+  assert.match(userMsg!.content, /phone-captures\/upload-1\.png/, "the data-URL image was persisted under the worktree");
+  assert.ok(existsSync(join(wt, "phone-captures", "upload-1.png")), "the decoded image file exists on disk");
+  assert.match(userMsg!.content, /example\.com\/x\.png/, "the http(s) URL passes through as a reference");
 });
 
 test("send: a text-only turn carries NO parts (unchanged behavior)", async () => {

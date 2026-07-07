@@ -413,6 +413,8 @@
         '<span class="grove-prompt">❯</span>' +
         '<input class="grove-input" type="text" id="grove-input" placeholder="State the goal…  (append --repo /abs/path)" ' +
           'onkeydown="if(event.key===\'Enter\'&&this.value.trim()){window.groveSend(this.value);this.value=\'\'}">' +
+        '<input type="file" id="grove-file" accept="image/*" style="display:none" onchange="window.groveAttach(this)">' +
+        '<button type="button" class="grove-attach" title="Attach a photo for Peh to see (vision)" onclick="document.getElementById(\'grove-file\').click()">📎</button>' +
       '</div>' +
     '</div>';
   }
@@ -503,10 +505,10 @@
 
   // The Grove chat escape hatch — still talks to /chat for conversational queries
   // (prefix a message with "?" or "chat:").
-  async function groveChat(text, msgs) {
+  async function groveChat(text, msgs, images) {
     var thinkingEl = buildMsg(msgs, 'system', 'ikbi is processing…');
     try {
-      var result = await window.IkbiAPI.converse(text);
+      var result = await window.IkbiAPI.converse(text, images && images.length ? { images: images } : undefined);
       if (thinkingEl.parentNode) thinkingEl.parentNode.removeChild(thinkingEl);
       if (result.ok && result.data) {
         buildMsg(msgs, 'assistant', result.data.response || result.data.content || JSON.stringify(result.data));
@@ -533,6 +535,43 @@
     var pr = parseGoalRepo(text);
     var repo = pr.repo || (typeof window !== 'undefined' && window.IKBI_DEFAULT_REPO) || null;
     await window.ikbiRunBuild(pr.goal, repo, msgs);
+  };
+
+  // Attach a photo from the device → Peh sees it via vision_analyze (the configured vision model).
+  // Uses whatever is typed in the grove input as the caption/question, else asks for a description.
+  window.groveAttach = function (input) {
+    var file = input && input.files && input.files[0];
+    input.value = '';
+    if (!file) return;
+    var msgs = document.getElementById('grove-msgs');
+    if (!msgs) return;
+    var inp = document.getElementById('grove-input');
+    var caption = (inp && inp.value.trim()) || 'Describe what you see in this image.';
+    if (inp) inp.value = '';
+    var reader = new FileReader();
+    reader.onload = function () {
+      var img = new Image();
+      img.onload = function () {
+        // Downscale to a vision-friendly size (keeps the upload small; models don't need full-res).
+        var max = 1568, w = img.width, h = img.height;
+        if (w > max || h > max) {
+          if (w >= h) { h = Math.round(h * max / w); w = max; } else { w = Math.round(w * max / h); h = max; }
+        }
+        var dataUrl;
+        try {
+          var canvas = document.createElement('canvas');
+          canvas.width = w; canvas.height = h;
+          canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+          dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+        } catch (e) { dataUrl = reader.result; }
+        buildMsg(msgs, 'user', '📷 ' + file.name + ' — “' + caption + '”');
+        groveChat(caption, msgs, [dataUrl]);
+      };
+      img.onerror = function () { buildMsg(msgs, 'system', 'Could not load that image.'); };
+      img.src = reader.result;
+    };
+    reader.onerror = function () { buildMsg(msgs, 'system', 'Could not read that image.'); };
+    reader.readAsDataURL(file);
   };
 
   // Launch Pad (builder-ws) build form submit → the same streaming build runner.
