@@ -70,6 +70,20 @@ termux-wake-lock && say "Wake-lock acquired (Termux stays alive with the screen 
 warn "IMPORTANT: in Android Settings → Apps → Termux → Battery, set it to UNRESTRICTED, or"
 warn "Android will still eventually kill the agent in the background."
 
+# ── 4b. auto-start on boot: wake-lock + sshd + the ikbi server ────────────────
+# Requires the Termux:Boot app (F-Droid) INSTALLED and OPENED ONCE — Android only runs
+# ~/.termux/boot/ scripts after that app has been launched. The server line is guarded so this
+# is harmless before ikbi is deployed to ~/ikbi-agent.
+mkdir -p "$HOME/.termux/boot"
+cat > "$HOME/.termux/boot/start-ikbi.sh" <<BOOT
+#!$PREFIX/bin/bash
+termux-wake-lock
+sshd                                   # restore remote (SSH) access on boot
+[ -x "\$HOME/ikbi-agent/run-ikbi.sh" ] && { cd "\$HOME/ikbi-agent"; setsid nohup bash run-ikbi.sh serve >serve.log 2>&1 </dev/null & }
+BOOT
+chmod +x "$HOME/.termux/boot/start-ikbi.sh"
+say "Boot auto-start written (~/.termux/boot/start-ikbi.sh) — install + open Termux:Boot once to arm it."
+
 # ── 5. verify the Termux:API bridge is really wired ───────────────────────────
 say "Verifying the Termux:API hardware bridge…"
 if command -v termux-battery-status >/dev/null && termux-battery-status >/dev/null 2>&1; then
