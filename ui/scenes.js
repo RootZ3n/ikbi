@@ -688,12 +688,14 @@
       opts += '<option value="' + i + '"' + sel + '>' + pehEsc(voices[i].name) + ' · ' + pehEsc(voices[i].lang) + '</option>';
     }
     var wrap = document.createElement('div');
+    var onbOn = (window.pehOnboard && typeof window.pehOnboard.isEnabled === 'function') ? window.pehOnboard.isEnabled() : true;
     wrap.className = 'grove-voicepick';
     wrap.innerHTML =
       '<div class="grove-voicepick-card">' +
-      '<div class="grove-voicepick-title">Choose Peh’s voice</div>' +
+      '<div class="grove-voicepick-title">Peh — voice &amp; settings</div>' +
       '<select id="grove-voice-sel" class="grove-voicepick-sel">' + opts + '</select>' +
       '<div class="grove-voicepick-hint">' + voices.length + ' voice(s) installed. No male one? Add voices in Android Text-to-speech settings, then reopen.</div>' +
+      '<label class="grove-voicepick-toggle"><input type="checkbox" id="grove-onboard-tgl"' + (onbOn ? ' checked' : '') + ' onchange="window.groveOnboardingToggle(this.checked)"> Show Peh’s guided intro (onboarding)</label>' +
       '<div class="grove-voicepick-actions">' +
       '<button type="button" class="grove-voicepick-use" onclick="window.groveVoiceUse()">Use &amp; test</button>' +
       '<button type="button" class="grove-voicepick-close" onclick="var w=this.closest(\'.grove-voicepick\');if(w)w.remove()">Close</button>' +
@@ -709,6 +711,19 @@
       try { localStorage.setItem('peh-voice-name', v.name); } catch (e) {}
       pehVoiceOn = true;
       window.groveSpeak('Voice set. I am Peh — a scientist, currently residing in a squirrel.');
+    }
+  };
+
+  // Settings toggle: show/hide Peh's guided onboarding intro. Persists a per-user override that beats
+  // the deployment default; re-enabling clears the "already onboarded" flag so it greets again.
+  window.groveOnboardingToggle = function (on) {
+    try {
+      localStorage.setItem('peh-onboarding', on ? 'on' : 'off');
+      if (on) { localStorage.removeItem('pehverse-onboarded'); }
+    } catch (e) {}
+    var msgs = document.getElementById('grove-msgs');
+    if (msgs && typeof buildMsg === 'function') {
+      buildMsg(msgs, 'system', on ? "Peh's guided intro is ON — it will greet new sessions." : "Peh's guided intro is OFF.");
     }
   };
 

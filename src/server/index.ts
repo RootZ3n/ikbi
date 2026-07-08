@@ -134,12 +134,23 @@ export function buildServer() {
   const __dirname = dirname(fileURLToPath(import.meta.url));
   const uiDir = join(__dirname, "..", "..", "ui");
   if (existsSync(join(uiDir, "index.html"))) {
+    // Deployment-configurable UI flags, read by index.html BEFORE the app boots. The Pehlichi guided
+    // onboarding defaults ON (good for the PUBLIC deployment — new users get a warm intro); set
+    // IKBI_ONBOARDING=off to hide it by default in the private LAB. A per-user settings toggle can
+    // still override this client-side either way.
+    const onboardingDefault = (process.env["IKBI_ONBOARDING"] ?? "on").toLowerCase() !== "off";
+    app.get("/peh-config.js", (_req, reply) => {
+      reply.header("content-type", "application/javascript; charset=utf-8");
+      reply.header("cache-control", "no-store");
+      return `window.PEH_CONFIG={onboarding:${onboardingDefault ? "true" : "false"}};`;
+    });
+
     void app.register(fastifyStatic, {
       root: uiDir,
       prefix: "/",
       decorateReply: false,
     });
-    log.info({ uiDir }, "UI served from ui/");
+    log.info({ uiDir, onboardingDefault }, "UI served from ui/");
   }
 
   return app;

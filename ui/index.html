@@ -7,6 +7,7 @@
 <meta name="theme-color" content="#0b0f0d">
 <link rel="manifest" href="manifest.json">
 <link rel="stylesheet" href="ikbi.css">
+<script src="peh-config.js"></script>
 </head>
 <body>
 <div id="app"></div>
@@ -910,6 +911,18 @@ var pehOnboard={
     try{localStorage.setItem('pehverse-onboarded','1')}catch(e){}
   },
 
+  // Is onboarding enabled at all? A per-user settings toggle (localStorage 'peh-onboarding' =
+  // 'on'|'off') wins; otherwise the deployment default from window.PEH_CONFIG (server-injected:
+  // ON for the public site, OFF in the private lab via IKBI_ONBOARDING=off).
+  isEnabled:function(){
+    try{
+      var pref=localStorage.getItem('peh-onboarding');
+      if(pref==='off')return false;
+      if(pref==='on')return true;
+    }catch(e){}
+    return !(window.PEH_CONFIG&&window.PEH_CONFIG.onboarding===false);
+  },
+
   // ── Show the welcome overlay ──────────────────────────────────────
   show:function(replay){
     if(this.overlay)return;
@@ -1131,7 +1144,9 @@ function boot(){
   }
 
   // ── Peh onboarding: first-launch check ────────────────────────────
-  if(typeof pehOnboard!=='undefined'){
+  // Onboarding only runs when enabled (deployment default + per-user toggle). Disabled = no
+  // overlay AND no help button (the lab wants Peh's teacher gone entirely).
+  if(typeof pehOnboard!=='undefined'&&pehOnboard.isEnabled()){
     if(!pehOnboard.isOnboarded()){
       // First visit — show the welcome overlay after a brief settle
       setTimeout(function(){pehOnboard.show()},350);
