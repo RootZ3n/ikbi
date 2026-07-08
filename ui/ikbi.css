@@ -1537,6 +1537,17 @@ button{font-family:inherit}
 .peh-grove-only .grove-messages{flex:1 1 auto;min-height:0;overflow-y:auto}
 .peh-grove-only .grove-input-wrap{flex:0 0 auto}
 .peh-grove-only .peh-live-options{flex:0 0 auto}
+/* Grove-only (mobile Peh chat): the body-level floating controls — the command bar, the
+   status + Build Log pills, and the orange chat FAB — are desktop HUD that stack ON TOP of
+   the Grove and bury the chat text. Hide them here: Grove has its own input, and Peh is meant
+   to BE the whole surface. (Desktop, without .peh-grove-only-mode, keeps all of them.) */
+.peh-grove-only-mode .peh-status,
+.peh-grove-only-mode .peh-jrnl-btn,
+.peh-grove-only-mode .peh-cmd,
+.peh-grove-only-mode .ikbi-chat-btn{display:none !important}
+
+/* With the overlays gone, the Grove input sits in the flex flow — just a little breathing room. */
+.peh-grove-only .grove-messages{padding-bottom:calc(18px + env(safe-area-inset-bottom,0px))}
 
 /* Grove input actions — attach + voice-in + voice-out + voice picker */
 .grove-attach,.grove-mic,.grove-voice,.grove-voicepick-btn{background:transparent;border:0;cursor:pointer;font-size:19px;line-height:1;padding:4px 7px;opacity:.85;border-radius:8px}
