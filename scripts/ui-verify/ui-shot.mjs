@@ -16,7 +16,7 @@ const ctx = await browser.newContext(
     ? { viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, isMobile: true, hasTouch: true }
     : { viewport: { width: 1280, height: 900 } },
 );
-await ctx.addInitScript(() => { try { localStorage.setItem('pehverse-onboarded','1'); } catch(e){} });
+if (!args.includes('--fresh')) { await ctx.addInitScript(() => { try { localStorage.setItem('pehverse-onboarded','1'); } catch(e){} }); }
 const page = await ctx.newPage();
 await page.goto(url, { waitUntil: 'networkidle', timeout: 25000 }).catch((e) => console.error('nav:', e.message));
 await page.waitForTimeout(2200);
