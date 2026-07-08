@@ -1555,6 +1555,22 @@ button{font-family:inherit}
 /* With the overlays gone, the Grove input sits in the flex flow — just a little breathing room. */
 .peh-grove-only .grove-messages{padding-bottom:calc(18px + env(safe-area-inset-bottom,0px))}
 
+/* Remove the onboarding / "teaching Peh" help star button — not wanted in this deployment. */
+.peh-onboard-help{display:none !important}
+
+/* Readability (bad eyesight): the faint stone/low-opacity system + tool text and the 11-13px sizes
+   were hard to read. Brighten to full-contrast cream everywhere, and size everything up on phones. */
+.grove-msg.system{color:var(--ikbi-cream);opacity:1;font-style:normal}
+.grove-msg.tool{opacity:1}
+.grove-msg code,.grove-header{color:var(--ikbi-gold)}
+.grove-msg code{background:rgba(212,168,67,.14);padding:1px 5px;border-radius:4px}
+@media (max-width:640px){
+  .grove-msg{font-size:17px;line-height:1.7}
+  .grove-msg.tool,.grove-msg.system{font-size:16px}
+  .grove-header{font-size:13px;letter-spacing:.1em}
+  .grove-input,.grove-input::placeholder{font-size:16px}
+}
+
 /* Grove input actions — attach + voice-in + voice-out + voice picker */
 .grove-attach,.grove-mic,.grove-voice,.grove-voicepick-btn{background:transparent;border:0;cursor:pointer;font-size:19px;line-height:1;padding:4px 7px;opacity:.85;border-radius:8px}
 .grove-attach:hover,.grove-mic:hover,.grove-voice:hover,.grove-voicepick-btn:hover{opacity:1;background:rgba(255,255,255,.06)}
