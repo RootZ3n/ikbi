@@ -34,3 +34,4 @@ reports/proving-ground/reachability/
 .idea/
 .vscode/
 memory-governor/
+scripts/ui-verify/node_modules/

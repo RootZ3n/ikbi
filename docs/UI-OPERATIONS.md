@@ -59,7 +59,7 @@ git add ui/ikbi.css && git commit -m "fix(ui): <what changed and why>"
 
 1. **Serve-grep** (mandatory): `curl … | grep` proves the change is in the served bytes.
 2. **Lint** (cheap correctness): run the JS/CSS through a linter/parser before shipping.
-3. **Headless screenshot** (the real check — see `scripts/ui-shot` once built): render the page in headless Chromium (Playwright), screenshot it, and eyeball/diff. This is the UI analog of the osapa QEMU boot test — proof the change *renders*, not just parses.
+3. **Headless screenshot** (the real check — see below): render the page in headless Chromium (Playwright), screenshot it, and eyeball/diff. This is the UI analog of the osapa QEMU boot test — proof the change *renders*, not just parses.
 4. **On-device**: the operator reloads and confirms. Ask a specific question ("is the star gone? is the text readable?").
 
 ## 5. Commit + deploy discipline
@@ -67,3 +67,19 @@ git add ui/ikbi.css && git commit -m "fix(ui): <what changed and why>"
 - One focused commit per change, message says **what + why** (the why is what future-cheap-models need).
 - Always `rsync` to every server the operator actually uses (phone is primary; PC is the source; laptop is a manual mirror).
 - Never leave the phone out of sync — a change that works on the PC but not the phone reads as "broken."
+
+## 6. The screenshot verifier (scripts/ui-verify/ui-shot.mjs)
+
+Renders a UI surface headlessly (system Brave via playwright-core — no bundled browser) and writes a
+PNG, so a change can be **seen**, not guessed. It pre-sets `localStorage['pehverse-onboarded']=1` so it
+lands on the real UI, not the onboarding modal.
+
+```bash
+# desktop viewport
+node scripts/ui-verify/ui-shot.mjs http://127.0.0.1:18796 /tmp/ui.png
+# phone viewport (390x844) — use this for Grove/mobile checks
+node scripts/ui-verify/ui-shot.mjs http://127.0.0.1:18796 /tmp/grove.png --mobile
+```
+Then open/read the PNG. This is the UI analog of osapa's QEMU boot test: proof the change RENDERS
+correctly, not merely that the CSS/JS parses. Verified live: it confirmed the star-button removal +
+readability bump actually rendered on mobile.
