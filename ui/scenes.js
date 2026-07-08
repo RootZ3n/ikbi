@@ -661,8 +661,8 @@
       if (!pehVoice) pehVoice = pickPehVoice();
       if (pehVoice) u.voice = pehVoice;
       u.lang = (pehVoice && pehVoice.lang) || 'en-US';
-      u.pitch = 0.75;  // deeper = the scientist, not the squirrel
-      u.rate = 1.03;   // brisk, alert
+      u.pitch = 1.0;  // natural — the pitch-shift made every voice sound off/robotic
+      u.rate = 1.0;   // natural speaking rate
       window.speechSynthesis.speak(u);
     } catch (e) {}
   };
