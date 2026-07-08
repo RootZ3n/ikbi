@@ -1537,10 +1537,16 @@ button{font-family:inherit}
 .peh-grove-only .grove-messages{flex:1 1 auto;min-height:0;overflow-y:auto}
 .peh-grove-only .grove-input-wrap{flex:0 0 auto}
 .peh-grove-only .peh-live-options{flex:0 0 auto}
-/* Grove-only (mobile Peh chat): the body-level floating controls — the command bar, the
-   status + Build Log pills, and the orange chat FAB — are desktop HUD that stack ON TOP of
-   the Grove and bury the chat text. Hide them here: Grove has its own input, and Peh is meant
-   to BE the whole surface. (Desktop, without .peh-grove-only-mode, keeps all of them.) */
+/* The body-level floating controls — command bar (.peh-cmd), status pill (.peh-status),
+   Build Log (.peh-jrnl-btn), and the orange chat FAB (.ikbi-chat-btn) — are fixed overlays that
+   stack ON TOP of the chat and bury the text on a phone. Hide them on MOBILE (Grove has its own
+   input; Peh is the surface) and in grove-only mode. Desktop keeps every control. */
+@media (max-width:640px){
+  .peh-status,
+  .peh-jrnl-btn,
+  .peh-cmd,
+  .ikbi-chat-btn{display:none !important}
+}
 .peh-grove-only-mode .peh-status,
 .peh-grove-only-mode .peh-jrnl-btn,
 .peh-grove-only-mode .peh-cmd,
