@@ -22,7 +22,10 @@ competitive mode. It runs both as a long-running localhost/Tailscale service and
   `/capabilities` `/chat`).
 - **TUI** (`tui/`): a standalone Ink/React client package (talks to `/chat`; not the primary
   surface — `ikbi repl` is the rich interactive daily-driver).
-- **Web UI** (`ui/`): a static SPA served at `/`.
+- **Web UI** (`ui/`): a static SPA served at `/`. **Changing the UI? Read `docs/UI-OPERATIONS.md`
+  first** — the exact edit→verify-served→rsync-to-phone→reload recipe, the CSS/deploy gotchas
+  (the `.peh-grove-only-mode` mobile trap, floating overlays, readability), and how to verify a UI
+  change when there are no unit tests (serve-grep + `scripts/ui-shot` headless screenshot).
 
 ## Surfaces (what to use)
 - `ikbi build "<goal>" --repo <path>` — the golden batch path: 5-role pipeline in an
