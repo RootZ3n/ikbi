@@ -2731,15 +2731,32 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         // SUPPRESSED on an unverifiable target (`checksUnverifiable`): a stronger model cannot fix
         // a missing manifest/verifier, so escalating would waste a paid pro run, guaranteed to fail.
         const decision = escObservation.decision;
+        // GUARANTEED flash→pro (IKBI_ESCALATION_ALWAYS_ESCALATE, default on): on the cheap/default
+        // path, a builder that FAILED or STALLED always escalates to the mid (pro) tier — bypassing
+        // the worker→mid SCORE threshold, which is a boundary coin-flip (builderFailed weight == the
+        // threshold, so whether it fires depends on score arithmetic rather than "did the cheap model
+        // finish?"). Fail-closed: off when escalation is disabled or a tier was explicitly pinned
+        // (--tier mid|frontier sets escalationDisabled). Still bounded by !escalationAttempted (once),
+        // maxEscalations, and the per-build budget cap. When enabled + role builder, escObservation
+        // always returns a defined `decision` (see the guard at its top), so the block body is safe.
+        const alwaysEscalateToPro =
+          escalationConfig.enabled &&
+          escalationConfig.alwaysEscalate &&
+          task.escalationDisabled !== true;
         if (
           role === "builder" &&
           (result.outcome === "failure" || escSignals.builderFailed) &&
           checksUnverifiable === undefined &&
           !escalationAttempted &&
-          decision !== undefined &&
-          decision.escalate &&
-          decision.targetTier === "mid"
+          (alwaysEscalateToPro ||
+            (decision !== undefined && decision.escalate && decision.targetTier === "mid"))
         ) {
+          if (alwaysEscalateToPro && !(decision?.escalate && decision.targetTier === "mid")) {
+            log.info(
+              { taskId: task.taskId, failedRole: role, stopReason: (result.detail as Record<string, unknown> | undefined)?.stopReason },
+              "guaranteed flash→pro escalation: builder failed/stalled — escalating to the mid (pro) tier regardless of the escalation score (IKBI_ESCALATION_ALWAYS_ESCALATE)",
+            );
+          }
           const midModel = task.fallbackModel ?? escalationConfig.tierModels.mid[0];
           if (midModel !== undefined) {
             const failedResult = result;
@@ -2891,7 +2908,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             // dragged down; the mid start simply raises the floor to bigger-window models.
             const sweepStartTier = failedOnOverflow && seedTier === "worker" ? "mid" : seedTier;
             const recAttempts: RecoveryAttempt[] = [{ tier: seedTier, model: failedModel, outcome: "fail" }];
-            const handoff = decision.handoffContext;
+            // `decision` is defined whenever we reach here (escObservation returns a decision for a
+            // builder role when escalation is enabled + not tier-pinned — the always-escalate
+            // preconditions). The `?.` keeps the compiler happy for the score-independent path.
+            const handoff = decision?.handoffContext;
             let recovered = false;
             let lastSwapModel = failedModel;
 

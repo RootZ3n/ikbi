@@ -22,6 +22,7 @@ import {
   createBreakGlass,
   presentBreakGlass,
   escalationConfig,
+  loadEscalationConfig,
   DEFAULT_WEIGHTS,
   type EscalationSignals,
   type EscalationContext,
@@ -30,6 +31,26 @@ import {
 } from "./index.js";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+/** A minimal config reader (defaults through, per-key overrides) for loadEscalationConfig. */
+function fakeReader(overrides: Record<string, unknown> = {}): Parameters<typeof loadEscalationConfig>[0] {
+  const pick = <T,>(k: string, d: T): T => (k in overrides ? (overrides[k] as T) : d);
+  return {
+    bool: (k: string, d: boolean) => pick(k, d),
+    number: (k: string, d: number) => pick(k, d),
+    int: (k: string, d: number) => pick(k, d),
+    list: (k: string, d: readonly string[]) => pick(k, [...d]),
+  } as Parameters<typeof loadEscalationConfig>[0];
+}
+
+test("config — alwaysEscalate defaults ON (guaranteed flash→pro)", () => {
+  assert.equal(escalationConfig.alwaysEscalate, true, "the shipped default is always-on escalation");
+  assert.equal(loadEscalationConfig(fakeReader()).alwaysEscalate, true, "default reader ⇒ true");
+});
+
+test("config — IKBI_ESCALATION_ALWAYS_ESCALATE=false disables the guarantee", () => {
+  assert.equal(loadEscalationConfig(fakeReader({ ALWAYS_ESCALATE: false })).alwaysEscalate, false, "operator can opt out");
+});
 
 /** A clean (no-pressure) signal set; override fields per test. */
 function signals(over: Partial<EscalationSignals> = {}): EscalationSignals {

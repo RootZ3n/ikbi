@@ -971,7 +971,10 @@ test("failure path: a role failure short-circuits, workspace DISCARDED (not prom
   const ws = fakeWorkspaces(true);
   const cap = capturingRoles((r) => (r === "builder" ? "failure" : "success"));
   const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, workspaces: ws.workspaces }));
-  const result = await orch.run(task, parentCtx);
+  // escalationDisabled isolates the DISCARD mechanic this test pins from always-on flash→pro
+  // escalation (which now retries the builder on a pro model before a builder failure discards —
+  // covered by its own tests). With escalation off, a builder failure short-circuits immediately.
+  const result = await orch.run({ ...task, escalationDisabled: true }, parentCtx);
 
   assert.deepEqual(cap.seen.map((c) => c.role), ["scout", "builder"], "short-circuited after builder");
   assert.equal(ws.calls.promote, 0, "not promoted");
@@ -2269,6 +2272,29 @@ test("build-mode escalation: builder fails on the cheap tier → cheap retry →
   const proRetried = retried[retried.length - 1];
   assert.equal((proRetried?.payload as { toModel: string; success: boolean } | undefined)?.toModel, "deepseek-v4-flash");
   assert.equal((proRetried?.payload as { success: boolean } | undefined)?.success, true);
+});
+
+test("build-mode escalation: ALWAYS-ON — a bare builder failure (score below threshold) still escalates to pro", async () => {
+  // The builder fails with NO signal-bearing detail, so the escalation SCORE stays at 0 (below the
+  // worker→mid threshold). Pre-always-on this short-circuited to discard with no escalation (see the
+  // isolated "role failure short-circuits" test, which now pins escalationDisabled). With
+  // IKBI_ESCALATION_ALWAYS_ESCALATE (default on), a builder that can't finish ALWAYS escalates to pro.
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const bus = fakeBus();
+  const cap = capturingRoles();
+  let builderRuns = 0;
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    builder: async (): Promise<RoleResult> => { builderRuns += 1; return { role: "builder", outcome: "failure", summary: "bare fail" }; },
+  };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces, events: bus.bus }));
+  const result = await orch.run({ taskId: "t-always-on-esc", targetRepo: "/repo", goal: "do the thing" }, parentCtx);
+
+  assert.ok(builderRuns > 1, "always-on escalation retried the builder despite a below-threshold score");
+  assert.equal(result.escalationRetry?.attempted, true, "escalation was attempted (guaranteed, not score-gated)");
+  assert.ok(bus.sent.some((e) => e.type === "worker.escalation.retried"), "an escalation-retry event fired");
+  assert.equal(result.promoted, false, "all attempts failed → fail-closed discard (no false green)");
 });
 
 test("build-mode escalation: a CONTEXT-OVERFLOW skips the futile cheap same-model retry and escalates straight to a bigger-window mid model", async () => {
