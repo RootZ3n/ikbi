@@ -169,7 +169,10 @@ interface EscalationHandoffFields {
 
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, symlinkSync, mkdirSync, type Dirent } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, basename } from "node:path";
+
+import { computeWorkProduct, decidePromotability, type GitRunner, type SafetyLedger, type Verdict, type WorkAssessment } from "./adjudication/index.js";
 
 /**
  * Given `git status --porcelain` output, report whether the working tree has TRACKED
@@ -207,6 +210,22 @@ function liveCheckTargetDirty(targetRepo: string): string | undefined {
   } catch {
     return undefined; // git unavailable or not a git repo — let workspace allocation handle it
   }
+}
+
+/**
+ * ADJUDICATION CORE — shadow WorkProduct producer. Runs read-only git in the worktree (a throwaway
+ * index for the tree hash, so the real index/working tree are untouched). Used ONLY by the Step-2
+ * shadow instrumentation, which never affects the build; all callers wrap this in try/catch.
+ */
+async function shadowComputeWorkProduct(workspacePath: string, baseRef: string, taskId: string): Promise<import("./adjudication/index.js").WorkProduct> {
+  const git: GitRunner = async (args, opts) =>
+    execFileSync("git", ["-C", workspacePath, ...args], {
+      encoding: "utf8",
+      timeout: 10_000,
+      maxBuffer: 32 * 1024 * 1024,
+      env: opts?.env !== undefined ? { ...process.env, ...opts.env } : process.env,
+    });
+  return computeWorkProduct(git, { baseRef, tempIndexPath: join(tmpdir(), `ikbi-adj-${taskId}.index`) });
 }
 
 /**
@@ -3185,6 +3204,64 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // overall is non-success: a successful build is verifiable by definition. `??=` preserves any
     // classification the escalation-suppression block already made.
     if (overall !== "success") checksUnverifiable ??= classifyUnverifiableTarget();
+
+    // ── ADJUDICATION CORE — SHADOW MODE (Step 2) ────────────────────────────────────────────────
+    // Compute the new, centralized promotability decision ALONGSIDE the existing gate and receipt any
+    // divergence. This changes NOTHING (pure telemetry); it validates the core against real builds
+    // before Step 3 makes it authoritative. Two signals: (1) DECISION DIVERGENCE — the new core and the
+    // old integrator gate disagree on promote/discard (on paths the verifier reached); (2) UNVERIFIED
+    // WORK — the builder left work on disk that the pipeline is discarding WITHOUT ever verifying it
+    // (the false-RED candidate the core is designed to fix). Wrapped so a shadow error never affects
+    // the build. Gated by IKBI_ADJUDICATION_SHADOW (default on; set "off" to silence).
+    if ((modeEnv.IKBI_ADJUDICATION_SHADOW ?? "on") !== "off") {
+      try {
+        const wp = await shadowComputeWorkProduct(workspace.path, workspace.baseRef, task.taskId);
+        const verifierResult = results.find((r) => r.role === "verifier");
+        const rv = readVerifier(verifierResult);
+        const rawVerdict = (verifierResult?.detail as Record<string, unknown> | undefined)?.verdict;
+        const assessment: WorkAssessment = {
+          verdict: (typeof rawVerdict === "string" ? rawVerdict : "fail") as Verdict,
+          testEvidence: rv.testEvidence,
+          treeHash: wp.treeHash, // shadow: assume the verifier judged the current tree (TOCTOU is a Step-3 concern)
+          ...(task.reuseWorkspace !== undefined ? { accumulatedPass: true } : {}),
+        };
+        const criticDetail = (results.find((r) => r.role === "critic")?.detail ?? {}) as Record<string, unknown>;
+        const refuterDetail = (results.find((r) => r.role === "refuter")?.detail ?? {}) as Record<string, unknown>;
+        const safety: SafetyLedger = {
+          externalInjection: externalInjectionDetectedThisBuild,
+          effectiveBreach: false, // effective breaches raise separate higher-severity alarms; not tracked as a run flag here
+          refuted: refuterDetail.refuted === true,
+          killed: killedReason !== undefined,
+          driftBlocked: false, // a drift "block" rejects at entry, before any role runs — never reaches here
+          gateWallAuthorized: true, // compared against the PRE-gate-wall integrator intent (decision.promote)
+        };
+        const shadowDecision = decidePromotability(wp, assessment, safety, { pass: criticDetail.pass === true });
+        const oldIntent = readIntegratorDecision(results.find((r) => r.role === "integrator")).promote === true;
+        const newPromote = shadowDecision.action === "promote";
+        if (oldIntent !== newPromote) {
+          await receipts.append(
+            { operation: "worker.decision.divergence", outcome: { status: "success" }, project: task.targetRepo, requestId: task.taskId,
+              metadata: { taskId: task.taskId, oldPromote: oldIntent, newAction: shadowDecision.action, newReason: shadowDecision.reason, verifierRan: verifierResult !== undefined, verdict: assessment.verdict, testEvidence: assessment.testEvidence, workNonEmpty: wp.nonEmpty, filesChanged: wp.diffStat.filesChanged } },
+            parentIdentity,
+          );
+          log.warn({ taskId: task.taskId, oldPromote: oldIntent, newAction: shadowDecision.action, newReason: shadowDecision.reason }, "adjudication shadow: promotability DIVERGENCE (old gate vs new core)");
+        }
+        if (verifierResult === undefined && wp.nonEmpty && !oldIntent) {
+          // The builder short-circuited (no verification) but left work on disk — the false-RED
+          // candidate. The Adjudication Core would route this tree to the verifier instead of discarding
+          // it unseen. Behavior is unchanged in shadow; this measures how often the false-RED path fires.
+          await receipts.append(
+            { operation: "worker.adjudication.unverified_work", outcome: { status: "success" }, project: task.targetRepo, requestId: task.taskId,
+              metadata: { taskId: task.taskId, filesChanged: wp.diffStat.filesChanged, insertions: wp.diffStat.insertions, deletions: wp.diffStat.deletions, builderStopReason: String((results.find((r) => r.role === "builder")?.detail as Record<string, unknown> | undefined)?.stopReason ?? "unknown") } },
+            parentIdentity,
+          );
+          log.warn({ taskId: task.taskId, filesChanged: wp.diffStat.filesChanged }, "adjudication shadow: nonEmpty work discarded WITHOUT verification (false-RED candidate — the core would adjudicate it)");
+        }
+      } catch (shadowErr) {
+        // A shadow failure must NEVER affect the build. Record at debug and move on.
+        log.debug?.({ taskId: task.taskId, err: shadowErr instanceof Error ? shadowErr.message : String(shadowErr) }, "adjudication shadow: skipped (non-fatal)");
+      }
+    }
 
     // Terminal: a KILL halted the run mid-loop ⇒ stop cleanly (NEVER promote a half-run),
     // surface the kill, return. The workspace is RETAINED (not discarded) so its partial work
