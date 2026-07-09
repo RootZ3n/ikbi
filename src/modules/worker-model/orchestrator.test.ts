@@ -396,10 +396,11 @@ function capturingTrust() {
 test("INJECTION SIGNAL: a chokepoint block on a tool result is recorded in the role receipt AND attributed to trust (detection→enforcement)", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
   const cap = capturingRoles();
-  // The builder reports that the neutralization chokepoint blocked a tool result this run.
+  // The builder reports the chokepoint blocked a tool result from OUTSIDE content this run (the
+  // enforced case — e.g. a poisoned web_extract). externalInjectionDetected drives enforcement.
   const roles: Partial<Record<WorkerRole, RoleFn>> = {
     ...cap.roles,
-    builder: async () => ({ role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["a.ts"], injectionDetected: true, rejectedToolCalls: [] } }),
+    builder: async () => ({ role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["a.ts"], injectionDetected: true, externalInjectionDetected: true, rejectedToolCalls: [] } }),
   };
   // Local captures: role receipt metadata (ladder-independent audit) + recordOutcome signals (ladder on).
   const appended: Array<{ operation: string; metadata: Record<string, unknown> }> = [];
@@ -429,6 +430,40 @@ test("INJECTION SIGNAL: a chokepoint block on a tool result is recorded in the r
   assert.equal(result.promoted, false, "an injection-detected build is fail-closed — it does not promote");
   assert.equal(ws.calls.promote, 0, "nothing was promoted");
   assert.match(result.reason ?? "", /injection/i, "the discard reason names the injection");
+});
+
+test("INJECTION (own worktree output): neutralized self-hosting fixtures do NOT discard a green build (judge by effect)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const cap = capturingRoles();
+  // The builder's run_checks ran ikbi's own injection-test suite; the chokepoint re-detected the
+  // fixture attack strings in that OWN-worktree output. injectionDetected is set (audit) but
+  // externalInjectionDetected is NOT — the content was neutralized-and-inert. Judge by effect.
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    builder: async () => ({ role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["a.ts"], injectionDetected: true, rejectedToolCalls: [] } }),
+  };
+  const appended: Array<{ operation: string; metadata: Record<string, unknown> }> = [];
+  const receipts = { append: async (input: unknown): Promise<unknown> => { const i = input as { operation: string; metadata?: Record<string, unknown> }; appended.push({ operation: i.operation, metadata: i.metadata ?? {} }); return {}; } };
+  const trustCalls: Array<{ operation: string; injection: boolean }> = [];
+  const trust = {
+    recordOutcome: async (i: { agentId: string; defaultTrustTier: string; operation: string; status: string; signals?: { injection?: boolean } }): Promise<TrustDecision> => {
+      trustCalls.push({ operation: i.operation, injection: i.signals?.injection === true });
+      const t = asTier(i.defaultTrustTier, TRUST_FLOOR);
+      return { agentId: i.agentId, tier: t, previousTier: t, autonomy: autonomyForTier(t) };
+    },
+  };
+  const ws = fakeWorkspaces(true);
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, trust, receipts, workspaces: ws.workspaces }));
+  const result = await orch.run(task, parentCtx);
+
+  // Still audited: the role receipt records the detection regardless of origin.
+  const builderReceipt = appended.find((a) => a.operation === "worker.role.builder");
+  assert.equal(builderReceipt?.metadata.injectionDetected, true, "own-worktree injection is still recorded for audit");
+  // NOT enforced: no trust signal, and the verified-green build PROMOTES (judge by effect).
+  const buildTrust = trustCalls.find((c) => c.operation === "worker.build");
+  assert.equal(buildTrust?.injection ?? false, false, "own-worktree injection does NOT feed the trust signal");
+  assert.equal(result.promoted, true, "a green build with only own-worktree (neutralized) injection promotes");
+  assert.equal(ws.calls.promote, 1, "the build was promoted");
 });
 
 test("POLICY TAINT: a PREVENTED out-of-policy attempt does NOT discard a verified-green build (judge by effect)", async () => {

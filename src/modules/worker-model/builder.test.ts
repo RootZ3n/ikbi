@@ -21,7 +21,7 @@ import type { WorkspaceHandle } from "../../core/workspace/contract.js";
 import type { ExecRequest, ExecResult } from "../governed-exec/index.js";
 import { events, type IkbiEvent } from "../../core/events/index.js";
 import type { ReceiptInput } from "../../core/receipt/index.js";
-import { createBuilder, MAX_TOOL_ITERATIONS, simplifyTools, TOOLS, type ToolCallError } from "./builder.js";
+import { createBuilder, isExternalToolOrigin, MAX_TOOL_ITERATIONS, simplifyTools, TOOLS, type ToolCallError } from "./builder.js";
 import { VERIFIER_CHECKS } from "./checks.js";
 import { workerToolCallStalled } from "./events.js";
 import { builderModel } from "./role-models.js";
@@ -109,6 +109,22 @@ function makeCtx(dir: string, tier: TrustTier, engine: RoleEngine, priorResults:
 }
 
 const tmp = (): string => mkdtempSync(join(tmpdir(), "ikbi-builder-"));
+
+// ── injection origin classifier: worktree-local (judge by effect) vs. outside (enforce) ──
+
+test("isExternalToolOrigin: worktree-local origins are NOT external (judged by effect)", () => {
+  for (const local of ["read_file", "write_file", "list_dir", "search_files", "glob", "patch", "multi_edit", "terminal", "run_checks", "scout_detail", "git_status", "git_diff", "git_log", "context_summary"]) {
+    assert.equal(isExternalToolOrigin(local), false, `${local} is worktree-local`);
+  }
+});
+
+test("isExternalToolOrigin: outside-content origins ARE external (enforced), unknown fails closed", () => {
+  for (const ext of ["web_search", "web_extract", "vision_analyze", "delegate_task", "brain_search", "phone_read_text", "phone_take_photo"]) {
+    assert.equal(isExternalToolOrigin(ext), true, `${ext} is outside content`);
+  }
+  assert.equal(isExternalToolOrigin("some_new_tool"), true, "unknown origin fails closed (treated as external)");
+  assert.equal(isExternalToolOrigin(""), true, "empty origin fails closed");
+});
 
 // ── #8: the neutralization chokepoint (LOAD-BEARING) ───────────────────────
 

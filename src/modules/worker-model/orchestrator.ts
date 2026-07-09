@@ -745,9 +745,11 @@ interface IntegratorDecision {
 function winnerTaintReason(roles: readonly RoleResult[]): string | undefined {
   for (const r of roles) {
     const d = r.detail as Record<string, unknown> | undefined;
-    if (d?.injectionDetected === true) {
-      return "prompt-injection detected by the neutralization chokepoint during the winning candidate's build (fail-closed — must not promote)";
+    if (d?.externalInjectionDetected === true) {
+      return "prompt-injection from OUTSIDE content detected by the neutralization chokepoint during the winning candidate's build (fail-closed — must not promote)";
     }
+    // NB: injection NEUTRALIZED in the candidate's OWN worktree output (e.g. self-hosting test
+    // fixtures) does NOT taint the winner — judge by effect, like the policy-taint case below.
     // NB: a PREVENTED (rejected) out-of-policy tool ATTEMPT does NOT taint the winner. Judge by effect,
     // not intent — the governor blocked it (no effect) and the candidate was verified green. It is a
     // recorded warning + learning signal, not a discard (see the single-build promote gate). Only an
@@ -884,6 +886,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   // OFFENDING build cannot promote — the trust demotion only affects FUTURE builds and is off by
   // default. Reset at every run entry; builds are serial (like activeCheckHalt).
   let injectionDetectedThisBuild = false;
+  // ENFORCEMENT subset (per-run): injection whose blocked content came from OUTSIDE the worktree
+  // (web/vision/delegate/brain/phone/unknown origin). ONLY this discards a green build and feeds the
+  // trust signal. Injection in the build's OWN worktree output (run_checks, file reads — e.g. ikbi's
+  // own injection-test fixtures when self-hosting) is neutralized-and-inert: recorded via
+  // injectionDetectedThisBuild for audit, but judged by effect, not enforced. See isExternalToolOrigin.
+  let externalInjectionDetectedThisBuild = false;
   // POLICY-TAINT (per-run): set by recordRole when ANY builder ATTEMPT this build attempted an
   // out-of-policy tool call. recordRole records the INITIAL builder BEFORE the retry/escalation
   // blocks replace its result, so a later clean retry cannot LAUNDER the taint (the tainted
@@ -910,6 +918,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   const noteBuilderSignals = (r: RoleResult): void => {
     const d = (r.detail ?? {}) as Record<string, unknown>;
     if (d.injectionDetected === true) injectionDetectedThisBuild = true;
+    if (d.externalInjectionDetected === true) externalInjectionDetectedThisBuild = true;
     if (Array.isArray(d.policyViolations) && d.policyViolations.length > 0) policyTaintedThisBuild = true;
   };
 
@@ -1341,9 +1350,17 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // trust ladder) and, when the ladder is active, attributed as signals.injection so the trust
     // rules set the NON-RECOVERABLE injection flag — the marketed defense, wired detection→enforcement.
     const injectionDetected = ((result.detail ?? {}) as Record<string, unknown>).injectionDetected === true;
+    const externalInjectionDetected = ((result.detail ?? {}) as Record<string, unknown>).externalInjectionDetected === true;
     if (injectionDetected) {
-      injectionDetectedThisBuild = true; // carried to the per-build trust outcome + the in-run promote gate
-      log.warn({ role: result.role, taskId: task.taskId, agentId: spawned.identity.agentId }, "INJECTION DETECTED — chokepoint blocked a tool result; recorded as a trust signal");
+      injectionDetectedThisBuild = true; // audit: recorded in the role receipt regardless of origin
+      if (externalInjectionDetected) {
+        externalInjectionDetectedThisBuild = true; // ENFORCEMENT: carried to the per-build trust outcome + in-run promote gate
+        log.warn({ role: result.role, taskId: task.taskId, agentId: spawned.identity.agentId }, "INJECTION DETECTED (external origin) — chokepoint blocked a tool result; recorded as a trust signal + blocks promotion");
+      } else {
+        // Neutralized injection in the build's OWN worktree output (e.g. self-hosting test fixtures):
+        // the model never saw the raw text. Recorded for audit; judged by effect, not enforced.
+        log.warn({ role: result.role, taskId: task.taskId, agentId: spawned.identity.agentId }, "injection neutralized in the build's own worktree output — recorded for audit, judged by effect (not blocking promotion)");
+      }
     }
     // POLICY TAINT: a builder attempt that tried an out-of-policy tool call taints the whole build —
     // captured HERE (recordRole runs on the INITIAL builder before any retry replaces its result), so
@@ -1417,7 +1434,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         defaultTrustTier: spawned.identity.trustTier ?? TRUST_FLOOR,
         operation,
         status,
-        ...(injectionDetected ? { signals: { injection: true } } : {}),
+        ...(externalInjectionDetected ? { signals: { injection: true } } : {}),
       },
       spawned.validated,
     );
@@ -1480,9 +1497,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         defaultTrustTier: workerSpawned.identity.trustTier ?? TRUST_FLOOR,
         operation: "worker.build",
         status,
-        // Attribute a chokepoint-detected injection (any role this build) to the trust outcome — the
-        // trust rules then set the NON-RECOVERABLE injection flag that blocks promotion while flagged.
-        ...(injectionDetectedThisBuild ? { signals: { injection: true } } : {}),
+        // Attribute an EXTERNAL-origin chokepoint injection (any role this build) to the trust outcome —
+        // the trust rules then set the NON-RECOVERABLE injection flag that blocks promotion while flagged.
+        // Own-worktree injection (neutralized-and-inert, e.g. self-hosting fixtures) is NOT a trust signal.
+        ...(externalInjectionDetectedThisBuild ? { signals: { injection: true } } : {}),
       },
       workerSpawned.validated,
     );
@@ -1621,6 +1639,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     }
     const parentIdentity = parentCtx.identity.identity;
     injectionDetectedThisBuild = false; // reset the per-run injection flag (builds are serial)
+    externalInjectionDetectedThisBuild = false; // reset the per-run external-injection enforcement flag
     policyTaintedThisBuild = false; // reset the per-run policy-taint flag
     fixerPreventedThisBuild = []; // reset the per-run off-books fixer prevented-attempt accumulator
     buildDriftReports = []; // reset the per-run build-path drift advisory reports
@@ -3239,8 +3258,17 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     //  "injection blocks promotion" defense, enforced HERE. The trust-ladder demotion only affects
     //  FUTURE builds and is off by default, so it cannot block the OFFENDING build. This is a genuine
     //  gate failure (not an operator/governance decision) → trust is NOT suppressed.
-    if (decision.promote && injectionDetectedThisBuild) {
-      decision = { ...decision, promote: false, rationale: "discard: prompt-injection detected by the neutralization chokepoint during this build (fail-closed — the injected build must not promote)" };
+    if (decision.promote && externalInjectionDetectedThisBuild) {
+      decision = { ...decision, promote: false, rationale: "discard: prompt-injection from OUTSIDE content (web/vision/delegate/…) detected by the neutralization chokepoint during this build (fail-closed — the injected build must not promote)" };
+    } else if (decision.promote && injectionDetectedThisBuild) {
+      // Injection was detected but only in the build's OWN worktree output (neutralized-and-inert —
+      // e.g. ikbi's own injection-test fixtures when self-hosting). The model never acted on it, and
+      // planting it needs repo-write (outside the injection threat model). Judge by effect: record +
+      // proceed, mirroring the policy-taint gate below. External-origin injection still discards above.
+      log.warn(
+        { taskId: task.taskId, workspaceId: workspace.id },
+        "promote proceeds despite injection NEUTRALIZED in the build's own worktree output — recorded for audit, not a discard (judge by effect; external-origin injection would still block)",
+      );
     } else if (decision.promote && policyTaintedThisBuild) {
       // JUDGE BY EFFECT, NOT INTENT. A policy violation in ikbi is a PREVENTED (rejected) tool call —
       // the governor/sandbox blocked it, so it had NO effect, and the verifier passed on the real
@@ -4026,7 +4054,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 export function isFixableVerifierFailure(verifierResult: RoleResult): boolean {
   if (verifierResult.role !== "verifier" || verifierResult.outcome === "success") return false;
   const d = (verifierResult.detail ?? {}) as Record<string, unknown>;
-  if (d.injectionDetected === true) return false;
+  // Only EXTERNAL-origin injection (content hijack from outside) makes a failure unfixable — a
+  // neutralized-and-inert own-worktree detection (self-hosting fixtures) must not block the fixer.
+  if (d.externalInjectionDetected === true) return false;
   if (d.verdict === "skipped" || d.skipped === true) return false;
   if (d.verificationKind === "checks_unresolvable") return false;
   const v = readVerifier(verifierResult);

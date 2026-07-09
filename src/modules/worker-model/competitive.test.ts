@@ -186,12 +186,22 @@ function taintedWinnerRoles(taintDetail: Record<string, unknown>): Partial<Recor
 test("C-A1: a competitive winner whose build had prompt-injection is NOT promoted (fail-closed)", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
   const ws = compWorkspaces();
-  const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: taintedWinnerRoles({ injectionDetected: true }) }));
+  const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: taintedWinnerRoles({ injectionDetected: true, externalInjectionDetected: true }) }));
   const r = await orch.run(task, parentCtx);
-  assert.equal(r.promoted, false, "an injected winner must NOT promote");
+  assert.equal(r.promoted, false, "a winner injected from OUTSIDE content must NOT promote");
   assert.equal(r.outcome, "rejected");
   assert.deepEqual(ws.promoted, [], "nothing was promoted");
   assert.match(r.reason ?? "", /injection/i, "the reason names the fail-closed injection gate");
+});
+
+test("C-A1: a competitive winner with only OWN-worktree (neutralized) injection IS promoted (judge by effect)", async () => {
+  // Self-hosting: the winner's run_checks re-detected ikbi's own injection-test fixtures in its own
+  // output. injectionDetected is set (audit) but not externalInjectionDetected — neutralized-and-inert.
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = compWorkspaces();
+  const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: taintedWinnerRoles({ injectionDetected: true }) }));
+  const r = await orch.run(task, parentCtx);
+  assert.equal(r.promoted, true, "a green winner with only own-worktree injection promotes (judge by effect)");
 });
 
 test("C-A1: a competitive candidate that attempted a PREVENTED out-of-policy call is STILL promotable (judge by effect)", async () => {

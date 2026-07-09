@@ -147,6 +147,37 @@ const MAX_READ_BYTES = 32_000;
 /** Max entries returned by list_dir. */
 const MAX_LIST_ENTRIES = 200;
 
+/**
+ * Tool origins whose RESULTS are content that already lives inside the build's own worktree —
+ * files it read, its own build/test output, local governed git/shell. A `block` verdict on one
+ * of these is a SELF-HOSTING false-positive class: the canonical case is building ikbi with ikbi,
+ * where `run_checks` runs ikbi's own injection-detection test suite and its output legitimately
+ * prints attack fixtures, which the chokepoint then re-detects. To PLANT such content an attacker
+ * would already need repo-write access (outside the injection threat model), and the chokepoint has
+ * ALREADY neutralized it (the model can never act on the raw text). So injection here is judged BY
+ * EFFECT — recorded for audit, but it does not discard verified-green work.
+ *
+ * Everything NOT in this set — web fetch/search, vision, delegated sub-agents, the shared knowledge
+ * brain, phone sensors, and any UNRECOGNIZED origin — is treated as OUTSIDE content and a block
+ * verdict there STILL blocks promotion and feeds the trust signal. Fail-closed by construction:
+ * the relaxation applies only to this explicit allowlist of worktree-confined origins.
+ */
+const WORKTREE_LOCAL_ORIGINS: ReadonlySet<string> = new Set<string>([
+  "read_file", "write_file", "list_dir", "search_files", "glob", "patch", "multi_edit",
+  "terminal", "run_checks", "scout_detail",
+  "git_status", "git_diff", "git_log",
+  "context_summary",
+]);
+
+/**
+ * True when a `block` verdict on this tool's result must ENFORCE (block promotion, feed the trust
+ * signal) — i.e. the content originated OUTSIDE the build's own worktree. Unknown origins return
+ * true (fail-closed). Exported for unit testing.
+ */
+export function isExternalToolOrigin(toolName: string): boolean {
+  return !WORKTREE_LOCAL_ORIGINS.has(toolName);
+}
+
 // RAIL 2: a tight, cheap-model-anchored prompt. Boxes the task so wandering is a
 // rejected move: state the success condition, read-before-write, state-the-change,
 // scope discipline, and a REQUIRED `done` self-check (a bare stop = INCOMPLETE). One
@@ -878,6 +909,11 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
   // (signals.injection) — the non-recoverable injection flag the trust ladder acts on. Without this
   // the chokepoint's `block` recommendation was dead: detected-and-wrapped, but never attributed.
   let injectionDetected = false;
+  // ENFORCEMENT subset of injectionDetected: a block verdict on content from OUTSIDE the worktree
+  // (web/vision/delegate/brain/phone/unknown). Only this discards green work + feeds the trust
+  // signal. Injection in the build's OWN worktree output (run_checks, file reads) is neutralized-
+  // and-inert → recorded for audit but judged by effect (see WORKTREE_LOCAL_ORIGINS).
+  let externalInjectionDetected = false;
   let toolRounds = 0;
   let iterations = 0; // total model rounds (tool rounds + corrective turns) — bounds the loop
   let bareStops = 0; // RAIL 3: times the model stopped without a valid done (corrective turns)
@@ -1378,7 +1414,13 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       neutralizedCount += 1;
       // The chokepoint scanned + wrapped this untrusted result. A `block` verdict (high-confidence
       // injection) is a first-class trust signal — record it so it reaches recordOutcome, not just the log.
-      if (safe.blocked) injectionDetected = true;
+      // Classify by ORIGIN: block verdicts on OUTSIDE content (web/vision/delegate/…) enforce; block
+      // verdicts on the build's own worktree output (run_checks/file reads) are neutralized-and-inert
+      // and judged by effect (recorded, not discarding). See WORKTREE_LOCAL_ORIGINS.
+      if (safe.blocked) {
+        injectionDetected = true;
+        if (isExternalToolOrigin(call.name)) externalInjectionDetected = true;
+      }
       // Emulated (text-protocol) rounds have no real tool_call_id to attach a tool-role message
       // to — feed the (still-neutralized) result back as a user-role data message instead.
       messages.push(
@@ -2095,6 +2137,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         stopReason,
         neutralizedCount,
         ...(injectionDetected ? { injectionDetected: true } : {}),
+        ...(externalInjectionDetected ? { externalInjectionDetected: true } : {}),
         rejectedToolCalls,
         policyViolations,
         toolFormatErrors,
@@ -2120,7 +2163,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       role: "builder",
       outcome: "failure",
       summary: `builder failed: ${errMsg(err)}`,
-      detail: { filesWritten, filesRead, toolRounds, stopReason: overflowed ? "context_overflow" : stopReason, neutralizedCount, ...(injectionDetected ? { injectionDetected: true } : {}), rejectedToolCalls, policyViolations: rejectedToolCalls.filter(isPolicyViolation), toolFormatErrors: rejectedToolCalls.filter((e) => !isPolicyViolation(e)) },
+      detail: { filesWritten, filesRead, toolRounds, stopReason: overflowed ? "context_overflow" : stopReason, neutralizedCount, ...(injectionDetected ? { injectionDetected: true } : {}), ...(externalInjectionDetected ? { externalInjectionDetected: true } : {}), rejectedToolCalls, policyViolations: rejectedToolCalls.filter(isPolicyViolation), toolFormatErrors: rejectedToolCalls.filter((e) => !isPolicyViolation(e)) },
     };
   } finally {
     // Tear down any MCP transports (spawned child processes) — once, on every exit path. Best-effort.
