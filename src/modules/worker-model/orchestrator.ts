@@ -3143,10 +3143,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         const adjUnverifiable = adjudicable ? classifyUnverifiableTarget() !== undefined : false;
         if (adjudicable && !adjUnverifiable) {
           const runRescueVerifier = makeRescueVerifier(spawned);
-          let wpNonEmpty: boolean | undefined;
           const detectWork = async (): Promise<{ nonEmpty: boolean }> => {
             const wp = await computeWorktreeWorkProduct(workspace.path, workspace.baseRef, task.taskId);
-            wpNonEmpty = wp.nonEmpty;
             return { nonEmpty: wp.nonEmpty };
           };
           // Always apply the rescue result: on GREEN it is the rescued success; on RED it is the
@@ -3155,12 +3153,6 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           const rescue = await maybeAutoVerifyRescueBuilderResult(result, runRescueVerifier, makeRunFixer(runRescueVerifier), detectWork);
           result = rescue.result;
           results[results.length - 1] = result;
-          log.info(
-            { taskId: task.taskId, workNonEmpty: wpNonEmpty ?? null, rescued: result.outcome === "success", rescueAttempted: (result.detail as Record<string, unknown> | undefined)?.autoVerifyRescueAttempted === true, rescueResult: String((result.detail as Record<string, unknown> | undefined)?.rescueVerificationResult ?? "none") },
-            "terminal adjudication: ran on the final builder result",
-          );
-        } else if (adjudicable) {
-          log.info({ taskId: task.taskId, reason: "unverifiable-target" }, "terminal adjudication: SKIPPED");
         }
 
         if (result.outcome !== "success") {
