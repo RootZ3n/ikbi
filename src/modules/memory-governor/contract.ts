@@ -24,10 +24,14 @@
  * CONTRACT_VERSION changelog:
  *   1.0.0 — initial memory-governor contract: MemoryProposal, MemoryGovernor surface,
  *           governed paths/slug checks, proposal lifecycle (pending → approved/rejected).
+ *   1.1.0 — `content` is now ALWAYS the COMPLETE resulting file for file surfaces (patch/
+ *           multi_edit are resolved to the whole file at propose-time, not stored as a
+ *           fragment) + optional `baseSha256` CAS guard so apply refuses a changed target
+ *           instead of clobbering it (Codex C8).
  */
 
 /** Semantic version of the memory-governor contract. Bump on breaking change. */
-export const CONTRACT_VERSION = "1.0.0";
+export const CONTRACT_VERSION = "1.1.0";
 
 // ---------------------------------------------------------------------------
 // Governed surfaces
@@ -70,8 +74,19 @@ export interface MemoryProposal {
   readonly surface: MemorySurface;
   /** The target identifier (file path or brain slug). */
   readonly target: string;
-  /** The proposed content to write. */
+  /**
+   * The proposed content to write. For FILE surfaces this is ALWAYS the COMPLETE
+   * resulting file (patch/multi_edit are resolved to the whole file at propose-time),
+   * never a fragment — applying it is a full-file replace.
+   */
   readonly content: string;
+  /**
+   * For FILE surfaces: sha256 of the target's content the proposal was computed against
+   * (the CAS base; hash of "" for a new file). Apply refuses when the target's current
+   * hash differs — the file changed since the proposal, so replacing it would clobber
+   * unseen edits. Absent for brain-page surfaces.
+   */
+  readonly baseSha256?: string;
   /** Why the model wants to write this (from the model's context). */
   readonly reason?: string;
   /** Which agent proposed this (agentId). */
@@ -93,6 +108,8 @@ export interface ProposalInput {
   readonly surface: MemorySurface;
   readonly target: string;
   readonly content: string;
+  /** CAS base hash (see MemoryProposal.baseSha256). Set for file surfaces. */
+  readonly baseSha256?: string;
   readonly reason?: string;
   readonly agentId: string;
 }

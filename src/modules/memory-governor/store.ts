@@ -60,6 +60,7 @@ export function createMemoryGovernor(deps: MemoryGovernorDeps = {}): MemoryGover
       surface: input.surface,
       target: input.target,
       content: input.content,
+      ...(input.baseSha256 !== undefined ? { baseSha256: input.baseSha256 } : {}),
       ...(input.reason !== undefined ? { reason: input.reason } : {}),
       agentId: input.agentId,
       status: "pending",

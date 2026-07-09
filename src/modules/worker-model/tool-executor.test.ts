@@ -15,7 +15,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { existsSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -112,29 +112,53 @@ test("executeTool: write_file rejects a symlink escape and does not write outsid
 
 // ── 3 + 4. patch / multi_edit to a governed surface → proposal ───────────────
 
-test("executeTool: patch to .ikbi/project.md becomes a proposal (no edit applied)", async () => {
+test("executeTool: patch to a governed file proposes the FULL resulting file + CAS hash (Codex C8)", async () => {
   const root = worktree();
   const gov = governor();
-  // The file does NOT need to exist — governance intercepts BEFORE runPatch reads it.
-  const res = await executeTool(baseDeps(root, { memoryGovernor: gov }), call("patch", { path: ".ikbi/project.md", old_string: "a", new_string: "b" }));
+  // The governed file must EXIST so the patch resolves against real content — a proposal
+  // now stores the WHOLE resulting file (not the fragment), so approval can't truncate it.
+  mkdirSync(join(root, ".ikbi"), { recursive: true });
+  writeFileSync(join(root, ".ikbi/project.md"), "line a\nkeep me\n", "utf8");
+  const res = await executeTool(baseDeps(root, { memoryGovernor: gov }), call("patch", { path: ".ikbi/project.md", old_string: "line a", new_string: "line b" }));
 
   assert.equal(res.proposed, true);
   assert.match(res.output, /^PROPOSED:/);
+  // The file itself is untouched until approval.
+  assert.equal(readFileSync(join(root, ".ikbi/project.md"), "utf8"), "line a\nkeep me\n", "no edit applied pre-approval");
   const pending = await gov.list("pending");
   assert.equal(pending.length, 1);
   assert.equal(pending[0]!.surface, "project_file");
-  assert.equal(pending[0]!.content, "b", "the proposal records the new text");
+  assert.equal(pending[0]!.content, "line b\nkeep me\n", "proposal carries the FULL resulting file, not the fragment");
+  assert.ok(pending[0]!.baseSha256 && pending[0]!.baseSha256.length === 64, "proposal carries a CAS base hash");
 });
 
-test("executeTool: multi_edit to AGENTS.md becomes a proposal", async () => {
+test("executeTool: a governed patch that cannot resolve is WITHHELD, not clobbering (Codex C8)", async () => {
   const root = worktree();
   const gov = governor();
+  mkdirSync(join(root, ".ikbi"), { recursive: true });
+  writeFileSync(join(root, ".ikbi/project.md"), "hello\n", "utf8");
+  // old_string absent from the file → cannot resolve → no proposal, an actionable error,
+  // and the governed file is NOT written (the old bug wrote "b" as the whole file).
+  const res = await executeTool(baseDeps(root, { memoryGovernor: gov }), call("patch", { path: ".ikbi/project.md", old_string: "NOPE", new_string: "b" }));
+
+  assert.equal(res.ok, false, "unresolvable governed write is a failure");
+  assert.notEqual(res.proposed, true);
+  assert.match(res.output, /not proposed|not found/);
+  assert.equal((await gov.list("pending")).length, 0, "no clobbering proposal is created");
+  assert.equal(readFileSync(join(root, ".ikbi/project.md"), "utf8"), "hello\n", "target untouched");
+});
+
+test("executeTool: multi_edit to a governed file proposes the FULL resulting file", async () => {
+  const root = worktree();
+  const gov = governor();
+  writeFileSync(join(root, "AGENTS.md"), "x and more\n", "utf8");
   const res = await executeTool(baseDeps(root, { memoryGovernor: gov }), call("multi_edit", { path: "AGENTS.md", edits: [{ find: "x", replace: "y" }] }));
 
   assert.equal(res.proposed, true);
   const pending = await gov.list("pending");
   assert.equal(pending.length, 1);
   assert.equal(pending[0]!.target, `${root}/AGENTS.md`);
+  assert.equal(pending[0]!.content, "y and more\n", "full resulting file, not the edits JSON");
 });
 
 // ── 5. brain_put → proposal (never reaches the bridge) ───────────────────────

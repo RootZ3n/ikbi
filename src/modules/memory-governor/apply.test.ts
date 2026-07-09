@@ -11,9 +11,10 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, readFileSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 import { applyFileProposal, createBrainApply, createCombinedApply } from "./apply.js";
 import { createProductionGovernor } from "./create.js";
 import type { MemoryProposal, ProposalInput } from "./contract.js";
@@ -90,6 +91,42 @@ test("applyFileProposal: overwrites existing file", async () => {
   await applyFileProposal(p);
 
   assert.equal(readFileSync(target, "utf8"), "new content\n");
+});
+
+// ── CAS guard (Codex C8) ─────────────────────────────────────────────────────
+
+test("applyFileProposal: refuses to overwrite when the target changed since the proposal (CAS)", async () => {
+  const dir = tmp();
+  const target = join(dir, "CLAUDE.md");
+  writeFileSync(target, "base\n", "utf8");
+  const baseSha256 = createHash("sha256").update("base\n").digest("hex");
+  // A human edits the file AFTER the proposal was computed.
+  writeFileSync(target, "changed by a human\n", "utf8");
+  const p: MemoryProposal = { ...proposal({ surface: "instruction_file", target, content: "full new file\n" }), baseSha256 };
+
+  await assert.rejects(() => applyFileProposal(p), /changed since the proposal|refusing to overwrite/);
+  assert.equal(readFileSync(target, "utf8"), "changed by a human\n", "the human's edit is preserved, not clobbered");
+});
+
+test("applyFileProposal: applies when the target still matches the CAS base", async () => {
+  const dir = tmp();
+  const target = join(dir, "CLAUDE.md");
+  writeFileSync(target, "base\n", "utf8");
+  const baseSha256 = createHash("sha256").update("base\n").digest("hex");
+  const p: MemoryProposal = { ...proposal({ surface: "instruction_file", target, content: "full new file\n" }), baseSha256 };
+
+  await applyFileProposal(p);
+  assert.equal(readFileSync(target, "utf8"), "full new file\n");
+});
+
+test("applyFileProposal: a CAS base of empty applies only to an absent/empty target", async () => {
+  const dir = tmp();
+  const target = join(dir, "new.md");
+  const baseSha256 = createHash("sha256").update("").digest("hex");
+  const p: MemoryProposal = { ...proposal({ surface: "instruction_file", target, content: "created\n" }), baseSha256 };
+
+  await applyFileProposal(p); // target absent → hash of "" matches → applies
+  assert.equal(readFileSync(target, "utf8"), "created\n");
 });
 
 // ── createBrainApply ─────────────────────────────────────────────────────────
