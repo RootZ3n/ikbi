@@ -4,8 +4,8 @@
 
 import { mkdirSync, readFileSync, writeFileSync, readdirSync, existsSync, renameSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
+import { config } from "../../core/config.js";
 import type { SpecArtifact, SpecCardFields, SpecStep } from "./contract.js";
 
 /** Reject ids that could escape the store directory (GLM 5.2 LOW-3). */
@@ -15,8 +15,15 @@ function assertSafeId(id: string): void {
   }
 }
 
+/**
+ * Resolve the store directory. Defaults UNDER `config.stateRoot` (which honors
+ * `IKBI_STATE_ROOT`) — NOT the real home. Writing to `~/.ikbi/specs` regardless
+ * of state root was the truth-half false-RED: the mid-build verifier runs the
+ * suite under bubblewrap where home is read-only, so spec-route init threw and
+ * a green tree was certified RED. Codex audit H1.
+ */
 export function resolveStoreDir(override?: string): string {
-  return override ?? join(homedir(), ".ikbi", "specs");
+  return override ?? join(config.stateRoot, "specs");
 }
 
 function ensureDir(dir: string): void {
