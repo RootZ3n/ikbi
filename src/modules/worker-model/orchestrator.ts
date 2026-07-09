@@ -172,10 +172,27 @@ import { existsSync, readdirSync, readFileSync, symlinkSync, mkdirSync, type Dir
 import { join, basename } from "node:path";
 
 /**
+ * Given `git status --porcelain` output, report whether the working tree has TRACKED
+ * uncommitted changes (staged or unstaged). Untracked files (the `??` lines) are IGNORED:
+ * a build worktree is cut from HEAD, so untracked files are never carried into it and cannot
+ * conflict with auto-commit promotion — refusing on them (e.g. a stray build tarball or a
+ * generated lockfile) blocks the common case to guard a rare one. A genuine path collision
+ * (an untracked file at a path the build later creates) surfaces at promotion time, where the
+ * workspace manager already fails closed. Exported for unit testing.
+ */
+export function porcelainHasTrackedChanges(porcelain: string): boolean {
+  return porcelain
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => line.length > 0)
+    .some((line) => !line.startsWith("??"));
+}
+
+/**
  * Run `git status --porcelain` on `targetRepo`. Returns a human-readable reason
- * string when the repo has uncommitted changes, undefined when clean or when git
- * is unavailable / the path is not a git repo (fail-open: let workspace allocation
- * surface the real error).
+ * string when the repo has uncommitted TRACKED changes, undefined when clean (or only
+ * untracked files are present), or when git is unavailable / the path is not a git repo
+ * (fail-open: let workspace allocation surface the real error).
  */
 function liveCheckTargetDirty(targetRepo: string): string | undefined {
   try {
@@ -183,8 +200,10 @@ function liveCheckTargetDirty(targetRepo: string): string | undefined {
       encoding: "utf8",
       timeout: 5000,
       maxBuffer: 1024 * 1024,
-    }).trim();
-    return out.length === 0 ? undefined : "target repo has uncommitted changes — commit or stash them first";
+    });
+    return porcelainHasTrackedChanges(out)
+      ? "target repo has uncommitted changes — commit or stash them first"
+      : undefined;
   } catch {
     return undefined; // git unavailable or not a git repo — let workspace allocation handle it
   }

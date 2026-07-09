@@ -19,7 +19,7 @@ import type { OperationContext } from "../../core/identity/resolver.js";
 import { autonomyForTier, asTier, type TrustDecision } from "../../core/trust/index.js";
 import { tierRank, TRUST_FLOOR } from "../../core/trust/index.js";
 import type { DiscardResult, PromoteGovernance, PromoteResult, WorkspaceEvaluation, WorkspaceHandle } from "../../core/workspace/contract.js";
-import { createOrchestrator, type OrchestratorDeps } from "./orchestrator.js";
+import { createOrchestrator, porcelainHasTrackedChanges, type OrchestratorDeps } from "./orchestrator.js";
 import { integrator as realIntegrator } from "./integrator.js";
 import { escalationConfig } from "../escalation/index.js";
 import { loadWorkerModelConfig } from "./config.js";
@@ -1888,6 +1888,20 @@ test("Fix2: dirty-repo check skipped when reuseWorkspace is set (step-planner pa
   const result = await orch.run({ ...task, reuseWorkspace: existing }, parentCtx);
   assert.equal(checkCalled, false, "dirty check is not run when reuseWorkspace is set");
   assert.notEqual(result.outcome, "rejected", "step-planner path is not affected by dirty check");
+});
+
+test("Fix2: dirty-repo check ignores untracked-only files (build worktree is cut from HEAD)", () => {
+  // Untracked files never enter a from-HEAD worktree, so they must not block a build.
+  assert.equal(porcelainHasTrackedChanges(""), false, "empty status → clean");
+  assert.equal(
+    porcelainHasTrackedChanges("?? ikbi-0.1.0-rc.1.tgz\n?? .claude/\n?? scripts/ui-verify/package-lock.json"),
+    false,
+    "untracked-only → not dirty",
+  );
+  // Any tracked change (staged or unstaged) still counts as dirty.
+  assert.equal(porcelainHasTrackedChanges(" M src/foo.ts"), true, "modified tracked file → dirty");
+  assert.equal(porcelainHasTrackedChanges("A  src/new.ts"), true, "staged add → dirty");
+  assert.equal(porcelainHasTrackedChanges("?? junk.txt\n M src/foo.ts"), true, "mixed → dirty (tracked change present)");
 });
 
 // ── Fix 3: workspace manifest check ───────────────────────────────────────────────────────────
