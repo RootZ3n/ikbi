@@ -473,24 +473,21 @@ test("POLICY TAINT: a PREVENTED out-of-policy attempt does NOT discard a verifie
   let attempt = 0;
   const roles: Partial<Record<WorkerRole, RoleFn>> = {
     ...cap.roles,
-    builder: async (ctx: RoleContext): Promise<RoleResult> => {
+    builder: async (): Promise<RoleResult> => {
       attempt += 1;
-      // Attempt 1: writes files AND attempts a BLOCKED out-of-policy tool call (a prevented attempt —
-      // the governor rejected it, no effect), then fails → triggers a retry.
-      if (!ctx.task.goal.includes("[retry]") && !ctx.task.goal.includes("[escalation]")) {
-        return { role: "builder", outcome: "failure", summary: "flailed after a blocked call", detail: { filesWritten: ["a.ts"], policyViolations: [{ tool: "terminal", error: "blocked: pnpm run deploy" }], toolFormatErrors: [1, 2] } };
-      }
-      // The retry finishes CLEAN and green. EFFECT, NOT INTENT: the earlier PREVENTED attempt (blocked,
-      // no effect) is a recorded warning + learning signal, NOT a discard — the verified-green build promotes.
-      return { role: "builder", outcome: "success", summary: "clean retry", detail: { filesWritten: ["a.ts"], policyViolations: [] } };
+      // The builder writes files AND attempts a BLOCKED out-of-policy tool call (a prevented attempt —
+      // the governor rejected it, no effect), then hits a protocol failure. ADJUDICATION now runs the
+      // verifier on its work-on-disk: a GREEN verifier rescues it directly (no retry needed). EFFECT,
+      // NOT INTENT: the prevented attempt is a recorded warning + learning signal, NOT a discard.
+      return { role: "builder", outcome: "failure", summary: "flailed after a blocked call", detail: { stopReason: "no_progress", filesWritten: ["a.ts"], policyViolations: [{ tool: "terminal", error: "blocked: pnpm run deploy" }], toolFormatErrors: [1, 2] } };
     },
   };
   const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces }));
   const result = await orch.run({ taskId: "t-taint", targetRepo: "/repo", goal: "do the thing" }, parentCtx);
 
-  assert.ok(attempt >= 2, "the retry path ran (attempt 1 attempted a blocked call + failed, then a clean retry)");
-  assert.equal(result.promoted, true, "a PREVENTED attempt does not discard a verified-green build — it promotes");
-  assert.equal(ws.calls.promote, 1, "the green build promoted");
+  assert.ok(attempt >= 1, "the builder ran and left green work with a prevented policy attempt");
+  assert.equal(result.promoted, true, "a PREVENTED attempt does not discard a verified-green build — adjudication promotes it");
+  assert.equal(ws.calls.promote, 1, "the green build promoted (judged by effect, not intent)");
 });
 
 test("ISSUE 1: a builder TIMEOUT does NOT feed the trust signal (no demotion) and writes an explicit suppression receipt", async () => {
@@ -651,8 +648,14 @@ test("AUTO-VERIFY RESCUE: applies to every protocol termination (timeout / max_i
   }
 });
 
-test("AUTO-VERIFY RESCUE: a MODEL-failure stop (error/length/content_filter) is NOT rescued even if the verifier would pass", async () => {
-  for (const stop of ["error", "length", "content_filter", "unknown"] as const) {
+test("ADJUDICATION: any builder failure with work on disk is adjudicated regardless of stop reason (the verifier is the witness)", async () => {
+  // CONTRACT CHANGE (Adjudication Core, targeted increment): the old auto-verify rescue only fired on
+  // an ALLOWLIST of four "protocol termination" stops and discarded correct GREEN work for every other
+  // exit unseen — the recurring false-RED. Now the verifier, not the builder's exit code, is the
+  // witness: ANY failing exit that left work on disk (a model-failure stop error/length/content_filter,
+  // an unknown stop, a tool-call stall) is adjudicated, and a GREEN verifier rescues it. A red verifier
+  // still fails closed (pinned by the "RED rescue verifier" test below).
+  for (const stop of ["error", "length", "content_filter", "unknown", "tool_call_stalled"] as const) {
     const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
     const cap = capturingRoles();
     let verifierRuns = 0;
@@ -661,11 +664,12 @@ test("AUTO-VERIFY RESCUE: a MODEL-failure stop (error/length/content_filter) is 
       builder: builderNoChecks(stop),
       verifier: async (ctx) => { verifierRuns += 1; return cap.roles.verifier!(ctx); },
     };
-    const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles }));
+    const ws = fakeWorkspaces(true);
+    const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces }));
     const result = await orch.run(task, parentCtx);
-    assert.equal(result.roles.find((r) => r.role === "builder")?.outcome, "failure", `${stop} stays a failure`);
-    assert.equal(verifierRuns, 0, `${stop} never runs the rescue verifier (builder failure short-circuits)`);
-    assert.equal(result.promoted, false, `${stop} does not promote`);
+    assert.ok(verifierRuns >= 1, `${stop}: the rescue verifier runs (work on disk is adjudicated)`);
+    assert.equal(result.roles.find((r) => r.role === "builder")?.outcome, "success", `${stop}: a green verifier rescues the build`);
+    assert.equal(result.promoted, true, `${stop}: rescued green work promotes`);
   }
 });
 

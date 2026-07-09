@@ -213,11 +213,12 @@ function liveCheckTargetDirty(targetRepo: string): string | undefined {
 }
 
 /**
- * ADJUDICATION CORE — shadow WorkProduct producer. Runs read-only git in the worktree (a throwaway
- * index for the tree hash, so the real index/working tree are untouched). Used ONLY by the Step-2
- * shadow instrumentation, which never affects the build; all callers wrap this in try/catch.
+ * ADJUDICATION CORE — WorkProduct producer. Runs read-only git in the worktree (a throwaway index for
+ * the tree hash, so the real index/working tree are untouched) to get GROUND-TRUTH work-on-disk — the
+ * replacement for the builder's self-reported `filesWritten` ledger. Used by the Step-2 shadow
+ * instrumentation (wrapped in try/catch) AND by the auto-verify rescue's work detection.
  */
-async function shadowComputeWorkProduct(workspacePath: string, baseRef: string, taskId: string): Promise<import("./adjudication/index.js").WorkProduct> {
+async function computeWorktreeWorkProduct(workspacePath: string, baseRef: string, taskId: string): Promise<import("./adjudication/index.js").WorkProduct> {
   const git: GitRunner = async (args, opts) =>
     execFileSync("git", ["-C", workspacePath, ...args], {
       encoding: "utf8",
@@ -1535,21 +1536,27 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     return undefined;
   }
 
-  // ── AUTO-VERIFY RESCUE HELPER ────────────────────────────────────────────────
-  // Extracted so every orchestrator path (single-run, competitive, tournament) can
-  // rescue a builder that wrote correct code but hit a protocol termination (no_progress,
-  // max_iterations, timeout, stuck_detected) before ever calling run_checks.
+  // ── AUTO-VERIFY RESCUE HELPER (ADJUDICATION, targeted increment) ─────────────
+  // Adjudicate ANY builder failure that left work on disk: the verifier — not the builder's exit
+  // code — is the witness to whether the work is good. Shared by every orchestrator path (single-run,
+  // competitive, tournament).
   //
-  // Design constraints (from the user spec):
-  //   • Only applies to the builder role.
-  //   • Only fires on protocol terminations (NOT model-failure stops like error/content_filter).
-  //   • Requires filesWritten > 0 (something on disk to verify).
-  //   • Requires zero policy violations (fail-closed on unsafe work).
-  //   • Runs the REAL verifier — no weakening, no bypass.
-  //   • Stamps autoVerifyRescue: true + original_builder_stop + files_written on the result.
-  //   • Fail-closed: if the verifier is RED or blocked, the original failure stands.
-
-  const RESCUABLE_TERMINATIONS: ReadonlySet<string> = new Set(["max_iterations", "timeout", "stuck_detected", "no_progress"]);
+  // WHAT CHANGED (root fix for the recurring false-RED): the old version rescued ONLY four
+  // "protocol-termination" stop reasons (no_progress/max_iterations/timeout/stuck_detected) and keyed
+  // work-on-disk off the builder's self-reported `filesWritten` LEDGER. That discarded correct GREEN
+  // work for every OTHER exit (tool_call_stalled, context_overflow, a hard error that still left a
+  // green tree) and whenever the ledger desynced from disk (files written via governed `terminal`, or
+  // the loop cut mid-write). Now: rescue fires on ANY builder failure, and work-on-disk is GIT ground
+  // truth when a detector is wired (else the ledger, for callers that don't wire one).
+  //
+  // This can NEVER promote bad work — the REAL verifier is the gate; a red/blocked verifier still
+  // fails closed and the original failure stands. It only stops discarding GOOD work unseen. A KILLED
+  // run is handled by the orchestrator's kill short-circuit BEFORE the rescue, so a half-run is never
+  // adjudicated here.
+  //
+  // Invariants preserved: runs the REAL verifier (no weakening); prevented policy violations are judged
+  // by effect (a governor-blocked attempt does not block adjudication); RED verifier ⇒ original failure
+  // stands; stamps autoVerifyRescue + originalBuilderStop for observability.
 
   /**
    * If `builderResult` is a protocol-terminated builder failure with written files and
@@ -1568,6 +1575,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // then re-verifies, and reports whether it closed the checks. Absent ⇒ a red verifier is terminal
     // (unchanged behavior). See config.fixerModel.
     runFixer?: (redVerify: RoleResult) => Promise<{ fixed: boolean; verify: RoleResult }>,
+    // ADJUDICATION: ground-truth work-on-disk detector (git). When wired, work is read from the
+    // worktree; absent ⇒ fall back to the builder's filesWritten ledger. Returns nonEmpty.
+    detectWork?: () => Promise<{ nonEmpty: boolean }>,
   ): Promise<{ result: RoleResult; rescueVerify?: RoleResult }> {
     // Guard: only rescue builder failures.
     if (builderResult.role !== "builder" || builderResult.outcome !== "failure") {
@@ -1577,10 +1587,20 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     const builderStop = typeof bd.stopReason === "string" ? bd.stopReason : "";
     const builderFilesWritten = Array.isArray(bd.filesWritten) ? bd.filesWritten.length : 0;
 
-    // Guard: only protocol terminations, not model-failure stops.
-    if (!RESCUABLE_TERMINATIONS.has(builderStop)) return { result: builderResult };
-    // Guard: must have files on disk to verify.
-    if (builderFilesWritten <= 0) return { result: builderResult };
+    // Guard: must have WORK ON DISK to verify — git ground truth when wired, else the ledger. NO
+    // stop-reason allowlist: any failing exit that left work is adjudicated (the verifier is the gate).
+    // A git-detection failure degrades to the ledger (never throws out of the rescue).
+    let hasWork: boolean;
+    if (detectWork !== undefined) {
+      try {
+        hasWork = (await detectWork()).nonEmpty;
+      } catch {
+        hasWork = builderFilesWritten > 0;
+      }
+    } else {
+      hasWork = builderFilesWritten > 0;
+    }
+    if (!hasWork) return { result: builderResult };
     // JUDGE BY EFFECT, NOT INTENT: a policy violation in ikbi is a PREVENTED (rejected) tool call — the
     // governor/sandbox blocked it, so it had NO effect. A prevented attempt is evidence the governor
     // WORKED; it must NOT block the rescue/fixer from running the REAL verifier on the actual worktree.
@@ -2184,9 +2204,17 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         // ── AUTO-VERIFY RESCUE: builder wrote files but hit a protocol stop before run_checks ──
         // Delegated to maybeAutoVerifyRescueBuilderResult (shared with competitive/tournament).
         // Rescue verifier reuses the builder's spawn (unchanged behavior).
-        if (role === "builder") {
+        // Skip adjudication on an UNVERIFIABLE target (no derivable checks): the rescue verifier would
+        // only return unresolvable, and a stronger model cannot fix a missing verifier — running it
+        // would waste a dispatch and bypass the fail-closed unverifiable classification below.
+        if (role === "builder" && classifyUnverifiableTarget() === undefined) {
           const runRescueVerifier = makeRescueVerifier(spawned);
-          const rescue = await maybeAutoVerifyRescueBuilderResult(result, runRescueVerifier, makeRunFixer(runRescueVerifier));
+          // ADJUDICATION: detect work-on-disk from git ground truth (not the builder's ledger).
+          const detectWork = async (): Promise<{ nonEmpty: boolean }> => {
+            const wp = await computeWorktreeWorkProduct(workspace.path, workspace.baseRef, task.taskId);
+            return { nonEmpty: wp.nonEmpty };
+          };
+          const rescue = await maybeAutoVerifyRescueBuilderResult(result, runRescueVerifier, makeRunFixer(runRescueVerifier), detectWork);
           result = rescue.result;
           results[results.length - 1] = result;
         }
@@ -3215,7 +3243,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // the build. Gated by IKBI_ADJUDICATION_SHADOW (default on; set "off" to silence).
     if ((modeEnv.IKBI_ADJUDICATION_SHADOW ?? "on") !== "off") {
       try {
-        const wp = await shadowComputeWorkProduct(workspace.path, workspace.baseRef, task.taskId);
+        const wp = await computeWorktreeWorkProduct(workspace.path, workspace.baseRef, task.taskId);
         const verifierResult = results.find((r) => r.role === "verifier");
         const rv = readVerifier(verifierResult);
         const rawVerdict = (verifierResult?.detail as Record<string, unknown> | undefined)?.verdict;
