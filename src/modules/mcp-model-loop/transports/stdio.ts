@@ -24,6 +24,7 @@ import { spawn as nodeSpawn } from "node:child_process";
 
 import { childLogger } from "../../../core/log.js";
 import type { McpToolDef, McpTransport } from "../contract.js";
+import { parseLenientArgs } from "../lenient-args.js";
 
 const log = childLogger("mcp-stdio");
 
@@ -209,18 +210,28 @@ export function createStdioTransport(options: StdioTransportOptions): McpTranspo
 
     async callTool(name: string, argsJson: string): Promise<string> {
       let args: unknown = {};
-      try {
-        args = argsJson && argsJson.length > 0 ? JSON.parse(argsJson) : {};
-      } catch (e) {
-        // L3: a tool call whose arguments are not valid JSON falls back to `{}` so the call
-        // still proceeds, but that silently DROPS the model's intended arguments. Warn so the
-        // dropped payload is observable (e.g. a truncated/garbled arg string from a cheap model)
-        // rather than masquerading as a deliberate no-arg call.
-        log.warn(
-          { tool: name, argLen: argsJson?.length ?? 0, err: e instanceof Error ? e.message : String(e) },
-          "mcp callTool: tool arguments were not valid JSON — falling back to empty arguments {}",
-        );
-        args = {};
+      if (argsJson && argsJson.length > 0) {
+        // Weak models frequently emit near-JSON (single quotes, trailing commas, Python
+        // literals). parseLenientArgs repairs the common cases — every repair verified by
+        // re-parse, so it can never invent arguments the model did not send. Only if nothing
+        // parses do we fall back to `{}`, which silently DROPS the intended arguments and can
+        // stall a cheap builder on "no_progress" (it keeps re-emitting the same near-JSON).
+        const parsed = parseLenientArgs(argsJson);
+        if (parsed === undefined) {
+          log.warn(
+            { tool: name, argLen: argsJson.length },
+            "mcp callTool: tool arguments were not valid JSON (repair failed) — falling back to empty arguments {}",
+          );
+          args = {};
+        } else {
+          if (parsed.repaired) {
+            log.info(
+              { tool: name, argLen: argsJson.length },
+              "mcp callTool: repaired near-JSON tool arguments from the model",
+            );
+          }
+          args = parsed.value;
+        }
       }
       const result = (await request("tools/call", { name, arguments: args })) as { content?: unknown };
       const content = Array.isArray(result?.content) ? result.content : [];
