@@ -52,6 +52,7 @@ function isPublicPath(url: string): boolean {
  * Public endpoints (/health, /ready, /agent, /capabilities) are always exempt.
  */
 export async function apiAuth(request: FastifyRequest, reply: FastifyReply): Promise<void> {
+  if (reply.sent) return; // idempotent — a prior auth hook already answered (composes with per-module hooks)
   if (isPublicPath(request.url)) return; // public endpoint — no auth required
   const token = apiToken();
   if (token === undefined) return; // no token configured → open (local network)

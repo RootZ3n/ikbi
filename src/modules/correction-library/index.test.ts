@@ -425,3 +425,45 @@ test("DELETE /ikbi/corrections/:id rejects (200) or 404", async () => {
     assert.equal(missing.statusCode, 404);
   });
 });
+
+// ── Global auth mount (Codex C6) ──────────────────────────────────────────────
+// The shared bearer gate is now installed on EVERY module registrar's encapsulation,
+// so a governed route (correction approve) can no longer be reached unauthenticated
+// when IKBI_API_TOKEN is set — even though correction-library adds no auth hook itself.
+
+test("correction routes require the shared bearer when IKBI_API_TOKEN is set (C6)", async () => {
+  const prevToken = process.env.IKBI_API_TOKEN;
+  process.env.IKBI_API_TOKEN = "s3cret-token";
+  try {
+    await withServer(async (app) => {
+      // No Authorization header → 401.
+      const noAuth = await app.inject({
+        method: "POST",
+        url: "/ikbi/corrections",
+        payload: { category: "custom", finding: "a", correction: "b", regression: "c" },
+      });
+      assert.equal(noAuth.statusCode, 401, "unauthenticated correction propose is rejected");
+
+      // Wrong token → 401.
+      const wrong = await app.inject({
+        method: "POST",
+        url: "/ikbi/corrections",
+        headers: { authorization: "Bearer nope" },
+        payload: { category: "custom", finding: "a", correction: "b", regression: "c" },
+      });
+      assert.equal(wrong.statusCode, 401, "wrong bearer is rejected");
+
+      // Correct token → allowed (201).
+      const ok = await app.inject({
+        method: "POST",
+        url: "/ikbi/corrections",
+        headers: { authorization: "Bearer s3cret-token" },
+        payload: { category: "custom", finding: "a", correction: "b", regression: "c" },
+      });
+      assert.equal(ok.statusCode, 201, "correct bearer is accepted");
+    });
+  } finally {
+    if (prevToken === undefined) delete process.env.IKBI_API_TOKEN;
+    else process.env.IKBI_API_TOKEN = prevToken;
+  }
+});

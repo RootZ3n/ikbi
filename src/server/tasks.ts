@@ -61,6 +61,7 @@ function bearerOf(header: string | undefined): string | undefined {
  * API does NOT refuse-open — it is the explicitly local-only integration surface.
  */
 async function apiAuth(request: FastifyRequest, reply: FastifyReply): Promise<void> {
+  if (reply.sent) return; // idempotent — the shared global auth hook may have already answered
   const token = apiToken();
   if (token === undefined) return; // no token configured ⇒ open (local network)
   const presented = bearerOf(request.headers.authorization);
