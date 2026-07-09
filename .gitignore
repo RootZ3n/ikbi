@@ -33,5 +33,8 @@ reports/proving-ground/reachability/
 *.swp
 .idea/
 .vscode/
-memory-governor/
+# Runtime proposal store (only if state ever lands at the repo root). Root-ANCHORED so it
+# does NOT shadow the source module src/modules/memory-governor/ — an unanchored pattern
+# silently untracked new source files there.
+/memory-governor/
 scripts/ui-verify/node_modules/
