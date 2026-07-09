@@ -2204,20 +2204,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         // ── AUTO-VERIFY RESCUE: builder wrote files but hit a protocol stop before run_checks ──
         // Delegated to maybeAutoVerifyRescueBuilderResult (shared with competitive/tournament).
         // Rescue verifier reuses the builder's spawn (unchanged behavior).
-        // Skip adjudication on an UNVERIFIABLE target (no derivable checks): the rescue verifier would
-        // only return unresolvable, and a stronger model cannot fix a missing verifier — running it
-        // would waste a dispatch and bypass the fail-closed unverifiable classification below.
-        if (role === "builder" && classifyUnverifiableTarget() === undefined) {
-          const runRescueVerifier = makeRescueVerifier(spawned);
-          // ADJUDICATION: detect work-on-disk from git ground truth (not the builder's ledger).
-          const detectWork = async (): Promise<{ nonEmpty: boolean }> => {
-            const wp = await computeWorktreeWorkProduct(workspace.path, workspace.baseRef, task.taskId);
-            return { nonEmpty: wp.nonEmpty };
-          };
-          const rescue = await maybeAutoVerifyRescueBuilderResult(result, runRescueVerifier, makeRunFixer(runRescueVerifier), detectWork);
-          result = rescue.result;
-          results[results.length - 1] = result;
-        }
+        // NOTE: adjudication of a builder failure is done ONCE, at the TERMINAL adjudication point below
+        // (just before the short-circuit), on the FINAL builder result — so it covers work produced by
+        // ESCALATION too, and there is a single verifier dispatch (one decision point, per the design).
+        // The old per-attempt rescue here only saw the FIRST attempt and missed escalated work.
 
         // ── FIXER-ON-VERIFIER-FAIL RESCUE: the builder declared SUCCESS but the MAIN verifier caught a
         // FIXABLE red check (e.g. one leftover TS error). Without this, that build is discarded
@@ -3140,6 +3130,27 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               if (builderIdx >= 0) results[builderIdx] = result;
             }
           }
+        }
+
+        // TERMINAL ADJUDICATION (Adjudication Core): `result` here is the FINAL builder result — INCLUDING
+        // work produced by ESCALATION (the pro tier), which the per-attempt rescue above (it runs BEFORE
+        // escalation) never sees. If that final tree has work on a verifiable target, adjudicate it once
+        // more: run the verifier on the FINAL disk state and rescue on GREEN. THIS is what closes the
+        // false-RED that the per-attempt rescue alone could not — a stalled builder OR a stalled ESCALATED
+        // builder that left correct green work is no longer discarded unseen. Fail-closed: a red verifier
+        // leaves the failure to short-circuit below; killed runs never reach here (kill short-circuits).
+        if (role === "builder" && result.outcome !== "success" && classifyUnverifiableTarget() === undefined) {
+          const runRescueVerifier = makeRescueVerifier(spawned);
+          const detectWork = async (): Promise<{ nonEmpty: boolean }> => {
+            const wp = await computeWorktreeWorkProduct(workspace.path, workspace.baseRef, task.taskId);
+            return { nonEmpty: wp.nonEmpty };
+          };
+          // Always apply the rescue result: on GREEN it is the rescued success; on RED it is the
+          // original failure with the rescue stamps (autoVerifyRescueAttempted / rescueVerificationResult)
+          // for observability. Either way it never turns a success into a failure.
+          const rescue = await maybeAutoVerifyRescueBuilderResult(result, runRescueVerifier, makeRunFixer(runRescueVerifier), detectWork);
+          result = rescue.result;
+          results[results.length - 1] = result;
         }
 
         if (result.outcome !== "success") {
