@@ -169,6 +169,41 @@ export const invoker = new ProviderInvoker({
 });
 
 /**
+ * C9 — a `role:"tool"` message reached model-request construction WITHOUT an explicit trust decision.
+ * A tool RESULT is external-or-harness content: it must EITHER enter via the neutralization chokepoint
+ * (`toUntrustedMessage` ⇒ `untrusted:true`) for tool/command/web/MCP/repo output, OR be marked
+ * `untrusted:false` DELIBERATELY for ikbi-authored harness feedback (check results, protocol hints).
+ * An `undefined` flag means nobody triaged it — a bare tool-result string, the exact prompt-injection
+ * bypass this guard refuses fail-closed. This is a construction bug, never retried.
+ */
+export class UntriagedToolMessageError extends Error {
+  readonly index: number;
+  constructor(index: number) {
+    super(
+      `model-request rejected (C9): role:"tool" message [${index}] has no explicit \`untrusted\` trust decision. ` +
+        `Route external tool/command/web/MCP/repo output through toUntrustedMessage (untrusted:true), or mark ` +
+        `ikbi-authored harness feedback untrusted:false explicitly. Bare tool-result strings are refused fail-closed.`,
+    );
+    this.name = "UntriagedToolMessageError";
+    this.index = index;
+  }
+}
+
+/**
+ * C9 fail-closed guard: every `role:"tool"` message in a request must carry an EXPLICIT `untrusted`
+ * flag (true = neutralized external content, false = deliberate ikbi-authored feedback). An untriaged
+ * tool result (flag undefined) is a neutralization-chokepoint bypass and is rejected here — the single
+ * request-construction seam every model call passes through.
+ */
+function assertToolMessagesTriaged(request: ModelRequest): void {
+  const msgs = request.messages;
+  if (msgs === undefined) return;
+  for (let i = 0; i < msgs.length; i += 1) {
+    if (msgs[i]!.role === "tool" && msgs[i]!.untrusted === undefined) throw new UntriagedToolMessageError(i);
+  }
+}
+
+/**
  * The frozen entry point. Every model call in the engine goes through this.
  *
  * The caching floor wraps here — ABOVE the invoker loop and the egress guard. A
@@ -178,6 +213,13 @@ export const invoker = new ProviderInvoker({
  * disabled this is an exact passthrough to `invoker.invokeModel`.
  */
 export function invokeModel(request: ModelRequest): Promise<ModelResponse> {
+  // C9: reject bare (un-neutralized) tool-result strings — as a REJECTION so `.catch`/`await` callers
+  // both fail closed uniformly (never a divergent sync throw at only some call sites).
+  try {
+    assertToolMessagesTriaged(request);
+  } catch (e) {
+    return Promise.reject(e);
+  }
   return wrapModelInvocation(request, () => invoker.invokeModel(request));
 }
 
@@ -189,6 +231,11 @@ export function invokeModel(request: ModelRequest): Promise<ModelResponse> {
  * request/response on `invokeModel`.
  */
 export function invokeModelStream(request: ModelRequest): Promise<ModelStream> {
+  try {
+    assertToolMessagesTriaged(request); // C9: same fail-closed guard on the streaming path
+  } catch (e) {
+    return Promise.reject(e);
+  }
   return invoker.invokeModelStream(request);
 }
 
