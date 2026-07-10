@@ -62,8 +62,8 @@ One service: **snapshot → integrate → verify(immutable tree) → adjudicate(
 | C1b | C1 | remove boolean `accumulatedPass`; evidence must be executed + tree-bound | ✅ 7ee6861 |
 | C1c | C1 | branded, hash-bound promotion authorization: `WorkspaceManager.promote()` accepts `verifiedAgainst {targetHead, integratedTree}`, refuses on moved-target / tree-mismatch (fail-closed, optional). FOLLOW-UP: thread it into the call sites + re-verify loop = Cx | ✅ f1ac6d3 |
 | C3 | C3 | deterministic judge disqualifies zero/absent/unverified evidence (LAYER-1 override, not down-rank); ranks only admissible; aligned with the single-run integrator "executed"-required gate; judge grants no promotability | ✅ 2ba6cbf |
-| C7 | C7 | batch workers produce retained candidates only; replay into ONE integration workspace; conflict check + full verify combined tree; adjudicate once; one promote | ⬜ |
-| Cx | — | funnel single/competitive/tournament/batch/chat-apply/self-heal through the one terminal executor; make Adjudication Core authoritative (flip `IKBI_LEGACY_COMPLETION`, land I1–I9 guard tests); thread C1c `verifiedAgainst` into every promote + re-verify on moved target | ⬜ |
+| C7 | C7 | batch workers produce retained candidates only; replay into ONE integration workspace; conflict check + full verify combined tree; adjudicate once; one promote | ⬜ big refactor |
+| Cx | — | make Adjudication Core authoritative (flip `IKBI_LEGACY_COMPLETION`) + funnel all paths + thread C1c `verifiedAgainst`. **I1/I2/I4/I5/I6/I7 guard fixtures LANDED (eaa75c8 + earlier);** I3/I8/I9 are integration-level (need the flip). The concrete C1 correctness bugs are ALREADY fixed (C1a/b/c/C3); Cx is the ARCHITECTURAL centralization + default-flip. **Design GATES the flip behind a dogfood shadow-validation campaign** (key risk = more false-GREEN surface, worse than false-RED for a build tool) — do NOT flip blind. Strong `/code-review ultra` candidate | 🟡 partial |
 
 ## Workstream D — durable-state concurrency
 
