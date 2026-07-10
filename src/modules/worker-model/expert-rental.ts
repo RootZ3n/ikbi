@@ -74,8 +74,13 @@ export interface RentBuilderExpertInput {
   readonly vendorLane?: string;
 }
 
-/** Restrict a roster to one vendor lane; fall back to the full roster if the lane is empty. */
-function laneRoster(ids: readonly string[], lane: string | undefined): readonly string[] {
+/**
+ * Restrict a roster to one vendor lane; fall back to the full roster if the lane is empty.
+ * Exported so the orchestrator's retry/escalation paths can honor the SAME vendor lane the
+ * rental used — a lane-pinned attempt must stay in its lane across every model pick, not just
+ * the initial rental (IKBI-RT-002: retries must not silently cross vendor lanes).
+ */
+export function laneRoster(ids: readonly string[], lane: string | undefined): readonly string[] {
   if (lane === undefined || lane === "") return ids;
   const filtered = ids.filter((id) => id.startsWith(lane));
   return filtered.length > 0 ? filtered : ids;

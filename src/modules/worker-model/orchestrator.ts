@@ -59,7 +59,7 @@ import type { RecoveryAttempt } from "../recovery/index.js";
 import { DriftBlockedError } from "../drift-prevention/index.js";
 import type { DriftPrevention, DriftReport } from "../drift-prevention/index.js";
 import { rosterFromIds } from "../model-router/index.js";
-import { rentBuilderExpert, classifyTaskTier, resolveClassifierModel, type RentedExpert } from "./expert-rental.js";
+import { rentBuilderExpert, classifyTaskTier, resolveClassifierModel, laneRoster, type RentedExpert } from "./expert-rental.js";
 import { applyConsultPatch } from "./consult-apply.js";
 import type { ApplyConsultPatchInput, ApplyConsultPatchResult } from "./consult-apply.js";
 
@@ -804,6 +804,35 @@ function readIntegratorDecision(integ: RoleResult | undefined): IntegratorDecisi
     ...(typeof e.evaluatorId === "string" ? { evaluatorId: e.evaluatorId } : {}),
   };
   return { promote: true, evaluation, ...(rationale !== undefined ? { rationale } : {}) };
+}
+
+/**
+ * The ONE authoritative, attempt-scoped builder-model decision (IKBI-RT-001).
+ *
+ * Everything downstream reads from this single object: the initial builder dispatch, cost
+ * attribution, the builder receipt, and lane-constrained retries. It is made ONCE per attempt at
+ * rental time and is only replaced when an explicit NEW dispatch decision is made (the pre-flight
+ * context-size escalation), which records itself. This is what enforces the invariant:
+ *
+ *     rented model == dispatched model == billed model == receipt model
+ *
+ * `alias` is the identity that was REQUESTED (an operator `--tier` override, the semantically-rented
+ * expert id, or the configured default). `model` is the concrete id actually sent to the provider.
+ * In ikbi these are the same id string (the roster ids ARE the provider-facing model ids; the
+ * host/provider-model mapping happens one layer down, in the provider registry, from this exact
+ * `model`), so recording both truthfully means never claiming an unrequested model was dispatched.
+ */
+interface AttemptModelDecision {
+  /** The concrete model id dispatched to the provider (== billed == receipt). */
+  readonly model: string;
+  /** The identity that was requested/rented (equals `model` in ikbi's id scheme). */
+  readonly alias: string;
+  /** Why this model was chosen — for truthful receipts + logs. */
+  readonly source: "tier-override" | "moe-rental" | "complexity-large" | "default" | "preflight-context-escalation";
+  /** The vendor lane this attempt is pinned to (undefined = unpinned); constrains every retry. */
+  readonly vendorLane?: string;
+  /** Human-readable rationale (rental reason / escalation trigger). */
+  readonly rationale?: string;
 }
 
 /** Build an orchestrator. The default deps wire the real frozen singletons. */
@@ -1726,10 +1755,27 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       });
       log.info({ taskId: task.taskId, difficulty: verdict.tier, source: verdict.source, rationale: verdict.rationale, classifier: classifierModel, model: rentedExpert.modelId }, "MoE: router classified difficulty + rented builder expert");
     }
-    let effectiveBuilderModel =
-      task.builderModelOverride ??
-      rentedExpert?.modelId ??
-      (task.complexity === "large" ? (escalationConfig.tierModels.mid[0] ?? singleBuilderModel) : singleBuilderModel);
+    // The ONE authoritative model decision for this attempt (IKBI-RT-001). Precedence, highest
+    // first: an operator --tier preset (builderModelOverride) → the semantically-rented MoE expert
+    // → --complexity large's mid-tier bump → the configured default builder. This SAME value is what
+    // the initial builder dispatches on, what cost is attributed to, and what the receipt records —
+    // there is no longer a parallel "complexityModel" that could diverge from it. `let` so the sole
+    // legitimate post-rental replacement (the pre-flight context-size escalation, below) can install
+    // a NEW, recorded decision; nothing else recomputes model identity.
+    let modelDecision: AttemptModelDecision =
+      task.builderModelOverride !== undefined
+        ? { model: task.builderModelOverride, alias: task.builderModelOverride, source: "tier-override", ...(task.moeVendorLane !== undefined ? { vendorLane: task.moeVendorLane } : {}) }
+        : rentedExpert !== undefined
+          ? { model: rentedExpert.modelId, alias: rentedExpert.modelId, source: "moe-rental", rationale: rentedExpert.reason, ...(task.moeVendorLane !== undefined ? { vendorLane: task.moeVendorLane } : {}) }
+          : task.complexity === "large"
+            ? { model: escalationConfig.tierModels.mid[0] ?? singleBuilderModel, alias: escalationConfig.tierModels.mid[0] ?? singleBuilderModel, source: "complexity-large", ...(task.moeVendorLane !== undefined ? { vendorLane: task.moeVendorLane } : {}) }
+            : { model: singleBuilderModel, alias: singleBuilderModel, source: "default", ...(task.moeVendorLane !== undefined ? { vendorLane: task.moeVendorLane } : {}) };
+    // LANE DISCIPLINE (IKBI-RT-002): a lane-pinned attempt (the duel peer) must keep EVERY model pick —
+    // escalation swap, pool sweep, retries — inside its vendor lane, not just the initial rental, so a
+    // "duel-on-failure" attempt is a genuine single-vendor peer and its receipts prove it. `laneModelsFor`
+    // filters an escalation roster to the attempt's lane; it is a NO-OP (returns the full roster) when no
+    // lane is pinned, so the default single-attempt path is byte-unchanged.
+    const laneModelsFor = (ids: readonly string[]): readonly string[] => laneRoster(ids, modelDecision.vendorLane);
     armBudget(task); // start the whole-pipeline wall-clock deadline (covers every dispatch path)
     // Hand the (real) builder a mid-loop halt check so its loop stops promptly on a kill/budget
     // overrun. Reuses killHalt (kill-switch + budget); no-op for tests that inject a fake builder.
@@ -2010,7 +2056,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               targetRepo: task.targetRepo,
               outcome,
               promoted: false,
-              model: singleBuilderModel,
+              // The attempt's authoritative model (IKBI-RT-001). `aborted: true` already marks this
+              // as a terminated run, so this is the model the attempt SELECTED, never a claim that it
+              // executed — a pre-dispatch abort still reports the chosen model honestly, not a default.
+              model: modelDecision.model,
               costUsd,
               aborted,
               ...(task.originAgent !== undefined ? { originAgent: task.originAgent } : {}),
@@ -2127,27 +2176,39 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           priorResults: [...results],
           engine: runEngine,
         };
-        // Builder model override for the role dispatch (same precedence as effectiveBuilderModel):
-        // a --tier preset wins, else --complexity large bumps to the mid-tier model, else undefined
-        // (builderForModel falls back to the configured builder). Kept in sync with line ~1312.
-        let complexityModel = task.builderModelOverride ?? (task.complexity === "large" ? escalationConfig.tierModels.mid[0] : undefined);
-        // PRE-FLIGHT CONTEXT SIZE (proactive): the scout has run, so its brief is known. If the base
-        // builder context (goal + project instructions + scout brief) already fills most of the worker
-        // model's window, start the builder on a bigger-window mid model instead of burning a doomed
-        // cheap attempt that would only overflow (the reactive on-overflow path would then recover it).
-        // Only bumps UP, never overrides an explicit --tier/--complexity choice or a disabled cascade.
-        if (role === "builder" && complexityModel === undefined && task.escalationDisabled !== true) {
+        // PRE-FLIGHT CONTEXT SIZE (proactive) — the ONE legitimate post-rental model change. The scout
+        // has run, so its brief is known. If the base builder context (goal + project instructions +
+        // scout brief) already fills most of the SELECTED model's window, install a NEW model decision on
+        // a bigger-window mid model rather than burn a doomed attempt that would only overflow (the
+        // reactive on-overflow path would then recover it). This is an explicit, RECORDED replacement of
+        // the attempt decision — source "preflight-context-escalation" — so identity stays truthful.
+        // Only fires when no --tier/--complexity model was pinned and the cascade is enabled; only bumps
+        // UP (strictly larger window); LANE-AWARE, so a lane-pinned attempt bumps within its own vendor
+        // lane and never crosses it.
+        if (
+          role === "builder" &&
+          task.builderModelOverride === undefined &&
+          task.complexity !== "large" &&
+          task.escalationDisabled !== true
+        ) {
           const scoutResult = results.find((r) => r.role === "scout");
           const brief = typeof (scoutResult?.detail as Record<string, unknown> | undefined)?.brief === "string"
             ? ((scoutResult!.detail as Record<string, unknown>).brief as string)
             : undefined;
           const estTokens = estimatePromptTokens([task.goal, task.projectInstructions, brief]);
-          const workerWindow = getCapabilities(singleBuilderModel).context_window;
-          if (contextExceedsWindow(estTokens, workerWindow, CONTEXT_PREFLIGHT_FRACTION)) {
-            const midModel = escalationConfig.tierModels.mid[0];
-            if (midModel !== undefined && midModel !== singleBuilderModel) {
-              complexityModel = midModel;
-              effectiveBuilderModel = midModel; // keep cost attribution + the recorded model consistent
+          const currentWindow = getCapabilities(modelDecision.model).context_window;
+          if (contextExceedsWindow(estTokens, currentWindow, CONTEXT_PREFLIGHT_FRACTION)) {
+            const midModel = laneRoster(escalationConfig.tierModels.mid, modelDecision.vendorLane)[0];
+            if (midModel !== undefined && midModel !== modelDecision.model && getCapabilities(midModel).context_window > currentWindow) {
+              const fromModel = modelDecision.model;
+              modelDecision = {
+                model: midModel,
+                alias: midModel,
+                source: "preflight-context-escalation",
+                ...(modelDecision.vendorLane !== undefined ? { vendorLane: modelDecision.vendorLane } : {}),
+                rationale: `base context ~${estTokens} tok exceeds ${fromModel}'s window — pre-escalated to a bigger-window model`,
+              };
+              log.info({ taskId: task.taskId, fromModel, toModel: midModel, estTokens }, "pre-flight context escalation: bumped builder to a bigger-window model before dispatch");
               events.publish(
                 workerRoleDispatched.create(
                   { taskId: task.taskId, role: "builder" },
@@ -2157,7 +2218,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             }
           }
         }
-        const roleFn = role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderForModel(parentCtx, complexityModel, resolveBuilderMode(task)) : role === "critic" ? criticFor() : role === "refuter" ? refuterFor() : roles[role];
+        // Dispatch the builder on the ONE authoritative attempt model (IKBI-RT-001) — the rented
+        // expert, the operator override, or the default, WHATEVER modelDecision resolved to. This is the
+        // same value cost + the receipt attribute to, so the rented model is truly the dispatched model.
+        const roleFn = role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderForModel(parentCtx, modelDecision.model, resolveBuilderMode(task)) : role === "critic" ? criticFor() : role === "refuter" ? refuterFor() : roles[role];
         // H4: floor the verifier's role timeout at the per-check budget. Without this, a 300s role
         // timeout races against 600s checks — the role fails first, orphaning the still-running check.
         const verifierTimeout = role === "verifier" ? Math.max(roleTimeoutMs, resolveCheckTimeoutMs(modeEnv)) : undefined;
@@ -2281,7 +2345,25 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         // the cheap-retry attribution) fall back to the default instead of the model that actually ran.
         if (roleCost > 0 || role === "builder") {
           const prevDetail = (result.detail as Record<string, unknown> | undefined) ?? {};
-          result = { ...result, detail: { ...prevDetail, ...(roleCost > 0 ? { costUsd: roleCost } : {}), ...(role === "builder" ? { model: effectiveBuilderModel } : {}) } };
+          // The builder role records the AUTHORITATIVE attempt decision (IKBI-RT-001): the concrete
+          // dispatched `model`, plus the requested `modelAlias`, the `modelSource` (why it was chosen),
+          // and the `vendorLane` it was pinned to. `model` is exactly what builderForModel dispatched
+          // and what runCost() billed above, so request == dispatch == bill == receipt.
+          result = {
+            ...result,
+            detail: {
+              ...prevDetail,
+              ...(roleCost > 0 ? { costUsd: roleCost } : {}),
+              ...(role === "builder"
+                ? {
+                    model: modelDecision.model,
+                    modelAlias: modelDecision.alias,
+                    modelSource: modelDecision.source,
+                    ...(modelDecision.vendorLane !== undefined ? { vendorLane: modelDecision.vendorLane } : {}),
+                  }
+                : {}),
+            },
+          };
           results[results.length - 1] = result;
         }
         events.publish(
@@ -2293,7 +2375,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 
         // Attribute the builder's model ONLY to the builder role — scout/critic/verifier/refuter run
         // their OWN models, so recording the builder's model on their receipts is an audit lie.
-        await recordRole(task, workspace, spawned, result, roleCost, role === "builder" ? effectiveBuilderModel : undefined, true);
+        await recordRole(task, workspace, spawned, result, roleCost, role === "builder" ? modelDecision.model : undefined, true);
 
         // SG-5 PROGRESS: structured per-role detail beyond start/end — builder tool activity
         // and the verifier's verdict — so `--verbose` can show what each phase actually did.
@@ -2612,7 +2694,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           verifierStillGreen &&
           isRetryableCriticFail(result)
         ) {
-          const midModel = task.fallbackModel ?? escalationConfig.tierModels.mid[0];
+          // Escalate within the attempt's vendor lane (IKBI-RT-002); an operator --fallback-model wins.
+          const midModel = task.fallbackModel ?? laneModelsFor(escalationConfig.tierModels.mid)[0];
           if (midModel !== undefined) {
             escalationAttempted = true;
             const rejectedDetail = (result.detail ?? {}) as Record<string, unknown>;
@@ -2773,7 +2856,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           if (unverifiable !== undefined) {
             checksUnverifiable = unverifiable;
             const failedDetail = (result.detail ?? {}) as Record<string, unknown>;
-            const failedModel = typeof failedDetail.model === "string" ? failedDetail.model : effectiveBuilderModel;
+            const failedModel = typeof failedDetail.model === "string" ? failedDetail.model : modelDecision.model;
             events.publish(
               workerEscalationSuppressed.create(
                 { taskId: task.taskId, fromModel: failedModel, reason: unverifiable.reason, verificationKind: unverifiable.kind },
@@ -2830,11 +2913,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               "guaranteed flash→pro escalation: builder failed/stalled — escalating to the mid (pro) tier regardless of the escalation score (IKBI_ESCALATION_ALWAYS_ESCALATE)",
             );
           }
-          const midModel = task.fallbackModel ?? escalationConfig.tierModels.mid[0];
+          // Escalate within the attempt's vendor lane (IKBI-RT-002); an operator --fallback-model wins.
+          const midModel = task.fallbackModel ?? laneModelsFor(escalationConfig.tierModels.mid)[0];
           if (midModel !== undefined) {
             const failedResult = result;
             const failedDetail = (failedResult.detail ?? {}) as Record<string, unknown>;
-            const failedModel = typeof failedDetail.model === "string" ? failedDetail.model : effectiveBuilderModel;
+            const failedModel = typeof failedDetail.model === "string" ? failedDetail.model : modelDecision.model;
             // CONTEXT-OVERFLOW: the builder's prompt exceeded the current model's window. Re-running the
             // SAME small window with an even LONGER prompt (goal + failure feedback) is guaranteed to
             // overflow again, so SKIP the cheap same-model retry and go straight to the pool sweep, which
@@ -2872,11 +2956,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                   { source: EVENT_SOURCE, attribution: { identity: cheapRetrySpawn.identity, operation: "worker.role.builder", runId: task.taskId } },
                 ),
               );
-              // Retry on the SAME model that actually failed (effectiveBuilderModel reflects any
-              // pre-flight/--complexity bump) — NOT the default. Passing `undefined` would drop a
-              // bumped mid builder back to the weaker default, so "same-model retry" would silently
-              // retry a WEAKER model than the one that failed (a behavior bug + an audit lie).
-              const cheapRetryBuilder = builderForModel(parentCtx, effectiveBuilderModel, resolveBuilderMode(task));
+              // Retry on the EXACT model that actually failed — `failedModel` is the stamped model of
+              // the failed builder (it reflects any pre-flight/--complexity/rental bump), and it is ALSO
+              // the model stamped onto this retry's result below, so dispatch == receipt for the retry
+              // (IKBI-RT-001). Passing `undefined` would drop a bumped builder back to the weaker default,
+              // so a "same-model retry" would silently retry a WEAKER model than the one that failed.
+              const cheapRetryBuilder = builderForModel(parentCtx, failedModel, resolveBuilderMode(task));
               const cheapRetryCtx: RoleContext = {
                 task: { ...task, goal: cheapRetryGoal },
                 role: "builder",
@@ -2968,10 +3053,13 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             // ceiling and the original failure stands with a clear needs-authorization reason; the
             // verification ladder still gates promotion downstream exactly as before.
             escalationAttempted = true;
+            // Sweep the pool WITHIN the attempt's vendor lane (IKBI-RT-002): a lane-pinned peer never
+            // crosses into the other vendor's models on a retry. `laneModelsFor` is a no-op (full roster)
+            // for an unpinned attempt, so the default recovery ladder is unchanged.
             const recoveryRosters = {
-              worker: rosterFromIds(escalationConfig.tierModels.worker),
-              mid: rosterFromIds(escalationConfig.tierModels.mid),
-              frontier: rosterFromIds(escalationConfig.tierModels.frontier),
+              worker: rosterFromIds(laneModelsFor(escalationConfig.tierModels.worker)),
+              mid: rosterFromIds(laneModelsFor(escalationConfig.tierModels.mid)),
+              frontier: rosterFromIds(laneModelsFor(escalationConfig.tierModels.frontier)),
             };
             const seedTier =
               (["worker", "mid", "frontier"] as const).find((t) => escalationConfig.tierModels[t].includes(failedModel)) ?? "worker";

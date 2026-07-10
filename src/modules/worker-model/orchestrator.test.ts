@@ -2526,7 +2526,7 @@ test("tier preset: escalationDisabled suppresses the auto-escalation — a faile
 });
 
 // ── TIER PRESET: builderModelOverride is accepted and does not perturb a passing build ──
-// The override feeds effectiveBuilderModel/complexityModel (the same seam --complexity large uses),
+// The override feeds the attempt's authoritative modelDecision (the same seam --complexity large uses),
 // so a tier build with an overridden builder model runs the normal pipeline to promotion. This is
 // a smoke guard that the new task field is threaded without breaking the happy path; the override's
 // value-routing is pinned by tier-presets.test.ts (parseBuildArgs + preset table).
