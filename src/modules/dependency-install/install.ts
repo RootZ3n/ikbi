@@ -121,6 +121,53 @@ function sha256(s: string): string {
   return createHash("sha256").update(s, "utf8").digest("hex");
 }
 
+/** The set of allowlisted REGISTRY HOSTS (hostnames of the registry-allowlist URLs). */
+export function registryHosts(registryUrls: readonly string[]): ReadonlySet<string> {
+  const hosts = new Set<string>();
+  for (const u of registryUrls) {
+    try {
+      hosts.add(new URL(u).hostname.toLowerCase());
+    } catch {
+      /* a malformed registry entry contributes no host (it can never match) */
+    }
+  }
+  return hosts;
+}
+
+/**
+ * Validate every fetch target declared in a lockfile against the registry allowlist (Codex C11).
+ * The lockfile is otherwise trusted blindly, but `--registry` only sets the DEFAULT registry — a
+ * lockfile can still pin an absolute tarball URL on any host, a git dependency, or a `file:`/`link:`
+ * path, all of which bypass the allowlist. Text-scan (format-agnostic across pnpm/npm/yarn lockfiles):
+ *   • every `http(s)://host…` target host must be an allowlisted registry host;
+ *   • any VCS specifier (git+…, git://, git@, github:/gitlab:/bitbucket:) is rejected unless opted in.
+ */
+export function validateLockfileTargets(
+  lockfile: string,
+  allowedRegistryHosts: ReadonlySet<string>,
+  opts: { allowVcsDeps: boolean },
+): { ok: true } | { ok: false; reason: string } {
+  let scanText = lockfile;
+  if (!opts.allowVcsDeps) {
+    const vcs = /(?:git\+(?:https?|ssh|file):|git:\/\/|git@|(?:github|gitlab|bitbucket):[\w-])/i.exec(lockfile);
+    if (vcs !== null) {
+      return { ok: false, reason: `lockfile contains a VCS dependency ("${vcs[0]}") — not permitted (set IKBI_DEPENDENCY_INSTALL_ALLOW_VCS_DEPS=true to allow)` };
+    }
+  } else {
+    // VCS deps are permitted and legitimately point off-registry (git hosts) — exclude the git+<scheme>
+    // URLs from the registry-host check so an allowed git dep is not rejected as "off-registry".
+    scanText = scanText.replace(/git\+[a-z]+:\/\/\S+/gi, "");
+  }
+  for (const m of scanText.matchAll(/https?:\/\/([^/\s"'`,)\]]+)/gi)) {
+    const host = (m[1] ?? "").toLowerCase().replace(/:\d+$/, "");
+    if (host.length === 0) continue;
+    if (!allowedRegistryHosts.has(host)) {
+      return { ok: false, reason: `lockfile references off-registry host "${host}" — only allowlisted registry hosts may be fetched (frozen install)` };
+    }
+  }
+  return { ok: true };
+}
+
 /** Build a dependency installer. The default deps wire the live singletons + gate-wall. */
 export function createDependencyInstall(deps: DependencyInstallDeps = {}): DependencyInstall {
   const config = deps.config ?? dependencyInstallConfig;
@@ -222,6 +269,17 @@ export function createDependencyInstall(deps: DependencyInstallDeps = {}): Depen
       return deny(`lockfile "${spec.lockfile}" is missing/unreadable — cannot run a frozen-lockfile install`);
     }
     const lockfileHash = sha256(lockfileContents);
+
+    // (5a) LOCKFILE TARGET VALIDATION (Codex C11): the lockfile was previously trusted blindly — a
+    // pinned absolute tarball URL, git dependency, or file: path bypasses `--registry` and lets an
+    // untrusted repo's lockfile drive arbitrary egress or pull from a poisoned source. Reject any
+    // http(s) fetch target NOT on an allowlisted registry host, and any VCS dep unless opted in.
+    const targetCheck = validateLockfileTargets(
+      lockfileContents,
+      registryHosts(config.registryAllowlist),
+      { allowVcsDeps: config.allowVcsDeps === true },
+    );
+    if (!targetCheck.ok) return deny(targetCheck.reason);
 
     // (5b) SCRIPT POLICY: a package lifecycle script (postinstall) is arbitrary code execution — the
     // F1 escape vector applied to install. Disable scripts by default (`--ignore-scripts`); only an
