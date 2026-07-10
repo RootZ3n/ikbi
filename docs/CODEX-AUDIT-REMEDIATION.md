@@ -46,12 +46,12 @@ One service: **snapshot → integrate → verify(immutable tree) → adjudicate(
 
 | ID | Finding | Fix | State |
 |----|---------|-----|-------|
-| C1a | C1 | `computeWorkProduct.nonEmpty` = `candidateTree !== baseTree` (throwaway index incl. untracked), NOT `git status` | ⬜ |
-| C1b | C1 | remove boolean `accumulatedPass`; evidence must be executed + tree-bound | ⬜ |
-| C1c | C1 | branded, hash-bound promotion authorization: `WorkspaceManager.promote()` requires expected target head + `assessment.integratedTree`; re-verify if target moved | ⬜ |
-| C3 | C3 | deterministic judge ranks only already-admissible (executed, hash-bound) assessments; hard-disqualify zero/absent/unverified; judge never grants promotability | ⬜ |
+| C1a | C1 | `computeWorkProduct.nonEmpty` = `candidateTree !== baseTree` (throwaway index incl. untracked), NOT `git status` | ✅ 7ee6861 |
+| C1b | C1 | remove boolean `accumulatedPass`; evidence must be executed + tree-bound | ✅ 7ee6861 |
+| C1c | C1 | branded, hash-bound promotion authorization: `WorkspaceManager.promote()` accepts `verifiedAgainst {targetHead, integratedTree}`, refuses on moved-target / tree-mismatch (fail-closed, optional). FOLLOW-UP: thread it into the call sites + re-verify loop = Cx | ✅ f1ac6d3 |
+| C3 | C3 | deterministic judge disqualifies zero/absent/unverified evidence (LAYER-1 override, not down-rank); ranks only admissible; aligned with the single-run integrator "executed"-required gate; judge grants no promotability | ✅ 2ba6cbf |
 | C7 | C7 | batch workers produce retained candidates only; replay into ONE integration workspace; conflict check + full verify combined tree; adjudicate once; one promote | ⬜ |
-| Cx | — | funnel single/competitive/tournament/batch/chat-apply/self-heal through the one terminal executor; make Adjudication Core authoritative (flip `IKBI_LEGACY_COMPLETION`, land I1–I9 guard tests) | ⬜ |
+| Cx | — | funnel single/competitive/tournament/batch/chat-apply/self-heal through the one terminal executor; make Adjudication Core authoritative (flip `IKBI_LEGACY_COMPLETION`, land I1–I9 guard tests); thread C1c `verifiedAgainst` into every promote + re-verify on moved target | ⬜ |
 
 ## Workstream D — durable-state concurrency
 
