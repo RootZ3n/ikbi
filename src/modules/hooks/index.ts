@@ -43,6 +43,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { hooksEnabled, projectHooksEnabled } from "./config.js";
+
 // ── Types ──────────────────────────────────────────────────────────────────
 
 export type HookType = "PreToolUse" | "PostToolUse" | "Stop";
@@ -130,14 +132,23 @@ function loadHookFile(path: string): HookConfig[] {
   }
 }
 
-/** Load hooks from both global (~/.ikbi/hooks.json) and project (.ikbi/hooks.json).
- *  Project hooks with the same type+matcher override global ones. */
+/**
+ * Load hooks from global (~/.ikbi/hooks.json — operator-owned, trusted) and, ONLY when the
+ * operator opts in (`IKBI_PROJECT_HOOKS_ENABLED=true`), the project's own `.ikbi/hooks.json`.
+ *
+ * SECURITY (Codex C5): a project's hooks.json is attacker-controlled — merely building an
+ * untrusted repo would otherwise auto-run its `command` strings via `/bin/sh -c`. So project
+ * hooks are OFF by default; the whole system is off when `IKBI_HOOKS_ENABLED=false`. When both
+ * sources load, project hooks override global for the same type+matcher.
+ */
 export function loadHooks(projectDir: string): HookConfig[] {
-  const globalPath = join(homedir(), ".ikbi", "hooks.json");
-  const projectPath = join(projectDir, ".ikbi", "hooks.json");
+  if (!hooksEnabled()) return []; // master kill-switch
 
+  const globalPath = join(homedir(), ".ikbi", "hooks.json");
   const global = loadHookFile(globalPath);
-  const project = loadHookFile(projectPath);
+
+  // Project hooks come from the (possibly untrusted) target repo — opt-in only.
+  const project = projectHooksEnabled() ? loadHookFile(join(projectDir, ".ikbi", "hooks.json")) : [];
 
   // Merge: project overrides global for same type+matcher
   const key = (h: HookConfig) => `${h.type}::${h.matcher ?? "*"}`;

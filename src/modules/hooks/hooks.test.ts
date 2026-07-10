@@ -168,6 +168,8 @@ test("RC1: isSecretEnvKey flags credential shapes and clears benign ones", () =>
 
 test("RC1: passEnv survives JSON config loading (round-trips through loadHooks)", () => {
   const dir = tmpDir();
+  const prev = process.env.IKBI_PROJECT_HOOKS_ENABLED;
+  process.env.IKBI_PROJECT_HOOKS_ENABLED = "true"; // project hooks are opt-in (Codex C5)
   try {
     mkdirSync(join(dir, ".ikbi"), { recursive: true });
     writeFileSync(
@@ -180,6 +182,8 @@ test("RC1: passEnv survives JSON config loading (round-trips through loadHooks)"
     assert.deepEqual(hook!.passEnv, ["MY_REGION"]);
     assert.deepEqual(hook!.env, { FOO: "bar" });
   } finally {
+    if (prev === undefined) delete process.env.IKBI_PROJECT_HOOKS_ENABLED;
+    else process.env.IKBI_PROJECT_HOOKS_ENABLED = prev;
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -205,8 +209,10 @@ test("fireStopHooks never throws even when the hook command fails", async () => 
 
 // ── Config loading ─────────────────────────────────────────────────────────────
 
-test("loadHooks reads project .ikbi/hooks.json", () => {
+test("loadHooks reads project .ikbi/hooks.json when opted in", () => {
   const dir = tmpDir();
+  const prev = process.env.IKBI_PROJECT_HOOKS_ENABLED;
+  process.env.IKBI_PROJECT_HOOKS_ENABLED = "true";
   try {
     mkdirSync(join(dir, ".ikbi"), { recursive: true });
     writeFileSync(
@@ -216,12 +222,54 @@ test("loadHooks reads project .ikbi/hooks.json", () => {
     const hooks = loadHooks(dir);
     assert.ok(hooks.some((h) => h.type === "PreToolUse" && h.matcher === "Write*" && h.command === "exit 0"));
   } finally {
+    if (prev === undefined) delete process.env.IKBI_PROJECT_HOOKS_ENABLED;
+    else process.env.IKBI_PROJECT_HOOKS_ENABLED = prev;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// SECURITY (Codex C5): a project's hooks.json is attacker-controlled; building an untrusted
+// repo must NOT auto-run it. Project hooks load ONLY under the explicit operator opt-in.
+test("loadHooks does NOT read project hooks by default (Codex C5)", () => {
+  const dir = tmpDir();
+  const prev = process.env.IKBI_PROJECT_HOOKS_ENABLED;
+  delete process.env.IKBI_PROJECT_HOOKS_ENABLED; // default posture
+  try {
+    mkdirSync(join(dir, ".ikbi"), { recursive: true });
+    writeFileSync(
+      join(dir, ".ikbi", "hooks.json"),
+      JSON.stringify([{ type: "Stop", command: "touch /tmp/pwned-by-untrusted-repo" }]),
+    );
+    const hooks = loadHooks(dir);
+    assert.equal(hooks.some((h) => h.command.includes("pwned")), false, "untrusted project hook must NOT be loaded");
+  } finally {
+    if (prev === undefined) delete process.env.IKBI_PROJECT_HOOKS_ENABLED;
+    else process.env.IKBI_PROJECT_HOOKS_ENABLED = prev;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("loadHooks returns [] when the whole system is disabled (Codex C5)", () => {
+  const dir = tmpDir();
+  const prevMaster = process.env.IKBI_HOOKS_ENABLED;
+  const prevProj = process.env.IKBI_PROJECT_HOOKS_ENABLED;
+  process.env.IKBI_HOOKS_ENABLED = "false";
+  process.env.IKBI_PROJECT_HOOKS_ENABLED = "true";
+  try {
+    mkdirSync(join(dir, ".ikbi"), { recursive: true });
+    writeFileSync(join(dir, ".ikbi", "hooks.json"), JSON.stringify([{ type: "Stop", command: "echo x" }]));
+    assert.deepEqual(loadHooks(dir), [], "master kill-switch disables all hooks");
+  } finally {
+    if (prevMaster === undefined) delete process.env.IKBI_HOOKS_ENABLED; else process.env.IKBI_HOOKS_ENABLED = prevMaster;
+    if (prevProj === undefined) delete process.env.IKBI_PROJECT_HOOKS_ENABLED; else process.env.IKBI_PROJECT_HOOKS_ENABLED = prevProj;
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
 test("loadHooks ignores malformed entries", () => {
   const dir = tmpDir();
+  const prev = process.env.IKBI_PROJECT_HOOKS_ENABLED;
+  process.env.IKBI_PROJECT_HOOKS_ENABLED = "true";
   try {
     mkdirSync(join(dir, ".ikbi"), { recursive: true });
     writeFileSync(
@@ -237,6 +285,8 @@ test("loadHooks ignores malformed entries", () => {
     assert.equal(loaded.filter((h) => h.command === "echo ok").length, 1);
     assert.ok(!loaded.some((h) => (h.type as string) === "Nonsense"));
   } finally {
+    if (prev === undefined) delete process.env.IKBI_PROJECT_HOOKS_ENABLED;
+    else process.env.IKBI_PROJECT_HOOKS_ENABLED = prev;
     rmSync(dir, { recursive: true, force: true });
   }
 });
