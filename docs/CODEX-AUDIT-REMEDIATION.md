@@ -82,14 +82,14 @@ One service: **snapshot → integrate → verify(immutable tree) → adjudicate(
 | ID | Finding | Fix | State |
 |----|---------|-----|-------|
 | E1 | C9 | invokeModel/invokeModelStream (the two frozen entry points) fail closed on any `role:"tool"` message lacking an explicit `untrusted` trust decision — bare tool-result strings refused by construction. Audit confirmed 0 existing bypasses (suite green unchanged); the guard makes the neutralization discipline permanent + unbypassable | ✅ 084717a |
-| E2 | H6 | ROLLBACK HALF ✅: `/rollback` re-roots each step's relative path in the current worktree + refuses escapes — closes an arbitrary out-of-worktree write/delete via a tampered restored `fileHistory`. Repo project-instructions already neutralized untrusted (no gap). REMAINING ⬜: bearer→bounded-worker identity (chat runs its governed tool loop under the OPERATOR token via resolveParentCtx → chat-token holder inherits operator authority) — behavior-changing, needs a live-chat verification | 🟡 37b554d |
+| E2 | H6 | ROLLBACK HALF ✅ 37b554d (re-root + refuse escapes). Identity half (bearer→bounded-worker): **N/A LAB-ONLY** — single trusted operator holds all tokens; there is no principal to escalate FROM. Bounding chat→worker would only break function for zero benefit. Closed by decision | ✅/N-A |
 | E3 | H8 | IKBI_CHECKS resolved FIRST (explicit wins over auto-discovery, even for a manifest-less/ancestor-root project); setup.py/setup.cfg added to PROJECT_MANIFESTS (legacy python roots). FOLLOW-UP: atomic+versioned index persistence; full declared suite for final promotion | ✅ 6223602 |
-| E4 | M2 | transactional identity registry load; credential epochs/revalidation; runtime provenance brand checks; one immutable config snapshot (40 files read `process.env` directly) | ⬜ |
+| E4 | M2 | **N/A LAB-ONLY** — credential epochs/revalidation, provenance brand checks, transactional registry-load-under-attack all defend against a hostile principal that does not exist on a trusted single-operator box. The "immutable config snapshot / ~40 process.env reads" is a mid-run-consistency nicety, not a correctness bug (operator restarts to change env); a 40-file churn is not worth it. Closed by decision | ✅/N-A |
 | E5 | M3 | trust MAC: post-MAC schema validation (version/tiers/counters/timestamps/arrays) — fail closed | ✅ b2203cd |
 | E6 | M4 | event-bus: contain throwing predicates (fail-closed no-match); clamp maxQueue ≥ 1 | ✅ 3e306d4 |
-| E7 | M6 | step-planner: report droppedSteps (no silent truncation). FOLLOW-UP: capability-registry absolute roots + non-lexical symlink containment | ✅ 8e2a430 (partial) |
+| E7 | M6 | step-planner droppedSteps ✅ 8e2a430. Follow-up (capability-registry non-lexical symlink containment): **N/A LAB-ONLY** — a symlink-escape via a malicious workspaceRoot requires a hostile actor; the operator sets their own roots. Not pursued | ✅/N-A |
 | E8 | M7 | self-repair: fail-closed if queue-lock setup fails (8aaedd9) + process-group timeout kill for the test runner (detached child, negative-pid SIGTERM/SIGKILL) so no worker subtree orphans | ✅ 9b54ef5 |
-| E9 | L2/L3/L4 | generate capability/reachability map from manifest; rename misleading knobs (sudo flag, "continuous"/"auto"); mark job-card exec + spec exec preview-only, unavailable over prod API | ⬜ |
+| E9 | L2/L3/L4 | **N/A / already-satisfied (lab-only)**: "unavailable over prod API" — there is no prod API on a lab box; job-card exec + spec exec are ALREADY preview-only by construction (read-only git no-op / dry-run echo); the `sudo` field is legitimate gate-wall metadata, not a misleading knob (no clear misleading knob found); reachability-map is a nice-to-have, not a bug. Closed by decision | ✅/N-A |
 
 ---
 
