@@ -327,19 +327,32 @@ export function runTestCommand(command: string, cwd: string, timeoutMs: number):
       clearTimeout(timer);
       resolve(r);
     };
-    // Run through a shell so `pnpm test` (with args) works as configured.
-    const child = spawn(command, { cwd, shell: true, stdio: ["ignore", "pipe", "pipe"] });
+    // Run through a shell so `pnpm test` (with args) works as configured. `detached: true` makes the
+    // child its OWN process-group leader (M7) so a timeout can reap the WHOLE subtree — the shell spawns
+    // node which spawns test workers; killing just the shell leaks the workers (CPU/ports held forever).
+    const child = spawn(command, { cwd, shell: true, stdio: ["ignore", "pipe", "pipe"], detached: true });
     let tail = "";
     let timedOut = false;
     const onData = (d: Buffer): void => {
       tail = (tail + d.toString()).slice(-4000);
     };
+    // Kill the whole PROCESS GROUP (negative pid) so no descendant test worker orphans. detached:true
+    // above makes -pid target the child's own group, never the caller's — a fallback to the direct
+    // child covers a platform where the group signal fails.
+    const killGroup = (signal: NodeJS.Signals): void => {
+      if (child.pid === undefined) return;
+      try {
+        process.kill(-child.pid, signal);
+      } catch {
+        try { child.kill(signal); } catch { /* already gone */ }
+      }
+    };
     // Kill a wedged test command rather than waiting on it forever.
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGTERM");
+      killGroup("SIGTERM");
       // Escalate to SIGKILL if it ignores SIGTERM (e.g. a shell that traps it).
-      setTimeout(() => child.kill("SIGKILL"), 5000).unref?.();
+      setTimeout(() => killGroup("SIGKILL"), 5000).unref?.();
     }, timeoutMs);
     timer.unref?.();
     child.stdout?.on("data", onData);
