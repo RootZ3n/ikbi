@@ -289,6 +289,14 @@ describe("step-planner", () => {
       assert.equal(s0.goal, "Add function X");
     });
 
+    it("reports droppedSteps when the model plan exceeds MAX_STEPS (Codex M6)", async () => {
+      const many = Array.from({ length: 12 }, (_, i) => ({ goal: `Step ${i + 1}`, targetFiles: [`src/f${i}.ts`] }));
+      const plan = await decomposeWithModel("Complex task", async () => JSON.stringify(many));
+      assert.equal(plan.source, "model");
+      assert.equal(plan.steps.length, 10, "capped at MAX_STEPS");
+      assert.equal(plan.droppedSteps, 2, "the 2 dropped steps are reported, not silently discarded");
+    });
+
     it("falls back to heuristic when model returns invalid JSON", async () => {
       const mockModel = async () => "I can't decompose this";
       const plan = await decomposeWithModel("Simple fix", mockModel);

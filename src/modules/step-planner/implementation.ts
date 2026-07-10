@@ -296,6 +296,7 @@ export function decompose(goal: string): StepPlan {
     };
   }
 
+  const droppedSteps = Math.max(0, grouped.length - MAX_STEPS);
   const steps: Step[] = grouped.slice(0, MAX_STEPS).map((part, i, arr) => ({
     index: i + 1,
     goal: part,
@@ -309,6 +310,8 @@ export function decompose(goal: string): StepPlan {
     steps,
     source: "heuristic",
     decomposed: true,
+    // Codex M6: report truncation instead of silently discarding steps beyond MAX_STEPS.
+    ...(droppedSteps > 0 ? { droppedSteps } : {}),
   };
 }
 
@@ -349,13 +352,14 @@ export async function decomposeWithModel(
     if (!Array.isArray(parsed) || parsed.length < 2) {
       return decompose(goal);
     }
+    const droppedSteps = Math.max(0, parsed.length - MAX_STEPS);
     const steps: Step[] = parsed.slice(0, MAX_STEPS).map((p, i) => ({
       index: i + 1,
       goal: p.goal,
       ...(p.targetFiles !== undefined ? { targetFiles: p.targetFiles } : {}),
       ...(i === parsed.length - 1 ? { verificationHint: "run pnpm test to verify all changes" } : {}),
     }));
-    return { originalGoal: goal, steps, source: "model", decomposed: true };
+    return { originalGoal: goal, steps, source: "model", decomposed: true, ...(droppedSteps > 0 ? { droppedSteps } : {}) };
   } catch {
     // Model call failed — fall back to heuristic.
     return decompose(goal);
