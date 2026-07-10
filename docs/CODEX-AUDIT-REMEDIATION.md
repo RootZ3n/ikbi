@@ -32,10 +32,12 @@ Captured C2/C6-follow-ups (per-capability scopes, testEvidence tally, governed h
 
 | ID | Finding | Fix | State |
 |----|---------|-----|-------|
-| B1 | C4 | classify `git` as risky+sandboxed; allow only a read-only git subcommand/operand set, mutation via typed workspace APIs; isolate `$HOME`, bind only declared inputs ro; deny interpreter eval flags (`python3 -c`, etc.); revalidate every fd with `O_NOFOLLOW`/lstat + root-relative realpath (context loader) | ⬜ |
+| B1a | C4 | git read-only ALLOWLIST for model commands (clone/fetch/reset/clean/archive denied) | ✅ 20b5527 |
+| B1b | C4 | deny interpreter inline-eval (`python3 -c`, ruby/perl/php) — `-m` module stays allowed | ✅ 144ee8e |
+| B1c | C4 | REMAINING: isolate `$HOME` in bwrap (bind only declared toolchain inputs ro); context-loader fd revalidation (`O_NOFOLLOW`/lstat + root-relative realpath) — deeper, own pass | ⬜ |
 | B2 | C11 | parse+validate every lockfile fetch target against egress policy; reject git/file/path deps unless approved; per-run stores; no credential URLs in receipts | ⬜ |
 | B3 | C12 | route self-heal (`sh -c "pnpm build && pnpm test"`) and MCP stdio through governed subprocess infra: isolated home/env/cache, process groups, wall-clock + output limits, explicit fs/net caps, bounded JSON line | ⬜ |
-| B4 | H9 | repo-doctor: require auth capability + canonical allowlisted roots; file/byte/time limits; async; cache keyed by path+fingerprint | ⬜ |
+| B4 | H9 | repo-doctor: canonical allowlisted-root confinement (403 outside) + per-path cache; auth via C6 mount. FOLLOW-UP: file/byte/time limits + async | ✅ 128c692 |
 | B5 | H5 | one guarded-fetch factory for ALL outbound (capability-client, luak, howa, provider): audience-scoped creds, redirect policy, streaming byte ceiling, end-to-end deadline across retries | ⬜ |
 
 ## Workstream C — authoritative promotion (the structural core; supersedes adjudication Steps 3-full/4)
