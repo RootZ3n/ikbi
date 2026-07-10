@@ -32,7 +32,11 @@ const AGENT = () => identity("worker", "trusted");
 /** A shared in-memory latch store (simulates the durable substrate). */
 function memStore() {
   const m = new Map<string, KillState>();
-  const store: LatchStore = { get: async (id) => m.get(id), put: async (id, v) => void m.set(id, v) };
+  const store: LatchStore = {
+    get: async (id) => m.get(id),
+    put: async (id, v) => void m.set(id, v),
+    update: async (id, mutate) => { const next = mutate(m.get(id)); m.set(id, next); return next; },
+  };
   return { store, m };
 }
 
@@ -154,6 +158,7 @@ test("blocker 4: an unreadable latch (store throws on read) is treated as KILLED
   const throwingStore: LatchStore = {
     get: async () => { throw new Error("substrate read failed"); },
     put: async () => {},
+    update: async () => { throw new Error("substrate read failed"); },
   };
   const ks = mk({ store: throwingStore, publishKill: publishKillSpy().publishKill, publish: ev.publish });
   const check = await ks.isKilled({ agentId: "anyone" });
@@ -193,6 +198,26 @@ test("a kill persists to the store and a FRESH instance (restart) reads it as ki
   assert.equal(cleared.cleared, true);
   const afterClear = mk({ store: ms.store, publishKill: publishKillSpy().publishKill });
   assert.equal((await afterClear.isKilled({})).killed, false, "clear() removed the latch durably");
+});
+
+test("H4: concurrent engages from TWO instances over one store do not lose an update (atomic RMW)", async () => {
+  // Two kill-switch instances (simulating the engine process + the `ikbi kill` CLI) share one durable
+  // latch and engage DIFFERENT-scope kills concurrently. The old get-then-put on a stale in-memory copy
+  // would drop one; the atomic update() RMW keeps BOTH. A fresh reader must see both latched.
+  const ms = memStore();
+  const a = mk({ store: ms.store, publishKill: publishKillSpy().publishKill });
+  const b = mk({ store: ms.store, publishKill: publishKillSpy().publishKill });
+  const [ra, rb] = await Promise.all([
+    a.kill({ reason: "operator", mode: "hard", scope: "agent", target: "worker-7" }, OPERATOR()),
+    b.kill({ reason: "operator", mode: "soft", scope: "run", target: "task-42" }, OPERATOR()),
+  ]);
+  assert.equal(ra.engaged, true);
+  assert.equal(rb.engaged, true);
+  const fresh = mk({ store: ms.store, publishKill: publishKillSpy().publishKill });
+  const status = await fresh.status();
+  assert.equal(status.signals.length, 2, "BOTH concurrent kills survived — no lost update");
+  assert.ok((await fresh.isKilled({ agentId: "worker-7" })).killed, "agent kill latched");
+  assert.ok((await fresh.isKilled({ runId: "task-42" })).killed, "run kill latched");
 });
 
 // ── isKilled SCOPING ─────────────────────────────────────────────────────────
@@ -250,12 +275,12 @@ test("killswitch.* events carry reason/mode/scope/target — no identity tokens"
 // ── L4: PERSIST before mutating the in-memory latch ──────────────────────────
 
 test("L4: when persist FAILS, the in-memory latch is NOT mutated (no phantom kill; error surfaces)", async () => {
-  // A store whose put() always throws — simulates a durable-write failure.
+  // A store whose durable RMW always throws — simulates a durable-write failure (H4: engage now writes
+  // via the atomic update() RMW, so that is the path that must fail loudly without a phantom kill).
   const failing: LatchStore = {
     get: async () => undefined,
-    put: async () => {
-      throw new Error("disk full");
-    },
+    put: async () => { throw new Error("disk full"); },
+    update: async () => { throw new Error("disk full"); },
   };
   const pk = publishKillSpy();
   const ev = captureEvents();
