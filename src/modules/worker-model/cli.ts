@@ -1253,11 +1253,21 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       // tier's escalation target — so the tier fallback is only applied when none was set.
       ...(tierPreset !== undefined
         ? {
-            builderModelOverride: tierPreset.builderModel,
+            // MIXTURE OF EXPERTS: a `moe` tier does NOT pin one builder — it sets moeExpertRental so
+            // the orchestrator rents the cheapest-sufficient expert per sub-task (the tier's
+            // builderModel is only the typical/floor expert). A non-moe tier pins its builder as before.
+            ...(tierPreset.moe === true ? { moeExpertRental: true } : { builderModelOverride: tierPreset.builderModel }),
             criticModelOverride: tierPreset.criticModel,
             ...(tierPreset.escalation ? {} : { escalationDisabled: true }),
             ...(tierPreset.fallbackModel !== undefined && fallbackModel === undefined && !process.env.IKBI_FALLBACK_MODEL
               ? { fallbackModel: tierPreset.fallbackModel }
+              : {}),
+            // FULL-SYSTEM ENGAGEMENT: a tier that names candidate models runs the build as a
+            // candidate tournament (deterministic-judge + shadow verification), not a lone builder.
+            // An explicit IKBI_CANDIDATE_MODELS env still wins — the orchestrator reads it as the
+            // fallback, so we only inject the tier's list when the operator hasn't named their own.
+            ...(tierPreset.candidates !== undefined && tierPreset.candidates.length > 0 && (process.env.IKBI_CANDIDATE_MODELS ?? "").trim() === ""
+              ? { candidates: [...tierPreset.candidates] }
               : {}),
           }
         : {}),
@@ -1268,8 +1278,11 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
     // never pollutes a --json stdout contract.
     if (tierPreset !== undefined) {
       err(
-        `ikbi: tier=${tierPreset.tier} — builder=${tierPreset.builderModel}, critic=${tierPreset.criticModel}, ` +
-          `escalation=${tierPreset.escalation ? `ON → ${task.fallbackModel ?? tierPreset.fallbackModel ?? "mid"}` : "OFF (fail-closed)"}\n`,
+        `ikbi: tier=${tierPreset.tier} — ` +
+          `${tierPreset.moe === true ? `builder=MoE pool (rents cheapest-sufficient expert per sub-task; floor ${tierPreset.builderModel})` : `builder=${tierPreset.builderModel}`}, ` +
+          `critic=${tierPreset.criticModel}, ` +
+          `escalation=${tierPreset.escalation ? `ON → ${task.fallbackModel ?? tierPreset.fallbackModel ?? "mid"}` : "OFF (fail-closed)"}` +
+          `${task.candidates !== undefined && task.candidates.length > 0 ? `, tournament=[${task.candidates.join(", ")}] (judge+shadow)` : ""}\n`,
       );
     }
 
@@ -1362,6 +1375,10 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
             // Propagate --complexity so each building stage inherits the large-build model tier AND the
             // scaled builder wall-clock (a decomposed large goal can still have large individual stages).
             ...(complexity !== undefined ? { complexity } : {}),
+            // MIXTURE OF EXPERTS: each step is its own orchestrator.run, so propagate the rental flag —
+            // the coordinator rents the cheapest-sufficient expert for THIS step's difficulty (a
+            // mechanical scaffold step → worker roster; a hard-logic step → mid roster).
+            ...(task.moeExpertRental === true ? { moeExpertRental: true } : {}),
             reuseWorkspace: sharedWorkspace,
             skipPromote: true,
             // Intermediate stages skip the verifier by default — the project is incomplete until the

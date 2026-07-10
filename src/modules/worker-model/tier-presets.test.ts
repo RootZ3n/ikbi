@@ -91,3 +91,13 @@ test("every BuildTier has a preset entry", () => {
     assert.equal(preset, t, `preset for ${t} self-identifies`);
   }
 });
+
+test("no tier defaults to a candidate TOURNAMENT — the cheap tier is a coordinator MoE, not race-and-discard", () => {
+  // The cheap tier is a 4-model mixture of experts (a coordinator rents the cheapest-sufficient
+  // expert per sub-task, collaborating on ONE workspace) — competition that races candidates and
+  // discards losers is the WRONG shape. The tournament path stays available only via an explicit
+  // IKBI_CANDIDATE_MODELS opt-in, never as a tier default.
+  for (const t of BUILD_TIERS) {
+    assert.equal(TIER_PRESETS[t].candidates, undefined, `${t} tier does not default to a tournament`);
+  }
+});

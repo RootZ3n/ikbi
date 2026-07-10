@@ -59,6 +59,7 @@ import type { RecoveryAttempt } from "../recovery/index.js";
 import { DriftBlockedError } from "../drift-prevention/index.js";
 import type { DriftPrevention, DriftReport } from "../drift-prevention/index.js";
 import { rosterFromIds } from "../model-router/index.js";
+import { rentBuilderExpert } from "./expert-rental.js";
 import { applyConsultPatch } from "./consult-apply.js";
 import type { ApplyConsultPatchInput, ApplyConsultPatchResult } from "./consult-apply.js";
 
@@ -1687,13 +1688,31 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     await ensureEscalationResolver();
     // Builder model resolution, highest precedence first:
     //   1. --tier preset (builderModelOverride) — an explicit, operator-chosen tier builder.
-    //   2. --complexity large — bump straight to the mid-tier model, skipping flash.
-    //   3. the configured single builder model (default).
+    //   2. MIXTURE OF EXPERTS (moeExpertRental) — the cheap-tier coordinator RENTS the cheapest-
+    //      sufficient expert for THIS sub-task by difficulty (worker roster for mechanical work, mid
+    //      roster for reasoning), up front. This is the 4-model pool acting as one virtual builder;
+    //      each step of a decomposed build is its own rental (its own orchestrator.run).
+    //   3. --complexity large — bump straight to the mid-tier model, skipping flash.
+    //   4. the configured single builder model (default).
     // `let` so the pre-flight context-size check (below, once the scout brief is known) can bump it
     // to a bigger-window model — keeping cost attribution + the recorded model consistent with the
     // model the builder actually runs on.
+    const rentedExpert =
+      task.builderModelOverride === undefined && task.moeExpertRental === true
+        ? rentBuilderExpert({
+            goal: task.goal,
+            ...(task.complexity !== undefined ? { complexity: task.complexity } : {}),
+            tierRosters: escalationConfig.tierModels,
+            fallback: singleBuilderModel,
+          })
+        : undefined;
+    if (rentedExpert !== undefined) {
+      log.info({ taskId: task.taskId, model: rentedExpert.modelId, tier: rentedExpert.tier, reason: rentedExpert.reason }, "MoE: rented builder expert for sub-task");
+    }
     let effectiveBuilderModel =
-      task.builderModelOverride ?? (task.complexity === "large" ? (escalationConfig.tierModels.mid[0] ?? singleBuilderModel) : singleBuilderModel);
+      task.builderModelOverride ??
+      rentedExpert?.modelId ??
+      (task.complexity === "large" ? (escalationConfig.tierModels.mid[0] ?? singleBuilderModel) : singleBuilderModel);
     armBudget(task); // start the whole-pipeline wall-clock deadline (covers every dispatch path)
     // Hand the (real) builder a mid-loop halt check so its loop stops promptly on a kill/budget
     // overrun. Reuses killHalt (kill-switch + budget); no-op for tests that inject a fake builder.

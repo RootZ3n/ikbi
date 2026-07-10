@@ -204,6 +204,15 @@ export interface WorkerTask {
    */
   readonly builderModelOverride?: string;
   /**
+   * MIXTURE OF EXPERTS (cheap tier): when true AND no explicit `builderModelOverride` is set, the
+   * builder model for THIS sub-task is RENTED per difficulty via model-router's cheapest-sufficient
+   * gate (see expert-rental.ts) instead of using one fixed builder for the whole build. The cheap
+   * tier sets this so its 4-model pool acts as one virtual builder — mechanical steps rent the
+   * worker roster, harder steps rent the mid roster, up front (no escalation event). Absent/false =
+   * the single-builder path, byte-unchanged.
+   */
+  readonly moeExpertRental?: boolean;
+  /**
    * TIER PRESET (`--tier`): force the CRITIC role's model for this run, overriding the config
    * default. Set by a tier preset. Absent = use the config critic model.
    */
