@@ -662,11 +662,20 @@ export function parseTestCount(output: string): { passed: number; total: number 
   // build gets discarded for "no test evidence"). Stripping makes colored and plain output parse alike.
   // eslint-disable-next-line no-control-regex
   output = output.replace(/\x1b\[[0-9;]*m/g, "");
-  // node:test: "# tests N" / "# pass N" (the two markers can be far apart in the stream).
-  const nodeTests = /# tests (\d+)/.exec(output);
-  const nodePass = /# pass (\d+)/.exec(output);
-  if (nodeTests !== null && nodePass !== null) {
-    return { passed: Number(nodePass[1]), total: Number(nodeTests[1]) };
+  // node:test: the FINAL line-anchored summary block "# tests N" / "# pass N". Match as WHOLE summary
+  // lines (^…, `m` flag) and take the LAST of each — NOT the first `# tests`/`# pass` occurrence
+  // ANYWHERE in the stream. When ikbi builds ikbi (self-hosting), the suite echoes ikbi's OWN test
+  // NAMES as TAP lines, and a name can literally contain "# tests 0" mid-line; a first-match, unanchored
+  // parse then returns {passed:N, total:0} → testEvidence "zero" → a fully-green run is discarded as
+  // vacuous. Line-anchoring skips the name-carrier lines; last-match takes the run's real final summary.
+  const nodeTestsAll = [...output.matchAll(/^# tests (\d+)\b/gm)];
+  const nodePassAll = [...output.matchAll(/^# pass (\d+)\b/gm)];
+  if (nodeTestsAll.length > 0 && nodePassAll.length > 0) {
+    const total = Number(nodeTestsAll[nodeTestsAll.length - 1]![1]);
+    const passed = Number(nodePassAll[nodePassAll.length - 1]![1]);
+    // `passed > total` is impossible for a real node:test summary ⇒ a misparse; return undefined
+    // (⇒ "unverified", a real green signal that still passes the gate) rather than a bogus tally.
+    if (passed <= total) return { passed, total };
   }
 
   // vitest: "Tests  3 passed (3)" — passed count then total in parens.

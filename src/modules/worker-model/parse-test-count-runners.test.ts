@@ -12,6 +12,31 @@ test("parseTestCount: node:test '# tests' / '# pass' markers", () => {
   assert.deepEqual(parseTestCount("# tests 10\n# pass 10"), { passed: 10, total: 10 });
 });
 
+test("H-1 SELF-HOSTING: parseTestCount reads the FINAL line-anchored summary, not a '# tests 0' inside a test NAME", () => {
+  // ikbi-builds-ikbi: a test NAME echoed as a TAP line contains "# tests 0" mid-line; the real summary
+  // is a big green tally at the end. A first-match/unanchored parse returned {passed:3452,total:0} →
+  // testEvidence "zero" → a fully-green run discarded as vacuous. Must read the last `^# tests`/`^# pass`.
+  const selfHost = [
+    "TAP version 13",
+    "# Subtest: node:test with zero tests (`# tests 0`, exit 0) is NOT a pass",
+    "ok 96 - node:test with zero tests (`# tests 0`, exit 0) is NOT a pass",
+    "1..3453",
+    "# tests 3453",
+    "# pass 3452",
+    "# fail 0",
+  ].join("\n");
+  assert.deepEqual(parseTestCount(selfHost), { passed: 3452, total: 3453 }, "the real final summary, not the 0 inside a name");
+});
+
+test("H-1: a genuine node:test zero-test summary still parses as total 0 (the real signal is preserved)", () => {
+  assert.deepEqual(parseTestCount("TAP version 13\n1..0\n# tests 0\n# pass 0\n# fail 0"), { passed: 0, total: 0 });
+});
+
+test("H-1: multiple runs (ladder) → parseTestCount takes the LAST run's summary", () => {
+  const laddered = "# tests 5\n# pass 5\n# fail 0\n--- next stage ---\n# tests 42\n# pass 42\n# fail 0";
+  assert.deepEqual(parseTestCount(laddered), { passed: 42, total: 42 });
+});
+
 test("parseTestCount: vitest 'Tests  3 passed (3)'", () => {
   assert.deepEqual(parseTestCount("Tests  3 passed (3)"), { passed: 3, total: 3 });
 });

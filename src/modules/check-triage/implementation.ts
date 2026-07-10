@@ -78,6 +78,13 @@ function ranZeroTests(combined: string): boolean {
   for (const raw of combined.split("\n")) {
     const t = raw.trim();
     if (t.length === 0) continue;
+    // H-1: when ikbi builds ikbi, the suite echoes ikbi's OWN test NAMES as TAP lines
+    // (`# Subtest: …`, `ok N - …`, `not ok N - …`). Those names DESCRIBE these very zero-test detectors,
+    // so they literally contain the marker phrases below ("collected 0 items", "no tests ran"). A test
+    // NAME is not a runner reporting zero tests — skip the name-carrier lines so a fully-green
+    // self-hosting run is not falsely flagged zero-test. (The real summary markers below are line- and
+    // start-anchored, so a genuine `# tests 0` / `Tests: 0 total` summary line still fires.)
+    if (/^# Subtest:/.test(t) || /^(?:not )?ok\s+\d+\b/.test(t)) continue;
     if (/\[no test files\]/i.test(t)) return true;
     if (/no test files found/i.test(t)) return true;
     if (/^#?\s*tests\s+0\b/.test(t)) return true; // node:test TAP: `# tests 0`
