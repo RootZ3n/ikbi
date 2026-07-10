@@ -19,10 +19,17 @@
 
 import type { CriticVerdict, Decision, SafetyLedger, WorkAssessment, WorkProduct } from "./contract.js";
 
-/** True iff the assessment is a real, tree-bound green verdict (the only promotable state, per I2/I6). */
+/**
+ * True iff the assessment is a real, tree-bound green verdict (the only promotable state, per I2/I6).
+ *
+ * Evidence MUST be `executed` — tests actually ran against THIS tree (Codex C1b). There is no
+ * accumulated-pass bypass: a boolean "a prior step was green" flag would let a step promote without any
+ * executed evidence on its own tree, which is exactly the vacuous-green hole this gate exists to close.
+ * Multi-step builds earn a promotable assessment the same way single-step builds do — the verifier runs
+ * on the final tree, producing `executed` evidence bound to that tree hash.
+ */
 function isGreenOnMerit(work: WorkProduct, assessment: WorkAssessment): boolean {
-  const evidenceOk = assessment.testEvidence === "executed" || assessment.accumulatedPass === true;
-  return assessment.verdict === "pass" && evidenceOk && assessment.treeHash === work.treeHash;
+  return assessment.verdict === "pass" && assessment.testEvidence === "executed" && assessment.treeHash === work.treeHash;
 }
 
 /**

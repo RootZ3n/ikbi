@@ -3264,7 +3264,6 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           verdict: (typeof rawVerdict === "string" ? rawVerdict : "fail") as Verdict,
           testEvidence: rv.testEvidence,
           treeHash: wp.treeHash, // shadow: assume the verifier judged the current tree (TOCTOU is a Step-3 concern)
-          ...(task.reuseWorkspace !== undefined ? { accumulatedPass: true } : {}),
         };
         const criticDetail = (results.find((r) => r.role === "critic")?.detail ?? {}) as Record<string, unknown>;
         const refuterDetail = (results.find((r) => r.role === "refuter")?.detail ?? {}) as Record<string, unknown>;

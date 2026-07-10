@@ -35,24 +35,35 @@ function sumNumstat(numstat: string): { insertions: number; deletions: number; t
 /**
  * Compute the worktree's WorkProduct.
  *
- * `nonEmpty` and `filesChanged` come from `git status --porcelain` so a brand-new untracked file (the
- * common greenfield case — a whole new module) counts as work. `treeHash` is written from a THROWAWAY
- * index (`GIT_INDEX_FILE = tempIndexPath`, built fresh via `add -A`) so it reflects the full current
- * content without mutating the real index. `insertions`/`deletions` are the tracked-file numstat vs
- * `baseRef` (untracked additions are not double-counted there — they surface in `filesChanged`).
+ * `treeHash` is written from a THROWAWAY index (`GIT_INDEX_FILE = tempIndexPath`, built fresh via
+ * `add -A`) so it reflects the full current content (tracked + untracked, .gitignore-respecting) without
+ * mutating the real index.
+ *
+ * `nonEmpty` is the CONTENT truth — `candidateTree !== baseTree` (the throwaway tree hash vs the tree of
+ * `baseRef`) — NOT `git status --porcelain`. This is load-bearing (Codex C1a): the worktree state and the
+ * base state are compared as immutable tree objects, so `nonEmpty` agrees exactly with the thing that gets
+ * promoted. `git status` is the wrong oracle in both directions: after the build COMMITS its edits to the
+ * scratch branch, status shows a clean tree (nothing uncommitted) and would falsely report "no work" even
+ * though the committed tree differs from base; conversely a stat-cache/mode/CRLF flutter can make status
+ * dirty when the content tree is byte-identical to base. `filesChanged` still comes from `git status`
+ * (untracked-inclusive telemetry); `insertions`/`deletions` from the tracked-file numstat vs `baseRef`.
  */
 export async function computeWorkProduct(
   git: GitRunner,
   opts: { readonly baseRef: string; readonly tempIndexPath: string },
 ): Promise<WorkProduct> {
-  const porcelain = (await git(["status", "--porcelain"])).trim();
-  const changedLines = porcelain.split(/\r?\n/).filter((l) => l.trim().length > 0);
-  const nonEmpty = changedLines.length > 0;
-
   // Tree hash of the FULL working tree, via a throwaway index (does not touch the real index/worktree).
   const env = { GIT_INDEX_FILE: opts.tempIndexPath };
   await git(["add", "-A"], { env });
   const treeHash = (await git(["write-tree"], { env })).trim();
+
+  // The base's tree object — the content baseline `nonEmpty` compares against. `^{tree}` peels a commit
+  // (or a ref/tree) to its tree, so this works whether baseRef is a commit sha, a branch, or a tree.
+  const baseTree = (await git(["rev-parse", `${opts.baseRef}^{tree}`])).trim();
+  const nonEmpty = treeHash !== baseTree;
+
+  const porcelain = (await git(["status", "--porcelain"])).trim();
+  const changedLines = porcelain.split(/\r?\n/).filter((l) => l.trim().length > 0);
 
   const numstat = (await git(["diff", "--numstat", opts.baseRef, "--", "."])).trim();
   const { insertions, deletions } = sumNumstat(numstat);

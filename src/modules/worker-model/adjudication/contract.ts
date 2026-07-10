@@ -65,12 +65,6 @@ export interface WorkAssessment {
   readonly testEvidence: TestEvidence;
   /** The tree hash the verifier actually ran against. */
   readonly treeHash: string;
-  /**
-   * Accumulated-pass flag for multi-step (reuseWorkspace) builds — a prior step already produced real
-   * executed evidence, so this step's testEvidence gate is satisfied by accumulation. Preserves the
-   * existing integrator carve-out (integrator.ts) without weakening the single-run false-GREEN guard.
-   */
-  readonly accumulatedPass?: boolean;
 }
 
 /**

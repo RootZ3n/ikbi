@@ -36,9 +36,11 @@ test("promote: green + evidence executed + tree-bound + no veto + critic pass", 
   assert.deepEqual(d, { action: "promote", treeHash: TREE, reason: "verified-green" });
 });
 
-test("promote: accumulated-pass satisfies the evidence gate (multi-step build)", () => {
-  const d = decidePromotability(work(), green({ testEvidence: "absent", accumulatedPass: true }), noVeto(), criticPass);
-  assert.equal(d.action, "promote");
+test("C1b: NO accumulated-pass bypass — absent evidence never promotes, even in a multi-step build", () => {
+  // The removed `accumulatedPass` boolean used to let a step promote on a prior step's evidence with NO
+  // executed evidence on its own tree. That is a vacuous-green hole: evidence must be `executed` here.
+  const d = decidePromotability(work(), green({ testEvidence: "absent" }), noVeto(), criticPass);
+  assert.deepEqual(d, { action: "discard", reason: "vacuous-green" });
 });
 
 // ── B. DISCARD (not verified-good) ─────────────────────────────────────────────
