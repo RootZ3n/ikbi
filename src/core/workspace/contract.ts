@@ -139,12 +139,38 @@ export interface PromoteGovernance {
   readonly gateId?: string;
 }
 
+/**
+ * C1c — HASH-BOUND promotion authorization. Binds a promote to the EXACT state the caller verified, so
+ * a target that moved (or a worktree that changed) between verification and the CAS cannot land unseen.
+ *
+ * The workspace manager's CAS already prevents a torn write, but with a freshly-read expected value: if
+ * the target branch advanced after the verifier certified the work, a fresh-read fast-forward/merge would
+ * still land — integrating UNVERIFIED target changes into a "verified" promote. This authorization closes
+ * that window by carrying the caller's verify-time expectations:
+ *   - `targetHead`     — the target-branch head the verification ran against. Promote refuses (so the
+ *                        caller can re-verify against the new target) if the live head differs.
+ *   - `integratedTree` — the git TREE object the verifier/adjudicator certified. Promote refuses if the
+ *                        tree it would actually land differs (a post-verify write, or a merge that
+ *                        produced a tree the verifier never saw). Binds the verdict to the promoted tree.
+ * A refusal is a clean `promoted:false` with a re-verify `reason`; it NEVER moves the target ref.
+ */
+export interface VerifiedPromoteAuthorization {
+  readonly targetHead: string;
+  readonly integratedTree: string;
+}
+
 /** What `promote` requires: a judge verdict (required) + optional governance + merge message. */
 export interface PromoteApproval {
   readonly evaluation: WorkspaceEvaluation;
   readonly governance?: PromoteGovernance;
   readonly message?: string;
   readonly requestId?: string;
+  /**
+   * C1c — hash-bound authorization. When present, `promote` refuses (re-verify) unless the live target
+   * head still equals `targetHead` AND the tree it would land equals `integratedTree`. Absent ⇒ legacy
+   * CAS-only behavior for callers that have not yet threaded their verified expectations.
+   */
+  readonly verifiedAgainst?: VerifiedPromoteAuthorization;
 }
 
 export type PromoteStrategy = "noop" | "fast_forward" | "merge";

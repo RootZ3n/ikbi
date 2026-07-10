@@ -300,6 +300,21 @@ export class WorkspaceManager {
         const targetHead = await revParse(repo, handle.baseBranch);
         const scratchHead = await revParse(repo, handle.scratchBranch);
 
+        // C1c — hash-bound authorization. If the caller certified against a specific target head, and the
+        // live head has since moved, REFUSE: the verifier never saw this target, so a promote here would
+        // integrate unverified target changes. Refuse cleanly (target ref untouched) so the caller can
+        // re-verify against the new base. Checked before any intent/CAS.
+        if (approval.verifiedAgainst !== undefined && approval.verifiedAgainst.targetHead !== targetHead) {
+          return {
+            promoted: false,
+            workspaceId: handle.id,
+            targetBranch: handle.baseBranch,
+            beforeRef: targetHead,
+            strategy: "noop",
+            reason: `target moved since verification (verified against ${approval.verifiedAgainst.targetHead}, live head ${targetHead}) — re-verify before promoting`,
+          } satisfies PromoteResult;
+        }
+
         if (scratchHead === targetHead) {
           return { promoted: false, workspaceId: handle.id, targetBranch: handle.baseBranch, beforeRef: targetHead, strategy: "noop", reason: "no changes to promote" } satisfies PromoteResult;
         }
@@ -334,6 +349,24 @@ export class WorkspaceManager {
           mergeCommit = await commitTree(repo, merge.tree as string, [targetHead, scratchHead], approval.message ?? `ikbi: promote workspace ${handle.id}`);
           afterRef = mergeCommit;
           strategy = "merge";
+        }
+
+        // C1c — bind the verdict to the tree that actually lands. If the caller certified a specific
+        // tree, REFUSE unless the tree `afterRef` would land equals it. This catches (a) a post-verify
+        // write to the scratch branch and (b) a merge that produced a tree the verifier never saw —
+        // either way the landed tree is not the certified tree. Refuse cleanly (no intent, no CAS).
+        if (approval.verifiedAgainst !== undefined) {
+          const landedTree = await revParse(repo, `${afterRef}^{tree}`);
+          if (landedTree !== approval.verifiedAgainst.integratedTree) {
+            return {
+              promoted: false,
+              workspaceId: handle.id,
+              targetBranch: handle.baseBranch,
+              beforeRef: targetHead,
+              strategy,
+              reason: `landed tree ${landedTree} ≠ certified tree ${approval.verifiedAgainst.integratedTree} (${strategy}) — the promoted state is not what was verified; re-verify`,
+            } satisfies PromoteResult;
+          }
         }
 
         // INTENT before the CAS (crash here => reconcile reads the target ref).
