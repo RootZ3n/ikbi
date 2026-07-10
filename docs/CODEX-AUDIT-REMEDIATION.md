@@ -69,7 +69,7 @@ One service: **snapshot → integrate → verify(immutable tree) → adjudicate(
 
 | ID | Finding | Fix | State |
 |----|---------|-----|-------|
-| E1 | C9 | every external/tool/repo string → typed untrusted message via core neutralizer; ikbi instruction stays a separate trusted message; model-request construction rejects bare tool-result strings (builder/consult/patchsmith/MCP) | ⬜ |
+| E1 | C9 | invokeModel/invokeModelStream (the two frozen entry points) fail closed on any `role:"tool"` message lacking an explicit `untrusted` trust decision — bare tool-result strings refused by construction. Audit confirmed 0 existing bypasses (suite green unchanged); the guard makes the neutralization discipline permanent + unbypassable | ✅ 084717a |
 | E2 | H6 | chat: map bearer → minted caller identity, spawn bounded worker from it; repo personas untrusted unless operator-installed; revalidate rollback paths | ⬜ |
 | E3 | H8 | IKBI_CHECKS resolved FIRST (explicit wins over auto-discovery, even for a manifest-less/ancestor-root project); setup.py/setup.cfg added to PROJECT_MANIFESTS (legacy python roots). FOLLOW-UP: atomic+versioned index persistence; full declared suite for final promotion | ✅ 6223602 |
 | E4 | M2 | transactional identity registry load; credential epochs/revalidation; runtime provenance brand checks; one immutable config snapshot (40 files read `process.env` directly) | ⬜ |
