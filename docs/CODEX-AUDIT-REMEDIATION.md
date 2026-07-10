@@ -57,13 +57,13 @@ One service: **snapshot → integrate → verify(immutable tree) → adjudicate(
 
 | ID | Finding | Fix | State |
 |----|---------|-----|-------|
-| D1 | H2 | one cross-process txn lock over catch-up→allocate→append→prune→high-water; durable high-water sequence | ⬜ |
+| D1 | H2 | receipt seq-txn holds a CROSS-PROCESS lock over catch-up→allocate→append→(prune)→high-water; distinct `.seq.lock` file (nests outside the AppendLog's own cross-process `.lock`) | ✅ a3cedf4 |
 | D2 | H3 | workspace ops rehydrate path/branch/repo from durable record after lock; opaque IDs; lock before destructive reclaim | ⬜ |
-| D3 | H4 | kill-switch persist-before-publish; cross-process latch; compose global-kill + request-cancel + budget + shutdown | ⬜ |
+| D3 | H4 | kill-switch: persist-before-publish (already present) + atomic CROSS-PROCESS latch RMW (engage/clear via DocumentStore.update, crossProcess) — no lost kills. FOLLOW-UP: compose global-kill + request-cancel + budget + shutdown | ✅ 3ae3d5d |
 | D4 | H10 | task cancel = nonterminal to clients until worker drains; session lease for live lifecycle + CAS saves; never prune a live lease | ⬜ |
 | D5 | H7 | recovery: clamp unauthorized ceiling before pool build; cache keyed on full model-visible request + tool defs + identity policy; size bounds + stampede guard | ⬜ |
 | D6 | M1 | substrate: streaming reads, hard record-size limit, inode/nonce-safe stale-lock reclaim | ⬜ |
-| D7 | M5 | context/memory RMW: caps before allocation; cross-process update txns for counters/upserts | ⬜ |
+| D7 | M5 | context/memory RMW: atomic cross-process `update()` txns for upserts + cumulative pattern counters; H7 value-size cap enforced before allocation (already present) | ✅ 5226343 |
 
 ## Workstream E — neutralization, identity, discovery, cleanups
 
