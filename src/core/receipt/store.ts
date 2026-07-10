@@ -2,12 +2,14 @@
  * ikbi receipt store — lean, attributed, ordered, durable operational log.
  *
  * Built on the frozen substrate `AtomicAppendLog` (O(1) append, ordered, no
- * torn/lost lines under concurrency). SINGLE-WRITER: only the service writes
- * receipts; the CLI reads. Appends + prunes are serialized in-process under a
- * lock key DERIVED FROM THE LOG FILE PATH, so two `ReceiptStore` instances over
- * the same log are serialized by construction (no caller-supplied key can desync
- * them into duplicate seqs / dropped appends). If a CLI ever needs to WRITE
- * receipts, enable cross-process locking on the underlying log.
+ * torn/lost lines under concurrency). Appends + prunes are serialized under a
+ * CROSS-PROCESS lock keyed on the log file path (an in-process mutex AND an
+ * O_EXCL file lock on `<logfile>.lock`), so two `ReceiptStore` instances over the
+ * same log — whether in one process or in SEPARATE processes (the service, the
+ * self-heal worker, a writing CLI) — can never desync into duplicate seqs or
+ * dropped appends (Codex H2). The whole catch-up → allocate-seq → append → (prune)
+ * → high-water sequence runs inside that single lock, so seq allocation reads the
+ * durable tail under mutual exclusion and no other process can interleave.
  *
  * Ordering survives a moving clock: `seq` is assigned from a high-water mark
  * computed as the MAX seq in the durable log (not a wall-clock value), so an NTP
@@ -72,6 +74,8 @@ export class ReceiptStore {
   private readonly locks: LockManager;
   private readonly log_: Logger;
   private readonly appendKey: string;
+  /** H2: the cross-process lock FILE (sibling of the log). Serializes writers in separate processes. */
+  private readonly lockFile: string;
   private readonly retentionMs: number;
   private readonly fsync: boolean;
   private readonly now: () => number;
@@ -96,8 +100,13 @@ export class ReceiptStore {
     this.logFile = deps.logFile;
     this.locks = deps.locks;
     this.log_ = deps.logger;
-    // Lock key is derived from the log file — NOT caller-supplied.
+    // Lock key + cross-process lock file are derived from the log file — NOT caller-supplied.
     this.appendKey = `receipt:${resolve(deps.logFile)}`;
+    // H2: a DISTINCT seq-txn lock file (NOT `<logfile>.lock`, which the underlying cross-process
+    // AtomicAppendLog uses for its own append). This one nests OUTSIDE the log's lock — we hold it
+    // across catch-up → allocate-seq → log.append — so the two never collide (a shared `.lock` would
+    // self-deadlock: we'd hold it, then log.append would spin on the same file until timeout).
+    this.lockFile = `${resolve(deps.logFile)}.seq.lock`;
     this.retentionMs = deps.retentionMs;
     this.fsync = deps.fsync ?? true;
     this.now = deps.now ?? Date.now;
@@ -110,9 +119,9 @@ export class ReceiptStore {
     const clean = validateInput(input);
     return this.locks.withLock(this.appendKey, async () => {
       await this.ensureInit();
-      // Catch up on anything another instance appended since our last op (O(delta)),
+      // Catch up on anything another instance/process appended since our last op (O(delta)),
       // so the seq is derived from the DURABLE log — two instances sharing this
-      // (logfile-derived) lock can never assign a duplicate seq.
+      // (logfile-derived) CROSS-PROCESS lock can never assign a duplicate seq.
       await this.catchUp();
       const seq = this.lastSeq === undefined ? 0 : this.lastSeq + 1;
 
@@ -150,7 +159,7 @@ export class ReceiptStore {
         "receipt appended",
       );
       return receipt;
-    });
+    }, { file: this.lockFile });
   }
 
   /** All receipts, in sequence order. */
@@ -239,7 +248,7 @@ export class ReceiptStore {
         );
       }
       return { removed, kept: kept.length };
-    });
+    }, { file: this.lockFile });
   }
 
   private async ensureInit(): Promise<void> {

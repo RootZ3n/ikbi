@@ -282,6 +282,39 @@ test("TWO instances over the same log share the (logfile-derived) lock — no du
   }
 });
 
+test("H2: two instances with SEPARATE LockManagers (cross-process) share the FILE lock — no dup seq, no dropped append", async () => {
+  const dir = await tmp();
+  try {
+    // SEPARATE LockManager instances = separate processes: the in-process mutex does NOT serialize
+    // them, so ONLY the cross-process O_EXCL file lock (`<logfile>.lock`) prevents duplicate seqs.
+    // Without `{ file }` on the append lock this races into dup/dropped seqs; with it, they serialize.
+    const logFile = join(dir, "shared.ndjson");
+    const mk = () => {
+      const locks = new LockManager({ logger: silent, defaultTimeoutMs: 5000, defaultStaleMs: 30_000 });
+      return new ReceiptStore({
+        log: new AtomicAppendLog<Receipt>({ path: logFile, locks, logger: silent, fsync: false }),
+        logFile,
+        locks,
+        logger: silent,
+        retentionMs: 30 * DAY,
+        fsync: false,
+      });
+    };
+    const A = mk();
+    const B = mk();
+    await Promise.all([
+      ...Array.from({ length: 15 }, () => A.append(ok("from-a"), IDENTITY)),
+      ...Array.from({ length: 15 }, () => B.append(ok("from-b"), IDENTITY)),
+    ]);
+    const all = await A.readAll();
+    assert.equal(all.length, 30, "no dropped appends across processes");
+    const seqs = all.map((r) => r.seq).sort((x, y) => x - y);
+    assert.deepEqual(seqs, Array.from({ length: 30 }, (_u, i) => i), "seqs unique + contiguous under the cross-process file lock");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("backward clock: no seq reuse after restart, and prune keeps a contiguous suffix", async () => {
   const dir = await tmp();
   try {
