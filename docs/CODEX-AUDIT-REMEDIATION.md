@@ -1,8 +1,20 @@
 # Codex Audit — Remediation Program
 
 Tracks the fix-out of the GPT-5.6 Sol (Codex) end-to-end audit of `harness/cc-parity-and-bokahli-pilot @ e693ce8`.
-Goal: make ikbi defensible as a system that **promotes only verified-green work** and holds its stated
-invariants (fail-closed, no false green, no false red, one neutralization chokepoint, worktree confinement).
+Goal: make ikbi produce **correct, verified-green work** on a trusted single-operator box.
+
+> **⚠️ SCOPE RE-TRIAGE (2026-07-10): ikbi is LAB-ONLY / trusted single-operator (README line 1, SECURITY.md).**
+> The Codex audit framed many findings for a PRODUCTION / MULTI-TENANT / ADVERSARIAL setting. In this
+> threat model there is NO untrusted principal — the operator holds all tokens and controls all inputs.
+> So the value of each finding is judged by CORRECTNESS + ROBUSTNESS, not attacker-hardening:
+> - **KEEP** (real value): the adjudication/false-RED core; concurrency races that corrupt state in
+>   LEGITIMATE multi-process use (CLI + long-running service); resource leaks; OOM on corrupt files;
+>   checks-discovery correctness; authoritative promotion (C7/Cx).
+> - **N/A for lab-only** (adversarial, no principal to defend against — do NOT pursue): H6 bearer→
+>   bounded-worker priv-esc; tamper defense on the operator's own files; credential epochs/revalidation;
+>   symlink-escape containment vs a malicious workspaceRoot; hostile-user injection framing.
+> Items already landed that fall in the second bucket are harmless (green + tested) but were arguably
+> unnecessary. See memory `ikbi-lab-only-scope`.
 
 **Rule for every item:** land it behind `pnpm build` + `pnpm test` green; add an adversarial regression test
 that fails before the fix and passes after; commit per item (or tight group). Fail-closed by default.
