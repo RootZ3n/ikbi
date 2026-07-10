@@ -61,7 +61,7 @@ One service: **snapshot → integrate → verify(immutable tree) → adjudicate(
 | D2 | H3 | workspace ops rehydrate path/branch/repo from durable record after lock; opaque IDs; lock before destructive reclaim | ⬜ |
 | D3 | H4 | kill-switch: persist-before-publish (already present) + atomic CROSS-PROCESS latch RMW (engage/clear via DocumentStore.update, crossProcess) — no lost kills. FOLLOW-UP: compose global-kill + request-cancel + budget + shutdown | ✅ 3ae3d5d |
 | D4 | H10 | task cancel = nonterminal to clients until worker drains; session lease for live lifecycle + CAS saves; never prune a live lease | ⬜ |
-| D5 | H7 | recovery: clamp unauthorized ceiling before pool build; cache keyed on full model-visible request + tool defs + identity policy; size bounds + stampede guard | ⬜ |
+| D5 | H7 | CACHE HALF ✅: key covers full tool DEFS (not presence) — no cross-toolset poisoning; LRU hard entry cap (`IKBI_CACHE_MAX_ENTRIES`); stampede guard (coalesce concurrent identical misses). REMAINING ⬜: recovery/escalation clamp unauthorized trust ceiling BEFORE pool build | 🟡 022d212 |
 | D6 | M1 | substrate: streaming reads, hard record-size limit, inode/nonce-safe stale-lock reclaim | ⬜ |
 | D7 | M5 | context/memory RMW: atomic cross-process `update()` txns for upserts + cumulative pattern counters; H7 value-size cap enforced before allocation (already present) | ✅ 5226343 |
 
