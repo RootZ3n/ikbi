@@ -81,6 +81,95 @@ function laneRoster(ids: readonly string[], lane: string | undefined): readonly 
   return filtered.length > 0 ? filtered : ids;
 }
 
+// ── SEMANTIC DIFFICULTY ROUTER (the coordinator's brain) ────────────────────────
+//
+// The regex heuristic above is a zero-cost floor, but it can't tell "implements the recursion"
+// from "name-drops a recursive function" — difficulty is SEMANTIC. `classifyTaskTier` spends ONE
+// cheap classifier-model call to rate a sub-task, so the coordinator rents a pro expert for the
+// genuinely-hard step and keeps the trivial ones on flash. It ALWAYS falls back to the heuristic
+// (model unavailable / bad output), so routing degrades gracefully and never blocks a build.
+
+/** A minimal text-in/text-out model call the difficulty router uses (injectable for tests). */
+export type ClassifierInvoke = (prompt: string) => Promise<string>;
+
+const CLASSIFY_PROMPT =
+  "You are the difficulty ROUTER for a build pipeline's cheap model pool. Rate how hard ONE coding " +
+  "sub-task is for a CHEAP/small model to get RIGHT ON THE FIRST TRY. Reply with ONLY compact JSON: " +
+  '{"tier":"worker|mid","rationale":"<=12 words"}.\n' +
+  "worker = mechanical/boilerplate a small model handles reliably: create a file, add exports/re-exports, " +
+  "wire a simple type, follow an obvious existing pattern, write straightforward tests.\n" +
+  "mid = the CORE LOGIC needs real reasoning a small model routinely fumbles: recursion, tree/graph " +
+  "traversal, non-trivial algorithms, tricky state, exact fiddly signatures, subtle edge cases.\n" +
+  "Judge the LOGIC actually implemented, not the wording — a step that merely mentions a hard-sounding " +
+  "function name but only re-exports or tests it is worker. Default to worker; pick mid only with a concrete reason.\n\nSUB-TASK:\n";
+
+/** Parse the router's JSON verdict; undefined when it isn't the expected shape. */
+function parseTierVerdict(raw: string): { tier: ModelTier; rationale: string } | undefined {
+  const m = raw.match(/\{[\s\S]*\}/);
+  if (m === null) return undefined;
+  try {
+    const o = JSON.parse(m[0]) as Record<string, unknown>;
+    const t = typeof o.tier === "string" ? o.tier.toLowerCase().trim() : "";
+    if (t !== "worker" && t !== "mid" && t !== "frontier") return undefined;
+    return { tier: t as ModelTier, rationale: typeof o.rationale === "string" ? o.rationale.slice(0, 120) : "" };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Clamp a tier to at most `ceiling` (the cheap-tier pool is worker+mid; never rent frontier here). */
+function clampCeiling(tier: ModelTier, ceiling: ModelTier): ModelTier {
+  const order: readonly ModelTier[] = ["worker", "mid", "frontier"];
+  return order.indexOf(tier) > order.indexOf(ceiling) ? ceiling : tier;
+}
+
+/** The router's difficulty verdict for one sub-task. */
+export interface DifficultyVerdict {
+  readonly tier: ModelTier;
+  readonly rationale: string;
+  readonly source: "model" | "heuristic";
+}
+
+/**
+ * Semantically rate a sub-task's difficulty → the tier to rent the builder at. Spends one cheap
+ * classifier call; on ANY failure (throw, empty, unparseable) falls back to the zero-cost regex
+ * heuristic. An explicit `--complexity large` short-circuits to `mid` without a call. The result is
+ * clamped to `ceiling` (default "mid") so the cheap tier never rents outside its 4-model pool.
+ */
+export async function classifyTaskTier(
+  goal: string,
+  invoke: ClassifierInvoke,
+  opts?: { complexity?: string; ceiling?: ModelTier },
+): Promise<DifficultyVerdict> {
+  const ceiling = opts?.ceiling ?? "mid";
+  if (opts?.complexity === "large") return { tier: clampCeiling("mid", ceiling), rationale: "operator marked --complexity large", source: "heuristic" };
+  try {
+    const raw = await invoke(`${CLASSIFY_PROMPT}${goal}`);
+    const verdict = parseTierVerdict(raw);
+    if (verdict !== undefined) return { tier: clampCeiling(verdict.tier, ceiling), rationale: verdict.rationale, source: "model" };
+  } catch {
+    /* fall through to the heuristic — routing must never block a build */
+  }
+  return { tier: clampCeiling(estimateTaskTier(goal, opts?.complexity), ceiling), rationale: "classifier unavailable — heuristic fallback", source: "heuristic" };
+}
+
+/** Resolve the cheapest classifier-role model (always worker-tier); falls back to `fallback`. */
+export function resolveClassifierModel(tierRosters: Readonly<Record<ModelTier, readonly string[]>>, fallback: string): string {
+  try {
+    return resolveModel({
+      role: "classifier",
+      requestedTier: "worker",
+      tierRosters: {
+        worker: rosterFromIds(tierRosters.worker),
+        mid: rosterFromIds(tierRosters.mid),
+        frontier: rosterFromIds(tierRosters.frontier),
+      },
+    }).modelId;
+  } catch {
+    return fallback;
+  }
+}
+
 /** The rented expert for one sub-task. */
 export interface RentedExpert {
   readonly modelId: string;

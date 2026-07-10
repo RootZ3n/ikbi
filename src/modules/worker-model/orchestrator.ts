@@ -59,7 +59,7 @@ import type { RecoveryAttempt } from "../recovery/index.js";
 import { DriftBlockedError } from "../drift-prevention/index.js";
 import type { DriftPrevention, DriftReport } from "../drift-prevention/index.js";
 import { rosterFromIds } from "../model-router/index.js";
-import { rentBuilderExpert } from "./expert-rental.js";
+import { rentBuilderExpert, classifyTaskTier, resolveClassifierModel, type RentedExpert } from "./expert-rental.js";
 import { applyConsultPatch } from "./consult-apply.js";
 import type { ApplyConsultPatchInput, ApplyConsultPatchResult } from "./consult-apply.js";
 
@@ -1697,17 +1697,33 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // `let` so the pre-flight context-size check (below, once the scout brief is known) can bump it
     // to a bigger-window model — keeping cost attribution + the recorded model consistent with the
     // model the builder actually runs on.
-    const rentedExpert =
-      task.builderModelOverride === undefined && task.moeExpertRental === true
-        ? rentBuilderExpert({
-            goal: task.goal,
-            ...(task.complexity !== undefined ? { complexity: task.complexity } : {}),
-            tierRosters: escalationConfig.tierModels,
-            fallback: singleBuilderModel,
-          })
-        : undefined;
-    if (rentedExpert !== undefined) {
-      log.info({ taskId: task.taskId, model: rentedExpert.modelId, tier: rentedExpert.tier, reason: rentedExpert.reason }, "MoE: rented builder expert for sub-task");
+    let rentedExpert: RentedExpert | undefined = undefined;
+    if (task.builderModelOverride === undefined && task.moeExpertRental === true) {
+      // ROUTER (the coordinator's brain): semantically rate this sub-task's difficulty with ONE cheap
+      // classifier call, then rent the cheapest-sufficient expert at that tier. The classifier + rental
+      // both fall back to a zero-cost heuristic on any failure, so routing degrades gracefully and can
+      // never block a build. Runs BEFORE the costing engine exists — a ~20-token call, cost negligible.
+      const classifierModel = resolveClassifierModel(escalationConfig.tierModels, singleBuilderModel);
+      const verdict = await classifyTaskTier(
+        task.goal,
+        async (prompt) => {
+          try {
+            const res = await invokeModel({ model: classifierModel, prompt, temperature: 0, maxTokens: 200, identity: parentIdentity });
+            return typeof res.content === "string" ? res.content : "";
+          } catch {
+            return "";
+          }
+        },
+        task.complexity !== undefined ? { complexity: task.complexity } : {},
+      );
+      rentedExpert = rentBuilderExpert({
+        goal: task.goal,
+        ...(task.complexity !== undefined ? { complexity: task.complexity } : {}),
+        tierRosters: escalationConfig.tierModels,
+        fallback: singleBuilderModel,
+        tierOverride: verdict.tier,
+      });
+      log.info({ taskId: task.taskId, difficulty: verdict.tier, source: verdict.source, rationale: verdict.rationale, classifier: classifierModel, model: rentedExpert.modelId }, "MoE: router classified difficulty + rented builder expert");
     }
     let effectiveBuilderModel =
       task.builderModelOverride ??
