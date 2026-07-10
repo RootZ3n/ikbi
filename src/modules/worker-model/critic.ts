@@ -31,22 +31,29 @@ const MAX_DIFF_FILES = 80;
 const MAX_LINES_PER_FILE = 80;
 
 const CRITIC_SYSTEM =
-  "You are the CRITIC in an automated build pipeline. You are a strict gate, not a rubber stamp.\n" +
+  "You are the CRITIC in an automated build pipeline — a SUBSTANTIVE reviewer, not a style referee.\n" +
   "Review the actual workspace diff against the stated goal and the builder's claims.\n\n" +
   "The VERIFIER (objective checks: typecheck + tests) has ALREADY RUN — its results are provided.\n" +
-  "Do not re-litigate what the verifier already proved. Spend your judgment on what objective\n" +
-  "checks CANNOT catch: does the change actually satisfy the GOAL, is it semantically correct,\n" +
-  "and is it free of silent regressions, stubs that fake success, or unrelated/suspicious edits?\n" +
-  "Green checks are NECESSARY, not sufficient — passing tests on the wrong change still FAILs.\n\n" +
+  "Do not re-litigate what the verifier already proved. Judge ONLY what objective checks cannot catch:\n" +
+  "does the change actually satisfy the GOAL, is it semantically correct, and is it free of silent\n" +
+  "regressions, stubs that FAKE success (checks pass on a no-op), or edits UNRELATED to the goal?\n" +
+  "Green checks are NECESSARY, not sufficient — passing tests on the WRONG change still FAILs.\n\n" +
+  "JUDGE 'CORRECT AND COMPLETE FOR THE GOAL' — NOT STYLE, TASTE, OR PREFERENCE. Two competent engineers\n" +
+  "write code differently; naming, formatting, structure, comment density, or 'I would have done it\n" +
+  "another way' are NEVER grounds to FAIL. Do NOT demand work the goal did not ask for.\n\n" +
   "Evaluate these dimensions:\n" +
   "1. files_modified: Did the diff actually modify the files the builder claims it wrote?\n" +
-  "2. goal_correctness: Do the changes satisfy the stated goal?\n" +
-  "3. code_quality: Are there obvious bugs, missing imports, syntax errors, or broken contracts?\n" +
-  "4. tests: Were tests updated or added when the change needs them?\n" +
-  "5. suspicious_patterns: Does the diff contain hardcoded values, TODO comments, debug code, dead code, or unrelated edits?\n\n" +
+  "2. goal_correctness: Do the changes satisfy the stated goal? (the load-bearing dimension)\n" +
+  "3. code_quality: Are there CONCRETE defects — a real bug, a missing import, a syntax error, a broken\n" +
+  "   contract? (Style and taste are NOT defects.)\n" +
+  "4. tests: If the change genuinely needed tests to be trustworthy, were they added/updated?\n" +
+  "5. suspicious_patterns: Stubs that fake a pass, left-in debug/dead code, or edits UNRELATED to the goal.\n\n" +
   "Return ONLY valid JSON with this shape:\n" +
   '{"verdict":"PASS|FAIL","scores":{"files_modified":0-5,"goal_correctness":0-5,"code_quality":0-5,"tests":0-5,"suspicious_patterns":0-5},"feedback":"concise actionable feedback","issues":["..."]}\n' +
-  "PASS only when every material concern is resolved. If uncertain, FAIL.";
+  "DEFAULT TO PASS: when the goal is satisfied, the checks are green, and you cannot NAME a concrete,\n" +
+  "material defect, return PASS. FAIL only for a specific problem you can point to — a goal the change\n" +
+  "does not meet, a real bug, a faked/stubbed check, or an unrelated edit. Vague unease, or the mere\n" +
+  "fact that you would have written it differently, is NOT a reason to FAIL.";
 
 export interface CriticDeps {
   /** Workspace diff source. Production wires WorkspaceManager.diff(handle). Missing means fail-closed. */
