@@ -221,3 +221,25 @@ test("H4: a throw in the drain machinery is contained (no unhandledRejection), l
   const drainFail = errorObjs.find((o) => o.event === "bus_drain_failed");
   assert.ok(drainFail, "the drain-machinery throw was caught and logged as bus_drain_failed");
 });
+
+// ── M4: predicate containment + maxQueue clamp ─────────────────────────────────
+
+test("a throwing subscription predicate does not break publication to other subscribers (Codex M4)", async () => {
+  const { bus } = makeBus();
+  const healthy: number[] = [];
+  bus.subscribe({ predicate: () => { throw new Error("boom"); } }, () => { healthy.push(-1); });
+  bus.subscribe({}, (e) => { healthy.push(e.payload as number); });
+  assert.doesNotThrow(() => bus.publish({ type: "t", payload: 1 }), "publish must not throw on a bad predicate");
+  await until(() => healthy.includes(1));
+  assert.ok(!healthy.includes(-1), "the throwing predicate's subscriber received nothing (fail-closed)");
+  assert.ok(healthy.includes(1), "the healthy subscriber still received the event");
+});
+
+test("a nonpositive maxQueue is clamped to 1, not left to drop everything (Codex M4)", async () => {
+  const { bus } = makeBus();
+  const got: number[] = [];
+  bus.subscribe({ maxQueue: 0 }, (e) => { got.push(e.payload as number); });
+  bus.publish({ type: "t", payload: 42 });
+  await until(() => got.length === 1);
+  assert.deepEqual(got, [42], "clamped maxQueue delivers the event instead of dropping it");
+});
