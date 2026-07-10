@@ -23,12 +23,14 @@
  */
 
 import { randomBytes } from "node:crypto";
+import { stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { Logger } from "pino";
 
 import type { AgentIdentity } from "../provider/contract.js";
 import { atomicWriteFile } from "../substrate/atomic.js";
 import type { AtomicAppendLog } from "../substrate/append.js";
+import { SubstrateError } from "../substrate/contract.js";
 import type { LockManager } from "../substrate/lock.js";
 import {
   type AgentReceiptSummary,
@@ -271,11 +273,42 @@ export class ReceiptStore {
 
   /** Absorb receipts appended to the log since our last op (e.g. by another instance). */
   private async catchUp(): Promise<void> {
-    const { entries, nextOffset } = await this.log.readFrom(this.lastOffset);
-    for (const r of entries) {
-      if (this.lastSeq === undefined || r.seq > this.lastSeq) this.lastSeq = r.seq;
+    // H-5 (Fable): another process (e.g. the CLI pruning on cold start) can REWRITE the log SHORTER while
+    // this instance holds a cached byte offset. A delta read from a now-past-EOF or mid-line offset would
+    // either wedge every future append (corrupt parse ⇒ silent receipt loss) or silently reset past the
+    // pruner's newly-written seqs (duplicate seq). This runs inside the append `.seq.lock`, so a FULL
+    // reload from 0 is safe: fall back to it when the file shrank below our offset, or the delta read is
+    // corrupt. (loadHead re-derives lastSeq as the MAX seq in the durable log — never a reused seq.)
+    let size: number;
+    try {
+      size = (await stat(this.logFile)).size;
+    } catch {
+      size = 0; // missing/unreadable ⇒ treat as shrunk-to-empty ⇒ full reload below
     }
-    this.lastOffset = nextOffset;
+    if (size < this.lastOffset) {
+      await this.loadHead();
+      return;
+    }
+    try {
+      const { entries, nextOffset } = await this.log.readFrom(this.lastOffset);
+      // If the "delta" contains a seq we've already seen (<= lastSeq), the offset landed in REWRITTEN
+      // content (a prune re-laid the file at a size near our offset) — reload to re-derive the true
+      // high-water rather than mistake old receipts for new appends.
+      if (this.lastSeq !== undefined && entries.some((r) => typeof r.seq === "number" && r.seq <= this.lastSeq!)) {
+        await this.loadHead();
+        return;
+      }
+      for (const r of entries) {
+        if (this.lastSeq === undefined || r.seq > this.lastSeq) this.lastSeq = r.seq;
+      }
+      this.lastOffset = nextOffset;
+    } catch (err) {
+      if (err instanceof SubstrateError && err.kind === "corrupt_state") {
+        await this.loadHead(); // a rewrite landed our offset mid-line — reload the whole log
+        return;
+      }
+      throw err;
+    }
   }
 }
 

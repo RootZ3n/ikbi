@@ -315,6 +315,37 @@ test("H2: two instances with SEPARATE LockManagers (cross-process) share the FIL
   }
 });
 
+test("H-5: a cross-instance prune that shrinks the log ⇒ catchUp full-reloads — no reused (non-monotonic) seq", async () => {
+  const dir = await tmp();
+  try {
+    let clock = 1000;
+    const logFile = join(dir, "shared.ndjson");
+    const mk = () => {
+      const locks = new LockManager({ logger: silent, defaultTimeoutMs: 5000, defaultStaleMs: 30_000 });
+      return new ReceiptStore({
+        log: new AtomicAppendLog<Receipt>({ path: logFile, locks, logger: silent, fsync: false }),
+        logFile, locks, logger: silent, retentionMs: 30 * DAY, fsync: false, now: () => clock,
+      });
+    };
+    const A = mk();
+    const B = mk();
+    // A writes 3 (seq 0-2 @ t1000-1002) and caches its byte offset at the end of them.
+    for (let i = 0; i < 3; i += 1) { await A.append(ok("old"), IDENTITY); clock += 1; }
+    // B (a separate instance — think: the running service) appends 7 more (seq 3-9). A's cache is stale.
+    for (let i = 0; i < 7; i += 1) { await B.append(ok("mid"), IDENTITY); clock += 1; } // seq 3-9 @ t1003-1009
+    // B prunes everything older than t1008 — keeps only seq 8,9. The file SHRINKS well below A's offset.
+    await B.pruneOlderThan(1008);
+    // A appends. Its cached offset now trails a rewritten, much-smaller file. Without the full-reload
+    // fallback, A misses B's work and reuses a low, already-consumed seq (non-monotonic / duplicate).
+    const r = await A.append(ok("a-after"), IDENTITY);
+    const seqs = (await A.readAll()).map((x) => x.seq);
+    assert.equal(new Set(seqs).size, seqs.length, "no duplicate seq after the cross-instance prune");
+    assert.ok(r.seq > 9, `the new receipt's seq (${r.seq}) is above the surviving high-water (9), not a reused low seq`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("backward clock: no seq reuse after restart, and prune keeps a contiguous suffix", async () => {
   const dir = await tmp();
   try {
