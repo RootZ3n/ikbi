@@ -58,11 +58,11 @@ One service: **snapshot → integrate → verify(immutable tree) → adjudicate(
 | ID | Finding | Fix | State |
 |----|---------|-----|-------|
 | D1 | H2 | receipt seq-txn holds a CROSS-PROCESS lock over catch-up→allocate→append→(prune)→high-water; distinct `.seq.lock` file (nests outside the AppendLog's own cross-process `.lock`) | ✅ a3cedf4 |
-| D2 | H3 | workspace ops rehydrate path/branch/repo from durable record after lock; opaque IDs; lock before destructive reclaim | ⬜ |
+| D2 | H3 | discard + promote rehydrate git targets (path/branch/repo/identity) from the durable record under the lock — only the opaque id is trusted from the handle; reclaim already locks-before-destroy | ✅ 15ea19d |
 | D3 | H4 | kill-switch: persist-before-publish (already present) + atomic CROSS-PROCESS latch RMW (engage/clear via DocumentStore.update, crossProcess) — no lost kills. FOLLOW-UP: compose global-kill + request-cancel + budget + shutdown | ✅ 3ae3d5d |
-| D4 | H10 | task cancel = nonterminal to clients until worker drains; session lease for live lifecycle + CAS saves; never prune a live lease | ⬜ |
-| D5 | H7 | CACHE HALF ✅: key covers full tool DEFS (not presence) — no cross-toolset poisoning; LRU hard entry cap (`IKBI_CACHE_MAX_ENTRIES`); stampede guard (coalesce concurrent identical misses). REMAINING ⬜: recovery/escalation clamp unauthorized trust ceiling BEFORE pool build | 🟡 022d212 |
-| D6 | M1 | substrate: streaming reads, hard record-size limit, inode/nonce-safe stale-lock reclaim | ⬜ |
+| D4 | H10 | never prune a LIVE-leased session (prune skips live-locked sessions). Task-cancel-nonterminal-until-drain was ALREADY implemented (server `cancelling` state holds the slot). FOLLOW-UP: CAS session saves + full lifetime lease | ✅ 48ca410 |
+| D5 | H7 | CACHE HALF (022d212): full tool DEFS in key + LRU cap + stampede guard. RECOVERY HALF (9d9e73c): clamp the auto ceiling to `mid` before pool build — no frontier-authorization bypass | ✅ 022d212+9d9e73c |
+| D6 | M1 | hard per-record size limit on readJsonFile (16 MiB OOM guard, fail-closed). Stale-lock reclaim verified already nonce/body-safe. FOLLOW-UP: streaming reads for AtomicAppendLog readAll | 🟡 3758c31 |
 | D7 | M5 | context/memory RMW: atomic cross-process `update()` txns for upserts + cumulative pattern counters; H7 value-size cap enforced before allocation (already present) | ✅ 5226343 |
 
 ## Workstream E — neutralization, identity, discovery, cleanups
