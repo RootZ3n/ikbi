@@ -63,6 +63,19 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const MCP_PROTOCOL_VERSION = "2024-11-05";
 /** Bound the captured stderr used in diagnostics. */
 const MAX_STDERR = 4_000;
+/** Bound the stdout LINE buffer (Codex C12): a server flooding stdout with no newline must not OOM us. */
+const MAX_LINE_BUFFER = 1_000_000;
+
+/** Strip secret-shaped env vars so a third-party MCP server never inherits ikbi's keys/tokens (C12). */
+export function scrubSecretEnv(env: NodeJS.ProcessEnv): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (v === undefined) continue;
+    if (/(?:_KEY|_TOKEN|_SECRET|_PASSWORD|_PASSWD|_CREDENTIALS?|API[_-]?KEY|ACCESS[_-]?TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE[_-]?KEY|OAUTH|SESSION[_-]?TOKEN|COOKIE)/i.test(k)) continue;
+    out[k] = v;
+  }
+  return out;
+}
 
 interface JsonRpcResponse {
   readonly id?: number;
@@ -79,7 +92,8 @@ const defaultSpawn: SpawnLike = (command, args, opts) =>
   nodeSpawn(command, [...args], {
     stdio: ["pipe", "pipe", "pipe"],
     ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
-    env: opts.env !== undefined ? { ...process.env, ...opts.env } : process.env,
+    // Secret-scrubbed inherited env (Codex C12) + the server's own declared env last.
+    env: { ...scrubSecretEnv(process.env), ...(opts.env ?? {}) },
   }) as unknown as SpawnedChild;
 
 /**
@@ -124,6 +138,16 @@ export function createStdioTransport(options: StdioTransportOptions): McpTranspo
 
   const onData = (chunk: Buffer | string): void => {
     buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    // A server that streams megabytes with no newline would otherwise grow `buffer` unbounded (OOM).
+    // Fail closed: drop the buffer, reject in-flight requests, and tear the misbehaving child down.
+    if (buffer.length > MAX_LINE_BUFFER) {
+      buffer = "";
+      closed = true;
+      rejectAll(`MCP stdio server exceeded the ${MAX_LINE_BUFFER}-byte line buffer without a newline — closing`);
+      try { child?.kill(); } catch { /* already gone */ }
+      child = undefined;
+      return;
+    }
     for (let nl = buffer.indexOf("\n"); nl >= 0; nl = buffer.indexOf("\n")) {
       const line = buffer.slice(0, nl);
       buffer = buffer.slice(nl + 1);

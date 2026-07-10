@@ -352,17 +352,57 @@ function defaultRunSuite(cwd: string, targetRepo: string): Promise<{ code: numbe
   } catch { /* best-effort: if the link fails the suite fails loudly below, which is the safe outcome */ }
   return new Promise((resolve) => {
     // Build (typecheck) then test, sharing one shell so a build failure short-circuits the suite.
+    // Governed (Codex C12): secret-scrubbed env (no API keys leak into model-generated code),
+    // a new PROCESS GROUP so a timeout kills the whole tree, a wall-clock TIMEOUT, and a BOUNDED
+    // output buffer.
     const child = spawn("sh", ["-c", "pnpm build && pnpm test"], {
       cwd,
       stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, IKBI_ALLOW_INSECURE_DEV_KEYS: "true" },
+      detached: true, // own process group ⇒ kill(-pid) reaps sh + pnpm + node descendants
+      env: { ...scrubSecretEnv(process.env), IKBI_ALLOW_INSECURE_DEV_KEYS: "true" },
     });
     let output = "";
-    child.stdout.on("data", (d: Buffer) => { output += d.toString(); });
-    child.stderr.on("data", (d: Buffer) => { output += d.toString(); });
-    child.on("error", (e) => resolve({ code: 1, output: `${output}\nspawn error: ${e.message}` }));
-    child.on("close", (code) => resolve({ code: code ?? 1, output }));
+    let truncated = false;
+    const append = (d: Buffer): void => {
+      if (truncated) return;
+      output += d.toString();
+      if (output.length > SELF_HEAL_MAX_OUTPUT) { output = output.slice(0, SELF_HEAL_MAX_OUTPUT); truncated = true; }
+    };
+    child.stdout.on("data", append);
+    child.stderr.on("data", append);
+    let done = false;
+    const finish = (r: { code: number; output: string }): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(truncated ? { ...r, output: `${r.output}\n[output truncated at ${SELF_HEAL_MAX_OUTPUT} bytes]` } : r);
+    };
+    const timer = setTimeout(() => {
+      try {
+        if (typeof child.pid === "number") process.kill(-child.pid, "SIGKILL");
+        else child.kill("SIGKILL");
+      } catch { /* already gone */ }
+      finish({ code: 1, output: `${output}\n[self-heal suite timed out after ${SELF_HEAL_TIMEOUT_MS}ms — killed]` });
+    }, SELF_HEAL_TIMEOUT_MS);
+    child.on("error", (e) => finish({ code: 1, output: `${output}\nspawn error: ${e.message}` }));
+    child.on("close", (code) => finish({ code: code ?? 1, output }));
   });
+}
+
+/** Wall-clock cap for the self-heal build+test (generous for a full suite). */
+const SELF_HEAL_TIMEOUT_MS = 15 * 60_000;
+/** Bound the captured suite output so a runaway subprocess can't grow memory without limit. */
+const SELF_HEAL_MAX_OUTPUT = 2_000_000;
+
+/** Strip secret-shaped env vars so model-generated build/test code never inherits ikbi's keys (C12). */
+function scrubSecretEnv(env: NodeJS.ProcessEnv): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (v === undefined) continue;
+    if (/(?:_KEY|_TOKEN|_SECRET|_PASSWORD|_PASSWD|_CREDENTIALS?|API[_-]?KEY|ACCESS[_-]?TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE[_-]?KEY|OAUTH|SESSION[_-]?TOKEN|COOKIE)/i.test(k)) continue;
+    out[k] = v;
+  }
+  return out;
 }
 
 /** parseTestCount, guarded so a parse throw never sinks the suite verdict. */
