@@ -35,10 +35,10 @@ Captured C2/C6-follow-ups (per-capability scopes, testEvidence tally, governed h
 | B1a | C4 | git read-only ALLOWLIST for model commands (clone/fetch/reset/clean/archive denied) | ✅ 20b5527 |
 | B1b | C4 | deny interpreter inline-eval (`python3 -c`, ruby/perl/php) — `-m` module stays allowed | ✅ 144ee8e |
 | B1c | C4 | REMAINING: isolate `$HOME` in bwrap (bind only declared toolchain inputs ro); context-loader fd revalidation (`O_NOFOLLOW`/lstat + root-relative realpath) — deeper, own pass | ⬜ |
-| B2 | C11 | parse+validate every lockfile fetch target against egress policy; reject git/file/path deps unless approved; per-run stores; no credential URLs in receipts | ⬜ |
-| B3 | C12 | route self-heal (`sh -c "pnpm build && pnpm test"`) and MCP stdio through governed subprocess infra: isolated home/env/cache, process groups, wall-clock + output limits, explicit fs/net caps, bounded JSON line | ⬜ |
+| B2 | C11 | lockfile fetch-target validation vs registry allowlist; VCS deps denied unless opted in. FOLLOW-UP: per-run stores, content-address verify, no cred URLs in receipts | ✅ 7ddc93d |
+| B3 | C12 | self-heal + MCP stdio: secret-scrubbed env, process-group teardown, wall-clock + output bounds, bounded JSON line. FOLLOW-UP: full governed-exec routing | ✅ 901fbae |
 | B4 | H9 | repo-doctor: canonical allowlisted-root confinement (403 outside) + per-path cache; auth via C6 mount. FOLLOW-UP: file/byte/time limits + async | ✅ 128c692 |
-| B5 | H5 | one guarded-fetch factory for ALL outbound (capability-client, luak, howa, provider): audience-scoped creds, redirect policy, streaming byte ceiling, end-to-end deadline across retries | ⬜ |
+| B5 | H5 | capability/luak/howa route through the egress guard (fail-closed). FOLLOW-UP: streaming byte ceiling + end-to-end deadline across retries | ✅ fc2cad1 |
 
 ## Workstream C — authoritative promotion (the structural core; supersedes adjudication Steps 3-full/4)
 
