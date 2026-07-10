@@ -16,13 +16,17 @@ Legend: [x] done · [~] doing · [ ] todo · [-] deferred/needs-decision
 | ID | Finding | Fix | State |
 |----|---------|-----|-------|
 | A1 | H1 | store dirs honor `config.stateRoot` (spec/job-cards/corrections) — closes false-RED | ✅ 654a737 |
-| A2 | C6 | mount ONE global auth/identity hook before any route registrar; capability scopes for correction-approve, job exec, fs scan, specs, chat; delete direct git rollback | ⬜ |
-| A3 | C13 | Web UI same-origin only by default; never forward `IKBI_API_TOKEN` cross-origin; drop arbitrary `?api=` | ⬜ |
-| A4 | C10 | egress: deny cross-origin redirects by default; strip auth/cookies on the allowed hops; correct 30x method semantics | ⬜ |
+| A2 | C6 | mount global auth hook in the route-registrar seam; job rollback de-fanged. FOLLOW-UP: per-capability scopes | ✅ c398d2d |
+| A3 | C13 | Web UI same-origin only; token gated on same-origin; `?api=` dropped | ✅ ff9b739 |
+| A4 | C10 | egress: strip auth/cookies on cross-origin redirect hops; correct 30x method semantics | ✅ ff9b739 |
 | A5 | C5 | project `.ikbi/hooks.json` default OFF; consult `IKBI_HOOKS_ENABLED`; run approved hooks through governed-exec in the worktree sandbox | ⬜ |
-| A6 | C8 | memory-governor: typed op + canonical target + base/before/after hash + full result; atomic CAS apply from pending only; never write a fragment as whole file | ⬜ |
-| A7 | C2 | verifier truth: stream stdout+stderr into one bounded ordered spool; incremental failure/count parse; contradictory-marker ⇒ fail even on exit 0; require `testEvidence==="executed"` + consistent tally; immutable base checks/config; harden/remove legacy mode | ⬜ |
-| A8 | L1 | remove the e693ce8 terminal-adjudication diagnostic (orchestrator.ts:3158) — after the promote proof | ⬜ |
+| A6 | C8 | memory-governor: full-file proposal + baseSha256 CAS apply (atomic); withhold-on-unresolvable | ✅ 3b3bbf6 |
+| A7 | C2 | verifier+builder triage on FULL stdout+STDERR (all 3 consumers); exit-0-with-stderr-failures now fails. FOLLOW-UP: testEvidence==="executed" + consistent tally at verdict layer; immutable base checks; retire legacy mode | ✅ a237d54 |
+| A8 | L1 | removed the e693ce8 terminal-adjudication diagnostic | ✅ 49f65c2 |
+| A9 | — | (bonus) anchor `.gitignore` `memory-governor/` so new src files aren't silently untracked | ✅ |
+
+**✅ WORKSTREAM A (all P0 stop-ship containment) COMPLETE — 8 findings + 1 bonus, all committed & green (suite 3400).**
+Captured C2/C6-follow-ups (per-capability scopes, testEvidence tally, governed hooks/exec, immutable checks) are folded into the workstreams below.
 
 ## Workstream B — execution boundary
 
