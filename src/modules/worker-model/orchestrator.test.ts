@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -292,6 +293,70 @@ test("success path: workspace allocated then PROMOTED (not discarded)", async ()
   assert.equal(result.workspaceId, "wsabcd");
   // The VERIFIED work was committed (autoCommit, trusted) so promote sees a non-empty diff.
   assert.equal(ws.calls.commit.length, 1, "committed once (the verified-good state)");
+});
+
+test("Cx: IKBI_LEGACY_COMPLETION=off makes the adjudication core AUTHORITATIVE — overrides the integrator, fails CLOSED when tree facts are unavailable", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const cap = capturingRoles(); // every role green ⇒ the integrator returns promote (the legacy success path promotes this)
+  const orch = createOrchestrator(baseDeps({
+    resolveIdentity, roleClaim, roles: cap.roles, workspaces: ws.workspaces,
+    env: { ...process.env, IKBI_LEGACY_COMPLETION: "off" },
+  }));
+  const result = await orch.run(task, parentCtx);
+
+  // The fake workspace has no real git worktree, so the adjudication FACTS can't be computed. In
+  // authoritative mode the core REPLACES the integrator's promote intent and fails CLOSED — nothing
+  // promotes even though every role was green (the exact scenario the legacy default DOES promote,
+  // asserted by the test above). Proves the flip is wired to the terminal gate and fail-closed.
+  assert.equal(ws.calls.promote, 0, "authoritative + unavailable facts ⇒ no promote (fail-closed)");
+  assert.equal(result.promoted, false);
+  assert.match(result.reason ?? "", /adjudication core authoritative but the promotability verdict was unavailable/);
+});
+
+test("Cx: authoritative core PROMOTES green work on a real worktree — OVERRIDING an integrator that would discard", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-cx-real-"));
+  const git = (...args: string[]): string => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8" });
+  try {
+    git("init", "-b", "main", "-q");
+    git("config", "user.email", "t@ikbi.local");
+    git("config", "user.name", "ikbi test");
+    writeFileSync(join(dir, "README.md"), "base\n");
+    git("add", "-A"); git("commit", "-q", "-m", "base");
+    const baseRef = git("rev-parse", "HEAD").trim();
+    writeFileSync(join(dir, "feature.ts"), "export const x = 1;\n"); // the build's work — tree now differs from base
+
+    const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+    const handle: WorkspaceHandle = { ...fakeWorkspaceHandle(), id: "wsabcd", path: dir, targetRepo: dir, baseRef, baseBranch: "main" };
+    const calls = { promote: 0, discard: 0 };
+    const workspaces: NonNullable<OrchestratorDeps["workspaces"]> = {
+      allocate: async () => handle,
+      promote: async (h): Promise<PromoteResult> => { calls.promote += 1; return { promoted: true, workspaceId: h.id, targetBranch: h.baseBranch, beforeRef: "a", afterRef: "b" }; },
+      discard: async (): Promise<DiscardResult> => { calls.discard += 1; return { workspaceId: handle.id, removed: true }; },
+      commit: async () => true,
+    };
+    const roles: Partial<Record<WorkerRole, RoleFn>> = {
+      scout: async () => ({ role: "scout", outcome: "success", summary: "s" }),
+      builder: async () => ({ role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["feature.ts"], rejectedToolCalls: [], stopReason: "stop" } }),
+      verifier: async () => ({ role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, outputTail: "# tests 3\n# pass 3\n" }] } }),
+      critic: async () => ({ role: "critic", outcome: "success", summary: "c", detail: { pass: true } }),
+      // The integrator DISCARDS — but the authoritative adjudication core will override it on merit.
+      integrator: async () => ({ role: "integrator", outcome: "success", summary: "i", detail: { decision: "discard", rationale: "integrator says discard", evaluation: { approved: false } } }),
+    };
+    const orch = createOrchestrator(baseDeps({
+      resolveIdentity, roleClaim, workspaces, roles,
+      env: { ...process.env, IKBI_LEGACY_COMPLETION: "off" },
+    }));
+    const result = await orch.run({ taskId: "t-cx", targetRepo: dir, goal: "cx" }, parentCtx);
+
+    // Green + tree-bound + executed evidence + critic pass + no veto ⇒ the core PROMOTES, overriding the
+    // integrator's discard. This is the whole point of Cx: one authoritative predicate, not the old gate.
+    assert.equal(calls.promote, 1, "the authoritative core promoted the green work (integrator wanted discard)");
+    assert.equal(calls.discard, 0, "green work was not discarded (I1)");
+    assert.equal(result.promoted, true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("COMMIT after verifier on a trusted (autoCommit) success — captured AFTER verifier, BEFORE the integrator", async () => {

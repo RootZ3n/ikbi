@@ -172,7 +172,7 @@ import { existsSync, readdirSync, readFileSync, symlinkSync, mkdirSync, type Dir
 import { tmpdir } from "node:os";
 import { join, basename } from "node:path";
 
-import { computeWorkProduct, decidePromotability, type GitRunner, type SafetyLedger, type Verdict, type WorkAssessment } from "./adjudication/index.js";
+import { computeWorkProduct, decidePromotability, type Decision, type GitRunner, type SafetyLedger, type Verdict, type WorkAssessment } from "./adjudication/index.js";
 
 /**
  * Given `git status --porcelain` output, report whether the working tree has TRACKED
@@ -3246,15 +3246,21 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // classification the escalation-suppression block already made.
     if (overall !== "success") checksUnverifiable ??= classifyUnverifiableTarget();
 
-    // ── ADJUDICATION CORE — SHADOW MODE (Step 2) ────────────────────────────────────────────────
-    // Compute the new, centralized promotability decision ALONGSIDE the existing gate and receipt any
-    // divergence. This changes NOTHING (pure telemetry); it validates the core against real builds
-    // before Step 3 makes it authoritative. Two signals: (1) DECISION DIVERGENCE — the new core and the
-    // old integrator gate disagree on promote/discard (on paths the verifier reached); (2) UNVERIFIED
-    // WORK — the builder left work on disk that the pipeline is discarding WITHOUT ever verifying it
-    // (the false-RED candidate the core is designed to fix). Wrapped so a shadow error never affects
-    // the build. Gated by IKBI_ADJUDICATION_SHADOW (default on; set "off" to silence).
-    if ((modeEnv.IKBI_ADJUDICATION_SHADOW ?? "on") !== "off") {
+    // ── ADJUDICATION CORE — the centralized promotability decision ───────────────────────────────
+    // Compute the single `decidePromotability` verdict from the four fact-types. Two modes, one
+    // computation:
+    //   • SHADOW (IKBI_ADJUDICATION_SHADOW, default on): log any divergence vs the old integrator gate;
+    //     changes nothing. Validates the core against real builds.
+    //   • AUTHORITATIVE (IKBI_LEGACY_COMPLETION=off, Step 4 flip): the verdict below REPLACES the
+    //     integrator's promote intent at the terminal gate. DEFAULT IS LEGACY (flag on) — so with no
+    //     env override this block is pure telemetry and the terminal path is byte-unchanged. The flip is
+    //     rolled out by dogfood validation (its risk is more false-GREEN surface); flag-off enables it.
+    // Wrapped so a computation failure never crashes the build; in authoritative mode an unavailable
+    // verdict fails CLOSED at the terminal (no promote). `adjDecision`/`adjIntegratedTree` feed the gate.
+    const adjudicationAuthoritative = (modeEnv.IKBI_LEGACY_COMPLETION ?? "on") === "off";
+    const shadowEnabled = (modeEnv.IKBI_ADJUDICATION_SHADOW ?? "on") !== "off";
+    let adjDecision: Decision | undefined;
+    if (shadowEnabled || adjudicationAuthoritative) {
       try {
         const wp = await computeWorktreeWorkProduct(workspace.path, workspace.baseRef, task.taskId);
         const verifierResult = results.find((r) => r.role === "verifier");
@@ -3263,7 +3269,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         const assessment: WorkAssessment = {
           verdict: (typeof rawVerdict === "string" ? rawVerdict : "fail") as Verdict,
           testEvidence: rv.testEvidence,
-          treeHash: wp.treeHash, // shadow: assume the verifier judged the current tree (TOCTOU is a Step-3 concern)
+          treeHash: wp.treeHash, // the verifier judged this worktree; C1c re-checks the landed tree at promote
         };
         const criticDetail = (results.find((r) => r.role === "critic")?.detail ?? {}) as Record<string, unknown>;
         const refuterDetail = (results.find((r) => r.role === "refuter")?.detail ?? {}) as Record<string, unknown>;
@@ -3273,33 +3279,38 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           refuted: refuterDetail.refuted === true,
           killed: killedReason !== undefined,
           driftBlocked: false, // a drift "block" rejects at entry, before any role runs — never reaches here
-          gateWallAuthorized: true, // compared against the PRE-gate-wall integrator intent (decision.promote)
+          gateWallAuthorized: true, // adjudication does not pre-empt the gate-wall — the promote path enforces it downstream
         };
-        const shadowDecision = decidePromotability(wp, assessment, safety, { pass: criticDetail.pass === true });
-        const oldIntent = readIntegratorDecision(results.find((r) => r.role === "integrator")).promote === true;
-        const newPromote = shadowDecision.action === "promote";
-        if (oldIntent !== newPromote) {
-          await receipts.append(
-            { operation: "worker.decision.divergence", outcome: { status: "success" }, project: task.targetRepo, requestId: task.taskId,
-              metadata: { taskId: task.taskId, oldPromote: oldIntent, newAction: shadowDecision.action, newReason: shadowDecision.reason, verifierRan: verifierResult !== undefined, verdict: assessment.verdict, testEvidence: assessment.testEvidence, workNonEmpty: wp.nonEmpty, filesChanged: wp.diffStat.filesChanged } },
-            parentIdentity,
-          );
-          log.warn({ taskId: task.taskId, oldPromote: oldIntent, newAction: shadowDecision.action, newReason: shadowDecision.reason }, "adjudication shadow: promotability DIVERGENCE (old gate vs new core)");
+        adjDecision = decidePromotability(wp, assessment, safety, { pass: criticDetail.pass === true });
+
+        if (shadowEnabled) {
+          const oldIntent = readIntegratorDecision(results.find((r) => r.role === "integrator")).promote === true;
+          const newPromote = adjDecision.action === "promote";
+          if (oldIntent !== newPromote) {
+            await receipts.append(
+              { operation: "worker.decision.divergence", outcome: { status: "success" }, project: task.targetRepo, requestId: task.taskId,
+                metadata: { taskId: task.taskId, oldPromote: oldIntent, newAction: adjDecision.action, newReason: adjDecision.reason, authoritative: adjudicationAuthoritative, verifierRan: verifierResult !== undefined, verdict: assessment.verdict, testEvidence: assessment.testEvidence, workNonEmpty: wp.nonEmpty, filesChanged: wp.diffStat.filesChanged } },
+              parentIdentity,
+            );
+            log.warn({ taskId: task.taskId, oldPromote: oldIntent, newAction: adjDecision.action, newReason: adjDecision.reason }, "adjudication: promotability DIVERGENCE (old gate vs core)");
+          }
+          if (verifierResult === undefined && wp.nonEmpty && !oldIntent) {
+            // The builder short-circuited (no verification) but left work on disk — the false-RED
+            // candidate. The Adjudication Core would route this tree to the verifier instead of discarding
+            // it unseen. Behavior is unchanged in shadow; this measures how often the false-RED path fires.
+            await receipts.append(
+              { operation: "worker.adjudication.unverified_work", outcome: { status: "success" }, project: task.targetRepo, requestId: task.taskId,
+                metadata: { taskId: task.taskId, filesChanged: wp.diffStat.filesChanged, insertions: wp.diffStat.insertions, deletions: wp.diffStat.deletions, builderStopReason: String((results.find((r) => r.role === "builder")?.detail as Record<string, unknown> | undefined)?.stopReason ?? "unknown") } },
+              parentIdentity,
+            );
+            log.warn({ taskId: task.taskId, filesChanged: wp.diffStat.filesChanged }, "adjudication: nonEmpty work discarded WITHOUT verification (false-RED candidate — the core would adjudicate it)");
+          }
         }
-        if (verifierResult === undefined && wp.nonEmpty && !oldIntent) {
-          // The builder short-circuited (no verification) but left work on disk — the false-RED
-          // candidate. The Adjudication Core would route this tree to the verifier instead of discarding
-          // it unseen. Behavior is unchanged in shadow; this measures how often the false-RED path fires.
-          await receipts.append(
-            { operation: "worker.adjudication.unverified_work", outcome: { status: "success" }, project: task.targetRepo, requestId: task.taskId,
-              metadata: { taskId: task.taskId, filesChanged: wp.diffStat.filesChanged, insertions: wp.diffStat.insertions, deletions: wp.diffStat.deletions, builderStopReason: String((results.find((r) => r.role === "builder")?.detail as Record<string, unknown> | undefined)?.stopReason ?? "unknown") } },
-            parentIdentity,
-          );
-          log.warn({ taskId: task.taskId, filesChanged: wp.diffStat.filesChanged }, "adjudication shadow: nonEmpty work discarded WITHOUT verification (false-RED candidate — the core would adjudicate it)");
-        }
-      } catch (shadowErr) {
-        // A shadow failure must NEVER affect the build. Record at debug and move on.
-        log.debug?.({ taskId: task.taskId, err: shadowErr instanceof Error ? shadowErr.message : String(shadowErr) }, "adjudication shadow: skipped (non-fatal)");
+      } catch (adjErr) {
+        // A computation failure must NEVER crash the build. In SHADOW it's pure telemetry; in
+        // AUTHORITATIVE mode `adjDecision` stays undefined ⇒ the terminal gate fails CLOSED (no promote).
+        adjDecision = undefined;
+        log.debug?.({ taskId: task.taskId, authoritative: adjudicationAuthoritative, err: adjErr instanceof Error ? adjErr.message : String(adjErr) }, "adjudication: fact computation skipped (non-fatal)");
       }
     }
 
@@ -3390,6 +3401,23 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // (fail-closed). If a role hard-failed, the loop broke before the integrator ran,
     // so its result is absent → fail-closed discard. That composition is intentional.
     let decision = readIntegratorDecision(results.find((r) => r.role === "integrator"));
+    // ── CX — ADJUDICATION CORE AUTHORITATIVE (IKBI_LEGACY_COMPLETION=off) ──────────────────────────
+    // When the flip is enabled, `decidePromotability` (computed above) REPLACES the integrator's promote
+    // intent: promote ⇒ promote, retain ⇒ withhold-but-keep the green work (never discard, invariant I1),
+    // discard ⇒ discard. The downstream approval + gate-wall + C1c tree-binding gates STILL run on a
+    // promote (defense in depth). Fail-closed: if the verdict couldn't be computed, do NOT promote.
+    // DEFAULT (flag on / legacy) leaves `decision` exactly as the integrator returned it — no change.
+    let adjRetain = false;
+    if (adjudicationAuthoritative) {
+      if (adjDecision === undefined) {
+        decision = { ...decision, promote: false, rationale: "adjudication core authoritative but the promotability verdict was unavailable — fail closed (no promote)" };
+      } else if (adjDecision.action === "promote") {
+        decision = { ...decision, promote: true }; // spread preserves the integrator's rationale (if any)
+      } else {
+        adjRetain = adjDecision.action === "retain";
+        decision = { ...decision, promote: false, rationale: `adjudication core: ${adjDecision.action} (${adjDecision.reason})` };
+      }
+    }
     // FAIL-CLOSED IN-RUN GATE (enforced on THIS build's promote, independent of the trust ladder):
     //  INJECTION: the neutralization chokepoint blocked a tool result in some role this build — the
     //  "injection blocks promotion" defense, enforced HERE. The trust-ladder demotion only affects
@@ -3499,7 +3527,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       // discarding it (the builder may have written real files before the failure). A build
       // that ran GREEN but the integrator declined to promote is a deliberate "not promotable"
       // verdict → discard as before. Retention is gated (default on); off ⇒ old eager discard.
-      if (retainFailedWorkspaces && overall !== "success") {
+      // CX (I1): when the adjudication core withheld GREEN work (action=retain — governance/critic/
+      // safety-forensics), KEEP it (never discard green work), even though `overall` is "success".
+      if (adjRetain || (retainFailedWorkspaces && overall !== "success")) {
         await safeRetain(workspaces, workspace, reason);
       } else {
         await workspaces.discard(workspace);
