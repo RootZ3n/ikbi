@@ -185,7 +185,7 @@ test("sudo on an allowlisted binary at a requiresApproval tier is DENIED by the 
   const gate = capturingGate();
   const ge = createGovernedExec({ config: cfg(["git"]), gateWall: gate.gateWall, execFile: ex.fn, receipts: fakeReceipts().receipts, publish: () => {} });
 
-  const r = await ge.run({ parentCtx: makeCtx("probation"), command: "git", args: ["pull"], sudo: true });
+  const r = await ge.run({ parentCtx: makeCtx("probation"), command: "git", args: ["status"], sudo: true });
   assert.equal(r.denied, true, "probation + sudo → gate-wall denies");
   assert.equal(ex.calls.length, 0, "nothing ran");
   assert.equal(gate.inputs.length, 1, "the gate was consulted");
@@ -199,7 +199,7 @@ test("sudo at a non-approval tier is allowed by the gate and executes (still gat
   const gate = capturingGate();
   const ge = createGovernedExec({ config: cfg(["git"]), gateWall: gate.gateWall, execFile: ex.fn, receipts: fakeReceipts().receipts, publish: () => {} });
 
-  const r = await ge.run({ parentCtx: makeCtx("verified"), command: "git", args: ["pull"], sudo: true });
+  const r = await ge.run({ parentCtx: makeCtx("verified"), command: "git", args: ["status"], sudo: true });
   assert.equal(r.executed, true);
   assert.equal(gate.inputs.length, 1, "sudo still went through the gate");
   const action = gate.inputs[0]?.action;
@@ -380,7 +380,7 @@ test("an executed command writes an attributed exec receipt with argCount+sudo+e
   const rc = fakeReceipts();
   const ge = createGovernedExec({ config: cfg(["git"]), gateWall: capturingGate().gateWall, execFile: ex.fn, receipts: rc.receipts, publish: () => {} });
 
-  await ge.run({ parentCtx: makeCtx("verified"), command: "git", args: ["commit", "-m", "SUPERSECRET-VALUE"] });
+  await ge.run({ parentCtx: makeCtx("verified"), command: "git", args: ["log", "--grep", "SUPERSECRET-VALUE"] });
   const last = rc.calls.at(-1)!;
   assert.equal(last.input.metadata?.action, "exec");
   assert.equal(last.input.metadata?.argCount, 3);
@@ -394,7 +394,7 @@ test("events never carry the full args", async () => {
   const ev = captureEvents();
   const ge = createGovernedExec({ config: cfg(["git"]), gateWall: capturingGate().gateWall, execFile: fakeExecFile().fn, receipts: fakeReceipts().receipts, publish: ev.publish });
 
-  await ge.run({ parentCtx: makeCtx("verified"), command: "git", args: ["commit", "-m", "SUPERSECRET-VALUE"] });
+  await ge.run({ parentCtx: makeCtx("verified"), command: "git", args: ["log", "--grep", "SUPERSECRET-VALUE"] });
   for (const e of ev.sent) assert.equal(e.source, "governed-exec");
   assert.ok(ev.types().includes("govexec.executed"));
   assert.ok(!JSON.stringify(ev.sent).includes("SUPERSECRET-VALUE"), "full args are NOT logged in events");
