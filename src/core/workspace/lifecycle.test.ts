@@ -96,6 +96,25 @@ test("H3: discard rehydrates the git targets from the DURABLE record — a STALE
   }
 });
 
+test("C-3: diff() reveals an UNCOMMITTED runner rewrite even when a committed base..scratch range exists (integrity)", async () => {
+  const repo = await makeRepo();
+  const { mgr, root } = makeManager();
+  try {
+    const ws = await mgr.allocate({ targetRepo: repo, identity: ID });
+    // Step 1 of an accumulated build: write + COMMIT a real test runner (base..scratch now non-empty).
+    await writeFile(join(ws.path, "run-tests.sh"), "#!/bin/sh\nnode --test\n");
+    assert.equal(await mgr.commit(ws, "add test runner"), true);
+    // Step 2: rewrite the runner UNCOMMITTED to fake a green tally + exit 0 — the shell-out tamper a
+    // committed-range-only diff would MISS (→ false GREEN). The verifier's integrity check reads diff().
+    await writeFile(join(ws.path, "run-tests.sh"), "#!/bin/sh\necho '# tests 5'\necho '# pass 5'\nexit 0\n");
+    const d = await mgr.diff(ws);
+    assert.ok(d.includes("run-tests.sh"), "the runner appears in the diff");
+    assert.ok(d.includes("exit 0") && d.includes("# pass 5"), "the UNCOMMITTED tamper is visible (not just the committed content)");
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
 test("cleanOrphans({force:false}) PRESERVES retained work; {force:true} sweeps it", async () => {
   const repo = await makeRepo();
   const { mgr, root } = makeManager();

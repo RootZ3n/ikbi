@@ -264,16 +264,18 @@ export class WorkspaceManager {
   }
 
   async diff(handle: WorkspaceHandle): Promise<string> {
-    const committed = await diffRange(handle.targetRepo, handle.baseRef, handle.scratchBranch);
-    if (committed.trim().length > 0) return committed;
-    // FALLBACK: RETAINED/failed work is UNCOMMITTED, so the committed base..scratch range is empty.
-    // If the worktree dir still exists, compute the working-tree diff from it so `ikbi diff <id>`
-    // shows the real changes left behind (never a misleading "no changes"). A cleaned/promoted
-    // workspace has no worktree dir → returns the (empty) committed diff unchanged.
+    // C-3 (Fable): when the worktree still exists, use the WORKING-TREE diff (base..worktree, incl.
+    // tracked + untracked + UNCOMMITTED changes) — a SUPERSET of the committed base..scratch range. This
+    // is load-bearing for the verifier's shell-out integrity check: in an accumulated/multi-step
+    // (reuseWorkspace) build a later step can rewrite an UNCOMMITTED test runner (test.sh → `exit 0` + a
+    // forged tally); a committed-range-only diff (the old early-return when base..scratch was non-empty)
+    // never saw it → false GREEN. The working-tree diff catches it. Clean/committed work yields the same
+    // diff as the committed range. A cleaned/promoted workspace has no worktree dir ⇒ committed range.
     if (await this.pathExists(handle.path)) {
-      return workingTreeDiff(handle.path, handle.baseRef).catch(() => committed);
+      const wt = await workingTreeDiff(handle.path, handle.baseRef).catch(() => undefined);
+      if (wt !== undefined && wt.trim().length > 0) return wt;
     }
-    return committed;
+    return diffRange(handle.targetRepo, handle.baseRef, handle.scratchBranch);
   }
 
   // ---- promote (governed-closed, atomic CAS, crash-durable) ----
