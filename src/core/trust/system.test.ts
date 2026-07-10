@@ -71,7 +71,7 @@ test("F3: a genuine trusted doc for ANOTHER agent, placed at a victim's storage 
   try {
     const { trust, store } = makeTrust(dir);
     // A MAC-valid trusted doc for "attacker-x" (authentic — signed with the real KEY).
-    const foreign = wrap(KEY, { agentId: "attacker-x", tier: "trusted", grantedAt: 1000 } as never);
+    const foreign = wrap(KEY, { contractVersion: "1.0.0", agentId: "attacker-x", kind: "agent", defaultTrustTier: "trusted", tier: "trusted", successCount: 0, failureCount: 0, partialCount: 0, rejectedCount: 0, injectionFlags: 0, injectionFlagged: false, promotableStreak: 0, streakOperations: [], consecutiveFailures: 0, operations: {}, transitions: [], createdAt: 1000, updatedAt: 1000 } as never);
     // Copy/rename it onto the VICTIM's storage key (docKey = sha256(agentId)). The MAC still verifies.
     const victimKey = createHash("sha256").update("builder-3", "utf8").digest("hex");
     await store.put(victimKey, foreign);
@@ -91,7 +91,7 @@ test("round-3 #3: preload IGNORES a MAC-valid doc placed at a NON-canonical key 
     const { trust, store } = makeTrust(dir);
     // A genuine trusted doc for "attacker-x" placed under the WRONG store key (not sha256("attacker-x")).
     const wrongKey = createHash("sha256").update("some-other-slot", "utf8").digest("hex");
-    await store.put(wrongKey, wrap(KEY, { agentId: "attacker-x", tier: "trusted", grantedAt: 1000 } as never));
+    await store.put(wrongKey, wrap(KEY, { contractVersion: "1.0.0", agentId: "attacker-x", kind: "agent", defaultTrustTier: "trusted", tier: "trusted", successCount: 0, failureCount: 0, partialCount: 0, rejectedCount: 0, injectionFlags: 0, injectionFlagged: false, promotableStreak: 0, streakOperations: [], consecutiveFailures: 0, operations: {}, transitions: [], createdAt: 1000, updatedAt: 1000 } as never));
     const { rejected } = await trust.preload();
     assert.ok(rejected >= 1, "the misplaced doc was rejected, not loaded");
     // attacker-x must NOT be cached as trusted from a doc found at the wrong key.
@@ -108,7 +108,7 @@ test("A4: a planted foreign trusted doc cannot elevate a victim via the recordOu
     const { trust, store, subject } = makeTrust(dir);
     // Plant a MAC-valid trusted doc for "attacker-x" onto builder-3's storage key.
     const victimKey = createHash("sha256").update("builder-3", "utf8").digest("hex");
-    await store.put(victimKey, wrap(KEY, { agentId: "attacker-x", tier: "trusted", grantedAt: 1000 } as never));
+    await store.put(victimKey, wrap(KEY, { contractVersion: "1.0.0", agentId: "attacker-x", kind: "agent", defaultTrustTier: "trusted", tier: "trusted", successCount: 0, failureCount: 0, partialCount: 0, rejectedCount: 0, injectionFlags: 0, injectionFlagged: false, promotableStreak: 0, streakOperations: [], consecutiveFailures: 0, operations: {}, transitions: [], createdAt: 1000, updatedAt: 1000 } as never));
     // builder-3's OWN legitimate build finishing (no forged identity) must NOT read the planted doc as
     // its base and inherit `trusted`. The write path binds to the key and fail-closes.
     await assert.rejects(

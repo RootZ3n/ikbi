@@ -14,6 +14,35 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 
 import type { TrustState } from "./contract.js";
+import { MAX_TRANSITIONS, TRUST_CONTRACT_VERSION } from "./contract.js";
+import { TRUST_TIERS } from "../identity/contract.js";
+
+const TIERS = new Set<string>(TRUST_TIERS);
+const isNonNegInt = (n: unknown): boolean => typeof n === "number" && Number.isFinite(n) && n >= 0;
+const isFiniteNum = (n: unknown): boolean => typeof n === "number" && Number.isFinite(n);
+
+/**
+ * Post-MAC SCHEMA validation (Codex M3). The MAC proves integrity, but a MAC-valid doc could still
+ * be malformed — a contract-version mismatch after an upgrade, a serialization bug, or (if the key
+ * ever leaked) a forged doc with an out-of-range tier/counter. Validate the shape before trusting
+ * it; anything off ⇒ reject (fail closed, exactly like a bad MAC), so the caller resets to the floor.
+ */
+function isValidTrustState(s: Record<string, unknown>): boolean {
+  if (s.contractVersion !== TRUST_CONTRACT_VERSION) return false;
+  if (typeof s.agentId !== "string" || s.agentId.length === 0) return false;
+  if (s.kind !== "operator" && s.kind !== "agent") return false;
+  if (typeof s.defaultTrustTier !== "string" || !TIERS.has(s.defaultTrustTier)) return false;
+  if (typeof s.tier !== "string" || !TIERS.has(s.tier)) return false;
+  for (const k of ["successCount", "failureCount", "partialCount", "rejectedCount", "injectionFlags", "promotableStreak", "consecutiveFailures"] as const) {
+    if (!isNonNegInt(s[k])) return false;
+  }
+  if (typeof s.injectionFlagged !== "boolean") return false;
+  if (!isFiniteNum(s.createdAt) || !isFiniteNum(s.updatedAt)) return false;
+  if (!Array.isArray(s.transitions) || s.transitions.length > MAX_TRANSITIONS) return false;
+  if (!Array.isArray(s.streakOperations) || !s.streakOperations.every((o) => typeof o === "string")) return false;
+  if (s.operations === null || typeof s.operations !== "object" || Array.isArray(s.operations)) return false;
+  return true;
+}
 
 /** The persisted form: the trust state plus its integrity MAC. */
 export type PersistedTrustState = TrustState & { readonly mac: string };
@@ -65,5 +94,7 @@ export function verifyUnwrap(key: string, persisted: PersistedTrustState | undef
   const { mac, ...state } = persisted;
   if (typeof mac !== "string" || mac.length === 0) return undefined;
   const expected = computeMac(key, state as TrustState);
-  return macsEqual(mac, expected) ? (state as TrustState) : undefined;
+  if (!macsEqual(mac, expected)) return undefined;
+  // MAC valid — now require a well-formed schema too (M3), else fail closed.
+  return isValidTrustState(state as Record<string, unknown>) ? (state as TrustState) : undefined;
 }

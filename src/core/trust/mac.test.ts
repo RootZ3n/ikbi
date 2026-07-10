@@ -11,7 +11,37 @@ import type { TrustState } from "./contract.js";
 import { canonicalize, computeMac, verifyUnwrap, wrap, type PersistedTrustState } from "./mac.js";
 
 const KEY = "test-mac-key";
-const STATE = { agentId: "worker-1", tier: "trusted", grantedAt: 1000 } as unknown as TrustState;
+// A FULL, schema-valid TrustState — verifyUnwrap now validates the schema after the MAC (Codex M3),
+// so a 3-field stub would be (correctly) rejected. This exercises the MAC mechanism on a real shape.
+const STATE: TrustState = {
+  contractVersion: "1.0.0",
+  agentId: "worker-1",
+  kind: "agent",
+  defaultTrustTier: "verified",
+  tier: "trusted",
+  successCount: 0,
+  failureCount: 0,
+  partialCount: 0,
+  rejectedCount: 0,
+  injectionFlags: 0,
+  injectionFlagged: false,
+  promotableStreak: 0,
+  streakOperations: [],
+  consecutiveFailures: 0,
+  operations: {},
+  transitions: [],
+  createdAt: 1000,
+  updatedAt: 1000,
+};
+
+test("a MAC-valid doc with an INVALID schema is rejected (Codex M3)", () => {
+  // Each is correctly signed with the real KEY (MAC passes) but malformed — must be rejected,
+  // not blindly cast to TrustState. Guards against a version drift, a bug, or a leaked-key forgery.
+  assert.equal(verifyUnwrap(KEY, wrap(KEY, { ...STATE, tier: "superuser" } as unknown as TrustState)), undefined, "out-of-range tier");
+  assert.equal(verifyUnwrap(KEY, wrap(KEY, { ...STATE, successCount: -5 } as unknown as TrustState)), undefined, "negative counter");
+  assert.equal(verifyUnwrap(KEY, wrap(KEY, { ...STATE, contractVersion: "0.0.1" } as unknown as TrustState)), undefined, "contract-version mismatch");
+  assert.equal(verifyUnwrap(KEY, wrap(KEY, { ...STATE, transitions: "nope" } as unknown as TrustState)), undefined, "non-array transitions");
+});
 
 test("wrap → verifyUnwrap round-trips and returns the original state", () => {
   const persisted = wrap(KEY, STATE);
