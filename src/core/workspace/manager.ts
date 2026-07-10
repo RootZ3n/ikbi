@@ -287,18 +287,24 @@ export class WorkspaceManager {
       throw new WorkspaceError("not_approved", `promote refused: explicit governance approval required (workspace ${handle.id})`);
     }
 
-    const repo = handle.targetRepo;
-    const ref = `refs/heads/${handle.baseBranch}`;
     // ws-id lock OUTER, target-branch lock INNER (consistent order). Cross-process via withWorkspaceLock.
     return this.withWorkspaceLock(handle.id, async () => {
       const rec = await this.store.get(handle.id);
       if (rec === undefined || rec.state !== "allocated") {
         throw new WorkspaceError("invalid_state", `workspace ${handle.id} is not in a promotable state`);
       }
-      const branchLockKey = `workspace:branch:${repo}:${handle.baseBranch}`;
+      // H3 — REHYDRATE the git targets from the DURABLE record (source of truth), NOT the caller's
+      // handle. Only the opaque `id` is trusted from the handle; promote MOVES refs, so a stale/wrong
+      // `baseBranch`/`scratchBranch`/`targetRepo` on the handle must never drive the revParse/CAS at the
+      // wrong branch. `rec` is read under the ws lock (held for the whole op) and is authoritative.
+      const repo = rec.targetRepo;
+      const baseBranch = rec.baseBranch;
+      const scratchBranch = rec.scratchBranch;
+      const ref = `refs/heads/${baseBranch}`;
+      const branchLockKey = `workspace:branch:${repo}:${baseBranch}`;
       return this.locks.withLock(branchLockKey, async () => {
-        const targetHead = await revParse(repo, handle.baseBranch);
-        const scratchHead = await revParse(repo, handle.scratchBranch);
+        const targetHead = await revParse(repo, baseBranch);
+        const scratchHead = await revParse(repo, scratchBranch);
 
         // C1c — hash-bound authorization. If the caller certified against a specific target head, and the
         // live head has since moved, REFUSE: the verifier never saw this target, so a promote here would
@@ -308,7 +314,7 @@ export class WorkspaceManager {
           return {
             promoted: false,
             workspaceId: handle.id,
-            targetBranch: handle.baseBranch,
+            targetBranch: baseBranch,
             beforeRef: targetHead,
             strategy: "noop",
             reason: `target moved since verification (verified against ${approval.verifiedAgainst.targetHead}, live head ${targetHead}) — re-verify before promoting`,
@@ -316,22 +322,22 @@ export class WorkspaceManager {
         }
 
         if (scratchHead === targetHead) {
-          return { promoted: false, workspaceId: handle.id, targetBranch: handle.baseBranch, beforeRef: targetHead, strategy: "noop", reason: "no changes to promote" } satisfies PromoteResult;
+          return { promoted: false, workspaceId: handle.id, targetBranch: baseBranch, beforeRef: targetHead, strategy: "noop", reason: "no changes to promote" } satisfies PromoteResult;
         }
 
         // The target branch is typically checked out in the repo's MAIN working tree. Moving its
         // ref (the CAS below) would leave HEAD ahead of that tree — a phantom revert in
         // `git status`. Resolve that worktree NOW: if it has uncommitted work, REFUSE (never
         // clobber it, never leave HEAD/tree silently disagreeing); if clean, we sync it after the CAS.
-        const checkedOutPath = await worktreeForBranch(repo, handle.baseBranch);
+        const checkedOutPath = await worktreeForBranch(repo, baseBranch);
         if (checkedOutPath !== undefined && !(await isWorktreeClean(checkedOutPath))) {
           return {
             promoted: false,
             workspaceId: handle.id,
-            targetBranch: handle.baseBranch,
+            targetBranch: baseBranch,
             beforeRef: targetHead,
             strategy: "noop",
-            reason: `target branch "${handle.baseBranch}" is checked out at ${checkedOutPath} with uncommitted changes — refusing to promote (commit or stash there first, then retry)`,
+            reason: `target branch "${baseBranch}" is checked out at ${checkedOutPath} with uncommitted changes — refusing to promote (commit or stash there first, then retry)`,
           } satisfies PromoteResult;
         }
 
@@ -344,7 +350,7 @@ export class WorkspaceManager {
         } else {
           const merge = await computeMerge(repo, targetHead, scratchHead);
           if (!merge.clean) {
-            return { promoted: false, workspaceId: handle.id, targetBranch: handle.baseBranch, beforeRef: targetHead, strategy: "merge", conflicts: merge.conflicts, reason: "merge conflicts — governed resolution required" } satisfies PromoteResult;
+            return { promoted: false, workspaceId: handle.id, targetBranch: baseBranch, beforeRef: targetHead, strategy: "merge", conflicts: merge.conflicts, reason: "merge conflicts — governed resolution required" } satisfies PromoteResult;
           }
           mergeCommit = await commitTree(repo, merge.tree as string, [targetHead, scratchHead], approval.message ?? `ikbi: promote workspace ${handle.id}`);
           afterRef = mergeCommit;
@@ -361,7 +367,7 @@ export class WorkspaceManager {
             return {
               promoted: false,
               workspaceId: handle.id,
-              targetBranch: handle.baseBranch,
+              targetBranch: baseBranch,
               beforeRef: targetHead,
               strategy,
               reason: `landed tree ${landedTree} ≠ certified tree ${approval.verifiedAgainst.integratedTree} (${strategy}) — the promoted state is not what was verified; re-verify`,
@@ -397,7 +403,7 @@ export class WorkspaceManager {
         // the landing proof), so a receipt failure here MUST NOT be swallowed: surface
         // PROMOTED_BUT_RECEIPT_FAILED and stamp the durable record so status/ls/undo can see the
         // degraded state and still recover from this record's before/after refs.
-        const receiptStatus = await this.recordPromoteReceiptDurable(handle.identity, handle.targetRepo, handle.baseBranch, handle.id, targetHead, afterRef, strategy, approval.requestId);
+        const receiptStatus = await this.recordPromoteReceiptDurable(rec.identity, repo, baseBranch, handle.id, targetHead, afterRef, strategy, approval.requestId);
         // The single terminal record carried through cleanup, so the stamp is never overwritten.
         let landedRecord: WorkspaceRecord = promoted;
         if (receiptStatus !== undefined) {
@@ -413,11 +419,11 @@ export class WorkspaceManager {
           }
         }
 
-        const result: PromoteResult = { promoted: true, workspaceId: handle.id, targetBranch: handle.baseBranch, beforeRef: targetHead, afterRef, ...(mergeCommit !== undefined ? { mergeCommit } : {}), strategy, ...(receiptStatus !== undefined ? { receiptStatus } : {}) };
+        const result: PromoteResult = { promoted: true, workspaceId: handle.id, targetBranch: baseBranch, beforeRef: targetHead, afterRef, ...(mergeCommit !== undefined ? { mergeCommit } : {}), strategy, ...(receiptStatus !== undefined ? { receiptStatus } : {}) };
         this.events?.publish(
-          WorkspaceEvents.promoted.create({ workspaceId: handle.id, targetBranch: handle.baseBranch, strategy, beforeRef: targetHead, afterRef }, { source: "workspace", attribution: { identity: handle.identity } }),
+          WorkspaceEvents.promoted.create({ workspaceId: handle.id, targetBranch: baseBranch, strategy, beforeRef: targetHead, afterRef }, { source: "workspace", attribution: { identity: rec.identity } }),
         );
-        this.log.info({ event: "workspace_promoted", workspaceId: handle.id, strategy, beforeRef: targetHead, afterRef, targetBranch: handle.baseBranch, receiptStatus }, "workspace promoted");
+        this.log.info({ event: "workspace_promoted", workspaceId: handle.id, strategy, beforeRef: targetHead, afterRef, targetBranch: baseBranch, receiptStatus }, "workspace promoted");
 
         // SG-7: the source worktree DIRECTORY is no longer needed once promoted — free the disk
         // (best-effort; never undoes the landed promote). The scratch BRANCH is intentionally
@@ -436,11 +442,21 @@ export class WorkspaceManager {
 
   async discard(handle: WorkspaceHandle): Promise<DiscardResult> {
     return this.withWorkspaceLock(handle.id, async () => {
-      await removeWorktree(handle.targetRepo, handle.path);
-      await pruneWorktrees(handle.targetRepo);
-      await deleteBranch(handle.targetRepo, handle.scratchBranch);
-
+      // H3 — REHYDRATE the destructive targets from the DURABLE record (source of truth) BEFORE
+      // destroying anything. The only field trusted from the caller's handle is the opaque `id`; a
+      // stale/hand-built handle whose `path`/`scratchBranch`/`targetRepo` point elsewhere must never
+      // drive `removeWorktree`/`deleteBranch` at the WRONG worktree or branch. The record is read
+      // under the ws lock (held for the whole op), then its fields drive the teardown. If no record
+      // exists (already reconciled away), fall back to the handle — the ops are idempotent/guarded and
+      // nothing in the registry claims those paths.
       const rec = await this.store.get(handle.id);
+      const targetRepo = rec?.targetRepo ?? handle.targetRepo;
+      const path = rec?.path ?? handle.path;
+      const scratchBranch = rec?.scratchBranch ?? handle.scratchBranch;
+      await removeWorktree(targetRepo, path);
+      await pruneWorktrees(targetRepo);
+      await deleteBranch(targetRepo, scratchBranch);
+
       if (rec?.state === "promoted") {
         // Terminal: preserve the promoted record (+promotedTo); only note the cleanup.
         await this.store.put(handle.id, { ...rec, cleanedAt: this.now(), updatedAt: this.now() });
@@ -448,7 +464,7 @@ export class WorkspaceManager {
         await this.store.put(handle.id, { ...rec, state: "discarded", updatedAt: this.now() });
       }
       this.live.delete(handle.id);
-      this.events?.publish(WorkspaceEvents.discarded.create({ workspaceId: handle.id }, { source: "workspace", attribution: { identity: handle.identity } }));
+      this.events?.publish(WorkspaceEvents.discarded.create({ workspaceId: handle.id }, { source: "workspace", attribution: { identity: rec?.identity ?? handle.identity } }));
       this.log.info({ event: "workspace_discarded", workspaceId: handle.id, wasPromoted: rec?.state === "promoted" }, "workspace discarded");
       return { workspaceId: handle.id, removed: true };
     });

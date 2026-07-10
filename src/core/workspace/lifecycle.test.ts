@@ -68,6 +68,34 @@ test("diff falls back to the WORKING-TREE diff for uncommitted retained work (no
   }
 });
 
+test("H3: discard rehydrates the git targets from the DURABLE record — a STALE handle cannot misdirect the teardown", async () => {
+  const repo = await makeRepo();
+  const { mgr, root } = makeManager();
+  try {
+    const ws = await mgr.allocate({ targetRepo: repo, identity: ID });
+    await writeFile(join(ws.path, "work.txt"), "real work\n");
+
+    // A BYSTANDER scratch branch that a stale/wrong handle would wrongly name as the teardown target.
+    const victimBranch = "ikbi/ws/bystander-should-survive";
+    await runGit(repo, ["branch", victimBranch]);
+
+    // A caller passes a handle with the CORRECT opaque id but WRONG git fields (points the destructive
+    // op at the bystander branch + a bogus path). Only the durable record must drive the teardown.
+    const staleHandle = { ...ws, scratchBranch: victimBranch, path: join(root, "nonexistent-stale-path") };
+    const r = await mgr.discard(staleHandle);
+    assert.equal(r.removed, true);
+
+    // The REAL scratch branch (from the record) was deleted; the bystander the stale handle named survives.
+    const branches = (await runGit(repo, ["branch", "--list"])).stdout;
+    assert.ok(!branches.includes(ws.scratchBranch), "the record's real scratch branch was torn down");
+    assert.ok(branches.includes(victimBranch), "the bystander branch the stale handle named was NOT touched");
+    // The real worktree dir is gone (rehydrated path), and the durable record is now discarded.
+    assert.equal(await exists(ws.path), false, "the record's real worktree dir was removed");
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
 test("cleanOrphans({force:false}) PRESERVES retained work; {force:true} sweeps it", async () => {
   const repo = await makeRepo();
   const { mgr, root } = makeManager();
