@@ -558,7 +558,7 @@ export interface OrchestratorDeps {
   readonly proposeCorrection?: (input: CorrectionProposeInput) => void;
   readonly workspaces?: {
     allocate: (opts: { targetRepo: string; identity: AgentIdentity; baseBranch?: string; label?: string }) => Promise<WorkspaceHandle>;
-    promote: (handle: WorkspaceHandle, approval: { evaluation: WorkspaceEvaluation; governance?: PromoteGovernance; message?: string }) => Promise<PromoteResult>;
+    promote: (handle: WorkspaceHandle, approval: { evaluation: WorkspaceEvaluation; governance?: PromoteGovernance; message?: string; requestId?: string; verifiedAgainst?: { targetHead: string; integratedTree: string } }) => Promise<PromoteResult>;
     discard: (handle: WorkspaceHandle) => Promise<DiscardResult>;
     /**
      * Retain a FAILED build's workspace (mark it terminal-failed but KEEP the worktree on disk
@@ -680,6 +680,14 @@ export interface OrchestratorDeps {
    * Returns a non-empty reason string when the repo is dirty, undefined when clean or unknown.
    */
   readonly checkTargetDirty?: (targetRepo: string) => Promise<string | undefined>;
+  /**
+   * Reads the content tree hash of a candidate workspace (Phase 3 stale-tree protection). The
+   * canonical promotion authority captures this at verification time and re-reads it immediately
+   * before promotion; a mismatch blocks the promote (the candidate mutated since it was verified).
+   * Default: `git -C <path> rev-parse HEAD^{tree}` (undefined when the path is not a git worktree,
+   * e.g. an in-memory test workspace — the authority then skips the tree check, unchanged behavior).
+   */
+  readonly readTreeHash?: (workspacePath: string) => Promise<string | undefined>;
   /**
    * Memory governor — intercepts writes to governed surfaces (CLAUDE.md, .ikbi/*, brain pages)
    * and converts them to operator-reviewed proposals. When wired, the builder's tool-executor
@@ -833,6 +841,82 @@ interface AttemptModelDecision {
   readonly vendorLane?: string;
   /** Human-readable rationale (rental reason / escalation trigger). */
   readonly rationale?: string;
+}
+
+/**
+ * The strategy that PRODUCED a promotion candidate. Candidate generation/selection may differ per
+ * strategy, but the definition of promotion does NOT — every one of these routes through the single
+ * canonical promotion authority (`promoteCandidate`). (Phase 3, IKBI-RT-004.)
+ */
+export type PromotionStrategy = "normal" | "duel-primary" | "duel-peer" | "tournament" | "competitive";
+
+/**
+ * A uniquely identifiable proposed tree produced by one attempt/strategy (Phase 3). It carries the
+ * provenance the canonical promotion authority needs to prove the identity chain:
+ *   generated == selected == verified == policy-evaluated == promoted == receipt candidate.
+ * `verifiedTree` is the content tree hash the deterministic verifier certified; the authority refuses
+ * to promote if the workspace's live tree no longer matches it (stale-tree / post-verify mutation).
+ */
+export interface PromotionCandidate {
+  readonly taskId: string;
+  /** The attempt this candidate belongs to (== the lane-distinct taskId; Phase 2). */
+  readonly attemptId: string;
+  readonly strategy: PromotionStrategy;
+  readonly workspaceId: string;
+  readonly workspacePath: string;
+  /** The executed builder model (Phase 1) — for the truthful promotion receipt. */
+  readonly model?: string;
+  /** The attempt's vendor lane (Phase 2). */
+  readonly vendorLane?: string;
+  /** The content tree hash the verifier certified. Undefined ⇒ tree identity could not be read. */
+  readonly verifiedTree?: string;
+  /** The target-branch head verification ran against (for hash-bound promote authorization). */
+  readonly targetHead?: string;
+}
+
+/** How the critic's verdict was resolved (Phase 3 critic-parser boundary). */
+export type SemanticVerdictKind = "pass" | "concrete-fail" | "indeterminate" | "not-evaluated";
+
+/**
+ * Candidate-BOUND evidence submitted to the canonical promotion authority (Phase 3). Every field
+ * describes THIS candidate; the authority does not synthesize verification/safety facts, and a
+ * strategy may not reuse another candidate's evidence. `semanticKind === "indeterminate"` marks a
+ * bare/unparsable critic FAIL that is NOT a concrete defect — it must never be recorded as one.
+ */
+export interface CandidateEvidence {
+  /** Deterministic verifier result for this candidate. */
+  readonly verificationPassed: boolean;
+  readonly verificationMode?: string;
+  /** Semantic (critic) verdict, classified. `not-evaluated` = the strategy ran no model critic. */
+  readonly semanticKind: SemanticVerdictKind;
+  /** The authoritative policy decision (integrator/judge/adjudication) — promote iff true. */
+  readonly policyPromote: boolean;
+  /** The real gate-wall governance decision — must allow, or the authority refuses. */
+  readonly governance: PromoteGovernance;
+  readonly evaluation: WorkspaceEvaluation;
+  readonly message: string;
+  readonly rationale?: string;
+}
+
+/**
+ * Classify the critic's verdict for the canonical evidence (Phase 3 critic-parser boundary). A bare
+ * `FAIL` with no concrete issue — or a critic role that failed to parse — is NOT authentic defect
+ * evidence: it is `indeterminate`, and must never be recorded as a fabricated concrete defect. Only a
+ * FAIL that carries at least one concrete issue (or substantive feedback) is `concrete-fail`. This
+ * does not change the fail-closed decision (an indeterminate critic still does not promote); it makes
+ * the recorded EVIDENCE truthful. A dedicated later phase may improve the critic contract/retries.
+ */
+export function classifySemanticVerdict(critic: RoleResult | undefined): SemanticVerdictKind {
+  if (critic === undefined) return "not-evaluated";
+  const d = (critic.detail ?? {}) as Record<string, unknown>;
+  if (d.pass === true) return "pass";
+  // The critic role itself could not produce a parseable verdict (e.g. a parser throw surfaced as a
+  // role failure with no structured pass/feedback) ⇒ indeterminate, not a concrete defect.
+  if (d.pass !== false && critic.outcome !== "success") return "indeterminate";
+  const issues = Array.isArray(d.issues) ? d.issues.filter((x): x is string => typeof x === "string" && x.trim().length > 0) : [];
+  const fb = typeof d.feedback === "string" ? d.feedback.trim() : "";
+  const substantiveFeedback = fb.length > 0 && fb.toUpperCase() !== "FAIL" && fb.toUpperCase() !== "PASS";
+  return issues.length > 0 || substantiveFeedback ? "concrete-fail" : "indeterminate";
 }
 
 /** Build an orchestrator. The default deps wire the real frozen singletons. */
@@ -1554,6 +1638,115 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       },
       workerSpawned.validated,
     );
+  }
+
+  // ── CANONICAL PROMOTION AUTHORITY (Phase 3, IKBI-RT-004/005) ────────────────────────────────
+  // The SOLE caller of `workspaces.promote`. Every promotion-capable strategy (normal, duel primary/
+  // peer, tournament, competitive) submits a candidate + candidate-BOUND evidence here; no strategy
+  // promotes, marks completion, or emits a success receipt on its own. This is what makes the identity
+  // chain hold: generated == selected == verified == policy-evaluated == promoted == receipt candidate.
+  //
+  // The authority: (1) refuses unless the policy decision is promote AND the real gate-wall allowed;
+  // (2) STALE-TREE — re-reads the candidate's live tree and refuses if it no longer matches the tree
+  // that was verified (a post-verify/post-fix mutation, IKBI-RT-005); (3) binds `verifiedAgainst` so
+  // the workspace CAS also refuses a moved target / a landed tree ≠ the certified tree; (4) performs
+  // the one promote; (5) emits the canonical `worker.promotion` receipt carrying the full chain.
+  const readTreeHash: (workspacePath: string) => Promise<string | undefined> =
+    deps.readTreeHash ??
+    (async (workspacePath: string): Promise<string | undefined> => {
+      try {
+        return execFileSync("git", ["-C", workspacePath, "rev-parse", "HEAD^{tree}"], { encoding: "utf8", timeout: 10_000 }).trim();
+      } catch {
+        return undefined; // not a git worktree (e.g. an in-memory test workspace) — skip the tree check
+      }
+    });
+
+  interface CanonicalPromotionResult {
+    readonly promote: PromoteResult;
+    /** Set when the authority REFUSED before/at promote (policy, governance, or stale-tree). */
+    readonly blockedReason?: string;
+    /** True when the refusal was a stale-tree / post-verify mutation (candidate ≠ verified). */
+    readonly staleTree?: boolean;
+  }
+
+  async function promoteCandidate(
+    handle: WorkspaceHandle,
+    candidate: PromotionCandidate,
+    evidence: CandidateEvidence,
+    parentIdentity: AgentIdentity,
+  ): Promise<CanonicalPromotionResult> {
+    const noPromote = (reason: string, extra?: Record<string, unknown>): PromoteResult => ({
+      promoted: false,
+      workspaceId: handle.id,
+      targetBranch: handle.baseBranch,
+      beforeRef: candidate.targetHead ?? handle.baseRef,
+      reason,
+      ...extra,
+    });
+    // (1) POLICY + GOVERNANCE must both authorize — defense in depth (callers already gate these).
+    if (!evidence.policyPromote) return { promote: noPromote("policy declined promotion"), blockedReason: "policy declined promotion" };
+    if (evidence.governance.allow !== true) {
+      return { promote: noPromote(evidence.governance.reason ?? "governance denied promotion"), blockedReason: "governance denied" };
+    }
+    // (2) STALE-TREE: the candidate that is promoted must be the exact candidate that was verified.
+    const currentTree = await readTreeHash(candidate.workspacePath);
+    if (candidate.verifiedTree !== undefined && currentTree !== undefined && currentTree !== candidate.verifiedTree) {
+      const reason = `stale-tree: candidate ${candidate.attemptId} changed since verification (verified tree ${candidate.verifiedTree}, live tree ${currentTree}) — refusing to promote unverified work`;
+      await receipts.append(
+        {
+          operation: "worker.promotion.stale_tree",
+          outcome: { status: "failure", detail: reason },
+          requestId: candidate.taskId,
+          metadata: { taskId: candidate.taskId, attemptId: candidate.attemptId, strategy: candidate.strategy, workspaceId: candidate.workspaceId, verifiedTree: candidate.verifiedTree, liveTree: currentTree },
+          project: handle.targetRepo,
+        },
+        parentIdentity,
+      );
+      log.warn({ taskId: candidate.taskId, attemptId: candidate.attemptId, verifiedTree: candidate.verifiedTree, liveTree: currentTree }, "canonical promotion: STALE-TREE — candidate mutated since verification; promote refused");
+      return { promote: noPromote(reason, { strategy: "noop" }), blockedReason: reason, staleTree: true };
+    }
+    // (3) HASH-BOUND authorization for the workspace CAS (moved target / landed tree ≠ certified tree).
+    const verifiedAgainst =
+      candidate.verifiedTree !== undefined && candidate.targetHead !== undefined
+        ? { targetHead: candidate.targetHead, integratedTree: candidate.verifiedTree }
+        : undefined;
+    // (4) THE promote — the only `workspaces.promote` call in the module.
+    const result = await workspaces.promote(handle, {
+      evaluation: evidence.evaluation,
+      governance: evidence.governance,
+      message: evidence.message,
+      requestId: candidate.taskId,
+      ...(verifiedAgainst !== undefined ? { verifiedAgainst } : {}),
+    });
+    // (5) CANONICAL PROMOTION RECEIPT — the full identity chain, for every strategy uniformly.
+    await receipts.append(
+      {
+        operation: "worker.promotion",
+        outcome: { status: result.promoted ? "success" : "failure", ...(result.reason !== undefined ? { detail: result.reason } : {}) },
+        requestId: candidate.taskId,
+        metadata: {
+          taskId: candidate.taskId,
+          attemptId: candidate.attemptId,
+          strategy: candidate.strategy,
+          workspaceId: candidate.workspaceId,
+          ...(candidate.model !== undefined ? { model: candidate.model } : {}),
+          ...(candidate.vendorLane !== undefined ? { vendorLane: candidate.vendorLane } : {}),
+          ...(candidate.verifiedTree !== undefined ? { verifiedTree: candidate.verifiedTree } : {}),
+          verificationPassed: evidence.verificationPassed,
+          ...(evidence.verificationMode !== undefined ? { verificationMode: evidence.verificationMode } : {}),
+          semanticVerdict: evidence.semanticKind,
+          policyPromote: evidence.policyPromote,
+          gateWallAllowed: evidence.governance.allow,
+          staleTreeChecked: candidate.verifiedTree !== undefined && currentTree !== undefined,
+          promoted: result.promoted,
+          ...(result.afterRef !== undefined ? { landedRef: result.afterRef } : {}),
+          ...(evidence.rationale !== undefined ? { rationale: evidence.rationale } : {}),
+        },
+        project: handle.targetRepo,
+      },
+      parentIdentity,
+    );
+    return { promote: result };
   }
 
   /** Cooperative kill checkpoint: does an active kill target THIS run? (read-only; never publishes). */
@@ -3487,6 +3680,14 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       }
     }
 
+    // STALE-TREE BINDING (Phase 3): snapshot the content tree the verifier certified, AFTER every role
+    // + escalation + rescue has run and committed its work. The canonical promotion authority re-reads
+    // the live tree immediately before promoting and refuses if it changed — the exact candidate that
+    // was verified is the exact candidate that promotes. Captured via the injectable readTreeHash seam
+    // (undefined for a non-git/in-memory test workspace ⇒ the authority skips the check, unchanged).
+    const verifiedTree = await readTreeHash(workspace.path);
+    const verifiedTargetHead = workspace.baseRef;
+
     // Terminal: a KILL halted the run mid-loop ⇒ stop cleanly (NEVER promote a half-run),
     // surface the kill, return. The workspace is RETAINED (not discarded) so its partial work
     // survives for inspection — `ikbi workspace ls` shows it; `ikbi workspace discard <id>` or
@@ -3593,12 +3794,25 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         adjRetain = true;
         decision = { ...decision, promote: false, rationale: "adjudication core authoritative but the promotability verdict was unavailable — fail closed (no promote; work retained for inspection)" };
       } else if (adjDecision.action === "promote") {
-        // H-2 (Fable): the core decided promote — SYNTHESIZE an approving evaluation. The integrator's
-        // own `evaluation` is `{approved:false}` whenever IT denied (or was absent/malformed), and
-        // WorkspaceManager.promote THROWS `not_approved` on a non-approving evaluation — so overriding an
-        // integrator discard to promote while keeping its evaluation crashes the run (uncaught, workspace
-        // leak). The adjudication core IS the authority here; its verdict is the approval.
-        decision = { ...decision, promote: true, evaluation: { approved: true, reason: `adjudication core: ${adjDecision.reason}`, evaluatorId: "adjudication-core" } };
+        // QUARANTINE (Phase 3, IKBI-RT-005). The experimental adjudication core still decides on a
+        // SYNTHESIZED SafetyLedger (effectiveBreach/driftBlocked/gateWallAuthorized are hard-coded in the
+        // block above), so it must NOT manufacture an autonomous promote from evidence that was not
+        // authentically produced. It may CONFIRM a promote the integrator ALSO approved (which then still
+        // passes through the canonical authority's real gate-wall + stale-tree binding), but when the
+        // integrator did NOT approve it fails CLOSED and retains the work — the experimental path can no
+        // longer synthesize an approving evaluation to override an integrator discard. (The brief's
+        // preferred outcome: quarantine, because authentic safety-fact binding is out of this phase.)
+        if (decision.promote === true) {
+          decision = { ...decision, rationale: `adjudication core: promote — confirms the integrator (${adjDecision.reason})` };
+        } else {
+          adjRetain = true;
+          decision = {
+            ...decision,
+            promote: false,
+            rationale:
+              "adjudication core recommended promote, but the integrator did not approve — QUARANTINED: the experimental IKBI_LEGACY_COMPLETION=off path cannot autonomously promote from synthesized safety evidence (no promote; work retained for inspection)",
+          };
+        }
       } else {
         adjRetain = adjDecision.action === "retain";
         decision = { ...decision, promote: false, rationale: `adjudication core: ${adjDecision.action} (${adjDecision.reason})` };
@@ -3687,18 +3901,47 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           trustSuppressed = true;
           trustSuppressReason = "gate-wall denied promotion (governance decision)";
         } else {
-          const promote = await workspaces.promote(workspace, {
-            evaluation: decision.evaluation, // sourced from the integrator, NOT hardcoded
+          // CANONICAL PROMOTION (Phase 3): submit the candidate + its candidate-bound evidence to the
+          // single promotion authority — the normal path no longer calls workspaces.promote directly.
+          const builderDetail = (results.find((r) => r.role === "builder")?.detail ?? {}) as Record<string, unknown>;
+          const candidate: PromotionCandidate = {
+            taskId: task.taskId,
+            attemptId: task.taskId,
+            strategy: task.moeVendorLane === "mimo" ? "duel-peer" : task.moeVendorLane === "deepseek" ? "duel-primary" : "normal",
+            workspaceId: workspace.id,
+            workspacePath: workspace.path,
+            ...(typeof builderDetail.model === "string" ? { model: builderDetail.model } : {}),
+            ...(task.moeVendorLane !== undefined ? { vendorLane: task.moeVendorLane } : {}),
+            ...(verifiedTree !== undefined ? { verifiedTree } : {}),
+            targetHead: verifiedTargetHead,
+          };
+          const evidence: CandidateEvidence = {
+            verificationPassed: results.find((r) => r.role === "verifier")?.outcome === "success",
+            ...(actualVerificationMode !== undefined ? { verificationMode: actualVerificationMode } : {}),
+            semanticKind: classifySemanticVerdict(results.find((r) => r.role === "critic")),
+            policyPromote: true, // the integrator (or authoritative adjudication) already decided promote
             governance,
-            // Auditability: record the verification scope the promote relied on in the commit message.
+            evaluation: decision.evaluation, // sourced from the integrator, NOT hardcoded
             message: `worker-model: ${task.goal}${decision.rationale !== undefined ? ` — ${decision.rationale}` : ""}${verificationScope !== undefined ? ` [verification: ${verificationScope}]` : ""}`,
-            requestId: task.taskId,
-          });
-          promoted = promote.promoted;
+            ...(decision.rationale !== undefined ? { rationale: decision.rationale } : {}),
+          };
+          const canon = await promoteCandidate(workspace, candidate, evidence, parentIdentity);
+          promoted = canon.promote.promoted;
           if (!promoted) {
-            // Conflict: the workspace is reconcilable — downgrade to partial, do NOT discard.
-            overall = "partial";
-            reason = promote.reason ?? "promote did not land (conflict)";
+            if (canon.staleTree === true) {
+              // Post-verify mutation: the promoted tree would not be the verified tree. Fail CLOSED —
+              // discard the unverified work, reject, and suppress trust (an integrity/timing issue, not
+              // a worker quality failure).
+              await workspaces.discard(workspace);
+              overall = "rejected";
+              reason = canon.blockedReason;
+              trustSuppressed = true;
+              trustSuppressReason = "stale-tree: candidate mutated since verification (not a worker quality failure)";
+            } else {
+              // Conflict: the workspace is reconcilable — downgrade to partial, do NOT discard.
+              overall = "partial";
+              reason = canon.promote.reason ?? "promote did not land (conflict)";
+            }
           }
         }
       }
@@ -4176,12 +4419,29 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         await recordBuildTrust("rejected", compWorkerSpawned, task.taskId, task.targetRepo, false, compTaint); // NOT suppressed — a genuine gate failure
         return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: winnerRoles, workspaceId: retained.retained?.id ?? winner.id, promoted: false, reason: retained.reason, costUsd: runCost() };
       }
-      const promote = await workspaces.promote(winner, {
-        evaluation: { approved: true, score: verdict.winner.composite, evaluatorId: "deterministic-judge" },
-        governance,
-        message: `worker-model (competitive): ${task.goal}`,
-        requestId: task.taskId,
-      });
+      // CANONICAL PROMOTION (Phase 3): the competitive winner is a SELECTED candidate — it does not
+      // promote itself. It enters the same authority as every strategy (stale-tree + verifiedAgainst +
+      // canonical receipt). The deterministic judge selected it; the model critic is NOT run on the
+      // winner here (IKBI-RT-004 semantic-funnel gap — documented, not closed in this phase).
+      const compWinnerModel = ((rolesByWs.get(winner.id) ?? []).find((r) => r.role === "builder")?.detail as Record<string, unknown> | undefined)?.model;
+      const compVerifiedTree = await readTreeHash(winner.path);
+      const canon = await promoteCandidate(
+        winner,
+        {
+          taskId: task.taskId, attemptId: task.taskId, strategy: "competitive", workspaceId: winner.id, workspacePath: winner.path,
+          ...(typeof compWinnerModel === "string" ? { model: compWinnerModel } : {}),
+          ...(compVerifiedTree !== undefined ? { verifiedTree: compVerifiedTree } : {}), targetHead: winner.baseRef,
+        },
+        {
+          verificationPassed: winnerRoles.find((r) => r.role === "verifier")?.outcome === "success",
+          semanticKind: classifySemanticVerdict(winnerRoles.find((r) => r.role === "critic")),
+          policyPromote: true, governance,
+          evaluation: { approved: true, score: verdict.winner.composite, evaluatorId: "deterministic-judge" },
+          message: `worker-model (competitive): ${task.goal}`,
+        },
+        parentIdentity,
+      );
+      const promote = canon.promote;
       for (const ws of handles) if (ws.id !== winner.id) await safeDiscard(workspaces, ws);
 
       let promoted = promote.promoted;
@@ -4358,12 +4618,29 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       // C-A1: fail-closed injection/policy-taint gate for the tournament winner (parity with single-run).
       const tourTaint = winnerTaintReason(roleResults);
       if (tourTaint !== undefined) return { promoted: false, reason: `discard: ${tourTaint}` };
-      const result = await workspaces.promote(ws, {
-        evaluation: { approved: true, score: composite, evaluatorId: "deterministic-judge" },
-        governance,
-        message: `worker-model (tournament): ${t.goal}`,
-        requestId: t.taskId,
-      });
+      // CANONICAL PROMOTION (Phase 3): the tournament winner's clean-shadow replay is a SELECTED,
+      // reverified candidate — it enters the single promotion authority like every strategy (stale-tree
+      // + verifiedAgainst + canonical receipt). The model critic is NOT run on the shadow here
+      // (IKBI-RT-004 semantic-funnel gap — documented, not closed in this phase).
+      const tourWinnerModel = (roleResults.find((r) => r.role === "builder")?.detail as Record<string, unknown> | undefined)?.model;
+      const tourVerifiedTree = await readTreeHash(ws.path);
+      const canon = await promoteCandidate(
+        ws,
+        {
+          taskId: t.taskId, attemptId: t.taskId, strategy: "tournament", workspaceId: ws.id, workspacePath: ws.path,
+          ...(typeof tourWinnerModel === "string" ? { model: tourWinnerModel } : {}),
+          ...(tourVerifiedTree !== undefined ? { verifiedTree: tourVerifiedTree } : {}), targetHead: ws.baseRef,
+        },
+        {
+          verificationPassed: roleResults.find((r) => r.role === "verifier")?.outcome === "success",
+          semanticKind: classifySemanticVerdict(roleResults.find((r) => r.role === "critic")),
+          policyPromote: true, governance,
+          evaluation: { approved: true, score: composite, evaluatorId: "deterministic-judge" },
+          message: `worker-model (tournament): ${t.goal}`,
+        },
+        parentIdentity,
+      );
+      const result = canon.promote;
       if (result.promoted && result.receiptStatus === "failed") {
         log.warn({ workspaceId: ws.id, taskId: t.taskId, receiptStatus: result.receiptStatus }, "tournament promote landed but receipt append failed");
       }

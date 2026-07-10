@@ -314,7 +314,7 @@ test("Cx: IKBI_LEGACY_COMPLETION=off makes the adjudication core AUTHORITATIVE �
   assert.match(result.reason ?? "", /adjudication core authoritative but the promotability verdict was unavailable/);
 });
 
-test("Cx: authoritative core PROMOTES green work on a real worktree — OVERRIDING an integrator that would discard", async () => {
+test("Cx (Phase 3 QUARANTINE): authoritative core canNOT autonomously promote over an integrator discard — it retains, fail-closed", async () => {
   const dir = mkdtempSync(join(tmpdir(), "ikbi-cx-real-"));
   const git = (...args: string[]): string => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8" });
   try {
@@ -328,18 +328,12 @@ test("Cx: authoritative core PROMOTES green work on a real worktree — OVERRIDI
 
     const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
     const handle: WorkspaceHandle = { ...fakeWorkspaceHandle(), id: "wsabcd", path: dir, targetRepo: dir, baseRef, baseBranch: "main" };
-    const calls = { promote: 0, discard: 0 };
+    const calls = { promote: 0, discard: 0, retain: 0 };
     const workspaces: NonNullable<OrchestratorDeps["workspaces"]> = {
       allocate: async () => handle,
-      // H-2 (Fable): enforce the manager's real precondition — a non-approving evaluation THROWS
-      // not_approved. The integrator here returns discard/{approved:false}; the authoritative override
-      // must SYNTHESIZE an approving evaluation, or this promote crashes (as it would in production).
-      promote: async (h, approval): Promise<PromoteResult> => {
-        assert.equal(approval.evaluation.approved, true, "the core-decided promote carries an approving evaluation (not the integrator's {approved:false})");
-        calls.promote += 1;
-        return { promoted: true, workspaceId: h.id, targetBranch: h.baseBranch, beforeRef: "a", afterRef: "b" };
-      },
+      promote: async (h): Promise<PromoteResult> => { calls.promote += 1; return { promoted: true, workspaceId: h.id, targetBranch: h.baseBranch, beforeRef: "a", afterRef: "b" }; },
       discard: async (): Promise<DiscardResult> => { calls.discard += 1; return { workspaceId: handle.id, removed: true }; },
+      retain: async (h): Promise<DiscardResult> => { calls.retain += 1; return { workspaceId: h.id, removed: false }; },
       commit: async () => true,
     };
     const roles: Partial<Record<WorkerRole, RoleFn>> = {
@@ -347,7 +341,9 @@ test("Cx: authoritative core PROMOTES green work on a real worktree — OVERRIDI
       builder: async () => ({ role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["feature.ts"], rejectedToolCalls: [], stopReason: "stop" } }),
       verifier: async () => ({ role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, outputTail: "# tests 3\n# pass 3\n" }] } }),
       critic: async () => ({ role: "critic", outcome: "success", summary: "c", detail: { pass: true } }),
-      // The integrator DISCARDS — but the authoritative adjudication core will override it on merit.
+      // The integrator DISCARDS. Before Phase 3 the authoritative core would SYNTHESIZE an approving
+      // evaluation and override this to promote. Phase 3 quarantines that: the experimental path may not
+      // autonomously promote from synthesized safety evidence over an integrator deny.
       integrator: async () => ({ role: "integrator", outcome: "success", summary: "i", detail: { decision: "discard", rationale: "integrator says discard", evaluation: { approved: false } } }),
     };
     const orch = createOrchestrator(baseDeps({
@@ -356,11 +352,9 @@ test("Cx: authoritative core PROMOTES green work on a real worktree — OVERRIDI
     }));
     const result = await orch.run({ taskId: "t-cx", targetRepo: dir, goal: "cx" }, parentCtx);
 
-    // Green + tree-bound + executed evidence + critic pass + no veto ⇒ the core PROMOTES, overriding the
-    // integrator's discard. This is the whole point of Cx: one authoritative predicate, not the old gate.
-    assert.equal(calls.promote, 1, "the authoritative core promoted the green work (integrator wanted discard)");
-    assert.equal(calls.discard, 0, "green work was not discarded (I1)");
-    assert.equal(result.promoted, true);
+    assert.equal(calls.promote, 0, "QUARANTINE: the experimental core did NOT promote over the integrator's discard");
+    assert.equal(result.promoted, false);
+    assert.match(result.reason ?? "", /QUARANTINED/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -1124,8 +1118,11 @@ test("each role's outcome is recorded to receipts + trust under the ROLE identit
   const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, trust: tr.trust, receipts: rc.receipts }));
   await orch.run(task, parentCtx);
 
-  // Phase 3: one run-level summary receipt is now appended after role receipts complete.
-  assert.equal(rc.calls.length, 6, "five role receipts + one worker.run.summary");
+  // Phase 3: a promoting build now emits the canonical `worker.promotion` receipt (the single
+  // promotion authority's identity-chain record) in addition to the five role receipts and the
+  // run-level summary.
+  assert.equal(rc.calls.length, 7, "five role receipts + one worker.run.summary + one worker.promotion");
+  assert.ok(rc.calls.some((c) => c.operation === "worker.promotion"), "the canonical promotion receipt was written");
   assert.equal(tr.calls.length, 1, "FIX A: one trust outcome per BUILD, not per role");
   const roleReceipts = rc.calls.filter((c) => c.operation.startsWith("worker.role."));
   assert.equal(roleReceipts.length, 5, "one receipt per role");
