@@ -191,33 +191,31 @@ function testsFamily(r: ReturnType<ReturnType<typeof newJudge>["judge"]>, ws: st
   return r.ranking.find((x) => x.workspaceId === ws)?.familyScores?.tests ?? -1;
 }
 
-test("F6: a real executed suite outranks zero-test / unverified / custom-check success on the tests family", () => {
-  // All four PASS the gate (testsPass true) — none is disqualified — but their tests-family
-  // CONFIDENCE must differ so a passing `echo done` / `ci` cannot tie a real suite.
+test("C3: non-executed evidence (zero/unverified/absent) is DISQUALIFIED — only a real executed suite is admissible", () => {
+  // C3 supersedes Finding D's down-ranking: a candidate whose tests did not actually run has NOT
+  // earned promotable confidence, so it is disqualified outright (LAYER 1) — the judge ranks only
+  // admissible candidates and can never crown a vacuous-green winner over one with real evidence.
   const real = cand({ workspaceId: "real", testsPass: true, testEvidence: "executed", testCount: { passed: 10, total: 10 } });
   const unverified = cand({ workspaceId: "unverified", testsPass: true, testEvidence: "unverified" }); // e.g. `echo done`
   const absent = cand({ workspaceId: "absent", testsPass: true, testEvidence: "absent" });             // only a `ci` check
   const zero = cand({ workspaceId: "zero", testsPass: true, testEvidence: "zero" });                   // runner executed 0 tests
   const r = newJudge().judge([unverified, absent, zero, real]);
 
-  // Distinguishable, deterministic, strictly ordered: executed > unverified > absent > zero.
-  const tReal = testsFamily(r, "real"), tUnver = testsFamily(r, "unverified"), tAbsent = testsFamily(r, "absent"), tZero = testsFamily(r, "zero");
-  assert.ok(tReal > tUnver && tUnver > tAbsent && tAbsent > tZero, `tests-family ordering executed>unverified>absent>zero (got ${tReal},${tUnver},${tAbsent},${tZero})`);
-  assert.equal(tReal, 1.0, "a fully-passing real suite earns full tests confidence");
-  assert.ok(tUnver < 1.0 && tZero < 1.0, "no non-executed signal earns the real suite's confidence");
-  // The real suite wins outright (it leads the load-bearing tests family).
-  assert.equal(r.winner?.workspaceId, "real", "the real executed suite wins over the zero-test/custom passers");
+  for (const ws of ["unverified", "absent", "zero"]) {
+    const v = r.ranking.find((x) => x.workspaceId === ws);
+    assert.equal(v?.disqualified, true, `${ws} is disqualified (inadmissible)`);
+    assert.match(v?.overrideReason ?? "", /test-evidence:/);
+  }
+  assert.equal(r.ranking.find((x) => x.workspaceId === "real")?.disqualified, false, "the executed suite survives");
+  assert.equal(r.winner?.workspaceId, "real", "the only admissible candidate wins");
 });
 
-test("F6: a zero-test success scores STRICTLY below an identical real-suite candidate", () => {
-  const base = { typecheckPass: true as const, testsPass: true as const, toolRounds: 1, maxToolRounds: 20, rejectedToolCalls: 0, filesWritten: 1, diffLines: 100, stopReason: "stop" as const };
-  const real = { ...base, workspaceId: "real", testEvidence: "executed" as const, testCount: { passed: 5, total: 5 } };
-  const zero = { ...base, workspaceId: "zero", testEvidence: "zero" as const };
-  const r = newJudge().judge([zero, real]);
-  const realComposite = r.ranking.find((x) => x.workspaceId === "real")?.composite ?? 0;
-  const zeroComposite = r.ranking.find((x) => x.workspaceId === "zero")?.composite ?? 1;
-  assert.ok(realComposite > zeroComposite, "a real suite must never collapse to the same confidence as zero tests");
-  assert.equal(r.winner?.workspaceId, "real");
+test("C3: every candidate non-executed ⇒ rejectedAll (fail-closed; judge grants no promotability)", () => {
+  const unverified = cand({ workspaceId: "unverified", testsPass: true, testEvidence: "unverified" });
+  const zero = cand({ workspaceId: "zero", testsPass: true, testEvidence: "zero" });
+  const r = newJudge().judge([unverified, zero]);
+  assert.equal(r.winner, null, "no admissible candidate ⇒ no winner");
+  assert.equal(r.rejectedAll, true, "promote nothing — the judge never launders non-executed work into a winner");
 });
 
 test("F8 (back-compat): a candidate with NO testEvidence keeps the prior full-marks tests score", () => {

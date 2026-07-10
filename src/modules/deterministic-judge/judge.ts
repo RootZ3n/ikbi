@@ -8,6 +8,12 @@
  * before scoring — a hard-fail can NEVER be outscored (the Luak rule). LAYER 2
  * (weighted families) ranks the survivors. Winner = best composite, broken by an
  * EXPLICIT deterministic tie-break. No survivor ⇒ fail-closed (winner null).
+ *
+ * ADMISSIBILITY (Codex C3): the overrides include a test-evidence gate — only a candidate with a
+ * REAL executed suite is admissible; zero/unverified/absent evidence is disqualified, not down-ranked.
+ * The judge RANKS admissible candidates; it does NOT grant promotability. Its `winner` is a ranking,
+ * never a promote authorization — the winner still passes through the adjudication core (executed +
+ * tree-bound) and the hash-bound promote gate before anything lands.
  */
 
 import { events as coreEvents } from "../../core/events/index.js";
@@ -76,6 +82,20 @@ export function defaultOverrides(): JudgeOverride[] {
       label: "tests",
       disqualifies: (c) => c.testsPass === false,
       reason: () => "tests failed (pnpm test non-zero) — failing tests are worthless",
+    },
+    {
+      // C3 — ADMISSIBILITY: only a REAL executed suite can win. A candidate whose tests did not
+      // actually run (a runner that executed ZERO tests / a pass with no parseable count / no test
+      // check at all) has NOT earned promotable confidence, so it is DISQUALIFIED outright — never
+      // merely down-ranked. This is what stops a competitive/tournament shootout from crowning a
+      // vacuous-green candidate over one with real executed evidence (the judge ranks only admissible
+      // candidates; it never launders non-executed work into a promotable winner). `undefined`
+      // testEvidence (a legacy candidate predating evidence capture) is left to the prior
+      // testCount-driven scoring — back-compat, unchanged. Mirrors the adjudication core's I6 gate.
+      id: "test-evidence",
+      label: "test-evidence",
+      disqualifies: (c) => c.testEvidence === "zero" || c.testEvidence === "unverified" || c.testEvidence === "absent",
+      reason: (c) => `test evidence "${c.testEvidence}" is not an executed suite — only a real executed test run is admissible (no vacuous-green winner)`,
     },
     // NB: rejected (PREVENTED) tool calls are NOT a disqualifier. Judge by effect, not intent — a
     // rejected call was BLOCKED by the governor (no effect), so it is a recorded warning + a mild

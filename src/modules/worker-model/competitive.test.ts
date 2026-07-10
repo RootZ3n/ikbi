@@ -401,7 +401,10 @@ test("C1: a candidate whose builder mutated package.json scripts → verifier UN
   // The REAL governed + integrity-guarded verifier (no roles.verifier override). The
   // governed exec passes the clean candidate's checks; the mutated one never reaches it.
   const governedRuns: ExecRequest[] = [];
-  const governedExec = { run: async (req: ExecRequest): Promise<ExecResult> => { governedRuns.push(req); return { executed: true, exitCode: 0, stdoutTail: "ok" }; } };
+  // The clean candidate's real test check emits a parseable tally ⇒ testEvidence "executed" (admissible
+  // under the C3 gate). The git integrity PROBE keeps its plain output (mutation detection is via
+  // workspaces.diff, below). Only the executed suite must carry a count for the clean candidate to win.
+  const governedExec = { run: async (req: ExecRequest): Promise<ExecResult> => { governedRuns.push(req); return req.command === "git" ? { executed: true, exitCode: 0, stdoutTail: "ok" } : { executed: true, exitCode: 0, stdoutTail: "# tests 3\n# pass 3\n# fail 0\n" }; } };
   const roles: Partial<Record<WorkerRole, RoleFn>> = {
     scout: async () => ({ role: "scout", outcome: "success", summary: "s" }),
     builder: async () => ({ role: "builder", outcome: "success", summary: "b", detail: { toolRounds: 2, filesWritten: ["a.ts"], rejectedToolCalls: [], stopReason: "stop" } }),
@@ -446,7 +449,13 @@ test("competitive: the judge receives correctly-mapped BuildCandidates", async (
   assert.equal(c0.diffLines, 3, "diff line count from workspaces.diff");
 });
 
-test("competitive: verifier verdict pass with custom check name is authoritative", async () => {
+test("C3: a custom-check-only pass (no executed test suite) is NOT admissible in competitive — consistent with the single-run integrator gate", async () => {
+  // A verifier pass whose only check is a custom `ci` (no check named "test") yields testEvidence
+  // "absent". The single-run integrator ALREADY blocks promote on absent evidence (Codex C1: "an absent
+  // field means we cannot confirm a real test signal — block promote exactly like zero/unverified").
+  // C3 brings the competitive judge into line: absent evidence is DISQUALIFIED, so a shootout can never
+  // crown a candidate the single-run path would reject. The gate MAPPING is still correct (an
+  // authoritative pass verdict ⇒ typecheck/tests gates pass); it is the ADMISSIBILITY that now fails.
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
   const ws = compWorkspaces();
   const roles: Partial<Record<WorkerRole, RoleFn>> = {
@@ -458,11 +467,11 @@ test("competitive: verifier verdict pass with custom check name is authoritative
   const judge = { judge: (c: readonly BuildCandidate[]) => { seen = c; return deterministicJudge.judge(c); } };
   const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles, judge }));
   const r = await orch.run(task, parentCtx);
-  assert.equal(r.outcome, "success");
-  assert.equal(r.promoted, true);
+  assert.equal(r.promoted, false, "no executed evidence ⇒ nothing promotes (fail-closed, matches single-run)");
   for (const c of seen) {
-    assert.equal(c.typecheckPass, true, "custom-check verifier pass maps to typecheck gate pass");
-    assert.equal(c.testsPass, true, "custom-check verifier pass maps to tests gate pass");
+    assert.equal(c.typecheckPass, true, "custom-check verifier pass still maps to typecheck gate pass");
+    assert.equal(c.testsPass, true, "custom-check verifier pass still maps to tests gate pass");
+    assert.equal(c.testEvidence, "absent", "no check named \"test\" ⇒ absent evidence");
   }
 });
 
