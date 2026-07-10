@@ -162,3 +162,60 @@ test("precedence: no-work beats every other condition", () => {
   );
   assert.deepEqual(d, { action: "discard", reason: "no-work" });
 });
+
+// ── I4 / I5 / I7 — the remaining invariant guards (permanent fixtures for the audit) ─────────────
+test("I4: the verdict depends ONLY on {work, assessment, safety, critic} — protocol status has no channel", () => {
+  // ProtocolExit / stopReason are DELIBERATELY not parameters (type-enforced). Guard the arity so a
+  // future edit cannot smuggle a protocol channel into the predicate: exactly four fact inputs.
+  assert.equal(decidePromotability.length, 4, "decidePromotability takes exactly the four fact types — no protocol input");
+});
+
+test("I5: total mapping — EVERY fact combination yields a well-formed decision from the closed enums", () => {
+  const VERDICTS: Verdict[] = ["pass", "fail", "tool_limited", "dry-run", "skipped", "untrusted", "unresolvable", "indeterminate"];
+  const EVIDENCE: TestEvidence[] = ["executed", "zero", "unverified", "absent"];
+  const DISCARD = new Set(["verifier-red", "no-work", "vacuous-green", "unresolvable", "aborted"]);
+  const RETAIN = new Set(["governance-withheld", "critic-fail-exhausted", "safety-forensics", "adjudication-incomplete"]);
+  const bools = [false, true];
+  let cases = 0;
+  for (const nonEmpty of bools)
+    for (const verdict of VERDICTS)
+      for (const testEvidence of EVIDENCE)
+        for (const treeHash of [TREE, "other-tree"])
+          for (const externalInjection of bools)
+            for (const effectiveBreach of bools)
+              for (const refuted of bools)
+                for (const killed of bools)
+                  for (const driftBlocked of bools)
+                    for (const gateWallAuthorized of bools)
+                      for (const criticOk of bools) {
+                        cases += 1;
+                        const d = decidePromotability(
+                          work({ nonEmpty }),
+                          { verdict, testEvidence, treeHash },
+                          { externalInjection, effectiveBreach, refuted, killed, driftBlocked, gateWallAuthorized },
+                          { pass: criticOk },
+                        );
+                        assert.ok(d.action === "promote" || d.action === "retain" || d.action === "discard", "action is in the closed set");
+                        if (d.action === "promote") {
+                          assert.equal(d.reason, "verified-green");
+                          assert.equal(d.treeHash, TREE, "a promote binds the work's tree hash");
+                        } else if (d.action === "retain") {
+                          assert.ok(RETAIN.has(d.reason), `retain reason "${d.reason}" is a closed-enum value`);
+                        } else {
+                          assert.ok(DISCARD.has(d.reason), `discard reason "${d.reason}" is a closed-enum value`);
+                        }
+                      }
+  // nonEmpty(2) × verdict(8) × evidence(4) × treeHash(2) × [6 safety + 1 critic bools = 2^7].
+  assert.equal(cases, 2 * 8 * 4 * 2 * 2 ** 7, "the full fact grid was exercised");
+});
+
+test("I7: any single safety veto on green work ⇒ NEVER promote (vetoes are monotone)", () => {
+  const vetoes: Array<Partial<SafetyLedger>> = [
+    { externalInjection: true }, { effectiveBreach: true }, { refuted: true },
+    { killed: true }, { driftBlocked: true }, { gateWallAuthorized: false },
+  ];
+  for (const v of vetoes) {
+    const d = decidePromotability(work(), green(), noVeto(v), criticPass);
+    assert.notEqual(d.action, "promote", `a veto (${JSON.stringify(v)}) still promoted green work`);
+  }
+});
