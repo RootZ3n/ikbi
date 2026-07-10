@@ -1220,3 +1220,22 @@ test("graduated no-progress: a WRITE after the nudge clears the streak (recovery
 
   assert.notEqual((res.detail as Record<string, unknown>)?.stopReason, "no_progress", "recovered — not a no_progress kill");
 });
+
+test("MoE hand-off: task.handoffBrief is surfaced to the builder as team context", async () => {
+  const dir = tmp();
+  const { engine, requests } = mockEngine([runChecksResp(), doneResp(["x"])]);
+  const base = makeCtx(dir, "verified", engine);
+  const ctx: RoleContext = { ...base, task: { ...base.task, handoffBrief: "- step 1: created src/alpha.ts with the core type" } };
+  await run(ctx);
+  const joined = (requests[0]?.messages ?? []).map((m) => String(m.content)).join("\n");
+  assert.match(joined, /Team hand-off/i, "the builder sees the team hand-off framing");
+  assert.match(joined, /created src\/alpha\.ts/, "the prior step's accumulated work is included");
+});
+
+test("MoE hand-off: no handoffBrief ⇒ no team-context message (first step / single build)", async () => {
+  const dir = tmp();
+  const { engine, requests } = mockEngine([runChecksResp(), doneResp(["x"])]);
+  await run(makeCtx(dir, "verified", engine));
+  const joined = (requests[0]?.messages ?? []).map((m) => String(m.content)).join("\n");
+  assert.doesNotMatch(joined, /Team hand-off/i, "no hand-off framing when there is no prior work");
+});

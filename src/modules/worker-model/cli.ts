@@ -1371,6 +1371,10 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
           });
           let stepsOk = true;
           let lastResult: WorkerResult | undefined;
+          // MoE HAND-OFF: a running brief of what prior steps built, threaded into each subsequent
+          // step's builder so a freshly-rented expert collaborates with the team (builds ON the
+          // accumulated work) instead of restarting cold. Rebuilt per attempt (fresh workspace).
+          const completedSteps: string[] = [];
           for (const step of buildStages) {
             progress(`  → ${unit} ${step.index}/${buildStages.length}: ${step.goal}${step.verify ? " (verify)" : ""}\n`);
             const stepTask: WorkerTask = {
@@ -1386,6 +1390,8 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
               // vendor lane (when dueling) keeps the whole attempt within one vendor's experts.
               ...(task.moeExpertRental === true ? { moeExpertRental: true } : {}),
               ...(vendorLane !== undefined ? { moeVendorLane: vendorLane } : {}),
+              // Hand the current expert the team's accumulated work (absent on the first step).
+              ...(completedSteps.length > 0 ? { handoffBrief: completedSteps.join("\n") } : {}),
               reuseWorkspace: sharedWorkspace,
               skipPromote: true,
               // Intermediate stages skip the verifier by default — the project is incomplete until the
@@ -1403,6 +1409,7 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
               stepsOk = false;
               break;
             }
+            completedSteps.push(`- step ${step.index}: ${step.goal.slice(0, 120)}`);
             progress(`  ✓ ${unit} ${step.index} passed\n`);
           }
           if (stepsOk) {

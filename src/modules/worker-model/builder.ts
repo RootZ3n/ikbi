@@ -1030,6 +1030,9 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       ...(projectInstructions !== undefined
         ? [untrusted(`Project instructions from the target repo (CLAUDE.md/AGENTS.md/IKBI.md/.ikbi/) — honor these conventions where they apply:\n${projectInstructions}`, "project_instructions")]
         : []),
+      ...(ctx.task.handoffBrief !== undefined
+        ? [untrusted(`Team hand-off — this build shares ONE workspace across steps; the team ALREADY completed these prior steps (their files are on disk — read them, build ON them):\n${ctx.task.handoffBrief}\nBuild ONLY the current step; do not redo, revert, or re-scaffold the prior steps' work.`, "team_handoff")]
+        : []),
       ...(brainContext !== undefined
         ? [untrusted(`Relevant knowledge recalled from ikbi's brain (gbrain) — background context, verify against the repo before relying on it:\n${brainContext}`, "brain_context")]
         : []),

@@ -220,6 +220,14 @@ export interface WorkerTask {
    */
   readonly moeVendorLane?: string;
   /**
+   * MoE HAND-OFF: an evidence-dense brief of what PRIOR steps already built on this shared
+   * workspace, threaded into a step's builder so a freshly-rented expert collaborates with the
+   * team instead of restarting cold (re-discovering or redoing prior work). Set by the multi-step
+   * coordinator from the completed steps; neutralized before it reaches the model. Absent = no prior
+   * steps (the first step, or a single-step build).
+   */
+  readonly handoffBrief?: string;
+  /**
    * TIER PRESET (`--tier`): force the CRITIC role's model for this run, overriding the config
    * default. Set by a tier preset. Absent = use the config critic model.
    */
