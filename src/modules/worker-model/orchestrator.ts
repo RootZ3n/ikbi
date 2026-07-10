@@ -1722,6 +1722,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         tierRosters: escalationConfig.tierModels,
         fallback: singleBuilderModel,
         tierOverride: verdict.tier,
+        ...(task.moeVendorLane !== undefined ? { vendorLane: task.moeVendorLane } : {}),
       });
       log.info({ taskId: task.taskId, difficulty: verdict.tier, source: verdict.source, rationale: verdict.rationale, classifier: classifierModel, model: rentedExpert.modelId }, "MoE: router classified difficulty + rented builder expert");
     }

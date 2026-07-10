@@ -1337,13 +1337,12 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
     try {
       let result: WorkerResult;
 
+      // H5 (lane-independent, checked ONCE before any attempt): a multi-step plan only LANDS on a
+      // tier with autoCommit autonomy. Intermediate steps set skipPromote (they never commit), and
+      // the final step's commit is gated on autoCommit — so on a non-autoCommit tier every green
+      // step would evaporate to "partial" with nothing landed. Refuse up front with an actionable
+      // message. (A run-only orchestrator exposes no spawnRole ⇒ proceed, preserving the legacy path.)
       if (multiStage) {
-        // H5: a multi-step plan only LANDS on a tier with autoCommit autonomy. Intermediate
-        // steps set skipPromote (they never commit), and the final step's commit is gated on
-        // autoCommit — so on a non-autoCommit tier (verified/probation/untrusted) every green
-        // step would still evaporate to "partial" with nothing landed. Refuse the plan up front
-        // with an actionable message instead of burning N model calls on work that can't land.
-        // (A run-only orchestrator exposes no spawnRole ⇒ proceed, preserving the legacy path.)
         const canLand = orchestrator.spawnRole?.("builder", ctx).autonomy.autoCommit ?? true;
         if (!canLand) {
           err(
@@ -1354,81 +1353,105 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
           setExit(1);
           return;
         }
-        // MULTI-STAGE: allocate ONE workspace, run all stages in it, final verify + promote.
-        // This is the shared-workspace accumulator — changes accumulate across stages.
-        const unit = usingScope ? "stage" : "step";
-        progress(usingScope ? `  ↳ staged build: ${buildStages.length} stages from SCOPE.md\n` : `  ↳ decomposed into ${buildStages.length} steps\n`);
-        const sharedWorkspace = await stepWorkspaces.allocate({
-          targetRepo,
-          identity: who.identity,
-          label: `worker:${id}:steps`,
-        });
-        let stepsOk = true;
-        let lastResult: WorkerResult | undefined;
-        for (const step of buildStages) {
-          progress(`  → ${unit} ${step.index}/${buildStages.length}: ${step.goal}${step.verify ? " (verify)" : ""}\n`);
-          const stepTask: WorkerTask = {
-            taskId: `${id}:step${step.index}`,
+      }
+
+      // ONE BUILD ATTEMPT (single-step or accumulated multi-stage), optionally pinned to a vendor
+      // lane so the duel-on-failure can run a genuine PEER in the other lane. Each attempt allocates
+      // a FRESH shared workspace and uses lane-suffixed task ids so the two attempts never collide.
+      const runOneAttempt = async (vendorLane?: string): Promise<WorkerResult> => {
+        const laneSuffix = vendorLane !== undefined ? `:${vendorLane}` : "";
+        if (multiStage) {
+          // MULTI-STAGE: allocate ONE workspace, run all stages in it, final verify + promote.
+          const unit = usingScope ? "stage" : "step";
+          progress(usingScope ? `  ↳ staged build: ${buildStages.length} stages from SCOPE.md\n` : `  ↳ decomposed into ${buildStages.length} steps\n`);
+          const sharedWorkspace = await stepWorkspaces.allocate({
             targetRepo,
-            goal: step.goal,
-            writeScope: detectWriteScope(step.goal),
-            // Propagate --complexity so each building stage inherits the large-build model tier AND the
-            // scaled builder wall-clock (a decomposed large goal can still have large individual stages).
-            ...(complexity !== undefined ? { complexity } : {}),
-            // MIXTURE OF EXPERTS: each step is its own orchestrator.run, so propagate the rental flag —
-            // the coordinator rents the cheapest-sufficient expert for THIS step's difficulty (a
-            // mechanical scaffold step → worker roster; a hard-logic step → mid roster).
-            ...(task.moeExpertRental === true ? { moeExpertRental: true } : {}),
-            reuseWorkspace: sharedWorkspace,
-            skipPromote: true,
-            // Intermediate stages skip the verifier by default — the project is incomplete until the
-            // last stage, so a mid-build verify would fail on not-yet-built imports. A scope stage the
-            // author marked `(verify)` OPTS IN: it verifies the accumulated state so a broken foundation
-            // is caught EARLY (the stage fails, the build stops) instead of after every later stage ran.
-            skipVerifier: !step.verify,
-            // Skip the critic on intermediate stages: on a skipPromote stage its verdict is discarded,
-            // so the paid model call buys nothing. The final pass critiques the accumulated work.
-            skipCritic: true,
-          };
-          lastResult = await orchestrator.run(stepTask, ctx);
-          if (lastResult.outcome !== "success") {
-            progress(`  ✗ ${unit} ${step.index} failed: ${lastResult.reason ?? lastResult.outcome}\n`);
-            stepsOk = false;
-            result = lastResult;
-            break;
+            identity: who.identity,
+            label: `worker:${id}:steps${laneSuffix}`,
+          });
+          let stepsOk = true;
+          let lastResult: WorkerResult | undefined;
+          for (const step of buildStages) {
+            progress(`  → ${unit} ${step.index}/${buildStages.length}: ${step.goal}${step.verify ? " (verify)" : ""}\n`);
+            const stepTask: WorkerTask = {
+              taskId: `${id}:step${step.index}${laneSuffix}`,
+              targetRepo,
+              goal: step.goal,
+              writeScope: detectWriteScope(step.goal),
+              // Propagate --complexity so each building stage inherits the large-build model tier AND the
+              // scaled builder wall-clock (a decomposed large goal can still have large individual stages).
+              ...(complexity !== undefined ? { complexity } : {}),
+              // MIXTURE OF EXPERTS: each step is its own orchestrator.run, so propagate the rental flag —
+              // the coordinator rents the cheapest-sufficient expert for THIS step's difficulty. The
+              // vendor lane (when dueling) keeps the whole attempt within one vendor's experts.
+              ...(task.moeExpertRental === true ? { moeExpertRental: true } : {}),
+              ...(vendorLane !== undefined ? { moeVendorLane: vendorLane } : {}),
+              reuseWorkspace: sharedWorkspace,
+              skipPromote: true,
+              // Intermediate stages skip the verifier by default — the project is incomplete until the
+              // last stage, so a mid-build verify would fail on not-yet-built imports. A scope stage the
+              // author marked `(verify)` OPTS IN: it verifies the accumulated state so a broken foundation
+              // is caught EARLY (the stage fails, the build stops) instead of after every later stage ran.
+              skipVerifier: !step.verify,
+              // Skip the critic on intermediate stages: on a skipPromote stage its verdict is discarded,
+              // so the paid model call buys nothing. The final pass critiques the accumulated work.
+              skipCritic: true,
+            };
+            lastResult = await orchestrator.run(stepTask, ctx);
+            if (lastResult.outcome !== "success") {
+              progress(`  ✗ ${unit} ${step.index} failed: ${lastResult.reason ?? lastResult.outcome}\n`);
+              stepsOk = false;
+              break;
+            }
+            progress(`  ✓ ${unit} ${step.index} passed\n`);
           }
-          progress(`  ✓ ${unit} ${step.index} passed\n`);
-        }
-        if (stepsOk) {
-          // All steps passed — run full verification + promote on the accumulated workspace.
-          progress(`  → final verification + promote\n`);
-          const finalTask: WorkerTask = {
-            taskId: `${id}:verify`,
-            targetRepo,
-            goal: `Verify all changes from the ${usingScope ? "staged build" : "multi-step plan"}: ${finalGoal}`,
-            reuseWorkspace: sharedWorkspace,
-            // H4: the final pass VERIFIES the accumulated work — it must not MODIFY it. writeScope
-            // "none" blocks the builder from writing/patching/shell-writing any file, so a cheap
-            // builder model cannot revert or corrupt the prior steps' work. The verifier still runs
-            // its objective checks against the accumulated tree.
-            writeScope: "none",
-          };
-          result = await orchestrator.run(finalTask, ctx);
-        } else {
-          // H3: a failing step left the shared workspace ALIVE (intermediate steps set
-          // skipPromote, so the orchestrator neither promotes nor discards it). Discard it here
-          // so a failed multi-step build never leaks the worktree. Best-effort: a discard error
-          // must not mask the original step failure — the leak is reclaimable via `ikbi clean`.
+          if (stepsOk) {
+            // All steps passed — run full verification + promote on the accumulated workspace.
+            progress(`  → final verification + promote\n`);
+            const finalTask: WorkerTask = {
+              taskId: `${id}:verify${laneSuffix}`,
+              targetRepo,
+              goal: `Verify all changes from the ${usingScope ? "staged build" : "multi-step plan"}: ${finalGoal}`,
+              reuseWorkspace: sharedWorkspace,
+              // H4: the final pass VERIFIES the accumulated work — it must not MODIFY it. writeScope
+              // "none" blocks the builder from writing/patching/shell-writing any file, so a cheap
+              // builder model cannot revert or corrupt the prior steps' work. The verifier still runs
+              // its objective checks against the accumulated tree.
+              writeScope: "none",
+            };
+            return await orchestrator.run(finalTask, ctx);
+          }
+          // H3: a failing step left the shared workspace ALIVE (intermediate steps set skipPromote,
+          // so the orchestrator neither promotes nor discards it). Discard it here so a failed
+          // multi-step attempt never leaks the worktree. Best-effort — reclaimable via `ikbi clean`.
           try {
             await stepWorkspaces.discard(sharedWorkspace);
           } catch {
             /* discard failure must not mask the step failure; the workspace is reclaimable later */
           }
-          result = lastResult!;
+          return lastResult!;
         }
-      } else {
-        // SINGLE-STEP: run directly.
-        result = await orchestrator.run(task, ctx);
+        // SINGLE-STEP: run directly (lane-pinned when dueling).
+        const attemptTask: WorkerTask = vendorLane !== undefined ? { ...task, moeVendorLane: vendorLane } : task;
+        return await orchestrator.run(attemptTask, ctx);
+      };
+
+      // DUEL-ON-FAILURE (cheap MoE tier): run the primary attempt in one vendor lane; if it does not
+      // promote, run ONE peer attempt in the OTHER lane and keep whichever promoted. Two genuinely
+      // different builds — "one may fail but the other may be better" — not a stronger rung of a
+      // ladder. A build that promotes first never pays for the second attempt.
+      const duelEnabled = task.moeExpertRental === true;
+      const DUEL_LANES = ["deepseek", "mimo"] as const; // the cheap pool's two vendors
+      result = await runOneAttempt(duelEnabled ? DUEL_LANES[0] : undefined);
+      if (duelEnabled && result.outcome !== "success") {
+        progress(`  ⚔ primary (${DUEL_LANES[0]} lane) did not promote — dueling a ${DUEL_LANES[1]}-lane peer\n`);
+        const peer = await runOneAttempt(DUEL_LANES[1]);
+        if (peer.outcome === "success") {
+          progress(`  ✓ ${DUEL_LANES[1]}-lane peer promoted — keeping it\n`);
+          result = peer;
+        } else {
+          progress(`  ✗ peer also did not promote — keeping the primary result\n`);
+        }
       }
       // BASELINE (drift-prevention's reference): fold THIS run's receipts into the durable,
       // cumulative per-(agent, operation) success-rate baseline — the reference drift-prevention

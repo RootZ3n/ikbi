@@ -213,6 +213,13 @@ export interface WorkerTask {
    */
   readonly moeExpertRental?: boolean;
   /**
+   * MoE DUEL: restrict this attempt's expert rentals to one vendor lane (a model-id prefix, e.g.
+   * "deepseek" or "mimo"). The duel-on-failure runs the primary attempt in one lane and, if it
+   * fails to promote, a second PEER attempt in the other lane — two genuinely different builds, not
+   * a stronger rung of the same ladder. Only meaningful with `moeExpertRental`. Absent = full pool.
+   */
+  readonly moeVendorLane?: string;
+  /**
    * TIER PRESET (`--tier`): force the CRITIC role's model for this run, overriding the config
    * default. Set by a tier preset. Absent = use the config critic model.
    */

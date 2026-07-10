@@ -12,7 +12,7 @@ import { TRUST_FLOOR } from "../../core/trust/index.js";
 import type { DiscardResult, PromoteGovernance, PromoteResult, WorkspaceHandle } from "../../core/workspace/contract.js";
 import { createGateWall } from "../gate-wall/index.js";
 import { createOrchestrator, type OrchestratorDeps } from "./orchestrator.js";
-import { WORKER_ROLES, WorkerError, type RoleContext, type RoleFn, type WorkerResult, type WorkerRole, type WorkerTask } from "./contract.js";
+import { WORKER_ROLES, WorkerError, CONTRACT_VERSION, type RoleContext, type RoleFn, type WorkerResult, type WorkerRole, type WorkerTask } from "./contract.js";
 // Importing cli.js registers the `build` command at module load.
 import { createWorkerCli, loadScopePlan, parseBuildArgs, productionRoleClaim } from "./cli.js";
 import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
@@ -694,4 +694,47 @@ test("an unverifiable-target failure renders the actionable 'no runnable checks'
     const summary = JSON.parse(cap2.out);
     assert.equal(summary.outcome, "failure");
   });
+});
+
+// ── MoE DUEL-ON-FAILURE ─────────────────────────────────────────────────────────
+
+test("MoE duel: primary (deepseek lane) fails → a mimo-lane PEER runs and its promotion is kept", async () => {
+  const lanes: (string | undefined)[] = [];
+  const fakeOrch = {
+    run: async (task: WorkerTask): Promise<WorkerResult> => {
+      lanes.push(task.moeVendorLane);
+      const promoted = task.moeVendorLane === "mimo"; // deepseek lane fails; mimo lane promotes
+      return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: promoted ? "success" : "failure", roles: [], promoted, ...(promoted ? {} : { reason: "deepseek-lane attempt did not promote" }) } as WorkerResult;
+    },
+  };
+  const out: string[] = [];
+  const cli = createWorkerCli({
+    orchestrator: fakeOrch,
+    resolveIdentity: makeResolver("trusted", "trusted"),
+    operatorToken: OPERATOR_TOKEN, workerToken: WORKER_TOKEN,
+    stdout: (s) => out.push(s), stderr: () => {}, setExit: () => {}, now: () => 1, cwd: () => "/repo",
+  });
+  await cli.build(["fix", "the", "bug", "--repo", "/repo", "--yes", "--tier", "cheap"]);
+  // Primary ran in the deepseek lane and failed; ONE peer ran in the mimo lane and promoted.
+  assert.equal(lanes[0], "deepseek", "the primary attempt is pinned to the first vendor lane");
+  assert.ok(lanes.includes("mimo"), "a peer attempt ran in the other vendor lane after the primary failed");
+  assert.equal(lanes[lanes.length - 1], "mimo", "the last (winning) attempt was the peer");
+});
+
+test("MoE duel: a primary that promotes NEVER pays for a second attempt", async () => {
+  const lanes: (string | undefined)[] = [];
+  const fakeOrch = {
+    run: async (task: WorkerTask): Promise<WorkerResult> => {
+      lanes.push(task.moeVendorLane);
+      return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "success", roles: [], promoted: true } as WorkerResult;
+    },
+  };
+  const cli = createWorkerCli({
+    orchestrator: fakeOrch,
+    resolveIdentity: makeResolver("trusted", "trusted"),
+    operatorToken: OPERATOR_TOKEN, workerToken: WORKER_TOKEN,
+    stdout: () => {}, stderr: () => {}, setExit: () => {}, now: () => 1, cwd: () => "/repo",
+  });
+  await cli.build(["fix", "the", "bug", "--repo", "/repo", "--yes", "--tier", "cheap"]);
+  assert.deepEqual(lanes, ["deepseek"], "the primary promoted, so no mimo-lane peer was ever spun");
 });
