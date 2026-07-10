@@ -287,6 +287,10 @@ export const PROJECT_MANIFESTS: readonly string[] = [
   "settings.gradle",
   "settings.gradle.kts",
   "pyproject.toml",
+  // H8: legacy Python projects mark their root with setup.py / setup.cfg (no pyproject.toml). Without
+  // these a setup.py-only project is not detected as a root → its declared checks are missed.
+  "setup.py",
+  "setup.cfg",
   "deno.json",
   "deno.jsonc",
   "project.godot",
@@ -354,6 +358,17 @@ export function parseChecksEnv(raw: string | undefined): readonly Check[] | "mal
  */
 export function resolveChecks(worktreeReal: string, env: NodeJS.ProcessEnv = process.env): ChecksResolution {
   const wt = resolve(worktreeReal);
+  // H8 — EXPLICIT operator config wins, applied BEFORE any auto-discovery. IKBI_CHECKS is operator-only
+  // (NEVER model-chosen). Previously this was consulted only AFTER a project root was detected, so a
+  // manifest-less project (or one whose root resolved to an ancestor) silently IGNORED the operator's
+  // declared checks and fell through to fail-closed auto-discovery. Explicit config must always win.
+  // A malformed value fails closed (RED) rather than falling back to a guessed runner.
+  const fromEnv = parseChecksEnv(env.IKBI_CHECKS);
+  if (fromEnv === "malformed") {
+    return { ok: false, reason: "IKBI_CHECKS is malformed (expected a non-empty JSON array of {name,command,args}) — cannot verify (RED)" };
+  }
+  if (fromEnv !== undefined) return { ok: true, checks: fromEnv, source: "env" };
+
   const root = resolveProjectRoot(wt);
   if (root === undefined) {
     // .NET / C#: project files are glob-named (Foo.csproj / Foo.sln), not a fixed manifest, so the
@@ -381,14 +396,9 @@ export function resolveChecks(worktreeReal: string, env: NodeJS.ProcessEnv = pro
   if (root !== wt) {
     return { ok: false, reason: `the resolved project root (${root}) is an ANCESTOR of the worktree (${wt}) — checks would validate the WRONG repo (RED)` };
   }
-  // Fix 2: operator-configured, NEVER model-chosen. IKBI_CHECKS wins; default is pnpm.
-  const fromEnv = parseChecksEnv(env.IKBI_CHECKS);
-  if (fromEnv === "malformed") {
-    return { ok: false, reason: "IKBI_CHECKS is malformed (expected a non-empty JSON array of {name,command,args}) — cannot verify (RED)" };
-  }
-  if (fromEnv !== undefined) return { ok: true, checks: fromEnv, source: "env" };
   // Language-native detection (JS/TS unchanged; Rust/Go native; Python pytest-or-fail-closed; any
   // other manifest fails closed with guidance). NEVER silently runs pnpm/tsc against a non-JS repo.
+  // (IKBI_CHECKS was already applied above — explicit operator config wins before auto-discovery.)
   return detectChecksForProject(wt);
 }
 

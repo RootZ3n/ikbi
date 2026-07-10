@@ -74,6 +74,32 @@ test("resolveChecks: IKBI_CHECKS configures npm (not pnpm) for a target repo", (
   assert.equal(def.ok && def.checks[0]?.command, "pnpm");
 });
 
+test("H8: explicit IKBI_CHECKS wins for a MANIFEST-LESS project (applied before auto-discovery)", () => {
+  // A worktree with source files but NO recognizable manifest: auto-discovery would fail closed. The
+  // operator's explicit IKBI_CHECKS must be honored anyway — it was previously ignored (only consulted
+  // AFTER a project root was detected), so a manifest-less repo silently dropped the declared checks.
+  const wt = tmp("ikbi-checks-nomanifest-");
+  writeFileSync(join(wt, "thing.rb"), "puts 'hi'\n"); // an unrecognized language, no manifest
+  const env = { IKBI_CHECKS: '[{"name":"test","command":"rake","args":["test"]}]' } as unknown as NodeJS.ProcessEnv;
+  const r = resolveChecks(wt, env);
+  assert.equal(r.ok, true, "explicit checks resolve even without a manifest");
+  if (r.ok) {
+    assert.equal(r.source, "env");
+    assert.deepEqual(r.checks.map((c) => c.command), ["rake"]);
+  }
+  // Without the explicit config it still fails closed (no manifest ⇒ unresolvable).
+  assert.equal(resolveChecks(wt, {} as NodeJS.ProcessEnv).ok, false, "no manifest + no IKBI_CHECKS ⇒ fail-closed");
+});
+
+test("H8: a legacy Python project (setup.py + setup.cfg, NO pyproject.toml) is detected as a root and resolves python checks", () => {
+  const wt = tmp("ikbi-checks-setuppy-");
+  writeFileSync(join(wt, "setup.py"), "from setuptools import setup\nsetup(name='x')\n");
+  writeFileSync(join(wt, "setup.cfg"), "[tool:pytest]\ntestpaths = tests\n"); // pytest signal in setup.cfg
+  const r = resolveChecks(wt, {} as NodeJS.ProcessEnv);
+  assert.equal(r.ok, true, "setup.py/setup.cfg mark the project root; python checks resolve (no pyproject.toml needed)");
+  if (r.ok) assert.ok(r.checks.some((c) => c.command === "python3"), "a python runner was chosen");
+});
+
 test("resolveChecks: a malformed IKBI_CHECKS fails closed RED (never silently falls back)", () => {
   const wt = tmp("ikbi-checkscfg-bad-");
   writeFileSync(join(wt, "package.json"), JSON.stringify({ name: "x" }));
