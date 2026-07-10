@@ -1869,15 +1869,27 @@ export class ChatSession {
   rollback(n = 1): RollbackResult[] {
     const count = Math.max(0, Math.min(Math.floor(n), this.fileHistory.length));
     const results: RollbackResult[] = [];
+    const worktreeRoot = resolve(this.worktree);
     for (let i = 0; i < count; i += 1) {
       const m = this.fileHistory.pop();
       if (m === undefined) break;
+      // H6 — REVALIDATE containment before touching disk. `fileHistory` is restored from the (tamperable)
+      // session file, so a crafted FileMutation could point `full`/`path` at an arbitrary file
+      // (/etc/passwd, ~/.ssh/...). Re-root the recorded RELATIVE path in THIS session's current worktree
+      // (never trust the absolute `full`) and REFUSE anything that escapes — rollback must never write or
+      // delete outside the worktree. An absolute or `..`-bearing `path` resolves outside and is rejected.
+      const target = resolve(worktreeRoot, m.path);
+      const rel = relative(worktreeRoot, target);
+      if (rel.length === 0 || rel.startsWith("..") || isAbsolute(rel)) {
+        results.push({ tool: m.tool, path: m.path, action: "rollback REFUSED: path escapes the session worktree" });
+        continue;
+      }
       try {
         if (m.beforeContent === null) {
-          rmSync(m.full, { force: true });
+          rmSync(target, { force: true });
           results.push({ tool: m.tool, path: m.path, action: "deleted (was newly created)" });
         } else {
-          writeFileSync(m.full, m.beforeContent, "utf8");
+          writeFileSync(target, m.beforeContent, "utf8");
           results.push({ tool: m.tool, path: m.path, action: "restored to previous content" });
         }
       } catch (e) {
