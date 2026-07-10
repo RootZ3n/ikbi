@@ -3404,15 +3404,28 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // ── CX — ADJUDICATION CORE AUTHORITATIVE (IKBI_LEGACY_COMPLETION=off) ──────────────────────────
     // When the flip is enabled, `decidePromotability` (computed above) REPLACES the integrator's promote
     // intent: promote ⇒ promote, retain ⇒ withhold-but-keep the green work (never discard, invariant I1),
-    // discard ⇒ discard. The downstream approval + gate-wall + C1c tree-binding gates STILL run on a
-    // promote (defense in depth). Fail-closed: if the verdict couldn't be computed, do NOT promote.
-    // DEFAULT (flag on / legacy) leaves `decision` exactly as the integrator returned it — no change.
+    // discard ⇒ discard. The downstream approval + gate-wall gates STILL run on a promote (defense in
+    // depth). Fail-closed: if the verdict couldn't be computed, do NOT promote. DEFAULT (flag on /
+    // legacy) leaves `decision` exactly as the integrator returned it — no change.
+    // NOTE: C1c `verifiedAgainst` (the hash-bound promote in WorkspaceManager) is NOT yet threaded from
+    // here, so the manager does not re-check the landed tree against what the verifier saw — a follow-up
+    // (Fable C-2/C-4) before the default flip.
     let adjRetain = false;
     if (adjudicationAuthoritative) {
       if (adjDecision === undefined) {
-        decision = { ...decision, promote: false, rationale: "adjudication core authoritative but the promotability verdict was unavailable — fail closed (no promote)" };
+        // H-3 (Fable, I1): facts unavailable ⇒ fail closed to NO-PROMOTE, but RETAIN the work (never
+        // discard) — the core's contract for "cannot certify this tree" is retain(adjudication-incomplete),
+        // and destroying possibly-good work on a transient fact-computation failure (e.g. a git timeout)
+        // is the wrong fail-closed. The operator can inspect + discard deliberately.
+        adjRetain = true;
+        decision = { ...decision, promote: false, rationale: "adjudication core authoritative but the promotability verdict was unavailable — fail closed (no promote; work retained for inspection)" };
       } else if (adjDecision.action === "promote") {
-        decision = { ...decision, promote: true }; // spread preserves the integrator's rationale (if any)
+        // H-2 (Fable): the core decided promote — SYNTHESIZE an approving evaluation. The integrator's
+        // own `evaluation` is `{approved:false}` whenever IT denied (or was absent/malformed), and
+        // WorkspaceManager.promote THROWS `not_approved` on a non-approving evaluation — so overriding an
+        // integrator discard to promote while keeping its evaluation crashes the run (uncaught, workspace
+        // leak). The adjudication core IS the authority here; its verdict is the approval.
+        decision = { ...decision, promote: true, evaluation: { approved: true, reason: `adjudication core: ${adjDecision.reason}`, evaluatorId: "adjudication-core" } };
       } else {
         adjRetain = adjDecision.action === "retain";
         decision = { ...decision, promote: false, rationale: `adjudication core: ${adjDecision.action} (${adjDecision.reason})` };

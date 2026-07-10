@@ -331,7 +331,14 @@ test("Cx: authoritative core PROMOTES green work on a real worktree — OVERRIDI
     const calls = { promote: 0, discard: 0 };
     const workspaces: NonNullable<OrchestratorDeps["workspaces"]> = {
       allocate: async () => handle,
-      promote: async (h): Promise<PromoteResult> => { calls.promote += 1; return { promoted: true, workspaceId: h.id, targetBranch: h.baseBranch, beforeRef: "a", afterRef: "b" }; },
+      // H-2 (Fable): enforce the manager's real precondition — a non-approving evaluation THROWS
+      // not_approved. The integrator here returns discard/{approved:false}; the authoritative override
+      // must SYNTHESIZE an approving evaluation, or this promote crashes (as it would in production).
+      promote: async (h, approval): Promise<PromoteResult> => {
+        assert.equal(approval.evaluation.approved, true, "the core-decided promote carries an approving evaluation (not the integrator's {approved:false})");
+        calls.promote += 1;
+        return { promoted: true, workspaceId: h.id, targetBranch: h.baseBranch, beforeRef: "a", afterRef: "b" };
+      },
       discard: async (): Promise<DiscardResult> => { calls.discard += 1; return { workspaceId: handle.id, removed: true }; },
       commit: async () => true,
     };
