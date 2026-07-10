@@ -236,6 +236,26 @@ export function formatFailureDetail(r: WorkerResult): string {
   return `\n${lines.join("\n")}\n`;
 }
 
+/**
+ * DUEL POLICY (Phase 2, IKBI-RT-002). Whether the primary attempt's result warrants running a peer
+ * vendor-lane attempt. PURE. The peer runs ONLY when the primary produced a real candidate the
+ * pipeline judged not-promotable (`nonPromotion.duelEligible`); a different vendor lane might do
+ * better. It must NOT run for a governance refusal, an unverifiable target, an injection block, an
+ * operator interrupt, or an unlandable conflict — a peer vendor cannot fix any of those, and running
+ * one would waste the peer's cost and blur the two attempts. A thrown/transient infrastructure error
+ * never reaches here (it throws before a result exists), so it can never become a peer duel.
+ *
+ * Fallback for a result that omits the classification (an injected fake orchestrator, or a legacy
+ * result): only a pipeline `failure` — a lane that could not converge to promotable work — is
+ * duel-eligible; a `rejected`/`partial`/`stub` terminal is not (those are refusals, not candidate
+ * quality). A real orchestrator run always sets `nonPromotion` on a non-success terminal.
+ */
+export function primaryWarrantsPeer(r: WorkerResult): boolean {
+  if (r.outcome === "success") return false; // a promoted primary NEVER pays for a peer
+  if (r.nonPromotion !== undefined) return r.nonPromotion.duelEligible;
+  return r.outcome === "failure";
+}
+
 /** "Next command" hints for the operator after any build. PURE. */
 export function formatNextHints(r: WorkerResult): string {
   const cmds: Array<[string, string]> = [];
@@ -1438,20 +1458,24 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
           }
           return lastResult!;
         }
-        // SINGLE-STEP: run directly (lane-pinned when dueling).
-        const attemptTask: WorkerTask = vendorLane !== undefined ? { ...task, moeVendorLane: vendorLane } : task;
+        // SINGLE-STEP: run directly (lane-pinned when dueling). A lane-pinned attempt gets a
+        // lane-DISTINCT task id so the primary and peer are separately attributable in receipts, costs,
+        // and run summaries (Phase 2) — they are two attempts, never one blurred record.
+        const attemptTask: WorkerTask = vendorLane !== undefined ? { ...task, taskId: `${task.taskId}:${vendorLane}`, moeVendorLane: vendorLane } : task;
         return await orchestrator.run(attemptTask, ctx);
       };
 
-      // DUEL-ON-FAILURE (cheap MoE tier): run the primary attempt in one vendor lane; if it does not
-      // promote, run ONE peer attempt in the OTHER lane and keep whichever promoted. Two genuinely
-      // different builds — "one may fail but the other may be better" — not a stronger rung of a
-      // ladder. A build that promotes first never pays for the second attempt.
+      // DUEL-ON-FAILURE (cheap MoE tier): run the primary attempt in one vendor lane; ONLY when it
+      // produces a real candidate the pipeline judged not-promotable (a duel-eligible non-promotion) run
+      // ONE peer attempt in the OTHER lane and keep whichever promoted. Two genuinely different builds —
+      // "one may fail but the other may be better" — not a stronger rung of a ladder. A build that
+      // promotes first, or is refused for governance/structural/security/interrupt reasons a different
+      // vendor cannot fix, never pays for the second attempt (Phase 2, IKBI-RT-002).
       const duelEnabled = task.moeExpertRental === true;
       const DUEL_LANES = ["deepseek", "mimo"] as const; // the cheap pool's two vendors
       result = await runOneAttempt(duelEnabled ? DUEL_LANES[0] : undefined);
-      if (duelEnabled && result.outcome !== "success") {
-        progress(`  ⚔ primary (${DUEL_LANES[0]} lane) did not promote — dueling a ${DUEL_LANES[1]}-lane peer\n`);
+      if (duelEnabled && primaryWarrantsPeer(result)) {
+        progress(`  ⚔ primary (${DUEL_LANES[0]} lane) produced a non-promotable candidate — dueling a ${DUEL_LANES[1]}-lane peer\n`);
         const peer = await runOneAttempt(DUEL_LANES[1]);
         if (peer.outcome === "success") {
           progress(`  ✓ ${DUEL_LANES[1]}-lane peer promoted — keeping it\n`);
@@ -1459,6 +1483,8 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
         } else {
           progress(`  ✗ peer also did not promote — keeping the primary result\n`);
         }
+      } else if (duelEnabled && result.outcome !== "success") {
+        progress(`  ⓘ primary (${DUEL_LANES[0]} lane) did not promote (${result.nonPromotion?.class ?? "no candidate"}) — a peer vendor cannot fix this class of failure; NOT dueling\n`);
       }
       // BASELINE (drift-prevention's reference): fold THIS run's receipts into the durable,
       // cumulative per-(agent, operation) success-rate baseline — the reference drift-prevention

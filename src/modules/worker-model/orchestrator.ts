@@ -1776,6 +1776,47 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // filters an escalation roster to the attempt's lane; it is a NO-OP (returns the full roster) when no
     // lane is pinned, so the default single-attempt path is byte-unchanged.
     const laneModelsFor = (ids: readonly string[]): readonly string[] => laneRoster(ids, modelDecision.vendorLane);
+    // An operator --fallback-model is honored as an escalation pick only when it is IN this attempt's
+    // vendor lane. A cross-lane fallback would silently mutate a lane-pinned attempt's identity (Phase 2),
+    // so it is NOT applied within this attempt — the in-lane ladder is used instead, and the operator's
+    // other-lane preference is realized by the PEER attempt (a genuinely new attempt in that lane). For an
+    // unpinned attempt every model is "in lane", so this returns the operator's choice unchanged.
+    const laneFallbackModel: string | undefined =
+      task.fallbackModel !== undefined && (modelDecision.vendorLane === undefined || task.fallbackModel.startsWith(modelDecision.vendorLane))
+        ? task.fallbackModel
+        : undefined;
+    // EXPLICIT ATTEMPT-DECISION RECORD (Phase 2): on the MoE/duel path, persist the authoritative model
+    // decision (and any pre-dispatch replacement) as its own receipt so the trail distinguishes each
+    // attempt truthfully — even a pre-dispatch abort records which model this attempt intended, without
+    // claiming it executed. Gated on moeExpertRental so ordinary single builds' receipt trail is
+    // byte-unchanged. `attemptId` == this attempt's taskId (lane-distinct for a duel's primary vs peer).
+    const recordModelDecision = async (d: AttemptModelDecision, phase: "initial" | "preflight-replacement"): Promise<void> => {
+      if (task.moeExpertRental !== true) return;
+      try {
+        await receipts.append(
+          {
+            operation: "worker.model_decision",
+            outcome: { status: "success", detail: `${d.source}: ${d.model}${d.vendorLane !== undefined ? ` [${d.vendorLane} lane]` : ""}` },
+            requestId: task.taskId,
+            metadata: {
+              taskId: task.taskId,
+              attemptId: task.taskId,
+              phase,
+              model: d.model,
+              modelAlias: d.alias,
+              modelSource: d.source,
+              ...(d.vendorLane !== undefined ? { vendorLane: d.vendorLane } : {}),
+              ...(d.rationale !== undefined ? { rationale: d.rationale } : {}),
+            },
+            project: task.targetRepo,
+          },
+          parentIdentity,
+        );
+      } catch {
+        /* decision recording is best-effort observability — never break a build */
+      }
+    };
+    await recordModelDecision(modelDecision, "initial");
     armBudget(task); // start the whole-pipeline wall-clock deadline (covers every dispatch path)
     // Hand the (real) builder a mid-loop halt check so its loop stops promptly on a kill/budget
     // overrun. Reuses killHalt (kill-switch + budget); no-op for tests that inject a fake builder.
@@ -1794,7 +1835,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       if (dirtyReason !== undefined) {
         const reason = `Refusing to build: ${dirtyReason}`;
         events.publish(workerFailed.create({ taskId: task.taskId, reason }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } }));
-        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason };
+        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason, nonPromotion: { class: "governance-refused", duelEligible: false } };
       }
     }
 
@@ -1820,7 +1861,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           },
           parentIdentity,
         );
-        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason: drift.blockReason };
+        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason: drift.blockReason, nonPromotion: { class: "governance-refused", duelEligible: false } };
       }
       if (buildDriftReports.length > 0) {
         log.warn({ taskId: task.taskId, agentId: builderAgentId, drifted: buildDriftReports.map((r) => `${r.operation} ${Math.round(r.recentRate * 100)}%<${Math.round(r.baselineRate * 100)}%`) }, "drift governor: builder reliability drifted for this project — proceeding (advisory)");
@@ -1891,6 +1932,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           promoted: false,
           reason: diagnostic.message,
           verification: { kind: "checks_unresolvable", reason: concise, nextSteps: [...UNRESOLVABLE_NEXT_STEPS] },
+          nonPromotion: { class: "unverifiable", duelEligible: false },
         };
       }
     }
@@ -1932,7 +1974,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       const preKill = await killHalt(task, parentIdentity, parentCtx);
       if (preKill !== undefined) {
         events.publish(workerFailed.create({ taskId: task.taskId, reason: preKill }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } }));
-        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason: preKill };
+        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason: preKill, nonPromotion: { class: "interrupted", duelEligible: false } };
       }
     }
 
@@ -2215,6 +2257,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                   { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.preflight_context_escalation", runId: task.taskId } },
                 ),
               );
+              // Record the pre-dispatch decision REPLACEMENT explicitly (still same lane, still before any
+              // provider call) — the attempt's decision-replacement history, not a new attempt.
+              await recordModelDecision(modelDecision, "preflight-replacement");
             }
           }
         }
@@ -2694,8 +2739,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           verifierStillGreen &&
           isRetryableCriticFail(result)
         ) {
-          // Escalate within the attempt's vendor lane (IKBI-RT-002); an operator --fallback-model wins.
-          const midModel = task.fallbackModel ?? laneModelsFor(escalationConfig.tierModels.mid)[0];
+          // Escalate within the attempt's vendor lane (IKBI-RT-002). An operator --fallback-model wins ONLY
+          // when it is in-lane (laneFallbackModel); a cross-lane fallback is deferred to the peer attempt.
+          const midModel = laneFallbackModel ?? laneModelsFor(escalationConfig.tierModels.mid)[0];
           if (midModel !== undefined) {
             escalationAttempted = true;
             const rejectedDetail = (result.detail ?? {}) as Record<string, unknown>;
@@ -2913,8 +2959,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               "guaranteed flash→pro escalation: builder failed/stalled — escalating to the mid (pro) tier regardless of the escalation score (IKBI_ESCALATION_ALWAYS_ESCALATE)",
             );
           }
-          // Escalate within the attempt's vendor lane (IKBI-RT-002); an operator --fallback-model wins.
-          const midModel = task.fallbackModel ?? laneModelsFor(escalationConfig.tierModels.mid)[0];
+          // Escalate within the attempt's vendor lane (IKBI-RT-002). An operator --fallback-model wins ONLY
+          // when it is in-lane (laneFallbackModel); a cross-lane fallback is deferred to the peer attempt.
+          const midModel = laneFallbackModel ?? laneModelsFor(escalationConfig.tierModels.mid)[0];
           if (midModel !== undefined) {
             const failedResult = result;
             const failedDetail = (failedResult.detail ?? {}) as Record<string, unknown>;
@@ -3084,9 +3131,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 // Frontier (consult) crossing is authorized only by --escalate / a frontier budget.
                 frontierAuthorized: task.allowFrontierConsult === true,
                 startTier: sweepStartTier,
-                // An operator's --fallback-model is honored as the FIRST pick (still up the ladder);
-                // once tried, the sweep continues cheapest-first through the rest of the pool.
-                ...(task.fallbackModel !== undefined ? { requestedModel: task.fallbackModel } : {}),
+                // An operator's --fallback-model is honored as the FIRST pick (still up the ladder), but
+                // ONLY when it is in this attempt's vendor lane (laneFallbackModel) — a cross-lane fallback
+                // would break lane purity, so the pool sweep stays in-lane and the operator's other-lane
+                // choice lands in the peer attempt. Once tried, the sweep continues cheapest-first.
+                ...(laneFallbackModel !== undefined ? { requestedModel: laneFallbackModel } : {}),
               });
               if (action.kind === "terminate") {
                 break; // exhausted | needs-authorization — original failure stands.
@@ -3458,7 +3507,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       );
       fireStopHooks(hooks, task.targetRepo).catch(() => {});
       await writeTerminalCostSummary("rejected", runCost(), `interrupted: ${killedReason}`); // Gap A: mid-run kill spend is counted
-      return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: results, workspaceId: workspace.id, promoted: false, reason: killedReason };
+      return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: results, workspaceId: workspace.id, promoted: false, reason: killedReason, nonPromotion: { class: "interrupted", duelEligible: false } };
     }
 
     // Terminal: a GREEN build whose worker tier lacks autoCommit autonomy left its verified
@@ -3500,7 +3549,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       // authoritative run-summary so `ikbi cost` groups by IT (not by summing the run's per-role/retry
       // receipts, which would double-count the cumulative-stamped ones). aborted:false — it did not abort.
       await writeTerminalCostSummary("partial", runCost(), reason ?? "verified-good; autoCommit tier gate", false);
-      return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "partial", roles: results, workspaceId: workspace.id, promoted: false, reason, costUsd: runCost() };
+      return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "partial", roles: results, workspaceId: workspace.id, promoted: false, reason, costUsd: runCost(), nonPromotion: { class: "governance-refused", duelEligible: false } };
     }
 
     // STEP-PLANNER: when skipPromote is set, run the role pipeline but leave the
@@ -3687,6 +3736,22 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // wired decision. Always present on the result so the CLI summary + receipts can show them.
     const ranVerificationMode = actualVerificationMode ?? verificationMode;
     const ranRetrievalMode = actualRetrievalMode ?? retrievalMode;
+    // NON-PROMOTION CLASSIFICATION (Phase 2): why this attempt did not promote, so the duel scheduler
+    // launches a peer vendor lane ONLY for a real candidate the pipeline judged not-promotable. A
+    // governance refusal, an unverifiable target, an injection block, or an unlandable conflict are
+    // failures a different vendor cannot fix — the peer must not run. Order matters: the most specific
+    // structural/security/governance classes win over the generic "candidate-rejected".
+    const nonPromotion: WorkerResult["nonPromotion"] = promoted
+      ? undefined
+      : checksUnverifiable !== undefined
+        ? { class: "unverifiable", duelEligible: false }
+        : externalInjectionDetectedThisBuild
+          ? { class: "injection-blocked", duelEligible: false }
+          : trustSuppressed
+            ? { class: "governance-refused", duelEligible: false }
+            : overall === "partial"
+              ? { class: "candidate-conflict", duelEligible: false }
+              : { class: "candidate-rejected", duelEligible: true };
     const result: WorkerResult = {
       contractVersion: CONTRACT_VERSION,
       taskId: task.taskId,
@@ -3694,6 +3759,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       roles: results,
       workspaceId: workspace.id,
       promoted,
+      ...(nonPromotion !== undefined ? { nonPromotion } : {}),
       ...(reason !== undefined ? { reason } : {}),
       verificationMode: ranVerificationMode,
       retrievalMode: ranRetrievalMode,

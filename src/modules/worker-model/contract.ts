@@ -453,7 +453,34 @@ export interface WorkerResult {
     /** Operator-actionable next steps to make the target verifiable. */
     readonly nextSteps?: readonly string[];
   };
+  /**
+   * WHY a non-success attempt did not promote, classified at the terminal so the duel scheduler can
+   * decide truthfully whether a peer vendor lane is warranted (IKBI-RT-002 / Phase 2). Absent on a
+   * promoted (`outcome === "success"`) run. `duelEligible` is true ONLY for `candidate-rejected` — a
+   * real candidate the pipeline judged not-promotable, where a different vendor lane might do better.
+   * It is false for governance refusals, an unverifiable target, an injection block, an operator
+   * interrupt, or an unlandable promote conflict — a peer vendor cannot fix any of those, so the peer
+   * must NOT run. A thrown/transient infrastructure error never reaches here (it produces no result).
+   */
+  readonly nonPromotion?: {
+    readonly class: NonPromotionClass;
+    /** True ⇒ a peer vendor-lane attempt is warranted; false ⇒ a peer would be wasted/wrong. */
+    readonly duelEligible: boolean;
+  };
 }
+
+/**
+ * The classes of non-promoting terminal. Only `candidate-rejected` warrants a peer vendor lane; every
+ * other class is a refusal a different vendor cannot repair (governance, structural, security, or
+ * environmental) and must NOT silently escalate into a duel (Phase 2, requirement 7/9/10).
+ */
+export type NonPromotionClass =
+  | "candidate-rejected" // a real candidate ran the pipeline and was judged not-promotable (duel-eligible)
+  | "governance-refused" // gate-wall/approval/tier/drift/dirty-repo refusal (operator/policy decision)
+  | "unverifiable" // no derivable checks — a stronger/other model cannot make a verifier appear
+  | "injection-blocked" // the neutralization chokepoint blocked promotion (security gate)
+  | "interrupted" // a kill/budget interrupt halted the run
+  | "candidate-conflict"; // verified work could not land due to a reconcilable merge conflict
 
 /**
  * The engine seams a role builds against. The orchestrator supplies these; roles
