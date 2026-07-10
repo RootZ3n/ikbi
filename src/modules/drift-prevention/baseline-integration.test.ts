@@ -40,7 +40,7 @@ function identity() {
 
 function memStore() {
   const m = new Map<string, MemoryEntry>();
-  const store: MemoryStore = { get: async (id) => m.get(id), put: async (id, v) => void m.set(id, v), list: async () => [...m.keys()] };
+  const store: MemoryStore = { get: async (id) => m.get(id), put: async (id, v) => void m.set(id, v), list: async () => [...m.keys()], update: async (id, mutate) => { const next = mutate(m.get(id)); m.set(id, next); return next; } };
   return store;
 }
 

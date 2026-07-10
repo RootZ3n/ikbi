@@ -85,6 +85,13 @@ export interface MemoryStore {
   get(id: string): Promise<MemoryEntry | undefined>;
   put(id: string, value: MemoryEntry): Promise<void>;
   list(): Promise<string[]>;
+  /**
+   * M5 — atomic READ-MODIFY-WRITE under a CROSS-PROCESS lock. `mutate` sees the FRESH durable entry
+   * under the lock and returns the next one, so upserts and (critically) the cumulative pattern COUNTERS
+   * cannot lose an update when the shared memory dir is written from separate installs/processes: two
+   * concurrent projections both reading the same base then both writing would drop one increment.
+   */
+  update(id: string, mutate: (current: MemoryEntry | undefined) => MemoryEntry): Promise<MemoryEntry>;
 }
 
 /** Injectable dependencies (tests substitute store / receipts / publish / clock). */
@@ -111,8 +118,10 @@ function redactActivity(r: Receipt): Readonly<Record<string, unknown>> {
 /** Build the lab-memory store. The default deps wire the live singletons + a DocumentStore. */
 export function createLabMemory(deps: LabMemoryDeps = {}): LabMemory {
   const config = deps.config ?? labContextMemoryConfig;
+  // M5: CROSS-PROCESS store — the lab-memory dir can be SHARED across installs with independent seq
+  // spaces, so upserts + cumulative pattern counters must serialize their RMW across processes.
   const store: MemoryStore =
-    deps.store ?? createDocumentStore<MemoryEntry>({ dir: config.memoryDir, idPattern: MEMORY_ID_PATTERN });
+    deps.store ?? createDocumentStore<MemoryEntry>({ dir: config.memoryDir, idPattern: MEMORY_ID_PATTERN, crossProcess: true });
   const receipts = deps.receipts ?? (coreReceipts as ReceiptReadSeam);
   const publish = deps.publish ?? ((input: EventInput<LabMemEventPayload>) => void coreEvents.publish(input));
   const now = deps.now ?? Date.now;
@@ -128,8 +137,9 @@ export function createLabMemory(deps: LabMemoryDeps = {}): LabMemory {
   /** Upsert an entry with an EXPLICIT agent (record uses the caller; projection uses the receipt's agent). */
   async function upsert(parts: { project: string; agent: string; kind: MemoryKind; key: string; value: Readonly<Record<string, unknown>>; sourceReceiptSeq?: number }): Promise<MemoryEntry> {
     const id = makeId(parts.project, parts.agent, parts.kind, parts.key);
-    const existing = await store.get(id);
-    const entry: MemoryEntry = {
+    // M5: atomic RMW — `createdAt` is preserved from the FRESH durable entry under the lock (a
+    // get-then-put would race a concurrent upsert of the same id).
+    return store.update(id, (existing) => ({
       id,
       project: parts.project,
       agent: parts.agent,
@@ -139,9 +149,7 @@ export function createLabMemory(deps: LabMemoryDeps = {}): LabMemory {
       ...(parts.sourceReceiptSeq !== undefined ? { sourceReceiptSeq: parts.sourceReceiptSeq } : {}),
       createdAt: existing?.createdAt ?? now(),
       updatedAt: now(),
-    };
-    await store.put(id, entry);
-    return entry;
+    }));
   }
 
   async function loadAll(): Promise<MemoryEntry[]> {
@@ -211,37 +219,51 @@ export function createLabMemory(deps: LabMemoryDeps = {}): LabMemory {
       // rather than overwriting from the current query window. This is what makes drift's
       // baseline diverge from its recent-window and detect a real decline.
       const id = makeId(g.project, g.agent, "pattern", `op-${g.operation}`);
-      const prev = await store.get(id);
-      const pv = (prev?.value ?? {}) as Record<string, unknown>;
-      // PER-STORE HIGH-WATER (drift baseline C1): `seq` is monotonic only WITHIN one receipt store, but
-      // the lab-memory dir can be SHARED across installs with INDEPENDENT seq spaces. A single scalar
-      // high-water would drop a second install's low seqs as "already projected" (or double-count on
-      // overlap). Track the high-water PER store scope; the accumulated counts stay MERGED (one baseline
-      // per operation, so drift's read side is unchanged). Legacy entries carried a scalar `lastSeq`;
-      // seed THIS scope's mark from it so a pre-scoping baseline upgrades in place without re-counting.
-      const storeScope = config.storeScope;
-      const hasMap = typeof pv.lastSeqByStore === "object" && pv.lastSeqByStore !== null;
-      const prevByStore = hasMap ? (pv.lastSeqByStore as Record<string, unknown>) : {};
-      const lastSeqByStore: Record<string, number> = {};
-      for (const [k, v] of Object.entries(prevByStore)) lastSeqByStore[k] = asCount(v, -1);
-      // This scope's mark if it has one; else -1 for a NEW scope on an already-scoped entry. Only when NO
-      // map exists yet (a pre-scoping legacy entry, first upgrade) do we seed from the scalar `lastSeq` —
-      // otherwise a second install's fresh scope would wrongly inherit the first install's scalar mark.
-      const prevLastSeq = storeScope in lastSeqByStore ? lastSeqByStore[storeScope]! : hasMap ? -1 : asCount(pv.lastSeq, -1);
-      const fresh = g.receipts.filter((r) => r.seq > prevLastSeq).sort((a, b) => a.seq - b.seq);
-      if (fresh.length === 0) continue; // nothing new for this operation in THIS store — baseline unchanged
-      const addSucc = fresh.filter((x) => x.outcome.status === "success").length;
-      const successes = asCount(pv.successes, 0) + addSucc;
-      const failures = asCount(pv.failures, 0) + (fresh.length - addSucc);
-      const lastReceipt = fresh[fresh.length - 1] as Receipt;
-      lastSeqByStore[storeScope] = lastReceipt.seq;
-      await upsert({
-        project: g.project, agent: g.agent, kind: "pattern", key: `op-${g.operation}`,
-        // `lastSeq` retained for back-compat/observability (the max across scopes for THIS write);
-        // `lastSeqByStore` is the authoritative per-store high-water the freshness gate reads.
-        value: { operation: g.operation, successes, failures, total: successes + failures, lastOutcome: lastReceipt.outcome.status, lastSeq: lastReceipt.seq, lastSeqByStore },
+      // M5 — ATOMIC cumulative counter. The entire read → merge-fresh → write runs inside ONE
+      // cross-process RMW: `mutate` re-derives the fresh set and the counts from the FRESH durable
+      // entry under the lock, so two concurrent projections can never both read the same base and
+      // drop one another's increment (a get-then-merge-then-put would). Idempotent: when nothing is
+      // newer than THIS store's high-water, the merged entry equals the current one (a no-op-content
+      // rewrite) and `projected` is not bumped.
+      let merged = false;
+      await store.update(id, (current): MemoryEntry => {
+        const pv = (current?.value ?? {}) as Record<string, unknown>;
+        // PER-STORE HIGH-WATER (drift baseline C1): `seq` is monotonic only WITHIN one receipt store, but
+        // the lab-memory dir can be SHARED across installs with INDEPENDENT seq spaces. A single scalar
+        // high-water would drop a second install's low seqs as "already projected" (or double-count on
+        // overlap). Track the high-water PER store scope; the accumulated counts stay MERGED (one baseline
+        // per operation, so drift's read side is unchanged). Legacy entries carried a scalar `lastSeq`;
+        // seed THIS scope's mark from it so a pre-scoping baseline upgrades in place without re-counting.
+        const storeScope = config.storeScope;
+        const hasMap = typeof pv.lastSeqByStore === "object" && pv.lastSeqByStore !== null;
+        const prevByStore = hasMap ? (pv.lastSeqByStore as Record<string, unknown>) : {};
+        const lastSeqByStore: Record<string, number> = {};
+        for (const [k, v] of Object.entries(prevByStore)) lastSeqByStore[k] = asCount(v, -1);
+        // This scope's mark if it has one; else -1 for a NEW scope on an already-scoped entry. Only when NO
+        // map exists yet (a pre-scoping legacy entry, first upgrade) do we seed from the scalar `lastSeq` —
+        // otherwise a second install's fresh scope would wrongly inherit the first install's scalar mark.
+        const prevLastSeq = storeScope in lastSeqByStore ? lastSeqByStore[storeScope]! : hasMap ? -1 : asCount(pv.lastSeq, -1);
+        const fresh = g.receipts.filter((r) => r.seq > prevLastSeq).sort((a, b) => a.seq - b.seq);
+        const addSucc = fresh.filter((x) => x.outcome.status === "success").length;
+        const successes = asCount(pv.successes, 0) + addSucc;
+        const failures = asCount(pv.failures, 0) + (fresh.length - addSucc);
+        const last = fresh.length > 0 ? (fresh[fresh.length - 1] as Receipt) : undefined;
+        if (last !== undefined) { lastSeqByStore[storeScope] = last.seq; merged = true; }
+        return {
+          id, project: g.project, agent: g.agent, kind: "pattern", key: `op-${g.operation}`,
+          // `lastSeq` retained for back-compat/observability (the max across scopes for THIS write);
+          // `lastSeqByStore` is the authoritative per-store high-water the freshness gate reads.
+          value: {
+            operation: g.operation, successes, failures, total: successes + failures,
+            lastOutcome: last?.outcome.status ?? (typeof pv.lastOutcome === "string" ? pv.lastOutcome : undefined),
+            lastSeq: last?.seq ?? asCount(pv.lastSeq, -1),
+            lastSeqByStore,
+          },
+          createdAt: current?.createdAt ?? now(),
+          updatedAt: last !== undefined ? now() : (current?.updatedAt ?? now()),
+        };
       });
-      projected += 1;
+      if (merged) projected += 1;
     }
 
     emit(labmemProjected, { ...(opts.project !== undefined ? { project: opts.project } : {}), ...(opts.agent !== undefined ? { agent: opts.agent } : {}), count: projected }, opts.identity.identity);

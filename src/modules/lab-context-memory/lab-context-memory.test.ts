@@ -50,6 +50,7 @@ function memStore() {
     get: async (id) => m.get(id),
     put: async (id, v) => void m.set(id, v),
     list: async () => [...m.keys()],
+    update: async (id, mutate) => { const next = mutate(m.get(id)); m.set(id, next); return next; },
   };
   return { store, m };
 }
@@ -238,6 +239,23 @@ test("C1: two installs SHARING the lab-memory dir keep PER-STORE high-water mark
   await memB.projectFromReceipts({ identity: ikbi });
   const p2 = [...ms.m.values()].find((e) => e.kind === "pattern" && e.key === "op-build.run");
   assert.equal(p2?.value.total, 8, "re-projecting B is idempotent against B's own high-water");
+});
+
+test("M5: CONCURRENT projections into a shared pattern counter do not lose an increment (atomic RMW)", async () => {
+  // Two installs project into the SAME (agent, project, operation) pattern entry AT THE SAME TIME.
+  // The old get-then-merge-then-put would interleave and drop one install's increment; the atomic
+  // update() RMW re-derives the counts from the fresh entry under the lock, so BOTH accrue.
+  const { ikbi } = identities();
+  const ms = memStore();
+  const memA = createLabMemory({ config: cfg({ storeScope: "install-A" }), store: ms.store, receipts: fakeReceipts([1, 2, 3, 4, 5].map((seq) => receipt({ seq, operation: "build.run", outcome: { status: "success" } }))).receipts, publish: () => {}, now: () => 1000 });
+  const memB = createLabMemory({ config: cfg({ storeScope: "install-B" }), store: ms.store, receipts: fakeReceipts([1, 2, 3].map((seq) => receipt({ seq, operation: "build.run", outcome: { status: "failure" } }))).receipts, publish: () => {}, now: () => 1000 });
+
+  await Promise.all([memA.projectFromReceipts({ identity: ikbi }), memB.projectFromReceipts({ identity: ikbi })]);
+
+  const p = [...ms.m.values()].find((e) => e.kind === "pattern" && e.key === "op-build.run");
+  assert.equal(p?.value.total, 8, "BOTH installs' increments accrued (5 + 3) — no lost update");
+  assert.equal(p?.value.successes, 5);
+  assert.equal(p?.value.failures, 3);
 });
 
 test("C2: two long project paths sharing a 32-char slug prefix get DISTINCT baseline entries (no collision)", async () => {
