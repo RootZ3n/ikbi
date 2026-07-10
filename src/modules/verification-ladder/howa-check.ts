@@ -22,6 +22,7 @@
  */
 
 import { moduleEnv } from "../../core/module-config.js";
+import { resolveFetchGuard } from "../../core/provider/fetch-guard.js";
 
 const env = moduleEnv("verification-ladder");
 
@@ -132,7 +133,7 @@ export function interpretHowaResponse(body: unknown): { verdict: HowaVerdict; re
 export async function runHowaTruthfulnessCheck(
   input: HowaCheckInput,
   cfg: HowaCheckConfig = loadHowaCheckConfig(),
-  fetchImpl: FetchLike = fetch as unknown as FetchLike,
+  fetchImpl: FetchLike = ((input, init) => (resolveFetchGuard() as unknown as FetchLike)(input, init)),
 ): Promise<HowaCheckResult> {
   if (!cfg.enabled) {
     return { status: "skipped", lie: false, verdict: "indeterminate", reason: "Howa truthfulness check disabled (IKBI_VERIFICATION_LADDER_HOWA_ENABLED unset)" };

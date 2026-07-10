@@ -122,3 +122,29 @@ test("fetchLuakLeaderboard fails cleanly on non-2xx", async () => {
   assert.equal(r.ok, false);
   if (!r.ok) assert.match(r.error, /503/);
 });
+
+// ── H5: outbound goes through the egress guard, not raw fetch ───────────────────
+import { registerFetchGuard, resetFetchGuardForTests } from "../../core/provider/fetch-guard.js";
+
+test("fetchLuakLeaderboard defaults to the egress-guarded fetch (Codex H5)", async () => {
+  let sawUrl: string | undefined;
+  // A recording guard stands in for the SSRF floor. If the adapter used raw fetch, this never fires.
+  registerFetchGuard((async (input: string) => {
+    sawUrl = input;
+    return { ok: true, status: 200, json: async () => [], text: async () => "[]", headers: { get: () => null } };
+  }) as unknown as Parameters<typeof registerFetchGuard>[0]);
+  try {
+    const cfg = { url: "https://luak.example", path: "/leaderboard", timeoutMs: 1000, enabled: true } as unknown as LuakAdapterConfig;
+    await fetchLuakLeaderboard(cfg); // NO fetchImpl injected → must use the guard
+    assert.equal(sawUrl, "https://luak.example/leaderboard", "the request went through the registered egress guard");
+  } finally {
+    resetFetchGuardForTests();
+  }
+});
+
+test("fetchLuakLeaderboard fails closed when no egress guard is registered (Codex H5)", async () => {
+  resetFetchGuardForTests(); // no guard → resolveFetchGuard throws → NOT an ungoverned raw fetch
+  const cfg = { url: "https://luak.example", path: "/leaderboard", timeoutMs: 1000, enabled: true } as unknown as LuakAdapterConfig;
+  const r = await fetchLuakLeaderboard(cfg);
+  assert.equal(r.ok, false, "with no guard, the adapter must not make an ungoverned call");
+});
