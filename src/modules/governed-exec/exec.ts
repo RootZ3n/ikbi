@@ -240,6 +240,17 @@ function forbiddenEvalReason(command: string, args: readonly string[]): string |
   if (command === "node" && args.some((a) => a === "-e" || a === "--eval" || a === "-p" || a === "--print")) {
     return "node code-eval flags are not allowed by governed-exec";
   }
+  // Interpreter INLINE-eval flags run arbitrary code — a model could `python3 -c "open(~/.ssh/id_rsa)"`
+  // to read host files (SSH keys, provider config) even inside the read-only-host sandbox (Codex C4).
+  // `-m module` (e.g. `python3 -m pytest`) runs a real module and stays allowed; only INLINE code is
+  // denied. python3 is the one interpreter on the default allowlist; ruby/perl/php matter only when an
+  // operator opts them in, but are denied here for defense-in-depth.
+  if ((command === "python" || command === "python2" || command === "python3" || command === "pypy" || command === "pypy3") && args.includes("-c")) {
+    return `${command} inline-eval (-c) is not allowed by governed-exec — run a file or a module (-m) instead`;
+  }
+  if (command === "ruby" && args.includes("-e")) return "ruby inline-eval (-e) is not allowed by governed-exec";
+  if (command === "perl" && args.some((a) => a === "-e" || a === "-E")) return "perl inline-eval (-e/-E) is not allowed by governed-exec";
+  if (command === "php" && args.includes("-r")) return "php inline-eval (-r) is not allowed by governed-exec";
   if ((command === "npm" || command === "pnpm") && args.some((a) => a === "--eval" || a === "-e")) {
     return `${command} code-eval flags are not allowed by governed-exec`;
   }

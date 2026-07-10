@@ -282,15 +282,27 @@ test("F2: a risky command under sandbox mode=off runs but is LOUDLY receipted (n
 
 test("operator-allowed interpreters still reject direct code-eval flags", async () => {
   const ex = fakeExecFile();
-  const ge = createGovernedExec({ config: cfg(["node", "npm", "pnpm"]), gateWall: capturingGate().gateWall, execFile: ex.fn, receipts: fakeReceipts().receipts, publish: () => {} });
+  const ge = createGovernedExec({ config: cfg(["node", "npm", "pnpm", "python3", "ruby", "perl", "php"]), gateWall: capturingGate().gateWall, execFile: ex.fn, receipts: fakeReceipts().receipts, publish: () => {} });
   for (const [command, args] of [
     ["node", ["-e", "process.env"]],
     ["node", ["-p", "1+1"]],
+    // Codex C4: python3 -c is the reachable vector (python3 is on the default allowlist for pytest).
+    ["python3", ["-c", "open('/root/.ssh/id_rsa').read()"]],
+    ["ruby", ["-e", "puts 1"]],
+    ["perl", ["-e", "print 1"]],
+    ["php", ["-r", "echo 1;"]],
   ] as const) {
     const r = await ge.run({ parentCtx: makeCtx("verified"), command, args });
     assert.equal(r.denied, true, `${command} ${args.join(" ")} should be denied`);
   }
   assert.equal(ex.calls.length, 0);
+});
+
+test("python3 -m <module> (e.g. pytest) is NOT an eval flag — stays allowed", async () => {
+  const ex = fakeExecFile();
+  const ge = createGovernedExec({ config: cfg(["python3"]), gateWall: capturingGate().gateWall, execFile: ex.fn, receipts: fakeReceipts().receipts, publish: () => {} });
+  const r = await ge.run({ parentCtx: makeCtx("verified"), command: "python3", args: ["-m", "pytest", "-q"] });
+  assert.notEqual(r.denied, true, "python3 -m pytest must not be denied as inline-eval");
 });
 
 // ── curl / HTTP through the egress guard ─────────────────────────────────────
