@@ -93,6 +93,29 @@ test("whole worker+mid pool exhausted, frontier NOT authorized → needs-authori
   assert.equal(a.kind === "terminate" && a.terminal, "needs-authorization");
 });
 
+test("H7: autoCeiling='frontier' does NOT smuggle frontier models into the auto pool (ceiling clamped)", () => {
+  // A caller passing an over-high ceiling must not bypass the frontier authorization gate: the auto
+  // pool is clamped to 'mid', so no frontier model is ever offered as a plain 'attempt'.
+  const pool = eligiblePool(input([fail("worker", "deepseek-v4-flash")], { autoCeiling: "frontier" }));
+  assert.ok(pool.every((c) => c.tier !== "frontier"), "no frontier-tier model entered the auto pool");
+  assert.ok(pool.some((c) => c.tier === "mid"), "the pool still reaches the mid ceiling");
+});
+
+test("H7: with the whole worker+mid pool tried, autoCeiling='frontier' (unauthorized) → needs-authorization, NOT a frontier attempt", () => {
+  const all = [
+    fail("worker", "deepseek-v4-flash"),
+    fail("worker", "mimo-v2.5"),
+    fail("mid", "mimo-v2.5-pro"),
+    fail("mid", "deepseek-v4-pro"),
+    fail("mid", "minimax-m3"),
+    fail("mid", "glm-5.2")
+  ];
+  // Unauthorized frontier + an over-high ceiling: the gate must still hold (no blind frontier attempt).
+  const a = decideRecovery(input(all, { autoCeiling: "frontier" }));
+  assert.equal(a.kind, "terminate");
+  assert.equal(a.kind === "terminate" && a.terminal, "needs-authorization");
+});
+
 test("pool exhausted + frontier authorized → consult (not a blind swap)", () => {
   const all = [
     fail("worker", "deepseek-v4-flash"),
