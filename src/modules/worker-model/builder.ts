@@ -191,7 +191,8 @@ const BUILDER_SYSTEM =
   "4. If checks fail, fix and run_checks again\n" +
   "5. When all checks pass, call done\n\n" +
   "Use patch for small edits. Use write_file for new files or full rewrites.\n" +
-  "Only touch files the goal requires.\n";
+  "Only touch files the goal requires.\n" +
+  "Implement EXACTLY what the goal names — those functions/signatures only. Add NO extra helpers or unrequested API.\n";
 
 /** The FIXED tool set declared to the model. No shell, no network, no MCP this pass. */
 export const TOOLS: readonly ModelTool[] = [
