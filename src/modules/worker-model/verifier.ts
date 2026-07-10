@@ -908,15 +908,18 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
     // legacy loop would inherit governed-exec's 30s read-only-tool default and SIGKILL real suites.
     const legacyCheckTimeoutMs = resolveCheckTimeoutMs(env);
     const checks: CheckResult[] = [];
-    // The FULL stdout per check (aligned with `checks`), so triage sees the same evidence mapExec
-    // does — a zero-test / exit-swallow marker printed EARLY in a verbose run is gone from the tail.
+    // The FULL stdout AND stderr per check (aligned with `checks`), so triage sees the same evidence
+    // mapExec does — a zero-test / exit-swallow marker printed EARLY in a verbose run is gone from the
+    // tail, and a failure printed to STDERR was previously invisible entirely (Codex C2 false-green).
     const fullOutputs: string[] = [];
+    const fullErrors: string[] = [];
     let sawDryRun = false;
     for (const c of checkSet) {
-      // Accumulate the FULL stdout from the streaming sink: governed-exec retains only the bounded
-      // tail, so a zero-test marker printed early in a verbose passing run is gone from stdoutTail.
-      // mapExec parses the test tally from this full stream (robust), not the truncated tail.
+      // Accumulate the FULL stdout+stderr from the streaming sink: governed-exec retains only the
+      // bounded tail, so an early marker is gone from the tail. mapExec parses the tally from the full
+      // stdout; triage (below) parses failures from the full COMBINED stream.
       let fullStdout = "";
+      let fullStderr = "";
       const res = await governedExec.run({
         parentCtx,
         command: c.command,
@@ -929,11 +932,12 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
         // STREAMING path: a verbose suite emitting >maxBuffer (8MB) to stdout makes the buffered
         // execFile throw ENOBUFS → mapped to exit 1 → a FALSE RED on a passing build. The streaming
         // path caps CAPTURE at maxBuffer WITHOUT killing the process, so the real exit code survives.
-        onOutput: (chunk, stream) => { if (stream === "stdout") fullStdout += chunk; },
+        onOutput: (chunk, stream) => { if (stream === "stdout") fullStdout += chunk; else if (stream === "stderr") fullStderr += chunk; },
       });
       const { check, dryRun } = mapExec(c.name, `${c.command} ${c.args.join(" ")}`, res, fullStdout);
       checks.push(check);
       fullOutputs.push(fullStdout);
+      fullErrors.push(fullStderr);
       sawDryRun = sawDryRun || dryRun;
     }
 
@@ -952,9 +956,10 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
     // This brings the legacy path to parity with the ladder and builder run_checks.
     const triaged = checks.map((c, i) => ({
       check: c,
-      // Triage on the FULL output (parseCheckOutput bounds head+tail internally), NOT the 2k tail —
-      // otherwise a swallowed-exit / zero-test marker scrolled past the tail defeats the detectors.
-      triage: parseCheckOutput({ name: c.name, command: c.command, exitCode: c.exitCode, stdout: fullOutputs[i] ?? c.outputTail, stderr: "" }),
+      // Triage on the FULL stdout+stderr (parseCheckOutput bounds head+tail + combines both channels
+      // internally), NOT the 2k tail and NOT stdout-only — a swallowed-exit / zero-test marker scrolled
+      // past the tail, OR a failure printed to stderr, would otherwise defeat the detectors (Codex C2).
+      triage: parseCheckOutput({ name: c.name, command: c.command, exitCode: c.exitCode, stdout: fullOutputs[i] ?? c.outputTail, stderr: fullErrors[i] ?? "" }),
     }));
     const allPass = triaged.every((t) => t.check.exitCode === 0 && t.triage.passed);
     const failed = triaged.filter((t) => !t.triage.passed).map((t) => t.check.name);
@@ -1138,9 +1143,11 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
             };
           }
           const cmdStr = `${task.command} ${task.args.join(" ")}`;
-          // Accumulate the FULL stdout (see the legacy loop): the bounded tail can drop an early
-          // zero-test marker, so mapExec parses the tally from the whole stream, not the tail.
+          // Accumulate the FULL stdout+stderr (see the legacy loop): the bounded tail can drop an early
+          // zero-test marker, and a failure on stderr was previously only visible as the bounded tail —
+          // so mapExec parses the tally from the whole stdout and triage sees the full combined stream.
           let fullStdout = "";
+          let fullStderr = "";
           const res = await governedExec.run({
             parentCtx: pctx,
             command: task.command,
@@ -1152,7 +1159,7 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
             timeoutMs: checkTimeoutMs,
             // STREAMING path (bounded capture, no kill) so a >maxBuffer verbose suite keeps its real
             // exit code instead of an ENOBUFS-induced false RED. See the legacy loop for the rationale.
-            onOutput: (chunk, stream) => { if (stream === "stdout") fullStdout += chunk; },
+            onOutput: (chunk, stream) => { if (stream === "stdout") fullStdout += chunk; else if (stream === "stderr") fullStderr += chunk; },
           });
           const { check, dryRun } = mapExec(task.name, cmdStr, res, fullStdout);
           checks.push(check);
@@ -1163,9 +1170,10 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
               detail: { verdict: "dry-run", verificationScope: plan.scope, checks, stagesRun, neutralPackages: plan.neutralPackages, receipts: baseReceipts },
             };
           }
-          // Triage on the FULL stdout (bounded internally), not the 2k tail — the tail can drop an
-          // early swallowed-exit / zero-test marker, defeating the very detectors this stage relies on.
-          const tr: CheckTriage = triageFn({ name: task.name, command: cmdStr, exitCode: check.exitCode, stdout: fullStdout || (res.stdoutTail ?? ""), stderr: res.stderrTail ?? "" });
+          // Triage on the FULL stdout+stderr (bounded internally), not the 2k tail and not the bounded
+          // stderrTail — the tail can drop an early swallowed-exit / zero-test marker, and a failure
+          // printed early to stderr would scroll out of stderrTail, defeating the detectors (Codex C2).
+          const tr: CheckTriage = triageFn({ name: task.name, command: cmdStr, exitCode: check.exitCode, stdout: fullStdout || (res.stdoutTail ?? ""), stderr: fullStderr || (res.stderrTail ?? "") });
           triages.push({ stage: stage.stage, name: task.name, package: task.package, passed: tr.passed, failures: tr.failures, errorSummary: tr.errorSummary, detectedFrameworks: tr.detectedFrameworks });
           if (!tr.passed) {
             // FAIL FAST — stop before any later stage/task.

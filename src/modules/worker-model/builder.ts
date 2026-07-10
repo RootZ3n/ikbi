@@ -1543,8 +1543,15 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       // that takes longer — burning the builder's iterations on work the verifier would have passed.
       const checkTimeoutMs = resolveCheckTimeoutMs();
       const results: CheckResult[] = [];
+      const fullOutputs: string[] = [];
+      const fullErrors: string[] = [];
       let dry = false;
       for (const c of resolved.checks) {
+        // Accumulate the FULL stdout+stderr (governed-exec keeps only a bounded tail): triage below
+        // parses the FULL combined stream, so an early swallowed-exit / zero-test marker OR a failure
+        // printed to stderr can't scroll out of the tail and read as a pass (Codex C2 false-green).
+        let fullStdout = "";
+        let fullStderr = "";
         const res = await governedExec.run({
           parentCtx: deps.parentCtx,
           command: c.command,
@@ -1553,15 +1560,19 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
           verifier: true, // run_checks: trusted check-runner (runs the PLANNED checks, not model input)
           purpose: `builder check: ${c.name}`,
           timeoutMs: checkTimeoutMs,
+          onOutput: (chunk, stream) => { if (stream === "stdout") fullStdout += chunk; else if (stream === "stderr") fullStderr += chunk; },
         });
-        const { check, dryRun } = mapExec(c.name, `${c.command} ${c.args.join(" ")}`, res);
+        const { check, dryRun } = mapExec(c.name, `${c.command} ${c.args.join(" ")}`, res, fullStdout);
         results.push(check);
+        fullOutputs.push(fullStdout);
+        fullErrors.push(fullStderr);
         dry = dry || dryRun;
       }
-      // FALSE-GREEN HARDENING (M6): exit 0 is a FLOOR, not a ceiling. Route each check's output
-      // through the deterministic triage parser so an exit-swallowed failure (`vitest || true`) or
-      // a zero-tests run cannot read as a pass and let `done` go green on an unverified build.
-      const triaged = results.map((r) => ({ result: r, triage: parseCheckOutput({ name: r.name, command: r.command, exitCode: r.exitCode, stdout: r.outputTail }) }));
+      // FALSE-GREEN HARDENING (M6 + Codex C2): exit 0 is a FLOOR, not a ceiling. Route each check's
+      // FULL stdout+stderr through the deterministic triage parser so an exit-swallowed failure
+      // (`vitest || true`), a zero-tests run, or a failure printed to stderr cannot read as a pass
+      // and let `done` go green on an unverified build.
+      const triaged = results.map((r, i) => ({ result: r, triage: parseCheckOutput({ name: r.name, command: r.command, exitCode: r.exitCode, stdout: fullOutputs[i] ?? r.outputTail, stderr: fullErrors[i] ?? "" }) }));
       const allPass = !dry && triaged.every((t) => t.triage.passed);
       lastChecks = { allPass, checks: results };
       checksStale = false; // PRINCIPLE 4(b): the result now reflects the code on disk again
