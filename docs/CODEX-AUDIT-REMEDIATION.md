@@ -73,9 +73,9 @@ One service: **snapshot → integrate → verify(immutable tree) → adjudicate(
 | E2 | H6 | chat: map bearer → minted caller identity, spawn bounded worker from it; repo personas untrusted unless operator-installed; revalidate rollback paths | ⬜ |
 | E3 | H8 | apply explicit `IKBI_CHECKS` before auto-discovery; add python `setup.py`/`setup.cfg` manifests; atomic+versioned index persistence; full declared suite for final promotion | ⬜ |
 | E4 | M2 | transactional identity registry load; credential epochs/revalidation; runtime provenance brand checks; one immutable config snapshot (40 files read `process.env` directly) | ⬜ |
-| E5 | M3 | trust MAC: validate contract version/tiers/counters/timestamps/identity AFTER mac verify (not blind cast) | ⬜ |
-| E6 | M4 | event-bus: validate subscriptions; contain predicate failures; reject nonpositive queue sizes | ⬜ |
-| E7 | M6 | step-planner: reject overlarge plans explicitly (no silent drop); capability roots absolute + non-lexical symlink containment; derive requirements from action not caller | ⬜ |
+| E5 | M3 | trust MAC: post-MAC schema validation (version/tiers/counters/timestamps/arrays) — fail closed | ✅ b2203cd |
+| E6 | M4 | event-bus: contain throwing predicates (fail-closed no-match); clamp maxQueue ≥ 1 | ✅ 3e306d4 |
+| E7 | M6 | step-planner: report droppedSteps (no silent truncation). FOLLOW-UP: capability-registry absolute roots + non-lexical symlink containment | ✅ 8e2a430 (partial) |
 | E8 | M7 | self-repair: fail-closed if queue-lock setup fails; process-group timeout | ⬜ |
 | E9 | L2/L3/L4 | generate capability/reachability map from manifest; rename misleading knobs (sudo flag, "continuous"/"auto"); mark job-card exec + spec exec preview-only, unavailable over prod API | ⬜ |
 
