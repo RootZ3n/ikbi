@@ -71,12 +71,12 @@ One service: **snapshot → integrate → verify(immutable tree) → adjudicate(
 |----|---------|-----|-------|
 | E1 | C9 | every external/tool/repo string → typed untrusted message via core neutralizer; ikbi instruction stays a separate trusted message; model-request construction rejects bare tool-result strings (builder/consult/patchsmith/MCP) | ⬜ |
 | E2 | H6 | chat: map bearer → minted caller identity, spawn bounded worker from it; repo personas untrusted unless operator-installed; revalidate rollback paths | ⬜ |
-| E3 | H8 | apply explicit `IKBI_CHECKS` before auto-discovery; add python `setup.py`/`setup.cfg` manifests; atomic+versioned index persistence; full declared suite for final promotion | ⬜ |
+| E3 | H8 | IKBI_CHECKS resolved FIRST (explicit wins over auto-discovery, even for a manifest-less/ancestor-root project); setup.py/setup.cfg added to PROJECT_MANIFESTS (legacy python roots). FOLLOW-UP: atomic+versioned index persistence; full declared suite for final promotion | ✅ 6223602 |
 | E4 | M2 | transactional identity registry load; credential epochs/revalidation; runtime provenance brand checks; one immutable config snapshot (40 files read `process.env` directly) | ⬜ |
 | E5 | M3 | trust MAC: post-MAC schema validation (version/tiers/counters/timestamps/arrays) — fail closed | ✅ b2203cd |
 | E6 | M4 | event-bus: contain throwing predicates (fail-closed no-match); clamp maxQueue ≥ 1 | ✅ 3e306d4 |
 | E7 | M6 | step-planner: report droppedSteps (no silent truncation). FOLLOW-UP: capability-registry absolute roots + non-lexical symlink containment | ✅ 8e2a430 (partial) |
-| E8 | M7 | self-repair: fail-closed if queue-lock setup fails; process-group timeout | ⬜ |
+| E8 | M7 | self-repair: fail-closed if queue-lock setup fails (8aaedd9) + process-group timeout kill for the test runner (detached child, negative-pid SIGTERM/SIGKILL) so no worker subtree orphans | ✅ 9b54ef5 |
 | E9 | L2/L3/L4 | generate capability/reachability map from manifest; rename misleading knobs (sudo flag, "continuous"/"auto"); mark job-card exec + spec exec preview-only, unavailable over prod API | ⬜ |
 
 ---
