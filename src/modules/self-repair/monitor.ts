@@ -470,16 +470,26 @@ export async function runSelfRepair(
       { file: join(selfRepairConfig.workOrderDir, ".self-repair.lock") },
     );
   } catch (err) {
+    // FAIL CLOSED (Codex M7): if the coordination lock can't be set up/acquired, do NOT run an
+    // unlocked pass — a concurrent pass would race on WO-NNNN id allocation and overwrite work
+    // orders. Report not-healthy + not-handled so the caller knows the state was NOT verified.
     log.error(
       { dir: selfRepairConfig.workOrderDir, err: errMsg(err) },
-      "self-repair: could not prepare the work-order queue / lock",
+      "self-repair: could not prepare the work-order queue / acquire the coordination lock — refusing an unlocked pass",
     );
     out(
-      `self-repair could not prepare the work-order queue at ${selfRepairConfig.workOrderDir}: ` +
+      `self-repair could not prepare the work-order queue / acquire its coordination lock at ${selfRepairConfig.workOrderDir}: ` +
         `${errMsg(err)}\n` +
-        "running an unlocked pass (concurrent passes may race on id allocation)\n\n",
+        "REFUSING to run an unlocked pass (a concurrent pass could race on id allocation and overwrite work orders)\n\n",
     );
-    report = await runMonitor(opts, ports);
+    return {
+      ok: false,
+      healthy: false,
+      handled: false,
+      outcomes: [],
+      filed: [],
+      lines: [`self-repair could not acquire its coordination lock — pass skipped (fail-closed)`],
+    };
   }
   out("ikbi self-repair — monitoring pass\n\n");
   out(`${report.lines.join("\n")}\n\n`);
