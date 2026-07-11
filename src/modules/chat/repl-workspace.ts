@@ -17,6 +17,7 @@ import { execFileSync } from "node:child_process";
 import type { OperationContext } from "../../core/identity/index.js";
 import { neutralizeUntrusted } from "../../core/injection/index.js";
 import type { AgentIdentity } from "../../core/provider/contract.js";
+import { receipts as coreReceipts } from "../../core/receipt/index.js";
 import { autonomyForTier } from "../../core/trust/contract.js";
 import { asTier, TRUST_FLOOR } from "../../core/trust/index.js";
 import {
@@ -38,7 +39,7 @@ export interface WorkspaceManagerLike {
   allocate(opts: { targetRepo: string; identity: AgentIdentity; baseBranch?: string; label?: string }): Promise<WorkspaceHandle>;
   commit(handle: WorkspaceHandle, message: string): Promise<boolean>;
   diff(handle: WorkspaceHandle): Promise<string>;
-  promote(handle: WorkspaceHandle, approval: { evaluation: { approved: boolean; evaluatorId?: string; reason?: string }; governance?: { allow: boolean; gateId?: string; reason?: string }; message?: string }): Promise<PromoteResult>;
+  promote(handle: WorkspaceHandle, approval: { evaluation: { approved: boolean; evaluatorId?: string; reason?: string }; governance?: { allow: boolean; gateId?: string; reason?: string }; message?: string; verifiedAgainst?: { targetHead: string; integratedTree: string } }): Promise<PromoteResult>;
   discard(handle: WorkspaceHandle): Promise<DiscardResult>;
   get(id: string): Promise<WorkspaceRecord | undefined>;
 }
@@ -149,17 +150,19 @@ class ManagedWorkspace implements SessionWorkspace {
     return this.mgr.commit(this.handle, message);
   }
   async promote(message: string): Promise<PromoteResult> {
-    // GOVERNED promote (Codex blocker 3): the operator explicitly typed `/apply` (operator
-    // intent + evaluation), but the promotion ROUTES THROUGH THE SAME gate-wall decision path
-    // production build uses — no alternate UI path is weaker than build. The gate produces a
-    // durable decision receipt (allow OR deny); a DENY blocks the promote (nothing lands).
+    // MANUAL, OPERATOR-DIRECTED, UNVERIFIED APPLY (Phase 10, IKBI-REAUDIT-006). `/apply` is NOT the
+    // autonomous verified-promotion authority: it runs no critic/semantic evaluation and no executed-test
+    // gate, so it MUST NOT impersonate an autonomous success. It is a distinct authority class —
+    // manual-unverified — that a TRUSTED operator explicitly invokes. It still (a) routes through the REAL
+    // gate-wall (a deny blocks it), (b) binds the promote to the current tree identity so a drifted/moved
+    // target cannot silently land (the same CAS the autonomous authority uses), and (c) emits an explicitly
+    // MANUAL-UNVERIFIED receipt. It awards NO success trust and makes NO verified/semantic/test claim.
     const identity = chatIdentity(this.sessionId);
     const grant = autonomyForTier(asTier(identity.trustTier ?? TRUST_FLOOR, TRUST_FLOOR));
     const task: WorkerTask = { taskId: `repl-apply-${this.handle.id}`, targetRepo: this.handle.targetRepo, goal: message };
     const governance = await this.gateWall.evaluate({ grant, action: { kind: "promote", task, results: [] }, identity });
     if (!governance.allow) {
-      // Fail-closed: the gate-wall denied. It already recorded the deny decision receipt; do not
-      // promote (the workspace manager would also refuse a non-allow governance).
+      await this.recordManualApply(false, `gate-wall denied: ${governance.reason ?? "no reason"}`, undefined, identity);
       return {
         promoted: false,
         workspaceId: this.handle.id,
@@ -169,12 +172,64 @@ class ManagedWorkspace implements SessionWorkspace {
         reason: `gate-wall denied promotion: ${governance.reason ?? "no reason given"}`,
       };
     }
-    return this.mgr.promote(this.handle, {
-      // The operator typed `/apply` → evaluation approved; governance is the REAL gate verdict.
-      evaluation: { approved: true, evaluatorId: "repl-operator", reason: "operator invoked /apply" },
+    // TREE IDENTITY BINDING (fail-closed): bind the manual apply to the exact target head + scratch tree,
+    // so the workspace CAS refuses if the target moved or a drifted tree would land. If the identity is
+    // unreadable, proceed unbound (a non-git/degenerate case) — the manual receipt records that plainly.
+    const verifiedAgainst = this.readTreeIdentity();
+    const result = await this.mgr.promote(this.handle, {
+      // MANUAL apply: evaluatorId marks the operator; governance is the REAL gate verdict. This is NOT an
+      // autonomous verified promotion — the receipt below is labelled manual-unverified.
+      evaluation: { approved: true, evaluatorId: "repl-operator", reason: "operator invoked /apply (manual, unverified)" },
       governance,
       message,
+      ...(verifiedAgainst !== undefined ? { verifiedAgainst } : {}),
     });
+    await this.recordManualApply(result.promoted, result.reason ?? (result.promoted ? "landed" : "not promoted"), result.afterRef, identity);
+    return result;
+  }
+
+  /** Read the target head + scratch tree for a hash-bound manual apply. Undefined if not git-readable. */
+  private readTreeIdentity(): { targetHead: string; integratedTree: string } | undefined {
+    try {
+      const git = (args: string[], cwd: string): string => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"] }).trim();
+      const targetHead = git(["rev-parse", this.handle.baseBranch], this.handle.targetRepo);
+      const integratedTree = git(["rev-parse", "HEAD^{tree}"], this.handle.path);
+      if (targetHead.length === 0 || integratedTree.length === 0) return undefined;
+      return { targetHead, integratedTree };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Durable MANUAL-UNVERIFIED apply receipt (Phase 10). Distinct operation from the autonomous
+   * `worker.promotion`; it explicitly disclaims verification/semantic/test certification and success trust,
+   * so a manual operator apply can never be mistaken for an autonomous verified promotion in the audit trail.
+   */
+  private async recordManualApply(promoted: boolean, detail: string, landedRef: string | undefined, identity: AgentIdentity): Promise<void> {
+    try {
+      await coreReceipts.append(
+        {
+          operation: "workspace.manual_apply",
+          outcome: { status: promoted ? "success" : "failure", detail },
+          project: this.handle.targetRepo,
+          metadata: {
+            authorityMode: "manual-unverified",
+            operatorDirected: true,
+            sessionId: this.sessionId,
+            sourceWorkspaceId: this.handle.id,
+            targetBranch: this.handle.baseBranch,
+            ...(landedRef !== undefined ? { resultingRef: landedRef } : {}),
+            promoted,
+            testsCertified: false,
+            semanticEvaluationAuthoritative: false,
+            verifiedPromotion: false,
+            successTrustAwarded: false,
+          },
+        },
+        identity,
+      );
+    } catch { /* receipt failure must never break a manual apply */ }
   }
   discard(): Promise<DiscardResult> {
     return this.mgr.discard(this.handle);
