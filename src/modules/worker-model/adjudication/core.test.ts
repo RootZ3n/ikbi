@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import type { CriticVerdict, SafetyLedger, TestEvidence, Verdict, WorkAssessment, WorkProduct } from "./contract.js";
+import type { CriticVerdict, SafetyAssessment, TestEvidence, Verdict, WorkAssessment, WorkProduct } from "./contract.js";
 import { decidePromotability } from "./core.js";
 
 // ── fixtures ──────────────────────────────────────────────────────────────────
@@ -18,13 +18,12 @@ const green = (over: Partial<WorkAssessment> = {}): WorkAssessment => ({
   treeHash: TREE,
   ...over,
 });
-const noVeto = (over: Partial<SafetyLedger> = {}): SafetyLedger => ({
+const noVeto = (over: Partial<SafetyAssessment> = {}): SafetyAssessment => ({
   externalInjection: false,
   effectiveBreach: false,
   refuted: false,
   killed: false,
   driftBlocked: false,
-  gateWallAuthorized: true,
   ...over,
 });
 const criticPass: CriticVerdict = { pass: true };
@@ -109,9 +108,9 @@ test("retain(critic-fail-exhausted): critic rejects green work (goal misalignmen
   assert.deepEqual(d, { action: "retain", reason: "critic-fail-exhausted" });
 });
 
-test("retain(governance-withheld): gate-wall did not authorize", () => {
-  const d = decidePromotability(work(), green(), noVeto({ gateWallAuthorized: false }), criticPass);
-  assert.deepEqual(d, { action: "retain", reason: "governance-withheld" });
+test("Phase 8: the core does NOT gate on the gate-wall — green+unvetoed work is a promote RECOMMENDATION (the downstream gate-wall is authoritative)", () => {
+  const d = decidePromotability(work(), green(), noVeto(), criticPass);
+  assert.deepEqual(d, { action: "promote", treeHash: TREE, reason: "verified-green" }, "the core recommends promote; it never claims a gate-wall determination");
 });
 
 // ── D. INVARIANTS (property-style) ─────────────────────────────────────────────
@@ -121,16 +120,15 @@ test("I1: genuinely-green work is NEVER discarded — for every safety/critic co
     for (const effectiveBreach of bools)
       for (const refuted of bools)
         for (const driftBlocked of bools)
-          for (const gateWallAuthorized of bools)
-            for (const criticOk of bools) {
-              const d = decidePromotability(
-                work(),
-                green(),
-                noVeto({ externalInjection, effectiveBreach, refuted, driftBlocked, gateWallAuthorized }),
-                { pass: criticOk },
-              );
-              assert.notEqual(d.action, "discard", `green work discarded under ${JSON.stringify({ externalInjection, effectiveBreach, refuted, driftBlocked, gateWallAuthorized, criticOk })}`);
-            }
+          for (const criticOk of bools) {
+            const d = decidePromotability(
+              work(),
+              green(),
+              noVeto({ externalInjection, effectiveBreach, refuted, driftBlocked }),
+              { pass: criticOk },
+            );
+            assert.notEqual(d.action, "discard", `green work discarded under ${JSON.stringify({ externalInjection, effectiveBreach, refuted, driftBlocked, criticOk })}`);
+          }
 });
 
 test("I2: promote ALWAYS binds to the work's tree hash, and a mismatch never promotes", () => {
@@ -186,33 +184,32 @@ test("I5: total mapping — EVERY fact combination yields a well-formed decision
               for (const refuted of bools)
                 for (const killed of bools)
                   for (const driftBlocked of bools)
-                    for (const gateWallAuthorized of bools)
-                      for (const criticOk of bools) {
-                        cases += 1;
-                        const d = decidePromotability(
-                          work({ nonEmpty }),
-                          { verdict, testEvidence, treeHash },
-                          { externalInjection, effectiveBreach, refuted, killed, driftBlocked, gateWallAuthorized },
-                          { pass: criticOk },
-                        );
-                        assert.ok(d.action === "promote" || d.action === "retain" || d.action === "discard", "action is in the closed set");
-                        if (d.action === "promote") {
-                          assert.equal(d.reason, "verified-green");
-                          assert.equal(d.treeHash, TREE, "a promote binds the work's tree hash");
-                        } else if (d.action === "retain") {
-                          assert.ok(RETAIN.has(d.reason), `retain reason "${d.reason}" is a closed-enum value`);
-                        } else {
-                          assert.ok(DISCARD.has(d.reason), `discard reason "${d.reason}" is a closed-enum value`);
-                        }
+                    for (const criticOk of bools) {
+                      cases += 1;
+                      const d = decidePromotability(
+                        work({ nonEmpty }),
+                        { verdict, testEvidence, treeHash },
+                        { externalInjection, effectiveBreach, refuted, killed, driftBlocked },
+                        { pass: criticOk },
+                      );
+                      assert.ok(d.action === "promote" || d.action === "retain" || d.action === "discard", "action is in the closed set");
+                      if (d.action === "promote") {
+                        assert.equal(d.reason, "verified-green");
+                        assert.equal(d.treeHash, TREE, "a promote binds the work's tree hash");
+                      } else if (d.action === "retain") {
+                        assert.ok(RETAIN.has(d.reason), `retain reason "${d.reason}" is a closed-enum value`);
+                      } else {
+                        assert.ok(DISCARD.has(d.reason), `discard reason "${d.reason}" is a closed-enum value`);
                       }
-  // nonEmpty(2) × verdict(8) × evidence(4) × treeHash(2) × [6 safety + 1 critic bools = 2^7].
-  assert.equal(cases, 2 * 8 * 4 * 2 * 2 ** 7, "the full fact grid was exercised");
+                    }
+  // nonEmpty(2) × verdict(8) × evidence(4) × treeHash(2) × [5 safety + 1 critic bools = 2^6].
+  assert.equal(cases, 2 * 8 * 4 * 2 * 2 ** 6, "the full fact grid was exercised");
 });
 
 test("I7: any single safety veto on green work ⇒ NEVER promote (vetoes are monotone)", () => {
-  const vetoes: Array<Partial<SafetyLedger>> = [
+  const vetoes: Array<Partial<SafetyAssessment>> = [
     { externalInjection: true }, { effectiveBreach: true }, { refuted: true },
-    { killed: true }, { driftBlocked: true }, { gateWallAuthorized: false },
+    { killed: true }, { driftBlocked: true },
   ];
   for (const v of vetoes) {
     const d = decidePromotability(work(), green(), noVeto(v), criticPass);

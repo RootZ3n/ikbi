@@ -186,7 +186,7 @@ import { existsSync, readdirSync, readFileSync, symlinkSync, mkdirSync, type Dir
 import { tmpdir } from "node:os";
 import { join, basename } from "node:path";
 
-import { computeWorkProduct, decidePromotability, type Decision, type GitRunner, type SafetyLedger, type Verdict, type WorkAssessment } from "./adjudication/index.js";
+import { computeWorkProduct, decidePromotability, type Decision, type GitRunner, type SafetyAssessment, type Verdict, type WorkAssessment } from "./adjudication/index.js";
 
 /**
  * Given `git status --porcelain` output, report whether the working tree has TRACKED
@@ -3917,15 +3917,42 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         };
         const criticDetail = (results.find((r) => r.role === "critic")?.detail ?? {}) as Record<string, unknown>;
         const refuterDetail = (results.find((r) => r.role === "refuter")?.detail ?? {}) as Record<string, unknown>;
-        const safety: SafetyLedger = {
-          externalInjection: externalInjectionDetectedThisBuild,
-          effectiveBreach: false, // effective breaches raise separate higher-severity alarms; not tracked as a run flag here
-          refuted: refuterDetail.refuted === true,
-          killed: killedReason !== undefined,
-          driftBlocked: false, // a drift "block" rejects at entry, before any role runs — never reaches here
-          gateWallAuthorized: true, // adjudication does not pre-empt the gate-wall — the promote path enforces it downstream
+        // SAFETY ASSESSMENT (Phase 8): a DERIVED projection of AUTHENTIC monotone vetoes — each `true`
+        // is a concrete event OBSERVED by a named runtime component, never a manufactured affirmative
+        // "safe" claim. The gate-wall is deliberately ABSENT: it is a DOWNSTREAM authority enforced by
+        // `promoteCandidate()`, so this projection no longer fabricates `gateWallAuthorized: true`.
+        // `effectiveBreach`/`driftBlocked` are NOT-DETERMINED-HERE monotone-veto slots (an effective
+        // breach raises a separate alarm; a drift block rejects at entry) → false = "no such veto raised".
+        const safety: SafetyAssessment = {
+          externalInjection: externalInjectionDetectedThisBuild, // observed: neutralization chokepoint
+          effectiveBreach: false, // not tracked by this projection (separate higher-severity alarm) — no veto raised
+          refuted: refuterDetail.refuted === true, // observed: refuter role
+          killed: killedReason !== undefined, // observed: kill-switch / budget
+          driftBlocked: false, // a drift block rejects at ENTRY (before roles) — cannot reach this terminal
         };
         adjDecision = decidePromotability(wp, assessment, safety, { pass: criticDetail.pass === true });
+        // TRUTHFUL PROVENANCE RECEIPT: record WHICH fields are authentic OBSERVATIONS vs NOT-DETERMINED
+        // here, and the AUTHORITY — this assessment is advisory to the adjudication decision and NEVER a
+        // promotion authorizer (the real gate-wall + stale-tree in promoteCandidate are authoritative).
+        try {
+          await receipts.append(
+            {
+              operation: "worker.safety_assessment",
+              outcome: { status: "success", detail: `adjudication ${adjDecision.action} (${adjDecision.reason})` },
+              requestId: task.taskId,
+              metadata: {
+                taskId: task.taskId, treeHash: wp.treeHash,
+                authority: "advisory-to-adjudication; NOT a promotion authorizer (gate-wall + promoteCandidate are authoritative)",
+                observedVetoes: { externalInjection: safety.externalInjection, refuted: safety.refuted, killed: safety.killed },
+                notDeterminedHere: ["effectiveBreach", "driftBlocked", "gateWallAuthorized"],
+                adjudicationAction: adjDecision.action, adjudicationReason: adjDecision.reason,
+                mode: adjudicationAuthoritative ? "authoritative" : "shadow",
+              },
+              project: task.targetRepo,
+            },
+            parentIdentity,
+          );
+        } catch { /* provenance receipt failure must never break the build */ }
 
         if (shadowEnabled) {
           const oldIntent = readIntegratorDecision(results.find((r) => r.role === "integrator")).promote === true;
@@ -4072,14 +4099,13 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         adjRetain = true;
         decision = { ...decision, promote: false, rationale: "adjudication core authoritative but the promotability verdict was unavailable — fail closed (no promote; work retained for inspection)" };
       } else if (adjDecision.action === "promote") {
-        // QUARANTINE (Phase 3, IKBI-RT-005). The experimental adjudication core still decides on a
-        // SYNTHESIZED SafetyLedger (effectiveBreach/driftBlocked/gateWallAuthorized are hard-coded in the
-        // block above), so it must NOT manufacture an autonomous promote from evidence that was not
-        // authentically produced. It may CONFIRM a promote the integrator ALSO approved (which then still
+        // QUARANTINE (Phase 3, IKBI-RT-005), preserved. The adjudication core's `promote` is only a
+        // RECOMMENDATION over authentic vetoes (Phase 8 removed the manufactured `gateWallAuthorized:true`;
+        // the `SafetyAssessment` no longer fabricates gate-wall authorization). It must NOT manufacture an
+        // autonomous promote: it may CONFIRM a promote the integrator ALSO approved (which then still
         // passes through the canonical authority's real gate-wall + stale-tree binding), but when the
-        // integrator did NOT approve it fails CLOSED and retains the work — the experimental path can no
-        // longer synthesize an approving evaluation to override an integrator discard. (The brief's
-        // preferred outcome: quarantine, because authentic safety-fact binding is out of this phase.)
+        // integrator did NOT approve it fails CLOSED and retains the work — the experimental path can never
+        // override an integrator discard. The real gate-wall + promoteCandidate remain the sole authority.
         if (decision.promote === true) {
           decision = { ...decision, rationale: `adjudication core: promote — confirms the integrator (${adjDecision.reason})` };
         } else {

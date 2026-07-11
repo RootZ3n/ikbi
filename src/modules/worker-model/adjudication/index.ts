@@ -19,6 +19,7 @@ export type {
   DiscardReason,
   ProtocolExit,
   RetainReason,
+  SafetyAssessment,
   SafetyLedger,
   TestEvidence,
   Verdict,

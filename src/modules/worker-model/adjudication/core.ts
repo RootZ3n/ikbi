@@ -17,7 +17,7 @@
  *  5. All clear → promote(treeHash).
  */
 
-import type { CriticVerdict, Decision, SafetyLedger, WorkAssessment, WorkProduct } from "./contract.js";
+import type { CriticVerdict, Decision, SafetyAssessment, WorkAssessment, WorkProduct } from "./contract.js";
 
 /**
  * True iff the assessment is a real, tree-bound green verdict (the only promotable state, per I2/I6).
@@ -43,7 +43,7 @@ function isGreenOnMerit(work: WorkProduct, assessment: WorkAssessment): boolean 
 export function decidePromotability(
   work: WorkProduct,
   assessment: WorkAssessment,
-  safety: SafetyLedger,
+  safety: SafetyAssessment,
   critic: CriticVerdict,
 ): Decision {
   // 1. No work exists — a build that produced nothing is not a build.
@@ -65,13 +65,17 @@ export function decidePromotability(
 
   // 4. The work is GREEN ON MERIT. Only a gate can withhold it now — and only via RETAIN (I1).
   //    Safety forensics first (highest severity), then governance, then goal-alignment.
+  //    NOTE (Phase 8): the GATE-WALL is deliberately NOT gated here. It is a DOWNSTREAM authority
+  //    (`promoteCandidate()` enforces the real gate-wall + stale-tree/CAS on every promote); this core
+  //    must not claim a gate-wall determination it never made (the old `gateWallAuthorized: true` was a
+  //    manufactured affirmative fact). A "promote" verdict here is a RECOMMENDATION that the canonical
+  //    authority then gates — the core never authorizes promotion on its own.
   if (safety.effectiveBreach || safety.externalInjection || safety.refuted) {
     return { action: "retain", reason: "safety-forensics" };
   }
   if (safety.driftBlocked) return { action: "retain", reason: "governance-withheld" };
   if (!critic.pass) return { action: "retain", reason: "critic-fail-exhausted" };
-  if (!safety.gateWallAuthorized) return { action: "retain", reason: "governance-withheld" };
 
-  // 5. Green, tree-bound, evidenced, unvetoed, authorized.
+  // 5. Green, tree-bound, evidenced, unvetoed — a promote RECOMMENDATION (the downstream gate-wall gates).
   return { action: "promote", treeHash: work.treeHash, reason: "verified-green" };
 }

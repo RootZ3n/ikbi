@@ -68,24 +68,33 @@ export interface WorkAssessment {
 }
 
 /**
- * RUN-SCOPED SAFETY VETOES — sticky and monotone within a run (invariant I7): once set by the
- * chokepoint / gate-wall / refuter / kill-switch, no later retry launders them. PREVENTED
- * (governor-rejected) attempts are NOT here — they are warnings judged by effect, never a veto alone.
+ * A DERIVED, run-scoped projection of AUTHENTIC safety VETOES (Phase 8 — was the misleadingly-named
+ * `SafetyLedger`). It is NOT an authoritative append-only evidence record and it NEVER authorizes a
+ * promotion: it can only WITHHOLD (retain) green work in the adjudication decision, and even that is
+ * shadow/quarantined (Phase 3). The authoritative promotion-policy boundary is the real gate-wall +
+ * `promoteCandidate()`'s stale-tree/CAS checks — which run DOWNSTREAM of this projection.
+ *
+ * Every field here is a MONOTONE VETO — `true` means "a concrete bad event was OBSERVED by a named
+ * runtime component" (never a manufactured affirmative "safe" claim); `false` means "no such veto was
+ * raised" (the absence of a positive observation, never a claim that a check was run and passed). The
+ * gate-wall is deliberately ABSENT: it is a downstream authority, not this projection's to assert.
+ * PREVENTED (governor-rejected) attempts are NOT here — they are effect-judged warnings, never a veto.
  */
-export interface SafetyLedger {
-  /** Prompt-injection from OUTSIDE content (web/vision/delegate/…). Blocks promote. */
+export interface SafetyAssessment {
+  /** OBSERVED by the neutralization chokepoint: prompt-injection from OUTSIDE content (web/vision/delegate). */
   readonly externalInjection: boolean;
-  /** A control FAILURE that actually landed (sandbox escape, egress leak, out-of-workspace write). */
+  /** OBSERVED: a control FAILURE that actually LANDED (sandbox escape, egress leak, out-of-workspace write). */
   readonly effectiveBreach: boolean;
-  /** The refuter refuted the build. */
+  /** OBSERVED by the refuter role: the build was refuted. */
   readonly refuted: boolean;
-  /** A kill-switch / budget kill halted the run — never promote a half-run. */
+  /** OBSERVED by the kill-switch / budget: the run was halted — never promote a half-run. */
   readonly killed: boolean;
-  /** The drift governor blocked this build (policy=block on detected drift). */
+  /** OBSERVED by the drift governor: this build was blocked (policy=block on detected drift). */
   readonly driftBlocked: boolean;
-  /** Gate-wall authorized the promote. Absent authorization ⇒ withhold (never promote). */
-  readonly gateWallAuthorized: boolean;
 }
+
+/** @deprecated Phase 8: use `SafetyAssessment`. Kept as a transitional alias so external refs compile. */
+export type SafetyLedger = SafetyAssessment;
 
 /** The critic's subjective goal-alignment judgement — a WORK fact (allowed into the decision). */
 export interface CriticVerdict {
