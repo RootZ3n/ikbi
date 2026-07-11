@@ -2056,24 +2056,48 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // to a bigger-window model — keeping cost attribution + the recorded model consistent with the
     // model the builder actually runs on.
     let rentedExpert: RentedExpert | undefined = undefined;
+    // CLASSIFIER COST ACCOUNTING (Phase 7, IKBI-RT-011): the semantic-difficulty classifier is a REAL
+    // provider invocation that runs BEFORE the costing engine exists — its spend was previously
+    // discarded (invisible to runCost/the run-summary/the budget). Capture its cost/usage/model here;
+    // fold it into runCost after the engine is built (below), and receipt it truthfully. The classifier
+    // cost belongs to the CLASSIFIER model (e.g. deepseek-v4-flash), NEVER the expert it selects.
+    let classifierCostUsd = 0;
+    let classifierUsage: unknown;
+    let classifierCalled = false; // a real provider invocation was attempted
+    let classifierCostMeasured = false; // the provider returned a cost
+    let classifierProvider: string | undefined;
+    let classifierResponseModel: string | undefined;
+    let classifierRetries = 0;
+    let classifierDecisionSource: string | undefined;
+    let classifierModelUsed: string | undefined;
     if (task.builderModelOverride === undefined && task.moeExpertRental === true) {
       // ROUTER (the coordinator's brain): semantically rate this sub-task's difficulty with ONE cheap
       // classifier call, then rent the cheapest-sufficient expert at that tier. The classifier + rental
       // both fall back to a zero-cost heuristic on any failure, so routing degrades gracefully and can
-      // never block a build. Runs BEFORE the costing engine exists — a ~20-token call, cost negligible.
+      // never block a build.
       const classifierModel = resolveClassifierModel(escalationConfig.tierModels, singleBuilderModel);
+      classifierModelUsed = classifierModel;
       const verdict = await classifyTaskTier(
         task.goal,
         async (prompt) => {
+          classifierRetries += 1; // each ACTUAL provider attempt is a distinct invocation
+          classifierCalled = true;
           try {
             const res = await invokeModel({ model: classifierModel, prompt, temperature: 0, maxTokens: 200, identity: parentIdentity });
+            // MEASURED when the provider returned a cost; UNAVAILABLE when it did not (never assume zero).
+            if (res.cost?.usd !== undefined) { classifierCostUsd += res.cost.usd; classifierCostMeasured = true; }
+            classifierUsage = res.usage;
+            classifierProvider = res.provider;
+            classifierResponseModel = res.model;
             return typeof res.content === "string" ? res.content : "";
           } catch {
+            // A provider error loses the pre/post-dispatch distinction → cost UNKNOWN, never zero.
             return "";
           }
         },
         task.complexity !== undefined ? { complexity: task.complexity } : {},
       );
+      classifierDecisionSource = verdict.source; // "model" (a provider call ran) | "heuristic" (deterministic)
       rentedExpert = rentBuilderExpert({
         goal: task.goal,
         ...(task.complexity !== undefined ? { complexity: task.complexity } : {}),
@@ -2082,7 +2106,35 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         tierOverride: verdict.tier,
         ...(task.moeVendorLane !== undefined ? { vendorLane: task.moeVendorLane } : {}),
       });
-      log.info({ taskId: task.taskId, difficulty: verdict.tier, source: verdict.source, rationale: verdict.rationale, classifier: classifierModel, model: rentedExpert.modelId }, "MoE: router classified difficulty + rented builder expert");
+      // IDENTITY CHAIN: pricing/usage/receipt all bind to the CLASSIFIER model, distinct from the
+      // selected expert. `worker.classifier` records the routing invocation; a deterministic (heuristic)
+      // decision is a NO-CALL with zero model cost — never a fabricated invocation.
+      const status = classifierCalled ? (classifierCostMeasured ? "measured" : "unavailable") : "no-call";
+      try {
+        await receipts.append(
+          {
+            operation: "worker.classifier",
+            outcome: { status: status === "unavailable" ? "failure" : "success", detail: `difficulty=${verdict.tier} via ${verdict.source}` },
+            requestId: task.taskId,
+            metadata: {
+              taskId: task.taskId, stage: "classifier", invocationId: `${task.taskId}:classifier`,
+              // DISPATCHED == the model SENT to the provider (== billed == priced). The provider's echoed
+              // model is recorded separately as `providerReportedModel` (they match in production).
+              classifierModel, dispatchedModel: classifierModel,
+              ...(classifierResponseModel !== undefined && classifierResponseModel !== classifierModel ? { providerReportedModel: classifierResponseModel } : {}),
+              ...(classifierProvider !== undefined ? { provider: classifierProvider } : {}),
+              decision: verdict.tier, decisionSource: verdict.source, modelBacked: classifierCalled,
+              selectedExpert: rentedExpert.modelId, // SEPARATE from the classifier model — its cost is NOT charged here
+              ...(task.moeVendorLane !== undefined ? { vendorLane: task.moeVendorLane } : {}),
+              ...(classifierUsage !== undefined ? { usage: classifierUsage } : {}),
+              costUsd: classifierCostUsd, costStatus: status, retryCount: classifierRetries,
+            },
+            project: task.targetRepo,
+          },
+          parentIdentity,
+        );
+      } catch { /* classifier receipt failure must never break the build */ }
+      log.info({ taskId: task.taskId, difficulty: verdict.tier, source: verdict.source, rationale: verdict.rationale, classifier: classifierModel, model: rentedExpert.modelId, classifierCostUsd, classifierCostStatus: status }, "MoE: router classified difficulty + rented builder expert");
     }
     // The ONE authoritative model decision for this attempt (IKBI-RT-001). Precedence, highest
     // first: an operator --tier preset (builderModelOverride) → the semantically-rented MoE expert
@@ -2355,6 +2407,16 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 
     // Per-run costing engine: accumulates every model invocation's cost across all roles.
     const { engine: runEngine, cost: runCost, addCost: addRunCost } = makeCostingEngine(task.maxBudgetUsd, task.effort);
+    // ROUTING OVERHEAD (Phase 7): fold the pre-engine classifier spend into the run total + the budget,
+    // so `ikbi cost`, the run-summary, and the budget cap all see it. It is ROUTING overhead — kept as a
+    // distinct subtotal on the summary (not blurred into builder cost). `addRunCost` may throw
+    // BUDGET_EXHAUSTED if the classifier alone exceeds a tiny cap — correct: the classifier IS spend.
+    const routingOverheadUsd = classifierCostUsd;
+    // The classifier's cost STATUS: no-call (deterministic/off) | measured | unavailable (a call ran but
+    // the provider returned no cost — UNKNOWN, never zero).
+    const classifierCostStatus: "measured" | "unavailable" | "no-call" = classifierCalled ? (classifierCostMeasured ? "measured" : "unavailable") : "no-call";
+    // Aggregate cost is PARTIAL when any accounted invocation's cost is unknown (never a false-precise total).
+    const costPartial = classifierCostStatus === "unavailable";
 
     const results: RoleResult[] = [];
     // Run-level escalation accumulator (ADDITIVE observability; never alters dispatch).
@@ -2462,6 +2524,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     };
 
     try {
+      // ROUTING OVERHEAD (Phase 7): fold the pre-engine classifier spend into runCost + the budget HERE,
+      // inside the try, so a classifier that exceeds a tiny cap trips BUDGET_EXHAUSTED and is handled by
+      // the abort path below (which writes a truthful terminal summary) rather than throwing out of run.
+      if (routingOverheadUsd > 0) addRunCost(routingOverheadUsd);
       // ── DEPENDENCY INSTALL: ensure node_modules exists before running checks ──
       // If the worktree has a package.json but no node_modules, install dependencies
       // so run_checks (typecheck + tests) can actually succeed. This is the fix for
@@ -4325,6 +4391,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           promoted,
           model: singleBuilderModel,
           costUsd: runCost(),
+          // COST TRUTH (Phase 7, IKBI-RT-011): `costUsd` now INCLUDES routing overhead (the classifier).
+          // `routingOverheadUsd` breaks it out as a distinct subtotal; `costStatus` is "partial" when any
+          // accounted invocation's cost is unknown, so a total never falsely implies completeness.
+          routingOverheadUsd,
+          costStatus: costPartial ? "partial" : "complete",
+          ...(classifierModelUsed !== undefined ? { classifierModel: classifierModelUsed, classifierDecisionSource, classifierCostStatus } : {}),
           verificationResult: verifierResult !== undefined ? verifierResult.outcome : "not_run",
           verificationMode: ranVerificationMode,
           retrievalMode: ranRetrievalMode,
