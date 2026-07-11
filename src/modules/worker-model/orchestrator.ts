@@ -84,7 +84,7 @@ import { createPatchsmith } from "./patchsmith.js";
 import { runTournament } from "./tournament.js";
 import type { CandidateRun, CandidateSpec, ShadowVerification, TournamentEngine, TournamentEvent } from "./tournament.js";
 import { captureStreamedStdout, classifyUnresolvableReason, committedPackageJsonDiff, parseChecksEnv, parseTestCount, PROJECT_MANIFESTS, resolveChecks, resolveCheckTimeoutMs, UNRESOLVABLE_NEXT_STEPS, type VerificationKind, workingTreePackageJsonDiff, workingTreePlanningDiff } from "./checks.js";
-import { builderModel, competitiveBuilderModels } from "./role-models.js";
+import { builderModel, competitiveBuilderModels, criticModel } from "./role-models.js";
 import { estimatePromptTokens, contextExceedsWindow } from "./context-preflight.js";
 import { getCapabilities } from "../../core/provider/capabilities.js";
 import { createCritic, critic } from "./critic.js";
@@ -1188,6 +1188,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   const singleBuilderModel = deps.builderModel ?? builderModel();
   // Phase 11: the escalation tier rosters (default: deployed config; injectable for deterministic tests).
   const tierModels = deps.escalationTierModels ?? escalationConfig.tierModels;
+  // Phase 11B: the known cheap-tier vendor lanes (the duel pool). Used for the post-dispatch execution-identity
+  // check — a served model belonging to a DIFFERENT known lane than the attempt's is a genuine cross crossing.
+  const KNOWN_VENDOR_LANES = ["deepseek", "mimo"] as const;
   const competitiveModelList = deps.competitiveModels ?? competitiveBuilderModels();
   // TOURNAMENT candidate models (deps → config). A task's own `candidates` overrides both at run().
   const candidateModelList = deps.candidateModels ?? config.candidateModels ?? [];
@@ -1211,8 +1214,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       now: () => Date.now(),
       ...(maxBudgetUsd !== undefined ? { maxBudgetUsd } : {}),
       ...(effort !== undefined ? (() => { const p = effortModelParams(effort); return p !== undefined ? { effortParams: p } : {}; })() : {}),
-      // Vendor-lane membership follows the roster convention (id prefixed by the lane vendor).
+      // Vendor-lane membership follows the roster convention (id prefixed by the lane vendor). `laneMember`
+      // gates the PRE-dispatch block (a requested model must be in the attempt's lane); `servedOutOfLane`
+      // gates the POST-dispatch execution-identity check (a SERVED model belonging to a known OTHER lane is a
+      // genuine cross-vendor crossing — a generic/unknown served model is NOT flagged).
       laneMember: (model: string, lane: string) => model.startsWith(lane),
+      servedOutOfLane: (model: string, lane: string) => KNOWN_VENDOR_LANES.some((l) => l !== lane && model.startsWith(l)),
     });
     // `addCost` folds an EXTERNAL raw-provider cost (e.g. the frontier consult) into the ledger as its own
     // invocation record so it is counted once, enforces the budget cap, and cannot be double-summed.
@@ -1315,14 +1322,16 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     });
   }
 
-  /** The critic for THIS run. Honors injected tests, otherwise gives the critic workspace diff access. */
-  function criticFor(): RoleFn {
+  /** The critic for THIS run. Honors injected tests, otherwise gives the critic workspace diff access.
+   *  `laneModel` (Phase 11B) pins an attempt-bound critic to a lane-valid model. */
+  function criticFor(laneModel?: string): RoleFn {
     if (deps.roles?.critic !== undefined) return deps.roles.critic;
     return createCritic({
       ...(workspaces.diff !== undefined ? { diff: (ws: WorkspaceHandle) => workspaces.diff!(ws) } : {}),
       // Phase 9: bind the semantic verdict to the tree the verifier certified. Real-critic only — an
       // injected test double returns above, so this never perturbs the Phase 3 stale-tree read sequence.
       resolveVerifiedTree: (ws: WorkspaceHandle) => readTreeHash(ws.path),
+      ...(laneModel !== undefined ? { modelOverride: laneModel } : {}),
     });
   }
 
@@ -1467,6 +1476,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     costUsd?: number,
     model?: string,
     skipTrust?: boolean,
+    invocationId?: string,
   ): Promise<void> {
     const status = toOutcomeStatus(result.outcome);
     const operation = `worker.role.${result.role}`;
@@ -1563,6 +1573,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           outcome: result.outcome,
           ...(costUsd !== undefined ? { costUsd } : {}),
           ...(model !== undefined ? { model } : {}),
+          // Phase 11B: link this execution receipt to its authoritative ledger invocation record.
+          ...(invocationId !== undefined ? { invocationId } : {}),
           ...(perfTrust !== undefined
             ? { performanceFailure: true, trustDecision: perfTrust.decision, trustDecisionReason: perfTrust.reason }
             : {}),
@@ -2341,17 +2353,33 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       if (modelDecision.vendorLane === undefined || configured.startsWith(modelDecision.vendorLane)) return configured;
       return laneModelsFor(tierModels.mid)[0] ?? undefined;
     })();
-    // EMPTY-LANE CONFIG GUARD (Phase 11, IKBI-REAUDIT-002): a configured attempt lane with NO valid model
-    // (neither the decided model nor any worker-tier model belongs to it) is a CONFIGURATION error — never
-    // a licence to borrow the other vendor's models. Fail the attempt CLOSED before any dispatch (not a
-    // candidate defect; no duel/fixer/promotion). This runs BEFORE workspace allocation, so nothing leaks.
-    if (task.moeVendorLane !== undefined && !modelDecision.model.startsWith(task.moeVendorLane) && !laneHasModels(tierModels.worker, task.moeVendorLane)) {
-      const reason = `lane-config: vendor lane "${task.moeVendorLane}" has no configured model (neither the decided model "${modelDecision.model}" nor any worker-tier model is in the lane) — refusing to borrow another vendor's model`;
+    // LANE-VALID CANDIDATE CRITIC (Phase 11B, IKBI-REAUDIT-002): the candidate critic is ATTEMPT-BOUND. For a
+    // lane-pinned attempt it must run a lane-valid critic model (its structured-output recovery reuses the same
+    // model, so recovery stays in-lane too). Prefer the operator/configured critic when it is in-lane; else the
+    // lane's mid/pro-tier model. Undefined here on a LANE-PINNED attempt means the lane has no valid critic →
+    // the guard below fails the attempt closed. A lane-NEUTRAL attempt (normal build) leaves this undefined and
+    // the critic uses the configured critic (unchanged).
+    const laneCriticModel: string | undefined = (() => {
+      if (modelDecision.vendorLane === undefined) return undefined;
+      const configured = task.criticModelOverride ?? criticModel();
+      if (configured.startsWith(modelDecision.vendorLane)) return configured;
+      return laneModelsFor(tierModels.mid)[0];
+    })();
+    // EMPTY-LANE CONFIG GUARD (Phase 11/11B, IKBI-REAUDIT-002): a configured attempt lane with NO valid builder
+    // OR NO valid critic model is a CONFIGURATION error — never a licence to borrow the other vendor's models.
+    // Fail the attempt CLOSED before any dispatch (not a candidate defect; no duel/fixer/promotion). Runs BEFORE
+    // workspace allocation, so nothing leaks.
+    if (task.moeVendorLane !== undefined && (
+      (!modelDecision.model.startsWith(task.moeVendorLane) && !laneHasModels(tierModels.worker, task.moeVendorLane)) ||
+      laneCriticModel === undefined
+    )) {
+      const missing = laneCriticModel === undefined ? "critic" : "builder";
+      const reason = `lane-config: vendor lane "${task.moeVendorLane}" has no valid ${missing} model — refusing to borrow another vendor's model`;
       await receipts.append(
-        { operation: "worker.lane_config_error", outcome: { status: "failure", detail: reason }, requestId: task.taskId, metadata: { taskId: task.taskId, vendorLane: task.moeVendorLane, decidedModel: modelDecision.model, workerRoster: tierModels.worker }, project: task.targetRepo },
+        { operation: "worker.lane_config_error", outcome: { status: "failure", detail: reason }, requestId: task.taskId, metadata: { taskId: task.taskId, vendorLane: task.moeVendorLane, decidedModel: modelDecision.model, missing, workerRoster: tierModels.worker, midRoster: tierModels.mid }, project: task.targetRepo },
         parentIdentity,
       ).catch(() => {});
-      log.warn({ taskId: task.taskId, vendorLane: task.moeVendorLane }, "empty-lane config error — attempt failed closed (no cross-lane borrow)");
+      log.warn({ taskId: task.taskId, vendorLane: task.moeVendorLane, missing }, "lane config error — attempt failed closed (no cross-lane borrow)");
       return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason, costUsd: classifierCostUsd };
     }
     // EXPLICIT ATTEMPT-DECISION RECORD (Phase 2): on the MoE/duel path, persist the authoritative model
@@ -2874,7 +2902,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         // Dispatch the builder on the ONE authoritative attempt model (IKBI-RT-001) — the rented
         // expert, the operator override, or the default, WHATEVER modelDecision resolved to. This is the
         // same value cost + the receipt attribute to, so the rented model is truly the dispatched model.
-        const roleFn = role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderForModel(parentCtx, modelDecision.model, resolveBuilderMode(task)) : role === "critic" ? criticFor() : role === "refuter" ? refuterFor() : roles[role];
+        const roleFn = role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderForModel(parentCtx, modelDecision.model, resolveBuilderMode(task)) : role === "critic" ? criticFor(laneCriticModel) : role === "refuter" ? refuterFor() : roles[role];
         // H4: floor the verifier's role timeout at the per-check budget. Without this, a 300s role
         // timeout races against 600s checks — the role fails first, orphaning the still-running check.
         const verifierTimeout = role === "verifier" ? Math.max(roleTimeoutMs, resolveCheckTimeoutMs(modeEnv)) : undefined;
@@ -2892,12 +2920,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             : await runLedger.withContext(
                 {
                   role, stage: "role", attemptId: task.taskId,
-                  // The BUILDER is the lane-bound GENERATION role — its invocation is lane-enforced (a served
-                  // model outside `vendorLane` is flagged as a violation). Scout (analysis) and critic
-                  // (judgment) are TASK-LEVEL roles on the configured driver/critic model; they are recorded
-                  // lane-neutral (see the handoff — a documented, honest classification, not a hidden crossing).
-                  ...(role === "builder" && modelDecision.vendorLane !== undefined ? { vendorLane: modelDecision.vendorLane } : {}),
+                  // BUILDER (generation) and CRITIC (candidate judgment) are ATTEMPT-BOUND, lane-enforced roles
+                  // (Phase 11B): their ledger context carries the attempt lane, so a requested/served out-of-lane
+                  // model is blocked/flagged. Scout (general pre-attempt analysis) is task-level lane-neutral.
+                  ...((role === "builder" || role === "critic") && modelDecision.vendorLane !== undefined ? { vendorLane: modelDecision.vendorLane } : {}),
                   ...(role === "builder" ? { requestedAlias: modelDecision.model, modelDecisionSource: modelDecision.source } : {}),
+                  ...(role === "critic" && laneCriticModel !== undefined ? { requestedAlias: laneCriticModel } : {}),
                   strategy: task.moeVendorLane === "mimo" ? "duel-peer" : task.moeVendorLane === "deepseek" ? "duel-primary" : "normal",
                 },
                 () => runRoleFn(role, roleFn, ctx, verifierTimeout),
@@ -3087,9 +3115,15 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           ),
         );
 
-        // Attribute the builder's model ONLY to the builder role — scout/critic/verifier/refuter run
-        // their OWN models, so recording the builder's model on their receipts is an audit lie.
-        await recordRole(task, workspace, spawned, result, roleCost, role === "builder" ? modelDecision.model : undefined, true);
+        // Phase 11B: the role receipt derives from the LEDGER — the DISPATCHED model (ledger `requestedAlias`
+        // == what was sent, the Phase 1 "dispatched == receipt" identity) + the authoritative invocation id. A
+        // role that made no model call records neither. (The SERVED model lives on the invocation record; a
+        // served-vs-dispatched divergence is the lane-violation/execution-identity case, not a normal receipt.)
+        {
+          const ledRec = runLedger.lastFor(role);
+          const roleModel = ledRec?.requestedAlias ?? (role === "builder" ? modelDecision.model : undefined);
+          await recordRole(task, workspace, spawned, result, roleCost, roleModel, true, ledRec?.invocationId);
+        }
 
         // SG-5 PROGRESS: structured per-role detail beyond start/end — builder tool activity
         // and the verifier's verdict — so `--verbose` can show what each phase actually did.
@@ -3334,7 +3368,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 priorResults: [...carriedPrior, builderResult, verifierResult],
                 engine: runEngine,
               };
-              return runRoleFn("critic", criticFor(), reCriticCtx);
+              return runRoleFn("critic", criticFor(laneCriticModel), reCriticCtx);
             },
           });
 
@@ -3468,7 +3502,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 { source: EVENT_SOURCE, attribution: { identity: escBuilder.identity, operation: "worker.role.builder", runId: task.taskId } },
               ),
             );
-            await recordRole(task, workspace, escBuilder, escBuilderResult, escBuilderCost, midModel, true);
+            await recordRole(task, workspace, escBuilder, escBuilderResult, escBuilderCost, midModel, true, runLedger.lastFor("builder")?.invocationId);
 
             let escSucceeded = false;
             if (escBuilderResult.outcome === "success") {
@@ -3497,7 +3531,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 ...escVerifyResult,
                 detail: { ...((escVerifyResult.detail as Record<string, unknown> | undefined) ?? {}), testEvidence: readVerifier(escVerifyResult).testEvidence },
               };
-              const escCriticResult = await runRoleFn("critic", criticFor(), {
+              const escCriticResult = await runRoleFn("critic", criticFor(laneCriticModel), {
                 task,
                 role: "critic",
                 identity: escCritic.identity,
@@ -3704,7 +3738,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                   { source: EVENT_SOURCE, attribution: { identity: cheapRetrySpawn.identity, operation: "worker.role.builder", runId: task.taskId } },
                 ),
               );
-              await recordRole(task, workspace, cheapRetrySpawn, cheapRetryResult, cheapRetryCost, failedModel, true);
+              await recordRole(task, workspace, cheapRetrySpawn, cheapRetryResult, cheapRetryCost, failedModel, true, runLedger.lastFor("builder")?.invocationId);
 
               if (cheapRetrySucceeded) {
                 // Cheap retry SUCCEEDED — replace the failed builder result and continue the
@@ -3932,7 +3966,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                   { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.escalation.retry", runId: task.taskId } },
                 ),
               );
-              await recordRole(task, workspace, escalatedSpawn, escalatedResult, retryCost, swapModel, true);
+              await recordRole(task, workspace, escalatedSpawn, escalatedResult, retryCost, swapModel, true, runLedger.lastFor("builder")?.invocationId);
               await receipts.append(
                 {
                   operation: "worker.escalation.retry",

@@ -27,7 +27,7 @@ import type { OperationContext, ValidatedIdentity } from "../../core/identity/re
 import type { EventBusSurface, EventInput, IkbiEvent } from "../../core/events/index.js";
 import { autonomyForTier, asTier, TRUST_FLOOR, type TrustDecision } from "../../core/trust/index.js";
 import type { DiscardResult, PromoteGovernance, PromoteResult, WorkspaceHandle } from "../../core/workspace/contract.js";
-import { InvocationLedger, chargedCostOf } from "./invocation-ledger.js";
+import { InvocationLedger, chargedCostOf, LaneViolationError } from "./invocation-ledger.js";
 import { laneRoster, laneHasModels } from "./expert-rental.js";
 import { createOrchestrator, type OrchestratorDeps } from "./orchestrator.js";
 import type { RoleFn } from "./contract.js";
@@ -42,8 +42,9 @@ function resp(opts: { model?: string; provider?: string; costUsd?: number; attem
   };
 }
 const neutral = ((c: string) => coreNeutralize(c, { source: "external", identity: { agentId: "t" }, origin: "t" })) as unknown as InvocationLedger["engine"]["neutralizeUntrusted"];
+const KNOWN_LANES = ["deepseek", "mimo"];
 function makeLedger(invoke: (r: ModelRequest) => Promise<ModelResponse>, opts: { maxBudgetUsd?: number } = {}) {
-  return new InvocationLedger({ invokeModel: invoke, neutralizeUntrusted: neutral, runId: "run-1", taskId: "t-1", now: () => 100, ...(opts.maxBudgetUsd !== undefined ? { maxBudgetUsd: opts.maxBudgetUsd } : {}), laneMember: (m, l) => m.startsWith(l) });
+  return new InvocationLedger({ invokeModel: invoke, neutralizeUntrusted: neutral, runId: "run-1", taskId: "t-1", now: () => 100, ...(opts.maxBudgetUsd !== undefined ? { maxBudgetUsd: opts.maxBudgetUsd } : {}), laneMember: (m, l) => m.startsWith(l), servedOutOfLane: (m, l) => KNOWN_LANES.some((k) => k !== l && m.startsWith(k)) });
 }
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -125,13 +126,30 @@ test("B5 (req 30): a retry records its own unique id + a parent relationship via
   assert.equal(led.all()[1]!.retryKind, "cheap-retry");
 });
 
-test("B6 [MUTATION: cross-lane hidden] (req 19): a served model OUTSIDE the attempt lane is FLAGGED as a lane violation", async () => {
-  const led = makeLedger(async () => resp({ model: "mimo-v2.5", provider: "mimo" }));
-  await led.withContext({ role: "builder", stage: "role", vendorLane: "deepseek" }, async () => {
-    await led.engine.invokeModel({ model: "deepseek-v4-flash", messages: [] } as unknown as ModelRequest);
-  });
-  assert.equal(led.laneViolations(), 1, "a mimo model served inside a deepseek-lane attempt is a recorded violation");
-  assert.equal(led.all()[0]!.laneViolation, true);
+test("B6 [MUTATION: laneViolation observe-only] (req 9): a SERVED out-of-lane model THROWS (execution-identity violation), preserves cost, and is not valid evidence", async () => {
+  // Requested in-lane (deepseek-v4-flash) but the provider served mimo-v2.5 ($0.7) — an execution-identity
+  // violation: it must THROW (the caller fails closed), record a truthful terminal state, and preserve the cost.
+  const led = makeLedger(async () => resp({ model: "mimo-v2.5", provider: "mimo", costUsd: 0.7 }));
+  await assert.rejects(
+    () => led.withContext({ role: "critic", stage: "role", vendorLane: "deepseek" }, () => led.engine.invokeModel({ model: "deepseek-v4-flash", messages: [] } as unknown as ModelRequest)),
+    (e: unknown) => e instanceof LaneViolationError && e.phase === "post-dispatch",
+  );
+  assert.equal(led.executionIdentityViolations(), 1);
+  assert.equal(led.all()[0]!.status, "execution-identity-violation");
+  assert.equal(led.all()[0]!.costUsd, 0.7, "a charged out-of-lane response still preserves its cost (truthful)");
+});
+
+test("B6b [MUTATION: laneViolation observe-only] (req 7,8): a REQUESTED out-of-lane model is BLOCKED pre-dispatch — no executed invocation, no cost, no provider call", async () => {
+  let called = 0;
+  const led = makeLedger(async () => { called += 1; return resp({ costUsd: 5 }); });
+  await assert.rejects(
+    () => led.withContext({ role: "critic", stage: "role", vendorLane: "deepseek" }, () => led.engine.invokeModel({ model: "mimo-v2.5-pro", messages: [] } as unknown as ModelRequest)),
+    (e: unknown) => e instanceof LaneViolationError && e.phase === "pre-dispatch",
+  );
+  assert.equal(called, 0, "the provider was NEVER called (blocked before dispatch)");
+  assert.equal(led.invocationCount(), 0, "a pre-dispatch block is NOT an executed invocation");
+  assert.equal(led.cost(), 0, "no cost is incurred for a blocked dispatch");
+  assert.equal(led.all()[0]!.status, "lane-blocked", "recorded as lane-blocked for diagnostics");
 });
 
 test("B7 (req 2): budget is enforced from the ledger's cumulative charged cost", async () => {

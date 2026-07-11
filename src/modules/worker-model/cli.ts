@@ -1440,6 +1440,11 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
               targetRepo,
               goal: `Verify all changes from the ${usingScope ? "staged build" : "multi-step plan"}: ${finalGoal}`,
               reuseWorkspace: sharedWorkspace,
+              // Phase 11B (IKBI-REAUDIT-002): the final multi-step executor is an EXPLICIT finalization attempt
+              // BOUND to the build's vendor lane (its `:verify:<lane>` id + this lane) — it cannot silently
+              // borrow another lane. Its candidate critic is lane-enforced by the orchestrator; a lane with no
+              // valid critic fails the attempt closed rather than crossing lanes.
+              ...(vendorLane !== undefined ? { moeVendorLane: vendorLane } : {}),
               // H4: the final pass VERIFIES the accumulated work — it must not MODIFY it. writeScope
               // "none" blocks the builder from writing/patching/shell-writing any file, so a cheap
               // builder model cannot revert or corrupt the prior steps' work. The verifier still runs

@@ -34,7 +34,25 @@ export type InvocationStatus =
   | "interrupted"
   | "cancelled"
   | "partial"
-  | "unknown-terminal";
+  | "unknown-terminal"
+  // Phase 11B: an attempt-bound dispatch whose REQUESTED model is outside the attempt's lane — BLOCKED
+  // before the provider ran (no executed invocation, no cost).
+  | "lane-blocked"
+  // Phase 11B: the provider SERVED a model/provider outside the attempt's lane — the response is NOT valid
+  // candidate evidence, but any charged cost is preserved (a truthful terminal state).
+  | "execution-identity-violation";
+
+/** Thrown when an attempt-bound dispatch is (pre) blocked for or (post) resolved to an out-of-lane model. */
+export class LaneViolationError extends Error {
+  readonly code = "LANE_VIOLATION" as const;
+  constructor(readonly phase: "pre-dispatch" | "post-dispatch", readonly requestedModel: string, readonly resolvedModel: string | undefined, readonly vendorLane: string) {
+    super(
+      phase === "pre-dispatch"
+        ? `lane violation (pre-dispatch): requested model "${requestedModel}" is not in the attempt's vendor lane "${vendorLane}" — refusing to dispatch (no cross-lane borrow)`
+        : `lane violation (post-dispatch): provider served "${resolvedModel}" for a "${vendorLane}"-lane attempt — the response is not valid candidate evidence`,
+    );
+  }
+}
 
 /** Cost knowledge for an invocation — a failed response is NOT automatically zero; missing price ≠ zero. */
 export type InvocationCostStatus = "measured" | "measured-zero" | "unavailable";
@@ -129,8 +147,15 @@ export interface InvocationLedgerDeps {
   readonly maxBudgetUsd?: number;
   /** Effort params applied to every request (temperature/maxTokens), Phase-existing. */
   readonly effortParams?: { temperature: number; maxTokens: number };
-  /** Resolve whether a served model belongs to a vendor lane (for lane-violation detection). */
+  /** Whether a REQUESTED model is eligible for a vendor lane — PRE-dispatch enforcement (block if false). */
   readonly laneMember?: (model: string, lane: string) => boolean;
+  /**
+   * Whether a SERVED model belongs to a KNOWN OTHER vendor lane — POST-dispatch execution-identity check.
+   * A genuine cross-vendor mismatch (e.g. a mimo model served for a deepseek attempt) is a violation; an
+   * unknown/generic model is NOT (so a stub or a novel model never false-positives). Distinct from
+   * `laneMember` so the post-check only fires on a definite cross-lane crossing.
+   */
+  readonly servedOutOfLane?: (servedModel: string, lane: string) => boolean;
 }
 
 /**
@@ -143,6 +168,7 @@ export class InvocationLedger {
   private ordinal = 0;
   private total = 0;
   private unknownCostCount = 0;
+  private executionIdentityViolationCount = 0;
   private budgetExhausted = false;
   private ctxStack: InvocationContext[] = [];
   /** The dispatch seam every role invokes through (identical RoleEngine shape). */
@@ -177,10 +203,32 @@ export class InvocationLedger {
     const invocationId = `${this.deps.taskId}:${ctx.role}:${ctx.stage}:${requestOrdinal}`;
     const dispatchedAt = this.now();
     const base = { ...ctx, invocationId, requestOrdinal, dispatchedAt, requestedAlias: ctx.requestedAlias ?? request.model };
+    // PRE-DISPATCH LANE ENFORCEMENT (Phase 11B): an attempt-bound call (vendorLane set) whose REQUESTED model
+    // is out of lane is BLOCKED before the provider runs — no executed invocation, no cost. It is not enough
+    // to record `laneViolation` and continue; the illegal dispatch never happens.
+    if (ctx.vendorLane !== undefined && this.deps.laneMember !== undefined && !this.deps.laneMember(request.model, ctx.vendorLane)) {
+      this.records.push({ ...base, completedAt: this.now(), status: "lane-blocked", costStatus: "measured-zero", laneViolation: true });
+      throw new LaneViolationError("pre-dispatch", request.model, undefined, ctx.vendorLane);
+    }
     try {
       const r = await this.deps.invokeModel(effReq);
       const { usd, status: costStatus } = chargedCostOf(r);
-      const laneViolation = ctx.vendorLane !== undefined && this.deps.laneMember !== undefined ? !this.deps.laneMember(r.model, ctx.vendorLane) : undefined;
+      // POST-dispatch: a violation is the SERVED model belonging to a KNOWN OTHER lane (a genuine cross-vendor
+      // crossing) — not merely "does not prefix-match this lane" (which would false-positive on a stub/novel model).
+      const laneViolation = ctx.vendorLane !== undefined && this.deps.servedOutOfLane !== undefined ? this.deps.servedOutOfLane(r.model, ctx.vendorLane) : undefined;
+      // POST-DISPATCH EXECUTION-IDENTITY ENFORCEMENT: the provider SERVED an out-of-lane model. Record the
+      // truthful terminal state + PRESERVE any charged cost, but the response is NOT valid candidate evidence
+      // — throw so the caller fails closed (never silently accept a cross-lane result as valid work).
+      if (laneViolation === true) {
+        this.records.push({
+          ...base, completedAt: this.now(), resolvedModel: r.model, provider: r.provider, providerModelId: r.providerModelId,
+          status: "execution-identity-violation", usage: r.usage, ...(usd !== undefined ? { costUsd: usd } : {}), costStatus, laneViolation: true,
+        });
+        if (costStatus === "unavailable") this.unknownCostCount += 1; else this.total += usd ?? 0;
+        this.executionIdentityViolationCount += 1;
+        this.enforceBudget();
+        throw new LaneViolationError("post-dispatch", request.model, r.model, ctx.vendorLane!);
+      }
       this.records.push({
         ...base, completedAt: this.now(), resolvedModel: r.model, provider: r.provider, providerModelId: r.providerModelId,
         status: statusFromFinish(r.finishReason), usage: r.usage, ...(usd !== undefined ? { costUsd: usd } : {}), costStatus,
@@ -191,6 +239,7 @@ export class InvocationLedger {
       this.enforceBudget();
       return r;
     } catch (err) {
+      if (err instanceof LaneViolationError) throw err; // already recorded above
       const { status, failureClass } = failureStatusOf(err);
       // A thrown dispatch is a POST-dispatch failure with UNKNOWN cost — never counted as zero.
       this.records.push({ ...base, completedAt: this.now(), status, failureClass, costStatus: "unavailable" });
@@ -230,8 +279,11 @@ export class InvocationLedger {
   /** "partial" when ANY accounted invocation's cost is unknown; else "complete". */
   costStatus(): "complete" | "partial" { return this.unknownCostCount > 0 ? "partial" : "complete"; }
   unknownCosts(): number { return this.unknownCostCount; }
-  invocationCount(): number { return this.records.length; }
+  /** Count of ACTUAL executed dispatches — a pre-dispatch `lane-blocked` record is NOT an executed invocation. */
+  invocationCount(): number { return this.records.filter((r) => r.status !== "lane-blocked").length; }
   laneViolations(): number { return this.records.filter((r) => r.laneViolation === true).length; }
+  /** Count of dispatches whose SERVED identity fell outside the attempt lane (invalid candidate evidence). */
+  executionIdentityViolations(): number { return this.executionIdentityViolationCount; }
   all(): readonly InvocationRecord[] { return this.records; }
   /** The most-recent record matching a role (for deriving a receipt's executed model from the ledger). */
   lastFor(role: string): InvocationRecord | undefined {

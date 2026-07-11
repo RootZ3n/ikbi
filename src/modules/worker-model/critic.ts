@@ -91,6 +91,13 @@ export interface CriticDeps {
    * sequence. Absent ⇒ the verdict binds candidateId only.
    */
   readonly resolveVerifiedTree?: (workspace: WorkspaceHandle) => Promise<string | undefined>;
+  /**
+   * The LANE-VALID critic model for an attempt-bound candidate critic (Phase 11B, IKBI-REAUDIT-002). When
+   * set, it takes precedence over `criticModelOverride`/`criticModel()` so a lane-pinned attempt's critic
+   * (and its structured-output recovery, which reuses this same request model) stays in the attempt's vendor
+   * lane. Undefined ⇒ a task-level/lane-neutral critic uses the configured critic model (unchanged).
+   */
+  readonly modelOverride?: string;
 }
 
 interface DiffStats {
@@ -399,7 +406,9 @@ export function createCritic(deps: CriticDeps = {}): RoleFn {
       const request: ModelRequest = {
         // A --tier preset pins the critic model per-run (criticModelOverride); otherwise the
         // configured critic model (IKBI_MODEL_CRITIC) is used.
-        model: ctx.task.criticModelOverride ?? criticModel(),
+        // Phase 11B: a lane-valid `modelOverride` (attempt-bound critic) wins so the critic + its recovery
+        // stay in the attempt's vendor lane; else the operator preset, else the configured critic.
+        model: deps.modelOverride ?? ctx.task.criticModelOverride ?? criticModel(),
         temperature: CRITIC_TEMPERATURE,
         maxTokens: CRITIC_MAX_TOKENS,
         identity: ctx.identity, // the spawned, ceiling-clamped role identity (#10)
