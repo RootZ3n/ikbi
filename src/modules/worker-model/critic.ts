@@ -22,6 +22,7 @@ import type { WorkspaceHandle } from "../../core/workspace/contract.js";
 import type { RoleFn, RoleResult } from "./contract.js";
 import { criticModel } from "./role-models.js";
 import { parseSemanticVerdict, infrastructureFailureVerdict, type SemanticVerdict } from "./semantic-verdict.js";
+import { renderEvidenceBlock } from "../runtime-truth/index.js";
 
 // The model id is CRITIC-tier and config-driven (see role-models.ts) — resolved at
 // request time so an operator's IKBI_MODEL_CRITIC takes effect without a roster alias.
@@ -368,6 +369,9 @@ export function createCritic(deps: CriticDeps = {}): RoleFn {
           { role: "system", content: CRITIC_SYSTEM },
           untrusted(`Goal (intent):\n${ctx.task.goal}`, "critic_goal"),
           ...(goalAlignmentContext !== undefined ? [untrusted(goalAlignmentContext, "critic_goal_alignment")] : []),
+          ...(ctx.runtimeEvidence !== undefined && ctx.runtimeEvidence.length > 0
+            ? [untrusted(renderEvidenceBlock(ctx.runtimeEvidence, Date.now()), "critic_runtime_truth_evidence")]
+            : []),
           untrusted(`Objective pre-check context:\n${JSON.stringify(objectiveContext)}`, "critic_objective_context"),
           untrusted(`Builder summary:\n${builderResult.summary ?? "(none)"}`, "critic_builder_summary"),
           untrusted(`Builder detail:\n${JSON.stringify(builderResult.detail ?? {})}`, "critic_builder_detail"),

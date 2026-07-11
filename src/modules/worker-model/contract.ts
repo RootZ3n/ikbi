@@ -515,6 +515,13 @@ export interface RoleContext {
   readonly priorResults: readonly RoleResult[];
   /** The engine seams (model + mandatory neutralization). */
   readonly engine: RoleEngine;
+  /**
+   * Bounded, provenance-bearing runtime-truth evidence for THIS role (Phase 5). Externally-grounded,
+   * scope-checked facts about the current build state — injected into the role's model context as
+   * untrusted DATA. Absent/empty ⇒ the role runs unchanged (evidence is advisory). Populated by the
+   * orchestrator from the production runtime-truth reader; already filtered to this task/candidate/tree.
+   */
+  readonly runtimeEvidence?: readonly import("../runtime-truth/index.js").RuntimeEvidence[];
 }
 
 /** A role: a typed function the orchestrator dispatches. */

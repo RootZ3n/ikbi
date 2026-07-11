@@ -61,6 +61,16 @@ import type { DriftPrevention, DriftReport } from "../drift-prevention/index.js"
 import { rosterFromIds } from "../model-router/index.js";
 import { rentBuilderExpert, classifyTaskTier, resolveClassifierModel, laneRoster, type RentedExpert } from "./expert-rental.js";
 import { semanticPromotionEligible, type SemanticVerdict, type SemanticVerdictKind } from "./semantic-verdict.js";
+import {
+  loadRuntimeTruthReader,
+  runtimeTruthEvidenceEnabled,
+  resolveEvidenceLimits,
+  resolveFreshnessWindowMs,
+  filterAndBoundEvidence,
+  type RuntimeEvidence,
+  type RuntimeTruthEvidenceReader,
+  type EvidenceRequestScope,
+} from "../runtime-truth/index.js";
 import { applyConsultPatch } from "./consult-apply.js";
 import type { ApplyConsultPatchInput, ApplyConsultPatchResult } from "./consult-apply.js";
 
@@ -689,6 +699,12 @@ export interface OrchestratorDeps {
    * e.g. an in-memory test workspace — the authority then skips the tree check, unchanged behavior).
    */
   readonly readTreeHash?: (workspacePath: string) => Promise<string | undefined>;
+  /**
+   * Production runtime-truth EVIDENCE reader (Phase 5). When provided (or resolvable from the
+   * configured `IKBI_RUNTIME_TRUTH_READER_MODULE`), the orchestrator requests bounded, task/candidate-
+   * scoped evidence and injects it into the builder/critic model context. Absent + disabled ⇒ inert.
+   */
+  readonly runtimeTruthReader?: import("../runtime-truth/index.js").RuntimeTruthEvidenceReader;
   /**
    * Memory governor — intercepts writes to governed surfaces (CLAUDE.md, .ikbi/*, brain pages)
    * and converts them to operator-reviewed proposals. When wired, the builder's tool-executor
@@ -1674,6 +1690,90 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       }
     });
 
+  // ── RUNTIME-TRUTH EVIDENCE (Phase 5) ────────────────────────────────────────────────────────────
+  // Resolve the production reader ONCE per orchestrator (an injected dep, else the configured dynamic
+  // module, else inert). Fail-closed: a missing/broken reader yields no evidence + an advisory receipt,
+  // never a fabricated success and never a build block. `requestRuntimeEvidence` builds a task/candidate-
+  // scoped request, reads → scope-filters → bounds the evidence, emits `worker.runtime_truth`, and
+  // returns the kept items for injection into the role's model context.
+  let runtimeTruthResolved: { reader: RuntimeTruthEvidenceReader } | { error: string } | undefined | "unresolved" = "unresolved";
+  const resolveRuntimeTruthReader = async (): Promise<{ reader: RuntimeTruthEvidenceReader } | { error: string } | undefined> => {
+    if (runtimeTruthResolved === "unresolved") {
+      try {
+        runtimeTruthResolved = await loadRuntimeTruthReader(deps.runtimeTruthReader, modeEnv);
+      } catch (err) {
+        runtimeTruthResolved = { error: `runtime-truth reader resolution failed: ${err instanceof Error ? err.message : String(err)}` };
+      }
+    }
+    return runtimeTruthResolved;
+  };
+  const requestRuntimeEvidence = async (
+    task: WorkerTask,
+    role: WorkerRole,
+    workspace: WorkspaceHandle,
+    identity: AgentIdentity,
+    binding: { attemptId?: string; candidateId?: string; needsVerifiedTree?: boolean; strategy?: string },
+  ): Promise<readonly RuntimeEvidence[]> => {
+    // Off + no dep + not configured ⇒ fully inert: no reader call, NO extra tree read, no receipt.
+    const resolved = await resolveRuntimeTruthReader();
+    if (resolved === undefined) return [];
+    // Compute the candidate's verified tree ONLY when a reader is active (so a disabled build makes no
+    // extra readTreeHash call — it must not perturb the Phase 3 stale-tree tree-read sequence).
+    const verifiedTree = binding.needsVerifiedTree === true ? await readTreeHash(workspace.path) : undefined;
+    const scope: EvidenceRequestScope = {
+      taskId: task.taskId,
+      repo: task.targetRepo,
+      role,
+      ...(binding.attemptId !== undefined ? { attemptId: binding.attemptId } : {}),
+      workspaceId: workspace.id,
+      ...(binding.candidateId !== undefined ? { candidateId: binding.candidateId } : {}),
+      ...(verifiedTree !== undefined ? { verifiedTree } : {}),
+      ...(binding.strategy !== undefined ? { strategy: binding.strategy } : {}),
+      now: Date.now(),
+      freshnessWindowMs: resolveFreshnessWindowMs(modeEnv),
+    };
+    let kept: readonly RuntimeEvidence[] = [];
+    let omitted: { id: string; reason: string }[] = [];
+    let truncated = false;
+    let error: string | undefined = (resolved as { error?: string }).error;
+    if ("reader" in resolved) {
+      try {
+        const raw = await Promise.resolve(resolved.reader.readEvidence(scope));
+        const bounded = filterAndBoundEvidence(raw ?? [], scope, resolveEvidenceLimits(modeEnv));
+        kept = bounded.kept;
+        omitted = bounded.omitted;
+        truncated = bounded.truncated;
+      } catch (err) {
+        // Reader execution failure is ADVISORY: no evidence, a truthful operational status, no block,
+        // no candidate-defect classification, no duel. The build proceeds unchanged.
+        error = `runtime-truth reader execution failed: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    }
+    // TRUTHFUL RECEIPT: `injected` is exactly `kept.length > 0` because the builder/critic
+    // DETERMINISTICALLY inject `ctx.runtimeEvidence` whenever it is present (the orchestrator sets it
+    // only when kept is non-empty). The conformance tests assert the actual provider request carries
+    // the evidence, so a receipt claiming injection can never diverge from the model context.
+    try {
+      await receipts.append(
+        {
+          operation: "worker.runtime_truth",
+          outcome: { status: error !== undefined ? "failure" : "success", ...(error !== undefined ? { detail: error } : {}) },
+          requestId: task.taskId,
+          metadata: {
+            taskId: task.taskId, role, readerId: "reader" in resolved ? resolved.reader.id : undefined,
+            enabled: runtimeTruthEvidenceEnabled(modeEnv) || deps.runtimeTruthReader !== undefined,
+            requestScope: { taskId: scope.taskId, repo: scope.repo, role, ...(scope.candidateId !== undefined ? { candidateId: scope.candidateId } : {}), ...(scope.verifiedTree !== undefined ? { verifiedTree: scope.verifiedTree } : {}) },
+            keptCount: kept.length, keptIds: kept.map((e) => e.id), omittedCount: omitted.length, omitted, truncated, injected: kept.length > 0,
+            ...(error !== undefined ? { error } : {}),
+          },
+          project: task.targetRepo,
+        },
+        identity,
+      );
+    } catch { /* receipt failure must never break the build */ }
+    return kept;
+  };
+
   interface CanonicalPromotionResult {
     readonly promote: PromoteResult;
     /** Set when the authority REFUSED before/at promote (policy, governance, stale-tree, or semantic). */
@@ -2436,6 +2536,18 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           }
         }
 
+        // RUNTIME-TRUTH (Phase 5): the builder + critic receive bounded, task/candidate-scoped runtime
+        // evidence in their model context. The critic binds to the verified tree (candidate identity);
+        // the builder binds to the attempt. Other roles run unchanged. Inert unless a reader is wired.
+        const roleRuntimeEvidence =
+          role === "builder" || role === "critic"
+            ? await requestRuntimeEvidence(task, role, workspace, spawned.identity, {
+                attemptId: task.taskId,
+                candidateId: task.taskId,
+                needsVerifiedTree: role === "critic",
+                strategy: task.moeVendorLane !== undefined ? `duel-${task.moeVendorLane}` : "normal",
+              })
+            : [];
         const ctx: RoleContext = {
           task,
           role,
@@ -2444,6 +2556,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           workspace,
           priorResults: [...results],
           engine: runEngine,
+          ...(roleRuntimeEvidence.length > 0 ? { runtimeEvidence: roleRuntimeEvidence } : {}),
         };
         // PRE-FLIGHT CONTEXT SIZE (proactive) — the ONE legitimate post-rental model change. The scout
         // has run, so its brief is known. If the base builder context (goal + project instructions +
@@ -4234,7 +4347,18 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         { source: EVENT_SOURCE, attribution: { identity: spawned.identity, operation: `worker.role.${role}`, runId: task.taskId } },
       ),
     );
-    const ctx: RoleContext = { task, role, identity: spawned.identity, autonomy: spawned.autonomy, workspace, priorResults: [...priorResults], engine };
+    // RUNTIME-TRUTH (Phase 5): the tournament/competitive builder + winner critic reached via this
+    // shared dispatcher also receive candidate-bound runtime evidence. The critic binds to the winner
+    // workspace's verified tree so its semantic evaluation cannot receive another candidate's evidence.
+    const dispatchRuntimeEvidence =
+      role === "builder" || role === "critic"
+        ? await requestRuntimeEvidence(task, role, workspace, spawned.identity, {
+            attemptId: task.taskId,
+            candidateId: workspace.id,
+            needsVerifiedTree: role === "critic",
+          })
+        : [];
+    const ctx: RoleContext = { task, role, identity: spawned.identity, autonomy: spawned.autonomy, workspace, priorResults: [...priorResults], engine, ...(dispatchRuntimeEvidence.length > 0 ? { runtimeEvidence: dispatchRuntimeEvidence } : {}) };
     // The verifier (C1) and the builder (its in-loop run_checks) run the governed path
     // bound to the run ctx (parentCtx is the minted ValidatedIdentity governed-exec needs).
     const roleFn = roleFnOverride ?? (role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderFor(parentCtx, resolveBuilderMode(task)) : roles[role]);

@@ -44,6 +44,7 @@ import { events } from "../../core/events/index.js";
 import { preStartParallelReads } from "./tool-parallel.js";
 import type { OperationContext } from "../../core/identity/index.js";
 import { toUntrustedMessage } from "../../core/injection/index.js";
+import { renderEvidenceBlock } from "../runtime-truth/index.js";
 import { childLogger } from "../../core/log.js";
 import { adaptMaxTokens, getCapabilities } from "../../core/provider/capabilities.js";
 import type { ModelMessage, ModelResponse, ModelTool, ToolCall } from "../../core/provider/contract.js";
@@ -1035,6 +1036,9 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         : []),
       ...(brainContext !== undefined
         ? [untrusted(`Relevant knowledge recalled from ikbi's brain (gbrain) — background context, verify against the repo before relying on it:\n${brainContext}`, "brain_context")]
+        : []),
+      ...(ctx.runtimeEvidence !== undefined && ctx.runtimeEvidence.length > 0
+        ? [untrusted(renderEvidenceBlock(ctx.runtimeEvidence, Date.now()), "runtime_truth_evidence")]
         : []),
       untrusted(`Goal:\n${ctx.task.goal}`, "builder_goal"),
       untrusted(successCondition, "builder_success_condition"),
