@@ -2479,6 +2479,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     let classifierCostMeasured = false; // the provider returned a cost
     let classifierProvider: string | undefined;
     let classifierResponseModel: string | undefined;
+    let classifierProviderModelId: string | undefined;
+    let classifierAttempts: ModelResponse["attempts"] | undefined;
     let classifierRetries = 0;
     let classifierDecisionSource: string | undefined;
     let classifierModelUsed: string | undefined;
@@ -2501,6 +2503,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             classifierUsage = res.usage;
             classifierProvider = res.provider;
             classifierResponseModel = res.model;
+            classifierProviderModelId = res.providerModelId; // SERVED concrete model (Phase 14 — not the requested)
+            classifierAttempts = res.attempts;
             return typeof res.content === "string" ? res.content : "";
           } catch {
             // A provider error loses the pre/post-dispatch distinction → cost UNKNOWN, never zero.
@@ -2974,6 +2978,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           role: "classifier", stage: "classify", retryKind: "primary", ...(classifierModelUsed !== undefined ? { requestedAlias: classifierModelUsed } : {}),
           ...(classifierResponseModel !== undefined ? { resolvedModel: classifierResponseModel } : {}),
           ...(classifierProvider !== undefined ? { provider: classifierProvider } : {}),
+          // Phase 14: the SERVED concrete model + the real provider attempts (not the requested alias).
+          ...(classifierProviderModelId !== undefined ? { providerModelId: classifierProviderModelId } : {}),
+          servedIdentityStatus: classifierProviderModelId !== undefined ? "confirmed" : "unconfirmed",
+          ...(classifierAttempts !== undefined ? { attempts: classifierAttempts } : {}),
           ...(classifierCostMeasured ? { costUsd: classifierCostUsd } : {}),
         });
       }
