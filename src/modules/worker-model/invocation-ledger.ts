@@ -178,7 +178,8 @@ export class InvocationLedger {
     this.now = deps.now ?? (() => 0);
     this.ctxStack = [{ runId: deps.runId, taskId: deps.taskId, role: "unknown", stage: "unknown" }];
     this.engine = {
-      invokeModel: (request: ModelRequest): Promise<ModelResponse> => this.invoke(request),
+      invokeModel: (request: ModelRequest, meta?: { stage?: string; retryKind?: string }): Promise<ModelResponse> =>
+        this.invoke(request, meta !== undefined ? { ...(meta.stage !== undefined ? { stage: meta.stage } : {}), ...(meta.retryKind !== undefined ? { retryKind: meta.retryKind as RetryKind } : {}) } : undefined),
       neutralizeUntrusted: deps.neutralizeUntrusted,
     };
   }
@@ -285,9 +286,28 @@ export class InvocationLedger {
   /** Count of dispatches whose SERVED identity fell outside the attempt lane (invalid candidate evidence). */
   executionIdentityViolations(): number { return this.executionIdentityViolationCount; }
   all(): readonly InvocationRecord[] { return this.records; }
-  /** The most-recent record matching a role (for deriving a receipt's executed model from the ledger). */
-  lastFor(role: string): InvocationRecord | undefined {
-    for (let i = this.records.length - 1; i >= 0; i--) if (this.records[i]!.role === role && this.records[i]!.resolvedModel !== undefined) return this.records[i];
+  /**
+   * Ordered, de-duplicated invocationIds of every EXECUTED record — the aggregate linkage a strategy/summary
+   * receipt uses to reference EVERY provider request it summarizes (each counted exactly once, dispatch order).
+   * Excludes pre-dispatch `lane-blocked` records (no execution happened).
+   */
+  executedIds(): readonly string[] {
+    const seen = new Set<string>();
+    const ids: string[] = [];
+    for (const r of this.records) {
+      if (r.resolvedModel !== undefined && !seen.has(r.invocationId)) { seen.add(r.invocationId); ids.push(r.invocationId); }
+    }
+    return ids;
+  }
+  /**
+   * The most-recent EXECUTED record matching a role (and optionally a stage) — the authority a receipt uses to
+   * derive execution model/provider/lane/cost/id. Skips non-executed records (`lane-blocked`, no resolvedModel).
+   */
+  lastFor(role: string, stage?: string): InvocationRecord | undefined {
+    for (let i = this.records.length - 1; i >= 0; i--) {
+      const r = this.records[i]!;
+      if (r.role === role && r.resolvedModel !== undefined && (stage === undefined || r.stage === stage)) return r;
+    }
     return undefined;
   }
 }

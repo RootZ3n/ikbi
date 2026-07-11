@@ -500,7 +500,9 @@ export function createCritic(deps: CriticDeps = {}): RoleFn {
             ...buildRecoveryRequest({ rawContent: response.content, model: request.model, candidateId, ...(verifiedTree !== undefined ? { verifiedTree } : {}), untrusted }),
             identity: ctx.identity,
           };
-          const recovered = await ctx.engine.invokeModel(recoveryRequest);
+          // Phase 11C: tag the recovery as a DISTINCT ledger sub-invocation (stage "structured-recovery") so
+          // the `worker.critic_recovery` receipt references the exact invocation record, not a synthetic id.
+          const recovered = await ctx.engine.invokeModel(recoveryRequest, { stage: "structured-recovery", retryKind: "structured-recovery" });
           const recoveredCostUsd = typeof recovered.cost?.usd === "number" && Number.isFinite(recovered.cost.usd) ? recovered.cost.usd : undefined;
           recovery.recoveryInvoked = true;
           recovery.recoveryInvocationId = recoveryInvocationId;

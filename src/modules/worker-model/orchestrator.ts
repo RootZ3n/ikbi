@@ -1991,6 +1991,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     criticResult: RoleResult | undefined,
     binding: { taskId: string; attemptId: string; candidateId: string; verifiedTree?: string; strategy: string; verificationPassed: boolean; targetRepo: string },
     parentIdentity: AgentIdentity,
+    ledger?: InvocationLedger,
   ): Promise<string | undefined> {
     if (criticResult === undefined) return undefined;
     const d = (criticResult.detail ?? {}) as Record<string, unknown>;
@@ -1998,25 +1999,41 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     if (typeof sv !== "object" || sv === null || typeof sv.kind !== "string") return undefined;
     const semanticEvaluationId = `${binding.candidateId}:${binding.verifiedTree ?? "novt"}:sem`;
     const recoveryInvoked = d.recoveryInvoked === true;
-    // Distinct RECOVERY receipt (Phase 9): the ONE model-backed reformat call — its own invocation id,
-    // in-lane model, and separately-attributed cost/status. Emitted only when recovery actually ran.
+    // Distinct RECOVERY receipt (Phase 9/11C): the ONE model-backed reformat call. Its execution identity
+    // (invocation id / resolved model / provider / lane / lifecycle / usage / cost / cost status) DERIVES from
+    // the ledger's structured-recovery invocation record — never the configured critic fields. Emitted only
+    // when recovery actually ran. Missing link → an explicit integrity error, never a fabricated/config id.
     if (recoveryInvoked) {
+      const recRec = ledger?.lastFor("critic", "structured-recovery");
       try {
         await receipts.append(
-          {
-            operation: "worker.critic_recovery",
-            outcome: { status: d.recoveryOutcome === "repaired" ? "success" : "failure", detail: String(d.recoveryOutcome ?? "") },
-            requestId: binding.taskId,
-            metadata: {
-              semanticEvaluationId, taskId: binding.taskId, attemptId: binding.attemptId, candidateId: binding.candidateId,
-              invocationId: d.recoveryInvocationId, recoveryModel: d.recoveryModel, dispatchedModel: d.recoveryModel,
-              ...(d.recoveryVendorLane !== undefined ? { vendorLane: d.recoveryVendorLane } : {}),
-              outcome: d.recoveryOutcome, rejectReason: d.recoveryRejectReason ?? d.recoveryFailReason,
-              costUsd: d.recoveryCostUsd, costStatus: d.recoveryCostStatus,
-              eligibilityReason: d.recoveryEligibilityReason, finalVerdict: sv.kind,
-            },
-            project: binding.targetRepo,
-          },
+          recRec !== undefined
+            ? {
+                operation: "worker.critic_recovery",
+                outcome: { status: d.recoveryOutcome === "repaired" ? "success" : "failure", detail: String(d.recoveryOutcome ?? "") },
+                requestId: binding.taskId,
+                metadata: {
+                  semanticEvaluationId, taskId: binding.taskId, attemptId: binding.attemptId, candidateId: binding.candidateId,
+                  invocationId: recRec.invocationId, recoveryModel: recRec.requestedAlias ?? recRec.resolvedModel, dispatchedModel: recRec.requestedAlias ?? recRec.resolvedModel,
+                  ...(recRec.resolvedModel !== undefined ? { servedModel: recRec.resolvedModel } : {}),
+                  ...(recRec.provider !== undefined ? { provider: recRec.provider } : {}),
+                  ...(recRec.vendorLane !== undefined ? { vendorLane: recRec.vendorLane } : {}),
+                  lifecycle: recRec.status, ...(recRec.usage !== undefined ? { usage: recRec.usage } : {}),
+                  costUsd: recRec.costUsd, costStatus: recRec.costStatus,
+                  outcome: d.recoveryOutcome, rejectReason: d.recoveryRejectReason ?? d.recoveryFailReason,
+                  eligibilityReason: d.recoveryEligibilityReason, finalVerdict: sv.kind,
+                },
+                project: binding.targetRepo,
+              }
+            : {
+                // INTEGRITY ERROR (Phase 11C): the critic reported a recovery but no ledger invocation backs it.
+                // Emit a truthful integrity-error record — do NOT fabricate an id or fall back to configured fields.
+                operation: "worker.critic_recovery.integrity_error",
+                outcome: { status: "failure", detail: "recovery claimed but no structured-recovery invocation record found in the ledger" },
+                requestId: binding.taskId,
+                metadata: { semanticEvaluationId, taskId: binding.taskId, attemptId: binding.attemptId, candidateId: binding.candidateId, integrityError: "recovery-invocation-not-found", outcome: d.recoveryOutcome, finalVerdict: sv.kind },
+                project: binding.targetRepo,
+              },
           parentIdentity,
         );
       } catch { /* receipt failure must never break the build */ }
@@ -2991,9 +3008,17 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               ...(fixerEvidence.length > 0 ? { runtimeEvidence: fixerEvidence } : {}),
             };
             // COST: bill the fixer's provider calls to the fixer model, separately from the builder role.
+            // Phase 11C: tag the fixer's invocations with stage "fixer" so the `worker.fixer` receipt derives
+            // its executed model/provider/lane/cost + invocation ids from the LEDGER (not config).
             const costBeforeFixer = runCost();
-            const fixResult = await runRoleFn("builder", builderForModel(parentCtx, fixerModel, resolveBuilderMode(task)), fixCtx);
+            const fixerRecordsBefore = runLedger.all().length;
+            const fixResult = await runLedger.withContext(
+              { role: "builder", stage: "fixer", retryKind: "fixer", attemptId: task.taskId, requestedAlias: fixerModel, ...(modelDecision.vendorLane !== undefined ? { vendorLane: modelDecision.vendorLane } : {}) },
+              () => runRoleFn("builder", builderForModel(parentCtx, fixerModel, resolveBuilderMode(task)), fixCtx),
+            );
             const fixerCost = runCost() - costBeforeFixer;
+            const fixerRecords = runLedger.all().slice(fixerRecordsBefore).filter((r) => r.stage === "fixer" && r.resolvedModel !== undefined);
+            const primaryFixerRec = fixerRecords[fixerRecords.length - 1]; // the last = the primary code-producing call
             events.publish(
               workerRoleCompleted.create(
                 { taskId: task.taskId, role: "builder", outcome: fixResult.outcome },
@@ -3019,6 +3044,23 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             // billed == receipt) + its own cost. `crossLaneAvoided` marks when a cross-lane config.fixerModel
             // was replaced by the in-lane model (the cross-lane repair is owned by the peer attempt).
             try {
+              // Phase 11C: `fixerModel`/`dispatchedModel` = the SELECTED lane-valid fixer model (the Phase 6
+              // "selected == dispatched == receipt" decision, always known). The EXECUTION LINKAGE — the ledger
+              // invocation id(s), the SERVED model, provider, and cost status — DERIVES from the ledger's
+              // fixer-staged invocation records; `executionLinked` marks whether a provider call was recorded
+              // (false when the repair produced no dispatch — e.g. a no-op/injected builder). The primary
+              // code-producing invocation is the last fixer-staged record; all are referenced in order.
+              const fixerExecution = primaryFixerRec !== undefined
+                ? {
+                    executionLinked: true,
+                    invocationId: primaryFixerRec.invocationId,
+                    invocationIds: fixerRecords.map((r) => r.invocationId),
+                    fixerModel, dispatchedModel: fixerModel,
+                    ...(primaryFixerRec.resolvedModel !== undefined ? { servedModel: primaryFixerRec.resolvedModel } : {}),
+                    ...(primaryFixerRec.provider !== undefined ? { provider: primaryFixerRec.provider } : {}),
+                    ledgerCostStatus: fixerRecords.some((r) => r.costStatus === "unavailable") ? "partial" : "complete",
+                  }
+                : { executionLinked: false, fixerModel, dispatchedModel: fixerModel };
               await receipts.append(
                 {
                   operation: "worker.fixer",
@@ -3027,7 +3069,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                   metadata: {
                     sourceTaskId: task.taskId, sourceAttemptId: task.taskId, sourceCandidateTree: sourceTree,
                     repairAttemptId: task.taskId, repairRound: fixerRound, repairStrategy: "same-lane", fixerTrigger,
-                    failingChecks, fixerModel, dispatchedModel: fixerModel,
+                    failingChecks, ...fixerExecution,
                     ...(modelDecision.vendorLane !== undefined ? { vendorLane: modelDecision.vendorLane } : {}),
                     crossLaneAvoided: config.fixerModel !== undefined && fixerModel !== config.fixerModel,
                     resultingCandidateTree: resultingTree, treeUnchanged: sourceTree !== undefined && sourceTree === resultingTree,
@@ -3120,7 +3162,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         // role that made no model call records neither. (The SERVED model lives on the invocation record; a
         // served-vs-dispatched divergence is the lane-violation/execution-identity case, not a normal receipt.)
         {
-          const ledRec = runLedger.lastFor(role);
+          // Pin the critic to its PRIMARY (stage "role") invocation: a critic that spawned a nested
+          // structured-recovery call also has a later "structured-recovery" record, which owns its OWN
+          // `worker.critic_recovery` receipt — the role receipt must not alias to it (distinct invocations).
+          const ledRec = role === "critic" ? runLedger.lastFor(role, "role") : runLedger.lastFor(role);
           const roleModel = ledRec?.requestedAlias ?? (role === "builder" ? modelDecision.model : undefined);
           await recordRole(task, workspace, spawned, result, roleCost, roleModel, true, ledRec?.invocationId);
         }
@@ -4242,6 +4287,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         targetRepo: task.targetRepo,
       },
       parentIdentity,
+      runLedger,
     );
 
     // Terminal: a KILL halted the run mid-loop ⇒ stop cleanly (NEVER promote a half-run),
@@ -4683,6 +4729,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           routingOverheadUsd,
           costStatus: runLedger.costStatus(),
           invocationCount: runLedger.invocationCount(),
+          // AGGREGATE LINKAGE (Phase 11C): the ordered set of EVERY executed provider invocation this run
+          // summarizes (each once, no double-count) + the primary code-producing builder invocation. The
+          // summary's aggregate cost/model/status DERIVE from these records — it invents no execution identity.
+          invocationIds: runLedger.executedIds(),
+          ...(runLedger.lastFor("builder") !== undefined ? { primaryInvocationId: runLedger.lastFor("builder")!.invocationId } : {}),
           unknownCostCount: runLedger.unknownCosts(),
           ...(runLedger.laneViolations() > 0 ? { laneViolations: runLedger.laneViolations() } : {}),
           ...(classifierModelUsed !== undefined ? { classifierModel: classifierModelUsed, classifierDecisionSource, classifierCostStatus } : {}),
@@ -4766,7 +4817,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 
   /** Dispatch one role in one workspace (events + recordRole), returning its result.
    *  `roleFnOverride` lets the competitive loop inject a per-candidate builder (its own model). */
-  async function dispatchRole(role: WorkerRole, spawned: SpawnedRole, task: WorkerTask, workspace: WorkspaceHandle, priorResults: readonly RoleResult[], parentCtx: OperationContext, engine: RoleEngine, roleFnOverride?: RoleFn, cost?: () => number): Promise<RoleResult> {
+  async function dispatchRole(role: WorkerRole, spawned: SpawnedRole, task: WorkerTask, workspace: WorkspaceHandle, priorResults: readonly RoleResult[], parentCtx: OperationContext, engine: RoleEngine, roleFnOverride?: RoleFn, cost?: () => number, ledger?: InvocationLedger): Promise<RoleResult> {
     events.publish(
       workerRoleDispatched.create(
         { taskId: task.taskId, role, ...(spawned.identity.trustTier !== undefined ? { tier: spawned.identity.trustTier } : {}) },
@@ -4791,7 +4842,13 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // H4: floor the verifier's role timeout at the per-check budget (same as the cooperative path).
     const verifierTimeout = role === "verifier" ? Math.max(roleTimeoutMs, resolveCheckTimeoutMs(modeEnv)) : undefined;
     const costBeforeRole = cost?.() ?? 0;
-    const result = await runRoleFn(role, roleFn, ctx, verifierTimeout);
+    // Phase 11C: tag the (competitive/tournament) candidate role's provider calls with the role/stage/attempt/
+    // candidate so the ledger records them under the right identity and the role receipt can reference the
+    // authoritative invocation. Competitive/tournament attempts are not lane-pinned (no vendorLane).
+    const runIt = (): Promise<RoleResult> => runRoleFn(role, roleFn, ctx, verifierTimeout);
+    const result = ledger !== undefined
+      ? await ledger.withContext({ role, stage: "candidate-role", attemptId: task.taskId, candidateId: workspace.id }, runIt)
+      : await runIt();
     events.publish(
       workerRoleCompleted.create(
         { taskId: task.taskId, role, outcome: result.outcome },
@@ -4799,12 +4856,15 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       ),
     );
     const roleCost = cost !== undefined ? cost() - costBeforeRole : undefined;
-    // EXECUTION TRUTH (Phase 11, IKBI-REAUDIT-002): stamp the model the ROLE actually ran (the builder
-    // records its own `detail.model`), NOT the flat `singleBuilderModel` default — which mis-stamped every
-    // competitive/tournament role (scout/critic/verifier) with the default builder model. A role that carries
-    // no model (scout/critic/verifier/integrator) records none, rather than a model that did not run.
-    const executedModel = (result.detail as Record<string, unknown> | undefined)?.model;
-    await recordRole(task, workspace, spawned, result, roleCost, typeof executedModel === "string" ? executedModel : undefined, true);
+    // EXECUTION TRUTH (Phase 11/11C): the receipt's model + invocation id derive from the LEDGER record for
+    // THIS role's actual invocation (the DISPATCHED model = requestedAlias, per Phase 1). A role that made no
+    // model call records neither — never the flat `singleBuilderModel` default that mis-stamped every role.
+    // Pin the PRIMARY role invocation (stage "candidate-role"): a critic that spawned a nested
+    // structured-recovery call also has a later "structured-recovery" record — the ROLE receipt must
+    // reference its own verdict-producing invocation, not the recovery (which owns its own receipt).
+    const ledRec = ledger?.lastFor(role, "candidate-role");
+    const roleModel = ledRec?.requestedAlias ?? ((result.detail as Record<string, unknown> | undefined)?.model as string | undefined);
+    await recordRole(task, workspace, spawned, result, roleCost, typeof roleModel === "string" ? roleModel : undefined, true, ledRec?.invocationId);
     return result;
   }
 
@@ -4860,7 +4920,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     }
 
     // Per-run costing engine: accumulates model cost across the shared scout + every candidate.
-    const { engine: runEngine, cost: runCost } = makeCostingEngine(task.taskId, task.maxBudgetUsd, task.effort);
+    const { engine: runEngine, cost: runCost, ledger: runLedger } = makeCostingEngine(task.taskId, task.maxBudgetUsd, task.effort);
 
     const handles: WorkspaceHandle[] = [];
     const rolesByWs = new Map<string, RoleResult[]>();
@@ -4902,7 +4962,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       // 2. scout ONCE (shared, read-only, in the first worktree's clean base state) —
       //    its findings seed every builder. (Per-workspace scout is a future option.)
       const scoutSpawn = spawnRole("scout", parentCtx);
-      const scoutResult = await dispatchRole("scout", scoutSpawn, task, handles[0]!, [], parentCtx, runEngine, undefined, runCost);
+      const scoutResult = await dispatchRole("scout", scoutSpawn, task, handles[0]!, [], parentCtx, runEngine, undefined, runCost, runLedger);
       // FIX 5: capture worker identity for trust recording (competitive mode).
       // The first spawned role carries the shared agent identity — subsequent roles
       // assert the same identity (Fix 6 invariant), so one capture suffices. ASSIGN the
@@ -4934,17 +4994,17 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         // builder model as fallback) in its OWN worktree — each with the full run_checks rail.
         const candidateModel = competitiveModelList?.[ci] ?? singleBuilderModel;
         const candidateBuilder = builderForModel(parentCtx, candidateModel, resolveBuilderMode(task));
-        const builderResult = await dispatchRole("builder", spawnRole("builder", parentCtx), task, ws, [scoutResult], parentCtx, runEngine, candidateBuilder, runCost);
+        const builderResult = await dispatchRole("builder", spawnRole("builder", parentCtx), task, ws, [scoutResult], parentCtx, runEngine, candidateBuilder, runCost, runLedger);
         // AUTO-VERIFY RESCUE: if the builder wrote files but hit a protocol termination,
         // try the verifier. On GREEN, reclassify the builder so the candidate proceeds.
         const rescue = await maybeAutoVerifyRescueBuilderResult(builderResult, async () => {
-          return dispatchRole("verifier", spawnRole("verifier", parentCtx), task, ws, [scoutResult, builderResult], parentCtx, runEngine, undefined, runCost);
+          return dispatchRole("verifier", spawnRole("verifier", parentCtx), task, ws, [scoutResult, builderResult], parentCtx, runEngine, undefined, runCost, runLedger);
         });
         const finalBuilderResult = rescue.result;
         let verifierResult: RoleResult | undefined;
         const verifierSpawn = spawnRole("verifier", parentCtx);
         if (finalBuilderResult.outcome === "success") {
-          verifierResult = rescue.rescueVerify ?? await dispatchRole("verifier", verifierSpawn, task, ws, [scoutResult, finalBuilderResult], parentCtx, runEngine, undefined, runCost);
+          verifierResult = rescue.rescueVerify ?? await dispatchRole("verifier", verifierSpawn, task, ws, [scoutResult, finalBuilderResult], parentCtx, runEngine, undefined, runCost, runLedger);
         }
         // COMMIT this candidate's VERIFIED-good work (gated on autoCommit) BEFORE the judge —
         // safeDiffLines + buildCandidate read the committed diff, and the winner is promoted, so
@@ -4996,7 +5056,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       // Phase 4: the deterministic judge SELECTED this candidate, but ranking is NOT semantic
       // verification. Run the canonical critic on the winner so it reaches promotion with a REAL
       // semantic verdict (never `not-evaluated`); a concrete-defect fail then blocks the promote.
-      const compCritic = await dispatchRole("critic", spawnRole("critic", parentCtx), task, winner, selectedRoles, parentCtx, runEngine, criticFor(), runCost);
+      const compCritic = await dispatchRole("critic", spawnRole("critic", parentCtx), task, winner, selectedRoles, parentCtx, runEngine, criticFor(), runCost, runLedger);
       const winnerRoles = [...selectedRoles, compCritic];
       const compSemanticKind = classifySemanticVerdict(compCritic);
 
@@ -5042,6 +5102,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         compCritic,
         { taskId: task.taskId, attemptId: task.taskId, candidateId: winner.id, ...(compVerifiedTree !== undefined ? { verifiedTree: compVerifiedTree } : {}), strategy: "competitive", verificationPassed: compVerifier?.outcome === "success", targetRepo: task.targetRepo },
         parentIdentity,
+        runLedger,
       );
       const canon = await promoteCandidate(
         winner,
@@ -5171,7 +5232,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
    * engine is shared across every candidate + the shadow.
    */
   function makeTournamentEngine(task: WorkerTask, parentCtx: OperationContext, parentIdentity: AgentIdentity): TournamentEngine {
-    const { engine: runEngine, cost: runCost } = makeCostingEngine(task.taskId, task.maxBudgetUsd, task.effort);
+    const { engine: runEngine, cost: runCost, ledger: runLedger } = makeCostingEngine(task.taskId, task.maxBudgetUsd, task.effort);
     // FIX 5: capture worker identity for trust recording (tournament mode).
     // The first spawned role carries the shared agent identity.
     let tournWorkerSpawned: SpawnedRole | undefined;
@@ -5196,19 +5257,19 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       await installWorkspaceDeps(ws, parentCtx, deps.dependencyInstall);
       const scoutSpawn = spawnRole("scout", parentCtx);
       if (tournWorkerSpawned === undefined) tournWorkerSpawned = scoutSpawn;
-      const scoutResult = await dispatchRole("scout", scoutSpawn, t, ws, [], parentCtx, runEngine, undefined, runCost);
+      const scoutResult = await dispatchRole("scout", scoutSpawn, t, ws, [], parentCtx, runEngine, undefined, runCost, runLedger);
       const candidateBuilder = builderForModel(parentCtx, spec.model, spec.mode);
-      const builderResult = await dispatchRole("builder", spawnRole("builder", parentCtx), t, ws, [scoutResult], parentCtx, runEngine, candidateBuilder, runCost);
+      const builderResult = await dispatchRole("builder", spawnRole("builder", parentCtx), t, ws, [scoutResult], parentCtx, runEngine, candidateBuilder, runCost, runLedger);
       // AUTO-VERIFY RESCUE: if the builder wrote files but hit a protocol termination,
       // try the verifier. On GREEN, reclassify the builder so the candidate proceeds.
       const rescue = await maybeAutoVerifyRescueBuilderResult(builderResult, async () => {
-        return dispatchRole("verifier", spawnRole("verifier", parentCtx), t, ws, [scoutResult, builderResult], parentCtx, runEngine, undefined, runCost);
+        return dispatchRole("verifier", spawnRole("verifier", parentCtx), t, ws, [scoutResult, builderResult], parentCtx, runEngine, undefined, runCost, runLedger);
       });
       const finalBuilderResult = rescue.result;
       let verifierResult: RoleResult | undefined;
       const verifierSpawn = spawnRole("verifier", parentCtx);
       if (finalBuilderResult.outcome === "success") {
-        verifierResult = rescue.rescueVerify ?? await dispatchRole("verifier", verifierSpawn, t, ws, [scoutResult, finalBuilderResult], parentCtx, runEngine, undefined, runCost);
+        verifierResult = rescue.rescueVerify ?? await dispatchRole("verifier", verifierSpawn, t, ws, [scoutResult, finalBuilderResult], parentCtx, runEngine, undefined, runCost, runLedger);
       }
       // COMMIT verified work so the candidate's diff is the clean committed range — that range is
       // both what the judge scores (diffLines) and what gets replayed into the shadow if it wins.
@@ -5225,7 +5286,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       // Install deps in the shadow workspace before verifying — the shadow is a clean
       // worktree without node_modules, so pnpm test / vitest will fail without this.
       await installWorkspaceDeps(ws, parentCtx, deps.dependencyInstall);
-      const verifierResult = await dispatchRole("verifier", spawnRole("verifier", parentCtx), t, ws, [], parentCtx, runEngine, undefined, runCost);
+      const verifierResult = await dispatchRole("verifier", spawnRole("verifier", parentCtx), t, ws, [], parentCtx, runEngine, undefined, runCost, runLedger);
       const verdict = (verifierResult.detail as { verdict?: unknown } | undefined)?.verdict;
       const pass = verifierResult.outcome === "success" && verdict === "pass";
       return { pass, roles: [verifierResult], ...(pass ? {} : { reason: verifierResult.summary ?? "shadow verifier did not pass" }) };
@@ -5240,7 +5301,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       // Phase 4: the clean-shadow replay is a SELECTED, reverified candidate — but tournament ranking is
       // NOT semantic verification. Run the canonical critic on the shadow so the winner reaches promotion
       // with a REAL semantic verdict (never `not-evaluated`); a concrete-defect fail blocks the promote.
-      const tourCritic = await dispatchRole("critic", spawnRole("critic", parentCtx), t, ws, roleResults, parentCtx, runEngine, criticFor(), runCost);
+      const tourCritic = await dispatchRole("critic", spawnRole("critic", parentCtx), t, ws, roleResults, parentCtx, runEngine, criticFor(), runCost, runLedger);
       const shadowRoles = [...roleResults, tourCritic];
       // C-A1: fail-closed injection/policy-taint gate for the tournament winner (parity with single-run).
       const tourTaint = winnerTaintReason(shadowRoles);
@@ -5255,6 +5316,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         tourCritic,
         { taskId: t.taskId, attemptId: t.taskId, candidateId: ws.id, ...(tourVerifiedTree !== undefined ? { verifiedTree: tourVerifiedTree } : {}), strategy: "tournament", verificationPassed: tourVerifier?.outcome === "success", targetRepo: t.targetRepo },
         parentIdentity,
+        runLedger,
       );
       const canon = await promoteCandidate(
         ws,
@@ -5311,6 +5373,13 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               shadow: receipt.shadow,
               promoted: receipt.promoted,
               costUsd: runCost(),
+              // AGGREGATE LINKAGE (Phase 11C): a tournament receipt is a SELECTION over many candidates. It
+              // references EVERY executed provider invocation across all candidates + the evaluator/critic +
+              // recovery (each once, dispatch order), and derives its aggregate cost status from those records
+              // — it never stamps one candidate's or the winner's model as if it executed the whole tournament.
+              invocationIds: runLedger.executedIds(),
+              invocationCount: runLedger.invocationCount(),
+              costStatus: runLedger.costStatus(),
             },
             project: task.targetRepo,
           },

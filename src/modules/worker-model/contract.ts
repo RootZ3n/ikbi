@@ -499,8 +499,12 @@ export type NonPromotionClass =
  * physically has it and cannot design it out.
  */
 export interface RoleEngine {
-  /** Invoke a model (caching/egress are transparent below this call). */
-  readonly invokeModel: (request: ModelRequest) => Promise<ModelResponse>;
+  /**
+   * Invoke a model (caching/egress are transparent below this call). The optional `meta` lets a role tag a
+   * DISTINCT sub-invocation (Phase 11C) — e.g. the critic's structured-output recovery — so the invocation
+   * ledger records it under its own stage and its receipt can reference the exact invocation record.
+   */
+  readonly invokeModel: (request: ModelRequest, meta?: { readonly stage?: string; readonly retryKind?: string }) => Promise<ModelResponse>;
   /** #8: neutralize untrusted content (MCP results, tool output) before the model loop. */
   readonly neutralizeUntrusted: (content: string, context: UntrustedContext) => NeutralizedContent;
 }
