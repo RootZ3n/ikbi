@@ -75,15 +75,21 @@ export interface RentBuilderExpertInput {
 }
 
 /**
- * Restrict a roster to one vendor lane; fall back to the full roster if the lane is empty.
- * Exported so the orchestrator's retry/escalation paths can honor the SAME vendor lane the
- * rental used — a lane-pinned attempt must stay in its lane across every model pick, not just
- * the initial rental (IKBI-RT-002: retries must not silently cross vendor lanes).
+ * Restrict a roster to one vendor lane. A lane-pinned attempt must stay in its lane across EVERY model
+ * pick, not just the initial rental (IKBI-RT-002). Phase 11 (IKBI-REAUDIT-002): a lane with NO matching
+ * model returns an EMPTY list — it NEVER silently falls back to the full roster (which would let a
+ * lane-pinned attempt borrow the other vendor's models). An empty result is a configuration error the
+ * caller must fail closed on (see `laneHasModels` / the attempt-setup validation), not a licence to pick
+ * any available model. `undefined`/empty lane = a lane-NEUTRAL roster (unchanged).
  */
 export function laneRoster(ids: readonly string[], lane: string | undefined): readonly string[] {
   if (lane === undefined || lane === "") return ids;
-  const filtered = ids.filter((id) => id.startsWith(lane));
-  return filtered.length > 0 ? filtered : ids;
+  return ids.filter((id) => id.startsWith(lane));
+}
+
+/** Whether a configured vendor lane has at least one model in the given roster (Phase 11). */
+export function laneHasModels(ids: readonly string[], lane: string | undefined): boolean {
+  return laneRoster(ids, lane).length > 0;
 }
 
 // ── SEMANTIC DIFFICULTY ROUTER (the coordinator's brain) ────────────────────────

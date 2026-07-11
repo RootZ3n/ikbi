@@ -59,7 +59,7 @@ import type { RecoveryAttempt } from "../recovery/index.js";
 import { DriftBlockedError } from "../drift-prevention/index.js";
 import type { DriftPrevention, DriftReport } from "../drift-prevention/index.js";
 import { rosterFromIds } from "../model-router/index.js";
-import { rentBuilderExpert, classifyTaskTier, resolveClassifierModel, laneRoster, type RentedExpert } from "./expert-rental.js";
+import { rentBuilderExpert, classifyTaskTier, resolveClassifierModel, laneRoster, laneHasModels, type RentedExpert } from "./expert-rental.js";
 import { semanticPromotionEligible, semanticDuelEligible, type SemanticVerdict, type SemanticVerdictKind } from "./semantic-verdict.js";
 import { evaluateExecutedTestEvidence, noTestsPolicyEnabled } from "./executed-evidence.js";
 import type { TestEvidence } from "./adjudication/contract.js";
@@ -130,7 +130,8 @@ import {
   workerEscalationRetried,
   workerEscalationSuppressed,
 } from "./events.js";
-import { CONTRACT_VERSION, toOutcomeStatus, WorkerError, WORKER_ROLES } from "./contract.js";
+import { CONTRACT_VERSION, toOutcomeStatus, WorkerError, WORKER_ROLES, effortModelParams } from "./contract.js";
+import { InvocationLedger } from "./invocation-ledger.js";
 import { fireStopHooks } from "../hooks/index.js";
 import { runIterativeLoop, DEFAULT_MAX_FIX_ITERATIONS, extractVerifierCheckResult } from "./iterative-loop.js";
 import { runCriticFixLoop, isRetryableCriticFail } from "./critic-fix-loop.js";
@@ -652,6 +653,13 @@ export interface OrchestratorDeps {
   readonly requestApproval?: (req: { taskId: string; workspaceId: string; goal: string }) => Promise<boolean>;
   /** The single builder model (per-candidate fallback). Default: config (IKBI_MODEL_BUILDER). */
   readonly builderModel?: string;
+  /**
+   * The escalation tier rosters (worker/mid/frontier). Default: the deployed `tierModels`
+   * (env/providers.json-resolved). Injectable (Phase 11) so a conformance test can pin a DETERMINISTIC
+   * roster independent of the ambient deployment config — the escalation MECHANICS are what a unit test
+   * asserts, not which vendor a specific deployment's cost-sorted roster ranks first.
+   */
+  readonly escalationTierModels?: { readonly worker: readonly string[]; readonly mid: readonly string[]; readonly frontier: readonly string[] };
   /** The head-to-head competitive model list. Default: config (IKBI_COMPETITIVE_MODELS). */
   readonly competitiveModels?: readonly string[];
   /**
@@ -1178,6 +1186,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   // for tests. When `competitiveModelList` is set, competitive mode races one candidate per
   // listed model; otherwise every candidate uses the single builder model (old behavior).
   const singleBuilderModel = deps.builderModel ?? builderModel();
+  // Phase 11: the escalation tier rosters (default: deployed config; injectable for deterministic tests).
+  const tierModels = deps.escalationTierModels ?? escalationConfig.tierModels;
   const competitiveModelList = deps.competitiveModels ?? competitiveBuilderModels();
   // TOURNAMENT candidate models (deps → config). A task's own `candidates` overrides both at run().
   const candidateModelList = deps.candidateModels ?? config.candidateModels ?? [];
@@ -1187,52 +1197,27 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
    * competitive candidates) accumulates `response.cost.usd` into one running total. The
    * neutralization seam is passed through untouched. `cost()` reads the accumulated total.
    */
-  function makeCostingEngine(maxBudgetUsd?: number, effort?: "low" | "medium" | "high" | "max"): { engine: RoleEngine; cost: () => number; addCost: (usd: number) => void } {
-    let total = 0;
-    let budgetExhausted = false;
-    const budget = maxBudgetUsd;
-    const costingEngine: RoleEngine = {
-      invokeModel: async (request: ModelRequest): Promise<ModelResponse> => {
-        if (budgetExhausted) {
-          throw Object.assign(new Error(`budget exhausted: cumulative cost exceeded $${budget?.toFixed(4)} cap`), { code: "BUDGET_EXHAUSTED" });
-        }
-        // Apply effort-level overrides to the model request (temperature, maxTokens)
-        // when the task specified --effort. These override role defaults.
-        const effortParams = effort !== undefined ? (() => { 
-          const { effortModelParams: emp } = require("./contract.js") as { effortModelParams: (e?: string) => { temperature: number; maxTokens: number } | undefined };
-          return emp(effort);
-        })() : undefined;
-        const effRequest = effortParams !== undefined
-          ? { ...request, temperature: effortParams.temperature, maxTokens: effortParams.maxTokens }
-          : request;
-        const r = await invokeModel(effRequest);
-        total += r.cost?.usd ?? 0;
-        if (budget !== undefined && total > budget && budget > 0) {
-          budgetExhausted = true;
-          const msg = `budget exhausted: cumulative cost $${total.toFixed(4)} exceeds $${budget.toFixed(4)} cap`;
-          throw Object.assign(new Error(msg), { code: "BUDGET_EXHAUSTED", costUsd: total, budgetUsd: budget });
-        }
-        return r;
-      },
+  function makeCostingEngine(taskId: string, maxBudgetUsd?: number, effort?: "low" | "medium" | "high" | "max"): { engine: RoleEngine; cost: () => number; addCost: (usd: number) => void; ledger: InvocationLedger } {
+    // Phase 11: the invocation LEDGER is the execution source of truth. Every role invokes through
+    // `ledger.engine`; each call records one immutable invocation (resolved model/provider/lane/status/
+    // charged cost from the actual response). Cost/budget/status DERIVE from the unique records — a failed
+    // provider attempt that charged tokens is counted (ModelResponse.cost is only the serving attempt), and
+    // any unknown cost makes the aggregate `partial` (not silently zero).
+    const ledger = new InvocationLedger({
+      invokeModel,
       neutralizeUntrusted,
-    };
-    // Gap B: fold a cost incurred OUTSIDE this engine (e.g. the frontier consult, which uses the raw
-    // provider) into the run total, so runCost() — and every receipt/summary that reports it — includes
-    // it. C-A3: and ENFORCE the budget cap on that external cost the same way invokeModel does — throw
-    // BUDGET_EXHAUSTED when it pushes the run over, rather than deferring enforcement to the NEXT role
-    // call (which may never happen: a consult that lands the fix and finishes could otherwise promote
-    // over budget). The throw propagates to the run's budget-abort handler.
-    const addCost = (usd: number): void => {
-      total += Math.max(0, usd);
-      if (budget !== undefined && total > budget && budget > 0) {
-        budgetExhausted = true;
-        throw Object.assign(
-          new Error(`budget exhausted: cumulative cost $${total.toFixed(4)} exceeds $${budget.toFixed(4)} cap`),
-          { code: "BUDGET_EXHAUSTED", costUsd: total, budgetUsd: budget },
-        );
-      }
-    };
-    return { engine: costingEngine, cost: () => total, addCost };
+      runId: taskId,
+      taskId,
+      now: () => Date.now(),
+      ...(maxBudgetUsd !== undefined ? { maxBudgetUsd } : {}),
+      ...(effort !== undefined ? (() => { const p = effortModelParams(effort); return p !== undefined ? { effortParams: p } : {}; })() : {}),
+      // Vendor-lane membership follows the roster convention (id prefixed by the lane vendor).
+      laneMember: (model: string, lane: string) => model.startsWith(lane),
+    });
+    // `addCost` folds an EXTERNAL raw-provider cost (e.g. the frontier consult) into the ledger as its own
+    // invocation record so it is counted once, enforces the budget cap, and cannot be double-summed.
+    const addCost = (usd: number): void => { ledger.recordExternal({ role: "consult", stage: "frontier-consult", retryKind: "consult", costUsd: Math.max(0, usd) }); };
+    return { engine: ledger.engine, cost: () => ledger.cost(), addCost, ledger };
   }
 
   /**
@@ -2252,7 +2237,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       // classifier call, then rent the cheapest-sufficient expert at that tier. The classifier + rental
       // both fall back to a zero-cost heuristic on any failure, so routing degrades gracefully and can
       // never block a build.
-      const classifierModel = resolveClassifierModel(escalationConfig.tierModels, singleBuilderModel);
+      const classifierModel = resolveClassifierModel(tierModels, singleBuilderModel);
       classifierModelUsed = classifierModel;
       const verdict = await classifyTaskTier(
         task.goal,
@@ -2278,7 +2263,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       rentedExpert = rentBuilderExpert({
         goal: task.goal,
         ...(task.complexity !== undefined ? { complexity: task.complexity } : {}),
-        tierRosters: escalationConfig.tierModels,
+        tierRosters: tierModels,
         fallback: singleBuilderModel,
         tierOverride: verdict.tier,
         ...(task.moeVendorLane !== undefined ? { vendorLane: task.moeVendorLane } : {}),
@@ -2326,7 +2311,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         : rentedExpert !== undefined
           ? { model: rentedExpert.modelId, alias: rentedExpert.modelId, source: "moe-rental", rationale: rentedExpert.reason, ...(task.moeVendorLane !== undefined ? { vendorLane: task.moeVendorLane } : {}) }
           : task.complexity === "large"
-            ? { model: escalationConfig.tierModels.mid[0] ?? singleBuilderModel, alias: escalationConfig.tierModels.mid[0] ?? singleBuilderModel, source: "complexity-large", ...(task.moeVendorLane !== undefined ? { vendorLane: task.moeVendorLane } : {}) }
+            ? { model: tierModels.mid[0] ?? singleBuilderModel, alias: tierModels.mid[0] ?? singleBuilderModel, source: "complexity-large", ...(task.moeVendorLane !== undefined ? { vendorLane: task.moeVendorLane } : {}) }
             : { model: singleBuilderModel, alias: singleBuilderModel, source: "default", ...(task.moeVendorLane !== undefined ? { vendorLane: task.moeVendorLane } : {}) };
     // LANE DISCIPLINE (IKBI-RT-002): a lane-pinned attempt (the duel peer) must keep EVERY model pick —
     // escalation swap, pool sweep, retries — inside its vendor lane, not just the initial rental, so a
@@ -2354,8 +2339,21 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       const configured = config.fixerModel;
       if (configured === undefined || configured === "") return undefined;
       if (modelDecision.vendorLane === undefined || configured.startsWith(modelDecision.vendorLane)) return configured;
-      return laneModelsFor(escalationConfig.tierModels.mid)[0] ?? undefined;
+      return laneModelsFor(tierModels.mid)[0] ?? undefined;
     })();
+    // EMPTY-LANE CONFIG GUARD (Phase 11, IKBI-REAUDIT-002): a configured attempt lane with NO valid model
+    // (neither the decided model nor any worker-tier model belongs to it) is a CONFIGURATION error — never
+    // a licence to borrow the other vendor's models. Fail the attempt CLOSED before any dispatch (not a
+    // candidate defect; no duel/fixer/promotion). This runs BEFORE workspace allocation, so nothing leaks.
+    if (task.moeVendorLane !== undefined && !modelDecision.model.startsWith(task.moeVendorLane) && !laneHasModels(tierModels.worker, task.moeVendorLane)) {
+      const reason = `lane-config: vendor lane "${task.moeVendorLane}" has no configured model (neither the decided model "${modelDecision.model}" nor any worker-tier model is in the lane) — refusing to borrow another vendor's model`;
+      await receipts.append(
+        { operation: "worker.lane_config_error", outcome: { status: "failure", detail: reason }, requestId: task.taskId, metadata: { taskId: task.taskId, vendorLane: task.moeVendorLane, decidedModel: modelDecision.model, workerRoster: tierModels.worker }, project: task.targetRepo },
+        parentIdentity,
+      ).catch(() => {});
+      log.warn({ taskId: task.taskId, vendorLane: task.moeVendorLane }, "empty-lane config error — attempt failed closed (no cross-lane borrow)");
+      return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason, costUsd: classifierCostUsd };
+    }
     // EXPLICIT ATTEMPT-DECISION RECORD (Phase 2): on the MoE/duel path, persist the authoritative model
     // decision (and any pre-dispatch replacement) as its own receipt so the trail distinguishes each
     // attempt truthfully — even a pre-dispatch abort records which model this attempt intended, without
@@ -2583,7 +2581,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     );
 
     // Per-run costing engine: accumulates every model invocation's cost across all roles.
-    const { engine: runEngine, cost: runCost, addCost: addRunCost } = makeCostingEngine(task.maxBudgetUsd, task.effort);
+    const { engine: runEngine, cost: runCost, addCost: addRunCost, ledger: runLedger } = makeCostingEngine(task.taskId, task.maxBudgetUsd, task.effort);
     // ROUTING OVERHEAD (Phase 7): fold the pre-engine classifier spend into the run total + the budget,
     // so `ikbi cost`, the run-summary, and the budget cap all see it. It is ROUTING overhead — kept as a
     // distinct subtotal on the summary (not blurred into builder cost). `addRunCost` may throw
@@ -2592,8 +2590,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // The classifier's cost STATUS: no-call (deterministic/off) | measured | unavailable (a call ran but
     // the provider returned no cost — UNKNOWN, never zero).
     const classifierCostStatus: "measured" | "unavailable" | "no-call" = classifierCalled ? (classifierCostMeasured ? "measured" : "unavailable") : "no-call";
-    // Aggregate cost is PARTIAL when any accounted invocation's cost is unknown (never a false-precise total).
-    const costPartial = classifierCostStatus === "unavailable";
+    // Phase 11: aggregate cost PARTIAL derives from the LEDGER (any unknown invocation cost, not only the
+    // classifier). Read at the run summary below via `runLedger.costStatus()`.
 
     const results: RoleResult[] = [];
     // Run-level escalation accumulator (ADDITIVE observability; never alters dispatch).
@@ -2701,10 +2699,18 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     };
 
     try {
-      // ROUTING OVERHEAD (Phase 7): fold the pre-engine classifier spend into runCost + the budget HERE,
-      // inside the try, so a classifier that exceeds a tiny cap trips BUDGET_EXHAUSTED and is handled by
-      // the abort path below (which writes a truthful terminal summary) rather than throwing out of run.
-      if (routingOverheadUsd > 0) addRunCost(routingOverheadUsd);
+      // ROUTING OVERHEAD (Phase 7/11): the classifier ran on the RAW provider (before this ledger existed).
+      // Record it as a lane-NEUTRAL task-level invocation (a pre-attempt routing call — NOT attributed to
+      // the builder lane) so the ledger counts it exactly once with its true cost status. INSIDE the try so
+      // a classifier that alone exceeds a tiny cap trips BUDGET_EXHAUSTED handled by the abort path below.
+      if (classifierCalled) {
+        runLedger.recordExternal({
+          role: "classifier", stage: "classify", retryKind: "primary", ...(classifierModelUsed !== undefined ? { requestedAlias: classifierModelUsed } : {}),
+          ...(classifierResponseModel !== undefined ? { resolvedModel: classifierResponseModel } : {}),
+          ...(classifierProvider !== undefined ? { provider: classifierProvider } : {}),
+          ...(classifierCostMeasured ? { costUsd: classifierCostUsd } : {}),
+        });
+      }
       // ── DEPENDENCY INSTALL: ensure node_modules exists before running checks ──
       // If the worktree has a package.json but no node_modules, install dependencies
       // so run_checks (typecheck + tests) can actually succeed. This is the fix for
@@ -2842,7 +2848,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           const estTokens = estimatePromptTokens([task.goal, task.projectInstructions, brief]);
           const currentWindow = getCapabilities(modelDecision.model).context_window;
           if (contextExceedsWindow(estTokens, currentWindow, CONTEXT_PREFLIGHT_FRACTION)) {
-            const midModel = laneRoster(escalationConfig.tierModels.mid, modelDecision.vendorLane)[0];
+            const midModel = laneRoster(tierModels.mid, modelDecision.vendorLane)[0];
             if (midModel !== undefined && midModel !== modelDecision.model && getCapabilities(midModel).context_window > currentWindow) {
               const fromModel = modelDecision.model;
               modelDecision = {
@@ -2877,10 +2883,25 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         // H7: when the fix loop already verified the SAME code GREEN, reuse its verifier result rather
         // than running the full typecheck+test suite again. The reused result flows through the normal
         // record/commit/integrator path below; only the redundant second verifier dispatch is skipped.
+        // Phase 11: tag every provider call this role makes with the attempt's role/stage/lane so the
+        // invocation ledger records execution truth (resolved model/provider/cost) under the right identity
+        // and can flag a served model outside the attempt's vendor lane.
         let result =
           role === "verifier" && fixLoopVerifierResult !== undefined
             ? fixLoopVerifierResult
-            : await runRoleFn(role, roleFn, ctx, verifierTimeout);
+            : await runLedger.withContext(
+                {
+                  role, stage: "role", attemptId: task.taskId,
+                  // The BUILDER is the lane-bound GENERATION role — its invocation is lane-enforced (a served
+                  // model outside `vendorLane` is flagged as a violation). Scout (analysis) and critic
+                  // (judgment) are TASK-LEVEL roles on the configured driver/critic model; they are recorded
+                  // lane-neutral (see the handoff — a documented, honest classification, not a hidden crossing).
+                  ...(role === "builder" && modelDecision.vendorLane !== undefined ? { vendorLane: modelDecision.vendorLane } : {}),
+                  ...(role === "builder" ? { requestedAlias: modelDecision.model, modelDecisionSource: modelDecision.source } : {}),
+                  strategy: task.moeVendorLane === "mimo" ? "duel-peer" : task.moeVendorLane === "deepseek" ? "duel-primary" : "normal",
+                },
+                () => runRoleFn(role, roleFn, ctx, verifierTimeout),
+              );
         results.push(result);
 
         // REFUTER → CORRECTION LIBRARY: a refuted build files each failed finding as a PROPOSED
@@ -3141,7 +3162,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               return extractVerifierCheckResult(vResult);
             },
             builder: async (fixGoal: string) => {
-              const fixBuilderFn = builderFor(parentCtx, resolveBuilderMode(task));
+              // Phase 11 (IKBI-REAUDIT-002): lane-pure repair — the iterative fix builder runs the ATTEMPT's
+              // own model, not `builderFor()`'s global default (which could cross the attempt's vendor lane).
+              const fixBuilderFn = builderForModel(parentCtx, modelDecision.model, resolveBuilderMode(task));
               const fixCtx: RoleContext = {
                 task: { ...task, goal: fixGoal },
                 role: "builder",
@@ -3279,7 +3302,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 priorResults: [...carriedPrior],
                 engine: runEngine,
               };
-              const br = await runRoleFn("builder", builderFor(parentCtx, resolveBuilderMode(task)), fixCtx);
+              const br = await runRoleFn("builder", builderForModel(parentCtx, modelDecision.model, resolveBuilderMode(task)), fixCtx); // Phase 11: lane-pure repair (attempt's model, not the global default)
               noteBuilderSignals(br); // injection/taint on a critic-fix retry must reach the promote gate
               return br;
             },
@@ -3389,7 +3412,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         ) {
           // Escalate within the attempt's vendor lane (IKBI-RT-002). An operator --fallback-model wins ONLY
           // when it is in-lane (laneFallbackModel); a cross-lane fallback is deferred to the peer attempt.
-          const midModel = laneFallbackModel ?? laneModelsFor(escalationConfig.tierModels.mid)[0];
+          const midModel = laneFallbackModel ?? laneModelsFor(tierModels.mid)[0];
           if (midModel !== undefined) {
             escalationAttempted = true;
             const rejectedDetail = (result.detail ?? {}) as Record<string, unknown>;
@@ -3609,7 +3632,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           }
           // Escalate within the attempt's vendor lane (IKBI-RT-002). An operator --fallback-model wins ONLY
           // when it is in-lane (laneFallbackModel); a cross-lane fallback is deferred to the peer attempt.
-          const midModel = laneFallbackModel ?? laneModelsFor(escalationConfig.tierModels.mid)[0];
+          const midModel = laneFallbackModel ?? laneModelsFor(tierModels.mid)[0];
           if (midModel !== undefined) {
             const failedResult = result;
             const failedDetail = (failedResult.detail ?? {}) as Record<string, unknown>;
@@ -3752,12 +3775,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             // crosses into the other vendor's models on a retry. `laneModelsFor` is a no-op (full roster)
             // for an unpinned attempt, so the default recovery ladder is unchanged.
             const recoveryRosters = {
-              worker: rosterFromIds(laneModelsFor(escalationConfig.tierModels.worker)),
-              mid: rosterFromIds(laneModelsFor(escalationConfig.tierModels.mid)),
-              frontier: rosterFromIds(laneModelsFor(escalationConfig.tierModels.frontier)),
+              worker: rosterFromIds(laneModelsFor(tierModels.worker)),
+              mid: rosterFromIds(laneModelsFor(tierModels.mid)),
+              frontier: rosterFromIds(laneModelsFor(tierModels.frontier)),
             };
             const seedTier =
-              (["worker", "mid", "frontier"] as const).find((t) => escalationConfig.tierModels[t].includes(failedModel)) ?? "worker";
+              (["worker", "mid", "frontier"] as const).find((t) => tierModels[t].includes(failedModel)) ?? "worker";
             // A CONTEXT-OVERFLOW needs a bigger WINDOW, not a cheaper same-tier model — start the sweep
             // at the mid tier so it skips the small-window worker pool (which would just overflow again).
             // recoveryFloor takes max(attempt tiers, startTier), so the accurate worker seed below is not
@@ -4615,13 +4638,19 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           targetRepo: task.targetRepo,
           outcome: overall,
           promoted,
-          model: singleBuilderModel,
+          // EXECUTION TRUTH (Phase 11): the summary model is the builder model the provider ACTUALLY served
+          // (from the invocation ledger), not the configured `singleBuilderModel` selection.
+          model: runLedger.lastFor("builder")?.resolvedModel ?? singleBuilderModel,
           costUsd: runCost(),
-          // COST TRUTH (Phase 7, IKBI-RT-011): `costUsd` now INCLUDES routing overhead (the classifier).
-          // `routingOverheadUsd` breaks it out as a distinct subtotal; `costStatus` is "partial" when any
-          // accounted invocation's cost is unknown, so a total never falsely implies completeness.
+          // COST TRUTH (Phase 7/11): `costUsd` = sum of unique invocation records (incl. charged failed
+          // attempts). `routingOverheadUsd` breaks out the classifier subtotal; `costStatus`/`unknownCostCount`
+          // are derived from the LEDGER (partial when ANY accounted invocation's cost is unknown, not only the
+          // classifier); `invocationCount` is the number of actual dispatched provider requests.
           routingOverheadUsd,
-          costStatus: costPartial ? "partial" : "complete",
+          costStatus: runLedger.costStatus(),
+          invocationCount: runLedger.invocationCount(),
+          unknownCostCount: runLedger.unknownCosts(),
+          ...(runLedger.laneViolations() > 0 ? { laneViolations: runLedger.laneViolations() } : {}),
           ...(classifierModelUsed !== undefined ? { classifierModel: classifierModelUsed, classifierDecisionSource, classifierCostStatus } : {}),
           verificationResult: verifierResult !== undefined ? verifierResult.outcome : "not_run",
           verificationMode: ranVerificationMode,
@@ -4736,7 +4765,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       ),
     );
     const roleCost = cost !== undefined ? cost() - costBeforeRole : undefined;
-    await recordRole(task, workspace, spawned, result, roleCost, singleBuilderModel, true);
+    // EXECUTION TRUTH (Phase 11, IKBI-REAUDIT-002): stamp the model the ROLE actually ran (the builder
+    // records its own `detail.model`), NOT the flat `singleBuilderModel` default — which mis-stamped every
+    // competitive/tournament role (scout/critic/verifier) with the default builder model. A role that carries
+    // no model (scout/critic/verifier/integrator) records none, rather than a model that did not run.
+    const executedModel = (result.detail as Record<string, unknown> | undefined)?.model;
+    await recordRole(task, workspace, spawned, result, roleCost, typeof executedModel === "string" ? executedModel : undefined, true);
     return result;
   }
 
@@ -4792,7 +4826,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     }
 
     // Per-run costing engine: accumulates model cost across the shared scout + every candidate.
-    const { engine: runEngine, cost: runCost } = makeCostingEngine(task.maxBudgetUsd, task.effort);
+    const { engine: runEngine, cost: runCost } = makeCostingEngine(task.taskId, task.maxBudgetUsd, task.effort);
 
     const handles: WorkspaceHandle[] = [];
     const rolesByWs = new Map<string, RoleResult[]>();
@@ -5103,7 +5137,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
    * engine is shared across every candidate + the shadow.
    */
   function makeTournamentEngine(task: WorkerTask, parentCtx: OperationContext, parentIdentity: AgentIdentity): TournamentEngine {
-    const { engine: runEngine, cost: runCost } = makeCostingEngine(task.maxBudgetUsd, task.effort);
+    const { engine: runEngine, cost: runCost } = makeCostingEngine(task.taskId, task.maxBudgetUsd, task.effort);
     // FIX 5: capture worker identity for trust recording (tournament mode).
     // The first spawned role carries the shared agent identity.
     let tournWorkerSpawned: SpawnedRole | undefined;
