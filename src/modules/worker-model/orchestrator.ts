@@ -155,6 +155,8 @@ const BUILDER_OPERATION = "worker.role.builder";
  * model could have handled. The reactive on-overflow escalation is the backstop for the rest.
  */
 const CONTEXT_PREFLIGHT_FRACTION = 0.7;
+/** Repair budget (Phase 6): the hard per-run cap on fixer/rescue model passes — prevents repair loops. */
+const MAX_FIXER_ROUNDS = 2;
 
 /** A mutable signal accumulator folded across roles within one run (see observeEscalation). */
 interface MutableEscalationSignals {
@@ -1931,7 +1933,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // pass with the configured fixer model (a DIFFERENT model than the builder) on the same workspace,
     // then re-verifies, and reports whether it closed the checks. Absent ⇒ a red verifier is terminal
     // (unchanged behavior). See config.fixerModel.
-    runFixer?: (redVerify: RoleResult) => Promise<{ fixed: boolean; verify: RoleResult }>,
+    runFixer?: (redVerify: RoleResult) => Promise<{ fixed: boolean; verify: RoleResult; model: string }>,
     // ADJUDICATION: ground-truth work-on-disk detector (git). When wired, work is read from the
     // worktree; absent ⇒ fall back to the builder's filesWritten ledger. Returns nonEmpty.
     detectWork?: () => Promise<{ nonEmpty: boolean }>,
@@ -1993,11 +1995,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         const rescued: RoleResult = {
           ...builderResult,
           outcome: "success",
-          summary: `${builderResult.summary}; fixer rescue: ${config.fixerModel} closed the red checks after ${builderStop}`,
+          summary: `${builderResult.summary}; fixer rescue: ${fix.model} closed the red checks after ${builderStop}`,
           detail: {
             ...bd,
             fixerRescue: true,
-            fixerModel: config.fixerModel,
+            fixerModel: fix.model, // the LANE-VALID model actually dispatched (Phase 6), not the raw config
             originalBuilderStop: builderStop,
             filesWritten: bd.filesWritten,
             rescueVerificationResult: "pass",
@@ -2009,7 +2011,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       return {
         result: {
           ...builderResult,
-          detail: { ...bd, autoVerifyRescueAttempted: true, fixerRescueAttempted: true, fixerModel: config.fixerModel, rescueVerificationResult: "fail" },
+          detail: { ...bd, autoVerifyRescueAttempted: true, fixerRescueAttempted: true, fixerModel: fix.model, rescueVerificationResult: "fail" },
         },
         rescueVerify: fix.verify,
       };
@@ -2112,6 +2114,19 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       task.fallbackModel !== undefined && (modelDecision.vendorLane === undefined || task.fallbackModel.startsWith(modelDecision.vendorLane))
         ? task.fallbackModel
         : undefined;
+    // SAME-LANE FIXER (Phase 6, IKBI-RT-012): a repair pass runs INSIDE the current attempt, so it must
+    // use a lane-valid model. `config.fixerModel` (e.g. mimo-v2.5-pro) is honored ONLY when it is in the
+    // attempt's vendor lane; a cross-lane fixer model would be a SILENT cross-lane execution inside the
+    // attempt (the IKBI-RT-012 defect) — instead the repair falls back to the lane's strongest (mid)
+    // model. For an unpinned attempt (a normal build, no duel) config.fixerModel is used verbatim (no
+    // lane to violate). Cross-lane repair is owned by the Phase 2 PEER attempt (the other vendor lane),
+    // never a hidden substitution — so no third vendor-lane attempt exists and the peer is not paid twice.
+    const laneFixerModel: string | undefined = (() => {
+      const configured = config.fixerModel;
+      if (configured === undefined || configured === "") return undefined;
+      if (modelDecision.vendorLane === undefined || configured.startsWith(modelDecision.vendorLane)) return configured;
+      return laneModelsFor(escalationConfig.tierModels.mid)[0] ?? undefined;
+    })();
     // EXPLICIT ATTEMPT-DECISION RECORD (Phase 2): on the MoE/duel path, persist the authoritative model
     // decision (and any pre-dispatch replacement) as its own receipt so the trail distinguishes each
     // attempt truthfully — even a pre-dispatch abort records which model this attempt intended, without
@@ -2387,6 +2402,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // (opt-in, config.criticFixLoop). This guard caps it at a single attempt per run so
     // subjective feedback can never loop forever.
     let criticFixAttempted = false;
+    // REPAIR BUDGET (Phase 6): a hard per-run cap on fixer/rescue model passes so a repair can never
+    // loop. Each `makeRunFixer` dispatch consumes one round; past the cap the fixer no-ops (the original
+    // failure stands). Combined with the "unchanged tree ⇒ stop" guard inside the fixer.
+    let fixerRoundsUsed = 0;
     // H7: when the verifier-driven fix loop runs (fixIterations > 0) and its LAST verify is GREEN,
     // we reuse that verifier RoleResult for the main verifier role instead of running the FULL
     // typecheck+test suite a second time on identical code. Set in the builder block below, consumed
@@ -2635,11 +2654,21 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           const rescueCtx: RoleContext = { task, role: "verifier", identity: rescueSpawn.identity, autonomy: rescueSpawn.autonomy, workspace, priorResults: [...results], engine: runEngine };
           return runRoleFn("verifier", verifierFor(parentCtx), rescueCtx, Math.max(roleTimeoutMs, resolveCheckTimeoutMs(modeEnv)));
         };
-        const makeRunFixer = (runRescueVerifier: () => Promise<RoleResult>): ((redVerify: RoleResult) => Promise<{ fixed: boolean; verify: RoleResult }>) | undefined => {
-          const fixerModel = config.fixerModel;
+        const makeRunFixer = (runRescueVerifier: () => Promise<RoleResult>, fixerTrigger: string): ((redVerify: RoleResult) => Promise<{ fixed: boolean; verify: RoleResult; model: string }>) | undefined => {
+          // SAME-LANE FIXER (Phase 6): dispatch a LANE-VALID repair model (never a silent cross-lane
+          // substitution). No configured fixer, or none resolvable in-lane ⇒ no fixer.
+          const fixerModel = laneFixerModel;
           if (!fixerModel) return undefined;
-          return async (redVerify: RoleResult): Promise<{ fixed: boolean; verify: RoleResult }> => {
-            void redVerify; // the fixer runs run_checks itself to see the live errors
+          return async (redVerify: RoleResult): Promise<{ fixed: boolean; verify: RoleResult; model: string }> => {
+            // REPAIR BUDGET: never loop. Past the cap, the original failure stands.
+            if (fixerRoundsUsed >= MAX_FIXER_ROUNDS) return { fixed: false, verify: redVerify, model: fixerModel };
+            fixerRoundsUsed += 1;
+            const fixerRound = fixerRoundsUsed;
+            // PROVENANCE: snapshot the SOURCE candidate tree + the concrete failing checks the repair acts
+            // on, so the repaired candidate is traceable and the trigger is authentic (a deterministic
+            // verifier failure, never a bare/indeterminate critic verdict).
+            const sourceTree = await readTreeHash(workspace.path);
+            const failingChecks = readVerifier(redVerify).checks.filter((c) => c.passed === false).map((c) => c.name);
             const fixSpawn = spawnRole("builder", parentCtx);
             const fixGoal = [
               task.goal,
@@ -2654,6 +2683,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 { source: EVENT_SOURCE, attribution: { identity: fixSpawn.identity, operation: "worker.role.fixer", runId: task.taskId } },
               ),
             );
+            // RUNTIME-TRUTH (Phase 5): the same-attempt repair receives task/attempt/candidate-scoped
+            // evidence — never another attempt's. Inert unless a reader is wired.
+            const fixerEvidence = await requestRuntimeEvidence(task, "builder", workspace, fixSpawn.identity, { attemptId: task.taskId, candidateId: task.taskId, strategy: `fixer:${fixerTrigger}` });
             const fixCtx: RoleContext = {
               // Preserve the task's declared write scope — a fix pass must NOT silently widen a
               // `new_only`/`none` task to full write access just because one check went red.
@@ -2664,8 +2696,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               workspace,
               priorResults: [...results],
               engine: runEngine,
+              ...(fixerEvidence.length > 0 ? { runtimeEvidence: fixerEvidence } : {}),
             };
+            // COST: bill the fixer's provider calls to the fixer model, separately from the builder role.
+            const costBeforeFixer = runCost();
             const fixResult = await runRoleFn("builder", builderForModel(parentCtx, fixerModel, resolveBuilderMode(task)), fixCtx);
+            const fixerCost = runCost() - costBeforeFixer;
             events.publish(
               workerRoleCompleted.create(
                 { taskId: task.taskId, role: "builder", outcome: fixResult.outcome },
@@ -2682,7 +2718,35 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             // that never reach the integrator). Kept SEPARATE from the builder's own prevented set.
             fixerPreventedThisBuild.push(...preventedAttemptsOf(fixResult));
             const verify = await runRescueVerifier();
-            return { fixed: verify.outcome === "success", verify };
+            // The REPAIRED candidate's tree (post-fix) — the exact tree the re-verify (and later the
+            // critic/promotion) judge. Distinct from `sourceTree`; the source verdicts are now stale.
+            const resultingTree = await readTreeHash(workspace.path);
+            const fixed = verify.outcome === "success";
+            // TRUTHFUL FIXER RECEIPT (Phase 6, IKBI-RT-012): the repair is no longer off-books. Records
+            // the provenance chain + the LANE-VALID model actually dispatched (selected == dispatched ==
+            // billed == receipt) + its own cost. `crossLaneAvoided` marks when a cross-lane config.fixerModel
+            // was replaced by the in-lane model (the cross-lane repair is owned by the peer attempt).
+            try {
+              await receipts.append(
+                {
+                  operation: "worker.fixer",
+                  outcome: { status: fixed ? "success" : "failure", detail: fixed ? "repair closed the red checks" : "repair did not close the red checks" },
+                  requestId: task.taskId,
+                  metadata: {
+                    sourceTaskId: task.taskId, sourceAttemptId: task.taskId, sourceCandidateTree: sourceTree,
+                    repairAttemptId: task.taskId, repairRound: fixerRound, repairStrategy: "same-lane", fixerTrigger,
+                    failingChecks, fixerModel, dispatchedModel: fixerModel,
+                    ...(modelDecision.vendorLane !== undefined ? { vendorLane: modelDecision.vendorLane } : {}),
+                    crossLaneAvoided: config.fixerModel !== undefined && fixerModel !== config.fixerModel,
+                    resultingCandidateTree: resultingTree, treeUnchanged: sourceTree !== undefined && sourceTree === resultingTree,
+                    verificationOutcome: verify.outcome, costUsd: fixerCost, promoted: false,
+                  },
+                  project: task.targetRepo,
+                },
+                fixSpawn.identity,
+              );
+            } catch { /* receipt failure must never break the repair */ }
+            return { fixed, verify, model: fixerModel };
           };
         };
 
@@ -2703,20 +2767,21 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         // not). Fail-closed: only genuine, fixable check failures are retried (not injection / unresolvable
         // / skipped), and a still-red re-verify leaves the original failure to discard as before.
         if (role === "verifier" && isFixableVerifierFailure(result)) {
-          const runFixer = makeRunFixer(makeRescueVerifier(spawnRole("verifier", parentCtx)));
+          const runFixer = makeRunFixer(makeRescueVerifier(spawnRole("verifier", parentCtx)), "verifier_fail");
           if (runFixer !== undefined) {
             const fix = await runFixer(result);
             const vd = (result.detail as Record<string, unknown> | undefined) ?? {};
-            // Observability: the fixer's builder pass runs via runRoleFn WITHOUT recordRole (like the
-            // builder-stop fixer), so it writes no receipt — log the rescue outcome so it is auditable.
-            log.warn({ taskId: task.taskId, fixerModel: config.fixerModel, fixed: fix.fixed, trigger: "verifier_fail" }, fix.fixed ? "fixer rescue: closed a verifier-caught red check" : "fixer rescue: could not close the verifier-caught red check");
+            // The fixer now emits its own `worker.fixer` receipt (Phase 6); the stamps below reflect the
+            // LANE-VALID model actually dispatched (`laneFixerModel`), not the raw config, so the trail is
+            // truthful about which model ran inside this attempt's lane.
+            log.warn({ taskId: task.taskId, fixerModel: laneFixerModel, fixed: fix.fixed, trigger: "verifier_fail" }, fix.fixed ? "fixer rescue: closed a verifier-caught red check" : "fixer rescue: could not close the verifier-caught red check");
             result = fix.fixed
               ? {
                   ...fix.verify,
-                  summary: `${fix.verify.summary}; fixer rescue: ${config.fixerModel} closed a verifier-caught red check`,
-                  detail: { ...((fix.verify.detail as Record<string, unknown> | undefined) ?? {}), fixerRescue: true, fixerModel: config.fixerModel, fixerTrigger: "verifier_fail", rescueVerificationResult: "pass" },
+                  summary: `${fix.verify.summary}; fixer rescue: ${laneFixerModel} closed a verifier-caught red check`,
+                  detail: { ...((fix.verify.detail as Record<string, unknown> | undefined) ?? {}), fixerRescue: true, fixerModel: laneFixerModel, fixerTrigger: "verifier_fail", rescueVerificationResult: "pass" },
                 }
-              : { ...result, detail: { ...vd, fixerRescueAttempted: true, fixerModel: config.fixerModel, fixerTrigger: "verifier_fail", rescueVerificationResult: "fail" } };
+              : { ...result, detail: { ...vd, fixerRescueAttempted: true, fixerModel: laneFixerModel, fixerTrigger: "verifier_fail", rescueVerificationResult: "fail" } };
             results[results.length - 1] = result;
           }
         }
@@ -3663,7 +3728,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           // Always apply the rescue result: on GREEN it is the rescued success; on RED it is the
           // original failure with the rescue stamps (autoVerifyRescueAttempted / rescueVerificationResult)
           // for observability. Either way it never turns a success into a failure.
-          const rescue = await maybeAutoVerifyRescueBuilderResult(result, runRescueVerifier, makeRunFixer(runRescueVerifier), detectWork);
+          const rescue = await maybeAutoVerifyRescueBuilderResult(result, runRescueVerifier, makeRunFixer(runRescueVerifier, "builder_stop"), detectWork);
           result = rescue.result;
           results[results.length - 1] = result;
         }

@@ -81,10 +81,19 @@ export interface CriticFixLoopOutcome {
  * gates (`detail.objectiveFailure`: empty diff, missing files, unparseable verdict,
  * truncated response, no diff source) are NOT subjective feedback the builder can
  * act on — retrying them is pointless and risks churn, so they are excluded.
+ *
+ * Phase 6 (IKBI-RT-012 trigger discipline): a repair may fire only from AUTHENTIC repair evidence — a
+ * CONCRETE semantic verdict (`fail`/`incomplete`). A bare or unparsable critic FAIL classifies as
+ * `indeterminate` (Phase 4), and an infrastructure failure is not candidate evidence — neither may
+ * trigger the fixer/critic-fix loop. When the critic stamped a canonical `semanticVerdict`, gate on it;
+ * when absent (a legacy/injected critic double), preserve the prior pass-based behavior.
  */
 export function isRetryableCriticFail(criticResult: RoleResult): boolean {
   const d = detailOf(criticResult);
-  return criticResult.outcome === "success" && d.pass === false && d.objectiveFailure !== true;
+  if (criticResult.outcome !== "success" || d.pass !== false || d.objectiveFailure === true) return false;
+  const sv = d.semanticVerdict as { kind?: unknown } | undefined;
+  if (sv !== undefined && sv !== null && typeof sv.kind === "string") return sv.kind === "fail" || sv.kind === "incomplete";
+  return true;
 }
 
 /**
