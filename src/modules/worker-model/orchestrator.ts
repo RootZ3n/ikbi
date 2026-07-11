@@ -75,6 +75,7 @@ import {
 } from "../runtime-truth/index.js";
 import { applyConsultPatch } from "./consult-apply.js";
 import { CandidateLeaseRegistry, type VerificationSnapshot } from "./candidate-lease.js";
+import { createPhysicalSnapshot as defaultCreatePhysicalSnapshot, verifySnapshotUnchanged, type PhysicalSnapshot } from "./workspace-snapshot.js";
 import type { ApplyConsultPatchInput, ApplyConsultPatchResult } from "./consult-apply.js";
 
 import type { ExecRequest, GovernedExec } from "../governed-exec/index.js";
@@ -725,6 +726,12 @@ export interface OrchestratorDeps {
    */
   readonly resolveWorkspaceIdentity?: (workspacePath: string) => Promise<WorkspaceIdentityResolution>;
   /**
+   * Phase 13C (physical frozen snapshot). Create a physically isolated, read-only snapshot of a git-backed
+   * candidate's committed tree (a detached worktree). Default: the real `createPhysicalSnapshot`. Injectable so
+   * tests can force success/failure/absence; returns undefined for a non-git source (the logical binding stands).
+   */
+  readonly createPhysicalSnapshot?: (sourceWorktreePath: string, expectedTree?: string) => Promise<PhysicalSnapshot | undefined>;
+  /**
    * Production runtime-truth EVIDENCE reader (Phase 5). When provided (or resolvable from the
    * configured `IKBI_RUNTIME_TRUTH_READER_MODULE`), the orchestrator requests bounded, task/candidate-
    * scoped evidence and injects it into the builder/critic model context. Absent + disabled ⇒ inert.
@@ -975,6 +982,9 @@ export interface PromotionCandidate {
    */
   readonly snapshotId?: string;
   readonly snapshotDigest?: string;
+  /** Phase 13C: the physically isolated (detached-worktree) snapshot path + immutability, when git-backed. */
+  readonly snapshotPath?: string;
+  readonly snapshotImmutable?: boolean;
 }
 
 /** How the critic's verdict was resolved (Phase 3 critic-parser boundary). */
@@ -2145,6 +2155,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           // FROZEN SUBJECT (Phase 13B): the immutable snapshot id + digest all evidence binds to. The stale-tree
           // + CAS above/below confirm the promoted content equals exactly this frozen subject.
           ...(candidate.snapshotId !== undefined ? { snapshotId: candidate.snapshotId, snapshotDigest: candidate.snapshotDigest } : {}),
+          // PHYSICAL FROZEN SUBJECT (Phase 13C): the isolated read-only snapshot path + immutability. Promotion
+          // sources exactly this frozen tree; the CAS confirms landedTree == the snapshot digest.
+          ...(candidate.snapshotPath !== undefined ? { snapshotPath: candidate.snapshotPath, snapshotImmutable: candidate.snapshotImmutable === true, snapshotKind: "physical-isolated" } : (candidate.snapshotId !== undefined ? { snapshotKind: "logical" } : {})),
           verificationPassed: evidence.verificationPassed,
           ...(evidence.verificationMode !== undefined ? { verificationMode: evidence.verificationMode } : {}),
           semanticVerdict: evidence.semanticKind,
@@ -4761,6 +4774,33 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             const freezeElig = normalReg.canFreeze(gen.generationId);
             if (freezeElig.ok) normalSnapshot = normalReg.freeze(gen.generationId, { canonicalDigest: verifiedTree, gitTree: verifiedTree, ...(verifiedTargetHead !== undefined ? { baseIdentity: verifiedTargetHead } : {}) });
           }
+          // PHYSICAL FROZEN SNAPSHOT (Phase 13C): for a git-backed candidate, materialize a physically isolated,
+          // read-only detached-worktree snapshot of the committed verified tree. A source mutation after this
+          // cannot change it. FAIL-CLOSED: if a git-backed subject cannot be physically frozen + verified, block
+          // autonomous promotion (do not promote the mutable source). Non-git ⇒ undefined (logical binding stands).
+          let physicalSnapshot: PhysicalSnapshot | undefined;
+          let snapshotIntegrityError: string | undefined;
+          // Only materialize a PHYSICAL snapshot when `verifiedTree` came from the REAL git probe (deps.readTreeHash
+          // not injected) — a stubbed tree reader means the test controls identity logically, so the physical
+          // (real-git) subject would not match; those keep the Phase 13B logical binding.
+          if (normalSnapshot !== undefined && deps.readTreeHash === undefined && normalIdentity.treeIdentityRequired && !normalIdentity.identityIndeterminate && verifiedTree !== undefined) {
+            try {
+              physicalSnapshot = await (deps.createPhysicalSnapshot ?? defaultCreatePhysicalSnapshot)(workspace.path, verifiedTree);
+            } catch (err) {
+              snapshotIntegrityError = err instanceof Error ? err.message : String(err);
+            }
+          }
+          if (snapshotIntegrityError !== undefined) {
+            await receipts.append(
+              { operation: "worker.promotion.snapshot_integrity_error", outcome: { status: "failure", detail: snapshotIntegrityError }, requestId: task.taskId, metadata: { taskId: task.taskId, workspaceId: workspace.id, verifiedTree: verifiedTree ?? null }, project: task.targetRepo },
+              parentIdentity,
+            ).catch(() => {});
+            await safeRetain(workspaces, workspace, `physical snapshot integrity failure: ${snapshotIntegrityError}`);
+            overall = "rejected";
+            reason = `snapshot-integrity: ${snapshotIntegrityError}`;
+            trustSuppressed = true;
+            trustSuppressReason = "physical verification snapshot could not be frozen/verified (integrity, not a worker quality failure)";
+          } else {
           const candidate: PromotionCandidate = {
             taskId: task.taskId,
             attemptId: task.taskId,
@@ -4775,7 +4815,18 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             ...(normalIdentity.identityIndeterminate ? { identityIndeterminate: true } : {}),
             ...(activeMutationFences.get(task.taskId)?.isFenced(workspace.id) ? { mutationFenced: true } : {}),
             ...(normalSnapshot !== undefined ? { snapshotId: normalSnapshot.snapshotId, snapshotDigest: normalSnapshot.canonicalDigest } : {}),
+            ...(physicalSnapshot !== undefined ? { snapshotPath: physicalSnapshot.snapshotPath, snapshotImmutable: physicalSnapshot.immutable } : {}),
           };
+          // IDENTITY IMMEDIATELY BEFORE PROMOTION (Phase 13C): re-verify the physical snapshot still resolves to
+          // its recorded tree + is still read-only. A snapshot that drifted is an integrity failure — block.
+          if (physicalSnapshot !== undefined && (await verifySnapshotUnchanged(physicalSnapshot)) === false) {
+            await physicalSnapshot.cleanup().catch(() => {});
+            await safeRetain(workspaces, workspace, "physical snapshot drifted before promotion");
+            overall = "rejected";
+            reason = "snapshot-integrity: the frozen snapshot changed before promotion";
+            trustSuppressed = true;
+            trustSuppressReason = "physical snapshot drifted before promotion (integrity, not a worker quality failure)";
+          } else {
           const evidence: CandidateEvidence = {
             verificationPassed: normalVerifier?.outcome === "success",
             ...(actualVerificationMode !== undefined ? { verificationMode: actualVerificationMode } : {}),
@@ -4819,6 +4870,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               reason = canon.promote.reason ?? "promote did not land (conflict)";
             }
           }
+          // PHYSICAL SNAPSHOT CLEANUP (Phase 13C): after the promote decision + its receipt are durable, tear
+          // down the isolated read-only worktree. Cleanup happens ONLY after promotion + receipt (never before).
+          if (physicalSnapshot !== undefined) await physicalSnapshot.cleanup().catch(() => {});
+          } // close the snapshot-drift else
+          } // close the snapshot-integrity else
         }
       }
     } else if (!approvalRejected) {

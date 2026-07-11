@@ -1648,6 +1648,13 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         stopReason = "timeout";
         break;
       }
+      // COOPERATIVE ABORT (Phase 13C): the orchestrator aborts `ctx.signal` when this role exceeds its
+      // wall-clock timeout. Stop the tool loop HERE (iteration granularity) so a timed-out builder stops
+      // scheduling new tools + mutating — the non-cooperative mutation fence remains the final authority.
+      if (ctx.signal?.aborted === true) {
+        stopReason = "aborted";
+        break;
+      }
       // COOPERATIVE MID-LOOP HALT: a kill-switch kill or a blown whole-pipeline budget stops
       // the builder HERE (iteration granularity) rather than waiting for the role to end.
       if (deps.checkHalt !== undefined) {
