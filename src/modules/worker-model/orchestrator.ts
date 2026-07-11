@@ -60,7 +60,7 @@ import { DriftBlockedError } from "../drift-prevention/index.js";
 import type { DriftPrevention, DriftReport } from "../drift-prevention/index.js";
 import { rosterFromIds } from "../model-router/index.js";
 import { rentBuilderExpert, classifyTaskTier, resolveClassifierModel, laneRoster, type RentedExpert } from "./expert-rental.js";
-import { semanticPromotionEligible, type SemanticVerdict, type SemanticVerdictKind } from "./semantic-verdict.js";
+import { semanticPromotionEligible, semanticDuelEligible, type SemanticVerdict, type SemanticVerdictKind } from "./semantic-verdict.js";
 import {
   loadRuntimeTruthReader,
   runtimeTruthEvidenceEnabled,
@@ -909,6 +909,9 @@ export interface CandidateEvidence {
   readonly verificationMode?: string;
   /** Semantic (critic) verdict, classified. `not-evaluated` = the strategy ran no model critic. */
   readonly semanticKind: SemanticVerdictKind;
+  /** The durable `worker.semantic` evidence id backing this verdict (Phase 9) — the promotion receipt
+   *  references it rather than duplicating the full validated defect set. */
+  readonly semanticEvaluationId?: string;
   /** Whether policy explicitly permits promoting THIS candidate without semantic evaluation (Phase 4). */
   readonly semanticEvaluationOptional?: boolean;
   /** The authoritative policy decision (integrator/judge/adjudication) — promote iff true. */
@@ -1309,6 +1312,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     if (deps.roles?.critic !== undefined) return deps.roles.critic;
     return createCritic({
       ...(workspaces.diff !== undefined ? { diff: (ws: WorkspaceHandle) => workspaces.diff!(ws) } : {}),
+      // Phase 9: bind the semantic verdict to the tree the verifier certified. Real-critic only — an
+      // injected test double returns above, so this never perturbs the Phase 3 stale-tree read sequence.
+      resolveVerifiedTree: (ws: WorkspaceHandle) => readTreeHash(ws.path),
     });
   }
 
@@ -1871,6 +1877,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           verificationPassed: evidence.verificationPassed,
           ...(evidence.verificationMode !== undefined ? { verificationMode: evidence.verificationMode } : {}),
           semanticVerdict: evidence.semanticKind,
+          ...(evidence.semanticEvaluationId !== undefined ? { semanticEvaluationId: evidence.semanticEvaluationId } : {}),
           policyPromote: evidence.policyPromote,
           gateWallAllowed: evidence.governance.allow,
           staleTreeChecked: candidate.verifiedTree !== undefined && currentTree !== undefined,
@@ -1883,6 +1890,88 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       parentIdentity,
     );
     return { promote: result };
+  }
+
+  /**
+   * DURABLE SEMANTIC EVIDENCE (Phase 9, IKBI-RT-006). Persist the FULL validated semantic evaluation for a
+   * final critic result — not just the KIND, but the complete validated blocking-defect set, missing
+   * requirements, advisories, the structured-output recovery trail, and the policy consequence. This is
+   * what the fixer, operator, and a later audit read to know WHY a candidate was rejected (the promotion
+   * receipt records the `semanticEvaluationId` and never has to duplicate the defect set). Persists ONLY
+   * parser-VALIDATED defects (the parser already dropped malformed/generic/cross-candidate/invented ones)
+   * and a raw-output HASH (never the raw model output). Best-effort: a receipt failure never breaks a build.
+   * Returns the stable `semanticEvaluationId`, or undefined when no model critic produced a verdict.
+   */
+  async function emitSemanticEvidence(
+    criticResult: RoleResult | undefined,
+    binding: { taskId: string; attemptId: string; candidateId: string; verifiedTree?: string; strategy: string; verificationPassed: boolean; targetRepo: string },
+    parentIdentity: AgentIdentity,
+  ): Promise<string | undefined> {
+    if (criticResult === undefined) return undefined;
+    const d = (criticResult.detail ?? {}) as Record<string, unknown>;
+    const sv = d.semanticVerdict as SemanticVerdict | undefined;
+    if (typeof sv !== "object" || sv === null || typeof sv.kind !== "string") return undefined;
+    const semanticEvaluationId = `${binding.candidateId}:${binding.verifiedTree ?? "novt"}:sem`;
+    const recoveryInvoked = d.recoveryInvoked === true;
+    // Distinct RECOVERY receipt (Phase 9): the ONE model-backed reformat call — its own invocation id,
+    // in-lane model, and separately-attributed cost/status. Emitted only when recovery actually ran.
+    if (recoveryInvoked) {
+      try {
+        await receipts.append(
+          {
+            operation: "worker.critic_recovery",
+            outcome: { status: d.recoveryOutcome === "repaired" ? "success" : "failure", detail: String(d.recoveryOutcome ?? "") },
+            requestId: binding.taskId,
+            metadata: {
+              semanticEvaluationId, taskId: binding.taskId, attemptId: binding.attemptId, candidateId: binding.candidateId,
+              invocationId: d.recoveryInvocationId, recoveryModel: d.recoveryModel, dispatchedModel: d.recoveryModel,
+              ...(d.recoveryVendorLane !== undefined ? { vendorLane: d.recoveryVendorLane } : {}),
+              outcome: d.recoveryOutcome, rejectReason: d.recoveryRejectReason ?? d.recoveryFailReason,
+              costUsd: d.recoveryCostUsd, costStatus: d.recoveryCostStatus,
+              eligibilityReason: d.recoveryEligibilityReason, finalVerdict: sv.kind,
+            },
+            project: binding.targetRepo,
+          },
+          parentIdentity,
+        );
+      } catch { /* receipt failure must never break the build */ }
+    }
+    try {
+      await receipts.append(
+        {
+          operation: "worker.semantic",
+          outcome: { status: sv.kind === "pass" ? "success" : "failure", detail: sv.summary },
+          requestId: binding.taskId,
+          metadata: {
+            semanticEvaluationId,
+            taskId: binding.taskId, attemptId: binding.attemptId, candidateId: binding.candidateId,
+            ...(binding.verifiedTree !== undefined ? { verifiedTree: binding.verifiedTree } : {}),
+            strategy: binding.strategy,
+            verificationPassed: binding.verificationPassed,
+            verdict: sv.kind,
+            ...(sv.evaluatorModel !== undefined ? { evaluatorModel: sv.evaluatorModel } : {}),
+            criticModel: sv.evaluatorModel,
+            parseStatus: sv.parseStatus,
+            summary: sv.summary,
+            blockingDefects: sv.blockingDefects, // FULL parser-validated set (Phase 9)
+            missingRequirements: sv.incompleteRequirements,
+            advisories: sv.advisories,
+            ...(typeof d.rawOutputHash === "string" ? { rawOutputHash: d.rawOutputHash } : {}),
+            recoveryInvoked,
+            ...(d.recoveryEligible !== undefined ? { recoveryEligible: d.recoveryEligible } : {}),
+            ...(d.recoveryOutcome !== undefined ? { recoveryOutcome: d.recoveryOutcome } : {}),
+            ...(d.recoveryInvocationId !== undefined ? { recoveryInvocationId: d.recoveryInvocationId } : {}),
+            ...(d.recoveryModel !== undefined ? { recoveryModel: d.recoveryModel } : {}),
+            ...(d.recoveryCostUsd !== undefined ? { recoveryCostUsd: d.recoveryCostUsd, recoveryCostStatus: d.recoveryCostStatus } : {}),
+            promotionEligible: semanticPromotionEligible(sv.kind, false),
+            duelEligible: semanticDuelEligible(sv.kind),
+          },
+          project: binding.targetRepo,
+        },
+        parentIdentity,
+      );
+    } catch { /* receipt failure must never break the build */ }
+    return semanticEvaluationId;
   }
 
   /** Cooperative kill checkpoint: does an active kill target THIS run? (read-only; never publishes). */
@@ -3993,6 +4082,23 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     const verifiedTree = await readTreeHash(workspace.path);
     const verifiedTargetHead = workspace.baseRef;
 
+    // DURABLE SEMANTIC EVIDENCE (Phase 9, IKBI-RT-006): persist the FULL validated verdict for the final
+    // critic result — whether the build promotes or is rejected — and reference its id from the promotion
+    // receipt. Runs after all roles/rescue so it captures the post-fix critic. No-op when no critic ran.
+    const normalSemanticEvaluationId = await emitSemanticEvidence(
+      results.find((r) => r.role === "critic"),
+      {
+        taskId: task.taskId,
+        attemptId: task.taskId,
+        candidateId: task.taskId,
+        ...(verifiedTree !== undefined ? { verifiedTree } : {}),
+        strategy: task.moeVendorLane === "mimo" ? "duel-peer" : task.moeVendorLane === "deepseek" ? "duel-primary" : "normal",
+        verificationPassed: results.find((r) => r.role === "verifier")?.outcome === "success",
+        targetRepo: task.targetRepo,
+      },
+      parentIdentity,
+    );
+
     // Terminal: a KILL halted the run mid-loop ⇒ stop cleanly (NEVER promote a half-run),
     // surface the kill, return. The workspace is RETAINED (not discarded) so its partial work
     // survives for inspection — `ikbi workspace ls` shows it; `ikbi workspace discard <id>` or
@@ -4223,6 +4329,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             verificationPassed: results.find((r) => r.role === "verifier")?.outcome === "success",
             ...(actualVerificationMode !== undefined ? { verificationMode: actualVerificationMode } : {}),
             semanticKind: classifySemanticVerdict(results.find((r) => r.role === "critic")),
+            ...(normalSemanticEvaluationId !== undefined ? { semanticEvaluationId: normalSemanticEvaluationId } : {}),
             policyPromote: true, // the integrator (or authoritative adjudication) already decided promote
             governance,
             evaluation: decision.evaluation, // sourced from the integrator, NOT hardcoded
@@ -4768,6 +4875,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       // authority as every strategy (stale-tree + verifiedAgainst + canonical receipt + semantic gate).
       const compWinnerModel = (selectedRoles.find((r) => r.role === "builder")?.detail as Record<string, unknown> | undefined)?.model;
       const compVerifiedTree = await readTreeHash(winner.path);
+      const compSemanticEvaluationId = await emitSemanticEvidence(
+        compCritic,
+        { taskId: task.taskId, attemptId: task.taskId, candidateId: winner.id, ...(compVerifiedTree !== undefined ? { verifiedTree: compVerifiedTree } : {}), strategy: "competitive", verificationPassed: selectedRoles.find((r) => r.role === "verifier")?.outcome === "success", targetRepo: task.targetRepo },
+        parentIdentity,
+      );
       const canon = await promoteCandidate(
         winner,
         {
@@ -4778,6 +4890,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         {
           verificationPassed: selectedRoles.find((r) => r.role === "verifier")?.outcome === "success",
           semanticKind: compSemanticKind,
+          ...(compSemanticEvaluationId !== undefined ? { semanticEvaluationId: compSemanticEvaluationId } : {}),
           policyPromote: true, governance,
           evaluation: { approved: true, score: verdict.winner.composite, evaluatorId: "deterministic-judge" },
           message: `worker-model (competitive): ${task.goal}`,
@@ -4970,6 +5083,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       // like every strategy (stale-tree + verifiedAgainst + canonical receipt + semantic gate).
       const tourWinnerModel = (roleResults.find((r) => r.role === "builder")?.detail as Record<string, unknown> | undefined)?.model;
       const tourVerifiedTree = await readTreeHash(ws.path);
+      const tourSemanticEvaluationId = await emitSemanticEvidence(
+        tourCritic,
+        { taskId: t.taskId, attemptId: t.taskId, candidateId: ws.id, ...(tourVerifiedTree !== undefined ? { verifiedTree: tourVerifiedTree } : {}), strategy: "tournament", verificationPassed: roleResults.find((r) => r.role === "verifier")?.outcome === "success", targetRepo: t.targetRepo },
+        parentIdentity,
+      );
       const canon = await promoteCandidate(
         ws,
         {
@@ -4980,6 +5098,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         {
           verificationPassed: roleResults.find((r) => r.role === "verifier")?.outcome === "success",
           semanticKind: classifySemanticVerdict(tourCritic),
+          ...(tourSemanticEvaluationId !== undefined ? { semanticEvaluationId: tourSemanticEvaluationId } : {}),
           policyPromote: true, governance,
           evaluation: { approved: true, score: composite, evaluatorId: "deterministic-judge" },
           message: `worker-model (tournament): ${t.goal}`,

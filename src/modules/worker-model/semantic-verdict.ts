@@ -106,6 +106,57 @@ function isConcreteClaim(s: string): boolean {
   return true;
 }
 
+/**
+ * Flatten a defect's `evidence` to a string. Accepts the legacy scalar string AND the Phase 9 rich
+ * `evidence: [{kind, reference, detail}]` array (each entry joined "kind: reference — detail"). Falls
+ * back to the claim when the model supplied no usable evidence.
+ */
+function flattenEvidence(value: unknown, fallback: string): string {
+  if (typeof value === "string" && value.trim().length > 0) return value.trim();
+  if (Array.isArray(value)) {
+    const parts = value
+      .map((e): string => {
+        if (typeof e === "string") return e.trim();
+        if (typeof e === "object" && e !== null) {
+          const o = e as Record<string, unknown>;
+          const kind = typeof o.kind === "string" ? o.kind.trim() : "";
+          const ref = typeof o.reference === "string" ? o.reference.trim() : "";
+          const detail = typeof o.detail === "string" ? o.detail.trim() : "";
+          const head = [kind, ref].filter((s) => s.length > 0).join(": ");
+          return [head, detail].filter((s) => s.length > 0).join(" — ");
+        }
+        return "";
+      })
+      .filter((s) => s.length > 0);
+    if (parts.length > 0) return parts.join("; ");
+  }
+  return fallback;
+}
+
+/**
+ * Concrete missing requirements. Accepts the legacy `string[]` (`incompleteRequirements`/`missing`) AND
+ * the Phase 9 rich `missingRequirements: [{requirement, evidence}]`. Only concrete requirements survive.
+ */
+function readMissingRequirements(obj: Record<string, unknown>): string[] {
+  const src = Array.isArray(obj.missingRequirements)
+    ? obj.missingRequirements
+    : Array.isArray(obj.incompleteRequirements)
+      ? obj.incompleteRequirements
+      : Array.isArray(obj.missing)
+        ? obj.missing
+        : [];
+  const out: string[] = [];
+  for (const item of src) {
+    if (typeof item === "string") {
+      if (isConcreteClaim(item)) out.push(item.trim());
+    } else if (typeof item === "object" && item !== null) {
+      const req = (item as Record<string, unknown>).requirement;
+      if (typeof req === "string" && isConcreteClaim(req)) out.push(req.trim());
+    }
+  }
+  return out;
+}
+
 /** Concrete defects from the RICH `blockingDefects` schema only. */
 function richDefects(obj: Record<string, unknown>, goal: string): BlockingDefect[] {
   const out: BlockingDefect[] = [];
@@ -115,7 +166,7 @@ function richDefects(obj: Record<string, unknown>, goal: string): BlockingDefect
     const d = raw as Record<string, unknown>;
     const claim = typeof d.claim === "string" ? d.claim.trim() : "";
     if (!isConcreteClaim(claim)) continue; // a defect without a concrete claim is not a defect
-    const evidence = typeof d.evidence === "string" && d.evidence.trim().length > 0 ? d.evidence.trim() : claim;
+    const evidence = flattenEvidence(d.evidence, claim);
     const requirement = typeof d.requirement === "string" && d.requirement.trim().length > 0 ? d.requirement.trim() : goal;
     const loc = typeof d.location === "object" && d.location !== null ? (d.location as Record<string, unknown>) : undefined;
     out.push({
@@ -189,6 +240,16 @@ export function parseSemanticVerdict(content: string, ctx?: SemanticParseContext
   const obj = extractJsonObject(trimmed);
   if (obj === undefined) return indeterminate("critic output was not parseable structured JSON", ctx, "unparsable");
 
+  // CANDIDATE/TREE BINDING (Phase 9): if the model ECHOED a binding that disagrees with the one under
+  // evaluation, the verdict describes a DIFFERENT candidate/tree — it cannot bind here → indeterminate
+  // (never a defect, never recovery-eligible). A missing echo is fine (the context binding is stamped).
+  const echoedCandidate = typeof obj.candidateId === "string" ? obj.candidateId.trim() : undefined;
+  const echoedTree = typeof obj.verifiedTree === "string" ? obj.verifiedTree.trim() : undefined;
+  if (ctx?.candidateId !== undefined && echoedCandidate !== undefined && echoedCandidate.length > 0 && echoedCandidate !== ctx.candidateId)
+    return indeterminate("cross-candidate: critic output is bound to a different candidateId than the candidate under evaluation", ctx, "unparsable");
+  if (ctx?.verifiedTree !== undefined && echoedTree !== undefined && echoedTree.length > 0 && echoedTree !== ctx.verifiedTree)
+    return indeterminate("stale-tree: critic output is bound to a different verifiedTree than the candidate under evaluation", ctx, "unparsable");
+
   const advisories: SemanticAdvisory[] = (Array.isArray(obj.advisories) ? obj.advisories : [])
     .map((a): SemanticAdvisory | undefined => (typeof a === "object" && a !== null && typeof (a as Record<string, unknown>).claim === "string" ? { claim: ((a as Record<string, unknown>).claim as string).trim(), ...(typeof (a as Record<string, unknown>).evidence === "string" ? { evidence: (a as Record<string, unknown>).evidence as string } : {}) } : undefined))
     .filter((a): a is SemanticAdvisory => a !== undefined && a.claim.length > 0);
@@ -201,9 +262,7 @@ export function parseSemanticVerdict(content: string, ctx?: SemanticParseContext
 
   const goal = ctx?.goal ?? "the stated goal";
   const rich = richDefects(obj, goal);
-  const incompleteRequirements = (Array.isArray(obj.incompleteRequirements) ? obj.incompleteRequirements : Array.isArray(obj.missing) ? obj.missing : [])
-    .filter((x): x is string => typeof x === "string" && isConcreteClaim(x))
-    .map((s) => s.trim());
+  const incompleteRequirements = readMissingRequirements(obj);
 
   if (verdict === "pass") {
     // A pass that also lists RICH blocking defects is CONTRADICTORY — cannot safely resolve intent.
