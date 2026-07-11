@@ -55,10 +55,12 @@ test("rentBuilderExpert: a vendorLane restricts rentals to that vendor's experts
   assert.equal(mimo.modelId, "mimo-v2.5-pro", "mimo lane rents the mimo mid expert — a genuine peer, different vendor");
 });
 
-test("rentBuilderExpert: a vendorLane that empties a tier falls back to the full roster (never strands)", () => {
-  // A mechanical task rents the worker tier; the "mimo" lane there is ["mimo-v2.5"], non-empty.
+test("rentBuilderExpert [Phase 11]: an empty vendorLane falls back to the explicit fallback model — NEVER borrows the other lane's roster", () => {
+  // Phase 11 (IKBI-REAUDIT-002): a lane with no matching model must NOT silently borrow the full roster
+  // (a cross-lane hole). rentBuilderExpert now returns the explicit operator `fallback`, not the cheapest
+  // model of some other vendor lane.
   const r = rentBuilderExpert({ goal: "append an export line", tierRosters: POOL, fallback: "x", vendorLane: "nonexistent-vendor" });
-  assert.equal(r.modelId, "deepseek-v4-flash", "an unknown lane empties every tier → full-roster fallback (cheapest worker)");
+  assert.equal(r.modelId, "x", "an unknown lane empties every tier → the EXPLICIT fallback, not a cross-lane borrow");
 });
 
 test("rentBuilderExpert: an explicit tierOverride skips the heuristic", () => {
