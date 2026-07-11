@@ -57,6 +57,7 @@ function cleanRoles() {
     roles[r] = async () => {
       if (r === "builder") { calls.builder += 1; return { role: r, outcome: "success", summary: "built", detail: { filesWritten: ["a.ts"], policyViolations: [] } }; }
       if (r === "integrator") return { role: r, outcome: "success", summary: r, detail: { decision: "promote", evaluation: { approved: true } } };
+      if (r === "verifier") return { role: r, outcome: "success", summary: r, detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }] } };
       return { role: r, outcome: "success", summary: r };
     };
   }

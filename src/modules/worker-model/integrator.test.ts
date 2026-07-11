@@ -105,9 +105,12 @@ test("STEP-PLANNER accumulated pass (reuseWorkspace): builder wrote 0 files this
   assert.match(rationaleOf(r), /accumulated multi-step build/);
 });
 
-// C1 — TEST EVIDENCE GATE. The verifier stamps a 4-state testEvidence onto its result detail.
-// A single-run build that VERIFIES but ran no real tests proved nothing and must NOT promote;
-// an accumulated build (reuseWorkspace) is exempt because prior steps already verified.
+// C1 — EXECUTED-TEST EVIDENCE GATE (Phase 10, IKBI-REAUDIT-001). The verifier stamps a 4-state
+// testEvidence onto its result. A build that VERIFIES but ran no real tests (zero/unverified/absent/
+// missing) proved nothing and must NOT autonomously promote — INCLUDING the accumulated (reuseWorkspace)
+// final pass, which runs the full verifier on the whole tree and must produce its OWN executed evidence.
+// The old "reuseWorkspace ⇒ exempt from the test-evidence gate" hole is CLOSED. A no-tests-configured
+// (`absent`) tree promotes ONLY under an explicit named policy (task.noTestsPolicy / IKBI_ALLOW_NO_TESTS).
 const reuseHandle: WorkspaceHandle = {
   id: "ws-shared", targetRepo: "/repo", baseBranch: "main", baseRef: "x", scratchBranch: "ikbi/ws/ws-shared",
   path: "/repo", identity: IDENTITY, state: "allocated", createdAt: 0,
@@ -118,14 +121,15 @@ for (const evidence of ["zero", "unverified"] as const) {
   test(`C1: single-run verifier pass with testEvidence="${evidence}" → DISCARD (no real test signal)`, async () => {
     const r = await integrator(ctxWith([builderOk, criticPass, verifierNoTests]));
     assert.equal(decisionOf(r), "discard");
-    assert.match(rationaleOf(r), /no real test evidence/);
+    assert.match(rationaleOf(r), /no authentic executed-test evidence/);
     assert.match(rationaleOf(r), new RegExp(evidence));
   });
 
-  test(`C1: ACCUMULATED verifier pass with testEvidence="${evidence}" → PROMOTE (prior steps verified)`, async () => {
+  test(`C1 [Phase 10]: ACCUMULATED verifier pass with testEvidence="${evidence}" → DISCARD (the reuseWorkspace exemption is removed)`, async () => {
     const ctx = ctxWith([{ role: "builder", outcome: "success", summary: "b", detail: { filesWritten: [], policyViolations: [] } }, criticPass, verifierNoTests]);
     const r = await integrator({ ...ctx, task: { ...ctx.task, reuseWorkspace: reuseHandle } });
-    assert.equal(decisionOf(r), "promote", "an accumulated pass is exempt from the test-evidence gate");
+    assert.equal(decisionOf(r), "discard", "an accumulated final pass is held to the same executed-evidence bar as a single run");
+    assert.match(rationaleOf(r), /no authentic executed-test evidence/);
   });
 }
 
@@ -135,13 +139,31 @@ test('C1: single-run verifier pass with testEvidence="executed" → PROMOTE (rea
   assert.equal(decisionOf(r), "promote");
 });
 
+test('C1 [Phase 10]: ACCUMULATED verifier pass with testEvidence="executed" → PROMOTE (final tree ran real tests)', async () => {
+  // The legitimate multi-step happy path: the final verify pass wrote 0 files (writeScope none) but ran
+  // the full suite on the accumulated tree → executed. The builder-files gate still relaxes on reuse.
+  const verifierExecuted: RoleResult = { role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: [], testEvidence: "executed" } };
+  const ctx = ctxWith([{ role: "builder", outcome: "success", summary: "b", detail: { filesWritten: [], policyViolations: [] } }, criticPass, verifierExecuted]);
+  const r = await integrator({ ...ctx, task: { ...ctx.task, reuseWorkspace: reuseHandle } });
+  assert.equal(decisionOf(r), "promote");
+});
+
+test('C1 [Phase 10]: testEvidence="absent" → DISCARD by default, but PROMOTE under an explicit noTestsPolicy', async () => {
+  const verifierAbsent: RoleResult = { role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: [], testEvidence: "absent" } };
+  const blocked = await integrator(ctxWith([builderOk, criticPass, verifierAbsent]));
+  assert.equal(decisionOf(blocked), "discard", "no tests configured blocks autonomous promotion by default (fail-closed)");
+  const ctx = ctxWith([builderOk, criticPass, verifierAbsent]);
+  const allowed = await integrator({ ...ctx, task: { ...ctx.task, noTestsPolicy: true } });
+  assert.equal(decisionOf(allowed), "promote", "an explicit no-tests policy permits promoting a genuinely test-less repo");
+});
+
 test("C1 (fail-closed): single-run verifier pass with MISSING testEvidence → DISCARD (cannot confirm a real signal)", async () => {
-  // No testEvidence field at all — the integrator no longer exempts it (Codex C1). An absent field
-  // is treated like "zero"/"unverified": promote requires a verified "executed" signal.
+  // No testEvidence field at all — never exempted. An absent field is treated like "zero"/"unverified":
+  // promote requires a verified "executed" signal.
   const verifierNoEvidence: RoleResult = { role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: [] } };
   const r = await integrator(ctxWith([builderOk, criticPass, verifierNoEvidence]));
   assert.equal(decisionOf(r), "discard");
-  assert.match(rationaleOf(r), /no real test evidence/);
+  assert.match(rationaleOf(r), /no authentic executed-test evidence/);
 });
 
 test("STEP-PLANNER accumulated pass still fail-closes: a RED verifier discards even with reuseWorkspace", async () => {

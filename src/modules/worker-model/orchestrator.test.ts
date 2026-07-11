@@ -157,6 +157,13 @@ function capturingRoles(outcomeFor: (role: WorkerRole) => WorkerOutcome = () => 
           ? { role: r, outcome, summary: r, detail: { decision: "promote", rationale: "test: promote", evaluation: { approved: true } } }
           : { role: r, outcome, summary: r, detail: { decision: "discard", rationale: "test: verifier not green", evaluation: { approved: false } } };
       }
+      // A GREEN verifier carries a real executed-test check (a passing suite with a parsed count), so a
+      // promoting candidate has authentic `executed` evidence — the Phase 10 promotion authority requires
+      // it. (readVerifier re-derives testEvidence from the checks, so a detail-less stub reads as `absent`
+      // and would be blocked.)
+      if (r === "verifier" && outcome === "success") {
+        return { role: r, outcome, summary: r, detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }] } };
+      }
       return { role: r, outcome, summary: r };
     };
   }
@@ -1244,7 +1251,7 @@ test("real scout/builder/critic + stubbed verifier/integrator → coherent succe
     diff: async () => "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n-export const a = 1;\n+export const a = 2;\n",
   };
   const roles: Partial<Record<WorkerRole, RoleFn>> = {
-    verifier: async () => ({ role: "verifier", outcome: "success", summary: "checks ok (stubbed in test)" }),
+    verifier: async () => ({ role: "verifier", outcome: "success", summary: "checks ok (stubbed in test)", detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }] } }),
     integrator: async () => ({
       role: "integrator",
       outcome: "success",
@@ -1280,7 +1287,9 @@ const successFakes = (): Partial<Record<WorkerRole, RoleFn>> => ({
   scout: async () => ({ role: "scout", outcome: "success", summary: "s" }),
   builder: async () => ({ role: "builder", outcome: "success", summary: "b" }),
   critic: async () => ({ role: "critic", outcome: "success", summary: "c" }),
-  verifier: async () => ({ role: "verifier", outcome: "success", summary: "v" }),
+  // A green verifier carries a real executed-test check so a promoting candidate has authentic
+  // `executed` evidence (Phase 10 promotion authority requires it; readVerifier re-derives from checks).
+  verifier: async () => ({ role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }] } }),
 });
 
 test("LATENT-BUG FIX: all roles succeed but critic pass=false → integrator discards → NO promote", async () => {

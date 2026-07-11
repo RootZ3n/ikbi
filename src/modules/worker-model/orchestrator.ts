@@ -61,6 +61,8 @@ import type { DriftPrevention, DriftReport } from "../drift-prevention/index.js"
 import { rosterFromIds } from "../model-router/index.js";
 import { rentBuilderExpert, classifyTaskTier, resolveClassifierModel, laneRoster, type RentedExpert } from "./expert-rental.js";
 import { semanticPromotionEligible, semanticDuelEligible, type SemanticVerdict, type SemanticVerdictKind } from "./semantic-verdict.js";
+import { evaluateExecutedTestEvidence, noTestsPolicyEnabled } from "./executed-evidence.js";
+import type { TestEvidence } from "./adjudication/contract.js";
 import {
   loadRuntimeTruthReader,
   runtimeTruthEvidenceEnabled,
@@ -702,6 +704,12 @@ export interface OrchestratorDeps {
    */
   readonly readTreeHash?: (workspacePath: string) => Promise<string | undefined>;
   /**
+   * Whether a workspace path is a real git worktree (Phase 10, IKBI-REAUDIT-006). Used to fail the
+   * promote CLOSED when a git-backed candidate's tree identity cannot be read (vs a genuinely non-git
+   * in-memory/test workspace, which is exempt). Default: `git rev-parse --is-inside-work-tree`.
+   */
+  readonly isGitBacked?: (workspacePath: string) => Promise<boolean>;
+  /**
    * Production runtime-truth EVIDENCE reader (Phase 5). When provided (or resolvable from the
    * configured `IKBI_RUNTIME_TRUTH_READER_MODULE`), the orchestrator requests bounded, task/candidate-
    * scoped evidence and injects it into the builder/critic model context. Absent + disabled ⇒ inert.
@@ -891,6 +899,13 @@ export interface PromotionCandidate {
   readonly verifiedTree?: string;
   /** The target-branch head verification ran against (for hash-bound promote authorization). */
   readonly targetHead?: string;
+  /**
+   * Whether the workspace is a real git worktree, so an ENFORCEABLE tree identity is REQUIRED (Phase 10,
+   * IKBI-REAUDIT-006). When true, an unreadable/absent tree hash fails the promote CLOSED instead of
+   * silently dropping the stale-tree + CAS checks. In-memory/non-git test workspaces leave this false and
+   * legitimately have no tree.
+   */
+  readonly treeIdentityRequired?: boolean;
 }
 
 /** How the critic's verdict was resolved (Phase 3 critic-parser boundary). */
@@ -904,9 +919,17 @@ export type { SemanticVerdictKind };
  * bare/unparsable critic FAIL that is NOT a concrete defect — it must never be recorded as one.
  */
 export interface CandidateEvidence {
-  /** Deterministic verifier result for this candidate. */
+  /** Deterministic verifier result for this candidate. The authority REJECTS a false value (Phase 10). */
   readonly verificationPassed: boolean;
   readonly verificationMode?: string;
+  /**
+   * The candidate's EXECUTED-TEST evidence class (Phase 10, IKBI-REAUDIT-001), from the verifier. The
+   * authority requires `executed` (or `absent` under an explicit no-tests policy); `zero`/`unverified`/
+   * missing block autonomous promotion. Undefined is treated as missing → fail-closed.
+   */
+  readonly testEvidence?: TestEvidence;
+  /** Whether the explicit no-tests policy permits promoting THIS candidate on `absent` evidence (Phase 10). */
+  readonly noTestsAcceptable?: boolean;
   /** Semantic (critic) verdict, classified. `not-evaluated` = the strategy ran no model critic. */
   readonly semanticKind: SemanticVerdictKind;
   /** The durable `worker.semantic` evidence id backing this verdict (Phase 9) — the promotion receipt
@@ -1698,6 +1721,21 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       }
     });
 
+  // Is the workspace a REAL git worktree? (Phase 10, IKBI-REAUDIT-006.) `readTreeHash` returns undefined
+  // for BOTH "not a git worktree" and "a transient git-read error on a real worktree" — indistinguishable,
+  // so a read failure on a production workspace silently dropped the stale-tree + CAS enforcement. This
+  // probe distinguishes the two: a git-backed candidate must FAIL CLOSED when its tree cannot be read; a
+  // genuinely non-git (in-memory/test) workspace legitimately has no tree and is exempt.
+  const isGitBacked: (workspacePath: string) => Promise<boolean> =
+    deps.isGitBacked ??
+    (async (workspacePath: string): Promise<boolean> => {
+      try {
+        return execFileSync("git", ["-C", workspacePath, "rev-parse", "--is-inside-work-tree"], { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"] }).trim() === "true";
+      } catch {
+        return false; // not a git worktree
+      }
+    });
+
   // ── RUNTIME-TRUTH EVIDENCE (Phase 5) ────────────────────────────────────────────────────────────
   // Resolve the production reader ONCE per orchestrator (an injected dep, else the configured dynamic
   // module, else inert). Fail-closed: a missing/broken reader yields no evidence + an advisory receipt,
@@ -1790,6 +1828,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     readonly staleTree?: boolean;
     /** True when the refusal was the semantic policy gate (a non-pass / unevaluated verdict). */
     readonly semanticWithheld?: boolean;
+    /** True when the refusal was the executed-test / verification evidence gate (Phase 10). */
+    readonly evidenceWithheld?: boolean;
+    /** True when the refusal was an unenforceable tree identity on a git-backed candidate (Phase 10). */
+    readonly treeIdentityUnavailable?: boolean;
   }
 
   async function promoteCandidate(
@@ -1830,8 +1872,54 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       log.warn({ taskId: candidate.taskId, strategy: candidate.strategy, semanticVerdict: evidence.semanticKind }, "canonical promotion: SEMANTIC withheld — non-pass verdict is not autonomously promotable");
       return { promote: noPromote(reason), blockedReason: reason, semanticWithheld: true };
     }
-    // (2) STALE-TREE: the candidate that is promoted must be the exact candidate that was verified.
+    // (1c) VERIFICATION + EXECUTED-TEST EVIDENCE (Phase 10, IKBI-REAUDIT-001). The AUTHORITY itself — not
+    // only the integrator — requires authentic candidate-bound verification evidence, so NO path (normal,
+    // multi-step final, tournament, competitive, adjudication) can autonomously promote without it. The
+    // deterministic verifier must be green, AND real `executed` test evidence must exist (a no-tests
+    // `absent` tree promotes only under an explicit policy; `zero`/`unverified`/missing always block).
+    const evidenceWithheld = async (reason: string, detail: Record<string, unknown>): Promise<CanonicalPromotionResult> => {
+      await receipts.append(
+        {
+          operation: "worker.promotion.evidence_withheld",
+          outcome: { status: "failure", detail: reason },
+          requestId: candidate.taskId,
+          metadata: { taskId: candidate.taskId, attemptId: candidate.attemptId, strategy: candidate.strategy, workspaceId: candidate.workspaceId, ...detail },
+          project: handle.targetRepo,
+        },
+        parentIdentity,
+      ).catch(() => {});
+      log.warn({ taskId: candidate.taskId, strategy: candidate.strategy, reason }, "canonical promotion: EVIDENCE withheld — no authentic executed verification evidence");
+      return { promote: noPromote(reason), blockedReason: reason, evidenceWithheld: true };
+    };
+    if (evidence.verificationPassed !== true) {
+      return evidenceWithheld("verification did not pass — the deterministic verifier is not green; refusing autonomous promotion", { verificationPassed: evidence.verificationPassed });
+    }
+    const testDecision = evaluateExecutedTestEvidence(evidence.testEvidence, { allowNoTests: evidence.noTestsAcceptable === true });
+    if (!testDecision.acceptable) {
+      return evidenceWithheld(`executed-test evidence not acceptable for autonomous promotion (${testDecision.reason}) — a green with test evidence "${testDecision.state}" proved nothing about behavior`, { testEvidence: testDecision.state, testEvidenceReason: testDecision.reason, noTestsAcceptable: evidence.noTestsAcceptable === true });
+    }
+    // (2) TREE IDENTITY (Phase 10, IKBI-REAUDIT-006) — fail CLOSED when a git-backed candidate's tree
+    // identity is unavailable. Reading undefined is legitimate ONLY for a genuinely non-git (in-memory/
+    // test) workspace; on a real git worktree a missing verified tree OR an unreadable live tree means we
+    // cannot establish an enforceable identity, so the stale-tree + CAS binding would silently disappear.
     const currentTree = await readTreeHash(candidate.workspacePath);
+    if (candidate.treeIdentityRequired === true && (candidate.verifiedTree === undefined || currentTree === undefined)) {
+      const which = candidate.verifiedTree === undefined ? "no verified tree was captured at verification time" : "the candidate's live tree is unreadable at promote time";
+      const reason = `tree-identity: ${which} on a git-backed candidate — refusing to promote without an enforceable tree identity (stale-tree/CAS cannot be established)`;
+      await receipts.append(
+        {
+          operation: "worker.promotion.tree_identity_unavailable",
+          outcome: { status: "failure", detail: reason },
+          requestId: candidate.taskId,
+          metadata: { taskId: candidate.taskId, attemptId: candidate.attemptId, strategy: candidate.strategy, workspaceId: candidate.workspaceId, verifiedTree: candidate.verifiedTree ?? null, liveTree: currentTree ?? null },
+          project: handle.targetRepo,
+        },
+        parentIdentity,
+      ).catch(() => {});
+      log.warn({ taskId: candidate.taskId, attemptId: candidate.attemptId }, "canonical promotion: TREE-IDENTITY unavailable on a git-backed candidate — promote refused (fail-closed)");
+      return { promote: noPromote(reason, { strategy: "noop" }), blockedReason: reason, treeIdentityUnavailable: true };
+    }
+    // (2b) STALE-TREE: the candidate that is promoted must be the exact candidate that was verified.
     if (candidate.verifiedTree !== undefined && currentTree !== undefined && currentTree !== candidate.verifiedTree) {
       const reason = `stale-tree: candidate ${candidate.attemptId} changed since verification (verified tree ${candidate.verifiedTree}, live tree ${currentTree}) — refusing to promote unverified work`;
       await receipts.append(
@@ -4314,6 +4402,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           // CANONICAL PROMOTION (Phase 3): submit the candidate + its candidate-bound evidence to the
           // single promotion authority — the normal path no longer calls workspaces.promote directly.
           const builderDetail = (results.find((r) => r.role === "builder")?.detail ?? {}) as Record<string, unknown>;
+          const normalVerifier = results.find((r) => r.role === "verifier");
+          const normalTreeIdentityRequired = await isGitBacked(workspace.path);
           const candidate: PromotionCandidate = {
             taskId: task.taskId,
             attemptId: task.taskId,
@@ -4324,10 +4414,13 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             ...(task.moeVendorLane !== undefined ? { vendorLane: task.moeVendorLane } : {}),
             ...(verifiedTree !== undefined ? { verifiedTree } : {}),
             targetHead: verifiedTargetHead,
+            treeIdentityRequired: normalTreeIdentityRequired,
           };
           const evidence: CandidateEvidence = {
-            verificationPassed: results.find((r) => r.role === "verifier")?.outcome === "success",
+            verificationPassed: normalVerifier?.outcome === "success",
             ...(actualVerificationMode !== undefined ? { verificationMode: actualVerificationMode } : {}),
+            testEvidence: readVerifier(normalVerifier).testEvidence,
+            noTestsAcceptable: noTestsPolicyEnabled(task),
             semanticKind: classifySemanticVerdict(results.find((r) => r.role === "critic")),
             ...(normalSemanticEvaluationId !== undefined ? { semanticEvaluationId: normalSemanticEvaluationId } : {}),
             policyPromote: true, // the integrator (or authoritative adjudication) already decided promote
@@ -4875,9 +4968,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       // authority as every strategy (stale-tree + verifiedAgainst + canonical receipt + semantic gate).
       const compWinnerModel = (selectedRoles.find((r) => r.role === "builder")?.detail as Record<string, unknown> | undefined)?.model;
       const compVerifiedTree = await readTreeHash(winner.path);
+      const compVerifier = selectedRoles.find((r) => r.role === "verifier");
+      const compTreeIdentityRequired = await isGitBacked(winner.path);
       const compSemanticEvaluationId = await emitSemanticEvidence(
         compCritic,
-        { taskId: task.taskId, attemptId: task.taskId, candidateId: winner.id, ...(compVerifiedTree !== undefined ? { verifiedTree: compVerifiedTree } : {}), strategy: "competitive", verificationPassed: selectedRoles.find((r) => r.role === "verifier")?.outcome === "success", targetRepo: task.targetRepo },
+        { taskId: task.taskId, attemptId: task.taskId, candidateId: winner.id, ...(compVerifiedTree !== undefined ? { verifiedTree: compVerifiedTree } : {}), strategy: "competitive", verificationPassed: compVerifier?.outcome === "success", targetRepo: task.targetRepo },
         parentIdentity,
       );
       const canon = await promoteCandidate(
@@ -4886,9 +4981,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           taskId: task.taskId, attemptId: task.taskId, strategy: "competitive", workspaceId: winner.id, workspacePath: winner.path,
           ...(typeof compWinnerModel === "string" ? { model: compWinnerModel } : {}),
           ...(compVerifiedTree !== undefined ? { verifiedTree: compVerifiedTree } : {}), targetHead: winner.baseRef,
+          treeIdentityRequired: compTreeIdentityRequired,
         },
         {
-          verificationPassed: selectedRoles.find((r) => r.role === "verifier")?.outcome === "success",
+          verificationPassed: compVerifier?.outcome === "success",
+          testEvidence: readVerifier(compVerifier).testEvidence,
+          noTestsAcceptable: noTestsPolicyEnabled(task),
           semanticKind: compSemanticKind,
           ...(compSemanticEvaluationId !== undefined ? { semanticEvaluationId: compSemanticEvaluationId } : {}),
           policyPromote: true, governance,
@@ -5083,9 +5181,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       // like every strategy (stale-tree + verifiedAgainst + canonical receipt + semantic gate).
       const tourWinnerModel = (roleResults.find((r) => r.role === "builder")?.detail as Record<string, unknown> | undefined)?.model;
       const tourVerifiedTree = await readTreeHash(ws.path);
+      const tourVerifier = roleResults.find((r) => r.role === "verifier");
+      const tourTreeIdentityRequired = await isGitBacked(ws.path);
       const tourSemanticEvaluationId = await emitSemanticEvidence(
         tourCritic,
-        { taskId: t.taskId, attemptId: t.taskId, candidateId: ws.id, ...(tourVerifiedTree !== undefined ? { verifiedTree: tourVerifiedTree } : {}), strategy: "tournament", verificationPassed: roleResults.find((r) => r.role === "verifier")?.outcome === "success", targetRepo: t.targetRepo },
+        { taskId: t.taskId, attemptId: t.taskId, candidateId: ws.id, ...(tourVerifiedTree !== undefined ? { verifiedTree: tourVerifiedTree } : {}), strategy: "tournament", verificationPassed: tourVerifier?.outcome === "success", targetRepo: t.targetRepo },
         parentIdentity,
       );
       const canon = await promoteCandidate(
@@ -5094,9 +5194,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           taskId: t.taskId, attemptId: t.taskId, strategy: "tournament", workspaceId: ws.id, workspacePath: ws.path,
           ...(typeof tourWinnerModel === "string" ? { model: tourWinnerModel } : {}),
           ...(tourVerifiedTree !== undefined ? { verifiedTree: tourVerifiedTree } : {}), targetHead: ws.baseRef,
+          treeIdentityRequired: tourTreeIdentityRequired,
         },
         {
-          verificationPassed: roleResults.find((r) => r.role === "verifier")?.outcome === "success",
+          verificationPassed: tourVerifier?.outcome === "success",
+          testEvidence: readVerifier(tourVerifier).testEvidence,
+          noTestsAcceptable: noTestsPolicyEnabled(t),
           semanticKind: classifySemanticVerdict(tourCritic),
           ...(tourSemanticEvaluationId !== undefined ? { semanticEvaluationId: tourSemanticEvaluationId } : {}),
           policyPromote: true, governance,

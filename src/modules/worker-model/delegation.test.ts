@@ -235,6 +235,7 @@ function capturingRoles(capturedTasks: WorkerTask[]) {
       if (r === "integrator") {
         return { role: r, outcome: "success", summary: r, detail: { decision: "promote", rationale: "test", evaluation: { approved: true } } };
       }
+      if (r === "verifier") return { role: r, outcome: "success", summary: r, detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }] } };
       return { role: r, outcome: "success", summary: r };
     };
   }

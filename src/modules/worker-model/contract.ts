@@ -265,6 +265,14 @@ export interface WorkerTask {
    */
   readonly reuseWorkspace?: import("../../core/workspace/contract.js").WorkspaceHandle;
   /**
+   * EXPLICIT NO-TESTS POLICY (Phase 10, IKBI-REAUDIT-001). Autonomous promotion requires authentic
+   * `executed` test evidence; a candidate whose target has NO tests configured (`absent`) may promote
+   * only when the operator EXPLICITLY declares this repo/task has no tests. Default (unset) is FALSE —
+   * fail-closed: a no-tests build does NOT autonomously promote. (Also settable via IKBI_ALLOW_NO_TESTS.)
+   * A `zero`/`unverified`/missing evidence state ALWAYS blocks, regardless of this flag.
+   */
+  readonly noTestsPolicy?: boolean;
+  /**
    * STEP-PLANNER: run the full role pipeline (scout → builder → critic → verifier)
    * but SKIP the promote/discard lifecycle at the end. The workspace stays alive
    * on disk so the next step (or a final verification pass) can continue.

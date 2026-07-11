@@ -47,9 +47,10 @@ function handle(id: string): WorkspaceHandle {
 /** Roles minus scout (orchestrator builds the production scout). `verifierMode` is what the
  *  injected verifier REPORTS — standing in for the path the orchestrator threaded. */
 function rolesWithVerifier(verifierMode: "ladder" | "legacy"): Partial<Record<WorkerRole, RoleFn>> {
+  const testCheck = { name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } };
   const detail = verifierMode === "ladder"
-    ? { verdict: "pass", verificationMode: "ladder", verificationScope: "full", checks: [] }
-    : { verdict: "pass", verificationMode: "legacy", checks: [] };
+    ? { verdict: "pass", verificationMode: "ladder", verificationScope: "full", checks: [testCheck] }
+    : { verdict: "pass", verificationMode: "legacy", checks: [testCheck] };
   return {
     builder: async () => ({ role: "builder", outcome: "success", summary: "b", detail: { toolRounds: 1, filesWritten: ["a.ts"], rejectedToolCalls: [], stopReason: "stop" } }),
     critic: async () => ({ role: "critic", outcome: "success", summary: "c", detail: { pass: true } }),

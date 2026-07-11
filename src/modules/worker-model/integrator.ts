@@ -37,6 +37,8 @@
 
 import type { RoleFn, RoleResult } from "./contract.js";
 import { workerModelConfig, DEFAULT_PREVENTED_REVIEW_THRESHOLD, DEFAULT_PREVENTED_HIGH_RISK_REVIEW_THRESHOLD } from "./config.js";
+import type { TestEvidence } from "./adjudication/contract.js";
+import { evaluateExecutedTestEvidence, noTestsPolicyEnabled } from "./executed-evidence.js";
 
 /**
  * HIGH-RISK prevented-attempt classifier: network / shell-escape / privilege / system reaches. Intent
@@ -152,20 +154,26 @@ export const integrator: RoleFn = async (ctx) => {
     const criticPass = detailOf(critic).pass === true;
     const verifierPass = detailOf(verifier).verdict === "pass";
 
-    // REAL TEST EVIDENCE (single-run only). The verifier classifies test signal four ways
-    // (executed / zero / unverified / absent — see readVerifier in orchestrator.ts, stamped onto
-    // the verifier result detail). A SINGLE-RUN build that VERIFIES but ran no real tests (zero
-    // tests, an unparseable green like `echo done`, or no "test" check at all) proved nothing about
-    // behavior — promoting it would forge a passing test signal. So require "executed" evidence for
-    // single-run promotes. ACCUMULATED builds (reuseWorkspace set) are EXEMPT: prior steps already
-    // verified, and this pass may legitimately run no tests.
+    // REAL EXECUTED-TEST EVIDENCE (Phase 10, IKBI-REAUDIT-001). The verifier classifies test signal four
+    // ways (executed / zero / unverified / absent — see readVerifier in orchestrator.ts, stamped onto the
+    // verifier result). A build that VERIFIES but ran no real tests (zero tests, an unparseable green like
+    // `echo done`, or no "test" check at all) proved nothing about behavior — promoting it would forge a
+    // passing test signal. Require AUTHENTIC `executed` evidence; a no-tests-configured (`absent`) tree may
+    // promote ONLY under an explicit named policy (task.noTestsPolicy / IKBI_ALLOW_NO_TESTS).
     //
-    // FAIL-CLOSED (Codex C1): a MISSING testEvidence field is NOT exempted. The production
-    // orchestrator stamps testEvidence onto every verifier result, so a real single-run promote
-    // always reports "executed"; an absent field means we cannot confirm a real test signal, which
-    // must block promote exactly like "zero"/"unverified" — never promote on unproven evidence.
-    const testEvidence = detailOf(verifier).testEvidence;
-    const testEvidenceOk = accumulatedPass || testEvidence === "executed";
+    // MULTI-STEP FIX: the FINAL accumulated pass (reuseWorkspace) runs the full verifier on the whole
+    // accumulated tree, so it can and MUST produce its OWN executed evidence. The old blanket exemption
+    // (`accumulatedPass || …`) treated "reuse workspace" as a proxy for "prior steps verified" — but
+    // ordinary intermediate steps skip verification, so an accumulated final could land code no test ever
+    // exercised. The exemption is REMOVED here; the final candidate is held to the same executed-evidence
+    // bar as a single run. (accumulatedPass still relaxes the filesWritten>0 builder gate above — a final
+    // verify pass may legitimately write nothing — but it can no longer waive the test-evidence gate.)
+    //
+    // FAIL-CLOSED (Codex C1): a MISSING testEvidence field is NOT exempted — an absent field means we
+    // cannot confirm a real signal, which blocks exactly like "zero"/"unverified".
+    const testEvidence = detailOf(verifier).testEvidence as TestEvidence | undefined;
+    const testEvidenceDecision = evaluateExecutedTestEvidence(testEvidence, { allowNoTests: noTestsPolicyEnabled(ctx.task) });
+    const testEvidenceOk = testEvidenceDecision.acceptable;
 
     if (builderOk && policyConfirmed && withinRiskBudget && criticPass && verifierPass && testEvidenceOk && !refuterRefuted) {
       const rationale =
@@ -230,7 +238,7 @@ export const integrator: RoleFn = async (ctx) => {
     if (!verifierPass) failures.push(verifier === undefined ? "no verifier result" : "verifier verdict=fail");
     // Only an ADDITIONAL constraint on an otherwise-passing verifier: a RED verifier already names
     // its own failure above, so the test-evidence note is redundant noise there.
-    else if (!testEvidenceOk) failures.push(`single-run build has no real test evidence (test evidence "${String(testEvidence)}")`);
+    else if (!testEvidenceOk) failures.push(`no authentic executed-test evidence for autonomous promotion (${testEvidenceDecision.reason}) — a green with test evidence "${String(testEvidence ?? "missing")}" proved nothing about behavior`);
     // REFUTER (HIGH-1): an adversarial REFUTAL is an independent discard reason — it can hold even
     // when every other gate is green (the whole point of the adversarial gate), so it is reported
     // unconditionally (not chained behind the verifier like the test-evidence note).

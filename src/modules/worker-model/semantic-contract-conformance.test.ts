@@ -205,13 +205,13 @@ function realOrchestrator(invokeModel: (r: ModelRequest) => Promise<ModelRespons
   return { orch, parentCtx, receipts: rc.appended, promoteCalls };
 }
 const passIntegrator: Partial<Record<WorkerRole, RoleFn>> = {
-  verifier: async () => ({ role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: [], testEvidence: "executed" } }),
+  verifier: async () => ({ role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }], testEvidence: "executed" } }),
   integrator: async () => ({ role: "integrator", outcome: "success", summary: "i", detail: { decision: "promote", rationale: "ok", evaluation: { approved: true } } }),
 };
 // A REALISTIC integrator that gates on the critic (mirrors production): it discards unless the critic
 // passed. Used for the FAIL/indeterminate cases so the terminal duel classification runs on the verdict.
 const criticAwareRoles: Partial<Record<WorkerRole, RoleFn>> = {
-  verifier: async () => ({ role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: [], testEvidence: "executed" } }),
+  verifier: async () => ({ role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }], testEvidence: "executed" } }),
   integrator: async (ctx) => {
     const pass = ((ctx.priorResults.find((r) => r.role === "critic")?.detail ?? {}) as Record<string, unknown>).pass === true;
     return pass

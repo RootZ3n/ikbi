@@ -118,7 +118,7 @@ function recordingProvider(classifierTier: "worker" | "mid") {
 
 /** Stubbed verifier + integrator so the real verifier does not spawn a toolchain in a unit test. */
 const stubRoles: Partial<Record<WorkerRole, RoleFn>> = {
-  verifier: async () => ({ role: "verifier", outcome: "success", summary: "checks ok (stubbed)", detail: { verdict: "pass", checks: [], testEvidence: "executed" } }),
+  verifier: async () => ({ role: "verifier", outcome: "success", summary: "checks ok (stubbed)", detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }], testEvidence: "executed" } }),
   critic: async () => ({ role: "critic", outcome: "success", summary: "c", detail: { pass: true, semanticVerdict: { kind: "pass", summary: "ok", blockingDefects: [], incompleteRequirements: [], advisories: [], parseStatus: "structured" } } }),
   integrator: async () => ({ role: "integrator", outcome: "success", summary: "promote (stubbed)", detail: { decision: "promote", rationale: "stubbed", evaluation: { approved: true } } }),
 };

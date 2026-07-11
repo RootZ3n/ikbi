@@ -400,7 +400,7 @@ function realRun(critic: RoleFn, taskId: string) {
     },
     events: fakeBus, receipts: rc.receipts, trust: stubTrust, resolveIdentity, roleClaim,
     roles: {
-      verifier: async () => ({ role: "verifier", outcome: "success", summary: "ok", detail: { verdict: "pass", checks: [], testEvidence: "executed" } }),
+      verifier: async () => ({ role: "verifier", outcome: "success", summary: "ok", detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }], testEvidence: "executed" } }),
       critic,
       integrator: async () => ({ role: "integrator", outcome: "success", summary: "p", detail: { decision: "promote", rationale: "s", evaluation: { approved: true } } }),
     },

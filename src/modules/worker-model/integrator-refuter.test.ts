@@ -36,7 +36,7 @@ function ctxWith(priorResults: RoleResult[]): RoleContext {
 
 const builderOk: RoleResult = { role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["a.ts"], rejectedToolCalls: [] } };
 const criticPass: RoleResult = { role: "critic", outcome: "success", summary: "c", detail: { pass: true, feedback: "ok" } };
-const verifierPass: RoleResult = { role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: [], testEvidence: "executed" } };
+const verifierPass: RoleResult = { role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }], testEvidence: "executed" } };
 
 const decisionOf = (r: RoleResult): string => (r.detail as { decision: string }).decision;
 const rationaleOf = (r: RoleResult): string => (r.detail as { rationale: string }).rationale;
