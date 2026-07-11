@@ -74,6 +74,7 @@ import {
   type EvidenceRequestScope,
 } from "../runtime-truth/index.js";
 import { applyConsultPatch } from "./consult-apply.js";
+import { CandidateLeaseRegistry, type VerificationSnapshot } from "./candidate-lease.js";
 import type { ApplyConsultPatchInput, ApplyConsultPatchResult } from "./consult-apply.js";
 
 import type { ExecRequest, GovernedExec } from "../governed-exec/index.js";
@@ -923,6 +924,8 @@ class MutationFence {
 }
 /** Active per-run fences, keyed by taskId so `runRoleFn` (a shared closure) reaches the right run's fence. */
 const activeMutationFences = new Map<string, MutationFence>();
+/** Phase 13B: active per-run candidate-generation lease registries, keyed by taskId (the write-boundary + snapshot authority). */
+const activeLeaseRegistries = new Map<string, CandidateLeaseRegistry>();
 
 /**
  * A uniquely identifiable proposed tree produced by one attempt/strategy (Phase 3). It carries the
@@ -965,6 +968,13 @@ export interface PromotionCandidate {
    * The promotable tree may contain post-timeout writes the executed tests never observed — fail-closed block.
    */
   readonly mutationFenced?: boolean;
+  /**
+   * Phase 13B: the immutable frozen verification-snapshot identity this candidate was frozen into (generation-
+   * scoped). The snapshot's `gitTree` equals `verifiedTree` (the content-addressed subject); test/semantic/
+   * promotion evidence bind to `snapshotId`, and the CAS confirms the promoted content equals the snapshot.
+   */
+  readonly snapshotId?: string;
+  readonly snapshotDigest?: string;
 }
 
 /** How the critic's verdict was resolved (Phase 3 critic-parser boundary). */
@@ -2132,6 +2142,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           ...(candidate.model !== undefined ? { model: candidate.model } : {}),
           ...(candidate.vendorLane !== undefined ? { vendorLane: candidate.vendorLane } : {}),
           ...(candidate.verifiedTree !== undefined ? { verifiedTree: candidate.verifiedTree } : {}),
+          // FROZEN SUBJECT (Phase 13B): the immutable snapshot id + digest all evidence binds to. The stale-tree
+          // + CAS above/below confirm the promoted content equals exactly this frozen subject.
+          ...(candidate.snapshotId !== undefined ? { snapshotId: candidate.snapshotId, snapshotDigest: candidate.snapshotDigest } : {}),
           verificationPassed: evidence.verificationPassed,
           ...(evidence.verificationMode !== undefined ? { verificationMode: evidence.verificationMode } : {}),
           semanticVerdict: evidence.semanticKind,
@@ -4686,6 +4699,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // (not a worker quality failure) so trust can be suppressed.
     let trustSuppressed = false;
     let trustSuppressReason: string | undefined;
+    // Phase 13B (IKBI-REAUDIT2-008): set when a successful promote's gate allow came from the operator
+    // BYPASS. A bypassed land is administratively-bypassed, NOT a fully-governed autonomous success — it must
+    // not receive governed-success trust and must be surfaced in the run summary.
+    let gateBypassedThisBuild = false;
     if (decision.promote && requestApproval !== undefined) {
       events.publish(
         workerApprovalRequested.create({ taskId: task.taskId, workspaceId: workspace.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } }),
@@ -4733,6 +4750,17 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           const builderDetail = (results.find((r) => r.role === "builder")?.detail ?? {}) as Record<string, unknown>;
           const normalVerifier = results.find((r) => r.role === "verifier");
           const normalIdentity = await candidateIdentityFields(workspace.path);
+          // FROZEN VERIFICATION SNAPSHOT (Phase 13B): when the fence is clear + identity resolved + a verified
+          // tree exists, freeze the generation into an immutable snapshot (the git tree is content-addressed).
+          // The snapshot id binds the promotion evidence; the stale-tree + CAS confirm the promoted content
+          // equals exactly this frozen subject. Skipped when the candidate is already blocked (fenced/indeterminate).
+          let normalSnapshot: VerificationSnapshot | undefined;
+          const normalReg = activeLeaseRegistries.get(task.taskId);
+          if (normalReg !== undefined && verifiedTree !== undefined && !normalIdentity.identityIndeterminate && normalReg.isFenced(workspace.id) === false && activeMutationFences.get(task.taskId)?.isFenced(workspace.id) !== true) {
+            const gen = normalReg.currentGeneration(workspace.id) ?? normalReg.openGeneration({ attemptId: task.taskId, candidateId: task.taskId, workspaceId: workspace.id, workspacePath: workspace.path });
+            const freezeElig = normalReg.canFreeze(gen.generationId);
+            if (freezeElig.ok) normalSnapshot = normalReg.freeze(gen.generationId, { canonicalDigest: verifiedTree, gitTree: verifiedTree, ...(verifiedTargetHead !== undefined ? { baseIdentity: verifiedTargetHead } : {}) });
+          }
           const candidate: PromotionCandidate = {
             taskId: task.taskId,
             attemptId: task.taskId,
@@ -4746,6 +4774,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             treeIdentityRequired: normalIdentity.treeIdentityRequired,
             ...(normalIdentity.identityIndeterminate ? { identityIndeterminate: true } : {}),
             ...(activeMutationFences.get(task.taskId)?.isFenced(workspace.id) ? { mutationFenced: true } : {}),
+            ...(normalSnapshot !== undefined ? { snapshotId: normalSnapshot.snapshotId, snapshotDigest: normalSnapshot.canonicalDigest } : {}),
           };
           const evidence: CandidateEvidence = {
             verificationPassed: normalVerifier?.outcome === "success",
@@ -4762,6 +4791,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           };
           const canon = await promoteCandidate(workspace, candidate, evidence, parentIdentity);
           promoted = canon.promote.promoted;
+          // Phase 13B: a bypassed autonomous land is administratively-bypassed — record it so the run summary
+          // is truthful and governed-success trust is withheld below.
+          if (promoted && governance.bypass === true) gateBypassedThisBuild = true;
           if (!promoted) {
             if (canon.staleTree === true) {
               // Post-verify mutation: the promoted tree would not be the verified tree. Fail CLOSED —
@@ -4968,6 +5000,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           verificationResult: verifierResult !== undefined ? verifierResult.outcome : "not_run",
           verificationMode: ranVerificationMode,
           retrievalMode: ranRetrievalMode,
+          // Phase 13B (IKBI-REAUDIT2-008): a bypassed autonomous land is surfaced on the run summary + earned
+          // no governed-success trust — the run is administratively-bypassed, not fully-governed.
+          ...(gateBypassedThisBuild ? { gateBypassed: true, gateAuthority: "administratively-bypassed" } : {}),
           ...(allPrevented.length > 0 ? { preventedCount: notablePrevented.length, allPreventedCount: allPrevented.length, highRiskCount, preventedCommands, requiresReview } : {}),
           // BUILD-PATH DRIFT (step 3): the advisory drifted operations the governor surfaced (reportOnly/warn).
           ...(buildDriftReports.length > 0 ? { driftedOperations: buildDriftReports.map((r) => ({ operation: r.operation, recentRate: r.recentRate, baselineRate: r.baselineRate, severity: r.severity ?? "minor" })) } : {}),
@@ -5013,6 +5048,13 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     let buildTrustStatus = toOutcomeStatus(overall);
     let buildTrustSuppressed = trustSuppressed;
     let buildTrustReason = trustSuppressReason;
+    // Phase 13B (IKBI-REAUDIT2-008): a gate-BYPASSED autonomous promote is administratively-bypassed — it must
+    // NOT earn fully-governed autonomous success trust (the gate veto was off). Suppress the trust signal (a
+    // `worker.trust.signal_suppressed` receipt records why); the promote still lands, the audit stays truthful.
+    if (gateBypassedThisBuild && !buildTrustSuppressed) {
+      buildTrustSuppressed = true;
+      buildTrustReason = "gate-wall bypassed — administratively-bypassed promote is not fully-governed autonomous success trust";
+    }
     // UNVERIFIABLE TARGET: a fail-closed terminal because no checks could be derived is NOT a worker
     // quality/code failure — the model could not have succeeded against a missing verifier. SUPPRESS
     // the trust signal (no demotion, no consecutive-failure cascade) and receipt the reason. Wins
@@ -5431,8 +5473,22 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
    * (the tournament then fails closed). Git-mutation governance still applies: `git apply` is
    * allowlisted but cannot redirect the worktree (the `-C`/`--work-tree` flags are denied upstream).
    */
-  async function defaultApplyDiff(parentCtx: OperationContext, workspace: WorkspaceHandle, diff: string, goal: string): Promise<{ applied: boolean; reason?: string }> {
+  async function defaultApplyDiff(parentCtx: OperationContext, workspace: WorkspaceHandle, diff: string, goal: string, taskId?: string): Promise<{ applied: boolean; reason?: string }> {
     if (diff.trim().length === 0) return { applied: false, reason: "winner produced an empty diff" };
+    // WRITE-BOUNDARY LEASE (Phase 13B): a candidate-mutating diff apply holds a lease bound to the workspace's
+    // current generation. If that generation was revoked/timed-out (fenced), the write is REJECTED here —
+    // before it mutates the candidate — and a truthful receipt is written. A revoked operation cannot land work.
+    const registry = taskId !== undefined ? activeLeaseRegistries.get(taskId) : undefined;
+    if (registry !== undefined) {
+      const gen = registry.currentGeneration(workspace.id) ?? registry.openGeneration({ attemptId: taskId!, candidateId: workspace.id, workspaceId: workspace.id, workspacePath: workspace.path });
+      if (registry.isFenced(workspace.id)) {
+        await receipts.append(
+          { operation: "worker.write_fenced", outcome: { status: "failure", detail: "candidate-mutating diff apply rejected: the workspace generation is revoked/timed-out (write-boundary lease invalid)" }, requestId: taskId!, metadata: { taskId, workspaceId: workspace.id, generationId: gen.generationId }, project: workspace.targetRepo },
+          parentCtx.identity.identity,
+        ).catch(() => {});
+        return { applied: false, reason: "write-boundary: the candidate generation is fenced (revoked/timed-out) — diff apply rejected" };
+      }
+    }
     const gov = govExecForRoles ?? (await import("../governed-exec/index.js")).governedExec;
     const os = await import("node:os");
     const fs = await import("node:fs/promises");
@@ -5587,7 +5643,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       allocate,
       runCandidate,
       judge: (candidates) => judge.judge(candidates),
-      applyDiff: async (ws, diff) => (deps.applyDiff !== undefined ? deps.applyDiff(ws, diff) : defaultApplyDiff(parentCtx, ws, diff, task.goal)),
+      applyDiff: async (ws, diff) => (deps.applyDiff !== undefined ? deps.applyDiff(ws, diff) : defaultApplyDiff(parentCtx, ws, diff, task.goal, task.taskId)),
       verifyShadow,
       promote,
       discard: async (ws) => safeDiscard(workspaces, ws),
@@ -5631,10 +5687,14 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     const existing = activeMutationFences.get(task.taskId);
     const fence = existing ?? new MutationFence();
     if (existing === undefined) activeMutationFences.set(task.taskId, fence);
+    // Phase 13B: a per-run candidate-generation lease registry (the write-boundary + snapshot authority).
+    const priorReg = activeLeaseRegistries.get(task.taskId);
+    if (priorReg === undefined) activeLeaseRegistries.set(task.taskId, new CandidateLeaseRegistry({ runId: task.taskId, taskId: task.taskId }));
     try {
       return await run(task, parentCtx);
     } finally {
       if (existing === undefined) activeMutationFences.delete(task.taskId);
+      if (priorReg === undefined) activeLeaseRegistries.delete(task.taskId);
     }
   };
   return { run: fencedRun, spawnRole };
