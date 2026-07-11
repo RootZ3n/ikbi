@@ -21,6 +21,7 @@ import type { ModelMessage, ModelRequest } from "../../core/provider/contract.js
 import type { WorkspaceHandle } from "../../core/workspace/contract.js";
 import type { RoleFn, RoleResult } from "./contract.js";
 import { criticModel } from "./role-models.js";
+import { parseSemanticVerdict, infrastructureFailureVerdict, type SemanticVerdict } from "./semantic-verdict.js";
 
 // The model id is CRITIC-tier and config-driven (see role-models.ts) — resolved at
 // request time so an operator's IKBI_MODEL_CRITIC takes effect without a roster alias.
@@ -276,12 +277,12 @@ function formatGoalAlignment(scout: RoleResult | undefined): string | undefined 
   );
 }
 
-function objectiveFail(feedback: string, extra: Record<string, unknown> = {}): RoleResult {
+function objectiveFail(feedback: string, extra: Record<string, unknown> = {}, sv?: SemanticVerdict): RoleResult {
   return {
     role: "critic",
     outcome: "success",
     summary: "critique verdict: FAIL",
-    detail: { pass: false, feedback, objectiveFailure: true, ...extra },
+    detail: { pass: false, feedback, objectiveFailure: true, ...extra, ...(sv !== undefined ? { semanticVerdict: sv } : {}) },
   };
 }
 
@@ -303,7 +304,9 @@ export function createCritic(deps: CriticDeps = {}): RoleFn {
 
     try {
       if (deps.diff === undefined) {
-        return objectiveFail("critic fail-closed: no workspace diff source wired");
+        // No diff to review — the semantic critique could not RUN. This is an infrastructure gap,
+        // not a candidate defect (Phase 4): it must not become a fabricated FAIL or a peer duel.
+        return objectiveFail("critic fail-closed: no workspace diff source wired", {}, infrastructureFailureVerdict("no workspace diff source wired — semantic evaluation could not run"));
       }
 
       const diffText = await deps.diff(ctx.workspace);
@@ -380,12 +383,15 @@ export function createCritic(deps: CriticDeps = {}): RoleFn {
       // the model ran out of output tokens trying to produce a verdict. Return a
       // subjective FAIL so isRetryableCriticFail=true and the fix-loop/escalation fires.
       if (response.finishReason === "content_filter") {
+        // A content-filter refusal is a provider INFRASTRUCTURE outcome, not candidate evidence.
         return objectiveFail(`critic fail-closed: model response ended with finishReason=${response.finishReason}`, {
           finishReason: response.finishReason,
           diffStats: { filesChanged: diff.files.length, additions: diff.additions, deletions: diff.deletions, truncated: diff.truncated },
-        });
+        }, infrastructureFailureVerdict(`critic response ended with finishReason=${response.finishReason} (provider refusal)`, { evaluatorModel: request.model }));
       }
       if (response.finishReason === "length") {
+        // Truncated output is an INFRASTRUCTURE failure (out of output tokens), NOT a candidate defect —
+        // it must not fabricate a FAIL or trigger a peer duel (Phase 4). `pass:false` still fail-closes.
         return {
           role: "critic",
           outcome: "success",
@@ -395,6 +401,7 @@ export function createCritic(deps: CriticDeps = {}): RoleFn {
             feedback: `critic response truncated (finishReason=length). The model could not complete its analysis with the available output tokens. A stronger model or higher token limit may succeed.`,
             finishReason: response.finishReason,
             diffStats: { filesChanged: diff.files.length, additions: diff.additions, deletions: diff.deletions, truncated: diff.truncated },
+            semanticVerdict: infrastructureFailureVerdict("critic response truncated (finishReason=length) — semantic evaluation incomplete", { evaluatorModel: request.model }),
           },
         };
       }
@@ -417,6 +424,11 @@ export function createCritic(deps: CriticDeps = {}): RoleFn {
             finishReason: response.finishReason,
             diffStats: { filesChanged: diff.files.length, additions: diff.additions, deletions: diff.deletions, truncated: diff.truncated },
             parseFailed: true,
+            // The model produced OUTPUT that is not a parseable verdict (a bare `FAIL`, prose, malformed
+            // JSON) → INDETERMINATE, never a fabricated concrete defect (Phase 4). `parseSemanticVerdict`
+            // resolves the exact kind; a genuine transport/truncation infra failure is handled above.
+            // `pass:false` still fail-closes the promote; indeterminate is NOT a peer-duel trigger.
+            semanticVerdict: parseSemanticVerdict(response.content, { evaluatorModel: request.model, goal: ctx.task.goal, parseStatus: "structured" }),
           },
         };
       }
@@ -426,6 +438,12 @@ export function createCritic(deps: CriticDeps = {}): RoleFn {
       // regardless of the verdict. `detail.pass` carries the judgment — outcome
       // reflects whether the critique RAN, not whether the work passed. "failure" is
       // reserved for infrastructure failure (the model call itself failing).
+      // CANONICAL SEMANTIC VERDICT (Phase 4): parse the SAME response into the strict, candidate-bound
+      // verdict. `detail.pass`/`feedback`/`issues` are unchanged (the integrator + fix-loop still read
+      // them); `detail.semanticVerdict` is the truthful contract the promotion/duel policy consumes — a
+      // bare `FAIL`, a contradiction, or generic hand-waving classifies as `indeterminate`, never a
+      // fabricated defect. `candidateId`/`verifiedTree` are bound later, by the orchestrator.
+      const semanticVerdict = parseSemanticVerdict(response.content, { evaluatorModel: request.model, goal: ctx.task.goal });
       return {
         role: "critic",
         outcome: "success",
@@ -437,6 +455,7 @@ export function createCritic(deps: CriticDeps = {}): RoleFn {
           changedFiles: diff.files,
           diffStats: { filesChanged: diff.files.length, additions: diff.additions, deletions: diff.deletions, truncated: diff.truncated },
           parseFormat: parsed.parseFormat,
+          semanticVerdict,
           ...(parsed.scores !== undefined ? { scores: parsed.scores } : {}),
           ...(parsed.issues !== undefined ? { issues: parsed.issues } : {}),
         },

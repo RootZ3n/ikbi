@@ -480,7 +480,8 @@ export type NonPromotionClass =
   | "unverifiable" // no derivable checks — a stronger/other model cannot make a verifier appear
   | "injection-blocked" // the neutralization chokepoint blocked promotion (security gate)
   | "interrupted" // a kill/budget interrupt halted the run
-  | "candidate-conflict"; // verified work could not land due to a reconcilable merge conflict
+  | "candidate-conflict" // verified work could not land due to a reconcilable merge conflict
+  | "semantic-indeterminate"; // the critic could not render a concrete verdict (indeterminate/infra) — a peer vendor cannot fix that (Phase 4)
 
 /**
  * The engine seams a role builds against. The orchestrator supplies these; roles

@@ -225,6 +225,7 @@ function toolResp(name: string, args: unknown): ModelResponse {
 }
 const stubRoles: Partial<Record<WorkerRole, RoleFn>> = {
   verifier: async () => ({ role: "verifier", outcome: "success", summary: "ok", detail: { verdict: "pass", checks: [], testEvidence: "executed" } }),
+  critic: async () => ({ role: "critic", outcome: "success", summary: "c", detail: { pass: true, semanticVerdict: { kind: "pass", summary: "ok", blockingDefects: [], incompleteRequirements: [], advisories: [], parseStatus: "structured" } } }),
   integrator: async () => ({ role: "integrator", outcome: "success", summary: "p", detail: { decision: "promote", rationale: "s", evaluation: { approved: true } } }),
 };
 
@@ -234,7 +235,7 @@ function successProvider(classifierTier: "worker" | "mid") {
   let turn = 0;
   const invokeModel = async (req: ModelRequest): Promise<ModelResponse> => {
     if (typeof (req as { prompt?: unknown }).prompt === "string") return ok(JSON.stringify({ tier: classifierTier, rationale: "x" }));
-    if (!(req.tools ?? []).some((t) => t.name === "done")) return ok("PASS\n- a finding");
+    if (!(req.tools ?? []).some((t) => t.name === "done")) return ok(JSON.stringify({ verdict: "PASS", scores: { files_modified: 5, goal_correctness: 5, code_quality: 5, tests: 5, suspicious_patterns: 5 }, feedback: "correct and complete for the goal" }));
     builderModels.push(req.model);
     turn += 1;
     if (turn === 1) return toolResp("read_file", { path: "a.ts" });
@@ -249,7 +250,7 @@ function failingProvider(classifierTier: "worker" | "mid") {
   const builderModels: string[] = [];
   const invokeModel = async (req: ModelRequest): Promise<ModelResponse> => {
     if (typeof (req as { prompt?: unknown }).prompt === "string") return ok(JSON.stringify({ tier: classifierTier, rationale: "x" }));
-    if (!(req.tools ?? []).some((t) => t.name === "done")) return ok("PASS\n- a finding");
+    if (!(req.tools ?? []).some((t) => t.name === "done")) return ok(JSON.stringify({ verdict: "PASS", scores: { files_modified: 5, goal_correctness: 5, code_quality: 5, tests: 5, suspicious_patterns: 5 }, feedback: "correct and complete for the goal" }));
     builderModels.push(req.model);
     return ok("");
   };

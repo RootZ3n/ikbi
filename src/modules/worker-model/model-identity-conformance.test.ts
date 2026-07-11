@@ -105,7 +105,7 @@ function recordingProvider(classifierTier: "worker" | "mid") {
       return ok(JSON.stringify({ tier: classifierTier, rationale: "forced by test" }));
     }
     const hasDone = (req.tools ?? []).some((t) => t.name === "done");
-    if (!hasDone) return ok("PASS\n- a finding"); // scout / critic (no done tool)
+    if (!hasDone) return ok(JSON.stringify({ verdict: "PASS", scores: { files_modified: 5, goal_correctness: 5, code_quality: 5, tests: 5, suspicious_patterns: 5 }, feedback: "correct and complete for the goal" })); // scout / critic (no done tool)
     builderModels.push(req.model);
     builderTurn += 1;
     if (builderTurn === 1) return toolResp("read_file", { path: "a.ts" });
@@ -119,6 +119,7 @@ function recordingProvider(classifierTier: "worker" | "mid") {
 /** Stubbed verifier + integrator so the real verifier does not spawn a toolchain in a unit test. */
 const stubRoles: Partial<Record<WorkerRole, RoleFn>> = {
   verifier: async () => ({ role: "verifier", outcome: "success", summary: "checks ok (stubbed)", detail: { verdict: "pass", checks: [], testEvidence: "executed" } }),
+  critic: async () => ({ role: "critic", outcome: "success", summary: "c", detail: { pass: true, semanticVerdict: { kind: "pass", summary: "ok", blockingDefects: [], incompleteRequirements: [], advisories: [], parseStatus: "structured" } } }),
   integrator: async () => ({ role: "integrator", outcome: "success", summary: "promote (stubbed)", detail: { decision: "promote", rationale: "stubbed", evaluation: { approved: true } } }),
 };
 
@@ -238,7 +239,7 @@ function failingRecordingProvider(classifierTier: "worker" | "mid") {
       return ok(JSON.stringify({ tier: classifierTier, rationale: "forced" }));
     }
     const hasDone = (req.tools ?? []).some((t) => t.name === "done");
-    if (!hasDone) return ok("PASS\n- a finding");
+    if (!hasDone) return ok(JSON.stringify({ verdict: "PASS", scores: { files_modified: 5, goal_correctness: 5, code_quality: 5, tests: 5, suspicious_patterns: 5 }, feedback: "correct and complete for the goal" }));
     builderModels.push(req.model);
     // Never write a file, never call a tool — the builder loop stalls out and fails, forcing the
     // cheap same-model retry and then the lane-scoped pool sweep.

@@ -478,6 +478,8 @@ function tourRoles(failOn: ReadonlySet<string> = new Set()) {
       const pass = !failOn.has(c.workspace.id);
       return { role: "verifier", outcome: "success", summary: "v", detail: { verdict: pass ? "pass" : "fail", checks: [{ name: "typecheck", command: "tsc", exitCode: pass ? 0 : 1, outputTail: "" }, { name: "test", command: "test", exitCode: pass ? 0 : 1, outputTail: "# tests 10\n# pass 10\n" }] } };
     },
+    // Phase 4: the tournament shadow winner receives canonical semantic evaluation before promotion.
+    critic: async (): Promise<RoleResult> => ({ role: "critic", outcome: "success", summary: "c", detail: { pass: true } }),
   } satisfies Partial<Record<WorkerRole, RoleFn>>;
 }
 
@@ -562,7 +564,7 @@ test("e2e: no candidate models ⇒ tournament does NOT run (single-workspace pat
   const ws = tourWorkspaces();
   const roles: Partial<Record<WorkerRole, RoleFn>> = {
     ...tourRoles(),
-    critic: async () => ({ role: "critic", outcome: "success", summary: "c" }),
+    critic: async () => ({ role: "critic", outcome: "success", summary: "c", detail: { pass: true } }),
     integrator: async () => ({ role: "integrator", outcome: "success", summary: "i", detail: { decision: "promote", evaluation: { approved: true } } }),
   };
   const orch = createOrchestrator(tourDeps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles }));
@@ -591,6 +593,7 @@ test("e2e: tournament rescues a builder that wrote files but hit no_progress —
       verifierRuns += 1;
       return { role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: [{ name: "typecheck", command: "tsc", exitCode: 0, outputTail: "" }, { name: "test", command: "test", exitCode: 0, outputTail: "# tests 10\n# pass 10\n" }] } };
     },
+    critic: async () => ({ role: "critic", outcome: "success", summary: "c", detail: { pass: true } }),
   };
   const orch = createOrchestrator(tourDeps({
     resolveIdentity, roleClaim, workspaces: ws.workspaces, roles,
@@ -626,6 +629,7 @@ test("e2e: tournament PROMOTES a candidate despite a PREVENTED policy attempt (j
       detail: { stopReason: "no_progress", filesWritten: ["a.ts"], checksRuns: 0, rejectedToolCalls: [], policyViolations: [{ tool: "terminal", error: "blocked: rm -rf /" }], toolRounds: 10 },
     }),
     verifier: async () => { verifierRuns += 1; return { role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: [{ name: "typecheck", command: "tsc", exitCode: 0, outputTail: "" }, { name: "test", command: "test", exitCode: 0, outputTail: "# tests 10\n# pass 10\n" }] } }; },
+    critic: async () => ({ role: "critic", outcome: "success", summary: "c", detail: { pass: true } }),
   };
   const orch = createOrchestrator(tourDeps({
     resolveIdentity, roleClaim, workspaces: ws.workspaces, roles,

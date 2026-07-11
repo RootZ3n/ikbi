@@ -124,6 +124,8 @@ function compRoles(outcomes: (wsId: string) => { builderOk?: boolean; toolRounds
       const c = checks(o.typecheck ?? 0, o.test ?? 0, o.passed ?? 10);
       return { role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: c } };
     },
+    // Phase 4: the competitive winner receives canonical semantic evaluation before promotion.
+    critic: async () => ({ role: "critic", outcome: "success", summary: "c", detail: { pass: true } }),
   };
   return { roles, builderTiers };
 }
@@ -156,7 +158,7 @@ test("competitive OFF ⇒ single-workspace path (one allocate), unchanged behavi
   // capturing roles that succeed; single-mode reads the integrator decision.
   const roles: Partial<Record<WorkerRole, RoleFn>> = {
     ...cap.roles,
-    critic: async () => ({ role: "critic", outcome: "success", summary: "c" }),
+    critic: async () => ({ role: "critic", outcome: "success", summary: "c", detail: { pass: true } }),
     integrator: async () => ({ role: "integrator", outcome: "success", summary: "i", detail: { decision: "promote", evaluation: { approved: true } } }),
   };
   const orch = createOrchestrator(deps({ config: SINGLE, resolveIdentity, roleClaim, workspaces: ws.workspaces, roles }));
@@ -180,6 +182,7 @@ function taintedWinnerRoles(taintDetail: Record<string, unknown>): Partial<Recor
       // ws0 passes; ws1 has a failing test ⇒ disqualified ⇒ ws0 is the sole winner.
       detail: { verdict: ctx.workspace.id === "ws0" ? "pass" : "fail", checks: checks(0, ctx.workspace.id === "ws0" ? 0 : 1, 10) },
     }),
+    critic: async () => ({ role: "critic", outcome: "success", summary: "c", detail: { pass: true } }),
   };
 }
 
@@ -409,6 +412,8 @@ test("C1: a candidate whose builder mutated package.json scripts → verifier UN
     scout: async () => ({ role: "scout", outcome: "success", summary: "s" }),
     builder: async () => ({ role: "builder", outcome: "success", summary: "b", detail: { toolRounds: 2, filesWritten: ["a.ts"], rejectedToolCalls: [], stopReason: "stop" } }),
     // NO verifier override — the orchestrator wires the real governed/integrity verifier.
+    // Phase 4: a pass critic on the winner (the semantic gate is exercised separately).
+    critic: async () => ({ role: "critic", outcome: "success", summary: "c", detail: { pass: true } }),
   };
   const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces, roles, governedExec }));
 
@@ -520,7 +525,7 @@ function builderDriver() {
 function nonBuilderRoles(verifierFor: (wsId: string) => { typecheck: number; test: number }): Partial<Record<WorkerRole, RoleFn>> {
   return {
     scout: async () => ({ role: "scout", outcome: "success", summary: "s" }),
-    critic: async () => ({ role: "critic", outcome: "success", summary: "c" }),
+    critic: async () => ({ role: "critic", outcome: "success", summary: "c", detail: { pass: true } }),
     verifier: async (ctx: RoleContext) => { const o = verifierFor(ctx.workspace.id); return { role: "verifier", outcome: "success", summary: "v", detail: { verdict: o.typecheck === 0 && o.test === 0 ? "pass" : "fail", checks: checks(o.typecheck, o.test) } }; },
     integrator: async () => ({ role: "integrator", outcome: "success", summary: "i", detail: { decision: "promote", evaluation: { approved: true } } }),
   };

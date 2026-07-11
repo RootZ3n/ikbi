@@ -52,8 +52,8 @@ test("critic boundary: an unparsable/failed critic is INDETERMINATE (req 19)", (
   assert.equal(classifySemanticVerdict(unparsable), "indeterminate");
 });
 
-test("critic boundary: a FAIL WITH a concrete issue is concrete-fail; a PASS is pass; no critic is not-evaluated", () => {
-  assert.equal(classifySemanticVerdict({ role: "critic", outcome: "success", detail: { pass: false, issues: ["missing subtreeBounds()"] } }), "concrete-fail");
+test("critic boundary: a FAIL WITH a concrete issue is fail; a PASS is pass; no critic is not-evaluated", () => {
+  assert.equal(classifySemanticVerdict({ role: "critic", outcome: "success", detail: { pass: false, issues: ["missing subtreeBounds()"] } }), "fail");
   assert.equal(classifySemanticVerdict({ role: "critic", outcome: "success", detail: { pass: true } }), "pass");
   assert.equal(classifySemanticVerdict(undefined), "not-evaluated");
 });
@@ -117,7 +117,7 @@ function successProvider() {
   let turn = 0;
   const invokeModel = async (req: ModelRequest): Promise<ModelResponse> => {
     if (typeof (req as { prompt?: unknown }).prompt === "string") return ok(JSON.stringify({ tier: "worker", rationale: "x" }));
-    if (!(req.tools ?? []).some((t) => t.name === "done")) return ok("PASS\n- a finding");
+    if (!(req.tools ?? []).some((t) => t.name === "done")) return ok(JSON.stringify({ verdict: "PASS", scores: { files_modified: 5, goal_correctness: 5, code_quality: 5, tests: 5, suspicious_patterns: 5 }, feedback: "correct and complete for the goal" }));
     builderModels.push(req.model);
     turn += 1;
     if (turn === 1) return toolResp("read_file", { path: "a.ts" });
@@ -129,6 +129,7 @@ function successProvider() {
 }
 const stubRoles: Partial<Record<WorkerRole, RoleFn>> = {
   verifier: async () => ({ role: "verifier", outcome: "success", summary: "ok", detail: { verdict: "pass", checks: [], testEvidence: "executed" } }),
+  critic: async () => ({ role: "critic", outcome: "success", summary: "c", detail: { pass: true, semanticVerdict: { kind: "pass", summary: "ok", blockingDefects: [], incompleteRequirements: [], advisories: [], parseStatus: "structured" } } }),
   integrator: async () => ({ role: "integrator", outcome: "success", summary: "p", detail: { decision: "promote", rationale: "s", evaluation: { approved: true } } }),
 };
 

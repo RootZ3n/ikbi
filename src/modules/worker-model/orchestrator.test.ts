@@ -1182,7 +1182,7 @@ test("a failed run emits worker.failed", async () => {
 function okModelResponse(): ModelResponse {
   return {
     contractVersion: "1.1.0", model: "mimo-v2.5", provider: "mimo", providerModelId: "mimo-v2.5",
-    content: "PASS\n- a finding", finishReason: "stop", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+    content: JSON.stringify({ verdict: "PASS", scores: { files_modified: 5, goal_correctness: 5, code_quality: 5, tests: 5, suspicious_patterns: 5 }, feedback: "correct and complete for the goal" }), finishReason: "stop", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
     cost: { usd: 0, promptUsd: 0, cachedUsd: 0, completionUsd: 0, rate: { promptPerMTok: 0, completionPerMTok: 0 } },
     latencyMs: 1, fellBack: false, attempts: [],
   };
@@ -1240,6 +1240,8 @@ test("real scout/builder/critic + stubbed verifier/integrator → coherent succe
       calls.discard += 1;
       return { workspaceId: handle.id, removed: true };
     },
+    // Phase 4: the REAL critic needs a diff to render a semantic verdict (the model returns PASS).
+    diff: async () => "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n-export const a = 1;\n+export const a = 2;\n",
   };
   const roles: Partial<Record<WorkerRole, RoleFn>> = {
     verifier: async () => ({ role: "verifier", outcome: "success", summary: "checks ok (stubbed in test)" }),

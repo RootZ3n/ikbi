@@ -60,6 +60,7 @@ import { DriftBlockedError } from "../drift-prevention/index.js";
 import type { DriftPrevention, DriftReport } from "../drift-prevention/index.js";
 import { rosterFromIds } from "../model-router/index.js";
 import { rentBuilderExpert, classifyTaskTier, resolveClassifierModel, laneRoster, type RentedExpert } from "./expert-rental.js";
+import { semanticPromotionEligible, type SemanticVerdict, type SemanticVerdictKind } from "./semantic-verdict.js";
 import { applyConsultPatch } from "./consult-apply.js";
 import type { ApplyConsultPatchInput, ApplyConsultPatchResult } from "./consult-apply.js";
 
@@ -875,7 +876,8 @@ export interface PromotionCandidate {
 }
 
 /** How the critic's verdict was resolved (Phase 3 critic-parser boundary). */
-export type SemanticVerdictKind = "pass" | "concrete-fail" | "indeterminate" | "not-evaluated";
+// The canonical semantic verdict kinds (Phase 4) — re-exported for the promotion evidence.
+export type { SemanticVerdictKind };
 
 /**
  * Candidate-BOUND evidence submitted to the canonical promotion authority (Phase 3). Every field
@@ -889,6 +891,8 @@ export interface CandidateEvidence {
   readonly verificationMode?: string;
   /** Semantic (critic) verdict, classified. `not-evaluated` = the strategy ran no model critic. */
   readonly semanticKind: SemanticVerdictKind;
+  /** Whether policy explicitly permits promoting THIS candidate without semantic evaluation (Phase 4). */
+  readonly semanticEvaluationOptional?: boolean;
   /** The authoritative policy decision (integrator/judge/adjudication) — promote iff true. */
   readonly policyPromote: boolean;
   /** The real gate-wall governance decision — must allow, or the authority refuses. */
@@ -909,14 +913,23 @@ export interface CandidateEvidence {
 export function classifySemanticVerdict(critic: RoleResult | undefined): SemanticVerdictKind {
   if (critic === undefined) return "not-evaluated";
   const d = (critic.detail ?? {}) as Record<string, unknown>;
+  // Prefer the canonical semantic verdict the critic stamped (Phase 4) — the single source of truth.
+  const sv = d.semanticVerdict;
+  if (typeof sv === "object" && sv !== null && typeof (sv as SemanticVerdict).kind === "string") {
+    return (sv as SemanticVerdict).kind;
+  }
+  // Fallback (an injected/legacy critic WITHOUT a stamped verdict — the production critic always
+  // stamps one, so this only affects test doubles). A bare `FAIL` with no concrete issue is
+  // indeterminate, never a fabricated defect. A critic that RAN (outcome success) and raised no
+  // explicit `pass:false` is a pass (it produced no blocking objection).
   if (d.pass === true) return "pass";
-  // The critic role itself could not produce a parseable verdict (e.g. a parser throw surfaced as a
-  // role failure with no structured pass/feedback) ⇒ indeterminate, not a concrete defect.
-  if (d.pass !== false && critic.outcome !== "success") return "indeterminate";
-  const issues = Array.isArray(d.issues) ? d.issues.filter((x): x is string => typeof x === "string" && x.trim().length > 0) : [];
-  const fb = typeof d.feedback === "string" ? d.feedback.trim() : "";
-  const substantiveFeedback = fb.length > 0 && fb.toUpperCase() !== "FAIL" && fb.toUpperCase() !== "PASS";
-  return issues.length > 0 || substantiveFeedback ? "concrete-fail" : "indeterminate";
+  if (d.pass === false) {
+    const issues = Array.isArray(d.issues) ? d.issues.filter((x): x is string => typeof x === "string" && x.trim().length > 0) : [];
+    const fb = typeof d.feedback === "string" ? d.feedback.trim() : "";
+    const substantiveFeedback = fb.length > 0 && fb.toUpperCase() !== "FAIL" && fb.toUpperCase() !== "PASS";
+    return issues.length > 0 || substantiveFeedback ? "fail" : "indeterminate";
+  }
+  return critic.outcome === "success" ? "pass" : "indeterminate";
 }
 
 /** Build an orchestrator. The default deps wire the real frozen singletons. */
@@ -1663,10 +1676,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 
   interface CanonicalPromotionResult {
     readonly promote: PromoteResult;
-    /** Set when the authority REFUSED before/at promote (policy, governance, or stale-tree). */
+    /** Set when the authority REFUSED before/at promote (policy, governance, stale-tree, or semantic). */
     readonly blockedReason?: string;
     /** True when the refusal was a stale-tree / post-verify mutation (candidate ≠ verified). */
     readonly staleTree?: boolean;
+    /** True when the refusal was the semantic policy gate (a non-pass / unevaluated verdict). */
+    readonly semanticWithheld?: boolean;
   }
 
   async function promoteCandidate(
@@ -1687,6 +1702,25 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     if (!evidence.policyPromote) return { promote: noPromote("policy declined promotion"), blockedReason: "policy declined promotion" };
     if (evidence.governance.allow !== true) {
       return { promote: noPromote(evidence.governance.reason ?? "governance denied promotion"), blockedReason: "governance denied" };
+    }
+    // (1b) SEMANTIC POLICY (Phase 4): only a semantic `pass` is autonomously promotable. `not-evaluated`
+    // promotes only when policy explicitly marks semantic evaluation optional for this candidate;
+    // `fail`/`incomplete`/`indeterminate`/`infrastructure-failure` never autonomously promote. This is
+    // the gate that stops a tournament/competitive winner from promoting as `not-evaluated` by default.
+    if (!semanticPromotionEligible(evidence.semanticKind, evidence.semanticEvaluationOptional === true)) {
+      const reason = `semantic policy: a "${evidence.semanticKind}" verdict is not autonomously promotable (only a semantic pass is; not-evaluated requires explicit optional policy)`;
+      await receipts.append(
+        {
+          operation: "worker.promotion.semantic_withheld",
+          outcome: { status: "failure", detail: reason },
+          requestId: candidate.taskId,
+          metadata: { taskId: candidate.taskId, attemptId: candidate.attemptId, strategy: candidate.strategy, workspaceId: candidate.workspaceId, semanticVerdict: evidence.semanticKind, semanticEvaluationOptional: evidence.semanticEvaluationOptional === true },
+          project: handle.targetRepo,
+        },
+        parentIdentity,
+      );
+      log.warn({ taskId: candidate.taskId, strategy: candidate.strategy, semanticVerdict: evidence.semanticKind }, "canonical promotion: SEMANTIC withheld — non-pass verdict is not autonomously promotable");
+      return { promote: noPromote(reason), blockedReason: reason, semanticWithheld: true };
     }
     // (2) STALE-TREE: the candidate that is promoted must be the exact candidate that was verified.
     const currentTree = await readTreeHash(candidate.workspacePath);
@@ -3937,6 +3971,15 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               reason = canon.blockedReason;
               trustSuppressed = true;
               trustSuppressReason = "stale-tree: candidate mutated since verification (not a worker quality failure)";
+            } else if (canon.semanticWithheld === true) {
+              // The integrator approved but the canonical semantic verdict is not a pass (e.g. a
+              // contradictory PASS-with-defects → indeterminate). Fail CLOSED — retain for inspection,
+              // reject, suppress trust (a semantic-evaluation gap, not a proven worker quality failure).
+              await safeRetain(workspaces, workspace, canon.blockedReason ?? "semantic policy withheld promotion");
+              overall = "rejected";
+              reason = canon.blockedReason;
+              trustSuppressed = true;
+              trustSuppressReason = "semantic policy withheld promotion (non-pass verdict)";
             } else {
               // Conflict: the workspace is reconcilable — downgrade to partial, do NOT discard.
               overall = "partial";
@@ -3984,6 +4027,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // governance refusal, an unverifiable target, an injection block, or an unlandable conflict are
     // failures a different vendor cannot fix — the peer must not run. Order matters: the most specific
     // structural/security/governance classes win over the generic "candidate-rejected".
+    // Phase 4: an INDETERMINATE or INFRASTRUCTURE critic verdict is NOT a candidate rejection — the
+    // critic could not render a concrete judgment, so a peer vendor lane cannot fix it (a duel would
+    // waste the peer's cost). Only a concrete quality rejection (fail/incomplete, or a builder/verifier
+    // failure where the critic gave no blocking verdict) stays duel-eligible.
+    const criticSemantic = classifySemanticVerdict(results.find((r) => r.role === "critic"));
+    const semanticNonDuel = criticSemantic === "indeterminate" || criticSemantic === "infrastructure-failure";
     const nonPromotion: WorkerResult["nonPromotion"] = promoted
       ? undefined
       : checksUnverifiable !== undefined
@@ -3994,7 +4043,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             ? { class: "governance-refused", duelEligible: false }
             : overall === "partial"
               ? { class: "candidate-conflict", duelEligible: false }
-              : { class: "candidate-rejected", duelEligible: true };
+              : semanticNonDuel
+                ? { class: "semantic-indeterminate", duelEligible: false }
+                : { class: "candidate-rejected", duelEligible: true };
     const result: WorkerResult = {
       contractVersion: CONTRACT_VERSION,
       taskId: task.taskId,
@@ -4386,7 +4437,13 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 
       // 5b. WINNER: promote it (gate-wall STILL governs), discard ALL losers.
       const winner = handles.find((h) => h.id === verdict.winner!.workspaceId)!;
-      const winnerRoles = rolesByWs.get(winner.id) ?? [];
+      const selectedRoles = rolesByWs.get(winner.id) ?? [];
+      // Phase 4: the deterministic judge SELECTED this candidate, but ranking is NOT semantic
+      // verification. Run the canonical critic on the winner so it reaches promotion with a REAL
+      // semantic verdict (never `not-evaluated`); a concrete-defect fail then blocks the promote.
+      const compCritic = await dispatchRole("critic", spawnRole("critic", parentCtx), task, winner, selectedRoles, parentCtx, runEngine, criticFor(), runCost);
+      const winnerRoles = [...selectedRoles, compCritic];
+      const compSemanticKind = classifySemanticVerdict(compCritic);
 
       // H5 FAIL-CLOSED: a promote REQUIRES gate-wall authorization. No gate-wall ⇒ DENY
       // (never advisory-allow an irreversible promote). Discard EVERY workspace, land
@@ -4419,11 +4476,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         await recordBuildTrust("rejected", compWorkerSpawned, task.taskId, task.targetRepo, false, compTaint); // NOT suppressed — a genuine gate failure
         return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: winnerRoles, workspaceId: retained.retained?.id ?? winner.id, promoted: false, reason: retained.reason, costUsd: runCost() };
       }
-      // CANONICAL PROMOTION (Phase 3): the competitive winner is a SELECTED candidate — it does not
-      // promote itself. It enters the same authority as every strategy (stale-tree + verifiedAgainst +
-      // canonical receipt). The deterministic judge selected it; the model critic is NOT run on the
-      // winner here (IKBI-RT-004 semantic-funnel gap — documented, not closed in this phase).
-      const compWinnerModel = ((rolesByWs.get(winner.id) ?? []).find((r) => r.role === "builder")?.detail as Record<string, unknown> | undefined)?.model;
+      // CANONICAL PROMOTION (Phase 3 authority + Phase 4 semantic): the competitive winner is a
+      // SELECTED, semantically-evaluated candidate — it does not promote itself. It enters the same
+      // authority as every strategy (stale-tree + verifiedAgainst + canonical receipt + semantic gate).
+      const compWinnerModel = (selectedRoles.find((r) => r.role === "builder")?.detail as Record<string, unknown> | undefined)?.model;
       const compVerifiedTree = await readTreeHash(winner.path);
       const canon = await promoteCandidate(
         winner,
@@ -4433,8 +4489,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           ...(compVerifiedTree !== undefined ? { verifiedTree: compVerifiedTree } : {}), targetHead: winner.baseRef,
         },
         {
-          verificationPassed: winnerRoles.find((r) => r.role === "verifier")?.outcome === "success",
-          semanticKind: classifySemanticVerdict(winnerRoles.find((r) => r.role === "critic")),
+          verificationPassed: selectedRoles.find((r) => r.role === "verifier")?.outcome === "success",
+          semanticKind: compSemanticKind,
           policyPromote: true, governance,
           evaluation: { approved: true, score: verdict.winner.composite, evaluatorId: "deterministic-judge" },
           message: `worker-model (competitive): ${task.goal}`,
@@ -4615,13 +4671,16 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       const governanceGrant = autonomyForTier(asTier(parentIdentity.trustTier ?? TRUST_FLOOR, TRUST_FLOOR));
       const governance: PromoteGovernance = await gateWall.evaluate({ grant: governanceGrant, action: { kind: "promote", task: t, results: [...roleResults] }, identity: parentIdentity });
       if (!governance.allow) return { promoted: false, reason: governance.reason ?? "gate-wall denied promotion" };
+      // Phase 4: the clean-shadow replay is a SELECTED, reverified candidate — but tournament ranking is
+      // NOT semantic verification. Run the canonical critic on the shadow so the winner reaches promotion
+      // with a REAL semantic verdict (never `not-evaluated`); a concrete-defect fail blocks the promote.
+      const tourCritic = await dispatchRole("critic", spawnRole("critic", parentCtx), t, ws, roleResults, parentCtx, runEngine, criticFor(), runCost);
+      const shadowRoles = [...roleResults, tourCritic];
       // C-A1: fail-closed injection/policy-taint gate for the tournament winner (parity with single-run).
-      const tourTaint = winnerTaintReason(roleResults);
+      const tourTaint = winnerTaintReason(shadowRoles);
       if (tourTaint !== undefined) return { promoted: false, reason: `discard: ${tourTaint}` };
-      // CANONICAL PROMOTION (Phase 3): the tournament winner's clean-shadow replay is a SELECTED,
-      // reverified candidate — it enters the single promotion authority like every strategy (stale-tree
-      // + verifiedAgainst + canonical receipt). The model critic is NOT run on the shadow here
-      // (IKBI-RT-004 semantic-funnel gap — documented, not closed in this phase).
+      // CANONICAL PROMOTION (Phase 3 authority + Phase 4 semantic): enter the single promotion authority
+      // like every strategy (stale-tree + verifiedAgainst + canonical receipt + semantic gate).
       const tourWinnerModel = (roleResults.find((r) => r.role === "builder")?.detail as Record<string, unknown> | undefined)?.model;
       const tourVerifiedTree = await readTreeHash(ws.path);
       const canon = await promoteCandidate(
@@ -4633,7 +4692,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         },
         {
           verificationPassed: roleResults.find((r) => r.role === "verifier")?.outcome === "success",
-          semanticKind: classifySemanticVerdict(roleResults.find((r) => r.role === "critic")),
+          semanticKind: classifySemanticVerdict(tourCritic),
           policyPromote: true, governance,
           evaluation: { approved: true, score: composite, evaluatorId: "deterministic-judge" },
           message: `worker-model (tournament): ${t.goal}`,
