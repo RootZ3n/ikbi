@@ -137,6 +137,12 @@ export interface PromoteGovernance {
   readonly allow: boolean;
   readonly reason?: string;
   readonly gateId?: string;
+  /**
+   * Phase 13 (IKBI-REAUDIT2-008): TRUE when this allow came from the operator-configured gate-wall BYPASS
+   * (`IKBI_GATE_WALL_BYPASS`), NOT from an actual policy evaluation. Callers must surface it so a bypassed
+   * land is never audited as a fully-governed autonomous promotion (the gate veto was administratively off).
+   */
+  readonly bypass?: boolean;
 }
 
 /**

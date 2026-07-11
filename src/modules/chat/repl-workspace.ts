@@ -172,10 +172,16 @@ class ManagedWorkspace implements SessionWorkspace {
         reason: `gate-wall denied promotion: ${governance.reason ?? "no reason given"}`,
       };
     }
-    // TREE IDENTITY BINDING (fail-closed): bind the manual apply to the exact target head + scratch tree,
-    // so the workspace CAS refuses if the target moved or a drifted tree would land. If the identity is
-    // unreadable, proceed unbound (a non-git/degenerate case) — the manual receipt records that plainly.
-    const verifiedAgainst = this.readTreeIdentity();
+    // TREE IDENTITY BINDING (Phase 13, IKBI-REAUDIT2-009 — fail-closed). Bind the manual apply to the exact
+    // target head + scratch tree so the workspace CAS refuses a moved target / drifted tree. A genuinely
+    // non-git workspace proceeds unbound (legit); a GIT-backed workspace whose identity cannot be read is
+    // INDETERMINATE and REFUSES — a probe error must not launder a git worktree into an unbound manual land.
+    const idResolution = this.resolveManualIdentity();
+    if (idResolution.status === "indeterminate") {
+      await this.recordManualApply(false, "tree-identity indeterminate on a git-backed workspace — refusing unbound manual apply", undefined, identity, governance.bypass === true);
+      return { promoted: false, workspaceId: this.handle.id, targetBranch: this.handle.baseBranch, beforeRef: this.handle.baseRef, strategy: "noop", reason: "manual apply refused: tree identity indeterminate on a git-backed workspace (a probe error must not land unbound)" };
+    }
+    const verifiedAgainst = idResolution.status === "git" ? idResolution.verifiedAgainst : undefined;
     const result = await this.mgr.promote(this.handle, {
       // MANUAL apply: evaluatorId marks the operator; governance is the REAL gate verdict. This is NOT an
       // autonomous verified promotion — the receipt below is labelled manual-unverified.
@@ -184,20 +190,36 @@ class ManagedWorkspace implements SessionWorkspace {
       message,
       ...(verifiedAgainst !== undefined ? { verifiedAgainst } : {}),
     });
-    await this.recordManualApply(result.promoted, result.reason ?? (result.promoted ? "landed" : "not promoted"), result.afterRef, identity);
+    await this.recordManualApply(result.promoted, result.reason ?? (result.promoted ? "landed" : "not promoted"), result.afterRef, identity, governance.bypass === true);
     return result;
   }
 
-  /** Read the target head + scratch tree for a hash-bound manual apply. Undefined if not git-readable. */
-  private readTreeIdentity(): { targetHead: string; integratedTree: string } | undefined {
+  /**
+   * FAIL-CLOSED manual tree-identity resolution (Phase 13, IKBI-REAUDIT2-009). Distinguishes a git-backed
+   * workspace (bind the CAS), a proven non-git workspace (proceed unbound), and an indeterminate probe error
+   * (refuse) — so a transient git/process failure can never launder a git worktree into an unbound land.
+   */
+  private resolveManualIdentity(): { status: "git"; verifiedAgainst: { targetHead: string; integratedTree: string } } | { status: "non-git" } | { status: "indeterminate" } {
+    let inside: string;
     try {
-      const git = (args: string[], cwd: string): string => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"] }).trim();
+      inside = execFileSync("git", ["-C", this.handle.path, "rev-parse", "--is-inside-work-tree"], { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "pipe"] }).trim();
+    } catch (err) {
+      const e = err as { code?: string; stderr?: Buffer | string; signal?: string; status?: number };
+      const stderr = typeof e.stderr === "string" ? e.stderr : e.stderr?.toString() ?? "";
+      if (e.code === "ENOENT" || e.code === "EACCES" || e.code === "ETIMEDOUT" || e.signal === "SIGTERM") return { status: "indeterminate" };
+      if (typeof e.status === "number" && (/not a git repository/i.test(stderr) || /cannot change to|no such file or directory|not a working tree/i.test(stderr))) return { status: "non-git" };
+      return { status: "indeterminate" };
+    }
+    if (inside !== "true") return { status: "non-git" };
+    try {
+      const git = (args: string[], cwd: string): string => execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "pipe"] }).trim();
       const targetHead = git(["rev-parse", this.handle.baseBranch], this.handle.targetRepo);
       const integratedTree = git(["rev-parse", "HEAD^{tree}"], this.handle.path);
-      if (targetHead.length === 0 || integratedTree.length === 0) return undefined;
-      return { targetHead, integratedTree };
+      if (targetHead.length === 0 || integratedTree.length === 0) return { status: "indeterminate" };
+      return { status: "git", verifiedAgainst: { targetHead, integratedTree } };
     } catch {
-      return undefined;
+      // A git worktree whose head/tree cannot be read is INDETERMINATE (fail-closed), not unbound.
+      return { status: "indeterminate" };
     }
   }
 
@@ -206,7 +228,7 @@ class ManagedWorkspace implements SessionWorkspace {
    * `worker.promotion`; it explicitly disclaims verification/semantic/test certification and success trust,
    * so a manual operator apply can never be mistaken for an autonomous verified promotion in the audit trail.
    */
-  private async recordManualApply(promoted: boolean, detail: string, landedRef: string | undefined, identity: AgentIdentity): Promise<void> {
+  private async recordManualApply(promoted: boolean, detail: string, landedRef: string | undefined, identity: AgentIdentity, gateBypassed = false): Promise<void> {
     try {
       await coreReceipts.append(
         {
@@ -225,6 +247,8 @@ class ManagedWorkspace implements SessionWorkspace {
             semanticEvaluationAuthoritative: false,
             verifiedPromotion: false,
             successTrustAwarded: false,
+            // Phase 13 (IKBI-REAUDIT2-008): surface when the gate veto was administratively bypassed.
+            ...(gateBypassed ? { gateBypassed: true } : {}),
           },
         },
         identity,

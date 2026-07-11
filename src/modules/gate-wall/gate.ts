@@ -102,9 +102,10 @@ export function createGateWall(deps: GateWallDeps = {}): GateWall {
 
     // DECISION: a pure function of the grant — the action does NOT influence it.
     let governance: PromoteGovernance;
-    // BYPASS: operator has explicitly opted out of approval gates.
+    // BYPASS: operator has explicitly opted out of approval gates. Phase 13 (IKBI-REAUDIT2-008): mark the
+    // decision `bypass: true` so a bypassed land is never audited as a fully-governed policy evaluation.
     if (config.bypass) {
-      governance = { allow: true, reason: `gate-wall bypass enabled — allowing all (${tier})`, gateId };
+      governance = { allow: true, bypass: true, reason: `gate-wall bypass enabled — allowing all (${tier})`, gateId };
     } else if (!config.enabled) {
       governance = { allow: false, reason: "gate-wall disabled — denying (fail-closed)", gateId };
     } else if (audit.kind === "exec") {
@@ -150,7 +151,7 @@ export function createGateWall(deps: GateWallDeps = {}): GateWall {
       {
         operation: GATE_OPERATION,
         outcome: { status: "success", detail: `${audit.summary} → ${governance.allow ? "allow" : "deny"}` },
-        metadata: { tier, action: audit.kind, allow: governance.allow, reason: governance.reason, gateId, ...audit.metadata },
+        metadata: { tier, action: audit.kind, allow: governance.allow, ...(governance.bypass === true ? { bypass: true } : {}), reason: governance.reason, gateId, ...audit.metadata },
         ...(audit.requestId !== undefined ? { requestId: audit.requestId } : {}),
         ...(audit.project !== undefined ? { project: audit.project } : {}),
       },

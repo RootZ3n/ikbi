@@ -718,6 +718,12 @@ export interface OrchestratorDeps {
    */
   readonly isGitBacked?: (workspacePath: string) => Promise<boolean>;
   /**
+   * Phase 13 (IKBI-REAUDIT2-002): fail-closed tree-identity resolution. Overrides the derived resolver so a
+   * test/production can return `indeterminate` for a git/process error (which must block autonomous promotion)
+   * instead of the boolean `isGitBacked` silently reclassifying a real worktree as an exempt non-git workspace.
+   */
+  readonly resolveWorkspaceIdentity?: (workspacePath: string) => Promise<WorkspaceIdentityResolution>;
+  /**
    * Production runtime-truth EVIDENCE reader (Phase 5). When provided (or resolvable from the
    * configured `IKBI_RUNTIME_TRUTH_READER_MODULE`), the orchestrator requests bounded, task/candidate-
    * scoped evidence and injects it into the builder/critic model context. Absent + disabled ⇒ inert.
@@ -886,6 +892,39 @@ interface AttemptModelDecision {
 export type PromotionStrategy = "normal" | "duel-primary" | "duel-peer" | "tournament" | "competitive";
 
 /**
+ * Phase 13 (IKBI-REAUDIT2-002): a FAIL-CLOSED tree-identity resolution. A boolean "is git" conflated a proven
+ * non-git workspace with an unknown/error probe, so a transient git/process failure silently reclassified a
+ * real worktree as exempt and dropped stale-tree/CAS. This 3-state result never does that: only a PROVEN
+ * git-backed or PROVEN non-git workspace resolves; any error/permission/missing-tool/hash failure is
+ * `indeterminate` and blocks autonomous promotion.
+ */
+export type WorkspaceIdentityResolution =
+  | { readonly status: "resolved"; readonly backing: "git"; readonly identity: string }
+  | { readonly status: "resolved"; readonly backing: "non-git"; readonly identity: string }
+  | { readonly status: "indeterminate"; readonly error: string };
+
+/**
+ * Phase 13 (IKBI-REAUDIT2-001): a run-scoped fence tracking, per workspace, whether a candidate-MUTATING role
+ * (builder/fixer/escalation/cheap-retry) TIMED OUT and was not superseded by a clean (non-timed-out) generation.
+ * `runRoleFn` cannot cancel the losing promise, so a timed-out builder can keep writing after its tests passed;
+ * a fenced workspace is fail-closed BLOCKED from autonomous promotion (its tree may contain post-timeout work).
+ * A subsequent clean generation on the same workspace (escalation/retry/fixer that did NOT time out) supersedes.
+ */
+class MutationFence {
+  private tick = 0;
+  private readonly lastMutatingTimeout = new Map<string, number>();
+  private readonly lastCleanMutation = new Map<string, number>();
+  recordMutatingTimeout(workspaceId: string): void { this.lastMutatingTimeout.set(workspaceId, ++this.tick); }
+  recordCleanMutation(workspaceId: string): void { this.lastCleanMutation.set(workspaceId, ++this.tick); }
+  /** True when an unsuperseded mutating-role timeout stands for this workspace. */
+  isFenced(workspaceId: string): boolean {
+    return (this.lastMutatingTimeout.get(workspaceId) ?? -1) > (this.lastCleanMutation.get(workspaceId) ?? -1);
+  }
+}
+/** Active per-run fences, keyed by taskId so `runRoleFn` (a shared closure) reaches the right run's fence. */
+const activeMutationFences = new Map<string, MutationFence>();
+
+/**
  * A uniquely identifiable proposed tree produced by one attempt/strategy (Phase 3). It carries the
  * provenance the canonical promotion authority needs to prove the identity chain:
  *   generated == selected == verified == policy-evaluated == promoted == receipt candidate.
@@ -914,6 +953,18 @@ export interface PromotionCandidate {
    * legitimately have no tree.
    */
   readonly treeIdentityRequired?: boolean;
+  /**
+   * Phase 13 (IKBI-REAUDIT2-002): the workspace's tree-identity RESOLUTION is indeterminate — a git/process
+   * probe error that CANNOT prove the workspace is genuinely non-git. Autonomous promotion is fail-closed
+   * blocked: an error must never be laundered into a non-git exemption that waives stale-tree/CAS.
+   */
+  readonly identityIndeterminate?: boolean;
+  /**
+   * Phase 13 (IKBI-REAUDIT2-001): a candidate-mutating role (builder/fixer/escalation) TIMED OUT on this
+   * workspace and its abandoned, uncancellable work was NOT superseded by a clean (non-timed-out) generation.
+   * The promotable tree may contain post-timeout writes the executed tests never observed — fail-closed block.
+   */
+  readonly mutationFenced?: boolean;
 }
 
 /** How the critic's verdict was resolved (Phase 3 critic-parser boundary). */
@@ -1140,16 +1191,36 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // An explicit override (the verifier's check-floored timeout) still wins.
     const roleBaseTimeout = role === "builder" ? resolveBuilderTimeoutMs(roleTimeoutMs, ctx.task.complexity) : roleTimeoutMs;
     const effectiveTimeout = timeoutOverrideMs ?? roleBaseTimeout;
-    if (!(effectiveTimeout > 0)) return roleFn(ctx);
+    // Phase 13: `builder` is the only candidate-MUTATING role (the fixer/escalation/cheap-retry all dispatch
+    // as "builder"); its timeout is a mutation fence, its clean completion supersedes a prior fence.
+    const fence = activeMutationFences.get(ctx.task.taskId);
+    const mutating = role === "builder";
+    if (!(effectiveTimeout > 0)) {
+      const r = await Promise.resolve(roleFn(ctx));
+      if (mutating && fence !== undefined) { if ((r.detail as Record<string, unknown> | undefined)?.timedOut === true) fence.recordMutatingTimeout(ctx.workspace.id); else if (r.outcome === "success") fence.recordCleanMutation(ctx.workspace.id); }
+      return r;
+    }
+    // COOPERATIVE CANCELLATION (Phase 13): an abort signal the role/tools/provider CAN honor to stop early.
+    // It is best-effort — a role that ignores it still cannot promote timed-out work (the fence below is the
+    // non-cooperative final authority). Threaded onto the RoleContext so honoring callers see it.
+    const controller = new AbortController();
+    const signalCtx: RoleContext = { ...ctx, signal: controller.signal };
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<RoleResult>((resolve) => {
-      timer = setTimeout(
-        () => resolve({ role, outcome: "failure", summary: `role "${role}" exceeded its ${effectiveTimeout}ms wall-clock timeout`, detail: { timedOut: true, timeoutMs: effectiveTimeout } }),
-        effectiveTimeout,
-      );
+      timer = setTimeout(() => {
+        controller.abort();
+        resolve({ role, outcome: "failure", summary: `role "${role}" exceeded its ${effectiveTimeout}ms wall-clock timeout`, detail: { timedOut: true, timeoutMs: effectiveTimeout } });
+      }, effectiveTimeout);
     });
     try {
-      return await Promise.race([Promise.resolve(roleFn(ctx)), timeout]);
+      const result = await Promise.race([Promise.resolve(roleFn(signalCtx)), timeout]);
+      // FENCE (non-cooperative): a mutating-role TIMEOUT quarantines this workspace's tree (the losing promise
+      // is uncancellable and may still write); a mutating-role CLEAN success supersedes a prior fence.
+      if (mutating && fence !== undefined) {
+        if ((result.detail as Record<string, unknown> | undefined)?.timedOut === true) fence.recordMutatingTimeout(ctx.workspace.id);
+        else if (result.outcome === "success") fence.recordCleanMutation(ctx.workspace.id);
+      }
+      return result;
     } finally {
       if (timer !== undefined) clearTimeout(timer);
     }
@@ -1744,6 +1815,56 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       }
     });
 
+  // FAIL-CLOSED TREE-IDENTITY RESOLVER (Phase 13, IKBI-REAUDIT2-002). Replaces the boolean "is git" decision
+  // for autonomous candidates: a git/process error may NOT be laundered into a non-git exemption. Precedence:
+  //   1. An injected `deps.resolveWorkspaceIdentity` (production wiring / tests) wins.
+  //   2. Else derive from the injected `deps.isGitBacked` + `deps.readTreeHash` (backward compatible — existing
+  //      tests inject these): git+readable ⇒ git; git+unreadable ⇒ indeterminate; not-git ⇒ proven non-git.
+  //   3. Else the default probes git ITSELF and classifies the error: a proven "not a git repository" is
+  //      non-git; a MISSING git binary / permission / timeout / other failure is INDETERMINATE (never non-git).
+  const resolveWorkspaceIdentity: (workspacePath: string) => Promise<WorkspaceIdentityResolution> =
+    deps.resolveWorkspaceIdentity ??
+    (async (workspacePath: string): Promise<WorkspaceIdentityResolution> => {
+      if (deps.isGitBacked !== undefined || deps.readTreeHash !== undefined) {
+        // Backward-compatible derivation from the (possibly injected) boolean probe. Classification only: a
+        // git worktree with an UNREADABLE tree is still git-backed — the downstream tree-identity gate fails it
+        // closed (Phase 10). `indeterminate` is reserved for a failed CLASSIFICATION (below / injected resolver).
+        const git = await isGitBacked(workspacePath);
+        if (!git) return { status: "resolved", backing: "non-git", identity: `nongit:${workspacePath}` };
+        const tree = await readTreeHash(workspacePath);
+        return { status: "resolved", backing: "git", identity: tree ?? "git:unreadable" };
+      }
+      // Default production resolver: one probe that DISTINGUISHES proven non-git from a git/process error, so a
+      // transient failure never launders a real worktree into a non-git exemption (IKBI-REAUDIT2-002).
+      let inside: string;
+      try {
+        inside = execFileSync("git", ["-C", workspacePath, "rev-parse", "--is-inside-work-tree"], { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "pipe"] }).trim();
+      } catch (err) {
+        const e = err as { code?: string; stderr?: Buffer | string; signal?: string; status?: number };
+        const stderr = typeof e.stderr === "string" ? e.stderr : e.stderr?.toString() ?? "";
+        // git could NOT run (missing binary / permission / timeout) ⇒ INDETERMINATE (fail-closed).
+        if (e.code === "ENOENT" || e.code === "EACCES" || e.code === "ETIMEDOUT" || e.signal === "SIGTERM") {
+          return { status: "indeterminate", error: `git identity probe could not run (${e.code ?? e.signal})` };
+        }
+        // git RAN and answered (nonzero exit with a diagnostic): a genuine non-repo, or a missing/degenerate
+        // path (an in-memory/test workspace), is PROVEN non-git and legitimately exempt.
+        if (typeof e.status === "number" && (/not a git repository/i.test(stderr) || /cannot change to|no such file or directory|not a working tree/i.test(stderr))) {
+          return { status: "resolved", backing: "non-git", identity: `nongit:${workspacePath}` };
+        }
+        // git ran but failed for an unrecognized reason ⇒ INDETERMINATE (fail-closed).
+        return { status: "indeterminate", error: `git identity probe failed (${e.code ?? e.signal ?? `exit ${e.status ?? "?"}`})` };
+      }
+      if (inside !== "true") return { status: "resolved", backing: "non-git", identity: `nongit:${workspacePath}` };
+      const tree = await readTreeHash(workspacePath);
+      return { status: "resolved", backing: "git", identity: tree ?? "git:unreadable" };
+    });
+  /** Resolve a candidate's identity into the two authority fields: whether tree identity is required + whether it is indeterminate (fail-closed). */
+  const candidateIdentityFields = async (workspacePath: string): Promise<{ treeIdentityRequired: boolean; identityIndeterminate: boolean }> => {
+    const res = await resolveWorkspaceIdentity(workspacePath);
+    if (res.status === "indeterminate") return { treeIdentityRequired: true, identityIndeterminate: true };
+    return { treeIdentityRequired: res.backing === "git", identityIndeterminate: false };
+  };
+
   // ── RUNTIME-TRUTH EVIDENCE (Phase 5) ────────────────────────────────────────────────────────────
   // Resolve the production reader ONCE per orchestrator (an injected dep, else the configured dynamic
   // module, else inert). Fail-closed: a missing/broken reader yields no evidence + an advisory receipt,
@@ -1840,6 +1961,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     readonly evidenceWithheld?: boolean;
     /** True when the refusal was an unenforceable tree identity on a git-backed candidate (Phase 10). */
     readonly treeIdentityUnavailable?: boolean;
+    /** True when the refusal was a timed-out candidate-mutating role fence (Phase 13, IKBI-REAUDIT2-001). */
+    readonly mutationFenced?: boolean;
+    /** True when the refusal was an indeterminate tree-identity resolution (Phase 13, IKBI-REAUDIT2-002). */
+    readonly identityIndeterminate?: boolean;
   }
 
   async function promoteCandidate(
@@ -1905,6 +2030,43 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     const testDecision = evaluateExecutedTestEvidence(evidence.testEvidence, { allowNoTests: evidence.noTestsAcceptable === true });
     if (!testDecision.acceptable) {
       return evidenceWithheld(`executed-test evidence not acceptable for autonomous promotion (${testDecision.reason}) — a green with test evidence "${testDecision.state}" proved nothing about behavior`, { testEvidence: testDecision.state, testEvidenceReason: testDecision.reason, noTestsAcceptable: evidence.noTestsAcceptable === true });
+    }
+    // (1b) MUTATION FENCE (Phase 13, IKBI-REAUDIT2-001) — a candidate-mutating role TIMED OUT on this
+    // workspace and was not superseded by a clean generation. `runRoleFn` cannot cancel the losing promise,
+    // so the promotable tree may contain post-timeout writes the executed tests never observed. Fail-closed:
+    // timed-out work is quarantined, never autonomously promoted (it may be retained for manual inspection).
+    if (candidate.mutationFenced === true) {
+      const reason = `mutation-fence: a candidate-mutating role timed out on ${candidate.attemptId} and its uncancellable work was not superseded by a clean generation — refusing to promote a tree that may contain post-timeout writes the tests never saw`;
+      await receipts.append(
+        {
+          operation: "worker.promotion.superseded_mutation",
+          outcome: { status: "failure", detail: reason },
+          requestId: candidate.taskId,
+          metadata: { taskId: candidate.taskId, attemptId: candidate.attemptId, strategy: candidate.strategy, workspaceId: candidate.workspaceId },
+          project: handle.targetRepo,
+        },
+        parentIdentity,
+      ).catch(() => {});
+      log.warn({ taskId: candidate.taskId, attemptId: candidate.attemptId }, "canonical promotion: MUTATION-FENCE — timed-out candidate-mutating role; promote refused (fail-closed)");
+      return { promote: noPromote(reason, { strategy: "noop" }), blockedReason: reason, mutationFenced: true };
+    }
+    // (1c) TREE-IDENTITY INDETERMINATE (Phase 13, IKBI-REAUDIT2-002) — a git/process probe error that CANNOT
+    // prove the workspace is genuinely non-git. It must NOT be laundered into a non-git exemption (which would
+    // silently waive stale-tree + CAS). Fail-closed: an unresolved identity blocks autonomous promotion.
+    if (candidate.identityIndeterminate === true) {
+      const reason = `identity-indeterminate: the candidate workspace's tree identity could not be resolved (git/process probe error) — refusing to promote without an enforceable identity (a probe error must never waive stale-tree/CAS)`;
+      await receipts.append(
+        {
+          operation: "worker.promotion.identity_indeterminate",
+          outcome: { status: "failure", detail: reason },
+          requestId: candidate.taskId,
+          metadata: { taskId: candidate.taskId, attemptId: candidate.attemptId, strategy: candidate.strategy, workspaceId: candidate.workspaceId },
+          project: handle.targetRepo,
+        },
+        parentIdentity,
+      ).catch(() => {});
+      log.warn({ taskId: candidate.taskId, attemptId: candidate.attemptId }, "canonical promotion: IDENTITY-INDETERMINATE — probe error; promote refused (fail-closed)");
+      return { promote: noPromote(reason, { strategy: "noop" }), blockedReason: reason, identityIndeterminate: true };
     }
     // (2) TREE IDENTITY (Phase 10, IKBI-REAUDIT-006) — fail CLOSED when a git-backed candidate's tree
     // identity is unavailable. Reading undefined is legitimate ONLY for a genuinely non-git (in-memory/
@@ -1976,6 +2138,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           ...(evidence.semanticEvaluationId !== undefined ? { semanticEvaluationId: evidence.semanticEvaluationId } : {}),
           policyPromote: evidence.policyPromote,
           gateWallAllowed: evidence.governance.allow,
+          // TRUTHFUL GATE AUTHORITY (Phase 13, IKBI-REAUDIT2-008): when the allow came from the operator BYPASS
+          // (not a policy evaluation), record it + downgrade the authority class — a bypassed land is
+          // administratively-bypassed, never a fully-governed autonomous promotion.
+          ...(evidence.governance.bypass === true ? { gateBypassed: true, gateAuthority: "administratively-bypassed" } : { gateAuthority: "policy-evaluated" }),
           staleTreeChecked: candidate.verifiedTree !== undefined && currentTree !== undefined,
           promoted: result.promoted,
           ...(result.afterRef !== undefined ? { landedRef: result.afterRef } : {}),
@@ -4566,7 +4732,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           // single promotion authority — the normal path no longer calls workspaces.promote directly.
           const builderDetail = (results.find((r) => r.role === "builder")?.detail ?? {}) as Record<string, unknown>;
           const normalVerifier = results.find((r) => r.role === "verifier");
-          const normalTreeIdentityRequired = await isGitBacked(workspace.path);
+          const normalIdentity = await candidateIdentityFields(workspace.path);
           const candidate: PromotionCandidate = {
             taskId: task.taskId,
             attemptId: task.taskId,
@@ -4577,7 +4743,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             ...(task.moeVendorLane !== undefined ? { vendorLane: task.moeVendorLane } : {}),
             ...(verifiedTree !== undefined ? { verifiedTree } : {}),
             targetHead: verifiedTargetHead,
-            treeIdentityRequired: normalTreeIdentityRequired,
+            treeIdentityRequired: normalIdentity.treeIdentityRequired,
+            ...(normalIdentity.identityIndeterminate ? { identityIndeterminate: true } : {}),
+            ...(activeMutationFences.get(task.taskId)?.isFenced(workspace.id) ? { mutationFenced: true } : {}),
           };
           const evidence: CandidateEvidence = {
             verificationPassed: normalVerifier?.outcome === "success",
@@ -5157,7 +5325,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       const compWinnerModel = (selectedRoles.find((r) => r.role === "builder")?.detail as Record<string, unknown> | undefined)?.model;
       const compVerifiedTree = await readTreeHash(winner.path);
       const compVerifier = selectedRoles.find((r) => r.role === "verifier");
-      const compTreeIdentityRequired = await isGitBacked(winner.path);
+      const compIdentity = await candidateIdentityFields(winner.path);
       const compSemanticEvaluationId = await emitSemanticEvidence(
         compCritic,
         { taskId: task.taskId, attemptId: task.taskId, candidateId: winner.id, ...(compVerifiedTree !== undefined ? { verifiedTree: compVerifiedTree } : {}), strategy: "competitive", verificationPassed: compVerifier?.outcome === "success", targetRepo: task.targetRepo },
@@ -5170,7 +5338,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           taskId: task.taskId, attemptId: task.taskId, strategy: "competitive", workspaceId: winner.id, workspacePath: winner.path,
           ...(typeof compWinnerModel === "string" ? { model: compWinnerModel } : {}),
           ...(compVerifiedTree !== undefined ? { verifiedTree: compVerifiedTree } : {}), targetHead: winner.baseRef,
-          treeIdentityRequired: compTreeIdentityRequired,
+          treeIdentityRequired: compIdentity.treeIdentityRequired,
+          ...(compIdentity.identityIndeterminate ? { identityIndeterminate: true } : {}),
+          ...(activeMutationFences.get(task.taskId)?.isFenced(winner.id) ? { mutationFenced: true } : {}),
         },
         {
           verificationPassed: compVerifier?.outcome === "success",
@@ -5371,7 +5541,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       const tourWinnerModel = (roleResults.find((r) => r.role === "builder")?.detail as Record<string, unknown> | undefined)?.model;
       const tourVerifiedTree = await readTreeHash(ws.path);
       const tourVerifier = roleResults.find((r) => r.role === "verifier");
-      const tourTreeIdentityRequired = await isGitBacked(ws.path);
+      const tourIdentity = await candidateIdentityFields(ws.path);
       const tourSemanticEvaluationId = await emitSemanticEvidence(
         tourCritic,
         { taskId: t.taskId, attemptId: t.taskId, candidateId: ws.id, ...(tourVerifiedTree !== undefined ? { verifiedTree: tourVerifiedTree } : {}), strategy: "tournament", verificationPassed: tourVerifier?.outcome === "success", targetRepo: t.targetRepo },
@@ -5384,7 +5554,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           taskId: t.taskId, attemptId: t.taskId, strategy: "tournament", workspaceId: ws.id, workspacePath: ws.path,
           ...(typeof tourWinnerModel === "string" ? { model: tourWinnerModel } : {}),
           ...(tourVerifiedTree !== undefined ? { verifiedTree: tourVerifiedTree } : {}), targetHead: ws.baseRef,
-          treeIdentityRequired: tourTreeIdentityRequired,
+          treeIdentityRequired: tourIdentity.treeIdentityRequired,
+          ...(tourIdentity.identityIndeterminate ? { identityIndeterminate: true } : {}),
+          ...(activeMutationFences.get(t.taskId)?.isFenced(ws.id) ? { mutationFenced: true } : {}),
         },
         {
           verificationPassed: tourVerifier?.outcome === "success",
@@ -5452,7 +5624,20 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     };
   }
 
-  return { run, spawnRole };
+  // Phase 13: register a per-run mutation fence for the whole build (normal + tournament + competitive all
+  // share `task.taskId`), and always clear it — so `runRoleFn` records mutating-role timeouts/clean generations
+  // into the right run's fence and no fence leaks across builds.
+  const fencedRun = async (task: WorkerTask, parentCtx: OperationContext): Promise<WorkerResult> => {
+    const existing = activeMutationFences.get(task.taskId);
+    const fence = existing ?? new MutationFence();
+    if (existing === undefined) activeMutationFences.set(task.taskId, fence);
+    try {
+      return await run(task, parentCtx);
+    } finally {
+      if (existing === undefined) activeMutationFences.delete(task.taskId);
+    }
+  };
+  return { run: fencedRun, spawnRole };
 }
 
 /**

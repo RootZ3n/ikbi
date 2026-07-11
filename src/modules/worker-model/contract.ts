@@ -534,6 +534,12 @@ export interface RoleContext {
    * orchestrator from the production runtime-truth reader; already filtered to this task/candidate/tree.
    */
   readonly runtimeEvidence?: readonly import("../runtime-truth/index.js").RuntimeEvidence[];
+  /**
+   * Phase 13 (IKBI-REAUDIT2-001): a cooperative cancellation signal aborted when this role exceeds its
+   * wall-clock timeout. A role's tool loop / provider call MAY honor it to stop mutating early; ignoring it
+   * is safe (the orchestrator's non-cooperative mutation fence still blocks promotion of timed-out work).
+   */
+  readonly signal?: AbortSignal;
 }
 
 /** A role: a typed function the orchestrator dispatches. */
