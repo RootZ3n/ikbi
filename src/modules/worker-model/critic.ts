@@ -24,6 +24,7 @@ import type { RoleFn, RoleResult } from "./contract.js";
 import { criticModel } from "./role-models.js";
 import { parseSemanticVerdict, infrastructureFailureVerdict, type SemanticVerdict, type SemanticParseContext } from "./semantic-verdict.js";
 import { classifyRecoveryEligibility, buildRecoveryRequest, recoveredPreservesSubstance } from "./critic-recovery.js";
+import { buildEvidencePackage, substanceFingerprint, substanceEquivalent, type EvidencePackage } from "./semantic-evidence.js";
 import { renderEvidenceBlock } from "../runtime-truth/index.js";
 
 // The model id is CRITIC-tier and config-driven (see role-models.ts) — resolved at
@@ -81,6 +82,24 @@ function bindingInstruction(candidateId: string, verifiedTree: string | undefine
   );
 }
 
+/**
+ * Enumerate the FINITE evidence surface a defect may cite (Phase 12). Every blocking defect must reference
+ * ≥1 of these evidence ids in its `evidenceIds`, and name a requirement id in `requirementId`. A defect that
+ * cites anything NOT listed here (an unshown file, a test not run, an imagined fact) is unsupported and will
+ * be discarded — the reviewer only knows what is listed below.
+ */
+function evidenceManifestInstruction(pkg: EvidencePackage): string {
+  const lines = pkg.items.map((it) => `  - ${it.id}${it.label !== undefined ? `  (${it.kind}: ${it.label.slice(0, 120)})` : `  (${it.kind})`}`);
+  const reqIds = [...pkg.requirementIds].join(", ");
+  return (
+    "ALLOWED EVIDENCE (you were shown ONLY these — cite nothing else):\n" +
+    `${lines.join("\n")}\n` +
+    "RULES: every blockingDefect MUST include an `evidenceIds` array naming ≥1 id above, and a\n" +
+    "`requirementId` naming one of the allowed requirement ids [" + reqIds + "]. A defect that cites a\n" +
+    "file/test/fact NOT listed above is INVALID and will be dropped — never invent evidence to look convincing."
+  );
+}
+
 export interface CriticDeps {
   /** Workspace diff source. Production wires WorkspaceManager.diff(handle). Missing means fail-closed. */
   readonly diff?: (workspace: WorkspaceHandle) => Promise<string>;
@@ -98,6 +117,14 @@ export interface CriticDeps {
    * lane. Undefined ⇒ a task-level/lane-neutral critic uses the configured critic model (unchanged).
    */
   readonly modelOverride?: string;
+  /**
+   * Phase 12 (IKBI-REAUDIT-003): enforce the canonical evidence package + substance-preserving recovery.
+   * When true (production critics wire it on), the critic builds a finite evidence manifest from the SAME
+   * inputs it shows the model, requires every blocking defect to cite resolvable evidence, and validates
+   * structured-output recovery by DETERMINISTIC substance equivalence (not the legacy keyword/polarity guard).
+   * Absent/false ⇒ the Phase 9 behavior (unit tests of the primitives keep their legacy contract).
+   */
+  readonly enforceEvidenceSubstance?: boolean;
 }
 
 interface DiffStats {
@@ -403,6 +430,30 @@ export function createCritic(deps: CriticDeps = {}): RoleFn {
         changedFiles: diff.files,
       };
 
+      // CANONICAL EVIDENCE PACKAGE (Phase 12): enumerate the finite evidence surface the critic may cite —
+      // from the SAME inputs it is shown. A blocking defect must reference an id in this set; an unsupported
+      // "specific-looking" claim can no longer become a concrete defect. Built only for enforcing critics.
+      let evidencePackage: EvidencePackage | undefined;
+      if (deps.enforceEvidenceSubstance === true) {
+        const verifierChecks = ((verifierResult?.detail as Record<string, unknown> | undefined)?.checks);
+        const checks = Array.isArray(verifierChecks)
+          ? verifierChecks
+              .map((c) => (typeof c === "object" && c !== null ? (c as Record<string, unknown>) : undefined))
+              .filter((c): c is Record<string, unknown> => c !== undefined && typeof c.name === "string")
+              .map((c) => ({ name: c.name as string, isTest: c.name === "test" || (typeof c.testCount === "object" && c.testCount !== null) }))
+          : [];
+        const acceptanceCriteria = (ctx.task as { acceptanceCriteria?: readonly string[] }).acceptanceCriteria;
+        evidencePackage = buildEvidencePackage({
+          candidateId,
+          ...(verifiedTree !== undefined ? { verifiedTree } : {}),
+          goal: ctx.task.goal,
+          ...(acceptanceCriteria !== undefined ? { acceptanceCriteria } : {}),
+          changedFiles: diff.files,
+          checks,
+          ...(ctx.runtimeEvidence !== undefined ? { runtimeEvidenceIds: ctx.runtimeEvidence.map((e) => e.id) } : {}),
+        });
+      }
+
       const request: ModelRequest = {
         // A --tier preset pins the critic model per-run (criticModelOverride); otherwise the
         // configured critic model (IKBI_MODEL_CRITIC) is used.
@@ -415,6 +466,7 @@ export function createCritic(deps: CriticDeps = {}): RoleFn {
         messages: [
           { role: "system", content: CRITIC_SYSTEM },
           { role: "system", content: bindingInstruction(candidateId, verifiedTree) },
+          ...(evidencePackage !== undefined ? [{ role: "system" as const, content: evidenceManifestInstruction(evidencePackage) }] : []),
           untrusted(`Goal (intent):\n${ctx.task.goal}`, "critic_goal"),
           ...(goalAlignmentContext !== undefined ? [untrusted(goalAlignmentContext, "critic_goal_alignment")] : []),
           ...(ctx.runtimeEvidence !== undefined && ctx.runtimeEvidence.length > 0
@@ -437,6 +489,7 @@ export function createCritic(deps: CriticDeps = {}): RoleFn {
         goal: ctx.task.goal,
         candidateId,
         ...(verifiedTree !== undefined ? { verifiedTree } : {}),
+        ...(evidencePackage !== undefined ? { evidencePackage } : {}),
       };
 
       // ── PROVIDER INFRASTRUCTURE outcomes — NOT candidate evidence, NEVER structured-output recovery ──
@@ -496,8 +549,15 @@ export function createCritic(deps: CriticDeps = {}): RoleFn {
         recovery.recoveryEligibilityReason = eligibility.reason;
         if (eligibility.eligible) {
           const recoveryInvocationId = `${ctx.task.taskId}:critic_recovery`;
+          // Phase 12: the DETERMINISTIC pre-recovery fingerprint of the raw output — captured locally BEFORE
+          // the reformat call. Recovery is accepted only if the recovered verdict is substance-equivalent to it.
+          const fingerprint = evidencePackage !== undefined ? substanceFingerprint(response.content) : undefined;
+          if (fingerprint !== undefined) recovery.substanceFingerprintHash = fingerprint.hash;
           const recoveryRequest: ModelRequest = {
-            ...buildRecoveryRequest({ rawContent: response.content, model: request.model, candidateId, ...(verifiedTree !== undefined ? { verifiedTree } : {}), untrusted }),
+            ...buildRecoveryRequest({
+              rawContent: response.content, model: request.model, candidateId, ...(verifiedTree !== undefined ? { verifiedTree } : {}), untrusted,
+              ...(evidencePackage !== undefined ? { allowedEvidenceIds: [...evidencePackage.ids], allowedRequirementIds: [...evidencePackage.requirementIds] } : {}),
+            }),
             identity: ctx.identity,
           };
           // Phase 11C: tag the recovery as a DISTINCT ledger sub-invocation (stage "structured-recovery") so
@@ -516,14 +576,30 @@ export function createCritic(deps: CriticDeps = {}): RoleFn {
             recovery.recoveryFailReason = `recovery response finishReason=${recovered.finishReason}`;
           } else {
             const recoveredVerdict = parseSemanticVerdict(recovered.content, { ...semCtx, parseStatus: "repaired" });
-            const guard = recoveredPreservesSubstance(response.content, recoveredVerdict);
-            if (recoveredVerdict.kind !== "indeterminate" && guard.ok) {
+            recovery.recoveredOutputHash = createHash("sha256").update(recovered.content ?? "").digest("hex");
+            // Phase 12: an enforcing critic validates recovery by DETERMINISTIC substance equivalence against
+            // the fingerprint (exact claims/evidence/requirements — never fuzzy). A non-enforcing critic keeps
+            // the legacy keyword/polarity guard so the Phase 9 primitives retain their contract.
+            let ok: boolean;
+            let rejectReason: string | undefined;
+            if (fingerprint !== undefined) {
+              const eq = substanceEquivalent(fingerprint, recoveredVerdict);
+              recovery.equivalenceOk = eq.ok;
+              if (eq.mismatches.length > 0) recovery.equivalenceMismatches = [...eq.mismatches];
+              ok = eq.ok;
+              rejectReason = eq.mismatches[0];
+            } else {
+              const guard = recoveredPreservesSubstance(response.content, recoveredVerdict);
+              ok = guard.ok;
+              rejectReason = guard.reason;
+            }
+            if (recoveredVerdict.kind !== "indeterminate" && ok) {
               semanticVerdict = recoveredVerdict; // adopt the reformatted, substance-preserving verdict
               recovery.recoveryOutcome = "repaired";
             } else {
               // A recovered indeterminate, or a substantive mutation, is rejected — fail-closed.
               recovery.recoveryOutcome = "rejected";
-              recovery.recoveryRejectReason = recoveredVerdict.kind === "indeterminate" ? "recovered-still-indeterminate" : guard.reason;
+              recovery.recoveryRejectReason = recoveredVerdict.kind === "indeterminate" ? "recovered-still-indeterminate" : rejectReason;
             }
           }
         }
@@ -552,6 +628,7 @@ export function createCritic(deps: CriticDeps = {}): RoleFn {
           diffStats,
           semanticVerdict,
           rawOutputHash,
+          ...(evidencePackage !== undefined ? { evidencePackageHash: evidencePackage.hash, evidenceEnforced: true } : {}),
           ...recovery,
           ...(parsed !== undefined ? { parseFormat: parsed.parseFormat } : { parseFailed: true }),
           ...(parsed?.scores !== undefined ? { scores: parsed.scores } : {}),

@@ -249,8 +249,13 @@ export class InvocationLedger {
     }
   }
 
-  /** Record an EXTERNAL invocation (a raw provider helper like the frontier consult) + fold its cost. */
-  recordExternal(ctx: Partial<InvocationContext> & { resolvedModel?: string; provider?: string; costUsd?: number; status?: InvocationStatus }): string {
+  /**
+   * Record an EXTERNAL invocation (a raw provider helper like the frontier consult) + fold its cost, and
+   * RETURN its authoritative invocation id so a receipt can reference the exact record. Execution identity
+   * (resolvedModel/provider/usage/status) is captured so `lastFor` finds it. `deferBudget` records + folds
+   * the cost WITHOUT tripping the budget cap here — the caller enforces it AFTER writing a durable receipt.
+   */
+  recordExternal(ctx: Partial<InvocationContext> & { resolvedModel?: string; provider?: string; providerModelId?: string; usage?: ModelResponse["usage"]; costUsd?: number; status?: InvocationStatus }, opts?: { deferBudget?: boolean }): string {
     const merged: InvocationContext = { ...this.context, ...ctx };
     const requestOrdinal = (this.ordinal += 1);
     const invocationId = `${this.deps.taskId}:${merged.role}:${merged.stage}:${requestOrdinal}`;
@@ -260,12 +265,17 @@ export class InvocationLedger {
       ...merged, invocationId, requestOrdinal, dispatchedAt: this.now(), completedAt: this.now(),
       ...(ctx.resolvedModel !== undefined ? { resolvedModel: ctx.resolvedModel } : {}),
       ...(ctx.provider !== undefined ? { provider: ctx.provider } : {}),
+      ...(ctx.providerModelId !== undefined ? { providerModelId: ctx.providerModelId } : {}),
+      ...(ctx.usage !== undefined ? { usage: ctx.usage } : {}),
       status: ctx.status ?? "succeeded", ...(known ? { costUsd: ctx.costUsd } : {}), costStatus,
     });
     if (known) this.total += ctx.costUsd!; else this.unknownCostCount += 1;
-    this.enforceBudget();
+    if (opts?.deferBudget !== true) this.enforceBudget();
     return invocationId;
   }
+
+  /** Trip the budget cap NOW (used after a `deferBudget` record whose receipt is already durable). */
+  applyBudget(): void { this.enforceBudget(); }
 
   private enforceBudget(): void {
     const budget = this.deps.maxBudgetUsd;

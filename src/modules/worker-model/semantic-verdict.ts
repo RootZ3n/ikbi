@@ -17,6 +17,8 @@
  *   - not-evaluated           → semantic evaluation was explicitly skipped by policy
  */
 
+import { validateDefectEvidence, validateMissingRequirement, type EvidencePackage } from "./semantic-evidence.js";
+
 /** The canonical set of semantic outcomes. Only `pass` is autonomously promotable by default. */
 export type SemanticVerdictKind = "pass" | "fail" | "incomplete" | "indeterminate" | "infrastructure-failure" | "not-evaluated";
 
@@ -37,6 +39,10 @@ export interface BlockingDefect {
   readonly location?: { readonly file?: string; readonly symbol?: string; readonly line?: number };
   /** Whether a fixer can plausibly repair it (default true). */
   readonly repairable?: boolean;
+  /** Phase 12: the canonical evidence-package ids this defect resolves against (when a package is supplied). */
+  readonly evidenceIds?: readonly string[];
+  /** Phase 12: the allowed requirement id (goal / acceptance criterion) this defect binds to. */
+  readonly requirementId?: string;
 }
 
 /** A non-blocking observation. Never affects promotion. */
@@ -72,6 +78,13 @@ export interface SemanticParseContext {
   /** The candidate goal (used to fill a defect's `requirement` when the model omitted it). */
   readonly goal?: string;
   readonly parseStatus?: "structured" | "repaired";
+  /**
+   * Phase 12: the finite evidence surface the critic was shown. When present, EVERY blocking defect must cite
+   * ≥1 resolvable evidence id and a goal/criterion requirement — an unsupported defect is dropped, and a
+   * fail/incomplete verdict with no surviving decision-bearing content becomes `indeterminate` (fail-closed).
+   * When ABSENT the parser keeps its Phase 4/9 structural behavior (backward compatible).
+   */
+  readonly evidencePackage?: EvidencePackage;
 }
 
 /** Generic non-defects: a claim this vague cannot be a concrete blocking defect (→ indeterminate). */
@@ -137,7 +150,7 @@ function flattenEvidence(value: unknown, fallback: string): string {
  * Concrete missing requirements. Accepts the legacy `string[]` (`incompleteRequirements`/`missing`) AND
  * the Phase 9 rich `missingRequirements: [{requirement, evidence}]`. Only concrete requirements survive.
  */
-function readMissingRequirements(obj: Record<string, unknown>): string[] {
+function readMissingRequirements(obj: Record<string, unknown>, pkg?: EvidencePackage): string[] {
   const src = Array.isArray(obj.missingRequirements)
     ? obj.missingRequirements
     : Array.isArray(obj.incompleteRequirements)
@@ -147,6 +160,9 @@ function readMissingRequirements(obj: Record<string, unknown>): string[] {
         : [];
   const out: string[] = [];
   for (const item of src) {
+    // Phase 12: with an evidence package, a missing requirement must name the goal / a supplied acceptance
+    // criterion — an off-goal "missing requirement" is not a concrete incompleteness the parser will honor.
+    if (pkg !== undefined && !validateMissingRequirement(item, pkg).valid) continue;
     if (typeof item === "string") {
       if (isConcreteClaim(item)) out.push(item.trim());
     } else if (typeof item === "object" && item !== null) {
@@ -158,7 +174,7 @@ function readMissingRequirements(obj: Record<string, unknown>): string[] {
 }
 
 /** Concrete defects from the RICH `blockingDefects` schema only. */
-function richDefects(obj: Record<string, unknown>, goal: string): BlockingDefect[] {
+function richDefects(obj: Record<string, unknown>, goal: string, pkg?: EvidencePackage): BlockingDefect[] {
   const out: BlockingDefect[] = [];
   const rich = Array.isArray(obj.blockingDefects) ? obj.blockingDefects : [];
   for (const [i, raw] of rich.entries()) {
@@ -166,6 +182,16 @@ function richDefects(obj: Record<string, unknown>, goal: string): BlockingDefect
     const d = raw as Record<string, unknown>;
     const claim = typeof d.claim === "string" ? d.claim.trim() : "";
     if (!isConcreteClaim(claim)) continue; // a defect without a concrete claim is not a defect
+    // Phase 12 (REAUDIT-003): with an evidence package, a defect must CITE resolvable evidence and a
+    // goal/criterion requirement — a specific-looking-but-unsupported claim is NOT a concrete defect.
+    let evidenceIds: readonly string[] | undefined;
+    let requirementId: string | undefined;
+    if (pkg !== undefined) {
+      const v = validateDefectEvidence(d, pkg);
+      if (!v.valid) continue; // unsupported claim → dropped (never becomes a blocking defect)
+      evidenceIds = v.evidenceIds;
+      requirementId = v.requirementId;
+    }
     const evidence = flattenEvidence(d.evidence, claim);
     const requirement = typeof d.requirement === "string" && d.requirement.trim().length > 0 ? d.requirement.trim() : goal;
     const loc = typeof d.location === "object" && d.location !== null ? (d.location as Record<string, unknown>) : undefined;
@@ -180,13 +206,18 @@ function richDefects(obj: Record<string, unknown>, goal: string): BlockingDefect
         ? { location: { ...(typeof loc.file === "string" ? { file: loc.file } : {}), ...(typeof loc.symbol === "string" ? { symbol: loc.symbol } : {}), ...(typeof loc.line === "number" ? { line: loc.line } : {}) } }
         : {}),
       ...(typeof d.repairable === "boolean" ? { repairable: d.repairable } : {}),
+      ...(evidenceIds !== undefined ? { evidenceIds } : {}),
+      ...(requirementId !== undefined ? { requirementId } : {}),
     });
   }
   return out;
 }
 
 /** Concrete defects from the LEGACY `issues: string[]` schema. Only meaningful on a FAIL verdict. */
-function legacyDefects(obj: Record<string, unknown>, goal: string): BlockingDefect[] {
+function legacyDefects(obj: Record<string, unknown>, goal: string, pkg?: EvidencePackage): BlockingDefect[] {
+  // Phase 12: a legacy `issues` string carries NO evidence reference, so with an evidence package every
+  // legacy issue is unsupported (fail-closed) — the model must use the structured, evidence-citing schema.
+  if (pkg !== undefined) return [];
   const issues = Array.isArray(obj.issues) ? obj.issues.filter((x): x is string => typeof x === "string") : [];
   const out: BlockingDefect[] = [];
   for (const [i, issue] of issues.entries()) {
@@ -194,6 +225,16 @@ function legacyDefects(obj: Record<string, unknown>, goal: string): BlockingDefe
     out.push({ id: `d${i + 1}`, claim: issue.trim(), evidence: issue.trim(), requirement: goal, severity: "blocking", confidence: 0.6 });
   }
   return out;
+}
+
+/**
+ * Whether the RAW output asserts ≥1 concrete blocking-defect CLAIM (independent of evidence validation).
+ * A `pass` that lists ANY such claim is self-contradictory (the model both approved and named a blocker) —
+ * that inconsistency is `indeterminate` (fail-closed), whether or not the defect cited resolvable evidence.
+ */
+function hasConcreteBlockingClaims(obj: Record<string, unknown>): boolean {
+  const rich = Array.isArray(obj.blockingDefects) ? obj.blockingDefects : [];
+  return rich.some((d) => typeof d === "object" && d !== null && typeof (d as Record<string, unknown>).claim === "string" && isConcreteClaim(((d as Record<string, unknown>).claim as string)));
 }
 
 /** On a PASS, any `issues` become non-blocking ADVISORIES (never a blocking defect). */
@@ -261,13 +302,15 @@ export function parseSemanticVerdict(content: string, ctx?: SemanticParseContext
   if (verdict === undefined) return indeterminate("critic verdict was missing or not one of pass/fail/incomplete/indeterminate", ctx, "unparsable");
 
   const goal = ctx?.goal ?? "the stated goal";
-  const rich = richDefects(obj, goal);
-  const incompleteRequirements = readMissingRequirements(obj);
+  const pkg = ctx?.evidencePackage;
+  const rich = richDefects(obj, goal, pkg);
+  const incompleteRequirements = readMissingRequirements(obj, pkg);
 
   if (verdict === "pass") {
-    // A pass that also lists RICH blocking defects is CONTRADICTORY — cannot safely resolve intent.
-    // (Legacy `issues` on a PASS are advisories, not defects.)
-    if (rich.length > 0) return indeterminate("contradictory critic output: verdict=pass but blocking defects were listed", ctx);
+    // A pass that also lists a concrete blocking-defect CLAIM is CONTRADICTORY — cannot safely resolve intent.
+    // Checked on the RAW claim (pre-evidence-validation) so an unsupported-but-listed blocker still fail-closes
+    // the pass rather than being silently dropped. (Legacy `issues` on a PASS are advisories, not defects.)
+    if (hasConcreteBlockingClaims(obj)) return indeterminate("contradictory critic output: verdict=pass but blocking defects were listed", ctx);
     // RUBRIC: a PASS whose goal_correctness score is below the passing threshold contradicts itself —
     // the change does not adequately satisfy the goal. That is a concrete, goal-relevant INCOMPLETE
     // (consistent with parseStructuredVerdict's PASS→FAIL rubric override), not a fabricated defect.
@@ -285,10 +328,11 @@ export function parseSemanticVerdict(content: string, ctx?: SemanticParseContext
     return indeterminate(summary || "critic reported indeterminate", ctx);
   }
   // verdict === "fail": require ≥1 concrete blocking defect (rich schema, else legacy `issues`).
-  const blockingDefects = rich.length > 0 ? rich : legacyDefects(obj, goal);
+  const blockingDefects = rich.length > 0 ? rich : legacyDefects(obj, goal, pkg);
   if (blockingDefects.length === 0) {
-    // A FAIL with no concrete defect is a bare rejection — NOT authentic defect evidence.
-    return indeterminate(summary || "verdict=fail but no concrete blocking defect was provided", ctx);
+    // A FAIL with no concrete defect is a bare rejection — NOT authentic defect evidence. With an evidence
+    // package this ALSO covers a fail whose every defect was unsupported (dropped) → fail-closed indeterminate.
+    return indeterminate(summary || (pkg !== undefined ? "verdict=fail but no defect cited resolvable evidence" : "verdict=fail but no concrete blocking defect was provided"), ctx);
   }
   return stamp({ kind: "fail", summary: summary || "concrete blocking defect(s) found", blockingDefects, incompleteRequirements, advisories, parseStatus }, ctx);
 }

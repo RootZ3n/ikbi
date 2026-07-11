@@ -257,7 +257,9 @@ test("21: a critic INFRASTRUCTURE failure (unparsable) does NOT trigger a peer d
 });
 
 test("2b: a real concrete-defect FAIL DOES make the attempt duel-eligible (candidate-rejected)", async () => {
-  const concreteFail = JSONV({ verdict: "FAIL", scores: { goal_correctness: 1 }, feedback: "wrong", issues: ["subtreeBounds() ignores descendants — returns the node's own bounds only (a.ts:1)"] });
+  // Phase 12: a concrete fail must cite RESOLVABLE evidence (an id in the critic's evidence package) — the
+  // changed file `a.ts` is the anchor. A legacy `issues` string with no evidence is now unsupported (dropped).
+  const concreteFail = JSONV({ verdict: "FAIL", feedback: "wrong", blockingDefects: [{ claim: "subtreeBounds() ignores descendants — returns the node's own bounds only", evidenceIds: ["file:a.ts"], requirementId: "req:goal" }] });
   const { orch, parentCtx } = realOrchestrator(providerWithCritic(concreteFail), criticAwareRoles);
   const r = await orch.run({ taskId: "t-fail", targetRepo: "/unused", goal: "do the thing", moeExpertRental: true, moeVendorLane: "deepseek" }, parentCtx);
   assert.notEqual(r.outcome, "success");

@@ -131,7 +131,7 @@ import {
   workerEscalationSuppressed,
 } from "./events.js";
 import { CONTRACT_VERSION, toOutcomeStatus, WorkerError, WORKER_ROLES, effortModelParams } from "./contract.js";
-import { InvocationLedger } from "./invocation-ledger.js";
+import { InvocationLedger, type InvocationRecord, type InvocationStatus } from "./invocation-ledger.js";
 import { fireStopHooks } from "../hooks/index.js";
 import { runIterativeLoop, DEFAULT_MAX_FIX_ITERATIONS, extractVerifierCheckResult } from "./iterative-loop.js";
 import { runCriticFixLoop, isRetryableCriticFail } from "./critic-fix-loop.js";
@@ -1200,7 +1200,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
    * competitive candidates) accumulates `response.cost.usd` into one running total. The
    * neutralization seam is passed through untouched. `cost()` reads the accumulated total.
    */
-  function makeCostingEngine(taskId: string, maxBudgetUsd?: number, effort?: "low" | "medium" | "high" | "max"): { engine: RoleEngine; cost: () => number; addCost: (usd: number) => void; ledger: InvocationLedger } {
+  function makeCostingEngine(taskId: string, maxBudgetUsd?: number, effort?: "low" | "medium" | "high" | "max"): { engine: RoleEngine; cost: () => number; addCost: (usd: number | undefined, meta?: { requestedAlias?: string; resolvedModel?: string; provider?: string; usage?: ModelResponse["usage"]; status?: InvocationStatus }) => string; ledger: InvocationLedger } {
     // Phase 11: the invocation LEDGER is the execution source of truth. Every role invokes through
     // `ledger.engine`; each call records one immutable invocation (resolved model/provider/lane/status/
     // charged cost from the actual response). Cost/budget/status DERIVE from the unique records — a failed
@@ -1222,8 +1222,15 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       servedOutOfLane: (model: string, lane: string) => KNOWN_VENDOR_LANES.some((l) => l !== lane && model.startsWith(l)),
     });
     // `addCost` folds an EXTERNAL raw-provider cost (e.g. the frontier consult) into the ledger as its own
-    // invocation record so it is counted once, enforces the budget cap, and cannot be double-summed.
-    const addCost = (usd: number): void => { ledger.recordExternal({ role: "consult", stage: "frontier-consult", retryKind: "consult", costUsd: Math.max(0, usd) }); };
+    // invocation record so it is counted once, and RETURNS its invocation id so the caller's receipt can
+    // reference the authoritative record (Phase 12). `meta` carries the consult's execution identity (model/
+    // provider/usage) so `lastFor` resolves it. The budget cap is DEFERRED — the caller enforces it after
+    // writing a durable receipt (so a BUDGET_EXHAUSTED throw can never skip the receipt; Gap B/A2).
+    const addCost = (usd: number | undefined, meta?: { requestedAlias?: string; resolvedModel?: string; provider?: string; usage?: ModelResponse["usage"]; status?: InvocationStatus }): string =>
+      ledger.recordExternal(
+        { role: "consult", stage: "frontier-consult", retryKind: "consult", ...(typeof usd === "number" ? { costUsd: Math.max(0, usd) } : {}), ...(meta ?? {}) },
+        { deferBudget: true },
+      );
     return { engine: ledger.engine, cost: () => ledger.cost(), addCost, ledger };
   }
 
@@ -1332,6 +1339,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       // injected test double returns above, so this never perturbs the Phase 3 stale-tree read sequence.
       resolveVerifiedTree: (ws: WorkspaceHandle) => readTreeHash(ws.path),
       ...(laneModel !== undefined ? { modelOverride: laneModel } : {}),
+      // Phase 12 (REAUDIT-003): the production critic enforces the evidence package + substance-preserving
+      // recovery. Every real critic evaluation must cite resolvable evidence and its recovery must prove
+      // deterministic substance equivalence — an injected test double returns above and is unaffected.
+      enforceEvidenceSubstance: true,
     });
   }
 
@@ -2059,14 +2070,32 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             missingRequirements: sv.incompleteRequirements,
             advisories: sv.advisories,
             ...(typeof d.rawOutputHash === "string" ? { rawOutputHash: d.rawOutputHash } : {}),
+            // EXECUTION LINKAGE (Phase 12): the PRIMARY critic invocation the verdict came from (from the
+            // ledger — the main-loop "role" stage or the competitive/tournament "candidate-role" stage), so an
+            // auditor can reconcile the semantic verdict to the exact model invocation + evidence package.
+            ...((ledger?.lastFor("critic", "role") ?? ledger?.lastFor("critic", "candidate-role")) !== undefined
+              ? { primaryCriticInvocationId: (ledger!.lastFor("critic", "role") ?? ledger!.lastFor("critic", "candidate-role"))!.invocationId }
+              : {}),
+            // EVIDENCE + SUBSTANCE PROVENANCE (Phase 12): a bounded, reconstructable record of the evidence
+            // package the critic cited, the deterministic pre-recovery fingerprint, and the recovery equivalence
+            // outcome — never the raw output. Present only for an enforcing critic.
+            ...(d.evidenceEnforced === true ? { evidenceEnforced: true } : {}),
+            ...(typeof d.evidencePackageHash === "string" ? { evidencePackageHash: d.evidencePackageHash } : {}),
+            ...(typeof d.substanceFingerprintHash === "string" ? { substanceFingerprintHash: d.substanceFingerprintHash } : {}),
+            ...(typeof d.recoveredOutputHash === "string" ? { recoveredOutputHash: d.recoveredOutputHash } : {}),
+            ...(d.equivalenceOk !== undefined ? { recoveryEquivalence: d.equivalenceOk } : {}),
+            ...(Array.isArray(d.equivalenceMismatches) ? { recoveryEquivalenceMismatches: d.equivalenceMismatches } : {}),
             recoveryInvoked,
             ...(d.recoveryEligible !== undefined ? { recoveryEligible: d.recoveryEligible } : {}),
             ...(d.recoveryOutcome !== undefined ? { recoveryOutcome: d.recoveryOutcome } : {}),
             ...(d.recoveryInvocationId !== undefined ? { recoveryInvocationId: d.recoveryInvocationId } : {}),
             ...(d.recoveryModel !== undefined ? { recoveryModel: d.recoveryModel } : {}),
             ...(d.recoveryCostUsd !== undefined ? { recoveryCostUsd: d.recoveryCostUsd, recoveryCostStatus: d.recoveryCostStatus } : {}),
+            // POLICY CONSEQUENCE (Phase 12): the downstream decisions this verdict authorizes — an auditor can
+            // see promotion/duel/fixer eligibility without re-deriving it.
             promotionEligible: semanticPromotionEligible(sv.kind, false),
             duelEligible: semanticDuelEligible(sv.kind),
+            fixerEligible: sv.kind === "fail" || sv.kind === "incomplete",
           },
           project: binding.targetRepo,
         },
@@ -3915,9 +3944,27 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 // trips the cap. So compute the cost, write the receipt with the consult-inclusive total
                 // FIRST, THEN fold+enforce — the BUDGET_EXHAUSTED throw (A2) can no longer skip this
                 // receipt, and the spend is still counted in the terminal summary the abort writes.
-                const consultUsd = applyRes.consult?.cost?.usd ?? 0;
+                const consultUsdRaw = applyRes.consult?.cost?.usd;
                 const consultModelId = applyRes.modelId ?? "frontier:consult";
                 lastSwapModel = consultModelId;
+                // EXECUTION LINKAGE (Phase 12): the frontier consult runs on the RAW provider (outside the run
+                // engine), so it is not auto-ledgered. When a provider request WAS dispatched (a consult result
+                // came back), record it as its own EXTERNAL invocation carrying the served model/provider/usage/
+                // cost, and derive the receipt's execution identity from that authoritative record. No consult
+                // dispatch ⇒ no execution claim. A dispatched-but-unrecordable consult ⇒ an integrity error.
+                const consultDispatched = applyRes.consult !== undefined;
+                let consultRec: InvocationRecord | undefined;
+                if (consultDispatched) {
+                  const consultProvider = consultModelId.split(/[-:/]/)[0];
+                  addRunCost(consultUsdRaw, {
+                    requestedAlias: consultModelId, resolvedModel: consultModelId,
+                    ...(consultProvider !== undefined && consultProvider.length > 0 ? { provider: consultProvider } : {}),
+                    ...(applyRes.consult?.usage !== undefined ? { usage: applyRes.consult.usage } : {}),
+                    status: applyRes.applied ? "succeeded" : "provider-rejected",
+                  });
+                  consultRec = runLedger.lastFor("consult", "frontier-consult");
+                }
+                const consultLinked = consultDispatched && consultRec !== undefined;
                 events.publish(
                   workerEscalationRetried.create(
                     { taskId: task.taskId, fromModel: failedModel, toModel: consultModelId, success: applyRes.applied },
@@ -3926,15 +3973,28 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 );
                 await receipts.append(
                   {
-                    operation: "worker.escalation.consult",
+                    // A dispatched consult with no backing ledger record is an integrity error — never a receipt
+                    // that silently claims execution without an authoritative invocation.
+                    operation: consultDispatched && consultRec === undefined ? "worker.escalation.consult.integrity_error" : "worker.escalation.consult",
                     outcome: { status: applyRes.applied ? "success" : "failure", ...(applyRes.error !== undefined ? { detail: applyRes.error } : {}) },
                     requestId: task.taskId,
-                    metadata: { taskId: task.taskId, workspaceId: workspace.id, model: consultModelId, applied: applyRes.applied, filesChanged: applyRes.filesChanged.length, ...(applyRes.stopReason !== undefined ? { stopReason: applyRes.stopReason } : {}), costUsd: runCost() + consultUsd },
+                    metadata: {
+                      taskId: task.taskId, workspaceId: workspace.id, model: consultModelId, applied: applyRes.applied, filesChanged: applyRes.filesChanged.length,
+                      ...(applyRes.stopReason !== undefined ? { stopReason: applyRes.stopReason } : {}),
+                      // The consult cost is already folded into the ledger above (deferred budget), so the run
+                      // total DERIVES it — no separate `+ consultUsd` (which would double-count).
+                      costUsd: runCost(),
+                      ...(consultLinked
+                        ? { executionLinked: true, invocationId: consultRec!.invocationId, servedModel: consultRec!.resolvedModel, ...(consultRec!.provider !== undefined ? { provider: consultRec!.provider } : {}), lifecycle: consultRec!.status, consultCostStatus: consultRec!.costStatus }
+                        : consultDispatched
+                          ? { executionLinked: false, integrityError: "consult-invocation-not-found" }
+                          : { executionLinked: false }),
+                    },
                     project: task.targetRepo,
                   },
                   parentIdentity,
                 );
-                if (consultUsd > 0) addRunCost(consultUsd); // fold + enforce the cap AFTER the receipt is durable (may throw BUDGET_EXHAUSTED)
+                if (consultDispatched) runLedger.applyBudget(); // enforce the cap AFTER the receipt is durable (may throw BUDGET_EXHAUSTED)
                 recAttempts.push({ tier: "frontier", model: consultModelId, outcome: applyRes.applied ? "green" : "fail" });
                 if (applyRes.applied) {
                   // Splice a success builder result so the pipeline verifier validates the applied diff.

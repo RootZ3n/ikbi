@@ -113,6 +113,9 @@ export interface BuildRecoveryOpts {
   readonly verifiedTree?: string;
   /** Neutralize + wrap the raw output as untrusted DATA (the caller supplies the project chokepoint). */
   readonly untrusted: (raw: string, origin: string) => ModelMessage;
+  /** Phase 12: the finite evidence-id set — the reformatter may only KEEP evidence ids already present. */
+  readonly allowedEvidenceIds?: readonly string[];
+  readonly allowedRequirementIds?: readonly string[];
 }
 
 /** Build the ONE reformat request (the caller attaches `identity`). Same model (⇒ same vendor lane);
@@ -121,7 +124,11 @@ export function buildRecoveryRequest(opts: BuildRecoveryOpts): Omit<ModelRequest
   const binding =
     `Reformat the assessment below. Bind it to EXACTLY these identifiers (do not change them):\n` +
     `candidateId: ${opts.candidateId}\n` +
-    (opts.verifiedTree !== undefined ? `verifiedTree: ${opts.verifiedTree}\n` : "");
+    (opts.verifiedTree !== undefined ? `verifiedTree: ${opts.verifiedTree}\n` : "") +
+    // Phase 12: the reformatter may PRESERVE evidence ids already asserted, but may never introduce a new one.
+    (opts.allowedEvidenceIds !== undefined
+      ? `You may keep ONLY evidence ids that already appear in the raw output AND are in this allowed set — never add one:\n  evidenceIds: [${opts.allowedEvidenceIds.join(", ")}]\n  requirementIds: [${(opts.allowedRequirementIds ?? []).join(", ")}]\n`
+      : "");
   return {
     model: opts.model,
     temperature: RECOVERY_TEMPERATURE,
