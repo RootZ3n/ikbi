@@ -440,7 +440,16 @@ export function createCritic(deps: CriticDeps = {}): RoleFn {
           ? verifierChecks
               .map((c) => (typeof c === "object" && c !== null ? (c as Record<string, unknown>) : undefined))
               .filter((c): c is Record<string, unknown> => c !== undefined && typeof c.name === "string")
-              .map((c) => ({ name: c.name as string, isTest: c.name === "test" || (typeof c.testCount === "object" && c.testCount !== null) }))
+              .map((c) => {
+                // Phase 15: the OBSERVED pass/fail — a `*-failure` defect must cite a check that actually failed.
+                // exitCode 0 = pass; a testCount with fewer passed than total = a test failure; unknown ⇒ passed.
+                const tc = typeof c.testCount === "object" && c.testCount !== null ? (c.testCount as Record<string, unknown>) : undefined;
+                const passed =
+                  typeof c.exitCode === "number" ? c.exitCode === 0
+                  : tc !== undefined && typeof tc.passed === "number" && typeof tc.total === "number" ? tc.passed >= tc.total
+                  : undefined;
+                return { name: c.name as string, isTest: c.name === "test" || tc !== undefined, ...(passed !== undefined ? { passed } : {}) };
+              })
           : [];
         const acceptanceCriteria = (ctx.task as { acceptanceCriteria?: readonly string[] }).acceptanceCriteria;
         evidencePackage = buildEvidencePackage({

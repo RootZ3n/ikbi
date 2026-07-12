@@ -26,13 +26,76 @@ import type { BlockingDefect, SemanticVerdict } from "./semantic-verdict.js";
 
 // ── canonical evidence package ────────────────────────────────────────────────────────────────────
 
+/** The provenance kind of one enumerated evidence identifier. */
+export type EvidenceKind =
+  | "candidate" | "verified-tree" | "goal-requirement" | "acceptance-criterion"
+  | "changed-file" | "diff" | "deterministic-check" | "executed-test"
+  | "runtime-fact" | "api-contract" | "governed-exec" | "prior-defect";
+
+/**
+ * Phase 15 (IKBI-REAUDIT2-005): the AUTHORITY CLASS of an evidence kind — what a citation of it can actually
+ * PROVE. An evidence id is not authoritative merely because it exists; its class bounds what defect it may
+ * support. This closes "a stylistic criticism becomes a blocker by citing the generic candidate anchor".
+ *
+ *   - `contextual-identity` — establishes WHICH subject is under evaluation (candidate id, snapshot/tree).
+ *     Scopes other evidence; can NEVER independently prove a blocking defect.
+ *   - `requirement`         — proves something is REQUIRED (the goal / an explicit acceptance criterion).
+ *     Does not by itself prove the candidate violates it.
+ *   - `observation`         — proves an observable candidate FACT (diff, source, a deterministic-check /
+ *     executed-test result, an API shape). The substantive support a blocker needs. Bound to the snapshot.
+ *   - `runtime-fact`        — an operator-supplied runtime/environment truth. ADVISORY unless a category
+ *     explicitly permits it to block (runtime-compatibility-conflict).
+ *   - `derived`             — a prior validated defect / an intermediate assessment. Cannot be the SOLE
+ *     support for another blocker.
+ */
+export type EvidenceAuthorityClass = "contextual-identity" | "requirement" | "observation" | "runtime-fact" | "derived";
+
+/** The deterministic authority class of each evidence kind — the single source of "what may this prove". */
+export const AUTHORITY_CLASS_OF_KIND: Readonly<Record<EvidenceKind, EvidenceAuthorityClass>> = {
+  candidate: "contextual-identity",
+  "verified-tree": "contextual-identity",
+  "goal-requirement": "requirement",
+  "acceptance-criterion": "requirement",
+  // A changed-file / diff / check / test / api the critic was SHOWN is a scoped observation of the candidate.
+  "changed-file": "observation",
+  diff: "observation",
+  "deterministic-check": "observation",
+  "executed-test": "observation",
+  "api-contract": "observation",
+  "governed-exec": "observation",
+  // Operator-supplied runtime truth is advisory by default (only a runtime-compatibility-conflict may block on it).
+  "runtime-fact": "runtime-fact",
+  // A prior validated defect is derived context (a repaired candidate references it) — not fresh support.
+  "prior-defect": "derived",
+};
+
+/** The evidence kind a canonical package id belongs to (the id prefix is the kind's discriminator). */
+export function kindOfEvidenceId(id: string): EvidenceKind | undefined {
+  if (id === "candidate") return "candidate";
+  if (id === "tree") return "verified-tree";
+  if (id === "req:goal") return "goal-requirement";
+  if (id.startsWith("req:")) return "acceptance-criterion";
+  if (id.startsWith("file:")) return "changed-file";
+  if (id.startsWith("diff:")) return "diff";
+  if (id.startsWith("check:")) return "deterministic-check";
+  if (id.startsWith("test:")) return "executed-test";
+  if (id.startsWith("runtime:")) return "runtime-fact";
+  if (id.startsWith("api:")) return "api-contract";
+  if (id.startsWith("exec:")) return "governed-exec";
+  if (id.startsWith("prior:")) return "prior-defect";
+  return undefined;
+}
+
+/** The authority class of a canonical package id (contextual-identity for an unknown/generic anchor). */
+export function authorityClassOfId(id: string): EvidenceAuthorityClass {
+  const kind = kindOfEvidenceId(id);
+  return kind !== undefined ? AUTHORITY_CLASS_OF_KIND[kind] : "contextual-identity";
+}
+
 /** One enumerated evidence identifier the critic may cite. `kind` classifies its provenance. */
 export interface EvidenceItem {
   readonly id: string;
-  readonly kind:
-    | "candidate" | "verified-tree" | "goal-requirement" | "acceptance-criterion"
-    | "changed-file" | "diff" | "deterministic-check" | "executed-test"
-    | "runtime-fact" | "api-contract" | "governed-exec" | "prior-defect";
+  readonly kind: EvidenceKind;
   /** A short human label (for prompt rendering + receipts). */
   readonly label?: string;
 }
@@ -52,6 +115,10 @@ export interface EvidencePackage {
   readonly checks: ReadonlySet<string>;
   /** Known executed-test evidence names (a test claim must resolve here — never an invented test). */
   readonly tests: ReadonlySet<string>;
+  /** Phase 15: checks that FAILED (a deterministic-check / executed-test-failure defect must cite one of these). */
+  readonly failedChecks: ReadonlySet<string>;
+  /** Phase 15: executed tests that FAILED (an executed-test-failure defect must cite one of these). */
+  readonly failedTests: ReadonlySet<string>;
   /** Known runtime-fact ids. */
   readonly runtimeIds: ReadonlySet<string>;
   /** Whether explicit acceptance criteria were supplied (⇒ a requirement must resolve to one). */
@@ -67,8 +134,12 @@ export interface BuildEvidenceInput {
   /** Explicit, enumerated acceptance criteria. When present, a defect requirement MUST name one. */
   readonly acceptanceCriteria?: readonly string[];
   readonly changedFiles?: readonly string[];
-  /** Deterministic checks the verifier ran; `isTest` marks executed-test evidence. */
-  readonly checks?: readonly { readonly name: string; readonly isTest?: boolean }[];
+  /**
+   * Deterministic checks the verifier ran; `isTest` marks executed-test evidence. `passed` records the
+   * OBSERVED result (Phase 15) — a `*-failure` defect must cite a check that actually FAILED (passed === false).
+   * Absent `passed` is treated as passed (a check the verifier surfaced without a failure is not a failure).
+   */
+  readonly checks?: readonly { readonly name: string; readonly isTest?: boolean; readonly passed?: boolean }[];
   readonly runtimeEvidenceIds?: readonly string[];
   readonly apiContractIds?: readonly string[];
   readonly governedExecIds?: readonly string[];
@@ -87,6 +158,8 @@ export function buildEvidencePackage(input: BuildEvidenceInput): EvidencePackage
   const files = new Set<string>();
   const checks = new Set<string>();
   const tests = new Set<string>();
+  const failedChecks = new Set<string>();
+  const failedTests = new Set<string>();
   const runtimeIds = new Set<string>();
 
   items.push({ id: "candidate", kind: "candidate", label: input.candidateId });
@@ -114,7 +187,9 @@ export function buildEvidencePackage(input: BuildEvidenceInput): EvidencePackage
     if (name.length === 0) continue;
     checks.add(name);
     items.push({ id: `check:${name}`, kind: "deterministic-check", label: name });
-    if (c.isTest === true) { tests.add(name); items.push({ id: `test:${name}`, kind: "executed-test", label: name }); }
+    const failed = c.passed === false; // absent passed ⇒ not a failure (a surfaced check without a failure)
+    if (failed) failedChecks.add(name);
+    if (c.isTest === true) { tests.add(name); items.push({ id: `test:${name}`, kind: "executed-test", label: name }); if (failed) failedTests.add(name); }
   }
   for (const rid of input.runtimeEvidenceIds ?? []) { const id = rid.trim(); if (id.length === 0) continue; runtimeIds.add(id); items.push({ id: `runtime:${id}`, kind: "runtime-fact", label: id }); }
   for (const id of input.apiContractIds ?? []) { const t = id.trim(); if (t.length > 0) items.push({ id: `api:${t}`, kind: "api-contract", label: t }); }
@@ -122,8 +197,8 @@ export function buildEvidencePackage(input: BuildEvidenceInput): EvidencePackage
   for (const id of input.priorDefectIds ?? []) { const t = id.trim(); if (t.length > 0) items.push({ id: `prior:${t}`, kind: "prior-defect", label: t }); }
 
   const ids = new Set(items.map((it) => it.id));
-  const hash = stableHash({ c: input.candidateId, t: input.verifiedTree ?? null, ids: [...ids].sort() });
-  return { candidateId: input.candidateId, ...(input.verifiedTree !== undefined ? { verifiedTree: input.verifiedTree } : {}), items, ids, requirementIds, files, checks, tests, runtimeIds, hasExplicitCriteria, hash };
+  const hash = stableHash({ c: input.candidateId, t: input.verifiedTree ?? null, ids: [...ids].sort(), fc: [...failedChecks].sort(), ft: [...failedTests].sort() });
+  return { candidateId: input.candidateId, ...(input.verifiedTree !== undefined ? { verifiedTree: input.verifiedTree } : {}), items, ids, requirementIds, files, checks, tests, failedChecks, failedTests, runtimeIds, hasExplicitCriteria, hash };
 }
 
 /** Resolve a raw evidence reference string to a canonical package id, or undefined when unsupported. */
@@ -210,13 +285,20 @@ export function canonicalText(s: string): string {
     .trim();
 }
 
-/** The decision-bearing substance of ONE defect, order-independent for comparison. */
+/**
+ * The decision-bearing substance of ONE defect, order-independent for comparison. Phase 15 (IKBI-REAUDIT2-006)
+ * adds FIELD-PRESENCE tracking: `requirementId`, `repairable`, and `category` record present-vs-absent (null =
+ * absent) so recovery cannot FILL an omitted requirement association / repairability / category — a schema
+ * repairer may restructure, never supply a decision-bearing field the raw output did not contain.
+ */
 export interface DefectSubstance {
   readonly claim: string;                 // canonicalized
   readonly evidence: readonly string[];   // sorted canonical evidence refs (raw refs, NOT resolved — resolution is the package's job)
-  readonly requirement: string;           // canonicalized (may be "")
+  readonly requirement: string;           // canonicalized free-text (may be "")
+  readonly requirementId: string | null;  // Phase 15: the requirement ID present (null = absent)
   readonly severity: string;              // "blocking" | "advisory" | ...
-  readonly repairable: boolean | null;
+  readonly repairable: boolean | null;    // present value, or null = absent
+  readonly category: string | null;       // Phase 15: the declared category (null = absent)
 }
 
 /** A local, inference-free capture of what a raw/parsed critic response actually asserts. */
@@ -258,12 +340,17 @@ function defectSubstanceOf(d: Record<string, unknown>): DefectSubstance | undefi
   const claim = typeof d.claim === "string" ? canonicalText(d.claim) : "";
   if (claim.length === 0) return undefined;
   const severity = typeof d.severity === "string" ? d.severity.trim().toLowerCase() : "blocking";
+  const rid = typeof d.requirementId === "string" && d.requirementId.trim().length > 0 ? d.requirementId.trim() : null;
+  const rawCat = typeof d.category === "string" && d.category.trim().length > 0 ? d.category.trim().toLowerCase() : null;
+  const category = rawCat === "unspecified" ? null : rawCat; // the default category is equivalent to absent
   return {
     claim,
     evidence: rawEvidenceRefs(d),
     requirement: typeof d.requirement === "string" ? canonicalText(d.requirement) : "",
+    requirementId: rid,
     severity,
     repairable: typeof d.repairable === "boolean" ? d.repairable : null,
+    category,
   };
 }
 
@@ -286,7 +373,7 @@ export function substanceFingerprint(rawContent: string): SubstanceFingerprint {
   const defects: DefectSubstance[] = [];
   for (const arr of defectArrays) {
     for (const raw of arr) {
-      if (typeof raw === "string") { const c = canonicalText(raw); if (c.length > 0) defects.push({ claim: c, evidence: [], requirement: "", severity: "blocking", repairable: null }); }
+      if (typeof raw === "string") { const c = canonicalText(raw); if (c.length > 0) defects.push({ claim: c, evidence: [], requirement: "", requirementId: null, severity: "blocking", repairable: null, category: null }); }
       else if (typeof raw === "object" && raw !== null) { const s = defectSubstanceOf(raw as Record<string, unknown>); if (s !== undefined) defects.push(s); }
     }
   }
@@ -319,8 +406,12 @@ function verdictSubstance(v: SemanticVerdict): { polarity: "pass" | "blocking" |
     claim: canonicalText(d.claim),
     evidence: [...new Set((d.evidenceIds ?? []).map((r) => r.trim()).filter((r) => r.length > 0))].sort(),
     requirement: canonicalText(d.requirement),
+    requirementId: typeof d.requirementId === "string" && d.requirementId.trim().length > 0 ? d.requirementId.trim() : null,
     severity: d.severity,
     repairable: typeof d.repairable === "boolean" ? d.repairable : null,
+    // `unspecified` is the DEFAULT category the parser stamps on any validated defect — treat it as ABSENT so a
+    // structure-only reformat (which the parser re-stamps `unspecified`) is not flagged as an invented category.
+    category: typeof d.category === "string" && d.category.trim().length > 0 && d.category.trim().toLowerCase() !== "unspecified" ? d.category.trim().toLowerCase() : null,
   }));
   defects.sort((a, b) => (a.claim < b.claim ? -1 : a.claim > b.claim ? 1 : 0));
   return { polarity, defects, missing: [...v.incompleteRequirements.map(canonicalText)].sort(), advisories: [...v.advisories.map((a) => canonicalText(a.claim))].sort() };
@@ -371,7 +462,21 @@ export function substanceEquivalent(fingerprint: SubstanceFingerprint, recovered
     for (const e of raw.evidence) if (!rd.evidence.includes(e)) mismatches.push("evidence-removed");
     if (raw.requirement !== "" && rd.requirement !== "" && raw.requirement !== rd.requirement) mismatches.push("requirement-changed");
     if (raw.severity !== rd.severity) mismatches.push("severity-changed");
-    if (raw.repairable !== null && rd.repairable !== null && raw.repairable !== rd.repairable) mismatches.push("repairability-changed");
+    // FIELD-PRESENCE (Phase 15, IKBI-REAUDIT2-006): recovery may not FILL/DROP a decision-bearing field.
+    // requirement-id: recovery may not ADD a SPECIFIC criterion association (whole-goal `req:goal` is the
+    // benign default that any substantive defect earns, so filling it is not a substance change), nor CHANGE
+    // or DROP a specific association the raw defect stated.
+    const rawRid = raw.requirementId, recRid = rd.requirementId;
+    if (rawRid === null && recRid !== null && recRid !== "req:goal") mismatches.push("requirement-id-added");
+    else if (rawRid !== null && recRid === null) mismatches.push("requirement-id-removed");
+    else if (rawRid !== null && recRid !== null && rawRid !== recRid) mismatches.push("requirement-id-changed");
+    // repairability: recovery may not fill an omitted value, drop a stated one, or flip it (fixer-eligibility drift).
+    if (raw.repairable === null && rd.repairable !== null) mismatches.push("repairability-added");
+    else if (raw.repairable !== null && rd.repairable === null) mismatches.push("repairability-removed");
+    else if (raw.repairable !== null && rd.repairable !== null && raw.repairable !== rd.repairable) mismatches.push("repairability-changed");
+    // category: recovery may not invent or change the typed category (which selects the support matrix).
+    if (raw.category === null && rd.category !== null) mismatches.push("category-added");
+    else if (raw.category !== null && rd.category !== null && raw.category !== rd.category) mismatches.push("category-changed");
   }
 
   // 5. missing requirements + advisories set equality (no advisory→blocker movement, no invented requirement)
@@ -392,28 +497,152 @@ function setEqual(a: readonly string[], b: readonly string[]): boolean {
 
 // ── defect evidence validation (parser-side gate) ───────────────────────────────────────────────────
 
+// ── typed defect categories + deterministic support matrix (Phase 15) ────────────────────────────────
+
+/**
+ * The controlled category a blocking defect declares. Each category has DETERMINISTIC support requirements
+ * (the support matrix below) — a defect cannot be policy-bearing without declaring one that its cited evidence
+ * can support. An absent/unknown category degrades to `unspecified` (the default rule: needs a substantive
+ * observation), so a defect can never gain authority by omitting a category.
+ */
+export type DefectCategory =
+  | "missing-required-output" | "behavioral-failure" | "executed-test-failure" | "deterministic-check-failure"
+  | "api-contract-mismatch" | "file-content-mismatch" | "missing-file-or-symbol" | "security-policy-violation"
+  | "explicit-style-policy-violation" | "runtime-compatibility-conflict" | "snapshot-integrity-conflict"
+  | "unspecified";
+
+const KNOWN_CATEGORIES = new Set<DefectCategory>([
+  "missing-required-output", "behavioral-failure", "executed-test-failure", "deterministic-check-failure",
+  "api-contract-mismatch", "file-content-mismatch", "missing-file-or-symbol", "security-policy-violation",
+  "explicit-style-policy-violation", "runtime-compatibility-conflict", "snapshot-integrity-conflict", "unspecified",
+]);
+
+/** Read the model-declared defect category; an unknown/absent value degrades to `unspecified` (never gains authority). */
+export function resolveDefectCategory(raw: Record<string, unknown>): DefectCategory {
+  const c = typeof raw.category === "string" ? raw.category.trim().toLowerCase() : "";
+  return KNOWN_CATEGORIES.has(c as DefectCategory) ? (c as DefectCategory) : "unspecified";
+}
+
+/** The deterministic support rule for a category — what its cited evidence must include to support a blocker. */
+interface CategoryRule {
+  /** The observation kinds that count as substantive support for THIS category. "any" = every observation kind. */
+  readonly observation: readonly EvidenceKind[] | "any";
+  /** A cited check/test id must be in the package's FAILED set. */
+  readonly requireFailed?: "check" | "test" | "either";
+  /** Requires an explicit style requirement (a named acceptance criterion) OR a failed deterministic check. */
+  readonly requireStylePolicy?: boolean;
+  /** Requires a cited runtime-fact id (the environment truth the conflict rests on). */
+  readonly requireRuntimeFact?: boolean;
+  /** Requires ABSENCE evidence — a failed check OR an explicit criterion naming the expected (absent) output. */
+  readonly requireAbsence?: boolean;
+  /** An operational condition, never a candidate correctness defect — never supportable as a blocker. */
+  readonly operationalOnly?: boolean;
+}
+
+const SUPPORT_MATRIX: Readonly<Record<DefectCategory, CategoryRule>> = {
+  "executed-test-failure": { observation: ["executed-test"], requireFailed: "test" },
+  "deterministic-check-failure": { observation: ["deterministic-check"], requireFailed: "check" },
+  "behavioral-failure": { observation: ["executed-test", "deterministic-check"], requireFailed: "either" },
+  "api-contract-mismatch": { observation: ["api-contract", "changed-file", "diff"] },
+  "file-content-mismatch": { observation: ["changed-file", "diff"] },
+  "missing-file-or-symbol": { observation: ["deterministic-check", "changed-file", "diff"], requireAbsence: true },
+  "missing-required-output": { observation: ["deterministic-check", "changed-file", "diff"], requireAbsence: true },
+  "security-policy-violation": { observation: ["governed-exec", "diff", "changed-file", "deterministic-check"] },
+  "explicit-style-policy-violation": { observation: ["deterministic-check"], requireStylePolicy: true },
+  "runtime-compatibility-conflict": { observation: ["changed-file", "diff"], requireRuntimeFact: true },
+  "snapshot-integrity-conflict": { observation: "any", operationalOnly: true },
+  unspecified: { observation: "any" },
+};
+
 export interface DefectValidation {
   readonly valid: boolean;
   readonly reason: string;
   readonly evidenceIds: readonly string[];
   readonly requirementId?: string;
+  /** Phase 15: the category the defect was validated as (declared or `unspecified`). */
+  readonly category: DefectCategory;
+  /** Phase 15: the support-matrix rule that admitted (or would have admitted) this defect. */
+  readonly supportKind: string;
+  /** Phase 15: the authority classes of the cited, resolvable evidence (for the receipt). */
+  readonly authorityClasses: readonly EvidenceAuthorityClass[];
+}
+
+/** Whether a cited id is a substantive OBSERVATION for the given rule (candidate/tree/requirement/runtime/derived are not). */
+function isSubstantiveObservation(id: string, rule: CategoryRule): boolean {
+  const kind = kindOfEvidenceId(id);
+  if (kind === undefined) return false;
+  if (AUTHORITY_CLASS_OF_KIND[kind] !== "observation") return false;
+  return rule.observation === "any" || rule.observation.includes(kind);
 }
 
 /**
- * Validate ONE blocking defect against the evidence package. A defect is VALID only when it cites at least one
- * resolvable evidence id AND its requirement resolves to the goal / a named acceptance criterion. An unsupported
- * claim (no resolvable evidence), a test claim citing a test not in executed-test evidence, or an off-goal
- * requirement is INVALID and must not become a concrete defect.
+ * Validate ONE blocking defect against the evidence package + the deterministic support matrix (Phase 15,
+ * IKBI-REAUDIT2-005). A defect is VALID only when ALL hold:
+ *   1. it cites ≥1 resolvable evidence id;
+ *   2. its requirement resolves to the goal / a named acceptance criterion;
+ *   3. it cites ≥1 SUBSTANTIVE OBSERVATION for its declared category — a CONTEXTUAL anchor (candidate/tree),
+ *      a bare requirement, an advisory runtime fact, or a derived prior-defect can never be the sole support;
+ *   4. the category's extra support requirement is met (a `*-failure` needs a FAILED check; a style defect
+ *      needs an explicit style criterion OR a failed formatter check; a runtime conflict needs a runtime fact;
+ *      a missing-* needs absence evidence).
+ * An unsupported claim (candidate-anchor-only, off-goal requirement, unfailed check, style-without-policy) is
+ * INVALID and must not become a concrete defect.
  */
 export function validateDefectEvidence(rawDefect: Record<string, unknown>, pkg: EvidencePackage): DefectValidation {
+  const category = resolveDefectCategory(rawDefect);
+  const rule = SUPPORT_MATRIX[category];
   const evidenceIds = resolvedDefectEvidence(rawDefect, pkg);
+  const authorityClasses = [...new Set(evidenceIds.map(authorityClassOfId))];
+  const fail = (reason: string): DefectValidation => ({ valid: false, reason, evidenceIds, category, supportKind: "none", authorityClasses });
+
   if (evidenceIds.length === 0) {
     const cited = defectEvidenceRefs(rawDefect);
-    return { valid: false, reason: cited.length === 0 ? "defect-cites-no-evidence" : "defect-cites-unsupplied-evidence", evidenceIds: [] };
+    return fail(cited.length === 0 ? "defect-cites-no-evidence" : "defect-cites-unsupplied-evidence");
   }
   const requirementId = resolveRequirement(rawDefect, pkg);
-  if (requirementId === undefined) return { valid: false, reason: "defect-requirement-outside-goal", evidenceIds };
-  return { valid: true, reason: "supported", evidenceIds, requirementId };
+  if (requirementId === undefined) return fail("defect-requirement-outside-goal");
+
+  // An operational condition is never a candidate correctness defect (it explains why evaluation/promotion
+  // could not proceed) — it can never be a model-asserted blocker.
+  if (rule.operationalOnly === true) return fail(`category-is-operational-not-correctness:${category}`);
+
+  // 3. SUBSTANTIVE OBSERVATION — the core anti-anchor rule. Contextual identity (candidate/tree), a bare
+  // requirement, an advisory runtime fact, or a derived prior-defect proves identity/requirement only.
+  const observations = evidenceIds.filter((id) => isSubstantiveObservation(id, rule));
+
+  // 4a. explicit-style-policy-violation: an explicit STYLE criterion (a named acceptance criterion, NOT the
+  // whole goal) OR a failed formatter/linter deterministic-check. A style preference citing the generic
+  // candidate anchor + the whole goal is NOT blocking.
+  if (rule.requireStylePolicy === true) {
+    const namedCriterion = requirementId !== "req:goal" && pkg.requirementIds.has(requirementId);
+    const failedFormatter = evidenceIds.some((id) => kindOfEvidenceId(id) === "deterministic-check" && pkg.failedChecks.has(id.replace(/^check:/, "")));
+    if (!namedCriterion && !failedFormatter) return fail("style-defect-without-explicit-policy");
+    return { valid: true, reason: "supported", evidenceIds, requirementId, category, supportKind: namedCriterion ? "explicit-style-criterion" : "failed-formatter-check", authorityClasses };
+  }
+
+  if (observations.length === 0) return fail(authorityClasses.every((c) => c === "contextual-identity") ? "defect-cites-only-contextual-evidence" : "defect-cites-no-substantive-observation");
+
+  // 4b. `*-failure` categories require a cited check/test that ACTUALLY FAILED (a passing check cannot support
+  // a failure claim). The critic runs after the verifier, so a green tree cannot fabricate a test failure.
+  if (rule.requireFailed !== undefined) {
+    const citesFailedCheck = evidenceIds.some((id) => kindOfEvidenceId(id) === "deterministic-check" && pkg.failedChecks.has(id.replace(/^check:/, "")));
+    const citesFailedTest = evidenceIds.some((id) => kindOfEvidenceId(id) === "executed-test" && pkg.failedTests.has(id.replace(/^test:/, "")));
+    const ok = rule.requireFailed === "check" ? citesFailedCheck : rule.requireFailed === "test" ? citesFailedTest : citesFailedCheck || citesFailedTest;
+    if (!ok) return fail("defect-cites-no-failed-check");
+  }
+
+  // 4c. runtime-compatibility-conflict: needs the operator-supplied runtime fact the conflict rests on.
+  if (rule.requireRuntimeFact === true && !evidenceIds.some((id) => kindOfEvidenceId(id) === "runtime-fact")) return fail("runtime-conflict-without-runtime-fact");
+
+  // 4d. missing-* : needs ABSENCE evidence — a failed check OR an explicit criterion naming the expected output
+  // (the whole-goal anchor alone cannot prove a specific output is absent).
+  if (rule.requireAbsence === true) {
+    const failedCheck = evidenceIds.some((id) => kindOfEvidenceId(id) === "deterministic-check" && pkg.failedChecks.has(id.replace(/^check:/, "")));
+    const namedCriterion = requirementId !== "req:goal" && pkg.requirementIds.has(requirementId);
+    if (!failedCheck && !namedCriterion) return fail("missing-defect-without-absence-evidence");
+  }
+
+  return { valid: true, reason: "supported", evidenceIds, requirementId, category, supportKind: `observation:${category}`, authorityClasses };
 }
 
 /** Validate a missing-requirement entry: it must name the goal or a supplied acceptance criterion. */

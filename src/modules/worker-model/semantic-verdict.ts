@@ -43,6 +43,17 @@ export interface BlockingDefect {
   readonly evidenceIds?: readonly string[];
   /** Phase 12: the allowed requirement id (goal / acceptance criterion) this defect binds to. */
   readonly requirementId?: string;
+  /** Phase 15: the typed defect category the support matrix validated this defect as. */
+  readonly category?: string;
+  /** Phase 15: the support-matrix rule that admitted this defect (for the durable receipt). */
+  readonly supportKind?: string;
+}
+
+/** Phase 15: a raw defect the parser REJECTED (dropped) + the deterministic reason — recorded for the receipt. */
+export interface RejectedDefect {
+  readonly claim: string;
+  readonly reason: string;
+  readonly category?: string;
 }
 
 /** A non-blocking observation. Never affects promotion. */
@@ -67,6 +78,14 @@ export interface SemanticVerdict {
   readonly evaluatorModel?: string;
   /** Bounded critic retries spent (parser repair / reformat). */
   readonly retryCount?: number;
+  /**
+   * Phase 15: whether this verdict was parsed under a typed EVIDENCE PACKAGE (production enforcement). A
+   * decision-bearing `fail`/`incomplete` is authoritative only when `evidenceEnforced` — a no-package
+   * verdict is downgraded to `indeterminate` for promotion/duel/fixer decisions (`effectiveDecisionKind`).
+   */
+  readonly evidenceEnforced?: boolean;
+  /** Phase 15: the raw defects the parser dropped + why (support-matrix rejections), for the durable receipt. */
+  readonly rejectedDefects?: readonly RejectedDefect[];
 }
 
 /** Context the orchestrator threads so the verdict binds to THIS candidate + evidence. */
@@ -173,24 +192,30 @@ function readMissingRequirements(obj: Record<string, unknown>, pkg?: EvidencePac
   return out;
 }
 
-/** Concrete defects from the RICH `blockingDefects` schema only. */
-function richDefects(obj: Record<string, unknown>, goal: string, pkg?: EvidencePackage): BlockingDefect[] {
+/** Concrete defects from the RICH `blockingDefects` schema only, plus the rejected-with-reason set (Phase 15). */
+function richDefects(obj: Record<string, unknown>, goal: string, pkg?: EvidencePackage): { defects: BlockingDefect[]; rejected: RejectedDefect[] } {
   const out: BlockingDefect[] = [];
+  const rejected: RejectedDefect[] = [];
   const rich = Array.isArray(obj.blockingDefects) ? obj.blockingDefects : [];
   for (const [i, raw] of rich.entries()) {
     if (typeof raw !== "object" || raw === null) continue;
     const d = raw as Record<string, unknown>;
     const claim = typeof d.claim === "string" ? d.claim.trim() : "";
-    if (!isConcreteClaim(claim)) continue; // a defect without a concrete claim is not a defect
-    // Phase 12 (REAUDIT-003): with an evidence package, a defect must CITE resolvable evidence and a
-    // goal/criterion requirement — a specific-looking-but-unsupported claim is NOT a concrete defect.
+    if (!isConcreteClaim(claim)) { if (claim.length > 0) rejected.push({ claim, reason: "claim-not-concrete" }); continue; } // a defect without a concrete claim is not a defect
+    // Phase 12/15 (REAUDIT-003/REAUDIT2-005): with an evidence package, a defect must CITE a SUBSTANTIVE
+    // observation (never a contextual candidate/tree anchor alone) whose type SUPPORTS its declared category,
+    // and a goal/criterion requirement — a specific-looking-but-unsupported claim is NOT a concrete defect.
     let evidenceIds: readonly string[] | undefined;
     let requirementId: string | undefined;
+    let category: string | undefined;
+    let supportKind: string | undefined;
     if (pkg !== undefined) {
       const v = validateDefectEvidence(d, pkg);
-      if (!v.valid) continue; // unsupported claim → dropped (never becomes a blocking defect)
+      if (!v.valid) { rejected.push({ claim, reason: v.reason, category: v.category }); continue; } // unsupported → dropped
       evidenceIds = v.evidenceIds;
       requirementId = v.requirementId;
+      category = v.category;
+      supportKind = v.supportKind;
     }
     const evidence = flattenEvidence(d.evidence, claim);
     const requirement = typeof d.requirement === "string" && d.requirement.trim().length > 0 ? d.requirement.trim() : goal;
@@ -208,9 +233,11 @@ function richDefects(obj: Record<string, unknown>, goal: string, pkg?: EvidenceP
       ...(typeof d.repairable === "boolean" ? { repairable: d.repairable } : {}),
       ...(evidenceIds !== undefined ? { evidenceIds } : {}),
       ...(requirementId !== undefined ? { requirementId } : {}),
+      ...(category !== undefined ? { category } : {}),
+      ...(supportKind !== undefined ? { supportKind } : {}),
     });
   }
-  return out;
+  return { defects: out, rejected };
 }
 
 /** Concrete defects from the LEGACY `issues: string[]` schema. Only meaningful on a FAIL verdict. */
@@ -260,11 +287,13 @@ function stamp(v: Omit<SemanticVerdict, "candidateId" | "verifiedTree" | "evalua
     ...(ctx?.verifiedTree !== undefined ? { verifiedTree: ctx.verifiedTree } : {}),
     ...(ctx?.evaluatorModel !== undefined ? { evaluatorModel: ctx.evaluatorModel } : {}),
     ...(ctx?.retryCount !== undefined ? { retryCount: ctx.retryCount } : {}),
+    // Phase 15: mark whether a typed evidence package governed this parse (decision authority for fail/incomplete).
+    ...(ctx?.evidencePackage !== undefined ? { evidenceEnforced: true } : {}),
   };
 }
 
-const indeterminate = (summary: string, ctx: SemanticParseContext | undefined, parseStatus: "structured" | "repaired" | "unparsable" = "structured"): SemanticVerdict =>
-  stamp({ kind: "indeterminate", summary, blockingDefects: [], incompleteRequirements: [], advisories: [], parseStatus }, ctx);
+const indeterminate = (summary: string, ctx: SemanticParseContext | undefined, parseStatus: "structured" | "repaired" | "unparsable" = "structured", rejectedDefects?: readonly RejectedDefect[]): SemanticVerdict =>
+  stamp({ kind: "indeterminate", summary, blockingDefects: [], incompleteRequirements: [], advisories: [], parseStatus, ...(rejectedDefects !== undefined && rejectedDefects.length > 0 ? { rejectedDefects } : {}) }, ctx);
 
 /**
  * Parse a critic model response into the canonical `SemanticVerdict`. STRICT:
@@ -303,7 +332,8 @@ export function parseSemanticVerdict(content: string, ctx?: SemanticParseContext
 
   const goal = ctx?.goal ?? "the stated goal";
   const pkg = ctx?.evidencePackage;
-  const rich = richDefects(obj, goal, pkg);
+  const { defects: rich, rejected: richRejected } = richDefects(obj, goal, pkg);
+  const rej = richRejected.length > 0 ? richRejected : undefined;
   const incompleteRequirements = readMissingRequirements(obj, pkg);
 
   if (verdict === "pass") {
@@ -321,20 +351,20 @@ export function parseSemanticVerdict(content: string, ctx?: SemanticParseContext
     return stamp({ kind: "pass", summary: summary || "no concrete blocking defect", blockingDefects: [], incompleteRequirements: [], advisories: [...advisories, ...issuesAsAdvisories(obj)], parseStatus }, ctx);
   }
   if (verdict === "incomplete") {
-    if (incompleteRequirements.length === 0) return indeterminate("verdict=incomplete but no concrete missing requirement was named", ctx);
-    return stamp({ kind: "incomplete", summary: summary || "requested goal not fully met", blockingDefects: rich, incompleteRequirements, advisories, parseStatus }, ctx);
+    if (incompleteRequirements.length === 0) return indeterminate("verdict=incomplete but no concrete missing requirement was named", ctx, "structured", rej);
+    return stamp({ kind: "incomplete", summary: summary || "requested goal not fully met", blockingDefects: rich, incompleteRequirements, advisories, parseStatus, ...(rej !== undefined ? { rejectedDefects: rej } : {}) }, ctx);
   }
   if (verdict === "indeterminate") {
-    return indeterminate(summary || "critic reported indeterminate", ctx);
+    return indeterminate(summary || "critic reported indeterminate", ctx, "structured", rej);
   }
   // verdict === "fail": require ≥1 concrete blocking defect (rich schema, else legacy `issues`).
   const blockingDefects = rich.length > 0 ? rich : legacyDefects(obj, goal, pkg);
   if (blockingDefects.length === 0) {
     // A FAIL with no concrete defect is a bare rejection — NOT authentic defect evidence. With an evidence
     // package this ALSO covers a fail whose every defect was unsupported (dropped) → fail-closed indeterminate.
-    return indeterminate(summary || (pkg !== undefined ? "verdict=fail but no defect cited resolvable evidence" : "verdict=fail but no concrete blocking defect was provided"), ctx);
+    return indeterminate(summary || (pkg !== undefined ? "verdict=fail but no defect cited resolvable evidence" : "verdict=fail but no concrete blocking defect was provided"), ctx, "structured", rej);
   }
-  return stamp({ kind: "fail", summary: summary || "concrete blocking defect(s) found", blockingDefects, incompleteRequirements, advisories, parseStatus }, ctx);
+  return stamp({ kind: "fail", summary: summary || "concrete blocking defect(s) found", blockingDefects, incompleteRequirements, advisories, parseStatus, ...(rej !== undefined ? { rejectedDefects: rej } : {}) }, ctx);
 }
 
 /** A verdict that is genuinely a critic INFRASTRUCTURE failure (provider/parser/timeout/context). */
@@ -352,6 +382,19 @@ export function verdictBindsCandidate(v: SemanticVerdict, candidateId: string | 
   if (v.candidateId !== undefined && candidateId !== undefined && v.candidateId !== candidateId) return false;
   if (v.verifiedTree !== undefined && verifiedTree !== undefined && v.verifiedTree !== verifiedTree) return false;
   return true;
+}
+
+/**
+ * Phase 15 (IKBI-REAUDIT2-005): the DECISION-BEARING kind of a verdict. A concrete `fail`/`incomplete` is
+ * authoritative for promotion/duel/fixer ONLY when it was produced under a typed evidence package
+ * (`evidenceEnforced`). A decision-bearing semantic evaluation WITHOUT a typed evidence package is not a
+ * concrete candidate rejection — it is downgraded to `indeterminate` (fail-closed), so a non-authoritative
+ * compatibility parse can never authorize a fixer, peer duel, or promotion block as a concrete defect. `pass`,
+ * `indeterminate`, `infrastructure-failure`, and `not-evaluated` are unaffected.
+ */
+export function effectiveDecisionKind(v: Pick<SemanticVerdict, "kind" | "evidenceEnforced">): SemanticVerdictKind {
+  if ((v.kind === "fail" || v.kind === "incomplete") && v.evidenceEnforced !== true) return "indeterminate";
+  return v.kind;
 }
 
 /**

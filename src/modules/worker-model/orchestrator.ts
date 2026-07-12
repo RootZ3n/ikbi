@@ -60,7 +60,7 @@ import { DriftBlockedError } from "../drift-prevention/index.js";
 import type { DriftPrevention, DriftReport } from "../drift-prevention/index.js";
 import { rosterFromIds } from "../model-router/index.js";
 import { rentBuilderExpert, classifyTaskTier, resolveClassifierModel, laneRoster, laneHasModels, type RentedExpert } from "./expert-rental.js";
-import { semanticPromotionEligible, semanticDuelEligible, type SemanticVerdict, type SemanticVerdictKind } from "./semantic-verdict.js";
+import { semanticPromotionEligible, semanticDuelEligible, effectiveDecisionKind, type SemanticVerdict, type SemanticVerdictKind } from "./semantic-verdict.js";
 import { evaluateExecutedTestEvidence, noTestsPolicyEnabled } from "./executed-evidence.js";
 import type { TestEvidence } from "./adjudication/contract.js";
 import {
@@ -1037,9 +1037,11 @@ export function classifySemanticVerdict(critic: RoleResult | undefined): Semanti
   if (critic === undefined) return "not-evaluated";
   const d = (critic.detail ?? {}) as Record<string, unknown>;
   // Prefer the canonical semantic verdict the critic stamped (Phase 4) — the single source of truth.
+  // Phase 15: a stamped concrete fail/incomplete NOT produced under a typed evidence package is downgraded to
+  // indeterminate for DECISIONS (a no-package compatibility verdict never authorizes fixer/duel/promotion-block).
   const sv = d.semanticVerdict;
   if (typeof sv === "object" && sv !== null && typeof (sv as SemanticVerdict).kind === "string") {
-    return (sv as SemanticVerdict).kind;
+    return effectiveDecisionKind(sv as SemanticVerdict);
   }
   // Fallback (an injected/legacy critic WITHOUT a stamped verdict — the production critic always
   // stamps one, so this only affects test doubles). A bare `FAIL` with no concrete issue is
@@ -2283,11 +2285,20 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             ...(d.recoveryInvocationId !== undefined ? { recoveryInvocationId: d.recoveryInvocationId } : {}),
             ...(d.recoveryModel !== undefined ? { recoveryModel: d.recoveryModel } : {}),
             ...(d.recoveryCostUsd !== undefined ? { recoveryCostUsd: d.recoveryCostUsd, recoveryCostStatus: d.recoveryCostStatus } : {}),
-            // POLICY CONSEQUENCE (Phase 12): the downstream decisions this verdict authorizes — an auditor can
-            // see promotion/duel/fixer eligibility without re-deriving it.
-            promotionEligible: semanticPromotionEligible(sv.kind, false),
-            duelEligible: semanticDuelEligible(sv.kind),
-            fixerEligible: sv.kind === "fail" || sv.kind === "incomplete",
+            // EVIDENCE RELEVANCE PROVENANCE (Phase 15): the support-matrix rule applied to each VALIDATED defect
+            // (category + support kind + cited evidence authority classes) and the reasons unsupported defects
+            // were REJECTED (candidate-anchor-only, off-goal requirement, unfailed check, style-without-policy).
+            ...(Array.isArray(sv.blockingDefects) && sv.blockingDefects.length > 0
+              ? { supportMatrix: sv.blockingDefects.map((bd) => ({ ...(bd.category !== undefined ? { category: bd.category } : {}), ...(bd.supportKind !== undefined ? { supportKind: bd.supportKind } : {}), ...(bd.evidenceIds !== undefined ? { evidenceIds: bd.evidenceIds } : {}) })) }
+              : {}),
+            ...(Array.isArray(sv.rejectedDefects) && sv.rejectedDefects.length > 0 ? { rejectedDefects: sv.rejectedDefects } : {}),
+            ...(sv.evidenceEnforced === true ? { evidenceEnforcedVerdict: true } : {}),
+            // POLICY CONSEQUENCE: the downstream decisions this verdict authorizes — derived from the EFFECTIVE
+            // decision kind (a no-package fail/incomplete is downgraded to indeterminate, Phase 15) so the receipt
+            // matches the actual promotion/duel/fixer gates.
+            promotionEligible: semanticPromotionEligible(effectiveDecisionKind(sv), false),
+            duelEligible: semanticDuelEligible(effectiveDecisionKind(sv)),
+            fixerEligible: effectiveDecisionKind(sv) === "fail" || effectiveDecisionKind(sv) === "incomplete",
           },
           project: binding.targetRepo,
         },
