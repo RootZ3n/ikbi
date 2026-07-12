@@ -4955,6 +4955,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       verificationMode: ranVerificationMode,
       retrievalMode: ranRetrievalMode,
       costUsd: runCost(),
+      // Phase 14B: surface this run's cost status + provider-attempt projection so a parent composite operation
+      // can aggregate the union of unique attempts across child runs (duel/multi-step) without double-counting.
+      costStatus: runLedger.costStatus(),
+      providerAttempts: runLedger.providerAttempts().map((a) => ({ providerAttemptId: a.providerAttemptId, ...(a.costUsd !== undefined ? { costUsd: a.costUsd } : {}), costStatus: a.costStatus })),
       ...(checksUnverifiable !== undefined && overall !== "success"
         ? { verification: { kind: checksUnverifiable.kind, reason: checksUnverifiable.reason, nextSteps: [...UNRESOLVABLE_NEXT_STEPS] } }
         : {}),

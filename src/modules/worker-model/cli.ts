@@ -43,6 +43,7 @@ import { driftPrevention as coreDriftPrevention } from "../drift-prevention/inde
 import type { ExecRequest, ExecResult } from "../governed-exec/index.js";
 import { createOrchestrator } from "./orchestrator.js";
 import { WorkerError, validateDelegationEnvelope, type DelegationEnvelope, type WorkerResult, type WorkerRole, type WorkerTask } from "./contract.js";
+import { CompositeOperationLedger, type ChildRunRole } from "./composite-ledger.js";
 import { preBuildRefinement, formatInterview } from "../../core/goal-refinement.js";
 import { createCognitionLayer } from "../cognition-layer/cognition.js";
 import { loadRepoRegistry } from "../../core/repo-registry.js";
@@ -925,6 +926,23 @@ export function formatCostBreakdown(r: WorkerResult): string {
   return `${lines.join("\n")}\n`;
 }
 
+/**
+ * Phase 14B — render the PARENT composite total for a multi-run operation (a conditional duel today). It surfaces
+ * the union-of-unique-provider-attempts cost across BOTH children (winning + losing), each child's scoped spend,
+ * and a `partial` marker if any attempt's cost is unknown — so the losing peer's cost is never invisible.
+ */
+export function formatCompositeCost(composite: CompositeOperationLedger): string {
+  const s = composite.summary();
+  const lines: string[] = [`Composite operation (${s.strategy}) — ${s.childRuns.length} runs:`];
+  for (const c of s.childRuns) {
+    lines.push(`  ${c.role.padEnd(10)}  ${c.childId}${c.selected ? " ✓" : ""}  (${c.outcome}, ${c.providerAttemptCount} attempts)`);
+  }
+  lines.push(`  ${"─".repeat(22)}`);
+  const suffix = s.cost.status === "partial" ? `  (partial — ${s.cost.unknownCostAttempts} attempt(s) unknown-cost)` : "";
+  lines.push(`  ${"composite".padEnd(10)}  $${s.cost.usd.toFixed(4)}  [${s.cost.uniqueProviderAttempts} unique attempts]${suffix}`);
+  return `${lines.join("\n")}\n`;
+}
+
 /** Injectable surfaces so the construction + roleClaim + spawn/clamp + gate chain is testable. */
 export interface WorkerCliDeps {
   /** The run surface. Default: a live orchestrator wired with the production roleClaim + real gate-wall. */
@@ -1478,10 +1496,16 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       // vendor cannot fix, never pays for the second attempt (Phase 2, IKBI-RT-002).
       const duelEnabled = task.moeExpertRental === true;
       const DUEL_LANES = ["deepseek", "mimo"] as const; // the cheap pool's two vendors
+      // COMPOSITE OPERATION (Phase 14B): a conditional duel is ONE user operation spanning up to two runs. The
+      // composite cost is the union of unique provider attempts across BOTH child runs (primary + peer) — the
+      // LOSING child's spend is never dropped. Built from each run's provider-attempt projection.
+      const duelChildren: Array<{ result: WorkerResult; role: ChildRunRole }> = [];
       result = await runOneAttempt(duelEnabled ? DUEL_LANES[0] : undefined);
+      duelChildren.push({ result, role: duelEnabled ? "primary" : "worker" });
       if (duelEnabled && primaryWarrantsPeer(result)) {
         progress(`  ⚔ primary (${DUEL_LANES[0]} lane) produced a non-promotable candidate — dueling a ${DUEL_LANES[1]}-lane peer\n`);
         const peer = await runOneAttempt(DUEL_LANES[1]);
+        duelChildren.push({ result: peer, role: "peer" });
         if (peer.outcome === "success") {
           progress(`  ✓ ${DUEL_LANES[1]}-lane peer promoted — keeping it\n`);
           result = peer;
@@ -1490,6 +1514,25 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
         }
       } else if (duelEnabled && result.outcome !== "success") {
         progress(`  ⓘ primary (${DUEL_LANES[0]} lane) did not promote (${result.nonPromotion?.class ?? "no candidate"}) — a peer vendor cannot fix this class of failure; NOT dueling\n`);
+      }
+      // COMPOSITE TOTAL (Phase 14B): when a duel actually dispatched a peer, the CLI operation spans TWO worker
+      // runs. Aggregate their provider-attempt projections into a parent composite so the surfaced total includes
+      // the LOSING child's spend (the re-audit found the CLI dropped it). One child = no composite (scoped total
+      // is already honest). Provider-attempt ids are disjoint across runs (taskId-prefixed) so union = complete sum.
+      let composite: CompositeOperationLedger | undefined;
+      if (duelChildren.length > 1) {
+        composite = new CompositeOperationLedger(`composite:${result.taskId}`, result.taskId, "conditional-duel");
+        for (const c of duelChildren) {
+          composite.registerChild({
+            childId: c.result.taskId, strategy: "moe-expert-rental", role: c.role, outcome: c.result.outcome,
+            selected: c.result.taskId === result.taskId,
+            providerAttempts: (c.result.providerAttempts ?? []).map((a) => ({
+              providerAttemptId: a.providerAttemptId,
+              ...(a.costUsd !== undefined ? { costUsd: a.costUsd } : {}),
+              costStatus: a.costStatus,
+            })),
+          });
+        }
       }
       // BASELINE (drift-prevention's reference): fold THIS run's receipts into the durable,
       // cumulative per-(agent, operation) success-rate baseline — the reference drift-prevention
@@ -1514,20 +1557,23 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
           promoted: result.promoted,
           ...(result.workspaceId !== undefined ? { workspaceId: result.workspaceId } : {}),
           ...(result.costUsd !== undefined ? { costUsd: result.costUsd } : {}),
+          // COMPOSITE (Phase 14B): when the operation spanned >1 run, the machine envelope carries the parent
+          // total (union of unique provider attempts across BOTH children) alongside the scoped worker-run cost.
+          ...(composite !== undefined ? (() => { const c = composite.compositeCost(); return { compositeCostUsd: c.usd, compositeCostStatus: c.status, compositeProviderAttempts: c.uniqueProviderAttempts }; })() : {}),
           ...(result.reason !== undefined ? { reason: result.reason } : {}),
           ...(result.verification !== undefined ? { verification: result.verification } : {}),
         };
         out(`${JSON.stringify(jsonResult)}\n`);
         err(summarize(result));
         err(formatRepairNarrative(result));
-        if (cost === true) err(formatCostBreakdown(result));
+        if (cost === true) { err(formatCostBreakdown(result)); if (composite !== undefined) err(formatCompositeCost(composite)); }
       } else {
         // A gate denial / non-promote is a CLEAN outcome (printed), not an error.
         out(summarize(result));
         // ISSUE 3: surface the repair report (root cause / files / rationale / tests) when present.
         out(formatRepairNarrative(result));
         // --cost: print a per-role cost breakdown after the build.
-        if (cost === true) out(formatCostBreakdown(result));
+        if (cost === true) { out(formatCostBreakdown(result)); if (composite !== undefined) out(formatCompositeCost(composite)); }
         // SG-2: after the run, show a one-line diff summary of what changed (best-effort).
         if (result.workspaceId !== undefined) await printDiffSummary(result.workspaceId);
       }

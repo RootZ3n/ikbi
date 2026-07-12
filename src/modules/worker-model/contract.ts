@@ -411,6 +411,14 @@ export interface WorkerResult {
    * paths that never invoke a model (e.g. a pre-allocation kill). Surfaced for cost visibility.
    */
   readonly costUsd?: number;
+  /** Phase 14B: whether this run's cost is complete or partial (any unknown-cost provider attempt). */
+  readonly costStatus?: "complete" | "partial";
+  /**
+   * Phase 14B: a compact projection of this run's UNIQUE provider attempts (id + cost + status), so a PARENT
+   * composite operation (duel primary+peer, multi-step steps, CLI cognition+worker) can aggregate the union of
+   * unique attempts across child runs WITHOUT double-counting — losing/failed work included, never erased.
+   */
+  readonly providerAttempts?: readonly { readonly providerAttemptId: string; readonly costUsd?: number; readonly costStatus: "measured" | "measured-zero" | "unavailable" }[];
   /**
    * The escalation engine's recommendation for this run, surfaced so an operator can see the
    * strongest recommendation across the scoring roles (a `recommended` one wins over a declined one;
