@@ -116,6 +116,11 @@ const cleanBuilder: RoleFn = async () => ({ role: "builder", outcome: "success",
 const greenVerifier: RoleFn = async () => ({ role: "verifier", outcome: "success", summary: "green", detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }], testEvidence: "executed" } });
 const passCritic: RoleFn = async () => ({ role: "critic", outcome: "success", summary: "c", detail: { pass: true } });
 const promoteIntegrator: RoleFn = async () => ({ role: "integrator", outcome: "success", summary: "i", detail: { decision: "promote", rationale: "s", evaluation: { approved: true } } });
+// INJECTED TEST FACT (adjudication seam): the STUB builder reports filesWritten but does not actually
+// mutate the real git worktree, so the production computeWorkProduct would see an empty tree. Inject a
+// tree-bound GREEN work product so the core promotes and the PHYSICAL-snapshot path (real git) is exercised.
+// (Production always computes from real git; this stands in for the work the stub builder claims.)
+const promotableWorkProduct: NonNullable<OrchestratorDeps["computeWorkProduct"]> = async () => ({ treeHash: "test-tree-green", diffStat: { filesChanged: 1, insertions: 1, deletions: 0 }, nonEmpty: true });
 const find = (rs: Array<{ operation: string; metadata: Record<string, unknown> }>, op: string) => rs.find((r) => r.operation === op);
 
 /** A real-git-backed run (default real readTreeHash ⇒ the physical snapshot path is active). */
@@ -139,6 +144,7 @@ function makeRun(over: { createPhysicalSnapshot?: OrchestratorDeps["createPhysic
     roles: { scout: async () => ({ role: "scout", outcome: "success", summary: "s" }), builder: cleanBuilder, verifier: greenVerifier, critic: passCritic, integrator: promoteIntegrator },
     invokeModel: async () => { throw new Error("unused"); }, governedExec: { run: async () => ({ executed: true as const, exitCode: 0, stdoutTail: "ok", stderrTail: "" }) }, builderModel: "deepseek-v4-flash",
     gateWall: { evaluate: async (): Promise<PromoteGovernance> => ({ allow: true, reason: "ok" }) },
+    computeWorkProduct: promotableWorkProduct,
     ...(over.createPhysicalSnapshot !== undefined ? { createPhysicalSnapshot: over.createPhysicalSnapshot } : {}),
   });
   return { run: () => orch.run({ taskId: "t13c", targetRepo: dir, goal: "do the thing" }, parentCtx), receipts: rc.appended };

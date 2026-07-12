@@ -4532,7 +4532,30 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     let adjDecision: Decision | undefined;
     if (shadowEnabled || adjudicationAuthoritative) {
       try {
-        const wp = await (deps.computeWorkProduct ?? computeWorktreeWorkProduct)(workspace.path, workspace.baseRef, task.taskId);
+        let wp: import("./adjudication/index.js").WorkProduct;
+        if (deps.computeWorkProduct !== undefined) {
+          wp = await deps.computeWorkProduct(workspace.path, workspace.baseRef, task.taskId);
+        } else {
+          try {
+            // The common path: a real git worktree. Compute the tree-bound product directly (no identity
+            // probe — a probe here would consume the treeReader/readTreeHash sequence that the stale-tree
+            // gate relies on for git-backed candidates).
+            wp = await computeWorktreeWorkProduct(workspace.path, workspace.baseRef, task.taskId);
+          } catch (gitErr) {
+            // The git computation failed. DISTINGUISH a PROVEN non-git workspace (an in-memory/test candidate)
+            // from a transient git/process error: only a proven non-git state gets the legacy tree-identity
+            // EXEMPTION (promote on the logical binding — verified evidence + integrator decision). An
+            // INDETERMINATE resolution (missing binary / permission / timeout) is NOT exempted — rethrow so the
+            // authoritative core fails CLOSED. This preserves IKBI-REAUDIT2-002: no laundering a git error into
+            // a non-git exemption. `isGitBacked=false` short-circuits before readTreeHash, so no sequence is consumed.
+            const idRes = await resolveWorkspaceIdentity(workspace.path);
+            if (idRes.status === "resolved" && idRes.backing === "non-git") {
+              wp = { treeHash: idRes.identity, diffStat: { filesChanged: 1, insertions: 0, deletions: 0 }, nonEmpty: true };
+            } else {
+              throw gitErr;
+            }
+          }
+        }
         const verifierResult = results.find((r) => r.role === "verifier");
         const rv = readVerifier(verifierResult);
         const rawVerdict = (verifierResult?.detail as Record<string, unknown> | undefined)?.verdict;
@@ -4583,6 +4606,40 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             parentIdentity,
           );
         } catch { /* provenance receipt failure must never break the build */ }
+
+        // CANONICAL WITHHOLDING RECEIPT (I9 single decision point). When the AUTHORITATIVE core WITHHOLDS a
+        // build the integrator approved, the withholding is the SAME audit event the downstream authority
+        // (`promoteCandidate`) would record had the core let it through — so record it with the canonical
+        // receipt naming the reason, referencing THIS (the single) decision. The core is the sole promote
+        // authority in authoritative mode; when it promotes, `promoteCandidate` emits these receipts instead
+        // (mutually exclusive — no double emission). Emitting is best-effort and never breaks the build.
+        if (adjudicationAuthoritative && adjDecision.action !== "promote") {
+          const integratorApproved = readIntegratorDecision(results.find((r) => r.role === "integrator")).promote === true;
+          if (integratorApproved) {
+            try {
+              if (adjDecision.action === "discard" && adjDecision.reason === "vacuous-green") {
+                // A "pass" verdict without authentic executed (or policy-permitted `absent`) test evidence —
+                // the canonical EVIDENCE withholding (Phase 10). `zero`/`unverified`/absent-without-policy.
+                await receipts.append(
+                  { operation: "worker.promotion.evidence_withheld", outcome: { status: "failure", detail: `executed-test evidence not acceptable for autonomous promotion (${assessment.testEvidence}) — a green that proved nothing about behavior` },
+                    requestId: task.taskId, metadata: { taskId: task.taskId, workspaceId: workspace.id, testEvidence: assessment.testEvidence, noTestsAcceptable: assessment.noTestsAcceptable === true, adjudicationReason: adjDecision.reason, decisionAuthority: "adjudication-core" }, project: task.targetRepo },
+                  parentIdentity,
+                );
+              } else if (adjDecision.action === "retain" && adjDecision.reason === "critic-fail-exhausted") {
+                // The critic withheld. When its SEMANTIC verdict is a concrete non-pass (a contradictory
+                // PASS-with-defects → indeterminate, or fail/incomplete), record the canonical SEMANTIC withholding.
+                const semanticKind = classifySemanticVerdict(results.find((r) => r.role === "critic"));
+                if (semanticKind !== "pass") {
+                  await receipts.append(
+                    { operation: "worker.promotion.semantic_withheld", outcome: { status: "failure", detail: `semantic policy: a "${semanticKind}" verdict is not autonomously promotable` },
+                      requestId: task.taskId, metadata: { taskId: task.taskId, workspaceId: workspace.id, semanticVerdict: semanticKind, adjudicationReason: adjDecision.reason, decisionAuthority: "adjudication-core" }, project: task.targetRepo },
+                    parentIdentity,
+                  );
+                }
+              }
+            } catch { /* canonical withholding receipt failure must never break the build */ }
+          }
+        }
 
         if (shadowEnabled) {
           const oldIntent = readIntegratorDecision(results.find((r) => r.role === "integrator")).promote === true;

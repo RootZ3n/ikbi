@@ -270,7 +270,11 @@ test("D2 [MUTATION 7]: the receipt is HONEST about what it did NOT determine —
 });
 
 test("D3: the receipt records only OBSERVED vetoes + the adjudication outcome + mode — the authentic facts, nothing synthetic", async () => {
-  const h = realOrchestrator({ treeSeq: ["T"] });
+  // This test pins the SHADOW-telemetry receipt (the legacy default), so it forces the legacy mode
+  // explicitly rather than inheriting the suite-wide IKBI_LEGACY_COMPLETION=off override — the receipt's
+  // `mode` field must then read "shadow" (the run is NOT authoritative). The authoritative-mode receipt is
+  // covered elsewhere; here we assert the shadow projection is truthful about being shadow.
+  const h = realOrchestrator({ treeSeq: ["T"], extra: { env: { ...process.env, IKBI_LEGACY_COMPLETION: "on" } } });
   await run(h.orch, h.parentCtx, "t-obs");
   const rec = h.receipts.find((r) => r.operation === "worker.safety_assessment")!;
   const observed = rec.metadata.observedVetoes as Record<string, boolean>;
