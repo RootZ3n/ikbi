@@ -102,8 +102,12 @@ is the mechanism without which the false-RED merely relocates.
    allowlist, fixer-on-verifier-fail, silent-success-0-files branch, `builderOk`, guaranteed escalation,
    fix loops). Split the budget. Preserve: trust-suppression, skip-critic-on-red, injection chokepoint,
    refuter, gate-wall, dirty-repo refusal, step-planner skipVerifier.
-4. **Flip and lock**: old path behind `IKBI_LEGACY_COMPLETION=true` for one release, then remove. Land
-   the I1–I9 guard tests as permanent fixtures so the next edge-case cannot re-scatter the decision.
+4. **Flip and lock** ✅ DONE: the authoritative core is now the DEFAULT promotion decision. The legacy
+   integrator-decides terminal is a DEPRECATED, explicit opt-in selected ONLY by `IKBI_LEGACY_COMPLETION=on`;
+   missing / `off` / any invalid value ⇒ authoritative (fail-closed — an invalid flag can never re-enable the
+   old gate). The full suite passes in BOTH modes. Remaining: remove the legacy opt-in entirely after a
+   deprecation window. The I1–I9 guard tests are landed as permanent fixtures so the next edge-case cannot
+   re-scatter the decision.
 
 Also fold in the truth-half fixes: scope the builder's `run_checks` to the verifier's ladder set + give
 it full stdout (not the 2000-char tail); run affected-test *targets* rather than the whole root suite in

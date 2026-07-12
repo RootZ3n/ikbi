@@ -4519,15 +4519,23 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // ── ADJUDICATION CORE — the centralized promotability decision ───────────────────────────────
     // Compute the single `decidePromotability` verdict from the four fact-types. Two modes, one
     // computation:
-    //   • SHADOW (IKBI_ADJUDICATION_SHADOW, default on): log any divergence vs the old integrator gate;
-    //     changes nothing. Validates the core against real builds.
-    //   • AUTHORITATIVE (IKBI_LEGACY_COMPLETION=off, Step 4 flip): the verdict below REPLACES the
-    //     integrator's promote intent at the terminal gate. DEFAULT IS LEGACY (flag on) — so with no
-    //     env override this block is pure telemetry and the terminal path is byte-unchanged. The flip is
-    //     rolled out by dogfood validation (its risk is more false-GREEN surface); flag-off enables it.
+    //   • AUTHORITATIVE (Step 4 flip — now the DEFAULT): the verdict below REPLACES the integrator's
+    //     promote intent at the terminal gate. This is the single promotion decision point (I9): a
+    //     tree-bound, evidence-gated, fail-closed judge. With no env set, THIS is the path.
+    //   • LEGACY completion (the old integrator-decides terminal): a DEPRECATED, EXPLICIT opt-in selected
+    //     ONLY by the exact value IKBI_LEGACY_COMPLETION=on. Missing / "off" / any other (invalid) value ⇒
+    //     authoritative (fail-closed to the safer, evidence-bound path — an invalid flag can never silently
+    //     re-enable the old gate). This flip decides the promote/retain/discard VERDICT only; the autonomous-
+    //     promotion QUARANTINE (IKBI_ENABLE_AUTONOMOUS_PROMOTION) + gate-wall bypass are UNCHANGED and still
+    //     independently gate whether a verdict may actually LAND.
+    //   • SHADOW (IKBI_ADJUDICATION_SHADOW, default on): also emit divergence telemetry vs the integrator gate.
     // Wrapped so a computation failure never crashes the build; in authoritative mode an unavailable
     // verdict fails CLOSED at the terminal (no promote). `adjDecision`/`adjIntegratedTree` feed the gate.
-    const adjudicationAuthoritative = (modeEnv.IKBI_LEGACY_COMPLETION ?? "on") === "off";
+    const legacyCompletionOptIn = modeEnv.IKBI_LEGACY_COMPLETION === "on";
+    const adjudicationAuthoritative = !legacyCompletionOptIn;
+    if (legacyCompletionOptIn) {
+      log.warn({ taskId: task.taskId }, "IKBI_LEGACY_COMPLETION=on: the DEPRECATED legacy completion path is active — the authoritative adjudication core is the default and this opt-in will be removed in a future release");
+    }
     const shadowEnabled = (modeEnv.IKBI_ADJUDICATION_SHADOW ?? "on") !== "off";
     let adjDecision: Decision | undefined;
     if (shadowEnabled || adjudicationAuthoritative) {
@@ -4785,15 +4793,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // (fail-closed). If a role hard-failed, the loop broke before the integrator ran,
     // so its result is absent → fail-closed discard. That composition is intentional.
     let decision = readIntegratorDecision(results.find((r) => r.role === "integrator"));
-    // ── CX — ADJUDICATION CORE AUTHORITATIVE (IKBI_LEGACY_COMPLETION=off) ──────────────────────────
-    // When the flip is enabled, `decidePromotability` (computed above) REPLACES the integrator's promote
-    // intent: promote ⇒ promote, retain ⇒ withhold-but-keep the green work (never discard, invariant I1),
-    // discard ⇒ discard. The downstream approval + gate-wall gates STILL run on a promote (defense in
-    // depth). Fail-closed: if the verdict couldn't be computed, do NOT promote. DEFAULT (flag on /
-    // legacy) leaves `decision` exactly as the integrator returned it — no change.
-    // NOTE: C1c `verifiedAgainst` (the hash-bound promote in WorkspaceManager) is NOT yet threaded from
-    // here, so the manager does not re-check the landed tree against what the verifier saw — a follow-up
-    // (Fable C-2/C-4) before the default flip.
+    // ── CX — ADJUDICATION CORE AUTHORITATIVE (the DEFAULT; legacy is IKBI_LEGACY_COMPLETION=on) ────────
+    // `decidePromotability` (computed above) REPLACES the integrator's promote intent: promote ⇒ promote,
+    // retain ⇒ withhold-but-keep the green work (never discard, invariant I1), discard ⇒ discard. The
+    // downstream approval + gate-wall gates STILL run on a promote (defense in depth). Fail-closed: if the
+    // verdict couldn't be computed, do NOT promote. Only the DEPRECATED legacy opt-in (IKBI_LEGACY_COMPLETION=on)
+    // leaves `decision` exactly as the integrator returned it.
     let adjRetain = false;
     if (adjudicationAuthoritative) {
       if (adjDecision === undefined) {
@@ -4809,7 +4814,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         // the `SafetyAssessment` no longer fabricates gate-wall authorization). It must NOT manufacture an
         // autonomous promote: it may CONFIRM a promote the integrator ALSO approved (which then still
         // passes through the canonical authority's real gate-wall + stale-tree binding), but when the
-        // integrator did NOT approve it fails CLOSED and retains the work — the experimental path can never
+        // integrator did NOT approve it fails CLOSED and retains the work — the adjudication path can never
         // override an integrator discard. The real gate-wall + promoteCandidate remain the sole authority.
         if (decision.promote === true) {
           // PRESERVE the integrator's rationale (it is the promote evaluation's own reasoning) and ANNOTATE
@@ -4821,7 +4826,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             ...decision,
             promote: false,
             rationale:
-              "adjudication core recommended promote, but the integrator did not approve — QUARANTINED: the experimental IKBI_LEGACY_COMPLETION=off path cannot autonomously promote from synthesized safety evidence (no promote; work retained for inspection)",
+              "adjudication core recommended promote, but the integrator did not approve — QUARANTINED: the authoritative adjudication path cannot autonomously promote over an integrator discard from synthesized safety evidence (no promote; work retained for inspection)",
           };
         }
       } else {
