@@ -355,6 +355,8 @@ function capturingRoles() {
       seen.push(ctx);
       if (r === "integrator") return { role: r, outcome: "success", summary: r, detail: { decision: "promote", rationale: "test", evaluation: { approved: true } } };
       if (r === "verifier") return { role: r, outcome: "success", summary: r, detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }] } };
+      // A GREEN critic states its PASS verdict (`detail.pass`) — the field the authoritative core reads.
+      if (r === "critic") return { role: r, outcome: "success", summary: r, detail: { pass: true } };
       return { role: r, outcome: "success", summary: r };
     };
   }
@@ -402,6 +404,9 @@ function governedWorker(resolveIdentity: (c: { token?: string }) => ReturnType<R
     receipts: fakeReceiptsOrch(),
     events: noopBusOrch() as unknown as NonNullable<OrchestratorDeps["events"]>,
     invokeModel: async () => { throw new Error("invokeModel not used (capturing roles)"); },
+    // INJECTED TEST FACT (adjudication seam): the governance workspace is a non-git fake, so inject a
+    // tree-bound GREEN work product. Production always computes from real git.
+    computeWorkProduct: async () => ({ treeHash: "test-tree-green", diffStat: { filesChanged: 1, insertions: 1, deletions: 0 }, nonEmpty: true }),
     ...over,
   });
   return { run: orchestrator.run, cap, ws };

@@ -171,6 +171,10 @@ function promotingRoles(): Partial<Record<WorkerRole, RoleFn>> {
       if (r === "integrator") {
         return { role: r, outcome: "success", summary: r, detail: { decision: "promote", rationale: "test", evaluation: { approved: true } } };
       }
+      // A GREEN verifier carries executed-test evidence + a GREEN critic states its PASS verdict — the
+      // facts the authoritative core reads so the build reaches the PROMOTE gate (where the gate-wall denies).
+      if (r === "verifier") return { role: r, outcome: "success", summary: r, detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }] } };
+      if (r === "critic") return { role: r, outcome: "success", summary: r, detail: { pass: true } };
       return { role: r, outcome: "success", summary: r };
     };
   }

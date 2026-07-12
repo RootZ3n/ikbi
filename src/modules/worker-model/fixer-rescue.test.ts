@@ -49,6 +49,8 @@ function fixerRoles() {
           : { role: r, outcome: "success", summary: "run_checks GREEN", detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }] } };
       }
       if (r === "integrator") return { role: r, outcome: "success", summary: r, detail: { decision: "promote", evaluation: { approved: true } } };
+      // A GREEN critic states its PASS verdict (`detail.pass`) — the field the authoritative core reads.
+      if (r === "critic") return { role: r, outcome: "success", summary: r, detail: { pass: true } };
       return { role: r, outcome: "success", summary: r };
     };
   }
@@ -118,6 +120,8 @@ function verifierFailRoles() {
       // greenness is caused by the fixer, isolating the verifier-fail rescue path from any other re-verify.
       if (r === "verifier") { calls.verifier += 1; return calls.builder >= 2 ? { role: r, outcome: "success", summary: "run_checks GREEN", detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }] } } : { role: r, outcome: "failure", summary: "run_checks RED (1 type error)" }; }
       if (r === "integrator") return { role: r, outcome: "success", summary: r, detail: { decision: "promote", evaluation: { approved: true } } };
+      // A GREEN critic states its PASS verdict (`detail.pass`) — the field the authoritative core reads.
+      if (r === "critic") return { role: r, outcome: "success", summary: r, detail: { pass: true } };
       return { role: r, outcome: "success", summary: r };
     };
   }
