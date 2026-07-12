@@ -294,6 +294,12 @@ export class InvocationLedger {
       this.records.push({ ...base, completedAt: this.now(), status: "lane-blocked", costStatus: "measured-zero", laneViolation: true });
       throw new LaneViolationError("pre-dispatch", request.model, undefined, ctx.vendorLane);
     }
+    // PRE-DISPATCH JOURNAL (Phase 14B): allocate + record the DISPATCHED state BEFORE calling the provider,
+    // so a dispatched attempt has a durable record before the promise resolves. It is FINALIZED in place from
+    // the real response/failure — never replaced by a record created after return. A call that hangs or ends
+    // abnormally leaves this `dispatched` record (finalizable to `unknown-terminal`), never a deleted attempt.
+    const pendingIndex = this.records.length;
+    this.records.push({ ...base, status: "dispatched", costStatus: "unavailable", servedIdentityStatus: "unavailable" });
     try {
       const r = await this.deps.invokeModel(effReq);
       const { usd, status: costStatus } = chargedCostOf(r);
@@ -310,20 +316,20 @@ export class InvocationLedger {
       // truthful terminal state + PRESERVE any charged cost, but the response is NOT valid candidate evidence
       // — throw so the caller fails closed (never silently accept a cross-lane result as valid work).
       if (laneViolation === true) {
-        this.records.push({
+        this.records[pendingIndex] = { // FINALIZE the pre-dispatch record in place (never a replacement record)
           ...base, completedAt: this.now(), resolvedModel: served.servedModel ?? r.providerModelId ?? r.model, provider: r.provider, providerModelId: r.providerModelId, ...servedFields,
           status: "execution-identity-violation", usage: r.usage, ...(usd !== undefined ? { costUsd: usd } : {}), costStatus, laneViolation: true, providerAttempts,
-        });
+        };
         if (costStatus === "unavailable") this.unknownCostCount += 1; else this.total += usd ?? 0;
         this.executionIdentityViolationCount += 1;
         this.enforceBudget();
         throw new LaneViolationError("post-dispatch", request.model, served.servedModel ?? r.model, ctx.vendorLane!);
       }
-      this.records.push({
+      this.records[pendingIndex] = { // FINALIZE the pre-dispatch record in place from the real response
         ...base, completedAt: this.now(), resolvedModel: served.servedModel ?? r.providerModelId ?? r.model, provider: r.provider, providerModelId: r.providerModelId, ...servedFields,
         status: statusFromFinish(r.finishReason), usage: r.usage, ...(usd !== undefined ? { costUsd: usd } : {}), costStatus,
         ...(laneViolation !== undefined ? { laneViolation } : {}), providerAttempts,
-      });
+      };
       if (costStatus === "unavailable") this.unknownCostCount += 1;
       else this.total += usd ?? 0;
       this.enforceBudget();
@@ -338,11 +344,11 @@ export class InvocationLedger {
       const providerAttempts = expandProviderAttempts(failedAttempts, invocationId);
       const { usd, status: costStatus } = failedAttempts.length > 0 ? chargedCostOfAttempts(failedAttempts) : { usd: undefined, status: "unavailable" as InvocationCostStatus };
       const lastServing = [...failedAttempts].reverse().find((a) => a.providerModelId.trim().length > 0);
-      this.records.push({
+      this.records[pendingIndex] = { // FINALIZE the pre-dispatch record in place from the thrown failure
         ...base, completedAt: this.now(), status, failureClass, ...(usd !== undefined ? { costUsd: usd } : {}), costStatus,
         ...(lastServing !== undefined ? { servedModel: lastServing.providerModelId, servedProvider: lastServing.provider, servedIdentityStatus: "confirmed" as ServedIdentityStatus } : { servedIdentityStatus: "unavailable" as ServedIdentityStatus }),
         ...(providerAttempts.length > 0 ? { providerAttempts } : {}),
-      });
+      };
       if (costStatus === "unavailable") this.unknownCostCount += 1; else this.total += usd ?? 0;
       this.enforceBudget();
       throw err;
@@ -425,6 +431,14 @@ export class InvocationLedger {
   }
   /** Count of charged FAILED provider attempts preserved (Phase 14 — never dropped). */
   chargedFailureCount(): number { return this.providerAttempts().filter((a) => a.chargedFailure).length; }
+  /** Phase 14B: dispatched invocations not yet finalized (a hung/in-flight provider call). A pre-dispatch record exists here BEFORE the promise resolves. */
+  pendingAttempts(): readonly InvocationRecord[] { return this.records.filter((r) => r.status === "dispatched"); }
+  /** Phase 14B: mark every still-dispatched record `unknown-terminal` (run teardown while a call was in flight) — the attempt is preserved, never deleted. */
+  finalizeStalePending(): void {
+    for (let i = 0; i < this.records.length; i++) {
+      if (this.records[i]!.status === "dispatched") this.records[i] = { ...this.records[i]!, status: "unknown-terminal", completedAt: this.now() };
+    }
+  }
   /**
    * Ordered, de-duplicated invocationIds of every EXECUTED record — the aggregate linkage a strategy/summary
    * receipt uses to reference EVERY provider request it summarizes (each counted exactly once, dispatch order).
