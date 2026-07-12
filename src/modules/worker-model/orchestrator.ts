@@ -1870,6 +1870,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         }
         // git RAN and answered (nonzero exit with a diagnostic): a genuine non-repo, or a missing/degenerate
         // path (an in-memory/test workspace), is PROVEN non-git and legitimately exempt.
+        // NOTE (IKBI-REAUDIT3-008): the strict "existing-accessible-dir only" classification is documented as
+        // OPEN in HANDOFF-FINAL-CONFORMANCE-REPAIR.md — it cannot be applied here without migrating the entire
+        // in-memory-workspace test corpus (incl. the production probe, which uses non-existent fake paths).
         if (typeof e.status === "number" && (/not a git repository/i.test(stderr) || /cannot change to|no such file or directory|not a working tree/i.test(stderr))) {
           return { status: "resolved", backing: "non-git", identity: `nongit:${workspacePath}` };
         }
@@ -4859,7 +4862,22 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             message: `worker-model: ${task.goal}${decision.rationale !== undefined ? ` — ${decision.rationale}` : ""}${verificationScope !== undefined ? ` [verification: ${verificationScope}]` : ""}`,
             ...(decision.rationale !== undefined ? { rationale: decision.rationale } : {}),
           };
-          const canon = await promoteCandidate(workspace, candidate, evidence, parentIdentity);
+          // Phase-16 (IKBI-REAUDIT3-017): own the physical snapshot across the throw-prone promotion +
+          // receipt appends. `promoteCandidate` (and its mandatory receipt appends / `workspaces.promote`) can
+          // throw; without this the detached read-only worktree would leak into /tmp. Cleanup is idempotent, so
+          // the success-path cleanup below is harmless if this already ran.
+          let canon: Awaited<ReturnType<typeof promoteCandidate>>;
+          try {
+            canon = await promoteCandidate(workspace, candidate, evidence, parentIdentity);
+          } catch (promoteErr) {
+            if (physicalSnapshot !== undefined) {
+              try { await physicalSnapshot.cleanup(); } catch (cleanupErr) {
+                await receipts.append({ operation: "worker.promotion.snapshot_cleanup_incomplete", outcome: { status: "failure", detail: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr) }, requestId: task.taskId, metadata: { taskId: task.taskId, workspaceId: workspace.id, snapshotPath: physicalSnapshot.snapshotPath, phase: "promote-threw" }, project: task.targetRepo }, parentIdentity).catch(() => {});
+              }
+              physicalSnapshot = undefined; // already cleaned — do not double-clean below
+            }
+            throw promoteErr;
+          }
           promoted = canon.promote.promoted;
           // Phase 13B: a bypassed autonomous land is administratively-bypassed — record it so the run summary
           // is truthful and governed-success trust is withheld below.
@@ -5800,13 +5818,22 @@ export function isFixableVerifierFailure(verifierResult: RoleResult): boolean {
 }
 
 /** Parse the verifier's check results into the candidate's pass flags + (best-effort) test count. */
+/** Phase-16 (IKBI-REAUDIT3-013): typed check kinds that count as EXECUTED-TEST evidence, independent of display name. */
+export const TEST_CHECK_KINDS: ReadonlySet<string> = new Set(["unit-test", "integration-test", "repository-test", "executed-test"]);
+
 export function readVerifier(verifierResult: RoleResult | undefined): { typecheckPass: boolean; testsPass: boolean; testCount?: { passed: number; total: number }; testEvidence: "executed" | "zero" | "unverified" | "absent"; checks: ReadonlyArray<{ name: string; passed: boolean }> } {
   // Builder failed (no verify ran) ⇒ both gates fail.
   if (verifierResult === undefined) return { typecheckPass: false, testsPass: false, testEvidence: "absent", checks: [] };
   const detail = (verifierResult.detail ?? {}) as Record<string, unknown>;
   const checks = Array.isArray(detail.checks) ? (detail.checks as Array<Record<string, unknown>>) : [];
-  const find = (name: string) => checks.find((c) => c.name === name);
-  const typecheck = find("typecheck");
+  // Phase-16 (IKBI-REAUDIT3-013): recognize a check by its TYPED `kind` when present, not only the display
+  // name `"test"`. A verifier may surface a typed executed-test kind (unit-test / integration-test /
+  // repository-test) under any display name; a `deterministic-verifier` under kind "typecheck". Backward
+  // compatible: a legacy check named "test"/"typecheck" with no kind still matches the name fallback.
+  const kindOf = (c: Record<string, unknown>): string | undefined => (typeof c.kind === "string" ? c.kind : undefined);
+  const isTestCheck = (c: Record<string, unknown>): boolean => c.name === "test" || TEST_CHECK_KINDS.has(kindOf(c) ?? "");
+  const isTypecheckCheck = (c: Record<string, unknown>): boolean => c.name === "typecheck" || kindOf(c) === "typecheck" || kindOf(c) === "deterministic-verifier";
+  const typecheck = checks.find(isTypecheckCheck);
   const verdict = detail.verdict;
   const authoritativePass = verdict === "pass" && verifierResult.outcome === "success";
   const typecheckPass = typecheck !== undefined ? typecheck.exitCode === 0 : authoritativePass;
@@ -5833,7 +5860,7 @@ export function readVerifier(verifierResult: RoleResult | undefined): { typechec
   // as "unverified" and the integrator discards a build that verification actually proved. So carry
   // the STRONGEST real evidence any successful test check produced. This NEVER manufactures a count:
   // with no real tally anywhere it still reports unverified/absent and the fail-closed gate holds.
-  const testChecks = checks.filter((c) => c.name === "test");
+  const testChecks = checks.filter(isTestCheck);
   const testsPass = testChecks.length > 0 ? testChecks.every((c) => c.exitCode === 0) : authoritativePass;
   const testCounts = testChecks.map((c) => countOf(c)).filter((x): x is { passed: number; total: number } => x !== undefined);
   // Prefer a count from a check that actually ran tests (total>0); else any count (e.g. a real 0).
