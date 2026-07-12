@@ -200,10 +200,15 @@ test("C26/C27 [MUTATION 8] (req 26,27): a BYPASSED gate carries a bypass discrim
   const bypassGate = createGateWall({ config: { enabled: true, bypass: true }, receipts: { append: async (i: unknown) => { const r = i as { operation: string; metadata?: Record<string, unknown> }; gateReceipts.push({ operation: r.operation, metadata: r.metadata ?? {} }); return {}; } }, publish: () => {} });
   const h = makeRun({ roles: rolesWith(cleanBuilder), gateWall: bypassGate });
   const result = await h.run();
-  assert.equal(result.promoted, true, "bypass allows the land (earlier semantic/test/tree gates still applied)");
-  const promo = find(h.receipts, "worker.promotion")!;
-  assert.equal(promo.metadata.gateBypassed, true, "the promotion receipt records the bypass");
-  assert.equal(promo.metadata.gateAuthority, "administratively-bypassed", "authority is NOT fully-governed");
+  // Post-REAUDIT3 CONTAINMENT: a gate-BYPASSED autonomous promote no longer lands — the quarantine gate refuses
+  // it and records the truthful `administratively-bypassed` authority on a `worker.promotion.quarantined` receipt.
+  assert.equal(result.promoted, false, "a bypassed autonomous promote is quarantined (never lands)");
+  const promo = find(h.receipts, "worker.promotion");
+  assert.ok(promo === undefined || promo.metadata.promoted !== true, "no successful worker.promotion receipt from a bypassed run");
+  const quar = find(h.receipts, "worker.promotion.quarantined")!;
+  assert.ok(quar !== undefined, "a quarantine receipt is written for the bypassed run");
+  assert.equal(quar.metadata.gateBypassed, true, "the quarantine receipt records the bypass");
+  assert.equal(quar.metadata.gateAuthority, "administratively-bypassed", "authority is NOT fully-governed");
   assert.ok(gateReceipts.some((r) => r.metadata.bypass === true), "the gate receipt surfaces bypass=true");
 });
 

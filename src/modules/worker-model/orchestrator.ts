@@ -561,8 +561,26 @@ function observeEscalation(
 }
 
 /** Minimal injected surfaces (each a Pick of the real singleton's relevant method). */
+/**
+ * Post-REAUDIT3 (final containment): resolve whether AUTONOMOUS PROMOTION is enabled. FAIL-CLOSED — enabled
+ * ONLY when the explicit opt-in env is exactly "true" (case-insensitive, trimmed). Missing, invalid, "false",
+ * "1", or any other value ⇒ DISABLED. The critical immutable tested-subject invariant (IKBI-REAUDIT3-001)
+ * remains architecturally open, so autonomous promotion is quarantined by default across every strategy.
+ */
+export const AUTONOMOUS_PROMOTION_ENV = "IKBI_ENABLE_AUTONOMOUS_PROMOTION";
+export function resolveAutonomousPromotionEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env[AUTONOMOUS_PROMOTION_ENV];
+  return typeof raw === "string" && raw.trim().toLowerCase() === "true";
+}
+
 export interface OrchestratorDeps {
   readonly config?: WorkerModelConfig;
+  /**
+   * Post-REAUDIT3 containment: explicit opt-in for AUTONOMOUS PROMOTION. Default (undefined) ⇒ read the
+   * fail-closed env (`IKBI_ENABLE_AUTONOMOUS_PROMOTION`), which is DISABLED unless exactly "true". Injectable so
+   * tests can force the quarantine on/off without touching the environment.
+   */
+  readonly autonomousPromotionEnabled?: boolean;
   /** Resolve a role credential to a validated identity. Default: core resolveIdentity. */
   readonly resolveIdentity?: (claim: IdentityClaim, ctx?: ResolveContext) => ValidatedIdentity;
   /** Produce the credential claim for a role. Default: fail-closed (must be configured). */
@@ -1072,6 +1090,15 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   const trust = deps.trust ?? coreTrust;
   const workspaces = deps.workspaces ?? coreWorkspaces;
   const receipts = deps.receipts ?? coreReceipts;
+  // Post-REAUDIT3 CONTAINMENT: surface the autonomous-promotion quarantine ONCE at startup when disabled, so the
+  // operator understands that candidates require review + manual apply. Not spammed per-operation. Opt-in does
+  // NOT override an active gate-wall bypass (the quarantine still refuses a bypassed autonomous promote).
+  if (!(deps.autonomousPromotionEnabled ?? resolveAutonomousPromotionEnabled())) {
+    log.warn(
+      { setting: AUTONOMOUS_PROMOTION_ENV, openFinding: "IKBI-REAUDIT3-001" },
+      `AUTONOMOUS PROMOTION QUARANTINED: candidates are generated, verified, and criticized but do NOT land unattended — they require operator review / manual \`/apply\`. The critical immutable tested-subject invariant (IKBI-REAUDIT3-001) is architecturally open — see IKBI-RUNTIME-CONFORMANCE-REAUDIT-3.md. To opt in once your workflow is verified, set ${AUTONOMOUS_PROMOTION_ENV}=true (this does NOT override an active IKBI_GATE_WALL_BYPASS — a bypassed gate can never autonomously land).`,
+    );
+  }
   const events = deps.events ?? coreEvents;
   const invokeModel = deps.invokeModel ?? lazyInvokeModel;
   const neutralizeUntrusted = deps.neutralizeUntrusted ?? coreNeutralize;
@@ -1990,6 +2017,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     readonly mutationFenced?: boolean;
     /** True when the refusal was an indeterminate tree-identity resolution (Phase 13, IKBI-REAUDIT2-002). */
     readonly identityIndeterminate?: boolean;
+    /** Post-REAUDIT3: true when autonomous promotion is QUARANTINED (opt-in off, or gate bypass active). */
+    readonly quarantined?: boolean;
   }
 
   async function promoteCandidate(
@@ -2006,6 +2035,40 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       reason,
       ...extra,
     });
+    // (0) AUTONOMOUS-PROMOTION QUARANTINE (post-REAUDIT3 final containment). The Critical immutable
+    // tested-subject invariant (IKBI-REAUDIT3-001) remains architecturally OPEN, so autonomous promotion is
+    // DISABLED BY DEFAULT for EVERY strategy (normal / duel / competitive / tournament / multi-step / fixer).
+    // It may land ONLY when the operator explicitly opts in (`IKBI_ENABLE_AUTONOMOUS_PROMOTION=true`) AND the
+    // gate-wall veto is NOT administratively bypassed. Candidate generation / verification / criticism /
+    // receipts / reports all still run; the candidate simply does not land unattended. Manual `/apply` remains
+    // a separately-classified operator-directed path. This is the canonical authority chokepoint — no strategy
+    // can bypass it.
+    const autonomyOptIn = deps.autonomousPromotionEnabled ?? resolveAutonomousPromotionEnabled();
+    const gateBypassActive = evidence.governance.bypass === true;
+    if (!autonomyOptIn || gateBypassActive) {
+      const why = gateBypassActive
+        ? "gate-wall bypass is active — an administratively-bypassed gate can never autonomously land"
+        : `autonomous promotion is disabled by default (set ${AUTONOMOUS_PROMOTION_ENV}=true to opt in once the immutable tested-subject invariant is verified for your workflow)`;
+      const reason = `autonomous promotion QUARANTINED: ${why}. Operator review required — use manual /apply (manual-unverified) to land after review. The critical immutable tested-subject invariant (IKBI-REAUDIT3-001) remains OPEN — see IKBI-RUNTIME-CONFORMANCE-REAUDIT-3.md.`;
+      await receipts.append(
+        {
+          operation: "worker.promotion.quarantined",
+          outcome: { status: "failure", detail: reason },
+          requestId: candidate.taskId,
+          metadata: {
+            taskId: candidate.taskId, attemptId: candidate.attemptId, strategy: candidate.strategy, workspaceId: candidate.workspaceId,
+            autonomousPromotionQuarantined: true, operatorReviewRequired: true, openFinding: "IKBI-REAUDIT3-001",
+            autonomousPromotionEnabled: autonomyOptIn,
+            ...(gateBypassActive ? { gateBypassed: true, gateAuthority: "administratively-bypassed" } : {}),
+            governedLandedSuccessTrustAwarded: false,
+          },
+          project: handle.targetRepo,
+        },
+        parentIdentity,
+      ).catch(() => {});
+      log.warn({ taskId: candidate.taskId, strategy: candidate.strategy, autonomyOptIn, gateBypassActive }, "canonical promotion: QUARANTINED — autonomous promotion withheld; operator review required (IKBI-REAUDIT3-001 open)");
+      return { promote: noPromote(reason), blockedReason: reason, quarantined: true };
+    }
     // (1) POLICY + GOVERNANCE must both authorize — defense in depth (callers already gate these).
     if (!evidence.policyPromote) return { promote: noPromote("policy declined promotion"), blockedReason: "policy declined promotion" };
     if (evidence.governance.allow !== true) {
@@ -2170,9 +2233,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           policyPromote: evidence.policyPromote,
           gateWallAllowed: evidence.governance.allow,
           // TRUTHFUL GATE AUTHORITY (Phase 13, IKBI-REAUDIT2-008): when the allow came from the operator BYPASS
-          // (not a policy evaluation), record it + downgrade the authority class — a bypassed land is
-          // administratively-bypassed, never a fully-governed autonomous promotion.
-          ...(evidence.governance.bypass === true ? { gateBypassed: true, gateAuthority: "administratively-bypassed" } : { gateAuthority: "policy-evaluated" }),
+          // Post-REAUDIT3: a gate-BYPASSED autonomous promote can no longer reach this actual-promote receipt —
+          // it is refused earlier by the quarantine gate (0) and recorded as `worker.promotion.quarantined`
+          // with `gateAuthority: "administratively-bypassed"`. So any promote that lands here is policy-evaluated.
+          gateAuthority: "policy-evaluated",
           staleTreeChecked: candidate.verifiedTree !== undefined && currentTree !== undefined,
           promoted: result.promoted,
           ...(result.afterRef !== undefined ? { landedRef: result.afterRef } : {}),
@@ -4883,7 +4947,16 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           // is truthful and governed-success trust is withheld below.
           if (promoted && governance.bypass === true) gateBypassedThisBuild = true;
           if (!promoted) {
-            if (canon.staleTree === true) {
+            if (canon.quarantined === true) {
+              // Post-REAUDIT3: autonomous promotion is quarantined (opt-in off / gate bypass active). RETAIN
+              // the verified-good work for operator review, reject the autonomous land, and SUPPRESS trust —
+              // no governed landed-success may be awarded for a candidate that did not land.
+              await safeRetain(workspaces, workspace, canon.blockedReason ?? "autonomous promotion quarantined");
+              overall = "rejected";
+              reason = canon.blockedReason;
+              trustSuppressed = true;
+              trustSuppressReason = "autonomous promotion quarantined — operator review required (IKBI-REAUDIT3-001 open)";
+            } else if (canon.staleTree === true) {
               // Post-verify mutation: the promoted tree would not be the verified tree. Fail CLOSED —
               // discard the unverified work, reject, and suppress trust (an integrity/timing issue, not
               // a worker quality failure).

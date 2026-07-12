@@ -147,3 +147,63 @@ landed work is a correct, tested, regression-safe reduction of the semantic styl
 (3850/0/1) and 111/111 probe are preserved. The path to full closure is a multi-pass effort requiring test-corpus
 migrations (008, 016), a promotion-pipeline reorder (001), and frozen-core journaling (002) that cannot be done
 safely in a single session without destroying the verified test baseline.
+
+---
+
+## 13. FINAL CONTAINMENT — autonomous-promotion quarantine (post-checkpoint)
+
+Because the Critical immutable tested-subject invariant (**IKBI-REAUDIT3-001**) remains architecturally OPEN,
+a canonical runtime control now leaves Ikbi safe for **operator-reviewed** work but **not** unattended
+autonomous promotion. This does NOT fix 001 — it contains it.
+
+- **Quarantine setting:** `IKBI_ENABLE_AUTONOMOUS_PROMOTION` (fail-closed: enabled ONLY when exactly `"true"`,
+  trimmed/case-insensitive; missing / invalid / `"false"` / `"1"` ⇒ **disabled**). Resolved by the exported pure
+  `resolveAutonomousPromotionEnabled(env)`; injectable via `deps.autonomousPromotionEnabled` for tests.
+- **Default behavior:** autonomous promotion **DISABLED**. Candidate generation, verification, criticism,
+  receipts, and reports still run; the candidate does **not** land unattended.
+- **Strategy coverage:** enforced at the ONE canonical authority — `promoteCandidate` gate (0) in
+  `orchestrator.ts`. Normal, conditional duel, competitive, tournament, multi-step finalizer, and
+  fixer/repaired candidates all promote through this chokepoint, so all inherit the quarantine. No strategy can
+  bypass it.
+- **Gate-bypass interaction:** even with the explicit opt-in `true`, an active `IKBI_GATE_WALL_BYPASS=true`
+  **blocks** autonomous promotion. The `worker.promotion.quarantined` receipt records `gateBypassed: true` +
+  `gateAuthority: "administratively-bypassed"`. (This intentionally changes Phase 13's bypass-lands-with-
+  suppressed-trust contract; the two bypass conformance tests were updated to assert quarantine.)
+- **Manual-apply behavior:** unchanged and separately classified — `manual-unverified`, operator-directed,
+  identity/CAS-checked, awards no autonomous trust. Manual `/apply` remains available for operator-reviewed
+  landing.
+- **Trust behavior:** a quarantined run awards **no governed landed-success trust** (the candidate never lands;
+  the normal caller suppresses, competitive `compSuppress` fires, tournament records `partial`+suppressed).
+- **Operator surfacing:** one startup warning (`log.warn`, not spammed per-operation) when autonomous promotion
+  is disabled — states the quarantine, that candidates need review / manual apply, references
+  `IKBI-RUNTIME-CONFORMANCE-REAUDIT-3.md`, explains the opt-in, and that opt-in does not override gate bypass.
+
+**Files changed (containment):** `src/modules/worker-model/orchestrator.ts` (opt-in reader + deps field + gate
+(0) at `promoteCandidate` + normal-caller quarantine branch + startup warning + dead bypass-branch cleanup on
+the actual-promote receipt); `package.json` (test env sets `IKBI_ENABLE_AUTONOMOUS_PROMOTION=true` so the
+existing promotion suites + probe run with autonomous promotion explicitly enabled);
+`phase13-immutable-verification-conformance.test.ts` + `phase13b-frozen-snapshot-conformance.test.ts` (the two
+bypass tests updated to the new contract); **new** `phase16-quarantine-conformance.test.ts` (11 tests).
+
+**Tests (containment):** Q1–Q2 reader default/missing/invalid; Q3 normal quarantined + receipt + result reason;
+Q4 no landed-success trust; Q5 duel variant; Q6 competitive; Q7 tournament; Q8 multi-step/fixer share the
+chokepoint; Q9 opt-in promotes when bypass false; Q10 bypass blocks with opt-in; Q11 manual-unverified intact.
+
+**Commands + results (containment):** `pnpm build` clean; `pnpm test` **3861 pass / 0 fail / 1 skipped**
+(3862 total, +23 across the two phase16 suites); quarantine suite **11/11**; production probe
+(`IKBI_ENABLE_AUTONOMOUS_PROMOTION=true`, `IKBI_GATE_WALL_BYPASS=false`) **111/111**.
+
+**Commit hashes (containment):** `442d1ae` `docs(conformance): checkpoint final repair findings`;
+`fix(safety): quarantine autonomous promotion by default` (HEAD).
+
+**Active `.env` WARNING:** the operator's untracked `.env` currently sets **`IKBI_GATE_WALL_BYPASS=true`**. It was
+NOT read for secrets, staged, or modified. While that bypass is active, autonomous promotion is refused
+regardless of the opt-in (the quarantine treats a bypassed gate as never autonomously landable). A governed
+autonomous profile must set `IKBI_GATE_WALL_BYPASS=false` AND `IKBI_ENABLE_AUTONOMOUS_PROMOTION=true`.
+
+**`IKBI-REAUDIT3-001` remains architecturally OPEN** — the immutable tested-subject invariant is NOT
+established; the quarantine is operational containment, not a fix.
+
+**Operational posture:** Ikbi is safe for **operator-reviewed** work (candidate generation + verification +
+criticism + manual `/apply` after review). It is **NOT** safe for **unattended autonomous promotion** until
+IKBI-REAUDIT3-001 (and the related open findings 002/003/004/007/009 and the medium/low set) are repaired.

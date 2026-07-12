@@ -224,15 +224,19 @@ test("B-snapshot [MUTATION 4,5] (req 20,22,23,30): the promotion receipt binds a
   assert.equal(promo.metadata.snapshotDigest, promo.metadata.verifiedTree, "the snapshot digest IS the verified tree (the content-addressed frozen subject the CAS confirms)");
 });
 
-test("C-bypass-trust [MUTATION 8] (req 32,33,34): a gate-BYPASSED autonomous promote earns NO governed-success trust + is surfaced", async () => {
+test("C-bypass-trust [MUTATION 8] (req 32,33,34): a gate-BYPASSED autonomous promote is QUARANTINED + earns NO governed-success trust", async () => {
   const rt = recordingTrust();
   const bypassGate = createGateWall({ config: { enabled: true, bypass: true }, receipts: { append: async () => ({}) }, publish: () => {} });
   const h = makeRun({ gateWall: bypassGate, trust: rt.trust, trustLadder: true });
   const result = await h.run();
-  assert.equal(result.promoted, true, "the bypassed promote still lands");
+  // Post-REAUDIT3 CONTAINMENT: a gate-BYPASSED autonomous promote no longer lands — it is quarantined, so it
+  // certainly earns no governed-success trust, and the quarantine receipt states administratively-bypassed.
+  assert.equal(result.promoted, false, "a bypassed autonomous promote is quarantined (never lands)");
   assert.ok(!rt.calls.some((c) => c.status === "success"), "NO governed-success trust outcome was recorded for a bypassed promote");
-  assert.ok(find(h.receipts, "worker.trust.signal_suppressed") !== undefined, "a trust-suppressed receipt records why");
-  assert.equal(find(h.receipts, "worker.run.summary")?.metadata.gateBypassed, true, "the run summary surfaces the bypass");
+  const quar = find(h.receipts, "worker.promotion.quarantined");
+  assert.ok(quar !== undefined, "a quarantine receipt records the refusal");
+  assert.equal(quar!.metadata.gateBypassed, true, "the quarantine receipt surfaces the bypass");
+  assert.equal(quar!.metadata.gateAuthority, "administratively-bypassed", "authority is administratively-bypassed, not fully-governed");
 });
 
 test("C-governed-trust (req 33 control): a POLICY-EVALUATED promote DOES earn governed-success trust", async () => {

@@ -5,15 +5,18 @@
   "branch": "harness/cc-parity-and-bokahli-pilot",
   "generated": "2026-07-12",
   "summary": { "fixed": 2, "partially-fixed": 2, "quarantined": 0, "open": 13, "total": 17 },
-  "note": "Constraints (must not break the build/production probe, must not destroy verified work, safety-preserving) bound this pass to the surgical, regression-safe subset. Two findings (008, 016) were IMPLEMENTED then REVERTED after they broke the production probe / the injected-critic test-double corpus respectively; they are recorded open with the exact one-line fix and the test-corpus migration each requires. The full suite is green (3850/0/1) and the production probe is 111/111 at sprint HEAD.",
+  "note": "Constraints (must not break the build/production probe, must not destroy verified work, safety-preserving) bound this pass to the surgical, regression-safe subset. Two findings (008, 016) were IMPLEMENTED then REVERTED after they broke the production probe / the injected-critic test-double corpus respectively; they are recorded open with the exact one-line fix and the test-corpus migration each requires. FINAL CONTAINMENT (this commit (`fix(safety): quarantine autonomous promotion by default`)): because the Critical finding 001 remains architecturally OPEN, autonomous promotion is now DISABLED BY DEFAULT for every strategy at the canonical authority and refuses under gate-wall bypass — Ikbi is safe for operator-reviewed work (manual /apply) but NOT for unattended autonomous promotion. This is operational containment, not a fix; 001 remains open. Full suite green (3861/0/1); production probe (autonomous enabled, bypass false) 111/111 at containment HEAD (this commit).",
   "findings": [
     {
       "id": "IKBI-REAUDIT3-001", "severity": "Critical", "status": "open",
+      "operationalContainment": "quarantined-by-default",
+      "containmentCommit": "this-commit-fix-safety-quarantine",
+      "containmentTests": ["phase16-quarantine-conformance.test.ts::Q1-Q11 (x11)"],
       "commit": null,
       "sourceFiles": ["src/modules/worker-model/orchestrator.ts", "src/modules/worker-model/candidate-lease.ts", "src/modules/worker-model/workspace-snapshot.ts", "src/core/workspace/manager.ts"],
       "retainedTests": [],
       "title": "Test evidence is not bound to the exact immutable promotion subject",
-      "remainingLimitation": "Requires a full run() pipeline REORDER (freeze/commit BEFORE final verification, run tests+semantic against the frozen subject), mandatory-snapshot for every git-backed autonomous strategy (competitive/tournament build no snapshot today), production lease wiring on every mutation channel, and passing the snapshot object into WorkspaceManager.promote. This cannot land without breaking the production probe (uses non-existent fake workspace paths) and every strategy integration test. Phase 13 protections (MutationFence + stale-tree + CAS + normal-mode physical snapshot) remain in force."
+      "remainingLimitation": "STILL OPEN (not fixed). The underlying architecture (freeze/commit BEFORE final verification, run tests+semantic against the frozen subject, mandatory-snapshot for every git-backed autonomous strategy, production lease wiring, snapshot-into-WorkspaceManager.promote) is NOT implemented and cannot land without breaking the production probe + every strategy integration test. OPERATIONAL CONTAINMENT (this commit (`fix(safety): quarantine autonomous promotion by default`)): autonomous promotion is now DISABLED BY DEFAULT at the canonical promoteCandidate authority for every strategy, and refuses when gate-wall bypass is active — so an unattended autonomous land of a possibly-non-immutable subject cannot occur by default. Manual /apply (manual-unverified, operator-reviewed) remains available. This containment does NOT establish the immutable-subject invariant; it prevents unattended promotion while it is open. Phase 13 protections (MutationFence + stale-tree + CAS + normal-mode physical snapshot) also remain in force."
     },
     {
       "id": "IKBI-REAUDIT3-002", "severity": "High", "status": "open",
