@@ -1,0 +1,147 @@
+{
+  "audit": "IKBI-RUNTIME-CONFORMANCE-REAUDIT-3.md",
+  "reviewedHead": "19a2c75",
+  "sprintHead": "c06fe94",
+  "branch": "harness/cc-parity-and-bokahli-pilot",
+  "generated": "2026-07-12",
+  "summary": { "fixed": 2, "partially-fixed": 2, "quarantined": 0, "open": 13, "total": 17 },
+  "note": "Constraints (must not break the build/production probe, must not destroy verified work, safety-preserving) bound this pass to the surgical, regression-safe subset. Two findings (008, 016) were IMPLEMENTED then REVERTED after they broke the production probe / the injected-critic test-double corpus respectively; they are recorded open with the exact one-line fix and the test-corpus migration each requires. The full suite is green (3850/0/1) and the production probe is 111/111 at sprint HEAD.",
+  "findings": [
+    {
+      "id": "IKBI-REAUDIT3-001", "severity": "Critical", "status": "open",
+      "commit": null,
+      "sourceFiles": ["src/modules/worker-model/orchestrator.ts", "src/modules/worker-model/candidate-lease.ts", "src/modules/worker-model/workspace-snapshot.ts", "src/core/workspace/manager.ts"],
+      "retainedTests": [],
+      "title": "Test evidence is not bound to the exact immutable promotion subject",
+      "remainingLimitation": "Requires a full run() pipeline REORDER (freeze/commit BEFORE final verification, run tests+semantic against the frozen subject), mandatory-snapshot for every git-backed autonomous strategy (competitive/tournament build no snapshot today), production lease wiring on every mutation channel, and passing the snapshot object into WorkspaceManager.promote. This cannot land without breaking the production probe (uses non-existent fake workspace paths) and every strategy integration test. Phase 13 protections (MutationFence + stale-tree + CAS + normal-mode physical snapshot) remain in force."
+    },
+    {
+      "id": "IKBI-REAUDIT3-002", "severity": "High", "status": "open",
+      "commit": null,
+      "sourceFiles": ["src/modules/worker-model/invocation-ledger.ts", "src/core/provider/invoke.ts", "src/modules/consult/orchestrator.ts"],
+      "retainedTests": [],
+      "title": "Provider-attempt journaling is post-terminal, not pre-dispatch or universal",
+      "remainingLimitation": "Requires moving the append-before-dispatch/finalize-after-terminal into the FROZEN-CORE ProviderInvoker per route, and routing classifier/consult through it. Frozen-core change + high blast radius; not landed."
+    },
+    {
+      "id": "IKBI-REAUDIT3-003", "severity": "High", "status": "open",
+      "commit": null,
+      "sourceFiles": ["src/modules/worker-model/invocation-ledger.ts", "src/modules/worker-model/cli.ts", "src/modules/worker-model/tournament.ts", "src/modules/worker-model/composite-ledger.ts", "src/modules/worker-model/orchestrator.ts"],
+      "retainedTests": [],
+      "title": "Cost and composite totals are not fully reconcilable across production operations",
+      "remainingLimitation": "Requires known-subtotal retention in cost() when partial, executedIds() including thrown charged records, and a production parent-operation ledger wired into duel/tournament/competitive/multi-step/CLI-cognition. The surgical cost/executedIds bits touch tested ledger accounting; deferred to avoid ledger-test blast radius. Duel composite (Phase 14B) remains the only production-wired composite."
+    },
+    {
+      "id": "IKBI-REAUDIT3-004", "severity": "High", "status": "open",
+      "commit": null,
+      "sourceFiles": ["src/modules/worker-model/orchestrator.ts", "src/modules/worker-model/invocation-ledger.ts", "src/modules/chat/repl-workspace.ts"],
+      "retainedTests": [],
+      "title": "Receipt and aggregate execution identity can disagree with invocation/attempt truth",
+      "remainingLimitation": "Requires passing immutable invocation/evaluation objects (not lastFor/string IDs) + a pre-append reconciler. Large cross-cutting change; not landed. Phase 11C/12 happy-path linkage remains."
+    },
+    {
+      "id": "IKBI-REAUDIT3-005", "severity": "High", "status": "fixed",
+      "commit": "c06fe94",
+      "sourceFiles": ["src/modules/worker-model/semantic-evidence.ts"],
+      "retainedTests": ["phase16-final-sprint-conformance.test.ts::WS2/005 (x4)"],
+      "title": "Omitted or misdeclared category can turn unsupported style preference into a blocker",
+      "remainingLimitation": "A deterministic style-claim detector forces any style/formatting/naming/architecture-preference claim through the explicit-style-policy rule regardless of declared/omitted/mislabeled category. Whole-goal req:goal remains contextual (documented). Non-style categoryless defects still validate through the default rule — the audit's 'make category mandatory for ALL blockers' is stricter and would require migrating the Phase 12/15 categoryless-defect test corpus."
+    },
+    {
+      "id": "IKBI-REAUDIT3-006", "severity": "High", "status": "partially-fixed",
+      "commit": "c06fe94",
+      "sourceFiles": ["src/modules/worker-model/semantic-evidence.ts"],
+      "retainedTests": ["phase16-final-sprint-conformance.test.ts::WS2/006 (x3)"],
+      "title": "Recovery can still change requirement association, category, binding presence, and verdict authority",
+      "remainingLimitation": "CLOSED: category removal (non-null->null) and unknown/indeterminate->blocking polarity recovery. RESIDUAL (accepted/documented): req:goal whole-goal-default addition (contextual, authorizes no blocker alone) and free-text requirement presence add/remove (noisy; Phase 15's requirementId presence tracking is the authority-bearing check). Full canonical-tuple presence equality would require also making req:goal non-authorizing, which cascades to the categoryless-defect test corpus."
+    },
+    {
+      "id": "IKBI-REAUDIT3-007", "severity": "Medium", "status": "open",
+      "commit": null,
+      "sourceFiles": ["src/modules/worker-model/orchestrator.ts", "src/modules/worker-model/tournament.ts"],
+      "retainedTests": [],
+      "title": "Gate bypass trust suppression is strategy-dependent",
+      "remainingLimitation": "Requires making gate authority a required field of every strategy result and every strategy trust reducer to suppress on administratively-bypassed. Normal mode already suppresses + labels; competitive/tournament reducers do not. Deferred to avoid competitive/tournament trust-test blast radius."
+    },
+    {
+      "id": "IKBI-REAUDIT3-008", "severity": "Medium", "status": "open",
+      "commit": null,
+      "sourceFiles": ["src/modules/worker-model/orchestrator.ts", "src/modules/chat/repl-workspace.ts"],
+      "retainedTests": [],
+      "title": "Default identity resolver can classify a path/access error as proven non-Git",
+      "remainingLimitation": "IMPLEMENTED (existing-accessible-dir-only non-git classification) then REVERTED: it made the production probe's non-existent fake workspace paths (`/repo`) indeterminate, breaking 58 promotion/tournament/competitive tests including the sacred 111/111 probe. The correct fix (only an existing accessible dir with 'not a git repository' proves non-git) is a one-regex change but requires migrating the entire in-memory-workspace test corpus to use real accessible dirs. Not safely landable in this pass."
+    },
+    {
+      "id": "IKBI-REAUDIT3-009", "severity": "High", "status": "open",
+      "commit": null,
+      "sourceFiles": ["src/modules/worker-model/orchestrator.ts", "src/modules/execution-policy/risk.ts"],
+      "retainedTests": [],
+      "title": "Production tournament shadow replay remains self-denied",
+      "remainingLimitation": "defaultApplyDiff sends `git apply` through the model-command policy that denies `apply`. Requires a typed internal shadow-replay capability outside model-command authority (validated patch, path-contained, traversal-protected, receipted). Not attempted; tournament autonomous mode should be treated as quarantined until this lands."
+    },
+    {
+      "id": "IKBI-REAUDIT3-010", "severity": "Medium", "status": "open",
+      "commit": null,
+      "sourceFiles": ["src/modules/runtime-truth/policy.ts", "src/modules/worker-model/orchestrator.ts"],
+      "retainedTests": [],
+      "title": "Runtime-truth scope and repair evidence propagation remain incomplete",
+      "remainingLimitation": "scopeMismatch checks a partial tuple and accepts absent optional bindings; repair paths do not uniformly request fresh evidence. Requires a mandatory immutable scope tuple + fresh-package-after-mutation. Not landed. Runtime truth remains advisory."
+    },
+    {
+      "id": "IKBI-REAUDIT3-011", "severity": "Medium", "status": "open",
+      "commit": null,
+      "sourceFiles": ["src/modules/worker-model/cli.ts"],
+      "retainedTests": [],
+      "title": "Multi-step handoff remains labels rather than build evidence",
+      "remainingLimitation": "runOneAttempt records completedSteps as labels and drops prior-stage evidence/cost from the finalizer + parent total. Requires a typed immutable handoff. Not landed."
+    },
+    {
+      "id": "IKBI-REAUDIT3-012", "severity": "Medium", "status": "open",
+      "commit": null,
+      "sourceFiles": ["src/modules/worker-model/tool-executor.ts", "src/modules/worker-model/orchestrator.ts"],
+      "retainedTests": [],
+      "title": "Memory/protected-path governance is not universal across mutation channels",
+      "remainingLimitation": "The tool governor covers its enumerated tool path; there is no final whole-diff protected-path rescan before freeze/promotion. Requires a deterministic final candidate-delta scan in promoteCandidate. Not landed."
+    },
+    {
+      "id": "IKBI-REAUDIT3-013", "severity": "Medium", "status": "fixed",
+      "commit": "693ddde",
+      "sourceFiles": ["src/modules/worker-model/orchestrator.ts"],
+      "retainedTests": ["phase16-final-sprint-conformance.test.ts::WS1/013 (x4)"],
+      "title": "Displayed test evidence depends on the verifier check being named exactly 'test'",
+      "remainingLimitation": "readVerifier now recognizes executed-test evidence by typed check kind (unit-test/integration-test/repository-test/executed-test) and typecheck by kind, in addition to the display name. Backward compatible. (The verifier does not YET STAMP these kinds on its checks by default — the reader honors them when present; stamping typed kinds at the verifier is a follow-on.)"
+    },
+    {
+      "id": "IKBI-REAUDIT3-014", "severity": "Low", "status": "open",
+      "commit": null,
+      "sourceFiles": ["src/modules/worker-model/orchestrator.ts"],
+      "retainedTests": [],
+      "title": "Success trust can still be recorded without promotion in the lower-tier terminal",
+      "remainingLimitation": "The verified-but-not-landed sub-trusted terminal records recordBuildTrust('success'). Distinguishing verified-workspace-success from governed-landed-success requires a core trust-schema change (src/core/trust). Low severity, trust ladder off by default. Deferred to avoid a core-trust change late in the pass."
+    },
+    {
+      "id": "IKBI-REAUDIT3-015", "severity": "Low", "status": "open",
+      "commit": null,
+      "sourceFiles": ["src/modules/chat/repl-workspace.ts", "src/core/workspace/manager.ts"],
+      "retainedTests": [],
+      "title": "Manual apply authority labeling remains non-atomic",
+      "remainingLimitation": "The manual receipt already carries authorityMode:'manual-unverified' but as a SECONDARY best-effort record whose append failure is swallowed. Full atomicity requires the core WorkspaceManager.promote receipt to carry the authority class + surfacing a post-land receipt failure as audit-incomplete. Not landed."
+    },
+    {
+      "id": "IKBI-REAUDIT3-016", "severity": "Medium", "status": "open",
+      "commit": null,
+      "sourceFiles": ["src/modules/worker-model/critic-fix-loop.ts"],
+      "retainedTests": ["phase16-final-sprint-conformance.test.ts::WS2/016 (partial: reducer downgrade proven)"],
+      "title": "An unenforced no-package fail can still authorize the critic fixer",
+      "remainingLimitation": "IMPLEMENTED (isRetryableCriticFail -> effectiveDecisionKind) then REVERTED: it broke ~30 injected-critic test doubles that stamp a `fail` semanticVerdict WITHOUT evidenceEnforced and rely on the fixer firing. The duel/promotion decision gates ALREADY downgrade a no-package fail (effectiveDecisionKind); only the fix-loop trigger checks raw kind. The correct fix requires migrating the injected-critic double corpus to carry evidenceEnforced (or a non-production marker), which the audit itself recommends but is out of safe scope here."
+    },
+    {
+      "id": "IKBI-REAUDIT3-017", "severity": "Medium", "status": "partially-fixed",
+      "commit": "693ddde",
+      "sourceFiles": ["src/modules/worker-model/orchestrator.ts"],
+      "retainedTests": [],
+      "title": "Physical snapshot cleanup is not protected by a finally boundary",
+      "remainingLimitation": "CLOSED: the primary leak — a throw from promoteCandidate (its mandatory receipt appends / workspaces.promote) after a real snapshot is created now cleans the detached worktree and surfaces a cleanup failure via worker.promotion.snapshot_cleanup_incomplete. RESIDUAL: a full try/finally owning the snapshot across EVERY exceptional exit (semantic-withheld/stale-tree receipt throws before the promote call) — the dominant throw source (promoteCandidate) is covered. No retained integration test injects the throw yet (documented)."
+    }
+  ]
+}
