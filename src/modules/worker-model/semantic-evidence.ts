@@ -438,6 +438,10 @@ export function substanceEquivalent(fingerprint: SubstanceFingerprint, recovered
   if (fingerprint.verdictPolarity === "blocking" && rec.polarity === "pass") mismatches.push("verdict-flipped-blocking-to-pass");
   // a blocking recovery from raw with no discernible polarity AND no defect substance invents a rejection
   if (rec.polarity === "blocking" && fingerprint.verdictPolarity !== "blocking" && fingerprint.defects.length === 0) mismatches.push("blocking-verdict-without-raw-substance");
+  // Phase-16 (IKBI-REAUDIT3-006): recovering an UNKNOWN or INDETERMINATE raw polarity into a BLOCKING verdict
+  // invents decision authority even when defect substance is present — only a raw whose polarity was already
+  // blocking (a real fail/reject/incomplete token) may recover blocking.
+  if (rec.polarity === "blocking" && (fingerprint.verdictPolarity === "unknown" || fingerprint.verdictPolarity === "indeterminate")) mismatches.push("unknown-polarity-recovered-to-blocking");
 
   // 2. candidate / tree binding must not change
   if (fingerprint.candidateId !== undefined && recovered.candidateId !== undefined && fingerprint.candidateId !== recovered.candidateId) mismatches.push("candidate-binding-changed");
@@ -474,8 +478,11 @@ export function substanceEquivalent(fingerprint: SubstanceFingerprint, recovered
     if (raw.repairable === null && rd.repairable !== null) mismatches.push("repairability-added");
     else if (raw.repairable !== null && rd.repairable === null) mismatches.push("repairability-removed");
     else if (raw.repairable !== null && rd.repairable !== null && raw.repairable !== rd.repairable) mismatches.push("repairability-changed");
-    // category: recovery may not invent or change the typed category (which selects the support matrix).
+    // category: recovery may not invent, change, OR REMOVE the typed category (each selects the support matrix).
+    // Phase-16 (IKBI-REAUDIT3-006): category REMOVAL (non-null → null) is now also rejected — dropping a typed
+    // category re-routes the defect through the permissive default rule.
     if (raw.category === null && rd.category !== null) mismatches.push("category-added");
+    else if (raw.category !== null && rd.category === null) mismatches.push("category-removed");
     else if (raw.category !== null && rd.category !== null && raw.category !== rd.category) mismatches.push("category-changed");
   }
 
@@ -588,8 +595,25 @@ function isSubstantiveObservation(id: string, rule: CategoryRule): boolean {
  * An unsupported claim (candidate-anchor-only, off-goal requirement, unfailed check, style-without-policy) is
  * INVALID and must not become a concrete defect.
  */
+/**
+ * Phase-16 (IKBI-REAUDIT3-005): a deterministic detector for STYLE / FORMATTING / NAMING / ARCHITECTURE-preference
+ * claims. Such a claim can NEVER launder into a blocker via the permissive `unspecified` category with a generic
+ * file/diff observation — regardless of the declared/omitted/mislabeled category, it is routed through the
+ * `explicit-style-policy-violation` rule (which requires a named style criterion OR a failed formatter/linter
+ * check). Conservative: a false positive only makes an unsupported style claim indeterminate (fail-closed).
+ */
+const STYLE_CLAIM_RE = /\b(tabs?|spaces?|indent(?:ation|ed)?|whitespace|formatting|reformat|code style|coding style|stylistic|lint(?:er|ing)?|prettier|eslint|rename|renamed|naming|named|camel[- ]?case|snake[- ]?case|pascal[- ]?case|kebab[- ]?case|should be called|should be named|architect(?:ure|ural)|restructure|refactor(?:ed|ing)? for (?:style|readability|clarity)|prefer(?:red)? (?:style|convention)|convention)\b/i;
+
+function isStyleClaim(rawDefect: Record<string, unknown>): boolean {
+  const claim = typeof rawDefect.claim === "string" ? rawDefect.claim : "";
+  return claim.length > 0 && STYLE_CLAIM_RE.test(claim);
+}
+
 export function validateDefectEvidence(rawDefect: Record<string, unknown>, pkg: EvidencePackage): DefectValidation {
-  const category = resolveDefectCategory(rawDefect);
+  const declared = resolveDefectCategory(rawDefect);
+  // A style-preference CLAIM is forced through the explicit-style-policy rule no matter what category it declares
+  // (omitted → `unspecified`, or a deliberate mislabel like `file-content-mismatch`) — closing REAUDIT3-005.
+  const category: DefectCategory = isStyleClaim(rawDefect) ? "explicit-style-policy-violation" : declared;
   const rule = SUPPORT_MATRIX[category];
   const evidenceIds = resolvedDefectEvidence(rawDefect, pkg);
   const authorityClasses = [...new Set(evidenceIds.map(authorityClassOfId))];
