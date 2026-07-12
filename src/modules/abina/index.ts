@@ -41,3 +41,5 @@ export type {
 } from "./types.js";
 
 export type { ValidationError } from "./document.js";
+
+export { nodeBounds, subtreeBounds } from "./geometry.js";
