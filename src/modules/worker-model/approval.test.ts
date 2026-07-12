@@ -45,15 +45,27 @@ function bus() {
 const roles = (): Partial<Record<WorkerRole, RoleFn>> => {
   const r: Partial<Record<WorkerRole, RoleFn>> = {};
   for (const role of WORKER_ROLES) {
-    r[role] = async () =>
+    r[role] =
       role === "integrator"
-        ? { role, outcome: "success", summary: role, detail: { decision: "promote", rationale: "ok", evaluation: { approved: true } } }
+        ? async () => ({ role, outcome: "success", summary: role, detail: { decision: "promote", rationale: "ok", evaluation: { approved: true } } })
         : role === "verifier"
-          ? { role, outcome: "success", summary: role, detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }] } }
-          : { role, outcome: "success", summary: role };
+          ? async () => ({ role, outcome: "success", summary: role, detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }] } })
+          // A GREEN critic states its PASS verdict (`detail.pass`) — the field the authoritative
+          // adjudication core reads (`criticDetail.pass === true`).
+          : role === "critic"
+            ? async () => ({ role, outcome: "success", summary: role, detail: { pass: true } })
+            : async () => ({ role, outcome: "success", summary: role });
   }
   return r;
 };
+
+// INJECTED TEST FACT (adjudication seam): a tree-bound GREEN work product for a promotable candidate.
+// These approval tests use an in-memory workspace double (no real git worktree), so the authoritative
+// core is fed this labeled fact via the explicit computeWorkProduct seam. The approval gate still fires
+// (approve ⇒ land, reject ⇒ refuse); this only supplies the tree facts the core requires to reach it.
+function promotableWorkProduct(): NonNullable<OrchestratorDeps["computeWorkProduct"]> {
+  return async () => ({ treeHash: "test-tree-green", diffStat: { filesChanged: 1, insertions: 1, deletions: 0 }, nonEmpty: true });
+}
 
 function ws() {
   const calls = { promote: 0, discard: 0 };
@@ -75,7 +87,7 @@ const allowGate: NonNullable<OrchestratorDeps["gateWall"]> = { evaluate: async (
 
 function orch(extra: Partial<OrchestratorDeps>, w = ws(), b = bus()) {
   const { parentCtx, resolveIdentity, roleClaim } = ids();
-  const o = createOrchestrator({ config: ENABLED, resolveIdentity, roleClaim, roles: roles(), workspaces: w.workspaces, trust: fakeTrust, receipts: fakeReceipts, events: b.surface, gateWall: allowGate, invokeModel: async () => { throw new Error("unused"); }, ...extra });
+  const o = createOrchestrator({ config: ENABLED, resolveIdentity, roleClaim, roles: roles(), workspaces: w.workspaces, trust: fakeTrust, receipts: fakeReceipts, events: b.surface, gateWall: allowGate, computeWorkProduct: promotableWorkProduct(), invokeModel: async () => { throw new Error("unused"); }, ...extra });
   return { run: () => o.run(task, parentCtx), w, b };
 }
 

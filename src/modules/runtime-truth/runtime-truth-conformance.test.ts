@@ -213,6 +213,9 @@ function orchestratorWith(reader: RuntimeTruthEvidenceReader | undefined, treeHa
     governedExec: greenGovernedExec, builderModel: "deepseek-v4-flash",
     gateWall: { evaluate: async (): Promise<PromoteGovernance> => ({ allow: true }) },
     readTreeHash: async () => treeHash,
+    // INJECTED TEST FACT (adjudication seam): the temp workspace is not git-initialized, so inject a
+    // tree-bound GREEN work product (a promotable candidate). Production always computes from real git.
+    computeWorkProduct: async () => ({ treeHash, diffStat: { filesChanged: 1, insertions: 1, deletions: 0 }, nonEmpty: true }),
     ...(wrapped !== undefined ? { runtimeTruthReader: wrapped } : {}),
   });
   return { orch, parentCtx, rp, receipts: rc.appended, readerCalls, taskId: "rt-task" };

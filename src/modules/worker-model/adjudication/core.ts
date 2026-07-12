@@ -22,14 +22,21 @@ import type { CriticVerdict, Decision, SafetyAssessment, WorkAssessment, WorkPro
 /**
  * True iff the assessment is a real, tree-bound green verdict (the only promotable state, per I2/I6).
  *
- * Evidence MUST be `executed` — tests actually ran against THIS tree (Codex C1b). There is no
- * accumulated-pass bypass: a boolean "a prior step was green" flag would let a step promote without any
- * executed evidence on its own tree, which is exactly the vacuous-green hole this gate exists to close.
- * Multi-step builds earn a promotable assessment the same way single-step builds do — the verifier runs
- * on the final tree, producing `executed` evidence bound to that tree hash.
+ * Evidence MUST be `executed` — tests actually ran against THIS tree (Codex C1b) — OR `absent` under an
+ * explicit, named no-tests policy (`noTestsAcceptable`), the SAME rule the Phase-10 authority enforces
+ * (see `evaluateExecutedTestEvidence`): a repository with genuinely no test suite may promote only when
+ * the operator has explicitly permitted it. `zero`/`unverified` NEVER qualify — a green that proved
+ * nothing about behavior. There is no accumulated-pass bypass: a boolean "a prior step was green" flag
+ * would let a step promote without any executed evidence on its own tree, which is exactly the
+ * vacuous-green hole this gate exists to close. Multi-step builds earn a promotable assessment the same
+ * way single-step builds do — the verifier runs on the final tree, producing `executed` evidence bound
+ * to that tree hash. `noTestsAcceptable` is a NAMED policy fact, never a fallback for missing evidence.
  */
 function isGreenOnMerit(work: WorkProduct, assessment: WorkAssessment): boolean {
-  return assessment.verdict === "pass" && assessment.testEvidence === "executed" && assessment.treeHash === work.treeHash;
+  const evidenceAcceptable =
+    assessment.testEvidence === "executed" ||
+    (assessment.testEvidence === "absent" && assessment.noTestsAcceptable === true);
+  return assessment.verdict === "pass" && evidenceAcceptable && assessment.treeHash === work.treeHash;
 }
 
 /**

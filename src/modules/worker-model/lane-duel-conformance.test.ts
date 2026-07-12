@@ -211,6 +211,14 @@ function capturingReceipts() {
   return { receipts, appended };
 }
 const greenGovernedExec = { run: async () => ({ executed: true as const, exitCode: 0, stdoutTail: "ok", stderrTail: "" }) };
+// INJECTED TEST FACT (adjudication seam): the in-memory workspace doubles here have no real tree change on
+// disk, so the authoritative adjudication core (which requires a tree-bound WorkProduct) would compute
+// discard(no-work). Feed a promotable tree-bound fact so a genuinely-successful build reaches promote; the
+// failing-provider / gate-deny tests still refuse upstream at their own chokepoint regardless of this fact.
+const promotableWorkProduct: NonNullable<OrchestratorDeps["computeWorkProduct"]> = async () => ({ treeHash: "test-tree-green", diffStat: { filesChanged: 1, insertions: 1, deletions: 0 }, nonEmpty: true });
+// INJECTED TEST FACT — a build that produced NOTHING on disk (the failing provider writes no files): an
+// empty tree-bound work product. The adjudication core reads this as not-promotable → candidate-rejected.
+const emptyWorkProduct: NonNullable<OrchestratorDeps["computeWorkProduct"]> = async () => ({ treeHash: "test-tree-empty", diffStat: { filesChanged: 0, insertions: 0, deletions: 0 }, nonEmpty: false });
 const COST = 0.002;
 function ok(content: string): ModelResponse {
   return {
@@ -274,6 +282,7 @@ function realOrchestrator(invokeModel: (r: ModelRequest) => Promise<ModelRespons
     events: fakeBus().bus, receipts: rc.receipts, resolveIdentity, roleClaim, roles: stubRoles, invokeModel,
     governedExec: greenGovernedExec, builderModel: "deepseek-v4-flash",
     gateWall: { evaluate: async (): Promise<PromoteGovernance> => ({ allow: true, reason: "ok" }) },
+    computeWorkProduct: promotableWorkProduct,
     ...extra,
   });
   return { orch, parentCtx, receipts: rc.appended, dir };
@@ -329,7 +338,9 @@ test("real seam: a same-lane --fallback-model escalates in-lane (all deepseek), 
 // ── nonPromotion classification is set truthfully on the real terminals ──
 test("real seam: a failing candidate is classified candidate-rejected (duel-eligible)", async () => {
   const rp = failingProvider("worker");
-  const { orch, parentCtx, dir } = realOrchestrator(rp.invokeModel);
+  // The builder writes NOTHING (failingProvider) → an empty tree-bound work product. The adjudication
+  // core reads this as not-promotable → candidate-rejected (the intended duel-eligible classification).
+  const { orch, parentCtx, dir } = realOrchestrator(rp.invokeModel, { computeWorkProduct: emptyWorkProduct });
   const result = await orch.run({ taskId: "t:deepseek", targetRepo: dir, goal: "do the thing", moeExpertRental: true, moeVendorLane: "deepseek" }, parentCtx);
   assert.notEqual(result.outcome, "success");
   assert.equal(result.nonPromotion?.class, "candidate-rejected", "a real, judged-not-promotable candidate");

@@ -53,6 +53,9 @@ const progressRoles = (): Partial<Record<WorkerRole, RoleFn>> => {
       if (r === "builder") return { role: r, outcome: "success", summary: r, detail: { toolRounds: 3, filesWritten: ["a.ts", "b.ts"] } };
       if (r === "verifier") return { role: r, outcome: "success", summary: r, detail: { verdict: "pass", checks: [{ name: "typecheck", exitCode: 0 }, { name: "test", exitCode: 0, testCount: { passed: 1, total: 1 } }] } };
       if (r === "integrator") return { role: r, outcome: "success", summary: r, detail: { decision: "promote", rationale: "ok", evaluation: { approved: true } } };
+      // A GREEN critic carries an explicit PASS verdict — the field the authoritative adjudication core
+      // reads (`criticDetail.pass === true`). Without it the core retains (critic-fail-exhausted).
+      if (r === "critic") return { role: r, outcome: "success", summary: r, detail: { pass: true } };
       return { role: r, outcome: "success", summary: r };
     };
   }
@@ -72,12 +75,22 @@ const fakeTrust = { recordOutcome: async (i: { agentId: string; defaultTrustTier
 const fakeReceipts = { append: async (): Promise<unknown> => ({}) };
 const allowGate: NonNullable<OrchestratorDeps["gateWall"]> = { evaluate: async (): Promise<PromoteGovernance> => ({ allow: true }) };
 
+/**
+ * INJECTED TEST FACT (adjudication seam): a tree-bound GREEN work product. `fakeWs()` has no real git
+ * worktree, so the authoritative adjudication core (which requires a real tree-bound WorkProduct) is fed
+ * this labeled fact via the explicit `deps.computeWorkProduct` seam. Production always computes from real
+ * git. Refusal-path tests (integrator discard) still refuse at their chokepoint — the fact just needs to
+ * be available so the core is reached rather than failing closed on an absent WorkProduct.
+ */
+const promotableWorkProduct = (): NonNullable<OrchestratorDeps["computeWorkProduct"]> =>
+  async () => ({ treeHash: "test-tree-green", diffStat: { filesChanged: 1, insertions: 1, deletions: 0 }, nonEmpty: true });
+
 test("a build emits the full progress sequence incl. builder activity + verification", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = ids();
   const bus = capturingBus();
   const orch = createOrchestrator({
     config: { enabled: true, roleTimeoutMs: 1000, maxConcurrentRuns: 1 },
-    resolveIdentity, roleClaim, roles: progressRoles(), workspaces: fakeWs(), trust: fakeTrust, receipts: fakeReceipts, events: bus.bus, gateWall: allowGate,
+    resolveIdentity, roleClaim, roles: progressRoles(), workspaces: fakeWs(), trust: fakeTrust, receipts: fakeReceipts, events: bus.bus, gateWall: allowGate, computeWorkProduct: promotableWorkProduct(),
     invokeModel: async () => { throw new Error("unused"); },
   });
   await orch.run({ taskId: "t-1", targetRepo: "/repo", goal: "g" }, parentCtx);
@@ -225,10 +238,10 @@ test("scope reaches the verification + completed events (operators/judges see im
     flush: async () => {},
   };
   const roles = progressRoles();
-  roles.verifier = async () => ({ role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", verificationScope: "impact", checks: [{ name: "test", exitCode: 0 }] } });
+  roles.verifier = async () => ({ role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", verificationScope: "impact", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }] } });
   const orch = createOrchestrator({
     config: { enabled: true, roleTimeoutMs: 1000, maxConcurrentRuns: 1 },
-    resolveIdentity, roleClaim, roles, workspaces: fakeWs(), trust: fakeTrust, receipts: fakeReceipts, events: bus, gateWall: allowGate,
+    resolveIdentity, roleClaim, roles, workspaces: fakeWs(), trust: fakeTrust, receipts: fakeReceipts, events: bus, gateWall: allowGate, computeWorkProduct: promotableWorkProduct(),
     invokeModel: async () => { throw new Error("unused"); },
   });
   await orch.run({ taskId: "t-1", targetRepo: "/repo", goal: "g" }, parentCtx);
@@ -248,7 +261,7 @@ test("WO5: a promoted build emits worker.trust.established AND tags builder acti
   };
   const orch = createOrchestrator({
     config: { enabled: true, roleTimeoutMs: 1000, maxConcurrentRuns: 1 },
-    resolveIdentity, roleClaim, roles: progressRoles(), workspaces: fakeWs(), trust: fakeTrust, receipts: fakeReceipts, events: bus, gateWall: allowGate,
+    resolveIdentity, roleClaim, roles: progressRoles(), workspaces: fakeWs(), trust: fakeTrust, receipts: fakeReceipts, events: bus, gateWall: allowGate, computeWorkProduct: promotableWorkProduct(),
     invokeModel: async () => { throw new Error("unused"); },
   });
   await orch.run({ taskId: "t-1", targetRepo: "/repo", goal: "g" }, parentCtx);
@@ -280,7 +293,7 @@ test("WO5: a NON-promoted build does NOT emit worker.trust.established (no false
   roles.integrator = async () => ({ role: "integrator", outcome: "success", summary: "i", detail: { decision: "discard", rationale: "not promotable" } });
   const orch = createOrchestrator({
     config: { enabled: true, roleTimeoutMs: 1000, maxConcurrentRuns: 1 },
-    resolveIdentity, roleClaim, roles, workspaces: fakeWs(), trust: fakeTrust, receipts: fakeReceipts, events: bus, gateWall: allowGate,
+    resolveIdentity, roleClaim, roles, workspaces: fakeWs(), trust: fakeTrust, receipts: fakeReceipts, events: bus, gateWall: allowGate, computeWorkProduct: promotableWorkProduct(),
     invokeModel: async () => { throw new Error("unused"); },
   });
   await orch.run({ taskId: "t-1", targetRepo: "/repo", goal: "g" }, parentCtx);

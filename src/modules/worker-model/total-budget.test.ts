@@ -38,6 +38,8 @@ function capturingRoles() {
       seen.push(ctx);
       if (r === "integrator") return { role: r, outcome: "success", summary: r, detail: { decision: "promote", evaluation: { approved: true } } };
       if (r === "verifier") return { role: r, outcome: "success", summary: r, detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }] } };
+      // A GREEN critic states its PASS verdict (`detail.pass`) — the field the authoritative core reads.
+      if (r === "critic") return { role: r, outcome: "success", summary: r, detail: { pass: true } };
       return { role: r, outcome: "success", summary: r };
     };
   }
@@ -66,6 +68,10 @@ const noopBus = () => ({ publish: <P>(i: P) => ({ ...(i as object), contractVers
 const allowGate: NonNullable<OrchestratorDeps["gateWall"]> = { evaluate: async () => ({ allow: true, reason: "test gate allows" }) };
 
 const task: WorkerTask = { taskId: "t-budget", targetRepo: "/repo", goal: "do the thing" };
+
+function promotableWorkProduct(treeHash = "test-tree-green"): NonNullable<OrchestratorDeps["computeWorkProduct"]> {
+  return async () => ({ treeHash, diffStat: { filesChanged: 1, insertions: 1, deletions: 0 }, nonEmpty: true });
+}
 
 test("total budget: a run that overruns its wall-clock ceiling halts at a role boundary (discard, no promote)", async () => {
   const ids = makeIdentities();
@@ -135,6 +141,7 @@ test("total budget disabled (0) ⇒ the run proceeds normally", async () => {
     events: noopBus() as unknown as NonNullable<OrchestratorDeps["events"]>,
     gateWall: allowGate, invokeModel: async () => { throw new Error("unused"); },
     killCheck: async () => ({ killed: false }),
+    computeWorkProduct: promotableWorkProduct(),
     now,
   });
 

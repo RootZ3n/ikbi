@@ -71,6 +71,13 @@ const fakeReceipts = () => ({ append: async (_i: unknown, _id: AgentIdentity): P
 const noopBus = () => ({ publish: <P>(i: P) => ({ ...(i as object), contractVersion: "1.0.0", id: "e", seq: 1, timestamp: 0 }) as unknown, subscribe: () => ({ id: "s", unsubscribe: () => {}, stats: () => ({ delivered: 0, dropped: 0, failures: 0, queued: 0 }) }), flush: async () => {} });
 const allowGate: NonNullable<OrchestratorDeps["gateWall"]> = { evaluate: async () => ({ allow: true, reason: "test gate allows" }) };
 
+// INJECTED TEST FACT (adjudication seam) — every builder in this suite LEAVES FILES on disk (`filesWritten`),
+// so the fixer-rescue path has real work to rescue. The non-git fake workspace can't compute a tree-bound
+// WorkProduct, so the authoritative core is fed a labeled GREEN product (nonEmpty ⇒ there IS work to rescue).
+const promotableWorkProduct: NonNullable<OrchestratorDeps["computeWorkProduct"]> = async () => ({
+  treeHash: "test-tree-green", diffStat: { filesChanged: 1, insertions: 1, deletions: 0 }, nonEmpty: true,
+});
+
 // escalationDisabled keeps the no-fixer failure path deterministic (no cheap-retry/escalation fan-out).
 const task: WorkerTask = { taskId: "t-fixer", targetRepo: "/repo", goal: "build the thing", escalationDisabled: true };
 
@@ -81,7 +88,7 @@ function orchestratorWith(fixerModel: string | undefined, roles: Partial<Record<
     workspaces: deps.ws.workspaces, trust: fakeTrust(), receipts: fakeReceipts(),
     events: noopBus() as unknown as NonNullable<OrchestratorDeps["events"]>,
     gateWall: allowGate, invokeModel: async () => { throw new Error("unused"); },
-    killCheck: async () => ({ killed: false }),
+    killCheck: async () => ({ killed: false }), computeWorkProduct: promotableWorkProduct,
   });
 }
 
@@ -171,7 +178,7 @@ test("effect-based gate + telemetry: a PREVENTED attempt promotes AND records pr
     config: { enabled: true, roleTimeoutMs: 5000, maxConcurrentRuns: 1, totalBudgetMs: 0 },
     resolveIdentity: ids.resolveIdentity, roleClaim: ids.roleClaim, roles: preventedAttemptRoles(),
     workspaces: ws.workspaces, trust: fakeTrust(), receipts: capturingReceipts,
-    events: noopBus() as unknown as NonNullable<OrchestratorDeps["events"]>, gateWall: allowGate, invokeModel: async () => { throw new Error("unused"); }, killCheck: async () => ({ killed: false }),
+    events: noopBus() as unknown as NonNullable<OrchestratorDeps["events"]>, gateWall: allowGate, invokeModel: async () => { throw new Error("unused"); }, killCheck: async () => ({ killed: false }), computeWorkProduct: promotableWorkProduct,
   });
 
   const r = await orch.run(task, ids.parentCtx);
@@ -214,7 +221,7 @@ function orchestratorCapturing(fixerModel: string, roles: Partial<Record<WorkerR
     config: { enabled: true, roleTimeoutMs: 5000, maxConcurrentRuns: 1, totalBudgetMs: 0, fixerModel },
     resolveIdentity: deps.ids.resolveIdentity, roleClaim: deps.ids.roleClaim, roles,
     workspaces: deps.ws.workspaces, trust: fakeTrust(), receipts: capturingReceipts,
-    events: noopBus() as unknown as NonNullable<OrchestratorDeps["events"]>, gateWall: allowGate, invokeModel: async () => { throw new Error("unused"); }, killCheck: async () => ({ killed: false }),
+    events: noopBus() as unknown as NonNullable<OrchestratorDeps["events"]>, gateWall: allowGate, invokeModel: async () => { throw new Error("unused"); }, killCheck: async () => ({ killed: false }), computeWorkProduct: promotableWorkProduct,
   });
 }
 

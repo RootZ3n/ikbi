@@ -58,10 +58,21 @@ function cleanRoles() {
       if (r === "builder") { calls.builder += 1; return { role: r, outcome: "success", summary: "built", detail: { filesWritten: ["a.ts"], policyViolations: [] } }; }
       if (r === "integrator") return { role: r, outcome: "success", summary: r, detail: { decision: "promote", evaluation: { approved: true } } };
       if (r === "verifier") return { role: r, outcome: "success", summary: r, detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }] } };
+      // A GREEN critic states its PASS verdict — the field the authoritative adjudication core reads
+      // (`criticDetail.pass === true`); without it a promotable candidate retains (critic-fail-exhausted).
+      if (r === "critic") return { role: r, outcome: "success", summary: r, detail: { pass: true } };
       return { role: r, outcome: "success", summary: r };
     };
   }
   return { roles, calls };
+}
+
+// INJECTED TEST FACT (adjudication seam): a tree-bound GREEN work product for a promotable candidate.
+// These drift tests use in-memory workspace doubles (no real git worktree), so the authoritative core
+// is fed this labeled fact via the explicit computeWorkProduct seam. Drift-BLOCK tests still refuse at
+// the drift gate; this only lets the non-blocked flows reach (and land) a legitimate promote.
+function promotableWorkProduct(): NonNullable<OrchestratorDeps["computeWorkProduct"]> {
+  return async () => ({ treeHash: "test-tree-green", diffStat: { filesChanged: 1, insertions: 1, deletions: 0 }, nonEmpty: true });
 }
 
 function driftReport(over: Partial<DriftReport> = {}): DriftReport {
@@ -79,6 +90,7 @@ function orchestratorWith(driftGovernor: DriftPrevention | undefined, roles: Par
     events: noopBus() as unknown as NonNullable<OrchestratorDeps["events"]>,
     gateWall: allowGate, invokeModel: async () => { throw new Error("unused"); },
     killCheck: async () => ({ killed: false }),
+    computeWorkProduct: promotableWorkProduct(),
     ...(driftGovernor !== undefined ? { driftGovernor } : {}),
   });
 }

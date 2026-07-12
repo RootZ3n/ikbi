@@ -80,6 +80,10 @@ function orchestratorWith(inv: (r: ModelRequest) => Promise<ModelResponse>, maxB
     workspaces: { allocate: async () => handle, promote: async (h): Promise<PromoteResult> => ({ promoted: true, workspaceId: h.id, targetBranch: h.baseBranch, beforeRef: "a", afterRef: "b" }), discard: async (h): Promise<DiscardResult> => ({ workspaceId: h.id, removed: true }), commit: async () => true, diff: async () => "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n-export const a = 1;\n+export const a = 2;\n" },
     events: fakeBus(), receipts: rc.receipts, governedExec: greenExec, builderModel: "deepseek-v4-flash",
     gateWall: { evaluate: async (): Promise<PromoteGovernance> => ({ allow: true }) }, readTreeHash: async () => "T",
+    // Adjudication seam: this non-git fake workspace can't produce a real tree-bound WorkProduct, so the
+    // authoritative core is fed a labeled GREEN product. The builder always writes a.ts, so every run here
+    // has real work on disk (the classifier + build always reach a promotable candidate).
+    computeWorkProduct: async () => ({ treeHash: "T", diffStat: { filesChanged: 1, insertions: 1, deletions: 0 }, nonEmpty: true }),
   });
   const task: WorkerTask = { taskId: "t", targetRepo: dir, goal: "do the thing", moeExpertRental: true, ...(maxBudgetUsd !== undefined ? { maxBudgetUsd } : {}) };
   return { orch, parentCtx: ids.parentCtx, receipts: rc.appended, task };

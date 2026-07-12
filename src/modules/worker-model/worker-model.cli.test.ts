@@ -47,6 +47,9 @@ function capturingRoles() {
       seen.push(ctx);
       if (r === "integrator") return { role: r, outcome: "success", summary: r, detail: { decision: "promote", rationale: "test", evaluation: { approved: true } } };
       if (r === "verifier") return { role: r, outcome: "success", summary: r, detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }] } };
+      // A GREEN critic carries an explicit PASS verdict — the field the authoritative adjudication core
+      // reads (`criticDetail.pass === true`). Without it the core retains (critic-fail-exhausted).
+      if (r === "critic") return { role: r, outcome: "success", summary: r, detail: { pass: true } };
       return { role: r, outcome: "success", summary: r };
     };
   }
@@ -55,6 +58,16 @@ function capturingRoles() {
 
 function fakeWorkspaceHandle(): WorkspaceHandle {
   return { id: "wsabcd", targetRepo: "/repo", baseBranch: "main", baseRef: "deadbeef", scratchBranch: "ikbi/ws/wsabcd", path: "/tmp/wsabcd", identity: { agentId: "lead" }, state: "allocated", createdAt: 1000 };
+}
+
+/**
+ * INJECTED TEST FACT (adjudication seam): a tree-bound GREEN work product for a promotable candidate.
+ * These CLI tests wire in-memory workspace doubles with non-existent paths, so the authoritative
+ * adjudication core (which requires a real tree-bound WorkProduct) is fed this labeled fact via the
+ * explicit `deps.computeWorkProduct` seam. Production always computes from real git.
+ */
+function promotableWorkProduct(treeHash = "test-tree-green"): NonNullable<OrchestratorDeps["computeWorkProduct"]> {
+  return async () => ({ treeHash, diffStat: { filesChanged: 1, insertions: 1, deletions: 0 }, nonEmpty: true });
 }
 
 /** Workspaces fake that HONORS governance at promote + captures the verdict. No real git. */
@@ -117,6 +130,10 @@ function realOrchestrator(operatorTier: string, workerTier: string) {
     trust: fakeTrust(),
     receipts: fakeReceipts(),
     events: noopBus() as unknown as NonNullable<OrchestratorDeps["events"]>,
+    // Adjudication seam: these workspace doubles have no real git worktree — inject a tree-bound GREEN
+    // work product so the authoritative core reaches its real chokepoints (promote for trusted, the
+    // gate-wall's deny for probation) instead of failing closed on an absent WorkProduct fact.
+    computeWorkProduct: promotableWorkProduct(),
     invokeModel: async () => {
       throw new Error("invokeModel not used (capturing roles)");
     },

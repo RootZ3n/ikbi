@@ -123,7 +123,22 @@ const stubRoles: Partial<Record<WorkerRole, RoleFn>> = {
   integrator: async () => ({ role: "integrator", outcome: "success", summary: "promote (stubbed)", detail: { decision: "promote", rationale: "stubbed", evaluation: { approved: true } } }),
 };
 
-function realBuilderOrchestrator(invokeModel: (request: ModelRequest) => Promise<ModelResponse>, builderModel: string) {
+// INJECTED TEST FACTS (adjudication seam) — these tests use a non-git fake workspace, so the authoritative
+// adjudication core (which requires a tree-bound WorkProduct) is fed the labeled fact via the sanctioned
+// `deps.computeWorkProduct` seam. PROMOTE-expecting runs inject a tree-bound GREEN product; a run that
+// produced NOTHING on disk injects the empty product (no work to promote/rescue).
+function promotableWorkProduct(): NonNullable<OrchestratorDeps["computeWorkProduct"]> {
+  return async () => ({ treeHash: "test-tree-green", diffStat: { filesChanged: 1, insertions: 1, deletions: 0 }, nonEmpty: true });
+}
+function emptyWorkProduct(): NonNullable<OrchestratorDeps["computeWorkProduct"]> {
+  return async () => ({ treeHash: "test-tree-empty", diffStat: { filesChanged: 0, insertions: 0, deletions: 0 }, nonEmpty: false });
+}
+
+function realBuilderOrchestrator(
+  invokeModel: (request: ModelRequest) => Promise<ModelResponse>,
+  builderModel: string,
+  computeWorkProduct: NonNullable<OrchestratorDeps["computeWorkProduct"]> = promotableWorkProduct(),
+) {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities();
   const bus = fakeBus();
   const rc = capturingReceipts();
@@ -142,7 +157,7 @@ function realBuilderOrchestrator(invokeModel: (request: ModelRequest) => Promise
   const orch = createOrchestrator({
     config: { enabled: true, roleTimeoutMs: 1000, maxConcurrentRuns: 1, trustLadder: false },
     workspaces, events: bus.bus, receipts: rc.receipts, resolveIdentity, roleClaim,
-    roles: stubRoles, invokeModel, governedExec: greenGovernedExec, builderModel,
+    roles: stubRoles, invokeModel, governedExec: greenGovernedExec, builderModel, computeWorkProduct,
     gateWall: { evaluate: async (): Promise<PromoteGovernance> => ({ allow: true, reason: "test gate allows" }) },
   });
   return { orch, parentCtx, receipts: rc.appended, dir };
@@ -250,7 +265,8 @@ function failingRecordingProvider(classifierTier: "worker" | "mid") {
 
 test("retry stays in lane: a failing MiMo-lane attempt escalates only within the MiMo lane (no cross-lane retry)", async () => {
   const rp = failingRecordingProvider("worker");
-  const { orch, parentCtx } = realBuilderOrchestrator(rp.invokeModel, DEFAULT_BUILDER);
+  // The builder writes NOTHING (protocol-stops each turn) → no work on disk → empty product (no rescue).
+  const { orch, parentCtx } = realBuilderOrchestrator(rp.invokeModel, DEFAULT_BUILDER, emptyWorkProduct());
   const task: WorkerTask = { taskId: "t-lane-retry", targetRepo: "/unused", goal: "do the thing", moeExpertRental: true, moeVendorLane: "mimo" };
   await orch.run(task, parentCtx);
 

@@ -236,10 +236,20 @@ function capturingRoles(capturedTasks: WorkerTask[]) {
         return { role: r, outcome: "success", summary: r, detail: { decision: "promote", rationale: "test", evaluation: { approved: true } } };
       }
       if (r === "verifier") return { role: r, outcome: "success", summary: r, detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }] } };
+      // A GREEN critic states its PASS verdict (`detail.pass`) — the field the authoritative
+      // adjudication core reads (`criticDetail.pass === true`).
+      if (r === "critic") return { role: r, outcome: "success", summary: r, detail: { pass: true } };
       return { role: r, outcome: "success", summary: r };
     };
   }
   return roles;
+}
+
+// INJECTED TEST FACT (adjudication seam): a tree-bound GREEN work product for a promotable candidate.
+// These delegation CLI tests drive an in-memory workspace double (no real git worktree), so the
+// authoritative core is fed this labeled fact via the explicit computeWorkProduct seam.
+function promotableWorkProduct(): NonNullable<OrchestratorDeps["computeWorkProduct"]> {
+  return async () => ({ treeHash: "test-tree-green", diffStat: { filesChanged: 1, insertions: 1, deletions: 0 }, nonEmpty: true });
 }
 
 function makeOrchestrator(capturedTasks: WorkerTask[], targetRepo: string) {
@@ -267,6 +277,7 @@ function makeOrchestrator(capturedTasks: WorkerTask[], targetRepo: string) {
     trust: fakeTrust(),
     receipts: fakeReceipts(),
     events: noopBus() as unknown as NonNullable<OrchestratorDeps["events"]>,
+    computeWorkProduct: promotableWorkProduct(),
     invokeModel: async () => { throw new Error("invokeModel not used (capturing roles)"); },
   });
 }

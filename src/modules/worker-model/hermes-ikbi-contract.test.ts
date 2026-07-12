@@ -79,6 +79,8 @@ function capturingRoles(capturedTasks: WorkerTask[]) {
         return { role: r, outcome: "success", summary: r, detail: { decision: "promote", rationale: "test", evaluation: { approved: true } } };
       }
       if (r === "verifier") return { role: r, outcome: "success", summary: r, detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }] } };
+      // A GREEN critic states its PASS verdict (`detail.pass`) — the field the authoritative core reads.
+      if (r === "critic") return { role: r, outcome: "success", summary: r, detail: { pass: true } };
       return { role: r, outcome: "success", summary: r };
     };
   }
@@ -135,6 +137,9 @@ function makeOrchestrator(capturedTasks: WorkerTask[], targetRepo: string, opts:
     receipts: recordingReceipts(opts.receiptsSink ?? []),
     events: noopBus() as unknown as NonNullable<OrchestratorDeps["events"]>,
     invokeModel: async () => { throw new Error("invokeModel not used (capturing roles)"); },
+    // INJECTED TEST FACT (adjudication seam): the fake workspace has no real git worktree, so inject a
+    // tree-bound GREEN work product. The WITHOUT-approval refusal still fires at the approval gate.
+    computeWorkProduct: async () => ({ treeHash: "test-tree-green", diffStat: { filesChanged: 1, insertions: 1, deletions: 0 }, nonEmpty: true }),
     ...(opts.requestApproval !== undefined ? { requestApproval: opts.requestApproval } : {}),
   });
 }

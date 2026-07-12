@@ -139,6 +139,18 @@ function treeReader(seq: (string | undefined)[]) {
   return async (): Promise<string | undefined> => { const v = seq[Math.min(i, seq.length - 1)]; i += 1; return v; };
 }
 
+/**
+ * INJECTED TEST FACT (adjudication seam) — a complete tree-bound GREEN work product for a promotable
+ * candidate. These real-seam tests use an in-memory / non-git workspace double, so the authoritative
+ * adjudication core (`IKBI_LEGACY_COMPLETION=off`, which requires a tree-bound WorkProduct) is fed this
+ * labeled fact via the explicit `deps.computeWorkProduct` seam. Production always computes from real git.
+ * NOTE: the orchestrator sets `assessment.treeHash = wp.treeHash`, so this hash matches the assessment
+ * automatically (green-on-merit) — it need not equal the `readTreeHash`/treeSeq stale-tree value.
+ */
+function promotableWorkProduct(treeHash = "test-tree-green"): NonNullable<OrchestratorDeps["computeWorkProduct"]> {
+  return async () => ({ treeHash, diffStat: { filesChanged: 1, insertions: 1, deletions: 0 }, nonEmpty: true });
+}
+
 function realOrchestrator(opts: { invokeModel: (r: ModelRequest) => Promise<ModelResponse>; treeSeq?: (string | undefined)[]; extra?: Partial<OrchestratorDeps> }) {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities();
   const rc = capturingReceipts();
@@ -168,7 +180,7 @@ function realOrchestrator(opts: { invokeModel: (r: ModelRequest) => Promise<Mode
 // req 1, 10, 13, 17: a promoting build routes through the authority + canonical receipt with the chain.
 test("normal success routes through the canonical authority and emits worker.promotion with the identity chain", async () => {
   const rp = successProvider();
-  const { orch, parentCtx, receipts, promoteCalls } = realOrchestrator({ invokeModel: rp.invokeModel, treeSeq: ["T-verified"] });
+  const { orch, parentCtx, receipts, promoteCalls } = realOrchestrator({ invokeModel: rp.invokeModel, treeSeq: ["T-verified"], extra: { computeWorkProduct: promotableWorkProduct() } });
   const result = await orch.run({ taskId: "t1", targetRepo: "/unused", goal: "do the thing", moeExpertRental: true, moeVendorLane: "deepseek" }, parentCtx);
 
   assert.equal(result.outcome, "success");
@@ -189,7 +201,7 @@ test("normal success routes through the canonical authority and emits worker.pro
 test("stale-tree: a candidate mutated after verification is REFUSED — the promoted tree must be the verified tree", async () => {
   const rp = successProvider();
   // capture at verification → "T-verified"; the authority's re-read → "T-mutated" (a post-verify change).
-  const { orch, parentCtx, receipts, promoteCalls } = realOrchestrator({ invokeModel: rp.invokeModel, treeSeq: ["T-verified", "T-mutated"] });
+  const { orch, parentCtx, receipts, promoteCalls } = realOrchestrator({ invokeModel: rp.invokeModel, treeSeq: ["T-verified", "T-mutated"], extra: { computeWorkProduct: promotableWorkProduct() } });
   const result = await orch.run({ taskId: "t-stale", targetRepo: "/unused", goal: "do the thing", moeExpertRental: true, moeVendorLane: "deepseek" }, parentCtx);
 
   assert.notEqual(result.outcome, "success", "a stale candidate does not promote");
@@ -201,20 +213,20 @@ test("stale-tree: a candidate mutated after verification is REFUSED — the prom
 
 // req 16, mutation 4: success trust credit occurs ONLY after an actual promotion.
 test("trust ordering: a build that promotes records success trust; a stale-blocked build does NOT", async () => {
-  const good = realOrchestrator({ invokeModel: successProvider().invokeModel, treeSeq: ["T"] });
+  const good = realOrchestrator({ invokeModel: successProvider().invokeModel, treeSeq: ["T"], extra: { computeWorkProduct: promotableWorkProduct() } });
   await good.orch.run({ taskId: "t-good", targetRepo: "/unused", goal: "do the thing", moeExpertRental: true, moeVendorLane: "deepseek" }, good.parentCtx);
   assert.deepEqual(good.trust.calls.map((c) => c.status), ["success"], "promoted build → one success trust outcome");
 
-  const stale = realOrchestrator({ invokeModel: successProvider().invokeModel, treeSeq: ["T", "T2"] });
+  const stale = realOrchestrator({ invokeModel: successProvider().invokeModel, treeSeq: ["T", "T2"], extra: { computeWorkProduct: promotableWorkProduct() } });
   await stale.orch.run({ taskId: "t-stale2", targetRepo: "/unused", goal: "do the thing", moeExpertRental: true, moeVendorLane: "deepseek" }, stale.parentCtx);
   assert.ok(!stale.trust.calls.some((c) => c.status === "success"), "a stale-blocked build earns NO success trust credit");
 });
 
 // req 3, 4, 5, 24, mutation 3: duel primary and peer are separately attributable with independent evidence.
 test("duel funnel: primary and peer each traverse the authority with DISTINCT attempt ids + their own verified tree", async () => {
-  const primary = realOrchestrator({ invokeModel: successProvider().invokeModel, treeSeq: ["T-primary"] });
+  const primary = realOrchestrator({ invokeModel: successProvider().invokeModel, treeSeq: ["T-primary"], extra: { computeWorkProduct: promotableWorkProduct("test-tree-primary") } });
   await primary.orch.run({ taskId: "build:deepseek", targetRepo: "/unused", goal: "do the thing", moeExpertRental: true, moeVendorLane: "deepseek" }, primary.parentCtx);
-  const peer = realOrchestrator({ invokeModel: successProvider().invokeModel, treeSeq: ["T-peer"] });
+  const peer = realOrchestrator({ invokeModel: successProvider().invokeModel, treeSeq: ["T-peer"], extra: { computeWorkProduct: promotableWorkProduct("test-tree-peer") } });
   await peer.orch.run({ taskId: "build:mimo", targetRepo: "/unused", goal: "do the thing", moeExpertRental: true, moeVendorLane: "mimo" }, peer.parentCtx);
 
   const pPromo = primary.receipts.find((r) => r.operation === "worker.promotion")!;
@@ -243,7 +255,7 @@ test("selection is not completion: an integrator DISCARD produces no worker.prom
 // req 12, mutation 5: the authority binds verifiedAgainst so the workspace CAS also gets the certified tree.
 test("candidate-bound authorization: the promote carries verifiedAgainst (hash-bound) when a tree is known", async () => {
   const rp = successProvider();
-  const { orch, parentCtx, promoteCalls } = realOrchestrator({ invokeModel: rp.invokeModel, treeSeq: ["T-verified"] });
+  const { orch, parentCtx, promoteCalls } = realOrchestrator({ invokeModel: rp.invokeModel, treeSeq: ["T-verified"], extra: { computeWorkProduct: promotableWorkProduct() } });
   await orch.run({ taskId: "t-va", targetRepo: "/unused", goal: "do the thing", moeExpertRental: true, moeVendorLane: "deepseek" }, parentCtx);
   assert.equal(promoteCalls.length, 1);
   assert.equal(promoteCalls[0]!.hasVerifiedAgainst, true, "the authority binds the certified tree + target head into the promote (IKBI-RT-005 stale-target guard)");

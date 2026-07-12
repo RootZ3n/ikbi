@@ -581,6 +581,15 @@ export interface OrchestratorDeps {
    * tests can force the quarantine on/off without touching the environment.
    */
   readonly autonomousPromotionEnabled?: boolean;
+  /**
+   * Adjudication (Step 4): the tree-bound WORK PRODUCT fact provider for `decidePromotability`. Default
+   * (undefined) ⇒ the REAL git-based `computeWorktreeWorkProduct` (a throwaway-index tree hash of the actual
+   * worktree). Injectable ONLY through this explicit dependency — NO environment variable injects facts, and
+   * there is NO fallback from missing facts to a permissive promotion. Tests that represent a PROMOTABLE git
+   * candidate inject a complete tree-bound product; refusal tests inject the intended missing/mismatched fact.
+   * The seam cannot override CAS or landed-tree verification (those remain in `WorkspaceManager.promote`).
+   */
+  readonly computeWorkProduct?: (workspacePath: string, baseRef: string, taskId: string) => Promise<import("./adjudication/index.js").WorkProduct>;
   /** Resolve a role credential to a validated identity. Default: core resolveIdentity. */
   readonly resolveIdentity?: (claim: IdentityClaim, ctx?: ResolveContext) => ValidatedIdentity;
   /** Produce the credential claim for a role. Default: fail-closed (must be configured). */
@@ -4405,7 +4414,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         if (adjudicable && !adjUnverifiable) {
           const runRescueVerifier = makeRescueVerifier(spawned);
           const detectWork = async (): Promise<{ nonEmpty: boolean }> => {
-            const wp = await computeWorktreeWorkProduct(workspace.path, workspace.baseRef, task.taskId);
+            const wp = await (deps.computeWorkProduct ?? computeWorktreeWorkProduct)(workspace.path, workspace.baseRef, task.taskId);
             return { nonEmpty: wp.nonEmpty };
           };
           // Always apply the rescue result: on GREEN it is the rescued success; on RED it is the
@@ -4523,7 +4532,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     let adjDecision: Decision | undefined;
     if (shadowEnabled || adjudicationAuthoritative) {
       try {
-        const wp = await computeWorktreeWorkProduct(workspace.path, workspace.baseRef, task.taskId);
+        const wp = await (deps.computeWorkProduct ?? computeWorktreeWorkProduct)(workspace.path, workspace.baseRef, task.taskId);
         const verifierResult = results.find((r) => r.role === "verifier");
         const rv = readVerifier(verifierResult);
         const rawVerdict = (verifierResult?.detail as Record<string, unknown> | undefined)?.verdict;
@@ -4531,6 +4540,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           verdict: (typeof rawVerdict === "string" ? rawVerdict : "fail") as Verdict,
           testEvidence: rv.testEvidence,
           treeHash: wp.treeHash, // the verifier judged this worktree; C1c re-checks the landed tree at promote
+          // Phase 10: the explicit no-tests policy (task field or IKBI_ALLOW_NO_TESTS) — the SAME fact the
+          // downstream promotion authority reads — so the core honors a genuinely test-less repo the operator
+          // has permitted, instead of fail-closing it as vacuous-green.
+          noTestsAcceptable: noTestsPolicyEnabled(task, modeEnv),
         };
         const criticDetail = (results.find((r) => r.role === "critic")?.detail ?? {}) as Record<string, unknown>;
         const refuterDetail = (results.find((r) => r.role === "refuter")?.detail ?? {}) as Record<string, unknown>;
@@ -4742,7 +4755,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         // integrator did NOT approve it fails CLOSED and retains the work — the experimental path can never
         // override an integrator discard. The real gate-wall + promoteCandidate remain the sole authority.
         if (decision.promote === true) {
-          decision = { ...decision, rationale: `adjudication core: promote — confirms the integrator (${adjDecision.reason})` };
+          // PRESERVE the integrator's rationale (it is the promote evaluation's own reasoning) and ANNOTATE
+          // it with the adjudication confirmation — don't discard the integrator's account of why it promoted.
+          decision = { ...decision, rationale: `${decision.rationale} — adjudication core confirms promote (${adjDecision.reason})` };
         } else {
           adjRetain = true;
           decision = {
@@ -4754,7 +4769,15 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         }
       } else {
         adjRetain = adjDecision.action === "retain";
-        decision = { ...decision, promote: false, rationale: `adjudication core: ${adjDecision.action} (${adjDecision.reason})` };
+        // Name the underlying cause when the retain is a safety-forensics hold triggered by an EXTERNAL
+        // prompt-injection this build: the neutralization chokepoint blocked outside content, so the
+        // work is retained for forensics rather than promoted. Truthful provenance (the closed retain
+        // enum stays "safety-forensics"; the rationale states the observed cause) — not a reworded verdict.
+        const rationale =
+          adjDecision.action === "retain" && adjDecision.reason === "safety-forensics" && externalInjectionDetectedThisBuild
+            ? "adjudication core: retain (safety-forensics) — external prompt-injection detected by the neutralization chokepoint this build (fail-closed; work retained for forensics, not promoted)"
+            : `adjudication core: ${adjDecision.action} (${adjDecision.reason})`;
+        decision = { ...decision, promote: false, rationale };
       }
     }
     // FAIL-CLOSED IN-RUN GATE (enforced on THIS build's promote, independent of the trust ladder):
@@ -4990,9 +5013,16 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     } else if (!approvalRejected) {
       // The integrator did not approve promote (and it was not an approval-gate rejection,
       // which already discarded above). Fail-closed: nothing lands.
-      reason =
-        decision.rationale ??
-        (overall !== "success" ? `run ended with role outcome "${overall}"` : "integrator did not approve promote");
+      // Reason precedence: (1) a GREEN work product the adjudication core withheld (adjRetain) reports
+      // WHY it was withheld — the adjudication rationale. (2) A build that actually FAILED (a role did
+      // not converge) reports the failure OUTCOME — not the adjudication sub-verdict (e.g. "discard
+      // (no-work)"), which would misdescribe why the failed workspace is being kept for inspection.
+      // (3) A green build the integrator simply declined reports the integrator's rationale.
+      reason = adjRetain
+        ? (decision.rationale ?? "adjudication core withheld the promotion")
+        : overall !== "success"
+          ? `run ended with role outcome "${overall}"`
+          : (decision.rationale ?? "integrator did not approve promote");
       // Bug 2: when the build actually FAILED (a role did not converge — overall is not
       // "success"), RETAIN the workspace so its work survives for inspection instead of
       // discarding it (the builder may have written real files before the failure). A build

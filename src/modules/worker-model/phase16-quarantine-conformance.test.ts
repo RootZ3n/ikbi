@@ -78,6 +78,11 @@ const promoteIntegrator: RoleFn = async () => ({ role: "integrator", outcome: "s
 const cleanBuilder: RoleFn = async () => ({ role: "builder", outcome: "success", summary: "built", detail: { filesWritten: ["a.ts"], rejectedToolCalls: [], stopReason: "stop" } });
 const greenExec = { run: async () => ({ executed: true as const, exitCode: 0, stdoutTail: "ok", stderrTail: "" }) };
 const allowGate = { evaluate: async (): Promise<PromoteGovernance> => ({ allow: true, reason: "ok" }) };
+// INJECTED TEST FACT (adjudication seam): these in-memory workspace doubles have no real tree change on
+// disk, so the authoritative adjudication core (which requires a tree-bound WorkProduct) would compute
+// discard(no-work) and never reach the quarantine chokepoint. Feed a promotable tree-bound fact so the
+// flow REACHES the quarantine gate — the quarantine backstop must still block the autonomous land.
+const promotableWorkProduct: NonNullable<OrchestratorDeps["computeWorkProduct"]> = async () => ({ treeHash: "test-tree-green", diffStat: { filesChanged: 1, insertions: 1, deletions: 0 }, nonEmpty: true });
 const DIFF = "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n-export const a = 1;\n+export const a = 2;\n";
 function gitInit(dir: string): string {
   const g = (...a: string[]): string => execFileSync("git", ["-C", dir, ...a], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } });
@@ -112,6 +117,7 @@ function makeRun(over: RunOpts = {}) {
     events: fakeBus, receipts: rc.receipts, trust: rt.trust, resolveIdentity, roleClaim,
     roles: { scout: async () => ({ role: "scout", outcome: "success", summary: "s" }), builder: cleanBuilder, verifier: greenVerifier, critic: passCritic, integrator: promoteIntegrator },
     invokeModel: async (): Promise<ModelResponse> => { throw new Error("unused"); }, governedExec: greenExec, builderModel: "deepseek-v4-flash",
+    computeWorkProduct: promotableWorkProduct,
     escalationTierModels: { worker: ["deepseek-v4-flash"], mid: ["deepseek-v4-pro"], frontier: ["deepseek-v4-pro"] },
     gateWall: over.gateWall ?? allowGate,
   });

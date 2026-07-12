@@ -186,6 +186,16 @@ const greenVerifier: RoleFn = async () => ({ role: "verifier", outcome: "success
 const passCritic: RoleFn = async () => ({ role: "critic", outcome: "success", summary: "c", detail: { pass: true } });
 const promoteIntegrator: RoleFn = async () => ({ role: "integrator", outcome: "success", summary: "i", detail: { decision: "promote", rationale: "s", evaluation: { approved: true } } });
 const find = (rs: Array<{ operation: string; metadata: Record<string, unknown> }>, op: string) => rs.find((r) => r.operation === op);
+/**
+ * INJECTED TEST FACT (adjudication seam) — a tree-bound GREEN work product for a promotable candidate.
+ * These Part B/C seam tests drive fake role doubles (the builder never physically writes), so the
+ * authoritative adjudication core (which requires a tree-bound WorkProduct) is fed this labeled fact via
+ * `deps.computeWorkProduct`. Production always computes from real git; no env var injects this. The
+ * bypass-quarantine test still refuses at its real chokepoint — the fact only lets the flow reach it.
+ */
+function promotableWorkProduct(treeHash = "test-tree-green"): NonNullable<OrchestratorDeps["computeWorkProduct"]> {
+  return async () => ({ treeHash, diffStat: { filesChanged: 1, insertions: 1, deletions: 0 }, nonEmpty: true });
+}
 function gitInit(dir: string): void {
   const g = (...a: string[]): string => execFileSync("git", ["-C", dir, ...a], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } });
   g("init", "-q"); writeFileSync(join(dir, "a.ts"), "export const a = 1;"); g("add", "-A"); g("commit", "-q", "-m", "base");
@@ -211,6 +221,7 @@ function makeRun(over: { gateWall?: OrchestratorDeps["gateWall"]; trust?: Orches
     roles: { scout: async () => ({ role: "scout", outcome: "success", summary: "s" }), builder: cleanBuilder, verifier: greenVerifier, critic: passCritic, integrator: promoteIntegrator },
     invokeModel: async () => { throw new Error("unused"); }, governedExec: { run: async () => ({ executed: true as const, exitCode: 0, stdoutTail: "ok", stderrTail: "" }) }, builderModel: "deepseek-v4-flash",
     gateWall: over.gateWall ?? { evaluate: async (): Promise<PromoteGovernance> => ({ allow: true, reason: "ok" }) },
+    computeWorkProduct: promotableWorkProduct(), // injected adjudication fact — the fake builder writes no disk
   });
   return { run: () => orch.run({ taskId: "t13b", targetRepo: dir, goal: "do the thing" }, parentCtx), receipts: rc.appended };
 }

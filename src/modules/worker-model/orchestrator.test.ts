@@ -164,6 +164,12 @@ function capturingRoles(outcomeFor: (role: WorkerRole) => WorkerOutcome = () => 
       if (r === "verifier" && outcome === "success") {
         return { role: r, outcome, summary: r, detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }] } };
       }
+      // A GREEN critic carries an explicit PASS verdict (`detail.pass`), the field the adjudication core
+      // reads (`criticDetail.pass === true`). Without it the authoritative core retains (critic-fail-exhausted),
+      // so a green critic double must state its pass — mirroring the real critic's `detail: { pass }`.
+      if (r === "critic" && outcome === "success") {
+        return { role: r, outcome, summary: r, detail: { pass: true } };
+      }
       return { role: r, outcome, summary: r };
     };
   }
@@ -184,6 +190,21 @@ function omitGate(d: OrchestratorDeps): OrchestratorDeps {
   const copy = { ...d };
   delete (copy as { gateWall?: unknown }).gateWall;
   return copy;
+}
+
+/**
+ * INJECTED TEST FACT (adjudication seam) — a complete tree-bound GREEN work product for a promotable
+ * candidate. NOT real git: these unit tests use in-memory workspace doubles, so the authoritative
+ * adjudication core (which requires a tree-bound WorkProduct) is fed this labeled fact via the explicit
+ * `deps.computeWorkProduct` seam. Production always computes from real git; no env var injects this.
+ * Refusal tests override with the intended missing/mismatched fact (e.g. `emptyWorkProduct`).
+ */
+function promotableWorkProduct(treeHash = "test-tree-green"): NonNullable<OrchestratorDeps["computeWorkProduct"]> {
+  return async () => ({ treeHash, diffStat: { filesChanged: 1, insertions: 1, deletions: 0 }, nonEmpty: true });
+}
+/** INJECTED TEST FACT — a work product with NO change on disk (a build that produced nothing → discard(no-work)). */
+function emptyWorkProduct(): NonNullable<OrchestratorDeps["computeWorkProduct"]> {
+  return async () => ({ treeHash: "test-tree-empty", diffStat: { filesChanged: 0, insertions: 0, deletions: 0 }, nonEmpty: false });
 }
 
 function baseDeps(extra: Partial<OrchestratorDeps>): OrchestratorDeps {
@@ -208,6 +229,10 @@ function baseDeps(extra: Partial<OrchestratorDeps>): OrchestratorDeps {
     invokeModel: async () => {
       throw new Error("invokeModel not used in these tests");
     },
+    // Adjudication (Step 4): these in-memory doubles have no real git worktree, so inject a tree-bound GREEN
+    // work product by default (a promotable candidate). Tests asserting a REFUSAL override this (empty /
+    // mismatched) or refuse upstream (verifier-red / gate-deny / semantic-withheld), all of which still apply.
+    computeWorkProduct: promotableWorkProduct(),
     ...extra,
   };
 }
@@ -314,6 +339,10 @@ test("Cx: IKBI_LEGACY_COMPLETION=off makes the adjudication core AUTHORITATIVE �
   const orch = createOrchestrator(baseDeps({
     resolveIdentity, roleClaim, roles: cap.roles, workspaces: ws.workspaces,
     env: { ...process.env, IKBI_LEGACY_COMPLETION: "off" },
+    // Facts UNAVAILABLE: the fake workspace has no real git worktree, so computing the tree-bound work
+    // product throws (exactly what the real git runner does against a non-worktree path). This is the
+    // fail-closed-when-facts-are-missing scenario — NOT an injected promotable product.
+    computeWorkProduct: async () => { throw new Error("no git worktree: adjudication facts unavailable"); },
   }));
   const result = await orch.run(task, parentCtx);
 
@@ -795,7 +824,7 @@ test("AUTO-VERIFY RESCUE: NOT triggered when checks already ran, or when no file
       builder: builderNoChecks("no_progress", []),
       verifier: async (ctx) => { verifierRuns += 1; return cap.roles.verifier!(ctx); },
     };
-    const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles }));
+    const orch = createOrchestrator(baseDeps({ computeWorkProduct: emptyWorkProduct(), resolveIdentity, roleClaim, roles }));
     const result = await orch.run(task, parentCtx);
     assert.equal(result.roles.find((r) => r.role === "builder")?.outcome, "failure", "empty-tree build is not rescued");
     assert.equal(verifierRuns, 0, "no rescue verifier when no files were written");
@@ -1052,7 +1081,7 @@ test("failure path: a role failure short-circuits, workspace DISCARDED (not prom
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
   const ws = fakeWorkspaces(true);
   const cap = capturingRoles((r) => (r === "builder" ? "failure" : "success"));
-  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, workspaces: ws.workspaces }));
+  const orch = createOrchestrator(baseDeps({ computeWorkProduct: emptyWorkProduct(), resolveIdentity, roleClaim, roles: cap.roles, workspaces: ws.workspaces }));
   // escalationDisabled isolates the DISCARD mechanic this test pins from always-on flash→pro
   // escalation (which now retries the builder on a pro model before a builder failure discards —
   // covered by its own tests). With escalation off, a builder failure short-circuits immediately.
@@ -1081,7 +1110,7 @@ test("Bug 2: a role failure RETAINS the workspace (not discarded) when the manag
     },
   };
   const cap = capturingRoles((r) => (r === "builder" ? "failure" : "success"));
-  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, workspaces: wrapped }));
+  const orch = createOrchestrator(baseDeps({ computeWorkProduct: emptyWorkProduct(), resolveIdentity, roleClaim, roles: cap.roles, workspaces: wrapped }));
   const result = await orch.run(task, parentCtx);
 
   assert.equal(ws.calls.promote, 0, "not promoted");
@@ -1102,7 +1131,7 @@ test("Bug 2: retention OFF restores eager discard on a failed build", async () =
   };
   const cap = capturingRoles((r) => (r === "builder" ? "failure" : "success"));
   const orch = createOrchestrator(
-    baseDeps({ config: { ...ENABLED, retainFailedWorkspaces: false }, resolveIdentity, roleClaim, roles: cap.roles, workspaces: wrapped }),
+    baseDeps({ computeWorkProduct: emptyWorkProduct(), config: { ...ENABLED, retainFailedWorkspaces: false }, resolveIdentity, roleClaim, roles: cap.roles, workspaces: wrapped }),
   );
   await orch.run(task, parentCtx);
   assert.equal(retained, 0, "retention off ⇒ retain not called");
@@ -1132,9 +1161,11 @@ test("each role's outcome is recorded to receipts + trust under the ROLE identit
 
   // Phase 3: a promoting build now emits the canonical `worker.promotion` receipt (the single
   // promotion authority's identity-chain record) in addition to the five role receipts and the
-  // run-level summary.
-  assert.equal(rc.calls.length, 7, "five role receipts + one worker.run.summary + one worker.promotion");
+  // run-level summary. Adjudication (Step 4): when the tree-bound work-product facts are available
+  // the pipeline also emits one advisory `worker.safety_assessment` provenance receipt.
+  assert.equal(rc.calls.length, 8, "five role receipts + run.summary + promotion + safety_assessment");
   assert.ok(rc.calls.some((c) => c.operation === "worker.promotion"), "the canonical promotion receipt was written");
+  assert.ok(rc.calls.some((c) => c.operation === "worker.safety_assessment"), "the adjudication provenance receipt was written");
   assert.equal(tr.calls.length, 1, "FIX A: one trust outcome per BUILD, not per role");
   const roleReceipts = rc.calls.filter((c) => c.operation.startsWith("worker.role."));
   assert.equal(roleReceipts.length, 5, "one receipt per role");
@@ -1291,7 +1322,8 @@ test("real scout/builder/critic + stubbed verifier/integrator → coherent succe
 const successFakes = (): Partial<Record<WorkerRole, RoleFn>> => ({
   scout: async () => ({ role: "scout", outcome: "success", summary: "s" }),
   builder: async () => ({ role: "builder", outcome: "success", summary: "b" }),
-  critic: async () => ({ role: "critic", outcome: "success", summary: "c" }),
+  // A green critic states its PASS verdict (`detail.pass`) — the field the adjudication core reads.
+  critic: async () => ({ role: "critic", outcome: "success", summary: "c", detail: { pass: true } }),
   // A green verifier carries a real executed-test check so a promoting candidate has authentic
   // `executed` evidence (Phase 10 promotion authority requires it; readVerifier re-derives from checks).
   verifier: async () => ({ role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }] } }),
@@ -1392,7 +1424,7 @@ test("short-circuit: a builder hard-failure → integrator never runs → discar
     builder: async () => ({ role: "builder", outcome: "failure", summary: "boom" }),
     integrator: realIntegrator,
   };
-  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles }));
+  const orch = createOrchestrator(baseDeps({ computeWorkProduct: emptyWorkProduct(), resolveIdentity, roleClaim, workspaces: ws.workspaces, roles }));
   const result = await orch.run(task, parentCtx);
   assert.equal(ws.calls.promote, 0);
   assert.equal(ws.calls.discard, 1);
@@ -1600,7 +1632,7 @@ test("skipPromote: a failed step still reports failure without discarding", asyn
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
   const ws = fakeWorkspaces(true);
   const cap = capturingRoles((role) => role === "builder" ? "failure" : "success");
-  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, workspaces: ws.workspaces }));
+  const orch = createOrchestrator(baseDeps({ computeWorkProduct: emptyWorkProduct(), resolveIdentity, roleClaim, roles: cap.roles, workspaces: ws.workspaces }));
   const existing = fakeWorkspaceHandle();
   const stepFail: WorkerTask = { ...task, reuseWorkspace: existing, skipPromote: true };
   const result = await orch.run(stepFail, parentCtx);
@@ -2377,7 +2409,7 @@ test("build-mode escalation: ALWAYS-ON — a bare builder failure (score below t
     ...cap.roles,
     builder: async (): Promise<RoleResult> => { builderRuns += 1; return { role: "builder", outcome: "failure", summary: "bare fail" }; },
   };
-  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces, events: bus.bus }));
+  const orch = createOrchestrator(baseDeps({ computeWorkProduct: emptyWorkProduct(), resolveIdentity, roleClaim, roles, workspaces: ws.workspaces, events: bus.bus }));
   const result = await orch.run({ taskId: "t-always-on-esc", targetRepo: "/repo", goal: "do the thing" }, parentCtx);
 
   assert.ok(builderRuns > 1, "always-on escalation retried the builder despite a below-threshold score");
@@ -2443,7 +2475,7 @@ test("build-mode escalation: a failed escalated retry leaves the original failur
       return { role: "builder", outcome: "failure", summary: "still failing", detail: { toolFormatErrors: [1, 2], retryCount: 3 } };
     },
   };
-  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces, events: bus.bus }));
+  const orch = createOrchestrator(baseDeps({ computeWorkProduct: emptyWorkProduct(), resolveIdentity, roleClaim, roles, workspaces: ws.workspaces, events: bus.bus }));
   const result = await orch.run({ taskId: "t-esc-all-fail", targetRepo: "/repo", goal: "do the thing" }, parentCtx);
 
   assert.equal(builderCalls, 7, "mimo-v2.5 attempt + cheap retry + the 5-model worker+mid pool sweep — then exhausted, no loop");
@@ -2497,7 +2529,7 @@ test("build-mode escalation: frontier consult NOT called when unauthorized (gate
     consultCalls += 1;
     return { applied: true, filesChanged: [], modelId: "opus-4.8" };
   };
-  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces, events: bus.bus, applyConsultPatch }));
+  const orch = createOrchestrator(baseDeps({ computeWorkProduct: emptyWorkProduct(), resolveIdentity, roleClaim, roles, workspaces: ws.workspaces, events: bus.bus, applyConsultPatch }));
   // no allowFrontierConsult → frontier stays gated
   const result = await orch.run({ taskId: "t-frontier-gated", targetRepo: "/repo", goal: "do the thing" }, parentCtx);
 
@@ -2526,7 +2558,7 @@ test("tier preset: escalationDisabled suppresses the auto-escalation — a faile
       return { role: "builder", outcome: "failure", summary: "mid builder failed", detail: { toolFormatErrors: [1, 2], retryCount: 3 } };
     },
   };
-  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces, events: bus.bus }));
+  const orch = createOrchestrator(baseDeps({ computeWorkProduct: emptyWorkProduct(), resolveIdentity, roleClaim, roles, workspaces: ws.workspaces, events: bus.bus }));
   const result = await orch.run({ taskId: "t-tier-mid-noesc", targetRepo: "/repo", goal: "do the thing", escalationDisabled: true }, parentCtx);
 
   assert.equal(builderCalls, 1, "with escalationDisabled the builder runs exactly once — no cheap retry, no pro escalation");

@@ -157,6 +157,10 @@ function noopBus(): EventBusSurface {
   };
 }
 
+function promotableWorkProduct(treeHash = "test-tree-green"): NonNullable<OrchestratorDeps["computeWorkProduct"]> {
+  return async () => ({ treeHash, diffStat: { filesChanged: 1, insertions: 1, deletions: 0 }, nonEmpty: true });
+}
+
 /** All five roles succeed; the integrator returns a well-formed PROMOTE decision. */
 function promotingRoles(): Partial<Record<WorkerRole, RoleFn>> {
   const seen: RoleContext[] = [];
@@ -199,6 +203,7 @@ test("ENFORCEMENT LIVE: a probation parent ⇒ child probation ⇒ gate-wall DEN
     receipts: fakeReceipts(),
     events: noopBus(),
     config: { enabled: true, roleTimeoutMs: 1000, maxConcurrentRuns: 1 },
+    computeWorkProduct: promotableWorkProduct(),
     invokeModel: async () => {
       throw new Error("invokeModel not used");
     },

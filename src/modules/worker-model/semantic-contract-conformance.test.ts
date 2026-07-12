@@ -201,6 +201,9 @@ function realOrchestrator(invokeModel: (r: ModelRequest) => Promise<ModelRespons
     events: fakeBus(), receipts: rc.receipts, resolveIdentity, roleClaim, roles, invokeModel,
     governedExec: greenGovernedExec, builderModel: "deepseek-v4-flash",
     gateWall: { evaluate: async (): Promise<PromoteGovernance> => ({ allow: true, reason: "ok" }) },
+    // INJECTED TEST FACT (adjudication seam): the temp workspace is not git-initialized, so inject a
+    // tree-bound GREEN work product. A semantic WITHHOLD still fires at the critic/semantic gate.
+    computeWorkProduct: async () => ({ treeHash: "test-tree-green", diffStat: { filesChanged: 1, insertions: 1, deletions: 0 }, nonEmpty: true }),
   });
   return { orch, parentCtx, receipts: rc.appended, promoteCalls };
 }

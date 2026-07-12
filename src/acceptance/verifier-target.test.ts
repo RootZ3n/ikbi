@@ -8,6 +8,21 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { cleanup, makeGitRepo, makeIdentities, makeManager, realGovernedExec, realOrchestrator, stubRoles } from "./harness.js";
+import type { RoleFn, WorkerRole } from "../modules/worker-model/contract.js";
+
+// Adjudication authority (IKBI_LEGACY_COMPLETION=off): the canonical core reads the critic's
+// `detail.pass === true` as the goal-alignment signal. The shared harness stub critic reports
+// `outcome:"success"` but carries no `detail.pass`, so an authoritative run would RETAIN
+// (critic-fail-exhausted) even on a real-git GREEN build. These promotion-expecting acceptance
+// tests therefore attach an explicit GREEN critic verdict — the same labeled fact production's
+// real critic emits — WITHOUT weakening any assertion. (Tests that never reach promotion, e.g.
+// the no-manifest fast-fail, do not need it.)
+function withGreenCritic(roles: Partial<Record<WorkerRole, RoleFn>>): Partial<Record<WorkerRole, RoleFn>> {
+  return {
+    ...roles,
+    critic: async () => ({ role: "critic", outcome: "success", summary: "critic", detail: { pass: true } }),
+  };
+}
 
 // WORK ORDER 2 (contract change): a no-manifest target used to run the full pipeline and surface a
 // verifier RED. The orchestrator now FAST-FAILS such a target BEFORE dispatching any role — no model
@@ -53,7 +68,7 @@ test("HB-1: a valid target with a passing check ⇒ verifier GREEN, PROMOTED (le
     const { parentCtx, resolveIdentity, roleClaim } = makeIdentities();
     const orch = realOrchestrator({
       targetRepo: repo, manager, governedExec: realGovernedExec(["git"]), resolveIdentity, roleClaim,
-      roles: stubRoles({ write: { path: "feature.txt", content: "the fix\n" } }),
+      roles: withGreenCritic(stubRoles({ write: { path: "feature.txt", content: "the fix\n" } })),
     });
     const result = await orch.run({ taskId: "t-green", targetRepo: repo, goal: "add feature" }, parentCtx);
 
@@ -88,7 +103,7 @@ test("HB-1: ladder is the production default ⇒ real test script runs, scope-st
     const orch = realOrchestrator({
       targetRepo: repo, manager, governedExec: realGovernedExec(["node", "git", "npm", "pnpm"]), resolveIdentity, roleClaim,
       // Write a CODE file so the ladder's impact planning sees a relevant change to scope to.
-      roles: stubRoles({ write: { path: "feature.ts", content: "export const fix = 1;\n" } }),
+      roles: withGreenCritic(stubRoles({ write: { path: "feature.ts", content: "export const fix = 1;\n" } })),
     });
     const result = await orch.run({ taskId: "t-ladder", targetRepo: repo, goal: "add feature" }, parentCtx);
 

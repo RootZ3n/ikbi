@@ -60,6 +60,17 @@ const greenVerifier: RoleFn = async () => ({ role: "verifier", outcome: "success
 const passCritic: RoleFn = async () => ({ role: "critic", outcome: "success", summary: "c", detail: { pass: true } });
 const promoteIntegrator: RoleFn = async () => ({ role: "integrator", outcome: "success", summary: "i", detail: { decision: "promote", rationale: "s", evaluation: { approved: true } } });
 const find = (rs: Array<{ operation: string; metadata: Record<string, unknown> }>, op: string) => rs.find((r) => r.operation === op);
+/**
+ * INJECTED TEST FACT (adjudication seam) — a complete tree-bound GREEN work product for a promotable
+ * candidate. These seam tests drive fake role/workspace doubles (the builder never physically writes),
+ * so the authoritative adjudication core (which requires a tree-bound WorkProduct) is fed this labeled
+ * fact via `deps.computeWorkProduct`. Production always computes from real git; no env var injects this.
+ * Every orchestrator test here reaches its real chokepoint (fence, identity block, quarantine) with the
+ * fact available — none is a "no-work" scenario, so all use the promotable fact.
+ */
+function promotableWorkProduct(treeHash = "test-tree-green"): NonNullable<OrchestratorDeps["computeWorkProduct"]> {
+  return async () => ({ treeHash, diffStat: { filesChanged: 1, insertions: 1, deletions: 0 }, nonEmpty: true });
+}
 function gitInit(dir: string): void {
   const g = (...a: string[]): string => execFileSync("git", ["-C", dir, ...a], { encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } });
   g("init", "-q"); writeFileSync(join(dir, "a.ts"), "export const a = 1;"); g("add", "-A"); g("commit", "-q", "-m", "base");
@@ -86,6 +97,7 @@ function makeRun(over: { roles?: OrchestratorDeps["roles"]; gateWall?: Orchestra
     roles: over.roles ?? { scout: async () => ({ role: "scout", outcome: "success", summary: "s" }), verifier: greenVerifier, critic: passCritic, integrator: promoteIntegrator },
     invokeModel: async () => { throw new Error("unused"); }, governedExec: greenExec, builderModel: "deepseek-v4-flash",
     gateWall: over.gateWall ?? allowGate,
+    computeWorkProduct: promotableWorkProduct(), // injected adjudication fact — the fake builder writes no disk
     ...(over.resolveWorkspaceIdentity !== undefined ? { resolveWorkspaceIdentity: over.resolveWorkspaceIdentity } : {}),
   });
   return { run: (extra: Record<string, unknown> = {}) => orch.run({ taskId: "t13", targetRepo: dir, goal: "do the thing", ...extra }, parentCtx), receipts: rc.appended, dir };
@@ -121,6 +133,7 @@ test("A2 [MUTATION 2] (req 2): a REAL uncancellable timeout (the losing promise 
     workspaces: { allocate: async () => handle, diff: async () => "d", promote: async (hh): Promise<PromoteResult> => ({ promoted: true, workspaceId: hh.id, targetBranch: hh.baseBranch, beforeRef: "a", afterRef: "b" }), discard: async (hh): Promise<DiscardResult> => ({ workspaceId: hh.id, removed: true }), retain: async (hh): Promise<DiscardResult> => ({ workspaceId: hh.id, removed: false }), commit: async () => true },
     events: fakeBus, receipts: rc.receipts, trust: stubTrust, resolveIdentity, roleClaim,
     roles: rolesWith(slowBuilder), invokeModel: async () => { throw new Error("unused"); }, governedExec: greenExec, builderModel: "deepseek-v4-flash", gateWall: allowGate,
+    computeWorkProduct: promotableWorkProduct(), // injected adjudication fact — the timeout fence is the real chokepoint
   });
   const result = await orch.run({ taskId: "t13rt", targetRepo: dir, goal: "g" }, parentCtx);
   assert.equal(result.promoted, false, "an uncancellable timed-out builder (abandoned promise) does not autonomously promote");

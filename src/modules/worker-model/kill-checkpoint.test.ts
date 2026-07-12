@@ -39,6 +39,8 @@ function capturingRoles() {
       seen.push(ctx);
       if (r === "integrator") return { role: r, outcome: "success", summary: r, detail: { decision: "promote", evaluation: { approved: true } } };
       if (r === "verifier") return { role: r, outcome: "success", summary: r, detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }] } };
+      // A GREEN critic states its PASS verdict (`detail.pass`) — the field the authoritative core reads.
+      if (r === "critic") return { role: r, outcome: "success", summary: r, detail: { pass: true } };
       return { role: r, outcome: "success", summary: r };
     };
   }
@@ -66,8 +68,12 @@ const task: WorkerTask = { taskId: "t-1", targetRepo: "/repo", goal: "do the thi
 /** An ALLOWING gate-wall — a promote REQUIRES gate-wall authorization (H5). */
 const allowGate: NonNullable<OrchestratorDeps["gateWall"]> = { evaluate: async () => ({ allow: true, reason: "test gate allows" }) };
 
+function promotableWorkProduct(treeHash = "test-tree-green"): NonNullable<OrchestratorDeps["computeWorkProduct"]> {
+  return async () => ({ treeHash, diffStat: { filesChanged: 1, insertions: 1, deletions: 0 }, nonEmpty: true });
+}
+
 function deps(killCheck: NonNullable<OrchestratorDeps["killCheck"]>, ws: ReturnType<typeof fakeWorkspaces>, cap: ReturnType<typeof capturingRoles>, ids: ReturnType<typeof makeIdentities>): OrchestratorDeps {
-  return { config: ENABLED, resolveIdentity: ids.resolveIdentity, roleClaim: ids.roleClaim, roles: cap.roles, workspaces: ws.workspaces, trust: fakeTrust(), receipts: fakeReceipts(), events: noopBus() as unknown as NonNullable<OrchestratorDeps["events"]>, gateWall: allowGate, invokeModel: async () => { throw new Error("unused"); }, killCheck };
+  return { config: ENABLED, resolveIdentity: ids.resolveIdentity, roleClaim: ids.roleClaim, roles: cap.roles, workspaces: ws.workspaces, trust: fakeTrust(), receipts: fakeReceipts(), events: noopBus() as unknown as NonNullable<OrchestratorDeps["events"]>, gateWall: allowGate, invokeModel: async () => { throw new Error("unused"); }, killCheck, computeWorkProduct: promotableWorkProduct() };
 }
 
 // ── PREVENT NEW WORK ─────────────────────────────────────────────────────────

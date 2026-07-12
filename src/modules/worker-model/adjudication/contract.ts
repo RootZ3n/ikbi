@@ -65,6 +65,13 @@ export interface WorkAssessment {
   readonly testEvidence: TestEvidence;
   /** The tree hash the verifier actually ran against. */
   readonly treeHash: string;
+  /**
+   * Whether an EXPLICIT, named no-tests policy (`task.noTestsPolicy` / `IKBI_ALLOW_NO_TESTS=true`) permits
+   * promoting THIS candidate on `absent` test evidence (Phase 10). Default undefined ⇒ false ⇒ a repo with
+   * no test suite is NOT autonomously promotable. This is a named policy fact, NOT a fallback for missing
+   * evidence: only `absent` (genuinely no test check) is exempted — `zero`/`unverified` still block.
+   */
+  readonly noTestsAcceptable?: boolean;
 }
 
 /**
