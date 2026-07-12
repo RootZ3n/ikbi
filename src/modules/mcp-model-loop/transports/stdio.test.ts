@@ -183,3 +183,37 @@ test("L3: callTool with malformed argument JSON falls back to empty arguments an
     await t.close();
   }
 });
+
+// ── C12: env scrub + bounded line buffer ───────────────────────────────────────
+import { scrubSecretEnv } from "./stdio.js";
+
+test("scrubSecretEnv strips secret-shaped vars, keeps functional ones (Codex C12)", () => {
+  const scrubbed = scrubSecretEnv({
+    PATH: "/usr/bin", HOME: "/home/x", LANG: "en_US.UTF-8",
+    ANTHROPIC_API_KEY: "sk-secret", GITHUB_TOKEN: "ghp_x", MY_PASSWORD: "p", AWS_SECRET_ACCESS_KEY: "s", SESSION_TOKEN: "t",
+  });
+  assert.equal(scrubbed.PATH, "/usr/bin");
+  assert.equal(scrubbed.HOME, "/home/x");
+  assert.equal(scrubbed.LANG, "en_US.UTF-8");
+  for (const k of ["ANTHROPIC_API_KEY", "GITHUB_TOKEN", "MY_PASSWORD", "AWS_SECRET_ACCESS_KEY", "SESSION_TOKEN"]) {
+    assert.equal(scrubbed[k], undefined, `${k} must be scrubbed`);
+  }
+});
+
+test("stdio: a newline-less stdout flood fails closed via the bounded buffer (Codex C12)", async () => {
+  let dataCb: ((c: Buffer | string) => void) | undefined;
+  let killed = false;
+  const spawn: SpawnLike = () => ({
+    stdin: { write() { return true; } },
+    stdout: { on(_e: string, cb: (c: Buffer | string) => void) { dataCb = cb; } },
+    stderr: { on() { /* noop */ } },
+    on() { /* noop */ },
+    kill() { killed = true; },
+  } as unknown as SpawnedChild);
+  const t = createStdioTransport({ command: "flooder", spawnImpl: spawn, timeoutMs: 2000 });
+  const connectP = t.connect(); // awaits the initialize response, which never comes
+  await new Promise((r) => setImmediate(r)); // let connect spawn + register the stdout handler
+  dataCb?.("x".repeat(1_000_001)); // > MAX_LINE_BUFFER, no newline → fail closed
+  await assert.rejects(connectP, /line buffer|closing/i);
+  assert.equal(killed, true, "the misbehaving MCP child was killed");
+});

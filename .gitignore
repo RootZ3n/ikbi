@@ -24,10 +24,17 @@ state/
 # Proving-ground fixtures (temp repos with node_modules); the isolated `state/` roots are already
 # covered by the unanchored `state/` rule above. The small .md/.jsonl evidence stays committable.
 reports/proving-ground/*/fixtures/
+# Reachability harness work dir (coverage dumps, isolated state, fixtures) — ephemeral.
+# The committed evidence is scripts/proving-ground/REACHABILITY-REPORT.md.
+reports/proving-ground/reachability/
 
 # Editor / OS cruft
 .DS_Store
 *.swp
 .idea/
 .vscode/
-memory-governor/
+# Runtime proposal store (only if state ever lands at the repo root). Root-ANCHORED so it
+# does NOT shadow the source module src/modules/memory-governor/ — an unanchored pattern
+# silently untracked new source files there.
+/memory-governor/
+scripts/ui-verify/node_modules/

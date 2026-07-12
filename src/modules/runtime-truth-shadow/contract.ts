@@ -1,6 +1,11 @@
 /**
  * ikbi runtime-truth-shadow - THE MODULE CONTRACT (versioned).
  *
+ * NAMING NOTE: this is NOT ikbi's filesystem shadow workspace or isolation layer. It is cognition
+ * telemetry: a read-only "shadow" comparison against Truth Firewall advisory summaries. The real
+ * disposable worktree / promotion isolation system lives in `src/core/workspace/` (especially
+ * `src/core/workspace/manager.ts`).
+ *
  * A SHADOW-ONLY bridge that lets ikbi's cognition layer consume a Truth Firewall
  * RuntimeTruthReader's advisory output as READ-ONLY context. It is strictly observational:
  *   - it NEVER changes a cognition decision (shadow output is logged/receipted for comparison only);

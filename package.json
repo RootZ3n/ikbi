@@ -3,9 +3,8 @@
   "version": "0.1.0-rc.1",
   "description": "ikbi (Choctaw: \"to build\") — the build/repair engine for a lab of agents. A localhost/Tailscale-reachable system service.",
   "type": "module",
-  "author": "Jeffrey Miller",
-  "license": "MIT",
   "author": "RootZ3n <rootz3n@proton.me>",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/RootZ3n/ikbi.git"
@@ -14,11 +13,6 @@
   "bugs": {
     "url": "https://github.com/RootZ3n/ikbi/issues"
   },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/RootZ3n/ikbi.git"
-  },
-  "homepage": "https://github.com/RootZ3n/ikbi#readme",
   "keywords": [
     "build-engine",
     "agent-orchestration",
@@ -56,7 +50,8 @@
     "!vendor/velum-ai/src/**",
     "!vendor/velum-ai/tests/**",
     "!vendor/velum-ai/examples/**",
-    "!vendor/velum-ai/**/*.map"
+    "!vendor/velum-ai/**/*.map",
+    "ui/"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -64,7 +59,8 @@
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "sh -c 'IKBI_STATE_ROOT=$(mktemp -d /tmp/ikbi-test-state.XXXXXX) env -u IKBI_OPERATOR_TOKEN -u IKBI_WORKER_TOKEN IKBI_ALLOW_INSECURE_DEV_KEYS=true node --import tsx --test \"src/**/*.test.ts\"'",
+    "test": "sh -c 'IKBI_STATE_ROOT=$(mktemp -d /tmp/ikbi-test-state.XXXXXX) env -u IKBI_OPERATOR_TOKEN -u IKBI_WORKER_TOKEN IKBI_ALLOW_INSECURE_DEV_KEYS=true IKBI_ENABLE_AUTONOMOUS_PROMOTION=true node --import tsx --test \"src/**/*.test.ts\"'",
+    "test:abina": "sh -c 'IKBI_STATE_ROOT=$(mktemp -d /tmp/ikbi-abina-state.XXXXXX) env -u IKBI_OPERATOR_TOKEN -u IKBI_WORKER_TOKEN IKBI_ALLOW_INSECURE_DEV_KEYS=true node --import tsx --test src/modules/abina/*.test.ts'",
     "public:smoke": "bash scripts/public-smoke.sh"
   },
   "dependencies": {

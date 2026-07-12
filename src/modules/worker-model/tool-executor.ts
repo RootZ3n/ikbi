@@ -31,8 +31,8 @@
  * chokepoint before it re-enters the model. This module only produces; it never neutralizes.
  */
 
-import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { readFileSync, readdirSync } from "node:fs";
+import { createHash } from "node:crypto";
 
 import type { OperationContext } from "../../core/identity/index.js";
 import type { GbrainBridge } from "../../core/gbrain-bridge.js";
@@ -40,7 +40,7 @@ import type { GovernedExec } from "../governed-exec/index.js";
 import type { ToolCall } from "../../core/provider/index.js";
 import type { MemoryGovernor } from "../memory-governor/contract.js";
 import { isGovernedPath } from "../memory-governor/guard.js";
-import { confinePath, type ToolCallError } from "./builder-tools/confine.js";
+import { confinePath, writeConfinedFile, type ToolCallError } from "./builder-tools/confine.js";
 import { runSearchFiles } from "./builder-tools/search-files.js";
 import { runGlob } from "./builder-tools/glob.js";
 import { runPatch } from "./builder-tools/patch.js";
@@ -108,9 +108,14 @@ export interface ToolExecutionResult {
   readonly rejection?: ToolCallError;
 }
 
-/** Result of the governance chokepoint: either intercepted (with the PROPOSED message) or not. */
+/**
+ * Result of the governance chokepoint: either intercepted (with the message the caller
+ * feeds back to the model) or not. An intercepted result is a stored proposal by default;
+ * `ok: false` marks an intercepted REJECTION (e.g. a governed patch that cannot be cleanly
+ * resolved) — the write is still withheld, but the message is an ERROR, not a PROPOSED.
+ */
 export type GovernedInterception =
-  | { readonly intercepted: true; readonly message: string; readonly proposalId: string }
+  | { readonly intercepted: true; readonly message: string; readonly proposalId: string; readonly ok?: boolean }
   | { readonly intercepted: false };
 
 /** The mutation tools whose target PATH the memory governor checks against the governed surfaces. */
@@ -173,11 +178,27 @@ export async function interceptMemoryGovernor(deps: ToolExecutorDeps, call: Tool
     // Resolve to absolute path so the apply function can find the file at approve-time
     // (the worktree may be gone by then if it was a managed workspace).
     const absTarget = target.startsWith("/") ? target : `${deps.worktreeReal}/${target}`;
-    const content = proposalContentFor(call.name, args);
+    // Read the current target so patch/multi_edit are resolved to the COMPLETE resulting
+    // file (never a fragment) and the proposal carries a CAS base hash (Codex C8: approving
+    // a patch used to overwrite the whole file with just new_string).
+    let before: string | null = null;
+    try { before = readFileSync(absTarget, "utf8"); } catch { before = null; }
+    const write = computeProposalWrite(call.name, args, before);
+    if (!write.ok) {
+      // A governed write that cannot be cleanly resolved is WITHHELD (never falls through to
+      // a direct write, never creates a clobbering proposal) and surfaces an actionable error.
+      return {
+        intercepted: true,
+        ok: false,
+        proposalId: "",
+        message: `ERROR: ${call.name} to "${target}" was not proposed: ${write.error}`,
+      };
+    }
     const proposal = await governor.propose({
       surface,
       target: absTarget,
-      content,
+      content: write.content,
+      baseSha256: write.baseSha256,
       reason: `${call.name} to ${target}`,
       agentId: deps.agentId,
     });
@@ -191,12 +212,51 @@ export async function interceptMemoryGovernor(deps: ToolExecutorDeps, call: Tool
   return NOT_INTERCEPTED;
 }
 
-/** Derive the proposal content for a governed file write (the new text we would otherwise apply). */
-function proposalContentFor(toolName: string, args: Record<string, unknown>): string {
-  if (toolName === "write_file") return typeof args.content === "string" ? args.content : "";
-  if (toolName === "patch") return typeof args.new_string === "string" ? args.new_string : "";
-  if (toolName === "multi_edit") return Array.isArray(args.edits) ? JSON.stringify(args.edits) : "";
-  return "";
+function sha256(s: string): string {
+  return createHash("sha256").update(s, "utf8").digest("hex");
+}
+
+/** Full resulting file content for a governed write, plus the CAS base hash — or a reason it can't apply. */
+type ProposalWrite = { ok: true; content: string; baseSha256: string } | { ok: false; error: string };
+
+/**
+ * Compute the COMPLETE resulting file content for a governed write (Codex C8). For patch /
+ * multi_edit this DRY-RUNS the edit in memory against `before`, mirroring the exact-unique-match
+ * semantics of builder-tools/patch.ts + multi-edit.ts, so the proposal stores the whole file
+ * rather than a fragment. `baseSha256` binds the result to the content it was computed against.
+ */
+function computeProposalWrite(toolName: string, args: Record<string, unknown>, before: string | null): ProposalWrite {
+  const base = before ?? "";
+  const baseSha256 = sha256(base);
+  if (toolName === "write_file") {
+    return { ok: true, content: typeof args.content === "string" ? args.content : "", baseSha256 };
+  }
+  if (toolName === "patch") {
+    const oldString = typeof args.old_string === "string" ? args.old_string : "";
+    const newString = typeof args.new_string === "string" ? args.new_string : "";
+    if (oldString.length === 0) return { ok: false, error: "patch requires a non-empty 'old_string'" };
+    const occurrences = base.split(oldString).length - 1;
+    if (occurrences === 0) return { ok: false, error: "old_string not found in the target (it must match exactly, including whitespace)" };
+    if (occurrences > 1) return { ok: false, error: `old_string occurs ${occurrences} times; it must be unique — add surrounding context` };
+    return { ok: true, content: base.replace(oldString, newString), baseSha256 };
+  }
+  if (toolName === "multi_edit") {
+    if (!Array.isArray(args.edits) || args.edits.length === 0) return { ok: false, error: "multi_edit requires a non-empty 'edits' array" };
+    let next = base;
+    for (let i = 0; i < args.edits.length; i += 1) {
+      const e = args.edits[i] as Record<string, unknown> | null;
+      if (typeof e !== "object" || e === null) return { ok: false, error: `edit ${i} is not an object` };
+      const find = typeof e.find === "string" ? e.find : "";
+      const replace = typeof e.replace === "string" ? e.replace : "";
+      if (find.length === 0) return { ok: false, error: `edit ${i} has an empty 'find' (a non-empty anchor is required)` };
+      const occurrences = next.split(find).length - 1;
+      if (occurrences === 0) return { ok: false, error: `edit ${i} — text not found (it must match exactly, including whitespace)` };
+      if (occurrences > 1) return { ok: false, error: `edit ${i} — anchor occurs ${occurrences} times; it must be unique` };
+      next = next.replace(find, replace);
+    }
+    return { ok: true, content: next, baseSha256 };
+  }
+  return { ok: false, error: `unsupported governed tool ${toolName}` };
 }
 
 function errMsg(e: unknown): string {
@@ -218,7 +278,7 @@ function isFailure(output: string): boolean {
 export async function executeTool(deps: ToolExecutorDeps, call: ToolCall): Promise<ToolExecutionResult> {
   // GOVERNANCE FIRST: a governed write never touches the fs — it becomes a proposal.
   const gov = await interceptMemoryGovernor(deps, call);
-  if (gov.intercepted) return { output: gov.message, ok: true, proposed: true };
+  if (gov.intercepted) return { output: gov.message, ok: gov.ok !== false, proposed: gov.ok !== false };
 
   const args = parseArgs(call);
   const worktreeReal = deps.worktreeReal;
@@ -266,8 +326,7 @@ export async function executeTool(deps: ToolExecutorDeps, call: ToolCall): Promi
       let before: string | null = null;
       try { before = readFileSync(c.full, "utf8"); } catch { before = null; }
       try {
-        mkdirSync(dirname(c.full), { recursive: true });
-        writeFileSync(c.full, content, "utf8");
+        writeConfinedFile(worktreeReal, c, content);
         return { output: `wrote ${Buffer.byteLength(content, "utf8")} bytes to ${c.rel}`, ok: true, wrote: c.rel, rel: c.rel, full: c.full, before, after: content };
       } catch (e) {
         return { output: `ERROR: write failed: ${errMsg(e)}`, ok: false, rel: c.rel, full: c.full };

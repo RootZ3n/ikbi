@@ -204,6 +204,10 @@ function parseCapabilitiesMaybe(v: unknown, source: string): Partial<ModelCapabi
     if (typeof r.supports_tools !== "boolean") throw new Error(`Provider roster ${source}: capabilities.supports_tools must be a boolean`);
     caps.supports_tools = r.supports_tools;
   }
+  if (r.supports_thinking !== undefined) {
+    if (typeof r.supports_thinking !== "boolean") throw new Error(`Provider roster ${source}: capabilities.supports_thinking must be a boolean`);
+    caps.supports_thinking = r.supports_thinking;
+  }
   if (r.reasoning_level !== undefined) {
     if (typeof r.reasoning_level !== "string" || !REASONING_LEVELS.has(r.reasoning_level)) {
       throw new Error(`Provider roster ${source}: capabilities.reasoning_level must be one of low|medium|high`);
@@ -266,6 +270,16 @@ function parseModelSpec(v: unknown, source: string): ModelSpec {
   };
 }
 
+/** True when a base URL targets the Anthropic API host (used to catch the shim misconfiguration). */
+export function isAnthropicBaseUrl(baseUrl: unknown): boolean {
+  if (typeof baseUrl !== "string") return false;
+  try {
+    return new URL(baseUrl).hostname === "api.anthropic.com";
+  } catch {
+    return /(^|\/\/|\.)api\.anthropic\.com(\/|$|:)/.test(baseUrl);
+  }
+}
+
 function parseProviderEntry(v: unknown, source: string): ModelProvider {
   const r = asRecord(v, "provider", source);
   const kind = r.kind ?? "openai-compatible";
@@ -281,6 +295,18 @@ function parseProviderEntry(v: unknown, source: string): ModelProvider {
       baseUrl: asString(r.baseUrl, "provider.baseUrl", source),
       apiKey: apiKeyA,
     });
+  }
+  // FAIL CLEARLY (not silently): routing an Anthropic base URL through the OpenAI-compatible shim
+  // silently forfeits native tool_use fidelity + prompt caching — the exact misconfiguration this
+  // release migrates away from. Reject it at load with an actionable fix. Backward compat is
+  // preserved WHERE APPROPRIATE via an explicit opt-out for anyone who truly wants the shim.
+  if (isAnthropicBaseUrl(r.baseUrl) && process.env.IKBI_ALLOW_ANTHROPIC_SHIM !== "true") {
+    throw new Error(
+      `Provider roster ${source}: provider "${String(r.id)}" points at the Anthropic API ` +
+        `("${String(r.baseUrl)}") but uses kind "openai-compatible" (the shim), which forfeits ` +
+        `native tool_use and prompt caching. Set "kind": "anthropic" for the native /messages ` +
+        `adapter. To intentionally keep the OpenAI-compat shim, set IKBI_ALLOW_ANTHROPIC_SHIM=true.`,
+    );
   }
   const headersRaw = r.headers;
   const extraHeaders: Record<string, string> = {};

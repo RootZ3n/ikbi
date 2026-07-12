@@ -51,6 +51,9 @@ export interface GateWallActionExec {
   readonly args: readonly string[];
   readonly sudo: boolean;
   readonly purpose?: string;
+  /** STRUCTURED AUTHORITY (not the free-text purpose): `true` iff a trusted check-runner may run scripts.
+   *  Carried from the ExecRequest so gate-wall's policy re-check reads the same flag as governed-exec. */
+  readonly verifier?: boolean;
 }
 
 /**

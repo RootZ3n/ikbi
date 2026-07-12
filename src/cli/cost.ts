@@ -13,6 +13,7 @@
 import { registerCommand } from "./registry.js";
 import { receipts as coreReceipts } from "../core/receipt/index.js";
 import type { Receipt, ReceiptQuery } from "../core/receipt/index.js";
+import { groupReceiptsByTask } from "../core/receipt/grouping.js";
 
 /** The read surface the command needs (the store's query). Injectable for tests. */
 export interface ReceiptReader {
@@ -91,12 +92,17 @@ export function createCostCli(deps: CostCliDeps = {}) {
       setExit(1);
       return;
     }
+    // H4: the TASK TOTAL is the AUTHORITATIVE per-task cost (the worker.run.summary's cumulative
+    // total, via the shared grouping) — NOT the sum of every receipt. Naively summing double-counted,
+    // because the run-summary AND the fix-loop/critic-fix/escalation receipts each stamp a CUMULATIVE
+    // runCost() on top of the per-role costs, inflating a real build 3-4x.
+    const total = groupReceiptsByTask(trail).reduce((s, g) => s + g.costUsd, 0);
+    // Per-model breakdown from PER-ROLE receipts only — they carry a per-role cost; the cumulative-
+    // stamped run-summary/retry receipts would double-count here too.
     const perModel = new Map<string, number>();
-    let total = 0;
     for (const r of trail) {
-      const c = costOf(r);
-      total += c;
-      perModel.set(modelOf(r), (perModel.get(modelOf(r)) ?? 0) + c);
+      if (!r.operation.startsWith("worker.role.")) continue;
+      perModel.set(modelOf(r), (perModel.get(modelOf(r)) ?? 0) + costOf(r));
     }
 
     out(`ikbi cost for task ${task}\n`);
@@ -117,13 +123,17 @@ export function createCostCli(deps: CostCliDeps = {}) {
     const perTask = new Map<string, number>();
     let total = 0;
 
+    // H4: aggregate by TASK using the authoritative per-task cost (grouping), not per-receipt sums —
+    // the run-summary + cumulative-stamped retry receipts would otherwise inflate the total 3-4x.
+    for (const g of groupReceiptsByTask(all)) {
+      total += g.costUsd;
+      perTask.set(g.taskId, g.costUsd);
+      perDay.set(dayOf(g.latestTimestamp), (perDay.get(dayOf(g.latestTimestamp)) ?? 0) + g.costUsd);
+    }
+    // Per-model from per-role receipts only (accurate per-role costs, not the cumulative stamps).
     for (const r of all) {
-      const c = costOf(r);
-      total += c;
-      perDay.set(dayOf(r.timestamp), (perDay.get(dayOf(r.timestamp)) ?? 0) + c);
-      perModel.set(modelOf(r), (perModel.get(modelOf(r)) ?? 0) + c);
-      const task = taskIdOf(r);
-      if (task !== undefined) perTask.set(task, (perTask.get(task) ?? 0) + c);
+      if (!r.operation.startsWith("worker.role.")) continue;
+      perModel.set(modelOf(r), (perModel.get(modelOf(r)) ?? 0) + costOf(r));
     }
 
     const builds = perTask.size;

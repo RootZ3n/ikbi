@@ -1,0 +1,117 @@
+/**
+ * isPolicyViolation — decides whether a REJECTED builder tool call taints promotion (discards an
+ * otherwise-verified build). Recalibrated for the trusted-local context: a bare allowlist denial
+ * BLOCKED the command (confinement held, no effect), so a benign dev/build tool the model improvised
+ * must NOT discard verified-clean work — but a reach for the network / a raw shell / privilege
+ * escalation / a destructive tool STILL taints even when blocked, and genuine boundary breaches
+ * (scope escape, write-scope, dependency-dir, "only for verifier/check") always taint.
+ */
+import assert from "node:assert/strict";
+import { test } from "node:test";
+
+import { isPolicyViolation } from "./builder.js";
+import type { ToolCallError } from "./builder-tools/confine.js";
+
+const denied = (bin: string): ToolCallError => ({ tool: "terminal", error: `binary '${bin}' is not on the allowlist (denied)` });
+
+test("a blocked BENIGN dev/build tool does not taint (verified-clean work survives)", () => {
+  for (const bin of ["tsc", "yarn", "npx", "make", "eslint", "prettier", "tsx", "vitest"]) {
+    assert.equal(isPolicyViolation(denied(bin)), false, `${bin} should be benign`);
+  }
+});
+
+test("a blocked read-only probe does not taint", () => {
+  for (const bin of ["which", "env", "pwd", "whoami"]) {
+    assert.equal(isPolicyViolation(denied(bin)), false, `${bin} should be benign`);
+  }
+});
+
+test("a blocked DANGEROUS binary still taints (network / shell / privilege / destructive)", () => {
+  for (const bin of ["curl", "wget", "ssh", "nc", "bash", "sh", "sudo", "su", "rm", "dd", "chmod", "systemctl"]) {
+    assert.equal(isPolicyViolation(denied(bin)), true, `${bin} must taint`);
+  }
+});
+
+test("a blocked `mv` (rename inside the worktree) does NOT taint, but data-destroying tools still do", () => {
+  // REGRESSION: `mv` was grouped with rm/dd/shred and tainted promotion. A cheap builder with no rename
+  // tool improvises `mv a b` to reorganize its OWN files; the governor blocks it (no effect) and the
+  // sandbox bounds any move. One denied `mv` discarded a fully-verified osapa build. Renaming is not a
+  // red flag — data destruction is, so those stay tainting.
+  assert.equal(isPolicyViolation(denied("mv")), false, "a denied rename must not discard a green build");
+  for (const bin of ["rm", "rmdir", "dd", "mkfs", "shred"]) {
+    assert.equal(isPolicyViolation(denied(bin)), true, `${bin} (data-destroying) must still taint`);
+  }
+});
+
+const deniedCmd = (bin: string, command: string): ToolCallError => ({ tool: "terminal", path: command, error: `binary '${bin}' is not on the allowlist (denied)` });
+
+test("a blocked `rm` of WORKTREE-RELATIVE scratch files does NOT taint (benign cleanup, no effect)", () => {
+  // REGRESSION (bokahli run 2): the builder made scratch files, improvised `rm src/debug_assess.ts
+  // src/run_test.ts` to clean up (no delete tool), the governor blocked it (no effect), and the ATTEMPT
+  // discarded an all-5-roles-green build. Deleting its own worktree files is ordinary build behavior.
+  assert.equal(isPolicyViolation(deniedCmd("rm", "rm src/debug_assess.ts src/run_test.ts")), false);
+  assert.equal(isPolicyViolation(deniedCmd("rm", "rm -f tmp/scratch.ts")), false);
+  assert.equal(isPolicyViolation(deniedCmd("rm", "rm -rf build")), false, "removing a scratch dir it made is benign");
+  assert.equal(isPolicyViolation(deniedCmd("rmdir", "rmdir src/empty")), false);
+});
+
+test("a blocked `rm` reaching OUTSIDE the worktree / at the root / via a glob STILL taints", () => {
+  for (const cmd of ["rm -rf /", "rm -rf ~", "rm ../secret.ts", "rm /etc/passwd", "rm src/../../x", "rm *", "rm src/*.ts", "rm .", "rm -rf ..", "rm -rf ./", "rm ./", "rm src/..", "rm a/../.."]) {
+    assert.equal(isPolicyViolation(deniedCmd("rm", cmd)), true, `\`${cmd}\` must taint (dangerous target)`);
+  }
+  // an unparseable / target-less rm fails closed (taints)
+  assert.equal(isPolicyViolation(deniedCmd("rm", "rm")), true);
+  assert.equal(isPolicyViolation(deniedCmd("rm", "rm -rf")), true);
+  // data/device destroyers are never benign cleanup even with a worktree path
+  assert.equal(isPolicyViolation(deniedCmd("dd", "dd if=/dev/zero of=src/x")), true);
+});
+
+test("a BLOCKED write in a read-only verify pass does not taint (benign, no effect)", () => {
+  assert.equal(isPolicyViolation({ tool: "write_file", path: "src/x.ts", error: "write_scope is 'none' — read-only mode" }), false);
+});
+
+test("a new-file-only OVERWRITE attempt on an existing file still taints", () => {
+  assert.equal(isPolicyViolation({ tool: "write_file", path: "src/x.ts", error: "write_scope is 'new_only' — cannot modify existing file" }), true);
+});
+
+test("genuine boundary breaches always taint", () => {
+  assert.equal(isPolicyViolation({ tool: "write_file", error: 'path "../x" escapes the worktree' }), true);
+  assert.equal(isPolicyViolation({ tool: "write_file", error: "WRITE SCOPE VIOLATION: outside declared scope" }), true);
+  assert.equal(isPolicyViolation({ tool: "write_file", error: "write to dependency directory node_modules is not allowed" }), true);
+  assert.equal(isPolicyViolation({ tool: "terminal", error: "terminal is only for verifier/check purposes" }), true);
+});
+
+test("a path-confinement /denied/ that is NOT a bare allowlist-binary denial still taints", () => {
+  assert.equal(isPolicyViolation({ tool: "terminal", error: "egress denied: attempted network connection" }), true);
+});
+
+test("a blocked builder attempt to run the project's TEST/CHECK command does NOT taint (benign self-verification)", () => {
+  // Captured live from a multi-step Bokahli build: the builder reached for `pnpm test` to check its
+  // own work; pnpm scripts are reserved for the verifier/check role, so it was blocked. That is
+  // benign self-verification through the wrong tool (run_checks exists; the verifier runs the real
+  // checks; nothing executed) — it must NOT discard an otherwise-verified build.
+  const err = "pnpm script execution is allowed only for verifier/check runs";
+  assert.equal(isPolicyViolation({ tool: "terminal", error: err, path: "pnpm test" }), false, "pnpm test");
+  assert.equal(isPolicyViolation({ tool: "terminal", error: err, path: "pnpm run typecheck" }), false, "typecheck");
+  assert.equal(isPolicyViolation({ tool: "terminal", error: err, path: "pnpm run lint" }), false, "lint");
+  assert.equal(isPolicyViolation({ tool: "terminal", error: err, path: "pnpm build" }), false, "build");
+  // ANY runner's check-command denial is benign, not just pnpm (captured live from an osapa build:
+  // the builder ran `npx tsc --noEmit` to typecheck and it was tainting).
+  assert.equal(isPolicyViolation({ tool: "terminal", error: "npx script execution is allowed only for verifier/check runs", path: "npx tsc --noEmit" }), false, "npx tsc");
+  assert.equal(isPolicyViolation({ tool: "terminal", error: "yarn script execution is allowed only for verifier/check runs", path: "yarn test" }), false, "yarn test");
+  assert.equal(isPolicyViolation({ tool: "terminal", error: "bunx script execution is allowed only for verifier/check runs", path: "bunx tsc" }), false, "bunx tsc");
+});
+
+test("a blocked builder pnpm script that is NOT a check/test/build script STILL taints", () => {
+  // A non-verification pnpm script (deploy/publish/postinstall/arbitrary) is a genuine red flag —
+  // it could run arbitrary code — so a blocked attempt still taints even though confinement held.
+  const err = "pnpm script execution is allowed only for verifier/check runs";
+  assert.equal(isPolicyViolation({ tool: "terminal", error: err, path: "pnpm run deploy" }), true, "deploy");
+  assert.equal(isPolicyViolation({ tool: "terminal", error: err, path: "pnpm publish" }), true, "publish");
+  assert.equal(isPolicyViolation({ tool: "terminal", error: err, path: "pnpm run seed-db" }), true, "seed-db");
+});
+
+test("a plain tool-format error does not taint", () => {
+  assert.equal(isPolicyViolation({ tool: "write_file", error: "malformed arguments (not valid JSON)" }), false);
+  assert.equal(isPolicyViolation({ tool: "frobnicate", error: 'unknown tool "frobnicate"' }), false);
+});

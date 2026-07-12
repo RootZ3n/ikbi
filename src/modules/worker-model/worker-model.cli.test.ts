@@ -12,9 +12,12 @@ import { TRUST_FLOOR } from "../../core/trust/index.js";
 import type { DiscardResult, PromoteGovernance, PromoteResult, WorkspaceHandle } from "../../core/workspace/contract.js";
 import { createGateWall } from "../gate-wall/index.js";
 import { createOrchestrator, type OrchestratorDeps } from "./orchestrator.js";
-import { WORKER_ROLES, WorkerError, type RoleContext, type RoleFn, type WorkerResult, type WorkerRole, type WorkerTask } from "./contract.js";
+import { WORKER_ROLES, WorkerError, CONTRACT_VERSION, type RoleContext, type RoleFn, type WorkerResult, type WorkerRole, type WorkerTask } from "./contract.js";
 // Importing cli.js registers the `build` command at module load.
-import { createWorkerCli, parseBuildArgs, productionRoleClaim } from "./cli.js";
+import { createWorkerCli, loadScopePlan, parseBuildArgs, productionRoleClaim } from "./cli.js";
+import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join as tmpJoin } from "node:path";
 
 const silent = () => pino({ level: "silent" });
 const OPERATOR_TOKEN = "operator-token-value";
@@ -43,6 +46,7 @@ function capturingRoles() {
     roles[r] = async (ctx) => {
       seen.push(ctx);
       if (r === "integrator") return { role: r, outcome: "success", summary: r, detail: { decision: "promote", rationale: "test", evaluation: { approved: true } } };
+      if (r === "verifier") return { role: r, outcome: "success", summary: r, detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }] } };
       return { role: r, outcome: "success", summary: r };
     };
   }
@@ -141,23 +145,56 @@ test("productionRoleClaim returns the worker token for ALL roles; throws fail-cl
 });
 
 test("parseBuildArgs extracts --repo and leaves the goal", () => {
-  assert.deepEqual(parseBuildArgs(["fix", "the", "bug", "--repo", "/r"]), { repo: "/r", rest: ["fix", "the", "bug"] });
-  assert.deepEqual(parseBuildArgs(["g", "--repo=/x"]), { repo: "/x", rest: ["g"] });
-  assert.deepEqual(parseBuildArgs(["just", "a", "goal"]), { rest: ["just", "a", "goal"] });
+  assert.deepEqual(parseBuildArgs(["fix", "the", "bug", "--repo", "/r"]), { repo: "/r", unknownFlags: [], rest: ["fix", "the", "bug"] });
+  assert.deepEqual(parseBuildArgs(["g", "--repo=/x"]), { repo: "/x", unknownFlags: [], rest: ["g"] });
+  assert.deepEqual(parseBuildArgs(["just", "a", "goal"]), { unknownFlags: [], rest: ["just", "a", "goal"] });
 });
 
 test("parseBuildArgs parses --escalate (authorize the frontier consult)", () => {
-  assert.deepEqual(parseBuildArgs(["fix", "it", "--escalate"]), { escalate: true, rest: ["fix", "it"] });
+  assert.deepEqual(parseBuildArgs(["fix", "it", "--escalate"]), { escalate: true, unknownFlags: [], rest: ["fix", "it"] });
   assert.deepEqual(parseBuildArgs(["fix", "it"]).escalate, undefined, "frontier authorization is off by default");
 });
 
 test("parseBuildArgs parses --yes / -y (skip the Socratic interview)", () => {
-  assert.deepEqual(parseBuildArgs(["fix", "it", "--yes"]), { yes: true, rest: ["fix", "it"] });
-  assert.deepEqual(parseBuildArgs(["fix", "it", "-y"]), { yes: true, rest: ["fix", "it"] });
+  assert.deepEqual(parseBuildArgs(["fix", "it", "--yes"]), { yes: true, unknownFlags: [], rest: ["fix", "it"] });
+  assert.deepEqual(parseBuildArgs(["fix", "it", "-y"]), { yes: true, unknownFlags: [], rest: ["fix", "it"] });
   // absent ⇒ no `yes` key (so callers see undefined, the interview default)
-  assert.deepEqual(parseBuildArgs(["fix", "it"]), { rest: ["fix", "it"] });
+  assert.deepEqual(parseBuildArgs(["fix", "it"]), { unknownFlags: [], rest: ["fix", "it"] });
   // composes with the other flags
-  assert.deepEqual(parseBuildArgs(["g", "--repo=/x", "-y", "--cost"]), { repo: "/x", cost: true, yes: true, rest: ["g"] });
+  assert.deepEqual(parseBuildArgs(["g", "--repo=/x", "-y", "--cost"]), { repo: "/x", cost: true, yes: true, unknownFlags: [], rest: ["g"] });
+});
+
+test("#9: parseBuildArgs COLLECTS unknown flags (not folded into the goal) and honors `--` end-of-options", () => {
+  // A typo'd flag is captured, not swallowed into the goal.
+  assert.deepEqual(parseBuildArgs(["fix", "it", "--no-promote"]), { unknownFlags: ["--no-promote"], rest: ["fix", "it"] });
+  // `--` ends option parsing: a genuine leading-dash goal token survives as text.
+  assert.deepEqual(parseBuildArgs(["--", "--weird-goal-token"]), { unknownFlags: [], rest: ["--weird-goal-token"] });
+});
+
+test("parseBuildArgs parses --scope (bare ⇒ auto-detect) and --scope=<path> (explicit), never eating the goal", () => {
+  // Bare --scope ⇒ "" (auto-detect at repo root); the goal token is NOT consumed as the path.
+  assert.deepEqual(parseBuildArgs(["build", "the", "thing", "--scope"]), { scope: "", unknownFlags: [], rest: ["build", "the", "thing"] });
+  assert.deepEqual(parseBuildArgs(["g", "--scope=plan/SCOPE.md"]), { scope: "plan/SCOPE.md", unknownFlags: [], rest: ["g"] });
+  assert.equal(parseBuildArgs(["g"]).scope, undefined, "staging is off unless requested");
+});
+
+test("loadScopePlan: undefined ⇒ not requested; a real SCOPE.md ⇒ ordered stages; missing explicit path ⇒ notFound", async () => {
+  assert.deepEqual(await loadScopePlan(undefined, "/repo"), {}, "no --scope ⇒ {} (heuristic path unchanged)");
+
+  const repo = mkdtempSync(tmpJoin(tmpdir(), "ikbi-scope-"));
+  writeFileSync(tmpJoin(repo, "SCOPE.md"), "# Scope\n\n1. Core contracts (verify)\n2. Storage domain\n3. CPU domain\n");
+  const auto = await loadScopePlan("", repo); // bare flag ⇒ auto-detect at the repo root
+  assert.equal(auto.plan?.stages.length, 3, "the repo-root SCOPE.md is auto-detected and parsed");
+  assert.equal(auto.plan?.stages[0]?.verify, true, "the (verify) marker survives into the plan");
+
+  // An explicit relative path resolves against the repo too.
+  mkdirSync(tmpJoin(repo, ".ikbi"), { recursive: true });
+  writeFileSync(tmpJoin(repo, ".ikbi", "STAGES.md"), "- a\n- b\n");
+  assert.equal((await loadScopePlan(".ikbi/STAGES.md", repo)).plan?.stages.length, 2, "an explicit path is honored");
+
+  const missing = await loadScopePlan("does-not-exist.md", repo);
+  assert.equal(missing.plan, undefined);
+  assert.match(missing.notFound ?? "", /not found/, "an explicit missing path reports notFound (caller fails loudly)");
 });
 
 // ── --yes SKIPS the blocking Socratic interview (Fix 1) ──────────────────────
@@ -258,13 +295,43 @@ test("a gate-denied promote (probation parent) surfaces a discarded/partial outc
   const cli = createWorkerCli({ orchestrator, resolveIdentity, operatorToken: OPERATOR_TOKEN, workerToken: WORKER_TOKEN, stdout: cap2.stdout, stderr: cap2.stderr, setExit: cap2.setExit, now: () => 1, cwd: () => "/repo" });
 
   return cli.build(["ship", "it"]).then(() => {
-    assert.equal(cap2.exit, undefined, "a gate denial is NOT a crash");
+    // H2: a rejected build exits NON-ZERO (so `ikbi build && deploy` won't deploy) — but CLEANLY,
+    // via setExit(1), not a thrown crash. (Was previously exit undefined.)
+    assert.equal(cap2.exit, 1, "a gate denial exits 1 (not promoted), cleanly — not a crash");
     // Phase 2: rejected outcomes now emit failure detail + next hints on stderr.
     assert.match(cap2.err, /Build REJECTED/, "rejected outcome emits failure detail on stderr");
     assert.equal(gateDecision()?.allow, false, "the real gate-wall DENIED the probation promote");
     const summary = JSON.parse(cap2.out);
     assert.equal(summary.promoted, false, "not promoted");
     assert.notEqual(summary.outcome, "success");
+  });
+});
+
+test("H2/H3: --json emits ONLY the result JSON on stdout, narrative on stderr, and a failure exits 1", () => {
+  const failOrchestrator = {
+    run: async (task: WorkerTask): Promise<WorkerResult> => ({
+      contractVersion: "1.0.0", taskId: task.taskId, outcome: "failure" as const,
+      roles: [{ role: "builder" as const, outcome: "failure" as const, summary: "compile error", detail: { filesWritten: ["a.ts"] } }],
+      workspaceId: "ws-json", promoted: false, reason: "compile error",
+    }),
+  };
+  const cap2 = capture();
+  const cli = createWorkerCli({
+    orchestrator: failOrchestrator, resolveIdentity: makeResolver("trusted", "trusted"),
+    operatorToken: OPERATOR_TOKEN, workerToken: WORKER_TOKEN,
+    stdout: cap2.stdout, stderr: cap2.stderr, setExit: cap2.setExit, now: () => 1, cwd: () => "/repo",
+  });
+  return cli.build(["--json", "fix it"]).then(() => {
+    // stdout is a single clean JSON object — `ikbi build --json | jq` works.
+    const parsed = JSON.parse(cap2.out.trim());
+    assert.equal(parsed.outcome, "failure");
+    assert.equal(parsed.promoted, false);
+    assert.equal(parsed.reason, "compile error");
+    // Narrative / hints went to stderr, not stdout.
+    assert.doesNotMatch(cap2.out, /Build FAILED|→ next|builder/, "stdout carries no narrative");
+    assert.match(cap2.err, /Build FAILED/, "the narrative is on stderr");
+    // H2: a non-success build exits non-zero.
+    assert.equal(cap2.exit, 1, "a failed build exits 1");
   });
 });
 
@@ -541,6 +608,54 @@ test("H5: multi-step plan is REFUSED (exit 1, nothing allocated/run) on a tier w
   });
 });
 
+test("STAGING: a SCOPE.md drives ordered stages; a (verify) stage verifies mid-build, others skip; final verify+promote runs", () => {
+  const repo = mkdtempSync(tmpJoin(tmpdir(), "ikbi-stage-"));
+  writeFileSync(tmpJoin(repo, "SCOPE.md"), "# Product scope\n\n1. Core contracts (verify)\n2. Storage domain\n3. CPU domain\n");
+  const { orchestrator, tasks } = multiStepOrchestrator({ autoCommit: true });
+  const stepWs = stepWorkspacesFake();
+  const cap2 = capture();
+  const cli = createWorkerCli({
+    orchestrator, resolveIdentity: makeResolver("trusted", "trusted"),
+    operatorToken: OPERATOR_TOKEN, workerToken: WORKER_TOKEN,
+    stdout: cap2.stdout, stderr: cap2.stderr, setExit: cap2.setExit, now: () => 1, cwd: () => repo,
+    interactive: false, stepWorkspaces: stepWs.surface, cognition: benignCognition,
+  });
+  // Bare --scope ⇒ auto-detect SCOPE.md at the repo (cwd) root; the goal arg is just the umbrella label.
+  return cli.build(["build the whole product", "--scope"]).then(() => {
+    const stages = tasks.filter((t) => /:step\d+$/.test(t.taskId));
+    assert.equal(stages.length, 3, "all 3 SCOPE stages ran");
+    assert.deepEqual(stages.map((t) => t.goal), ["Core contracts", "Storage domain", "CPU domain"], "each stage used its OWN goal, not the umbrella label or a heuristic split");
+    // The (verify)-marked stage 1 verifies the accumulated state; the others defer to the final pass.
+    assert.equal(stages[0]!.skipVerifier, false, "stage 1 (verify) runs the verifier mid-build (catch a broken foundation early)");
+    assert.equal(stages[1]!.skipVerifier, true, "an unmarked stage skips intermediate verify (incomplete project)");
+    assert.equal(stages[2]!.skipVerifier, true);
+    // Every intermediate stage accumulates in the ONE shared workspace and never promotes on its own.
+    assert.ok(stages.every((t) => t.reuseWorkspace !== undefined && t.skipPromote === true), "stages accumulate in the shared workspace, no per-stage promote");
+    assert.equal(stepWs.calls.allocate, 1, "one shared workspace for the whole staged build");
+    const verify = tasks.find((t) => t.taskId.endsWith(":verify"));
+    assert.ok(verify !== undefined && verify.writeScope === "none", "a final read-only verify+promote pass ran on the accumulated tree");
+  });
+});
+
+test("STAGING: an explicit --scope path that is MISSING fails loudly (exit 1, nothing allocated)", () => {
+  const repo = mkdtempSync(tmpJoin(tmpdir(), "ikbi-stage-"));
+  const { orchestrator, tasks } = multiStepOrchestrator({ autoCommit: true });
+  const stepWs = stepWorkspacesFake();
+  const cap2 = capture();
+  const cli = createWorkerCli({
+    orchestrator, resolveIdentity: makeResolver("trusted", "trusted"),
+    operatorToken: OPERATOR_TOKEN, workerToken: WORKER_TOKEN,
+    stdout: cap2.stdout, stderr: cap2.stderr, setExit: cap2.setExit, now: () => 1, cwd: () => repo,
+    interactive: false, stepWorkspaces: stepWs.surface, cognition: benignCognition,
+  });
+  return cli.build(["build it", "--scope=nope/STAGES.md"]).then(() => {
+    assert.equal(cap2.exit, 1, "an explicitly-requested but missing scope file fails loudly");
+    assert.match(cap2.err, /--scope requested but/, "the error names the missing scope file");
+    assert.equal(stepWs.calls.allocate, 0, "nothing was allocated / run");
+    assert.equal(tasks.length, 0);
+  });
+});
+
 test("an unverifiable-target failure renders the actionable 'no runnable checks' diagnostic (not a model-failure)", () => {
   const unverifiableOrchestrator = {
     run: async (task: WorkerTask): Promise<WorkerResult> => ({
@@ -580,4 +695,47 @@ test("an unverifiable-target failure renders the actionable 'no runnable checks'
     const summary = JSON.parse(cap2.out);
     assert.equal(summary.outcome, "failure");
   });
+});
+
+// ── MoE DUEL-ON-FAILURE ─────────────────────────────────────────────────────────
+
+test("MoE duel: primary (deepseek lane) fails → a mimo-lane PEER runs and its promotion is kept", async () => {
+  const lanes: (string | undefined)[] = [];
+  const fakeOrch = {
+    run: async (task: WorkerTask): Promise<WorkerResult> => {
+      lanes.push(task.moeVendorLane);
+      const promoted = task.moeVendorLane === "mimo"; // deepseek lane fails; mimo lane promotes
+      return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: promoted ? "success" : "failure", roles: [], promoted, ...(promoted ? {} : { reason: "deepseek-lane attempt did not promote" }) } as WorkerResult;
+    },
+  };
+  const out: string[] = [];
+  const cli = createWorkerCli({
+    orchestrator: fakeOrch,
+    resolveIdentity: makeResolver("trusted", "trusted"),
+    operatorToken: OPERATOR_TOKEN, workerToken: WORKER_TOKEN,
+    stdout: (s) => out.push(s), stderr: () => {}, setExit: () => {}, now: () => 1, cwd: () => "/repo",
+  });
+  await cli.build(["fix", "the", "bug", "--repo", "/repo", "--yes", "--tier", "cheap"]);
+  // Primary ran in the deepseek lane and failed; ONE peer ran in the mimo lane and promoted.
+  assert.equal(lanes[0], "deepseek", "the primary attempt is pinned to the first vendor lane");
+  assert.ok(lanes.includes("mimo"), "a peer attempt ran in the other vendor lane after the primary failed");
+  assert.equal(lanes[lanes.length - 1], "mimo", "the last (winning) attempt was the peer");
+});
+
+test("MoE duel: a primary that promotes NEVER pays for a second attempt", async () => {
+  const lanes: (string | undefined)[] = [];
+  const fakeOrch = {
+    run: async (task: WorkerTask): Promise<WorkerResult> => {
+      lanes.push(task.moeVendorLane);
+      return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "success", roles: [], promoted: true } as WorkerResult;
+    },
+  };
+  const cli = createWorkerCli({
+    orchestrator: fakeOrch,
+    resolveIdentity: makeResolver("trusted", "trusted"),
+    operatorToken: OPERATOR_TOKEN, workerToken: WORKER_TOKEN,
+    stdout: () => {}, stderr: () => {}, setExit: () => {}, now: () => 1, cwd: () => "/repo",
+  });
+  await cli.build(["fix", "the", "bug", "--repo", "/repo", "--yes", "--tier", "cheap"]);
+  assert.deepEqual(lanes, ["deepseek"], "the primary promoted, so no mimo-lane peer was ever spun");
 });

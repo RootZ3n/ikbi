@@ -25,8 +25,14 @@ export function complexityScore(goal: string): number {
  * Imperative action verbs that open a genuine independent task ("Add X", "update the README").
  * A split clause that does NOT start with one of these is most likely a continuation of a single
  * sentence ("...gracefully handles expired sessions"), not a separate task.
+ *
+ * The trailing `(?!\s*\()` excludes a verb used as a CODE IDENTIFIER — a function-call clause like
+ * "generate(prompt, options) does POST ..." opens with the method name `generate`, which collides
+ * with the imperative verb "generate". Requiring the verb NOT be immediately followed by `(` keeps
+ * an API description ("...and generate(x) returns y") from being miscounted as a second independent
+ * task and spuriously authorizing a decomposition. "generate a report" (verb + object) still counts.
  */
-const ACTION_VERB = /^(?:add|create|implement|build|write|update|modify|change|fix|refactor|remove|delete|drop|rename|move|extract|introduce|replace|migrate|document|test|wire|expose|register|configure|install|generate|setup|set up|support|enable|disable)\b/i;
+const ACTION_VERB = /^(?:add|create|implement|build|write|update|modify|change|fix|refactor|remove|delete|drop|rename|move|extract|introduce|replace|migrate|document|test|wire|expose|register|configure|install|generate|setup|set up|support|enable|disable)\b(?!\s*\()/i;
 
 /** How many of the split clauses open with an imperative action verb (a genuine-task signal). */
 function actionLedClauseCount(parts: readonly string[]): number {
@@ -34,30 +40,96 @@ function actionLedClauseCount(parts: readonly string[]): number {
 }
 
 /**
- * STRONG structural separators — unambiguous multi-task markers (numbered/ordered lists,
- * semicolon-separated clauses, or explicit sequencer words after a comma). When present, the
- * split is a real decomposition regardless of length. The weaker "and …and" conjunction signal
- * does NOT count here — that is exactly the over-trigger this guard exists to suppress.
+ * Length-preserving mask of "code-literal" spans so their punctuation never registers as a task
+ * separator. Everything strictly INSIDE `(...)`, `[...]`, `{...}`, or a `` `backtick` `` span is
+ * replaced with a space; the delimiters themselves are kept. A TypeScript return type
+ * `{ a: number; b: string }`, a union `('a' | 'b' | 'c')`, or an inline `foo; bar` therefore
+ * contributes NO semicolons / commas / "and"s to the heuristics below. Unbalanced openers mask to
+ * end-of-string. The result is the same UTF-16 length as the input, so callers can locate a real
+ * delimiter in the masked string and slice the ORIGINAL at the same index (see `splitByMask`).
+ *
+ * This is the fix for goals that carry code in their prose (e.g. "export function f(): { a; b }"):
+ * before it, a TS type's `;` looked like a multi-task separator and fragmented one goal into many.
+ */
+export function maskCodeSpans(goal: string): string {
+  const chars = goal.split(""); // UTF-16 code units → indices align with RegExp match indices
+  let depth = 0;
+  let inTick = false;
+  for (let i = 0; i < chars.length; i += 1) {
+    const ch = chars[i]!;
+    if (inTick) {
+      if (ch === "`") inTick = false;
+      else chars[i] = " ";
+      continue;
+    }
+    if (ch === "`") {
+      inTick = true;
+      continue;
+    }
+    if (ch === "(" || ch === "[" || ch === "{") {
+      depth += 1;
+      continue;
+    }
+    if (ch === ")" || ch === "]" || ch === "}") {
+      if (depth > 0) depth -= 1;
+      continue;
+    }
+    if (depth > 0) chars[i] = " ";
+  }
+  return chars.join("");
+}
+
+/**
+ * Split `original` at every match of `sep` that falls OUTSIDE a code-literal span — the matches are
+ * located in the equal-length `masked` string (where in-code delimiters have become spaces) and the
+ * pieces are sliced from `original` so bracketed content survives verbatim. Mirrors `String.split`:
+ * the delimiter is removed and the pieces are returned untrimmed.
+ */
+function splitByMask(original: string, masked: string, sep: RegExp): string[] {
+  const re = new RegExp(sep.source, sep.flags.includes("g") ? sep.flags : `${sep.flags}g`);
+  const parts: string[] = [];
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(masked)) !== null) {
+    if (m[0].length === 0) {
+      re.lastIndex += 1; // guard against a zero-width match spinning forever
+      continue;
+    }
+    parts.push(original.slice(last, m.index));
+    last = m.index + m[0].length;
+  }
+  parts.push(original.slice(last));
+  return parts;
+}
+
+/**
+ * STRONG structural separators — unambiguous multi-task markers (numbered/ordered lists or explicit
+ * sequencer words after a comma). When present, the split is a real decomposition regardless of
+ * length. Two signals are DELIBERATELY excluded here:
+ *   - the weaker "and …and" conjunction — the classic over-trigger this guard suppresses;
+ *   - semicolons — code literals (a TS type `{ a: number; b: string }`) use them freely, so a
+ *     semicolon alone must NOT authorize a split. A semicolon-separated goal can still decompose,
+ *     but only when corroborated by ≥2 action-led clauses (see `looksMultiTask`).
+ * Detection runs on the code-masked goal so punctuation inside `()[]{}`/backticks never counts.
  */
 function hasStrongSeparator(goal: string): boolean {
+  const masked = maskCodeSpans(goal);
   // Numbered/ordered list: "1. ... 2. ..." or "1) ... 2) ...".
-  if ((goal.match(/\b\d+[.)]\s*.+/g) ?? []).length >= 2) return true;
+  if ((masked.match(/\b\d+[.)]\s*.+/g) ?? []).length >= 2) return true;
   // Explicit sequencers introduced by a comma: "do X, also Y", "do X, then Y, plus Z".
-  if (/,\s*(?:also|then|additionally|plus)\s+/i.test(goal)) return true;
-  // Semicolon-separated clauses (each substantial).
-  if (goal.split(/\s*;\s*/).filter((p) => p.trim().length > 10).length >= 2) return true;
+  if (/,\s*(?:also|then|additionally|plus)\s+/i.test(masked)) return true;
   return false;
 }
 
 /**
  * SENTENCE BOUNDARY — a softer ordering signal than `hasStrongSeparator`: explicit sequencer
  * words (first / then / finally / next / lastly / afterwards) that mark genuinely SEPARATE,
- * ordered sub-tasks. (Semicolons and numbered lists are STRONG separators handled by
- * `hasStrongSeparator`; this catches the "first do X then do Y" shape that lacks punctuation.)
- * Without any such boundary, a long run of "and"s is most likely ONE verbose sentence.
+ * ordered sub-tasks. (Numbered lists are a STRONG separator handled by `hasStrongSeparator`; this
+ * catches the "first do X then do Y" shape that lacks punctuation.) Without any such boundary, a
+ * long run of "and"s is most likely ONE verbose sentence.
  */
 function hasSentenceBoundary(goal: string): boolean {
-  return /\b(?:first|then|finally|next|lastly|afterwards)\b/i.test(goal);
+  return /\b(?:first|then|finally|next|lastly|afterwards)\b/i.test(maskCodeSpans(goal));
 }
 
 /**
@@ -65,13 +137,16 @@ function hasSentenceBoundary(goal: string): boolean {
  * description merely contains "and" twice — and verbose single tasks are often LONG, so a pure
  * word-count gate does not save them. Only treat a split as a genuine decomposition when there is
  * real evidence of multiple INDEPENDENT tasks:
- *   1. a STRONG structural separator (numbered list / semicolons / comma+sequencer), OR
+ *   1. a STRONG structural separator (numbered list / comma+sequencer), OR
  *   2. ≥2 clauses that each open with an imperative action verb (genuine independent tasks), OR
  *   3. a clear SENTENCE BOUNDARY (sequencer words) *and* the goal clears the word-count FLOOR.
  *
- * The word count is a FLOOR (a necessary minimum), never the sole gate: a goal with NO semicolons,
- * NO numbered list, and NO sequencer words requires ≥2 action-led clauses to split, no matter how
- * long it is. This is the core of the Codex fix — length alone no longer authorizes a split.
+ * The word count is a FLOOR (a necessary minimum), never the sole gate: a goal with NO strong
+ * separator and NO sequencer words requires ≥2 action-led clauses to split, no matter how long it
+ * is. Semicolons alone are NOT a strong separator (code literals use them freely) — a
+ * semicolon-delimited goal still needs ≥2 action-led clauses via case (2). This, plus the code-span
+ * masking in `maskCodeSpans`, is what keeps a single-imperative goal that carries TypeScript
+ * signatures ("export function f(): { a; b }") from fragmenting into spurious steps.
  */
 function looksMultiTask(goal: string, parts: readonly string[]): boolean {
   if (hasStrongSeparator(goal)) return true;
@@ -84,37 +159,78 @@ function looksMultiTask(goal: string, parts: readonly string[]): boolean {
   return wordCount >= MIN_MULTITASK_WORDS;
 }
 
+/** A raw split of the goal + whether it came from an explicit NUMBERED list (which must not be
+ *  regrouped — the user's own numbering is authoritative). Conjunction/semicolon splits are
+ *  regrouped by `groupByActionLead` so each step is a complete task, not a mid-task fragment. */
+interface GoalSplit {
+  readonly parts: string[];
+  readonly numbered: boolean;
+}
+
 /**
  * Split a goal on conjunctions and punctuation into sub-goals.
  * Tries multiple delimiters in order of specificity.
  */
-function splitGoal(goal: string): string[] {
-  // Try numbered list: "1. do X\n2. do Y" or "1) do X\n2) do Y"
-  const numbered = goal.match(/\b\d+[.)]\s*.+/g);
+function splitGoal(goal: string): GoalSplit {
+  // All delimiter splits below are located in the code-masked view, so a separator that lives
+  // inside a `()[]{}`/backtick code span (a TS type's `;`, a union's `|`, a signature's `,`) is
+  // never treated as a task boundary. Pieces are still sliced from the ORIGINAL goal.
+  const masked = maskCodeSpans(goal);
+
+  // Try numbered list: "1. do X\n2. do Y" or "1) do X\n2) do Y". Markers are matched on the masked
+  // view (so "0..1" inside a code span cannot masquerade as a list) but extracted from the original.
+  const numbered = masked.match(/\b\d+[.)]\s*.+/g);
   if (numbered && numbered.length >= 2) {
-    return numbered.map((s) => s.replace(/^\d+[.)]\s*/, "").trim()).filter(Boolean);
+    return {
+      parts: goal
+        .match(/\b\d+[.)]\s*.+/g)!
+        .map((s) => s.replace(/^\d+[.)]\s*/, "").trim())
+        .filter(Boolean),
+      numbered: true,
+    };
   }
 
   // Try "and" splitting: "do X and do Y and do Z"
   // Only split on "and" that separates independent clauses (not "read and write")
-  const andParts = goal.split(/\s+and\s+(?=[a-z])/i);
+  const andParts = splitByMask(goal, masked, /\s+and\s+(?=[a-z])/i);
   if (andParts.length >= 2 && andParts.every((p) => p.length > 10)) {
-    return andParts.map((s) => s.trim()).filter(Boolean);
+    return { parts: andParts.map((s) => s.trim()).filter(Boolean), numbered: false };
   }
 
   // Try comma+conjunction: "do X, also Y, plus Z"
-  const commaParts = goal.split(/,\s*(?:also|then|additionally|plus|and)\s+/i);
+  const commaParts = splitByMask(goal, masked, /,\s*(?:also|then|additionally|plus|and)\s+/i);
   if (commaParts.length >= 2 && commaParts.every((p) => p.length > 10)) {
-    return commaParts.map((s) => s.trim()).filter(Boolean);
+    return { parts: commaParts.map((s) => s.trim()).filter(Boolean), numbered: false };
   }
 
-  // Try semicolons: "do X; do Y; do Z"
-  const semiParts = goal.split(/\s*;\s*/);
+  // Try semicolons: "do X; do Y; do Z" (only semicolons OUTSIDE code spans reach here).
+  const semiParts = splitByMask(goal, masked, /\s*;\s*/);
   if (semiParts.length >= 2 && semiParts.every((p) => p.length > 10)) {
-    return semiParts.map((s) => s.trim()).filter(Boolean);
+    return { parts: semiParts.map((s) => s.trim()).filter(Boolean), numbered: false };
   }
 
-  return [goal];
+  return { parts: [goal], numbered: false };
+}
+
+/**
+ * Regroup conjunction-split clauses so each group BEGINS at an imperative action verb. A clause that
+ * does NOT open with an action verb is a CONTINUATION of the preceding task ("...and exports greet()",
+ * "...and capitalized name") and is merged back into it. Without this, a single multi-file task whose
+ * prose contains intra-task "and"s ("imports X and exports Y") fragments into incoherent sub-steps —
+ * the exact failure that decomposed one greeter/names goal into 5 pieces (2 of them fragments), built
+ * green per-step, then got discarded by the whole-build critic. `looksMultiTask` already gated on
+ * ≥2 action-led clauses, so grouping here recovers exactly those genuine tasks, each with its full
+ * description. Callers fall back to the raw parts if grouping would collapse below 2 groups.
+ */
+function groupByActionLead(parts: readonly string[]): string[] {
+  const groups: string[] = [];
+  for (const part of parts) {
+    const trimmed = part.trim();
+    if (trimmed.length === 0) continue;
+    if (groups.length === 0 || ACTION_VERB.test(trimmed)) groups.push(trimmed);
+    else groups[groups.length - 1] = `${groups[groups.length - 1]} and ${trimmed}`;
+  }
+  return groups;
 }
 
 /**
@@ -146,7 +262,7 @@ export function decompose(goal: string): StepPlan {
   }
 
   // Complex goal — try to split.
-  const parts = splitGoal(goal);
+  const { parts, numbered } = splitGoal(goal);
   // OVER-TRIGGER GUARD (Issue 2): a split into < 2 parts, OR a split that lacks genuine
   // multi-task evidence (a short goal whose only signal is "and" twice), is NOT a real
   // decomposition — pass through as a single step rather than spawning spurious sub-steps.
@@ -160,12 +276,33 @@ export function decompose(goal: string): StepPlan {
     };
   }
 
-  const steps: Step[] = parts.slice(0, MAX_STEPS).map((part, i) => ({
+  // A NUMBERED list is explicit user structure — keep each item as its own step. A conjunction/
+  // semicolon split is REGROUPED so each step begins at an action verb (mid-task continuations like
+  // "...and exports greet()" merge into their parent task) — this keeps a multi-file goal from
+  // fragmenting into incoherent sub-steps.
+  const grouped = numbered ? parts : groupByActionLead(parts);
+
+  // Grouping is the FINAL arbiter of the step count. If it collapses below 2 groups, the goal is ONE
+  // cohesive action-led task whose prose merely contains an incidental sequencer or "and" (e.g. "Add
+  // session.ts that ... calls X; then Y, and returns Z") — NOT a second task. Build it in a single
+  // pass (the builder handles multi-part / multi-file goals coherently — proven on cohesive 4-file
+  // goals) instead of fragmenting on misaligned "and" boundaries, which produced stuck sub-steps.
+  if (grouped.length < 2) {
+    return {
+      originalGoal: goal,
+      steps: [{ index: 1, goal, targetFiles: extractPaths(goal) }],
+      source: "heuristic",
+      decomposed: false,
+    };
+  }
+
+  const droppedSteps = Math.max(0, grouped.length - MAX_STEPS);
+  const steps: Step[] = grouped.slice(0, MAX_STEPS).map((part, i, arr) => ({
     index: i + 1,
     goal: part,
     targetFiles: extractPaths(part),
     // L4: verificationHint is RESERVED metadata — no caller consumes it yet (see Step.verificationHint).
-    ...(i === parts.length - 1 ? { verificationHint: "run pnpm test to verify all changes" } : {}),
+    ...(i === arr.length - 1 ? { verificationHint: "run pnpm test to verify all changes" } : {}),
   }));
 
   return {
@@ -173,6 +310,8 @@ export function decompose(goal: string): StepPlan {
     steps,
     source: "heuristic",
     decomposed: true,
+    // Codex M6: report truncation instead of silently discarding steps beyond MAX_STEPS.
+    ...(droppedSteps > 0 ? { droppedSteps } : {}),
   };
 }
 
@@ -213,15 +352,48 @@ export async function decomposeWithModel(
     if (!Array.isArray(parsed) || parsed.length < 2) {
       return decompose(goal);
     }
+    const droppedSteps = Math.max(0, parsed.length - MAX_STEPS);
     const steps: Step[] = parsed.slice(0, MAX_STEPS).map((p, i) => ({
       index: i + 1,
       goal: p.goal,
       ...(p.targetFiles !== undefined ? { targetFiles: p.targetFiles } : {}),
       ...(i === parsed.length - 1 ? { verificationHint: "run pnpm test to verify all changes" } : {}),
     }));
-    return { originalGoal: goal, steps, source: "model", decomposed: true };
+    return { originalGoal: goal, steps, source: "model", decomposed: true, ...(droppedSteps > 0 ? { droppedSteps } : {}) };
   } catch {
     // Model call failed — fall back to heuristic.
     return decompose(goal);
   }
+}
+
+/** Options for {@link decomposeAdaptive}. */
+export interface AdaptiveDecomposeOpts {
+  /** Model invoker for the model strategy. When absent, ONLY the zero-cost heuristic runs. */
+  readonly invokeModel?: (prompt: string) => Promise<string>;
+  /** Force the model strategy even when the heuristic looks confident. Default false. */
+  readonly forceModel?: boolean;
+}
+
+/**
+ * Decompose adaptively — the wiring that makes the model strategy usable without abandoning the
+ * zero-cost default. Runs the heuristic `decompose` first; when a model invoker is supplied AND the
+ * heuristic looks UNCERTAIN (it hit the MAX_STEPS cap, so the goal likely has more atomic steps than
+ * the heuristic could express) OR `forceModel` is set, it runs `decomposeWithModel` and PREFERS a
+ * richer decomposition (strictly more steps). Any model failure falls back to the heuristic.
+ *
+ * Cost contract: with NO invoker this is byte-identical to `decompose` (no model call) — so the
+ * production default (worker-model/cli.ts) stays free until an operator opts in (IKBI_STEP_PLANNER_MODEL).
+ */
+export async function decomposeAdaptive(goal: string, opts: AdaptiveDecomposeOpts = {}): Promise<StepPlan> {
+  const heuristic = decompose(goal);
+  if (opts.invokeModel === undefined) return heuristic;
+  // The heuristic is least reliable when it saturates the step cap: it truncates at MAX_STEPS, so a
+  // goal with more atomic steps is under-represented. That (or an explicit force) is when the model
+  // second pass earns its cost.
+  const uncertain = heuristic.steps.length >= MAX_STEPS;
+  if (!opts.forceModel && !uncertain) return heuristic;
+  const model = await decomposeWithModel(goal, opts.invokeModel);
+  // Prefer the model plan ONLY when it is a genuinely richer decomposition — never regress to fewer
+  // steps than the heuristic already found.
+  return model.decomposed && model.steps.length > heuristic.steps.length ? model : heuristic;
 }

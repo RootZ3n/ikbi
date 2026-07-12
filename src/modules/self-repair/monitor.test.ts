@@ -6,6 +6,11 @@
  */
 
 import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
+import { readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { test } from "node:test";
 
 import type { CheckResult, MonitorOptions, MonitorPorts, WorkOrder } from "./contract.js";
@@ -309,4 +314,28 @@ test("runTestCommand kills a hung command and reports it as a failure", async ()
 test("runTestCommand returns ok for a fast successful command", async () => {
   const r = await runTestCommand("true", process.cwd(), 5000);
   assert.equal(r.ok, true);
+});
+
+test("M7: a timeout reaps the whole PROCESS GROUP — a grandchild subprocess is not orphaned", async () => {
+  const pidFile = join(tmpdir(), `ikbi-selfrepair-pg-${randomBytes(6).toString("hex")}`);
+  let gpid = -1;
+  try {
+    // The shell backgrounds a `sleep 300` grandchild (job control off ⇒ same process group),
+    // records its pid, then hangs. Killing ONLY the shell would orphan the sleep; the group kill
+    // (detached child + negative-pid signal) reaps it too.
+    const cmd = `sleep 300 & echo $! > ${pidFile}; sleep 300`;
+    const r = await runTestCommand(cmd, process.cwd(), 500);
+    assert.equal(r.ok, false, "the hung command timed out");
+    gpid = Number.parseInt(readFileSync(pidFile, "utf8").trim(), 10);
+    assert.ok(Number.isInteger(gpid) && gpid > 0, "captured the grandchild pid");
+    // Poll briefly for the group SIGTERM to land on the grandchild.
+    let alive = true;
+    for (let i = 0; i < 40 && alive; i += 1) {
+      try { process.kill(gpid, 0); await delay(50); } catch { alive = false; }
+    }
+    assert.equal(alive, false, "the grandchild sleep was reaped with the group (not left orphaned)");
+  } finally {
+    rmSync(pidFile, { force: true });
+    if (gpid > 0) { try { process.kill(gpid, "SIGKILL"); } catch { /* already reaped */ } } // no leak if the assert failed
+  }
 });

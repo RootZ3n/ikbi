@@ -78,6 +78,13 @@ function ranZeroTests(combined: string): boolean {
   for (const raw of combined.split("\n")) {
     const t = raw.trim();
     if (t.length === 0) continue;
+    // H-1: when ikbi builds ikbi, the suite echoes ikbi's OWN test NAMES as TAP lines
+    // (`# Subtest: …`, `ok N - …`, `not ok N - …`). Those names DESCRIBE these very zero-test detectors,
+    // so they literally contain the marker phrases below ("collected 0 items", "no tests ran"). A test
+    // NAME is not a runner reporting zero tests — skip the name-carrier lines so a fully-green
+    // self-hosting run is not falsely flagged zero-test. (The real summary markers below are line- and
+    // start-anchored, so a genuine `# tests 0` / `Tests: 0 total` summary line still fires.)
+    if (/^# Subtest:/.test(t) || /^(?:not )?ok\s+\d+\b/.test(t)) continue;
     if (/\[no test files\]/i.test(t)) return true;
     if (/no test files found/i.test(t)) return true;
     if (/^#?\s*tests\s+0\b/.test(t)) return true; // node:test TAP: `# tests 0`
@@ -86,6 +93,36 @@ function ranZeroTests(combined: string): boolean {
     if (/\bno tests ran\b/i.test(t)) return true; // pytest: `no tests ran`
   }
   return false;
+}
+
+/**
+ * VECTOR C detector (phantom pass): `node --test <dir>` pointed at a bare directory does NOT
+ * discover the `*.test.js` files inside it — node:test runs the PATH itself as a single opaque
+ * "test" and reports `ok 1 - dist`, so ZERO real test bodies execute yet the run exits 0 with a
+ * non-zero count. `# tests 0` never fires (it's "1"), so the zero-test guard misses it and a build
+ * gets a green it did not earn. The tell: a genuine node:test name comes from test()/it() — a human
+ * description — and is NEVER merely the file/dir path passed to `--test`. So if EVERY reported
+ * `ok/not ok` names a path argument, discovery failed and nothing real ran. (The fix for the project
+ * is to glob — `node --test dist/*.test.js` — but ikbi must not accept the vacuous green regardless.)
+ */
+function nodeTestPhantomDirPass(command: string, combined: string): boolean {
+  if (!/--test\b/.test(command.toLowerCase())) return false;
+  const m = /--test\s+(.+)$/s.exec(command);
+  if (m?.[1] === undefined) return false;
+  const pathArgs = new Set(
+    m[1]
+      .split(/\s+/)
+      .filter((a) => a.length > 0 && !a.startsWith("-"))
+      .map((a) => a.replace(/\/+$/, "")),
+  );
+  if (pathArgs.size === 0) return false;
+  const testNames: string[] = [];
+  for (const raw of combined.split("\n")) {
+    const tm = /^(?:ok|not ok)\s+\d+\s+-\s+(.+)$/.exec(raw.trim());
+    if (tm?.[1] !== undefined) testNames.push(tm[1].trim().replace(/\/+$/, ""));
+  }
+  // Only phantom when there ARE reported tests and every one of them is just a path arg.
+  return testNames.length > 0 && testNames.every((n) => pathArgs.has(n));
 }
 
 /** Internal worker — wrapped by parseCheckOutput so the public API never throws. */
@@ -181,7 +218,9 @@ function parse(input: CheckInput, cfg: CheckTriageConfig): CheckTriage {
   // exit 0 is necessary but NOT sufficient — both vectors override it to fail.
   const cmdLower = (input.command ?? "").toLowerCase();
   const zeroTests = isTestCheck(input.name, cmdLower, detectedFrameworks) && ranZeroTests(combined);
-  const passed = exitCode === 0 && failures.length === 0 && !zeroTests;
+  // VECTOR C (phantom node:test dir pass): `node --test <dir>` reports `ok 1 - dir` and runs nothing.
+  const phantomTests = isTestCheck(input.name, cmdLower, detectedFrameworks) && nodeTestPhantomDirPass(input.command ?? "", combined);
+  const passed = exitCode === 0 && failures.length === 0 && !zeroTests && !phantomTests;
 
   // errorSummary — always non-empty, bounded
   let errorSummary: string;
@@ -190,6 +229,8 @@ function parse(input: CheckInput, cfg: CheckTriageConfig): CheckTriage {
   } else if (zeroTests) {
     const fw = detectedFrameworks.length > 0 ? detectedFrameworks.join("/") : "unknown format";
     errorSummary = `${input.name}: FAILED — a test check ran ZERO tests (exit ${exitCode}, ${fw}); exit 0 with no tests executed is not a pass`;
+  } else if (phantomTests) {
+    errorSummary = `${input.name}: FAILED — \`node --test\` was pointed at a bare directory, so it reported the path itself as a phantom test and discovered NONE of the real test files (exit ${exitCode}). This is a vacuous green — use a glob like \`node --test dist/*.test.js\` (or explicit files) so the tests actually run`;
   } else if (exitCode === 0 && failures.length > 0) {
     const fw = detectedFrameworks.length > 0 ? detectedFrameworks.join("/") : "unknown format";
     const shown = failures.slice(0, 3).join("; ");

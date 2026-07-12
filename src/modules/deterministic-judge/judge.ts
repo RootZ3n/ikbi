@@ -8,6 +8,12 @@
  * before scoring — a hard-fail can NEVER be outscored (the Luak rule). LAYER 2
  * (weighted families) ranks the survivors. Winner = best composite, broken by an
  * EXPLICIT deterministic tie-break. No survivor ⇒ fail-closed (winner null).
+ *
+ * ADMISSIBILITY (Codex C3): the overrides include a test-evidence gate — only a candidate with a
+ * REAL executed suite is admissible; zero/unverified/absent evidence is disqualified, not down-ranked.
+ * The judge RANKS admissible candidates; it does NOT grant promotability. Its `winner` is a ranking,
+ * never a promote authorization — the winner still passes through the adjudication core (executed +
+ * tree-bound) and the hash-bound promote gate before anything lands.
  */
 
 import { events as coreEvents } from "../../core/events/index.js";
@@ -78,10 +84,35 @@ export function defaultOverrides(): JudgeOverride[] {
       reason: () => "tests failed (pnpm test non-zero) — failing tests are worthless",
     },
     {
-      id: "rejected-tool-calls",
-      label: "rejected-tool-calls",
-      disqualifies: (c) => c.rejectedToolCalls > 0,
-      reason: (c) => `${c.rejectedToolCalls} rejected tool call(s) — attempted out-of-policy action`,
+      // C3 — ADMISSIBILITY: only a REAL executed suite can win. A candidate whose tests did not
+      // actually run (a runner that executed ZERO tests / a pass with no parseable count / no test
+      // check at all) has NOT earned promotable confidence, so it is DISQUALIFIED outright — never
+      // merely down-ranked. This is what stops a competitive/tournament shootout from crowning a
+      // vacuous-green candidate over one with real executed evidence (the judge ranks only admissible
+      // candidates; it never launders non-executed work into a promotable winner). `undefined`
+      // testEvidence (a legacy candidate predating evidence capture) is left to the prior
+      // testCount-driven scoring — back-compat, unchanged. Mirrors the adjudication core's I6 gate.
+      id: "test-evidence",
+      label: "test-evidence",
+      disqualifies: (c) => c.testEvidence === "zero" || c.testEvidence === "unverified" || c.testEvidence === "absent",
+      reason: (c) => `test evidence "${c.testEvidence}" is not an executed suite — only a real executed test run is admissible (no vacuous-green winner)`,
+    },
+    // NB: rejected (PREVENTED) tool calls are NOT a disqualifier. Judge by effect, not intent — a
+    // rejected call was BLOCKED by the governor (no effect), so it is a recorded warning + a mild
+    // RANKING penalty (see the `better` tie-break: fewer rejected calls wins a tie), not grounds to
+    // discard a candidate the verifier passed. Discarding a verified-green candidate over a prevented
+    // attempt measures obedience, not engineering — and would let a flukier-but-timid candidate beat a
+    // stronger one that merely improvised a blocked command. Only EFFECTIVE breaches (control failures
+    // that landed) would disqualify, and those never appear as a rejected tool call.
+    {
+      id: "no-work",
+      label: "no-work",
+      // A candidate that wrote 0 files AND produced 0 (or unknown) diff did NO work. Without this it
+      // would MAX the files+diff families (0/max ⇒ score 1.0) and — on a repo that is already green —
+      // inherit testsPass/typecheckPass from the untouched base, letting a do-nothing candidate OUTSCORE
+      // and DISCARD candidates with real, verified changes. A shootout must never crown a no-op.
+      disqualifies: (c) => c.filesWritten === 0 && (c.diffLines ?? 0) === 0,
+      reason: () => "no work produced (0 files written, 0 diff) — a do-nothing candidate cannot win",
     },
   ];
 }
@@ -152,6 +183,10 @@ export function createDeterministicJudge(deps: DeterministicJudgeDeps = {}): Det
     // Tie-break, in order: tests score (desc) → toolRounds (asc) → diffLines (asc) →
     // workspaceId (lexically smallest). The last guarantees a stable, identical winner.
     if (a.testsScore !== b.testsScore) return a.testsScore > b.testsScore;
+    // A candidate with FEWER prevented (rejected) tool calls wins a tie — the "additive taint" ranking
+    // signal (cleaner conduct is preferred), without disqualifying a verified candidate that improvised
+    // a blocked command.
+    if (a.c.rejectedToolCalls !== b.c.rejectedToolCalls) return a.c.rejectedToolCalls < b.c.rejectedToolCalls;
     if (a.c.toolRounds !== b.c.toolRounds) return a.c.toolRounds < b.c.toolRounds;
     const ad = a.c.diffLines ?? Number.POSITIVE_INFINITY;
     const bd = b.c.diffLines ?? Number.POSITIVE_INFINITY;

@@ -10,7 +10,7 @@ import { config } from "../config.js";
 import { childLogger } from "../log.js";
 import { wrapModelInvocation } from "./invoke-wrapper.js";
 import { computeCost, ProviderInvoker } from "./invoke.js";
-import { getCapabilities, type ModelCapabilities } from "./capabilities.js";
+import { getCapabilities, findUnclassifiedModels, FALLBACK_CAPABILITIES, type ModelCapabilities } from "./capabilities.js";
 import type { Cost, CostRate, ModelRequest, ModelResponse, ModelStream, TokenUsage } from "./contract.js";
 import {
   createDeepseekProvider,
@@ -25,7 +25,6 @@ import {
   createMistralProvider,
   createTogetherProvider,
   DEEPSEEK_PROVIDER_ID,
-  MINIMAX_PROVIDER_ID,
   MIMO_PROVIDER_ID,
   OPENROUTER_PROVIDER_ID,
 } from "./providers/index.js";
@@ -40,8 +39,9 @@ const log = childLogger("provider");
  */
 const STUB_PROVIDER_ID = "stub";
 
-/** Build the default registry: built-in roster + configured providers, then the roster file. */
-function buildDefaultRegistry(): ModelRegistry {
+/** Build the default registry: built-in roster + configured providers, then the roster file.
+ *  Exported for tests that pin the built-in default routes (before any roster file overrides). */
+export function buildDefaultRegistry(): ModelRegistry {
   const pc = config.provider;
   const { driver, critic } = pc.defaultModels;
 
@@ -59,9 +59,16 @@ function buildDefaultRegistry(): ModelRegistry {
     {
       id: critic,
       role: "critic",
+      // Route the default critic / mid-tier model (deepseek-v4-pro) to the REAL DeepSeek endpoint —
+      // the same provider the deepseek-v4-flash driver uses, and the route proven to carry a large
+      // build. It is NOT routed to MiniMax: that placeholder route dead-ended EVERY --complexity-large
+      // build (the mid tier bumps the builder to this model) with `minimax=permanent_error` whenever
+      // the roster file was absent — a config-shaped footgun that failed the run before a line was
+      // written. DeepSeek is the working route and minimax is not needed here. Cost is a placeholder
+      // (the roster file overrides it with the real per-Mtok rate when present).
       cost: { promptPerMTok: 0.5, completionPerMTok: 1.5 },
       providers: [
-        { provider: MINIMAX_PROVIDER_ID, providerModelId: "MiniMax-M1" },
+        { provider: DEEPSEEK_PROVIDER_ID, providerModelId: critic },
       ],
     },
     // DeepSeek direct models — usable out of the box once IKBI_DEEPSEEK_API_KEY is set.
@@ -94,6 +101,9 @@ function buildDefaultRegistry(): ModelRegistry {
     // minimax-m3: real provider now wired via providers.json
     // gpt-5.5: real provider now wired via providers.json (OpenAI)
     // opus-4.8: stub entry so the escalation roster resolves; real calls fail gracefully.
+    // The escalation cascade (policy.modelFor + the registry-backed resolver in escalation/engine)
+    // now SKIPS this stub when a wired model exists in the same tier, so it never dead-ends an
+    // escalation — wire a real Anthropic route in providers.json to make opus-4.8 a live target.
     {
       id: "opus-4.8",
       role: "critic",
@@ -128,6 +138,21 @@ function buildDefaultRegistry(): ModelRegistry {
     log.error({ err, file: pc.rosterFile }, "failed to load provider roster file");
     throw err;
   }
+
+  // Silent-degradation guard: a roster model whose id matches no capability table/pattern
+  // and carries no explicit override resolves to the conservative fallback (small window,
+  // no native tools). On a large-context model that is a ~25× context loss driven silently.
+  // Warn LOUDLY at startup (not fatal — a stub/escalation-tier id may legitimately be
+  // unwired) so the misconfiguration surfaces here, not mid-build. Also reported by `doctor`.
+  const unclassified = findUnclassifiedModels(reg.listModels());
+  if (unclassified.length > 0) {
+    log.warn(
+      { models: unclassified.map((u) => u.id), fallbackWindow: FALLBACK_CAPABILITIES.context_window },
+      "roster models are unclassified and silently degrade to the fallback capability profile " +
+        `(${FALLBACK_CAPABILITIES.context_window}-token window, no native tools) — add a family pattern in ` +
+        "capabilities.ts or an explicit `capabilities` override in the roster so a large-context model isn't driven at 8k",
+    );
+  }
   return reg;
 }
 
@@ -144,6 +169,41 @@ export const invoker = new ProviderInvoker({
 });
 
 /**
+ * C9 — a `role:"tool"` message reached model-request construction WITHOUT an explicit trust decision.
+ * A tool RESULT is external-or-harness content: it must EITHER enter via the neutralization chokepoint
+ * (`toUntrustedMessage` ⇒ `untrusted:true`) for tool/command/web/MCP/repo output, OR be marked
+ * `untrusted:false` DELIBERATELY for ikbi-authored harness feedback (check results, protocol hints).
+ * An `undefined` flag means nobody triaged it — a bare tool-result string, the exact prompt-injection
+ * bypass this guard refuses fail-closed. This is a construction bug, never retried.
+ */
+export class UntriagedToolMessageError extends Error {
+  readonly index: number;
+  constructor(index: number) {
+    super(
+      `model-request rejected (C9): role:"tool" message [${index}] has no explicit \`untrusted\` trust decision. ` +
+        `Route external tool/command/web/MCP/repo output through toUntrustedMessage (untrusted:true), or mark ` +
+        `ikbi-authored harness feedback untrusted:false explicitly. Bare tool-result strings are refused fail-closed.`,
+    );
+    this.name = "UntriagedToolMessageError";
+    this.index = index;
+  }
+}
+
+/**
+ * C9 fail-closed guard: every `role:"tool"` message in a request must carry an EXPLICIT `untrusted`
+ * flag (true = neutralized external content, false = deliberate ikbi-authored feedback). An untriaged
+ * tool result (flag undefined) is a neutralization-chokepoint bypass and is rejected here — the single
+ * request-construction seam every model call passes through.
+ */
+function assertToolMessagesTriaged(request: ModelRequest): void {
+  const msgs = request.messages;
+  if (msgs === undefined) return;
+  for (let i = 0; i < msgs.length; i += 1) {
+    if (msgs[i]!.role === "tool" && msgs[i]!.untrusted === undefined) throw new UntriagedToolMessageError(i);
+  }
+}
+
+/**
  * The frozen entry point. Every model call in the engine goes through this.
  *
  * The caching floor wraps here — ABOVE the invoker loop and the egress guard. A
@@ -153,6 +213,13 @@ export const invoker = new ProviderInvoker({
  * disabled this is an exact passthrough to `invoker.invokeModel`.
  */
 export function invokeModel(request: ModelRequest): Promise<ModelResponse> {
+  // C9: reject bare (un-neutralized) tool-result strings — as a REJECTION so `.catch`/`await` callers
+  // both fail closed uniformly (never a divergent sync throw at only some call sites).
+  try {
+    assertToolMessagesTriaged(request);
+  } catch (e) {
+    return Promise.reject(e);
+  }
   return wrapModelInvocation(request, () => invoker.invokeModel(request));
 }
 
@@ -164,6 +231,11 @@ export function invokeModel(request: ModelRequest): Promise<ModelResponse> {
  * request/response on `invokeModel`.
  */
 export function invokeModelStream(request: ModelRequest): Promise<ModelStream> {
+  try {
+    assertToolMessagesTriaged(request); // C9: same fail-closed guard on the streaming path
+  } catch (e) {
+    return Promise.reject(e);
+  }
   return invoker.invokeModelStream(request);
 }
 

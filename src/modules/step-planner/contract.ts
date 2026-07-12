@@ -40,6 +40,12 @@ export interface StepPlan {
   readonly source: "heuristic" | "model";
   /** Whether the goal was actually complex (false = no decomposition needed). */
   readonly decomposed: boolean;
+  /**
+   * How many steps were DROPPED because the plan exceeded MAX_STEPS. Present (and > 0) only when
+   * truncation occurred (Codex M6: a plan cap must be reported, never a silent drop). Callers
+   * should surface this — a truncated plan does NOT cover the whole goal.
+   */
+  readonly droppedSteps?: number;
 }
 
 /** Result of executing one step. */

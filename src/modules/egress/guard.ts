@@ -39,6 +39,55 @@ import { classifyIp } from "./ip.js";
 
 const MAX_REDIRECT_HOPS = 5;
 
+/** The `init` shape the guarded fetch forwards to the transport. */
+type RedirectInit = Parameters<FetchLike>[1];
+
+/** The request origin (scheme//host:port) for a URL string, or "" if unparseable. */
+function originOf(u: string): string {
+  try {
+    return new URL(u).origin;
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Reconstruct the request `init` for a redirect hop (Codex C10 — the old guard
+ * replayed the ORIGINAL init on every hop, leaking a provider's Authorization /
+ * Cookie to another allowlisted origin, along with the POST body + method):
+ *   • 303 ⇒ GET + drop body; 301/302 on POST ⇒ GET + drop body (browser behavior);
+ *     307/308 preserve method + body.
+ *   • CROSS-ORIGIN hop ⇒ strip Authorization / Cookie / Proxy-Authorization, so a
+ *     credential minted for origin A is never sent to origin B. Destination
+ *     allowlisting answers "may ikbi contact this host", NOT "may this host receive
+ *     another provider's secret".
+ */
+function rebuildRedirectInit(
+  init: RedirectInit,
+  status: number,
+  fromOrigin: string,
+  toOrigin: string,
+): RedirectInit {
+  let method = init.method;
+  let body = init.body;
+  const m = method.toUpperCase();
+  if (status === 303 || ((status === 301 || status === 302) && m === "POST")) {
+    method = "GET";
+    body = "";
+  }
+  let headers = init.headers;
+  if (fromOrigin !== toOrigin) {
+    const stripped: Record<string, string> = {};
+    for (const [k, v] of Object.entries(init.headers)) {
+      const lk = k.toLowerCase();
+      if (lk === "authorization" || lk === "cookie" || lk === "proxy-authorization") continue;
+      stripped[k] = v;
+    }
+    headers = stripped;
+  }
+  return { ...init, method, headers, body };
+}
+
 /** Injectable dependencies (tests substitute DNS + transport + publish). */
 export interface GuardedFetchDeps {
   /** Permitted egress hosts, lowercased + exact-match. Empty = default-deny-all. */
@@ -170,9 +219,10 @@ export function createGuardedFetch(deps: GuardedFetchDeps): FetchLike {
 
   return async (input, init) => {
     let current = input;
+    let nextInit = init;
     for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop += 1) {
       await validate(current);
-      const res = await transport(current, { ...init, redirect: "manual" });
+      const res = await transport(current, { ...nextInit, redirect: "manual" });
       if (res.status < 300 || res.status >= 400) return res;
       const location = res.headers?.get("location");
       if (location === null || location === undefined || location.trim().length === 0) return res;
@@ -186,11 +236,17 @@ export function createGuardedFetch(deps: GuardedFetchDeps): FetchLike {
         })();
         return block("invalid_url", host, `redirect limit exceeded after ${MAX_REDIRECT_HOPS} hops`);
       }
+      let next: string;
       try {
-        current = new URL(location, current).toString();
+        next = new URL(location, current).toString();
       } catch {
         return block("invalid_url", current, `malformed redirect Location: ${location}`);
       }
+      // Rebuild the request for the next hop: 30x method/body semantics + strip
+      // credential headers on a cross-origin hop (Codex C10). The next iteration
+      // re-runs validate() against `next`, so the allowlist/SSRF floor still applies.
+      nextInit = rebuildRedirectInit(nextInit, res.status, originOf(current), originOf(next));
+      current = next;
     }
     return block("invalid_url", input, "redirect limit exceeded");
   };

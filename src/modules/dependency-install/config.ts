@@ -55,6 +55,11 @@ export interface DependencyInstallConfig {
   readonly sandboxMode: "auto" | "off" | "required";
   /** Explicit, default-OFF override: when scripts are allowed but no sandbox exists, run anyway (noisy). */
   readonly sandboxTrustedLocalOverride: boolean;
+  /**
+   * Allow VCS (git/github/…) dependencies in the lockfile? DEFAULT FALSE (Codex C11). A git dep is
+   * pinned to a repo, not the registry, so it bypasses the registry allowlist — off by default.
+   */
+  readonly allowVcsDeps?: boolean;
 }
 
 function asPackageManager(v: string | undefined): PackageManager {
@@ -77,6 +82,7 @@ export function loadDependencyInstallConfig(reader = env): DependencyInstallConf
     allowScripts: reader.bool("ALLOW_SCRIPTS", false),
     sandboxMode: asSandboxMode(reader.str("SANDBOX")),
     sandboxTrustedLocalOverride: reader.bool("TRUSTED_LOCAL", false),
+    allowVcsDeps: reader.bool("ALLOW_VCS_DEPS", false),
   });
 }
 

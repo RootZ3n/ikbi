@@ -9,7 +9,7 @@ import { pino, type Logger } from "pino";
 import { atomicWriteJson } from "./atomic.js";
 import { SubstrateError } from "./contract.js";
 import { LockManager } from "./lock.js";
-import { DocumentStore, readModifyWrite, type RmwDeps } from "./store.js";
+import { DocumentStore, readJsonFile, readModifyWrite, type RmwDeps } from "./store.js";
 
 const silent: Logger = pino({ level: "silent" });
 
@@ -139,6 +139,37 @@ test("DocumentStore corrupt policy: throw (fail-closed) vs quarantine", async ()
     const entries = await readdir(dir);
     assert.ok(!entries.includes("bad.json"), "corrupt file moved aside");
     assert.ok(entries.some((n) => n.startsWith("bad.json.corrupt.")), "quarantined sidecar exists");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("M1: readJsonFile refuses an OVERSIZE record (fail-closed) without reading it — throw + quarantine", async () => {
+  const dir = await tmp();
+  try {
+    const path = join(dir, "big.json");
+    await writeFile(path, JSON.stringify({ blob: "x".repeat(4000) })); // well over the tiny cap below
+    // throw policy: an oversize record fails closed as corrupt_state (never pulled into memory).
+    await assert.rejects(
+      readJsonFile(path, "throw", silent, Date.now, 500),
+      (e: unknown) => e instanceof SubstrateError && e.kind === "corrupt_state",
+    );
+    // quarantine policy: the oversize record is moved aside and treated as missing.
+    assert.equal(await readJsonFile(path, "quarantine", silent, Date.now, 500), undefined, "quarantine treats oversize as missing");
+    const entries = await readdir(dir);
+    assert.ok(!entries.includes("big.json"), "oversize file moved aside");
+    assert.ok(entries.some((n) => n.startsWith("big.json.corrupt.")), "oversize sidecar exists");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("M1: a within-cap record reads normally (the cap only rejects the pathological)", async () => {
+  const dir = await tmp();
+  try {
+    const path = join(dir, "ok.json");
+    await writeFile(path, JSON.stringify({ n: 7 }));
+    assert.deepEqual(await readJsonFile<{ n: number }>(path, "throw", silent, Date.now, 10_000), { n: 7 });
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

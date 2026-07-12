@@ -5,6 +5,8 @@
  * Wires the dormant project-index module into a visible health surface.
  */
 
+import { realpathSync, statSync } from "node:fs";
+import { resolve, sep } from "node:path";
 import type { FastifyInstance } from "fastify";
 import { registerRoutes } from "../../server/registry.js";
 import type { HealthReport, HealthDimension, DimensionReport } from "./contract.js";
@@ -51,24 +53,89 @@ export function runAnalyzer(dimension: HealthDimension, repoPath: string): Dimen
 }
 
 // ── Cache ────────────────────────────────────────────────────────────────
-let cachedReport: HealthReport | undefined;
+// Keyed by CANONICAL repo path (Codex H9): a single global report let one repo receive
+// another repo's cached scan. Bounded FIFO so an attacker can't grow it without limit.
+const MAX_CACHED_REPORTS = 32;
+const reportCache = new Map<string, HealthReport>();
 
-/** Get the cached report or run a fresh scan. */
+/** Get the cached report for a path or run a fresh scan. Cache is per-path. */
 export function getReport(repoPath: string, force = false): HealthReport {
-  if (!cachedReport || force) {
-    cachedReport = runAllAnalyzers(repoPath);
+  const cached = reportCache.get(repoPath);
+  if (cached !== undefined && !force) return cached;
+  const report = runAllAnalyzers(repoPath);
+  reportCache.set(repoPath, report);
+  if (reportCache.size > MAX_CACHED_REPORTS) {
+    const oldest = reportCache.keys().next().value;
+    if (oldest !== undefined) reportCache.delete(oldest);
   }
-  return cachedReport;
+  return report;
+}
+
+/** Test-only: clear the per-path report cache. */
+export function resetReportCache(): void {
+  reportCache.clear();
+}
+
+// ── Path confinement (Codex H9) ────────────────────────────────────────────
+/** A rejected repo path (outside the allowed roots / not a directory). */
+export class RepoDoctorPathError extends Error {}
+
+/** Roots repo-doctor may scan: the process cwd + any operator-listed IKBI_REPO_DOCTOR_ROOTS (colon-sep). */
+function allowedRoots(): string[] {
+  const roots = [process.cwd()];
+  const extra = process.env.IKBI_REPO_DOCTOR_ROOTS;
+  if (extra !== undefined) {
+    for (const r of extra.split(":")) {
+      const t = r.trim();
+      if (t.length > 0) roots.push(t);
+    }
+  }
+  return roots.map((r) => { try { return realpathSync(resolve(r)); } catch { return resolve(r); } });
+}
+
+/**
+ * Canonicalize + confine a requested repo path. Without this, `?repo=/etc` (or `/`) would trigger a
+ * synchronous recursive scan of ANY host directory. Realpath defeats symlink escapes; the result must
+ * be an existing directory AT or UNDER an allowed root.
+ */
+export function resolveRepoPath(input: string): string {
+  let canonical: string;
+  try {
+    canonical = realpathSync(resolve(input));
+  } catch {
+    throw new RepoDoctorPathError(`path does not exist or is not accessible: ${input}`);
+  }
+  try {
+    if (!statSync(canonical).isDirectory()) throw new RepoDoctorPathError(`not a directory: ${input}`);
+  } catch (e) {
+    throw e instanceof RepoDoctorPathError ? e : new RepoDoctorPathError(`not a directory: ${input}`);
+  }
+  const ok = allowedRoots().some((root) => canonical === root || canonical.startsWith(root + sep));
+  if (!ok) {
+    throw new RepoDoctorPathError(`path "${input}" is outside the allowed repo-doctor roots (set IKBI_REPO_DOCTOR_ROOTS to permit it)`);
+  }
+  return canonical;
 }
 
 // ── Route registration ───────────────────────────────────────────────────
 registerRoutes("repo-doctor", (app: FastifyInstance) => {
+  // Resolve+confine the requested path, or send a 403 (never scan an arbitrary host dir).
+  const confinedPath = (raw: string | undefined, reply: import("fastify").FastifyReply): string | undefined => {
+    try {
+      return resolveRepoPath(raw ?? process.cwd());
+    } catch (e) {
+      void reply.code(403);
+      void reply.send({ error: e instanceof RepoDoctorPathError ? e.message : "invalid repo path" });
+      return undefined;
+    }
+  };
+
   // Full health report
-  app.get("/ikbi/repo-doctor/health", async (request) => {
+  app.get("/ikbi/repo-doctor/health", async (request, reply) => {
     const query = request.query as Record<string, string>;
-    const repoPath = query.repo ?? process.cwd();
-    const report = getReport(repoPath);
-    return report;
+    const repoPath = confinedPath(query.repo, reply);
+    if (repoPath === undefined) return reply;
+    return getReport(repoPath);
   });
 
   // Single dimension
@@ -79,15 +146,16 @@ registerRoutes("repo-doctor", (app: FastifyInstance) => {
       return { error: `Unknown dimension: ${dimension}. Valid: ${DIMENSIONS.join(", ")}` };
     }
     const query = request.query as Record<string, string>;
-    const repoPath = query.repo ?? process.cwd();
+    const repoPath = confinedPath(query.repo, reply);
+    if (repoPath === undefined) return reply;
     return runAnalyzer(dimension as HealthDimension, repoPath);
   });
 
   // Trigger fresh scan
-  app.post("/ikbi/repo-doctor/scan", async (request) => {
+  app.post("/ikbi/repo-doctor/scan", async (request, reply) => {
     const body = (request.body ?? {}) as Record<string, string>;
-    const repoPath = body.repo ?? process.cwd();
-    cachedReport = runAllAnalyzers(repoPath);
-    return cachedReport;
+    const repoPath = confinedPath(body.repo, reply);
+    if (repoPath === undefined) return reply;
+    return getReport(repoPath, true);
   });
 });

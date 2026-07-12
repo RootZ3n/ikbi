@@ -12,6 +12,31 @@ test("parseTestCount: node:test '# tests' / '# pass' markers", () => {
   assert.deepEqual(parseTestCount("# tests 10\n# pass 10"), { passed: 10, total: 10 });
 });
 
+test("H-1 SELF-HOSTING: parseTestCount reads the FINAL line-anchored summary, not a '# tests 0' inside a test NAME", () => {
+  // ikbi-builds-ikbi: a test NAME echoed as a TAP line contains "# tests 0" mid-line; the real summary
+  // is a big green tally at the end. A first-match/unanchored parse returned {passed:3452,total:0} →
+  // testEvidence "zero" → a fully-green run discarded as vacuous. Must read the last `^# tests`/`^# pass`.
+  const selfHost = [
+    "TAP version 13",
+    "# Subtest: node:test with zero tests (`# tests 0`, exit 0) is NOT a pass",
+    "ok 96 - node:test with zero tests (`# tests 0`, exit 0) is NOT a pass",
+    "1..3453",
+    "# tests 3453",
+    "# pass 3452",
+    "# fail 0",
+  ].join("\n");
+  assert.deepEqual(parseTestCount(selfHost), { passed: 3452, total: 3453 }, "the real final summary, not the 0 inside a name");
+});
+
+test("H-1: a genuine node:test zero-test summary still parses as total 0 (the real signal is preserved)", () => {
+  assert.deepEqual(parseTestCount("TAP version 13\n1..0\n# tests 0\n# pass 0\n# fail 0"), { passed: 0, total: 0 });
+});
+
+test("H-1: multiple runs (ladder) → parseTestCount takes the LAST run's summary", () => {
+  const laddered = "# tests 5\n# pass 5\n# fail 0\n--- next stage ---\n# tests 42\n# pass 42\n# fail 0";
+  assert.deepEqual(parseTestCount(laddered), { passed: 42, total: 42 });
+});
+
 test("parseTestCount: vitest 'Tests  3 passed (3)'", () => {
   assert.deepEqual(parseTestCount("Tests  3 passed (3)"), { passed: 3, total: 3 });
 });
@@ -64,6 +89,69 @@ test("parseTestCount: cargo test 'test result: ok. N passed; M failed'", () => {
 
 test("parseTestCount: cargo test simpler form 'test result: ok. N passed'", () => {
   assert.deepEqual(parseTestCount("test result: ok. 8 passed"), { passed: 8, total: 8 });
+});
+
+test("parseTestCount: cargo MULTI-SECTION output (lib + empty bin + doc-tests) — the Rust greenfield regression", () => {
+  // A real `cargo test` on a lib+bin crate prints THREE result blocks: the lib tests (the real ones),
+  // then the bin's "running 0 tests", then doc-tests. The greedy generic matcher used to bridge the
+  // lib's "17 passed" to the bin's "running 0 tests" and return total:0 ⇒ testEvidence "zero" ⇒ a
+  // fully-tested Rust build was DISCARDED (found live: the roman-numeral E2E build). The precise cargo
+  // matcher must win: 17 real passing tests, total 17.
+  const cargo = [
+    "     Running unittests src/lib.rs (target/debug/deps/roman-3a303b11c2f23ca8)",
+    "",
+    "running 17 tests",
+    "test tests::to_roman_1 ... ok",
+    "test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+    "",
+    "     Running unittests src/main.rs (target/debug/deps/roman-12d997bc85f6ed2b)",
+    "",
+    "running 0 tests",
+    "",
+    "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+    "",
+    "   Doc-tests roman",
+    "",
+    "running 0 tests",
+    "",
+    "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+  ].join("\n");
+  assert.deepEqual(parseTestCount(cargo), { passed: 17, total: 17 });
+});
+
+test("parseTestCount: .NET VSTest 'Passed! - Failed: F, Passed: P, Skipped: S, Total: T'", () => {
+  assert.deepEqual(parseTestCount("Passed!  - Failed:     0, Passed:     6, Skipped:     0, Total:     6, Duration: 12 ms"), { passed: 6, total: 6 });
+  assert.deepEqual(parseTestCount("Failed!  - Failed:     2, Passed:     3, Skipped:     1, Total:     6, Duration: 9 ms"), { passed: 3, total: 6 });
+});
+
+test("parseTestCount: JVM 'Tests run: N, Failures: F, Errors: E' (JUnit / Maven Surefire / hand-rolled)", () => {
+  assert.deepEqual(parseTestCount("Tests run: 7, Failures: 0, Errors: 0"), { passed: 7, total: 7 });
+  assert.deepEqual(parseTestCount("Tests run: 10, Failures: 2, Errors: 1, Skipped: 0"), { passed: 7, total: 10 });
+  assert.deepEqual(parseTestCount("[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0\n[INFO] BUILD SUCCESS"), { passed: 3, total: 3 });
+});
+
+test("parseTestCount: python unittest 'Ran N tests ... OK' (stdlib, sandbox-runnable)", () => {
+  const ok = [
+    "test_addition (test_rpn.TestRPN.test_addition) ... ok",
+    "test_division (test_rpn.TestRPN.test_division) ... ok",
+    "",
+    "----------------------------------------------------------------------",
+    "Ran 9 tests in 0.000s",
+    "",
+    "OK",
+  ].join("\n");
+  assert.deepEqual(parseTestCount(ok), { passed: 9, total: 9 });
+});
+
+test("parseTestCount: python unittest FAILED subtracts failures+errors", () => {
+  assert.deepEqual(parseTestCount("Ran 5 tests in 0.001s\n\nFAILED (failures=1, errors=1)"), { passed: 3, total: 5 });
+  assert.deepEqual(parseTestCount("Ran 4 tests in 0.001s\n\nFAILED (failures=2)"), { passed: 2, total: 4 });
+});
+
+test("parseTestCount: python unittest 'Ran 0 tests' is vacuous ⇒ total 0 (gate discards)", () => {
+  // A discover run that matched nothing prints "Ran 0 tests ... OK" — green but vacuous. total:0 ⇒
+  // readVerifier scores testEvidence "zero" ⇒ the single-run gate refuses to promote. Anti-vacuous.
+  assert.deepEqual(parseTestCount("Ran 0 tests in 0.000s\n\nOK"), { passed: 0, total: 0 });
 });
 
 test("parseTestCount: go test ok/FAIL lines", () => {

@@ -16,6 +16,7 @@ import { receipts as coreReceipts } from "../core/receipt/index.js";
 import type { Receipt, ReceiptQuery } from "../core/receipt/index.js";
 import { groupReceiptsByTask } from "../core/receipt/grouping.js";
 import { registerRoutes } from "./registry.js";
+import { apiAuth } from "./auth.js";
 
 export interface ReceiptReader {
   query(filter?: ReceiptQuery): Promise<Receipt[]>;
@@ -59,6 +60,8 @@ function costOf(r: Receipt): number {
 
 export function createTimelineRouteRegistrar(store: ReceiptReader = coreReceipts): (app: FastifyInstance) => void {
   return (app: FastifyInstance) => {
+    // C3: enforce the shared bearer guard (timeline exposes the same receipt-derived data as /api/receipts).
+    app.addHook("preHandler", apiAuth);
     app.get<{ Querystring: { period?: string; from?: string; to?: string } }>(
       "/api/timeline",
       async (request) => {

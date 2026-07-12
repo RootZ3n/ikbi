@@ -59,7 +59,7 @@ import { runQualityChecks, type QualityResult } from "./quality-checks.js";
 // LADDER MODE (opt-in, IKBI_VERIFY=ladder): package/impact-aware verification. These are
 // library-only consumers — no side effects at import; the default (legacy) path never calls them.
 import { projectIndex, type ProjectIndexData } from "../project-index/index.js";
-import { isStubScript, verificationLadder, type VerificationPlan } from "../verification-ladder/index.js";
+import { isStubScript, isInlineEvalTestScript, verificationLadder, type VerificationPlan } from "../verification-ladder/index.js";
 import { loadHowaCheckConfig, runHowaTruthfulnessCheck } from "../verification-ladder/howa-check.js";
 import { parseCheckOutput, type CheckTriage } from "../check-triage/index.js";
 import { resolveVerificationMode, type VerificationMode } from "./modes.js";
@@ -352,7 +352,9 @@ function detectStubTestScript(workspacePath: string): string | undefined {
       // The `test` key is the real signal — ANY stub (echo, true, --passWithNoTests, …) is a vacuous
       // green. A pretest/posttest HOOK is only a stub when it is a HARD no-op (Codex M6): a setup
       // command like `echo preparing` is legitimate and must not trip the guard.
-      const stubbed = key === "test" ? isStubScript(script) : isNeuteredHook(script);
+      // The test key fails closed on a stub OR an inline-eval fake runner (`node -e '# tests 3'`),
+      // which can forge test output + exit 0 without running a suite. A hook only trips on a hard no-op.
+      const stubbed = key === "test" ? (isStubScript(script) || isInlineEvalTestScript(script)) : isNeuteredHook(script);
       if (stubbed) {
         const where = relative(workspacePath, pkgPath) || "package.json";
         return `stub ${key} script ("${script}") in ${where} is not meaningful verification — refusing a vacuous green`;
@@ -628,6 +630,24 @@ export function isLikelyTestFile(path: string): boolean {
   return TEST_FILE_PATTERNS.some((p) => p.test(path));
 }
 
+/**
+ * NARROW test-file shapes — the UNAMBIGUOUS ones only. Deliberately EXCLUDES the `test*.js` filename
+ * pattern and the `tests?/` directory pattern, because a file like `test-runner.js` or `tests/run.js`
+ * can be the verification RUNNER a guarded `"test"` script shells out to. Used for the SHELL-OUT
+ * exclusion so a build that neuters its own test runner (e.g. `"test":"node tests/run.js"` → runner
+ * rewritten to exit 0) stays guarded, instead of being waved through as "just editing a test file".
+ */
+const NARROW_TEST_FILE_PATTERNS = [
+  /\.(?:test|spec)\.[cm]?[jt]sx?$/i, // *.test.js, *.spec.ts
+  /_test\.(?:py|go|rs|rb)$/i, // *_test.py, *_test.go
+  /test_[^/]+\.(?:py|go|rs|rb)$/i, // test_*.py, test_*.go
+];
+
+/** True for an unambiguous test file (never a possible verification runner) — see NARROW_TEST_FILE_PATTERNS. */
+export function isNarrowTestFile(path: string): boolean {
+  return NARROW_TEST_FILE_PATTERNS.some((p) => p.test(path));
+}
+
 /** Source-file extensions to look for when extracting file names from a build goal. */
 const GOAL_FILE_EXTS = new Set([
   ".js", ".ts", ".cjs", ".mjs", ".jsx", ".tsx", ".cts", ".mts",
@@ -847,7 +867,10 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
     const allGoalFiles = extractGoalFiles(ctx.task?.goal ?? "");
     const changedFiles = parseChangedFiles(diffText);
     for (const f of changedFiles) {
-      if (isLikelyTestFile(f)) allGoalFiles.add(f);
+      // NARROW exclusion: only unambiguous test files are auto-excluded. A `test-runner.js` /
+      // `tests/run.js` shape is NOT — it may be the verification runner a guarded script invokes, and
+      // excluding it here is exactly how a build could neuter its own checks past the shell-out guard.
+      if (isNarrowTestFile(f)) allGoalFiles.add(f);
     }
     const shellOut = detectShellOutMutation(diffText, ctx.workspace.path, allGoalFiles.size > 0 ? allGoalFiles : undefined);
     if (shellOut.mutated) {
@@ -885,27 +908,36 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
     // legacy loop would inherit governed-exec's 30s read-only-tool default and SIGKILL real suites.
     const legacyCheckTimeoutMs = resolveCheckTimeoutMs(env);
     const checks: CheckResult[] = [];
+    // The FULL stdout AND stderr per check (aligned with `checks`), so triage sees the same evidence
+    // mapExec does — a zero-test / exit-swallow marker printed EARLY in a verbose run is gone from the
+    // tail, and a failure printed to STDERR was previously invisible entirely (Codex C2 false-green).
+    const fullOutputs: string[] = [];
+    const fullErrors: string[] = [];
     let sawDryRun = false;
     for (const c of checkSet) {
-      // Accumulate the FULL stdout from the streaming sink: governed-exec retains only the bounded
-      // tail, so a zero-test marker printed early in a verbose passing run is gone from stdoutTail.
-      // mapExec parses the test tally from this full stream (robust), not the truncated tail.
+      // Accumulate the FULL stdout+stderr from the streaming sink: governed-exec retains only the
+      // bounded tail, so an early marker is gone from the tail. mapExec parses the tally from the full
+      // stdout; triage (below) parses failures from the full COMBINED stream.
       let fullStdout = "";
+      let fullStderr = "";
       const res = await governedExec.run({
         parentCtx,
         command: c.command,
         args: [...c.args],
         cwd: ctx.workspace.path,
         worktreeRoot: ctx.workspace.path, // OS sandbox keeps the worktree writable, host read-only (F1)
+        verifier: true, // trusted check-runner — may run package scripts
         purpose: `verifier check: ${c.name}`,
         timeoutMs: legacyCheckTimeoutMs,
         // STREAMING path: a verbose suite emitting >maxBuffer (8MB) to stdout makes the buffered
         // execFile throw ENOBUFS → mapped to exit 1 → a FALSE RED on a passing build. The streaming
         // path caps CAPTURE at maxBuffer WITHOUT killing the process, so the real exit code survives.
-        onOutput: (chunk, stream) => { if (stream === "stdout") fullStdout += chunk; },
+        onOutput: (chunk, stream) => { if (stream === "stdout") fullStdout += chunk; else if (stream === "stderr") fullStderr += chunk; },
       });
       const { check, dryRun } = mapExec(c.name, `${c.command} ${c.args.join(" ")}`, res, fullStdout);
       checks.push(check);
+      fullOutputs.push(fullStdout);
+      fullErrors.push(fullStderr);
       sawDryRun = sawDryRun || dryRun;
     }
 
@@ -922,9 +954,12 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
 
     // Triage: detect false-greens (zero tests, exit-swallowing) even in legacy mode.
     // This brings the legacy path to parity with the ladder and builder run_checks.
-    const triaged = checks.map((c) => ({
+    const triaged = checks.map((c, i) => ({
       check: c,
-      triage: parseCheckOutput({ name: c.name, command: c.command, exitCode: c.exitCode, stdout: c.outputTail, stderr: "" }),
+      // Triage on the FULL stdout+stderr (parseCheckOutput bounds head+tail + combines both channels
+      // internally), NOT the 2k tail and NOT stdout-only — a swallowed-exit / zero-test marker scrolled
+      // past the tail, OR a failure printed to stderr, would otherwise defeat the detectors (Codex C2).
+      triage: parseCheckOutput({ name: c.name, command: c.command, exitCode: c.exitCode, stdout: fullOutputs[i] ?? c.outputTail, stderr: fullErrors[i] ?? "" }),
     }));
     const allPass = triaged.every((t) => t.check.exitCode === 0 && t.triage.passed);
     const failed = triaged.filter((t) => !t.triage.passed).map((t) => t.check.name);
@@ -1108,20 +1143,23 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
             };
           }
           const cmdStr = `${task.command} ${task.args.join(" ")}`;
-          // Accumulate the FULL stdout (see the legacy loop): the bounded tail can drop an early
-          // zero-test marker, so mapExec parses the tally from the whole stream, not the tail.
+          // Accumulate the FULL stdout+stderr (see the legacy loop): the bounded tail can drop an early
+          // zero-test marker, and a failure on stderr was previously only visible as the bounded tail —
+          // so mapExec parses the tally from the whole stdout and triage sees the full combined stream.
           let fullStdout = "";
+          let fullStderr = "";
           const res = await governedExec.run({
             parentCtx: pctx,
             command: task.command,
             args: [...task.args],
             cwd: task.cwd === "" ? worktree : join(worktree, task.cwd),
             worktreeRoot: worktree, // OS sandbox keeps the whole worktree writable (not just the pkg subdir) (F1)
+            verifier: true, // ladder executor — trusted check-runner
             purpose: `verifier[ladder:${task.scope}] ${task.name} (${task.package || "(root)"})`,
             timeoutMs: checkTimeoutMs,
             // STREAMING path (bounded capture, no kill) so a >maxBuffer verbose suite keeps its real
             // exit code instead of an ENOBUFS-induced false RED. See the legacy loop for the rationale.
-            onOutput: (chunk, stream) => { if (stream === "stdout") fullStdout += chunk; },
+            onOutput: (chunk, stream) => { if (stream === "stdout") fullStdout += chunk; else if (stream === "stderr") fullStderr += chunk; },
           });
           const { check, dryRun } = mapExec(task.name, cmdStr, res, fullStdout);
           checks.push(check);
@@ -1132,7 +1170,10 @@ export function createVerifier(deps: VerifierDeps = {}): RoleFn {
               detail: { verdict: "dry-run", verificationScope: plan.scope, checks, stagesRun, neutralPackages: plan.neutralPackages, receipts: baseReceipts },
             };
           }
-          const tr: CheckTriage = triageFn({ name: task.name, command: cmdStr, exitCode: check.exitCode, stdout: res.stdoutTail ?? "", stderr: res.stderrTail ?? "" });
+          // Triage on the FULL stdout+stderr (bounded internally), not the 2k tail and not the bounded
+          // stderrTail — the tail can drop an early swallowed-exit / zero-test marker, and a failure
+          // printed early to stderr would scroll out of stderrTail, defeating the detectors (Codex C2).
+          const tr: CheckTriage = triageFn({ name: task.name, command: cmdStr, exitCode: check.exitCode, stdout: fullStdout || (res.stdoutTail ?? ""), stderr: fullStderr || (res.stderrTail ?? "") });
           triages.push({ stage: stage.stage, name: task.name, package: task.package, passed: tr.passed, failures: tr.failures, errorSummary: tr.errorSummary, detectedFrameworks: tr.detectedFrameworks });
           if (!tr.passed) {
             // FAIL FAST — stop before any later stage/task.

@@ -8,6 +8,9 @@
  */
 
 import { execFile } from "node:child_process";
+import { closeSync, openSync, readSync } from "node:fs";
+import { access, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { promisify } from "node:util";
 
 import { WorkspaceError } from "./contract.js";
@@ -42,8 +45,18 @@ export async function isGitRepo(repo: string): Promise<boolean> {
 }
 
 export async function currentBranch(repo: string): Promise<string> {
-  const r = await runGit(repo, ["rev-parse", "--abbrev-ref", "HEAD"]);
-  return r.stdout.trim();
+  const symbolic = await runGit(repo, ["symbolic-ref", "--quiet", "--short", "HEAD"], { okCodes: [1] });
+  if (symbolic.code === 0) return symbolic.stdout.trim();
+
+  const abbreviated = await runGit(repo, ["rev-parse", "--abbrev-ref", "HEAD"], { okCodes: [128] }).catch(() => undefined);
+  const head = abbreviated?.stdout.trim();
+  if (head === "HEAD" || symbolic.code === 1) {
+    throw new WorkspaceError(
+      "config",
+      "target repository is in detached HEAD; pass an explicit baseBranch so workspace promotion has a real target branch",
+    );
+  }
+  throw new WorkspaceError("config", "could not resolve the target repository's current branch; pass an explicit baseBranch");
 }
 
 export async function revParse(repo: string, ref: string): Promise<string> {
@@ -108,11 +121,92 @@ export async function listBranches(repo: string, prefix: string): Promise<string
   return r.stdout.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
 }
 
+/**
+ * Universal build-OUTPUT dirs no repo wants committed. Every entry is a build artifact, never source
+ * — so seeding these can only prevent junk, never hide the builder's work. Kept deliberately narrow
+ * (no `dist/`/`build/`, which some repos DO track as source) so the seed is unambiguous.
+ */
+const DEFAULT_GITIGNORE = [
+  "# seeded by ikbi — this greenfield build had no .gitignore; excludes build output only",
+  "/target/", "target/",          // Rust / Maven / some JVM
+  "node_modules/",                // Node
+  "__pycache__/", "*.pyc", ".venv/", "*.egg-info/", // Python
+  "*.class", "*.jar",             // JVM (javac output / packaged artifacts)
+  "bin/", "obj/",                 // .NET (build output + NuGet restore intermediates)
+  "build/", ".gradle/",           // Gradle (target/ above covers Maven)
+  ".DS_Store",
+  "",
+].join("\n");
+
+/**
+ * If a worktree has NO `.gitignore`, seed a minimal one covering universal build-output dirs before
+ * we stage. Without this, a greenfield build that runs a toolchain (e.g. `cargo test` → `target/`,
+ * `npm i` → `node_modules/`) commits hundreds of artifact files on promote (the O3 papercut). NEVER
+ * overwrites an existing `.gitignore` (respects the operator's), and is best-effort: any failure
+ * leaves the original `git add -A` behavior untouched.
+ */
+async function seedDefaultGitignoreIfAbsent(worktreePath: string): Promise<void> {
+  const gitignorePath = join(worktreePath, ".gitignore");
+  try {
+    await access(gitignorePath);
+    return; // exists — leave it exactly as the operator/build left it
+  } catch {
+    // absent — fall through to seed
+  }
+  try {
+    await writeFile(gitignorePath, DEFAULT_GITIGNORE, { flag: "wx" }); // wx: never clobber a race-created file
+  } catch {
+    // best-effort — a failure just means we stage as before
+  }
+}
+
+/** True iff `path` begins with the ELF magic (\x7fELF) — a compiled binary (Go/C/Rust exe, .o, .so).
+ *  Reads only the first 4 bytes; a shell script or any text file is never ELF, so this never misfires. */
+function isElfBinary(path: string): boolean {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, "r");
+    const buf = Buffer.alloc(4);
+    if (readSync(fd, buf, 0, 4, 0) < 4) return false;
+    return buf[0] === 0x7f && buf[1] === 0x45 && buf[2] === 0x4c && buf[3] === 0x46;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) try { closeSync(fd); } catch { /* ignore */ }
+  }
+}
+
+/**
+ * Un-stage newly-ADDED compiled binaries a build dropped in the worktree (e.g. `go build` → an
+ * extensionless `./modulename`, or a C `a.out`). Directory-based ignores (target/, bin/, obj/) miss
+ * these because they land at the root with no extension, so .gitignore can't catch them generically.
+ * ELF magic is the reliable signal. `--diff-filter=A` scopes this to NEW files only, so a binary a repo
+ * legitimately tracks (and the build merely rebuilt) is left staged.
+ */
+async function unstageAddedBinaries(worktreePath: string): Promise<void> {
+  const added = (await runGit(worktreePath, ["diff", "--cached", "--name-only", "--diff-filter=A"])).stdout
+    .split("\n").map((s) => s.trim()).filter((s) => s.length > 0);
+  for (const rel of added) {
+    if (isElfBinary(join(worktreePath, rel))) await runGit(worktreePath, ["reset", "--quiet", "--", rel]);
+  }
+}
+
 /** Stage everything and commit in a worktree. Returns false if there was nothing to commit. */
 export async function commitAll(worktreePath: string, message: string): Promise<boolean> {
+  // Detect changes BEFORE seeding, so a genuine no-op build lands nothing (and we never write a
+  // spurious .gitignore into an otherwise-unchanged repo). `status --porcelain` sees untracked files
+  // (e.g. `?? target/`) too, so this is a faithful "did the build change anything?" check.
+  const pre = await runGit(worktreePath, ["status", "--porcelain"]);
+  if (pre.stdout.trim().length === 0) return false;
+  // There ARE changes ⇒ seed a default .gitignore (if absent) so build-output dirs (target/,
+  // node_modules/, …) are excluded from the `add -A` below instead of committed as artifacts.
+  await seedDefaultGitignoreIfAbsent(worktreePath);
   await runGit(worktreePath, ["add", "-A"]);
-  const status = await runGit(worktreePath, ["status", "--porcelain"]);
-  if (status.stdout.trim().length === 0) return false;
+  // Drop extensionless compiled binaries that slipped past the dir-based ignores (e.g. a `go build` exe).
+  await unstageAddedBinaries(worktreePath);
+  // Re-check what's actually STAGED (a build whose only output was an unstaged binary lands nothing).
+  const staged = await runGit(worktreePath, ["diff", "--cached", "--name-only"]);
+  if (staged.stdout.trim().length === 0) return false;
   await runGit(worktreePath, ["commit", "--quiet", "-m", message]);
   return true;
 }
@@ -221,7 +315,8 @@ export async function isWorktreeClean(worktreePath: string): Promise<boolean> {
  * preserved in the worktree's stash list — the late work is never lost, only set aside — and the
  * reset then proceeds against a clean tree. The operator recovers it with `git stash pop`.
  */
-export async function syncWorktreeToRef(worktreePath: string, ref: string): Promise<void> {
+export async function syncWorktreeToRef(worktreePath: string, ref: string): Promise<{ stashed: boolean }> {
+  let stashed = false;
   if (!(await isWorktreeClean(worktreePath))) {
     await runGit(worktreePath, [
       "stash",
@@ -231,6 +326,11 @@ export async function syncWorktreeToRef(worktreePath: string, ref: string): Prom
       "-m",
       `ikbi: auto-stashed late uncommitted work before promote-sync to ${ref}`,
     ]);
+    stashed = true;
   }
   await runGit(worktreePath, ["reset", "--hard", "--quiet", ref]);
+  // Report whether a stash was created so the caller can LOUDLY tell the operator their working tree
+  // was reset and their uncommitted work set aside (recover with `git stash pop`) — a crash-reconcile
+  // that silently resets the user's checkout is a nasty surprise, even though nothing is lost.
+  return { stashed };
 }

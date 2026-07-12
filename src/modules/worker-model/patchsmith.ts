@@ -644,6 +644,7 @@ async function runVerification(deps: PatchsmithDeps, workspacePath: string): Pro
       command: c.command,
       args: [...c.args],
       cwd: workspacePath,
+      verifier: true, // trusted check-runner — may run package scripts
       purpose: `patchsmith check: ${c.name}`,
       timeoutMs: checkTimeoutMs,
     });

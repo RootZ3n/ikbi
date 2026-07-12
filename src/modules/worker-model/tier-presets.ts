@@ -42,6 +42,23 @@ export interface TierPreset {
    * escalation OFF. An explicit `--fallback-model` overrides this.
    */
   readonly fallbackModel?: string;
+  /**
+   * CANDIDATE TOURNAMENT models. When present (cheap tier), the build races these models
+   * INDEPENDENTLY, the deterministic-judge scores every verified candidate, the winner's diff is
+   * replayed into a clean shadow workspace + re-verified, and only then does the critic/adjudication
+   * promote path run. This is how the cheap tier engages the FULL system (tournament + judge +
+   * shadow verification) rather than a lone builder — a weak candidate that over-produces or drifts
+   * from the goal loses to a tighter one on the judge's objective score. Absent ⇒ single-builder path.
+   */
+  readonly candidates?: readonly string[];
+  /**
+   * MIXTURE OF EXPERTS: when true (cheap tier), the build runs as a coordinated 4-model pool —
+   * each sub-task RENTS the cheapest-sufficient expert by difficulty (see expert-rental.ts) rather
+   * than pinning one fixed builder. The tier's `builderModel` becomes the typical/floor expert the
+   * rental resolves to for mechanical work; harder sub-tasks rent up to the mid roster. mid/frontier
+   * leave this unset — they run a single, explicitly-chosen capable builder.
+   */
+  readonly moe?: boolean;
 }
 
 /** The canonical, documented tier presets. */
@@ -52,6 +69,12 @@ export const TIER_PRESETS: Readonly<Record<BuildTier, TierPreset>> = Object.free
     criticModel: "deepseek-v4-pro",
     escalation: true,
     fallbackModel: "mimo-v2.5-pro",
+    // The cheap tier is a 4-model MIXTURE OF EXPERTS: a coordinator rents the cheapest-sufficient
+    // expert per sub-task (worker roster for mechanical work, mid roster for reasoning), all
+    // collaborating on ONE workspace. NOT a candidate tournament that races and discards losers
+    // (`candidates` left unset — tournament stays an explicit IKBI_CANDIDATE_MODELS opt-in), and
+    // NOT a lone builder with an escalation ladder. `builderModel` above is the typical/floor expert.
+    moe: true,
   }),
   mid: Object.freeze({
     tier: "mid",

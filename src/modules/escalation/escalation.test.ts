@@ -22,6 +22,7 @@ import {
   createBreakGlass,
   presentBreakGlass,
   escalationConfig,
+  loadEscalationConfig,
   DEFAULT_WEIGHTS,
   type EscalationSignals,
   type EscalationContext,
@@ -30,6 +31,26 @@ import {
 } from "./index.js";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+/** A minimal config reader (defaults through, per-key overrides) for loadEscalationConfig. */
+function fakeReader(overrides: Record<string, unknown> = {}): Parameters<typeof loadEscalationConfig>[0] {
+  const pick = <T,>(k: string, d: T): T => (k in overrides ? (overrides[k] as T) : d);
+  return {
+    bool: (k: string, d: boolean) => pick(k, d),
+    number: (k: string, d: number) => pick(k, d),
+    int: (k: string, d: number) => pick(k, d),
+    list: (k: string, d: readonly string[]) => pick(k, [...d]),
+  } as Parameters<typeof loadEscalationConfig>[0];
+}
+
+test("config — alwaysEscalate defaults ON (guaranteed flash→pro)", () => {
+  assert.equal(escalationConfig.alwaysEscalate, true, "the shipped default is always-on escalation");
+  assert.equal(loadEscalationConfig(fakeReader()).alwaysEscalate, true, "default reader ⇒ true");
+});
+
+test("config — IKBI_ESCALATION_ALWAYS_ESCALATE=false disables the guarantee", () => {
+  assert.equal(loadEscalationConfig(fakeReader({ ALWAYS_ESCALATE: false })).alwaysEscalate, false, "operator can opt out");
+});
 
 /** A clean (no-pressure) signal set; override fields per test. */
 function signals(over: Partial<EscalationSignals> = {}): EscalationSignals {
@@ -161,6 +182,26 @@ test("policy — tier ladder + thresholds", () => {
   assert.equal(modelFor("frontier", escalationConfig), "sonnet-4.6");
 });
 
+test("policy — modelFor skips an unresolvable/stub tier model in favor of a wired one", () => {
+  // frontier roster is [sonnet-4.6, opus-4.8, gpt-5.5]. Pretend only opus-4.8 is wired:
+  const onlyOpus = (m: string): boolean => m === "opus-4.8";
+  assert.equal(modelFor("frontier", escalationConfig, onlyOpus), "opus-4.8", "the stub-position model, now the only wired one, is chosen");
+  // When NONE resolve, it falls back to the first roster entry (unchanged behavior).
+  assert.equal(modelFor("frontier", escalationConfig, () => false), "sonnet-4.6");
+  // The first roster entry, when wired, still wins (no needless skipping).
+  assert.equal(modelFor("frontier", escalationConfig, () => true), "sonnet-4.6");
+});
+
+test("policy — decideEscalation targets a wired model, skipping a stub, when a resolver is given", () => {
+  // mid→frontier with only gpt-5.5 wired: sonnet-4.6 and opus-4.8 (stub) are skipped.
+  const onlyGpt = (m: string): boolean => m === "gpt-5.5";
+  const d = decideEscalation(score(70), "mid", escalationConfig, 0, onlyGpt);
+  assert.equal(d.escalate, true);
+  assert.equal(d.targetTier, "frontier");
+  assert.equal(d.targetModel, "gpt-5.5", "the wired frontier model is chosen over the unwired ones");
+  assert.equal(d.requiresApproval, true, "INVARIANT preserved: frontier still needs approval");
+});
+
 function score(total: number): EscalationScore {
   return { total, breakdown: { synthetic: total }, shouldEscalate: false };
 }
@@ -231,6 +272,21 @@ test("engine — worker→mid auto-escalates and builds a handoff", () => {
   if (last === undefined) throw new Error("expected an attempt summary");
   assert.equal(last.model, "deepseek-v4-flash");
   assert.deepEqual([...last.failureReasons], ["tests red"]);
+});
+
+test("engine — an injected resolver steers the target to a wired model, skipping a stub", () => {
+  // Only gpt-5.5 is wired in the frontier tier; sonnet-4.6 (roster[0]) and opus-4.8 (stub) are not.
+  const engine = createEscalationEngine(escalationConfig, { isResolvable: (m) => m === "gpt-5.5" });
+  const decision = engine.evaluate(
+    ctx({
+      currentTier: "mid",
+      signals: signals({ schemaFailures: 1, retryCount: 1, criticRejected: true, verificationFailed: true }),
+    }),
+  );
+  assert.equal(decision.escalate, true);
+  assert.equal(decision.targetTier, "frontier");
+  assert.equal(decision.targetModel, "gpt-5.5", "the engine's resolver skipped the unwired sonnet-4.6/opus-4.8");
+  assert.equal(decision.requiresApproval, true);
 });
 
 test("engine — mid→frontier escalates but flags approval", () => {

@@ -413,6 +413,11 @@
         '<span class="grove-prompt">❯</span>' +
         '<input class="grove-input" type="text" id="grove-input" placeholder="State the goal…  (append --repo /abs/path)" ' +
           'onkeydown="if(event.key===\'Enter\'&&this.value.trim()){window.groveSend(this.value);this.value=\'\'}">' +
+        '<input type="file" id="grove-file" accept="image/*" style="display:none" onchange="window.groveAttach(this)">' +
+        '<button type="button" class="grove-attach" title="Attach a photo for Peh to see (vision)" onclick="document.getElementById(\'grove-file\').click()">📎</button>' +
+        '<button type="button" class="grove-mic" id="grove-mic" title="Talk to Peh (voice)" onclick="window.groveMic(this)">🎤</button>' +
+        '<button type="button" class="grove-voice" id="grove-voice" title="Peh speaks replies (tap to mute)" onclick="window.groveVoiceToggle(this)">🔊</button>' +
+        '<button type="button" class="grove-voicepick-btn" title="Choose Peh\'s voice" onclick="window.groveVoicePick()">⚙</button>' +
       '</div>' +
     '</div>';
   }
@@ -503,13 +508,15 @@
 
   // The Grove chat escape hatch — still talks to /chat for conversational queries
   // (prefix a message with "?" or "chat:").
-  async function groveChat(text, msgs) {
+  async function groveChat(text, msgs, images) {
     var thinkingEl = buildMsg(msgs, 'system', 'ikbi is processing…');
     try {
-      var result = await window.IkbiAPI.converse(text);
+      var result = await window.IkbiAPI.converse(text, images && images.length ? { images: images } : undefined);
       if (thinkingEl.parentNode) thinkingEl.parentNode.removeChild(thinkingEl);
       if (result.ok && result.data) {
-        buildMsg(msgs, 'assistant', result.data.response || result.data.content || JSON.stringify(result.data));
+        var reply = result.data.response || result.data.content || JSON.stringify(result.data);
+        buildMsg(msgs, 'assistant', reply);
+        if (typeof window.groveSpeak === 'function') window.groveSpeak(reply);
       } else if (result.status === 401 || result.status === 503) {
         buildMsg(msgs, 'system', 'Chat requires IKBI_CHAT_TOKEN. Set it on the server to enable conversation.');
       } else {
@@ -533,6 +540,191 @@
     var pr = parseGoalRepo(text);
     var repo = pr.repo || (typeof window !== 'undefined' && window.IKBI_DEFAULT_REPO) || null;
     await window.ikbiRunBuild(pr.goal, repo, msgs);
+  };
+
+  // Attach a photo from the device → Peh sees it via vision_analyze (the configured vision model).
+  // Uses whatever is typed in the grove input as the caption/question, else asks for a description.
+  // Send an image (data-URL) to Peh: downscale to a vision-friendly size, then converse. Shared by
+  // the 📎 attach button AND the Android "Share → Peh" handler (window.groveSendImage).
+  window.groveSendImage = function (dataUrl, caption, label) {
+    var msgs = document.getElementById('grove-msgs');
+    if (!msgs || !dataUrl) return;
+    var cap = (caption && caption.trim()) || 'Read or describe this image.';
+    var img = new Image();
+    img.onload = function () {
+      var max = 1568, w = img.width, h = img.height;
+      if (w > max || h > max) { if (w >= h) { h = Math.round(h * max / w); w = max; } else { w = Math.round(w * max / h); h = max; } }
+      var out;
+      try {
+        var canvas = document.createElement('canvas');
+        canvas.width = w; canvas.height = h;
+        canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+        out = canvas.toDataURL('image/jpeg', 0.85);
+      } catch (e) { out = dataUrl; }
+      buildMsg(msgs, 'user', '📷 ' + (label || 'image') + ' — “' + cap + '”');
+      groveChat(cap, msgs, [out]);
+    };
+    img.onerror = function () { buildMsg(msgs, 'system', 'Could not load that image.'); };
+    img.src = dataUrl;
+  };
+
+  window.groveAttach = function (input) {
+    var file = input && input.files && input.files[0];
+    input.value = '';
+    if (!file) return;
+    var inp = document.getElementById('grove-input');
+    var caption = (inp && inp.value.trim()) || '';
+    if (inp) inp.value = '';
+    var reader = new FileReader();
+    reader.onload = function () { window.groveSendImage(reader.result, caption, file.name); };
+    reader.onerror = function () { var m = document.getElementById('grove-msgs'); if (m) buildMsg(m, 'system', 'Could not read that image.'); };
+    reader.readAsDataURL(file);
+  };
+
+  // Voice-in: browser speech-to-text (Web Speech API). Tap to talk; interim text shows live in the
+  // input; when you stop, the transcript is sent to Peh as CHAT. Tap again while listening to stop.
+  window.groveMic = function (btn) {
+    var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    var msgs = document.getElementById('grove-msgs');
+    if (!SR) { if (msgs) buildMsg(msgs, 'system', 'Voice input isn\'t supported in this browser.'); return; }
+    if (window._groveRec) { try { window._groveRec.stop(); } catch (e) {} return; } // toggle off
+    var inp = document.getElementById('grove-input');
+    var rec = new SR();
+    rec.lang = 'en-US';
+    rec.interimResults = true;
+    rec.continuous = false;
+    window._groveRec = rec;
+    if (btn) btn.classList.add('listening');
+    var finalText = '';
+    rec.onresult = function (e) {
+      var interim = '';
+      for (var i = e.resultIndex; i < e.results.length; i++) {
+        var t = e.results[i][0].transcript;
+        if (e.results[i].isFinal) finalText += t; else interim += t;
+      }
+      if (inp) inp.value = (finalText + interim);
+    };
+    rec.onerror = function (e) {
+      if (msgs && e && e.error === 'not-allowed') buildMsg(msgs, 'system', 'Microphone permission is needed for voice — allow it in the browser.');
+    };
+    rec.onend = function () {
+      window._groveRec = null;
+      if (btn) btn.classList.remove('listening');
+      var text = (inp && inp.value.trim()) || finalText.trim();
+      if (inp) inp.value = '';
+      var m = document.getElementById('grove-msgs');
+      if (text && m) { buildMsg(m, 'user', '🎤 ' + text); groveChat(text, m); }
+    };
+    try { rec.start(); } catch (e) { window._groveRec = null; if (btn) btn.classList.remove('listening'); }
+  };
+
+  // Voice-OUT: Peh speaks his replies aloud (Web Speech Synthesis). Peh is a scientist stuck in a
+  // squirrel brain → a MALE voice, a touch lower pitch, brisk rate. Toggle with the 🔊 button.
+  var pehVoiceOn = true;
+  var pehVoice = null;
+  function pickPehVoice() {
+    if (!('speechSynthesis' in window)) return null;
+    var voices = window.speechSynthesis.getVoices() || [];
+    var saved = null; try { saved = localStorage.getItem('peh-voice-name'); } catch (e) {}
+    if (saved) { for (var s = 0; s < voices.length; s++) { if (voices[s].name === saved) return voices[s]; } }
+    var en = voices.filter(function (v) { return /^en([-_]|$)/i.test(v.lang || ''); });
+    var pool = en.length ? en : voices;
+    var male = pool.filter(function (v) { return /male/i.test(v.name || '') && !/female/i.test(v.name || ''); });
+    if (male.length) return male[0];
+    // Known male voice names across Android/Chrome/desktop TTS engines.
+    var known = ['Google UK English Male', 'Microsoft David', 'David', 'Daniel', 'Alex', 'Fred', 'Rishi', 'Arthur', 'en-gb-x-gbb', 'en-us-x-iom', 'en-us-x-iol', 'en-us-x-tpd'];
+    for (var i = 0; i < known.length; i++) {
+      for (var j = 0; j < pool.length; j++) { if ((pool[j].name || '').indexOf(known[i]) !== -1) return pool[j]; }
+    }
+    return pool[0] || null;
+  }
+  if ('speechSynthesis' in window) {
+    try { pehVoice = pickPehVoice(); window.speechSynthesis.onvoiceschanged = function () { pehVoice = pickPehVoice(); }; } catch (e) {}
+  }
+  function speechClean(t) {
+    return String(t || '')
+      .replace(/```[\s\S]*?```/g, '. (code omitted) ')
+      .replace(/`([^`]*)`/g, '$1')
+      .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+      .replace(/[*_#>~|]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+  window.groveSpeak = function (text) {
+    if (!pehVoiceOn || !('speechSynthesis' in window)) return;
+    var clean = speechClean(text);
+    if (!clean) return;
+    if (clean.length > 1200) clean = clean.slice(0, 1200);
+    try {
+      window.speechSynthesis.cancel();
+      var u = new SpeechSynthesisUtterance(clean);
+      if (!pehVoice) pehVoice = pickPehVoice();
+      if (pehVoice) u.voice = pehVoice;
+      u.lang = (pehVoice && pehVoice.lang) || 'en-US';
+      u.pitch = 1.0;  // natural — the pitch-shift made every voice sound off/robotic
+      u.rate = 1.0;   // natural speaking rate
+      window.speechSynthesis.speak(u);
+    } catch (e) {}
+  };
+  window.groveVoiceToggle = function (btn) {
+    pehVoiceOn = !pehVoiceOn;
+    if (!pehVoiceOn && 'speechSynthesis' in window) { try { window.speechSynthesis.cancel(); } catch (e) {} }
+    if (btn) { btn.textContent = pehVoiceOn ? '🔊' : '🔇'; btn.title = pehVoiceOn ? 'Peh speaks replies (tap to mute)' : 'Peh muted (tap to unmute)'; }
+  };
+
+  // Voice PICKER: choose exactly which installed voice is Peh (persisted). Also surfaces what's
+  // available so you can tell if a male voice is even installed (else add one in Android TTS settings).
+  function pehEsc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
+  window.groveVoicePick = function () {
+    if (!('speechSynthesis' in window)) return;
+    var voices = window.speechSynthesis.getVoices() || [];
+    var msgs = document.getElementById('grove-msgs');
+    if (!voices.length) { if (msgs) buildMsg(msgs, 'system', 'No speech voices are installed. Add one in Android Settings → System → Languages & input → Text-to-speech.'); return; }
+    var existing = document.querySelector('.grove-voicepick'); if (existing) existing.remove();
+    var saved = null; try { saved = localStorage.getItem('peh-voice-name'); } catch (e) {}
+    var opts = '';
+    for (var i = 0; i < voices.length; i++) {
+      var sel = (voices[i].name === saved) ? ' selected' : '';
+      opts += '<option value="' + i + '"' + sel + '>' + pehEsc(voices[i].name) + ' · ' + pehEsc(voices[i].lang) + '</option>';
+    }
+    var wrap = document.createElement('div');
+    var onbOn = (window.pehOnboard && typeof window.pehOnboard.isEnabled === 'function') ? window.pehOnboard.isEnabled() : true;
+    wrap.className = 'grove-voicepick';
+    wrap.innerHTML =
+      '<div class="grove-voicepick-card">' +
+      '<div class="grove-voicepick-title">Peh — voice &amp; settings</div>' +
+      '<select id="grove-voice-sel" class="grove-voicepick-sel">' + opts + '</select>' +
+      '<div class="grove-voicepick-hint">' + voices.length + ' voice(s) installed. No male one? Add voices in Android Text-to-speech settings, then reopen.</div>' +
+      '<label class="grove-voicepick-toggle"><input type="checkbox" id="grove-onboard-tgl"' + (onbOn ? ' checked' : '') + ' onchange="window.groveOnboardingToggle(this.checked)"> Show Peh’s guided intro (onboarding)</label>' +
+      '<div class="grove-voicepick-actions">' +
+      '<button type="button" class="grove-voicepick-use" onclick="window.groveVoiceUse()">Use &amp; test</button>' +
+      '<button type="button" class="grove-voicepick-close" onclick="var w=this.closest(\'.grove-voicepick\');if(w)w.remove()">Close</button>' +
+      '</div></div>';
+    document.body.appendChild(wrap);
+  };
+  window.groveVoiceUse = function () {
+    var sel = document.getElementById('grove-voice-sel'); if (!sel) return;
+    var voices = window.speechSynthesis.getVoices() || [];
+    var v = voices[parseInt(sel.value, 10)];
+    if (v) {
+      pehVoice = v;
+      try { localStorage.setItem('peh-voice-name', v.name); } catch (e) {}
+      pehVoiceOn = true;
+      window.groveSpeak('Voice set. I am Peh — a scientist, currently residing in a squirrel.');
+    }
+  };
+
+  // Settings toggle: show/hide Peh's guided onboarding intro. Persists a per-user override that beats
+  // the deployment default; re-enabling clears the "already onboarded" flag so it greets again.
+  window.groveOnboardingToggle = function (on) {
+    try {
+      localStorage.setItem('peh-onboarding', on ? 'on' : 'off');
+      if (on) { localStorage.removeItem('pehverse-onboarded'); }
+    } catch (e) {}
+    var msgs = document.getElementById('grove-msgs');
+    if (msgs && typeof buildMsg === 'function') {
+      buildMsg(msgs, 'system', on ? "Peh's guided intro is ON — it will greet new sessions." : "Peh's guided intro is OFF.");
+    }
   };
 
   // Launch Pad (builder-ws) build form submit → the same streaming build runner.

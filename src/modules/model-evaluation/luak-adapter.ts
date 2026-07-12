@@ -16,6 +16,7 @@
  */
 
 import { moduleEnv } from "../../core/module-config.js";
+import { resolveFetchGuard } from "../../core/provider/fetch-guard.js";
 
 const env = moduleEnv("model-evaluation");
 
@@ -183,7 +184,7 @@ export type LuakFetchResult =
 /** Fetch + parse Luak's leaderboard. Never throws — failures become a structured error result. */
 export async function fetchLuakLeaderboard(
   cfg: LuakAdapterConfig = loadLuakAdapterConfig(),
-  fetchImpl: FetchLike = fetch as unknown as FetchLike,
+  fetchImpl: FetchLike = ((input, init) => (resolveFetchGuard() as unknown as FetchLike)(input, init)),
 ): Promise<LuakFetchResult> {
   const url = `${cfg.url}${cfg.path}`;
   const headers: Record<string, string> = { accept: "application/json" };

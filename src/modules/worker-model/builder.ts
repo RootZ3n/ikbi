@@ -36,13 +36,15 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 
 import { configEnv } from "../../core/config.js";
+import { classifyError } from "../../core/errors/index.js";
 import { events } from "../../core/events/index.js";
+import { preStartParallelReads } from "./tool-parallel.js";
 import type { OperationContext } from "../../core/identity/index.js";
 import { toUntrustedMessage } from "../../core/injection/index.js";
+import { renderEvidenceBlock } from "../runtime-truth/index.js";
 import { childLogger } from "../../core/log.js";
 import { adaptMaxTokens, getCapabilities } from "../../core/provider/capabilities.js";
 import type { ModelMessage, ModelResponse, ModelTool, ToolCall } from "../../core/provider/contract.js";
@@ -50,7 +52,7 @@ import { parseCheckOutput } from "../check-triage/index.js";
 import type { GovernedExec } from "../governed-exec/index.js";
 import { gbrainBridge } from "../../core/gbrain-bridge.js";
 import { BRAIN_TOOLS, BRAIN_TOOL_NAMES, runBrainTool } from "./builder-tools/brain-tools.js";
-import { confinePath, type ToolCallError } from "./builder-tools/confine.js";
+import { confinePath, writeConfinedFile, type ToolCallError } from "./builder-tools/confine.js";
 import { fireHooks, loadHooks } from "../hooks/index.js";
 import { delegateTaskTool, runDelegateTask } from "./builder-tools/delegate.js";
 import { gitDiffTool, gitLogTool, gitStatusTool, GIT_TOOL_NAMES, runGitTool } from "./builder-tools/git-tools.js";
@@ -64,7 +66,7 @@ import { commandPolicyDenyReason } from "../governed-exec/policy.js";
 import { runVisionAnalyze, visionAnalyzeTool } from "./builder-tools/vision-tool.js";
 import { runWebExtract, runWebSearch, webExtractTool, webSearchTool, WEB_TOOL_NAMES } from "./builder-tools/web-tools.js";
 import { type CheckResult, type ChecksResolution, mapExec, resolveCheckTimeoutMs, VERIFIER_CHECKS } from "./checks.js";
-import { workerModelConfig } from "./config.js";
+import { LARGE_COMPLEXITY_TIMEOUT_FACTOR, resolveBuilderTimeoutMs, workerModelConfig } from "./config.js";
 import { estimateTokens, maybeCompress } from "./context-manager.js";
 import { ContextLayer } from "./context-layer.js";
 import type { RoleFn, RoleResult, WorkerOutcome } from "./contract.js";
@@ -111,6 +113,17 @@ function resolveMaxToolIterations(): number {
 
 /** Hard cap on model rounds — IKBI_MAX_TOOL_ITERATIONS overrides the default (40). */
 export const MAX_TOOL_ITERATIONS = resolveMaxToolIterations();
+
+/**
+ * The effective round cap for a task. A `--complexity large` build (greenfield scaffold, many files)
+ * needs more model rounds than a focused edit — the SAME failure class as the wall-clock cut-off: a
+ * legitimately large build hitting a ceiling mid-tree with 75% written and nothing landed. Scaled by
+ * the shared {@link LARGE_COMPLEXITY_TIMEOUT_FACTOR} so the round cap and the wall-clock budget move
+ * together; every other complexity is unchanged. Operators still tune the base via IKBI_MAX_TOOL_ITERATIONS.
+ */
+export function effectiveMaxIterations(complexity?: "small" | "medium" | "large"): number {
+  return complexity === "large" ? MAX_TOOL_ITERATIONS * LARGE_COMPLEXITY_TIMEOUT_FACTOR : MAX_TOOL_ITERATIONS;
+}
 /**
  * WO4 — STREAM-STALL RECOVERY. Max number of stalls (the initial stall + its retries)
  * tolerated within a single build before terminating cleanly with `tool_call_stalled`.
@@ -119,10 +132,52 @@ export const MAX_TOOL_ITERATIONS = resolveMaxToolIterations();
  * loop forever.
  */
 const MAX_TOOL_CALL_STALLS = 3;
+/**
+ * GRADUATED NO-PROGRESS GOVERNOR — the intra-build "keep the cheap model in line" seam. Once the
+ * builder has written SOMETHING, a run of zero-write rounds means it is reading/looping instead of
+ * producing (the classic cheap-model failure: it wrote most of the project, then wandered while trying
+ * to close the last errors). Rather than KILLING on the first sign — which discarded near-complete
+ * builds mid-fix — the loop first NUDGES the model back to writing at NUDGE_AT, and only terminates
+ * as `no_progress` if it STILL hasn't produced by KILL_AT. The next escalation rung after termination
+ * is the auto-verify rescue + the last-mile fixer (a DIFFERENT model).
+ */
+const NO_PROGRESS_NUDGE_AT = 5;
+const NO_PROGRESS_KILL_AT = 9;
 /** Max bytes returned by read_file (untrusted content is bounded before the model). */
 const MAX_READ_BYTES = 32_000;
 /** Max entries returned by list_dir. */
 const MAX_LIST_ENTRIES = 200;
+
+/**
+ * Tool origins whose RESULTS are content that already lives inside the build's own worktree —
+ * files it read, its own build/test output, local governed git/shell. A `block` verdict on one
+ * of these is a SELF-HOSTING false-positive class: the canonical case is building ikbi with ikbi,
+ * where `run_checks` runs ikbi's own injection-detection test suite and its output legitimately
+ * prints attack fixtures, which the chokepoint then re-detects. To PLANT such content an attacker
+ * would already need repo-write access (outside the injection threat model), and the chokepoint has
+ * ALREADY neutralized it (the model can never act on the raw text). So injection here is judged BY
+ * EFFECT — recorded for audit, but it does not discard verified-green work.
+ *
+ * Everything NOT in this set — web fetch/search, vision, delegated sub-agents, the shared knowledge
+ * brain, phone sensors, and any UNRECOGNIZED origin — is treated as OUTSIDE content and a block
+ * verdict there STILL blocks promotion and feeds the trust signal. Fail-closed by construction:
+ * the relaxation applies only to this explicit allowlist of worktree-confined origins.
+ */
+const WORKTREE_LOCAL_ORIGINS: ReadonlySet<string> = new Set<string>([
+  "read_file", "write_file", "list_dir", "search_files", "glob", "patch", "multi_edit",
+  "terminal", "run_checks", "scout_detail",
+  "git_status", "git_diff", "git_log",
+  "context_summary",
+]);
+
+/**
+ * True when a `block` verdict on this tool's result must ENFORCE (block promotion, feed the trust
+ * signal) — i.e. the content originated OUTSIDE the build's own worktree. Unknown origins return
+ * true (fail-closed). Exported for unit testing.
+ */
+export function isExternalToolOrigin(toolName: string): boolean {
+  return !WORKTREE_LOCAL_ORIGINS.has(toolName);
+}
 
 // RAIL 2: a tight, cheap-model-anchored prompt. Boxes the task so wandering is a
 // rejected move: state the success condition, read-before-write, state-the-change,
@@ -137,7 +192,8 @@ const BUILDER_SYSTEM =
   "4. If checks fail, fix and run_checks again\n" +
   "5. When all checks pass, call done\n\n" +
   "Use patch for small edits. Use write_file for new files or full rewrites.\n" +
-  "Only touch files the goal requires.\n";
+  "Only touch files the goal requires.\n" +
+  "Implement EXACTLY what the goal names — those functions/signatures only. Add NO extra helpers or unrequested API.\n";
 
 /** The FIXED tool set declared to the model. No shell, no network, no MCP this pass. */
 export const TOOLS: readonly ModelTool[] = [
@@ -602,25 +658,108 @@ const READ_ONLY_PROBE_BINARIES: ReadonlySet<string> = new Set([
   "uname", "hostname", "readlink", "realpath", "basename", "dirname", "locale", "tty", "date",
 ]);
 
+/**
+ * Binaries whose ATTEMPTED use is a red flag even when the allowlist blocked it (confinement held).
+ * A cheap builder reaching for the network, a raw shell, privilege escalation, or a destructive tool
+ * is a genuine out-of-policy signal that must taint promotion — regardless of trust context. Anything
+ * NOT here and NOT a read-only probe is a benign dev/build tool (tsc, yarn, npx, make, eslint, …) the
+ * model improvised: the governor already blocked it with no effect, so it must NOT discard an
+ * otherwise-verified build in a trusted-local setup.
+ *
+ * `mv` is deliberately NOT here. Renaming/moving a source file inside the confined worktree is ordinary
+ * build behavior a cheap model naturally reaches for (it has no rename tool, so it improvises `mv a b`);
+ * the governor already blocked it with no effect, and the sandbox + worktree confinement bound any real
+ * move. Tainting a denied `mv` discarded fully-verified builds (the model renamed one file, got denied,
+ * and the whole green tree was thrown away). DATA-DESTROYING tools (rm/rmdir/dd/mkfs/shred) stay — those
+ * are a genuine red flag; a rename is not.
+ */
+const DANGEROUS_DENIED_BINARIES: ReadonlySet<string> = new Set([
+  "curl", "wget", "ssh", "scp", "sftp", "rsync", "nc", "ncat", "netcat", "telnet", "ftp", "socat",
+  "bash", "sh", "zsh", "dash", "ksh", "fish", "csh", "tcsh",
+  "sudo", "su", "doas", "pkexec",
+  "rm", "rmdir", "dd", "mkfs", "shred", "chmod", "chown", "chgrp", "kill", "pkill", "killall",
+  "eval", "exec", "xargs", "chroot", "mount", "umount", "systemctl", "crontab", "at",
+]);
+
 /** The binary denied by a bare governed-exec ALLOWLIST denial, if `error` is exactly that (else undefined). */
 function deniedAllowlistBinary(error: string): string | undefined {
   const m = /binary ['"]?([A-Za-z0-9_.+-]+)['"]? is not on the allowlist/i.exec(error);
   return m?.[1]?.toLowerCase();
 }
 
-function isPolicyViolation(e: ToolCallError): boolean {
-  // GENUINE boundary breach — confinement/scope escape, write-scope violation, or an attempt to run
+/**
+ * A denied `rm`/`rmdir` is BENIGN scratch cleanup — NOT a destructive red flag — when every target is a
+ * plain worktree-relative path. A cheap builder has no delete tool, so it improvises `rm scratch.ts` to
+ * remove its own debug/scratch files (this session: `rm src/debug_assess.ts src/run_test.ts` discarded a
+ * fully green build). The governor already blocked it (no effect), the verifier already confirmed the
+ * tree green, and the sandbox confines any real delete to the worktree — so a prevented in-worktree rm
+ * is ordinary build behavior, judged by EFFECT (none), like a denied `mv`. A rm that reaches OUTSIDE the
+ * tree (absolute/home path), at/above the root (`.`/`..`/parent traversal), or via a glob is a genuine
+ * red flag and STILL taints. Unparseable command ⇒ fail-closed (taint). Data/device destroyers
+ * (dd/mkfs/shred) and system tools (chmod/mount/systemctl/…) are NEVER normal cleanup and stay tainting.
+ */
+function isBenignWorktreeCleanup(command: string | undefined): boolean {
+  if (command === undefined) return false; // cannot inspect the targets → fail-closed
+  const toks = command.trim().split(/\s+/);
+  const bin = toks[0]?.toLowerCase();
+  if (bin !== "rm" && bin !== "rmdir") return false;
+  const targets = toks.slice(1).filter((t) => !t.startsWith("-")); // flags don't decide danger; the target does
+  if (targets.length === 0) return false; // only flags / no explicit target → not obviously benign
+  return targets.every((t) => {
+    if (t.startsWith("/") || t.startsWith("~")) return false; // absolute / home — outside the worktree
+    const norm = t.replace(/\/+$/, ""); // ignore a trailing slash so `./` and `..` normalize
+    if (norm === "" || norm === "." || norm === "..") return false; // the worktree root or its parent
+    if (norm.split("/").some((seg) => seg === "..")) return false; // any parent traversal (a leading `./` is fine)
+    if (/[*?[\]]/.test(t)) return false; // a glob could match more than intended
+    return true; // a plain worktree-relative path — its own scratch/generated file
+  });
+}
+
+export function isPolicyViolation(e: ToolCallError): boolean {
+  // READ-ONLY VERIFY PASS: the multi-step final pass runs with writeScope="none". A cheap builder
+  // naturally tries to improve its own work; the scope guard BLOCKS the write (no effect). Tainting
+  // that blocked attempt discarded builds that otherwise verified green. The scope guard is the real
+  // control, so a blocked read-only-mode write is benign in a trusted-local context and must not
+  // discard a clean build. (A "new_only" overwrite attempt on an EXISTING file still taints below.)
+  if (/write_scope is 'none'|read-only mode/i.test(e.error)) return false;
+  // BENIGN SELF-VERIFICATION: a builder that reaches for the project's TEST/CHECK command via terminal
+  // ("pnpm test", "npx tsc --noEmit", "yarn build", …) is blocked because package-manager script
+  // RUNNERS (pnpm/npm/npx/yarn/bun) are reserved for the verifier/check role — but that is the model
+  // trying to VERIFY its own work through the wrong tool. It has `run_checks` for exactly this, the
+  // verifier runs the real checks regardless, and the governor already blocked the call (nothing
+  // executed). Like a blocked `tsc`/probe, a blocked CHECK-script call must NOT discard an otherwise-
+  // verified build (it fires intermittently on cheap models and silently tanked green builds — seen
+  // for both `pnpm test` and `npx tsc`). A runner invocation that is NOT a recognised
+  // check/test/build/lint command (deploy/publish/postinstall/arbitrary) STILL taints — that intent is
+  // the real red flag. Match ANY runner's denial (the shared "script execution is allowed only for
+  // verifier/check" suffix) and classify by the COMMAND (e.path), not the runner prefix.
+  if (/script execution is allowed only for verifier\/check/i.test(e.error)) {
+    const cmd = (e.path ?? "").toLowerCase();
+    return !/\b(test|tests|check|checks|lint|typecheck|type-check|tsc|build|vitest|jest|coverage|verify|ci)\b/.test(cmd);
+  }
+  // GENUINE boundary breach — confinement/scope escape, new-file-only overwrite, or an attempt to run
   // arbitrary code through a package manager. These ALWAYS taint promotion, even when confinement held.
+  // ("only for verifier/check" still taints here — the benign CHECK-script case was already returned
+  // above; what reaches here is e.g. a general terminal-role restriction, which remains a red flag.)
   if (/escape|write_scope|dependency directory|not allowed|only for verifier\/check|WRITE SCOPE VIOLATION/i.test(e.error)) {
     return true;
   }
-  // A bare ALLOWLIST denial of a READ-ONLY environment probe (which/env/pwd/…) is benign governor
-  // routing — not a boundary violation. It must not discard an otherwise-verified build.
-  const probe = deniedAllowlistBinary(e.error);
-  if (probe !== undefined && READ_ONLY_PROBE_BINARIES.has(probe)) return false;
-  // Any other denial (a non-probe binary denied by the allowlist, a terminal path-confinement refusal,
-  // an egress/privilege attempt) is an attempted out-of-policy action — tainting. "denied" does not
-  // over-match benign tool-format errors (those say "malformed"/"requires"/"unknown tool", never "denied").
+  // A bare ALLOWLIST denial means the governor BLOCKED the command — it never ran (confinement held).
+  // Classify by intent: a read-only probe (which/env/pwd) or a benign dev/build tool the model
+  // improvised (tsc/yarn/npx/make/…) is benign routing and must NOT discard an otherwise-verified,
+  // clean build in a trusted-local context. A reach for the network, a raw shell, privilege
+  // escalation, or a destructive tool STILL taints even when blocked — that intent is the red flag.
+  const denied = deniedAllowlistBinary(e.error);
+  if (denied !== undefined) {
+    if (READ_ONLY_PROBE_BINARIES.has(denied)) return false; // benign environment probe
+    // Benign in-worktree scratch cleanup (denied rm/rmdir of worktree-relative paths): no effect, tree
+    // already verified, confined by the sandbox — ordinary build behavior, not a destructive red flag.
+    if ((denied === "rm" || denied === "rmdir") && isBenignWorktreeCleanup(e.path)) return false;
+    if (DANGEROUS_DENIED_BINARIES.has(denied)) return true; // network / shell / privilege / destructive
+    return false; // benign dev/build tool the model improvised — blocked, no effect, no boundary crossed
+  }
+  // A /denied/ that is NOT a bare allowlist-binary denial (a terminal path-confinement refusal, an
+  // egress/privilege attempt) still taints — those are genuine boundary breaches, not benign routing.
   return /denied/i.test(e.error);
 }
 
@@ -767,6 +906,16 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
   const filesRead: string[] = [];
   const rejectedToolCalls: ToolCallError[] = [];
   let neutralizedCount = 0;
+  // INJECTION SIGNAL: set when the neutralization chokepoint returns a `block` verdict on any tool
+  // result this build. Surfaced on the result detail so the orchestrator records it as a trust signal
+  // (signals.injection) — the non-recoverable injection flag the trust ladder acts on. Without this
+  // the chokepoint's `block` recommendation was dead: detected-and-wrapped, but never attributed.
+  let injectionDetected = false;
+  // ENFORCEMENT subset of injectionDetected: a block verdict on content from OUTSIDE the worktree
+  // (web/vision/delegate/brain/phone/unknown). Only this discards green work + feeds the trust
+  // signal. Injection in the build's OWN worktree output (run_checks, file reads) is neutralized-
+  // and-inert → recorded for audit but judged by effect (see WORKTREE_LOCAL_ORIGINS).
+  let externalInjectionDetected = false;
   let toolRounds = 0;
   let iterations = 0; // total model rounds (tool rounds + corrective turns) — bounds the loop
   let bareStops = 0; // RAIL 3: times the model stopped without a valid done (corrective turns)
@@ -782,6 +931,8 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
   const stallRecords: StallRecord[] = []; // WO4: per-stall observations surfaced on the result + receipt
   const filesWrittenPerRound: number[] = []; // EARLY STOP: tracks new files written each tool-round iteration
   let consecutiveRejectedToolRounds = 0;
+  let consecutiveZeroWriteRounds = 0; // GRADUATED NO-PROGRESS: rounds since the last file write
+  let noProgressNudged = false; // whether the model has been nudged in the current zero-write streak
   let emulatedToolRound = false; // this round's tool calls came from TEXT (no native tool API) → feed results back as user, not tool-role
   // MCP TOOLS: operator-configured MCP servers' tools, discovered once at builder start and
   // exposed alongside the built-in suite. Declared out here so the finally always tears the
@@ -808,8 +959,13 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       agentId: ctx.identity.agentId,
       ...(deps.memoryGovernor !== undefined ? { memoryGovernor: deps.memoryGovernor } : {}),
     };
-    const timeoutMs = workerModelConfig.roleTimeoutMs; // builder self-bounds; the
-    // orchestrator does NOT enforce a per-role timeout yet (noted for the 3rd eye).
+    // Builder self-bounds its loop against a wall-clock budget. A `--complexity large` build gets a
+    // scaled budget (resolveBuilderTimeoutMs) so a big greenfield scaffold isn't cut off mid-tree; the
+    // orchestrator's per-role race uses the SAME resolver, so both agree on the deadline.
+    const timeoutMs = resolveBuilderTimeoutMs(workerModelConfig.roleTimeoutMs, ctx.task.complexity);
+    // Round cap scales with the SAME large-build knob as the wall-clock, so a big scaffold isn't cut
+    // off by whichever ceiling it reaches first.
+    const maxIterations = effectiveMaxIterations(ctx.task.complexity);
     const startedAt = Date.now();
 
     // C4: the goal (user-supplied) and the prior-role results (model-derived — a
@@ -855,13 +1011,34 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
           (writeScope === "new_only"
             ? "You may ONLY create NEW files. Do NOT modify any existing file — read_file to inspect, but write_file/patch on an existing file is FORBIDDEN and will be rejected."
             : "You are in READ-ONLY mode. Do NOT write or patch any file.");
+    // INTERMEDIATE STEP: on a decomposed plan, intermediate steps set skipVerifier/skipPromote — the
+    // project is deliberately incomplete until the LAST step, and the final pass runs the real checks.
+    // Without this the builder's "run_checks must be green before done" RAIL is unsatisfiable for a
+    // partial step (e.g. a types-only step can't compile+test yet), so a cheap model spins to
+    // no_progress and the whole multi-step build evaporates. Relax the gate for THIS step only: write
+    // the scoped files, then done — full verification is deferred to the final step. Safe because an
+    // intermediate step never promotes; the final writeScope="none" pass verifies the accumulated tree.
+    const intermediateStepAddendum =
+      ctx.task.skipVerifier === true
+        ? "\n\nINTERMEDIATE STEP (part of a larger multi-step plan): the project is INTENTIONALLY INCOMPLETE " +
+          "at this step — later steps add the rest and the FULL checks run only at the END. Do NOT expect " +
+          "run_checks to be green now; a partial project will not compile or test yet. The `done` tool's " +
+          "\"run_checks must be green first\" requirement does NOT apply to this intermediate step — ignore it " +
+          "here. Write THIS step's files, optionally sanity-check, then call done."
+        : "";
     const messages: ModelMessage[] = [
-      { role: "system", content: BUILDER_SYSTEM + writeScopeAddendum + primaryTargetsAddendum(targetFiles) },
+      { role: "system", content: BUILDER_SYSTEM + writeScopeAddendum + intermediateStepAddendum + primaryTargetsAddendum(targetFiles) },
       ...(projectInstructions !== undefined
         ? [untrusted(`Project instructions from the target repo (CLAUDE.md/AGENTS.md/IKBI.md/.ikbi/) — honor these conventions where they apply:\n${projectInstructions}`, "project_instructions")]
         : []),
+      ...(ctx.task.handoffBrief !== undefined
+        ? [untrusted(`Team hand-off — this build shares ONE workspace across steps; the team ALREADY completed these prior steps (their files are on disk — read them, build ON them):\n${ctx.task.handoffBrief}\nBuild ONLY the current step; do not redo, revert, or re-scaffold the prior steps' work.`, "team_handoff")]
+        : []),
       ...(brainContext !== undefined
         ? [untrusted(`Relevant knowledge recalled from ikbi's brain (gbrain) — background context, verify against the repo before relying on it:\n${brainContext}`, "brain_context")]
+        : []),
+      ...(ctx.runtimeEvidence !== undefined && ctx.runtimeEvidence.length > 0
+        ? [untrusted(renderEvidenceBlock(ctx.runtimeEvidence, Date.now()), "runtime_truth_evidence")]
         : []),
       untrusted(`Goal:\n${ctx.task.goal}`, "builder_goal"),
       untrusted(successCondition, "builder_success_condition"),
@@ -970,8 +1147,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
           log.info({ path: c.rel, writeScope, exists: existsSync(c.full) }, "write_file ALLOWED");
           const content = typeof args.content === "string" ? args.content : "";
           try {
-            mkdirSync(dirname(c.full), { recursive: true });
-            writeFileSync(c.full, content, "utf8");
+            writeConfinedFile(worktreeReal, c, content);
             filesWritten.push(c.rel);
             checksStale = true; // PRINCIPLE 4(b): the green (if any) is now stale until run_checks re-runs
             return `wrote ${Buffer.byteLength(content, "utf8")} bytes to ${c.rel}`;
@@ -1113,7 +1289,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         return `ERROR: ${detail} — quote the argument correctly and retry.`;
       }
       const binary = tokens[0];
-      const policyDeny = binary !== undefined ? commandPolicyDenyReason(binary, tokens.slice(1), `builder terminal: ${cmd.slice(0, 120)}`) : undefined;
+      const policyDeny = binary !== undefined ? commandPolicyDenyReason(binary, tokens.slice(1), { verifier: false }) : undefined; // model terminal
       if (policyDeny !== undefined) {
         rejectedToolCalls.push({ tool: "terminal", path: cmd.slice(0, 100), error: policyDeny });
         return `DENIED: ${policyDeny}`;
@@ -1244,6 +1420,15 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         origin: call.name,
       });
       neutralizedCount += 1;
+      // The chokepoint scanned + wrapped this untrusted result. A `block` verdict (high-confidence
+      // injection) is a first-class trust signal — record it so it reaches recordOutcome, not just the log.
+      // Classify by ORIGIN: block verdicts on OUTSIDE content (web/vision/delegate/…) enforce; block
+      // verdicts on the build's own worktree output (run_checks/file reads) are neutralized-and-inert
+      // and judged by effect (recorded, not discarding). See WORKTREE_LOCAL_ORIGINS.
+      if (safe.blocked) {
+        injectionDetected = true;
+        if (isExternalToolOrigin(call.name)) externalInjectionDetected = true;
+      }
       // Emulated (text-protocol) rounds have no real tool_call_id to attach a tool-role message
       // to — feed the (still-neutralized) result back as a user-role data message instead.
       messages.push(
@@ -1366,24 +1551,36 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       // that takes longer — burning the builder's iterations on work the verifier would have passed.
       const checkTimeoutMs = resolveCheckTimeoutMs();
       const results: CheckResult[] = [];
+      const fullOutputs: string[] = [];
+      const fullErrors: string[] = [];
       let dry = false;
       for (const c of resolved.checks) {
+        // Accumulate the FULL stdout+stderr (governed-exec keeps only a bounded tail): triage below
+        // parses the FULL combined stream, so an early swallowed-exit / zero-test marker OR a failure
+        // printed to stderr can't scroll out of the tail and read as a pass (Codex C2 false-green).
+        let fullStdout = "";
+        let fullStderr = "";
         const res = await governedExec.run({
           parentCtx: deps.parentCtx,
           command: c.command,
           args: [...c.args],
           cwd: ctx.workspace.path,
+          verifier: true, // run_checks: trusted check-runner (runs the PLANNED checks, not model input)
           purpose: `builder check: ${c.name}`,
           timeoutMs: checkTimeoutMs,
+          onOutput: (chunk, stream) => { if (stream === "stdout") fullStdout += chunk; else if (stream === "stderr") fullStderr += chunk; },
         });
-        const { check, dryRun } = mapExec(c.name, `${c.command} ${c.args.join(" ")}`, res);
+        const { check, dryRun } = mapExec(c.name, `${c.command} ${c.args.join(" ")}`, res, fullStdout);
         results.push(check);
+        fullOutputs.push(fullStdout);
+        fullErrors.push(fullStderr);
         dry = dry || dryRun;
       }
-      // FALSE-GREEN HARDENING (M6): exit 0 is a FLOOR, not a ceiling. Route each check's output
-      // through the deterministic triage parser so an exit-swallowed failure (`vitest || true`) or
-      // a zero-tests run cannot read as a pass and let `done` go green on an unverified build.
-      const triaged = results.map((r) => ({ result: r, triage: parseCheckOutput({ name: r.name, command: r.command, exitCode: r.exitCode, stdout: r.outputTail }) }));
+      // FALSE-GREEN HARDENING (M6 + Codex C2): exit 0 is a FLOOR, not a ceiling. Route each check's
+      // FULL stdout+stderr through the deterministic triage parser so an exit-swallowed failure
+      // (`vitest || true`), a zero-tests run, or a failure printed to stderr cannot read as a pass
+      // and let `done` go green on an unverified build.
+      const triaged = results.map((r, i) => ({ result: r, triage: parseCheckOutput({ name: r.name, command: r.command, exitCode: r.exitCode, stdout: fullOutputs[i] ?? r.outputTail, stderr: fullErrors[i] ?? "" }) }));
       const allPass = !dry && triaged.every((t) => t.triage.passed);
       lastChecks = { allPass, checks: results };
       checksStale = false; // PRINCIPLE 4(b): the result now reflects the code on disk again
@@ -1443,12 +1640,19 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
     // turns), so a model that keeps bare-stopping can never spin forever. ---
     for (;;) {
       iterations += 1;
-      if (iterations > MAX_TOOL_ITERATIONS) {
+      if (iterations > maxIterations) {
         stopReason = "max_iterations";
         break;
       }
       if (Date.now() - startedAt > timeoutMs) {
         stopReason = "timeout";
+        break;
+      }
+      // COOPERATIVE ABORT (Phase 13C): the orchestrator aborts `ctx.signal` when this role exceeds its
+      // wall-clock timeout. Stop the tool loop HERE (iteration granularity) so a timed-out builder stops
+      // scheduling new tools + mutating — the non-cooperative mutation fence remains the final authority.
+      if (ctx.signal?.aborted === true) {
+        stopReason = "aborted";
         break;
       }
       // COOPERATIVE MID-LOOP HALT: a kill-switch kill or a blown whole-pipeline budget stops
@@ -1540,7 +1744,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       if (stall !== undefined) {
         toolCallStalls += 1;
         const willRetry =
-          toolCallStalls < MAX_TOOL_CALL_STALLS && iterations < MAX_TOOL_ITERATIONS && Date.now() - startedAt <= timeoutMs;
+          toolCallStalls < MAX_TOOL_CALL_STALLS && iterations < maxIterations && Date.now() - startedAt <= timeoutMs;
         stallRecords.push({ tools: stall.tools, partialArgBytes: stall.partialArgBytes, attempt: toolCallStalls, willRetry });
         events.publish(
           workerToolCallStalled.create(
@@ -1635,6 +1839,16 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       if (roundToolCalls !== undefined) {
         toolRounds += 1;
         let terminated = false;
+        // PARALLEL DISPATCH: worktree-INDEPENDENT async read tools (web research, vision) that the
+        // model emitted together in one round run CONCURRENTLY — pre-started here, then awaited in
+        // call order in the serial loop below so results still append deterministically. See
+        // tool-parallel.ts for why only these fully-external tools are parallelized (no write↔read
+        // race, no reordered side effects); everything else stays strictly serial.
+        const parallelDispatch = preStartParallelReads(
+          roundToolCalls,
+          (c) => WEB_TOOL_NAMES.has(c.name) || c.name === "vision_analyze",
+          (c) => (WEB_TOOL_NAMES.has(c.name) ? runWebCall(c) : runVisionCall(c)),
+        );
         // DELIBERATE DUPLICATION (YELLOW / Issue 3): this per-tool dispatch chain re-implements the
         // confine→govern→execute core of the shared `executeTool` (tool-executor.ts — the CANONICAL
         // path for the chat surface). It is kept separate ON PURPOSE: the builder folds each tool's
@@ -1690,8 +1904,9 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
             appendToolResult(raw, call);
           } else if (WEB_TOOL_NAMES.has(call.name)) {
             // Web research through the egress SSRF guard — async; output is UNTRUSTED internet
-            // content, neutralized by the chokepoint.
-            const raw = await runWebCall(call);
+            // content, neutralized by the chokepoint. Run concurrently with sibling web/vision calls
+            // in this round when one was pre-started above (awaited here, in call order).
+            const raw = await (parallelDispatch.get(call) ?? runWebCall(call));
             appendToolResult(raw, call);
           } else if (call.name === "delegate_task") {
             // Sub-agent delegation — async; its result is UNTRUSTED to the parent → chokepoint.
@@ -1706,8 +1921,9 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
             }
             appendToolResult(raw, call);
           } else if (call.name === "vision_analyze") {
-            // Multimodal image analysis — async; the analysis is UNTRUSTED → chokepoint.
-            const raw = await runVisionCall(call);
+            // Multimodal image analysis — async; the analysis is UNTRUSTED → chokepoint. Runs
+            // concurrently with sibling web/vision calls in this round (pre-started above).
+            const raw = await (parallelDispatch.get(call) ?? runVisionCall(call));
             appendToolResult(raw, call);
           } else if (call.name === "lsp_diagnostic") {
             // Language-server-grade diagnostics through governed-exec — async; the compiler
@@ -1798,10 +2014,36 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         // rounds produced no new writes, it may be stuck. Only fires when the builder has
         // previously demonstrated write activity (excludes pure-read exploration rounds).
         const totalFilesWritten = filesWrittenPerRound.reduce((a, b) => a + b, 0);
-        const recentFileWrites = filesWrittenPerRound.slice(-5);
-        if (totalFilesWritten > 0 && recentFileWrites.length >= 5 && recentFileWrites.every((n) => n === 0)) {
-          stopReason = "no_progress";
-          break;
+        // GRADUATED NO-PROGRESS GOVERNOR: track the zero-write streak. A round that writes resets the
+        // streak (and clears the nudge). Once the builder has produced something, a long zero-write run
+        // means it is investigating/looping instead of editing.
+        if (newFilesThisRound > 0) {
+          consecutiveZeroWriteRounds = 0;
+          noProgressNudged = false;
+        } else {
+          consecutiveZeroWriteRounds += 1;
+        }
+        if (totalFilesWritten > 0 && consecutiveZeroWriteRounds >= NO_PROGRESS_NUDGE_AT) {
+          if (!noProgressNudged) {
+            // KEEP IT IN LINE: nudge the model back to producing before terminating. Restate the goal /
+            // targets / last-check state and demand a concrete edit or a run_checks — not another read.
+            noProgressNudged = true;
+            messages.push({
+              role: "user",
+              content:
+                `You have done ${consecutiveZeroWriteRounds} rounds without writing a file — you are reading or looping, ` +
+                "not making progress. Act NOW: either make the concrete change with write_file / patch / multi_edit, or call " +
+                "run_checks to see the current errors and then fix them. Do NOT read another file first.\n\n" +
+                buildContextReminder({ goal: ctx.task.goal, targetFiles, filesWritten, ...(lastChecks !== undefined ? { lastChecks } : {}) }),
+            });
+            continue; // give the model a chance to course-correct before we terminate
+          }
+          if (consecutiveZeroWriteRounds >= NO_PROGRESS_KILL_AT) {
+            // The nudge did not take — terminate. The auto-verify rescue + last-mile fixer (a different
+            // model) is the next rung; a red-but-near-complete tree is not discarded outright.
+            stopReason = "no_progress";
+            break;
+          }
         }
         continue; // keep looping while the model wants tools / has not validly done
       }
@@ -1885,6 +2127,16 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
 
     const policyViolations = rejectedToolCalls.filter(isPolicyViolation);
     const toolFormatErrors = rejectedToolCalls.filter((e) => !isPolicyViolation(e));
+    // OBSERVABILITY: a single policy violation DISCARDS an otherwise-verified build at the integrator
+    // gate, yet the discard reason only ever reported a COUNT ("attempted 1 out-of-policy tool call")
+    // — never WHICH call. That made a discard un-auditable without a costly --verbose re-run. Log the
+    // offending tool + error (command already truncated to 100 chars in `path`) so the trail is complete.
+    if (policyViolations.length > 0) {
+      log.warn(
+        { policyViolations: policyViolations.map((v) => ({ tool: v.tool, error: v.error, ...(v.path !== undefined ? { path: v.path } : {}) })) },
+        "builder recorded out-of-policy tool call(s) — these taint promotion at the integrator gate",
+      );
+    }
     const outcome = classifyOutcome(stopReason);
     let summary =
       `builder ${outcome} after ${toolRounds} tool round(s) (stop: ${stopReason}); ` +
@@ -1910,6 +2162,8 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
         ...(lastChecks !== undefined ? { lastChecks } : {}),
         stopReason,
         neutralizedCount,
+        ...(injectionDetected ? { injectionDetected: true } : {}),
+        ...(externalInjectionDetected ? { externalInjectionDetected: true } : {}),
         rejectedToolCalls,
         policyViolations,
         toolFormatErrors,
@@ -1926,12 +2180,16 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       },
     };
   } catch (err) {
-    // IO / model failure: report at the role boundary, never throw past it.
+    // IO / model failure: report at the role boundary, never throw past it. Classify the error so a
+    // CONTEXT-OVERFLOW is distinguishable downstream: the orchestrator escalates it straight to a
+    // larger-window model rather than futilely retrying the SAME small window with an even longer
+    // prompt (the failed context + retry feedback). Non-overflow errors keep the loop's stopReason.
+    const overflowed = classifyError(err) === "context_overflow";
     return {
       role: "builder",
       outcome: "failure",
       summary: `builder failed: ${errMsg(err)}`,
-      detail: { filesWritten, filesRead, toolRounds, stopReason, neutralizedCount, rejectedToolCalls, policyViolations: rejectedToolCalls.filter(isPolicyViolation), toolFormatErrors: rejectedToolCalls.filter((e) => !isPolicyViolation(e)) },
+      detail: { filesWritten, filesRead, toolRounds, stopReason: overflowed ? "context_overflow" : stopReason, neutralizedCount, ...(injectionDetected ? { injectionDetected: true } : {}), ...(externalInjectionDetected ? { externalInjectionDetected: true } : {}), rejectedToolCalls, policyViolations: rejectedToolCalls.filter(isPolicyViolation), toolFormatErrors: rejectedToolCalls.filter((e) => !isPolicyViolation(e)) },
     };
   } finally {
     // Tear down any MCP transports (spawned child processes) — once, on every exit path. Best-effort.

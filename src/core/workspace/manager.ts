@@ -21,8 +21,9 @@
  *   Same-workspace lifecycle ops therefore serialize (no interleaved teardown).
  */
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
+import { hostname } from "node:os";
 import { access, mkdir } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import type { Logger } from "pino";
@@ -137,25 +138,40 @@ export class WorkspaceManager {
     delete this.initPromise;
   }
 
-  private async doPreload(): Promise<number> {
-    let loaded = 0;
+  private async doPreload(reconcile = true): Promise<number> {
+    // A3: build a FRESH view from the durable store, then swap it in — do NOT merely ADD to this.live.
+    // An add-only refresh picks up cross-process ADDITIONS (fixing the C-A2 overflow) but never sheds
+    // cross-process REMOVALS: when a peer process (the documented CLI+server coexistence) promotes or
+    // discards a workspace, the entry this process previously loaded lingers forever, inflating
+    // this.live.size into a FALSE "workspace limit reached" that reapAbandoned (it scans the store, not
+    // this.live) cannot heal. Rebuilding from the store drops any entry now absent/terminal there.
+    const rebuilt = new Map<string, WorkspaceRecord>();
     for (const id of await this.store.list()) {
       const rec = await this.store.get(id).catch(() => undefined);
       if (rec === undefined) continue;
       if (rec.state === "promoting") {
-        await this.reconcilePromoting(rec);
-        const after = await this.store.get(id).catch(() => undefined);
-        if (after && (after.state === "allocated" || after.state === "allocating")) {
-          this.live.set(id, after);
-          loaded += 1;
+        // Reconciling a `promoting` record REVERTS/duplicates a promote — safe ONLY for a CRASHED promote,
+        // never a LIVE one. Liveness is decided by the workspace's CROSS-PROCESS lock (a live promote holds
+        // it; the lock layer's stale-recovery frees it for a DEAD holder): we ONLY reconcile if we can
+        // ACQUIRE that lock. A held lock (live peer promote) ⇒ skip and count the slot as active. Never
+        // reconcile during an ALLOCATE bound-refresh (`reconcile` = false) — that path only counts.
+        if (!reconcile) {
+          rebuilt.set(id, rec);
+          continue;
         }
+        const after = await this.reconcileIfUnlocked(id, rec);
+        if (after !== undefined && (after.state === "allocated" || after.state === "allocating")) rebuilt.set(id, after);
+        else if (after === undefined) rebuilt.set(id, rec); // couldn't take the lock (live promoter) ⇒ count as active
       } else if (rec.state === "allocating" || rec.state === "allocated") {
-        this.live.set(id, rec);
-        loaded += 1;
+        rebuilt.set(id, rec);
       }
     }
-    this.log.info({ event: "workspace_preloaded", loaded, bound: this.max }, "preloaded workspace registry");
-    return loaded;
+    // Atomic swap: clear + repopulate with NO await in between, so no other async op ever observes a
+    // partial map (JS is single-threaded; interleaving happens only at await points).
+    this.live.clear();
+    for (const [id, rec] of rebuilt) this.live.set(id, rec);
+    this.log.info({ event: "workspace_preloaded", loaded: rebuilt.size, bound: this.max }, "preloaded workspace registry");
+    return rebuilt.size;
   }
 
   // ---- allocate (record-then-resource, bounded, serialized) ----
@@ -165,25 +181,28 @@ export class WorkspaceManager {
       throw new WorkspaceError("config", `target is not a git repository: ${opts.targetRepo}`);
     }
     await this.preload();
-    // Cross-process file lock: CLI + server share the same workspace store,
-    // so the allocation check + create must be serialized across processes.
+    // Cross-process file lock: CLI + server share the same workspace store, so the allocation
+    // BOUND check + slot create must serialize across processes — otherwise two processes each read
+    // count = max-1, both pass the limit gate, and both allocate (bound overflow).
     return this.locks.withLock(ALLOC_LOCK, async () => {
+      // C-A2: refresh the live Map from the DURABLE store INSIDE the lock, BEFORE the bound check. The
+      // preload above the lock can be STALE — another process may have allocated while we waited on the
+      // cross-process file lock — and deciding the bound on that stale count let two processes each pass a
+      // max-1 gate and overflow (the lock serialized the WRITES but not the DECISION). A fresh read here
+      // always sees the other process's just-persisted record, so the bound decision uses shared state.
+      // reconcile=false (Codex round-3): a bound-refresh must NOT reconcile a peer's in-flight promote.
+      this.invalidatePreloadCache();
+      await this.doPreload(false);
       if (this.live.size >= this.max) {
-        // Refresh the live Map from the persistent store before failing — another
-        // process may have discarded workspaces since our last preload (Bubbles LOW-2).
-        this.invalidatePreloadCache();
-        await this.preload();
+        // SELF-HEAL: a crashed/killed run can strand its workspace in `allocated`, leaking the
+        // bound forever (no terminal transition, so `clean`/`reclaim` never reach it). Before
+        // failing, reap ABANDONED active records: a held per-workspace lock means a LIVE process
+        // owns the workspace (the established liveness contract — see RECLAIM_WS_TIMEOUT_MS), so
+        // those are skipped; only lock-free records are reconciled terminal and dropped from the
+        // bound. Repo-independent, so it heals even when the target repo is gone.
+        await this.reapAbandoned();
         if (this.live.size >= this.max) {
-          // SELF-HEAL: a crashed/killed run can strand its workspace in `allocated`, leaking the
-          // bound forever (no terminal transition, so `clean`/`reclaim` never reach it). Before
-          // failing, reap ABANDONED active records: a held per-workspace lock means a LIVE process
-          // owns the workspace (the established liveness contract — see RECLAIM_WS_TIMEOUT_MS), so
-          // those are skipped; only lock-free records are reconciled terminal and dropped from the
-          // bound. Repo-independent, so it heals even when the target repo is gone.
-          await this.reapAbandoned();
-          if (this.live.size >= this.max) {
-            throw new WorkspaceError("limit", `workspace limit reached (${this.max}); cannot allocate`);
-          }
+          throw new WorkspaceError("limit", `workspace limit reached (${this.max}); cannot allocate`);
         }
       }
       const baseBranch = opts.baseBranch ?? (await currentBranch(opts.targetRepo));
@@ -192,7 +211,7 @@ export class WorkspaceManager {
       const path = this.resolveWorktreePath(id); // validates id + confines path
       const scratchBranch = SCRATCH_BRANCH_PREFIX + id;
 
-      return this.locks.withLock(this.wsKey(id), async () => {
+      return this.withWorkspaceLock(id, async () => {
         const ts = this.now();
         const base: WorkspaceRecord = {
           id,
@@ -205,6 +224,9 @@ export class WorkspaceManager {
           state: "allocating",
           createdAt: ts,
           updatedAt: ts,
+          // H6: stamp the owning process so a crashed build's leaked record can be reaped by pid.
+          ownerPid: process.pid,
+          ownerHost: hostname(),
           ...(opts.label !== undefined ? { label: opts.label } : {}),
         };
         // 1. INTENT record before any resource (crash here => reclaimable, no orphan).
@@ -234,7 +256,7 @@ export class WorkspaceManager {
         this.log.info({ event: "workspace_allocated", workspaceId: id, targetRepo: opts.targetRepo, baseBranch, agentId: opts.identity.agentId }, "workspace allocated");
         return allocated;
       });
-    });
+    }, { file: this.lockFile(ALLOC_LOCK) });
   }
 
   async commit(handle: WorkspaceHandle, message: string): Promise<boolean> {
@@ -242,16 +264,18 @@ export class WorkspaceManager {
   }
 
   async diff(handle: WorkspaceHandle): Promise<string> {
-    const committed = await diffRange(handle.targetRepo, handle.baseRef, handle.scratchBranch);
-    if (committed.trim().length > 0) return committed;
-    // FALLBACK: RETAINED/failed work is UNCOMMITTED, so the committed base..scratch range is empty.
-    // If the worktree dir still exists, compute the working-tree diff from it so `ikbi diff <id>`
-    // shows the real changes left behind (never a misleading "no changes"). A cleaned/promoted
-    // workspace has no worktree dir → returns the (empty) committed diff unchanged.
+    // C-3 (Fable): when the worktree still exists, use the WORKING-TREE diff (base..worktree, incl.
+    // tracked + untracked + UNCOMMITTED changes) — a SUPERSET of the committed base..scratch range. This
+    // is load-bearing for the verifier's shell-out integrity check: in an accumulated/multi-step
+    // (reuseWorkspace) build a later step can rewrite an UNCOMMITTED test runner (test.sh → `exit 0` + a
+    // forged tally); a committed-range-only diff (the old early-return when base..scratch was non-empty)
+    // never saw it → false GREEN. The working-tree diff catches it. Clean/committed work yields the same
+    // diff as the committed range. A cleaned/promoted workspace has no worktree dir ⇒ committed range.
     if (await this.pathExists(handle.path)) {
-      return workingTreeDiff(handle.path, handle.baseRef).catch(() => committed);
+      const wt = await workingTreeDiff(handle.path, handle.baseRef).catch(() => undefined);
+      if (wt !== undefined && wt.trim().length > 0) return wt;
     }
-    return committed;
+    return diffRange(handle.targetRepo, handle.baseRef, handle.scratchBranch);
   }
 
   // ---- promote (governed-closed, atomic CAS, crash-durable) ----
@@ -265,35 +289,57 @@ export class WorkspaceManager {
       throw new WorkspaceError("not_approved", `promote refused: explicit governance approval required (workspace ${handle.id})`);
     }
 
-    const repo = handle.targetRepo;
-    const ref = `refs/heads/${handle.baseBranch}`;
-    // ws-id lock OUTER, target-branch lock INNER (consistent order).
-    return this.locks.withLock(this.wsKey(handle.id), async () => {
+    // ws-id lock OUTER, target-branch lock INNER (consistent order). Cross-process via withWorkspaceLock.
+    return this.withWorkspaceLock(handle.id, async () => {
       const rec = await this.store.get(handle.id);
       if (rec === undefined || rec.state !== "allocated") {
         throw new WorkspaceError("invalid_state", `workspace ${handle.id} is not in a promotable state`);
       }
-      return this.locks.withLock(`workspace:branch:${repo}:${handle.baseBranch}`, async () => {
-        const targetHead = await revParse(repo, handle.baseBranch);
-        const scratchHead = await revParse(repo, handle.scratchBranch);
+      // H3 — REHYDRATE the git targets from the DURABLE record (source of truth), NOT the caller's
+      // handle. Only the opaque `id` is trusted from the handle; promote MOVES refs, so a stale/wrong
+      // `baseBranch`/`scratchBranch`/`targetRepo` on the handle must never drive the revParse/CAS at the
+      // wrong branch. `rec` is read under the ws lock (held for the whole op) and is authoritative.
+      const repo = rec.targetRepo;
+      const baseBranch = rec.baseBranch;
+      const scratchBranch = rec.scratchBranch;
+      const ref = `refs/heads/${baseBranch}`;
+      const branchLockKey = `workspace:branch:${repo}:${baseBranch}`;
+      return this.locks.withLock(branchLockKey, async () => {
+        const targetHead = await revParse(repo, baseBranch);
+        const scratchHead = await revParse(repo, scratchBranch);
+
+        // C1c — hash-bound authorization. If the caller certified against a specific target head, and the
+        // live head has since moved, REFUSE: the verifier never saw this target, so a promote here would
+        // integrate unverified target changes. Refuse cleanly (target ref untouched) so the caller can
+        // re-verify against the new base. Checked before any intent/CAS.
+        if (approval.verifiedAgainst !== undefined && approval.verifiedAgainst.targetHead !== targetHead) {
+          return {
+            promoted: false,
+            workspaceId: handle.id,
+            targetBranch: baseBranch,
+            beforeRef: targetHead,
+            strategy: "noop",
+            reason: `target moved since verification (verified against ${approval.verifiedAgainst.targetHead}, live head ${targetHead}) — re-verify before promoting`,
+          } satisfies PromoteResult;
+        }
 
         if (scratchHead === targetHead) {
-          return { promoted: false, workspaceId: handle.id, targetBranch: handle.baseBranch, beforeRef: targetHead, strategy: "noop", reason: "no changes to promote" } satisfies PromoteResult;
+          return { promoted: false, workspaceId: handle.id, targetBranch: baseBranch, beforeRef: targetHead, strategy: "noop", reason: "no changes to promote" } satisfies PromoteResult;
         }
 
         // The target branch is typically checked out in the repo's MAIN working tree. Moving its
         // ref (the CAS below) would leave HEAD ahead of that tree — a phantom revert in
         // `git status`. Resolve that worktree NOW: if it has uncommitted work, REFUSE (never
         // clobber it, never leave HEAD/tree silently disagreeing); if clean, we sync it after the CAS.
-        const checkedOutPath = await worktreeForBranch(repo, handle.baseBranch);
+        const checkedOutPath = await worktreeForBranch(repo, baseBranch);
         if (checkedOutPath !== undefined && !(await isWorktreeClean(checkedOutPath))) {
           return {
             promoted: false,
             workspaceId: handle.id,
-            targetBranch: handle.baseBranch,
+            targetBranch: baseBranch,
             beforeRef: targetHead,
             strategy: "noop",
-            reason: `target branch "${handle.baseBranch}" is checked out at ${checkedOutPath} with uncommitted changes — refusing to promote (commit or stash there first, then retry)`,
+            reason: `target branch "${baseBranch}" is checked out at ${checkedOutPath} with uncommitted changes — refusing to promote (commit or stash there first, then retry)`,
           } satisfies PromoteResult;
         }
 
@@ -306,11 +352,29 @@ export class WorkspaceManager {
         } else {
           const merge = await computeMerge(repo, targetHead, scratchHead);
           if (!merge.clean) {
-            return { promoted: false, workspaceId: handle.id, targetBranch: handle.baseBranch, beforeRef: targetHead, strategy: "merge", conflicts: merge.conflicts, reason: "merge conflicts — governed resolution required" } satisfies PromoteResult;
+            return { promoted: false, workspaceId: handle.id, targetBranch: baseBranch, beforeRef: targetHead, strategy: "merge", conflicts: merge.conflicts, reason: "merge conflicts — governed resolution required" } satisfies PromoteResult;
           }
           mergeCommit = await commitTree(repo, merge.tree as string, [targetHead, scratchHead], approval.message ?? `ikbi: promote workspace ${handle.id}`);
           afterRef = mergeCommit;
           strategy = "merge";
+        }
+
+        // C1c — bind the verdict to the tree that actually lands. If the caller certified a specific
+        // tree, REFUSE unless the tree `afterRef` would land equals it. This catches (a) a post-verify
+        // write to the scratch branch and (b) a merge that produced a tree the verifier never saw —
+        // either way the landed tree is not the certified tree. Refuse cleanly (no intent, no CAS).
+        if (approval.verifiedAgainst !== undefined) {
+          const landedTree = await revParse(repo, `${afterRef}^{tree}`);
+          if (landedTree !== approval.verifiedAgainst.integratedTree) {
+            return {
+              promoted: false,
+              workspaceId: handle.id,
+              targetBranch: baseBranch,
+              beforeRef: targetHead,
+              strategy,
+              reason: `landed tree ${landedTree} ≠ certified tree ${approval.verifiedAgainst.integratedTree} (${strategy}) — the promoted state is not what was verified; re-verify`,
+            } satisfies PromoteResult;
+          }
         }
 
         // INTENT before the CAS (crash here => reconcile reads the target ref).
@@ -341,7 +405,7 @@ export class WorkspaceManager {
         // the landing proof), so a receipt failure here MUST NOT be swallowed: surface
         // PROMOTED_BUT_RECEIPT_FAILED and stamp the durable record so status/ls/undo can see the
         // degraded state and still recover from this record's before/after refs.
-        const receiptStatus = await this.recordPromoteReceiptDurable(handle.identity, handle.targetRepo, handle.baseBranch, handle.id, targetHead, afterRef, strategy, approval.requestId);
+        const receiptStatus = await this.recordPromoteReceiptDurable(rec.identity, repo, baseBranch, handle.id, targetHead, afterRef, strategy, approval.requestId);
         // The single terminal record carried through cleanup, so the stamp is never overwritten.
         let landedRecord: WorkspaceRecord = promoted;
         if (receiptStatus !== undefined) {
@@ -357,11 +421,11 @@ export class WorkspaceManager {
           }
         }
 
-        const result: PromoteResult = { promoted: true, workspaceId: handle.id, targetBranch: handle.baseBranch, beforeRef: targetHead, afterRef, ...(mergeCommit !== undefined ? { mergeCommit } : {}), strategy, ...(receiptStatus !== undefined ? { receiptStatus } : {}) };
+        const result: PromoteResult = { promoted: true, workspaceId: handle.id, targetBranch: baseBranch, beforeRef: targetHead, afterRef, ...(mergeCommit !== undefined ? { mergeCommit } : {}), strategy, ...(receiptStatus !== undefined ? { receiptStatus } : {}) };
         this.events?.publish(
-          WorkspaceEvents.promoted.create({ workspaceId: handle.id, targetBranch: handle.baseBranch, strategy, beforeRef: targetHead, afterRef }, { source: "workspace", attribution: { identity: handle.identity } }),
+          WorkspaceEvents.promoted.create({ workspaceId: handle.id, targetBranch: baseBranch, strategy, beforeRef: targetHead, afterRef }, { source: "workspace", attribution: { identity: rec.identity } }),
         );
-        this.log.info({ event: "workspace_promoted", workspaceId: handle.id, strategy, beforeRef: targetHead, afterRef, targetBranch: handle.baseBranch, receiptStatus }, "workspace promoted");
+        this.log.info({ event: "workspace_promoted", workspaceId: handle.id, strategy, beforeRef: targetHead, afterRef, targetBranch: baseBranch, receiptStatus }, "workspace promoted");
 
         // SG-7: the source worktree DIRECTORY is no longer needed once promoted — free the disk
         // (best-effort; never undoes the landed promote). The scratch BRANCH is intentionally
@@ -372,19 +436,29 @@ export class WorkspaceManager {
           this.log.warn({ err: e instanceof Error ? e.message : String(e), workspaceId: handle.id }, "post-promote worktree cleanup failed (non-fatal)"),
         );
         return result;
-      });
+      }, { file: this.lockFile(branchLockKey) });
     });
   }
 
   // ---- discard (per-ws lock; terminal-promoted preserved) ----
 
   async discard(handle: WorkspaceHandle): Promise<DiscardResult> {
-    return this.locks.withLock(this.wsKey(handle.id), async () => {
-      await removeWorktree(handle.targetRepo, handle.path);
-      await pruneWorktrees(handle.targetRepo);
-      await deleteBranch(handle.targetRepo, handle.scratchBranch);
-
+    return this.withWorkspaceLock(handle.id, async () => {
+      // H3 — REHYDRATE the destructive targets from the DURABLE record (source of truth) BEFORE
+      // destroying anything. The only field trusted from the caller's handle is the opaque `id`; a
+      // stale/hand-built handle whose `path`/`scratchBranch`/`targetRepo` point elsewhere must never
+      // drive `removeWorktree`/`deleteBranch` at the WRONG worktree or branch. The record is read
+      // under the ws lock (held for the whole op), then its fields drive the teardown. If no record
+      // exists (already reconciled away), fall back to the handle — the ops are idempotent/guarded and
+      // nothing in the registry claims those paths.
       const rec = await this.store.get(handle.id);
+      const targetRepo = rec?.targetRepo ?? handle.targetRepo;
+      const path = rec?.path ?? handle.path;
+      const scratchBranch = rec?.scratchBranch ?? handle.scratchBranch;
+      await removeWorktree(targetRepo, path);
+      await pruneWorktrees(targetRepo);
+      await deleteBranch(targetRepo, scratchBranch);
+
       if (rec?.state === "promoted") {
         // Terminal: preserve the promoted record (+promotedTo); only note the cleanup.
         await this.store.put(handle.id, { ...rec, cleanedAt: this.now(), updatedAt: this.now() });
@@ -392,7 +466,7 @@ export class WorkspaceManager {
         await this.store.put(handle.id, { ...rec, state: "discarded", updatedAt: this.now() });
       }
       this.live.delete(handle.id);
-      this.events?.publish(WorkspaceEvents.discarded.create({ workspaceId: handle.id }, { source: "workspace", attribution: { identity: handle.identity } }));
+      this.events?.publish(WorkspaceEvents.discarded.create({ workspaceId: handle.id }, { source: "workspace", attribution: { identity: rec?.identity ?? handle.identity } }));
       this.log.info({ event: "workspace_discarded", workspaceId: handle.id, wasPromoted: rec?.state === "promoted" }, "workspace discarded");
       return { workspaceId: handle.id, removed: true };
     });
@@ -412,7 +486,7 @@ export class WorkspaceManager {
    * already-terminal record (no-op beyond a note refresh).
    */
   async retain(handle: WorkspaceHandle, reason: string): Promise<DiscardResult> {
-    return this.locks.withLock(this.wsKey(handle.id), async () => {
+    return this.withWorkspaceLock(handle.id, async () => {
       const rec = await this.store.get(handle.id);
       if (rec === undefined) {
         this.live.delete(handle.id);
@@ -456,7 +530,8 @@ export class WorkspaceManager {
   // ---- reclaim (respects the per-workspace lock; skips active) ----
 
   async reclaim(targetRepo: string): Promise<ReclaimResult> {
-    return this.locks.withLock(`workspace:reclaim:${targetRepo}`, async () => {
+    const reclaimKey = `workspace:reclaim:${targetRepo}`;
+    return this.locks.withLock(reclaimKey, async () => {
       const before = (await listWorktrees(targetRepo)).length;
       await pruneWorktrees(targetRepo);
       const worktrees = await listWorktrees(targetRepo);
@@ -479,8 +554,8 @@ export class WorkspaceManager {
         if (rec === undefined || rec.targetRepo !== targetRepo) continue;
         if (rec.state !== "allocating" && rec.state !== "allocated" && rec.state !== "promoting") continue;
         try {
-          await this.locks.withLock(
-            this.wsKey(id),
+          await this.withWorkspaceLock(
+            id,
             async () => {
               const did = await this.reclaimOne(rec, livePaths);
               if (did) recordsReconciled += 1;
@@ -500,7 +575,7 @@ export class WorkspaceManager {
       this.events?.publish(WorkspaceEvents.reclaimed.create({ targetRepo, branchesDeleted, recordsReconciled }, { source: "workspace" }));
       this.log.info({ event: "workspace_reclaimed", targetRepo, ...result }, "reclaimed abandoned workspaces");
       return result;
-    });
+    }, { file: this.lockFile(reclaimKey) });
   }
 
   /**
@@ -512,18 +587,46 @@ export class WorkspaceManager {
    * (only held DURING ops), so lock-free ≠ abandoned. The orphan is still reconciled under its own
    * lock to avoid racing a concurrent teardown. No files are deleted. Returns the number reaped.
    */
+  /**
+   * H6: is this record's OWNING process provably dead? True only when the record was stamped with an
+   * `ownerPid`/`ownerHost` (this manager's stamps), the host matches ours (a pid on another host is
+   * unknowable), and `process.kill(pid, 0)` reports the process no longer exists (ESRCH). A live pid,
+   * a foreign host, or an unstamped (legacy) record all return false — we never reap something we can't
+   * prove is dead. Guards against reaping OUR OWN pid (a concurrent allocate in this same process).
+   */
+  private isOwnerDead(rec: WorkspaceRecord): boolean {
+    if (rec.ownerPid === undefined || rec.ownerHost !== hostname()) return false;
+    if (rec.ownerPid === process.pid) return false; // our own live process
+    try {
+      process.kill(rec.ownerPid, 0); // signal 0 = existence check; no-op if alive
+      return false; // still running
+    } catch (err) {
+      // ESRCH = no such process (dead). EPERM = alive but not ours to signal (treat as alive, safe).
+      return (err as NodeJS.ErrnoException).code === "ESRCH";
+    }
+  }
+
   private async reapAbandoned(): Promise<number> {
     let reaped = 0;
     for (const id of await this.store.list()) {
       const rec = await this.store.get(id).catch(() => undefined);
       if (rec === undefined) continue;
       if (rec.state !== "allocating" && rec.state !== "allocated" && rec.state !== "promoting") continue;
-      if (existsSync(rec.path)) continue; // worktree present ⇒ possibly LIVE ⇒ never auto-reap
+      // H6: a worktree still on disk usually means LIVE — but a crashed build (SIGKILL/OOM/power loss)
+      // leaves the worktree present with its owner process DEAD. If we can prove the owner is dead
+      // (same host, pid no longer running) we reap it too — else N crashes wedge the workspace cap with
+      // no recovery. A present worktree whose owner we CANNOT verify (other host / no pid) is left alone.
+      const worktreePresent = existsSync(rec.path);
+      const ownerDead = worktreePresent && this.isOwnerDead(rec);
+      if (worktreePresent && !ownerDead) continue; // present + (live or unverifiable) ⇒ never auto-reap
       try {
-        await this.locks.withLock(
-          this.wsKey(id),
+        await this.withWorkspaceLock(
+          id,
           async () => {
-            await this.store.put(id, { ...rec, state: "failed", updatedAt: this.now(), note: "reclaimed: orphan worktree (self-heal on allocate limit)" });
+            // A dead-owner record with a lingering worktree: remove the worktree + branch, then mark it.
+            if (ownerDead) await this.removeWorktreeDir(rec).catch(() => undefined);
+            const note = ownerDead ? "reclaimed: owner process dead (crash self-heal)" : "reclaimed: orphan worktree (self-heal on allocate limit)";
+            await this.store.put(id, { ...rec, state: "failed", updatedAt: this.now(), note });
             this.live.delete(id);
             reaped += 1;
           },
@@ -632,8 +735,8 @@ export class WorkspaceManager {
         continue;
       }
       try {
-        await this.locks.withLock(
-          this.wsKey(id),
+        await this.withWorkspaceLock(
+          id,
           async () => {
             await removeWorktree(rec.targetRepo, rec.path).catch(() => undefined);
             await pruneWorktrees(rec.targetRepo).catch(() => undefined);
@@ -673,6 +776,33 @@ export class WorkspaceManager {
 
   private wsKey(id: string): string {
     return `workspace:ws:${id}`;
+  }
+
+  /**
+   * #3: cross-process lock-file path for a SHARED-STATE orchestration lock key, under `<root>/locks`.
+   * The in-process mutex only serializes async tasks WITHIN one Node process, but the CLI and the
+   * service (or two CLI invocations) share this workspace root — so the allocation-bound check, a
+   * shared-branch promote, and a repo reclaim pass need an OS-level lock too. The key is SHA-1 hashed
+   * (repo paths carry slashes and vary in length) into a short, safe, collision-resistant filename;
+   * all processes on the same host + workspace root derive the SAME path and thus serialize.
+   * (Per-workspace RECORD writes are already cross-process-safe via the store's `crossProcess: true`.)
+   */
+  private lockFile(key: string): string {
+    return join(this.root, "locks", `${createHash("sha1").update(key).digest("hex").slice(0, 16)}.lock`);
+  }
+
+  /**
+   * Acquire the CROSS-PROCESS per-workspace lock (in-process mutex + file lock) for `id` and run `fn`.
+   * EVERY per-workspace lifecycle transition — allocate, promote, discard, retain, reclaim, reap, clean,
+   * preload-reconcile — goes through this ONE method, so the lock is cross-process EVERYWHERE and a peer
+   * process can never mutate/reconcile a workspace another process is promoting. There is deliberately no
+   * in-process-only variant to forget (the gap that let `reclaim`/cleanup reconcile a live promote).
+   */
+  private withWorkspaceLock<T>(id: string, fn: () => Promise<T>, opts?: { timeoutMs?: number }): Promise<T> {
+    return this.locks.withLock(this.wsKey(id), fn, {
+      file: this.lockFile(this.wsKey(id)),
+      ...(opts?.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
+    });
   }
 
   private resolveWorktreePath(id: string): string {
@@ -719,6 +849,31 @@ export class WorkspaceManager {
    * CAS landed => mark promoted (a landed mutation is always recorded); otherwise
    * it did not land => revert to allocated (promotable again).
    */
+  /**
+   * Reconcile a promoting record ONLY if its CROSS-PROCESS workspace lock is free — i.e. the promoter is
+   * gone (crashed; the lock layer's stale-recovery frees a dead holder's lock ~instantly). Returns the
+   * post-reconcile record, or `undefined` when a LIVE promoter still holds the lock (the caller then
+   * leaves the promote alone and counts the slot as active). Re-reads under the lock so a promote that
+   * finished between the store.list() and the lock is handled correctly, not double-reconciled.
+   */
+  private async reconcileIfUnlocked(id: string, rec: WorkspaceRecord): Promise<WorkspaceRecord | undefined> {
+    try {
+      return await this.withWorkspaceLock(
+        id,
+        async () => {
+          const fresh = await this.store.get(id).catch(() => undefined);
+          if (fresh?.state === "promoting") await this.reconcilePromoting(fresh);
+          return (await this.store.get(id).catch(() => undefined)) ?? rec;
+        },
+        { timeoutMs: RECLAIM_WS_TIMEOUT_MS },
+      );
+    } catch (err) {
+      if (err instanceof SubstrateError && err.kind === "lock_timeout") return undefined; // live promoter holds it
+      this.log.debug({ event: "workspace_reconcile_skip", workspaceId: id, err: String(err) }, "skipped a promote reconcile during preload");
+      return undefined;
+    }
+  }
+
   private async reconcilePromoting(rec: WorkspaceRecord): Promise<void> {
     const intent = rec.promoteIntent;
     if (intent === undefined) {
@@ -730,7 +885,18 @@ export class WorkspaceManager {
     const landed = targetHead === intent.afterRef && (await isAncestor(rec.targetRepo, intent.beforeRef, intent.afterRef).catch(() => false));
     if (landed) {
       const checkedOutPath = await worktreeForBranch(rec.targetRepo, rec.baseBranch).catch(() => undefined);
-      if (checkedOutPath !== undefined) await syncWorktreeToRef(checkedOutPath, intent.afterRef);
+      if (checkedOutPath !== undefined) {
+        const sync = await syncWorktreeToRef(checkedOutPath, intent.afterRef);
+        if (sync.stashed) {
+          // The operator had uncommitted work in their checkout when a crashed promote is reconciled
+          // on this startup. It is STASHED (not lost), but resetting their tree unannounced is a nasty
+          // surprise — warn LOUDLY with the recovery command instead of only a debug log.
+          this.log.warn(
+            { event: "workspace_reconcile_stashed_user_work", workspaceId: rec.id, checkout: checkedOutPath },
+            `reconcile of a crashed promote reset ${checkedOutPath} to the landed commit and STASHED your uncommitted work — recover it with \`git -C ${checkedOutPath} stash pop\``,
+          );
+        }
+      }
       const promoted: WorkspaceRecord = { ...rec, state: "promoted", promotedTo: intent.afterRef, updatedAt: this.now(), note: "reconciled: promote landed" };
       await this.store.put(rec.id, promoted);
       this.live.delete(rec.id);

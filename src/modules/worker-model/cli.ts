@@ -23,7 +23,8 @@
  */
 
 import { createInterface } from "node:readline";
-import { fstatSync } from "node:fs";
+import { existsSync, fstatSync, readFileSync } from "node:fs";
+import { isAbsolute, join as pathJoin, resolve as pathResolve } from "node:path";
 
 import { registerCommand } from "../../cli/registry.js";
 import { writeStderr, writeStdout } from "../../cli/io.js";
@@ -38,16 +39,18 @@ import type { AutonomyGrant } from "../../core/trust/contract.js";
 import { events as coreEvents } from "../../core/events/index.js";
 import type { EventBusSurface } from "../../core/events/index.js";
 import { gateWall as coreGateWall, type GateWall } from "../gate-wall/index.js";
+import { driftPrevention as coreDriftPrevention } from "../drift-prevention/index.js";
 import type { ExecRequest, ExecResult } from "../governed-exec/index.js";
 import { createOrchestrator } from "./orchestrator.js";
 import { WorkerError, validateDelegationEnvelope, type DelegationEnvelope, type WorkerResult, type WorkerRole, type WorkerTask } from "./contract.js";
+import { CompositeOperationLedger, type ChildRunRole } from "./composite-ledger.js";
 import { preBuildRefinement, formatInterview } from "../../core/goal-refinement.js";
 import { createCognitionLayer } from "../cognition-layer/cognition.js";
 import { loadRepoRegistry } from "../../core/repo-registry.js";
 import type { CognitionDecision, CognitionLayer } from "../cognition-layer/contract.js";
 import { loadProjectMemory, type ProjectMemoryResult } from "./project-memory.js";
 import { isBuildTier, resolveTierPreset, BUILD_TIERS, type BuildTier } from "./tier-presets.js";
-import { unresolvableMessage } from "./checks.js";
+import { PROJECT_MANIFESTS, unresolvableMessage } from "./checks.js";
 import { createProductionGovernor } from "../memory-governor/create.js";
 
 function errMsg(e: unknown): string {
@@ -232,6 +235,26 @@ export function formatFailureDetail(r: WorkerResult): string {
   lines.push(`  Undo available: ${r.promoted ? "yes" : "no (build was not promoted)"}`);
 
   return `\n${lines.join("\n")}\n`;
+}
+
+/**
+ * DUEL POLICY (Phase 2, IKBI-RT-002). Whether the primary attempt's result warrants running a peer
+ * vendor-lane attempt. PURE. The peer runs ONLY when the primary produced a real candidate the
+ * pipeline judged not-promotable (`nonPromotion.duelEligible`); a different vendor lane might do
+ * better. It must NOT run for a governance refusal, an unverifiable target, an injection block, an
+ * operator interrupt, or an unlandable conflict — a peer vendor cannot fix any of those, and running
+ * one would waste the peer's cost and blur the two attempts. A thrown/transient infrastructure error
+ * never reaches here (it throws before a result exists), so it can never become a peer duel.
+ *
+ * Fallback for a result that omits the classification (an injected fake orchestrator, or a legacy
+ * result): only a pipeline `failure` — a lane that could not converge to promotable work — is
+ * duel-eligible; a `rejected`/`partial`/`stub` terminal is not (those are refusals, not candidate
+ * quality). A real orchestrator run always sets `nonPromotion` on a non-success terminal.
+ */
+export function primaryWarrantsPeer(r: WorkerResult): boolean {
+  if (r.outcome === "success") return false; // a promoted primary NEVER pays for a peer
+  if (r.nonPromotion !== undefined) return r.nonPromotion.duelEligible;
+  return r.outcome === "failure";
 }
 
 /** "Next command" hints for the operator after any build. PURE. */
@@ -477,7 +500,10 @@ export function createProductionWorker(
   // COOPERATIVE per-run cancellation seam: the orchestrator already checks killCheck before
   // start + at each role boundary (target.runId === task.taskId), so a cancelled task stops
   // cleanly (discard, no half-promote). Absent ⇒ the live kill-switch default (unchanged).
-  return createOrchestrator({ roleClaim: productionRoleClaim(opts.workerToken), gateWall: opts.gateWall ?? coreGateWall, governedExec, workspaces: coreWorkspaces, enforceProjectRoot: true, ...(opts.onExecOutput !== undefined ? { onExecOutput: opts.onExecOutput } : {}), ...(opts.requestApproval !== undefined ? { requestApproval: opts.requestApproval } : {}), ...(opts.memoryGovernor !== undefined ? { memoryGovernor: opts.memoryGovernor } : {}), ...(opts.killCheck !== undefined ? { killCheck: opts.killCheck } : {}) });
+  // DRIFT GOVERNOR (step 3): wire the live drift detector so the build path becomes a reliability
+  // governor. The drift POLICY (IKBI_DRIFT_PREVENTION_POLICY, default reportOnly) decides whether a
+  // detected drift is advisory (default), warns, or blocks — so production wiring is safe by default.
+  return createOrchestrator({ roleClaim: productionRoleClaim(opts.workerToken), gateWall: opts.gateWall ?? coreGateWall, governedExec, workspaces: coreWorkspaces, driftGovernor: coreDriftPrevention, enforceProjectRoot: true, ...(opts.onExecOutput !== undefined ? { onExecOutput: opts.onExecOutput } : {}), ...(opts.requestApproval !== undefined ? { requestApproval: opts.requestApproval } : {}), ...(opts.memoryGovernor !== undefined ? { memoryGovernor: opts.memoryGovernor } : {}), ...(opts.killCheck !== undefined ? { killCheck: opts.killCheck } : {}) });
 }
 
 /**
@@ -485,7 +511,38 @@ export function createProductionWorker(
  * "new_only" to prevent the builder from over-writing existing files.
  * This is a heuristic — the goal text is the only signal available at dispatch time.
  */
-function detectWriteScope(goal: string): "all" | "new_only" | "none" {
+/**
+ * Resolve the requested SCOPE.md into an ordered scope plan (staged build). `scope` is the parsed
+ * `--scope` value: "" (bare flag ⇒ auto-detect the default file names at the repo root) or an
+ * explicit path (relative resolves against cwd, then the repo). Returns undefined when staging was
+ * not requested, the file is missing, or it parses to zero stages — the caller then falls back to
+ * the normal heuristic/single build. `notFound` carries a message for the EXPLICIT-path case so the
+ * caller can fail loudly (the operator asked for a specific file that isn't there).
+ */
+export async function loadScopePlan(
+  scope: string | undefined,
+  repo: string,
+): Promise<{ plan?: import("../scope-plan/index.js").ScopePlan; notFound?: string }> {
+  if (scope === undefined) return {}; // staging not requested
+  const { parseScopePlan, DEFAULT_SCOPE_FILES } = await import("../scope-plan/index.js");
+  const candidates =
+    scope.length > 0
+      ? [isAbsolute(scope) ? scope : pathResolve(process.cwd(), scope), pathJoin(repo, scope)]
+      : DEFAULT_SCOPE_FILES.map((f) => pathJoin(repo, f));
+  for (const path of candidates) {
+    if (!existsSync(path)) continue;
+    try {
+      const plan = parseScopePlan(readFileSync(path, "utf8"));
+      if (plan.stages.length > 0) return { plan };
+      return { notFound: `scope file ${path} has no recognizable stages (numbered list, bullets, or ## headings)` };
+    } catch (e) {
+      return { notFound: `could not read scope file ${path}: ${e instanceof Error ? e.message : String(e)}` };
+    }
+  }
+  return { notFound: scope.length > 0 ? `scope file not found: ${scope}` : `no SCOPE.md found at the repo root (${DEFAULT_SCOPE_FILES.join(", ")})` };
+}
+
+export function detectWriteScope(goal: string): "all" | "new_only" | "none" {
   const lower = goal.toLowerCase();
   // Pure read/audit/analysis patterns → new_only (create docs/reports, don't modify code)
   const docPatterns = [
@@ -500,6 +557,14 @@ function detectWriteScope(goal: string): "all" | "new_only" | "none" {
   const createPatterns = [
     /\bfix\b/, /\badd\b/, /\bimplement\b/, /\brefactor\b/, /\bupdate\b/,
     /\brebuild\b/, /\bcreate\s+(?:a\s+)?(?:skill|module|feature|utility|endpoint|component)\b/,
+    // A CONSTRUCTION goal — "build the complete X", "scaffold a Y", "build all of Z". Anchored on an
+    // article/quantifier after the verb so it fires on a real build task but NOT on an audit goal that
+    // merely names a "build pipeline". Building a whole project needs write-all: the builder scaffolds
+    // files then MODIFIES the ones it just created as it iterates — new_only walls it off mid-build,
+    // and the block loop reads as no-progress → stuck_detected. This is checked BEFORE docPatterns, so
+    // a phrase like "read-only by default" (describing the TARGET software, not the build task —
+    // straight out of a spec) can no longer misroute a build goal to new_only.
+    /\b(?:build|scaffold)\s+(?:the\s+|a\s+|an\s+|all\s+(?:of\s+)?|complete\s+|entire\s+|whole\s+|out\s+)/,
   ];
   // If explicitly told not to modify, honor it
   if (/\bdo\s+not\s+modify\b/i.test(goal) || /\bdon'?t\s+modify\b/i.test(goal)) return "new_only";
@@ -518,8 +583,15 @@ function detectWriteScope(goal: string): "all" | "new_only" | "none" {
  * every progress/diagnostic/hint/repair/cost line is routed to STDERR so a caller can pipe
  * stdout straight into a JSON parser without log noise interleaved (FIX 3).
  */
-export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbose?: boolean; cost?: boolean; yes?: boolean; json?: boolean; delegation?: string; noMemory?: boolean; memoryDiff?: boolean; check?: string; maxBudgetUsd?: number; fallbackModel?: string; complexity?: "small" | "medium" | "large"; tier?: BuildTier; bare?: boolean; effort?: "low" | "medium" | "high" | "max"; fromPr?: number; escalate?: boolean; rest: string[] } {
+export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbose?: boolean; cost?: boolean; yes?: boolean; json?: boolean; delegation?: string; noMemory?: boolean; memoryDiff?: boolean; check?: string; maxBudgetUsd?: number; fallbackModel?: string; complexity?: "small" | "medium" | "large"; tier?: BuildTier; scope?: string; bare?: boolean; effort?: "low" | "medium" | "high" | "max"; fromPr?: number; escalate?: boolean; unknownFlags: string[]; rest: string[] } {
   const rest: string[] = [];
+  // #9: unknown FLAG-LIKE tokens (a typo'd `--no-promote`, `--dry-run`, `--modle=x`) were silently
+  // folded into the GOAL prose — the flag did nothing and the operator never knew. Collect them so the
+  // handler can reject with a clear message. A real goal is a single quoted argv element (it never
+  // arrives as a lone `--foo` token), so a lone dash-prefixed unknown is a typo, not goal text. `--`
+  // is the explicit end-of-options separator: everything after it is goal text, dashes and all.
+  const unknownFlags: string[] = [];
+  let endOfFlags = false;
   let repo: string | undefined;
   let verbose = false;
   let cost = false;
@@ -534,12 +606,21 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
   let fallbackModel: string | undefined;
   let complexity: "small" | "medium" | "large" | undefined;
   let tier: BuildTier | undefined;
+  // STAGED BUILD (scope-plan): undefined ⇒ not requested (heuristic path unchanged); "" ⇒ bare
+  // `--scope` (auto-detect SCOPE.md at the repo root); a path ⇒ `--scope=<path>` (explicit file).
+  let scope: string | undefined;
   let bare = false;
   let effort: "low" | "medium" | "high" | "max" | undefined;
   let fromPr: number | undefined;
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i] as string;
-    if (a === "--repo") {
+    if (endOfFlags) {
+      rest.push(a);
+      continue;
+    }
+    if (a === "--") {
+      endOfFlags = true; // everything after this is goal text, never parsed as a flag
+    } else if (a === "--repo") {
       repo = argv[i + 1];
       i += 1;
     } else if (a.startsWith("--repo=")) {
@@ -593,6 +674,10 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
     } else if (a.startsWith("--tier=")) {
       const val = a.slice("--tier=".length);
       if (isBuildTier(val)) tier = val;
+    } else if (a === "--scope") {
+      scope = ""; // bare flag ⇒ auto-detect SCOPE.md at the repo root (does NOT consume the goal)
+    } else if (a.startsWith("--scope=")) {
+      scope = a.slice("--scope=".length);
     } else if (a === "--bare") {
       bare = true;
     } else if (a === "--effort") {
@@ -611,11 +696,13 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
       if (Number.isInteger(n) && n > 0) fromPr = n;
     } else if (a === "--escalate") {
       escalate = true;
+    } else if (a.length > 1 && a.startsWith("-")) {
+      unknownFlags.push(a); // a lone dash-prefixed token we don't recognize ⇒ a typo'd flag, not goal text
     } else {
       rest.push(a);
     }
   }
-  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), ...(verbose ? { verbose } : {}), ...(cost ? { cost } : {}), ...(yes ? { yes } : {}), ...(json ? { json } : {}), ...(delegation !== undefined ? { delegation } : {}), ...(noMemory ? { noMemory } : {}), ...(memoryDiff ? { memoryDiff } : {}), ...(check !== undefined && check.trim().length > 0 ? { check } : {}), ...(maxBudgetUsd !== undefined ? { maxBudgetUsd } : {}), ...(fallbackModel !== undefined ? { fallbackModel } : {}), ...(complexity !== undefined ? { complexity } : {}), ...(tier !== undefined ? { tier } : {}), ...(bare ? { bare } : {}), ...(effort !== undefined ? { effort } : {}), ...(fromPr !== undefined ? { fromPr } : {}), ...(escalate ? { escalate } : {}), rest };
+  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), ...(verbose ? { verbose } : {}), ...(cost ? { cost } : {}), ...(yes ? { yes } : {}), ...(json ? { json } : {}), ...(delegation !== undefined ? { delegation } : {}), ...(noMemory ? { noMemory } : {}), ...(memoryDiff ? { memoryDiff } : {}), ...(check !== undefined && check.trim().length > 0 ? { check } : {}), ...(maxBudgetUsd !== undefined ? { maxBudgetUsd } : {}), ...(fallbackModel !== undefined ? { fallbackModel } : {}), ...(complexity !== undefined ? { complexity } : {}), ...(tier !== undefined ? { tier } : {}), ...(scope !== undefined ? { scope } : {}), ...(bare ? { bare } : {}), ...(effort !== undefined ? { effort } : {}), ...(fromPr !== undefined ? { fromPr } : {}), ...(escalate ? { escalate } : {}), unknownFlags, rest };
 }
 
 /**
@@ -625,10 +712,50 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
  * verify a repo that has no recognizable manifest (e.g. a bare loose-source repo), overriding the
  * fast-fail manifest detection with an explicit command. NEVER model-chosen.
  */
+/** Classify a check stage by its command so the verifier reads it correctly. The verifier keys
+ *  test-EXECUTION evidence off a check NAMED "test" and typecheck off one named "typecheck"
+ *  (see readVerifier); an operator `--check "pnpm test"` named the generic "check" is otherwise
+ *  invisible as test evidence and a real, passing build is discarded ("test evidence absent"). */
+function classifyCheckName(cmdLower: string): "test" | "typecheck" | "check" {
+  if (
+    /--test\b/.test(cmdLower) ||
+    /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test\b/.test(cmdLower) ||
+    /\b(?:vitest|jest|pytest|mocha|ava|unittest)\b/.test(cmdLower) ||
+    /\bgo\b[^\n]*\btest\b/.test(cmdLower) ||
+    /\bcargo\b[^\n]*\btest\b/.test(cmdLower) ||
+    /\b(?:mvn|maven|gradle)\b[^\n]*\btest\b/.test(cmdLower) || // JVM build tools
+    /^\s*java\s+\S*test/.test(cmdLower)                        // `java` runner on a *Test class (NOT `javac`, NOT a *.java arg)
+  ) {
+    return "test";
+  }
+  if (/\btsc\b/.test(cmdLower) || /\btypecheck\b/.test(cmdLower) || /\bjavac\b/.test(cmdLower)) return "typecheck";
+  return "check";
+}
+
 export function checkToIkbiChecksJson(raw: string): string | undefined {
-  const toks = raw.trim().split(/\s+/).filter((t) => t.length > 0);
-  if (toks.length === 0) return undefined;
-  return JSON.stringify([{ name: "check", command: toks[0], args: toks.slice(1) }]);
+  // COMPOUND CHECKS: governed-exec runs array-args with NO shell, so a literal "&&" can never
+  // execute — a compile-then-test idiom ("pnpm exec tsc && node --test dist") tokenized as ONE
+  // command would hand "&&" to the binary and be rejected. Split on "&&" into SEQUENTIAL
+  // single-command checks (each still array-args, each allowlisted), run in order, all must pass.
+  // Each stage is NAMED by what it does (test/typecheck/check) so the verifier's test-evidence and
+  // typecheck gates recognize an operator-declared check — otherwise a passing `--check "pnpm test"`
+  // is filed as a nameless "check" and the promote gate discards a real green as "test evidence absent".
+  const stages = raw.split("&&").map((s) => s.trim()).filter((s) => s.length > 0);
+  let genericSeq = 0;
+  const checks = stages
+    .map((stage) => {
+      const toks = stage.split(/\s+/).filter((t) => t.length > 0);
+      if (toks.length === 0) return undefined;
+      const kind = classifyCheckName(stage.toLowerCase());
+      // Disambiguate multiple GENERIC stages ("check1"/"check2"); "test"/"typecheck" keep their
+      // meaningful names (the verifier reads evidence off those exact names, and it aggregates
+      // repeats, so duplicates there are harmless).
+      const name: string = kind === "check" && stages.length > 1 ? `check${(genericSeq += 1)}` : kind;
+      return { name, command: toks[0] as string, args: toks.slice(1) };
+    })
+    .filter((c): c is { name: string; command: string; args: string[] } => c !== undefined);
+  if (checks.length === 0) return undefined;
+  return JSON.stringify(checks);
 }
 
 /** Render a worker `worker.*` progress event into a concise human line (for `--verbose`). PURE. */
@@ -799,6 +926,23 @@ export function formatCostBreakdown(r: WorkerResult): string {
   return `${lines.join("\n")}\n`;
 }
 
+/**
+ * Phase 14B — render the PARENT composite total for a multi-run operation (a conditional duel today). It surfaces
+ * the union-of-unique-provider-attempts cost across BOTH children (winning + losing), each child's scoped spend,
+ * and a `partial` marker if any attempt's cost is unknown — so the losing peer's cost is never invisible.
+ */
+export function formatCompositeCost(composite: CompositeOperationLedger): string {
+  const s = composite.summary();
+  const lines: string[] = [`Composite operation (${s.strategy}) — ${s.childRuns.length} runs:`];
+  for (const c of s.childRuns) {
+    lines.push(`  ${c.role.padEnd(10)}  ${c.childId}${c.selected ? " ✓" : ""}  (${c.outcome}, ${c.providerAttemptCount} attempts)`);
+  }
+  lines.push(`  ${"─".repeat(22)}`);
+  const suffix = s.cost.status === "partial" ? `  (partial — ${s.cost.unknownCostAttempts} attempt(s) unknown-cost)` : "";
+  lines.push(`  ${"composite".padEnd(10)}  $${s.cost.usd.toFixed(4)}  [${s.cost.uniqueProviderAttempts} unique attempts]${suffix}`);
+  return `${lines.join("\n")}\n`;
+}
+
 /** Injectable surfaces so the construction + roleClaim + spawn/clamp + gate chain is testable. */
 export interface WorkerCliDeps {
   /** The run surface. Default: a live orchestrator wired with the production roleClaim + real gate-wall. */
@@ -911,7 +1055,11 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
           "  --escalate        Authorize a frontier consult (Opus-tier patch, ladder-verified) if the cheap+mid pool is exhausted\n" +
           "  --delegation <json>  Run from a delegation envelope (overrides goal + repo)\n" +
                     "  --fallback-model <m> Override the escalation mid-tier model (default from IKBI_ESCALATION_MID_MODEL)\n" +
-          "  --complexity <level>  small | medium | large — large skips flash entirely (uses pro)\n" +
+          "  --complexity <level>  small | medium | large — large skips flash (uses pro) AND extends the\n" +
+          "                        builder's wall-clock budget so a big scaffold isn't cut off mid-tree\n" +
+          "  --scope[=<path>]  Staged build from an author-ordered SCOPE.md (bare = SCOPE.md at repo root).\n" +
+          "                        Each ordered stage is one small builder pass (accumulate → verify+promote);\n" +
+          "                        mark a stage `(verify)` to verify it mid-build. Overrides heuristic decomposition.\n" +
           "  --tier <name>     cheap | mid | frontier — preset builder+critic models per tier.\n" +
           "                        cheap (flash+pro, auto-escalation ON); mid (glm-5.2+minimax-m3)\n" +
           "                        and frontier (sonnet-4.6+gpt-5.5) run one builder, escalation OFF.\n" +
@@ -921,7 +1069,16 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       return;
     }
 
-    const { repo, verbose, cost, yes, delegation: delegationJson, noMemory, memoryDiff, check, maxBudgetUsd, fallbackModel, complexity, tier, bare, effort, fromPr, escalate, rest } = parseBuildArgs(argv);
+    const { repo, verbose, cost, yes, json, delegation: delegationJson, noMemory, memoryDiff, check, maxBudgetUsd, fallbackModel, complexity, tier, scope, bare, effort, fromPr, escalate, unknownFlags, rest } = parseBuildArgs(argv);
+    // #9: reject typo'd/unknown flags instead of silently folding them into the build goal (where they
+    // do nothing). A legit goal that really needs a leading dash goes after `--`.
+    if (unknownFlags.length > 0) {
+      err(`ikbi build: unknown option${unknownFlags.length > 1 ? "s" : ""}: ${unknownFlags.join(", ")} — run \`ikbi build --help\`. (Goal text with a leading dash goes after \`--\`.)\n`);
+      setExit(1);
+      return;
+    }
+    // H3: in --json mode, step-planner PROGRESS lines go to stderr so stdout carries ONLY the result JSON.
+    const progress = json === true ? err : out;
 
     // `--tier` given a value parseBuildArgs couldn't match (e.g. `--tier turbo`) silently drops to
     // undefined. Catch that here and fail closed with the valid set, rather than running an
@@ -1090,12 +1247,27 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       targetRepo,
       goal: finalGoal,
       writeScope: detectWriteScope(finalGoal),
+      // GREENFIELD: when the target has no project manifest at its root, opt this build into
+      // greenfield scaffolding. The orchestrator only acts on it when the target is genuinely
+      // EMPTY (no source either) — letting the builder scaffold a verifiable project instead of
+      // fast-failing before it runs. A target WITH a manifest never sets this (normal flow); a
+      // loose-source-no-manifest target sets it but the orchestrator still fast-fails (not empty).
+      ...(!PROJECT_MANIFESTS.some((m) => existsSync(pathJoin(targetRepo, m))) ? { allowGreenfieldScaffold: true } : {}),
       ...(envelope !== undefined ? { originAgent: envelope.originAgent } : {}),
       ...(complexity !== undefined ? { complexity } : {}),
       // Pass pre-loaded memory content so the builder doesn't re-read the disk.
       // When --no-memory is set, projectMem is undefined; skipProjectMemory tells
-      // the builder not to fall back to its own file load.
-      ...(projectMem !== undefined ? { projectInstructions: projectMem.content } : {}),
+      // the builder not to fall back to its own file load. IKBI_BUILD_EXTRA_INSTRUCTIONS
+      // (set by the Peh launch_build path) carries the operator's standing instructions so a
+      // conversation-launched build honors the same baseline preferences the chat session does.
+      ...((() => {
+        const extra = (process.env.IKBI_BUILD_EXTRA_INSTRUCTIONS ?? "").trim();
+        const parts = [
+          projectMem?.content,
+          extra.length > 0 ? `Operator standing instructions — honor these across this build:\n${extra}` : undefined,
+        ].filter((s): s is string => typeof s === "string" && s.length > 0);
+        return parts.length > 0 ? { projectInstructions: parts.join("\n\n") } : {};
+      })()),
       ...(noMemory === true ? { skipProjectMemory: true } : {}),
       // Gap 5 (--bare): skip non-essential loading. Implies skipping project memory too.
       ...(bare === true ? { bare: true, skipProjectMemory: true } : {}),
@@ -1119,11 +1291,21 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       // tier's escalation target — so the tier fallback is only applied when none was set.
       ...(tierPreset !== undefined
         ? {
-            builderModelOverride: tierPreset.builderModel,
+            // MIXTURE OF EXPERTS: a `moe` tier does NOT pin one builder — it sets moeExpertRental so
+            // the orchestrator rents the cheapest-sufficient expert per sub-task (the tier's
+            // builderModel is only the typical/floor expert). A non-moe tier pins its builder as before.
+            ...(tierPreset.moe === true ? { moeExpertRental: true } : { builderModelOverride: tierPreset.builderModel }),
             criticModelOverride: tierPreset.criticModel,
             ...(tierPreset.escalation ? {} : { escalationDisabled: true }),
             ...(tierPreset.fallbackModel !== undefined && fallbackModel === undefined && !process.env.IKBI_FALLBACK_MODEL
               ? { fallbackModel: tierPreset.fallbackModel }
+              : {}),
+            // FULL-SYSTEM ENGAGEMENT: a tier that names candidate models runs the build as a
+            // candidate tournament (deterministic-judge + shadow verification), not a lone builder.
+            // An explicit IKBI_CANDIDATE_MODELS env still wins — the orchestrator reads it as the
+            // fallback, so we only inject the tier's list when the operator hasn't named their own.
+            ...(tierPreset.candidates !== undefined && tierPreset.candidates.length > 0 && (process.env.IKBI_CANDIDATE_MODELS ?? "").trim() === ""
+              ? { candidates: [...tierPreset.candidates] }
               : {}),
           }
         : {}),
@@ -1134,8 +1316,11 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
     // never pollutes a --json stdout contract.
     if (tierPreset !== undefined) {
       err(
-        `ikbi: tier=${tierPreset.tier} — builder=${tierPreset.builderModel}, critic=${tierPreset.criticModel}, ` +
-          `escalation=${tierPreset.escalation ? `ON → ${task.fallbackModel ?? tierPreset.fallbackModel ?? "mid"}` : "OFF (fail-closed)"}\n`,
+        `ikbi: tier=${tierPreset.tier} — ` +
+          `${tierPreset.moe === true ? `builder=MoE pool (rents cheapest-sufficient expert per sub-task; floor ${tierPreset.builderModel})` : `builder=${tierPreset.builderModel}`}, ` +
+          `critic=${tierPreset.criticModel}, ` +
+          `escalation=${tierPreset.escalation ? `ON → ${task.fallbackModel ?? tierPreset.fallbackModel ?? "mid"}` : "OFF (fail-closed)"}` +
+          `${task.candidates !== undefined && task.candidates.length > 0 ? `, tournament=[${task.candidates.join(", ")}] (judge+shadow)` : ""}\n`,
       );
     }
 
@@ -1143,8 +1328,46 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
     // the deterministic, zero-cost heuristic `decompose` — the model-based `decomposeWithModel`
     // strategy is intentionally DORMANT (not wired here) so the planner never spends a model call;
     // see step-planner/implementation.ts for the rationale and how to opt in later.
-    const { decompose } = await import("../step-planner/index.js");
-    const stepPlan = decompose(finalGoal);
+    const { decomposeAdaptive } = await import("../step-planner/index.js");
+    // OPT-IN (IKBI_STEP_PLANNER_MODEL): thread a model invoker so the planner can use a model
+    // second pass when the zero-cost heuristic is uncertain (it saturated the step cap). Off by
+    // default — the heuristic stays free. The provider is imported lazily (never at module load).
+    const useModelPlanner = /^(1|true|yes|on)$/i.test((process.env.IKBI_STEP_PLANNER_MODEL ?? "").trim());
+    const stepPlan = await decomposeAdaptive(
+      finalGoal,
+      useModelPlanner
+        ? {
+            invokeModel: async (prompt: string): Promise<string> => {
+              const { invokeModel } = await import("../../core/provider/index.js");
+              const res = await invokeModel({ model: config.provider.defaultModels.driver, messages: [{ role: "user", content: prompt }], temperature: 0.2, identity: who.identity });
+              return typeof res.content === "string" ? res.content : "";
+            },
+          }
+        : {},
+    );
+
+    // STAGED BUILD (scope-plan, step 4): an explicit author-ordered SCOPE.md OVERRIDES heuristic
+    // decomposition — the reliability path for a BIG greenfield build the goal-string heuristic
+    // cannot decompose. Each stage is one SMALL builder pass through the SAME shared-workspace
+    // machinery (accumulate → final verify/promote); a `(verify)`-marked stage verifies mid-build
+    // so a broken foundation is caught early. Requested via `--scope`; absent ⇒ heuristic, unchanged.
+    const scopeResult = await loadScopePlan(scope, targetRepo);
+    if (scope !== undefined && scopeResult.plan === undefined) {
+      err(`ikbi: --scope requested but ${scopeResult.notFound}\n`);
+      setExit(1);
+      return;
+    }
+    // The normalized ordered stage list the multi-step block runs. A scope plan (≥2 stages) wins;
+    // else the heuristic step plan (verify:false — heuristic steps only verify at the final pass).
+    type BuildStage = { index: number; goal: string; targetFiles?: readonly string[]; verify: boolean };
+    const usingScope = scopeResult.plan !== undefined && scopeResult.plan.stages.length > 1;
+    if (scopeResult.plan !== undefined && scopeResult.plan.stages.length === 1) {
+      progress("  ↳ scope file has a single stage — running as a normal single build\n");
+    }
+    const buildStages: BuildStage[] = usingScope
+      ? scopeResult.plan!.stages.map((s) => ({ index: s.index, goal: s.goal, ...(s.targetFiles !== undefined ? { targetFiles: s.targetFiles } : {}), verify: s.verify }))
+      : stepPlan.steps.map((s) => ({ index: s.index, goal: s.goal, ...(s.targetFiles !== undefined ? { targetFiles: s.targetFiles } : {}), verify: false }));
+    const multiStage = usingScope || (stepPlan.decomposed && stepPlan.steps.length > 1);
 
     // SG-5: with --verbose, stream the build's structured progress events (per-role start/end,
     // builder tool activity, verification status) live as they fire.
@@ -1152,104 +1375,215 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
     try {
       let result: WorkerResult;
 
-      if (stepPlan.decomposed && stepPlan.steps.length > 1) {
-        // H5: a multi-step plan only LANDS on a tier with autoCommit autonomy. Intermediate
-        // steps set skipPromote (they never commit), and the final step's commit is gated on
-        // autoCommit — so on a non-autoCommit tier (verified/probation/untrusted) every green
-        // step would still evaporate to "partial" with nothing landed. Refuse the plan up front
-        // with an actionable message instead of burning N model calls on work that can't land.
-        // (A run-only orchestrator exposes no spawnRole ⇒ proceed, preserving the legacy path.)
+      // H5 (lane-independent, checked ONCE before any attempt): a multi-step plan only LANDS on a
+      // tier with autoCommit autonomy. Intermediate steps set skipPromote (they never commit), and
+      // the final step's commit is gated on autoCommit — so on a non-autoCommit tier every green
+      // step would evaporate to "partial" with nothing landed. Refuse up front with an actionable
+      // message. (A run-only orchestrator exposes no spawnRole ⇒ proceed, preserving the legacy path.)
+      if (multiStage) {
         const canLand = orchestrator.spawnRole?.("builder", ctx).autonomy.autoCommit ?? true;
         if (!canLand) {
           err(
-            `ikbi: this goal decomposes into ${stepPlan.steps.length} steps, but the worker tier lacks autoCommit autonomy — ` +
-              `intermediate steps never commit and the accumulated work would evaporate to "partial" (nothing lands). ` +
-              `Grant the worker the "trusted" tier and re-run, or restate the goal so it runs as a single step.\n`,
+            `ikbi: this build runs as ${buildStages.length} ${usingScope ? "stages" : "steps"}, but the worker tier lacks autoCommit autonomy — ` +
+              `intermediate ${usingScope ? "stages" : "steps"} never commit and the accumulated work would evaporate to "partial" (nothing lands). ` +
+              `Grant the worker the "trusted" tier and re-run, or restate the goal so it runs as a single ${usingScope ? "stage" : "step"}.\n`,
           );
           setExit(1);
           return;
         }
-        // MULTI-STEP: allocate ONE workspace, run all steps in it, final verify + promote.
-        // This is the shared-workspace step planner — changes accumulate across steps.
-        out(`  ↳ decomposed into ${stepPlan.steps.length} steps\n`);
-        const sharedWorkspace = await stepWorkspaces.allocate({
-          targetRepo,
-          identity: who.identity,
-          label: `worker:${id}:steps`,
-        });
-        let stepsOk = true;
-        let lastResult: WorkerResult | undefined;
-        for (const step of stepPlan.steps) {
-          out(`  → step ${step.index}/${stepPlan.steps.length}: ${step.goal}\n`);
-          const stepTask: WorkerTask = {
-            taskId: `${id}:step${step.index}`,
+      }
+
+      // ONE BUILD ATTEMPT (single-step or accumulated multi-stage), optionally pinned to a vendor
+      // lane so the duel-on-failure can run a genuine PEER in the other lane. Each attempt allocates
+      // a FRESH shared workspace and uses lane-suffixed task ids so the two attempts never collide.
+      const runOneAttempt = async (vendorLane?: string): Promise<WorkerResult> => {
+        const laneSuffix = vendorLane !== undefined ? `:${vendorLane}` : "";
+        if (multiStage) {
+          // MULTI-STAGE: allocate ONE workspace, run all stages in it, final verify + promote.
+          const unit = usingScope ? "stage" : "step";
+          progress(usingScope ? `  ↳ staged build: ${buildStages.length} stages from SCOPE.md\n` : `  ↳ decomposed into ${buildStages.length} steps\n`);
+          const sharedWorkspace = await stepWorkspaces.allocate({
             targetRepo,
-            goal: step.goal,
-            writeScope: detectWriteScope(step.goal),
-            reuseWorkspace: sharedWorkspace,
-            skipPromote: true,
-            // Skip verifier on ALL intermediate steps — the project is incomplete
-            // until the last step runs. The final verify pass handles verification.
-            skipVerifier: true,
-            // Skip the critic too: on an intermediate (skipPromote) step its verdict is
-            // discarded, so the paid model call buys nothing. The final pass critiques the
-            // accumulated work against the full goal.
-            skipCritic: true,
-          };
-          lastResult = await orchestrator.run(stepTask, ctx);
-          if (lastResult.outcome !== "success") {
-            out(`  ✗ step ${step.index} failed: ${lastResult.reason ?? lastResult.outcome}\n`);
-            stepsOk = false;
-            result = lastResult;
-            break;
+            identity: who.identity,
+            label: `worker:${id}:steps${laneSuffix}`,
+          });
+          let stepsOk = true;
+          let lastResult: WorkerResult | undefined;
+          // MoE HAND-OFF: a running brief of what prior steps built, threaded into each subsequent
+          // step's builder so a freshly-rented expert collaborates with the team (builds ON the
+          // accumulated work) instead of restarting cold. Rebuilt per attempt (fresh workspace).
+          const completedSteps: string[] = [];
+          for (const step of buildStages) {
+            progress(`  → ${unit} ${step.index}/${buildStages.length}: ${step.goal}${step.verify ? " (verify)" : ""}\n`);
+            const stepTask: WorkerTask = {
+              taskId: `${id}:step${step.index}${laneSuffix}`,
+              targetRepo,
+              goal: step.goal,
+              writeScope: detectWriteScope(step.goal),
+              // Propagate --complexity so each building stage inherits the large-build model tier AND the
+              // scaled builder wall-clock (a decomposed large goal can still have large individual stages).
+              ...(complexity !== undefined ? { complexity } : {}),
+              // MIXTURE OF EXPERTS: each step is its own orchestrator.run, so propagate the rental flag —
+              // the coordinator rents the cheapest-sufficient expert for THIS step's difficulty. The
+              // vendor lane (when dueling) keeps the whole attempt within one vendor's experts.
+              ...(task.moeExpertRental === true ? { moeExpertRental: true } : {}),
+              ...(vendorLane !== undefined ? { moeVendorLane: vendorLane } : {}),
+              // Hand the current expert the team's accumulated work (absent on the first step).
+              ...(completedSteps.length > 0 ? { handoffBrief: completedSteps.join("\n") } : {}),
+              reuseWorkspace: sharedWorkspace,
+              skipPromote: true,
+              // Intermediate stages skip the verifier by default — the project is incomplete until the
+              // last stage, so a mid-build verify would fail on not-yet-built imports. A scope stage the
+              // author marked `(verify)` OPTS IN: it verifies the accumulated state so a broken foundation
+              // is caught EARLY (the stage fails, the build stops) instead of after every later stage ran.
+              skipVerifier: !step.verify,
+              // Skip the critic on intermediate stages: on a skipPromote stage its verdict is discarded,
+              // so the paid model call buys nothing. The final pass critiques the accumulated work.
+              skipCritic: true,
+            };
+            lastResult = await orchestrator.run(stepTask, ctx);
+            if (lastResult.outcome !== "success") {
+              progress(`  ✗ ${unit} ${step.index} failed: ${lastResult.reason ?? lastResult.outcome}\n`);
+              stepsOk = false;
+              break;
+            }
+            completedSteps.push(`- step ${step.index}: ${step.goal.slice(0, 120)}`);
+            progress(`  ✓ ${unit} ${step.index} passed\n`);
           }
-          out(`  ✓ step ${step.index} passed\n`);
-        }
-        if (stepsOk) {
-          // All steps passed — run full verification + promote on the accumulated workspace.
-          out(`  → final verification + promote\n`);
-          const finalTask: WorkerTask = {
-            taskId: `${id}:verify`,
-            targetRepo,
-            goal: `Verify all changes from the multi-step plan: ${finalGoal}`,
-            reuseWorkspace: sharedWorkspace,
-            // H4: the final pass VERIFIES the accumulated work — it must not MODIFY it. writeScope
-            // "none" blocks the builder from writing/patching/shell-writing any file, so a cheap
-            // builder model cannot revert or corrupt the prior steps' work. The verifier still runs
-            // its objective checks against the accumulated tree.
-            writeScope: "none",
-          };
-          result = await orchestrator.run(finalTask, ctx);
-        } else {
-          // H3: a failing step left the shared workspace ALIVE (intermediate steps set
-          // skipPromote, so the orchestrator neither promotes nor discards it). Discard it here
-          // so a failed multi-step build never leaks the worktree. Best-effort: a discard error
-          // must not mask the original step failure — the leak is reclaimable via `ikbi clean`.
+          if (stepsOk) {
+            // All steps passed — run full verification + promote on the accumulated workspace.
+            progress(`  → final verification + promote\n`);
+            const finalTask: WorkerTask = {
+              taskId: `${id}:verify${laneSuffix}`,
+              targetRepo,
+              goal: `Verify all changes from the ${usingScope ? "staged build" : "multi-step plan"}: ${finalGoal}`,
+              reuseWorkspace: sharedWorkspace,
+              // Phase 11B (IKBI-REAUDIT-002): the final multi-step executor is an EXPLICIT finalization attempt
+              // BOUND to the build's vendor lane (its `:verify:<lane>` id + this lane) — it cannot silently
+              // borrow another lane. Its candidate critic is lane-enforced by the orchestrator; a lane with no
+              // valid critic fails the attempt closed rather than crossing lanes.
+              ...(vendorLane !== undefined ? { moeVendorLane: vendorLane } : {}),
+              // H4: the final pass VERIFIES the accumulated work — it must not MODIFY it. writeScope
+              // "none" blocks the builder from writing/patching/shell-writing any file, so a cheap
+              // builder model cannot revert or corrupt the prior steps' work. The verifier still runs
+              // its objective checks against the accumulated tree.
+              writeScope: "none",
+            };
+            return await orchestrator.run(finalTask, ctx);
+          }
+          // H3: a failing step left the shared workspace ALIVE (intermediate steps set skipPromote,
+          // so the orchestrator neither promotes nor discards it). Discard it here so a failed
+          // multi-step attempt never leaks the worktree. Best-effort — reclaimable via `ikbi clean`.
           try {
             await stepWorkspaces.discard(sharedWorkspace);
           } catch {
             /* discard failure must not mask the step failure; the workspace is reclaimable later */
           }
-          result = lastResult!;
+          return lastResult!;
         }
-      } else {
-        // SINGLE-STEP: run directly.
-        result = await orchestrator.run(task, ctx);
+        // SINGLE-STEP: run directly (lane-pinned when dueling). A lane-pinned attempt gets a
+        // lane-DISTINCT task id so the primary and peer are separately attributable in receipts, costs,
+        // and run summaries (Phase 2) — they are two attempts, never one blurred record.
+        const attemptTask: WorkerTask = vendorLane !== undefined ? { ...task, taskId: `${task.taskId}:${vendorLane}`, moeVendorLane: vendorLane } : task;
+        return await orchestrator.run(attemptTask, ctx);
+      };
+
+      // DUEL-ON-FAILURE (cheap MoE tier): run the primary attempt in one vendor lane; ONLY when it
+      // produces a real candidate the pipeline judged not-promotable (a duel-eligible non-promotion) run
+      // ONE peer attempt in the OTHER lane and keep whichever promoted. Two genuinely different builds —
+      // "one may fail but the other may be better" — not a stronger rung of a ladder. A build that
+      // promotes first, or is refused for governance/structural/security/interrupt reasons a different
+      // vendor cannot fix, never pays for the second attempt (Phase 2, IKBI-RT-002).
+      const duelEnabled = task.moeExpertRental === true;
+      const DUEL_LANES = ["deepseek", "mimo"] as const; // the cheap pool's two vendors
+      // COMPOSITE OPERATION (Phase 14B): a conditional duel is ONE user operation spanning up to two runs. The
+      // composite cost is the union of unique provider attempts across BOTH child runs (primary + peer) — the
+      // LOSING child's spend is never dropped. Built from each run's provider-attempt projection.
+      const duelChildren: Array<{ result: WorkerResult; role: ChildRunRole }> = [];
+      result = await runOneAttempt(duelEnabled ? DUEL_LANES[0] : undefined);
+      duelChildren.push({ result, role: duelEnabled ? "primary" : "worker" });
+      if (duelEnabled && primaryWarrantsPeer(result)) {
+        progress(`  ⚔ primary (${DUEL_LANES[0]} lane) produced a non-promotable candidate — dueling a ${DUEL_LANES[1]}-lane peer\n`);
+        const peer = await runOneAttempt(DUEL_LANES[1]);
+        duelChildren.push({ result: peer, role: "peer" });
+        if (peer.outcome === "success") {
+          progress(`  ✓ ${DUEL_LANES[1]}-lane peer promoted — keeping it\n`);
+          result = peer;
+        } else {
+          progress(`  ✗ peer also did not promote — keeping the primary result\n`);
+        }
+      } else if (duelEnabled && result.outcome !== "success") {
+        progress(`  ⓘ primary (${DUEL_LANES[0]} lane) did not promote (${result.nonPromotion?.class ?? "no candidate"}) — a peer vendor cannot fix this class of failure; NOT dueling\n`);
       }
-      if (sub !== undefined) await eventBus.flush(); // drain the progress lines before the summary
-      // A gate denial / non-promote is a CLEAN outcome (printed), not an error.
-      out(summarize(result));
-      // ISSUE 3: surface the repair report (root cause / files / rationale / tests) when present.
-      out(formatRepairNarrative(result));
-      // --cost: print a per-role cost breakdown after the build.
-      if (cost === true) out(formatCostBreakdown(result));
-      // SG-2: after the run, show a one-line diff summary of what changed (best-effort).
-      if (result.workspaceId !== undefined) await printDiffSummary(result.workspaceId);
-      // Operator experience: failure details + next-command hints on STDERR (not stdout, which
-      // stays machine-readable JSON). All non-success outcomes get failure detail; all outcomes
-      // get next-command hints.
+      // COMPOSITE TOTAL (Phase 14B): when a duel actually dispatched a peer, the CLI operation spans TWO worker
+      // runs. Aggregate their provider-attempt projections into a parent composite so the surfaced total includes
+      // the LOSING child's spend (the re-audit found the CLI dropped it). One child = no composite (scoped total
+      // is already honest). Provider-attempt ids are disjoint across runs (taskId-prefixed) so union = complete sum.
+      let composite: CompositeOperationLedger | undefined;
+      if (duelChildren.length > 1) {
+        composite = new CompositeOperationLedger(`composite:${result.taskId}`, result.taskId, "conditional-duel");
+        for (const c of duelChildren) {
+          composite.registerChild({
+            childId: c.result.taskId, strategy: "moe-expert-rental", role: c.role, outcome: c.result.outcome,
+            selected: c.result.taskId === result.taskId,
+            providerAttempts: (c.result.providerAttempts ?? []).map((a) => ({
+              providerAttemptId: a.providerAttemptId,
+              ...(a.costUsd !== undefined ? { costUsd: a.costUsd } : {}),
+              costStatus: a.costStatus,
+            })),
+          });
+        }
+      }
+      // BASELINE (drift-prevention's reference): fold THIS run's receipts into the durable,
+      // cumulative per-(agent, operation) success-rate baseline — the reference drift-prevention
+      // compares a recent window against to detect a reliability decline. Without this the baseline
+      // is never written and drift is structurally inert (the value-ablation finding). Best-effort +
+      // idempotent (projectFromReceipts merges via a high-water seq); patternsOnly keeps it to the
+      // aggregate. A failure here must NEVER affect a completed build.
+      try {
+        const { labMemory } = await import("../lab-context-memory/index.js");
+        await labMemory.projectFromReceipts({ identity: ctx.identity, project: targetRepo, patternsOnly: true });
+      } catch { /* baseline update is advisory — never break a completed build */ }
+      // Drain progress lines before the summary — time-bounded and best-effort so a stuck
+      // subscriber drain can never suppress the result envelope below (a promoted build that
+      // prints nothing reads as a failure and invites a duplicate re-run).
+      if (sub !== undefined) await flushBestEffort(eventBus, 2000);
+      if (json === true) {
+        // H3: --json now HONORED — stdout carries ONLY the machine-readable result envelope; ALL
+        // narrative, cost, diff, and hints go to stderr so `ikbi build --json | jq` is a real contract.
+        const jsonResult = {
+          taskId: result.taskId,
+          outcome: result.outcome,
+          promoted: result.promoted,
+          ...(result.workspaceId !== undefined ? { workspaceId: result.workspaceId } : {}),
+          ...(result.costUsd !== undefined ? { costUsd: result.costUsd } : {}),
+          // COMPOSITE (Phase 14B): when the operation spanned >1 run, the machine envelope carries the parent
+          // total (union of unique provider attempts across BOTH children) alongside the scoped worker-run cost.
+          ...(composite !== undefined ? (() => { const c = composite.compositeCost(); return { compositeCostUsd: c.usd, compositeCostStatus: c.status, compositeProviderAttempts: c.uniqueProviderAttempts }; })() : {}),
+          ...(result.reason !== undefined ? { reason: result.reason } : {}),
+          ...(result.verification !== undefined ? { verification: result.verification } : {}),
+        };
+        out(`${JSON.stringify(jsonResult)}\n`);
+        err(summarize(result));
+        err(formatRepairNarrative(result));
+        if (cost === true) { err(formatCostBreakdown(result)); if (composite !== undefined) err(formatCompositeCost(composite)); }
+      } else {
+        // A gate denial / non-promote is a CLEAN outcome (printed), not an error.
+        out(summarize(result));
+        // ISSUE 3: surface the repair report (root cause / files / rationale / tests) when present.
+        out(formatRepairNarrative(result));
+        // --cost: print a per-role cost breakdown after the build.
+        if (cost === true) { out(formatCostBreakdown(result)); if (composite !== undefined) out(formatCompositeCost(composite)); }
+        // SG-2: after the run, show a one-line diff summary of what changed (best-effort).
+        if (result.workspaceId !== undefined) await printDiffSummary(result.workspaceId);
+      }
+      // Operator experience: failure details + next-command hints on STDERR. All non-success outcomes
+      // get failure detail; all outcomes get next-command hints.
       if (result.outcome !== "success") err(formatFailureDetail(result));
       err(formatNextHints(result));
+      // H2: a rejected/failed/non-promoted build must exit NON-ZERO (consistent with `ikbi fix` and
+      // `ikbi batch`) so `ikbi build "…" --repo . && deploy` never deploys on a build that did not land.
+      if (result.outcome !== "success") setExit(1);
     } catch (e) {
       err(`ikbi: build failed: ${errMsg(e)}\n`);
       setExit(1);
@@ -1272,6 +1606,29 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
   }
 
   return { build };
+}
+
+/**
+ * Await the event-bus drain, but never longer than `ms`, and never throw.
+ *
+ * The result envelope (JSON summary / cost / diff / next-hints) is printed AFTER the drain so
+ * progress lines land first. But a stuck or never-resolving subscriber drain must NEVER suppress
+ * that envelope: a build that promoted but printed nothing looks like a failure and invites a
+ * duplicate re-run. This bounds the drain by wall-clock and swallows any drain error so the
+ * caller always proceeds to print the result.
+ */
+export async function flushBestEffort(bus: { flush(): Promise<void> }, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, ms);
+  });
+  try {
+    await Promise.race([bus.flush(), timeout]);
+  } catch {
+    /* the drain is best-effort — never let it block or fail the result envelope */
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 // Register the LIVE command at import time (the modules barrel triggers this).

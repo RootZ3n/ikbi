@@ -6,6 +6,13 @@ tested but with no importer, caller, or entrypoint) is visible rather than assum
 
 Resolves the M8 (server is health-only) and M9 (barrel/orphan) honesty findings.
 
+> This doc is the **static claim** of how modules are wired. The **runtime proof** — which
+> modules actually EXECUTE, established by V8 coverage across every surface — lives in
+> [`scripts/proving-ground/REACHABILITY-REPORT.md`](scripts/proving-ground/REACHABILITY-REPORT.md)
+> (regenerate with `scripts/proving-ground/reachability.mjs`). When the two disagree, the
+> runtime report wins. `src/modules/reachability-guard.test.ts` fails CI if any module is
+> declared but wired nowhere and unlabeled.
+
 ## Categories
 
 - **CLI** — an operator types a command (`ikbi …`); the command is registered at barrel
@@ -54,6 +61,7 @@ golden path; naming them here keeps any of them from implying golden-path semant
 | kill-switch | `ikbi kill`, `ikbi unkill`, `ikbi kill-status` | Operator emergency halt; reads the durable latch at startup. |
 | capability-recovery | `ikbi recover <capability> [--project]` | **NEW (M9).** Operator DIAGNOSTIC: prints a `CapabilityRecoveryPlan` (what broke, the likely cause class, which module should repair it). **Non-executing** — it recommends, never dispatches the repair. |
 | mcp-model-loop | `ikbi mcp --server "<command>" <goal>` | Runs the governed MCP model+tool loop against an operator-configured **stdio** MCP server (every tool call gate-walled, every result neutralized). The default process-wide loop singleton still uses the in-process mock; `ikbi mcp` is the real, opt-in stdio entrypoint. |
+| repo-doctor | `ikbi health [--repo] [--dimension] [--json]` | Scores a repo across 6 health dimensions (file/dependency/test/doc/import/structure). Read-only + offline. Also served over HTTP at `GET /ikbi/repo-doctor/health` — the CLI and route share the same analyzers. |
 
 ## Reachable transitively / as a library
 

@@ -31,7 +31,9 @@ import { detectLiveProject, summarize } from "../project-detection/index.js";
 import { whatNext } from "../../cli/what-next.js";
 import { ChatSession, type ApplyResult, type DiscardOutcome, type PermissionMode, type PersistedSession, type RollbackResult, type StreamEvent, type TurnOptions, type WorkdirKind } from "./session.js";
 import { formatAskPrompt, type AskUserRequest } from "../cognition-layer/ask.js";
-import { findCustomAgent, loadCustomAgents, type CustomAgent } from "../agent-router/agent-directory.js";
+import { findCustomAgent, loadAllAgents, type CustomAgent } from "../agent-router/agent-directory.js";
+import { resolve } from "node:path";
+import { existsSync } from "node:fs";
 import { allocateSessionWorkspace, reconnectSessionWorkspace, resolveRepoTarget } from "./repl-workspace.js";
 import { persistentStore, PersistentSessionStore, sessionsDir } from "./session-store.js";
 import { createProductionGovernor } from "../memory-governor/create.js";
@@ -272,9 +274,9 @@ const COMMAND_LIST: readonly ReplCommand[] = [
         return;
       }
       if (arg === "list") {
-        const { agents, dir } = loadCustomAgents(repoRoot);
-        if (agents.length === 0) ctx.out(`[no custom agents in ${dir} — define one as .ikbi/agents/<name>.yaml]\n`);
-        else ctx.out(`[custom agents: ${agents.map((a) => a.name).join(", ")} — switch with /agent <name>]\n`);
+        const { agents } = loadAllAgents(repoRoot);
+        if (agents.length === 0) ctx.out(`[no agents available — define one as .ikbi/agents/<name>.yaml]\n`);
+        else ctx.out(`[agents: ${agents.map((a) => a.name).join(", ")} — switch with /agent <name>]\n`);
         return;
       }
       if (ctx.session.setPersona === undefined) {
@@ -832,7 +834,11 @@ function readlineSource(getTurnController?: () => AbortController | undefined): 
  * continues interactively; on non-TTY stdin it runs the one turn and exits (same one-shot
  * shape as piped input). When absent, piped stdin (if any) supplies the first message instead.
  */
-export async function liveRepl(argv: readonly string[] = [], initialMessage?: string): Promise<void> {
+export async function liveRepl(
+  argv: readonly string[] = [],
+  initialMessage?: string,
+  opts?: { readonly persona?: string; readonly model?: string; readonly greeting?: string },
+): Promise<void> {
   const out = (s: string): void => void process.stdout.write(s);
   const quiet = argv.includes("--quiet");
   // `--verbose`/`--debug` opt into raw technical detail (+stack) on translated error messages.
@@ -849,6 +855,16 @@ export async function liveRepl(argv: readonly string[] = [], initialMessage?: st
   const force = argv.includes("--force");
   const autosave = (s: ChatSession): Promise<void> => store.save(s, { force });
   const scratch = argv.includes("--scratch");
+  // REPO SELECTION (`ikbi peh --repo <path>` / `ikbi repl --repo <path>`): choose WHICH repo the
+  // session works in — Peh inspects it and any build targets it. Default: the current directory.
+  const repoIdx = argv.indexOf("--repo");
+  const repoArg = repoIdx >= 0 ? argv[repoIdx + 1] : undefined;
+  const selectedRepo = repoArg !== undefined && repoArg.length > 0 && !repoArg.startsWith("--") ? resolve(repoArg) : undefined;
+  if (selectedRepo !== undefined && !existsSync(selectedRepo)) {
+    out(`[--repo path does not exist: ${selectedRepo}]\n`);
+    return;
+  }
+  const baseDir = selectedRepo ?? process.cwd();
 
   // MEMORY GOVERNOR: intercepts governed writes (CLAUDE.md, .ikbi/*, brain pages) into
   // operator-reviewed proposals. Constructed once for the REPL session, shared across
@@ -873,10 +889,10 @@ export async function liveRepl(argv: readonly string[] = [], initialMessage?: st
     // default applies only when the operator has NOT pinned a workdir.
     const explicitWorkdir = process.env.IKBI_CHAT_WORKDIR;
     if (!scratch && explicitWorkdir !== undefined && explicitWorkdir.trim().length > 0) {
-      return new ChatSession(id, { autosave, cwd: process.cwd(), permissionMode: "confirm", memoryGovernor, invokeStream: invokeModelStream, makeContextManager });
+      return new ChatSession(id, { autosave, cwd: baseDir, permissionMode: "confirm", memoryGovernor, invokeStream: invokeModelStream, makeContextManager });
     }
     if (!scratch) {
-      const target = resolveRepoTarget(process.cwd());
+      const target = resolveRepoTarget(baseDir);
       if (target !== undefined) {
         try {
           const ws = await allocateSessionWorkspace({ targetRepo: target, sessionId: id });
@@ -886,7 +902,7 @@ export async function liveRepl(argv: readonly string[] = [], initialMessage?: st
         }
       }
     }
-    return new ChatSession(id, { autosave, cwd: process.cwd(), scratch: true, permissionMode: "confirm", memoryGovernor, invokeStream: invokeModelStream, makeContextManager });
+    return new ChatSession(id, { autosave, cwd: baseDir, scratch: true, permissionMode: "confirm", memoryGovernor, invokeStream: invokeModelStream, makeContextManager });
   };
 
   /** Resume a persisted session, reconnecting its managed workspace when one was recorded. */
@@ -946,6 +962,27 @@ export async function liveRepl(argv: readonly string[] = [], initialMessage?: st
     session = await newSession();
   }
 
+  // STARTING PERSONA (e.g. `ikbi peh` adopts Pehlichi): find + adopt the requested agent and set its
+  // model, so the user lands directly in a session with the guide. Built-in agents (Pehlichi) resolve
+  // with zero setup; a user's .ikbi/agents/ override of the same name wins. Best-effort — a missing
+  // persona never blocks the session.
+  if (opts?.persona !== undefined && opts.persona.length > 0 && session.setPersona !== undefined) {
+    // Look up the persona in the SESSION's repo, not process.cwd() — `ikbi peh --repo <path>` chose
+    // that repo, and a repo-local `.ikbi/agents/<name>` override of Pehlichi must win there (a built-in
+    // still resolves with zero setup). Using cwd silently ignored the override when --repo pointed
+    // elsewhere. `workingRepo` is the same target used for the greeting and any launched build.
+    const workingRepo = session.targetRepo ?? baseDir;
+    const agent = findCustomAgent(workingRepo, opts.persona);
+    if (agent !== undefined) {
+      session.setPersona(agent);
+      if (opts.model !== undefined && opts.model.length > 0 && session.setModel !== undefined) session.setModel(opts.model);
+      const model = session.currentModel !== undefined ? session.currentModel() : (opts.model ?? agent.modelPreference ?? "?");
+      status(opts.greeting ?? `\n🐿️  You're with ${agent.name} — ${agent.description ?? "ikbi's guide"} [model: ${model} · repo: ${workingRepo}].\n   Ask about ikbi, or tell ${agent.name} what you want to build and he'll help shape the goal (and run it, with your OK). Reopen with \`ikbi peh --repo <path>\` to work elsewhere. Type /exit to leave.\n\n`);
+    } else {
+      status(`[persona "${opts.persona}" not found — starting the default assistant]\n`);
+    }
+  }
+
   // PROJECT AUTO-DISCOVERY (FIX 2): a one-line overview of the worktree at startup.
   try {
     status(formatOverview(discoverProject(session.worktree)));
@@ -988,6 +1025,31 @@ registerCommand({
   summary: "Start an interactive conversational session (multi-turn, tool-calling)",
   usage: "ikbi repl [--continue | --resume <id> | --fork <id>]",
   run: (argv) => liveRepl(argv),
+});
+
+/**
+ * Resolve the model PEHLICHI runs on. Peh has his OWN brain, separate from the build roster and easy
+ * to change: `ikbi peh --model <id>` for a one-off, else IKBI_PEH_MODEL, else the default pro model.
+ * The model id resolves through the roster/registry, so pointing it at a model on a different provider
+ * (edit providers.json) changes Peh's provider too — one knob for model, the roster for provider.
+ */
+export function resolvePehModel(argv: readonly string[] = []): string {
+  const flagIdx = argv.indexOf("--model");
+  const flag = flagIdx >= 0 ? argv[flagIdx + 1] : undefined;
+  if (flag !== undefined && flag.length > 0 && !flag.startsWith("--")) return flag;
+  const env = process.env.IKBI_PEH_MODEL?.trim();
+  return env !== undefined && env.length > 0 ? env : "deepseek-v4-pro";
+}
+
+/**
+ * `ikbi peh` — the front door. Drops the user straight into a session with PEHLICHI ("Peh"), ikbi's
+ * teaching guide, on Peh's own model (see resolvePehModel). This is the face a new user meets first.
+ */
+registerCommand({
+  name: "peh",
+  summary: "Talk to Pehlichi — ikbi's teaching guide: learn ikbi and shape a build goal together",
+  usage: "ikbi peh [--model <id>] [--continue | --resume <id>]",
+  run: (argv) => liveRepl(argv, undefined, { persona: "Pehlichi", model: resolvePehModel(argv) }),
 });
 
 /**

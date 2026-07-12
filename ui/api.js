@@ -7,26 +7,45 @@
 (function () {
   'use strict';
 
-  // Resolve the backend base URL. Order: explicit ?api= query → injected
-  // window.IKBI_API → same-origin if already served from port 18796 →
-  // the local default. The build engine binds 127.0.0.1:18796.
+  // Resolve the backend base URL. Order: deploy-injected window.IKBI_API (trusted,
+  // set server-side) → same-origin (this SPA is served BY the engine) → the local
+  // default. The URL-controlled `?api=` selector was REMOVED (Codex C13): it let a
+  // crafted link point the client — and its bearer token — at an attacker origin.
   function resolveBase() {
-    try {
-      var q = new URLSearchParams(location.search).get('api');
-      if (q) return q.replace(/\/$/, '');
-    } catch (e) { /* file:// has no usable search */ }
     if (typeof window !== 'undefined' && window.IKBI_API) {
       return String(window.IKBI_API).replace(/\/$/, '');
     }
     try {
-      if (location.protocol.startsWith('http') && location.port === '18796') {
+      if (location.protocol.startsWith('http')) {
         return location.origin;
       }
-    } catch (e) { /* ignore */ }
+    } catch (e) { /* file:// has no usable origin */ }
     return 'http://127.0.0.1:18796';
   }
 
   var BASE = resolveBase();
+
+  // Only attach the bearer token when BASE is the SAME ORIGIN as the page (or, for a
+  // file:// page with an opaque origin, only the loopback default). This guarantees
+  // window.IKBI_API_TOKEN is NEVER forwarded cross-origin (Codex C13) — destination
+  // trust ("where the UI talks to") is not credential trust ("who may hold the token").
+  var ALLOW_CREDENTIALS = (function () {
+    try {
+      if (typeof location === 'undefined' || !location.origin || location.origin === 'null') {
+        return BASE === 'http://127.0.0.1:18796';
+      }
+      return new URL(BASE, location.href).origin === location.origin;
+    } catch (e) { return false; }
+  })();
+
+  // Attach Authorization iff same-origin AND a token is present. Central helper so
+  // no call site can leak the token by forgetting the guard.
+  function authHeader(headers) {
+    if (ALLOW_CREDENTIALS && typeof window !== 'undefined' && window.IKBI_API_TOKEN) {
+      headers['Authorization'] = 'Bearer ' + window.IKBI_API_TOKEN;
+    }
+    return headers;
+  }
   var cache = new Map();
   var CACHE_MS = 4000;
 
@@ -43,10 +62,7 @@
     try {
       var ctrl = new AbortController();
       var timer = setTimeout(function () { ctrl.abort(); }, opts.timeout || 6000);
-      var headers = { 'Accept': 'application/json' };
-      if (typeof window !== 'undefined' && window.IKBI_API_TOKEN) {
-        headers['Authorization'] = 'Bearer ' + window.IKBI_API_TOKEN;
-      }
+      var headers = authHeader({ 'Accept': 'application/json' });
       var res = await fetch(BASE + path, { method: 'GET', signal: ctrl.signal, headers: headers });
       clearTimeout(timer);
       var data = null;
@@ -65,11 +81,8 @@
     try {
       var ctrl = new AbortController();
       var timer = setTimeout(function () { ctrl.abort(); }, opts.timeout || 30000);
-      var headers = { 'Accept': 'application/json' };
+      var headers = authHeader({ 'Accept': 'application/json' });
       if (body) headers['Content-Type'] = 'application/json';
-      if (typeof window !== 'undefined' && window.IKBI_API_TOKEN) {
-        headers['Authorization'] = 'Bearer ' + window.IKBI_API_TOKEN;
-      }
       var fetchOpts = { method: method, signal: ctrl.signal, headers: headers };
       if (body) fetchOpts.body = JSON.stringify(body);
       var res = await fetch(BASE + path, fetchOpts);
@@ -94,8 +107,13 @@
     ready: function (o) { return get('/ready', o); },
     agent: function (o) { return get('/agent', o); },
     capabilities: function (o) { return get('/capabilities', o); },
-    // Chat endpoint — requires IKBI_CHAT_TOKEN Bearer auth.
-    converse: function (message, o) { return post('/chat', { message: message }, o); },
+    // Chat endpoint — requires IKBI_CHAT_TOKEN Bearer auth. `o.images` (data-URLs / http URLs) are
+    // attached so the server can route them to the vision model (vision_analyze).
+    converse: function (message, o) {
+      var body = { message: message };
+      if (o && o.images && o.images.length) body.images = o.images;
+      return post('/chat', body, o);
+    },
     // ── Build/repair task surface (the golden path) ───────────────────────
     // Submit a build task. Resolves {ok,data:{taskId,...}} (202 on accept).
     build: function (goal, repo, opts) {
@@ -144,10 +162,7 @@
       var done = false;
       function finish() { if (done) return; done = true; if (handlers.onClose) try { handlers.onClose(); } catch (e) {} }
       (async function () {
-        var headers = { 'Accept': 'text/event-stream' };
-        if (typeof window !== 'undefined' && window.IKBI_API_TOKEN) {
-          headers['Authorization'] = 'Bearer ' + window.IKBI_API_TOKEN;
-        }
+        var headers = authHeader({ 'Accept': 'text/event-stream' });
         var res;
         try {
           res = await fetch(BASE + '/api/tasks/' + encodeURIComponent(id) + '/stream', {

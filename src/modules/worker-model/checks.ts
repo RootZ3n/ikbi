@@ -13,6 +13,7 @@
 
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import type { ExecResult } from "../governed-exec/index.js";
 
@@ -62,6 +63,34 @@ const GO_CHECKS: readonly Check[] = [
 
 /** Python native checks (pytest) — only emitted when a pytest signal is detected (else fail closed). */
 const PYTHON_PYTEST_CHECKS: readonly Check[] = [{ name: "test", command: "python3", args: ["-m", "pytest", "-q"] }];
+
+/** Python STDLIB checks (unittest) — emitted when `test*.py` files exist but no pytest signal does.
+ *  unittest is stdlib (no pip/network, so it runs inside the sandbox where pytest install fails
+ *  closed) and its default discovery pattern is `test*.py`, which the detection below matches. */
+const PYTHON_UNITTEST_CHECKS: readonly Check[] = [{ name: "test", command: "python3", args: ["-m", "unittest", "discover", "-v"] }];
+
+/** .NET native checks — `dotnet test` restores (into the sandbox's writable NuGet cache over the
+ *  shared net), builds, and runs the test projects a .sln / .csproj declares. */
+const DOTNET_CHECKS: readonly Check[] = [{ name: "test", command: "dotnet", args: ["test", "--nologo", "-v", "q"] }];
+
+/** Maven native checks — `mvn test` (NOT `-q`, which hides the Surefire "Tests run:" summary the
+ *  evidence gate reads). Deps + plugins fetch from Central over the shared net into the sandbox's
+ *  redirected local repo (/tmp/.m2 via MAVEN_OPTS). */
+const MAVEN_CHECKS: readonly Check[] = [{ name: "test", command: "mvn", args: ["test"] }];
+
+/** Absolute path to the ikbi-shipped Gradle init script (resolved from this module, works under both
+ *  tsx/src and compiled dist since both sit 3 dirs below the repo root). */
+const GRADLE_INIT_SCRIPT = fileURLToPath(new URL("../../../assets/gradle-test-summary.init.gradle", import.meta.url));
+
+/** Gradle native checks — Gradle prints NO test count on success and caches tasks UP-TO-DATE, so a
+ *  passing build would read "no test evidence". `--rerun-tasks` forces execution and the shipped
+ *  `--init-script` emits a JUnit-style summary the evidence gate parses. `--no-daemon`/`--console=plain`
+ *  keep output clean and non-persistent in the sandbox. */
+const GRADLE_CHECKS: readonly Check[] = [{
+  name: "test",
+  command: "gradle",
+  args: ["test", "--rerun-tasks", "--no-daemon", "--console=plain", "--init-script", GRADLE_INIT_SCRIPT],
+}];
 
 /** Godot headless syntax check (Godot 4.x — lightweight, no test framework needed). */
 const GODOT_HEADLESS_CHECKS: readonly Check[] = [{ name: "check", command: "godot", args: ["--headless", "--quit"] }];
@@ -118,12 +147,42 @@ function detectPythonChecks(projectRoot: string): ChecksResolution {
     }
   }
   if (pytestSignal) return { ok: true, checks: PYTHON_PYTEST_CHECKS, source: "default" };
+  // STDLIB FALLBACK: no pytest signal, but `test*.py` files exist (unittest's default discovery
+  // pattern) ⇒ run `python3 -m unittest discover`. This is a REAL runner keyed off a real signal, not
+  // an invented one: with no matching test files unittest prints "Ran 0 tests" ⇒ testEvidence "zero"
+  // ⇒ the gate still discards. pytest needs pip/network (fails closed in the sandbox), so unittest is
+  // the only stdlib Python path that actually runs there.
+  if (hasUnittestFiles(projectRoot)) return { ok: true, checks: PYTHON_UNITTEST_CHECKS, source: "default" };
   return {
     ok: false,
     reason:
-      `Python project at ${projectRoot} has no detectable test runner (no pytest/tox config) — refusing to invent checks. ` +
+      `Python project at ${projectRoot} has no detectable test runner (no pytest/tox config, no test*.py files) — refusing to invent checks. ` +
       `Set IKBI_CHECKS to declare them, e.g. IKBI_CHECKS='[{"name":"test","command":"python3","args":["-m","pytest"]}]' (RED until configured).`,
   };
+}
+
+/** True iff a .NET project/solution file exists at the root or one level down — the `dotnet test` signal. */
+function hasDotnetProject(projectRoot: string): boolean {
+  const rx = /\.(csproj|fsproj|sln)$/i;
+  const scan = (dir: string): boolean => {
+    try { return readdirSync(dir, { withFileTypes: true }).some((e) => e.isFile() && rx.test(e.name)); } catch { return false; }
+  };
+  if (scan(projectRoot)) return true;
+  try {
+    return readdirSync(projectRoot, { withFileTypes: true }).some((e) => e.isDirectory() && !e.name.startsWith(".") && scan(join(projectRoot, e.name)));
+  } catch { return false; }
+}
+
+/** True iff `test*.py` files exist at the root or inside a `tests/` dir — the unittest discovery signal. */
+function hasUnittestFiles(projectRoot: string): boolean {
+  const scan = (dir: string): boolean => {
+    try {
+      return readdirSync(dir, { withFileTypes: true }).some((e) => e.isFile() && /^test.*\.py$/i.test(e.name));
+    } catch {
+      return false;
+    }
+  };
+  return scan(projectRoot) || scan(join(projectRoot, "tests"));
 }
 
 /**
@@ -186,6 +245,10 @@ function detectChecksForProject(projectRoot: string): ChecksResolution {
   }
   if (rootHas(projectRoot, "Cargo.toml")) return { ok: true, checks: RUST_CHECKS, source: "default" };
   if (rootHas(projectRoot, "go.mod")) return { ok: true, checks: GO_CHECKS, source: "default" };
+  if (rootHas(projectRoot, "pom.xml")) return { ok: true, checks: MAVEN_CHECKS, source: "default" };
+  if (rootHas(projectRoot, "build.gradle") || rootHas(projectRoot, "build.gradle.kts") || rootHas(projectRoot, "settings.gradle") || rootHas(projectRoot, "settings.gradle.kts")) {
+    return { ok: true, checks: GRADLE_CHECKS, source: "default" };
+  }
   if (rootHas(projectRoot, "pyproject.toml") || rootHas(projectRoot, "setup.py") || rootHas(projectRoot, "setup.cfg")) {
     return detectPythonChecks(projectRoot);
   }
@@ -218,7 +281,16 @@ export const PROJECT_MANIFESTS: readonly string[] = [
   "pnpm-workspace.yaml",
   "Cargo.toml",
   "go.mod",
+  "pom.xml",
+  "build.gradle",
+  "build.gradle.kts",
+  "settings.gradle",
+  "settings.gradle.kts",
   "pyproject.toml",
+  // H8: legacy Python projects mark their root with setup.py / setup.cfg (no pyproject.toml). Without
+  // these a setup.py-only project is not detected as a root → its declared checks are missed.
+  "setup.py",
+  "setup.cfg",
   "deno.json",
   "deno.jsonc",
   "project.godot",
@@ -286,8 +358,30 @@ export function parseChecksEnv(raw: string | undefined): readonly Check[] | "mal
  */
 export function resolveChecks(worktreeReal: string, env: NodeJS.ProcessEnv = process.env): ChecksResolution {
   const wt = resolve(worktreeReal);
+  // H8 — EXPLICIT operator config wins, applied BEFORE any auto-discovery. IKBI_CHECKS is operator-only
+  // (NEVER model-chosen). Previously this was consulted only AFTER a project root was detected, so a
+  // manifest-less project (or one whose root resolved to an ancestor) silently IGNORED the operator's
+  // declared checks and fell through to fail-closed auto-discovery. Explicit config must always win.
+  // A malformed value fails closed (RED) rather than falling back to a guessed runner.
+  const fromEnv = parseChecksEnv(env.IKBI_CHECKS);
+  if (fromEnv === "malformed") {
+    return { ok: false, reason: "IKBI_CHECKS is malformed (expected a non-empty JSON array of {name,command,args}) — cannot verify (RED)" };
+  }
+  if (fromEnv !== undefined) return { ok: true, checks: fromEnv, source: "env" };
+
   const root = resolveProjectRoot(wt);
   if (root === undefined) {
+    // .NET / C#: project files are glob-named (Foo.csproj / Foo.sln), not a fixed manifest, so the
+    // walk-up misses them. `dotnet test` restores + builds + runs the declared test projects (NuGet
+    // fetched into the sandbox's writable cache over the shared net). A vacuous run ("No test is
+    // available" / "Total: 0") yields no parseable count ⇒ testEvidence unverified/zero ⇒ still discarded.
+    if (hasDotnetProject(wt)) return { ok: true, checks: DOTNET_CHECKS, source: "default" };
+    // LOOSE-SOURCE PYTHON: no manifest, but `test*.py` files exist ⇒ stdlib unittest. A cheap model
+    // scaffolding a small Python CLI usually writes just `foo.py` + `test_foo.py` (no pyproject.toml);
+    // manifest-only detection would fail-close it. unittest is a REAL, deterministic runner keyed off a
+    // specific signal (not invented) and runs in the sandbox (stdlib, no pip); a no-match run prints
+    // "Ran 0 tests" ⇒ testEvidence zero ⇒ still discarded. So this never manufactures a vacuous pass.
+    if (hasUnittestFiles(wt)) return { ok: true, checks: PYTHON_UNITTEST_CHECKS, source: "default" };
     // Give a more actionable message when we can detect the language without a manifest.
     if (hasJsTsFiles(wt)) {
       return {
@@ -302,14 +396,9 @@ export function resolveChecks(worktreeReal: string, env: NodeJS.ProcessEnv = pro
   if (root !== wt) {
     return { ok: false, reason: `the resolved project root (${root}) is an ANCESTOR of the worktree (${wt}) — checks would validate the WRONG repo (RED)` };
   }
-  // Fix 2: operator-configured, NEVER model-chosen. IKBI_CHECKS wins; default is pnpm.
-  const fromEnv = parseChecksEnv(env.IKBI_CHECKS);
-  if (fromEnv === "malformed") {
-    return { ok: false, reason: "IKBI_CHECKS is malformed (expected a non-empty JSON array of {name,command,args}) — cannot verify (RED)" };
-  }
-  if (fromEnv !== undefined) return { ok: true, checks: fromEnv, source: "env" };
   // Language-native detection (JS/TS unchanged; Rust/Go native; Python pytest-or-fail-closed; any
   // other manifest fails closed with guidance). NEVER silently runs pnpm/tsc against a non-JS repo.
+  // (IKBI_CHECKS was already applied above — explicit operator config wins before auto-discovery.)
   return detectChecksForProject(wt);
 }
 
@@ -573,11 +662,20 @@ export function parseTestCount(output: string): { passed: number; total: number 
   // build gets discarded for "no test evidence"). Stripping makes colored and plain output parse alike.
   // eslint-disable-next-line no-control-regex
   output = output.replace(/\x1b\[[0-9;]*m/g, "");
-  // node:test: "# tests N" / "# pass N" (the two markers can be far apart in the stream).
-  const nodeTests = /# tests (\d+)/.exec(output);
-  const nodePass = /# pass (\d+)/.exec(output);
-  if (nodeTests !== null && nodePass !== null) {
-    return { passed: Number(nodePass[1]), total: Number(nodeTests[1]) };
+  // node:test: the FINAL line-anchored summary block "# tests N" / "# pass N". Match as WHOLE summary
+  // lines (^…, `m` flag) and take the LAST of each — NOT the first `# tests`/`# pass` occurrence
+  // ANYWHERE in the stream. When ikbi builds ikbi (self-hosting), the suite echoes ikbi's OWN test
+  // NAMES as TAP lines, and a name can literally contain "# tests 0" mid-line; a first-match, unanchored
+  // parse then returns {passed:N, total:0} → testEvidence "zero" → a fully-green run is discarded as
+  // vacuous. Line-anchoring skips the name-carrier lines; last-match takes the run's real final summary.
+  const nodeTestsAll = [...output.matchAll(/^# tests (\d+)\b/gm)];
+  const nodePassAll = [...output.matchAll(/^# pass (\d+)\b/gm)];
+  if (nodeTestsAll.length > 0 && nodePassAll.length > 0) {
+    const total = Number(nodeTestsAll[nodeTestsAll.length - 1]![1]);
+    const passed = Number(nodePassAll[nodePassAll.length - 1]![1]);
+    // `passed > total` is impossible for a real node:test summary ⇒ a misparse; return undefined
+    // (⇒ "unverified", a real green signal that still passes the gate) rather than a bogus tally.
+    if (passed <= total) return { passed, total };
   }
 
   // vitest: "Tests  3 passed (3)" — passed count then total in parens.
@@ -587,11 +685,6 @@ export function parseTestCount(output: string): { passed: number; total: number 
   // jest: "Tests:       3 passed, 3 total".
   const jest = /Tests:\s+(\d+)\s+passed.*?(\d+)\s+total/.exec(output);
   if (jest !== null) return { passed: Number(jest[1]), total: Number(jest[2]) };
-
-  // Generic "N passing/passed ... M total/tests" (mocha-style and friends).
-  const generic = /(\d+)\s+(?:passing|passed)[\s\S]*?(\d+)\s+(?:total|tests)/.exec(output);
-  if (generic !== null) return { passed: Number(generic[1]), total: Number(generic[2]) };
-
 
   // pytest: "N passed in X.XXs" or "N passed, M failed in X.XXs" (passed count only)
   const pytest = /(\d+)\s+passed(?:,\s+\d+\s+\w+)*\s+in\s+[\d.]+s/.exec(output);
@@ -615,6 +708,45 @@ export function parseTestCount(output: string): { passed: number; total: number 
   if (goOk > 0 || goFail > 0) {
     return { passed: goOk, total: goOk + goFail };
   }
+
+  // .NET VSTest (`dotnet test`): "Passed! - Failed: F, Passed: P, Skipped: S, Total: T, Duration: ..."
+  // (or "Failed! - ..." on failure). Total is authoritative; passed is P (Total − Failed − Skipped).
+  const vstest = /(?:Passed|Failed)!\s*-\s*Failed:\s*(\d+),\s*Passed:\s*(\d+),\s*Skipped:\s*(\d+),\s*Total:\s*(\d+)/i.exec(output);
+  if (vstest !== null) {
+    return { passed: Number(vstest[2]), total: Number(vstest[4]) };
+  }
+
+  // JVM (JUnit / Maven Surefire / Gradle): "Tests run: N, Failures: F, Errors: E[, Skipped: S]".
+  // The canonical JVM summary — a hand-rolled `main` test, JUnit's ConsoleLauncher, and `mvn test` all
+  // print it. passed = run − failures − errors (skipped are neither pass nor fail; they stay in total).
+  const junit = /Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+)/i.exec(output);
+  if (junit !== null) {
+    const total = Number(junit[1]);
+    const passed = Math.max(0, total - Number(junit[2]) - Number(junit[3]));
+    return { passed, total };
+  }
+
+  // python unittest: "Ran N tests in X.XXXs" then "OK" (all pass) or "FAILED (failures=F, errors=E)".
+  // unittest prints no per-status count, so total comes from "Ran N" and failures are subtracted from
+  // the FAILED(...) breakdown. A vacuous "Ran 0 tests" ⇒ total 0 ⇒ testEvidence "zero" (the gate still
+  // discards a suite that ran nothing) — so recognizing this format never manufactures evidence.
+  const unittestRan = /Ran\s+(\d+)\s+tests?\s+in\s+[\d.]+s/.exec(output);
+  if (unittestRan !== null) {
+    const total = Number(unittestRan[1]);
+    const failedBlock = /FAILED\s*\(([^)]*)\)/.exec(output);
+    let failed = 0;
+    for (const m of (failedBlock?.[1] ?? "").matchAll(/(?:failures|errors)=(\d+)/g)) failed += Number(m[1]);
+    return { passed: Math.max(0, total - failed), total };
+  }
+
+  // Generic "N passing/passed ... M total/tests" (mocha-style and friends). LAST — it is the greedy
+  // fallback: `[\s\S]*?` bridges across lines, so on a multi-section runner (e.g. cargo, which prints
+  // a "test result: ok. 17 passed" block then a trailing "running 0 tests" section for the bin/doc
+  // targets) it wrongly pairs "17 passed" with the later "0 tests" and yields total:0 ⇒ testEvidence
+  // "zero" ⇒ a fully-tested build is discarded. Trying it only AFTER the precise runners above lets
+  // cargo/pytest/go win with their real count; the generic shape remains for mocha-likes.
+  const generic = /(\d+)\s+(?:passing|passed)[\s\S]*?(\d+)\s+(?:total|tests)/.exec(output);
+  if (generic !== null) return { passed: Number(generic[1]), total: Number(generic[2]) };
 
   return undefined;
 }

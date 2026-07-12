@@ -35,6 +35,10 @@ const env = moduleEnv("governed-exec");
  * The `IKBI_GOVERNED_EXEC_ALLOWLIST` env override is ADDITIVE (see `loadGovernedExecConfig`):
  * it ADDS to these defaults rather than replacing them, so an operator who allows extra
  * binaries (e.g. `python3,mkdir`) does NOT lose the safe defaults the builder relies on.
+ * (Contrast the EGRESS allowlist, which REPLACES its defaults so egress can be tightened below
+ * them; the divergence is deliberate — a builder binary must never be droppable, an egress host
+ * must be. The shared `+defaults` token means "include the built-ins" on BOTH lists: it opts INTO
+ * additive on egress, and is an accepted no-op here since exec is already additive.)
  */
 export const DEFAULT_ALLOWLIST: readonly string[] = Object.freeze([
   // version control
@@ -46,9 +50,18 @@ export const DEFAULT_ALLOWLIST: readonly string[] = Object.freeze([
   // package managers + typecheck driver (REQUIRED for verifier checks and run_checks). Allowlisted
   // by default; `<mgr> run …` / code-eval flags remain policy-denied (script exec is gated separately).
   "npm", "npx", "pnpm", "yarn",
-  // language-native toolchains (REQUIRED for multi-language verification). cargo/go/python3 run
-  // project-owned code by design — the governed-exec policy layer blocks dangerous flags/patterns.
-  "cargo", "go", "python3", "godot",
+  // language-native toolchains (REQUIRED for multi-language verification). cargo/go/python3/javac/java
+  // run project-owned code by design — the governed-exec policy layer blocks dangerous flags/patterns,
+  // and the OS sandbox confines their filesystem writes to the worktree.
+  "cargo", "go", "python3", "godot", "javac", "java", "dotnet", "mvn", "gradle",
+  // Android device body (Termux:API) — the phone_* tool group. INERT off-device (these binaries
+  // exist only inside Termux on a phone), so default-allowing them is safe; each still passes the
+  // gate-wall + policy + receipt path. NOTE: `ssh` (the REMOTE PC→phone transport) is deliberately
+  // NOT here — it stays operator opt-in via IKBI_GOVERNED_EXEC_ALLOWLIST, since ssh is general egress.
+  "termux-camera-photo", "termux-microphone-record", "termux-sensor", "termux-location",
+  "termux-battery-status", "termux-tts-speak", "termux-notification", "termux-torch",
+  // On-device OCR for the phone_read_text tool (fast text extraction from screenshots/documents).
+  "tesseract",
 ]);
 
 /** Per-command wall-clock cap. NOTE: applies to FOREGROUND commands only — a background job (spawned
@@ -94,9 +107,15 @@ function parseSandboxMode(raw: string | undefined): SandboxMode {
  * of replacing them, so essential builder binaries (git/ls/cat/echo/...) survive an override
  * like `IKBI_GOVERNED_EXEC_ALLOWLIST=python3,mkdir`. An empty/absent override leaves exactly
  * the defaults.
+ *
+ * `+defaults` is accepted and IGNORED here (filtered out) — the defaults are ALWAYS included on
+ * this list, so the token is a documented no-op that keeps the SYNTAX consistent with the egress
+ * allowlist (where `+defaults` opts INTO the built-ins). Filtering it also prevents a literal
+ * "+defaults" from being registered as a bogus allowed binary name.
  */
 function mergeAllowlist(overrides: readonly string[]): readonly string[] {
-  return Object.freeze([...new Set([...DEFAULT_ALLOWLIST, ...overrides])]);
+  const extra = overrides.filter((b) => b.trim().toLowerCase() !== "+defaults");
+  return Object.freeze([...new Set([...DEFAULT_ALLOWLIST, ...extra])]);
 }
 
 /** Load the governed-exec config slice from `IKBI_GOVERNED_EXEC_*`. */

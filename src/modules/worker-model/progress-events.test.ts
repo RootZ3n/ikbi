@@ -51,7 +51,7 @@ const progressRoles = (): Partial<Record<WorkerRole, RoleFn>> => {
   for (const r of WORKER_ROLES) {
     roles[r] = async () => {
       if (r === "builder") return { role: r, outcome: "success", summary: r, detail: { toolRounds: 3, filesWritten: ["a.ts", "b.ts"] } };
-      if (r === "verifier") return { role: r, outcome: "success", summary: r, detail: { verdict: "pass", checks: [{ name: "typecheck", exitCode: 0 }, { name: "test", exitCode: 0 }] } };
+      if (r === "verifier") return { role: r, outcome: "success", summary: r, detail: { verdict: "pass", checks: [{ name: "typecheck", exitCode: 0 }, { name: "test", exitCode: 0, testCount: { passed: 1, total: 1 } }] } };
       if (r === "integrator") return { role: r, outcome: "success", summary: r, detail: { decision: "promote", rationale: "ok", evaluation: { approved: true } } };
       return { role: r, outcome: "success", summary: r };
     };

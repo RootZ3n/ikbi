@@ -15,6 +15,11 @@
  *                                    `run` is byte-identical to single-workspace behavior.
  *   IKBI_WORKER_MODEL_COMPETITIVE_N    candidate count when competitive. Default 2, bounded
  *                                    [MIN_COMPETITIVE_N, MAX_COMPETITIVE_N].
+ *   IKBI_WORKER_MODEL_TRUST_LADDER   on/off. DEFAULT OFF — the earned-trust tier ladder
+ *                                    (demotion + tier-gated autoCommit) is opt-in governance;
+ *                                    off, build outcomes never move trust and verified-green work
+ *                                    promotes regardless of tier. Safety controls (sandbox, gate-wall,
+ *                                    neutralization) are unaffected. See `trustLadder` below.
  *   IKBI_WORKER_MODEL_RETAIN_FAILED_WORKSPACES  on/off. DEFAULT ON — when a build FAILS
  *                                    (timeout, tool rejection, non-converging loop), the
  *                                    workspace is RETAINED (worktree kept on disk) instead of
@@ -65,6 +70,10 @@ export function loadCandidateModels(env: NodeJS.ProcessEnv = configEnv): readonl
 
 /** Default per-role wall-clock budget (ms) — a named constant, not a magic number. */
 export const DEFAULT_ROLE_TIMEOUT_MS = 300_000; // 5 minutes
+/** Default count of PREVENTED policy attempts before a build escalates to review instead of promoting. */
+export const DEFAULT_PREVENTED_REVIEW_THRESHOLD = 10;
+/** Default count of HIGH-RISK (network/shell/privilege) prevented attempts before escalating to review. */
+export const DEFAULT_PREVENTED_HIGH_RISK_REVIEW_THRESHOLD = 2;
 /**
  * Default WHOLE-PIPELINE wall-clock ceiling (ms). Per-role timeouts bound each role, but
  * a run does scout→builder→critic→verifier→integrator with retry/rescue and competitive/
@@ -73,6 +82,38 @@ export const DEFAULT_ROLE_TIMEOUT_MS = 300_000; // 5 minutes
  * every role boundary (the same checkpoints as the kill-switch). 0 disables.
  */
 export const DEFAULT_TOTAL_BUDGET_MS = 1_800_000; // 30 minutes
+/**
+ * Wall-clock MULTIPLIER applied to a `--complexity large` build's BUILDER role (and, so the longer
+ * builder actually fits, to the whole-pipeline budget). A large build — a greenfield scaffold or a
+ * many-file feature — legitimately needs more wall-clock than a focused edit: the osapa whole-project
+ * build wrote 34 files / 3025 lines and was still ~75% done when the base 5-minute role timeout fired,
+ * discarding a nearly-complete tree. The bump applies ONLY to the builder role (the one doing the long
+ * generative work) and ONLY when `complexity === "large"`; every other role and complexity is unchanged.
+ * The base is a NAMED knob, not a heuristic — the operator still opts into "large" explicitly (the same
+ * flag that bumps the builder to the mid tier), so this never silently lengthens an ordinary build.
+ */
+export const LARGE_COMPLEXITY_TIMEOUT_FACTOR = 3;
+
+/**
+ * The BUILDER role's effective wall-clock timeout (ms) for a task: the base `roleTimeoutMs`, scaled by
+ * {@link LARGE_COMPLEXITY_TIMEOUT_FACTOR} when the task is `--complexity large`. A disabled guard
+ * (base ≤ 0, meaning "no per-role timeout") stays disabled — scaling zero would be meaningless.
+ */
+export function resolveBuilderTimeoutMs(baseRoleTimeoutMs: number, complexity?: "small" | "medium" | "large"): number {
+  if (!(baseRoleTimeoutMs > 0)) return baseRoleTimeoutMs;
+  return complexity === "large" ? baseRoleTimeoutMs * LARGE_COMPLEXITY_TIMEOUT_FACTOR : baseRoleTimeoutMs;
+}
+
+/**
+ * The WHOLE-PIPELINE wall-clock budget (ms) for a task: the base `totalBudgetMs`, scaled by
+ * {@link LARGE_COMPLEXITY_TIMEOUT_FACTOR} when the task is `--complexity large` — so the scaled builder
+ * role (plus the usual scout/critic/verifier/integrator and any retry) can run to completion inside it
+ * rather than tripping the total ceiling. A disabled budget (base ≤ 0) stays disabled.
+ */
+export function resolveTotalBudgetMs(baseTotalBudgetMs: number, complexity?: "small" | "medium" | "large"): number {
+  if (!(baseTotalBudgetMs > 0)) return baseTotalBudgetMs;
+  return complexity === "large" ? baseTotalBudgetMs * LARGE_COMPLEXITY_TIMEOUT_FACTOR : baseTotalBudgetMs;
+}
 /** Default concurrent-run cap (concurrency feature deferred; safe default 1). */
 export const DEFAULT_MAX_CONCURRENT_RUNS = 1;
 /** Competitive candidate count: default + bounds (≥2 to be a competition; small cap on cost/disk). */
@@ -118,18 +159,47 @@ export interface WorkerModelConfig {
    */
   readonly penalizeTimeouts?: boolean;
   /**
+   * TRUST LADDER for building. DEFAULT OFF. The earned-trust tier system (promotion/demotion +
+   * tier-gated autoCommit) is GOVERNANCE, not a safety control — and for the local cheap-model build
+   * workflow it mostly gets in the way: a single harness-caused rejection (an over-decomposition
+   * artifact, a blocked no-effect probe classified as a policy violation) demotes the worker a full
+   * tier, which then BLOCKS promotion of later verified-green work. With the ladder OFF (default):
+   *   - build outcomes do NOT move the worker's trust tier (no demotion, no promotion-streak);
+   *   - verified-green work promotes regardless of tier (autoCommit forced on, approval gate dropped).
+   * What the toggle does NOT touch — these are SAFETY, always on: the OS/bubblewrap sandbox, the
+   * governed-exec allowlist + gate-wall, worktree confinement, and untrusted-content NEUTRALIZATION
+   * (injection defense). Set IKBI_WORKER_MODEL_TRUST_LADDER=true to restore the earned-trust ladder.
+   */
+  readonly trustLadder?: boolean;
+  /**
    * Iterative fix loop: after the builder succeeds, run the verifier and feed
    * test failures back to the builder for automatic fixing. DEFAULT OFF (opt-in).
    * Set IKBI_WORKER_MODEL_FIX_LOOP=true to enable.
    */
   readonly fixLoop?: boolean;
   /**
+   * DEDICATED FIXER model for the last mile. When a builder terminates on a PROTOCOL stop
+   * (no_progress / max_iterations / timeout / stuck_detected) having written files, the auto-verify
+   * rescue runs the real checks; if they are RED, a cheap builder often can't close the final errors
+   * it left (it wrote the whole project then floundered re-reading). If a fixer model is set, ikbi runs
+   * ONE bounded fix pass with THAT model on the same workspace — it runs run_checks, reads the errors,
+   * and repairs them — then re-verifies. On GREEN the build is rescued; on RED the original failure
+   * stands. This is the automatic form of the staged, verify-between-modules oversight a human used to
+   * provide. A DIFFERENT model than the builder is the point (model-diversity as a harness advantage:
+   * e.g. deepseek builds, mimo-v2.5-pro fixes). Empty/unset ⇒ no fixer pass (default). Set
+   * IKBI_WORKER_MODEL_FIXER_MODEL=<model-id> to enable. Optional in the type so pre-existing config
+   * literals stay valid; the loader always sets it.
+   */
+  readonly fixerModel?: string;
+  /**
    * Critic-driven fix loop: when the CRITIC returns a subjective FAIL verdict (the build is
    * objectively green but semantically wrong / off-goal), feed the critic's feedback back to the
    * builder as a fix goal, re-verify, and re-critique ONCE. Distinct from the verifier-driven
    * `fixLoop` (which retries on red checks) — this catches what objective checks cannot. Capped
-   * at a single retry (subjective feedback must not loop forever). DEFAULT OFF (opt-in). Set
-   * IKBI_WORKER_MODEL_CRITIC_FIX_LOOP=true to enable.
+   * at a single retry (subjective feedback must not loop forever). DEFAULT ON: an off-goal-but-green
+   * build is FIXABLE work that would otherwise be discarded, so one corrective pass earns it — the
+   * "no-babysit" default. Contained by the budget guards (the wall-clock deadline gates whether it
+   * fires; the per-call dollar budget hard-stops runaway spend). Set IKBI_WORKER_MODEL_CRITIC_FIX_LOOP=false to disable.
    */
   readonly criticFixLoop?: boolean;
   /**
@@ -144,6 +214,23 @@ export interface WorkerModelConfig {
    * verifier.
    */
   readonly skipCriticOnRed?: boolean;
+  /**
+   * EFFECT-BASED promote gate — the number of PREVENTED policy attempts a single build may accumulate
+   * before it escalates to REVIEW instead of auto-promoting. A prevented attempt (a governor-BLOCKED
+   * tool call — no effect) is a recorded RISK SIGNAL, not a discard: one blocked improvisation (rm,
+   * node -e, pnpm --dir) must not throw away a verified-green build. But repetition is a stronger
+   * signal — at/above this count the build is held for human review rather than silently promoted.
+   * DEFAULT 10. IKBI_WORKER_MODEL_PREVENTED_REVIEW_THRESHOLD to tune.
+   */
+  readonly preventedReviewThreshold?: number;
+  /**
+   * A SEVERITY-tiered companion to preventedReviewThreshold: the count of HIGH-RISK prevented attempts
+   * (network / shell-escape / privilege — curl/ssh/sudo/bash/…) that escalates to REVIEW. Intent still
+   * matters: one blocked `node -e` self-verify is noise (normal threshold), but repeated blocked reaches
+   * for the network or a root shell are a red flag even when prevented, so they escalate far faster.
+   * DEFAULT 2. IKBI_WORKER_MODEL_PREVENTED_HIGH_RISK_REVIEW_THRESHOLD to tune.
+   */
+  readonly preventedHighRiskReviewThreshold?: number;
   /**
    * Enable the adversarial REFUTER gate (runs after the critic, before the integrator). It runs a
    * fixed refutation checklist that tries to PROVE the build is broken/lying; a single critical
@@ -172,6 +259,7 @@ export interface WorkerModelConfig {
 
 /** Load the worker-model config slice from `IKBI_WORKER_MODEL_*`. */
 export function loadWorkerModelConfig(reader = env): WorkerModelConfig {
+  const fixerModel = reader.str("FIXER_MODEL");
   return Object.freeze({
     enabled: reader.bool("ENABLED", false),
     roleTimeoutMs: reader.int("ROLE_TIMEOUT_MS", DEFAULT_ROLE_TIMEOUT_MS, { min: 1 }),
@@ -181,9 +269,13 @@ export function loadWorkerModelConfig(reader = env): WorkerModelConfig {
     competitiveN: reader.int("COMPETITIVE_N", DEFAULT_COMPETITIVE_N, { min: MIN_COMPETITIVE_N, max: MAX_COMPETITIVE_N }),
     retainFailedWorkspaces: reader.bool("RETAIN_FAILED_WORKSPACES", true),
     penalizeTimeouts: reader.bool("PENALIZE_TIMEOUTS", false),
+    trustLadder: reader.bool("TRUST_LADDER", false),
     fixLoop: reader.bool("FIX_LOOP", false),
-    criticFixLoop: reader.bool("CRITIC_FIX_LOOP", false),
+    ...(fixerModel !== undefined ? { fixerModel } : {}),
+    criticFixLoop: reader.bool("CRITIC_FIX_LOOP", true),
     skipCriticOnRed: reader.bool("SKIP_CRITIC_ON_RED", true),
+    preventedReviewThreshold: reader.int("PREVENTED_REVIEW_THRESHOLD", DEFAULT_PREVENTED_REVIEW_THRESHOLD, { min: 1 }),
+    preventedHighRiskReviewThreshold: reader.int("PREVENTED_HIGH_RISK_REVIEW_THRESHOLD", DEFAULT_PREVENTED_HIGH_RISK_REVIEW_THRESHOLD, { min: 1 }),
     enableRefuter: reader.bool("ENABLE_REFUTER", false),
     builderMode: loadBuilderMode(),
     candidateModels: loadCandidateModels(),

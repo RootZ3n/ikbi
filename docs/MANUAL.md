@@ -826,18 +826,23 @@ Signal weights tune the escalation score: `IKBI_ESCALATION_WEIGHT_*` for
 
 Default-deny SSRF guard. When `IKBI_EGRESS_ALLOWLIST` is **unset**, a built-in default
 applies so web tools and model calls work out of the box; **setting it REPLACES the default
-entirely** — you must include your provider hosts or model calls fail closed.
+entirely** (so you can *tighten* egress below the built-ins) — you must include your provider
+hosts or model calls fail closed. To instead **keep the built-ins AND add your own**, include
+the `+defaults` token: `IKBI_EGRESS_ALLOWLIST=+defaults,myhost.com`. This is the same `+defaults`
+token the [governed-exec allowlist](#governed-exec-allowlist) accepts — one syntax, consistent
+across both lists. The divergent *default* (egress replaces, exec is additive) is deliberate: an
+egress host must be removable to tighten the floor, but a builder-essential binary must never be.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `IKBI_EGRESS_ALLOWLIST` | see below | Permitted hosts (exact, case-insensitive). Setting it replaces the default |
+| `IKBI_EGRESS_ALLOWLIST` | see below | Permitted hosts (exact, case-insensitive). Setting it replaces the default; prefix with `+defaults,` to keep the built-ins too |
 | `IKBI_EGRESS_ALLOW_LOCAL` | *(empty)* | Opt-in internal endpoints as `ip:port` — **IP-literals only** (a hostname could re-open SSRF; rejected loudly at load). Must *also* be host-allowlisted |
 
 Default allowlist: `html.duckduckgo.com`, `docs.python.org`, `developer.mozilla.org`,
 `stackoverflow.com`, `api.xiaomimimo.com`, `api.deepseek.com`, `openrouter.ai`.
 
-For a local Ollama: `IKBI_EGRESS_ALLOWLIST=127.0.0.1` and
-`IKBI_EGRESS_ALLOW_LOCAL=127.0.0.1:11434`.
+For a local Ollama: `IKBI_EGRESS_ALLOWLIST=+defaults,127.0.0.1` (keep the provider hosts, add
+loopback) and `IKBI_EGRESS_ALLOW_LOCAL=127.0.0.1:11434`.
 
 ### Governed-exec allowlist
 
@@ -1010,8 +1015,9 @@ isn't available, so the gate fails closed. **Fix:** grant or earn trust —
 ### "egress blocked (not_allowlisted): host \"<host>\" is not in IKBI_EGRESS_ALLOWLIST"
 
 The host isn't on the egress allowlist. Remember that **setting** `IKBI_EGRESS_ALLOWLIST`
-replaces the built-in defaults. **Fix:** add the host (and re-add your provider hosts, e.g.
-`api.deepseek.com`) to `IKBI_EGRESS_ALLOWLIST`. Related variants: `egress blocked (scheme)`
+replaces the built-in defaults. **Fix:** add the host — and to keep the built-in provider hosts
+without re-listing them, prefix the value with `+defaults,` (e.g.
+`IKBI_EGRESS_ALLOWLIST=+defaults,<host>`). Related variants: `egress blocked (scheme)`
 (use http/https), `egress blocked (internal_ip)` (add the exact `ip:port` to
 `IKBI_EGRESS_ALLOW_LOCAL` — IP-literal only), `egress blocked (dns_failure)` (check
 connectivity/hostname).

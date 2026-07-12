@@ -25,6 +25,19 @@ function tierRank(tier: ModelTier): number {
   return TIER_ORDER.indexOf(tier);
 }
 
+/**
+ * H7 — the hard maximum tier the AUTO pool may ever reach WITHOUT authorization. The frontier sits
+ * ABOVE the pool and is entered only via the gated consult path (never as a plain pool "attempt"), so
+ * the auto ceiling is clamped here fail-closed: a caller passing `autoCeiling: "frontier"` cannot
+ * smuggle frontier models into the pool and bypass the frontier-authorization gate.
+ */
+const AUTO_POOL_MAX_TIER: ModelTier = "mid";
+
+/** Clamp a requested auto ceiling to the unauthorized maximum ("mid"). Never widens it. */
+function clampAutoCeiling(requested: ModelTier): ModelTier {
+  return tierRank(requested) > tierRank(AUTO_POOL_MAX_TIER) ? AUTO_POOL_MAX_TIER : requested;
+}
+
 /** The monotonic floor: the highest tier any attempt has used, or `startTier` if none. */
 export function recoveryFloor(attempts: readonly RecoveryAttempt[], startTier: ModelTier = "worker"): ModelTier {
   let floor = startTier;
@@ -40,7 +53,9 @@ export function recoveryFloor(attempts: readonly RecoveryAttempt[], startTier: M
  * no-silent-frontier ceiling.
  */
 export function eligiblePool(input: RecoveryInput): RecoveryCandidate[] {
-  const autoCeiling = input.autoCeiling ?? "mid";
+  // H7: clamp the ceiling to the authorized maximum BEFORE building the pool (fail-closed) — the auto
+  // pool can never reach the frontier; that tier is only ever the separately-authorized consult path.
+  const autoCeiling = clampAutoCeiling(input.autoCeiling ?? "mid");
   const floor = recoveryFloor(input.attempts, input.startTier ?? "worker");
   const tried = new Set(input.attempts.map((a) => a.model));
 

@@ -63,7 +63,7 @@ const RECOMMENDATIONS: Record<string, Recommendation> = {
   balanced: {
     label: "Balanced",
     desc: "Best quality-to-price ratio — recommended for daily use",
-    builder: "claude-sonnet-4",
+    builder: "sonnet-4.6",
     critic: "deepseek-v4-pro",
     fallback: "deepseek-v4-pro",
     cost: "~$0.50/task",
@@ -71,8 +71,8 @@ const RECOMMENDATIONS: Record<string, Recommendation> = {
   quality: {
     label: "Max Quality",
     desc: "Strongest models available — for complex, multi-file refactors",
-    builder: "claude-opus-4",
-    critic: "claude-sonnet-4",
+    builder: "opus-4.8",
+    critic: "sonnet-4.6",
     cost: "~$2.00/task",
   },
   local: {
@@ -101,10 +101,10 @@ function generateEnvFile(rec: Recommendation, providers: ProviderStatus[]): stri
 
   lines.push("");
   lines.push("# Builder model (primary)");
-  lines.push(`IKBI_BUILDER_MODEL=${rec.builder}`);
+  lines.push(`IKBI_MODEL_BUILDER=${rec.builder}`); // C2a: the canonical key config.ts reads (was IKBI_BUILDER_MODEL — read by nothing)
   lines.push("");
   lines.push("# Critic model (verification)");
-  lines.push(`IKBI_CRITIC_MODEL=${rec.critic}`);
+  lines.push(`IKBI_MODEL_CRITIC=${rec.critic}`);
   if (rec.fallback) {
     lines.push("");
     lines.push("# Fallback model (when primary fails)");
@@ -127,7 +127,15 @@ function ensureDotIkbi(projectDir: string): string {
 
 async function prompt(rl: ReturnType<typeof createInterface>, question: string): Promise<string> {
   return new Promise((resolve) => {
-    rl.question(question, (answer: string) => resolve(answer.trim()));
+    // Resolve on EOF/close too (non-interactive stdin, `ikbi init < /dev/null`, a closed pipe):
+    // otherwise the question callback never fires and init HANGS FOREVER. An empty answer takes the
+    // safe default (the [Y/n] confirm treats empty as its default; other prompts fall back cleanly).
+    const onClose = (): void => resolve("");
+    rl.once("close", onClose);
+    rl.question(question, (answer: string) => {
+      rl.off("close", onClose);
+      resolve(answer.trim());
+    });
   });
 }
 

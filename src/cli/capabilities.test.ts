@@ -34,14 +34,23 @@ test("runCapabilities surfaces a parity MISMATCH in both directions", () => {
   assert.match(r.lines.join("\n"), /Parity: MISMATCH — builder-only: \[scout_detail\]; chat-only: \[vision_analyze\]\./);
 });
 
-test("the LIVE builder and chat tool sets are in parity at exactly 25 tools", () => {
-  // Defaults read the real TOOLS / CHAT_TOOLS arrays — the audit's invariant, pinned.
-  // 18 original (incl. glob + multi_edit) + 4 brain tools (brain_search, brain_think, brain_put,
-  // brain_sync) + 3 capability tools added by the Bubbles gap-closure: lsp_diagnostic,
-  // notebook_edit, ask_user.
+test("chat is a SUPERSET of the builder suite: 25 builder tools + the chat-only act/watch/body tools", () => {
+  // Defaults read the real TOOLS / CHAT_TOOLS arrays. The 25 builder tools are ALL offered in chat.
+  // The CHAT-ONLY tools are deliberate: launch_build (a persona can launch a governed build, the
+  // builder role must never nest one), build_report (the guide watches builds), and the 8 phone_*
+  // tools (Pehlichi's governed device body — the code-building role must never hold a camera/mic).
+  // So: no builder-only tool, and exactly ten chat-only.
   const r = runCapabilities();
   assert.equal(r.builder.length, 25, "builder declares 25 tools");
-  assert.equal(r.chat.length, 25, "chat declares 25 tools");
-  assert.deepEqual(r.builderOnly, [], "no builder-only tool (full chat parity)");
-  assert.deepEqual(r.chatOnly, [], "no chat-only tool");
+  assert.equal(r.chat.length, 36, "chat = 25 builder tools + launch_build + build_report + 9 phone_* tools");
+  assert.deepEqual(r.builderOnly, [], "chat advertises the full builder suite (no builder-only tool)");
+  assert.deepEqual(
+    [...r.chatOnly].sort(),
+    [
+      "build_report", "launch_build",
+      "phone_battery", "phone_location", "phone_notify", "phone_read_sensor",
+      "phone_read_text", "phone_record_audio", "phone_speak", "phone_take_photo", "phone_torch",
+    ],
+    "the chat-only tools: build_report (watch) + launch_build (act) + the phone_* body",
+  );
 });

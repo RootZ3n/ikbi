@@ -21,7 +21,8 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync } from "node:fs";
+import { join } from "node:path";
 
 /** existsSync that never throws (e.g. on EACCES of an intermediate dir). */
 function existsSyncSafe(p: string): boolean {
@@ -185,6 +186,53 @@ export function packageManagerStoreDirs(env: NodeJS.ProcessEnv = process.env): s
 }
 
 /**
+ * The PERSISTENT, ikbi-OWNED toolchain cache root. A sandboxed build's caches (Go's GOCACHE, .NET's
+ * NuGet packages, Maven's local repo, Gradle's home) all live in the read-only real $HOME, so they
+ * must be redirected somewhere writable. The first cut sent them to the ephemeral `/tmp` tmpfs —
+ * correct but SLOW: every sandboxed call re-compiled std / re-downloaded every dependency. This dir is
+ * bound writable AND persists across builds, so a toolchain fetches + compiles ONCE and reuses it.
+ *
+ * It is deliberately ikbi-namespaced (`<cache>/ikbi/toolchains`), NOT the operator's real ~/.m2 /
+ * ~/.nuget / ~/.gradle — those stay untouched, so an adversarial build running under the sandbox can
+ * poison only ikbi's own build cache, never the operator's. Honors XDG_CACHE_HOME.
+ */
+export function toolchainCacheBase(env: NodeJS.ProcessEnv = process.env): string {
+  const cacheHome = env.XDG_CACHE_HOME && env.XDG_CACHE_HOME.length > 0 ? env.XDG_CACHE_HOME : join(env.HOME ?? "/tmp", ".cache");
+  return join(cacheHome, "ikbi", "toolchains");
+}
+
+/** Per-toolchain env redirects pointing each cache at a subdir of the persistent base (above). Empty
+ *  for toolchains that cache in-worktree (Rust's target/) or need nothing. */
+export function toolchainSandboxEnv(command: string, env: NodeJS.ProcessEnv = process.env): ReadonlyArray<readonly [string, string]> {
+  const b = toolchainCacheBase(env);
+  switch (basename(command)) {
+    // Go: GOCACHE (build cache) + GOPATH (module cache lives at $GOPATH/pkg/mod). Without these a
+    // sandboxed `go test` fails "package testing is not in std" (a cache-write EROFS on read-only HOME).
+    case "go": return [["GOCACHE", join(b, "go", "build")], ["GOPATH", join(b, "go", "path")]];
+    // .NET: NuGet package cache + CLI home (first-run sentinels — else DotnetFirstTimeUseConfigurer
+    // throws writing to a read-only HOME); telemetry/logo off to avoid extra writes/noise.
+    case "dotnet": return [["NUGET_PACKAGES", join(b, "nuget")], ["DOTNET_CLI_HOME", join(b, "dotnet")], ["DOTNET_CLI_TELEMETRY_OPTOUT", "1"], ["DOTNET_NOLOGO", "1"]];
+    // Maven local repo, carried as a JVM system property via MAVEN_OPTS.
+    case "mvn": return [["MAVEN_OPTS", `-Dmaven.repo.local=${join(b, "m2")}`]];
+    // Gradle home (caches, wrapper, downloaded deps).
+    case "gradle": return [["GRADLE_USER_HOME", join(b, "gradle")]];
+    default: return [];
+  }
+}
+
+/**
+ * The writable host paths a toolchain command needs bound into the sandbox: the persistent cache base
+ * (created on demand so bwrap can bind it). Returns `[base]` for cache toolchains, `[]` otherwise.
+ * Best-effort mkdir — if it fails the build still runs, just without a warm cache.
+ */
+export function toolchainCacheWritable(command: string, env: NodeJS.ProcessEnv = process.env): string[] {
+  if (toolchainSandboxEnv(command, env).length === 0) return [];
+  const base = toolchainCacheBase(env);
+  try { mkdirSync(base, { recursive: true }); } catch { /* best-effort; buildBwrapArgs skips a missing bind source */ }
+  return [base];
+}
+
+/**
  * Construct the bwrap argv that wraps `command args` under the worktree-confinement policy:
  *   • the entire host is bound READ-ONLY (`--ro-bind / /`) — the real $HOME, ~/.ikbi, /pehverse,
  *     /etc, repo parents, and ANY absolute path are read-only, so a write to them fails hard
@@ -224,6 +272,9 @@ export function buildBwrapArgs(plan: SandboxPlan, command: string, args: readonl
   if (chdir !== undefined) {
     a.push("--chdir", chdir);
   }
+  // Redirect toolchain caches (e.g. Go's GOCACHE/GOPATH) to the writable tmpfs — else a read-only
+  // HOME makes `go test` fail to write its build cache. No-op for toolchains that cache in-worktree.
+  for (const [k, v] of toolchainSandboxEnv(command)) a.push("--setenv", k, v);
   a.push("--unshare-all");
   if (plan.networkAllowed) a.push("--share-net");
   a.push("--die-with-parent", "--new-session", "--", command, ...args);

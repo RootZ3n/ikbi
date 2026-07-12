@@ -65,6 +65,64 @@ const rec = (status: RecordOutcomeInput["status"], op = "build", signals?: { inj
   ...(signals ? { signals } : {}),
 });
 
+test("F3: a genuine trusted doc for ANOTHER agent, placed at a victim's storage key, is REJECTED", async () => {
+  const { wrap } = await import("./mac.js");
+  const dir = await tmp();
+  try {
+    const { trust, store } = makeTrust(dir);
+    // A MAC-valid trusted doc for "attacker-x" (authentic — signed with the real KEY).
+    const foreign = wrap(KEY, { contractVersion: "1.0.0", agentId: "attacker-x", kind: "agent", defaultTrustTier: "trusted", tier: "trusted", successCount: 0, failureCount: 0, partialCount: 0, rejectedCount: 0, injectionFlags: 0, injectionFlagged: false, promotableStreak: 0, streakOperations: [], consecutiveFailures: 0, operations: {}, transitions: [], createdAt: 1000, updatedAt: 1000 } as never);
+    // Copy/rename it onto the VICTIM's storage key (docKey = sha256(agentId)). The MAC still verifies.
+    const victimKey = createHash("sha256").update("builder-3", "utf8").digest("hex");
+    await store.put(victimKey, foreign);
+    // loadState must bind the doc to its key and REJECT the mismatch (fail-closed), not return "trusted".
+    const loaded = await trust.loadState("builder-3");
+    assert.equal(loaded, undefined, "a foreign trusted doc cannot be replayed onto another agent's key");
+    assert.equal(trust.resolve(AGENT), "untrusted", "the victim stays at the fail-closed floor, not elevated");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("round-3 #3: preload IGNORES a MAC-valid doc placed at a NON-canonical key (misplaced/planted)", async () => {
+  const { wrap } = await import("./mac.js");
+  const dir = await tmp();
+  try {
+    const { trust, store } = makeTrust(dir);
+    // A genuine trusted doc for "attacker-x" placed under the WRONG store key (not sha256("attacker-x")).
+    const wrongKey = createHash("sha256").update("some-other-slot", "utf8").digest("hex");
+    await store.put(wrongKey, wrap(KEY, { contractVersion: "1.0.0", agentId: "attacker-x", kind: "agent", defaultTrustTier: "trusted", tier: "trusted", successCount: 0, failureCount: 0, partialCount: 0, rejectedCount: 0, injectionFlags: 0, injectionFlagged: false, promotableStreak: 0, streakOperations: [], consecutiveFailures: 0, operations: {}, transitions: [], createdAt: 1000, updatedAt: 1000 } as never));
+    const { rejected } = await trust.preload();
+    assert.ok(rejected >= 1, "the misplaced doc was rejected, not loaded");
+    // attacker-x must NOT be cached as trusted from a doc found at the wrong key.
+    assert.equal(trust.resolve({ agentId: "attacker-x", kind: "agent", defaultTrustTier: "untrusted" } as TrustTierInput), "untrusted");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("A4: a planted foreign trusted doc cannot elevate a victim via the recordOutcome WRITE path", async () => {
+  const { wrap } = await import("./mac.js");
+  const dir = await tmp();
+  try {
+    const { trust, store, subject } = makeTrust(dir);
+    // Plant a MAC-valid trusted doc for "attacker-x" onto builder-3's storage key.
+    const victimKey = createHash("sha256").update("builder-3", "utf8").digest("hex");
+    await store.put(victimKey, wrap(KEY, { contractVersion: "1.0.0", agentId: "attacker-x", kind: "agent", defaultTrustTier: "trusted", tier: "trusted", successCount: 0, failureCount: 0, partialCount: 0, rejectedCount: 0, injectionFlags: 0, injectionFlagged: false, promotableStreak: 0, streakOperations: [], consecutiveFailures: 0, operations: {}, transitions: [], createdAt: 1000, updatedAt: 1000 } as never));
+    // builder-3's OWN legitimate build finishing (no forged identity) must NOT read the planted doc as
+    // its base and inherit `trusted`. The write path binds to the key and fail-closes.
+    await assert.rejects(
+      trust.recordOutcome(rec("success"), subject("builder-3")),
+      /bound to a different agent|cross-agent/i,
+      "recordOutcome rejects a cross-agent base",
+    );
+    // And the victim is NOT elevated in the live cache/resolve.
+    assert.notEqual(trust.resolve(AGENT), "trusted", "the victim was not elevated by the planted doc");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("resolve returns the EARNED tier after preload", async () => {
   const dir = await tmp();
   try {

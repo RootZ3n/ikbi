@@ -21,7 +21,7 @@ import type { WorkspaceHandle } from "../../core/workspace/contract.js";
 import type { ExecRequest, ExecResult } from "../governed-exec/index.js";
 import { events, type IkbiEvent } from "../../core/events/index.js";
 import type { ReceiptInput } from "../../core/receipt/index.js";
-import { createBuilder, MAX_TOOL_ITERATIONS, simplifyTools, TOOLS, type ToolCallError } from "./builder.js";
+import { createBuilder, isExternalToolOrigin, MAX_TOOL_ITERATIONS, simplifyTools, TOOLS, type ToolCallError } from "./builder.js";
 import { VERIFIER_CHECKS } from "./checks.js";
 import { workerToolCallStalled } from "./events.js";
 import { builderModel } from "./role-models.js";
@@ -109,6 +109,22 @@ function makeCtx(dir: string, tier: TrustTier, engine: RoleEngine, priorResults:
 }
 
 const tmp = (): string => mkdtempSync(join(tmpdir(), "ikbi-builder-"));
+
+// ── injection origin classifier: worktree-local (judge by effect) vs. outside (enforce) ──
+
+test("isExternalToolOrigin: worktree-local origins are NOT external (judged by effect)", () => {
+  for (const local of ["read_file", "write_file", "list_dir", "search_files", "glob", "patch", "multi_edit", "terminal", "run_checks", "scout_detail", "git_status", "git_diff", "git_log", "context_summary"]) {
+    assert.equal(isExternalToolOrigin(local), false, `${local} is worktree-local`);
+  }
+});
+
+test("isExternalToolOrigin: outside-content origins ARE external (enforced), unknown fails closed", () => {
+  for (const ext of ["web_search", "web_extract", "vision_analyze", "delegate_task", "brain_search", "phone_read_text", "phone_take_photo"]) {
+    assert.equal(isExternalToolOrigin(ext), true, `${ext} is outside content`);
+  }
+  assert.equal(isExternalToolOrigin("some_new_tool"), true, "unknown origin fails closed (treated as external)");
+  assert.equal(isExternalToolOrigin(""), true, "empty origin fails closed");
+});
 
 // ── #8: the neutralization chokepoint (LOAD-BEARING) ───────────────────────
 
@@ -1163,4 +1179,63 @@ test("WO4: a stall writes a durable receipt with REDACTED stall info (no partial
   // REDACTION: the partial argument VALUES must never appear anywhere in the receipt.
   assert.ok(!JSON.stringify(stallReceipt!.input).includes(SECRET), "the receipt must not leak the partial argument content");
   assert.equal(stallReceipt!.identity.agentId, "worker-1", "the receipt is attributed to the run identity");
+});
+
+// ── GRADUATED NO-PROGRESS GOVERNOR — nudge the cheap model back to producing before killing ──
+test("graduated no-progress: the builder is NUDGED (not killed) at 5 zero-write rounds, kills only if it persists", async () => {
+  const dir = tmp();
+  // Round 1 writes a file (so the governor is armed); then the model only READS for many rounds.
+  // Old behavior: killed at 5 zero-write rounds. New: nudged at 5, killed at 9.
+  const reads = Array.from({ length: 9 }, () => toolResp([call("read_file", { path: "a.ts" })]));
+  const { engine, requests } = mockEngine([
+    writeResp("a.ts", "export const x = 1;\n"),
+    ...reads,
+    doneResp(["a.ts"]), // never reached — the governor terminates first
+  ]);
+  const res = await run(makeCtx(dir, "trusted", engine));
+
+  const detail = (res.detail ?? {}) as Record<string, unknown>;
+  assert.equal(res.outcome, "failure");
+  assert.equal(detail.stopReason, "no_progress", "eventually terminates as no_progress");
+  // The NUDGE fired: a corrective message was injected into the conversation before termination.
+  assert.ok(
+    requests.some((r) => JSON.stringify(r.messages).includes("without writing a file")),
+    "the model was nudged back to producing",
+  );
+  // It did NOT kill at the old 5-round threshold — the nudge bought it ~4 more rounds (kill at 9).
+  assert.ok(requests.length >= 9, `the run continued past the old kill point (saw ${requests.length} rounds)`);
+});
+
+test("graduated no-progress: a WRITE after the nudge clears the streak (recovery, no kill)", async () => {
+  const dir = tmp();
+  // 1 write, 6 reads (crosses the nudge at 5), then a WRITE (recovery) → run_checks green → done.
+  const { engine } = mockEngine([
+    writeResp("a.ts", "export const x = 1;\n"),
+    ...Array.from({ length: 6 }, () => toolResp([call("read_file", { path: "a.ts" })])),
+    writeResp("b.ts", "export const y = 2;\n"), // recovery write resets the zero-write streak
+    runChecksResp(),
+    doneResp(["a.ts", "b.ts"]),
+  ]);
+  const res = await run(makeCtx(dir, "trusted", engine)); // greenExec ⇒ run_checks passes
+
+  assert.notEqual((res.detail as Record<string, unknown>)?.stopReason, "no_progress", "recovered — not a no_progress kill");
+});
+
+test("MoE hand-off: task.handoffBrief is surfaced to the builder as team context", async () => {
+  const dir = tmp();
+  const { engine, requests } = mockEngine([runChecksResp(), doneResp(["x"])]);
+  const base = makeCtx(dir, "verified", engine);
+  const ctx: RoleContext = { ...base, task: { ...base.task, handoffBrief: "- step 1: created src/alpha.ts with the core type" } };
+  await run(ctx);
+  const joined = (requests[0]?.messages ?? []).map((m) => String(m.content)).join("\n");
+  assert.match(joined, /Team hand-off/i, "the builder sees the team hand-off framing");
+  assert.match(joined, /created src\/alpha\.ts/, "the prior step's accumulated work is included");
+});
+
+test("MoE hand-off: no handoffBrief ⇒ no team-context message (first step / single build)", async () => {
+  const dir = tmp();
+  const { engine, requests } = mockEngine([runChecksResp(), doneResp(["x"])]);
+  await run(makeCtx(dir, "verified", engine));
+  const joined = (requests[0]?.messages ?? []).map((m) => String(m.content)).join("\n");
+  assert.doesNotMatch(joined, /Team hand-off/i, "no hand-off framing when there is no prior work");
 });

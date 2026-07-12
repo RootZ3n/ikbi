@@ -11,7 +11,7 @@
  * or use the primitives directly; nothing hand-rolls file writes or locks.
  */
 
-import { readFile, unlink, readdir, rename } from "node:fs/promises";
+import { readFile, stat, unlink, readdir, rename } from "node:fs/promises";
 import { resolve, sep } from "node:path";
 import type { Logger } from "pino";
 
@@ -24,40 +24,68 @@ import {
 import type { LockManager } from "./lock.js";
 
 /** Read + parse a JSON file. Missing => undefined. Corrupt => per `policy`. */
+/**
+ * M1 — hard per-record size limit. A single JSON state document (workspace record, kill latch, trust
+ * state, memory entry, …) is KB-scale; this cap is a generous OOM guard against a corrupt/pathological
+ * or hostile file, so `readJsonFile` never pulls an unbounded blob into memory before parsing it.
+ */
+export const MAX_DOCUMENT_BYTES = 16 * 1024 * 1024; // 16 MiB
+
+/**
+ * Fail-closed handling for an UNUSABLE state file (corrupt JSON or over the size cap): quarantine it
+ * (rename aside, return undefined) under the `quarantine` policy, else throw `corrupt_state`. Shared so
+ * an oversize record is handled with the exact same fail-closed discipline as a parse failure.
+ */
+async function handleUnusableFile(
+  path: string,
+  policy: CorruptPolicy,
+  logger: Logger,
+  now: () => number,
+  reason: "corrupt" | "oversize",
+  cause?: unknown,
+): Promise<undefined> {
+  if (policy === "quarantine") {
+    const aside = `${path}.corrupt.${now()}`;
+    try {
+      await rename(path, aside);
+    } catch (renameCause) {
+      // Quarantine FAILED — the bad file is still in place. Fail-closed: higher layers must not
+      // treat a still-present unusable file as "missing".
+      logger.error({ event: "corrupt_state_quarantine_failed", path, reason }, "failed to quarantine unusable state file");
+      throw new SubstrateError("corrupt_state", `failed to quarantine ${reason} state file ${path}`, { path, cause: renameCause });
+    }
+    logger.warn({ event: "corrupt_state_quarantined", path, aside, reason }, "quarantined unusable state file");
+    return undefined;
+  }
+  logger.error({ event: "corrupt_state", path, reason }, "unusable state file (fail-closed)");
+  throw new SubstrateError("corrupt_state", `${reason === "oversize" ? "oversize" : "corrupt JSON"} state file ${path}`, { path, cause });
+}
+
 export async function readJsonFile<T>(
   path: string,
   policy: CorruptPolicy,
   logger: Logger,
   now: () => number = Date.now,
+  maxBytes: number = MAX_DOCUMENT_BYTES,
 ): Promise<T | undefined> {
   let raw: string;
   try {
+    // M1: REFUSE to read an oversize document into memory — stat first, fail closed past the cap.
+    const st = await stat(path);
+    if (st.size > maxBytes) {
+      logger.error({ event: "state_file_oversize", path, size: st.size, maxBytes }, "state file exceeds the record-size cap (fail-closed)");
+      return await handleUnusableFile(path, policy, logger, now, "oversize");
+    }
     raw = await readFile(path, "utf8");
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    if (err instanceof SubstrateError) throw err; // an oversize throw (policy=throw) propagates as-is
     throw new SubstrateError("io", `failed to read ${path}`, { path, cause: err });
   }
   try {
     return JSON.parse(raw) as T;
   } catch (cause) {
-    if (policy === "quarantine") {
-      const aside = `${path}.corrupt.${now()}`;
-      try {
-        await rename(path, aside);
-      } catch (renameCause) {
-        // Quarantine FAILED — the corrupt file is still in place. Fail-closed:
-        // higher layers must not treat a still-present corrupt file as "missing".
-        logger.error({ event: "corrupt_state_quarantine_failed", path }, "failed to quarantine corrupt state file");
-        throw new SubstrateError("corrupt_state", `failed to quarantine corrupt state file ${path}`, {
-          path,
-          cause: renameCause,
-        });
-      }
-      logger.warn({ event: "corrupt_state_quarantined", path, aside }, "quarantined corrupt state file");
-      return undefined;
-    }
-    logger.error({ event: "corrupt_state", path }, "corrupt state file (fail-closed)");
-    throw new SubstrateError("corrupt_state", `corrupt JSON state file ${path}`, { path, cause });
+    return handleUnusableFile(path, policy, logger, now, "corrupt", cause);
   }
 }
 

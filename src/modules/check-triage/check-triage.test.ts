@@ -102,6 +102,41 @@ test("VECTOR A scope — a typecheck legitimately runs zero tests and STILL pass
   assert.equal(r.passed, true, "tsc is not a test check — zero-test floor does not apply");
 });
 
+test("H-1 SELF-HOSTING: ikbi's own test NAMES containing zero-test phrases do NOT flag a green run zero-test", () => {
+  // When ikbi builds ikbi, the suite echoes ITS OWN test names as TAP lines — and those names describe
+  // the zero-test detectors, so they literally contain "collected 0 items" / "no tests ran" / "# tests
+  // 0". The real summary at the end is a big green tally. Reading a test NAME as a zero-test marker
+  // false-REDs a fully-green self-hosting run (the recurring bug). The name-carrier lines must be skipped.
+  const selfHost = [
+    "TAP version 13",
+    "# Subtest: VECTOR A — pytest no-collect (`collected 0 items`, exit 0) is NOT a pass",
+    "ok 95 - VECTOR A — pytest no-collect (`collected 0 items`, exit 0) is NOT a pass",
+    "# Subtest: node:test with zero tests (`# tests 0`, exit 0) is NOT a pass",
+    "ok 96 - node:test with zero tests (`# tests 0`, exit 0) is NOT a pass",
+    "# Subtest: pytest `no tests ran` and `no test files found` are caught",
+    "ok 97 - pytest `no tests ran` and `no test files found` are caught",
+    "1..3453",
+    "# tests 3453",
+    "# suites 11",
+    "# pass 3452",
+    "# fail 0",
+    "# skipped 1",
+  ].join("\n");
+  const r = parseCheckOutput({ name: "test", command: "pnpm test", exitCode: 0, stdout: selfHost });
+  assert.equal(r.passed, true, "a green self-hosting run is a genuine pass — its own detector names are not zero-test markers");
+});
+
+test("VECTOR C — `node --test dist/` phantom dir pass (`ok 1 - dist`) is NOT a pass", () => {
+  const r = parseCheckOutput({ name: "test", command: "node --test dist/", exitCode: 0, stdout: "TAP version 13\nok 1 - dist\n1..1\n# tests 1\n# pass 1\n# fail 0\n" });
+  assert.equal(r.passed, false, "the only 'test' is the directory path — nothing real ran → not a pass");
+  assert.ok(/phantom|bare directory|vacuous/i.test(r.errorSummary));
+});
+
+test("VECTOR C scope — a REAL node:test run (named tests, not paths) still passes", () => {
+  const r = parseCheckOutput({ name: "test", command: "node --test dist/*.test.js", exitCode: 0, stdout: "TAP version 13\nok 1 - detects pnpm when a lock file is present\nok 2 - returns unknown when no lock file\n1..2\n# tests 2\n# pass 2\n# fail 0\n" });
+  assert.equal(r.passed, true, "real named tests ran → genuine pass, not flagged as phantom");
+});
+
 test("VECTOR B — exit 0 but parsed failures (exit-swallowing script) is NOT a pass", () => {
   const r = parseCheckOutput({ name: "test", command: "vitest run; echo done", exitCode: 0, stdout: "RUN  v1.0\nFAIL  src/math.test.ts > adds\n ✗ adds 3ms\ndone\n" });
   assert.equal(r.passed, false, "exit 0 with real failures parsed → fail closed");

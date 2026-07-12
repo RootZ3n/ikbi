@@ -37,6 +37,7 @@ function capturingRoles() {
     roles[r] = async (ctx) => {
       seen.push(ctx);
       if (r === "integrator") return { role: r, outcome: "success", summary: r, detail: { decision: "promote", evaluation: { approved: true } } };
+      if (r === "verifier") return { role: r, outcome: "success", summary: r, detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }] } };
       return { role: r, outcome: "success", summary: r };
     };
   }
@@ -56,6 +57,11 @@ function fakeWorkspaces() {
 
 const fakeTrust = () => ({ recordOutcome: async (i: { agentId: string; operation: string; status: string; defaultTrustTier: string }): Promise<TrustDecision> => { const t = asTier(i.defaultTrustTier, TRUST_FLOOR); return { agentId: i.agentId, tier: t, previousTier: t, autonomy: autonomyForTier(t) }; } });
 const fakeReceipts = () => ({ append: async (_i: unknown, _id: AgentIdentity): Promise<unknown> => ({}) });
+type CapturedReceipt = { operation: string; metadata?: Record<string, unknown>; outcome?: { status: string } };
+const capturingReceipts = () => {
+  const appended: CapturedReceipt[] = [];
+  return { receipts: { append: async (i: unknown, _id: AgentIdentity): Promise<unknown> => { appended.push(i as CapturedReceipt); return {}; } }, appended };
+};
 const noopBus = () => ({ publish: <P>(i: P) => ({ ...(i as object), contractVersion: "1.0.0", id: "e", seq: 1, timestamp: 0 }) as unknown, subscribe: () => ({ id: "s", unsubscribe: () => {}, stats: () => ({ delivered: 0, dropped: 0, failures: 0, queued: 0 }) }), flush: async () => {} });
 const allowGate: NonNullable<OrchestratorDeps["gateWall"]> = { evaluate: async () => ({ allow: true, reason: "test gate allows" }) };
 
@@ -85,6 +91,34 @@ test("total budget: a run that overruns its wall-clock ceiling halts at a role b
   assert.equal(r.promoted, false);
   assert.equal(r.outcome, "rejected");
   assert.match(r.reason ?? "", /budget/);
+});
+
+test("H4/Gap A: an ABORTED (budget-halted) run STILL writes a worker.run.summary cost receipt", async () => {
+  const ids = makeIdentities();
+  const ws = fakeWorkspaces();
+  const cap = capturingRoles();
+  const rec = capturingReceipts();
+  let t = 0;
+  const now = () => { const v = t; t += 3000; return v; };
+  const orch = createOrchestrator({
+    config: { enabled: true, roleTimeoutMs: 1000, maxConcurrentRuns: 1, totalBudgetMs: 5000 },
+    resolveIdentity: ids.resolveIdentity, roleClaim: ids.roleClaim, roles: cap.roles,
+    workspaces: ws.workspaces, trust: fakeTrust(), receipts: rec.receipts,
+    events: noopBus() as unknown as NonNullable<OrchestratorDeps["events"]>,
+    gateWall: allowGate, invokeModel: async () => { throw new Error("unused"); },
+    killCheck: async () => ({ killed: false }),
+    now,
+  });
+
+  const r = await orch.run(task, ids.parentCtx);
+  assert.equal(r.outcome, "rejected", "the run aborted");
+  // The whole point of Gap A: the abort still emits ONE authoritative cost receipt, else this build's
+  // spend is invisible to `ikbi cost` (which reads the run-summary's costUsd).
+  const summary = rec.appended.find((a) => a.operation === "worker.run.summary");
+  assert.ok(summary !== undefined, "an aborted run must still write a worker.run.summary");
+  assert.equal(summary!.metadata?.aborted, true, "marked as an aborted terminal");
+  assert.equal(typeof summary!.metadata?.costUsd, "number", "carries the spend-so-far as costUsd");
+  assert.equal(summary!.metadata?.promoted, false);
 });
 
 test("total budget disabled (0) ⇒ the run proceeds normally", async () => {

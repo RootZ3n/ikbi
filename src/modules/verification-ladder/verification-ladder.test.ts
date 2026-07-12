@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { FileEntry, ImportEdge, PackageEntry, ProjectIndexData } from "../project-index/index.js";
-import { createVerificationLadder, isStubScript, verificationLadderConfig } from "./index.js";
+import { createVerificationLadder, isStubScript, isInlineEvalTestScript, verificationLadderConfig } from "./index.js";
 
 const plan = createVerificationLadder().planVerification;
 
@@ -174,6 +174,24 @@ test("P0/F1: stub variants (true / exit 0 / : / empty / echo … && exit 0) are 
   }
   for (const body of ["vitest run", "tsc --noEmit", "node test.js", "echo start && vitest run"]) {
     assert.equal(isStubScript(body), false, `real: "${body}"`);
+  }
+});
+
+test("A3: an inline-eval test script (node -e/-p/--eval/--print <code>) is flagged as a fake runner", () => {
+  // The forgery: inline node code that PRINTS fake TAP markers, or -p/--print (which always prints).
+  for (const body of [
+    "node -e \"console.log('# tests 3\\n# pass 3')\"",
+    "node -e 'process.stdout.write(\"# pass 3\")'",
+    "node -p '1+1'",
+    "node --print 'true'",
+    "echo start && node -e 'console.log(\"ok\")'",
+  ]) {
+    assert.equal(isInlineEvalTestScript(body), true, `fake runner: "${body}"`);
+  }
+  // NOT flagged: real runners, and a bare inline exit-0 (writes nothing → forges no evidence; the
+  // test-evidence gate handles the vacuous exit-0).
+  for (const body of ["vitest run", "node --test", "node --test tests/", "pytest -q", "go test ./...", "jest", "node -e 'process.exit(0)'", "node --eval \"process.exit(0)\""]) {
+    assert.equal(isInlineEvalTestScript(body), false, `not a print-forgery: "${body}"`);
   }
 });
 

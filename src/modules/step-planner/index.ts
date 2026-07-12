@@ -7,6 +7,7 @@
  * planning, or dependency-aware scheduling). Do not delete.
  */
 
-export { decompose, decomposeWithModel, complexityScore } from "./implementation.js";
+export { decompose, decomposeWithModel, decomposeAdaptive, complexityScore } from "./implementation.js";
+export type { AdaptiveDecomposeOpts } from "./implementation.js";
 export type { Step, StepPlan, StepResult, StepPlanResult } from "./contract.js";
 export { MAX_STEPS, COMPLEX_THRESHOLD } from "./config.js";

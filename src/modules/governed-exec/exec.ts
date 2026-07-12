@@ -60,6 +60,7 @@ import { createJobManager, type JobManager } from "./jobs.js";
 import {
   classifyCommandRisk,
   detectSandbox,
+  toolchainCacheWritable,
   wrapWithSandbox,
   type SandboxAvailability,
   type SandboxPlan,
@@ -197,6 +198,17 @@ function scrubbedEnv(): NodeJS.ProcessEnv {
       if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) && process.env[key] !== undefined) env[key] = process.env[key];
     }
   }
+  // GIT HARDENING (defense-in-depth): governed builds run git inside worktrees of UNTRUSTED target
+  // repos, whose shared .git can carry hooks / a hostile core.hooksPath. ikbi must NEVER execute
+  // repo-supplied hook code. Neutralize it for every governed-exec git command via config env, which
+  // has higher precedence than any config FILE (so it overrides an attacker's repo core.hooksPath):
+  // point core.hooksPath at /dev/null ⇒ git finds no hooks to run, and ignore /etc/gitconfig. The
+  // operator's GLOBAL config is deliberately left intact so `git commit` still resolves an author.
+  // Harmless to non-git commands (they ignore these variables).
+  env.GIT_CONFIG_NOSYSTEM = "1";
+  env.GIT_CONFIG_COUNT = "1";
+  env.GIT_CONFIG_KEY_0 = "core.hooksPath";
+  env.GIT_CONFIG_VALUE_0 = "/dev/null";
   return env;
 }
 
@@ -228,6 +240,17 @@ function forbiddenEvalReason(command: string, args: readonly string[]): string |
   if (command === "node" && args.some((a) => a === "-e" || a === "--eval" || a === "-p" || a === "--print")) {
     return "node code-eval flags are not allowed by governed-exec";
   }
+  // Interpreter INLINE-eval flags run arbitrary code — a model could `python3 -c "open(~/.ssh/id_rsa)"`
+  // to read host files (SSH keys, provider config) even inside the read-only-host sandbox (Codex C4).
+  // `-m module` (e.g. `python3 -m pytest`) runs a real module and stays allowed; only INLINE code is
+  // denied. python3 is the one interpreter on the default allowlist; ruby/perl/php matter only when an
+  // operator opts them in, but are denied here for defense-in-depth.
+  if ((command === "python" || command === "python2" || command === "python3" || command === "pypy" || command === "pypy3") && args.includes("-c")) {
+    return `${command} inline-eval (-c) is not allowed by governed-exec — run a file or a module (-m) instead`;
+  }
+  if (command === "ruby" && args.includes("-e")) return "ruby inline-eval (-e) is not allowed by governed-exec";
+  if (command === "perl" && args.some((a) => a === "-e" || a === "-E")) return "perl inline-eval (-e/-E) is not allowed by governed-exec";
+  if (command === "php" && args.includes("-r")) return "php inline-eval (-r) is not allowed by governed-exec";
   if ((command === "npm" || command === "pnpm") && args.some((a) => a === "--eval" || a === "-e")) {
     return `${command} code-eval flags are not allowed by governed-exec`;
   }
@@ -317,14 +340,16 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
     if (!allowlist.has(command)) return deny(`binary "${command}" is not on the allowlist`);
     const evalDeny = forbiddenEvalReason(command, args);
     if (evalDeny !== undefined) return deny(evalDeny);
-    const policyDeny = commandPolicyDenyReason(command, args, request.purpose);
+    const policyDeny = commandPolicyDenyReason(command, args, { verifier: request.verifier === true });
     if (policyDeny !== undefined) return deny(policyDeny);
 
-    // (4) the caller's grant. (5) GATE-WALL — sudo is part of the gated action.
+    // (4) the caller's grant. (5) GATE-WALL — sudo is part of the gated action. The `verifier` authority
+    // flag is carried INTO the gated action so the gate-wall's own policy re-check agrees (both layers
+    // read the structured flag, never the free-text purpose).
     const grant = autonomyForTier(asTier(identity.trustTier ?? TRUST_FLOOR, TRUST_FLOOR));
     const governance = await gateWall.evaluate({
       grant,
-      action: { kind: "exec", command, args, sudo, ...(request.purpose !== undefined ? { purpose: request.purpose } : {}) },
+      action: { kind: "exec", command, args, sudo, verifier: request.verifier === true, ...(request.purpose !== undefined ? { purpose: request.purpose } : {}) },
       identity,
     });
     if (!governance.allow) return deny(governance.reason ?? "gate-wall denied the command", false);
@@ -339,15 +364,35 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
     let sandboxPlan: SandboxPlan | undefined;
     let sandboxLabel: "bwrap" | "none" | "unavailable" = "none";
     const sandboxWritableRoot = request.worktreeRoot ?? cwd;
-    if (risk.risky && config.sandbox.mode !== "off") {
+    if (risk.risky && config.sandbox.mode === "off") {
+      // EXPLICIT off (IKBI_GOVERNED_EXEC_SANDBOX=off): the operator disabled OS confinement. A risky
+      // command (a helper interpreter that does its own filesystem syscalls) then runs UNSANDBOXED and
+      // could write outside the worktree — the F1 escape. This is NOT a silent skip: it is LOUDLY
+      // receipted exactly like the trusted-local override, so "off" can never masquerade as safe in the
+      // audit trail. `off` is a dev/CI convenience, never a production posture.
+      sandboxLabel = "unavailable";
+      emit(govexecExecuted, { ...base, allow: true, sandbox: "unavailable", risk: risk.kind, reason: "sandbox mode=off: running risky command unsandboxed" }, identity, EXEC_OPERATION, requestId);
+      await receipt(
+        EXEC_OPERATION,
+        identity,
+        { status: "success", detail: `SANDBOX OFF — running ${command} [${risk.kind}] UNSANDBOXED (IKBI_GOVERNED_EXEC_SANDBOX=off; not a production posture)` },
+        sandboxMetadata("sandbox.unavailable", "unavailable", risk, sandboxWritableRoot, false),
+        requestId,
+        cwd,
+      );
+    } else if (risk.risky) {
       const avail = sandboxAvailability();
       if (avail.available) {
+        // Bind the persistent, ikbi-owned toolchain cache writable (Go/.NET/Maven/Gradle) so deps +
+        // compiled std are reused across builds instead of re-fetched into a throwaway tmpfs each run.
+        const extraWritable = toolchainCacheWritable(command);
         sandboxPlan = {
           mode: "bwrap",
           ...(sandboxWritableRoot !== undefined ? { writableRoot: sandboxWritableRoot } : {}),
           ...(cwd !== undefined ? { cwd } : {}),
           networkAllowed: risk.needsNetwork,
           risk,
+          ...(extraWritable.length > 0 ? { extraWritable } : {}),
         };
         sandboxLabel = "bwrap";
         emit(govexecExecuted, { ...base, allow: true, sandbox: "bwrap", risk: risk.kind }, identity, EXEC_OPERATION, requestId);

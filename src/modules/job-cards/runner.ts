@@ -8,6 +8,18 @@ import { execSync } from "node:child_process";
 import type { JobCard, JobCardResult } from "./contract.js";
 import { createRun, updateRun } from "./store.js";
 
+/**
+ * Rollback hook. Codex C6/L4: the old implementation shelled out to `git checkout -- .`
+ * in the SERVER's cwd — an UNGOVERNED, destructive wipe of all tracked changes reachable
+ * by anyone who could create+run a job card. Job-card execution is preview-only right now
+ * (executeGoal makes no real changes), so there is nothing to undo; rollback is a documented
+ * no-op until it runs through a managed workspace (discard the workspace, never `git checkout`
+ * a shared working tree). Keeping the call sites makes the future governed hook a one-line swap.
+ */
+function rollbackWorktree(): void {
+  /* intentionally does NOT mutate any working tree — see doc above */
+}
+
 /** Dependencies injected for testability. */
 export interface RunnerDeps {
   executeGoal: (goal: string) => Promise<{ output: string; filesChanged: string[]; success: boolean }>;
@@ -72,7 +84,7 @@ export async function runCard(
     if (card.guardrails.maxFilesChanged > 0 && filesChanged.length > card.guardrails.maxFilesChanged) {
       const error = `Guardrail violation: ${filesChanged.length} files changed (max ${card.guardrails.maxFilesChanged})`;
       if (card.rollback === "on-failure" || card.rollback === "always") {
-        try { execSync("git checkout -- .", { timeout: 10000, stdio: "ignore" }); } catch { /* best effort */ }
+        rollbackWorktree();
       }
       updateRun(card.id, run.id, { status: "failed", finishedAt: deps.now(), error }, storeDir);
       return { run: { ...run, status: "failed", finishedAt: deps.now(), error }, output: result.output, filesChanged, verificationPassed: false };
@@ -83,7 +95,7 @@ export async function runCard(
         if (file === prot || file.startsWith(prot + "/")) {
           const error = `Guardrail violation: protected path "${prot}" was modified`;
           if (card.rollback === "on-failure" || card.rollback === "always") {
-            try { execSync("git checkout -- .", { timeout: 10000, stdio: "ignore" }); } catch { /* best effort */ }
+            rollbackWorktree();
           }
           updateRun(card.id, run.id, { status: "failed", finishedAt: deps.now(), error }, storeDir);
           return { run: { ...run, status: "failed", finishedAt: deps.now(), error }, output: result.output, filesChanged, verificationPassed: false };
@@ -95,13 +107,13 @@ export async function runCard(
     const verificationPassed = card.verification === "skip" ? true : result.success;
 
     if (status === "failed" && (card.rollback === "on-failure" || card.rollback === "always")) {
-      try { execSync("git checkout -- .", { timeout: 10000, stdio: "ignore" }); } catch { /* best effort */ }
+      rollbackWorktree();
       updateRun(card.id, run.id, { status: "rolled-back", finishedAt: deps.now() }, storeDir);
       return { run: { ...run, status: "rolled-back", finishedAt: deps.now() }, output: result.output, filesChanged, verificationPassed: false };
     }
 
     if (card.rollback === "always") {
-      try { execSync("git checkout -- .", { timeout: 10000, stdio: "ignore" }); } catch { /* best effort */ }
+      rollbackWorktree();
     }
 
     updateRun(card.id, run.id, { status, finishedAt: deps.now() }, storeDir);
@@ -109,7 +121,7 @@ export async function runCard(
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
     if (card.rollback === "on-failure" || card.rollback === "always") {
-      try { execSync("git checkout -- .", { timeout: 10000, stdio: "ignore" }); } catch { /* best effort */ }
+      rollbackWorktree();
     }
     updateRun(card.id, run.id, { status: "failed", finishedAt: deps.now(), error }, storeDir);
     return { run: { ...run, status: "failed", finishedAt: deps.now(), error }, output: "", filesChanged: [], verificationPassed: false };

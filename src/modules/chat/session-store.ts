@@ -197,6 +197,19 @@ export class PersistentSessionStore {
     }
   }
 
+  /**
+   * H10: is the session for this `<stem>.json` file currently a LIVE lease — i.e. its `<stem>.lock`
+   * directory exists AND its recorded owner pid is a running process? A stale (dead-owner) or absent
+   * lock is NOT live. Used by `prune()` to never delete an in-use session.
+   */
+  private isLiveLocked(jsonFile: string): boolean {
+    const stem = jsonFile.endsWith(".json") ? jsonFile.slice(0, -".json".length) : jsonFile;
+    const lockDir = join(this.dir, `${stem}.lock`);
+    if (!existsSync(lockDir)) return false;
+    const owner = this.readLockOwner(join(lockDir, "owner.json"));
+    return owner !== undefined && isPidAlive(owner.pid);
+  }
+
   private readLockOwner(ownerFile: string): { pid: number; startedAt: number } | undefined {
     try {
       const parsed = JSON.parse(readFileSync(ownerFile, "utf8")) as { pid?: unknown; startedAt?: unknown };
@@ -312,6 +325,14 @@ export class PersistentSessionStore {
     const doomed = ranked.slice(this.maxSessions);
     let pruned = 0;
     for (const { f } of doomed) {
+      // H10: NEVER prune a LIVE lease — a session whose lock is held by a live process is in use
+      // (mid-write, or an open REPL). Deleting its file out from under an active writer would race
+      // the atomic save and lose state. Skip it; it stays even if that keeps us over the cap (a live
+      // session is not surplus). It becomes prunable once the process exits and the lock goes stale.
+      if (this.isLiveLocked(f)) {
+        log.debug?.({ file: f, dir: this.dir }, "chat-store: prune skipped a live-locked session (never prune a live lease)");
+        continue;
+      }
       try {
         rmSync(join(this.dir, f), { force: true });
         // Also drop the matching lock dir (stem.lock) if one was left behind.

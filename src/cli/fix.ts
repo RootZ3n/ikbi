@@ -207,7 +207,7 @@ export function createFixCli(deps: FixCliDeps = {}) {
 
     // The check runs through governed-exec (allowlist + gate-wall + receipts) under the operator ctx.
     const runCheck = async (repoPath: string, check: FixCheckCommand): Promise<CheckRun> => {
-      const res = await governedExec.run({ parentCtx: ctx, command: check.command, args: [...check.args], cwd: repoPath, purpose: `fix check: ${check.command} ${check.args.join(" ")}`.trim(), timeoutMs: checkTimeoutMs });
+      const res = await governedExec.run({ parentCtx: ctx, command: check.command, args: [...check.args], cwd: repoPath, verifier: true, purpose: `fix check: ${check.command} ${check.args.join(" ")}`.trim(), timeoutMs: checkTimeoutMs });
       return execToCheckRun(res, check.command);
     };
 

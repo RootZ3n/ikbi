@@ -21,6 +21,7 @@ import { config, type IkbiConfig } from "../core/config.js";
 import { loadRepoRegistry } from "../core/repo-registry.js";
 import type { ModelProvider } from "../core/provider/contract.js";
 import { registry as defaultRegistry } from "../core/provider/index.js";
+import { findUnclassifiedModels, FALLBACK_CAPABILITIES } from "../core/provider/capabilities.js";
 import type { ModelSpec } from "../core/provider/registry.js";
 import { workspaces as coreWorkspaces } from "../core/workspace/index.js";
 import { egressConfig } from "../modules/egress/config.js";
@@ -34,12 +35,16 @@ import {
   safetyPosture,
 } from "../modules/worker-model/modes.js";
 import { writeStdout } from "./io.js";
+import { getDotenvProvenance as liveDotenvProvenance } from "./bootstrap.js";
 import { postureLines, productPosture } from "./posture.js";
 
 /** The read-only registry surface doctor needs to check role-model resolution. */
 export interface DoctorRegistry {
   getModel: (id: string) => ModelSpec | undefined;
   getProvider: (id: string) => ModelProvider | undefined;
+  /** All roster models — for the silent-degradation capability check. Optional so test
+   *  fakes needn't provide it (the check is skipped, reported as unchecked, when absent). */
+  listModels?: () => ModelSpec[];
 }
 
 /** The inputs doctor reads — all default to the process-wide singletons; injectable for tests. */
@@ -53,6 +58,10 @@ export interface DoctorInputs {
   readonly registry?: DoctorRegistry;
   /** Env source for verification/retrieval mode reporting (tests inject). Default: process.env. */
   readonly env?: NodeJS.ProcessEnv;
+  /** Whether the earned-trust ladder is active. Default: workerModelConfig.trustLadder. */
+  readonly trustLadder?: boolean;
+  /** key → .env file that supplied it (config-precedence display). Default: the live bootstrap map. */
+  readonly dotenvProvenance?: ReadonlyMap<string, string>;
 }
 
 export interface DoctorResult {
@@ -94,26 +103,43 @@ export function runDoctor(inp: DoctorInputs = {}): DoctorResult {
   const builderId = cfg.provider.defaultModels.builder;
   const criticId = cfg.provider.defaultModels.critic;
   const competitive = cfg.provider.defaultModels.competitiveModels;
-  const resolves = (spec: ModelSpec | undefined): boolean =>
-    spec !== undefined && spec.providers.some((route) => reg.getProvider(route.provider) !== undefined);
+  // H1: KEY-AWARE resolution. The old check was purely structural (is a provider id registered?) — but
+  // every provider registers even with no API key, so doctor said "ready to build" and the build then
+  // died mid-pipeline for want of a key. Now a model resolves only when a route reaches a provider that
+  // is actually USABLE (keyless, or a key configured — via provider.ready()). We distinguish "no
+  // provider registered" from "provider registered but NO API KEY" so the fix is actionable.
+  const resolveStatus = (spec: ModelSpec | undefined): "ok" | "no-provider" | "no-key" => {
+    if (spec === undefined) return "no-provider";
+    let sawProvider = false;
+    for (const route of spec.providers) {
+      const p = reg.getProvider(route.provider);
+      if (p === undefined) continue;
+      sawProvider = true;
+      if (p.ready === undefined || p.ready()) return "ok"; // ready (or a fake without ready ⇒ assume ok)
+    }
+    return sawProvider ? "no-key" : "no-provider";
+  };
   // ALL configured models must resolve: scout(driver) + builder + critic + every
   // competitive-list model (the shootout — the operator needs to know if a racer isn't wired).
-  const modelChecks: Array<{ label: string; id: string; ok: boolean }> = [
-    { label: "driver model", id: driverId, ok: resolves(reg.getModel(driverId)) },
-    { label: "builder model", id: builderId, ok: resolves(reg.getModel(builderId)) },
-    { label: "critic model", id: criticId, ok: resolves(reg.getModel(criticId)) },
-    ...(competitive ?? []).map((id) => ({ label: "competitive model", id, ok: resolves(reg.getModel(id)) })),
+  const modelChecks: Array<{ label: string; id: string; ok: boolean; status: "ok" | "no-provider" | "no-key" }> = [
+    { label: "driver model", id: driverId, status: resolveStatus(reg.getModel(driverId)), ok: resolveStatus(reg.getModel(driverId)) === "ok" },
+    { label: "builder model", id: builderId, status: resolveStatus(reg.getModel(builderId)), ok: resolveStatus(reg.getModel(builderId)) === "ok" },
+    { label: "critic model", id: criticId, status: resolveStatus(reg.getModel(criticId)), ok: resolveStatus(reg.getModel(criticId)) === "ok" },
+    ...(competitive ?? []).map((id) => ({ label: "competitive model", id, status: resolveStatus(reg.getModel(id)), ok: resolveStatus(reg.getModel(id)) === "ok" })),
   ];
   const broken = modelChecks.filter((m) => !m.ok);
-  // Structural check: do role models resolve to registered providers? (checked via `broken` above)
+  // Do role models resolve to a USABLE (registered + keyed/keyless) provider? (checked via `broken`)
   const providerEntry = broken.length === 0
-    ? { ok: true, label: `provider — all role models resolve (driver '${driverId}', builder '${builderId}', critic '${criticId}'${competitive ? `, competitive ${competitive.map((m) => `'${m}'`).join(", ")}` : ""})`, fix: "" }
+    ? { ok: true, label: `provider — all role models resolve to a usable provider (driver '${driverId}', builder '${builderId}', critic '${criticId}'${competitive ? `, competitive ${competitive.map((m) => `'${m}'`).join(", ")}` : ""})`, fix: "" }
     : (() => {
-        const verb = broken.length > 1 ? "don't" : "doesn't";
+        const needsKey = broken.filter((m) => m.status === "no-key");
+        const verb = broken.length > 1 ? "aren't" : "isn't";
         return {
           ok: false,
-          label: `the ${broken.map((m) => `${m.label} '${m.id}'`).join(" and ")} ${verb} resolve to a registered provider`,
-          fix: "add a provider entry in the roster (providers.json) for it, or set a provider API key",
+          label: `the ${broken.map((m) => `${m.label} '${m.id}'`).join(" and ")} ${verb} usable (${needsKey.length > 0 ? "provider registered but NO API KEY" : "no registered provider"})`,
+          fix: needsKey.length > 0
+            ? `set the provider API key for ${needsKey.map((m) => `'${m.id}'`).join(", ")} (e.g. IKBI_<PROVIDER>_API_KEY) — the provider is registered but has no key, so the build would die mid-pipeline`
+            : "add a provider entry in the roster (providers.json) for it, or set a provider API key",
         };
       })();
 
@@ -203,12 +229,75 @@ export function runDoctor(inp: DoctorInputs = {}): DoctorResult {
     push(`  ${OK} IKBI_COMPETITIVE_MODELS = ${competitive.join(", ")}   (head-to-head shootout)`);
   }
 
+  // --- MODEL CAPABILITIES (silent-degradation guard) -----------------------
+  // A roster model whose id matches no capability table/pattern and carries no explicit
+  // override silently resolves to the conservative fallback (8k window, no native tools).
+  // On a large-context model that is a ~25× context loss driven silently — surface it here,
+  // actionably, so it's caught in doctor rather than one failed build at a time.
+  push("");
+  push("MODEL CAPABILITIES");
+  const allModels = reg.listModels?.() ?? [];
+  if (reg.listModels === undefined) {
+    push(`  ${WARN} registry does not expose a model list — capability classification not checked`);
+  } else {
+    const degraded = findUnclassifiedModels(allModels);
+    if (degraded.length === 0) {
+      push(`  ${OK} all ${allModels.length} roster model(s) classified (none silently degrade to ${FALLBACK_CAPABILITIES.context_window}-token/no-tools)`);
+    } else {
+      for (const d of degraded) {
+        push(`  ${WARN} '${d.id}' is unclassified → silently degrades to a ${d.contextWindow}-token window, no native tools — add a family pattern in capabilities.ts or a roster \`capabilities\` override`);
+      }
+    }
+  }
+
+  // --- PROMOTION POSTURE (will a self-build auto-promote, or stall on trust gating?) ---
+  // The operator's #1 "no-babysit" question: when I run a build, does verified-green work LAND,
+  // or does it stall on trust gating? Make the answer explicit rather than discovered on a stalled run.
+  push("");
+  push("PROMOTION POSTURE");
+  const trustLadderOn = inp.trustLadder ?? workerModelConfig.trustLadder === true;
+  const workerTier = cfg.identity.workerTrustTier;
+  if (!trustLadderOn) {
+    push(`  ${OK} trust ladder OFF (default) — verified-green work AUTO-PROMOTES regardless of tier (autoCommit forced on); build outcomes never move worker trust`);
+  } else {
+    const tier = workerTier.toLowerCase();
+    if (tier === "trusted" || tier === "operator") {
+      push(`  ${OK} trust ladder ON + worker tier '${workerTier}' — auto-commits with no approval gate (self-builds promote)`);
+    } else if (tier === "verified") {
+      push(`  ${WARN} trust ladder ON + worker tier '${workerTier}' — verified work is RETAINED but NOT landed (no autoCommit). Set IKBI_WORKER_TRUST_TIER=trusted or disable the ladder (unset IKBI_WORKER_MODEL_TRUST_LADDER).`);
+    } else {
+      // probation / untrusted / anything unknown → fail-closed: gate-wall DENIES promotion.
+      push(`  ${WARN} trust ladder ON + worker tier '${workerTier}' — self-builds will STALL at promote (gate-wall fail-closed, requires approval). Set IKBI_WORKER_TRUST_TIER=trusted or disable the ladder (unset IKBI_WORKER_MODEL_TRUST_LADDER).`);
+    }
+  }
+  push(`  · worker trust tier = ${workerTier} (IKBI_WORKER_TRUST_TIER)`);
+
   // --- STATE ---------------------------------------------------------------
   push("");
   push("STATE");
   push(`  ${OK} IKBI_STATE_ROOT    = ${cfg.stateRoot}`);
   push(`  ${OK} trust dir          = ${cfg.trust.dir}`);
   push(`  ${OK} roster file        = ${cfg.provider.rosterFile}`);
+
+  // --- CONFIG SOURCES (LOW: precedence visibility) -------------------------
+  // Show WHERE each important setting's value came from — a .env file (which one), a shell export, or a
+  // built-in default — so a surprising config ("why THAT model / bind host?") is diagnosable. Values are
+  // NOT printed (tokens/keys stay secret); only the source is.
+  const provenance = inp.dotenvProvenance ?? liveDotenvProvenance();
+  const sourceOf = (key: string): string => {
+    const file = provenance.get(key);
+    if (file !== undefined) return `.env (${file})`;
+    const v = env[key];
+    return v !== undefined && v.length > 0 ? "shell export" : "built-in default";
+  };
+  const TRACKED_VARS = [
+    "IKBI_MODEL_BUILDER", "IKBI_MODEL_CRITIC", "IKBI_MODEL_DRIVER",
+    "IKBI_BIND_HOST", "IKBI_API_TOKEN", "IKBI_OPERATOR_TOKEN", "IKBI_WORKER_TOKEN",
+    "IKBI_EGRESS_ALLOWLIST", "IKBI_GOVERNED_EXEC_ALLOWLIST", "IKBI_GOVERNED_EXEC_SANDBOX",
+  ];
+  push("");
+  push("CONFIG SOURCES (where each setting's value came from — precedence: shell > .env > default)");
+  for (const key of TRACKED_VARS) push(`  ${key.padEnd(30)} ${sourceOf(key)}`);
 
   // --- SUMMARY -------------------------------------------------------------
   // A security blocker (insecure default key, no dev opt-in) is fatal to readiness

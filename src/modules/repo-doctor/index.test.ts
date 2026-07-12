@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
 
-import { DIMENSIONS, runAllAnalyzers, runAnalyzer } from "./index.js";
+import { DIMENSIONS, runAllAnalyzers, runAnalyzer, resolveRepoPath, RepoDoctorPathError, getReport, resetReportCache } from "./index.js";
 import { analyze as analyzeFileHealth } from "./analyzers/file-health.js";
 import { analyze as analyzeDependencyHealth } from "./analyzers/dependency-health.js";
 import { analyze as analyzeTestHealth } from "./analyzers/test-health.js";
@@ -264,5 +264,51 @@ test("runAllAnalyzers on empty repo returns valid report", () => {
     assert.ok(report.overallScore >= 0);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ── Path confinement + per-path cache (Codex H9) ───────────────────────────────
+
+test("resolveRepoPath rejects a path outside the allowed roots", () => {
+  const outside = tmpRepo(); // a /tmp dir — not under cwd, not opted in
+  try {
+    assert.throws(() => resolveRepoPath(outside), RepoDoctorPathError);
+  } finally {
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("resolveRepoPath accepts the process cwd", () => {
+  assert.equal(typeof resolveRepoPath(process.cwd()), "string");
+});
+
+test("resolveRepoPath honors the IKBI_REPO_DOCTOR_ROOTS opt-in", () => {
+  const outside = tmpRepo();
+  const prev = process.env.IKBI_REPO_DOCTOR_ROOTS;
+  process.env.IKBI_REPO_DOCTOR_ROOTS = outside;
+  try {
+    assert.equal(typeof resolveRepoPath(outside), "string", "opted-in root is accepted");
+  } finally {
+    if (prev === undefined) delete process.env.IKBI_REPO_DOCTOR_ROOTS;
+    else process.env.IKBI_REPO_DOCTOR_ROOTS = prev;
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("getReport caches PER PATH — no cross-repo report bleed", () => {
+  resetReportCache();
+  const a = tmpRepo();
+  const b = tmpRepo();
+  writeFileSync(join(a, "README.md"), "# A\n");
+  writeFileSync(join(b, "README.md"), "# B\n");
+  try {
+    const ra = getReport(a);
+    const rb = getReport(b);
+    assert.equal(ra.repoPath, a, "report A is keyed to path A");
+    assert.equal(rb.repoPath, b, "report B is keyed to path B (NOT A's cached report)");
+  } finally {
+    rmSync(a, { recursive: true, force: true });
+    rmSync(b, { recursive: true, force: true });
+    resetReportCache();
   }
 });

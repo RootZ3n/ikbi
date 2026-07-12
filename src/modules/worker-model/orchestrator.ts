@@ -48,6 +48,7 @@ import type { BuildCandidate, JudgeResult } from "../deterministic-judge/index.j
 import {
   escalationConfig,
   escalationEngine,
+  configureEscalationResolver,
   escalationEvaluated,
   escalationTriggered,
   escalationDeclined,
@@ -55,8 +56,26 @@ import {
 import type { EscalationSignals, EscalationDecision } from "../escalation/index.js";
 import { decideRecovery } from "../recovery/index.js";
 import type { RecoveryAttempt } from "../recovery/index.js";
+import { DriftBlockedError } from "../drift-prevention/index.js";
+import type { DriftPrevention, DriftReport } from "../drift-prevention/index.js";
 import { rosterFromIds } from "../model-router/index.js";
+import { rentBuilderExpert, classifyTaskTier, resolveClassifierModel, laneRoster, laneHasModels, type RentedExpert } from "./expert-rental.js";
+import { semanticPromotionEligible, semanticDuelEligible, effectiveDecisionKind, type SemanticVerdict, type SemanticVerdictKind } from "./semantic-verdict.js";
+import { evaluateExecutedTestEvidence, noTestsPolicyEnabled } from "./executed-evidence.js";
+import type { TestEvidence } from "./adjudication/contract.js";
+import {
+  loadRuntimeTruthReader,
+  runtimeTruthEvidenceEnabled,
+  resolveEvidenceLimits,
+  resolveFreshnessWindowMs,
+  filterAndBoundEvidence,
+  type RuntimeEvidence,
+  type RuntimeTruthEvidenceReader,
+  type EvidenceRequestScope,
+} from "../runtime-truth/index.js";
 import { applyConsultPatch } from "./consult-apply.js";
+import { CandidateLeaseRegistry, type VerificationSnapshot } from "./candidate-lease.js";
+import { createPhysicalSnapshot as defaultCreatePhysicalSnapshot, verifySnapshotUnchanged, type PhysicalSnapshot } from "./workspace-snapshot.js";
 import type { ApplyConsultPatchInput, ApplyConsultPatchResult } from "./consult-apply.js";
 
 import type { ExecRequest, GovernedExec } from "../governed-exec/index.js";
@@ -67,7 +86,9 @@ import { createPatchsmith } from "./patchsmith.js";
 import { runTournament } from "./tournament.js";
 import type { CandidateRun, CandidateSpec, ShadowVerification, TournamentEngine, TournamentEvent } from "./tournament.js";
 import { captureStreamedStdout, classifyUnresolvableReason, committedPackageJsonDiff, parseChecksEnv, parseTestCount, PROJECT_MANIFESTS, resolveChecks, resolveCheckTimeoutMs, UNRESOLVABLE_NEXT_STEPS, type VerificationKind, workingTreePackageJsonDiff, workingTreePlanningDiff } from "./checks.js";
-import { builderModel, competitiveBuilderModels } from "./role-models.js";
+import { builderModel, competitiveBuilderModels, criticModel } from "./role-models.js";
+import { estimatePromptTokens, contextExceedsWindow } from "./context-preflight.js";
+import { getCapabilities } from "../../core/provider/capabilities.js";
 import { createCritic, critic } from "./critic.js";
 import { createRefuter, refuter, proposalFromFinding, type RefuterFinding } from "./refuter.js";
 import { liveCorrectionAccess } from "./correction-application.js";
@@ -83,6 +104,8 @@ import {
   MAX_CANDIDATE_MODELS,
   MAX_COMPETITIVE_N,
   MIN_COMPETITIVE_N,
+  resolveBuilderTimeoutMs,
+  resolveTotalBudgetMs,
   workerModelConfig,
   type WorkerModelConfig,
 } from "./config.js";
@@ -109,7 +132,8 @@ import {
   workerEscalationRetried,
   workerEscalationSuppressed,
 } from "./events.js";
-import { CONTRACT_VERSION, toOutcomeStatus, WorkerError, WORKER_ROLES } from "./contract.js";
+import { CONTRACT_VERSION, toOutcomeStatus, WorkerError, WORKER_ROLES, effortModelParams } from "./contract.js";
+import { InvocationLedger, type InvocationRecord, type InvocationStatus } from "./invocation-ledger.js";
 import { fireStopHooks } from "../hooks/index.js";
 import { runIterativeLoop, DEFAULT_MAX_FIX_ITERATIONS, extractVerifierCheckResult } from "./iterative-loop.js";
 import { runCriticFixLoop, isRetryableCriticFail } from "./critic-fix-loop.js";
@@ -124,6 +148,20 @@ import type {
 } from "./contract.js";
 
 const EVENT_SOURCE = "worker-model";
+/** The receipt operation a builder role writes (`worker.role.builder`) — the drift baseline key the
+ *  build-path governor consults for builder reliability. Kept in sync with recordRole's operation. */
+const BUILDER_OPERATION = "worker.role.builder";
+
+/**
+ * Pre-flight context threshold: bump the builder to a bigger-window model when the KNOWN base
+ * context (goal + project instructions + scout brief) already exceeds this fraction of the worker
+ * model's window. High (0.7) on purpose — it estimates only the pre-loop base (runtime file reads
+ * aren't counted), so it upgrades only when the size is unmistakable, never on a task the cheap
+ * model could have handled. The reactive on-overflow escalation is the backstop for the rest.
+ */
+const CONTEXT_PREFLIGHT_FRACTION = 0.7;
+/** Repair budget (Phase 6): the hard per-run cap on fixer/rescue model passes — prevents repair loops. */
+const MAX_FIXER_ROUNDS = 2;
 
 /** A mutable signal accumulator folded across roles within one run (see observeEscalation). */
 interface MutableEscalationSignals {
@@ -150,13 +188,33 @@ interface EscalationHandoffFields {
 
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, symlinkSync, mkdirSync, type Dirent } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, basename } from "node:path";
+
+import { computeWorkProduct, decidePromotability, type Decision, type GitRunner, type SafetyAssessment, type Verdict, type WorkAssessment } from "./adjudication/index.js";
+
+/**
+ * Given `git status --porcelain` output, report whether the working tree has TRACKED
+ * uncommitted changes (staged or unstaged). Untracked files (the `??` lines) are IGNORED:
+ * a build worktree is cut from HEAD, so untracked files are never carried into it and cannot
+ * conflict with auto-commit promotion — refusing on them (e.g. a stray build tarball or a
+ * generated lockfile) blocks the common case to guard a rare one. A genuine path collision
+ * (an untracked file at a path the build later creates) surfaces at promotion time, where the
+ * workspace manager already fails closed. Exported for unit testing.
+ */
+export function porcelainHasTrackedChanges(porcelain: string): boolean {
+  return porcelain
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => line.length > 0)
+    .some((line) => !line.startsWith("??"));
+}
 
 /**
  * Run `git status --porcelain` on `targetRepo`. Returns a human-readable reason
- * string when the repo has uncommitted changes, undefined when clean or when git
- * is unavailable / the path is not a git repo (fail-open: let workspace allocation
- * surface the real error).
+ * string when the repo has uncommitted TRACKED changes, undefined when clean (or only
+ * untracked files are present), or when git is unavailable / the path is not a git repo
+ * (fail-open: let workspace allocation surface the real error).
  */
 function liveCheckTargetDirty(targetRepo: string): string | undefined {
   try {
@@ -164,11 +222,30 @@ function liveCheckTargetDirty(targetRepo: string): string | undefined {
       encoding: "utf8",
       timeout: 5000,
       maxBuffer: 1024 * 1024,
-    }).trim();
-    return out.length === 0 ? undefined : "target repo has uncommitted changes — commit or stash them first";
+    });
+    return porcelainHasTrackedChanges(out)
+      ? "target repo has uncommitted changes — commit or stash them first"
+      : undefined;
   } catch {
     return undefined; // git unavailable or not a git repo — let workspace allocation handle it
   }
+}
+
+/**
+ * ADJUDICATION CORE — WorkProduct producer. Runs read-only git in the worktree (a throwaway index for
+ * the tree hash, so the real index/working tree are untouched) to get GROUND-TRUTH work-on-disk — the
+ * replacement for the builder's self-reported `filesWritten` ledger. Used by the Step-2 shadow
+ * instrumentation (wrapped in try/catch) AND by the auto-verify rescue's work detection.
+ */
+async function computeWorktreeWorkProduct(workspacePath: string, baseRef: string, taskId: string): Promise<import("./adjudication/index.js").WorkProduct> {
+  const git: GitRunner = async (args, opts) =>
+    execFileSync("git", ["-C", workspacePath, ...args], {
+      encoding: "utf8",
+      timeout: 10_000,
+      maxBuffer: 32 * 1024 * 1024,
+      env: opts?.env !== undefined ? { ...process.env, ...opts.env } : process.env,
+    });
+  return computeWorkProduct(git, { baseRef, tempIndexPath: join(tmpdir(), `ikbi-adj-${taskId}.index`) });
 }
 
 /**
@@ -255,15 +332,23 @@ const DIAGNOSTIC_SKIP_DIRS: ReadonlySet<string> = new Set([
   ".git", "node_modules", "dist", "build", "out", "target", ".venv", "venv", "__pycache__", ".ikbi",
 ]);
 
+/** A bare-repo diagnosis: the actionable message plus whether the target is EMPTY (greenfield). */
+interface BareRepoDiagnosis {
+  readonly message: string;
+  /** True when the target has NO manifest AND no source files — a greenfield scaffold candidate
+   *  (vs. loose source without a manifest, which is an existing project missing its manifest). */
+  readonly greenfield: boolean;
+}
+
 /**
- * Diagnose a target repo that cannot be verified. Returns an actionable message when the repo
- * root has NO recognizable project manifest (mirrors `resolveChecks`, which requires a manifest
- * AT the worktree root), or `undefined` when a manifest exists (normal flow) or the path is
- * unreadable (fail-open — let workspace allocation surface the real error). Best-effort and
- * never throws: a bounded, depth-limited walk summarizes whatever source files ARE present so
- * the operator sees what ikbi saw.
+ * Diagnose a target repo that cannot be verified. Returns an actionable message (+ whether the
+ * target is greenfield-empty) when the repo root has NO recognizable project manifest (mirrors
+ * `resolveChecks`, which requires a manifest AT the worktree root), or `undefined` when a manifest
+ * exists (normal flow) or the path is unreadable (fail-open — let workspace allocation surface the
+ * real error). Best-effort and never throws: a bounded, depth-limited walk summarizes whatever
+ * source files ARE present so the operator sees what ikbi saw.
  */
-function diagnoseBareRepo(root: string): string | undefined {
+function diagnoseBareRepo(root: string): BareRepoDiagnosis | undefined {
   // A recognizable manifest AT the root is exactly what resolveChecks needs (root === worktree).
   if (PROJECT_MANIFESTS.some((m) => existsSync(join(root, m)))) return undefined;
   if (!existsSync(root)) return undefined; // unreadable — fail-open
@@ -303,14 +388,17 @@ function diagnoseBareRepo(root: string): string | undefined {
           .map(([ext, n]) => `${n} ${ext}`)
           .join(", ");
 
-  return [
-    "No project manifest or verifier detected.",
-    `Detected files: ${summary}`,
-    "Suggested next steps:",
-    "  - Initialize a package manifest (e.g., `pnpm init`, `cargo init`)",
-    '  - Provide an explicit check command: `ikbi build <repo> --check "python -m pytest"`',
-    '  - Use `ikbi fix <repo> --check "<command>"` for fix mode',
-  ].join("\n");
+  return {
+    greenfield: totalFiles === 0,
+    message: [
+      "No project manifest or verifier detected.",
+      `Detected files: ${summary}`,
+      "Suggested next steps:",
+      "  - Initialize a package manifest (e.g., `pnpm init`, `cargo init`)",
+      '  - Provide an explicit check command: `ikbi build <repo> --check "python -m pytest"`',
+      '  - Use `ikbi fix <repo> --check "<command>"` for fix mode',
+    ].join("\n"),
+  };
 }
 
 /** True when the operator declared an explicit, well-formed check override (IKBI_CHECKS). */
@@ -473,8 +561,26 @@ function observeEscalation(
 }
 
 /** Minimal injected surfaces (each a Pick of the real singleton's relevant method). */
+/**
+ * Post-REAUDIT3 (final containment): resolve whether AUTONOMOUS PROMOTION is enabled. FAIL-CLOSED — enabled
+ * ONLY when the explicit opt-in env is exactly "true" (case-insensitive, trimmed). Missing, invalid, "false",
+ * "1", or any other value ⇒ DISABLED. The critical immutable tested-subject invariant (IKBI-REAUDIT3-001)
+ * remains architecturally open, so autonomous promotion is quarantined by default across every strategy.
+ */
+export const AUTONOMOUS_PROMOTION_ENV = "IKBI_ENABLE_AUTONOMOUS_PROMOTION";
+export function resolveAutonomousPromotionEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env[AUTONOMOUS_PROMOTION_ENV];
+  return typeof raw === "string" && raw.trim().toLowerCase() === "true";
+}
+
 export interface OrchestratorDeps {
   readonly config?: WorkerModelConfig;
+  /**
+   * Post-REAUDIT3 containment: explicit opt-in for AUTONOMOUS PROMOTION. Default (undefined) ⇒ read the
+   * fail-closed env (`IKBI_ENABLE_AUTONOMOUS_PROMOTION`), which is DISABLED unless exactly "true". Injectable so
+   * tests can force the quarantine on/off without touching the environment.
+   */
+  readonly autonomousPromotionEnabled?: boolean;
   /** Resolve a role credential to a validated identity. Default: core resolveIdentity. */
   readonly resolveIdentity?: (claim: IdentityClaim, ctx?: ResolveContext) => ValidatedIdentity;
   /** Produce the credential claim for a role. Default: fail-closed (must be configured). */
@@ -488,7 +594,7 @@ export interface OrchestratorDeps {
   readonly proposeCorrection?: (input: CorrectionProposeInput) => void;
   readonly workspaces?: {
     allocate: (opts: { targetRepo: string; identity: AgentIdentity; baseBranch?: string; label?: string }) => Promise<WorkspaceHandle>;
-    promote: (handle: WorkspaceHandle, approval: { evaluation: WorkspaceEvaluation; governance?: PromoteGovernance; message?: string }) => Promise<PromoteResult>;
+    promote: (handle: WorkspaceHandle, approval: { evaluation: WorkspaceEvaluation; governance?: PromoteGovernance; message?: string; requestId?: string; verifiedAgainst?: { targetHead: string; integratedTree: string } }) => Promise<PromoteResult>;
     discard: (handle: WorkspaceHandle) => Promise<DiscardResult>;
     /**
      * Retain a FAILED build's workspace (mark it terminal-failed but KEEP the worktree on disk
@@ -567,6 +673,13 @@ export interface OrchestratorDeps {
   readonly requestApproval?: (req: { taskId: string; workspaceId: string; goal: string }) => Promise<boolean>;
   /** The single builder model (per-candidate fallback). Default: config (IKBI_MODEL_BUILDER). */
   readonly builderModel?: string;
+  /**
+   * The escalation tier rosters (worker/mid/frontier). Default: the deployed `tierModels`
+   * (env/providers.json-resolved). Injectable (Phase 11) so a conformance test can pin a DETERMINISTIC
+   * roster independent of the ambient deployment config — the escalation MECHANICS are what a unit test
+   * asserts, not which vendor a specific deployment's cost-sorted roster ranks first.
+   */
+  readonly escalationTierModels?: { readonly worker: readonly string[]; readonly mid: readonly string[]; readonly frontier: readonly string[] };
   /** The head-to-head competitive model list. Default: config (IKBI_COMPETITIVE_MODELS). */
   readonly competitiveModels?: readonly string[];
   /**
@@ -611,12 +724,56 @@ export interface OrchestratorDeps {
    */
   readonly checkTargetDirty?: (targetRepo: string) => Promise<string | undefined>;
   /**
+   * Reads the content tree hash of a candidate workspace (Phase 3 stale-tree protection). The
+   * canonical promotion authority captures this at verification time and re-reads it immediately
+   * before promotion; a mismatch blocks the promote (the candidate mutated since it was verified).
+   * Default: `git -C <path> rev-parse HEAD^{tree}` (undefined when the path is not a git worktree,
+   * e.g. an in-memory test workspace — the authority then skips the tree check, unchanged behavior).
+   */
+  readonly readTreeHash?: (workspacePath: string) => Promise<string | undefined>;
+  /**
+   * Whether a workspace path is a real git worktree (Phase 10, IKBI-REAUDIT-006). Used to fail the
+   * promote CLOSED when a git-backed candidate's tree identity cannot be read (vs a genuinely non-git
+   * in-memory/test workspace, which is exempt). Default: `git rev-parse --is-inside-work-tree`.
+   */
+  readonly isGitBacked?: (workspacePath: string) => Promise<boolean>;
+  /**
+   * Phase 13 (IKBI-REAUDIT2-002): fail-closed tree-identity resolution. Overrides the derived resolver so a
+   * test/production can return `indeterminate` for a git/process error (which must block autonomous promotion)
+   * instead of the boolean `isGitBacked` silently reclassifying a real worktree as an exempt non-git workspace.
+   */
+  readonly resolveWorkspaceIdentity?: (workspacePath: string) => Promise<WorkspaceIdentityResolution>;
+  /**
+   * Phase 13C (physical frozen snapshot). Create a physically isolated, read-only snapshot of a git-backed
+   * candidate's committed tree (a detached worktree). Default: the real `createPhysicalSnapshot`. Injectable so
+   * tests can force success/failure/absence; returns undefined for a non-git source (the logical binding stands).
+   */
+  readonly createPhysicalSnapshot?: (sourceWorktreePath: string, expectedTree?: string) => Promise<PhysicalSnapshot | undefined>;
+  /**
+   * Production runtime-truth EVIDENCE reader (Phase 5). When provided (or resolvable from the
+   * configured `IKBI_RUNTIME_TRUTH_READER_MODULE`), the orchestrator requests bounded, task/candidate-
+   * scoped evidence and injects it into the builder/critic model context. Absent + disabled ⇒ inert.
+   */
+  readonly runtimeTruthReader?: import("../runtime-truth/index.js").RuntimeTruthEvidenceReader;
+  /**
    * Memory governor — intercepts writes to governed surfaces (CLAUDE.md, .ikbi/*, brain pages)
    * and converts them to operator-reviewed proposals. When wired, the builder's tool-executor
    * routes governed writes through the governor instead of writing directly.
    * Absent ⇒ no interception (backward compatible).
    */
   readonly memoryGovernor?: import("../memory-governor/contract.js").MemoryGovernor;
+  /**
+   * Drift GOVERNOR — the reliability watchdog on the BUILD PATH (step 3). Before spending on any
+   * paid role, it reads the builder agent's durable baseline vs. its recent success rate for this
+   * project and, per the drift POLICY (IKBI_DRIFT_PREVENTION_POLICY):
+   *   - reportOnly (default) ⇒ advisory: emit + attach a note; the build proceeds unchanged.
+   *   - warn ⇒ log + attach a warning note; the build proceeds.
+   *   - block ⇒ REFUSE the build at zero API cost (a degraded agent must not keep burning spend).
+   * Absent ⇒ no build-path governor (backward compatible; tests + bare orchestrators unaffected).
+   * Wired to the live singleton by `createProductionWorker`. Fail-OPEN: a drift READ error never
+   * breaks a build — drift is advisory infrastructure, not a correctness gate.
+   */
+  readonly driftGovernor?: DriftPrevention;
 }
 
 /** A role identity spawned under the parent ceiling (#10). */
@@ -636,6 +793,29 @@ async function lazyInvokeModel(request: ModelRequest): Promise<ModelResponse> {
   return mod.invokeModel(request);
 }
 
+/**
+ * Wire the escalation engine's "is this model wired?" resolver from the provider registry —
+ * ONCE, lazily, via the same dynamic import as `lazyInvokeModel` (so the provider singleton
+ * is never constructed at module load, before the egress-fetch-guard floor registers). After
+ * this runs, the escalation cascade skips unwired/stub tier models in favor of a live one.
+ */
+let escalationResolverWired = false;
+async function ensureEscalationResolver(): Promise<void> {
+  if (escalationResolverWired) return;
+  try {
+    const { registry } = await import("../../core/provider/index.js");
+    configureEscalationResolver((modelId) => {
+      const spec = registry.getModel(modelId);
+      return spec !== undefined && spec.providers.some((route) => registry.getProvider(route.provider) !== undefined);
+    });
+    escalationResolverWired = true; // only latch on success, so a properly-loaded run can still wire it
+  } catch {
+    // The provider registry isn't constructible yet (e.g. a unit test that hasn't loaded the egress
+    // floor). Wiring is best-effort hardening — leave the resolver unset (cascade behaves as before,
+    // preferring roster[0]) and retry on the next run. Never fail a build over this.
+  }
+}
+
 /** The promote/discard decision read from the integrator's result. */
 interface IntegratorDecision {
   readonly promote: boolean;
@@ -650,6 +830,30 @@ interface IntegratorDecision {
  * malformed/non-approving evaluation all fall to DISCARD. Never throws on
  * malformed detail (it is an open `Record<string, unknown>`).
  */
+/**
+ * C-A1 (fail-closed): the injection / policy-taint promote gate must cover EVERY promote path. The
+ * single-run path checks run-global flags; competitive & tournament race independent candidates in
+ * SEPARATE worktrees and only the WINNER promotes — so the winner's OWN role details are the right thing
+ * to inspect (a tainted loser is discarded regardless, and a run-global flag would false-block a clean
+ * winner). Returns a discard reason when the winner's build was injected or attempted an out-of-policy
+ * tool call, else undefined.
+ */
+function winnerTaintReason(roles: readonly RoleResult[]): string | undefined {
+  for (const r of roles) {
+    const d = r.detail as Record<string, unknown> | undefined;
+    if (d?.externalInjectionDetected === true) {
+      return "prompt-injection from OUTSIDE content detected by the neutralization chokepoint during the winning candidate's build (fail-closed — must not promote)";
+    }
+    // NB: injection NEUTRALIZED in the candidate's OWN worktree output (e.g. self-hosting test
+    // fixtures) does NOT taint the winner — judge by effect, like the policy-taint case below.
+    // NB: a PREVENTED (rejected) out-of-policy tool ATTEMPT does NOT taint the winner. Judge by effect,
+    // not intent — the governor blocked it (no effect) and the candidate was verified green. It is a
+    // recorded warning + learning signal, not a discard (see the single-build promote gate). Only an
+    // EFFECTIVE breach (a control failure that landed) would discard, and that is a separate alarm.
+  }
+  return undefined;
+}
+
 function readIntegratorDecision(integ: RoleResult | undefined): IntegratorDecision {
   const deny = (rationale?: string): IntegratorDecision => ({
     promote: false,
@@ -677,6 +881,200 @@ function readIntegratorDecision(integ: RoleResult | undefined): IntegratorDecisi
   return { promote: true, evaluation, ...(rationale !== undefined ? { rationale } : {}) };
 }
 
+/**
+ * The ONE authoritative, attempt-scoped builder-model decision (IKBI-RT-001).
+ *
+ * Everything downstream reads from this single object: the initial builder dispatch, cost
+ * attribution, the builder receipt, and lane-constrained retries. It is made ONCE per attempt at
+ * rental time and is only replaced when an explicit NEW dispatch decision is made (the pre-flight
+ * context-size escalation), which records itself. This is what enforces the invariant:
+ *
+ *     rented model == dispatched model == billed model == receipt model
+ *
+ * `alias` is the identity that was REQUESTED (an operator `--tier` override, the semantically-rented
+ * expert id, or the configured default). `model` is the concrete id actually sent to the provider.
+ * In ikbi these are the same id string (the roster ids ARE the provider-facing model ids; the
+ * host/provider-model mapping happens one layer down, in the provider registry, from this exact
+ * `model`), so recording both truthfully means never claiming an unrequested model was dispatched.
+ */
+interface AttemptModelDecision {
+  /** The concrete model id dispatched to the provider (== billed == receipt). */
+  readonly model: string;
+  /** The identity that was requested/rented (equals `model` in ikbi's id scheme). */
+  readonly alias: string;
+  /** Why this model was chosen — for truthful receipts + logs. */
+  readonly source: "tier-override" | "moe-rental" | "complexity-large" | "default" | "preflight-context-escalation";
+  /** The vendor lane this attempt is pinned to (undefined = unpinned); constrains every retry. */
+  readonly vendorLane?: string;
+  /** Human-readable rationale (rental reason / escalation trigger). */
+  readonly rationale?: string;
+}
+
+/**
+ * The strategy that PRODUCED a promotion candidate. Candidate generation/selection may differ per
+ * strategy, but the definition of promotion does NOT — every one of these routes through the single
+ * canonical promotion authority (`promoteCandidate`). (Phase 3, IKBI-RT-004.)
+ */
+export type PromotionStrategy = "normal" | "duel-primary" | "duel-peer" | "tournament" | "competitive";
+
+/**
+ * Phase 13 (IKBI-REAUDIT2-002): a FAIL-CLOSED tree-identity resolution. A boolean "is git" conflated a proven
+ * non-git workspace with an unknown/error probe, so a transient git/process failure silently reclassified a
+ * real worktree as exempt and dropped stale-tree/CAS. This 3-state result never does that: only a PROVEN
+ * git-backed or PROVEN non-git workspace resolves; any error/permission/missing-tool/hash failure is
+ * `indeterminate` and blocks autonomous promotion.
+ */
+export type WorkspaceIdentityResolution =
+  | { readonly status: "resolved"; readonly backing: "git"; readonly identity: string }
+  | { readonly status: "resolved"; readonly backing: "non-git"; readonly identity: string }
+  | { readonly status: "indeterminate"; readonly error: string };
+
+/**
+ * Phase 13 (IKBI-REAUDIT2-001): a run-scoped fence tracking, per workspace, whether a candidate-MUTATING role
+ * (builder/fixer/escalation/cheap-retry) TIMED OUT and was not superseded by a clean (non-timed-out) generation.
+ * `runRoleFn` cannot cancel the losing promise, so a timed-out builder can keep writing after its tests passed;
+ * a fenced workspace is fail-closed BLOCKED from autonomous promotion (its tree may contain post-timeout work).
+ * A subsequent clean generation on the same workspace (escalation/retry/fixer that did NOT time out) supersedes.
+ */
+class MutationFence {
+  private tick = 0;
+  private readonly lastMutatingTimeout = new Map<string, number>();
+  private readonly lastCleanMutation = new Map<string, number>();
+  recordMutatingTimeout(workspaceId: string): void { this.lastMutatingTimeout.set(workspaceId, ++this.tick); }
+  recordCleanMutation(workspaceId: string): void { this.lastCleanMutation.set(workspaceId, ++this.tick); }
+  /** True when an unsuperseded mutating-role timeout stands for this workspace. */
+  isFenced(workspaceId: string): boolean {
+    return (this.lastMutatingTimeout.get(workspaceId) ?? -1) > (this.lastCleanMutation.get(workspaceId) ?? -1);
+  }
+}
+/** Active per-run fences, keyed by taskId so `runRoleFn` (a shared closure) reaches the right run's fence. */
+const activeMutationFences = new Map<string, MutationFence>();
+/** Phase 13B: active per-run candidate-generation lease registries, keyed by taskId (the write-boundary + snapshot authority). */
+const activeLeaseRegistries = new Map<string, CandidateLeaseRegistry>();
+
+/**
+ * A uniquely identifiable proposed tree produced by one attempt/strategy (Phase 3). It carries the
+ * provenance the canonical promotion authority needs to prove the identity chain:
+ *   generated == selected == verified == policy-evaluated == promoted == receipt candidate.
+ * `verifiedTree` is the content tree hash the deterministic verifier certified; the authority refuses
+ * to promote if the workspace's live tree no longer matches it (stale-tree / post-verify mutation).
+ */
+export interface PromotionCandidate {
+  readonly taskId: string;
+  /** The attempt this candidate belongs to (== the lane-distinct taskId; Phase 2). */
+  readonly attemptId: string;
+  readonly strategy: PromotionStrategy;
+  readonly workspaceId: string;
+  readonly workspacePath: string;
+  /** The executed builder model (Phase 1) — for the truthful promotion receipt. */
+  readonly model?: string;
+  /** The attempt's vendor lane (Phase 2). */
+  readonly vendorLane?: string;
+  /** The content tree hash the verifier certified. Undefined ⇒ tree identity could not be read. */
+  readonly verifiedTree?: string;
+  /** The target-branch head verification ran against (for hash-bound promote authorization). */
+  readonly targetHead?: string;
+  /**
+   * Whether the workspace is a real git worktree, so an ENFORCEABLE tree identity is REQUIRED (Phase 10,
+   * IKBI-REAUDIT-006). When true, an unreadable/absent tree hash fails the promote CLOSED instead of
+   * silently dropping the stale-tree + CAS checks. In-memory/non-git test workspaces leave this false and
+   * legitimately have no tree.
+   */
+  readonly treeIdentityRequired?: boolean;
+  /**
+   * Phase 13 (IKBI-REAUDIT2-002): the workspace's tree-identity RESOLUTION is indeterminate — a git/process
+   * probe error that CANNOT prove the workspace is genuinely non-git. Autonomous promotion is fail-closed
+   * blocked: an error must never be laundered into a non-git exemption that waives stale-tree/CAS.
+   */
+  readonly identityIndeterminate?: boolean;
+  /**
+   * Phase 13 (IKBI-REAUDIT2-001): a candidate-mutating role (builder/fixer/escalation) TIMED OUT on this
+   * workspace and its abandoned, uncancellable work was NOT superseded by a clean (non-timed-out) generation.
+   * The promotable tree may contain post-timeout writes the executed tests never observed — fail-closed block.
+   */
+  readonly mutationFenced?: boolean;
+  /**
+   * Phase 13B: the immutable frozen verification-snapshot identity this candidate was frozen into (generation-
+   * scoped). The snapshot's `gitTree` equals `verifiedTree` (the content-addressed subject); test/semantic/
+   * promotion evidence bind to `snapshotId`, and the CAS confirms the promoted content equals the snapshot.
+   */
+  readonly snapshotId?: string;
+  readonly snapshotDigest?: string;
+  /** Phase 13C: the physically isolated (detached-worktree) snapshot path + immutability, when git-backed. */
+  readonly snapshotPath?: string;
+  readonly snapshotImmutable?: boolean;
+}
+
+/** How the critic's verdict was resolved (Phase 3 critic-parser boundary). */
+// The canonical semantic verdict kinds (Phase 4) — re-exported for the promotion evidence.
+export type { SemanticVerdictKind };
+
+/**
+ * Candidate-BOUND evidence submitted to the canonical promotion authority (Phase 3). Every field
+ * describes THIS candidate; the authority does not synthesize verification/safety facts, and a
+ * strategy may not reuse another candidate's evidence. `semanticKind === "indeterminate"` marks a
+ * bare/unparsable critic FAIL that is NOT a concrete defect — it must never be recorded as one.
+ */
+export interface CandidateEvidence {
+  /** Deterministic verifier result for this candidate. The authority REJECTS a false value (Phase 10). */
+  readonly verificationPassed: boolean;
+  readonly verificationMode?: string;
+  /**
+   * The candidate's EXECUTED-TEST evidence class (Phase 10, IKBI-REAUDIT-001), from the verifier. The
+   * authority requires `executed` (or `absent` under an explicit no-tests policy); `zero`/`unverified`/
+   * missing block autonomous promotion. Undefined is treated as missing → fail-closed.
+   */
+  readonly testEvidence?: TestEvidence;
+  /** Whether the explicit no-tests policy permits promoting THIS candidate on `absent` evidence (Phase 10). */
+  readonly noTestsAcceptable?: boolean;
+  /** Semantic (critic) verdict, classified. `not-evaluated` = the strategy ran no model critic. */
+  readonly semanticKind: SemanticVerdictKind;
+  /** The durable `worker.semantic` evidence id backing this verdict (Phase 9) — the promotion receipt
+   *  references it rather than duplicating the full validated defect set. */
+  readonly semanticEvaluationId?: string;
+  /** Whether policy explicitly permits promoting THIS candidate without semantic evaluation (Phase 4). */
+  readonly semanticEvaluationOptional?: boolean;
+  /** The authoritative policy decision (integrator/judge/adjudication) — promote iff true. */
+  readonly policyPromote: boolean;
+  /** The real gate-wall governance decision — must allow, or the authority refuses. */
+  readonly governance: PromoteGovernance;
+  readonly evaluation: WorkspaceEvaluation;
+  readonly message: string;
+  readonly rationale?: string;
+}
+
+/**
+ * Classify the critic's verdict for the canonical evidence (Phase 3 critic-parser boundary). A bare
+ * `FAIL` with no concrete issue — or a critic role that failed to parse — is NOT authentic defect
+ * evidence: it is `indeterminate`, and must never be recorded as a fabricated concrete defect. Only a
+ * FAIL that carries at least one concrete issue (or substantive feedback) is `concrete-fail`. This
+ * does not change the fail-closed decision (an indeterminate critic still does not promote); it makes
+ * the recorded EVIDENCE truthful. A dedicated later phase may improve the critic contract/retries.
+ */
+export function classifySemanticVerdict(critic: RoleResult | undefined): SemanticVerdictKind {
+  if (critic === undefined) return "not-evaluated";
+  const d = (critic.detail ?? {}) as Record<string, unknown>;
+  // Prefer the canonical semantic verdict the critic stamped (Phase 4) — the single source of truth.
+  // Phase 15: a stamped concrete fail/incomplete NOT produced under a typed evidence package is downgraded to
+  // indeterminate for DECISIONS (a no-package compatibility verdict never authorizes fixer/duel/promotion-block).
+  const sv = d.semanticVerdict;
+  if (typeof sv === "object" && sv !== null && typeof (sv as SemanticVerdict).kind === "string") {
+    return effectiveDecisionKind(sv as SemanticVerdict);
+  }
+  // Fallback (an injected/legacy critic WITHOUT a stamped verdict — the production critic always
+  // stamps one, so this only affects test doubles). A bare `FAIL` with no concrete issue is
+  // indeterminate, never a fabricated defect. A critic that RAN (outcome success) and raised no
+  // explicit `pass:false` is a pass (it produced no blocking objection).
+  if (d.pass === true) return "pass";
+  if (d.pass === false) {
+    const issues = Array.isArray(d.issues) ? d.issues.filter((x): x is string => typeof x === "string" && x.trim().length > 0) : [];
+    const fb = typeof d.feedback === "string" ? d.feedback.trim() : "";
+    const substantiveFeedback = fb.length > 0 && fb.toUpperCase() !== "FAIL" && fb.toUpperCase() !== "PASS";
+    return issues.length > 0 || substantiveFeedback ? "fail" : "indeterminate";
+  }
+  return critic.outcome === "success" ? "pass" : "indeterminate";
+}
+
 /** Build an orchestrator. The default deps wire the real frozen singletons. */
 export function createOrchestrator(deps: OrchestratorDeps = {}) {
   const config = deps.config ?? workerModelConfig;
@@ -692,10 +1090,20 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   const trust = deps.trust ?? coreTrust;
   const workspaces = deps.workspaces ?? coreWorkspaces;
   const receipts = deps.receipts ?? coreReceipts;
+  // Post-REAUDIT3 CONTAINMENT: surface the autonomous-promotion quarantine ONCE at startup when disabled, so the
+  // operator understands that candidates require review + manual apply. Not spammed per-operation. Opt-in does
+  // NOT override an active gate-wall bypass (the quarantine still refuses a bypassed autonomous promote).
+  if (!(deps.autonomousPromotionEnabled ?? resolveAutonomousPromotionEnabled())) {
+    log.warn(
+      { setting: AUTONOMOUS_PROMOTION_ENV, openFinding: "IKBI-REAUDIT3-001" },
+      `AUTONOMOUS PROMOTION QUARANTINED: candidates are generated, verified, and criticized but do NOT land unattended — they require operator review / manual \`/apply\`. The critical immutable tested-subject invariant (IKBI-REAUDIT3-001) is architecturally open — see IKBI-RUNTIME-CONFORMANCE-REAUDIT-3.md. To opt in once your workflow is verified, set ${AUTONOMOUS_PROMOTION_ENV}=true (this does NOT override an active IKBI_GATE_WALL_BYPASS — a bypassed gate can never autonomously land).`,
+    );
+  }
   const events = deps.events ?? coreEvents;
   const invokeModel = deps.invokeModel ?? lazyInvokeModel;
   const neutralizeUntrusted = deps.neutralizeUntrusted ?? coreNeutralize;
   const gateWall = deps.gateWall; // optional in the type — absent → promote DENIED fail-closed (H5)
+  const driftGovernor = deps.driftGovernor; // absent → no build-path drift governor (backward compatible)
   const judge = deps.judge ?? deterministicJudge; // competitive-mode scorer (pure, no model)
   const enforceProjectRoot = deps.enforceProjectRoot ?? false; // Fix 1/2 guard — production-only (off in tests)
   // HARDENED-BY-DEFAULT (production): the verification + retrieval modes this run wires. The
@@ -707,6 +1115,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   const retrievalMode = resolveRetrievalMode(modeEnv, { production: enforceProjectRoot });
   // Bug 2: retain (don't discard) a FAILED build's workspace so its work survives for inspection.
   const retainFailedWorkspaces = config.retainFailedWorkspaces ?? true;
+  // TRUST LADDER (default OFF): earned-trust tier governance for building. OFF ⇒ build outcomes never
+  // move the worker's tier (no demotion) AND verified-green work promotes regardless of tier. ON only
+  // when explicitly enabled (IKBI_WORKER_MODEL_TRUST_LADDER=true). Safety controls are independent.
+  const trustLadderActive = config.trustLadder === true;
   const requestApproval = deps.requestApproval; // SG-10 human-approval gate (undefined ⇒ no gate)
 
   // H3: enforce a per-role WALL-CLOCK timeout. Only the builder self-checks between model calls;
@@ -726,29 +1138,138 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   const totalBudgetMs = config.totalBudgetMs ?? 0;
   const buildDeadlines = new WeakMap<WorkerTask, number>();
   function armBudget(task: WorkerTask): void {
-    if (totalBudgetMs > 0 && !buildDeadlines.has(task)) buildDeadlines.set(task, nowMs() + totalBudgetMs);
+    // Scale the whole-pipeline ceiling for a --complexity large build so the scaled builder role (plus
+    // the usual roles + any retry) fits inside it rather than tripping the total budget mid-run.
+    const budgetMs = resolveTotalBudgetMs(totalBudgetMs, task.complexity);
+    if (budgetMs > 0 && !buildDeadlines.has(task)) buildDeadlines.set(task, nowMs() + budgetMs);
   }
   function budgetExceeded(task: WorkerTask): boolean {
     const deadline = buildDeadlines.get(task);
     return deadline !== undefined && nowMs() > deadline;
   }
 
+  /**
+   * BUILD-PATH DRIFT GOVERNOR (step 3). Consult the wired drift detector for the builder agent's
+   * reliability on this project, BEFORE any paid role runs. Returns the drifted reports for advisory
+   * attachment, plus a `blockReason` when the drift "block" policy fired (the caller turns that into a
+   * zero-cost rejection). FAIL-OPEN: any drift READ error is swallowed (empty result) — drift is
+   * advisory infrastructure and must never break a build. Only the drift POLICY (block) refuses, and
+   * only on genuine detected drift. Caller has already checked driftGovernor !== undefined.
+   */
+  async function checkBuildDrift(task: WorkerTask, builderAgentId: string): Promise<{ reports: DriftReport[]; blockReason?: string }> {
+    try {
+      const reports = (await driftGovernor!.check({ agent: builderAgentId, operation: BUILDER_OPERATION, project: task.targetRepo })).filter((r) => r.drifted);
+      return { reports };
+    } catch (err) {
+      if (err instanceof DriftBlockedError) {
+        const detail = err.reports
+          .map((r) => `${r.operation} recent ${Math.round(r.recentRate * 100)}% vs baseline ${Math.round(r.baselineRate * 100)}% (${r.severity ?? "minor"})`)
+          .join("; ");
+        const blockReason = `Refusing to build: builder reliability has drifted for this project — ${detail}. Held under the drift "block" policy; investigate the degradation or set IKBI_DRIFT_PREVENTION_POLICY=warn to proceed.`;
+        return { reports: [...err.reports], blockReason };
+      }
+      // Any OTHER error → fail open. A drift read failure must never break a build.
+      log.debug({ taskId: task.taskId, err: err instanceof Error ? err.message : String(err) }, "drift governor read failed — proceeding (fail-open)");
+      return { reports: [] };
+    }
+  }
+
   // The active run's mid-loop halt check, handed to the (real) builder so its loop can stop at
   // iteration granularity on a kill or budget overrun. Set at run() entry; builds are serial.
   let activeCheckHalt: (() => Promise<{ halt: boolean; reason?: string }>) | undefined;
 
+  // INJECTION SIGNAL (per-run): set by recordRole when the neutralization chokepoint blocked a tool
+  // result in ANY role this build. Read by recordBuildTrust to attribute it to the per-build trust
+  // outcome (trust is recorded per-build, not per-role — FIX A), so the NON-RECOVERABLE injection
+  // flag is set when the ladder is active. ALSO a fail-closed IN-RUN promote gate (below) so the
+  // OFFENDING build cannot promote — the trust demotion only affects FUTURE builds and is off by
+  // default. Reset at every run entry; builds are serial (like activeCheckHalt).
+  let injectionDetectedThisBuild = false;
+  // ENFORCEMENT subset (per-run): injection whose blocked content came from OUTSIDE the worktree
+  // (web/vision/delegate/brain/phone/unknown origin). ONLY this discards a green build and feeds the
+  // trust signal. Injection in the build's OWN worktree output (run_checks, file reads — e.g. ikbi's
+  // own injection-test fixtures when self-hosting) is neutralized-and-inert: recorded via
+  // injectionDetectedThisBuild for audit, but judged by effect, not enforced. See isExternalToolOrigin.
+  let externalInjectionDetectedThisBuild = false;
+  // POLICY-TAINT (per-run): set by recordRole when ANY builder ATTEMPT this build attempted an
+  // out-of-policy tool call. recordRole records the INITIAL builder BEFORE the retry/escalation
+  // blocks replace its result, so a later clean retry cannot LAUNDER the taint (the tainted
+  // attempt's writes may still be on disk in the shared worktree). A fail-closed in-run promote gate
+  // reads it, mirroring the auto-verify-rescue policy guard across every retry path.
+  let policyTaintedThisBuild = false;
+  // FIXER PREVENTED ATTEMPTS (per-run, A2/D3): the off-books last-mile FIXER pass's PREVENTED
+  // (governor-blocked) out-of-policy attempts. The fixer bypasses recordRole and its result never enters
+  // `results`, so these are collected here and (a) stamped onto the builder result before the integrator
+  // dispatches, feeding the review threshold + risk signal; (b) read directly by the run-summary risk
+  // telemetry, so they accrue as evidence even on failed runs that never reach the integrator. Reset at
+  // every run entry; builds are serial (like injectionDetectedThisBuild / policyTaintedThisBuild).
+  let fixerPreventedThisBuild: Array<Record<string, unknown>> = [];
+  // BUILD-PATH DRIFT (per-run, step 3): the advisory drifted reports the build-path governor surfaced
+  // for THIS build (reportOnly/warn policies). Recorded on the run-summary receipt so the reliability
+  // signal is auditable without a separate query. A "block" outcome never reaches here — it rejects the
+  // build at entry before any role runs. Reset at every run entry; builds are serial.
+  let buildDriftReports: DriftReport[] = [];
+
+  // Accumulate a builder attempt's security signals (injection / policy taint) into the per-run flags.
+  // recordRole does this for the roles it records; RETRY builders that bypass recordRole (the
+  // critic-fix loop, the verifier-driven fix loop, the critic-driven escalation) call this directly so
+  // an injection/taint on a RETRY still reaches the fail-closed in-run promote gate.
+  const noteBuilderSignals = (r: RoleResult): void => {
+    const d = (r.detail ?? {}) as Record<string, unknown>;
+    if (d.injectionDetected === true) injectionDetectedThisBuild = true;
+    if (d.externalInjectionDetected === true) externalInjectionDetectedThisBuild = true;
+    if (Array.isArray(d.policyViolations) && d.policyViolations.length > 0) policyTaintedThisBuild = true;
+  };
+
+  // The raw PREVENTED (governor-blocked) tool attempts a builder attempt recorded. Mirrors the
+  // integrator's source-of-truth precedence: the reclassified `policyViolations` set if present, else
+  // the fuller raw `rejectedToolCalls` set. Used to thread an off-books FIXER pass's prevented attempts
+  // into run-level risk accounting (A2/D3).
+  const preventedAttemptsOf = (r: RoleResult): Array<Record<string, unknown>> => {
+    const d = (r.detail ?? {}) as Record<string, unknown>;
+    if (Array.isArray(d.policyViolations)) return d.policyViolations as Array<Record<string, unknown>>;
+    if (Array.isArray(d.rejectedToolCalls)) return d.rejectedToolCalls as Array<Record<string, unknown>>;
+    return [];
+  };
+
   async function runRoleFn(role: WorkerRole, roleFn: RoleFn, ctx: RoleContext, timeoutOverrideMs?: number): Promise<RoleResult> {
-    const effectiveTimeout = timeoutOverrideMs ?? roleTimeoutMs;
-    if (!(effectiveTimeout > 0)) return roleFn(ctx);
+    // The BUILDER role's per-role race honors the --complexity-large wall-clock bump (same resolver the
+    // builder self-bounds with), so a large greenfield scaffold isn't cut off at the base 5-min timeout.
+    // Applied here — the one chokepoint every builder dispatch (main + fix/escalation retries) flows
+    // through — so every builder call site inherits the scaled deadline without threading it manually.
+    // An explicit override (the verifier's check-floored timeout) still wins.
+    const roleBaseTimeout = role === "builder" ? resolveBuilderTimeoutMs(roleTimeoutMs, ctx.task.complexity) : roleTimeoutMs;
+    const effectiveTimeout = timeoutOverrideMs ?? roleBaseTimeout;
+    // Phase 13: `builder` is the only candidate-MUTATING role (the fixer/escalation/cheap-retry all dispatch
+    // as "builder"); its timeout is a mutation fence, its clean completion supersedes a prior fence.
+    const fence = activeMutationFences.get(ctx.task.taskId);
+    const mutating = role === "builder";
+    if (!(effectiveTimeout > 0)) {
+      const r = await Promise.resolve(roleFn(ctx));
+      if (mutating && fence !== undefined) { if ((r.detail as Record<string, unknown> | undefined)?.timedOut === true) fence.recordMutatingTimeout(ctx.workspace.id); else if (r.outcome === "success") fence.recordCleanMutation(ctx.workspace.id); }
+      return r;
+    }
+    // COOPERATIVE CANCELLATION (Phase 13): an abort signal the role/tools/provider CAN honor to stop early.
+    // It is best-effort — a role that ignores it still cannot promote timed-out work (the fence below is the
+    // non-cooperative final authority). Threaded onto the RoleContext so honoring callers see it.
+    const controller = new AbortController();
+    const signalCtx: RoleContext = { ...ctx, signal: controller.signal };
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<RoleResult>((resolve) => {
-      timer = setTimeout(
-        () => resolve({ role, outcome: "failure", summary: `role "${role}" exceeded its ${effectiveTimeout}ms wall-clock timeout`, detail: { timedOut: true, timeoutMs: effectiveTimeout } }),
-        effectiveTimeout,
-      );
+      timer = setTimeout(() => {
+        controller.abort();
+        resolve({ role, outcome: "failure", summary: `role "${role}" exceeded its ${effectiveTimeout}ms wall-clock timeout`, detail: { timedOut: true, timeoutMs: effectiveTimeout } });
+      }, effectiveTimeout);
     });
     try {
-      return await Promise.race([Promise.resolve(roleFn(ctx)), timeout]);
+      const result = await Promise.race([Promise.resolve(roleFn(signalCtx)), timeout]);
+      // FENCE (non-cooperative): a mutating-role TIMEOUT quarantines this workspace's tree (the losing promise
+      // is uncancellable and may still write); a mutating-role CLEAN success supersedes a prior fence.
+      if (mutating && fence !== undefined) {
+        if ((result.detail as Record<string, unknown> | undefined)?.timedOut === true) fence.recordMutatingTimeout(ctx.workspace.id);
+        else if (result.outcome === "success") fence.recordCleanMutation(ctx.workspace.id);
+      }
+      return result;
     } finally {
       if (timer !== undefined) clearTimeout(timer);
     }
@@ -785,6 +1306,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   // for tests. When `competitiveModelList` is set, competitive mode races one candidate per
   // listed model; otherwise every candidate uses the single builder model (old behavior).
   const singleBuilderModel = deps.builderModel ?? builderModel();
+  // Phase 11: the escalation tier rosters (default: deployed config; injectable for deterministic tests).
+  const tierModels = deps.escalationTierModels ?? escalationConfig.tierModels;
+  // Phase 11B: the known cheap-tier vendor lanes (the duel pool). Used for the post-dispatch execution-identity
+  // check — a served model belonging to a DIFFERENT known lane than the attempt's is a genuine cross crossing.
+  const KNOWN_VENDOR_LANES = ["deepseek", "mimo"] as const;
   const competitiveModelList = deps.competitiveModels ?? competitiveBuilderModels();
   // TOURNAMENT candidate models (deps → config). A task's own `candidates` overrides both at run().
   const candidateModelList = deps.candidateModels ?? config.candidateModels ?? [];
@@ -794,36 +1320,38 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
    * competitive candidates) accumulates `response.cost.usd` into one running total. The
    * neutralization seam is passed through untouched. `cost()` reads the accumulated total.
    */
-  function makeCostingEngine(maxBudgetUsd?: number, effort?: "low" | "medium" | "high" | "max"): { engine: RoleEngine; cost: () => number } {
-    let total = 0;
-    let budgetExhausted = false;
-    const budget = maxBudgetUsd;
-    const costingEngine: RoleEngine = {
-      invokeModel: async (request: ModelRequest): Promise<ModelResponse> => {
-        if (budgetExhausted) {
-          throw Object.assign(new Error(`budget exhausted: cumulative cost exceeded $${budget?.toFixed(4)} cap`), { code: "BUDGET_EXHAUSTED" });
-        }
-        // Apply effort-level overrides to the model request (temperature, maxTokens)
-        // when the task specified --effort. These override role defaults.
-        const effortParams = effort !== undefined ? (() => { 
-          const { effortModelParams: emp } = require("./contract.js") as { effortModelParams: (e?: string) => { temperature: number; maxTokens: number } | undefined };
-          return emp(effort);
-        })() : undefined;
-        const effRequest = effortParams !== undefined
-          ? { ...request, temperature: effortParams.temperature, maxTokens: effortParams.maxTokens }
-          : request;
-        const r = await invokeModel(effRequest);
-        total += r.cost?.usd ?? 0;
-        if (budget !== undefined && total > budget && budget > 0) {
-          budgetExhausted = true;
-          const msg = `budget exhausted: cumulative cost $${total.toFixed(4)} exceeds $${budget.toFixed(4)} cap`;
-          throw Object.assign(new Error(msg), { code: "BUDGET_EXHAUSTED", costUsd: total, budgetUsd: budget });
-        }
-        return r;
-      },
+  function makeCostingEngine(taskId: string, maxBudgetUsd?: number, effort?: "low" | "medium" | "high" | "max"): { engine: RoleEngine; cost: () => number; addCost: (usd: number | undefined, meta?: { requestedAlias?: string; resolvedModel?: string; provider?: string; usage?: ModelResponse["usage"]; status?: InvocationStatus }) => string; ledger: InvocationLedger } {
+    // Phase 11: the invocation LEDGER is the execution source of truth. Every role invokes through
+    // `ledger.engine`; each call records one immutable invocation (resolved model/provider/lane/status/
+    // charged cost from the actual response). Cost/budget/status DERIVE from the unique records — a failed
+    // provider attempt that charged tokens is counted (ModelResponse.cost is only the serving attempt), and
+    // any unknown cost makes the aggregate `partial` (not silently zero).
+    const ledger = new InvocationLedger({
+      invokeModel,
       neutralizeUntrusted,
-    };
-    return { engine: costingEngine, cost: () => total };
+      runId: taskId,
+      taskId,
+      now: () => Date.now(),
+      ...(maxBudgetUsd !== undefined ? { maxBudgetUsd } : {}),
+      ...(effort !== undefined ? (() => { const p = effortModelParams(effort); return p !== undefined ? { effortParams: p } : {}; })() : {}),
+      // Vendor-lane membership follows the roster convention (id prefixed by the lane vendor). `laneMember`
+      // gates the PRE-dispatch block (a requested model must be in the attempt's lane); `servedOutOfLane`
+      // gates the POST-dispatch execution-identity check (a SERVED model belonging to a known OTHER lane is a
+      // genuine cross-vendor crossing — a generic/unknown served model is NOT flagged).
+      laneMember: (model: string, lane: string) => model.startsWith(lane),
+      servedOutOfLane: (model: string, lane: string) => KNOWN_VENDOR_LANES.some((l) => l !== lane && model.startsWith(l)),
+    });
+    // `addCost` folds an EXTERNAL raw-provider cost (e.g. the frontier consult) into the ledger as its own
+    // invocation record so it is counted once, and RETURNS its invocation id so the caller's receipt can
+    // reference the authoritative record (Phase 12). `meta` carries the consult's execution identity (model/
+    // provider/usage) so `lastFor` resolves it. The budget cap is DEFERRED — the caller enforces it after
+    // writing a durable receipt (so a BUDGET_EXHAUSTED throw can never skip the receipt; Gap B/A2).
+    const addCost = (usd: number | undefined, meta?: { requestedAlias?: string; resolvedModel?: string; provider?: string; usage?: ModelResponse["usage"]; status?: InvocationStatus }): string =>
+      ledger.recordExternal(
+        { role: "consult", stage: "frontier-consult", retryKind: "consult", ...(typeof usd === "number" ? { costUsd: Math.max(0, usd) } : {}), ...(meta ?? {}) },
+        { deferBudget: true },
+      );
+    return { engine: ledger.engine, cost: () => ledger.cost(), addCost, ledger };
   }
 
   /**
@@ -921,11 +1449,20 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     });
   }
 
-  /** The critic for THIS run. Honors injected tests, otherwise gives the critic workspace diff access. */
-  function criticFor(): RoleFn {
+  /** The critic for THIS run. Honors injected tests, otherwise gives the critic workspace diff access.
+   *  `laneModel` (Phase 11B) pins an attempt-bound critic to a lane-valid model. */
+  function criticFor(laneModel?: string): RoleFn {
     if (deps.roles?.critic !== undefined) return deps.roles.critic;
     return createCritic({
       ...(workspaces.diff !== undefined ? { diff: (ws: WorkspaceHandle) => workspaces.diff!(ws) } : {}),
+      // Phase 9: bind the semantic verdict to the tree the verifier certified. Real-critic only — an
+      // injected test double returns above, so this never perturbs the Phase 3 stale-tree read sequence.
+      resolveVerifiedTree: (ws: WorkspaceHandle) => readTreeHash(ws.path),
+      ...(laneModel !== undefined ? { modelOverride: laneModel } : {}),
+      // Phase 12 (REAUDIT-003): the production critic enforces the evidence package + substance-preserving
+      // recovery. Every real critic evaluation must cite resolvable evidence and its recovery must prove
+      // deterministic substance equivalence — an injected test double returns above and is unaffected.
+      enforceEvidenceSubstance: true,
     });
   }
 
@@ -1051,7 +1588,14 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       spawnedFrom: parent.agentId,
       ...(parent.sessionId !== undefined ? { sessionId: parent.sessionId } : {}),
     });
-    return { identity, kind: resolved.kind, autonomy: autonomyForTier(effectiveTier), validated: resolved };
+    // TRUST LADDER (default OFF for building): the trust tier must not GATE building. With the ladder
+    // off, verified-green work promotes regardless of tier — force autoCommit on. Everything else is
+    // left exactly as the tier dictates: `sandboxed`/`gateLevel` (execution confinement, enforced by
+    // governed-exec + the OS sandbox) AND `requiresApproval` (the SG-10 human gate) are UNCHANGED, so
+    // this lifts only the promotion friction, never a safety or operator control.
+    const grant = autonomyForTier(effectiveTier);
+    const autonomy: AutonomyGrant = trustLadderActive ? grant : { ...grant, autoCommit: true };
+    return { identity, kind: resolved.kind, autonomy, validated: resolved };
   }
 
   /** Record a role's outcome to receipts. Trust recording is opt-in (skipTrust=true skips it). */
@@ -1063,6 +1607,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     costUsd?: number,
     model?: string,
     skipTrust?: boolean,
+    invocationId?: string,
   ): Promise<void> {
     const status = toOutcomeStatus(result.outcome);
     const operation = `worker.role.${result.role}`;
@@ -1120,6 +1665,31 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // role receipt so the run-level audit trail records that stalls happened, alongside the
     // per-stall receipts the builder writes at detection time.
     const toolCallStalls = (result.detail as Record<string, unknown> | undefined)?.toolCallStalls;
+    // INJECTION SIGNAL: the neutralization chokepoint returned a `block` verdict on a tool result
+    // this role. It is ALWAYS recorded in the role receipt below (durable audit, independent of the
+    // trust ladder) and, when the ladder is active, attributed as signals.injection so the trust
+    // rules set the NON-RECOVERABLE injection flag — the marketed defense, wired detection→enforcement.
+    const injectionDetected = ((result.detail ?? {}) as Record<string, unknown>).injectionDetected === true;
+    const externalInjectionDetected = ((result.detail ?? {}) as Record<string, unknown>).externalInjectionDetected === true;
+    if (injectionDetected) {
+      injectionDetectedThisBuild = true; // audit: recorded in the role receipt regardless of origin
+      if (externalInjectionDetected) {
+        externalInjectionDetectedThisBuild = true; // ENFORCEMENT: carried to the per-build trust outcome + in-run promote gate
+        log.warn({ role: result.role, taskId: task.taskId, agentId: spawned.identity.agentId }, "INJECTION DETECTED (external origin) — chokepoint blocked a tool result; recorded as a trust signal + blocks promotion");
+      } else {
+        // Neutralized injection in the build's OWN worktree output (e.g. self-hosting test fixtures):
+        // the model never saw the raw text. Recorded for audit; judged by effect, not enforced.
+        log.warn({ role: result.role, taskId: task.taskId, agentId: spawned.identity.agentId }, "injection neutralized in the build's own worktree output — recorded for audit, judged by effect (not blocking promotion)");
+      }
+    }
+    // POLICY TAINT: a builder attempt that tried an out-of-policy tool call taints the whole build —
+    // captured HERE (recordRole runs on the INITIAL builder before any retry replaces its result), so
+    // a later clean retry can't launder it. Attempt-level, not the final integrator view.
+    if (result.role === "builder") {
+      const bd = (result.detail ?? {}) as Record<string, unknown>;
+      const pv = Array.isArray(bd.policyViolations) ? bd.policyViolations : [];
+      if (pv.length > 0) policyTaintedThisBuild = true;
+    }
 
     await receipts.append(
       {
@@ -1134,6 +1704,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           outcome: result.outcome,
           ...(costUsd !== undefined ? { costUsd } : {}),
           ...(model !== undefined ? { model } : {}),
+          // Phase 11B: link this execution receipt to its authoritative ledger invocation record.
+          ...(invocationId !== undefined ? { invocationId } : {}),
           ...(perfTrust !== undefined
             ? { performanceFailure: true, trustDecision: perfTrust.decision, trustDecisionReason: perfTrust.reason }
             : {}),
@@ -1141,6 +1713,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           ...(doneClaim?.fixRationale !== undefined ? { fixRationale: doneClaim.fixRationale } : {}),
           ...(Array.isArray(filesWritten) ? { filesChanged: filesWritten } : {}),
           ...(Array.isArray(toolCallStalls) && toolCallStalls.length > 0 ? { toolCallStalls } : {}),
+          ...(injectionDetected ? { injectionDetected: true } : {}),
         },
         project: task.targetRepo,
       },
@@ -1150,7 +1723,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // FIX A: per-build trust recording. When skipTrust is set, trust is recorded ONCE
     // after the build completes (worker.build) instead of per-role (worker.role.*).
     // This eliminates the cascade where one failed build = 3-4 consecutive failures.
-    if (skipTrust) return;
+    // TRUST LADDER OFF (default): build outcomes never move the worker's trust tier — skip the
+    // per-role trust signal entirely (the role receipt above still records the outcome for audit).
+    if (skipTrust || !trustLadderActive) return;
 
     if (suppressTrustSignal) {
       // EXPLICIT, auditable receipt for the autonomy decision: trust is deliberately left
@@ -1181,6 +1756,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         defaultTrustTier: spawned.identity.trustTier ?? TRUST_FLOOR,
         operation,
         status,
+        ...(externalInjectionDetected ? { signals: { injection: true } } : {}),
       },
       spawned.validated,
     );
@@ -1205,6 +1781,24 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     reason?: string,
   ): Promise<void> {
     if (workerSpawned === undefined) return;
+    // TRUST LADDER OFF (default): a build outcome must NOT move the worker's trust tier. Write one
+    // auditable receipt recording that the ladder was disabled (so the trail explains why trust did
+    // not move) and skip trust.recordOutcome entirely — no demotion, no promotion-streak. This is the
+    // fix for harness-caused demotion (an over-decomposition artifact or a blocked no-effect probe
+    // classified as a policy violation must never strip a worker's autonomy during building).
+    if (!trustLadderActive) {
+      await receipts.append(
+        {
+          operation: "worker.trust.ladder_disabled",
+          outcome: { status: "success", detail: `trust ladder OFF — build outcome "${status}" did not move worker trust (set IKBI_WORKER_MODEL_TRUST_LADDER=true to enable earned-trust demotion/promotion).${reason !== undefined ? ` (${reason})` : ""}` },
+          requestId: taskId,
+          metadata: { agentId: workerSpawned.identity.agentId, buildStatus: status, ...(reason !== undefined ? { reason } : {}) },
+          project: targetRepo,
+        },
+        workerSpawned.identity,
+      );
+      return;
+    }
     if (suppress) {
       await receipts.append(
         {
@@ -1225,9 +1819,560 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         defaultTrustTier: workerSpawned.identity.trustTier ?? TRUST_FLOOR,
         operation: "worker.build",
         status,
+        // Attribute an EXTERNAL-origin chokepoint injection (any role this build) to the trust outcome —
+        // the trust rules then set the NON-RECOVERABLE injection flag that blocks promotion while flagged.
+        // Own-worktree injection (neutralized-and-inert, e.g. self-hosting fixtures) is NOT a trust signal.
+        ...(externalInjectionDetectedThisBuild ? { signals: { injection: true } } : {}),
       },
       workerSpawned.validated,
     );
+  }
+
+  // ── CANONICAL PROMOTION AUTHORITY (Phase 3, IKBI-RT-004/005) ────────────────────────────────
+  // The SOLE caller of `workspaces.promote`. Every promotion-capable strategy (normal, duel primary/
+  // peer, tournament, competitive) submits a candidate + candidate-BOUND evidence here; no strategy
+  // promotes, marks completion, or emits a success receipt on its own. This is what makes the identity
+  // chain hold: generated == selected == verified == policy-evaluated == promoted == receipt candidate.
+  //
+  // The authority: (1) refuses unless the policy decision is promote AND the real gate-wall allowed;
+  // (2) STALE-TREE — re-reads the candidate's live tree and refuses if it no longer matches the tree
+  // that was verified (a post-verify/post-fix mutation, IKBI-RT-005); (3) binds `verifiedAgainst` so
+  // the workspace CAS also refuses a moved target / a landed tree ≠ the certified tree; (4) performs
+  // the one promote; (5) emits the canonical `worker.promotion` receipt carrying the full chain.
+  const readTreeHash: (workspacePath: string) => Promise<string | undefined> =
+    deps.readTreeHash ??
+    (async (workspacePath: string): Promise<string | undefined> => {
+      try {
+        return execFileSync("git", ["-C", workspacePath, "rev-parse", "HEAD^{tree}"], { encoding: "utf8", timeout: 10_000 }).trim();
+      } catch {
+        return undefined; // not a git worktree (e.g. an in-memory test workspace) — skip the tree check
+      }
+    });
+
+  // Is the workspace a REAL git worktree? (Phase 10, IKBI-REAUDIT-006.) `readTreeHash` returns undefined
+  // for BOTH "not a git worktree" and "a transient git-read error on a real worktree" — indistinguishable,
+  // so a read failure on a production workspace silently dropped the stale-tree + CAS enforcement. This
+  // probe distinguishes the two: a git-backed candidate must FAIL CLOSED when its tree cannot be read; a
+  // genuinely non-git (in-memory/test) workspace legitimately has no tree and is exempt.
+  const isGitBacked: (workspacePath: string) => Promise<boolean> =
+    deps.isGitBacked ??
+    (async (workspacePath: string): Promise<boolean> => {
+      try {
+        return execFileSync("git", ["-C", workspacePath, "rev-parse", "--is-inside-work-tree"], { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"] }).trim() === "true";
+      } catch {
+        return false; // not a git worktree
+      }
+    });
+
+  // FAIL-CLOSED TREE-IDENTITY RESOLVER (Phase 13, IKBI-REAUDIT2-002). Replaces the boolean "is git" decision
+  // for autonomous candidates: a git/process error may NOT be laundered into a non-git exemption. Precedence:
+  //   1. An injected `deps.resolveWorkspaceIdentity` (production wiring / tests) wins.
+  //   2. Else derive from the injected `deps.isGitBacked` + `deps.readTreeHash` (backward compatible — existing
+  //      tests inject these): git+readable ⇒ git; git+unreadable ⇒ indeterminate; not-git ⇒ proven non-git.
+  //   3. Else the default probes git ITSELF and classifies the error: a proven "not a git repository" is
+  //      non-git; a MISSING git binary / permission / timeout / other failure is INDETERMINATE (never non-git).
+  const resolveWorkspaceIdentity: (workspacePath: string) => Promise<WorkspaceIdentityResolution> =
+    deps.resolveWorkspaceIdentity ??
+    (async (workspacePath: string): Promise<WorkspaceIdentityResolution> => {
+      if (deps.isGitBacked !== undefined || deps.readTreeHash !== undefined) {
+        // Backward-compatible derivation from the (possibly injected) boolean probe. Classification only: a
+        // git worktree with an UNREADABLE tree is still git-backed — the downstream tree-identity gate fails it
+        // closed (Phase 10). `indeterminate` is reserved for a failed CLASSIFICATION (below / injected resolver).
+        const git = await isGitBacked(workspacePath);
+        if (!git) return { status: "resolved", backing: "non-git", identity: `nongit:${workspacePath}` };
+        const tree = await readTreeHash(workspacePath);
+        return { status: "resolved", backing: "git", identity: tree ?? "git:unreadable" };
+      }
+      // Default production resolver: one probe that DISTINGUISHES proven non-git from a git/process error, so a
+      // transient failure never launders a real worktree into a non-git exemption (IKBI-REAUDIT2-002).
+      let inside: string;
+      try {
+        inside = execFileSync("git", ["-C", workspacePath, "rev-parse", "--is-inside-work-tree"], { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "pipe"] }).trim();
+      } catch (err) {
+        const e = err as { code?: string; stderr?: Buffer | string; signal?: string; status?: number };
+        const stderr = typeof e.stderr === "string" ? e.stderr : e.stderr?.toString() ?? "";
+        // git could NOT run (missing binary / permission / timeout) ⇒ INDETERMINATE (fail-closed).
+        if (e.code === "ENOENT" || e.code === "EACCES" || e.code === "ETIMEDOUT" || e.signal === "SIGTERM") {
+          return { status: "indeterminate", error: `git identity probe could not run (${e.code ?? e.signal})` };
+        }
+        // git RAN and answered (nonzero exit with a diagnostic): a genuine non-repo, or a missing/degenerate
+        // path (an in-memory/test workspace), is PROVEN non-git and legitimately exempt.
+        // NOTE (IKBI-REAUDIT3-008): the strict "existing-accessible-dir only" classification is documented as
+        // OPEN in HANDOFF-FINAL-CONFORMANCE-REPAIR.md — it cannot be applied here without migrating the entire
+        // in-memory-workspace test corpus (incl. the production probe, which uses non-existent fake paths).
+        if (typeof e.status === "number" && (/not a git repository/i.test(stderr) || /cannot change to|no such file or directory|not a working tree/i.test(stderr))) {
+          return { status: "resolved", backing: "non-git", identity: `nongit:${workspacePath}` };
+        }
+        // git ran but failed for an unrecognized reason ⇒ INDETERMINATE (fail-closed).
+        return { status: "indeterminate", error: `git identity probe failed (${e.code ?? e.signal ?? `exit ${e.status ?? "?"}`})` };
+      }
+      if (inside !== "true") return { status: "resolved", backing: "non-git", identity: `nongit:${workspacePath}` };
+      const tree = await readTreeHash(workspacePath);
+      return { status: "resolved", backing: "git", identity: tree ?? "git:unreadable" };
+    });
+  /** Resolve a candidate's identity into the two authority fields: whether tree identity is required + whether it is indeterminate (fail-closed). */
+  const candidateIdentityFields = async (workspacePath: string): Promise<{ treeIdentityRequired: boolean; identityIndeterminate: boolean }> => {
+    const res = await resolveWorkspaceIdentity(workspacePath);
+    if (res.status === "indeterminate") return { treeIdentityRequired: true, identityIndeterminate: true };
+    return { treeIdentityRequired: res.backing === "git", identityIndeterminate: false };
+  };
+
+  // ── RUNTIME-TRUTH EVIDENCE (Phase 5) ────────────────────────────────────────────────────────────
+  // Resolve the production reader ONCE per orchestrator (an injected dep, else the configured dynamic
+  // module, else inert). Fail-closed: a missing/broken reader yields no evidence + an advisory receipt,
+  // never a fabricated success and never a build block. `requestRuntimeEvidence` builds a task/candidate-
+  // scoped request, reads → scope-filters → bounds the evidence, emits `worker.runtime_truth`, and
+  // returns the kept items for injection into the role's model context.
+  let runtimeTruthResolved: { reader: RuntimeTruthEvidenceReader } | { error: string } | undefined | "unresolved" = "unresolved";
+  const resolveRuntimeTruthReader = async (): Promise<{ reader: RuntimeTruthEvidenceReader } | { error: string } | undefined> => {
+    if (runtimeTruthResolved === "unresolved") {
+      try {
+        runtimeTruthResolved = await loadRuntimeTruthReader(deps.runtimeTruthReader, modeEnv);
+      } catch (err) {
+        runtimeTruthResolved = { error: `runtime-truth reader resolution failed: ${err instanceof Error ? err.message : String(err)}` };
+      }
+    }
+    return runtimeTruthResolved;
+  };
+  const requestRuntimeEvidence = async (
+    task: WorkerTask,
+    role: WorkerRole,
+    workspace: WorkspaceHandle,
+    identity: AgentIdentity,
+    binding: { attemptId?: string; candidateId?: string; needsVerifiedTree?: boolean; strategy?: string },
+  ): Promise<readonly RuntimeEvidence[]> => {
+    // Off + no dep + not configured ⇒ fully inert: no reader call, NO extra tree read, no receipt.
+    const resolved = await resolveRuntimeTruthReader();
+    if (resolved === undefined) return [];
+    // Compute the candidate's verified tree ONLY when a reader is active (so a disabled build makes no
+    // extra readTreeHash call — it must not perturb the Phase 3 stale-tree tree-read sequence).
+    const verifiedTree = binding.needsVerifiedTree === true ? await readTreeHash(workspace.path) : undefined;
+    const scope: EvidenceRequestScope = {
+      taskId: task.taskId,
+      repo: task.targetRepo,
+      role,
+      ...(binding.attemptId !== undefined ? { attemptId: binding.attemptId } : {}),
+      workspaceId: workspace.id,
+      ...(binding.candidateId !== undefined ? { candidateId: binding.candidateId } : {}),
+      ...(verifiedTree !== undefined ? { verifiedTree } : {}),
+      ...(binding.strategy !== undefined ? { strategy: binding.strategy } : {}),
+      now: Date.now(),
+      freshnessWindowMs: resolveFreshnessWindowMs(modeEnv),
+    };
+    let kept: readonly RuntimeEvidence[] = [];
+    let omitted: { id: string; reason: string }[] = [];
+    let truncated = false;
+    let error: string | undefined = (resolved as { error?: string }).error;
+    if ("reader" in resolved) {
+      try {
+        const raw = await Promise.resolve(resolved.reader.readEvidence(scope));
+        const bounded = filterAndBoundEvidence(raw ?? [], scope, resolveEvidenceLimits(modeEnv));
+        kept = bounded.kept;
+        omitted = bounded.omitted;
+        truncated = bounded.truncated;
+      } catch (err) {
+        // Reader execution failure is ADVISORY: no evidence, a truthful operational status, no block,
+        // no candidate-defect classification, no duel. The build proceeds unchanged.
+        error = `runtime-truth reader execution failed: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    }
+    // TRUTHFUL RECEIPT: `injected` is exactly `kept.length > 0` because the builder/critic
+    // DETERMINISTICALLY inject `ctx.runtimeEvidence` whenever it is present (the orchestrator sets it
+    // only when kept is non-empty). The conformance tests assert the actual provider request carries
+    // the evidence, so a receipt claiming injection can never diverge from the model context.
+    try {
+      await receipts.append(
+        {
+          operation: "worker.runtime_truth",
+          outcome: { status: error !== undefined ? "failure" : "success", ...(error !== undefined ? { detail: error } : {}) },
+          requestId: task.taskId,
+          metadata: {
+            taskId: task.taskId, role, readerId: "reader" in resolved ? resolved.reader.id : undefined,
+            enabled: runtimeTruthEvidenceEnabled(modeEnv) || deps.runtimeTruthReader !== undefined,
+            requestScope: { taskId: scope.taskId, repo: scope.repo, role, ...(scope.candidateId !== undefined ? { candidateId: scope.candidateId } : {}), ...(scope.verifiedTree !== undefined ? { verifiedTree: scope.verifiedTree } : {}) },
+            keptCount: kept.length, keptIds: kept.map((e) => e.id), omittedCount: omitted.length, omitted, truncated, injected: kept.length > 0,
+            ...(error !== undefined ? { error } : {}),
+          },
+          project: task.targetRepo,
+        },
+        identity,
+      );
+    } catch { /* receipt failure must never break the build */ }
+    return kept;
+  };
+
+  interface CanonicalPromotionResult {
+    readonly promote: PromoteResult;
+    /** Set when the authority REFUSED before/at promote (policy, governance, stale-tree, or semantic). */
+    readonly blockedReason?: string;
+    /** True when the refusal was a stale-tree / post-verify mutation (candidate ≠ verified). */
+    readonly staleTree?: boolean;
+    /** True when the refusal was the semantic policy gate (a non-pass / unevaluated verdict). */
+    readonly semanticWithheld?: boolean;
+    /** True when the refusal was the executed-test / verification evidence gate (Phase 10). */
+    readonly evidenceWithheld?: boolean;
+    /** True when the refusal was an unenforceable tree identity on a git-backed candidate (Phase 10). */
+    readonly treeIdentityUnavailable?: boolean;
+    /** True when the refusal was a timed-out candidate-mutating role fence (Phase 13, IKBI-REAUDIT2-001). */
+    readonly mutationFenced?: boolean;
+    /** True when the refusal was an indeterminate tree-identity resolution (Phase 13, IKBI-REAUDIT2-002). */
+    readonly identityIndeterminate?: boolean;
+    /** Post-REAUDIT3: true when autonomous promotion is QUARANTINED (opt-in off, or gate bypass active). */
+    readonly quarantined?: boolean;
+  }
+
+  async function promoteCandidate(
+    handle: WorkspaceHandle,
+    candidate: PromotionCandidate,
+    evidence: CandidateEvidence,
+    parentIdentity: AgentIdentity,
+  ): Promise<CanonicalPromotionResult> {
+    const noPromote = (reason: string, extra?: Record<string, unknown>): PromoteResult => ({
+      promoted: false,
+      workspaceId: handle.id,
+      targetBranch: handle.baseBranch,
+      beforeRef: candidate.targetHead ?? handle.baseRef,
+      reason,
+      ...extra,
+    });
+    // (0) AUTONOMOUS-PROMOTION QUARANTINE (post-REAUDIT3 final containment). The Critical immutable
+    // tested-subject invariant (IKBI-REAUDIT3-001) remains architecturally OPEN, so autonomous promotion is
+    // DISABLED BY DEFAULT for EVERY strategy (normal / duel / competitive / tournament / multi-step / fixer).
+    // It may land ONLY when the operator explicitly opts in (`IKBI_ENABLE_AUTONOMOUS_PROMOTION=true`) AND the
+    // gate-wall veto is NOT administratively bypassed. Candidate generation / verification / criticism /
+    // receipts / reports all still run; the candidate simply does not land unattended. Manual `/apply` remains
+    // a separately-classified operator-directed path. This is the canonical authority chokepoint — no strategy
+    // can bypass it.
+    const autonomyOptIn = deps.autonomousPromotionEnabled ?? resolveAutonomousPromotionEnabled();
+    const gateBypassActive = evidence.governance.bypass === true;
+    if (!autonomyOptIn || gateBypassActive) {
+      const why = gateBypassActive
+        ? "gate-wall bypass is active — an administratively-bypassed gate can never autonomously land"
+        : `autonomous promotion is disabled by default (set ${AUTONOMOUS_PROMOTION_ENV}=true to opt in once the immutable tested-subject invariant is verified for your workflow)`;
+      const reason = `autonomous promotion QUARANTINED: ${why}. Operator review required — use manual /apply (manual-unverified) to land after review. The critical immutable tested-subject invariant (IKBI-REAUDIT3-001) remains OPEN — see IKBI-RUNTIME-CONFORMANCE-REAUDIT-3.md.`;
+      await receipts.append(
+        {
+          operation: "worker.promotion.quarantined",
+          outcome: { status: "failure", detail: reason },
+          requestId: candidate.taskId,
+          metadata: {
+            taskId: candidate.taskId, attemptId: candidate.attemptId, strategy: candidate.strategy, workspaceId: candidate.workspaceId,
+            autonomousPromotionQuarantined: true, operatorReviewRequired: true, openFinding: "IKBI-REAUDIT3-001",
+            autonomousPromotionEnabled: autonomyOptIn,
+            ...(gateBypassActive ? { gateBypassed: true, gateAuthority: "administratively-bypassed" } : {}),
+            governedLandedSuccessTrustAwarded: false,
+          },
+          project: handle.targetRepo,
+        },
+        parentIdentity,
+      ).catch(() => {});
+      log.warn({ taskId: candidate.taskId, strategy: candidate.strategy, autonomyOptIn, gateBypassActive }, "canonical promotion: QUARANTINED — autonomous promotion withheld; operator review required (IKBI-REAUDIT3-001 open)");
+      return { promote: noPromote(reason), blockedReason: reason, quarantined: true };
+    }
+    // (1) POLICY + GOVERNANCE must both authorize — defense in depth (callers already gate these).
+    if (!evidence.policyPromote) return { promote: noPromote("policy declined promotion"), blockedReason: "policy declined promotion" };
+    if (evidence.governance.allow !== true) {
+      return { promote: noPromote(evidence.governance.reason ?? "governance denied promotion"), blockedReason: "governance denied" };
+    }
+    // (1b) SEMANTIC POLICY (Phase 4): only a semantic `pass` is autonomously promotable. `not-evaluated`
+    // promotes only when policy explicitly marks semantic evaluation optional for this candidate;
+    // `fail`/`incomplete`/`indeterminate`/`infrastructure-failure` never autonomously promote. This is
+    // the gate that stops a tournament/competitive winner from promoting as `not-evaluated` by default.
+    if (!semanticPromotionEligible(evidence.semanticKind, evidence.semanticEvaluationOptional === true)) {
+      const reason = `semantic policy: a "${evidence.semanticKind}" verdict is not autonomously promotable (only a semantic pass is; not-evaluated requires explicit optional policy)`;
+      await receipts.append(
+        {
+          operation: "worker.promotion.semantic_withheld",
+          outcome: { status: "failure", detail: reason },
+          requestId: candidate.taskId,
+          metadata: { taskId: candidate.taskId, attemptId: candidate.attemptId, strategy: candidate.strategy, workspaceId: candidate.workspaceId, semanticVerdict: evidence.semanticKind, semanticEvaluationOptional: evidence.semanticEvaluationOptional === true },
+          project: handle.targetRepo,
+        },
+        parentIdentity,
+      );
+      log.warn({ taskId: candidate.taskId, strategy: candidate.strategy, semanticVerdict: evidence.semanticKind }, "canonical promotion: SEMANTIC withheld — non-pass verdict is not autonomously promotable");
+      return { promote: noPromote(reason), blockedReason: reason, semanticWithheld: true };
+    }
+    // (1c) VERIFICATION + EXECUTED-TEST EVIDENCE (Phase 10, IKBI-REAUDIT-001). The AUTHORITY itself — not
+    // only the integrator — requires authentic candidate-bound verification evidence, so NO path (normal,
+    // multi-step final, tournament, competitive, adjudication) can autonomously promote without it. The
+    // deterministic verifier must be green, AND real `executed` test evidence must exist (a no-tests
+    // `absent` tree promotes only under an explicit policy; `zero`/`unverified`/missing always block).
+    const evidenceWithheld = async (reason: string, detail: Record<string, unknown>): Promise<CanonicalPromotionResult> => {
+      await receipts.append(
+        {
+          operation: "worker.promotion.evidence_withheld",
+          outcome: { status: "failure", detail: reason },
+          requestId: candidate.taskId,
+          metadata: { taskId: candidate.taskId, attemptId: candidate.attemptId, strategy: candidate.strategy, workspaceId: candidate.workspaceId, ...detail },
+          project: handle.targetRepo,
+        },
+        parentIdentity,
+      ).catch(() => {});
+      log.warn({ taskId: candidate.taskId, strategy: candidate.strategy, reason }, "canonical promotion: EVIDENCE withheld — no authentic executed verification evidence");
+      return { promote: noPromote(reason), blockedReason: reason, evidenceWithheld: true };
+    };
+    if (evidence.verificationPassed !== true) {
+      return evidenceWithheld("verification did not pass — the deterministic verifier is not green; refusing autonomous promotion", { verificationPassed: evidence.verificationPassed });
+    }
+    const testDecision = evaluateExecutedTestEvidence(evidence.testEvidence, { allowNoTests: evidence.noTestsAcceptable === true });
+    if (!testDecision.acceptable) {
+      return evidenceWithheld(`executed-test evidence not acceptable for autonomous promotion (${testDecision.reason}) — a green with test evidence "${testDecision.state}" proved nothing about behavior`, { testEvidence: testDecision.state, testEvidenceReason: testDecision.reason, noTestsAcceptable: evidence.noTestsAcceptable === true });
+    }
+    // (1b) MUTATION FENCE (Phase 13, IKBI-REAUDIT2-001) — a candidate-mutating role TIMED OUT on this
+    // workspace and was not superseded by a clean generation. `runRoleFn` cannot cancel the losing promise,
+    // so the promotable tree may contain post-timeout writes the executed tests never observed. Fail-closed:
+    // timed-out work is quarantined, never autonomously promoted (it may be retained for manual inspection).
+    if (candidate.mutationFenced === true) {
+      const reason = `mutation-fence: a candidate-mutating role timed out on ${candidate.attemptId} and its uncancellable work was not superseded by a clean generation — refusing to promote a tree that may contain post-timeout writes the tests never saw`;
+      await receipts.append(
+        {
+          operation: "worker.promotion.superseded_mutation",
+          outcome: { status: "failure", detail: reason },
+          requestId: candidate.taskId,
+          metadata: { taskId: candidate.taskId, attemptId: candidate.attemptId, strategy: candidate.strategy, workspaceId: candidate.workspaceId },
+          project: handle.targetRepo,
+        },
+        parentIdentity,
+      ).catch(() => {});
+      log.warn({ taskId: candidate.taskId, attemptId: candidate.attemptId }, "canonical promotion: MUTATION-FENCE — timed-out candidate-mutating role; promote refused (fail-closed)");
+      return { promote: noPromote(reason, { strategy: "noop" }), blockedReason: reason, mutationFenced: true };
+    }
+    // (1c) TREE-IDENTITY INDETERMINATE (Phase 13, IKBI-REAUDIT2-002) — a git/process probe error that CANNOT
+    // prove the workspace is genuinely non-git. It must NOT be laundered into a non-git exemption (which would
+    // silently waive stale-tree + CAS). Fail-closed: an unresolved identity blocks autonomous promotion.
+    if (candidate.identityIndeterminate === true) {
+      const reason = `identity-indeterminate: the candidate workspace's tree identity could not be resolved (git/process probe error) — refusing to promote without an enforceable identity (a probe error must never waive stale-tree/CAS)`;
+      await receipts.append(
+        {
+          operation: "worker.promotion.identity_indeterminate",
+          outcome: { status: "failure", detail: reason },
+          requestId: candidate.taskId,
+          metadata: { taskId: candidate.taskId, attemptId: candidate.attemptId, strategy: candidate.strategy, workspaceId: candidate.workspaceId },
+          project: handle.targetRepo,
+        },
+        parentIdentity,
+      ).catch(() => {});
+      log.warn({ taskId: candidate.taskId, attemptId: candidate.attemptId }, "canonical promotion: IDENTITY-INDETERMINATE — probe error; promote refused (fail-closed)");
+      return { promote: noPromote(reason, { strategy: "noop" }), blockedReason: reason, identityIndeterminate: true };
+    }
+    // (2) TREE IDENTITY (Phase 10, IKBI-REAUDIT-006) — fail CLOSED when a git-backed candidate's tree
+    // identity is unavailable. Reading undefined is legitimate ONLY for a genuinely non-git (in-memory/
+    // test) workspace; on a real git worktree a missing verified tree OR an unreadable live tree means we
+    // cannot establish an enforceable identity, so the stale-tree + CAS binding would silently disappear.
+    const currentTree = await readTreeHash(candidate.workspacePath);
+    if (candidate.treeIdentityRequired === true && (candidate.verifiedTree === undefined || currentTree === undefined)) {
+      const which = candidate.verifiedTree === undefined ? "no verified tree was captured at verification time" : "the candidate's live tree is unreadable at promote time";
+      const reason = `tree-identity: ${which} on a git-backed candidate — refusing to promote without an enforceable tree identity (stale-tree/CAS cannot be established)`;
+      await receipts.append(
+        {
+          operation: "worker.promotion.tree_identity_unavailable",
+          outcome: { status: "failure", detail: reason },
+          requestId: candidate.taskId,
+          metadata: { taskId: candidate.taskId, attemptId: candidate.attemptId, strategy: candidate.strategy, workspaceId: candidate.workspaceId, verifiedTree: candidate.verifiedTree ?? null, liveTree: currentTree ?? null },
+          project: handle.targetRepo,
+        },
+        parentIdentity,
+      ).catch(() => {});
+      log.warn({ taskId: candidate.taskId, attemptId: candidate.attemptId }, "canonical promotion: TREE-IDENTITY unavailable on a git-backed candidate — promote refused (fail-closed)");
+      return { promote: noPromote(reason, { strategy: "noop" }), blockedReason: reason, treeIdentityUnavailable: true };
+    }
+    // (2b) STALE-TREE: the candidate that is promoted must be the exact candidate that was verified.
+    if (candidate.verifiedTree !== undefined && currentTree !== undefined && currentTree !== candidate.verifiedTree) {
+      const reason = `stale-tree: candidate ${candidate.attemptId} changed since verification (verified tree ${candidate.verifiedTree}, live tree ${currentTree}) — refusing to promote unverified work`;
+      await receipts.append(
+        {
+          operation: "worker.promotion.stale_tree",
+          outcome: { status: "failure", detail: reason },
+          requestId: candidate.taskId,
+          metadata: { taskId: candidate.taskId, attemptId: candidate.attemptId, strategy: candidate.strategy, workspaceId: candidate.workspaceId, verifiedTree: candidate.verifiedTree, liveTree: currentTree },
+          project: handle.targetRepo,
+        },
+        parentIdentity,
+      );
+      log.warn({ taskId: candidate.taskId, attemptId: candidate.attemptId, verifiedTree: candidate.verifiedTree, liveTree: currentTree }, "canonical promotion: STALE-TREE — candidate mutated since verification; promote refused");
+      return { promote: noPromote(reason, { strategy: "noop" }), blockedReason: reason, staleTree: true };
+    }
+    // (3) HASH-BOUND authorization for the workspace CAS (moved target / landed tree ≠ certified tree).
+    const verifiedAgainst =
+      candidate.verifiedTree !== undefined && candidate.targetHead !== undefined
+        ? { targetHead: candidate.targetHead, integratedTree: candidate.verifiedTree }
+        : undefined;
+    // (4) THE promote — the only `workspaces.promote` call in the module.
+    const result = await workspaces.promote(handle, {
+      evaluation: evidence.evaluation,
+      governance: evidence.governance,
+      message: evidence.message,
+      requestId: candidate.taskId,
+      ...(verifiedAgainst !== undefined ? { verifiedAgainst } : {}),
+    });
+    // (5) CANONICAL PROMOTION RECEIPT — the full identity chain, for every strategy uniformly.
+    await receipts.append(
+      {
+        operation: "worker.promotion",
+        outcome: { status: result.promoted ? "success" : "failure", ...(result.reason !== undefined ? { detail: result.reason } : {}) },
+        requestId: candidate.taskId,
+        metadata: {
+          taskId: candidate.taskId,
+          attemptId: candidate.attemptId,
+          strategy: candidate.strategy,
+          workspaceId: candidate.workspaceId,
+          ...(candidate.model !== undefined ? { model: candidate.model } : {}),
+          ...(candidate.vendorLane !== undefined ? { vendorLane: candidate.vendorLane } : {}),
+          ...(candidate.verifiedTree !== undefined ? { verifiedTree: candidate.verifiedTree } : {}),
+          // FROZEN SUBJECT (Phase 13B): the immutable snapshot id + digest all evidence binds to. The stale-tree
+          // + CAS above/below confirm the promoted content equals exactly this frozen subject.
+          ...(candidate.snapshotId !== undefined ? { snapshotId: candidate.snapshotId, snapshotDigest: candidate.snapshotDigest } : {}),
+          // PHYSICAL FROZEN SUBJECT (Phase 13C): the isolated read-only snapshot path + immutability. Promotion
+          // sources exactly this frozen tree; the CAS confirms landedTree == the snapshot digest.
+          ...(candidate.snapshotPath !== undefined ? { snapshotPath: candidate.snapshotPath, snapshotImmutable: candidate.snapshotImmutable === true, snapshotKind: "physical-isolated" } : (candidate.snapshotId !== undefined ? { snapshotKind: "logical" } : {})),
+          verificationPassed: evidence.verificationPassed,
+          ...(evidence.verificationMode !== undefined ? { verificationMode: evidence.verificationMode } : {}),
+          semanticVerdict: evidence.semanticKind,
+          ...(evidence.semanticEvaluationId !== undefined ? { semanticEvaluationId: evidence.semanticEvaluationId } : {}),
+          policyPromote: evidence.policyPromote,
+          gateWallAllowed: evidence.governance.allow,
+          // TRUTHFUL GATE AUTHORITY (Phase 13, IKBI-REAUDIT2-008): when the allow came from the operator BYPASS
+          // Post-REAUDIT3: a gate-BYPASSED autonomous promote can no longer reach this actual-promote receipt —
+          // it is refused earlier by the quarantine gate (0) and recorded as `worker.promotion.quarantined`
+          // with `gateAuthority: "administratively-bypassed"`. So any promote that lands here is policy-evaluated.
+          gateAuthority: "policy-evaluated",
+          staleTreeChecked: candidate.verifiedTree !== undefined && currentTree !== undefined,
+          promoted: result.promoted,
+          ...(result.afterRef !== undefined ? { landedRef: result.afterRef } : {}),
+          ...(evidence.rationale !== undefined ? { rationale: evidence.rationale } : {}),
+        },
+        project: handle.targetRepo,
+      },
+      parentIdentity,
+    );
+    return { promote: result };
+  }
+
+  /**
+   * DURABLE SEMANTIC EVIDENCE (Phase 9, IKBI-RT-006). Persist the FULL validated semantic evaluation for a
+   * final critic result — not just the KIND, but the complete validated blocking-defect set, missing
+   * requirements, advisories, the structured-output recovery trail, and the policy consequence. This is
+   * what the fixer, operator, and a later audit read to know WHY a candidate was rejected (the promotion
+   * receipt records the `semanticEvaluationId` and never has to duplicate the defect set). Persists ONLY
+   * parser-VALIDATED defects (the parser already dropped malformed/generic/cross-candidate/invented ones)
+   * and a raw-output HASH (never the raw model output). Best-effort: a receipt failure never breaks a build.
+   * Returns the stable `semanticEvaluationId`, or undefined when no model critic produced a verdict.
+   */
+  async function emitSemanticEvidence(
+    criticResult: RoleResult | undefined,
+    binding: { taskId: string; attemptId: string; candidateId: string; verifiedTree?: string; strategy: string; verificationPassed: boolean; targetRepo: string },
+    parentIdentity: AgentIdentity,
+    ledger?: InvocationLedger,
+  ): Promise<string | undefined> {
+    if (criticResult === undefined) return undefined;
+    const d = (criticResult.detail ?? {}) as Record<string, unknown>;
+    const sv = d.semanticVerdict as SemanticVerdict | undefined;
+    if (typeof sv !== "object" || sv === null || typeof sv.kind !== "string") return undefined;
+    const semanticEvaluationId = `${binding.candidateId}:${binding.verifiedTree ?? "novt"}:sem`;
+    const recoveryInvoked = d.recoveryInvoked === true;
+    // Distinct RECOVERY receipt (Phase 9/11C): the ONE model-backed reformat call. Its execution identity
+    // (invocation id / resolved model / provider / lane / lifecycle / usage / cost / cost status) DERIVES from
+    // the ledger's structured-recovery invocation record — never the configured critic fields. Emitted only
+    // when recovery actually ran. Missing link → an explicit integrity error, never a fabricated/config id.
+    if (recoveryInvoked) {
+      const recRec = ledger?.lastFor("critic", "structured-recovery");
+      try {
+        await receipts.append(
+          recRec !== undefined
+            ? {
+                operation: "worker.critic_recovery",
+                outcome: { status: d.recoveryOutcome === "repaired" ? "success" : "failure", detail: String(d.recoveryOutcome ?? "") },
+                requestId: binding.taskId,
+                metadata: {
+                  semanticEvaluationId, taskId: binding.taskId, attemptId: binding.attemptId, candidateId: binding.candidateId,
+                  invocationId: recRec.invocationId, recoveryModel: recRec.requestedAlias ?? recRec.resolvedModel, dispatchedModel: recRec.requestedAlias ?? recRec.resolvedModel,
+                  ...(recRec.resolvedModel !== undefined ? { servedModel: recRec.resolvedModel } : {}),
+                  ...(recRec.provider !== undefined ? { provider: recRec.provider } : {}),
+                  ...(recRec.vendorLane !== undefined ? { vendorLane: recRec.vendorLane } : {}),
+                  lifecycle: recRec.status, ...(recRec.usage !== undefined ? { usage: recRec.usage } : {}),
+                  costUsd: recRec.costUsd, costStatus: recRec.costStatus,
+                  outcome: d.recoveryOutcome, rejectReason: d.recoveryRejectReason ?? d.recoveryFailReason,
+                  eligibilityReason: d.recoveryEligibilityReason, finalVerdict: sv.kind,
+                },
+                project: binding.targetRepo,
+              }
+            : {
+                // INTEGRITY ERROR (Phase 11C): the critic reported a recovery but no ledger invocation backs it.
+                // Emit a truthful integrity-error record — do NOT fabricate an id or fall back to configured fields.
+                operation: "worker.critic_recovery.integrity_error",
+                outcome: { status: "failure", detail: "recovery claimed but no structured-recovery invocation record found in the ledger" },
+                requestId: binding.taskId,
+                metadata: { semanticEvaluationId, taskId: binding.taskId, attemptId: binding.attemptId, candidateId: binding.candidateId, integrityError: "recovery-invocation-not-found", outcome: d.recoveryOutcome, finalVerdict: sv.kind },
+                project: binding.targetRepo,
+              },
+          parentIdentity,
+        );
+      } catch { /* receipt failure must never break the build */ }
+    }
+    try {
+      await receipts.append(
+        {
+          operation: "worker.semantic",
+          outcome: { status: sv.kind === "pass" ? "success" : "failure", detail: sv.summary },
+          requestId: binding.taskId,
+          metadata: {
+            semanticEvaluationId,
+            taskId: binding.taskId, attemptId: binding.attemptId, candidateId: binding.candidateId,
+            ...(binding.verifiedTree !== undefined ? { verifiedTree: binding.verifiedTree } : {}),
+            strategy: binding.strategy,
+            verificationPassed: binding.verificationPassed,
+            verdict: sv.kind,
+            ...(sv.evaluatorModel !== undefined ? { evaluatorModel: sv.evaluatorModel } : {}),
+            criticModel: sv.evaluatorModel,
+            parseStatus: sv.parseStatus,
+            summary: sv.summary,
+            blockingDefects: sv.blockingDefects, // FULL parser-validated set (Phase 9)
+            missingRequirements: sv.incompleteRequirements,
+            advisories: sv.advisories,
+            ...(typeof d.rawOutputHash === "string" ? { rawOutputHash: d.rawOutputHash } : {}),
+            // EXECUTION LINKAGE (Phase 12): the PRIMARY critic invocation the verdict came from (from the
+            // ledger — the main-loop "role" stage or the competitive/tournament "candidate-role" stage), so an
+            // auditor can reconcile the semantic verdict to the exact model invocation + evidence package.
+            ...((ledger?.lastFor("critic", "role") ?? ledger?.lastFor("critic", "candidate-role")) !== undefined
+              ? { primaryCriticInvocationId: (ledger!.lastFor("critic", "role") ?? ledger!.lastFor("critic", "candidate-role"))!.invocationId }
+              : {}),
+            // EVIDENCE + SUBSTANCE PROVENANCE (Phase 12): a bounded, reconstructable record of the evidence
+            // package the critic cited, the deterministic pre-recovery fingerprint, and the recovery equivalence
+            // outcome — never the raw output. Present only for an enforcing critic.
+            ...(d.evidenceEnforced === true ? { evidenceEnforced: true } : {}),
+            ...(typeof d.evidencePackageHash === "string" ? { evidencePackageHash: d.evidencePackageHash } : {}),
+            ...(typeof d.substanceFingerprintHash === "string" ? { substanceFingerprintHash: d.substanceFingerprintHash } : {}),
+            ...(typeof d.recoveredOutputHash === "string" ? { recoveredOutputHash: d.recoveredOutputHash } : {}),
+            ...(d.equivalenceOk !== undefined ? { recoveryEquivalence: d.equivalenceOk } : {}),
+            ...(Array.isArray(d.equivalenceMismatches) ? { recoveryEquivalenceMismatches: d.equivalenceMismatches } : {}),
+            recoveryInvoked,
+            ...(d.recoveryEligible !== undefined ? { recoveryEligible: d.recoveryEligible } : {}),
+            ...(d.recoveryOutcome !== undefined ? { recoveryOutcome: d.recoveryOutcome } : {}),
+            ...(d.recoveryInvocationId !== undefined ? { recoveryInvocationId: d.recoveryInvocationId } : {}),
+            ...(d.recoveryModel !== undefined ? { recoveryModel: d.recoveryModel } : {}),
+            ...(d.recoveryCostUsd !== undefined ? { recoveryCostUsd: d.recoveryCostUsd, recoveryCostStatus: d.recoveryCostStatus } : {}),
+            // EVIDENCE RELEVANCE PROVENANCE (Phase 15): the support-matrix rule applied to each VALIDATED defect
+            // (category + support kind + cited evidence authority classes) and the reasons unsupported defects
+            // were REJECTED (candidate-anchor-only, off-goal requirement, unfailed check, style-without-policy).
+            ...(Array.isArray(sv.blockingDefects) && sv.blockingDefects.length > 0
+              ? { supportMatrix: sv.blockingDefects.map((bd) => ({ ...(bd.category !== undefined ? { category: bd.category } : {}), ...(bd.supportKind !== undefined ? { supportKind: bd.supportKind } : {}), ...(bd.evidenceIds !== undefined ? { evidenceIds: bd.evidenceIds } : {}) })) }
+              : {}),
+            ...(Array.isArray(sv.rejectedDefects) && sv.rejectedDefects.length > 0 ? { rejectedDefects: sv.rejectedDefects } : {}),
+            ...(sv.evidenceEnforced === true ? { evidenceEnforcedVerdict: true } : {}),
+            // POLICY CONSEQUENCE: the downstream decisions this verdict authorizes — derived from the EFFECTIVE
+            // decision kind (a no-package fail/incomplete is downgraded to indeterminate, Phase 15) so the receipt
+            // matches the actual promotion/duel/fixer gates.
+            promotionEligible: semanticPromotionEligible(effectiveDecisionKind(sv), false),
+            duelEligible: semanticDuelEligible(effectiveDecisionKind(sv)),
+            fixerEligible: effectiveDecisionKind(sv) === "fail" || effectiveDecisionKind(sv) === "incomplete",
+          },
+          project: binding.targetRepo,
+        },
+        parentIdentity,
+      );
+    } catch { /* receipt failure must never break the build */ }
+    return semanticEvaluationId;
   }
 
   /** Cooperative kill checkpoint: does an active kill target THIS run? (read-only; never publishes). */
@@ -1240,21 +2385,27 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     return undefined;
   }
 
-  // ── AUTO-VERIFY RESCUE HELPER ────────────────────────────────────────────────
-  // Extracted so every orchestrator path (single-run, competitive, tournament) can
-  // rescue a builder that wrote correct code but hit a protocol termination (no_progress,
-  // max_iterations, timeout, stuck_detected) before ever calling run_checks.
+  // ── AUTO-VERIFY RESCUE HELPER (ADJUDICATION, targeted increment) ─────────────
+  // Adjudicate ANY builder failure that left work on disk: the verifier — not the builder's exit
+  // code — is the witness to whether the work is good. Shared by every orchestrator path (single-run,
+  // competitive, tournament).
   //
-  // Design constraints (from the user spec):
-  //   • Only applies to the builder role.
-  //   • Only fires on protocol terminations (NOT model-failure stops like error/content_filter).
-  //   • Requires filesWritten > 0 (something on disk to verify).
-  //   • Requires zero policy violations (fail-closed on unsafe work).
-  //   • Runs the REAL verifier — no weakening, no bypass.
-  //   • Stamps autoVerifyRescue: true + original_builder_stop + files_written on the result.
-  //   • Fail-closed: if the verifier is RED or blocked, the original failure stands.
-
-  const RESCUABLE_TERMINATIONS: ReadonlySet<string> = new Set(["max_iterations", "timeout", "stuck_detected", "no_progress"]);
+  // WHAT CHANGED (root fix for the recurring false-RED): the old version rescued ONLY four
+  // "protocol-termination" stop reasons (no_progress/max_iterations/timeout/stuck_detected) and keyed
+  // work-on-disk off the builder's self-reported `filesWritten` LEDGER. That discarded correct GREEN
+  // work for every OTHER exit (tool_call_stalled, context_overflow, a hard error that still left a
+  // green tree) and whenever the ledger desynced from disk (files written via governed `terminal`, or
+  // the loop cut mid-write). Now: rescue fires on ANY builder failure, and work-on-disk is GIT ground
+  // truth when a detector is wired (else the ledger, for callers that don't wire one).
+  //
+  // This can NEVER promote bad work — the REAL verifier is the gate; a red/blocked verifier still
+  // fails closed and the original failure stands. It only stops discarding GOOD work unseen. A KILLED
+  // run is handled by the orchestrator's kill short-circuit BEFORE the rescue, so a half-run is never
+  // adjudicated here.
+  //
+  // Invariants preserved: runs the REAL verifier (no weakening); prevented policy violations are judged
+  // by effect (a governor-blocked attempt does not block adjudication); RED verifier ⇒ original failure
+  // stands; stamps autoVerifyRescue + originalBuilderStop for observability.
 
   /**
    * If `builderResult` is a protocol-terminated builder failure with written files and
@@ -1268,6 +2419,14 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
   async function maybeAutoVerifyRescueBuilderResult(
     builderResult: RoleResult,
     runVerifier: () => Promise<RoleResult>,
+    // OPTIONAL last-mile fixer. Invoked ONLY when the rescue verifier is RED. It runs a bounded fix
+    // pass with the configured fixer model (a DIFFERENT model than the builder) on the same workspace,
+    // then re-verifies, and reports whether it closed the checks. Absent ⇒ a red verifier is terminal
+    // (unchanged behavior). See config.fixerModel.
+    runFixer?: (redVerify: RoleResult) => Promise<{ fixed: boolean; verify: RoleResult; model: string }>,
+    // ADJUDICATION: ground-truth work-on-disk detector (git). When wired, work is read from the
+    // worktree; absent ⇒ fall back to the builder's filesWritten ledger. Returns nonEmpty.
+    detectWork?: () => Promise<{ nonEmpty: boolean }>,
   ): Promise<{ result: RoleResult; rescueVerify?: RoleResult }> {
     // Guard: only rescue builder failures.
     if (builderResult.role !== "builder" || builderResult.outcome !== "failure") {
@@ -1276,14 +2435,27 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     const bd = (builderResult.detail ?? {}) as Record<string, unknown>;
     const builderStop = typeof bd.stopReason === "string" ? bd.stopReason : "";
     const builderFilesWritten = Array.isArray(bd.filesWritten) ? bd.filesWritten.length : 0;
-    const policyViolations = Array.isArray(bd.policyViolations) ? bd.policyViolations : [];
 
-    // Guard: only protocol terminations, not model-failure stops.
-    if (!RESCUABLE_TERMINATIONS.has(builderStop)) return { result: builderResult };
-    // Guard: must have files on disk to verify.
-    if (builderFilesWritten <= 0) return { result: builderResult };
-    // Guard: fail closed on any unsafe policy violation.
-    if (policyViolations.length > 0) return { result: builderResult };
+    // Guard: must have WORK ON DISK to verify — git ground truth when wired, else the ledger. NO
+    // stop-reason allowlist: any failing exit that left work is adjudicated (the verifier is the gate).
+    // A git-detection failure degrades to the ledger (never throws out of the rescue).
+    let hasWork: boolean;
+    if (detectWork !== undefined) {
+      try {
+        hasWork = (await detectWork()).nonEmpty;
+      } catch {
+        hasWork = builderFilesWritten > 0;
+      }
+    } else {
+      hasWork = builderFilesWritten > 0;
+    }
+    if (!hasWork) return { result: builderResult };
+    // JUDGE BY EFFECT, NOT INTENT: a policy violation in ikbi is a PREVENTED (rejected) tool call — the
+    // governor/sandbox blocked it, so it had NO effect. A prevented attempt is evidence the governor
+    // WORKED; it must NOT block the rescue/fixer from running the REAL verifier on the actual worktree.
+    // (An EFFECTIVE breach — a sandbox/egress/confinement FAILURE that actually landed — is a separate,
+    // higher-severity alarm, not a rejected tool call, and never reaches here.) The prevented attempt is
+    // still recorded on the builder receipt as a warning + learning signal.
 
     // Run the real verifier against the current workspace.
     const rescueVerify = await runVerifier();
@@ -1302,7 +2474,40 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       };
       return { result: rescued, rescueVerify };
     }
-    // Verifier RED: the original failure stands. Stamp the attempt for observability.
+
+    // Verifier RED. A cheap builder often writes the WHOLE project then can't close the last errors it
+    // left (it floundered re-reading and tripped no_progress). If a dedicated FIXER is configured, give
+    // that DIFFERENT model ONE bounded pass to repair the red checks on the same worktree — the
+    // automatic form of the staged, verify-between-modules oversight a human used to provide.
+    if (runFixer !== undefined) {
+      const fix = await runFixer(rescueVerify);
+      if (fix.fixed) {
+        const rescued: RoleResult = {
+          ...builderResult,
+          outcome: "success",
+          summary: `${builderResult.summary}; fixer rescue: ${fix.model} closed the red checks after ${builderStop}`,
+          detail: {
+            ...bd,
+            fixerRescue: true,
+            fixerModel: fix.model, // the LANE-VALID model actually dispatched (Phase 6), not the raw config
+            originalBuilderStop: builderStop,
+            filesWritten: bd.filesWritten,
+            rescueVerificationResult: "pass",
+          },
+        };
+        return { result: rescued, rescueVerify: fix.verify };
+      }
+      // The fixer could not close it either — original failure stands, stamp both attempts.
+      return {
+        result: {
+          ...builderResult,
+          detail: { ...bd, autoVerifyRescueAttempted: true, fixerRescueAttempted: true, fixerModel: fix.model, rescueVerificationResult: "fail" },
+        },
+        rescueVerify: fix.verify,
+      };
+    }
+
+    // Verifier RED, no fixer: the original failure stands. Stamp the attempt for observability.
     return {
       result: {
         ...builderResult,
@@ -1321,12 +2526,214 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       throw new WorkerError("identity", "run requires an OperationContext carrying a validated identity");
     }
     const parentIdentity = parentCtx.identity.identity;
+    injectionDetectedThisBuild = false; // reset the per-run injection flag (builds are serial)
+    externalInjectionDetectedThisBuild = false; // reset the per-run external-injection enforcement flag
+    policyTaintedThisBuild = false; // reset the per-run policy-taint flag
+    fixerPreventedThisBuild = []; // reset the per-run off-books fixer prevented-attempt accumulator
+    buildDriftReports = []; // reset the per-run build-path drift advisory reports
+    // Wire the escalation resolver (once) so the tier cascade skips unwired/stub models — done
+    // here, in the async build entry, where the egress floor + provider registry are fully loaded.
+    await ensureEscalationResolver();
     // Builder model resolution, highest precedence first:
     //   1. --tier preset (builderModelOverride) — an explicit, operator-chosen tier builder.
-    //   2. --complexity large — bump straight to the mid-tier model, skipping flash.
-    //   3. the configured single builder model (default).
-    const effectiveBuilderModel =
-      task.builderModelOverride ?? (task.complexity === "large" ? (escalationConfig.tierModels.mid[0] ?? singleBuilderModel) : singleBuilderModel);
+    //   2. MIXTURE OF EXPERTS (moeExpertRental) — the cheap-tier coordinator RENTS the cheapest-
+    //      sufficient expert for THIS sub-task by difficulty (worker roster for mechanical work, mid
+    //      roster for reasoning), up front. This is the 4-model pool acting as one virtual builder;
+    //      each step of a decomposed build is its own rental (its own orchestrator.run).
+    //   3. --complexity large — bump straight to the mid-tier model, skipping flash.
+    //   4. the configured single builder model (default).
+    // `let` so the pre-flight context-size check (below, once the scout brief is known) can bump it
+    // to a bigger-window model — keeping cost attribution + the recorded model consistent with the
+    // model the builder actually runs on.
+    let rentedExpert: RentedExpert | undefined = undefined;
+    // CLASSIFIER COST ACCOUNTING (Phase 7, IKBI-RT-011): the semantic-difficulty classifier is a REAL
+    // provider invocation that runs BEFORE the costing engine exists — its spend was previously
+    // discarded (invisible to runCost/the run-summary/the budget). Capture its cost/usage/model here;
+    // fold it into runCost after the engine is built (below), and receipt it truthfully. The classifier
+    // cost belongs to the CLASSIFIER model (e.g. deepseek-v4-flash), NEVER the expert it selects.
+    let classifierCostUsd = 0;
+    let classifierUsage: unknown;
+    let classifierCalled = false; // a real provider invocation was attempted
+    let classifierCostMeasured = false; // the provider returned a cost
+    let classifierProvider: string | undefined;
+    let classifierResponseModel: string | undefined;
+    let classifierProviderModelId: string | undefined;
+    let classifierAttempts: ModelResponse["attempts"] | undefined;
+    let classifierRetries = 0;
+    let classifierDecisionSource: string | undefined;
+    let classifierModelUsed: string | undefined;
+    if (task.builderModelOverride === undefined && task.moeExpertRental === true) {
+      // ROUTER (the coordinator's brain): semantically rate this sub-task's difficulty with ONE cheap
+      // classifier call, then rent the cheapest-sufficient expert at that tier. The classifier + rental
+      // both fall back to a zero-cost heuristic on any failure, so routing degrades gracefully and can
+      // never block a build.
+      const classifierModel = resolveClassifierModel(tierModels, singleBuilderModel);
+      classifierModelUsed = classifierModel;
+      const verdict = await classifyTaskTier(
+        task.goal,
+        async (prompt) => {
+          classifierRetries += 1; // each ACTUAL provider attempt is a distinct invocation
+          classifierCalled = true;
+          try {
+            const res = await invokeModel({ model: classifierModel, prompt, temperature: 0, maxTokens: 200, identity: parentIdentity });
+            // MEASURED when the provider returned a cost; UNAVAILABLE when it did not (never assume zero).
+            if (res.cost?.usd !== undefined) { classifierCostUsd += res.cost.usd; classifierCostMeasured = true; }
+            classifierUsage = res.usage;
+            classifierProvider = res.provider;
+            classifierResponseModel = res.model;
+            classifierProviderModelId = res.providerModelId; // SERVED concrete model (Phase 14 — not the requested)
+            classifierAttempts = res.attempts;
+            return typeof res.content === "string" ? res.content : "";
+          } catch {
+            // A provider error loses the pre/post-dispatch distinction → cost UNKNOWN, never zero.
+            return "";
+          }
+        },
+        task.complexity !== undefined ? { complexity: task.complexity } : {},
+      );
+      classifierDecisionSource = verdict.source; // "model" (a provider call ran) | "heuristic" (deterministic)
+      rentedExpert = rentBuilderExpert({
+        goal: task.goal,
+        ...(task.complexity !== undefined ? { complexity: task.complexity } : {}),
+        tierRosters: tierModels,
+        fallback: singleBuilderModel,
+        tierOverride: verdict.tier,
+        ...(task.moeVendorLane !== undefined ? { vendorLane: task.moeVendorLane } : {}),
+      });
+      // IDENTITY CHAIN: pricing/usage/receipt all bind to the CLASSIFIER model, distinct from the
+      // selected expert. `worker.classifier` records the routing invocation; a deterministic (heuristic)
+      // decision is a NO-CALL with zero model cost — never a fabricated invocation.
+      const status = classifierCalled ? (classifierCostMeasured ? "measured" : "unavailable") : "no-call";
+      try {
+        await receipts.append(
+          {
+            operation: "worker.classifier",
+            outcome: { status: status === "unavailable" ? "failure" : "success", detail: `difficulty=${verdict.tier} via ${verdict.source}` },
+            requestId: task.taskId,
+            metadata: {
+              taskId: task.taskId, stage: "classifier", invocationId: `${task.taskId}:classifier`,
+              // DISPATCHED == the model SENT to the provider (== billed == priced). The provider's echoed
+              // model is recorded separately as `providerReportedModel` (they match in production).
+              classifierModel, dispatchedModel: classifierModel,
+              ...(classifierResponseModel !== undefined && classifierResponseModel !== classifierModel ? { providerReportedModel: classifierResponseModel } : {}),
+              ...(classifierProvider !== undefined ? { provider: classifierProvider } : {}),
+              decision: verdict.tier, decisionSource: verdict.source, modelBacked: classifierCalled,
+              selectedExpert: rentedExpert.modelId, // SEPARATE from the classifier model — its cost is NOT charged here
+              ...(task.moeVendorLane !== undefined ? { vendorLane: task.moeVendorLane } : {}),
+              ...(classifierUsage !== undefined ? { usage: classifierUsage } : {}),
+              costUsd: classifierCostUsd, costStatus: status, retryCount: classifierRetries,
+            },
+            project: task.targetRepo,
+          },
+          parentIdentity,
+        );
+      } catch { /* classifier receipt failure must never break the build */ }
+      log.info({ taskId: task.taskId, difficulty: verdict.tier, source: verdict.source, rationale: verdict.rationale, classifier: classifierModel, model: rentedExpert.modelId, classifierCostUsd, classifierCostStatus: status }, "MoE: router classified difficulty + rented builder expert");
+    }
+    // The ONE authoritative model decision for this attempt (IKBI-RT-001). Precedence, highest
+    // first: an operator --tier preset (builderModelOverride) → the semantically-rented MoE expert
+    // → --complexity large's mid-tier bump → the configured default builder. This SAME value is what
+    // the initial builder dispatches on, what cost is attributed to, and what the receipt records —
+    // there is no longer a parallel "complexityModel" that could diverge from it. `let` so the sole
+    // legitimate post-rental replacement (the pre-flight context-size escalation, below) can install
+    // a NEW, recorded decision; nothing else recomputes model identity.
+    let modelDecision: AttemptModelDecision =
+      task.builderModelOverride !== undefined
+        ? { model: task.builderModelOverride, alias: task.builderModelOverride, source: "tier-override", ...(task.moeVendorLane !== undefined ? { vendorLane: task.moeVendorLane } : {}) }
+        : rentedExpert !== undefined
+          ? { model: rentedExpert.modelId, alias: rentedExpert.modelId, source: "moe-rental", rationale: rentedExpert.reason, ...(task.moeVendorLane !== undefined ? { vendorLane: task.moeVendorLane } : {}) }
+          : task.complexity === "large"
+            ? { model: tierModels.mid[0] ?? singleBuilderModel, alias: tierModels.mid[0] ?? singleBuilderModel, source: "complexity-large", ...(task.moeVendorLane !== undefined ? { vendorLane: task.moeVendorLane } : {}) }
+            : { model: singleBuilderModel, alias: singleBuilderModel, source: "default", ...(task.moeVendorLane !== undefined ? { vendorLane: task.moeVendorLane } : {}) };
+    // LANE DISCIPLINE (IKBI-RT-002): a lane-pinned attempt (the duel peer) must keep EVERY model pick —
+    // escalation swap, pool sweep, retries — inside its vendor lane, not just the initial rental, so a
+    // "duel-on-failure" attempt is a genuine single-vendor peer and its receipts prove it. `laneModelsFor`
+    // filters an escalation roster to the attempt's lane; it is a NO-OP (returns the full roster) when no
+    // lane is pinned, so the default single-attempt path is byte-unchanged.
+    const laneModelsFor = (ids: readonly string[]): readonly string[] => laneRoster(ids, modelDecision.vendorLane);
+    // An operator --fallback-model is honored as an escalation pick only when it is IN this attempt's
+    // vendor lane. A cross-lane fallback would silently mutate a lane-pinned attempt's identity (Phase 2),
+    // so it is NOT applied within this attempt — the in-lane ladder is used instead, and the operator's
+    // other-lane preference is realized by the PEER attempt (a genuinely new attempt in that lane). For an
+    // unpinned attempt every model is "in lane", so this returns the operator's choice unchanged.
+    const laneFallbackModel: string | undefined =
+      task.fallbackModel !== undefined && (modelDecision.vendorLane === undefined || task.fallbackModel.startsWith(modelDecision.vendorLane))
+        ? task.fallbackModel
+        : undefined;
+    // SAME-LANE FIXER (Phase 6, IKBI-RT-012): a repair pass runs INSIDE the current attempt, so it must
+    // use a lane-valid model. `config.fixerModel` (e.g. mimo-v2.5-pro) is honored ONLY when it is in the
+    // attempt's vendor lane; a cross-lane fixer model would be a SILENT cross-lane execution inside the
+    // attempt (the IKBI-RT-012 defect) — instead the repair falls back to the lane's strongest (mid)
+    // model. For an unpinned attempt (a normal build, no duel) config.fixerModel is used verbatim (no
+    // lane to violate). Cross-lane repair is owned by the Phase 2 PEER attempt (the other vendor lane),
+    // never a hidden substitution — so no third vendor-lane attempt exists and the peer is not paid twice.
+    const laneFixerModel: string | undefined = (() => {
+      const configured = config.fixerModel;
+      if (configured === undefined || configured === "") return undefined;
+      if (modelDecision.vendorLane === undefined || configured.startsWith(modelDecision.vendorLane)) return configured;
+      return laneModelsFor(tierModels.mid)[0] ?? undefined;
+    })();
+    // LANE-VALID CANDIDATE CRITIC (Phase 11B, IKBI-REAUDIT-002): the candidate critic is ATTEMPT-BOUND. For a
+    // lane-pinned attempt it must run a lane-valid critic model (its structured-output recovery reuses the same
+    // model, so recovery stays in-lane too). Prefer the operator/configured critic when it is in-lane; else the
+    // lane's mid/pro-tier model. Undefined here on a LANE-PINNED attempt means the lane has no valid critic →
+    // the guard below fails the attempt closed. A lane-NEUTRAL attempt (normal build) leaves this undefined and
+    // the critic uses the configured critic (unchanged).
+    const laneCriticModel: string | undefined = (() => {
+      if (modelDecision.vendorLane === undefined) return undefined;
+      const configured = task.criticModelOverride ?? criticModel();
+      if (configured.startsWith(modelDecision.vendorLane)) return configured;
+      return laneModelsFor(tierModels.mid)[0];
+    })();
+    // EMPTY-LANE CONFIG GUARD (Phase 11/11B, IKBI-REAUDIT-002): a configured attempt lane with NO valid builder
+    // OR NO valid critic model is a CONFIGURATION error — never a licence to borrow the other vendor's models.
+    // Fail the attempt CLOSED before any dispatch (not a candidate defect; no duel/fixer/promotion). Runs BEFORE
+    // workspace allocation, so nothing leaks.
+    if (task.moeVendorLane !== undefined && (
+      (!modelDecision.model.startsWith(task.moeVendorLane) && !laneHasModels(tierModels.worker, task.moeVendorLane)) ||
+      laneCriticModel === undefined
+    )) {
+      const missing = laneCriticModel === undefined ? "critic" : "builder";
+      const reason = `lane-config: vendor lane "${task.moeVendorLane}" has no valid ${missing} model — refusing to borrow another vendor's model`;
+      await receipts.append(
+        { operation: "worker.lane_config_error", outcome: { status: "failure", detail: reason }, requestId: task.taskId, metadata: { taskId: task.taskId, vendorLane: task.moeVendorLane, decidedModel: modelDecision.model, missing, workerRoster: tierModels.worker, midRoster: tierModels.mid }, project: task.targetRepo },
+        parentIdentity,
+      ).catch(() => {});
+      log.warn({ taskId: task.taskId, vendorLane: task.moeVendorLane, missing }, "lane config error — attempt failed closed (no cross-lane borrow)");
+      return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason, costUsd: classifierCostUsd };
+    }
+    // EXPLICIT ATTEMPT-DECISION RECORD (Phase 2): on the MoE/duel path, persist the authoritative model
+    // decision (and any pre-dispatch replacement) as its own receipt so the trail distinguishes each
+    // attempt truthfully — even a pre-dispatch abort records which model this attempt intended, without
+    // claiming it executed. Gated on moeExpertRental so ordinary single builds' receipt trail is
+    // byte-unchanged. `attemptId` == this attempt's taskId (lane-distinct for a duel's primary vs peer).
+    const recordModelDecision = async (d: AttemptModelDecision, phase: "initial" | "preflight-replacement"): Promise<void> => {
+      if (task.moeExpertRental !== true) return;
+      try {
+        await receipts.append(
+          {
+            operation: "worker.model_decision",
+            outcome: { status: "success", detail: `${d.source}: ${d.model}${d.vendorLane !== undefined ? ` [${d.vendorLane} lane]` : ""}` },
+            requestId: task.taskId,
+            metadata: {
+              taskId: task.taskId,
+              attemptId: task.taskId,
+              phase,
+              model: d.model,
+              modelAlias: d.alias,
+              modelSource: d.source,
+              ...(d.vendorLane !== undefined ? { vendorLane: d.vendorLane } : {}),
+              ...(d.rationale !== undefined ? { rationale: d.rationale } : {}),
+            },
+            project: task.targetRepo,
+          },
+          parentIdentity,
+        );
+      } catch {
+        /* decision recording is best-effort observability — never break a build */
+      }
+    };
+    await recordModelDecision(modelDecision, "initial");
     armBudget(task); // start the whole-pipeline wall-clock deadline (covers every dispatch path)
     // Hand the (real) builder a mid-loop halt check so its loop stops promptly on a kill/budget
     // overrun. Reuses killHalt (kill-switch + budget); no-op for tests that inject a fake builder.
@@ -1345,7 +2752,36 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       if (dirtyReason !== undefined) {
         const reason = `Refusing to build: ${dirtyReason}`;
         events.publish(workerFailed.create({ taskId: task.taskId, reason }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } }));
-        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason };
+        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason, nonPromotion: { class: "governance-refused", duelEligible: false } };
+      }
+    }
+
+    // BUILD-PATH DRIFT GOVERNOR (step 3): turn drift DETECTION into INTERVENTION on the build path.
+    // Before spending on any paid role, consult the drift detector for the builder agent's reliability
+    // on THIS project. Skipped on a reuseWorkspace step (a mid-chain step-planner pass — the governor
+    // fires on the first/standalone build, like the dirty check) and when no governor is wired.
+    // FAIL-OPEN by construction (see checkBuildDrift): a drift READ error never blocks a build; only a
+    // deliberate "block" policy on genuine detected drift refuses — at zero API cost.
+    if (task.reuseWorkspace === undefined && driftGovernor !== undefined) {
+      const builderAgentId = spawnRole("builder", parentCtx).identity.agentId;
+      const drift = await checkBuildDrift(task, builderAgentId);
+      buildDriftReports = drift.reports;
+      if (drift.blockReason !== undefined) {
+        events.publish(workerFailed.create({ taskId: task.taskId, reason: drift.blockReason }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } }));
+        await receipts.append(
+          {
+            operation: "worker.run.drift_blocked",
+            outcome: { status: "rejected", detail: drift.blockReason },
+            requestId: task.taskId,
+            metadata: { taskId: task.taskId, agentId: builderAgentId, targetRepo: task.targetRepo, driftedOperations: drift.reports.map((r) => r.operation) },
+            project: task.targetRepo,
+          },
+          parentIdentity,
+        );
+        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason: drift.blockReason, nonPromotion: { class: "governance-refused", duelEligible: false } };
+      }
+      if (buildDriftReports.length > 0) {
+        log.warn({ taskId: task.taskId, agentId: builderAgentId, drifted: buildDriftReports.map((r) => `${r.operation} ${Math.round(r.recentRate * 100)}%<${Math.round(r.baselineRate * 100)}%`) }, "drift governor: builder reliability drifted for this project — proceeding (advisory)");
       }
     }
 
@@ -1368,15 +2804,30 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       !hasExplicitChecks(modeEnv)
     ) {
       const diagnostic = diagnoseBareRepo(task.targetRepo);
-      if (diagnostic !== undefined) {
+      // GREENFIELD SCAFFOLD (opt-in via task.allowGreenfieldScaffold): an EMPTY target (no manifest,
+      // no source) is a from-scratch project the builder can make verifiable by scaffolding a manifest
+      // + tests. Rather than reject before the builder runs, let it proceed — verification is resolved
+      // POST-build from the now-populated workspace, and promotion STILL requires a green verify (a
+      // build that fails to produce a verifiable project simply doesn't promote; the post-build
+      // classifyUnverifiableTarget path handles it). Only a genuinely EMPTY target qualifies: loose
+      // source without a manifest still fast-fails (adding a manifest there is the operator's call).
+      if (diagnostic !== undefined && diagnostic.greenfield && task.allowGreenfieldScaffold === true) {
+        events.publish(
+          workerRoleDispatched.create(
+            { taskId: task.taskId, role: "builder" },
+            { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.greenfield_scaffold", runId: task.taskId } },
+          ),
+        );
+        // fall through to the normal build flow — the builder scaffolds; the verifier gates promotion.
+      } else if (diagnostic !== undefined) {
         // CLASSIFY: a no-manifest target is CHECKS_UNRESOLVABLE — fail closed with the structured
         // verdict (NOT a model failure). This pre-allocation path already escalates nothing (it
         // returns before any model call) and records no trust, satisfying the no-escalate /
         // no-demote contract; the `verification` field + receipt make the classification explicit.
-        const concise = diagnostic.split("\n").slice(0, 2).join(" ");
+        const concise = diagnostic.message.split("\n").slice(0, 2).join(" ");
         events.publish(
           workerFailed.create(
-            { taskId: task.taskId, reason: diagnostic },
+            { taskId: task.taskId, reason: diagnostic.message },
             { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } },
           ),
         );
@@ -1396,8 +2847,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           outcome: "rejected",
           roles: [],
           promoted: false,
-          reason: diagnostic,
+          reason: diagnostic.message,
           verification: { kind: "checks_unresolvable", reason: concise, nextSteps: [...UNRESOLVABLE_NEXT_STEPS] },
+          nonPromotion: { class: "unverifiable", duelEligible: false },
         };
       }
     }
@@ -1407,7 +2859,13 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // a clean shadow workspace, re-verify, then take the existing promote path. Takes precedence
     // over competitive. Byte-unchanged when no candidate models are configured.
     const taskCandidates = task.candidates !== undefined && task.candidates.length > 0 ? task.candidates : candidateModelList;
-    if (taskCandidates.length > 0) {
+    // STEP-PLANNER GUARD: a step that REUSES a shared workspace, or skips promote/verify (an
+    // intermediate or final step of a multi-step plan), MUST take the single-workspace path — the
+    // tournament/competitive paths allocate FRESH worktrees and would ABANDON the accumulated work,
+    // run the verifier against a deliberately-partial project (guaranteed red), and could even try to
+    // promote mid-plan. So a multi-step build never enters those modes even when their env is set.
+    const isStepPlannerStep = task.reuseWorkspace !== undefined || task.skipPromote === true || task.skipVerifier === true;
+    if (!isStepPlannerStep && taskCandidates.length > 0) {
       const mode = resolveBuilderMode(task);
       const specs: CandidateSpec[] = taskCandidates.slice(0, MAX_CANDIDATE_MODELS).map((model) => ({ model, mode }));
       return runTournament(task, parentCtx, specs, makeTournamentEngine(task, parentCtx, parentIdentity));
@@ -1415,7 +2873,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 
     // COMPETITIVE BUILD MODE (default OFF). When on, take the N-workspace path and
     // return; otherwise fall through to the single-workspace path below — BYTE-UNCHANGED.
-    if (config.competitive === true) {
+    if (!isStepPlannerStep && config.competitive === true) {
       // N reconciliation: a competitive MODEL LIST means race exactly the listed models —
       // one candidate per model, capped at MAX_COMPETITIVE_N. No list ⇒ competitiveN
       // candidates all on the single builder model (the old workspace-isolation behavior).
@@ -1433,7 +2891,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       const preKill = await killHalt(task, parentIdentity, parentCtx);
       if (preKill !== undefined) {
         events.publish(workerFailed.create({ taskId: task.taskId, reason: preKill }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } }));
-        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason: preKill };
+        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: [], promoted: false, reason: preKill, nonPromotion: { class: "interrupted", duelEligible: false } };
       }
     }
 
@@ -1471,7 +2929,17 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     );
 
     // Per-run costing engine: accumulates every model invocation's cost across all roles.
-    const { engine: runEngine, cost: runCost } = makeCostingEngine(task.maxBudgetUsd, task.effort);
+    const { engine: runEngine, cost: runCost, addCost: addRunCost, ledger: runLedger } = makeCostingEngine(task.taskId, task.maxBudgetUsd, task.effort);
+    // ROUTING OVERHEAD (Phase 7): fold the pre-engine classifier spend into the run total + the budget,
+    // so `ikbi cost`, the run-summary, and the budget cap all see it. It is ROUTING overhead — kept as a
+    // distinct subtotal on the summary (not blurred into builder cost). `addRunCost` may throw
+    // BUDGET_EXHAUSTED if the classifier alone exceeds a tiny cap — correct: the classifier IS spend.
+    const routingOverheadUsd = classifierCostUsd;
+    // The classifier's cost STATUS: no-call (deterministic/off) | measured | unavailable (a call ran but
+    // the provider returned no cost — UNKNOWN, never zero).
+    const classifierCostStatus: "measured" | "unavailable" | "no-call" = classifierCalled ? (classifierCostMeasured ? "measured" : "unavailable") : "no-call";
+    // Phase 11: aggregate cost PARTIAL derives from the LEDGER (any unknown invocation cost, not only the
+    // classifier). Read at the run summary below via `runLedger.costStatus()`.
 
     const results: RoleResult[] = [];
     // Run-level escalation accumulator (ADDITIVE observability; never alters dispatch).
@@ -1519,6 +2987,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // (opt-in, config.criticFixLoop). This guard caps it at a single attempt per run so
     // subjective feedback can never loop forever.
     let criticFixAttempted = false;
+    // REPAIR BUDGET (Phase 6): a hard per-run cap on fixer/rescue model passes so a repair can never
+    // loop. Each `makeRunFixer` dispatch consumes one round; past the cap the fixer no-ops (the original
+    // failure stands). Combined with the "unchanged tree ⇒ stop" guard inside the fixer.
+    let fixerRoundsUsed = 0;
     // H7: when the verifier-driven fix loop runs (fixIterations > 0) and its LAST verify is GREEN,
     // we reuse that verifier RoleResult for the main verifier role instead of running the FULL
     // typecheck+test suite a second time on identical code. Set in the builder block below, consumed
@@ -1538,7 +3010,59 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     let actualVerificationMode: string | undefined;
     let actualRetrievalMode: string | undefined;
 
+    // H4/Gap A: every TERMINATED build must write ONE authoritative cost receipt — `ikbi cost`
+    // reads the run-summary's costUsd, so a build that ABORTS (budget exhausted, kill, infra failure)
+    // and returns/throws before the normal summary below would leave its spend uncounted. The abort
+    // branches call this to emit a minimal terminal summary. Best-effort: a receipt failure here must
+    // never mask the abort we're already handling. (`aborted: true` distinguishes it in the trail.)
+    const writeTerminalCostSummary = async (outcome: WorkerResult["outcome"], costUsd: number, detail: string, aborted = true): Promise<void> => {
+      try {
+        await receipts.append(
+          {
+            operation: "worker.run.summary",
+            outcome: { status: toOutcomeStatus(outcome), detail },
+            requestId: task.taskId,
+            metadata: {
+              taskId: task.taskId,
+              workspaceId: workspace.id,
+              targetBranch: workspace.baseBranch,
+              targetRepo: task.targetRepo,
+              outcome,
+              promoted: false,
+              // The attempt's authoritative model (IKBI-RT-001). `aborted: true` already marks this
+              // as a terminated run, so this is the model the attempt SELECTED, never a claim that it
+              // executed — a pre-dispatch abort still reports the chosen model honestly, not a default.
+              model: modelDecision.model,
+              costUsd,
+              aborted,
+              ...(task.originAgent !== undefined ? { originAgent: task.originAgent } : {}),
+            },
+            project: task.targetRepo,
+          },
+          parentIdentity,
+        );
+      } catch {
+        /* a terminal-summary receipt failure must not mask the outcome being handled */
+      }
+    };
+
     try {
+      // ROUTING OVERHEAD (Phase 7/11): the classifier ran on the RAW provider (before this ledger existed).
+      // Record it as a lane-NEUTRAL task-level invocation (a pre-attempt routing call — NOT attributed to
+      // the builder lane) so the ledger counts it exactly once with its true cost status. INSIDE the try so
+      // a classifier that alone exceeds a tiny cap trips BUDGET_EXHAUSTED handled by the abort path below.
+      if (classifierCalled) {
+        runLedger.recordExternal({
+          role: "classifier", stage: "classify", retryKind: "primary", ...(classifierModelUsed !== undefined ? { requestedAlias: classifierModelUsed } : {}),
+          ...(classifierResponseModel !== undefined ? { resolvedModel: classifierResponseModel } : {}),
+          ...(classifierProvider !== undefined ? { provider: classifierProvider } : {}),
+          // Phase 14: the SERVED concrete model + the real provider attempts (not the requested alias).
+          ...(classifierProviderModelId !== undefined ? { providerModelId: classifierProviderModelId } : {}),
+          servedIdentityStatus: classifierProviderModelId !== undefined ? "confirmed" : "unconfirmed",
+          ...(classifierAttempts !== undefined ? { attempts: classifierAttempts } : {}),
+          ...(classifierCostMeasured ? { costUsd: classifierCostUsd } : {}),
+        });
+      }
       // ── DEPENDENCY INSTALL: ensure node_modules exists before running checks ──
       // If the worktree has a package.json but no node_modules, install dependencies
       // so run_checks (typecheck + tests) can actually succeed. This is the fix for
@@ -1619,6 +3143,31 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           ),
         );
 
+        // A2/D3: before the integrator judges, fold any off-books FIXER prevented attempts onto the
+        // builder result so the integrator's review threshold + risk signal account for them (the fixer
+        // ran during the builder/verifier roles, both of which have now passed). Provenance-preserved:
+        // stamped as a SEPARATE `fixerPreventedViolations` field, not merged into the builder's own set.
+        if (role === "integrator" && fixerPreventedThisBuild.length > 0) {
+          const bIdx = results.findIndex((r) => r.role === "builder");
+          const builderRole = bIdx >= 0 ? results[bIdx] : undefined;
+          if (builderRole !== undefined) {
+            const bd = (builderRole.detail ?? {}) as Record<string, unknown>;
+            results[bIdx] = { ...builderRole, detail: { ...bd, fixerPreventedViolations: [...fixerPreventedThisBuild] } };
+          }
+        }
+
+        // RUNTIME-TRUTH (Phase 5): the builder + critic receive bounded, task/candidate-scoped runtime
+        // evidence in their model context. The critic binds to the verified tree (candidate identity);
+        // the builder binds to the attempt. Other roles run unchanged. Inert unless a reader is wired.
+        const roleRuntimeEvidence =
+          role === "builder" || role === "critic"
+            ? await requestRuntimeEvidence(task, role, workspace, spawned.identity, {
+                attemptId: task.taskId,
+                candidateId: task.taskId,
+                needsVerifiedTree: role === "critic",
+                strategy: task.moeVendorLane !== undefined ? `duel-${task.moeVendorLane}` : "normal",
+              })
+            : [];
         const ctx: RoleContext = {
           task,
           role,
@@ -1627,12 +3176,57 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           workspace,
           priorResults: [...results],
           engine: runEngine,
+          ...(roleRuntimeEvidence.length > 0 ? { runtimeEvidence: roleRuntimeEvidence } : {}),
         };
-        // Builder model override for the role dispatch (same precedence as effectiveBuilderModel):
-        // a --tier preset wins, else --complexity large bumps to the mid-tier model, else undefined
-        // (builderForModel falls back to the configured builder). Kept in sync with line ~1312.
-        const complexityModel = task.builderModelOverride ?? (task.complexity === "large" ? escalationConfig.tierModels.mid[0] : undefined);
-        const roleFn = role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderForModel(parentCtx, complexityModel, resolveBuilderMode(task)) : role === "critic" ? criticFor() : role === "refuter" ? refuterFor() : roles[role];
+        // PRE-FLIGHT CONTEXT SIZE (proactive) — the ONE legitimate post-rental model change. The scout
+        // has run, so its brief is known. If the base builder context (goal + project instructions +
+        // scout brief) already fills most of the SELECTED model's window, install a NEW model decision on
+        // a bigger-window mid model rather than burn a doomed attempt that would only overflow (the
+        // reactive on-overflow path would then recover it). This is an explicit, RECORDED replacement of
+        // the attempt decision — source "preflight-context-escalation" — so identity stays truthful.
+        // Only fires when no --tier/--complexity model was pinned and the cascade is enabled; only bumps
+        // UP (strictly larger window); LANE-AWARE, so a lane-pinned attempt bumps within its own vendor
+        // lane and never crosses it.
+        if (
+          role === "builder" &&
+          task.builderModelOverride === undefined &&
+          task.complexity !== "large" &&
+          task.escalationDisabled !== true
+        ) {
+          const scoutResult = results.find((r) => r.role === "scout");
+          const brief = typeof (scoutResult?.detail as Record<string, unknown> | undefined)?.brief === "string"
+            ? ((scoutResult!.detail as Record<string, unknown>).brief as string)
+            : undefined;
+          const estTokens = estimatePromptTokens([task.goal, task.projectInstructions, brief]);
+          const currentWindow = getCapabilities(modelDecision.model).context_window;
+          if (contextExceedsWindow(estTokens, currentWindow, CONTEXT_PREFLIGHT_FRACTION)) {
+            const midModel = laneRoster(tierModels.mid, modelDecision.vendorLane)[0];
+            if (midModel !== undefined && midModel !== modelDecision.model && getCapabilities(midModel).context_window > currentWindow) {
+              const fromModel = modelDecision.model;
+              modelDecision = {
+                model: midModel,
+                alias: midModel,
+                source: "preflight-context-escalation",
+                ...(modelDecision.vendorLane !== undefined ? { vendorLane: modelDecision.vendorLane } : {}),
+                rationale: `base context ~${estTokens} tok exceeds ${fromModel}'s window — pre-escalated to a bigger-window model`,
+              };
+              log.info({ taskId: task.taskId, fromModel, toModel: midModel, estTokens }, "pre-flight context escalation: bumped builder to a bigger-window model before dispatch");
+              events.publish(
+                workerRoleDispatched.create(
+                  { taskId: task.taskId, role: "builder" },
+                  { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.preflight_context_escalation", runId: task.taskId } },
+                ),
+              );
+              // Record the pre-dispatch decision REPLACEMENT explicitly (still same lane, still before any
+              // provider call) — the attempt's decision-replacement history, not a new attempt.
+              await recordModelDecision(modelDecision, "preflight-replacement");
+            }
+          }
+        }
+        // Dispatch the builder on the ONE authoritative attempt model (IKBI-RT-001) — the rented
+        // expert, the operator override, or the default, WHATEVER modelDecision resolved to. This is the
+        // same value cost + the receipt attribute to, so the rented model is truly the dispatched model.
+        const roleFn = role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderForModel(parentCtx, modelDecision.model, resolveBuilderMode(task)) : role === "critic" ? criticFor(laneCriticModel) : role === "refuter" ? refuterFor() : roles[role];
         // H4: floor the verifier's role timeout at the per-check budget. Without this, a 300s role
         // timeout races against 600s checks — the role fails first, orphaning the still-running check.
         const verifierTimeout = role === "verifier" ? Math.max(roleTimeoutMs, resolveCheckTimeoutMs(modeEnv)) : undefined;
@@ -1641,10 +3235,25 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         // H7: when the fix loop already verified the SAME code GREEN, reuse its verifier result rather
         // than running the full typecheck+test suite again. The reused result flows through the normal
         // record/commit/integrator path below; only the redundant second verifier dispatch is skipped.
+        // Phase 11: tag every provider call this role makes with the attempt's role/stage/lane so the
+        // invocation ledger records execution truth (resolved model/provider/cost) under the right identity
+        // and can flag a served model outside the attempt's vendor lane.
         let result =
           role === "verifier" && fixLoopVerifierResult !== undefined
             ? fixLoopVerifierResult
-            : await runRoleFn(role, roleFn, ctx, verifierTimeout);
+            : await runLedger.withContext(
+                {
+                  role, stage: "role", attemptId: task.taskId,
+                  // BUILDER (generation) and CRITIC (candidate judgment) are ATTEMPT-BOUND, lane-enforced roles
+                  // (Phase 11B): their ledger context carries the attempt lane, so a requested/served out-of-lane
+                  // model is blocked/flagged. Scout (general pre-attempt analysis) is task-level lane-neutral.
+                  ...((role === "builder" || role === "critic") && modelDecision.vendorLane !== undefined ? { vendorLane: modelDecision.vendorLane } : {}),
+                  ...(role === "builder" ? { requestedAlias: modelDecision.model, modelDecisionSource: modelDecision.source } : {}),
+                  ...(role === "critic" && laneCriticModel !== undefined ? { requestedAlias: laneCriticModel } : {}),
+                  strategy: task.moeVendorLane === "mimo" ? "duel-peer" : task.moeVendorLane === "deepseek" ? "duel-primary" : "normal",
+                },
+                () => runRoleFn(role, roleFn, ctx, verifierTimeout),
+              );
         results.push(result);
 
         // REFUTER → CORRECTION LIBRARY: a refuted build files each failed finding as a PROPOSED
@@ -1654,31 +3263,198 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           fileRefuterCorrections(result, task.taskId);
         }
 
-        // ── AUTO-VERIFY RESCUE: builder wrote files but NEVER ran checks ──────────
-        // Delegated to maybeAutoVerifyRescueBuilderResult (shared with competitive/tournament).
-        if (role === "builder") {
-          const rescue = await maybeAutoVerifyRescueBuilderResult(result, async () => {
-            const rescueCtx: RoleContext = {
-              task, role: "verifier",
-              identity: spawned.identity,
-              autonomy: spawned.autonomy,
+        // ── LAST-MILE FIXER MACHINERY (shared by the builder-stop rescue AND the verifier-fail rescue) ──
+        // The configured fixer model (a DIFFERENT model than the builder — e.g. deepseek builds,
+        // mimo-v2.5-pro fixes) gets ONE bounded repair pass on the SAME worktree, then a re-verify.
+        const makeRescueVerifier = (rescueSpawn: SpawnedRole) => async (): Promise<RoleResult> => {
+          const rescueCtx: RoleContext = { task, role: "verifier", identity: rescueSpawn.identity, autonomy: rescueSpawn.autonomy, workspace, priorResults: [...results], engine: runEngine };
+          return runRoleFn("verifier", verifierFor(parentCtx), rescueCtx, Math.max(roleTimeoutMs, resolveCheckTimeoutMs(modeEnv)));
+        };
+        const makeRunFixer = (runRescueVerifier: () => Promise<RoleResult>, fixerTrigger: string): ((redVerify: RoleResult) => Promise<{ fixed: boolean; verify: RoleResult; model: string }>) | undefined => {
+          // SAME-LANE FIXER (Phase 6): dispatch a LANE-VALID repair model (never a silent cross-lane
+          // substitution). No configured fixer, or none resolvable in-lane ⇒ no fixer.
+          const fixerModel = laneFixerModel;
+          if (!fixerModel) return undefined;
+          return async (redVerify: RoleResult): Promise<{ fixed: boolean; verify: RoleResult; model: string }> => {
+            // REPAIR BUDGET: never loop. Past the cap, the original failure stands.
+            if (fixerRoundsUsed >= MAX_FIXER_ROUNDS) return { fixed: false, verify: redVerify, model: fixerModel };
+            fixerRoundsUsed += 1;
+            const fixerRound = fixerRoundsUsed;
+            // PROVENANCE: snapshot the SOURCE candidate tree + the concrete failing checks the repair acts
+            // on, so the repaired candidate is traceable and the trigger is authentic (a deterministic
+            // verifier failure, never a bare/indeterminate critic verdict).
+            const sourceTree = await readTreeHash(workspace.path);
+            const failingChecks = readVerifier(redVerify).checks.filter((c) => c.passed === false).map((c) => c.name);
+            const fixSpawn = spawnRole("builder", parentCtx);
+            const fixGoal = [
+              task.goal,
+              "",
+              "[FIX PASS] The project is already written but `run_checks` is RED. Do NOT rewrite working code or start over.",
+              "Run run_checks, read the SPECIFIC errors it reports, and change ONLY what is needed to make every check pass.",
+              "Iterate tightly: fix a file, run_checks, repeat until green, then call done.",
+            ].join("\n");
+            events.publish(
+              workerRoleDispatched.create(
+                { taskId: task.taskId, role: "builder", ...(fixSpawn.identity.trustTier !== undefined ? { tier: fixSpawn.identity.trustTier } : {}) },
+                { source: EVENT_SOURCE, attribution: { identity: fixSpawn.identity, operation: "worker.role.fixer", runId: task.taskId } },
+              ),
+            );
+            // RUNTIME-TRUTH (Phase 5): the same-attempt repair receives task/attempt/candidate-scoped
+            // evidence — never another attempt's. Inert unless a reader is wired.
+            const fixerEvidence = await requestRuntimeEvidence(task, "builder", workspace, fixSpawn.identity, { attemptId: task.taskId, candidateId: task.taskId, strategy: `fixer:${fixerTrigger}` });
+            const fixCtx: RoleContext = {
+              // Preserve the task's declared write scope — a fix pass must NOT silently widen a
+              // `new_only`/`none` task to full write access just because one check went red.
+              task: { ...task, goal: fixGoal, writeScope: task.writeScope ?? "all" },
+              role: "builder",
+              identity: fixSpawn.identity,
+              autonomy: fixSpawn.autonomy,
               workspace,
               priorResults: [...results],
               engine: runEngine,
+              ...(fixerEvidence.length > 0 ? { runtimeEvidence: fixerEvidence } : {}),
             };
-            return runRoleFn("verifier", verifierFor(parentCtx), rescueCtx, Math.max(roleTimeoutMs, resolveCheckTimeoutMs(modeEnv)));
-          });
-          result = rescue.result;
-          results[results.length - 1] = result;
+            // COST: bill the fixer's provider calls to the fixer model, separately from the builder role.
+            // Phase 11C: tag the fixer's invocations with stage "fixer" so the `worker.fixer` receipt derives
+            // its executed model/provider/lane/cost + invocation ids from the LEDGER (not config).
+            const costBeforeFixer = runCost();
+            const fixerRecordsBefore = runLedger.all().length;
+            const fixResult = await runLedger.withContext(
+              { role: "builder", stage: "fixer", retryKind: "fixer", attemptId: task.taskId, requestedAlias: fixerModel, ...(modelDecision.vendorLane !== undefined ? { vendorLane: modelDecision.vendorLane } : {}) },
+              () => runRoleFn("builder", builderForModel(parentCtx, fixerModel, resolveBuilderMode(task)), fixCtx),
+            );
+            const fixerCost = runCost() - costBeforeFixer;
+            const fixerRecords = runLedger.all().slice(fixerRecordsBefore).filter((r) => r.stage === "fixer" && r.resolvedModel !== undefined);
+            const primaryFixerRec = fixerRecords[fixerRecords.length - 1]; // the last = the primary code-producing call
+            events.publish(
+              workerRoleCompleted.create(
+                { taskId: task.taskId, role: "builder", outcome: fixResult.outcome },
+                { source: EVENT_SOURCE, attribution: { identity: fixSpawn.identity, operation: "worker.role.fixer", runId: task.taskId } },
+              ),
+            );
+            noteBuilderSignals(fixResult); // a fixer taint/injection reaches the fail-closed promote gate
+            // A2/D3: thread the fixer pass's PREVENTED (governor-blocked) attempts into run-level risk
+            // accounting. The fixer runs off-books — no recordRole, its result never enters `results` — so
+            // without this its blocked out-of-policy attempts are INVISIBLE to the integrator's review
+            // threshold AND the run-summary risk telemetry. Accumulate them here; they are stamped onto the
+            // builder result before the integrator dispatches (so the review threshold sees them) and read
+            // directly by the run-summary telemetry (so they accrue as risk evidence even on FAILED runs
+            // that never reach the integrator). Kept SEPARATE from the builder's own prevented set.
+            fixerPreventedThisBuild.push(...preventedAttemptsOf(fixResult));
+            const verify = await runRescueVerifier();
+            // The REPAIRED candidate's tree (post-fix) — the exact tree the re-verify (and later the
+            // critic/promotion) judge. Distinct from `sourceTree`; the source verdicts are now stale.
+            const resultingTree = await readTreeHash(workspace.path);
+            const fixed = verify.outcome === "success";
+            // TRUTHFUL FIXER RECEIPT (Phase 6, IKBI-RT-012): the repair is no longer off-books. Records
+            // the provenance chain + the LANE-VALID model actually dispatched (selected == dispatched ==
+            // billed == receipt) + its own cost. `crossLaneAvoided` marks when a cross-lane config.fixerModel
+            // was replaced by the in-lane model (the cross-lane repair is owned by the peer attempt).
+            try {
+              // Phase 11C: `fixerModel`/`dispatchedModel` = the SELECTED lane-valid fixer model (the Phase 6
+              // "selected == dispatched == receipt" decision, always known). The EXECUTION LINKAGE — the ledger
+              // invocation id(s), the SERVED model, provider, and cost status — DERIVES from the ledger's
+              // fixer-staged invocation records; `executionLinked` marks whether a provider call was recorded
+              // (false when the repair produced no dispatch — e.g. a no-op/injected builder). The primary
+              // code-producing invocation is the last fixer-staged record; all are referenced in order.
+              const fixerExecution = primaryFixerRec !== undefined
+                ? {
+                    executionLinked: true,
+                    invocationId: primaryFixerRec.invocationId,
+                    invocationIds: fixerRecords.map((r) => r.invocationId),
+                    fixerModel, dispatchedModel: fixerModel,
+                    ...(primaryFixerRec.resolvedModel !== undefined ? { servedModel: primaryFixerRec.resolvedModel } : {}),
+                    ...(primaryFixerRec.provider !== undefined ? { provider: primaryFixerRec.provider } : {}),
+                    ledgerCostStatus: fixerRecords.some((r) => r.costStatus === "unavailable") ? "partial" : "complete",
+                  }
+                : { executionLinked: false, fixerModel, dispatchedModel: fixerModel };
+              await receipts.append(
+                {
+                  operation: "worker.fixer",
+                  outcome: { status: fixed ? "success" : "failure", detail: fixed ? "repair closed the red checks" : "repair did not close the red checks" },
+                  requestId: task.taskId,
+                  metadata: {
+                    sourceTaskId: task.taskId, sourceAttemptId: task.taskId, sourceCandidateTree: sourceTree,
+                    repairAttemptId: task.taskId, repairRound: fixerRound, repairStrategy: "same-lane", fixerTrigger,
+                    failingChecks, ...fixerExecution,
+                    ...(modelDecision.vendorLane !== undefined ? { vendorLane: modelDecision.vendorLane } : {}),
+                    crossLaneAvoided: config.fixerModel !== undefined && fixerModel !== config.fixerModel,
+                    resultingCandidateTree: resultingTree, treeUnchanged: sourceTree !== undefined && sourceTree === resultingTree,
+                    verificationOutcome: verify.outcome, costUsd: fixerCost, promoted: false,
+                  },
+                  project: task.targetRepo,
+                },
+                fixSpawn.identity,
+              );
+            } catch { /* receipt failure must never break the repair */ }
+            return { fixed, verify, model: fixerModel };
+          };
+        };
+
+        // ── AUTO-VERIFY RESCUE: builder wrote files but hit a protocol stop before run_checks ──
+        // Delegated to maybeAutoVerifyRescueBuilderResult (shared with competitive/tournament).
+        // Rescue verifier reuses the builder's spawn (unchanged behavior).
+        // NOTE: adjudication of a builder failure is done ONCE, at the TERMINAL adjudication point below
+        // (just before the short-circuit), on the FINAL builder result — so it covers work produced by
+        // ESCALATION too, and there is a single verifier dispatch (one decision point, per the design).
+        // The old per-attempt rescue here only saw the FIRST attempt and missed escalated work.
+
+        // ── FIXER-ON-VERIFIER-FAIL RESCUE: the builder declared SUCCESS but the MAIN verifier caught a
+        // FIXABLE red check (e.g. one leftover TS error). Without this, that build is discarded
+        // (skip-critic-on-red → integrator discard) with a ~$0.01 fixer pass in reach — the last-mile
+        // fixer above only fires on builder PROTOCOL-STOPS, never on a verifier catch after builder
+        // success. Give the fixer model ONE bounded pass + re-verify HERE, at the verifier boundary, so
+        // the critic/integrator see a GREEN verifier when it works (and an unchanged RED one when it does
+        // not). Fail-closed: only genuine, fixable check failures are retried (not injection / unresolvable
+        // / skipped), and a still-red re-verify leaves the original failure to discard as before.
+        if (role === "verifier" && isFixableVerifierFailure(result)) {
+          const runFixer = makeRunFixer(makeRescueVerifier(spawnRole("verifier", parentCtx)), "verifier_fail");
+          if (runFixer !== undefined) {
+            const fix = await runFixer(result);
+            const vd = (result.detail as Record<string, unknown> | undefined) ?? {};
+            // The fixer now emits its own `worker.fixer` receipt (Phase 6); the stamps below reflect the
+            // LANE-VALID model actually dispatched (`laneFixerModel`), not the raw config, so the trail is
+            // truthful about which model ran inside this attempt's lane.
+            log.warn({ taskId: task.taskId, fixerModel: laneFixerModel, fixed: fix.fixed, trigger: "verifier_fail" }, fix.fixed ? "fixer rescue: closed a verifier-caught red check" : "fixer rescue: could not close the verifier-caught red check");
+            result = fix.fixed
+              ? {
+                  ...fix.verify,
+                  summary: `${fix.verify.summary}; fixer rescue: ${laneFixerModel} closed a verifier-caught red check`,
+                  detail: { ...((fix.verify.detail as Record<string, unknown> | undefined) ?? {}), fixerRescue: true, fixerModel: laneFixerModel, fixerTrigger: "verifier_fail", rescueVerificationResult: "pass" },
+                }
+              : { ...result, detail: { ...vd, fixerRescueAttempted: true, fixerModel: laneFixerModel, fixerTrigger: "verifier_fail", rescueVerificationResult: "fail" } };
+            results[results.length - 1] = result;
+          }
         }
 
         // Per-role cost: compute once after rescue (rescue verifier calls count against builder).
         const roleCost = runCost() - costBeforeRole;
         // Stamp into detail (open shape) so the CLI post-build breakdown can read it without
         // changing the WorkerResult contract. Also stamp the model on the builder role.
-        if (roleCost > 0) {
+        // Stamp the builder's model UNCONDITIONALLY (not only when cost>0) — a free/local provider
+        // reports roleCost 0, and an unstamped model made downstream paths (the recovery seed,
+        // the cheap-retry attribution) fall back to the default instead of the model that actually ran.
+        if (roleCost > 0 || role === "builder") {
           const prevDetail = (result.detail as Record<string, unknown> | undefined) ?? {};
-          result = { ...result, detail: { ...prevDetail, costUsd: roleCost, ...(role === "builder" ? { model: effectiveBuilderModel } : {}) } };
+          // The builder role records the AUTHORITATIVE attempt decision (IKBI-RT-001): the concrete
+          // dispatched `model`, plus the requested `modelAlias`, the `modelSource` (why it was chosen),
+          // and the `vendorLane` it was pinned to. `model` is exactly what builderForModel dispatched
+          // and what runCost() billed above, so request == dispatch == bill == receipt.
+          result = {
+            ...result,
+            detail: {
+              ...prevDetail,
+              ...(roleCost > 0 ? { costUsd: roleCost } : {}),
+              ...(role === "builder"
+                ? {
+                    model: modelDecision.model,
+                    modelAlias: modelDecision.alias,
+                    modelSource: modelDecision.source,
+                    ...(modelDecision.vendorLane !== undefined ? { vendorLane: modelDecision.vendorLane } : {}),
+                  }
+                : {}),
+            },
+          };
           results[results.length - 1] = result;
         }
         events.publish(
@@ -1688,7 +3464,18 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           ),
         );
 
-        await recordRole(task, workspace, spawned, result, roleCost, effectiveBuilderModel, true);
+        // Phase 11B: the role receipt derives from the LEDGER — the DISPATCHED model (ledger `requestedAlias`
+        // == what was sent, the Phase 1 "dispatched == receipt" identity) + the authoritative invocation id. A
+        // role that made no model call records neither. (The SERVED model lives on the invocation record; a
+        // served-vs-dispatched divergence is the lane-violation/execution-identity case, not a normal receipt.)
+        {
+          // Pin the critic to its PRIMARY (stage "role") invocation: a critic that spawned a nested
+          // structured-recovery call also has a later "structured-recovery" record, which owns its OWN
+          // `worker.critic_recovery` receipt — the role receipt must not alias to it (distinct invocations).
+          const ledRec = role === "critic" ? runLedger.lastFor(role, "role") : runLedger.lastFor(role);
+          const roleModel = ledRec?.requestedAlias ?? (role === "builder" ? modelDecision.model : undefined);
+          await recordRole(task, workspace, spawned, result, roleCost, roleModel, true, ledRec?.invocationId);
+        }
 
         // SG-5 PROGRESS: structured per-role detail beyond start/end — builder tool activity
         // and the verifier's verdict — so `--verbose` can show what each phase actually did.
@@ -1761,7 +3548,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               return extractVerifierCheckResult(vResult);
             },
             builder: async (fixGoal: string) => {
-              const fixBuilderFn = builderFor(parentCtx, resolveBuilderMode(task));
+              // Phase 11 (IKBI-REAUDIT-002): lane-pure repair — the iterative fix builder runs the ATTEMPT's
+              // own model, not `builderFor()`'s global default (which could cross the attempt's vendor lane).
+              const fixBuilderFn = builderForModel(parentCtx, modelDecision.model, resolveBuilderMode(task));
               const fixCtx: RoleContext = {
                 task: { ...task, goal: fixGoal },
                 role: "builder",
@@ -1771,7 +3560,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 priorResults: [...results],
                 engine: runEngine,
               };
-              return runRoleFn("builder", fixBuilderFn, fixCtx);
+              const br = await runRoleFn("builder", fixBuilderFn, fixCtx);
+              noteBuilderSignals(br); // injection/taint on a verifier-driven fix retry must reach the promote gate
+              return br;
             },
           });
 
@@ -1846,11 +3637,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           const criticFailVerdict = ((result.detail ?? {}) as Record<string, unknown>).pass === false;
           const subConditions = {
             criticFixLoopEnabled: config.criticFixLoop === true,
+            withinBudget: !budgetExceeded(task),
             notAlreadyAttempted: !criticFixAttempted,
             verifierPassedForCriticGate,
             isRetryableCriticFail: isRetryableCriticFail(result),
           };
-          const willFire = subConditions.criticFixLoopEnabled && subConditions.notAlreadyAttempted && subConditions.verifierPassedForCriticGate && subConditions.isRetryableCriticFail;
+          const willFire = subConditions.criticFixLoopEnabled && subConditions.withinBudget && subConditions.notAlreadyAttempted && subConditions.verifierPassedForCriticGate && subConditions.isRetryableCriticFail;
           if (criticFailVerdict && !willFire) {
             await receipts.append(
               {
@@ -1870,7 +3662,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             );
           }
         }
-        if (role === "critic" && config.criticFixLoop && !criticFixAttempted && verifierPassedForCriticGate && isRetryableCriticFail(result)) {
+        // BUDGET GUARD (critic-fix is ON by default): the loop spends another builder+verifier+critic
+        // round, so don't even START it once the whole-build wall-clock deadline is blown — the run is
+        // already condemned to halt. (The per-call dollar budget independently hard-stops runaway spend.)
+        if (role === "critic" && config.criticFixLoop && !budgetExceeded(task) && !criticFixAttempted && verifierPassedForCriticGate && isRetryableCriticFail(result)) {
           criticFixAttempted = true;
           // The prior results the re-run roles inherit: everything EXCEPT the stale builder /
           // verifier / critic, which are replaced with their fresh results as produced.
@@ -1893,7 +3688,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 priorResults: [...carriedPrior],
                 engine: runEngine,
               };
-              return runRoleFn("builder", builderFor(parentCtx, resolveBuilderMode(task)), fixCtx);
+              const br = await runRoleFn("builder", builderForModel(parentCtx, modelDecision.model, resolveBuilderMode(task)), fixCtx); // Phase 11: lane-pure repair (attempt's model, not the global default)
+              noteBuilderSignals(br); // injection/taint on a critic-fix retry must reach the promote gate
+              return br;
             },
             verifier: async (builderResult: RoleResult) => {
               const verifyCtx: RoleContext = {
@@ -1923,7 +3720,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 priorResults: [...carriedPrior, builderResult, verifierResult],
                 engine: runEngine,
               };
-              return runRoleFn("critic", criticFor(), reCriticCtx);
+              return runRoleFn("critic", criticFor(laneCriticModel), reCriticCtx);
             },
           });
 
@@ -1999,7 +3796,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           verifierStillGreen &&
           isRetryableCriticFail(result)
         ) {
-          const midModel = task.fallbackModel ?? escalationConfig.tierModels.mid[0];
+          // Escalate within the attempt's vendor lane (IKBI-RT-002). An operator --fallback-model wins ONLY
+          // when it is in-lane (laneFallbackModel); a cross-lane fallback is deferred to the peer attempt.
+          const midModel = laneFallbackModel ?? laneModelsFor(tierModels.mid)[0];
           if (midModel !== undefined) {
             escalationAttempted = true;
             const rejectedDetail = (result.detail ?? {}) as Record<string, unknown>;
@@ -2055,7 +3854,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 { source: EVENT_SOURCE, attribution: { identity: escBuilder.identity, operation: "worker.role.builder", runId: task.taskId } },
               ),
             );
-            await recordRole(task, workspace, escBuilder, escBuilderResult, escBuilderCost, midModel, true);
+            await recordRole(task, workspace, escBuilder, escBuilderResult, escBuilderCost, midModel, true, runLedger.lastFor("builder")?.invocationId);
 
             let escSucceeded = false;
             if (escBuilderResult.outcome === "success") {
@@ -2084,7 +3883,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 ...escVerifyResult,
                 detail: { ...((escVerifyResult.detail as Record<string, unknown> | undefined) ?? {}), testEvidence: readVerifier(escVerifyResult).testEvidence },
               };
-              const escCriticResult = await runRoleFn("critic", criticFor(), {
+              const escCriticResult = await runRoleFn("critic", criticFor(laneCriticModel), {
                 task,
                 role: "critic",
                 identity: escCritic.identity,
@@ -2160,7 +3959,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           if (unverifiable !== undefined) {
             checksUnverifiable = unverifiable;
             const failedDetail = (result.detail ?? {}) as Record<string, unknown>;
-            const failedModel = typeof failedDetail.model === "string" ? failedDetail.model : singleBuilderModel;
+            const failedModel = typeof failedDetail.model === "string" ? failedDetail.model : modelDecision.model;
             events.publish(
               workerEscalationSuppressed.create(
                 { taskId: task.taskId, fromModel: failedModel, reason: unverifiable.reason, verificationKind: unverifiable.kind },
@@ -2191,25 +3990,59 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         // SUPPRESSED on an unverifiable target (`checksUnverifiable`): a stronger model cannot fix
         // a missing manifest/verifier, so escalating would waste a paid pro run, guaranteed to fail.
         const decision = escObservation.decision;
+        // GUARANTEED flash→pro (IKBI_ESCALATION_ALWAYS_ESCALATE, default on): on the cheap/default
+        // path, a builder that FAILED or STALLED always escalates to the mid (pro) tier — bypassing
+        // the worker→mid SCORE threshold, which is a boundary coin-flip (builderFailed weight == the
+        // threshold, so whether it fires depends on score arithmetic rather than "did the cheap model
+        // finish?"). Fail-closed: off when escalation is disabled or a tier was explicitly pinned
+        // (--tier mid|frontier sets escalationDisabled). Still bounded by !escalationAttempted (once),
+        // maxEscalations, and the per-build budget cap. When enabled + role builder, escObservation
+        // always returns a defined `decision` (see the guard at its top), so the block body is safe.
+        const alwaysEscalateToPro =
+          escalationConfig.enabled &&
+          escalationConfig.alwaysEscalate &&
+          task.escalationDisabled !== true;
         if (
           role === "builder" &&
           (result.outcome === "failure" || escSignals.builderFailed) &&
           checksUnverifiable === undefined &&
           !escalationAttempted &&
-          decision !== undefined &&
-          decision.escalate &&
-          decision.targetTier === "mid"
+          (alwaysEscalateToPro ||
+            (decision !== undefined && decision.escalate && decision.targetTier === "mid"))
         ) {
-          const midModel = task.fallbackModel ?? escalationConfig.tierModels.mid[0];
+          if (alwaysEscalateToPro && !(decision?.escalate && decision.targetTier === "mid")) {
+            log.info(
+              { taskId: task.taskId, failedRole: role, stopReason: (result.detail as Record<string, unknown> | undefined)?.stopReason },
+              "guaranteed flash→pro escalation: builder failed/stalled — escalating to the mid (pro) tier regardless of the escalation score (IKBI_ESCALATION_ALWAYS_ESCALATE)",
+            );
+          }
+          // Escalate within the attempt's vendor lane (IKBI-RT-002). An operator --fallback-model wins ONLY
+          // when it is in-lane (laneFallbackModel); a cross-lane fallback is deferred to the peer attempt.
+          const midModel = laneFallbackModel ?? laneModelsFor(tierModels.mid)[0];
           if (midModel !== undefined) {
             const failedResult = result;
             const failedDetail = (failedResult.detail ?? {}) as Record<string, unknown>;
-            const failedModel = typeof failedDetail.model === "string" ? failedDetail.model : singleBuilderModel;
+            const failedModel = typeof failedDetail.model === "string" ? failedDetail.model : modelDecision.model;
+            // CONTEXT-OVERFLOW: the builder's prompt exceeded the current model's window. Re-running the
+            // SAME small window with an even LONGER prompt (goal + failure feedback) is guaranteed to
+            // overflow again, so SKIP the cheap same-model retry and go straight to the pool sweep, which
+            // escalates up the ladder to a larger-window model. Turns a permanent overflow-fail into recovery.
+            const failedOnOverflow = failedDetail.stopReason === "context_overflow";
+            if (failedOnOverflow && !cheapModelRetryAttempted) {
+              cheapModelRetryAttempted = true; // consume the cheap-retry slot without spending a doomed call
+              events.publish(
+                workerEscalationRetried.create(
+                  { taskId: task.taskId, fromModel: failedModel, toModel: `${failedModel} (cheap retry skipped — context overflow)`, success: false },
+                  { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.cheap_retry", runId: task.taskId } },
+                ),
+              );
+            }
 
             // ── STEP 1: CHEAP RETRY — same model, with failure feedback ──────
             // Before escalating to the mid-tier model, give the cheap model ONE more chance
             // with the failure context. This implements: flash → flash retry → pro.
             // Fires on ANY builder struggle: explicit failure OR silent success with 0 files.
+            // Skipped for a context-overflow (handled just above — a bigger window is what's needed).
             if (!cheapModelRetryAttempted) {
               cheapModelRetryAttempted = true;
               const cheapRetryGoal = [
@@ -2227,7 +4060,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                   { source: EVENT_SOURCE, attribution: { identity: cheapRetrySpawn.identity, operation: "worker.role.builder", runId: task.taskId } },
                 ),
               );
-              const cheapRetryBuilder = builderForModel(parentCtx, undefined, resolveBuilderMode(task));
+              // Retry on the EXACT model that actually failed — `failedModel` is the stamped model of
+              // the failed builder (it reflects any pre-flight/--complexity/rental bump), and it is ALSO
+              // the model stamped onto this retry's result below, so dispatch == receipt for the retry
+              // (IKBI-RT-001). Passing `undefined` would drop a bumped builder back to the weaker default,
+              // so a "same-model retry" would silently retry a WEAKER model than the one that failed.
+              const cheapRetryBuilder = builderForModel(parentCtx, failedModel, resolveBuilderMode(task));
               const cheapRetryCtx: RoleContext = {
                 task: { ...task, goal: cheapRetryGoal },
                 role: "builder",
@@ -2252,7 +4090,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                   { source: EVENT_SOURCE, attribution: { identity: cheapRetrySpawn.identity, operation: "worker.role.builder", runId: task.taskId } },
                 ),
               );
-              await recordRole(task, workspace, cheapRetrySpawn, cheapRetryResult, cheapRetryCost, failedModel, true);
+              await recordRole(task, workspace, cheapRetrySpawn, cheapRetryResult, cheapRetryCost, failedModel, true, runLedger.lastFor("builder")?.invocationId);
 
               if (cheapRetrySucceeded) {
                 // Cheap retry SUCCEEDED — replace the failed builder result and continue the
@@ -2319,15 +4157,26 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             // ceiling and the original failure stands with a clear needs-authorization reason; the
             // verification ladder still gates promotion downstream exactly as before.
             escalationAttempted = true;
+            // Sweep the pool WITHIN the attempt's vendor lane (IKBI-RT-002): a lane-pinned peer never
+            // crosses into the other vendor's models on a retry. `laneModelsFor` is a no-op (full roster)
+            // for an unpinned attempt, so the default recovery ladder is unchanged.
             const recoveryRosters = {
-              worker: rosterFromIds(escalationConfig.tierModels.worker),
-              mid: rosterFromIds(escalationConfig.tierModels.mid),
-              frontier: rosterFromIds(escalationConfig.tierModels.frontier),
+              worker: rosterFromIds(laneModelsFor(tierModels.worker)),
+              mid: rosterFromIds(laneModelsFor(tierModels.mid)),
+              frontier: rosterFromIds(laneModelsFor(tierModels.frontier)),
             };
             const seedTier =
-              (["worker", "mid", "frontier"] as const).find((t) => escalationConfig.tierModels[t].includes(failedModel)) ?? "worker";
+              (["worker", "mid", "frontier"] as const).find((t) => tierModels[t].includes(failedModel)) ?? "worker";
+            // A CONTEXT-OVERFLOW needs a bigger WINDOW, not a cheaper same-tier model — start the sweep
+            // at the mid tier so it skips the small-window worker pool (which would just overflow again).
+            // recoveryFloor takes max(attempt tiers, startTier), so the accurate worker seed below is not
+            // dragged down; the mid start simply raises the floor to bigger-window models.
+            const sweepStartTier = failedOnOverflow && seedTier === "worker" ? "mid" : seedTier;
             const recAttempts: RecoveryAttempt[] = [{ tier: seedTier, model: failedModel, outcome: "fail" }];
-            const handoff = decision.handoffContext;
+            // `decision` is defined whenever we reach here (escObservation returns a decision for a
+            // builder role when escalation is enabled + not tier-pinned — the always-escalate
+            // preconditions). The `?.` keeps the compiler happy for the score-independent path.
+            const handoff = decision?.handoffContext;
             let recovered = false;
             let lastSwapModel = failedModel;
 
@@ -2338,10 +4187,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 autoCeiling: "mid",
                 // Frontier (consult) crossing is authorized only by --escalate / a frontier budget.
                 frontierAuthorized: task.allowFrontierConsult === true,
-                startTier: seedTier,
-                // An operator's --fallback-model is honored as the FIRST pick (still up the ladder);
-                // once tried, the sweep continues cheapest-first through the rest of the pool.
-                ...(task.fallbackModel !== undefined ? { requestedModel: task.fallbackModel } : {}),
+                startTier: sweepStartTier,
+                // An operator's --fallback-model is honored as the FIRST pick (still up the ladder), but
+                // ONLY when it is in this attempt's vendor lane (laneFallbackModel) — a cross-lane fallback
+                // would break lane purity, so the pool sweep stays in-lane and the operator's other-lane
+                // choice lands in the peer attempt. Once tried, the sweep continues cheapest-first.
+                ...(laneFallbackModel !== undefined ? { requestedModel: laneFallbackModel } : {}),
               });
               if (action.kind === "terminate") {
                 break; // exhausted | needs-authorization — original failure stands.
@@ -2365,8 +4216,33 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 } catch (e) {
                   applyRes = { applied: false, filesChanged: [], error: e instanceof Error ? e.message : String(e) };
                 }
+                // Gap B / A2: the frontier consult uses the RAW provider, NOT the run's costing engine.
+                // Its spend must be (a) reflected in this receipt's costUsd, (b) folded into the run total
+                // for `ikbi cost` + the budget cap, and (c) recorded on the receipt EVEN IF folding it
+                // trips the cap. So compute the cost, write the receipt with the consult-inclusive total
+                // FIRST, THEN fold+enforce — the BUDGET_EXHAUSTED throw (A2) can no longer skip this
+                // receipt, and the spend is still counted in the terminal summary the abort writes.
+                const consultUsdRaw = applyRes.consult?.cost?.usd;
                 const consultModelId = applyRes.modelId ?? "frontier:consult";
                 lastSwapModel = consultModelId;
+                // EXECUTION LINKAGE (Phase 12): the frontier consult runs on the RAW provider (outside the run
+                // engine), so it is not auto-ledgered. When a provider request WAS dispatched (a consult result
+                // came back), record it as its own EXTERNAL invocation carrying the served model/provider/usage/
+                // cost, and derive the receipt's execution identity from that authoritative record. No consult
+                // dispatch ⇒ no execution claim. A dispatched-but-unrecordable consult ⇒ an integrity error.
+                const consultDispatched = applyRes.consult !== undefined;
+                let consultRec: InvocationRecord | undefined;
+                if (consultDispatched) {
+                  const consultProvider = consultModelId.split(/[-:/]/)[0];
+                  addRunCost(consultUsdRaw, {
+                    requestedAlias: consultModelId, resolvedModel: consultModelId,
+                    ...(consultProvider !== undefined && consultProvider.length > 0 ? { provider: consultProvider } : {}),
+                    ...(applyRes.consult?.usage !== undefined ? { usage: applyRes.consult.usage } : {}),
+                    status: applyRes.applied ? "succeeded" : "provider-rejected",
+                  });
+                  consultRec = runLedger.lastFor("consult", "frontier-consult");
+                }
+                const consultLinked = consultDispatched && consultRec !== undefined;
                 events.publish(
                   workerEscalationRetried.create(
                     { taskId: task.taskId, fromModel: failedModel, toModel: consultModelId, success: applyRes.applied },
@@ -2375,14 +4251,28 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 );
                 await receipts.append(
                   {
-                    operation: "worker.escalation.consult",
+                    // A dispatched consult with no backing ledger record is an integrity error — never a receipt
+                    // that silently claims execution without an authoritative invocation.
+                    operation: consultDispatched && consultRec === undefined ? "worker.escalation.consult.integrity_error" : "worker.escalation.consult",
                     outcome: { status: applyRes.applied ? "success" : "failure", ...(applyRes.error !== undefined ? { detail: applyRes.error } : {}) },
                     requestId: task.taskId,
-                    metadata: { taskId: task.taskId, workspaceId: workspace.id, model: consultModelId, applied: applyRes.applied, filesChanged: applyRes.filesChanged.length, ...(applyRes.stopReason !== undefined ? { stopReason: applyRes.stopReason } : {}), costUsd: runCost() },
+                    metadata: {
+                      taskId: task.taskId, workspaceId: workspace.id, model: consultModelId, applied: applyRes.applied, filesChanged: applyRes.filesChanged.length,
+                      ...(applyRes.stopReason !== undefined ? { stopReason: applyRes.stopReason } : {}),
+                      // The consult cost is already folded into the ledger above (deferred budget), so the run
+                      // total DERIVES it — no separate `+ consultUsd` (which would double-count).
+                      costUsd: runCost(),
+                      ...(consultLinked
+                        ? { executionLinked: true, invocationId: consultRec!.invocationId, servedModel: consultRec!.resolvedModel, ...(consultRec!.provider !== undefined ? { provider: consultRec!.provider } : {}), lifecycle: consultRec!.status, consultCostStatus: consultRec!.costStatus }
+                        : consultDispatched
+                          ? { executionLinked: false, integrityError: "consult-invocation-not-found" }
+                          : { executionLinked: false }),
+                    },
                     project: task.targetRepo,
                   },
                   parentIdentity,
                 );
+                if (consultDispatched) runLedger.applyBudget(); // enforce the cap AFTER the receipt is durable (may throw BUDGET_EXHAUSTED)
                 recAttempts.push({ tier: "frontier", model: consultModelId, outcome: applyRes.applied ? "green" : "fail" });
                 if (applyRes.applied) {
                   // Splice a success builder result so the pipeline verifier validates the applied diff.
@@ -2390,7 +4280,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                     role: "builder",
                     outcome: "success",
                     summary: `frontier consult patch applied by ${consultModelId} (${applyRes.filesChanged.length} file(s))`,
-                    detail: { model: consultModelId, escalated: true, consult: true, filesWritten: [...applyRes.filesChanged] },
+                    // policyViolations: [] is TRUTHFUL — the consult path is a diff apply (applyConsultPatch),
+                    // not a builder tool loop, so no tool-call policy could be violated. Without it the
+                    // integrator's fail-closed policy gate reads `undefined` ("cannot confirm clean") and
+                    // discards every authorized frontier recovery — making the feature structurally unreachable.
+                    detail: { model: consultModelId, escalated: true, consult: true, filesWritten: [...applyRes.filesChanged], policyViolations: [] },
                   };
                   const builderIdx = results.lastIndexOf(failedResult);
                   if (builderIdx >= 0) results[builderIdx] = synth;
@@ -2455,7 +4349,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                   { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.escalation.retry", runId: task.taskId } },
                 ),
               );
-              await recordRole(task, workspace, escalatedSpawn, escalatedResult, retryCost, swapModel, true);
+              await recordRole(task, workspace, escalatedSpawn, escalatedResult, retryCost, swapModel, true, runLedger.lastFor("builder")?.invocationId);
               await receipts.append(
                 {
                   operation: "worker.escalation.retry",
@@ -2497,6 +4391,29 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               if (builderIdx >= 0) results[builderIdx] = result;
             }
           }
+        }
+
+        // TERMINAL ADJUDICATION (Adjudication Core): `result` here is the FINAL builder result — INCLUDING
+        // work produced by ESCALATION (the pro tier), which the per-attempt rescue above (it runs BEFORE
+        // escalation) never sees. If that final tree has work on a verifiable target, adjudicate it once
+        // more: run the verifier on the FINAL disk state and rescue on GREEN. THIS is what closes the
+        // false-RED that the per-attempt rescue alone could not — a stalled builder OR a stalled ESCALATED
+        // builder that left correct green work is no longer discarded unseen. Fail-closed: a red verifier
+        // leaves the failure to short-circuit below; killed runs never reach here (kill short-circuits).
+        const adjudicable = role === "builder" && result.outcome !== "success";
+        const adjUnverifiable = adjudicable ? classifyUnverifiableTarget() !== undefined : false;
+        if (adjudicable && !adjUnverifiable) {
+          const runRescueVerifier = makeRescueVerifier(spawned);
+          const detectWork = async (): Promise<{ nonEmpty: boolean }> => {
+            const wp = await computeWorktreeWorkProduct(workspace.path, workspace.baseRef, task.taskId);
+            return { nonEmpty: wp.nonEmpty };
+          };
+          // Always apply the rescue result: on GREEN it is the rescued success; on RED it is the
+          // original failure with the rescue stamps (autoVerifyRescueAttempted / rescueVerificationResult)
+          // for observability. Either way it never turns a success into a failure.
+          const rescue = await maybeAutoVerifyRescueBuilderResult(result, runRescueVerifier, makeRunFixer(runRescueVerifier, "builder_stop"), detectWork);
+          result = rescue.result;
+          results[results.length - 1] = result;
         }
 
         if (result.outcome !== "success") {
@@ -2554,6 +4471,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         );
         if (retainFailedWorkspaces) await safeRetain(workspaces, workspace, budgetErr.message);
         else await safeDiscard(workspaces, workspace);
+        await writeTerminalCostSummary("rejected", costToReport, budgetErr.message); // Gap A: budget-abort spend is counted
         return {
           contractVersion: CONTRACT_VERSION,
           taskId: task.taskId,
@@ -2577,6 +4495,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } },
         ),
       );
+      await writeTerminalCostSummary("failure", runCost(), `infrastructure failure: ${reason}`); // Gap A: spend-so-far is counted even on a throw
       throw err;
     }
 
@@ -2587,6 +4506,127 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // overall is non-success: a successful build is verifiable by definition. `??=` preserves any
     // classification the escalation-suppression block already made.
     if (overall !== "success") checksUnverifiable ??= classifyUnverifiableTarget();
+
+    // ── ADJUDICATION CORE — the centralized promotability decision ───────────────────────────────
+    // Compute the single `decidePromotability` verdict from the four fact-types. Two modes, one
+    // computation:
+    //   • SHADOW (IKBI_ADJUDICATION_SHADOW, default on): log any divergence vs the old integrator gate;
+    //     changes nothing. Validates the core against real builds.
+    //   • AUTHORITATIVE (IKBI_LEGACY_COMPLETION=off, Step 4 flip): the verdict below REPLACES the
+    //     integrator's promote intent at the terminal gate. DEFAULT IS LEGACY (flag on) — so with no
+    //     env override this block is pure telemetry and the terminal path is byte-unchanged. The flip is
+    //     rolled out by dogfood validation (its risk is more false-GREEN surface); flag-off enables it.
+    // Wrapped so a computation failure never crashes the build; in authoritative mode an unavailable
+    // verdict fails CLOSED at the terminal (no promote). `adjDecision`/`adjIntegratedTree` feed the gate.
+    const adjudicationAuthoritative = (modeEnv.IKBI_LEGACY_COMPLETION ?? "on") === "off";
+    const shadowEnabled = (modeEnv.IKBI_ADJUDICATION_SHADOW ?? "on") !== "off";
+    let adjDecision: Decision | undefined;
+    if (shadowEnabled || adjudicationAuthoritative) {
+      try {
+        const wp = await computeWorktreeWorkProduct(workspace.path, workspace.baseRef, task.taskId);
+        const verifierResult = results.find((r) => r.role === "verifier");
+        const rv = readVerifier(verifierResult);
+        const rawVerdict = (verifierResult?.detail as Record<string, unknown> | undefined)?.verdict;
+        const assessment: WorkAssessment = {
+          verdict: (typeof rawVerdict === "string" ? rawVerdict : "fail") as Verdict,
+          testEvidence: rv.testEvidence,
+          treeHash: wp.treeHash, // the verifier judged this worktree; C1c re-checks the landed tree at promote
+        };
+        const criticDetail = (results.find((r) => r.role === "critic")?.detail ?? {}) as Record<string, unknown>;
+        const refuterDetail = (results.find((r) => r.role === "refuter")?.detail ?? {}) as Record<string, unknown>;
+        // SAFETY ASSESSMENT (Phase 8): a DERIVED projection of AUTHENTIC monotone vetoes — each `true`
+        // is a concrete event OBSERVED by a named runtime component, never a manufactured affirmative
+        // "safe" claim. The gate-wall is deliberately ABSENT: it is a DOWNSTREAM authority enforced by
+        // `promoteCandidate()`, so this projection no longer fabricates `gateWallAuthorized: true`.
+        // `effectiveBreach`/`driftBlocked` are NOT-DETERMINED-HERE monotone-veto slots (an effective
+        // breach raises a separate alarm; a drift block rejects at entry) → false = "no such veto raised".
+        const safety: SafetyAssessment = {
+          externalInjection: externalInjectionDetectedThisBuild, // observed: neutralization chokepoint
+          effectiveBreach: false, // not tracked by this projection (separate higher-severity alarm) — no veto raised
+          refuted: refuterDetail.refuted === true, // observed: refuter role
+          killed: killedReason !== undefined, // observed: kill-switch / budget
+          driftBlocked: false, // a drift block rejects at ENTRY (before roles) — cannot reach this terminal
+        };
+        adjDecision = decidePromotability(wp, assessment, safety, { pass: criticDetail.pass === true });
+        // TRUTHFUL PROVENANCE RECEIPT: record WHICH fields are authentic OBSERVATIONS vs NOT-DETERMINED
+        // here, and the AUTHORITY — this assessment is advisory to the adjudication decision and NEVER a
+        // promotion authorizer (the real gate-wall + stale-tree in promoteCandidate are authoritative).
+        try {
+          await receipts.append(
+            {
+              operation: "worker.safety_assessment",
+              outcome: { status: "success", detail: `adjudication ${adjDecision.action} (${adjDecision.reason})` },
+              requestId: task.taskId,
+              metadata: {
+                taskId: task.taskId, treeHash: wp.treeHash,
+                authority: "advisory-to-adjudication; NOT a promotion authorizer (gate-wall + promoteCandidate are authoritative)",
+                observedVetoes: { externalInjection: safety.externalInjection, refuted: safety.refuted, killed: safety.killed },
+                notDeterminedHere: ["effectiveBreach", "driftBlocked", "gateWallAuthorized"],
+                adjudicationAction: adjDecision.action, adjudicationReason: adjDecision.reason,
+                mode: adjudicationAuthoritative ? "authoritative" : "shadow",
+              },
+              project: task.targetRepo,
+            },
+            parentIdentity,
+          );
+        } catch { /* provenance receipt failure must never break the build */ }
+
+        if (shadowEnabled) {
+          const oldIntent = readIntegratorDecision(results.find((r) => r.role === "integrator")).promote === true;
+          const newPromote = adjDecision.action === "promote";
+          if (oldIntent !== newPromote) {
+            await receipts.append(
+              { operation: "worker.decision.divergence", outcome: { status: "success" }, project: task.targetRepo, requestId: task.taskId,
+                metadata: { taskId: task.taskId, oldPromote: oldIntent, newAction: adjDecision.action, newReason: adjDecision.reason, authoritative: adjudicationAuthoritative, verifierRan: verifierResult !== undefined, verdict: assessment.verdict, testEvidence: assessment.testEvidence, workNonEmpty: wp.nonEmpty, filesChanged: wp.diffStat.filesChanged } },
+              parentIdentity,
+            );
+            log.warn({ taskId: task.taskId, oldPromote: oldIntent, newAction: adjDecision.action, newReason: adjDecision.reason }, "adjudication: promotability DIVERGENCE (old gate vs core)");
+          }
+          if (verifierResult === undefined && wp.nonEmpty && !oldIntent) {
+            // The builder short-circuited (no verification) but left work on disk — the false-RED
+            // candidate. The Adjudication Core would route this tree to the verifier instead of discarding
+            // it unseen. Behavior is unchanged in shadow; this measures how often the false-RED path fires.
+            await receipts.append(
+              { operation: "worker.adjudication.unverified_work", outcome: { status: "success" }, project: task.targetRepo, requestId: task.taskId,
+                metadata: { taskId: task.taskId, filesChanged: wp.diffStat.filesChanged, insertions: wp.diffStat.insertions, deletions: wp.diffStat.deletions, builderStopReason: String((results.find((r) => r.role === "builder")?.detail as Record<string, unknown> | undefined)?.stopReason ?? "unknown") } },
+              parentIdentity,
+            );
+            log.warn({ taskId: task.taskId, filesChanged: wp.diffStat.filesChanged }, "adjudication: nonEmpty work discarded WITHOUT verification (false-RED candidate — the core would adjudicate it)");
+          }
+        }
+      } catch (adjErr) {
+        // A computation failure must NEVER crash the build. In SHADOW it's pure telemetry; in
+        // AUTHORITATIVE mode `adjDecision` stays undefined ⇒ the terminal gate fails CLOSED (no promote).
+        adjDecision = undefined;
+        log.debug?.({ taskId: task.taskId, authoritative: adjudicationAuthoritative, err: adjErr instanceof Error ? adjErr.message : String(adjErr) }, "adjudication: fact computation skipped (non-fatal)");
+      }
+    }
+
+    // STALE-TREE BINDING (Phase 3): snapshot the content tree the verifier certified, AFTER every role
+    // + escalation + rescue has run and committed its work. The canonical promotion authority re-reads
+    // the live tree immediately before promoting and refuses if it changed — the exact candidate that
+    // was verified is the exact candidate that promotes. Captured via the injectable readTreeHash seam
+    // (undefined for a non-git/in-memory test workspace ⇒ the authority skips the check, unchanged).
+    const verifiedTree = await readTreeHash(workspace.path);
+    const verifiedTargetHead = workspace.baseRef;
+
+    // DURABLE SEMANTIC EVIDENCE (Phase 9, IKBI-RT-006): persist the FULL validated verdict for the final
+    // critic result — whether the build promotes or is rejected — and reference its id from the promotion
+    // receipt. Runs after all roles/rescue so it captures the post-fix critic. No-op when no critic ran.
+    const normalSemanticEvaluationId = await emitSemanticEvidence(
+      results.find((r) => r.role === "critic"),
+      {
+        taskId: task.taskId,
+        attemptId: task.taskId,
+        candidateId: task.taskId,
+        ...(verifiedTree !== undefined ? { verifiedTree } : {}),
+        strategy: task.moeVendorLane === "mimo" ? "duel-peer" : task.moeVendorLane === "deepseek" ? "duel-primary" : "normal",
+        verificationPassed: results.find((r) => r.role === "verifier")?.outcome === "success",
+        targetRepo: task.targetRepo,
+      },
+      parentIdentity,
+      runLedger,
+    );
 
     // Terminal: a KILL halted the run mid-loop ⇒ stop cleanly (NEVER promote a half-run),
     // surface the kill, return. The workspace is RETAINED (not discarded) so its partial work
@@ -2607,7 +4647,8 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         ),
       );
       fireStopHooks(hooks, task.targetRepo).catch(() => {});
-      return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: results, workspaceId: workspace.id, promoted: false, reason: killedReason };
+      await writeTerminalCostSummary("rejected", runCost(), `interrupted: ${killedReason}`); // Gap A: mid-run kill spend is counted
+      return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: results, workspaceId: workspace.id, promoted: false, reason: killedReason, nonPromotion: { class: "interrupted", duelEligible: false } };
     }
 
     // Terminal: a GREEN build whose worker tier lacks autoCommit autonomy left its verified
@@ -2645,7 +4686,11 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       // The worker did verified-good work; it just can't autoCommit. Record the
       // success so it can EARN trust toward the autoCommit tier.
       await recordBuildTrust("success", workerSpawned, task.taskId, task.targetRepo, false);
-      return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "partial", roles: results, workspaceId: workspace.id, promoted: false, reason, costUsd: runCost() };
+      // C-A4: this is a CLEAN non-promoting terminal (verified-good, tier lacks autoCommit) — write the
+      // authoritative run-summary so `ikbi cost` groups by IT (not by summing the run's per-role/retry
+      // receipts, which would double-count the cumulative-stamped ones). aborted:false — it did not abort.
+      await writeTerminalCostSummary("partial", runCost(), reason ?? "verified-good; autoCommit tier gate", false);
+      return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "partial", roles: results, workspaceId: workspace.id, promoted: false, reason, costUsd: runCost(), nonPromotion: { class: "governance-refused", duelEligible: false } };
     }
 
     // STEP-PLANNER: when skipPromote is set, run the role pipeline but leave the
@@ -2658,6 +4703,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } },
         ),
       );
+      // C-A4: a step-planner step is a clean non-promoting terminal — write the authoritative run-summary
+      // so its spend is grouped by IT, not double-counted by summing the step's per-role/retry receipts.
+      await writeTerminalCostSummary(overall, runCost(), `step completed (skipPromote) with outcome "${overall}"`, false);
       return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: overall, roles: results, workspaceId: workspace.id, promoted: false, ...(overall !== "success" ? { reason: `step completed with outcome "${overall}"` } : {}), costUsd: runCost() };
     }
 
@@ -2666,7 +4714,81 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // returned an affirmative, well-formed promote decision; anything else discards
     // (fail-closed). If a role hard-failed, the loop broke before the integrator ran,
     // so its result is absent → fail-closed discard. That composition is intentional.
-    const decision = readIntegratorDecision(results.find((r) => r.role === "integrator"));
+    let decision = readIntegratorDecision(results.find((r) => r.role === "integrator"));
+    // ── CX — ADJUDICATION CORE AUTHORITATIVE (IKBI_LEGACY_COMPLETION=off) ──────────────────────────
+    // When the flip is enabled, `decidePromotability` (computed above) REPLACES the integrator's promote
+    // intent: promote ⇒ promote, retain ⇒ withhold-but-keep the green work (never discard, invariant I1),
+    // discard ⇒ discard. The downstream approval + gate-wall gates STILL run on a promote (defense in
+    // depth). Fail-closed: if the verdict couldn't be computed, do NOT promote. DEFAULT (flag on /
+    // legacy) leaves `decision` exactly as the integrator returned it — no change.
+    // NOTE: C1c `verifiedAgainst` (the hash-bound promote in WorkspaceManager) is NOT yet threaded from
+    // here, so the manager does not re-check the landed tree against what the verifier saw — a follow-up
+    // (Fable C-2/C-4) before the default flip.
+    let adjRetain = false;
+    if (adjudicationAuthoritative) {
+      if (adjDecision === undefined) {
+        // H-3 (Fable, I1): facts unavailable ⇒ fail closed to NO-PROMOTE, but RETAIN the work (never
+        // discard) — the core's contract for "cannot certify this tree" is retain(adjudication-incomplete),
+        // and destroying possibly-good work on a transient fact-computation failure (e.g. a git timeout)
+        // is the wrong fail-closed. The operator can inspect + discard deliberately.
+        adjRetain = true;
+        decision = { ...decision, promote: false, rationale: "adjudication core authoritative but the promotability verdict was unavailable — fail closed (no promote; work retained for inspection)" };
+      } else if (adjDecision.action === "promote") {
+        // QUARANTINE (Phase 3, IKBI-RT-005), preserved. The adjudication core's `promote` is only a
+        // RECOMMENDATION over authentic vetoes (Phase 8 removed the manufactured `gateWallAuthorized:true`;
+        // the `SafetyAssessment` no longer fabricates gate-wall authorization). It must NOT manufacture an
+        // autonomous promote: it may CONFIRM a promote the integrator ALSO approved (which then still
+        // passes through the canonical authority's real gate-wall + stale-tree binding), but when the
+        // integrator did NOT approve it fails CLOSED and retains the work — the experimental path can never
+        // override an integrator discard. The real gate-wall + promoteCandidate remain the sole authority.
+        if (decision.promote === true) {
+          decision = { ...decision, rationale: `adjudication core: promote — confirms the integrator (${adjDecision.reason})` };
+        } else {
+          adjRetain = true;
+          decision = {
+            ...decision,
+            promote: false,
+            rationale:
+              "adjudication core recommended promote, but the integrator did not approve — QUARANTINED: the experimental IKBI_LEGACY_COMPLETION=off path cannot autonomously promote from synthesized safety evidence (no promote; work retained for inspection)",
+          };
+        }
+      } else {
+        adjRetain = adjDecision.action === "retain";
+        decision = { ...decision, promote: false, rationale: `adjudication core: ${adjDecision.action} (${adjDecision.reason})` };
+      }
+    }
+    // FAIL-CLOSED IN-RUN GATE (enforced on THIS build's promote, independent of the trust ladder):
+    //  INJECTION: the neutralization chokepoint blocked a tool result in some role this build — the
+    //  "injection blocks promotion" defense, enforced HERE. The trust-ladder demotion only affects
+    //  FUTURE builds and is off by default, so it cannot block the OFFENDING build. This is a genuine
+    //  gate failure (not an operator/governance decision) → trust is NOT suppressed.
+    if (decision.promote && externalInjectionDetectedThisBuild) {
+      decision = { ...decision, promote: false, rationale: "discard: prompt-injection from OUTSIDE content (web/vision/delegate/…) detected by the neutralization chokepoint during this build (fail-closed — the injected build must not promote)" };
+    } else if (decision.promote && injectionDetectedThisBuild) {
+      // Injection was detected but only in the build's OWN worktree output (neutralized-and-inert —
+      // e.g. ikbi's own injection-test fixtures when self-hosting). The model never acted on it, and
+      // planting it needs repo-write (outside the injection threat model). Judge by effect: record +
+      // proceed, mirroring the policy-taint gate below. External-origin injection still discards above.
+      log.warn(
+        { taskId: task.taskId, workspaceId: workspace.id },
+        "promote proceeds despite injection NEUTRALIZED in the build's own worktree output — recorded for audit, not a discard (judge by effect; external-origin injection would still block)",
+      );
+    } else if (decision.promote && policyTaintedThisBuild) {
+      // JUDGE BY EFFECT, NOT INTENT. A policy violation in ikbi is a PREVENTED (rejected) tool call —
+      // the governor/sandbox blocked it, so it had NO effect, and the verifier passed on the real
+      // worktree. A prevented attempt is evidence the governor WORKED, not that the build is bad. It is
+      // recorded as a warning + learning signal (the builder receipt / detail.policyViolations carry it,
+      // and self-heal can adapt the prompt/context), and it feeds a small trust delta — but it does NOT
+      // discard a verified-green build. Only an EFFECTIVE breach (a control FAILURE that actually landed
+      // — sandbox escape, egress leak, out-of-workspace write, receipt tampering) discards, and those
+      // surface as separate higher-severity alarms, not as rejected tool calls. Cheap models improvise
+      // blocked commands routinely; discarding green work over a prevented attempt measures obedience,
+      // not engineering, and would collapse the autonomous success rate for reasons unrelated to code.
+      log.warn(
+        { taskId: task.taskId, workspaceId: workspace.id },
+        "promote proceeds despite a PREVENTED (blocked) out-of-policy attempt — recorded as a learning signal, not a discard (judge by effect, not intent)",
+      );
+    }
     let promoted = false;
     let reason: string | undefined;
     // SG-10 HUMAN-APPROVAL GATE (opt-in): the build is VERIFIED and the integrator approved —
@@ -2676,6 +4798,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // (not a worker quality failure) so trust can be suppressed.
     let trustSuppressed = false;
     let trustSuppressReason: string | undefined;
+    // Phase 13B (IKBI-REAUDIT2-008): set when a successful promote's gate allow came from the operator
+    // BYPASS. A bypassed land is administratively-bypassed, NOT a fully-governed autonomous success — it must
+    // not receive governed-success trust and must be surfaced in the run summary.
+    let gateBypassedThisBuild = false;
     if (decision.promote && requestApproval !== undefined) {
       events.publish(
         workerApprovalRequested.create({ taskId: task.taskId, workspaceId: workspace.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.run", runId: task.taskId } }),
@@ -2718,19 +4844,147 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           trustSuppressed = true;
           trustSuppressReason = "gate-wall denied promotion (governance decision)";
         } else {
-          const promote = await workspaces.promote(workspace, {
-            evaluation: decision.evaluation, // sourced from the integrator, NOT hardcoded
-            governance,
-            // Auditability: record the verification scope the promote relied on in the commit message.
-            message: `worker-model: ${task.goal}${decision.rationale !== undefined ? ` — ${decision.rationale}` : ""}${verificationScope !== undefined ? ` [verification: ${verificationScope}]` : ""}`,
-            requestId: task.taskId,
-          });
-          promoted = promote.promoted;
-          if (!promoted) {
-            // Conflict: the workspace is reconcilable — downgrade to partial, do NOT discard.
-            overall = "partial";
-            reason = promote.reason ?? "promote did not land (conflict)";
+          // CANONICAL PROMOTION (Phase 3): submit the candidate + its candidate-bound evidence to the
+          // single promotion authority — the normal path no longer calls workspaces.promote directly.
+          const builderDetail = (results.find((r) => r.role === "builder")?.detail ?? {}) as Record<string, unknown>;
+          const normalVerifier = results.find((r) => r.role === "verifier");
+          const normalIdentity = await candidateIdentityFields(workspace.path);
+          // FROZEN VERIFICATION SNAPSHOT (Phase 13B): when the fence is clear + identity resolved + a verified
+          // tree exists, freeze the generation into an immutable snapshot (the git tree is content-addressed).
+          // The snapshot id binds the promotion evidence; the stale-tree + CAS confirm the promoted content
+          // equals exactly this frozen subject. Skipped when the candidate is already blocked (fenced/indeterminate).
+          let normalSnapshot: VerificationSnapshot | undefined;
+          const normalReg = activeLeaseRegistries.get(task.taskId);
+          if (normalReg !== undefined && verifiedTree !== undefined && !normalIdentity.identityIndeterminate && normalReg.isFenced(workspace.id) === false && activeMutationFences.get(task.taskId)?.isFenced(workspace.id) !== true) {
+            const gen = normalReg.currentGeneration(workspace.id) ?? normalReg.openGeneration({ attemptId: task.taskId, candidateId: task.taskId, workspaceId: workspace.id, workspacePath: workspace.path });
+            const freezeElig = normalReg.canFreeze(gen.generationId);
+            if (freezeElig.ok) normalSnapshot = normalReg.freeze(gen.generationId, { canonicalDigest: verifiedTree, gitTree: verifiedTree, ...(verifiedTargetHead !== undefined ? { baseIdentity: verifiedTargetHead } : {}) });
           }
+          // PHYSICAL FROZEN SNAPSHOT (Phase 13C): for a git-backed candidate, materialize a physically isolated,
+          // read-only detached-worktree snapshot of the committed verified tree. A source mutation after this
+          // cannot change it. FAIL-CLOSED: if a git-backed subject cannot be physically frozen + verified, block
+          // autonomous promotion (do not promote the mutable source). Non-git ⇒ undefined (logical binding stands).
+          let physicalSnapshot: PhysicalSnapshot | undefined;
+          let snapshotIntegrityError: string | undefined;
+          // Only materialize a PHYSICAL snapshot when `verifiedTree` came from the REAL git probe (deps.readTreeHash
+          // not injected) — a stubbed tree reader means the test controls identity logically, so the physical
+          // (real-git) subject would not match; those keep the Phase 13B logical binding.
+          if (normalSnapshot !== undefined && deps.readTreeHash === undefined && normalIdentity.treeIdentityRequired && !normalIdentity.identityIndeterminate && verifiedTree !== undefined) {
+            try {
+              physicalSnapshot = await (deps.createPhysicalSnapshot ?? defaultCreatePhysicalSnapshot)(workspace.path, verifiedTree);
+            } catch (err) {
+              snapshotIntegrityError = err instanceof Error ? err.message : String(err);
+            }
+          }
+          if (snapshotIntegrityError !== undefined) {
+            await receipts.append(
+              { operation: "worker.promotion.snapshot_integrity_error", outcome: { status: "failure", detail: snapshotIntegrityError }, requestId: task.taskId, metadata: { taskId: task.taskId, workspaceId: workspace.id, verifiedTree: verifiedTree ?? null }, project: task.targetRepo },
+              parentIdentity,
+            ).catch(() => {});
+            await safeRetain(workspaces, workspace, `physical snapshot integrity failure: ${snapshotIntegrityError}`);
+            overall = "rejected";
+            reason = `snapshot-integrity: ${snapshotIntegrityError}`;
+            trustSuppressed = true;
+            trustSuppressReason = "physical verification snapshot could not be frozen/verified (integrity, not a worker quality failure)";
+          } else {
+          const candidate: PromotionCandidate = {
+            taskId: task.taskId,
+            attemptId: task.taskId,
+            strategy: task.moeVendorLane === "mimo" ? "duel-peer" : task.moeVendorLane === "deepseek" ? "duel-primary" : "normal",
+            workspaceId: workspace.id,
+            workspacePath: workspace.path,
+            ...(typeof builderDetail.model === "string" ? { model: builderDetail.model } : {}),
+            ...(task.moeVendorLane !== undefined ? { vendorLane: task.moeVendorLane } : {}),
+            ...(verifiedTree !== undefined ? { verifiedTree } : {}),
+            targetHead: verifiedTargetHead,
+            treeIdentityRequired: normalIdentity.treeIdentityRequired,
+            ...(normalIdentity.identityIndeterminate ? { identityIndeterminate: true } : {}),
+            ...(activeMutationFences.get(task.taskId)?.isFenced(workspace.id) ? { mutationFenced: true } : {}),
+            ...(normalSnapshot !== undefined ? { snapshotId: normalSnapshot.snapshotId, snapshotDigest: normalSnapshot.canonicalDigest } : {}),
+            ...(physicalSnapshot !== undefined ? { snapshotPath: physicalSnapshot.snapshotPath, snapshotImmutable: physicalSnapshot.immutable } : {}),
+          };
+          // IDENTITY IMMEDIATELY BEFORE PROMOTION (Phase 13C): re-verify the physical snapshot still resolves to
+          // its recorded tree + is still read-only. A snapshot that drifted is an integrity failure — block.
+          if (physicalSnapshot !== undefined && (await verifySnapshotUnchanged(physicalSnapshot)) === false) {
+            await physicalSnapshot.cleanup().catch(() => {});
+            await safeRetain(workspaces, workspace, "physical snapshot drifted before promotion");
+            overall = "rejected";
+            reason = "snapshot-integrity: the frozen snapshot changed before promotion";
+            trustSuppressed = true;
+            trustSuppressReason = "physical snapshot drifted before promotion (integrity, not a worker quality failure)";
+          } else {
+          const evidence: CandidateEvidence = {
+            verificationPassed: normalVerifier?.outcome === "success",
+            ...(actualVerificationMode !== undefined ? { verificationMode: actualVerificationMode } : {}),
+            testEvidence: readVerifier(normalVerifier).testEvidence,
+            noTestsAcceptable: noTestsPolicyEnabled(task),
+            semanticKind: classifySemanticVerdict(results.find((r) => r.role === "critic")),
+            ...(normalSemanticEvaluationId !== undefined ? { semanticEvaluationId: normalSemanticEvaluationId } : {}),
+            policyPromote: true, // the integrator (or authoritative adjudication) already decided promote
+            governance,
+            evaluation: decision.evaluation, // sourced from the integrator, NOT hardcoded
+            message: `worker-model: ${task.goal}${decision.rationale !== undefined ? ` — ${decision.rationale}` : ""}${verificationScope !== undefined ? ` [verification: ${verificationScope}]` : ""}`,
+            ...(decision.rationale !== undefined ? { rationale: decision.rationale } : {}),
+          };
+          // Phase-16 (IKBI-REAUDIT3-017): own the physical snapshot across the throw-prone promotion +
+          // receipt appends. `promoteCandidate` (and its mandatory receipt appends / `workspaces.promote`) can
+          // throw; without this the detached read-only worktree would leak into /tmp. Cleanup is idempotent, so
+          // the success-path cleanup below is harmless if this already ran.
+          let canon: Awaited<ReturnType<typeof promoteCandidate>>;
+          try {
+            canon = await promoteCandidate(workspace, candidate, evidence, parentIdentity);
+          } catch (promoteErr) {
+            if (physicalSnapshot !== undefined) {
+              try { await physicalSnapshot.cleanup(); } catch (cleanupErr) {
+                await receipts.append({ operation: "worker.promotion.snapshot_cleanup_incomplete", outcome: { status: "failure", detail: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr) }, requestId: task.taskId, metadata: { taskId: task.taskId, workspaceId: workspace.id, snapshotPath: physicalSnapshot.snapshotPath, phase: "promote-threw" }, project: task.targetRepo }, parentIdentity).catch(() => {});
+              }
+              physicalSnapshot = undefined; // already cleaned — do not double-clean below
+            }
+            throw promoteErr;
+          }
+          promoted = canon.promote.promoted;
+          // Phase 13B: a bypassed autonomous land is administratively-bypassed — record it so the run summary
+          // is truthful and governed-success trust is withheld below.
+          if (promoted && governance.bypass === true) gateBypassedThisBuild = true;
+          if (!promoted) {
+            if (canon.quarantined === true) {
+              // Post-REAUDIT3: autonomous promotion is quarantined (opt-in off / gate bypass active). RETAIN
+              // the verified-good work for operator review, reject the autonomous land, and SUPPRESS trust —
+              // no governed landed-success may be awarded for a candidate that did not land.
+              await safeRetain(workspaces, workspace, canon.blockedReason ?? "autonomous promotion quarantined");
+              overall = "rejected";
+              reason = canon.blockedReason;
+              trustSuppressed = true;
+              trustSuppressReason = "autonomous promotion quarantined — operator review required (IKBI-REAUDIT3-001 open)";
+            } else if (canon.staleTree === true) {
+              // Post-verify mutation: the promoted tree would not be the verified tree. Fail CLOSED —
+              // discard the unverified work, reject, and suppress trust (an integrity/timing issue, not
+              // a worker quality failure).
+              await workspaces.discard(workspace);
+              overall = "rejected";
+              reason = canon.blockedReason;
+              trustSuppressed = true;
+              trustSuppressReason = "stale-tree: candidate mutated since verification (not a worker quality failure)";
+            } else if (canon.semanticWithheld === true) {
+              // The integrator approved but the canonical semantic verdict is not a pass (e.g. a
+              // contradictory PASS-with-defects → indeterminate). Fail CLOSED — retain for inspection,
+              // reject, suppress trust (a semantic-evaluation gap, not a proven worker quality failure).
+              await safeRetain(workspaces, workspace, canon.blockedReason ?? "semantic policy withheld promotion");
+              overall = "rejected";
+              reason = canon.blockedReason;
+              trustSuppressed = true;
+              trustSuppressReason = "semantic policy withheld promotion (non-pass verdict)";
+            } else {
+              // Conflict: the workspace is reconcilable — downgrade to partial, do NOT discard.
+              overall = "partial";
+              reason = canon.promote.reason ?? "promote did not land (conflict)";
+            }
+          }
+          // PHYSICAL SNAPSHOT CLEANUP (Phase 13C): after the promote decision + its receipt are durable, tear
+          // down the isolated read-only worktree. Cleanup happens ONLY after promotion + receipt (never before).
+          if (physicalSnapshot !== undefined) await physicalSnapshot.cleanup().catch(() => {});
+          } // close the snapshot-drift else
+          } // close the snapshot-integrity else
         }
       }
     } else if (!approvalRejected) {
@@ -2744,7 +4998,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       // discarding it (the builder may have written real files before the failure). A build
       // that ran GREEN but the integrator declined to promote is a deliberate "not promotable"
       // verdict → discard as before. Retention is gated (default on); off ⇒ old eager discard.
-      if (retainFailedWorkspaces && overall !== "success") {
+      // CX (I1): when the adjudication core withheld GREEN work (action=retain — governance/critic/
+      // safety-forensics), KEEP it (never discard green work), even though `overall` is "success".
+      if (adjRetain || (retainFailedWorkspaces && overall !== "success")) {
         await safeRetain(workspaces, workspace, reason);
       } else {
         await workspaces.discard(workspace);
@@ -2765,6 +5021,30 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // wired decision. Always present on the result so the CLI summary + receipts can show them.
     const ranVerificationMode = actualVerificationMode ?? verificationMode;
     const ranRetrievalMode = actualRetrievalMode ?? retrievalMode;
+    // NON-PROMOTION CLASSIFICATION (Phase 2): why this attempt did not promote, so the duel scheduler
+    // launches a peer vendor lane ONLY for a real candidate the pipeline judged not-promotable. A
+    // governance refusal, an unverifiable target, an injection block, or an unlandable conflict are
+    // failures a different vendor cannot fix — the peer must not run. Order matters: the most specific
+    // structural/security/governance classes win over the generic "candidate-rejected".
+    // Phase 4: an INDETERMINATE or INFRASTRUCTURE critic verdict is NOT a candidate rejection — the
+    // critic could not render a concrete judgment, so a peer vendor lane cannot fix it (a duel would
+    // waste the peer's cost). Only a concrete quality rejection (fail/incomplete, or a builder/verifier
+    // failure where the critic gave no blocking verdict) stays duel-eligible.
+    const criticSemantic = classifySemanticVerdict(results.find((r) => r.role === "critic"));
+    const semanticNonDuel = criticSemantic === "indeterminate" || criticSemantic === "infrastructure-failure";
+    const nonPromotion: WorkerResult["nonPromotion"] = promoted
+      ? undefined
+      : checksUnverifiable !== undefined
+        ? { class: "unverifiable", duelEligible: false }
+        : externalInjectionDetectedThisBuild
+          ? { class: "injection-blocked", duelEligible: false }
+          : trustSuppressed
+            ? { class: "governance-refused", duelEligible: false }
+            : overall === "partial"
+              ? { class: "candidate-conflict", duelEligible: false }
+              : semanticNonDuel
+                ? { class: "semantic-indeterminate", duelEligible: false }
+                : { class: "candidate-rejected", duelEligible: true };
     const result: WorkerResult = {
       contractVersion: CONTRACT_VERSION,
       taskId: task.taskId,
@@ -2772,10 +5052,15 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       roles: results,
       workspaceId: workspace.id,
       promoted,
+      ...(nonPromotion !== undefined ? { nonPromotion } : {}),
       ...(reason !== undefined ? { reason } : {}),
       verificationMode: ranVerificationMode,
       retrievalMode: ranRetrievalMode,
       costUsd: runCost(),
+      // Phase 14B: surface this run's cost status + provider-attempt projection so a parent composite operation
+      // can aggregate the union of unique attempts across child runs (duel/multi-step) without double-counting.
+      costStatus: runLedger.costStatus(),
+      providerAttempts: runLedger.providerAttempts().map((a) => ({ providerAttemptId: a.providerAttemptId, ...(a.costUsd !== undefined ? { costUsd: a.costUsd } : {}), costStatus: a.costStatus })),
       ...(checksUnverifiable !== undefined && overall !== "success"
         ? { verification: { kind: checksUnverifiable.kind, reason: checksUnverifiable.reason, nextSteps: [...UNRESOLVABLE_NEXT_STEPS] } }
         : {}),
@@ -2825,6 +5110,32 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // model, cost, verification result, and promotion result — enabling `receipts --task` to
     // show a complete picture without inspecting individual role receipts.
     const verifierResult = results.find((r) => r.role === "verifier");
+    // PASSIVE RISK TELEMETRY: record this build's PREVENTED policy attempts (count + command shapes)
+    // on the run summary EVERY build writes. Prevented attempts no longer discard (effect-based gate),
+    // but recording them here means risk evidence accrues on ordinary usage — no dedicated (paid)
+    // observation campaign is ever needed to answer "which prevented behaviours are normal cheap-model
+    // noise vs. patterns that predict bad outcomes?" before designing graduated trust scoring.
+    const riskDetail = (results.find((r) => r.role === "builder")?.detail ?? {}) as Record<string, unknown>;
+    // A2/D3: the off-books FIXER pass's prevented attempts (accumulated across the run). Merge them into
+    // BOTH the notable and the fuller raw set so the passive risk telemetry is not blind to what a fixer
+    // pass tried and the governor blocked — read the accumulator directly so a FAILED run that never
+    // reached the integrator (no builder-result stamp) still records its fixer attempts as evidence.
+    const fixerPrevented = fixerPreventedThisBuild;
+    const notablePrevented = [...(Array.isArray(riskDetail.policyViolations) ? (riskDetail.policyViolations as Array<Record<string, unknown>>) : []), ...fixerPrevented];
+    // For EVIDENCE, record the FULLER raw set (rejectedToolCalls — includes the benign-reclassified rm/mv/
+    // probes filtered out of policyViolations) so the risk histogram is not blind to exactly the behaviours
+    // the effect-based gate reclassified. `preventedCount` stays the NOTABLE count (what the threshold uses).
+    const allPrevented = [...(Array.isArray(riskDetail.rejectedToolCalls) ? (riskDetail.rejectedToolCalls as Array<Record<string, unknown>>) : (Array.isArray(riskDetail.policyViolations) ? (riskDetail.policyViolations as Array<Record<string, unknown>>) : [])), ...fixerPrevented];
+    const preventedCommands = allPrevented
+      .map((v) => {
+        const tool = typeof v.tool === "string" ? v.tool : "tool";
+        const path = typeof v.path === "string" ? v.path : "";
+        return path ? `${tool}:${path}` : tool;
+      })
+      .slice(0, 30);
+    const integratorDetail = (results.find((r) => r.role === "integrator")?.detail ?? {}) as Record<string, unknown>;
+    const requiresReview = integratorDetail.requiresReview === true;
+    const highRiskCount = typeof integratorDetail.highRiskCount === "number" ? integratorDetail.highRiskCount : 0;
     await receipts.append(
       {
         operation: "worker.run.summary",
@@ -2837,11 +5148,34 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           targetRepo: task.targetRepo,
           outcome: overall,
           promoted,
-          model: singleBuilderModel,
+          // EXECUTION TRUTH (Phase 11): the summary model is the builder model the provider ACTUALLY served
+          // (from the invocation ledger), not the configured `singleBuilderModel` selection.
+          model: runLedger.lastFor("builder")?.resolvedModel ?? singleBuilderModel,
           costUsd: runCost(),
+          // COST TRUTH (Phase 7/11): `costUsd` = sum of unique invocation records (incl. charged failed
+          // attempts). `routingOverheadUsd` breaks out the classifier subtotal; `costStatus`/`unknownCostCount`
+          // are derived from the LEDGER (partial when ANY accounted invocation's cost is unknown, not only the
+          // classifier); `invocationCount` is the number of actual dispatched provider requests.
+          routingOverheadUsd,
+          costStatus: runLedger.costStatus(),
+          invocationCount: runLedger.invocationCount(),
+          // AGGREGATE LINKAGE (Phase 11C): the ordered set of EVERY executed provider invocation this run
+          // summarizes (each once, no double-count) + the primary code-producing builder invocation. The
+          // summary's aggregate cost/model/status DERIVE from these records — it invents no execution identity.
+          invocationIds: runLedger.executedIds(),
+          ...(runLedger.lastFor("builder") !== undefined ? { primaryInvocationId: runLedger.lastFor("builder")!.invocationId } : {}),
+          unknownCostCount: runLedger.unknownCosts(),
+          ...(runLedger.laneViolations() > 0 ? { laneViolations: runLedger.laneViolations() } : {}),
+          ...(classifierModelUsed !== undefined ? { classifierModel: classifierModelUsed, classifierDecisionSource, classifierCostStatus } : {}),
           verificationResult: verifierResult !== undefined ? verifierResult.outcome : "not_run",
           verificationMode: ranVerificationMode,
           retrievalMode: ranRetrievalMode,
+          // Phase 13B (IKBI-REAUDIT2-008): a bypassed autonomous land is surfaced on the run summary + earned
+          // no governed-success trust — the run is administratively-bypassed, not fully-governed.
+          ...(gateBypassedThisBuild ? { gateBypassed: true, gateAuthority: "administratively-bypassed" } : {}),
+          ...(allPrevented.length > 0 ? { preventedCount: notablePrevented.length, allPreventedCount: allPrevented.length, highRiskCount, preventedCommands, requiresReview } : {}),
+          // BUILD-PATH DRIFT (step 3): the advisory drifted operations the governor surfaced (reportOnly/warn).
+          ...(buildDriftReports.length > 0 ? { driftedOperations: buildDriftReports.map((r) => ({ operation: r.operation, recentRate: r.recentRate, baselineRate: r.baselineRate, severity: r.severity ?? "minor" })) } : {}),
           ...(task.originAgent !== undefined ? { originAgent: task.originAgent } : {}),
         },
         project: task.targetRepo,
@@ -2884,6 +5218,13 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     let buildTrustStatus = toOutcomeStatus(overall);
     let buildTrustSuppressed = trustSuppressed;
     let buildTrustReason = trustSuppressReason;
+    // Phase 13B (IKBI-REAUDIT2-008): a gate-BYPASSED autonomous promote is administratively-bypassed — it must
+    // NOT earn fully-governed autonomous success trust (the gate veto was off). Suppress the trust signal (a
+    // `worker.trust.signal_suppressed` receipt records why); the promote still lands, the audit stays truthful.
+    if (gateBypassedThisBuild && !buildTrustSuppressed) {
+      buildTrustSuppressed = true;
+      buildTrustReason = "gate-wall bypassed — administratively-bypassed promote is not fully-governed autonomous success trust";
+    }
     // UNVERIFIABLE TARGET: a fail-closed terminal because no checks could be derived is NOT a worker
     // quality/code failure — the model could not have succeeded against a missing verifier. SUPPRESS
     // the trust signal (no demotion, no consecutive-failure cascade) and receipt the reason. Wins
@@ -2916,21 +5257,38 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 
   /** Dispatch one role in one workspace (events + recordRole), returning its result.
    *  `roleFnOverride` lets the competitive loop inject a per-candidate builder (its own model). */
-  async function dispatchRole(role: WorkerRole, spawned: SpawnedRole, task: WorkerTask, workspace: WorkspaceHandle, priorResults: readonly RoleResult[], parentCtx: OperationContext, engine: RoleEngine, roleFnOverride?: RoleFn, cost?: () => number): Promise<RoleResult> {
+  async function dispatchRole(role: WorkerRole, spawned: SpawnedRole, task: WorkerTask, workspace: WorkspaceHandle, priorResults: readonly RoleResult[], parentCtx: OperationContext, engine: RoleEngine, roleFnOverride?: RoleFn, cost?: () => number, ledger?: InvocationLedger): Promise<RoleResult> {
     events.publish(
       workerRoleDispatched.create(
         { taskId: task.taskId, role, ...(spawned.identity.trustTier !== undefined ? { tier: spawned.identity.trustTier } : {}) },
         { source: EVENT_SOURCE, attribution: { identity: spawned.identity, operation: `worker.role.${role}`, runId: task.taskId } },
       ),
     );
-    const ctx: RoleContext = { task, role, identity: spawned.identity, autonomy: spawned.autonomy, workspace, priorResults: [...priorResults], engine };
+    // RUNTIME-TRUTH (Phase 5): the tournament/competitive builder + winner critic reached via this
+    // shared dispatcher also receive candidate-bound runtime evidence. The critic binds to the winner
+    // workspace's verified tree so its semantic evaluation cannot receive another candidate's evidence.
+    const dispatchRuntimeEvidence =
+      role === "builder" || role === "critic"
+        ? await requestRuntimeEvidence(task, role, workspace, spawned.identity, {
+            attemptId: task.taskId,
+            candidateId: workspace.id,
+            needsVerifiedTree: role === "critic",
+          })
+        : [];
+    const ctx: RoleContext = { task, role, identity: spawned.identity, autonomy: spawned.autonomy, workspace, priorResults: [...priorResults], engine, ...(dispatchRuntimeEvidence.length > 0 ? { runtimeEvidence: dispatchRuntimeEvidence } : {}) };
     // The verifier (C1) and the builder (its in-loop run_checks) run the governed path
     // bound to the run ctx (parentCtx is the minted ValidatedIdentity governed-exec needs).
     const roleFn = roleFnOverride ?? (role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderFor(parentCtx, resolveBuilderMode(task)) : roles[role]);
     // H4: floor the verifier's role timeout at the per-check budget (same as the cooperative path).
     const verifierTimeout = role === "verifier" ? Math.max(roleTimeoutMs, resolveCheckTimeoutMs(modeEnv)) : undefined;
     const costBeforeRole = cost?.() ?? 0;
-    const result = await runRoleFn(role, roleFn, ctx, verifierTimeout);
+    // Phase 11C: tag the (competitive/tournament) candidate role's provider calls with the role/stage/attempt/
+    // candidate so the ledger records them under the right identity and the role receipt can reference the
+    // authoritative invocation. Competitive/tournament attempts are not lane-pinned (no vendorLane).
+    const runIt = (): Promise<RoleResult> => runRoleFn(role, roleFn, ctx, verifierTimeout);
+    const result = ledger !== undefined
+      ? await ledger.withContext({ role, stage: "candidate-role", attemptId: task.taskId, candidateId: workspace.id }, runIt)
+      : await runIt();
     events.publish(
       workerRoleCompleted.create(
         { taskId: task.taskId, role, outcome: result.outcome },
@@ -2938,7 +5296,15 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       ),
     );
     const roleCost = cost !== undefined ? cost() - costBeforeRole : undefined;
-    await recordRole(task, workspace, spawned, result, roleCost, singleBuilderModel, true);
+    // EXECUTION TRUTH (Phase 11/11C): the receipt's model + invocation id derive from the LEDGER record for
+    // THIS role's actual invocation (the DISPATCHED model = requestedAlias, per Phase 1). A role that made no
+    // model call records neither — never the flat `singleBuilderModel` default that mis-stamped every role.
+    // Pin the PRIMARY role invocation (stage "candidate-role"): a critic that spawned a nested
+    // structured-recovery call also has a later "structured-recovery" record — the ROLE receipt must
+    // reference its own verdict-producing invocation, not the recovery (which owns its own receipt).
+    const ledRec = ledger?.lastFor(role, "candidate-role");
+    const roleModel = ledRec?.requestedAlias ?? ((result.detail as Record<string, unknown> | undefined)?.model as string | undefined);
+    await recordRole(task, workspace, spawned, result, roleCost, typeof roleModel === "string" ? roleModel : undefined, true, ledRec?.invocationId);
     return result;
   }
 
@@ -2994,7 +5360,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     }
 
     // Per-run costing engine: accumulates model cost across the shared scout + every candidate.
-    const { engine: runEngine, cost: runCost } = makeCostingEngine(task.maxBudgetUsd, task.effort);
+    const { engine: runEngine, cost: runCost, ledger: runLedger } = makeCostingEngine(task.taskId, task.maxBudgetUsd, task.effort);
 
     const handles: WorkspaceHandle[] = [];
     const rolesByWs = new Map<string, RoleResult[]>();
@@ -3036,11 +5402,13 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       // 2. scout ONCE (shared, read-only, in the first worktree's clean base state) —
       //    its findings seed every builder. (Per-workspace scout is a future option.)
       const scoutSpawn = spawnRole("scout", parentCtx);
-      const scoutResult = await dispatchRole("scout", scoutSpawn, task, handles[0]!, [], parentCtx, runEngine, undefined, runCost);
+      const scoutResult = await dispatchRole("scout", scoutSpawn, task, handles[0]!, [], parentCtx, runEngine, undefined, runCost, runLedger);
       // FIX 5: capture worker identity for trust recording (competitive mode).
       // The first spawned role carries the shared agent identity — subsequent roles
-      // assert the same identity (Fix 6 invariant), so one capture suffices.
-      const compWorkerSpawned: SpawnedRole = scoutSpawn;
+      // assert the same identity (Fix 6 invariant), so one capture suffices. ASSIGN the
+      // outer binding (declared before the try) — a `const` here would SHADOW it, leaving the
+      // catch-path's recordBuildTrust with `undefined` (no trust outcome, no audit receipt).
+      compWorkerSpawned = scoutSpawn;
 
       // 3. builder + verifier PER workspace (sequential in v1; parallelism is a future
       //    optimization). Each builder writes into ITS worktree; each verifier checks ITS
@@ -3057,21 +5425,26 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           await recordBuildTrust("rejected", compWorkerSpawned, task.taskId, task.targetRepo, true, killReason);
           return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: rolesByWs.get(handles[0]?.id ?? "") ?? [], ...(handles[0] !== undefined ? { workspaceId: handles[0].id } : {}), promoted: false, reason: killReason };
         }
+        // DEPENDENCY INSTALL (per candidate): each candidate has its OWN fresh worktree with no
+        // node_modules. Without this, its builder's in-loop run_checks and the verifier both fail with
+        // "command not found" / "Cannot find module" → every candidate is disqualified and competitive
+        // mode systematically fails on any repo needing installs. Mirrors the single-run + tournament paths.
+        await installWorkspaceDeps(ws, parentCtx, deps.dependencyInstall);
         // HEAD-TO-HEAD: candidate ci races its OWN model (the Nth listed model, or the single
         // builder model as fallback) in its OWN worktree — each with the full run_checks rail.
         const candidateModel = competitiveModelList?.[ci] ?? singleBuilderModel;
         const candidateBuilder = builderForModel(parentCtx, candidateModel, resolveBuilderMode(task));
-        const builderResult = await dispatchRole("builder", spawnRole("builder", parentCtx), task, ws, [scoutResult], parentCtx, runEngine, candidateBuilder, runCost);
+        const builderResult = await dispatchRole("builder", spawnRole("builder", parentCtx), task, ws, [scoutResult], parentCtx, runEngine, candidateBuilder, runCost, runLedger);
         // AUTO-VERIFY RESCUE: if the builder wrote files but hit a protocol termination,
         // try the verifier. On GREEN, reclassify the builder so the candidate proceeds.
         const rescue = await maybeAutoVerifyRescueBuilderResult(builderResult, async () => {
-          return dispatchRole("verifier", spawnRole("verifier", parentCtx), task, ws, [scoutResult, builderResult], parentCtx, runEngine, undefined, runCost);
+          return dispatchRole("verifier", spawnRole("verifier", parentCtx), task, ws, [scoutResult, builderResult], parentCtx, runEngine, undefined, runCost, runLedger);
         });
         const finalBuilderResult = rescue.result;
         let verifierResult: RoleResult | undefined;
         const verifierSpawn = spawnRole("verifier", parentCtx);
         if (finalBuilderResult.outcome === "success") {
-          verifierResult = rescue.rescueVerify ?? await dispatchRole("verifier", verifierSpawn, task, ws, [scoutResult, finalBuilderResult], parentCtx, runEngine, undefined, runCost);
+          verifierResult = rescue.rescueVerify ?? await dispatchRole("verifier", verifierSpawn, task, ws, [scoutResult, finalBuilderResult], parentCtx, runEngine, undefined, runCost, runLedger);
         }
         // COMMIT this candidate's VERIFIED-good work (gated on autoCommit) BEFORE the judge —
         // safeDiffLines + buildCandidate read the committed diff, and the winner is promoted, so
@@ -3119,7 +5492,13 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 
       // 5b. WINNER: promote it (gate-wall STILL governs), discard ALL losers.
       const winner = handles.find((h) => h.id === verdict.winner!.workspaceId)!;
-      const winnerRoles = rolesByWs.get(winner.id) ?? [];
+      const selectedRoles = rolesByWs.get(winner.id) ?? [];
+      // Phase 4: the deterministic judge SELECTED this candidate, but ranking is NOT semantic
+      // verification. Run the canonical critic on the winner so it reaches promotion with a REAL
+      // semantic verdict (never `not-evaluated`); a concrete-defect fail then blocks the promote.
+      const compCritic = await dispatchRole("critic", spawnRole("critic", parentCtx), task, winner, selectedRoles, parentCtx, runEngine, criticFor(), runCost, runLedger);
+      const winnerRoles = [...selectedRoles, compCritic];
+      const compSemanticKind = classifySemanticVerdict(compCritic);
 
       // H5 FAIL-CLOSED: a promote REQUIRES gate-wall authorization. No gate-wall ⇒ DENY
       // (never advisory-allow an irreversible promote). Discard EVERY workspace, land
@@ -3143,12 +5522,51 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         await recordBuildTrust("rejected", compWorkerSpawned, task.taskId, task.targetRepo, true, reason);
         return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: winnerRoles, workspaceId: retained.retained?.id ?? winner.id, promoted: false, reason: retained.reason, costUsd: runCost() };
       }
-      const promote = await workspaces.promote(winner, {
-        evaluation: { approved: true, score: verdict.winner.composite, evaluatorId: "deterministic-judge" },
-        governance,
-        message: `worker-model (competitive): ${task.goal}`,
-        requestId: task.taskId,
-      });
+      // C-A1: fail-closed injection/policy-taint gate for the competitive winner (parity with single-run).
+      const compTaint = winnerTaintReason(winnerRoles);
+      if (compTaint !== undefined) {
+        const retained = await retainCompetitiveFailure(compTaint, winner.id);
+        events.publish(workerCompetitiveCompleted.create({ taskId: task.taskId, candidateCount: n, winnerWorkspaceId: winner.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
+        events.publish(workerFailed.create({ taskId: task.taskId, reason: retained.reason, workspaceId: retained.retained?.id ?? winner.id }, { source: EVENT_SOURCE, attribution: { identity: parentIdentity, operation: "worker.competitive", runId: task.taskId } }));
+        await recordBuildTrust("rejected", compWorkerSpawned, task.taskId, task.targetRepo, false, compTaint); // NOT suppressed — a genuine gate failure
+        return { contractVersion: CONTRACT_VERSION, taskId: task.taskId, outcome: "rejected", roles: winnerRoles, workspaceId: retained.retained?.id ?? winner.id, promoted: false, reason: retained.reason, costUsd: runCost() };
+      }
+      // CANONICAL PROMOTION (Phase 3 authority + Phase 4 semantic): the competitive winner is a
+      // SELECTED, semantically-evaluated candidate — it does not promote itself. It enters the same
+      // authority as every strategy (stale-tree + verifiedAgainst + canonical receipt + semantic gate).
+      const compWinnerModel = (selectedRoles.find((r) => r.role === "builder")?.detail as Record<string, unknown> | undefined)?.model;
+      const compVerifiedTree = await readTreeHash(winner.path);
+      const compVerifier = selectedRoles.find((r) => r.role === "verifier");
+      const compIdentity = await candidateIdentityFields(winner.path);
+      const compSemanticEvaluationId = await emitSemanticEvidence(
+        compCritic,
+        { taskId: task.taskId, attemptId: task.taskId, candidateId: winner.id, ...(compVerifiedTree !== undefined ? { verifiedTree: compVerifiedTree } : {}), strategy: "competitive", verificationPassed: compVerifier?.outcome === "success", targetRepo: task.targetRepo },
+        parentIdentity,
+        runLedger,
+      );
+      const canon = await promoteCandidate(
+        winner,
+        {
+          taskId: task.taskId, attemptId: task.taskId, strategy: "competitive", workspaceId: winner.id, workspacePath: winner.path,
+          ...(typeof compWinnerModel === "string" ? { model: compWinnerModel } : {}),
+          ...(compVerifiedTree !== undefined ? { verifiedTree: compVerifiedTree } : {}), targetHead: winner.baseRef,
+          treeIdentityRequired: compIdentity.treeIdentityRequired,
+          ...(compIdentity.identityIndeterminate ? { identityIndeterminate: true } : {}),
+          ...(activeMutationFences.get(task.taskId)?.isFenced(winner.id) ? { mutationFenced: true } : {}),
+        },
+        {
+          verificationPassed: compVerifier?.outcome === "success",
+          testEvidence: readVerifier(compVerifier).testEvidence,
+          noTestsAcceptable: noTestsPolicyEnabled(task),
+          semanticKind: compSemanticKind,
+          ...(compSemanticEvaluationId !== undefined ? { semanticEvaluationId: compSemanticEvaluationId } : {}),
+          policyPromote: true, governance,
+          evaluation: { approved: true, score: verdict.winner.composite, evaluatorId: "deterministic-judge" },
+          message: `worker-model (competitive): ${task.goal}`,
+        },
+        parentIdentity,
+      );
+      const promote = canon.promote;
       for (const ws of handles) if (ws.id !== winner.id) await safeDiscard(workspaces, ws);
 
       let promoted = promote.promoted;
@@ -3225,8 +5643,22 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
    * (the tournament then fails closed). Git-mutation governance still applies: `git apply` is
    * allowlisted but cannot redirect the worktree (the `-C`/`--work-tree` flags are denied upstream).
    */
-  async function defaultApplyDiff(parentCtx: OperationContext, workspace: WorkspaceHandle, diff: string, goal: string): Promise<{ applied: boolean; reason?: string }> {
+  async function defaultApplyDiff(parentCtx: OperationContext, workspace: WorkspaceHandle, diff: string, goal: string, taskId?: string): Promise<{ applied: boolean; reason?: string }> {
     if (diff.trim().length === 0) return { applied: false, reason: "winner produced an empty diff" };
+    // WRITE-BOUNDARY LEASE (Phase 13B): a candidate-mutating diff apply holds a lease bound to the workspace's
+    // current generation. If that generation was revoked/timed-out (fenced), the write is REJECTED here —
+    // before it mutates the candidate — and a truthful receipt is written. A revoked operation cannot land work.
+    const registry = taskId !== undefined ? activeLeaseRegistries.get(taskId) : undefined;
+    if (registry !== undefined) {
+      const gen = registry.currentGeneration(workspace.id) ?? registry.openGeneration({ attemptId: taskId!, candidateId: workspace.id, workspaceId: workspace.id, workspacePath: workspace.path });
+      if (registry.isFenced(workspace.id)) {
+        await receipts.append(
+          { operation: "worker.write_fenced", outcome: { status: "failure", detail: "candidate-mutating diff apply rejected: the workspace generation is revoked/timed-out (write-boundary lease invalid)" }, requestId: taskId!, metadata: { taskId, workspaceId: workspace.id, generationId: gen.generationId }, project: workspace.targetRepo },
+          parentCtx.identity.identity,
+        ).catch(() => {});
+        return { applied: false, reason: "write-boundary: the candidate generation is fenced (revoked/timed-out) — diff apply rejected" };
+      }
+    }
     const gov = govExecForRoles ?? (await import("../governed-exec/index.js")).governedExec;
     const os = await import("node:os");
     const fs = await import("node:fs/promises");
@@ -3256,7 +5688,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
    * engine is shared across every candidate + the shadow.
    */
   function makeTournamentEngine(task: WorkerTask, parentCtx: OperationContext, parentIdentity: AgentIdentity): TournamentEngine {
-    const { engine: runEngine, cost: runCost } = makeCostingEngine(task.maxBudgetUsd, task.effort);
+    const { engine: runEngine, cost: runCost, ledger: runLedger } = makeCostingEngine(task.taskId, task.maxBudgetUsd, task.effort);
     // FIX 5: capture worker identity for trust recording (tournament mode).
     // The first spawned role carries the shared agent identity.
     let tournWorkerSpawned: SpawnedRole | undefined;
@@ -3281,19 +5713,19 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       await installWorkspaceDeps(ws, parentCtx, deps.dependencyInstall);
       const scoutSpawn = spawnRole("scout", parentCtx);
       if (tournWorkerSpawned === undefined) tournWorkerSpawned = scoutSpawn;
-      const scoutResult = await dispatchRole("scout", scoutSpawn, t, ws, [], parentCtx, runEngine, undefined, runCost);
+      const scoutResult = await dispatchRole("scout", scoutSpawn, t, ws, [], parentCtx, runEngine, undefined, runCost, runLedger);
       const candidateBuilder = builderForModel(parentCtx, spec.model, spec.mode);
-      const builderResult = await dispatchRole("builder", spawnRole("builder", parentCtx), t, ws, [scoutResult], parentCtx, runEngine, candidateBuilder, runCost);
+      const builderResult = await dispatchRole("builder", spawnRole("builder", parentCtx), t, ws, [scoutResult], parentCtx, runEngine, candidateBuilder, runCost, runLedger);
       // AUTO-VERIFY RESCUE: if the builder wrote files but hit a protocol termination,
       // try the verifier. On GREEN, reclassify the builder so the candidate proceeds.
       const rescue = await maybeAutoVerifyRescueBuilderResult(builderResult, async () => {
-        return dispatchRole("verifier", spawnRole("verifier", parentCtx), t, ws, [scoutResult, builderResult], parentCtx, runEngine, undefined, runCost);
+        return dispatchRole("verifier", spawnRole("verifier", parentCtx), t, ws, [scoutResult, builderResult], parentCtx, runEngine, undefined, runCost, runLedger);
       });
       const finalBuilderResult = rescue.result;
       let verifierResult: RoleResult | undefined;
       const verifierSpawn = spawnRole("verifier", parentCtx);
       if (finalBuilderResult.outcome === "success") {
-        verifierResult = rescue.rescueVerify ?? await dispatchRole("verifier", verifierSpawn, t, ws, [scoutResult, finalBuilderResult], parentCtx, runEngine, undefined, runCost);
+        verifierResult = rescue.rescueVerify ?? await dispatchRole("verifier", verifierSpawn, t, ws, [scoutResult, finalBuilderResult], parentCtx, runEngine, undefined, runCost, runLedger);
       }
       // COMMIT verified work so the candidate's diff is the clean committed range — that range is
       // both what the judge scores (diffLines) and what gets replayed into the shadow if it wins.
@@ -3310,28 +5742,69 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       // Install deps in the shadow workspace before verifying — the shadow is a clean
       // worktree without node_modules, so pnpm test / vitest will fail without this.
       await installWorkspaceDeps(ws, parentCtx, deps.dependencyInstall);
-      const verifierResult = await dispatchRole("verifier", spawnRole("verifier", parentCtx), t, ws, [], parentCtx, runEngine, undefined, runCost);
+      const verifierResult = await dispatchRole("verifier", spawnRole("verifier", parentCtx), t, ws, [], parentCtx, runEngine, undefined, runCost, runLedger);
       const verdict = (verifierResult.detail as { verdict?: unknown } | undefined)?.verdict;
       const pass = verifierResult.outcome === "success" && verdict === "pass";
       return { pass, roles: [verifierResult], ...(pass ? {} : { reason: verifierResult.summary ?? "shadow verifier did not pass" }) };
     };
 
-    const promote = async (t: WorkerTask, ws: WorkspaceHandle, roleResults: readonly RoleResult[], composite: number): Promise<{ promoted: boolean; reason?: string; conflicts?: readonly string[] }> => {
+    const promote = async (t: WorkerTask, ws: WorkspaceHandle, roleResults: readonly RoleResult[], composite: number): Promise<{ promoted: boolean; reason?: string; conflicts?: readonly string[]; receiptStatus?: "recorded" | "failed" }> => {
       // H5 FAIL-CLOSED: a promote REQUIRES gate-wall authorization — no gate-wall ⇒ DENY.
       if (gateWall === undefined) return { promoted: false, reason: "gate-wall not wired — promote denied (fail-closed)" };
       const governanceGrant = autonomyForTier(asTier(parentIdentity.trustTier ?? TRUST_FLOOR, TRUST_FLOOR));
       const governance: PromoteGovernance = await gateWall.evaluate({ grant: governanceGrant, action: { kind: "promote", task: t, results: [...roleResults] }, identity: parentIdentity });
       if (!governance.allow) return { promoted: false, reason: governance.reason ?? "gate-wall denied promotion" };
-      const result = await workspaces.promote(ws, {
-        evaluation: { approved: true, score: composite, evaluatorId: "deterministic-judge" },
-        governance,
-        message: `worker-model (tournament): ${t.goal}`,
-        requestId: t.taskId,
-      });
+      // Phase 4: the clean-shadow replay is a SELECTED, reverified candidate — but tournament ranking is
+      // NOT semantic verification. Run the canonical critic on the shadow so the winner reaches promotion
+      // with a REAL semantic verdict (never `not-evaluated`); a concrete-defect fail blocks the promote.
+      const tourCritic = await dispatchRole("critic", spawnRole("critic", parentCtx), t, ws, roleResults, parentCtx, runEngine, criticFor(), runCost, runLedger);
+      const shadowRoles = [...roleResults, tourCritic];
+      // C-A1: fail-closed injection/policy-taint gate for the tournament winner (parity with single-run).
+      const tourTaint = winnerTaintReason(shadowRoles);
+      if (tourTaint !== undefined) return { promoted: false, reason: `discard: ${tourTaint}` };
+      // CANONICAL PROMOTION (Phase 3 authority + Phase 4 semantic): enter the single promotion authority
+      // like every strategy (stale-tree + verifiedAgainst + canonical receipt + semantic gate).
+      const tourWinnerModel = (roleResults.find((r) => r.role === "builder")?.detail as Record<string, unknown> | undefined)?.model;
+      const tourVerifiedTree = await readTreeHash(ws.path);
+      const tourVerifier = roleResults.find((r) => r.role === "verifier");
+      const tourIdentity = await candidateIdentityFields(ws.path);
+      const tourSemanticEvaluationId = await emitSemanticEvidence(
+        tourCritic,
+        { taskId: t.taskId, attemptId: t.taskId, candidateId: ws.id, ...(tourVerifiedTree !== undefined ? { verifiedTree: tourVerifiedTree } : {}), strategy: "tournament", verificationPassed: tourVerifier?.outcome === "success", targetRepo: t.targetRepo },
+        parentIdentity,
+        runLedger,
+      );
+      const canon = await promoteCandidate(
+        ws,
+        {
+          taskId: t.taskId, attemptId: t.taskId, strategy: "tournament", workspaceId: ws.id, workspacePath: ws.path,
+          ...(typeof tourWinnerModel === "string" ? { model: tourWinnerModel } : {}),
+          ...(tourVerifiedTree !== undefined ? { verifiedTree: tourVerifiedTree } : {}), targetHead: ws.baseRef,
+          treeIdentityRequired: tourIdentity.treeIdentityRequired,
+          ...(tourIdentity.identityIndeterminate ? { identityIndeterminate: true } : {}),
+          ...(activeMutationFences.get(t.taskId)?.isFenced(ws.id) ? { mutationFenced: true } : {}),
+        },
+        {
+          verificationPassed: tourVerifier?.outcome === "success",
+          testEvidence: readVerifier(tourVerifier).testEvidence,
+          noTestsAcceptable: noTestsPolicyEnabled(t),
+          semanticKind: classifySemanticVerdict(tourCritic),
+          ...(tourSemanticEvaluationId !== undefined ? { semanticEvaluationId: tourSemanticEvaluationId } : {}),
+          policyPromote: true, governance,
+          evaluation: { approved: true, score: composite, evaluatorId: "deterministic-judge" },
+          message: `worker-model (tournament): ${t.goal}`,
+        },
+        parentIdentity,
+      );
+      const result = canon.promote;
+      if (result.promoted && result.receiptStatus === "failed") {
+        log.warn({ workspaceId: ws.id, taskId: t.taskId, receiptStatus: result.receiptStatus }, "tournament promote landed but receipt append failed");
+      }
       return {
         promoted: result.promoted,
         ...(result.reason !== undefined ? { reason: result.reason } : {}),
         ...(result.conflicts !== undefined ? { conflicts: result.conflicts } : {}),
+        ...(result.receiptStatus !== undefined ? { receiptStatus: result.receiptStatus } : {}),
       };
     };
 
@@ -3340,7 +5813,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       allocate,
       runCandidate,
       judge: (candidates) => judge.judge(candidates),
-      applyDiff: async (ws, diff) => (deps.applyDiff !== undefined ? deps.applyDiff(ws, diff) : defaultApplyDiff(parentCtx, ws, diff, task.goal)),
+      applyDiff: async (ws, diff) => (deps.applyDiff !== undefined ? deps.applyDiff(ws, diff) : defaultApplyDiff(parentCtx, ws, diff, task.goal, task.taskId)),
       verifyShadow,
       promote,
       discard: async (ws) => safeDiscard(workspaces, ws),
@@ -3358,6 +5831,13 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               shadow: receipt.shadow,
               promoted: receipt.promoted,
               costUsd: runCost(),
+              // AGGREGATE LINKAGE (Phase 11C): a tournament receipt is a SELECTION over many candidates. It
+              // references EVERY executed provider invocation across all candidates + the evaluator/critic +
+              // recovery (each once, dispatch order), and derives its aggregate cost status from those records
+              // — it never stamps one candidate's or the winner's model as if it executed the whole tournament.
+              invocationIds: runLedger.executedIds(),
+              invocationCount: runLedger.invocationCount(),
+              costStatus: runLedger.costStatus(),
             },
             project: task.targetRepo,
           },
@@ -3370,17 +5850,63 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     };
   }
 
-  return { run, spawnRole };
+  // Phase 13: register a per-run mutation fence for the whole build (normal + tournament + competitive all
+  // share `task.taskId`), and always clear it — so `runRoleFn` records mutating-role timeouts/clean generations
+  // into the right run's fence and no fence leaks across builds.
+  const fencedRun = async (task: WorkerTask, parentCtx: OperationContext): Promise<WorkerResult> => {
+    const existing = activeMutationFences.get(task.taskId);
+    const fence = existing ?? new MutationFence();
+    if (existing === undefined) activeMutationFences.set(task.taskId, fence);
+    // Phase 13B: a per-run candidate-generation lease registry (the write-boundary + snapshot authority).
+    const priorReg = activeLeaseRegistries.get(task.taskId);
+    if (priorReg === undefined) activeLeaseRegistries.set(task.taskId, new CandidateLeaseRegistry({ runId: task.taskId, taskId: task.taskId }));
+    try {
+      return await run(task, parentCtx);
+    } finally {
+      if (existing === undefined) activeMutationFences.delete(task.taskId);
+      if (priorReg === undefined) activeLeaseRegistries.delete(task.taskId);
+    }
+  };
+  return { run: fencedRun, spawnRole };
+}
+
+/**
+ * Whether a RED verifier result is a GENUINE, FIXABLE check failure worth handing to the last-mile
+ * fixer (a leftover typecheck/test error the builder declared success on). Excludes cases a fixer
+ * cannot or must not "repair around": injection (content hijack — a security signal, never fixed),
+ * a skipped verifier (nothing ran), and checks_unresolvable (no meaningful verifier to satisfy). A
+ * permissive positive (a failed typecheck or failed tests) is safe because the fixer + re-verify is
+ * the real gate — a still-red re-verify simply leaves the original failure to discard.
+ */
+export function isFixableVerifierFailure(verifierResult: RoleResult): boolean {
+  if (verifierResult.role !== "verifier" || verifierResult.outcome === "success") return false;
+  const d = (verifierResult.detail ?? {}) as Record<string, unknown>;
+  // Only EXTERNAL-origin injection (content hijack from outside) makes a failure unfixable — a
+  // neutralized-and-inert own-worktree detection (self-hosting fixtures) must not block the fixer.
+  if (d.externalInjectionDetected === true) return false;
+  if (d.verdict === "skipped" || d.skipped === true) return false;
+  if (d.verificationKind === "checks_unresolvable") return false;
+  const v = readVerifier(verifierResult);
+  return v.typecheckPass === false || v.testsPass === false;
 }
 
 /** Parse the verifier's check results into the candidate's pass flags + (best-effort) test count. */
+/** Phase-16 (IKBI-REAUDIT3-013): typed check kinds that count as EXECUTED-TEST evidence, independent of display name. */
+export const TEST_CHECK_KINDS: ReadonlySet<string> = new Set(["unit-test", "integration-test", "repository-test", "executed-test"]);
+
 export function readVerifier(verifierResult: RoleResult | undefined): { typecheckPass: boolean; testsPass: boolean; testCount?: { passed: number; total: number }; testEvidence: "executed" | "zero" | "unverified" | "absent"; checks: ReadonlyArray<{ name: string; passed: boolean }> } {
   // Builder failed (no verify ran) ⇒ both gates fail.
   if (verifierResult === undefined) return { typecheckPass: false, testsPass: false, testEvidence: "absent", checks: [] };
   const detail = (verifierResult.detail ?? {}) as Record<string, unknown>;
   const checks = Array.isArray(detail.checks) ? (detail.checks as Array<Record<string, unknown>>) : [];
-  const find = (name: string) => checks.find((c) => c.name === name);
-  const typecheck = find("typecheck");
+  // Phase-16 (IKBI-REAUDIT3-013): recognize a check by its TYPED `kind` when present, not only the display
+  // name `"test"`. A verifier may surface a typed executed-test kind (unit-test / integration-test /
+  // repository-test) under any display name; a `deterministic-verifier` under kind "typecheck". Backward
+  // compatible: a legacy check named "test"/"typecheck" with no kind still matches the name fallback.
+  const kindOf = (c: Record<string, unknown>): string | undefined => (typeof c.kind === "string" ? c.kind : undefined);
+  const isTestCheck = (c: Record<string, unknown>): boolean => c.name === "test" || TEST_CHECK_KINDS.has(kindOf(c) ?? "");
+  const isTypecheckCheck = (c: Record<string, unknown>): boolean => c.name === "typecheck" || kindOf(c) === "typecheck" || kindOf(c) === "deterministic-verifier";
+  const typecheck = checks.find(isTypecheckCheck);
   const verdict = detail.verdict;
   const authoritativePass = verdict === "pass" && verifierResult.outcome === "success";
   const typecheckPass = typecheck !== undefined ? typecheck.exitCode === 0 : authoritativePass;
@@ -3407,7 +5933,7 @@ export function readVerifier(verifierResult: RoleResult | undefined): { typechec
   // as "unverified" and the integrator discards a build that verification actually proved. So carry
   // the STRONGEST real evidence any successful test check produced. This NEVER manufactures a count:
   // with no real tally anywhere it still reports unverified/absent and the fail-closed gate holds.
-  const testChecks = checks.filter((c) => c.name === "test");
+  const testChecks = checks.filter(isTestCheck);
   const testsPass = testChecks.length > 0 ? testChecks.every((c) => c.exitCode === 0) : authoritativePass;
   const testCounts = testChecks.map((c) => countOf(c)).filter((x): x is { passed: number; total: number } => x !== undefined);
   // Prefer a count from a check that actually ran tests (total>0); else any count (e.g. a real 0).

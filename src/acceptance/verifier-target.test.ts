@@ -42,9 +42,13 @@ test("HB-1: a valid target with a passing check ⇒ verifier GREEN, PROMOTED (le
   const { manager, root } = makeManager();
   const savedChecks = process.env.IKBI_CHECKS;
   const savedVerify = process.env.IKBI_VERIFY;
+  const savedNoTests = process.env.IKBI_ALLOW_NO_TESTS;
   // A trivial, real, passing check (operator-configured, never model-chosen) run via real governed-exec.
+  // The check is `git --version` (not a "test" check) so this build has NO executed-test evidence — under
+  // the Phase 10 authority the operator must EXPLICITLY permit promoting a test-less build.
   process.env.IKBI_CHECKS = JSON.stringify([{ name: "check", command: "git", args: ["--version"] }]);
   process.env.IKBI_VERIFY = "legacy"; // explicit opt-out of the hardened ladder default → legacy resolveChecks
+  process.env.IKBI_ALLOW_NO_TESTS = "true"; // explicit no-tests policy: this fixture has no test suite
   try {
     const { parentCtx, resolveIdentity, roleClaim } = makeIdentities();
     const orch = realOrchestrator({
@@ -61,6 +65,7 @@ test("HB-1: a valid target with a passing check ⇒ verifier GREEN, PROMOTED (le
   } finally {
     if (savedChecks === undefined) delete process.env.IKBI_CHECKS; else process.env.IKBI_CHECKS = savedChecks;
     if (savedVerify === undefined) delete process.env.IKBI_VERIFY; else process.env.IKBI_VERIFY = savedVerify;
+    if (savedNoTests === undefined) delete process.env.IKBI_ALLOW_NO_TESTS; else process.env.IKBI_ALLOW_NO_TESTS = savedNoTests;
     await cleanup(repo, root);
   }
 });
@@ -69,7 +74,9 @@ test("HB-1: a valid target with a passing check ⇒ verifier GREEN, PROMOTED (le
 // it plans from the project-index, runs the package's REAL `test` script (a non-stub command) over
 // an impactful code change, and reports a scope-stamped GREEN. This is the fresh-operator default.
 test("HB-1: ladder is the production default ⇒ real test script runs, scope-stamped GREEN, PROMOTED", async () => {
-  const repo = await makeGitRepo({ packageJson: { name: "ikbitrial-ladder", version: "0.0.0", scripts: { test: "node -e \"process.exit(0)\"" } } });
+  // A REAL passing test script that emits a parsed count → the verifier classifies EXECUTED evidence,
+  // which the Phase 10 promotion authority requires for autonomous promotion.
+  const repo = await makeGitRepo({ packageJson: { name: "ikbitrial-ladder", version: "0.0.0", scripts: { test: "node -e \"console.log('# tests 1'); console.log('# pass 1')\"" } } });
   const { manager, root } = makeManager();
   // Belt-and-suspenders: ensure no inherited env forces a path — the DEFAULT must be ladder.
   const savedChecks = process.env.IKBI_CHECKS;

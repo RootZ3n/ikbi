@@ -178,6 +178,16 @@ export class TrustSystem implements TrustTierResolver {
         rejected += 1;
         continue;
       }
+      // F3/A4: bind the doc to its storage key here too. preload caches by the doc's EMBEDDED agentId,
+      // so a MAC-valid doc sitting at a NON-canonical key (a copied/stale doc an attacker placed under
+      // any store id) would seed the cache for its embedded agent — bypassing the docKey binding that
+      // loadState enforces (loadState only ever reads docKey(agentId)). Only accept a doc found at its
+      // OWN canonical key; a mismatch is a misplaced/planted copy and is rejected (fail-closed).
+      if (id !== docKey(state.agentId)) {
+        rejected += 1;
+        this.log.error({ event: "trust_state_misplaced", storeKey: id, docAgentId: state.agentId }, "trust doc at a non-canonical key (misplaced/planted); ignored");
+        continue;
+      }
       this.cache.set(state.agentId, state);
       this.checked.add(state.agentId);
       loaded += 1;
@@ -241,6 +251,13 @@ export class TrustSystem implements TrustTierResolver {
         if (curPersisted !== undefined && cur === undefined) {
           // The existing doc failed integrity — refuse to build trust on a forged base.
           throw new TrustError("state", `trust state for "${agentId}" failed integrity verification`);
+        }
+        // A4/F3: bind the doc to its storage key on the WRITE path too — a MAC-valid doc for a DIFFERENT
+        // agent (renamed onto this key) is authentic but MISPLACED. applyOutcome would carry its planted
+        // tier into this agent's new state and poison the cache, elevating the victim. Reject fail-closed
+        // (the loadState read-path binding alone left this write-path replay open).
+        if (cur !== undefined && cur.agentId !== agentId) {
+          throw new TrustError("state", `trust state for "${agentId}" is bound to a different agent ("${cur.agentId}") — cross-agent replay rejected`);
         }
         previousTier = cur?.tier ?? previousTier;
         const result = applyOutcome(cur, effectiveInput, opts);
@@ -317,6 +334,10 @@ export class TrustSystem implements TrustTierResolver {
     let newState: TrustState | undefined;
     const persisted = await this.store.update(docKey(input.agentId), (cur) => {
       const verified = cur === undefined ? undefined : verifyUnwrap(this.key, cur);
+      // A4/F3: bind the doc to its storage key — reject a MAC-valid doc for a different agent (replay).
+      if (verified !== undefined && verified.agentId !== input.agentId) {
+        throw new TrustError("state", `trust state for "${input.agentId}" is bound to a different agent ("${verified.agentId}") — cross-agent replay rejected`);
+      }
       // No prior state => create at the FLOOR, NOT the caller-supplied tier (reset is
       // flag-clearing, never a tier grant). An existing state keeps its earned tier.
       const base = verified ?? freshState({ ...input, defaultTrustTier: TRUST_FLOOR }, now);
@@ -377,6 +398,10 @@ export class TrustSystem implements TrustTierResolver {
         // Refuse to grant on top of a forged/corrupt base (fail-closed).
         throw new TrustError("state", `trust state for "${input.agentId}" failed integrity verification`);
       }
+      // A4/F3: bind the doc to its storage key — reject a MAC-valid doc for a different agent (replay).
+      if (verified !== undefined && verified.agentId !== input.agentId) {
+        throw new TrustError("state", `trust state for "${input.agentId}" is bound to a different agent ("${verified.agentId}") — cross-agent replay rejected`);
+      }
       const base = verified ?? freshState(input, now);
       // A never-seen worker is effectively at the cold FLOOR before the grant — that
       // is the honest `from` for the audit trail (the grant moves it off the floor).
@@ -432,6 +457,15 @@ export class TrustSystem implements TrustTierResolver {
     if (state === undefined) {
       this.failedClosed.add(agentId);
       this.log.error({ event: "trust_state_rejected", agentId }, "trust state failed integrity (forged/corrupt); fail-closed to floor");
+      return undefined;
+    }
+    // F3: the MAC proves the doc is AUTHENTIC but NOT that it belongs to THIS agentId. A genuine trusted
+    // doc for another agent, copied/renamed onto this agent's docKey file, still verifies — so bind the
+    // doc to its storage key here and reject a mismatch (fail-closed to floor). Without this, an attacker
+    // with write access to the trust dir + any valid trusted doc could replay it to elevate a victim id.
+    if (state.agentId !== agentId) {
+      this.failedClosed.add(agentId);
+      this.log.error({ event: "trust_state_agent_mismatch", agentId, docAgentId: state.agentId }, "trust doc agentId does not match its storage key (cross-agent replay attempt); fail-closed to floor");
       return undefined;
     }
     this.cache.set(agentId, state);

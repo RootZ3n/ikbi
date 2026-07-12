@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { applyDotEnv, loadConfig } from "./config.js";
+import { applyDotEnv, assertBindAuthorized, loadConfig } from "./config.js";
 
 const DEV_ENV = { IKBI_ALLOW_INSECURE_DEV_KEYS: "true" } as const;
 
@@ -30,10 +30,21 @@ test("refuses public bind without IKBI_ALLOW_PUBLIC_BIND", () => {
   assert.throws(() => loadConfig({ ...DEV_ENV, IKBI_BIND_HOST: "0.0.0.0" }));
 });
 
-test("allows public bind when explicitly opted in", () => {
+test("allows public bind when explicitly opted in (config load succeeds; token enforced at bind)", () => {
+  // A public-bind env must NOT break offline commands (help/diff) — config load succeeds; the token
+  // requirement is enforced at SERVER BIND via assertBindAuthorized (below), not here.
   const cfg = loadConfig({ ...DEV_ENV, IKBI_BIND_HOST: "0.0.0.0", IKBI_ALLOW_PUBLIC_BIND: "true" });
   assert.equal(cfg.bindHost, "0.0.0.0");
   assert.equal(cfg.allowPublicBind, true);
+});
+
+test("#1: assertBindAuthorized refuses a public bind with NO IKBI_API_TOKEN, allows loopback + allows a keyed public bind", () => {
+  // Public bind, no token → refuse (would expose /api unauthenticated).
+  assert.throws(() => assertBindAuthorized("0.0.0.0", { ...DEV_ENV }), /IKBI_API_TOKEN/);
+  // Public bind WITH a token → allowed.
+  assert.doesNotThrow(() => assertBindAuthorized("0.0.0.0", { ...DEV_ENV, IKBI_API_TOKEN: "a-real-api-token" }));
+  // Loopback with no token → allowed (local single-user trust).
+  assert.doesNotThrow(() => assertBindAuthorized("127.0.0.1", { ...DEV_ENV }));
 });
 
 test(".env value flows into config.provider.defaultModels.critic via applyDotEnv", () => {

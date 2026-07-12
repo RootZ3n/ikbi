@@ -8,11 +8,19 @@
  *   IKBI_EGRESS_ALLOWLIST  comma-separated egress hosts (exact host match,
  *                          case-insensitive). When UNSET, a small DEFAULT allowlist
  *                          applies (`DEFAULT_EGRESS_HOSTS` below: the web-search host
- *                          + common doc hosts) so the web tools work out of the box.
- *                          When SET, the operator's list REPLACES the default entirely
- *                          — set it to restrict (or widen) egress to exactly those
- *                          hosts. The guard itself stays DEFAULT-DENY: any host not on
- *                          the resolved allowlist is blocked.
+ *                          + common doc/provider hosts) so the web + model tools work
+ *                          out of the box. When SET, the operator's list REPLACES the
+ *                          default entirely — set it to restrict (or widen) egress to
+ *                          exactly those hosts. To instead ADD to the defaults (keep the
+ *                          built-ins AND add your own), include the `+defaults` token:
+ *                          `IKBI_EGRESS_ALLOWLIST=+defaults,myhost.com`. This mirrors the
+ *                          governed-exec allowlist convention (which is additive), so one
+ *                          `+defaults` syntax means the same thing on both lists. The two
+ *                          DEFAULTS differ deliberately: egress replaces (so an operator can
+ *                          TIGHTEN below the built-ins — a security lever), while exec is
+ *                          additive (so a builder-essential binary can never be dropped). The
+ *                          guard itself stays DEFAULT-DENY: any host not on the resolved
+ *                          allowlist is blocked.
  *   IKBI_EGRESS_ALLOW_LOCAL  comma-separated `ip:port` LOCAL endpoints (exact match),
  *                          e.g. "127.0.0.1:11434" for a local Ollama. The host part MUST
  *                          be an IP LITERAL (IPv4, or bracketed IPv6 "[::1]:11434") — a
@@ -36,8 +44,9 @@ const env = moduleEnv("egress");
  * The DEFAULT egress allowlist applied when `IKBI_EGRESS_ALLOWLIST` is UNSET — just
  * enough for the web tools to work out of the box: the no-key web-search host plus a
  * few common documentation hosts. Lowercased, exact host match. Setting the env var
- * REPLACES this list entirely (the operator can restrict or widen at will). The guard
- * stays default-deny — nothing outside the resolved allowlist is reachable.
+ * REPLACES this list (the operator can restrict or widen at will); include the `+defaults`
+ * token in the value to keep these AND add more. The guard stays default-deny — nothing
+ * outside the resolved allowlist is reachable.
  */
 export const DEFAULT_EGRESS_HOSTS: readonly string[] = Object.freeze([
   // Web-search + common documentation hosts (web tools work out of the box).
@@ -103,10 +112,31 @@ export function parseLocalEndpoint(entry: string): string {
   return `${host}:${port}`;
 }
 
+/** The `+defaults` sentinel token: include the built-in DEFAULT_EGRESS_HOSTS in addition to the
+ *  operator's hosts (opt into ADDITIVE, since egress otherwise REPLACES). Same token name the
+ *  governed-exec allowlist accepts, so the syntax is consistent across both lists. */
+const INCLUDE_DEFAULTS_TOKEN = "+defaults";
+
+/**
+ * Resolve the egress host allowlist from the raw env list. Semantics (documented on the module header):
+ *   - empty/absent  → the built-in DEFAULT_EGRESS_HOSTS (web + model tools work out of the box).
+ *   - list WITHOUT `+defaults` → REPLACES the defaults (tighten/widen to EXACTLY these hosts).
+ *   - list WITH `+defaults`    → the defaults PLUS the operator's hosts (explicit additive).
+ * All entries are lowercased, trimmed, de-duplicated, and empties dropped.
+ */
+export function resolveEgressAllowlist(raw: readonly string[]): readonly string[] {
+  const entries = raw.map((h) => h.trim().toLowerCase()).filter((h) => h.length > 0);
+  if (entries.length === 0) return DEFAULT_EGRESS_HOSTS.map((h) => h.toLowerCase());
+  const includeDefaults = entries.includes(INCLUDE_DEFAULTS_TOKEN);
+  const hosts = entries.filter((h) => h !== INCLUDE_DEFAULTS_TOKEN);
+  const merged = includeDefaults ? [...DEFAULT_EGRESS_HOSTS.map((h) => h.toLowerCase()), ...hosts] : hosts;
+  return Object.freeze([...new Set(merged)]);
+}
+
 /** Load the egress config slice from `IKBI_EGRESS_*`. */
 export function loadEgressConfig(reader = env): EgressConfig {
   return Object.freeze({
-    allowlist: reader.list("ALLOWLIST", DEFAULT_EGRESS_HOSTS).map((h) => h.toLowerCase()),
+    allowlist: resolveEgressAllowlist(reader.list("ALLOWLIST", [])),
     localEndpoints: reader.list("ALLOW_LOCAL").map(parseLocalEndpoint),
   });
 }

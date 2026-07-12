@@ -10,6 +10,7 @@ import "../modules/egress/index.js";
 
 import { loadConfig } from "../core/config.js";
 import type { ModelProvider } from "../core/provider/contract.js";
+import type { ModelSpec } from "../core/provider/registry.js";
 import { detectPackageManager, envTemplate, runDoctor, runDoctorFix, type DoctorFixPorts, type DoctorInputs, type DoctorRegistry } from "./doctor.js";
 
 /**
@@ -17,11 +18,22 @@ import { detectPackageManager, envTemplate, runDoctor, runDoctorFix, type Doctor
  * `registered` is the set of provider ids that are actually declared. A model
  * "resolves" iff it exists AND some route's provider is registered.
  */
-function fakeRegistry(models: Record<string, string[]>, registered: string[]): DoctorRegistry {
+function fakeRegistry(
+  models: Record<string, string[]>,
+  registered: string[],
+  caps: Record<string, { context_window?: number; supports_tools?: boolean }> = {},
+  unready: string[] = [], // provider ids that are registered but report ready()===false (no API key)
+): DoctorRegistry {
   const provs = new Set(registered);
+  const unreadySet = new Set(unready);
+  const specOf = (id: string): ModelSpec | undefined =>
+    models[id]
+      ? { id, providers: models[id].map((p) => ({ provider: p, providerModelId: id })), ...(caps[id] ? { capabilities: caps[id] } : {}) }
+      : undefined;
   return {
-    getModel: (id) => (models[id] ? { id, providers: models[id].map((p) => ({ provider: p, providerModelId: id })) } : undefined),
-    getProvider: (id) => (provs.has(id) ? ({ id } as unknown as ModelProvider) : undefined),
+    getModel: (id) => specOf(id),
+    getProvider: (id) => (provs.has(id) ? ({ id, ready: () => !unreadySet.has(id) } as unknown as ModelProvider) : undefined),
+    listModels: () => Object.keys(models).map((id) => specOf(id)!).filter(Boolean),
   };
 }
 
@@ -50,6 +62,20 @@ function readyInputs(over: Partial<DoctorInputs> = {}): DoctorInputs {
   };
 }
 
+test("LOW: doctor shows CONFIG SOURCES — .env file vs shell export vs built-in default", () => {
+  const r = runDoctor(readyInputs({
+    // IKBI_MODEL_BUILDER supplied by the shell (present in env, absent from the provenance map);
+    // IKBI_MODEL_CRITIC supplied by a .env file; IKBI_BIND_HOST supplied by neither (default).
+    env: { ...DEV_ENV, IKBI_MODEL_BUILDER: "shell-model", IKBI_MODEL_CRITIC: "dotenv-critic" },
+    dotenvProvenance: new Map([["IKBI_MODEL_CRITIC", "/proj/.env"]]),
+  }));
+  const text = r.lines.join("\n");
+  assert.match(text, /CONFIG SOURCES/);
+  assert.match(text, /IKBI_MODEL_BUILDER\s+shell export/, "a shell-set var is attributed to the shell");
+  assert.match(text, /IKBI_MODEL_CRITIC\s+\.env \(\/proj\/\.env\)/, "a .env-set var names its file");
+  assert.match(text, /IKBI_BIND_HOST\s+built-in default/, "an unset var is a built-in default");
+});
+
 test("doctor REPORTS MISSING required settings and ends NOT ready (cold start)", () => {
   const r = runDoctor({
     config: loadConfig(DEV_ENV), // no build credentials set; dev key opt-in only lets config load
@@ -67,7 +93,7 @@ test("doctor REPORTS MISSING required settings and ends NOT ready (cold start)",
   assert.match(text, /✗ IKBI_WORKER_MODEL_ENABLED/);
   assert.match(text, /export IKBI_WORKER_MODEL_ENABLED=true/);
   assert.match(text, /✗ IKBI_GOVERNED_EXEC_ALLOWLIST/);
-  assert.match(text, /✗ the driver model 'mimo-v2.5' and builder model 'mimo-v2.5' and critic model 'deepseek-v4-pro' don't resolve to a registered provider/);
+  assert.match(text, /✗ the driver model 'mimo-v2.5' and builder model 'mimo-v2.5' and critic model 'deepseek-v4-pro' aren't usable \(no registered provider\)/);
   assert.match(text, /NOT ready — 5 required settings missing/);
 });
 
@@ -81,13 +107,13 @@ test("ROSTER PROVIDER SEEN: role models resolving via a roster provider (no env 
     }),
   );
   const text = r.lines.join("\n");
-  assert.match(text, /✓ provider — all role models resolve \(driver 'mimo-v2.5', builder 'mimo-v2.5', critic 'deepseek-v4-pro'\)/);
+  assert.match(text, /✓ provider — all role models resolve to a usable provider \(driver 'mimo-v2.5', builder 'mimo-v2.5', critic 'deepseek-v4-pro'\)/);
   assert.equal(r.ready, true, "a roster setup that just ran a build is correctly reported ready");
 });
 
 test("BUILT-IN KEY STILL WORKS: models resolving via a built-in keyed provider ⇒ ✓ (regression)", () => {
   const r = runDoctor(readyInputs({ registry: fakeRegistry({ "mimo-v2.5": ["mimo"], "deepseek-v4-pro": ["deepseek"] }, ["mimo", "openrouter", "deepseek"]) }));
-  assert.match(r.lines.join("\n"), /✓ provider — all role models resolve/);
+  assert.match(r.lines.join("\n"), /✓ provider — all role models resolve to a usable provider/);
   assert.equal(r.ready, true);
 });
 
@@ -99,9 +125,23 @@ test("UNRESOLVABLE MODEL FLAGGED: a driver model with no registered provider ⇒
     }),
   );
   const text = r.lines.join("\n");
-  assert.match(text, /✗ the driver model 'mimo-v2.5' and builder model 'mimo-v2.5' don't resolve to a registered provider — add a provider entry/);
+  assert.match(text, /✗ the driver model 'mimo-v2.5' and builder model 'mimo-v2.5' aren't usable \(no registered provider\) — add a provider entry/);
   assert.equal(r.ready, false);
   assert.match(text, /NOT ready — 1 required setting missing/);
+});
+
+test("H1: a provider REGISTERED but with NO API KEY (ready()===false) is NOT ready — doctor names the key gap", () => {
+  // The exact bug: doctor said "ready to build" with zero keys, then the build died mid-pipeline.
+  // Here mimo is registered but unkeyed (ready false); deepseek is keyed.
+  const r = runDoctor(
+    readyInputs({
+      registry: fakeRegistry({ "mimo-v2.5": ["mimo"], "deepseek-v4-pro": ["deepseek"] }, ["mimo", "deepseek"], {}, ["mimo"]),
+    }),
+  );
+  const text = r.lines.join("\n");
+  assert.equal(r.ready, false, "an unkeyed role-model provider is NOT ready (no longer a false green)");
+  assert.match(text, /provider registered but NO API KEY/, "the message names the key gap, not a bogus 'no provider'");
+  assert.match(text, /set the provider API key/, "the fix is actionable");
 });
 
 test("WHICH MODEL FLAGGED: driver resolves but critic doesn't ⇒ the CRITIC model is named specifically", () => {
@@ -111,7 +151,7 @@ test("WHICH MODEL FLAGGED: driver resolves but critic doesn't ⇒ the CRITIC mod
     }),
   );
   const text = r.lines.join("\n");
-  assert.match(text, /✗ the critic model 'deepseek-v4-pro' doesn't resolve to a registered provider/);
+  assert.match(text, /✗ the critic model 'deepseek-v4-pro' isn't usable \(no registered provider\)/);
   assert.doesNotMatch(text, /driver model 'mimo-v2.5' (?:and|doesn't)/, "the resolving driver is NOT flagged");
   assert.equal(r.ready, false);
 });
@@ -207,8 +247,84 @@ test("doctor SHOWS the competitive shootout list and resolution-CHECKS each race
   );
   const text = r.lines.join("\n");
   assert.match(text, /IKBI_COMPETITIVE_MODELS = mimo-v2\.5, qwen3:14b/, "the shootout list is shown");
-  assert.match(text, /✗ the competitive model 'qwen3:14b' doesn't resolve to a registered provider/, "the unwired racer is flagged by name");
+  assert.match(text, /✗ the competitive model 'qwen3:14b' isn't usable \(no registered provider\)/, "the unwired racer is flagged by name");
   assert.equal(r.ready, false, "an unresolvable competitive racer blocks readiness");
+});
+
+// ── MODEL CAPABILITIES: silent-degradation guard ────────────────────────────
+
+test("doctor REPORTS all roster models classified when none silently degrade", () => {
+  const r = runDoctor(
+    readyInputs({
+      registry: fakeRegistry({ "mimo-v2.5": ["mimo"], "opus-4.8": ["anthropic"], "deepseek-v4-pro": ["deepseek"] }, ["mimo", "anthropic", "deepseek"]),
+    }),
+  );
+  const text = r.lines.join("\n");
+  assert.match(text, /MODEL CAPABILITIES/);
+  assert.match(text, /✓ all 3 roster model\(s\) classified/, "classified frontier logical ids (opus-4.8) count as classified");
+  assert.equal(r.ready, true, "the capability check is advisory — it does not block readiness");
+});
+
+test("doctor FLAGS a roster model that silently degrades to the 8k/no-tools fallback", () => {
+  const r = runDoctor(
+    readyInputs({
+      // "mystery-frontier-x" matches no table/pattern and carries no override → silent 8k.
+      registry: fakeRegistry({ "mimo-v2.5": ["mimo"], "mystery-frontier-x": ["custom"], "deepseek-v4-pro": ["deepseek"] }, ["mimo", "custom", "deepseek"]),
+    }),
+  );
+  const text = r.lines.join("\n");
+  assert.match(text, /⚠ 'mystery-frontier-x' is unclassified → silently degrades to a 8192-token window/, "the degraded model is named with the fix");
+  assert.equal(r.ready, true, "advisory — surfaced loudly but not a readiness blocker");
+});
+
+test("doctor does NOT flag a small local model with an explicit capabilities override", () => {
+  const r = runDoctor(
+    readyInputs({
+      // An operator running a genuine small local model declares it explicitly → intentional, not flagged.
+      registry: fakeRegistry(
+        { "mimo-v2.5": ["mimo"], "local-tiny": ["ollama"], "deepseek-v4-pro": ["deepseek"] },
+        ["mimo", "ollama", "deepseek"],
+        { "local-tiny": { context_window: 8_192, supports_tools: false } },
+      ),
+    }),
+  );
+  const text = r.lines.join("\n");
+  assert.doesNotMatch(text, /'local-tiny' is unclassified/, "an explicit override signals intent — no false alarm");
+  assert.match(text, /✓ all 3 roster model\(s\) classified/);
+});
+
+// ── PROMOTION POSTURE: will a self-build auto-promote, or stall on trust gating? ─────────────
+
+test("doctor REPORTS auto-promote posture when the trust ladder is OFF (the default)", () => {
+  const r = runDoctor(readyInputs({ trustLadder: false }));
+  const text = r.lines.join("\n");
+  assert.match(text, /PROMOTION POSTURE/);
+  assert.match(text, /✓ trust ladder OFF \(default\) — verified-green work AUTO-PROMOTES/);
+  assert.equal(r.ready, true);
+});
+
+test("doctor WARNS that self-builds STALL when the ladder is ON and the worker tier is probation", () => {
+  const r = runDoctor(
+    readyInputs({
+      trustLadder: true,
+      config: loadConfig({
+        IKBI_OPERATOR_TOKEN: "op-secret-strong-value",
+        IKBI_WORKER_TOKEN: "worker-secret-strong-value",
+        IKBI_TRUST_HMAC_KEY: "a-real-hmac-key",
+        IKBI_IDENTITY_TOKEN_SALT: "a-real-salt",
+        IKBI_WORKER_TRUST_TIER: "probation",
+      }),
+    }),
+  );
+  const text = r.lines.join("\n");
+  assert.match(text, /⚠ trust ladder ON \+ worker tier 'probation' — self-builds will STALL at promote/);
+  assert.match(text, /worker trust tier = probation/);
+});
+
+test("doctor confirms the auto-commit path when the ladder is ON and the worker is trusted", () => {
+  const r = runDoctor(readyInputs({ trustLadder: true })); // default worker tier is 'trusted'
+  const text = r.lines.join("\n");
+  assert.match(text, /✓ trust ladder ON \+ worker tier 'trusted' — auto-commits with no approval gate/);
 });
 
 // ── SAFETY POSTURE: verification + retrieval mode reporting (the hardening patch) ────────────

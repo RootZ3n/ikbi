@@ -68,6 +68,10 @@ export function whatNext(action: string, result: WhatNextResult = {}): string[] 
       return ["Run `ikbi spec list` to see all specs, or `ikbi spec status <id>` to track progress."];
     case "job-cards":
       return ["Run `ikbi job-cards list` to see all cards, or run one to execute its automation."];
+    case "health":
+      return issues > 0
+        ? ["Review the findings above; run `ikbi health --dimension <name>` to focus one dimension, or `ikbi build \"<fix>\"` to address them."]
+        : ["Repo looks healthy. Re-run after significant changes, or wire it into CI."];
     default:
       return ["Run `ikbi help` to see available commands, or `ikbi doctor` to check your setup."];
   }

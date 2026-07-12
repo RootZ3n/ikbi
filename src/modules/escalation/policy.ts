@@ -29,10 +29,28 @@ export function thresholdFor(tier: ModelTier, config: EscalationConfig): number 
   return undefined; // frontier has no successor
 }
 
-/** The model the retry should switch to for `tier` (first of the roster), or `undefined`. */
-export function modelFor(tier: ModelTier, config: EscalationConfig): string | undefined {
+/**
+ * The model the retry should switch to for `tier`, or `undefined` for an empty roster.
+ *
+ * With no `isResolvable` predicate this is the first roster entry (pure, deterministic).
+ * WITH the predicate (the engine wires it from the provider registry), it returns the
+ * first roster model that resolves to a REGISTERED provider — so an unwired/stub tier
+ * model (e.g. an `opus-4.8` stub with no API route) is transparently skipped rather than
+ * chosen as the target and dead-ended on invocation. If none resolve, it falls back to
+ * the first entry (unchanged behavior — the invocation then fails gracefully as before).
+ */
+export function modelFor(
+  tier: ModelTier,
+  config: EscalationConfig,
+  isResolvable?: (modelId: string) => boolean,
+): string | undefined {
   const roster = config.tierModels[tier];
-  return roster.length > 0 ? roster[0] : undefined;
+  if (roster.length === 0) return undefined;
+  if (isResolvable !== undefined) {
+    const wired = roster.find((m) => isResolvable(m));
+    if (wired !== undefined) return wired;
+  }
+  return roster[0];
 }
 
 /** A tier-aware verdict the engine wraps into a full `EscalationDecision`. */
@@ -61,6 +79,7 @@ export function decideEscalation(
   currentTier: ModelTier,
   config: EscalationConfig,
   escalationCount: number,
+  isResolvable?: (modelId: string) => boolean,
 ): PolicyOutcome {
   const target = nextTier(currentTier);
   const threshold = thresholdFor(currentTier, config);
@@ -97,7 +116,7 @@ export function decideEscalation(
     };
   }
 
-  const targetModel = modelFor(target, config);
+  const targetModel = modelFor(target, config, isResolvable);
   return {
     score,
     escalate: true,

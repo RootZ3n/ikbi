@@ -7,8 +7,8 @@
 
 import { mkdirSync, readFileSync, writeFileSync, readdirSync, existsSync, unlinkSync, renameSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
+import { config } from "../../core/config.js";
 import type { JobCard, JobCardRun, JobCardRunStatus } from "./contract.js";
 
 /** Reject ids that could escape the store directory (GLM 5.2 LOW-3 / Bubbles). */
@@ -18,9 +18,13 @@ export function assertSafeId(id: string): void {
   }
 }
 
-/** Resolve the store directory. Overridable for tests. */
+/**
+ * Resolve the store directory. Defaults UNDER `config.stateRoot` (honors
+ * `IKBI_STATE_ROOT`) — not the real home, which is read-only under the
+ * mid-build sandbox. See spec-artifact/store.ts (Codex audit H1). Overridable.
+ */
 export function resolveStoreDir(override?: string): string {
-  return override ?? join(homedir(), ".ikbi", "job-cards");
+  return override ?? join(config.stateRoot, "job-cards");
 }
 
 function ensureDir(dir: string): void {

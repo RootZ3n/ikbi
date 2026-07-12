@@ -238,6 +238,29 @@ test("BLOCKER-3: list() caps at MAX_SESSIONS and prunes the oldest files", () =>
   assert.ok(!metas.some((m) => m.id === "sess-0"), "the pruned oldest is absent from the listing");
 });
 
+test("H10: prune() NEVER deletes a LIVE-locked session even when it is the oldest (never prune a live lease)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-prune-live-"));
+  const store = new PersistentSessionStore(dir, 3);
+  seedSessions(dir, 6); // sess-0 (oldest) .. sess-5 (newest); cap 3 ⇒ prune would delete sess-0..sess-2.
+
+  // sess-0 is the OLDEST (first to be pruned), but a LIVE process holds its lease.
+  const lockDir = join(dir, "sess-0.lock");
+  mkdirSync(lockDir, { recursive: true });
+  writeFileSync(join(lockDir, "owner.json"), JSON.stringify({ pid: process.pid, startedAt: Date.now() }), "utf8");
+
+  const pruned = store.prune();
+  assert.ok(existsSync(join(dir, "sess-0.json")), "the live-locked oldest session was NOT pruned");
+  // The other two oldest UNLOCKED sessions are still pruned (the cap is enforced against surplus).
+  assert.ok(!existsSync(join(dir, "sess-1.json")), "an unlocked oldest session is pruned as usual");
+  assert.ok(!existsSync(join(dir, "sess-2.json")), "an unlocked oldest session is pruned as usual");
+  assert.equal(pruned, 2, "only the two unlocked surplus sessions were pruned");
+
+  // Once the lock goes stale (dead pid), the session becomes prunable again.
+  writeFileSync(join(lockDir, "owner.json"), JSON.stringify({ pid: 2147483646, startedAt: Date.now() }), "utf8");
+  store.prune();
+  assert.ok(!existsSync(join(dir, "sess-0.json")), "a stale-locked session is prunable once its owner is dead");
+});
+
 test("BLOCKER-3: the max-sessions cap is configurable (constructor / IKBI_MAX_SESSIONS)", () => {
   const dir = mkdtempSync(join(tmpdir(), "ikbi-prune2-"));
   seedSessions(dir, 40);

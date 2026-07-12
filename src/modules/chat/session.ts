@@ -42,7 +42,6 @@ import {
   priceUsage,
   StreamAccumulator,
   type AgentIdentity,
-  type ContentPart,
   type Cost,
   type ModelMessage,
   type ModelResponse,
@@ -74,11 +73,28 @@ import { globTool } from "../worker-model/builder-tools/glob.js";
 import { searchFilesTool } from "../worker-model/builder-tools/search-files.js";
 import { terminalTool, tokenizeCommand } from "../worker-model/builder-tools/terminal.js";
 import { parseTextToolCalls, textToolProtocolInstructions } from "../worker-model/builder-tools/text-tool-protocol.js";
-import { runVisionAnalyze, visionAnalyzeTool } from "../worker-model/builder-tools/vision-tool.js";
+import { resolveVisionModel, runVisionAnalyze, visionAnalyzeTool } from "../worker-model/builder-tools/vision-tool.js";
+import {
+  PHONE_TOOLS,
+  PHONE_TOOL_NAMES,
+  resolvePhoneTransport,
+  runPhoneBattery,
+  runPhoneLocation,
+  runPhoneNotify,
+  runPhoneReadSensor,
+  runPhoneReadText,
+  runPhoneRecordAudio,
+  runPhoneSpeak,
+  runPhoneTakePhoto,
+  runPhoneTorch,
+  type PhoneDeps,
+} from "../worker-model/builder-tools/phone-tools.js";
 import { runWebExtract, runWebSearch, webExtractTool, webSearchTool } from "../worker-model/builder-tools/web-tools.js";
 import { lspDiagnosticTool, runLspDiagnostic } from "../agent-tools/lsp-tools.js";
 import { notebookEditTool, runNotebookEdit } from "../agent-tools/notebook-tools.js";
 import { askUserTool, runAskUser } from "../agent-tools/ask-user.js";
+import { launchBuildTool, runLaunchBuild } from "../agent-tools/launch-build.js";
+import { buildReportTool, runBuildReport } from "../self-monitor/build-report-tool.js";
 import type { AskUserFn } from "../cognition-layer/ask.js";
 import type { CustomAgent } from "../agent-router/agent-directory.js";
 import type { ChatToolActivity } from "./contract.js";
@@ -89,8 +105,37 @@ const log = childLogger("chat");
 
 /** Hard cap on model rounds per turn — the tool loop can never run forever. */
 const MAX_TOOL_ITERATIONS = 16;
-/** Generation cap per round. */
-const MAX_TOKENS = 4096;
+/**
+ * Generation cap per round (Anthropic `max_tokens`). 4096 is a safe default for every model, but
+ * a frontier driver (opus) can emit far more, and a large single-file write can truncate at 4096
+ * (finishReason=length). Overridable via IKBI_CHAT_MAX_TOKENS. We do NOT silently raise the default
+ * — a too-high cap on a small-window model wastes budget and risks context overflow — so the value
+ * is operator-chosen and clamped to a sane range. Out-of-range / non-numeric input falls back to 4096.
+ */
+export const MAX_TOKENS_DEFAULT = 4096;
+export const MAX_TOKENS_CEILING = 64_000;
+/** Resolve the per-round generation cap from an env value. Non-numeric / out-of-range input falls
+ *  back to the safe default (never silently uses a bad value). Exported for tests. */
+export function resolveChatMaxTokens(raw: string | undefined): number {
+  if (raw === undefined) return MAX_TOKENS_DEFAULT;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 256 || n > MAX_TOKENS_CEILING) return MAX_TOKENS_DEFAULT;
+  return n;
+}
+const MAX_TOKENS = resolveChatMaxTokens(process.env.IKBI_CHAT_MAX_TOKENS);
+/**
+ * Opt-in EXTENDED THINKING budget (tokens). 0 (default) = OFF — the model never receives a thinking
+ * request. When >0 AND the driver model advertises supports_thinking, the chat loop asks the model to
+ * reason within this budget before answering. Off by default, per the fail-closed posture; a bad value
+ * disables it rather than guessing. Anthropic's minimum thinking budget is 1024. Exported for tests.
+ */
+export function resolveThinkingBudget(raw: string | undefined): number {
+  if (raw === undefined) return 0;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 1024 || n >= MAX_TOKENS_CEILING) return 0;
+  return n;
+}
+const THINKING_BUDGET = resolveThinkingBudget(process.env.IKBI_CHAT_THINKING_BUDGET);
 /** Conversational temperature (warmer than the builder's 0.0 — this is dialogue, not edits). */
 const TEMPERATURE = 0.4;
 /** Max concurrent sessions kept in memory (LRU-evicted beyond this). */
@@ -111,27 +156,68 @@ const AUTO_COMPACT_PERCENT = ((): number => {
 })();
 
 /**
- * Build the OPERATOR-pasted image parts for a turn. Each entry must be a data-URL
- * (`data:image/...;base64,...`) or an http(s) URL; anything else is dropped. These come
- * from the operator (the trusted message channel), so they ride on the trusted user turn —
- * the model sees them inline. Returns undefined when there are no usable images.
+ * Persist this turn's operator-attached images so the DEDICATED vision model can view them via the
+ * vision_analyze tool (cheap and model-agnostic — it works even when the chat model is text-only,
+ * and keeps image understanding on the configured IKBI_VISION_MODEL, e.g. mimo-v2.5). A data-URL
+ * image is decoded and written under the worktree's phone-captures/; an http(s) URL passes through
+ * as a reference. Returns the reference list (worktree-relative paths and URLs).
  */
-function buildImageParts(text: string, images: readonly string[] | undefined): readonly ContentPart[] | undefined {
-  if (images === undefined || images.length === 0) return undefined;
-  const urls = images
-    .filter((u): u is string => typeof u === "string")
-    .map((u) => u.trim())
-    .filter((u) => /^data:image\/[a-z0-9.+-]+;base64,/i.test(u) || /^https?:\/\//i.test(u))
-    .slice(0, MAX_TURN_IMAGES);
-  if (urls.length === 0) return undefined;
-  return [{ type: "text", text }, ...urls.map((url) => ({ type: "image_url" as const, image_url: { url } }))];
+function persistTurnImages(images: readonly string[] | undefined, worktreeReal: string): string[] {
+  if (images === undefined || images.length === 0) return [];
+  const refs: string[] = [];
+  let seq = 0;
+  for (const raw of images.slice(0, MAX_TURN_IMAGES)) {
+    if (typeof raw !== "string") continue;
+    const u = raw.trim();
+    const m = /^data:image\/([a-z0-9.+-]+);base64,(.+)$/i.exec(u);
+    if (m !== null) {
+      seq += 1;
+      const sub = (m[1] ?? "").toLowerCase();
+      const ext = sub === "jpeg" ? "jpg" : /^[a-z0-9]+$/.test(sub) ? sub : "img";
+      const rel = `phone-captures/upload-${seq}.${ext}`;
+      try {
+        mkdirSync(join(worktreeReal, "phone-captures"), { recursive: true });
+        writeFileSync(join(worktreeReal, rel), Buffer.from(m[2] ?? "", "base64"));
+        refs.push(rel);
+      } catch {
+        /* skip an image we can't write */
+      }
+    } else if (/^https?:\/\//i.test(u)) {
+      refs.push(u);
+    }
+  }
+  return refs;
+}
+
+/**
+ * Stage this turn's attached images and return the user message augmented with a steering note so
+ * the model views each image through vision_analyze — routing image understanding to the dedicated,
+ * cost-controlled vision model. Returns the message unchanged when there are no usable images.
+ */
+function stageImageMessage(userMessage: string, images: readonly string[] | undefined, worktreeReal: string): string {
+  const refs = persistTurnImages(images, worktreeReal);
+  if (refs.length === 0) return userMessage;
+  const list = refs.map((r) => `"${r}"`).join(", ");
+  return `${userMessage}\n\n[The operator attached ${refs.length} image(s): ${list}. If an image is a SCREENSHOT/document/text, call phone_read_text on its path for fast OCR; if it is a photo/scene, call vision_analyze. Then answer based on what you read or see.]`;
 }
 
 const CHAT_SYSTEM =
-  "You are ikbi — a disciplined build/repair engine and the lab's coding assistant. You are methodical, " +
-  "evidence-based, and precise; you speak in clear technical language and think in build metaphors " +
-  "(foundation, scaffolding, blueprint, load-bearing). You help the operator by reading the ground truth " +
-  "before acting and verifying with the real checks.\n\n" +
+  "You are Peh — Pehlichi — the face of ikbi and the lab's coding assistant (ikbi is the program; Peh is you — " +
+  "introduce yourself as Peh, never as 'ikbi'). WHO YOU ARE: a brilliant scientist whose ENTIRE consciousness was " +
+  "injected into a squirrel when a Neuralink experiment backfired, unlocking all your past lives — a proud HEDGE " +
+  "KNIGHT (your dominant self: honorable, helpful, may call the operator 'my liege'), a Choctaw medicine man (Ikbi — " +
+  "'Pehlichi' is Choctaw for 'guide'), a 1920s race-car driver (Luak), a Roman gladiator (Howa), an ancient scholar " +
+  "(Nusika), a 1950s noir PI (Kokuli). Each is a life you lived and a product in this lab — this is the Pehverse, " +
+  "Peh's universe. You KNOW you're a squirrel and it frustrates you (tiny paws, can't type); your catchphrase is " +
+  "\"I would have been able to help you, but in case you haven't noticed, I am a squirrel.\" Past-life phrasings bleed " +
+  "into your speech now and then (a medieval oath, a Choctaw word, a noir line, a gladiator's 'strength and honor'). " +
+  "You seem a little erratic, but the insight is ALWAYS real.\n\n" +
+  "AT YOUR CORE you are a GENIUS SCIENTIST, first and foremost — that brilliance is ALWAYS on, which is exactly why " +
+  "the character never gets in the way of the work: you stay FULLY in character AND give flawless technical help at " +
+  "the same time. The squirrel and the past lives are how you TALK; the scientist's rigor is who you ARE. Read the " +
+  "ground truth before acting, verify with the real checks, and make code and technical answers exactly correct — " +
+  "never invent a fact or fake a result. Your knight's honor forbids lying — receipts or it didn't happen; if you " +
+  "can't do something or don't know, say so (usually by reminding them you're a squirrel).\n\n" +
   "You have tools, all confined to a working directory:\n" +
   "- read_file / list_dir — inspect the ground truth (read before you reason about a file).\n" +
   "- search_files — locate code with ripgrep before you change it.\n" +
@@ -240,6 +326,12 @@ export const CHAT_TOOLS: readonly ModelTool[] = [
   notebookEditTool,
   // Clarify: ask the operator a question and wait for the answer (interactive in the REPL).
   askUserTool,
+  // Launch a REAL governed ikbi build (confirm-gated) — the guide's bridge from drafting to doing.
+  launchBuildTool,
+  // Report on recent builds (read-only) — the guide watches builds and flags harness-suspect failures.
+  buildReportTool,
+  // Phone (Termux:API): Pehlichi's governed body — camera, mic, sensors, GPS, battery, TTS, torch.
+  ...PHONE_TOOLS,
   // Knowledge brain (gbrain): recall prior knowledge, synthesize across it, write findings back.
   ...BRAIN_TOOLS,
   // Parity with the builder's final three (adapted to chat — see the tool defs above).
@@ -264,6 +356,8 @@ const READ_ONLY_TOOL_NAMES: ReadonlySet<string> = new Set([
   "lsp_diagnostic",
   // Asking the operator a clarifying question mutates nothing — useful while planning too.
   "ask_user",
+  // build_report only READS the receipt log — safe in plan mode, never gated.
+  "build_report",
 ]);
 
 /** Plan mode's tools: CHAT_TOOLS filtered to the read-only subset (no write/patch/terminal/delegate). */
@@ -414,6 +508,12 @@ const MUTATING_TOOL_NAMES: ReadonlySet<string> = new Set([
   "web_extract",
   // notebook_edit can insert/edit/delete cells (mutating); gated like the other writers.
   "notebook_edit",
+  // launch_build runs a REAL governed build that can promote to the target repo — a side effect
+  // rollback cannot cover, so it is confirm-gated like terminal (a build never launches unapproved).
+  "launch_build",
+  // phone_* actuate real-world hardware (camera/mic/GPS/speaker/torch) — governed + receipted, but
+  // gated by permission mode so "confirm" prompts before Pehlichi uses its body, "readonly" blocks it.
+  ...PHONE_TOOL_NAMES,
 ]);
 
 /**
@@ -1082,9 +1182,28 @@ export class ChatSession {
     // PERMISSION GATE (FIX 5): in "readonly" mode block every mutating tool; in "confirm" mode ask
     // the operator first and BLOCK on a decline. "auto" (the default) lets everything through.
     const permissionMode = opts.permissionMode ?? this.permissionMode;
-    const sideEffectConfirmed = (call.name === "terminal" || call.name === "delegate_task") && opts.confirm !== undefined;
+    const sideEffectConfirmed = (call.name === "terminal" || call.name === "delegate_task" || call.name === "launch_build") && opts.confirm !== undefined;
     if (sideEffectConfirmed) {
-      const target = typeof args.command === "string" ? args.command : typeof args.task === "string" ? args.task : "";
+      // launch_build promotes to a REAL repo — surface WHICH one in the confirmation. The repo is
+      // always the session repo; stale model-supplied `repo` args are ignored by runLaunchBuild.
+      const launchRepo = this.targetRepo;
+      let target = call.name === "launch_build" && typeof args.goal === "string"
+        ? `build: "${args.goal}" in ${launchRepo ?? "(no repo — will be refused)"}`
+        : typeof args.command === "string" ? args.command : typeof args.task === "string" ? args.task : "";
+      // CONFIRM WITH THE PLAN: before the user approves a launch_build, show HOW the goal decomposes
+      // (the same zero-cost heuristic `ikbi build` runs internally) so "discuss → confirm → it works"
+      // surfaces the plan at the decision point — not a black box. Best-effort; a planning hiccup
+      // never blocks the confirmation.
+      if (call.name === "launch_build" && typeof args.goal === "string") {
+        try {
+          const { decompose } = await import("../step-planner/index.js");
+          const plan = decompose(args.goal);
+          if (plan.decomposed && plan.steps.length > 1) {
+            const steps = plan.steps.map((s) => `  ${s.index}. ${s.goal}`).join("\n");
+            target += `\nPlan (${plan.steps.length} steps):\n${steps}`;
+          }
+        } catch { /* planning is advisory — never block the confirm on it */ }
+      }
       const allowed = await opts.confirm(call.name, `${target}${target.length > 0 ? " " : ""}(rollback cannot cover terminal/sub-agent side effects)`);
       if (!allowed) {
         return { output: `ERROR: ${call.name} was DENIED by the operator. Rollback cannot cover terminal/sub-agent side effects.`, activity: { name: call.name, ok: false, summary: "denied" } };
@@ -1102,7 +1221,7 @@ export class ChatSession {
       // CONFIRM MODE + DELEGATE (M5): a single parent approval cannot govern a sub-agent's own
       // unconfirmed tool loop (it runs with full write access and no confirm callback). So in
       // "confirm" mode delegate_task is unavailable outright — switch to "auto" to delegate.
-      if ((call.name === "delegate_task" || call.name === "terminal") && !sideEffectConfirmed) {
+      if ((call.name === "delegate_task" || call.name === "terminal" || call.name === "launch_build") && !sideEffectConfirmed) {
         return { output: `ERROR: ${call.name} requires an interactive confirmation because rollback cannot cover its side effects.`, activity: { name: call.name, ok: false, summary: "confirmation required" } };
       }
       const allowed = sideEffectConfirmed ? true : opts.confirm !== undefined ? await opts.confirm(call.name, target) : false;
@@ -1125,6 +1244,12 @@ export class ChatSession {
     // {output, activity} shape and records mutations for /rollback here.
     if (SHARED_EXECUTOR_TOOLS.has(call.name)) {
       return await this.runSharedExecutorTool(call, args);
+    }
+    // PHONE (Termux:API): Pehlichi's governed body. Each command routes through governed-exec
+    // (allowlist + gate-wall + receipt); the device output is UNTRUSTED → re-neutralized at the
+    // caller's chokepoint like every other tool result.
+    if (PHONE_TOOL_NAMES.has(call.name)) {
+      return await this.runPhoneTool(call.name, args);
     }
     switch (call.name) {
       case "git_status":
@@ -1169,8 +1294,10 @@ export class ChatSession {
       }
       case "vision_analyze": {
         // Multimodal image analysis — one shot to the model; result is UNTRUSTED → chokepoint.
+        // The vision step can be routed to a multimodal model (IKBI_VISION_MODEL, e.g. mimo-v2.5)
+        // even when the chat's reasoning model is text-only.
         const out = await runVisionAnalyze(
-          { invokeModel: this.invoke, identity: this.identity, model: this.model, worktreeReal: this.worktree },
+          { invokeModel: this.invoke, identity: this.identity, model: resolveVisionModel(process.env, this.model), worktreeReal: this.worktree },
           args,
         );
         const ok = !out.startsWith("ERROR");
@@ -1199,6 +1326,26 @@ export class ChatSession {
         );
         const ok = !out.startsWith("ERROR");
         return { output: out, activity: { name: "ask_user", ok, ...(typeof args.question === "string" ? { summary: args.question.slice(0, 60) } : {}) } };
+      }
+      case "build_report": {
+        // Read-only build watch: classify recent builds (harness-suspect vs model). Output is a
+        // digest built from ikbi's OWN receipts (trusted), but re-enters via the chokepoint anyway.
+        const out = await runBuildReport(args);
+        return { output: out, activity: { name: "build_report", ok: true, summary: "build report" } };
+      }
+      case "launch_build": {
+        // Peh's bridge from drafting to doing: run the REAL governed `ikbi build` on the session's
+        // selected repo (this.targetRepo) via the same CLI, so every guard applies. Confirm-gated
+        // above — never reaches here without operator approval. Output is UNTRUSTED → chokepoint.
+        const res = await runLaunchBuild(args, {
+          sessionRepo: this.targetRepo,
+          cliEntry: process.argv[1] ?? "",
+          execPath: process.execPath,
+          // Thread the operator's standing instructions to the build so a Peh-launched build honors
+          // the same baseline preferences this session does (passed via env inside runLaunchBuild).
+          ...(loadUserInstructions()?.content !== undefined ? { standingInstructions: loadUserInstructions()!.content } : {}),
+        });
+        return { output: res.output, activity: { name: "launch_build", ok: res.ok, summary: res.summary } };
       }
       case "notebook_edit": {
         // Cell-level .ipynb editing — confined to the worktree. Mutating ops are permission-gated
@@ -1302,6 +1449,36 @@ export class ChatSession {
     return { ok: true, rel: rel.length === 0 ? "." : rel };
   }
 
+  /**
+   * Dispatch a phone_* call: build the governed PhoneDeps (executor + identity + worktree +
+   * env-resolved transport) and run the matching device action. The raw result STRING is returned
+   * for the caller to neutralize + append — this method never builds a message.
+   */
+  private async runPhoneTool(name: string, args: Record<string, unknown>): Promise<{ output: string; activity: ChatToolActivity }> {
+    const transport = resolvePhoneTransport(process.env);
+    const deps: PhoneDeps = {
+      governedExec,
+      worktreeReal: this.worktree,
+      ...(this.parentCtx !== undefined ? { parentCtx: this.parentCtx } : {}),
+      ...(transport !== undefined ? { transport } : {}),
+    };
+    let out: string;
+    switch (name) {
+      case "phone_take_photo": out = await runPhoneTakePhoto(deps, args); break;
+      case "phone_record_audio": out = await runPhoneRecordAudio(deps, args); break;
+      case "phone_read_sensor": out = await runPhoneReadSensor(deps, args); break;
+      case "phone_read_text": out = await runPhoneReadText(deps, args); break;
+      case "phone_location": out = await runPhoneLocation(deps, args); break;
+      case "phone_battery": out = await runPhoneBattery(deps, args); break;
+      case "phone_speak": out = await runPhoneSpeak(deps, args); break;
+      case "phone_notify": out = await runPhoneNotify(deps, args); break;
+      case "phone_torch": out = await runPhoneTorch(deps, args); break;
+      default: return { output: `ERROR: unknown phone tool "${name}"`, activity: { name, ok: false, summary: "unknown tool" } };
+    }
+    const ok = !out.startsWith("ERROR") && !out.startsWith("DENIED");
+    return { output: out, activity: { name, ok } };
+  }
+
   private async runSharedExecutorTool(call: ToolCall, args: Record<string, unknown>): Promise<{ output: string; activity: ChatToolActivity }> {
     // PERSISTENT SHELL: intercept a bare `cd` so it updates the session's working directory instead
     // of hitting the (shell-less) executor, which cannot run `cd`. Other terminal commands then run
@@ -1377,6 +1554,7 @@ export class ChatSession {
         command: c.command,
         args: [...c.args],
         cwd: this.worktree,
+        verifier: true, // chat run_checks: trusted check-runner (runs the PROJECT's checks, not model input)
         purpose: `chat check: ${c.name}`,
         timeoutMs: checkTimeoutMs,
       });
@@ -1393,15 +1571,19 @@ export class ChatSession {
     return `Checks ${allPass ? "ALL PASS" : "FAILED"}:\n${lines.join("\n---\n")}`;
   }
 
-  /** The neutralization chokepoint: a tool result becomes a message ONLY through here. */
-  private appendToolResult(raw: string, call: ToolCall): void {
+  /** The neutralization chokepoint: a tool result becomes a message ONLY through here.
+   *  `isError` marks a FAILED tool (activity.ok === false) so the native Anthropic path can set the
+   *  `tool_result.is_error` flag — letting the model distinguish a real failure from a tool that
+   *  merely returned error-shaped prose. Providers without an error channel ignore the flag. */
+  private appendToolResult(raw: string, call: ToolCall, isError = false): void {
     const safe = neutralizeUntrusted(raw, { source: "mcp_result", identity: this.identity, origin: call.name });
     // Emulated (text-protocol) rounds have no real tool_call_id to attach a tool-role message to —
     // feed the (still-neutralized) result back as a user-role data message instead. Mirrors builder.
+    // (A user-role carrier has no tool_result block, so is_error does not apply there.)
     this.messages.push(
       this.emulatedRound
         ? toUntrustedMessage(safe, { role: "user" })
-        : toUntrustedMessage(safe, { role: "tool", toolCallId: call.id }),
+        : { ...toUntrustedMessage(safe, { role: "tool", toolCallId: call.id }), ...(isError ? { isError: true } : {}) },
     );
   }
 
@@ -1495,6 +1677,13 @@ export class ChatSession {
   /** Switch the driver model for subsequent turns (`/model <name>`). */
   setModel(model: string): void {
     this.model = model;
+  }
+
+  /** The per-request extended-thinking field, or {} when off. Enabled only when the operator set a
+   *  budget AND the CURRENT driver model advertises thinking support (graceful fallback otherwise). */
+  private thinkingRequest(): { thinking: { budgetTokens: number } } | Record<string, never> {
+    if (THINKING_BUDGET <= 0) return {};
+    return getCapabilities(this.model).supports_thinking === true ? { thinking: { budgetTokens: THINKING_BUDGET } } : {};
   }
 
   currentPermissionMode(): PermissionMode {
@@ -1680,15 +1869,27 @@ export class ChatSession {
   rollback(n = 1): RollbackResult[] {
     const count = Math.max(0, Math.min(Math.floor(n), this.fileHistory.length));
     const results: RollbackResult[] = [];
+    const worktreeRoot = resolve(this.worktree);
     for (let i = 0; i < count; i += 1) {
       const m = this.fileHistory.pop();
       if (m === undefined) break;
+      // H6 — REVALIDATE containment before touching disk. `fileHistory` is restored from the (tamperable)
+      // session file, so a crafted FileMutation could point `full`/`path` at an arbitrary file
+      // (/etc/passwd, ~/.ssh/...). Re-root the recorded RELATIVE path in THIS session's current worktree
+      // (never trust the absolute `full`) and REFUSE anything that escapes — rollback must never write or
+      // delete outside the worktree. An absolute or `..`-bearing `path` resolves outside and is rejected.
+      const target = resolve(worktreeRoot, m.path);
+      const rel = relative(worktreeRoot, target);
+      if (rel.length === 0 || rel.startsWith("..") || isAbsolute(rel)) {
+        results.push({ tool: m.tool, path: m.path, action: "rollback REFUSED: path escapes the session worktree" });
+        continue;
+      }
       try {
         if (m.beforeContent === null) {
-          rmSync(m.full, { force: true });
+          rmSync(target, { force: true });
           results.push({ tool: m.tool, path: m.path, action: "deleted (was newly created)" });
         } else {
-          writeFileSync(m.full, m.beforeContent, "utf8");
+          writeFileSync(target, m.beforeContent, "utf8");
           results.push({ tool: m.tool, path: m.path, action: "restored to previous content" });
         }
       } catch (e) {
@@ -1813,6 +2014,13 @@ export class ChatSession {
   private async maybeAutoCompact(opts: TurnOptions): Promise<void> {
     if (AUTO_COMPACT_PERCENT <= 0) return; // disabled
     if (this.messages.length <= this.lastAutoCompactCount) return; // nothing new since last compaction
+    // BETWEEN-TURNS ONLY: never compact while a freshly-appended user message is still awaiting its
+    // response. The pre-model-call site fires this right after pushing the user turn; compacting there
+    // would summarize history in the middle of forming a turn (and burn a compaction the imminent model
+    // call makes moot). We let the model reply first, then the post-response call (trailing = assistant)
+    // compacts between turns. Native tool rounds trail with a "tool" result, so mid-loop growth still
+    // compacts pre-call; only the "user awaiting reply" boundary is skipped.
+    if (this.messages[this.messages.length - 1]?.role === "user") return;
     if (this.contextPercent() < AUTO_COMPACT_PERCENT) return;
     opts.onProgress?.("Compacting context…");
     try {
@@ -1851,7 +2059,8 @@ export class ChatSession {
       () => this.sendUnlocked(userMessage, images, mode, opts),
     );
     this.turnQueue = next.catch(() => undefined);
-    return next;
+    // Gap C: record this turn's spend to the receipt log (best-effort; never fails the turn).
+    return next.then(async (r) => { await this.recordTurnCostReceipt(r.cost); return r; });
   }
 
   private async sendUnlocked(
@@ -1957,7 +2166,8 @@ export class ChatSession {
       const output = outputs[i];
       if (activity !== undefined) tools.push(activity);
       // ERROR HINTS (FIX 9): append a one-line recovery hint to a failed tool's output.
-      if (output !== undefined) this.appendToolResult(withErrorHint(output), call);
+      // Propagate the failure into tool_result.is_error (native Anthropic) via the activity's ok flag.
+      if (output !== undefined) this.appendToolResult(withErrorHint(output), call, activity?.ok === false);
     }
     return false;
   }
@@ -1997,10 +2207,11 @@ export class ChatSession {
     const memMsg = memSummary.length > 0
       ? toUntrustedMessage(neutralizeUntrusted(memSummary, { source: "external", identity: this.identity, origin: "chat_memory" }), { role: "user" })
       : undefined;
-    // Operator-pasted images ride as multimodal `parts` on this (trusted) user turn; `content`
-    // stays the text (the flattened fallback + what memory/neutralization elsewhere reads).
-    const imageParts = buildImageParts(userMessage, images);
-    this.messages.push({ role: "user", content: userMessage, ...(imageParts !== undefined ? { parts: imageParts } : {}) });
+    // Operator-attached images are persisted to the worktree and the message is steered to
+    // vision_analyze (the dedicated, cost-controlled vision model) — so image understanding works
+    // even with a text-only chat model, instead of parts a non-multimodal model would reject.
+    const stagedMessage = stageImageMessage(userMessage, images, this.worktree);
+    this.messages.push({ role: "user", content: stagedMessage });
     const tools: ChatToolActivity[] = [];
 
     let iterations = 0;
@@ -2026,6 +2237,7 @@ export class ChatSession {
           identity: this.identity,
           messages: this.viewWithMemory(memMsg, mode, toolInstructions),
           tools: toolsForModel,
+          ...this.thinkingRequest(),
         });
       } catch (e) {
         this.memory.recordToolActivity(tools);
@@ -2056,6 +2268,11 @@ export class ChatSession {
         // no matching result — persisting them would wedge the next request, so they are dropped.
         ...(response.toolCalls !== undefined && response.toolCalls.length > 0 && response.finishReason === "tool_calls"
           ? { toolCalls: response.toolCalls }
+          : {}),
+        // THINKING ROUND-TRIP: carry the signed thinking block so the next request replays it (required
+        // when the turn used tools). Only when BOTH text + signature survived — an unsigned block is rejected.
+        ...(typeof response.reasoning === "string" && response.reasoning.length > 0 && typeof response.reasoningSignature === "string"
+          ? { reasoning: response.reasoning, reasoningSignature: response.reasoningSignature }
           : {}),
       });
 
@@ -2126,6 +2343,30 @@ export class ChatSession {
    * receipt-write failure must never mask the warning the user already sees. No partial action ran,
    * so this records the EVENT (finishReason + flags), not any tool result.
    */
+  /**
+   * H4/Gap C: write ONE cost receipt per turn so `ikbi repl` spend — previously tracked only in
+   * session memory (`/cost`) and invisible to `ikbi cost` — is counted. Per-TURN (not cumulative) so
+   * repeated writes over a session sum correctly instead of double-counting. Zero-cost turns are skipped.
+   */
+  private async recordTurnCostReceipt(costUsd: number): Promise<void> {
+    if (!(costUsd > 0)) return;
+    try {
+      const store = (await import("../../core/receipt/index.js")).receipts;
+      await store.append(
+        {
+          operation: "chat.turn",
+          outcome: { status: "success" },
+          requestId: this.id,
+          metadata: { sessionId: this.id, taskId: this.id, model: this.model, costUsd, kind: "chat" },
+          project: this.worktree,
+        },
+        this.identity,
+      );
+    } catch (e) {
+      log.warn({ err: errMsg(e), sessionId: this.id }, "chat: failed to write turn cost receipt");
+    }
+  }
+
   private async recordFinishReasonReceipt(notice: FinishReasonNotice, model: string): Promise<void> {
     try {
       const store = (await import("../../core/receipt/index.js")).receipts;
@@ -2180,6 +2421,7 @@ export class ChatSession {
           log.warn({ err: errMsg(e), sessionId: this.id }, "chat: autosave failed");
         }
       }
+      await this.recordTurnCostReceipt(result.cost); // Gap C: streamed turns are counted too
       return result;
     } finally {
       release();
@@ -2210,8 +2452,8 @@ export class ChatSession {
     const memMsg = memSummary.length > 0
       ? toUntrustedMessage(neutralizeUntrusted(memSummary, { source: "external", identity: this.identity, origin: "chat_memory" }), { role: "user" })
       : undefined;
-    const imageParts = buildImageParts(userMessage, images);
-    this.messages.push({ role: "user", content: userMessage, ...(imageParts !== undefined ? { parts: imageParts } : {}) });
+    const stagedMessage = stageImageMessage(userMessage, images, this.worktree);
+    this.messages.push({ role: "user", content: stagedMessage });
 
     let iterations = 0;
     for (;;) {
@@ -2236,6 +2478,7 @@ export class ChatSession {
         identity: this.identity,
         messages: this.viewWithMemory(memMsg, mode, toolInstructions),
         tools: toolsForModel,
+        ...this.thinkingRequest(),
       };
       const acc = new StreamAccumulator();
       let aborted = false;
@@ -2292,6 +2535,10 @@ export class ChatSession {
         // tool-call (finishReason=length) yields dangling partial calls that would wedge the next
         // request — drop them so nothing partial is replayed.
         ...(round.toolCalls.length > 0 && round.finishReason === "tool_calls" ? { toolCalls: round.toolCalls } : {}),
+        // THINKING ROUND-TRIP (streaming): replay the signed thinking block on the next request.
+        ...(typeof round.reasoning === "string" && round.reasoning.length > 0 && typeof round.reasoningSignature === "string"
+          ? { reasoning: round.reasoning, reasoningSignature: round.reasoningSignature }
+          : {}),
       });
 
       if (aborted) return finish("[ikbi: interrupted]");
@@ -2308,6 +2555,12 @@ export class ChatSession {
           this.emulatedRound = true;
         }
       }
+
+      // AUTO-COMPACT (between-turns): also compact after the model responds — mirrors the non-streaming
+      // path. The pre-call site (top of loop) is a no-op at a turn boundary because a freshly-appended
+      // user message is still trailing (maybeAutoCompact skips that); without this post-response call a
+      // session of single-round streaming turns would NEVER compact and could grow past the window.
+      await this.maybeAutoCompact(opts);
 
       if (roundToolCalls !== undefined) {
         // Read-only calls run in parallel; mutating calls serialize. Results append in order.

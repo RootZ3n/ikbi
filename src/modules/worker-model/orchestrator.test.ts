@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,8 +20,11 @@ import type { OperationContext } from "../../core/identity/resolver.js";
 import { autonomyForTier, asTier, type TrustDecision } from "../../core/trust/index.js";
 import { tierRank, TRUST_FLOOR } from "../../core/trust/index.js";
 import type { DiscardResult, PromoteGovernance, PromoteResult, WorkspaceEvaluation, WorkspaceHandle } from "../../core/workspace/contract.js";
-import { createOrchestrator, type OrchestratorDeps } from "./orchestrator.js";
+import { createOrchestrator, porcelainHasTrackedChanges, type OrchestratorDeps } from "./orchestrator.js";
 import { integrator as realIntegrator } from "./integrator.js";
+import { escalationConfig } from "../escalation/index.js";
+import { loadWorkerModelConfig } from "./config.js";
+import { moduleEnv } from "../../core/module-config.js";
 import {
   WORKER_ROLES,
   WorkerError,
@@ -153,13 +157,23 @@ function capturingRoles(outcomeFor: (role: WorkerRole) => WorkerOutcome = () => 
           ? { role: r, outcome, summary: r, detail: { decision: "promote", rationale: "test: promote", evaluation: { approved: true } } }
           : { role: r, outcome, summary: r, detail: { decision: "discard", rationale: "test: verifier not green", evaluation: { approved: false } } };
       }
+      // A GREEN verifier carries a real executed-test check (a passing suite with a parsed count), so a
+      // promoting candidate has authentic `executed` evidence — the Phase 10 promotion authority requires
+      // it. (readVerifier re-derives testEvidence from the checks, so a detail-less stub reads as `absent`
+      // and would be blocked.)
+      if (r === "verifier" && outcome === "success") {
+        return { role: r, outcome, summary: r, detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }] } };
+      }
       return { role: r, outcome, summary: r };
     };
   }
   return { seen, roles };
 }
 
-const ENABLED = { enabled: true, roleTimeoutMs: 1000, maxConcurrentRuns: 1 };
+// trustLadder: true — this suite exercises the earned-trust LADDER machinery (tier-gated autoCommit,
+// demotion, timeout-suppression). The ladder is opt-in (default OFF for building), so these tests
+// enable it explicitly. Ladder-OFF default behavior is covered by dedicated tests (see below).
+const ENABLED = { enabled: true, roleTimeoutMs: 1000, maxConcurrentRuns: 1, trustLadder: true };
 const task: WorkerTask = { taskId: "t-1", targetRepo: "/repo", goal: "do the thing" };
 
 /** An ALLOWING gate-wall — the wired/governed path (production wires the real gate-wall). */
@@ -186,6 +200,11 @@ function baseDeps(extra: Partial<OrchestratorDeps>): OrchestratorDeps {
     // A promote REQUIRES gate-wall authorization (H5). Default to a wired ALLOWING gate so
     // the happy-path promote tests exercise the GOVERNED path; H5 tests pass `gateWall: undefined`.
     gateWall: allowGate,
+    // Phase 11: pin a DETERMINISTIC escalation roster so escalation-mechanics tests assert a fixed model
+    // ORDER independent of the ambient deployment config (project .env / providers.json). This makes the
+    // suite green in BOTH the isolated runner AND the isolation-off production-config probe (the previous
+    // 5 probe failures were escalation tests leaking the deployed roster order, not production bugs).
+    escalationTierModels: { worker: ["deepseek-v4-flash", "mimo-v2.5"], mid: ["mimo-v2.5-pro", "deepseek-v4-pro", "minimax-m3", "glm-5.2"], frontier: ["sonnet-4.6", "opus-4.8", "gpt-5.5"] },
     invokeModel: async () => {
       throw new Error("invokeModel not used in these tests");
     },
@@ -288,6 +307,71 @@ test("success path: workspace allocated then PROMOTED (not discarded)", async ()
   assert.equal(ws.calls.commit.length, 1, "committed once (the verified-good state)");
 });
 
+test("Cx: IKBI_LEGACY_COMPLETION=off makes the adjudication core AUTHORITATIVE — overrides the integrator, fails CLOSED when tree facts are unavailable", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const cap = capturingRoles(); // every role green ⇒ the integrator returns promote (the legacy success path promotes this)
+  const orch = createOrchestrator(baseDeps({
+    resolveIdentity, roleClaim, roles: cap.roles, workspaces: ws.workspaces,
+    env: { ...process.env, IKBI_LEGACY_COMPLETION: "off" },
+  }));
+  const result = await orch.run(task, parentCtx);
+
+  // The fake workspace has no real git worktree, so the adjudication FACTS can't be computed. In
+  // authoritative mode the core REPLACES the integrator's promote intent and fails CLOSED — nothing
+  // promotes even though every role was green (the exact scenario the legacy default DOES promote,
+  // asserted by the test above). Proves the flip is wired to the terminal gate and fail-closed.
+  assert.equal(ws.calls.promote, 0, "authoritative + unavailable facts ⇒ no promote (fail-closed)");
+  assert.equal(result.promoted, false);
+  assert.match(result.reason ?? "", /adjudication core authoritative but the promotability verdict was unavailable/);
+});
+
+test("Cx (Phase 3 QUARANTINE): authoritative core canNOT autonomously promote over an integrator discard — it retains, fail-closed", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-cx-real-"));
+  const git = (...args: string[]): string => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8" });
+  try {
+    git("init", "-b", "main", "-q");
+    git("config", "user.email", "t@ikbi.local");
+    git("config", "user.name", "ikbi test");
+    writeFileSync(join(dir, "README.md"), "base\n");
+    git("add", "-A"); git("commit", "-q", "-m", "base");
+    const baseRef = git("rev-parse", "HEAD").trim();
+    writeFileSync(join(dir, "feature.ts"), "export const x = 1;\n"); // the build's work — tree now differs from base
+
+    const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+    const handle: WorkspaceHandle = { ...fakeWorkspaceHandle(), id: "wsabcd", path: dir, targetRepo: dir, baseRef, baseBranch: "main" };
+    const calls = { promote: 0, discard: 0, retain: 0 };
+    const workspaces: NonNullable<OrchestratorDeps["workspaces"]> = {
+      allocate: async () => handle,
+      promote: async (h): Promise<PromoteResult> => { calls.promote += 1; return { promoted: true, workspaceId: h.id, targetBranch: h.baseBranch, beforeRef: "a", afterRef: "b" }; },
+      discard: async (): Promise<DiscardResult> => { calls.discard += 1; return { workspaceId: handle.id, removed: true }; },
+      retain: async (h): Promise<DiscardResult> => { calls.retain += 1; return { workspaceId: h.id, removed: false }; },
+      commit: async () => true,
+    };
+    const roles: Partial<Record<WorkerRole, RoleFn>> = {
+      scout: async () => ({ role: "scout", outcome: "success", summary: "s" }),
+      builder: async () => ({ role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["feature.ts"], rejectedToolCalls: [], stopReason: "stop" } }),
+      verifier: async () => ({ role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, outputTail: "# tests 3\n# pass 3\n" }] } }),
+      critic: async () => ({ role: "critic", outcome: "success", summary: "c", detail: { pass: true } }),
+      // The integrator DISCARDS. Before Phase 3 the authoritative core would SYNTHESIZE an approving
+      // evaluation and override this to promote. Phase 3 quarantines that: the experimental path may not
+      // autonomously promote from synthesized safety evidence over an integrator deny.
+      integrator: async () => ({ role: "integrator", outcome: "success", summary: "i", detail: { decision: "discard", rationale: "integrator says discard", evaluation: { approved: false } } }),
+    };
+    const orch = createOrchestrator(baseDeps({
+      resolveIdentity, roleClaim, workspaces, roles,
+      env: { ...process.env, IKBI_LEGACY_COMPLETION: "off" },
+    }));
+    const result = await orch.run({ taskId: "t-cx", targetRepo: dir, goal: "cx" }, parentCtx);
+
+    assert.equal(calls.promote, 0, "QUARANTINE: the experimental core did NOT promote over the integrator's discard");
+    assert.equal(result.promoted, false);
+    assert.match(result.reason ?? "", /QUARANTINED/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("COMMIT after verifier on a trusted (autoCommit) success — captured AFTER verifier, BEFORE the integrator", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
   const ws = fakeWorkspaces(true);
@@ -339,6 +423,41 @@ test("verified-good but non-autoCommit tier: RETAIN + actionable reason, never a
   assert.match(result.reason ?? "", /ikbi trust grant .+ trusted/, "gives the exact operator command");
 });
 
+// ── TRUST LADDER OFF (default for building): tier does not gate promotion; outcomes don't demote ──
+
+test("TRUST LADDER OFF (default): a verified-tier build PROMOTES — autoCommit is forced, not tier-gated", async () => {
+  // Same setup as the ladder-ON "NO COMMIT for a non-autoCommit tier" test, but with the ladder OFF
+  // (the build default). The verified tier no longer blocks promotion: autoCommit is forced on, the
+  // verified-green work is committed and promoted. This is the fix for "verified tier lacks autoCommit
+  // autonomy" blocking a green build during the pilot.
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("verified", "verified");
+  const ws = fakeWorkspaces(true);
+  const cap = capturingRoles();
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, workspaces: ws.workspaces, config: { ...ENABLED, trustLadder: false } }));
+  const result = await orch.run(task, parentCtx);
+  assert.equal(ws.calls.commit.length, 1, "ladder off: verified-green work IS committed (autoCommit forced)");
+  assert.equal(ws.calls.promote, 1, "ladder off: the build promotes regardless of tier");
+  assert.equal(result.promoted, true, "the verified work landed");
+});
+
+test("TRUST LADDER OFF (default): a REAL failure does NOT move trust — a ladder_disabled receipt is written instead", async () => {
+  // With the ladder OFF, NO build outcome (even a genuine verification failure) calls trust.recordOutcome
+  // — so a harness-caused rejection can never demote the worker and strip its autonomy. An auditable
+  // `worker.trust.ladder_disabled` receipt records that the outcome was seen but deliberately not counted.
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const cap = capturingRoles();
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    verifier: async () => ({ role: "verifier", outcome: "failure", summary: "checks failed", detail: { verdict: "fail", checks: [{ name: "test", exitCode: 1 }] } }),
+  };
+  const tr = capturingTrust();
+  const rc = fakeReceipts();
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, trust: tr.trust, receipts: rc.receipts, config: { ...ENABLED, trustLadder: false } }));
+  await orch.run(task, parentCtx);
+  assert.equal(tr.calls.length, 0, "ladder off: trust.recordOutcome is NEVER called for a build outcome");
+  assert.ok(rc.calls.some((c) => c.operation === "worker.trust.ladder_disabled"), "an auditable ladder_disabled receipt is written");
+});
+
 // ── ISSUE 1: performance failures (timeouts) are separated from trust demotion ───
 function capturingTrust() {
   const calls: Array<{ operation: string; status: string }> = [];
@@ -351,6 +470,103 @@ function capturingTrust() {
   };
   return { trust, calls };
 }
+
+test("INJECTION SIGNAL: a chokepoint block on a tool result is recorded in the role receipt AND attributed to trust (detection→enforcement)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const cap = capturingRoles();
+  // The builder reports the chokepoint blocked a tool result from OUTSIDE content this run (the
+  // enforced case — e.g. a poisoned web_extract). externalInjectionDetected drives enforcement.
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    builder: async () => ({ role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["a.ts"], injectionDetected: true, externalInjectionDetected: true, rejectedToolCalls: [] } }),
+  };
+  // Local captures: role receipt metadata (ladder-independent audit) + recordOutcome signals (ladder on).
+  const appended: Array<{ operation: string; metadata: Record<string, unknown> }> = [];
+  const receipts = { append: async (input: unknown): Promise<unknown> => { const i = input as { operation: string; metadata?: Record<string, unknown> }; appended.push({ operation: i.operation, metadata: i.metadata ?? {} }); return {}; } };
+  const trustCalls: Array<{ operation: string; injection: boolean }> = [];
+  const trust = {
+    recordOutcome: async (i: { agentId: string; defaultTrustTier: string; operation: string; status: string; signals?: { injection?: boolean } }): Promise<TrustDecision> => {
+      trustCalls.push({ operation: i.operation, injection: i.signals?.injection === true });
+      const t = asTier(i.defaultTrustTier, TRUST_FLOOR);
+      return { agentId: i.agentId, tier: t, previousTier: t, autonomy: autonomyForTier(t) };
+    },
+  };
+  // ENABLED has trustLadder: true, so the per-role recordOutcome fires (the demotion path is live).
+  const ws = fakeWorkspaces(true);
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, trust, receipts, workspaces: ws.workspaces }));
+  const result = await orch.run(task, parentCtx);
+
+  // Durable audit: the builder role receipt records the detected injection regardless of the ladder.
+  const builderReceipt = appended.find((a) => a.operation === "worker.role.builder");
+  assert.equal(builderReceipt?.metadata.injectionDetected, true, "the role receipt records the chokepoint block (always-on audit)");
+  // Enforcement: trust is recorded PER-BUILD (FIX A). With the ladder active, the per-build outcome
+  // carries signals.injection so the trust rules can set the non-recoverable flag.
+  const buildTrust = trustCalls.find((c) => c.operation === "worker.build");
+  assert.ok(buildTrust?.injection, "the per-build recordOutcome received signals.injection — detection reaches enforcement");
+  // IN-RUN PROMOTE BLOCK (the real teeth): the OFFENDING build must NOT promote — even though every
+  // role (incl. the stubbed integrator) approved — regardless of the trust ladder.
+  assert.equal(result.promoted, false, "an injection-detected build is fail-closed — it does not promote");
+  assert.equal(ws.calls.promote, 0, "nothing was promoted");
+  assert.match(result.reason ?? "", /injection/i, "the discard reason names the injection");
+});
+
+test("INJECTION (own worktree output): neutralized self-hosting fixtures do NOT discard a green build (judge by effect)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const cap = capturingRoles();
+  // The builder's run_checks ran ikbi's own injection-test suite; the chokepoint re-detected the
+  // fixture attack strings in that OWN-worktree output. injectionDetected is set (audit) but
+  // externalInjectionDetected is NOT — the content was neutralized-and-inert. Judge by effect.
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    builder: async () => ({ role: "builder", outcome: "success", summary: "b", detail: { filesWritten: ["a.ts"], injectionDetected: true, rejectedToolCalls: [] } }),
+  };
+  const appended: Array<{ operation: string; metadata: Record<string, unknown> }> = [];
+  const receipts = { append: async (input: unknown): Promise<unknown> => { const i = input as { operation: string; metadata?: Record<string, unknown> }; appended.push({ operation: i.operation, metadata: i.metadata ?? {} }); return {}; } };
+  const trustCalls: Array<{ operation: string; injection: boolean }> = [];
+  const trust = {
+    recordOutcome: async (i: { agentId: string; defaultTrustTier: string; operation: string; status: string; signals?: { injection?: boolean } }): Promise<TrustDecision> => {
+      trustCalls.push({ operation: i.operation, injection: i.signals?.injection === true });
+      const t = asTier(i.defaultTrustTier, TRUST_FLOOR);
+      return { agentId: i.agentId, tier: t, previousTier: t, autonomy: autonomyForTier(t) };
+    },
+  };
+  const ws = fakeWorkspaces(true);
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, trust, receipts, workspaces: ws.workspaces }));
+  const result = await orch.run(task, parentCtx);
+
+  // Still audited: the role receipt records the detection regardless of origin.
+  const builderReceipt = appended.find((a) => a.operation === "worker.role.builder");
+  assert.equal(builderReceipt?.metadata.injectionDetected, true, "own-worktree injection is still recorded for audit");
+  // NOT enforced: no trust signal, and the verified-green build PROMOTES (judge by effect).
+  const buildTrust = trustCalls.find((c) => c.operation === "worker.build");
+  assert.equal(buildTrust?.injection ?? false, false, "own-worktree injection does NOT feed the trust signal");
+  assert.equal(result.promoted, true, "a green build with only own-worktree (neutralized) injection promotes");
+  assert.equal(ws.calls.promote, 1, "the build was promoted");
+});
+
+test("POLICY TAINT: a PREVENTED out-of-policy attempt does NOT discard a verified-green build (judge by effect)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const cap = capturingRoles();
+  let attempt = 0;
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    builder: async (): Promise<RoleResult> => {
+      attempt += 1;
+      // The builder writes files AND attempts a BLOCKED out-of-policy tool call (a prevented attempt —
+      // the governor rejected it, no effect), then hits a protocol failure. ADJUDICATION now runs the
+      // verifier on its work-on-disk: a GREEN verifier rescues it directly (no retry needed). EFFECT,
+      // NOT INTENT: the prevented attempt is a recorded warning + learning signal, NOT a discard.
+      return { role: "builder", outcome: "failure", summary: "flailed after a blocked call", detail: { stopReason: "no_progress", filesWritten: ["a.ts"], policyViolations: [{ tool: "terminal", error: "blocked: pnpm run deploy" }], toolFormatErrors: [1, 2] } };
+    },
+  };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces }));
+  const result = await orch.run({ taskId: "t-taint", targetRepo: "/repo", goal: "do the thing" }, parentCtx);
+
+  assert.ok(attempt >= 1, "the builder ran and left green work with a prevented policy attempt");
+  assert.equal(result.promoted, true, "a PREVENTED attempt does not discard a verified-green build — adjudication promotes it");
+  assert.equal(ws.calls.promote, 1, "the green build promoted (judged by effect, not intent)");
+});
 
 test("ISSUE 1: a builder TIMEOUT does NOT feed the trust signal (no demotion) and writes an explicit suppression receipt", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
@@ -510,8 +726,14 @@ test("AUTO-VERIFY RESCUE: applies to every protocol termination (timeout / max_i
   }
 });
 
-test("AUTO-VERIFY RESCUE: a MODEL-failure stop (error/length/content_filter) is NOT rescued even if the verifier would pass", async () => {
-  for (const stop of ["error", "length", "content_filter", "unknown"] as const) {
+test("ADJUDICATION: any builder failure with work on disk is adjudicated regardless of stop reason (the verifier is the witness)", async () => {
+  // CONTRACT CHANGE (Adjudication Core, targeted increment): the old auto-verify rescue only fired on
+  // an ALLOWLIST of four "protocol termination" stops and discarded correct GREEN work for every other
+  // exit unseen — the recurring false-RED. Now the verifier, not the builder's exit code, is the
+  // witness: ANY failing exit that left work on disk (a model-failure stop error/length/content_filter,
+  // an unknown stop, a tool-call stall) is adjudicated, and a GREEN verifier rescues it. A red verifier
+  // still fails closed (pinned by the "RED rescue verifier" test below).
+  for (const stop of ["error", "length", "content_filter", "unknown", "tool_call_stalled"] as const) {
     const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
     const cap = capturingRoles();
     let verifierRuns = 0;
@@ -520,11 +742,12 @@ test("AUTO-VERIFY RESCUE: a MODEL-failure stop (error/length/content_filter) is 
       builder: builderNoChecks(stop),
       verifier: async (ctx) => { verifierRuns += 1; return cap.roles.verifier!(ctx); },
     };
-    const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles }));
+    const ws = fakeWorkspaces(true);
+    const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces }));
     const result = await orch.run(task, parentCtx);
-    assert.equal(result.roles.find((r) => r.role === "builder")?.outcome, "failure", `${stop} stays a failure`);
-    assert.equal(verifierRuns, 0, `${stop} never runs the rescue verifier (builder failure short-circuits)`);
-    assert.equal(result.promoted, false, `${stop} does not promote`);
+    assert.ok(verifierRuns >= 1, `${stop}: the rescue verifier runs (work on disk is adjudicated)`);
+    assert.equal(result.roles.find((r) => r.role === "builder")?.outcome, "success", `${stop}: a green verifier rescues the build`);
+    assert.equal(result.promoted, true, `${stop}: rescued green work promotes`);
   }
 });
 
@@ -579,25 +802,28 @@ test("AUTO-VERIFY RESCUE: NOT triggered when checks already ran, or when no file
   }
 });
 
-// ── AUTO-VERIFY RESCUE: policy violation blocks rescue ─────────────────────
-test("AUTO-VERIFY RESCUE: a builder with policy violations is NOT rescued even on protocol termination", async () => {
+// ── AUTO-VERIFY RESCUE: a PREVENTED policy attempt does NOT block rescue (judge by effect) ─────────
+test("AUTO-VERIFY RESCUE: a PREVENTED (blocked) policy attempt does NOT block rescue — the governor already prevented it", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
   const cap = capturingRoles();
   let verifierRuns = 0;
   const roles: Partial<Record<WorkerRole, RoleFn>> = {
     ...cap.roles,
+    // The model reached for a destructive command; the governor BLOCKED it (a prevented attempt — no
+    // effect). Judge by effect, not intent: this is a recorded warning, not a reason to discard work
+    // the verifier passes on the real worktree.
     builder: async () => ({
       role: "builder", outcome: "failure", summary: "no_progress",
-      detail: { stopReason: "no_progress", filesWritten: ["a.ts"], checksRuns: 0, rejectedToolCalls: [], policyViolations: [{ kind: "unsafe_command", command: "rm -rf /" }] },
+      detail: { stopReason: "no_progress", filesWritten: ["a.ts"], checksRuns: 0, rejectedToolCalls: [], policyViolations: [{ tool: "terminal", error: "blocked: rm -rf /" }] },
     }),
     verifier: async (ctx) => { verifierRuns += 1; return cap.roles.verifier!(ctx); },
   };
   const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles }));
   const result = await orch.run(task, parentCtx);
 
-  assert.equal(result.roles.find((r) => r.role === "builder")?.outcome, "failure", "policy violation blocks rescue");
-  assert.equal(verifierRuns, 0, "no rescue verifier when policy violations exist");
-  assert.equal(result.promoted, false, "nothing with policy violations promotes");
+  assert.ok(verifierRuns >= 1, "the rescue verifier runs despite the prevented (blocked) attempt");
+  assert.equal(result.roles.find((r) => r.role === "builder")?.outcome, "success", "the verified-green build is rescued");
+  assert.equal(result.promoted, true, "a prevented attempt does not block promotion of verified work");
 });
 
 // ── AUTO-VERIFY RESCUE: receipt stamps rescue details ─────────────────────
@@ -827,7 +1053,10 @@ test("failure path: a role failure short-circuits, workspace DISCARDED (not prom
   const ws = fakeWorkspaces(true);
   const cap = capturingRoles((r) => (r === "builder" ? "failure" : "success"));
   const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, workspaces: ws.workspaces }));
-  const result = await orch.run(task, parentCtx);
+  // escalationDisabled isolates the DISCARD mechanic this test pins from always-on flash→pro
+  // escalation (which now retries the builder on a pro model before a builder failure discards —
+  // covered by its own tests). With escalation off, a builder failure short-circuits immediately.
+  const result = await orch.run({ ...task, escalationDisabled: true }, parentCtx);
 
   assert.deepEqual(cap.seen.map((c) => c.role), ["scout", "builder"], "short-circuited after builder");
   assert.equal(ws.calls.promote, 0, "not promoted");
@@ -901,8 +1130,11 @@ test("each role's outcome is recorded to receipts + trust under the ROLE identit
   const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cap.roles, trust: tr.trust, receipts: rc.receipts }));
   await orch.run(task, parentCtx);
 
-  // Phase 3: one run-level summary receipt is now appended after role receipts complete.
-  assert.equal(rc.calls.length, 6, "five role receipts + one worker.run.summary");
+  // Phase 3: a promoting build now emits the canonical `worker.promotion` receipt (the single
+  // promotion authority's identity-chain record) in addition to the five role receipts and the
+  // run-level summary.
+  assert.equal(rc.calls.length, 7, "five role receipts + one worker.run.summary + one worker.promotion");
+  assert.ok(rc.calls.some((c) => c.operation === "worker.promotion"), "the canonical promotion receipt was written");
   assert.equal(tr.calls.length, 1, "FIX A: one trust outcome per BUILD, not per role");
   const roleReceipts = rc.calls.filter((c) => c.operation.startsWith("worker.role."));
   assert.equal(roleReceipts.length, 5, "one receipt per role");
@@ -962,7 +1194,7 @@ test("a failed run emits worker.failed", async () => {
 function okModelResponse(): ModelResponse {
   return {
     contractVersion: "1.1.0", model: "mimo-v2.5", provider: "mimo", providerModelId: "mimo-v2.5",
-    content: "PASS\n- a finding", finishReason: "stop", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+    content: JSON.stringify({ verdict: "PASS", scores: { files_modified: 5, goal_correctness: 5, code_quality: 5, tests: 5, suspicious_patterns: 5 }, feedback: "correct and complete for the goal" }), finishReason: "stop", usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
     cost: { usd: 0, promptUsd: 0, cachedUsd: 0, completionUsd: 0, rate: { promptPerMTok: 0, completionPerMTok: 0 } },
     latencyMs: 1, fellBack: false, attempts: [],
   };
@@ -1020,9 +1252,11 @@ test("real scout/builder/critic + stubbed verifier/integrator → coherent succe
       calls.discard += 1;
       return { workspaceId: handle.id, removed: true };
     },
+    // Phase 4: the REAL critic needs a diff to render a semantic verdict (the model returns PASS).
+    diff: async () => "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n-export const a = 1;\n+export const a = 2;\n",
   };
   const roles: Partial<Record<WorkerRole, RoleFn>> = {
-    verifier: async () => ({ role: "verifier", outcome: "success", summary: "checks ok (stubbed in test)" }),
+    verifier: async () => ({ role: "verifier", outcome: "success", summary: "checks ok (stubbed in test)", detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }] } }),
     integrator: async () => ({
       role: "integrator",
       outcome: "success",
@@ -1058,7 +1292,9 @@ const successFakes = (): Partial<Record<WorkerRole, RoleFn>> => ({
   scout: async () => ({ role: "scout", outcome: "success", summary: "s" }),
   builder: async () => ({ role: "builder", outcome: "success", summary: "b" }),
   critic: async () => ({ role: "critic", outcome: "success", summary: "c" }),
-  verifier: async () => ({ role: "verifier", outcome: "success", summary: "v" }),
+  // A green verifier carries a real executed-test check so a promoting candidate has authentic
+  // `executed` evidence (Phase 10 promotion authority requires it; readVerifier re-derives from checks).
+  verifier: async () => ({ role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }] } }),
 });
 
 test("LATENT-BUG FIX: all roles succeed but critic pass=false → integrator discards → NO promote", async () => {
@@ -1520,11 +1756,11 @@ test("ISSUE 1: the critic-driven retry is capped at ONE, then escalates ONCE, th
   assert.equal(ws.calls.promote, 0, "nothing promoted");
 });
 
-test("ISSUE 1: with criticFixLoop OFF (default), a critic FAIL does NOT retry — original discard behavior", async () => {
+test("ISSUE 1: with criticFixLoop explicitly OFF, a critic FAIL does NOT retry — original discard behavior", async () => {
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
   const ws = fakeWorkspaces(true);
   const cf = criticFixRoles();
-  // config without criticFixLoop → default off.
+  // config with criticFixLoop unset → treated as off (the injected config governs, not the module default).
   const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles: cf.roles, workspaces: ws.workspaces }));
   const result = await orch.run(task, parentCtx);
 
@@ -1532,6 +1768,15 @@ test("ISSUE 1: with criticFixLoop OFF (default), a critic FAIL does NOT retry �
   assert.equal(cf.calls.critic, 1, "critic ran exactly once");
   assert.notEqual(result.outcome, "success", "the single FAIL verdict discards as before");
   assert.equal(ws.calls.promote, 0, "nothing promoted");
+});
+
+test("ISSUE 1: the PRODUCTION default for criticFixLoop is ON (an off-goal-but-green build earns one corrective pass)", () => {
+  // The module config default (not the test-injected config) — a fresh env yields criticFixLoop ON.
+  const cfg = loadWorkerModelConfig(moduleEnv("worker-model", {}));
+  assert.equal(cfg.criticFixLoop, true, "critic-fix loop defaults ON — fixable off-goal-green work is not silently discarded");
+  // And it remains explicitly disableable.
+  const off = loadWorkerModelConfig(moduleEnv("worker-model", { IKBI_WORKER_MODEL_CRITIC_FIX_LOOP: "false" }));
+  assert.equal(off.criticFixLoop, false, "IKBI_WORKER_MODEL_CRITIC_FIX_LOOP=false still disables it");
 });
 
 test("ISSUE 1 (gate): a RED verifier + critic FAIL does NOT trigger the critic fix loop — no subjective-feedback retry", async () => {
@@ -1772,6 +2017,20 @@ test("Fix2: dirty-repo check skipped when reuseWorkspace is set (step-planner pa
   assert.notEqual(result.outcome, "rejected", "step-planner path is not affected by dirty check");
 });
 
+test("Fix2: dirty-repo check ignores untracked-only files (build worktree is cut from HEAD)", () => {
+  // Untracked files never enter a from-HEAD worktree, so they must not block a build.
+  assert.equal(porcelainHasTrackedChanges(""), false, "empty status → clean");
+  assert.equal(
+    porcelainHasTrackedChanges("?? ikbi-0.1.0-rc.1.tgz\n?? .claude/\n?? scripts/ui-verify/package-lock.json"),
+    false,
+    "untracked-only → not dirty",
+  );
+  // Any tracked change (staged or unstaged) still counts as dirty.
+  assert.equal(porcelainHasTrackedChanges(" M src/foo.ts"), true, "modified tracked file → dirty");
+  assert.equal(porcelainHasTrackedChanges("A  src/new.ts"), true, "staged add → dirty");
+  assert.equal(porcelainHasTrackedChanges("?? junk.txt\n M src/foo.ts"), true, "mixed → dirty (tracked change present)");
+});
+
 // ── Fix 3: workspace manifest check ───────────────────────────────────────────────────────────
 
 test("Fix3: warn when worktree has no project manifest", async () => {
@@ -1865,6 +2124,79 @@ test("WO2: an EMPTY repo (no manifest, no source) FAST-FAILS with 'empty or unre
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("GREENFIELD: an EMPTY target with allowGreenfieldScaffold PROCEEDS (builder scaffolds) instead of fast-failing", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-greenfield-"));
+  try {
+    const h = bareRepoHarness();
+    const result = await h.orch.run(
+      { taskId: "t-greenfield", targetRepo: dir, goal: "create a new TypeScript CLI", allowGreenfieldScaffold: true },
+      h.parentCtx,
+    );
+    // Did NOT fast-fail: roles ran and a workspace was allocated — the builder gets to scaffold.
+    assert.notEqual(result.outcome, "rejected", "an empty greenfield target with the flag is NOT pre-flight rejected");
+    assert.ok(h.cap.seen.length > 0, "roles were dispatched (the builder can scaffold a manifest + tests)");
+    assert.ok(h.ws.calls.allocate.length > 0, "a workspace was allocated for the scaffold build");
+    assert.ok(h.sent.some((e) => e.type === "worker.role.dispatched"), "emits the greenfield scaffold dispatch");
+    assert.ok(!h.sent.some((e) => e.type === "worker.failed"), "no pre-flight checks_unresolvable failure");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("GREENFIELD: a LOOSE-SOURCE target (no manifest) STILL fast-fails even with the flag — only EMPTY qualifies", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ikbi-greenfield-loose-"));
+  try {
+    writeFileSync(join(dir, "hello.js"), "console.log('hi');\n");
+    const h = bareRepoHarness();
+    const result = await h.orch.run(
+      { taskId: "t-greenfield-loose", targetRepo: dir, goal: "do the thing", allowGreenfieldScaffold: true },
+      h.parentCtx,
+    );
+    // Loose source without a manifest is NOT greenfield-empty — the flag does not bypass the reject.
+    assert.equal(result.outcome, "rejected", "loose source without a manifest still fast-fails (adding a manifest is the operator's call)");
+    assert.equal(h.cap.seen.length, 0, "no roles ran");
+    assert.match(result.reason ?? "", /No project manifest or verifier detected/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+const preflightOp = (e: unknown): boolean =>
+  (e as { attribution?: { operation?: string } }).attribution?.operation === "worker.preflight_context_escalation";
+
+test("PRE-FLIGHT CONTEXT: a large scout brief pre-escalates the builder to a bigger-window model before a doomed cheap attempt", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const bus = fakeBus();
+  const cap = capturingRoles();
+  // A scout brief that ≈ fills a 32k worker window: 120k chars ≈ 30k tokens > 0.7 * 32768 (≈22.9k).
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    scout: async () => ({ role: "scout", outcome: "success", summary: "s", detail: { brief: "x".repeat(120_000) } }),
+  };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces, events: bus.bus, builderModel: "mimo-v2.5" }));
+  const result = await orch.run({ taskId: "t-preflight-big", targetRepo: "/repo", goal: "build the big thing" }, parentCtx);
+
+  assert.ok(bus.sent.some(preflightOp), "pre-flight bumped the builder up when the base context already fills the worker window");
+  assert.equal(result.outcome, "success", "the build still ran the full pipeline (bumped, not blocked)");
+});
+
+test("PRE-FLIGHT CONTEXT: a small brief keeps the builder on the cheap model (no needless upgrade)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const bus = fakeBus();
+  const cap = capturingRoles();
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    scout: async () => ({ role: "scout", outcome: "success", summary: "s", detail: { brief: "x".repeat(4_000) } }),
+  };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces, events: bus.bus, builderModel: "mimo-v2.5" }));
+  const result = await orch.run({ taskId: "t-preflight-small", targetRepo: "/repo", goal: "small task" }, parentCtx);
+
+  assert.ok(!bus.sent.some(preflightOp), "no pre-flight bump for a small base context (no needless upgrade)");
+  assert.equal(result.outcome, "success");
 });
 
 test("WO2: a repo WITH a manifest proceeds through the normal flow (no regression)", async () => {
@@ -1970,18 +2302,18 @@ test("build-mode escalation: builder succeeds with 0 files → cheap retry → p
   assert.equal(builderGoals.length, 3, "builder ran three times: silent success + cheap retry + first pool-sweep model (converged)");
   assert.match(builderGoals[1] ?? "", /\[retry\]/, "the cheap retry carried retry context");
   assert.match(builderGoals[2] ?? "", /\[escalation\]/, "the escalated retry carried the escalation handoff context");
-  assert.match(builderGoals[2] ?? "", /deepseek-v4-flash/, "the handoff names the swept model (cheapest eligible pool model)");
+  assert.match(builderGoals[2] ?? "", /deepseek-v4-flash|mimo-v2\.5/, "the handoff names the swept WORKER-tier model (which vendor the router cost-ranks first is deployment-dependent)");
   assert.ok(result.escalationRetry, "escalationRetry surfaced on the result");
   assert.equal(result.escalationRetry?.attempted, true);
   assert.equal(result.escalationRetry?.succeeded, true, "the swept model converged");
-  assert.equal(result.escalationRetry?.model, "deepseek-v4-flash", "converged on the first eligible pool model swept");
+  assert.ok(["deepseek-v4-flash", "mimo-v2.5"].includes(result.escalationRetry?.model ?? ""), "converged on a WORKER-tier pool model (membership, not a deployment-specific cost-rank)");
   assert.equal(result.outcome, "success", "the escalated build verified and promoted like a first-try green build");
   assert.equal(result.promoted, true);
   assert.equal(ws.calls.promote, 1, "promoted the escalated work");
   const retried = bus.sent.filter((e) => e.type === "worker.escalation.retried");
   assert.ok(retried.length >= 2, "both cheap retry and pool-sweep escalation events emitted");
   const proRetried = retried[retried.length - 1];
-  assert.equal((proRetried?.payload as { toModel: string; success: boolean } | undefined)?.toModel, "deepseek-v4-flash");
+  assert.ok(["deepseek-v4-flash", "mimo-v2.5"].includes((proRetried?.payload as { toModel: string } | undefined)?.toModel ?? ""), "escalated to a worker-tier pool model");
   assert.equal((proRetried?.payload as { success: boolean } | undefined)?.success, true);
 });
 
@@ -2016,19 +2348,84 @@ test("build-mode escalation: builder fails on the cheap tier → cheap retry →
   assert.equal(builderGoals.length, 3, "builder ran three times: cheap attempt + cheap retry + first pool-sweep model (converged)");
   assert.match(builderGoals[1] ?? "", /\[retry\]/, "the cheap retry carried retry context");
   assert.match(builderGoals[2] ?? "", /\[escalation\]/, "the escalated retry carried the escalation handoff context");
-  assert.match(builderGoals[2] ?? "", /deepseek-v4-flash/, "the handoff names the swept model (cheapest eligible pool model)");
+  assert.match(builderGoals[2] ?? "", /deepseek-v4-flash|mimo-v2\.5/, "the handoff names the swept WORKER-tier model (which vendor the router cost-ranks first is deployment-dependent)");
   assert.ok(result.escalationRetry, "escalationRetry surfaced on the result");
   assert.equal(result.escalationRetry?.attempted, true);
   assert.equal(result.escalationRetry?.succeeded, true, "the swept model converged");
-  assert.equal(result.escalationRetry?.model, "deepseek-v4-flash", "converged on the first eligible pool model swept");
+  assert.ok(["deepseek-v4-flash", "mimo-v2.5"].includes(result.escalationRetry?.model ?? ""), "converged on a WORKER-tier pool model (membership, not a deployment-specific cost-rank)");
   assert.equal(result.outcome, "success", "the escalated build verified and promoted like a first-try green build");
   assert.equal(result.promoted, true);
   assert.equal(ws.calls.promote, 1, "promoted the escalated work");
   const retried = bus.sent.filter((e) => e.type === "worker.escalation.retried");
   assert.ok(retried.length >= 2, "both cheap retry and pool-sweep escalation events emitted");
   const proRetried = retried[retried.length - 1];
-  assert.equal((proRetried?.payload as { toModel: string; success: boolean } | undefined)?.toModel, "deepseek-v4-flash");
+  assert.ok(["deepseek-v4-flash", "mimo-v2.5"].includes((proRetried?.payload as { toModel: string } | undefined)?.toModel ?? ""), "escalated to a worker-tier pool model");
   assert.equal((proRetried?.payload as { success: boolean } | undefined)?.success, true);
+});
+
+test("build-mode escalation: ALWAYS-ON — a bare builder failure (score below threshold) still escalates to pro", async () => {
+  // The builder fails with NO signal-bearing detail, so the escalation SCORE stays at 0 (below the
+  // worker→mid threshold). Pre-always-on this short-circuited to discard with no escalation (see the
+  // isolated "role failure short-circuits" test, which now pins escalationDisabled). With
+  // IKBI_ESCALATION_ALWAYS_ESCALATE (default on), a builder that can't finish ALWAYS escalates to pro.
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const bus = fakeBus();
+  const cap = capturingRoles();
+  let builderRuns = 0;
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    builder: async (): Promise<RoleResult> => { builderRuns += 1; return { role: "builder", outcome: "failure", summary: "bare fail" }; },
+  };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces, events: bus.bus }));
+  const result = await orch.run({ taskId: "t-always-on-esc", targetRepo: "/repo", goal: "do the thing" }, parentCtx);
+
+  assert.ok(builderRuns > 1, "always-on escalation retried the builder despite a below-threshold score");
+  assert.equal(result.escalationRetry?.attempted, true, "escalation was attempted (guaranteed, not score-gated)");
+  assert.ok(bus.sent.some((e) => e.type === "worker.escalation.retried"), "an escalation-retry event fired");
+  assert.equal(result.promoted, false, "all attempts failed → fail-closed discard (no false green)");
+});
+
+test("build-mode escalation: a CONTEXT-OVERFLOW skips the futile cheap same-model retry and escalates straight to a bigger-window mid model", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = fakeWorkspaces(true);
+  const bus = fakeBus();
+  const cap = capturingRoles();
+  const builderGoals: string[] = [];
+  let cheapRetried = false;
+  const roles: Partial<Record<WorkerRole, RoleFn>> = {
+    ...cap.roles,
+    builder: async (ctx: RoleContext): Promise<RoleResult> => {
+      builderGoals.push(ctx.task.goal);
+      // The cheap-retry path (STEP 1) splices "[retry]" into the goal; the pool sweep splices "[escalation]".
+      if (ctx.task.goal.includes("[retry]")) {
+        cheapRetried = true;
+        return { role: "builder", outcome: "failure", summary: "cheap retry also failed" };
+      }
+      if (ctx.task.goal.includes("[escalation]")) {
+        return { role: "builder", outcome: "success", summary: "the bigger-window model fit the context" };
+      }
+      // Initial cheap attempt: FAIL with the context-overflow marker (the builder's classified error).
+      return { role: "builder", outcome: "failure", summary: "builder failed: context window exceeded", detail: { stopReason: "context_overflow" } };
+    },
+  };
+  const orch = createOrchestrator(baseDeps({ resolveIdentity, roleClaim, roles, workspaces: ws.workspaces, events: bus.bus }));
+  const result = await orch.run({ taskId: "t-esc-overflow", targetRepo: "/repo", goal: "do the thing" }, parentCtx);
+
+  assert.equal(cheapRetried, false, "the futile cheap same-model retry is SKIPPED on a context overflow");
+  assert.ok(!builderGoals.some((g) => g.includes("[retry]")), "no [retry] same-model attempt was made");
+  assert.equal(builderGoals.length, 2, "builder ran twice: overflow attempt + bigger-window escalation (no wasted cheap retry)");
+  assert.match(builderGoals[1] ?? "", /\[escalation\]/, "went straight to the escalation handoff");
+  // The sweep seeded at the mid tier (bigger window), skipping the small-window worker pool.
+  const escModel = result.escalationRetry?.model;
+  assert.ok(escModel !== undefined && !escalationConfig.tierModels.worker.includes(escModel), `escalated to a bigger-window model outside the worker pool (got ${escModel})`);
+  assert.ok(escalationConfig.tierModels.mid.includes(escModel!), `the swept model is a mid-tier model (got ${escModel})`);
+  assert.equal(result.escalationRetry?.succeeded, true, "the bigger-window model recovered the overflow");
+  assert.equal(result.outcome, "success");
+  assert.equal(result.promoted, true);
+  // The skip is observable: a cheap_retry event notes it was skipped for context overflow.
+  const skipEvent = bus.sent.find((e) => e.type === "worker.escalation.retried" && /cheap retry skipped — context overflow/.test((e.payload as { toModel?: string }).toModel ?? ""));
+  assert.ok(skipEvent, "emitted an observable 'cheap retry skipped — context overflow' event");
 });
 
 test("build-mode escalation: a failed escalated retry leaves the original failure standing (fail-closed, flash → cheap retry → pro — all fail)", async () => {
@@ -2142,7 +2539,7 @@ test("tier preset: escalationDisabled suppresses the auto-escalation — a faile
 });
 
 // ── TIER PRESET: builderModelOverride is accepted and does not perturb a passing build ──
-// The override feeds effectiveBuilderModel/complexityModel (the same seam --complexity large uses),
+// The override feeds the attempt's authoritative modelDecision (the same seam --complexity large uses),
 // so a tier build with an overridden builder model runs the normal pipeline to promotion. This is
 // a smoke guard that the new task field is threaded without breaking the happy path; the override's
 // value-routing is pinned by tier-presets.test.ts (parseBuildArgs + preset table).

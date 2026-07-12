@@ -1016,3 +1016,41 @@ test("detectScriptMutation: stub → typecheck is NOT flagged (semantic)", () =>
   ].join("\n");
   assert.equal(detectScriptMutation(diff).mutated, false, "stub→tsc is expected");
 });
+
+// ── C2: combined stdout+stderr evidence (no false green on stderr failures) ────────
+// A fake governed executor that STREAMS chunks to req.onOutput, so the verifier's full-stream
+// accumulation (not just the bounded tail) is exercised.
+function streamingExecStub(handler: (req: ExecRequest) => ExecResult) {
+  const calls: ExecRequest[] = [];
+  const governedExec = { run: async (req: ExecRequest): Promise<ExecResult> => { calls.push(req); return handler(req); } };
+  return { governedExec, calls };
+}
+
+test("C2: a check that prints failures to STDERR and exits 0 is NOT certified green", async () => {
+  // Exit-swallowing wrapper: exit 0 with a passing-looking stdout tally, real failures on STDERR.
+  const exec = streamingExecStub((req) => {
+    if (req.args.includes("test")) {
+      req.onOutput?.("TAP version 13\n# tests 3\n# pass 3\nok 1\nok 2\nok 3\n", "stdout");
+      req.onOutput?.("not ok 1 - critical invariant broke\n", "stderr"); // failure hidden on stderr
+      return { executed: true, exitCode: 0, stdoutTail: "# pass 3", stderrTail: "not ok 1 - critical invariant broke" };
+    }
+    return { executed: true, exitCode: 0, stdoutTail: "ok", stderrTail: "" };
+  });
+  const { ctx } = makeCtx();
+  const result = await createVerifier({ governedExec: exec.governedExec, parentCtx: makeParentCtx(), diff: cleanDiff })(ctx);
+  assert.notEqual(result.outcome, "success", "an exit-0 check with failures on stderr must NOT pass (Codex C2)");
+});
+
+test("C2: benign stderr noise on a passing check does NOT cause a false RED", async () => {
+  const exec = streamingExecStub((req) => {
+    req.onOutput?.("Debugger listening on ws://127.0.0.1:9229/abc\n", "stderr"); // benign, not a failure marker
+    if (req.args.includes("test")) {
+      req.onOutput?.("TAP version 13\n# tests 3\n# pass 3\nok 1\nok 2\nok 3\n", "stdout");
+      return { executed: true, exitCode: 0, stdoutTail: "# pass 3", stderrTail: "Debugger listening on ws://127.0.0.1:9229/abc" };
+    }
+    return { executed: true, exitCode: 0, stdoutTail: "ok", stderrTail: "Debugger listening on ws://127.0.0.1:9229/abc" };
+  });
+  const { ctx } = makeCtx();
+  const result = await createVerifier({ governedExec: exec.governedExec, parentCtx: makeParentCtx(), diff: cleanDiff })(ctx);
+  assert.equal(result.outcome, "success", "ordinary stderr noise must not be read as a failure");
+});

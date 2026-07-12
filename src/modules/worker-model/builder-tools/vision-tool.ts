@@ -101,6 +101,17 @@ function resolveImageUrl(deps: VisionDeps, imageArg: string): { url: string } | 
   return { url: `data:${mime};base64,${bytes.toString("base64")}` };
 }
 
+/**
+ * Resolve which model answers a vision_analyze call. The CHAT/builder model is often text-only
+ * (e.g. a cheap coder), so IKBI_VISION_MODEL lets an operator route JUST the image step to a
+ * multimodal model (e.g. mimo-v2.5) without changing the reasoning model. Unset ⇒ the caller's
+ * own model (unchanged behavior).
+ */
+export function resolveVisionModel(env: NodeJS.ProcessEnv, chatModel: string): string {
+  const override = typeof env.IKBI_VISION_MODEL === "string" ? env.IKBI_VISION_MODEL.trim() : "";
+  return override.length > 0 ? override : chatModel;
+}
+
 /** Run a single multimodal vision request and return the analysis string. Never throws past the boundary. */
 export async function runVisionAnalyze(deps: VisionDeps, args: Record<string, unknown>): Promise<string> {
   const imageArg = typeof args.image_url === "string" ? args.image_url.trim() : "";

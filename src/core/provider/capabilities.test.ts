@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { adaptMaxTokens, FALLBACK_CAPABILITIES, getCapabilities } from "./capabilities.js";
+import {
+  adaptMaxTokens,
+  FALLBACK_CAPABILITIES,
+  findUnclassifiedModels,
+  getCapabilities,
+  isModelClassified,
+} from "./capabilities.js";
 import { ModelRegistry } from "./registry.js";
 
 // ── getCapabilities: known ids, family patterns, fallback ───────────────────
@@ -64,16 +70,18 @@ test("a roster ModelSpec can declare a capabilities override, parsed and resolva
         id: "local-tiny",
         cost: { promptPerMTok: 0, completionPerMTok: 0 },
         providers: [{ provider: "p", providerModelId: "local-tiny" }],
-        capabilities: { context_window: 2_048, supports_tools: false, reasoning_level: "low", speed_class: "fast" },
+        capabilities: { context_window: 2_048, supports_tools: false, supports_thinking: true, reasoning_level: "low", speed_class: "fast" },
       },
     ],
   });
   const override = reg.capabilitiesFor("local-tiny");
   assert.equal(override?.context_window, 2_048);
   assert.equal(override?.supports_tools, false);
+  assert.equal(override?.supports_thinking, true);
   const resolved = getCapabilities("local-tiny", override);
   assert.equal(resolved.context_window, 2_048);
   assert.equal(resolved.supports_tools, false);
+  assert.equal(resolved.supports_thinking, true);
 });
 
 test("the roster rejects an invalid capability field (fail loud)", () => {
@@ -92,6 +100,43 @@ test("the roster rejects an invalid capability field (fail loud)", () => {
       }),
     /reasoning_level must be one of/,
   );
+});
+
+// ── silent-degradation guard: isModelClassified / findUnclassifiedModels ────
+
+test("isModelClassified is true for exact-table and family-pattern ids, false for unknowns", () => {
+  assert.equal(isModelClassified("mimo-v2.5"), true, "exact table");
+  assert.equal(isModelClassified("opus-4.8"), true, "frontier logical id via family pattern");
+  assert.equal(isModelClassified("deepseek-anything"), true, "family pattern");
+  assert.equal(isModelClassified("some-brand-new-llm-xyz"), false, "wholly unknown");
+});
+
+test("findUnclassifiedModels flags an unknown id with no override (the silent-8k bug)", () => {
+  const flagged = findUnclassifiedModels([{ id: "mystery-model-v1" }]);
+  assert.equal(flagged.length, 1);
+  assert.equal(flagged[0]!.id, "mystery-model-v1");
+  assert.equal(flagged[0]!.contextWindow, FALLBACK_CAPABILITIES.context_window, "resolves to the 8k fallback");
+});
+
+test("findUnclassifiedModels does NOT flag classified frontier logical ids", () => {
+  // opus-4.8 / sonnet-4.6 don't contain 'claude' but are classified by family pattern.
+  assert.deepEqual(findUnclassifiedModels([{ id: "opus-4.8" }, { id: "sonnet-4.6" }]), []);
+});
+
+test("findUnclassifiedModels treats an explicit window/tools override as intentional (not flagged)", () => {
+  // An operator running a genuine small local model declares it — that's not the bug.
+  const models = [
+    { id: "local-tiny", capabilities: { context_window: 8_192, supports_tools: false } },
+    { id: "local-toolless", capabilities: { supports_tools: false } },
+  ];
+  assert.deepEqual(findUnclassifiedModels(models), []);
+});
+
+test("findUnclassifiedModels still flags an unknown id whose override touches neither window nor tools", () => {
+  // A partial override that doesn't address the degraded fields is NOT intentional config.
+  const flagged = findUnclassifiedModels([{ id: "mystery-v2", capabilities: { reasoning_level: "high" } }]);
+  assert.equal(flagged.length, 1);
+  assert.equal(flagged[0]!.id, "mystery-v2");
 });
 
 test("capabilitiesFor is undefined for a model without an override (defaults still resolve)", () => {

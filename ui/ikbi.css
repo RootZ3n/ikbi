@@ -1413,6 +1413,19 @@ button{font-family:inherit}
 .peh-dash-wall-flex{display:flex;flex-direction:column;gap:1px}
 .peh-dash-row{display:flex;flex:1 1 0;gap:1px;min-height:0}
 .peh-dash-wall-flex .peh-dash-tile{flex:1 1 0;min-width:0}
+
+/* Mobile: the packed wall becomes a single scrolling column of cards.
+   Below the breakpoint the rows dissolve (display:contents) so every tile
+   flows straight into the wall's flex column at full width instead of being
+   squeezed side-by-side; tall full-content tiles cap at 80vh and keep their
+   own internal scroll, so no single card dominates the page. Placed AFTER the
+   flex-wall rules so it wins the cascade at equal specificity. */
+@media (max-width:880px){
+  .peh-dash-surface{overflow-y:auto;overflow-x:hidden}
+  .peh-dash-wall-flex{flex:0 0 auto}
+  .peh-dash-row{display:contents}
+  .peh-dash-wall-flex .peh-dash-tile{flex:0 0 auto;min-width:0;min-height:200px;max-height:80vh}
+}
 .peh-dash-tile{display:flex;flex-direction:column;min-width:0;min-height:0;background:var(--bg-card,rgba(22,18,52,.96));border:0;border-radius:0;box-shadow:none;overflow:hidden}
 .peh-dash-tile-head{flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border-subtle);background:linear-gradient(180deg,rgba(255,255,255,.035),transparent)}
 .peh-dash-tile-glyph{color:var(--peh-accent);display:inline-flex;flex:0 0 auto}
@@ -1513,3 +1526,65 @@ button{font-family:inherit}
   .peh-product-ikbi .peh-ws-window *,
   .peh-product-ikbi .peh-dash-tile-body *{scrollbar-width:thin;scrollbar-color:var(--ikbi-amber-dk) rgba(26,18,10,.5)}
 }
+
+/* ── Grove-only mode — mobile-first: Peh's terminal IS the whole stage ───────── */
+.peh-grove-only-mode .peh-stage{padding:0;overflow:hidden}
+.peh-grove-only-mode .peh-taskbar{display:none}
+.peh-grove-only{position:absolute;inset:0;display:flex;flex-direction:column;min-height:0}
+.peh-grove-only .peh-live{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;border:0;background:transparent}
+.peh-grove-only .peh-live-body{flex:1 1 auto;min-height:0;display:flex;flex-direction:column}
+.peh-grove-only .grove-terminal{flex:1 1 auto;min-height:0;height:auto;border:0;border-radius:0}
+.peh-grove-only .grove-messages{flex:1 1 auto;min-height:0;overflow-y:auto}
+.peh-grove-only .grove-input-wrap{flex:0 0 auto}
+.peh-grove-only .peh-live-options{flex:0 0 auto}
+/* The body-level floating controls — command bar (.peh-cmd), status pill (.peh-status),
+   Build Log (.peh-jrnl-btn), and the orange chat FAB (.ikbi-chat-btn) — are fixed overlays that
+   stack ON TOP of the chat and bury the text on a phone. Hide them on MOBILE (Grove has its own
+   input; Peh is the surface) and in grove-only mode. Desktop keeps every control. */
+@media (max-width:640px){
+  .peh-status,
+  .peh-jrnl-btn,
+  .peh-cmd,
+  .ikbi-chat-btn{display:none !important}
+}
+.peh-grove-only-mode .peh-status,
+.peh-grove-only-mode .peh-jrnl-btn,
+.peh-grove-only-mode .peh-cmd,
+.peh-grove-only-mode .ikbi-chat-btn{display:none !important}
+
+/* With the overlays gone, the Grove input sits in the flex flow — just a little breathing room. */
+.peh-grove-only .grove-messages{padding-bottom:calc(18px + env(safe-area-inset-bottom,0px))}
+
+/* Remove the onboarding / "teaching Peh" help star button — not wanted in this deployment. */
+.peh-onboard-help{display:none !important}
+
+/* Readability (bad eyesight): the faint stone/low-opacity system + tool text and the 11-13px sizes
+   were hard to read. Brighten to full-contrast cream everywhere, and size everything up on phones. */
+.grove-msg.system{color:var(--ikbi-cream);opacity:1;font-style:normal}
+.grove-msg.tool{opacity:1}
+.grove-msg code,.grove-header{color:var(--ikbi-gold)}
+.grove-msg code{background:rgba(212,168,67,.14);padding:1px 5px;border-radius:4px}
+@media (max-width:640px){
+  .grove-msg{font-size:17px;line-height:1.7}
+  .grove-msg.tool,.grove-msg.system{font-size:16px}
+  .grove-header{font-size:13px;letter-spacing:.1em}
+  .grove-input,.grove-input::placeholder{font-size:16px}
+}
+
+/* Grove input actions — attach + voice-in + voice-out + voice picker */
+.grove-attach,.grove-mic,.grove-voice,.grove-voicepick-btn{background:transparent;border:0;cursor:pointer;font-size:19px;line-height:1;padding:4px 7px;opacity:.85;border-radius:8px}
+.grove-attach:hover,.grove-mic:hover,.grove-voice:hover,.grove-voicepick-btn:hover{opacity:1;background:rgba(255,255,255,.06)}
+.grove-voicepick-btn{font-size:16px}
+
+/* Voice picker popover */
+.grove-voicepick{position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.55);padding:18px}
+.grove-voicepick-card{background:#141a17;border:1px solid rgba(255,255,255,.14);border-radius:14px;padding:18px;max-width:420px;width:100%;box-shadow:0 12px 40px rgba(0,0,0,.5)}
+.grove-voicepick-title{font-weight:600;font-size:16px;margin-bottom:12px;color:#e8efe9}
+.grove-voicepick-sel{width:100%;padding:10px;border-radius:9px;background:#0c110e;color:#e8efe9;border:1px solid rgba(255,255,255,.16);font-size:15px}
+.grove-voicepick-hint{font-size:12px;opacity:.7;margin:10px 0 14px;color:#cdd6cf;line-height:1.4}
+.grove-voicepick-actions{display:flex;gap:10px;justify-content:flex-end}
+.grove-voicepick-actions button{padding:9px 14px;border-radius:9px;border:1px solid rgba(255,255,255,.16);cursor:pointer;font-size:14px}
+.grove-voicepick-use{background:var(--ikbi-gold,#d8a34a);color:#1a120a;border-color:transparent!important;font-weight:600}
+.grove-voicepick-close{background:transparent;color:#cdd6cf}
+.grove-mic.listening{opacity:1;animation:grove-mic-pulse 1s ease-in-out infinite}
+@keyframes grove-mic-pulse{0%,100%{transform:scale(1);filter:none}50%{transform:scale(1.18);filter:drop-shadow(0 0 7px #e05a5a)}}

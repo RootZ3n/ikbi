@@ -2,6 +2,7 @@
  * ikbi escalation — config slice (`moduleEnv("escalation")`, prefix `IKBI_ESCALATION_`).
  *
  *   IKBI_ESCALATION_ENABLED                      orchestrator hook on/off. Default true.
+ *   IKBI_ESCALATION_ALWAYS_ESCALATE              guaranteed flash→pro on any builder fail/stall. Default true.
  *   IKBI_ESCALATION_WORKER_TO_MID_THRESHOLD      worker→mid score gate (0-100). Default 50.
  *   IKBI_ESCALATION_MID_TO_FRONTIER_THRESHOLD    mid→frontier score gate (0-100). Default 70.
  *   IKBI_ESCALATION_MAX_ESCALATIONS              per-task transition cap. Default 2.
@@ -72,6 +73,7 @@ export function loadEscalationConfig(reader = env): EscalationConfig {
 
   return Object.freeze({
     enabled: reader.bool("ENABLED", true),
+    alwaysEscalate: reader.bool("ALWAYS_ESCALATE", true),
     workerToMidThreshold: reader.number("WORKER_TO_MID_THRESHOLD", DEFAULT_WORKER_TO_MID_THRESHOLD, { min: 0, max: 100 }),
     midToFrontierThreshold: reader.number("MID_TO_FRONTIER_THRESHOLD", DEFAULT_MID_TO_FRONTIER_THRESHOLD, { min: 0, max: 100 }),
     maxEscalations: reader.int("MAX_ESCALATIONS", DEFAULT_MAX_ESCALATIONS, { min: 0 }),

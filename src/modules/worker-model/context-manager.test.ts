@@ -134,6 +134,38 @@ test("maybeCompress never lets the kept tail begin with an orphaned tool result"
   assert.notEqual(messages[5]?.role, "tool", "the orphan tool was pulled into the compressed middle");
 });
 
+test("B2: maybeCompress never ORPHANS a header-boundary tool result (parallel first-turn round)", async () => {
+  const assistantWithCalls: ModelMessage = {
+    role: "assistant", content: "calling",
+    toolCalls: [{ id: "tc1", name: "read", arguments: "{}" }, { id: "tc2", name: "read", arguments: "{}" }],
+  };
+  // Layout: [sys, user, assistant(2 calls), tool#1, tool#2, ...middle..., ...tail]. The default headerLen
+  // cuts the middle START at tool#2 → without the header-side push it is summarized away, orphaning tc2.
+  const header = [msg("system", "S"), msg("user", "G"), assistantWithCalls, msg("tool", "r1", "tc1")];
+  const middle = Array.from({ length: 8 }, (_, i) => msg("assistant", `m${i} ${"y".repeat(10)}`));
+  const tail = Array.from({ length: 6 }, (_, i) => msg("user", `t${i}`));
+  const messages = [...header, msg("tool", "r2", "tc2"), ...middle, ...tail];
+
+  await maybeCompress(messages, TINY, deps(summarizer().invoke));
+  const asstKept = messages.some((m) => m.role === "assistant" && m.toolCalls?.length === 2);
+  const toolIds = messages.filter((m) => m.role === "tool").map((m) => m.toolCallId);
+  assert.ok(asstKept, "the parallel assistant turn is kept in the header");
+  assert.ok(toolIds.includes("tc1") && toolIds.includes("tc2"), "BOTH tool_results survive — no orphaned tool_use id (session cannot wedge)");
+});
+
+test("B3: maybeCompress SKIPS (preserves the working set) when the whole tail is tool results", async () => {
+  const header = [msg("system", "S"), msg("user", "G"), msg("user", "C"), msg("user", "P")];
+  const middle = Array.from({ length: 8 }, (_, i) => msg("assistant", `m${i} ${"y".repeat(10)}`));
+  // The last keepRecent (6) are ALL tool results (one big parallel round) — the tail push would consume
+  // the entire tail, summarizing away the model's live working set. It must skip instead.
+  const tail = Array.from({ length: 6 }, (_, i) => msg("tool", `tool out ${i} ${"y".repeat(10)}`, `tc${i}`));
+  const messages = [...header, ...middle, ...tail];
+  const before = messages.length;
+  const r = await maybeCompress(messages, TINY, deps(summarizer().invoke));
+  assert.equal(r.compressed, false, "skipped rather than destroying the live working set");
+  assert.equal(messages.length, before, "messages untouched");
+});
+
 test("maybeCompress never fails the build — a summarizer error leaves messages untouched", async () => {
   const header = [msg("system", "S"), msg("user", "G"), msg("user", "C"), msg("user", "P")];
   const middle = Array.from({ length: 10 }, (_, i) => msg("assistant", `m${i} ${"z".repeat(20)}`));

@@ -95,13 +95,25 @@ test("`ikbi clean` (no --force) PRESERVES retained work and reports it", async (
   assert.match(cap.out, /ikbi clean --force/);
 });
 
-test("`ikbi clean --force` opts into sweeping retained work", async () => {
+test("`ikbi clean --force --yes` opts into sweeping retained work", async () => {
   const cap = capture();
   let forcedSeen: boolean | undefined;
   await createCleanCli({
     workspaces: { cleanOrphans: async (opts) => { forcedSeen = opts?.force; return { removed: 1, checked: 1, skipped: 0, reclaimed: 0, skippedIds: [] }; } },
     stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit,
-  }).clean(["--force"]);
-  assert.equal(forcedSeen, true, "--force passes force:true");
+  }).clean(["--force", "--yes"]);
+  assert.equal(forcedSeen, true, "--force --yes passes force:true");
   assert.match(cap.out, /reclaimed 1 orphaned worktree/);
+});
+
+test("`ikbi clean --force` WITHOUT --yes previews only (does not sweep retained work)", async () => {
+  const cap = capture();
+  const forceCalls: Array<boolean | undefined> = [];
+  await createCleanCli({
+    workspaces: { cleanOrphans: async (opts) => { forceCalls.push(opts?.force); return { removed: 1, checked: 2, skipped: 3, reclaimed: 0, skippedIds: ["a", "b", "c"] }; } },
+    stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit,
+  }).clean(["--force"]);
+  assert.deepEqual(forceCalls, [false], "the destructive force:true sweep was NOT invoked");
+  assert.match(cap.out, /WOULD ALSO DESTROY 3 retained/, "previews what --force would destroy");
+  assert.match(cap.out, /--force --yes/, "points at the confirm gate");
 });

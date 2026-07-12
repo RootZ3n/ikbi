@@ -31,12 +31,16 @@ import {
 } from "../modules/model-evaluation/index.js";
 import { trust } from "../core/trust/index.js";
 import { commands } from "./registry.js";
+import { suggestCommand } from "./suggest.js";
 import { runDoctor, runDoctorFixCli } from "./doctor.js";
 import { runEnvironmentChecks, renderEnvironmentChecks } from "./doctor-env.js";
 import { runSandboxChecks, renderSandboxChecks } from "./doctor-sandbox.js";
 import { whatNextFooter } from "./what-next.js";
 import { runInit } from "./init.js";
 import { runSelfRepair } from "../modules/self-repair/index.js";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
 import { runCapabilities } from "./capabilities.js";
 import { postureLines } from "./posture.js";
 import { writeStderr, writeStdout } from "./io.js";
@@ -47,6 +51,8 @@ import { helpForTopic } from "./help-pages.js";
 import "./receipts.js";
 import "./summary.js";
 import "./cost.js";
+import "./monitor.js";
+import "./heal.js";
 import "./undo.js";
 import "./clean.js";
 import "./workspace.js";
@@ -60,6 +66,7 @@ import "./review.js";
 import "./agents.js";
 import "./evaluate.js";
 import "./detect.js";
+import "./health.js";
 import "./spec.js";
 import "./job-cards.js";
 import { workspaces as coreWorkspaces } from "../core/workspace/index.js";
@@ -71,6 +78,11 @@ import { liveRepl } from "../modules/chat/cli.js";
 
 /** Built-in command names — reserved, cannot be shadowed by a module command. */
 const BUILTINS = new Set(["version", "models", "providers", "init", "doctor", "capabilities", "help"]);
+
+/** Known command names for the "did you mean" suggester (built-ins + repl + registered modules). */
+function knownCommandNames(): string[] {
+  return [...BUILTINS, "repl", ...commands.all().map((c) => c.name)];
+}
 
 /**
  * Does this arg list ask for a subcommand's help? (`--help`/`-h` anywhere in the args.)
@@ -196,15 +208,15 @@ const RECOMMENDED: RecommendProfile[] = [
   },
   {
     label: "Balanced",
-    builder: "claude-sonnet-4",
+    builder: "sonnet-4.6",
     critic: "deepseek-v4-pro",
     fallback: "deepseek-v4-pro",
     caveats: "Best quality-to-price. Recommended for daily use. Critic catches most issues.",
   },
   {
     label: "Max Quality",
-    builder: "claude-opus-4",
-    critic: "claude-sonnet-4",
+    builder: "opus-4.8",
+    critic: "sonnet-4.6",
     caveats: "Strongest models. Best for complex multi-file refactors. Higher cost and latency.",
   },
   {
@@ -227,7 +239,7 @@ function printRecommendations(): void {
     writeStdout(`    Caveats:    ${r.caveats}\n\n`);
   }
   writeStdout("Apply with: ikbi models --set-recommend <n>\n");
-  writeStdout("  (writes IKBI_BUILDER_MODEL + IKBI_CRITIC_MODEL to .env)\n");
+  writeStdout("  (writes IKBI_MODEL_BUILDER + IKBI_MODEL_CRITIC to .env)\n");
 }
 
 function listModels(): void {
@@ -389,16 +401,19 @@ async function run(argv: readonly string[]): Promise<void> {
           return;
         }
         const r = RECOMMENDED[n - 1]!;
-        const envPath = require("node:path").join(process.cwd(), ".env");
-        const { existsSync, readFileSync, writeFileSync } = require("node:fs");
+        // C2b: static imports — `require` is undefined in this ESM module, so the old code threw
+        // ReferenceError hidden behind "Something went wrong". C2a: write the CANONICAL env keys the
+        // config actually reads (IKBI_MODEL_BUILDER/IKBI_MODEL_CRITIC) — the old IKBI_BUILDER_MODEL/
+        // IKBI_CRITIC_MODEL names are read by nothing, so a build silently kept the hardcoded default.
+        const envPath = join(process.cwd(), ".env");
         let env = existsSync(envPath) ? readFileSync(envPath, "utf-8") : "";
         const append = (key: string, val: string): void => {
           const re = new RegExp(`^${key}=.*$`, "m");
           if (re.test(env)) env = env.replace(re, `${key}=${val}`);
           else env += `\n${key}=${val}\n`;
         };
-        append("IKBI_BUILDER_MODEL", r.builder);
-        append("IKBI_CRITIC_MODEL", r.critic);
+        append("IKBI_MODEL_BUILDER", r.builder);
+        append("IKBI_MODEL_CRITIC", r.critic);
         if (r.fallback) append("IKBI_FALLBACK_MODEL", r.fallback);
         writeFileSync(envPath, env);
         writeStdout(`Applied profile [${n}] ${r.label} to ${envPath}\n`);
@@ -525,17 +540,38 @@ async function run(argv: readonly string[]): Promise<void> {
       // never block on durable state, and dispatch straight to the handler (which prints
       // its usage and returns). This is what keeps `ikbi build --help` fast and offline.
       const sawHelp = wantsHelp(argv.slice(1));
-      if (!sawHelp) {
-        // STARTUP PRELOAD (the cold-start on-ramp): warm the trust cache from durable state
-        // BEFORE any command resolves worker trust, then prune receipts. Skipped for the
-        // pure-info builtins above (no trust path) and for subcommand --help.
-        await coldStartPreload();
+      if (sawHelp) {
+        // C1 (SAFETY): NEVER dispatch a subcommand `--help` to its handler. Several DESTRUCTIVE
+        // commands do not intercept it and would EXECUTE — `kill --help` engages the engine-wide kill
+        // switch, `clean --help` deletes worktrees, `trust promote --help` promotes, `batch/ask --help`
+        // spend money. Answer help CENTRALLY from the help pages and RETURN; a command with no page
+        // gets a safe usage pointer and is never run. (Info builtins above print their own help.)
+        const page = helpForTopic(cmd);
+        writeStdout(page !== undefined ? `${page}\n` : `No detailed help for "${cmd}". Run \`ikbi help\` for the command list, or \`ikbi help <topic>\`.\n`);
+        return;
       }
+      // STARTUP PRELOAD (the cold-start on-ramp): warm the trust cache from durable state
+      // BEFORE any command resolves worker trust, then prune receipts.
+      await coldStartPreload();
       // Module commands compose via the command-registrar seam. Built-ins above
       // take precedence (a module cannot shadow a core command).
       const moduleCmd = commands.get(cmd);
       if (moduleCmd !== undefined) {
         await moduleCmd.run(argv.slice(1));
+        return;
+      }
+      // LOW (typo help): a MISTYPED command otherwise silently opens the REPL with the typo as its first
+      // chat message. When the first token is a close typo of a known command AND the invocation looks
+      // like a command attempt (a lone token, or followed by --flags — prose has neither), suggest the
+      // correction and exit non-zero instead of doing the surprising thing. Ambiguous prose still seeds
+      // the REPL as before.
+      // A trailing flag is a strong "I meant a command" signal → allow a looser (≤2) typo match; a lone
+      // bare word could be REPL prose, so require a tighter (≤1) match to avoid hijacking it.
+      const hasFlags = argv.slice(1).some((a) => a.startsWith("-"));
+      const suggestion = (argv.length === 1 || hasFlags) ? suggestCommand(cmd, knownCommandNames(), hasFlags ? 2 : 1) : undefined;
+      if (suggestion !== undefined) {
+        writeStderr(`ikbi: unknown command "${cmd}". Did you mean \`ikbi ${suggestion}\`?\n(Run \`ikbi help\` for the command list, or \`ikbi repl\` to start a chat.)\n`);
+        process.exitCode = 1;
         return;
       }
       // GOLDEN PATH: not a known command ⇒ launch the interactive REPL.
@@ -572,6 +608,22 @@ process.on("SIGINT", () => {
       process.exit(130);
     })
     .catch(() => process.exit(130));
+});
+
+// H6: SIGTERM (systemd stop / `kill <pid>` / orchestrator shutdown) got NO handler — a mid-build
+// SIGTERM left the ALLOCATED record + worktree behind with no retain, leaking the slot. Mirror SIGINT:
+// retain live workspaces so the work survives and the record is a clean `failed` (reapable), then exit
+// 143 (128+SIGTERM). Best-effort and time-bounded — a stuck retain must never block shutdown forever.
+let terminating = false;
+process.on("SIGTERM", () => {
+  if (terminating) process.exit(143);
+  terminating = true;
+  const forceExit = setTimeout(() => process.exit(143), 3000);
+  forceExit.unref?.();
+  void coreWorkspaces
+    .retainAllLive("terminated by SIGTERM")
+    .then(() => process.exit(143))
+    .catch(() => process.exit(143));
 });
 
 run(process.argv.slice(2)).catch((err: unknown) => {

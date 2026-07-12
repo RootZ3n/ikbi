@@ -5,15 +5,16 @@
  */
 
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { test } from "node:test";
 
 import "../egress/index.js";
 
 import type { ModelResponse, ToolCall } from "../../core/provider/contract.js";
 import { boundDiff, ChatSession, computeLineDiff, errorRecoveryHint } from "./session.js";
+import type { PersistedSession, SessionWorkspace } from "./session.js";
 
 type Invoke = ConstructorParameters<typeof ChatSession>[1] extends { invoke?: infer F } ? F : never;
 
@@ -89,6 +90,38 @@ test("FIX1: rollback with nothing to undo returns an empty result", async () => 
   assert.deepEqual(s.rollback(), []);
 });
 
+test("H6: /rollback REFUSES a tampered fileHistory path that escapes the worktree (no arbitrary write/delete)", () => {
+  const dir = wt();
+  const victimDir = mkdtempSync(join(tmpdir(), "ikbi-rb-victim-"));
+  const victim = join(victimDir, "precious.txt");
+  writeFileSync(victim, "DO NOT TOUCH\n");
+  const escapeTarget = join(victimDir, "should-never-be-created");
+  try {
+    // A MALICIOUS persisted session (fileHistory is restored from the tamperable session file): one entry
+    // points OUTSIDE the worktree via an absolute `full` + a `..`-escaping `path`; another would create a
+    // file outside via a delete-rollback flipped to a write. Both must be refused.
+    const restore: PersistedSession = {
+      id: "rb-tamper", worktree: dir, model: "mimo-v2.5",
+      messages: [{ role: "system", content: "x" }],
+      memory: { filesModified: [], testResults: [], decisions: [] },
+      createdAt: 1, lastUsedAt: 1,
+      fileHistory: [
+        { path: relative(dir, victim), full: victim, beforeContent: "HIJACKED\n", afterContent: "x", tool: "write_file", timestamp: 1 },
+        { path: relative(dir, escapeTarget), full: escapeTarget, beforeContent: "created\n", afterContent: "y", tool: "write_file", timestamp: 2 },
+      ],
+    };
+    const s = new ChatSession("rb-tamper", { restore, worktree: dir, invoke: queued([stop("ok")]) });
+    const results = s.rollback(2);
+    assert.equal(results.length, 2, "both tampered steps are reported");
+    for (const r of results) assert.match(r.action, /REFUSED/, "each escaping path is refused, not applied");
+    assert.equal(readFileSync(victim, "utf8"), "DO NOT TOUCH\n", "the outside file was NOT overwritten");
+    assert.ok(!existsSync(escapeTarget), "no file was created outside the worktree");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(victimDir, { recursive: true, force: true });
+  }
+});
+
 // ── FIX 3: inline diffs ─────────────────────────────────────────────────────────
 
 test("FIX3: a write_file mutation carries a colorizable diff in its activity", async () => {
@@ -150,6 +183,34 @@ test("FIX5: confirm mode allows the tool when the operator accepts", async () =>
   const res = await s.send("write it", undefined, "agent", { permissionMode: "confirm", confirm: async () => true });
   assert.equal(res.tools.find((t) => t.name === "write_file")?.ok, true);
   assert.equal(readFileSync(join(dir, "ok.ts"), "utf8"), "yes\n");
+});
+
+test("launch_build confirmation discloses the EFFECTIVE target repo, not just the goal", async () => {
+  // A minimal managed workspace so the session has a targetRepo (the build's default landing site).
+  const stubWorkspace = (targetRepo: string): SessionWorkspace => ({
+    id: "lb-ws", path: wt(), targetRepo, baseBranch: "main", baseRef: "HEAD",
+    diff: async () => "", commit: async () => true,
+    promote: async () => ({ ok: false, reason: "test" }) as unknown as Awaited<ReturnType<SessionWorkspace["promote"]>>,
+    discard: async () => ({ removed: true }) as unknown as Awaited<ReturnType<SessionWorkspace["discard"]>>,
+    verify: async () => ({ ok: false } as unknown as Awaited<ReturnType<SessionWorkspace["verify"]>>),
+  });
+
+  // Default: the session's target repo is shown so the operator sees where the build lands.
+  const invoke = queued([toolTurn(call("launch_build", { goal: "add a test" })), stop("ok")]);
+  const s = new ChatSession("lb-1", { invoke, workspace: stubWorkspace("/repos/session-repo") });
+  let target = "";
+  await s.send("build it", undefined, "agent", { permissionMode: "confirm", confirm: async (_t, x) => { target = x; return false; } });
+  assert.match(target, /add a test/, "the goal is disclosed");
+  assert.match(target, /\/repos\/session-repo/, "the effective target repo is disclosed");
+
+  // A stale explicit `repo` arg that differs from the session repo is ignored; the session repo is
+  // what the operator approves and what runLaunchBuild uses.
+  const invoke2 = queued([toolTurn(call("launch_build", { goal: "add a test", repo: "/repos/OTHER" })), stop("ok")]);
+  const s2 = new ChatSession("lb-2", { invoke: invoke2, workspace: stubWorkspace("/repos/session-repo") });
+  let target2 = "";
+  await s2.send("build elsewhere", undefined, "agent", { permissionMode: "confirm", confirm: async (_t, x) => { target2 = x; return false; } });
+  assert.match(target2, /\/repos\/session-repo/, "the session repo is what the operator approves");
+  assert.doesNotMatch(target2, /\/repos\/OTHER/, "the stale repo arg is not shown as the target");
 });
 
 // ── FIX 7: prompt-cache counters ────────────────────────────────────────────────

@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { access, mkdtemp, rm, rmdir, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { existsSync } from "node:fs";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
@@ -11,7 +12,8 @@ import { EventBus } from "../events/bus.js";
 import type { IkbiEvent } from "../events/contract.js";
 import type { AgentIdentity } from "../provider/contract.js";
 import type { ReceiptInput } from "../receipt/contract.js";
-import { LockManager } from "../substrate/lock.js";
+import { acquireFileLock, LockManager } from "../substrate/lock.js";
+import { SubstrateError } from "../substrate/contract.js";
 import { DocumentStore } from "../substrate/store.js";
 import { SCRATCH_BRANCH_PREFIX, type WorkspaceRecord, WorkspaceError } from "./contract.js";
 import { listBranches, runGit } from "./git.js";
@@ -41,9 +43,9 @@ async function makeRepo(): Promise<string> {
   return repo;
 }
 
-function makeManager(opts?: { root?: string; max?: number; events?: EventBus; receipts?: WorkspaceReceiptSink; idGen?: () => string }) {
+function makeManager(opts?: { root?: string; max?: number; events?: EventBus; receipts?: WorkspaceReceiptSink; idGen?: () => string; timeoutMs?: number }) {
   const root = opts?.root ?? join(tmpdir(), `ikbi-ws-${randomBytes(8).toString("hex")}`);
-  const locks = new LockManager({ logger: silent, defaultTimeoutMs: 5000, defaultStaleMs: 30_000 });
+  const locks = new LockManager({ logger: silent, defaultTimeoutMs: opts?.timeoutMs ?? 5000, defaultStaleMs: 30_000 });
   const store = new DocumentStore<WorkspaceRecord>({ dir: join(root, "registry"), locks, logger: silent, fsync: false });
   const mgr = new WorkspaceManager({
     root,
@@ -78,6 +80,24 @@ test("allocate creates an isolated worktree; work in it does not touch main", as
 
     await writeFile(join(ws.path, "feature.txt"), "work\n");
     assert.equal(await exists(join(repo, "feature.txt")), false, "main repo untouched by work in the worktree");
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
+test("allocate without baseBranch rejects detached HEAD instead of promoting through a branch named HEAD", async () => {
+  const repo = await makeRepo();
+  const { mgr, root } = makeManager();
+  try {
+    await runGit(repo, ["checkout", "--quiet", "--detach", "HEAD"]);
+    await assert.rejects(
+      mgr.allocate({ targetRepo: repo, identity: ID }),
+      (e: unknown) => e instanceof WorkspaceError && e.kind === "config" && /detached HEAD|baseBranch/.test(e.message),
+    );
+
+    const ws = await mgr.allocate({ targetRepo: repo, identity: ID, baseBranch: "main" });
+    assert.equal(ws.baseBranch, "main", "an explicit branch remains valid from detached HEAD");
+    assert.equal((await listBranches(repo, "HEAD")).includes("HEAD"), false, "no accidental local branch named HEAD");
   } finally {
     await cleanup(repo, root);
   }
@@ -129,6 +149,161 @@ test("allocate SELF-HEALS an orphaned slot — a crashed run's worktree vanished
     // At the bound, the next allocate must reap the ORPHAN and succeed (not reject with "limit").
     const c = await mgr.allocate({ targetRepo: repo, identity: ID });
     assert.ok(c.id && c.id !== a.id, "allocate succeeded by self-healing the orphaned slot");
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
+test("H6: allocate reaps a slot whose worktree EXISTS but whose OWNER PROCESS is dead (crash self-heal)", async () => {
+  const repo = await makeRepo();
+  const { mgr, root, store } = makeManager({ max: 2 });
+  try {
+    const a = await mgr.allocate({ targetRepo: repo, identity: ID });
+    await mgr.allocate({ targetRepo: repo, identity: ID });
+    // Simulate a build that CRASHED (SIGKILL / OOM): its worktree is still on disk, but its owner pid
+    // is dead. Rewrite the record's ownerPid to a pid that cannot exist (above any realistic pid_max).
+    const rec = await store.get(a.id);
+    assert.ok(rec);
+    const deadPid = 2_000_000_000;
+    assert.throws(() => process.kill(deadPid, 0), "sanity: the fake owner pid is genuinely dead");
+    await store.put(a.id, { ...rec!, ownerPid: deadPid, ownerHost: hostname() });
+    assert.ok(existsSync(a.path), "the crashed build's worktree is still on disk");
+    // At the bound, the next allocate must reap the DEAD-OWNER slot (previously unreapable → wedged
+    // at the cap with no recovery) and succeed.
+    const c = await mgr.allocate({ targetRepo: repo, identity: ID });
+    assert.ok(c.id && c.id !== a.id, "allocate self-healed the dead-owner slot");
+    assert.ok(!existsSync(a.path), "the dead owner's lingering worktree was removed");
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
+test("round-3 #4: a peer's LIVE promote (its cross-process lock HELD) is not reconciled by a preload", async () => {
+  const repo = await makeRepo();
+  const root = join(tmpdir(), `ikbi-ws-nrec-${randomBytes(8).toString("hex")}`);
+  const a = makeManager({ root, max: 3 });
+  const b = makeManager({ root, max: 3 });
+  try {
+    const ws1 = await a.mgr.allocate({ targetRepo: repo, identity: ID });
+    // Simulate a PEER's IN-FLIGHT promote: the durable record is "promoting" AND the workspace's cross-
+    // process lock is HELD (as promote() now does). A reconcile must NOT touch it (it would revert/dupe).
+    const rec = await a.store.get(ws1.id);
+    await a.store.put(ws1.id, { ...rec!, state: "promoting" });
+    const wsLockPath = join(root, "locks", `${createHash("sha1").update(`workspace:ws:${ws1.id}`).digest("hex").slice(0, 16)}.lock`);
+    const held = await acquireFileLock(wsLockPath, 1000, { logger: silent, staleMs: 30_000 });
+    // B allocates while the promote lock is held → its boot reconcile can't acquire the lock → skips ws1.
+    await b.mgr.allocate({ targetRepo: repo, identity: ID });
+    const after = await b.store.get(ws1.id);
+    assert.equal(after?.state, "promoting", "the live promote (lock held) was left intact, not reconciled");
+    await held();
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
+test("verify: reclaim() does NOT reconcile a LIVE promote held by a peer (cross-process wsKey lock)", async () => {
+  const repo = await makeRepo();
+  const root = join(tmpdir(), `ikbi-ws-reclaim-${randomBytes(8).toString("hex")}`);
+  const a = makeManager({ root, max: 3 });
+  const b = makeManager({ root, max: 3 });
+  try {
+    const ws1 = await a.mgr.allocate({ targetRepo: repo, identity: ID });
+    const rec = await a.store.get(ws1.id);
+    await a.store.put(ws1.id, { ...rec!, state: "promoting" });
+    // A peer holds the workspace's cross-process lock (a live promote).
+    const wsLockPath = join(root, "locks", `${createHash("sha1").update(`workspace:ws:${ws1.id}`).digest("hex").slice(0, 16)}.lock`);
+    const held = await acquireFileLock(wsLockPath, 1000, { logger: silent, staleMs: 30_000 });
+    // `ikbi clean` / doctor cleanup on the OTHER process runs reclaim — it must respect the lock and skip.
+    await b.mgr.reclaim(repo);
+    const after = await b.store.get(ws1.id);
+    assert.equal(after?.state, "promoting", "reclaim left the live promote intact (respected the cross-process lock)");
+    await held();
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
+test("round-3 #4b: a CRASHED promote (lock FREE) IS reconciled at boot preload", async () => {
+  const repo = await makeRepo();
+  const root = join(tmpdir(), `ikbi-ws-crash-${randomBytes(8).toString("hex")}`);
+  const a = makeManager({ root, max: 3 });
+  const b = makeManager({ root, max: 3 });
+  try {
+    const ws1 = await a.mgr.allocate({ targetRepo: repo, identity: ID });
+    // A promoting record with NO holder (the promoter crashed) and no promoteIntent ⇒ a boot preload
+    // acquires the (free) lock and reconciles it back to "allocated" (promotable again). This is the
+    // healing the lock-free path must still perform.
+    const rec = await a.store.get(ws1.id);
+    await a.store.put(ws1.id, { ...rec!, state: "promoting" });
+    await b.mgr.preload(); // B's boot preload reconciles the crashed promote
+    const after = await b.store.get(ws1.id);
+    assert.equal(after?.state, "allocated", "a crashed (lock-free) promote is healed back to allocated");
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
+test("A3: a cross-process REMOVAL is shed on re-preload — no false 'workspace limit reached'", async () => {
+  const repo = await makeRepo();
+  const root = join(tmpdir(), `ikbi-ws-shed-${randomBytes(8).toString("hex")}`);
+  const a = makeManager({ root, max: 1 });
+  const b = makeManager({ root, max: 1 });
+  try {
+    const wsA = await a.mgr.allocate({ targetRepo: repo, identity: ID });
+    // Peer process B discards it — the shared durable record goes terminal — but A's in-memory `live`
+    // still holds the (now-stale) entry. A fresh allocate by A must SUCCEED: the in-lock REBUILD sheds
+    // the shed entry instead of the add-only refresh keeping it and falsely reporting "limit reached".
+    await b.mgr.discard(wsA);
+    const wsA2 = await a.mgr.allocate({ targetRepo: repo, identity: ID });
+    assert.ok(wsA2.id && wsA2.id !== wsA.id, "A reused the slot the peer freed (no phantom-count wedge)");
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
+test("C-A2: the cap holds across processes even when the second process has a STALE preloaded count", async () => {
+  const repo = await makeRepo();
+  const root = join(tmpdir(), `ikbi-ws-shared-${randomBytes(8).toString("hex")}`);
+  // Two managers over the SAME root ⇒ shared durable registry + shared cross-process lock file, but
+  // SEPARATE in-memory `live` Maps (this is exactly the CLI-vs-service / two-CLI situation).
+  const a = makeManager({ root, max: 1 });
+  const b = makeManager({ root, max: 1 });
+  try {
+    // Process B preloads while nothing is allocated — its live count is a STALE 0.
+    await b.mgr.preload();
+    // Process A allocates the one permitted slot (persists a record B's in-memory Map doesn't know about).
+    const wsA = await a.mgr.allocate({ targetRepo: repo, identity: ID });
+    assert.ok(wsA.id, "A got the single slot");
+    // B — with its stale live.size = 0 — must STILL be refused: the in-lock refresh reads A's record.
+    // (Before the fix, B skipped the refresh because 0 < max and allocated a SECOND workspace.)
+    await assert.rejects(
+      b.mgr.allocate({ targetRepo: repo, identity: ID }),
+      (e: unknown) => e instanceof WorkspaceError && e.kind === "limit",
+      "the second process cannot exceed the cap with a stale count",
+    );
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
+test("#3: allocate takes a CROSS-PROCESS file lock — an alloc lock held by 'another process' blocks it", async () => {
+  const repo = await makeRepo();
+  const { mgr, root } = makeManager({ max: 2, timeoutMs: 250 }); // short timeout so the block is quick
+  try {
+    // Mirror WorkspaceManager.lockFile("workspace:alloc") — the path all processes on this root derive.
+    const allocLockPath = join(root, "locks", `${createHash("sha1").update("workspace:alloc").digest("hex").slice(0, 16)}.lock`);
+    // Simulate ANOTHER OS process holding the allocation lock (the in-process mutex can't see it).
+    const heldByOther = await acquireFileLock(allocLockPath, 1000, { logger: silent, staleMs: 30_000 });
+    // Our allocate must fail closed — it cannot acquire the cross-process lock while it's held.
+    await assert.rejects(
+      mgr.allocate({ targetRepo: repo, identity: ID }),
+      (e: unknown) => e instanceof SubstrateError && e.kind === "lock_timeout",
+      "allocate blocks on the cross-process alloc lock",
+    );
+    await heldByOther(); // the other process releases
+    // Now it proceeds — proving the file lock (not just the in-process mutex) gated it.
+    const a = await mgr.allocate({ targetRepo: repo, identity: ID });
+    assert.ok(a.id, "allocate succeeds once the cross-process lock is free");
   } finally {
     await cleanup(repo, root);
   }

@@ -65,6 +65,7 @@ export interface TournamentReceiptCandidate {
   readonly verified: boolean;
   readonly diffLines?: number;
   readonly rejectedToolCalls: number;
+  readonly failureReason?: string;
 }
 
 /** The full tournament receipt: every candidate, the winner + reason, the shadow result, the promote. */
@@ -104,7 +105,7 @@ export interface TournamentEngine {
   /** Verify a workspace with the SAME ladder verifier the candidates ran. */
   verifyShadow(task: WorkerTask, workspace: WorkspaceHandle): Promise<ShadowVerification>;
   /** Promote a workspace through the EXISTING promote path (gate-wall governs; fail-closed without it). */
-  promote(task: WorkerTask, workspace: WorkspaceHandle, roles: readonly RoleResult[], composite: number): Promise<{ promoted: boolean; reason?: string; conflicts?: readonly string[] }>;
+  promote(task: WorkerTask, workspace: WorkspaceHandle, roles: readonly RoleResult[], composite: number): Promise<{ promoted: boolean; reason?: string; conflicts?: readonly string[]; receiptStatus?: "recorded" | "failed" }>;
   /** Discard a workspace (best-effort teardown). */
   discard(workspace: WorkspaceHandle): Promise<void>;
   /** Retain a failed workspace on disk for inspection (best-effort; falls back to discard). */
@@ -139,6 +140,7 @@ function receiptCandidate(run: CandidateRun): TournamentReceiptCandidate {
 function buildReceipt(
   task: WorkerTask,
   runs: readonly CandidateRun[],
+  failedCandidates: readonly TournamentReceiptCandidate[],
   winner: { run: CandidateRun; composite: number } | null,
   shadow: TournamentReceipt["shadow"],
   promoted: boolean,
@@ -146,7 +148,7 @@ function buildReceipt(
 ): TournamentReceipt {
   return {
     taskId: task.taskId,
-    candidates: runs.map(receiptCandidate),
+    candidates: [...runs.map(receiptCandidate), ...failedCandidates],
     winner: winner === null ? null : { workspaceId: winner.run.workspace.id, model: winner.run.spec.model, composite: winner.composite },
     shadow,
     promoted,
@@ -191,6 +193,7 @@ export async function runTournament(
   // 1. Run each candidate INDEPENDENTLY in its OWN workspace. A failed allocation skips that
   //    candidate and continues with the rest (per the error-handling contract).
   const runs: CandidateRun[] = [];
+  const failedCandidates: TournamentReceiptCandidate[] = [];
   for (let i = 0; i < specs.length; i += 1) {
     const ws = await engine.allocate(`tournament:${task.taskId}:c${i}`);
     if (ws === null) continue;
@@ -201,11 +204,34 @@ export async function runTournament(
       for (const r of runs) await engine.discard(r.workspace);
       return await fail(killReason, ws.id);
     }
-    runs.push(await engine.runCandidate(task, ws, specs[i]!));
+    const spec = specs[i]!;
+    try {
+      runs.push(await engine.runCandidate(task, ws, spec));
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      const failureReason = `candidate ${spec.model} failed: ${reason}`;
+      failedCandidates.push({
+        model: spec.model,
+        mode: spec.mode,
+        workspaceId: ws.id,
+        builderOutcome: "failure",
+        verified: false,
+        rejectedToolCalls: 0,
+        failureReason,
+      });
+      await engine.emit({ kind: "failed", reason: failureReason, workspaceId: ws.id });
+      await engine.retain(ws, failureReason);
+    }
   }
 
   // Every candidate workspace failed to allocate → nothing to judge, fail closed.
-  if (runs.length === 0) return await fail("all candidate workspaces failed to allocate — tournament fails closed");
+  if (runs.length === 0) {
+    const reason = failedCandidates.length > 0
+      ? "all candidate runs failed — tournament fails closed"
+      : "all candidate workspaces failed to allocate — tournament fails closed";
+    await engine.recordReceipt(buildReceipt(task, runs, failedCandidates, null, { applied: false, verified: false }, false, reason));
+    return await fail(reason);
+  }
 
   // 2. JUDGE — deterministic, pure, no model. Verified pass beats all; ties broken objectively.
   const verdict = engine.judge(runs.map((r) => r.candidate));
@@ -240,7 +266,7 @@ export async function runTournament(
   if (verdict.winner === null) {
     const reason = verdict.reason ?? "no candidate passed verification — tournament fails closed";
     const retainedId = await retainBest(reason);
-    await engine.recordReceipt(buildReceipt(task, runs, null, { applied: false, verified: false }, false, reason));
+    await engine.recordReceipt(buildReceipt(task, runs, failedCandidates, null, { applied: false, verified: false }, false, reason));
     return await fail(reason, retainedId);
   }
 
@@ -267,7 +293,7 @@ export async function runTournament(
   if (shadow === null) {
     const reason = "shadow workspace allocation failed — tournament fails closed";
     const id = await retainBest(reason);
-    await engine.recordReceipt(buildReceipt(task, runs, winnerRef, { applied: false, verified: false, reason }, false, reason));
+    await engine.recordReceipt(buildReceipt(task, runs, failedCandidates, winnerRef, { applied: false, verified: false, reason }, false, reason));
     return await fail(reason, id);
   }
 
@@ -276,7 +302,7 @@ export async function runTournament(
     const reason = `winner's diff failed to apply to the clean shadow workspace${apply.reason !== undefined ? `: ${apply.reason}` : ""} — tournament fails closed`;
     await engine.discard(shadow);
     const id = await retainBest(reason);
-    await engine.recordReceipt(buildReceipt(task, runs, winnerRef, { workspaceId: shadow.id, applied: false, verified: false, reason }, false, reason));
+    await engine.recordReceipt(buildReceipt(task, runs, failedCandidates, winnerRef, { workspaceId: shadow.id, applied: false, verified: false, reason }, false, reason));
     return await fail(reason, id);
   }
 
@@ -286,7 +312,7 @@ export async function runTournament(
     const reason = `shadow verification failed${shadowVerdict.reason !== undefined ? `: ${shadowVerdict.reason}` : ""} — tournament fails closed (no fallback to other candidates)`;
     await engine.discard(shadow);
     const id = await retainBest(reason);
-    await engine.recordReceipt(buildReceipt(task, runs, winnerRef, { workspaceId: shadow.id, applied: true, verified: false, reason }, false, reason));
+    await engine.recordReceipt(buildReceipt(task, runs, failedCandidates, winnerRef, { workspaceId: shadow.id, applied: true, verified: false, reason }, false, reason));
     return await fail(reason, id);
   }
 
@@ -309,7 +335,7 @@ export async function runTournament(
     const outcome: WorkerResult["outcome"] = promote.conflicts !== undefined && promote.conflicts.length > 0 ? "partial" : "rejected";
     const reason = promote.reason ?? "shadow not promoted (gate denied or conflict)";
     await engine.retain(shadow, reason);
-    await engine.recordReceipt(buildReceipt(task, runs, winnerRef, { workspaceId: shadow.id, applied: true, verified: true, reason }, false, reason));
+    await engine.recordReceipt(buildReceipt(task, runs, failedCandidates, winnerRef, { workspaceId: shadow.id, applied: true, verified: true, reason }, false, reason));
     await engine.emit({ kind: "completed", winnerWorkspaceId: winner.workspace.id, shadowWorkspaceId: shadow.id, promoted: false });
     return withMode({
       contractVersion: CONTRACT_VERSION,
@@ -318,12 +344,13 @@ export async function runTournament(
       roles: resultRoles,
       workspaceId: shadow.id,
       promoted: false,
+      ...(promote.receiptStatus !== undefined ? { metadata: { receiptStatus: promote.receiptStatus } } : {}),
       reason,
       costUsd: engine.cost(),
     });
   }
 
-  await engine.recordReceipt(buildReceipt(task, runs, winnerRef, { workspaceId: shadow.id, applied: true, verified: true }, true));
+  await engine.recordReceipt(buildReceipt(task, runs, failedCandidates, winnerRef, { workspaceId: shadow.id, applied: true, verified: true }, true));
   await engine.emit({ kind: "completed", winnerWorkspaceId: winner.workspace.id, shadowWorkspaceId: shadow.id, promoted: true });
   return withMode({
     contractVersion: CONTRACT_VERSION,
@@ -332,6 +359,7 @@ export async function runTournament(
     roles: resultRoles,
     workspaceId: shadow.id,
     promoted: true,
+    ...(promote.receiptStatus !== undefined ? { metadata: { receiptStatus: promote.receiptStatus } } : {}),
     costUsd: engine.cost(),
   });
 }

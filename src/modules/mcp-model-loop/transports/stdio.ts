@@ -24,6 +24,7 @@ import { spawn as nodeSpawn } from "node:child_process";
 
 import { childLogger } from "../../../core/log.js";
 import type { McpToolDef, McpTransport } from "../contract.js";
+import { parseLenientArgs } from "../lenient-args.js";
 
 const log = childLogger("mcp-stdio");
 
@@ -62,6 +63,19 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 const MCP_PROTOCOL_VERSION = "2024-11-05";
 /** Bound the captured stderr used in diagnostics. */
 const MAX_STDERR = 4_000;
+/** Bound the stdout LINE buffer (Codex C12): a server flooding stdout with no newline must not OOM us. */
+const MAX_LINE_BUFFER = 1_000_000;
+
+/** Strip secret-shaped env vars so a third-party MCP server never inherits ikbi's keys/tokens (C12). */
+export function scrubSecretEnv(env: NodeJS.ProcessEnv): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (v === undefined) continue;
+    if (/(?:_KEY|_TOKEN|_SECRET|_PASSWORD|_PASSWD|_CREDENTIALS?|API[_-]?KEY|ACCESS[_-]?TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE[_-]?KEY|OAUTH|SESSION[_-]?TOKEN|COOKIE)/i.test(k)) continue;
+    out[k] = v;
+  }
+  return out;
+}
 
 interface JsonRpcResponse {
   readonly id?: number;
@@ -78,7 +92,8 @@ const defaultSpawn: SpawnLike = (command, args, opts) =>
   nodeSpawn(command, [...args], {
     stdio: ["pipe", "pipe", "pipe"],
     ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
-    env: opts.env !== undefined ? { ...process.env, ...opts.env } : process.env,
+    // Secret-scrubbed inherited env (Codex C12) + the server's own declared env last.
+    env: { ...scrubSecretEnv(process.env), ...(opts.env ?? {}) },
   }) as unknown as SpawnedChild;
 
 /**
@@ -123,6 +138,16 @@ export function createStdioTransport(options: StdioTransportOptions): McpTranspo
 
   const onData = (chunk: Buffer | string): void => {
     buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    // A server that streams megabytes with no newline would otherwise grow `buffer` unbounded (OOM).
+    // Fail closed: drop the buffer, reject in-flight requests, and tear the misbehaving child down.
+    if (buffer.length > MAX_LINE_BUFFER) {
+      buffer = "";
+      closed = true;
+      rejectAll(`MCP stdio server exceeded the ${MAX_LINE_BUFFER}-byte line buffer without a newline — closing`);
+      try { child?.kill(); } catch { /* already gone */ }
+      child = undefined;
+      return;
+    }
     for (let nl = buffer.indexOf("\n"); nl >= 0; nl = buffer.indexOf("\n")) {
       const line = buffer.slice(0, nl);
       buffer = buffer.slice(nl + 1);
@@ -209,18 +234,28 @@ export function createStdioTransport(options: StdioTransportOptions): McpTranspo
 
     async callTool(name: string, argsJson: string): Promise<string> {
       let args: unknown = {};
-      try {
-        args = argsJson && argsJson.length > 0 ? JSON.parse(argsJson) : {};
-      } catch (e) {
-        // L3: a tool call whose arguments are not valid JSON falls back to `{}` so the call
-        // still proceeds, but that silently DROPS the model's intended arguments. Warn so the
-        // dropped payload is observable (e.g. a truncated/garbled arg string from a cheap model)
-        // rather than masquerading as a deliberate no-arg call.
-        log.warn(
-          { tool: name, argLen: argsJson?.length ?? 0, err: e instanceof Error ? e.message : String(e) },
-          "mcp callTool: tool arguments were not valid JSON — falling back to empty arguments {}",
-        );
-        args = {};
+      if (argsJson && argsJson.length > 0) {
+        // Weak models frequently emit near-JSON (single quotes, trailing commas, Python
+        // literals). parseLenientArgs repairs the common cases — every repair verified by
+        // re-parse, so it can never invent arguments the model did not send. Only if nothing
+        // parses do we fall back to `{}`, which silently DROPS the intended arguments and can
+        // stall a cheap builder on "no_progress" (it keeps re-emitting the same near-JSON).
+        const parsed = parseLenientArgs(argsJson);
+        if (parsed === undefined) {
+          log.warn(
+            { tool: name, argLen: argsJson.length },
+            "mcp callTool: tool arguments were not valid JSON (repair failed) — falling back to empty arguments {}",
+          );
+          args = {};
+        } else {
+          if (parsed.repaired) {
+            log.info(
+              { tool: name, argLen: argsJson.length },
+              "mcp callTool: repaired near-JSON tool arguments from the model",
+            );
+          }
+          args = parsed.value;
+        }
       }
       const result = (await request("tools/call", { name, arguments: args })) as { content?: unknown };
       const content = Array.isArray(result?.content) ? result.content : [];

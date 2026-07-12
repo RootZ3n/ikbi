@@ -14,6 +14,8 @@ import {
   wrapWithSandbox,
   detectSandbox,
   resetSandboxAvailabilityCache,
+  toolchainCacheBase,
+  toolchainCacheWritable,
   type SandboxPlan,
 } from "./sandbox.js";
 
@@ -106,6 +108,48 @@ test("buildBwrapArgs: host read-only, worktree writable, net denied by default, 
   // HOME is left as the REAL (read-only) home — NOT isolated — so toolchains find their
   // packages/stores (pnpm store + deps check, python ~/.local, cargo registry). Writes still EROFS.
   assert.ok(!a.includes("HOME"), "HOME is not overridden — the real home is bound read-only for tool discovery");
+});
+
+test("buildBwrapArgs: a `go` command redirects GOCACHE/GOPATH into the PERSISTENT ikbi cache (not the read-only HOME, not an ephemeral tmpfs)", () => {
+  const base = toolchainCacheBase();
+  const plan: SandboxPlan = { mode: "bwrap", writableRoot: "/work/wt", cwd: "/work/wt", networkAllowed: true, risk: classifyCommandRisk("go", ["test", "./..."]) };
+  const a = buildBwrapArgs(plan, "go", ["test", "./..."]);
+  const gc = a.indexOf("GOCACHE");
+  assert.ok(gc >= 0 && a[gc - 1] === "--setenv" && (a[gc + 1] ?? "").startsWith(base), "GOCACHE under the persistent cache base");
+  const gp = a.indexOf("GOPATH");
+  assert.ok(gp >= 0 && a[gp - 1] === "--setenv" && (a[gp + 1] ?? "").startsWith(base), "GOPATH under the persistent cache base");
+});
+
+test("toolchainCacheWritable: cache toolchains get the base as an extraWritable bind; cargo does not", () => {
+  const base = toolchainCacheBase();
+  for (const c of ["go", "dotnet", "mvn", "gradle"]) assert.deepEqual(toolchainCacheWritable(c), [base], `${c} binds the persistent cache`);
+  assert.deepEqual(toolchainCacheWritable("cargo"), [], "cargo caches in-worktree — no extra bind");
+});
+
+test("buildBwrapArgs: a non-Go toolchain (cargo) gets NO GOCACHE redirect (cargo caches in-worktree)", () => {
+  const plan: SandboxPlan = { mode: "bwrap", writableRoot: "/work/wt", cwd: "/work/wt", networkAllowed: true, risk: classifyCommandRisk("cargo", ["test"]) };
+  const a = buildBwrapArgs(plan, "cargo", ["test"]);
+  assert.ok(!a.includes("GOCACHE"), "no Go env leaks onto a cargo invocation");
+});
+
+test("buildBwrapArgs: `mvn` redirects the local repo (MAVEN_OPTS) and `gradle` redirects GRADLE_USER_HOME into the persistent cache", () => {
+  const base = toolchainCacheBase();
+  const plan = (cmd: string): SandboxPlan => ({ mode: "bwrap", writableRoot: "/w", cwd: "/w", networkAllowed: true, risk: classifyCommandRisk(cmd, ["test"]) });
+  const mvn = buildBwrapArgs(plan("mvn"), "mvn", ["test"]);
+  const mo = mvn.indexOf("MAVEN_OPTS");
+  assert.ok(mo >= 0 && mvn[mo - 1] === "--setenv" && (mvn[mo + 1] ?? "").includes(`maven.repo.local=${base}`), "MAVEN_OPTS points the local repo at the persistent cache");
+  const gradle = buildBwrapArgs(plan("gradle"), "gradle", ["test"]);
+  const gh = gradle.indexOf("GRADLE_USER_HOME");
+  assert.ok(gh >= 0 && gradle[gh - 1] === "--setenv" && (gradle[gh + 1] ?? "").startsWith(base), "GRADLE_USER_HOME under the persistent cache");
+});
+
+test("buildBwrapArgs: a `dotnet` command redirects NuGet + CLI-home into the persistent cache (read-only HOME breaks dotnet's first-run)", () => {
+  const base = toolchainCacheBase();
+  const plan: SandboxPlan = { mode: "bwrap", writableRoot: "/work/wt", cwd: "/work/wt", networkAllowed: true, risk: classifyCommandRisk("dotnet", ["test"]) };
+  const a = buildBwrapArgs(plan, "dotnet", ["test"]);
+  const np = a.indexOf("NUGET_PACKAGES");
+  assert.ok(np >= 0 && a[np - 1] === "--setenv" && (a[np + 1] ?? "").startsWith(base), "NUGET_PACKAGES under the persistent cache");
+  assert.ok(a.includes("DOTNET_CLI_HOME") && a.includes("DOTNET_CLI_TELEMETRY_OPTOUT"), "CLI home + telemetry-optout set");
 });
 
 test("buildBwrapArgs: --share-net is added ONLY when network is explicitly allowed", () => {

@@ -8,8 +8,8 @@
 
 import { mkdirSync, readFileSync, writeFileSync, readdirSync, existsSync, unlinkSync, renameSync } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
+import { config } from "../../core/config.js";
 import type { CorrectionEntry, CorrectionFilter, CorrectionProposeInput } from "./contract.js";
 
 /** Reject ids that could escape the store directory (GLM 5.2 LOW-3). */
@@ -22,13 +22,15 @@ function assertSafeId(id: string): void {
 /**
  * Resolve the store directory. Precedence: explicit `override` arg (store tests) →
  * `IKBI_CORRECTIONS_DIR` env (route/server tests, which exercise handlers that call
- * the store WITHOUT an override arg) → the default `~/.ikbi/corrections/`.
+ * the store WITHOUT an override arg) → the default under `config.stateRoot`
+ * (honors `IKBI_STATE_ROOT`; NOT the real home, which is read-only under the
+ * mid-build sandbox — see spec-artifact/store.ts, Codex audit H1).
  */
 export function resolveStoreDir(override?: string): string {
   if (override !== undefined) return override;
   const env = process.env.IKBI_CORRECTIONS_DIR;
   if (env !== undefined && env.trim().length > 0) return env;
-  return join(homedir(), ".ikbi", "corrections");
+  return join(config.stateRoot, "corrections");
 }
 
 function ensureDir(dir: string): void {

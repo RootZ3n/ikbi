@@ -182,6 +182,15 @@ export interface EscalationWeights {
 export interface EscalationConfig {
   /** Master switch for the orchestrator observability hook (the engine itself is always usable). */
   readonly enabled: boolean;
+  /**
+   * GUARANTEED flash→pro escalation (default true). When on, a builder that FAILS or STALLS on the
+   * cheap/default path always escalates to the mid (pro) tier — bypassing the worker→mid score
+   * threshold, which is otherwise a boundary coin-flip (builderFailed weight == the threshold). This
+   * is the operator's expected default: "if the cheap model can't finish, always try pro." It only
+   * applies when escalation is enabled AND the task did not explicitly pin a tier (escalationDisabled);
+   * `--tier mid|frontier` stays fail-closed. Bounded by maxEscalations + the per-build budget cap.
+   */
+  readonly alwaysEscalate: boolean;
   /** Score threshold for worker → mid escalation (0-100, default 50). */
   readonly workerToMidThreshold: number;
   /** Score threshold for mid → frontier escalation (0-100, default 70). */

@@ -32,7 +32,13 @@
  *         provider@1.0.x stay compatible.
  * 1.0.0 — frozen-core provider contract.
  */
-export const CONTRACT_VERSION = "1.3.0";
+// 1.4.0 — ADDITIVE, backward-compatible: `ModelMessage.isError` (tool_result error channel);
+//         `ModelRequest.thinking` (opt-in extended thinking budget); `ModelMessage.reasoning` +
+//         `.reasoningSignature` and `ProviderResult`/`StreamDelta` reasoning-signature fields
+//         (round-trip of signed thinking blocks). Every field is optional; callers that never set
+//         them and providers that never read them are byte-unchanged. Modules pinning 1.3.x stay
+//         compatible.
+export const CONTRACT_VERSION = "1.4.0";
 
 // ---------------------------------------------------------------------------
 // Request
@@ -76,6 +82,15 @@ export interface ModelMessage {
   /** Optional name (e.g. the tool name for a tool message). */
   readonly name?: string;
   /**
+   * ADDITIVE (1.4.0, backward-compatible): for `role: "tool"`, marks that this
+   * result reports a tool FAILURE rather than a success. Providers that model an
+   * explicit error channel on tool results (the native Anthropic `tool_result`
+   * `is_error` flag) set it so the model can distinguish a failed tool from a tool
+   * that returned error-shaped prose. Optional; providers without an error channel
+   * ignore it and existing callers that never set it are byte-unchanged on the wire.
+   */
+  readonly isError?: boolean;
+  /**
    * ADDITIVE (Phase 2 coordination, backward-compatible): marks this message as
    * carrying neutralized UNTRUSTED content (the output of the injection
    * chokepoint). It is structural isolation metadata — untrusted content travels
@@ -84,6 +99,16 @@ export interface ModelMessage {
    * fields are unchanged. See `src/core/injection`.
    */
   readonly untrusted?: boolean;
+  /**
+   * ADDITIVE (1.4.0): for `role: "assistant"`, the model's extended-thinking text and its opaque
+   * cryptographic `reasoningSignature`. Anthropic REQUIRES a prior turn's thinking blocks be replayed
+   * VERBATIM (text + signature) when the turn used tools and the conversation continues — so these are
+   * carried on the assistant message and re-emitted by the native provider. Never neutralized (this is
+   * the model's own output, not untrusted data) so the signature stays byte-exact. Providers without a
+   * thinking channel ignore both. Optional; unset ⇒ no thinking block on the wire.
+   */
+  readonly reasoning?: string;
+  readonly reasoningSignature?: string;
 }
 
 /** A tool the model may call. Parameters are a JSON Schema object. For later tool-use. */
@@ -164,6 +189,14 @@ export interface ModelRequest {
   readonly timeoutMs?: number;
   /** Free-form correlation/tracing metadata. Never sent to the model. */
   readonly metadata?: Readonly<Record<string, unknown>>;
+  /**
+   * ADDITIVE (1.4.0): opt-in EXTENDED THINKING. When set, a supporting provider (native Anthropic)
+   * asks the model to reason with the given token budget before answering; the reasoning returns in
+   * `reasoning`/`reasoningSignature`. Providers/models without a thinking channel ignore it (graceful
+   * fallback). Off unless explicitly set — never a default. `budgetTokens` must be < the effective
+   * `maxTokens` (the provider enforces this).
+   */
+  readonly thinking?: { readonly budgetTokens: number };
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +288,8 @@ export interface ModelResponse {
    * providers/models populate this.
    */
   readonly reasoning?: string;
+  /** ADDITIVE (1.4.0): opaque signature for the reasoning block (Anthropic thinking), for verbatim round-trip. */
+  readonly reasoningSignature?: string;
   /** Tool calls emitted by the model, if any. */
   readonly toolCalls?: readonly ToolCall[];
   readonly finishReason: FinishReason;
@@ -289,6 +324,8 @@ export interface ProviderResult {
   readonly content: string;
   /** Separate reasoning text, when the model emits it distinctly from content. */
   readonly reasoning?: string;
+  /** ADDITIVE (1.4.0): opaque signature for the reasoning block (Anthropic thinking), for verbatim round-trip. */
+  readonly reasoningSignature?: string;
   readonly toolCalls?: readonly ToolCall[];
   readonly finishReason: FinishReason;
   readonly usage: TokenUsage;
@@ -308,6 +345,10 @@ export interface ProviderResult {
 export interface StreamDelta {
   /** A slice of assistant text to append to the running content. */
   readonly content?: string;
+  /** ADDITIVE (1.4.0): a slice of extended-thinking text (Anthropic thinking_delta). */
+  readonly reasoning?: string;
+  /** ADDITIVE (1.4.0): the reasoning block's opaque signature (Anthropic signature_delta), for round-trip. */
+  readonly reasoningSignature?: string;
   /** Incremental tool-call chunks (OpenAI streams tool calls piecewise by index). */
   readonly toolCalls?: readonly ToolCallDelta[];
   /** The terminal finish reason, present on the final content-bearing chunk. */
@@ -343,6 +384,13 @@ export type ModelStream = AsyncIterable<StreamDelta>;
 export interface ModelProvider {
   /** Stable provider id, e.g. "mimo", "openrouter". */
   readonly id: string;
+  /**
+   * ADDITIVE (OPTIONAL): is this provider actually USABLE — i.e. keyless, or configured with an API
+   * key? A registered-but-keyless-and-keyRequiring provider will fail-closed at invoke, so `doctor`
+   * reads this to avoid green-lighting a build that dies mid-pipeline for want of a key. Providers
+   * that omit it are assumed ready (back-compat) — doctor then falls back to its structural check.
+   */
+  ready?(): boolean;
   /** Perform a single invocation. MUST throw `ProviderError` on failure. */
   invoke(invocation: ProviderInvocation): Promise<ProviderResult>;
   /**

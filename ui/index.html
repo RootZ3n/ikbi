@@ -4,7 +4,10 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>The Workshop · ikbi</title>
+<meta name="theme-color" content="#0b0f0d">
+<link rel="manifest" href="manifest.json">
 <link rel="stylesheet" href="ikbi.css">
+<script src="peh-config.js"></script>
 </head>
 <body>
 <div id="app"></div>
@@ -39,6 +42,9 @@ const state={
     product:'ikbi',
     scene:localStorage.getItem('pehverse-scene')||null,
     mode:localStorage.getItem('pehverse-mode')||'dashboard',
+    // GROVE-ONLY: mobile-first — show ONLY Peh's terminal, hide the card wall/map. Defaults ON for
+    // narrow (mobile) screens; a stored preference wins. Toggle via the top-bar Grove/Immersive/Dashboard.
+    groveOnly:(localStorage.getItem('pehverse-grove-only')||((typeof window!=='undefined'&&window.innerWidth&&window.innerWidth<=820)?'1':'0'))==='1',
     workspaces:[],
     focus:null,
     fastTravel:false,
@@ -125,9 +131,9 @@ const WORKSPACE_REGISTRY={
 //    vs glance-only, and supplies the floating-window solo size. priority
 //    orders the Voltron dashboard wall. (See the Pehverse rollout map.)
 const PANEL_META={
-  'engine-status':    {role:'status',      priority:1,  console:true,  solo:{w:'min(560px,52vw)', h:'70%'}},
-  'builder-ws':       {role:'config',      priority:2,  console:true,  solo:{w:'min(580px,54vw)', h:'74%'}},
-  'grove-ws':         {role:'results',     priority:3,  console:true,  solo:{w:'min(640px,58vw)', h:'76%'}},
+  'grove-ws':         {role:'results',     priority:1,  console:true,  solo:{w:'min(640px,58vw)', h:'76%'}},
+  'engine-status':    {role:'status',      priority:2,  console:true,  solo:{w:'min(560px,52vw)', h:'70%'}},
+  'builder-ws':       {role:'config',      priority:3,  console:true,  solo:{w:'min(580px,54vw)', h:'74%'}},
   'test-results':     {role:'results',     priority:4,  console:true,  solo:{w:'min(540px,50vw)', h:'68%'}},
   'trust-ws':         {role:'status',      priority:5,  console:true,  solo:{w:'min(520px,48vw)', h:'66%'}},
   'modules-ws':       {role:'metrics',     priority:6,  console:true,  solo:{w:'min(540px,50vw)', h:'66%'}},
@@ -505,7 +511,7 @@ function renderPehverse(deckMarkup){
   const product=pehActiveProduct();
   const scene=pehCurrentScene();
   const styleVars=`--peh-accent:${product.accent};--peh-accent2:${product.accent2||product.accent}`;
-  return `<div class="peh-shell peh-mode-${pv.mode} peh-product-${product.id}" data-product="${product.id}" style="${styleVars}">
+  return `<div class="peh-shell peh-mode-${pv.mode} peh-product-${product.id}${pv.groveOnly?' peh-grove-only-mode':''}" data-product="${product.id}" style="${styleVars}">
     ${renderPehTopBar(product,scene)}
     <div class="peh-stage">${renderPehStage(product,scene,deckMarkup)}</div>
     ${renderPehTaskbar()}
@@ -524,8 +530,9 @@ function renderPehTopBar(product,scene){
       <span class="peh-travel-cta">Fast travel</span>
     </button>
     <div class="peh-mode-toggle" role="group" aria-label="View mode (Alt+M to toggle)">
-      <button type="button" class="${pv.mode==='immersive'?'active':''}" aria-pressed="${pv.mode==='immersive'}" onclick="pehSetMode('immersive')">Immersive</button>
-      <button type="button" class="${pv.mode==='dashboard'?'active':''}" aria-pressed="${pv.mode==='dashboard'}" onclick="pehSetMode('dashboard')">Dashboard</button>
+      <button type="button" class="${pv.groveOnly?'active':''}" aria-pressed="${!!pv.groveOnly}" onclick="pehSetGroveOnly(true)">Grove</button>
+      <button type="button" class="${!pv.groveOnly&&pv.mode==='immersive'?'active':''}" aria-pressed="${!pv.groveOnly&&pv.mode==='immersive'}" onclick="pehSetGroveOnly(false);pehSetMode('immersive')">Immersive</button>
+      <button type="button" class="${!pv.groveOnly&&pv.mode==='dashboard'?'active':''}" aria-pressed="${!pv.groveOnly&&pv.mode==='dashboard'}" onclick="pehSetGroveOnly(false);pehSetMode('dashboard')">Dashboard</button>
     </div>
   </header>`;
 }
@@ -534,8 +541,20 @@ function renderPehTopBar(product,scene){
 // Voltron wall (DashboardSurface); immersive mode is the map with movable
 // windows popping up at their hotspots.
 function renderPehStage(product,scene,deckMarkup){
+  if(state.pehverse.groveOnly)return renderGroveOnly();
   if(state.pehverse.mode==='dashboard')return renderDashboardSurface(product,scene,deckMarkup);
   return renderPehMap(product,scene,deckMarkup);
+}
+// GROVE-ONLY: the mobile-first view — just Peh's terminal, full-screen, nothing else. The other
+// panels are one tap away via the top-bar toggle (Immersive/Dashboard).
+function renderGroveOnly(){
+  const body=(typeof window.pehWorkspaceBody==='function')?window.pehWorkspaceBody({defId:'grove-ws',console:true},''):'';
+  return `<div class="peh-grove-only">${body}</div>`;
+}
+function pehSetGroveOnly(v){
+  state.pehverse.groveOnly=!!v;
+  try{localStorage.setItem('pehverse-grove-only',v?'1':'0')}catch(e){}
+  render();
 }
 
 function renderPehMap(product,scene,deckMarkup){
@@ -852,6 +871,7 @@ window.pehHotspotActivate=pehHotspotActivate;
 window.pehDismissBubble=pehDismissBubble;
 window.pehToggleFastTravel=pehToggleFastTravel;
 window.pehSetMode=pehSetMode;
+window.pehSetGroveOnly=pehSetGroveOnly;
 window.pehSetScene=pehSetScene;
 window.pehGoScene=pehGoScene;
 window.pehDevSwitchProduct=pehDevSwitchProduct;
@@ -889,6 +909,18 @@ var pehOnboard={
   },
   setOnboarded:function(){
     try{localStorage.setItem('pehverse-onboarded','1')}catch(e){}
+  },
+
+  // Is onboarding enabled at all? A per-user settings toggle (localStorage 'peh-onboarding' =
+  // 'on'|'off') wins; otherwise the deployment default from window.PEH_CONFIG (server-injected:
+  // ON for the public site, OFF in the private lab via IKBI_ONBOARDING=off).
+  isEnabled:function(){
+    try{
+      var pref=localStorage.getItem('peh-onboarding');
+      if(pref==='off')return false;
+      if(pref==='on')return true;
+    }catch(e){}
+    return !(window.PEH_CONFIG&&window.PEH_CONFIG.onboarding===false);
   },
 
   // ── Show the welcome overlay ──────────────────────────────────────
@@ -1112,7 +1144,9 @@ function boot(){
   }
 
   // ── Peh onboarding: first-launch check ────────────────────────────
-  if(typeof pehOnboard!=='undefined'){
+  // Onboarding only runs when enabled (deployment default + per-user toggle). Disabled = no
+  // overlay AND no help button (the lab wants Peh's teacher gone entirely).
+  if(typeof pehOnboard!=='undefined'&&pehOnboard.isEnabled()){
     if(!pehOnboard.isOnboarded()){
       // First visit — show the welcome overlay after a brief settle
       setTimeout(function(){pehOnboard.show()},350);

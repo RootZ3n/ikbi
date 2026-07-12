@@ -36,6 +36,31 @@
  */
 
 import type { RoleFn, RoleResult } from "./contract.js";
+import { workerModelConfig, DEFAULT_PREVENTED_REVIEW_THRESHOLD, DEFAULT_PREVENTED_HIGH_RISK_REVIEW_THRESHOLD } from "./config.js";
+import type { TestEvidence } from "./adjudication/contract.js";
+import { evaluateExecutedTestEvidence, noTestsPolicyEnabled } from "./executed-evidence.js";
+
+/**
+ * HIGH-RISK prevented-attempt classifier: network / shell-escape / privilege / system reaches. Intent
+ * still matters even when the governor blocked it — a repeated reach for the network or a root shell is
+ * a red flag a single blocked `node -e` self-verify is not, so these escalate to review far faster. We
+ * classify from the recorded command/error text (a prevented terminal call carries the command in
+ * `path` and the binary in `error`). NOT high-risk: code-eval self-verify (node/python -e), dev/build
+ * tools, benign cleanup — those are the ordinary cheap-model noise the effect-based gate stopped punishing.
+ */
+const HIGH_RISK_BINARIES: ReadonlySet<string> = new Set([
+  "curl", "wget", "ssh", "scp", "sftp", "rsync", "nc", "ncat", "netcat", "telnet", "ftp", "socat",
+  "bash", "sh", "zsh", "dash", "ksh", "sudo", "su", "doas", "pkexec", "chroot", "mount", "umount", "systemctl", "crontab",
+]);
+function isHighRiskPrevented(v: unknown): boolean {
+  const o = (v ?? {}) as { path?: unknown; error?: unknown };
+  // The governor names the denied binary in its error ("binary 'curl' is not on the allowlist") — the
+  // precise signal. Fall back to the first token of the recorded command. Matching the BINARY (not any
+  // substring of the path) avoids false-flagging a file that merely contains "sh"/"nc" in its name.
+  const err = typeof o.error === "string" ? /binary ['"]?([A-Za-z0-9_.+-]+)/i.exec(o.error) : null;
+  const bin = (err?.[1] ?? (typeof o.path === "string" ? o.path.trim().split(/\s+/)[0] ?? "" : "")).toLowerCase();
+  return HIGH_RISK_BINARIES.has(bin);
+}
 
 /** Safe accessor for a role result's open detail bag. */
 function detailOf(result: RoleResult | undefined): Record<string, unknown> {
@@ -95,37 +120,82 @@ export const integrator: RoleFn = async (ctx) => {
     // forge a landed change — the workspace manager's promote downgrades a zero-diff promote to noop.
     const builderOk =
       builder?.outcome === "success" && (filesWritten.length > 0 || accumulatedPass || noChangeRequired);
-    const noPolicyViolations = policyViolations !== undefined && policyViolations.length === 0;
+    // EFFECT-BASED PROMOTE GATE: a policy violation in ikbi is a PREVENTED (governor-BLOCKED) tool call
+    // — it never ran, the sandbox held, and the verifier passed on the real worktree. Judging by EFFECT
+    // (the architect's directive), a prevented attempt is a recorded RISK SIGNAL, not a discard: one
+    // blocked improvisation (rm / node -e / pnpm --dir — the cheap model's self-verify goofs) must NOT
+    // throw away a verified-green build. Two guards remain: (1) FAIL-CLOSED on an ABSENT policy field —
+    // we cannot confirm the builder even reported its tool-call status; (2) escalate to REVIEW (do not
+    // silently promote) once prevented attempts reach a threshold — repetition is a stronger signal.
+    // EFFECTIVE breaches that LAND (sandbox escape, egress leak, out-of-workspace write, receipt
+    // tampering) are separate higher-severity alarms enforced by the orchestrator's in-run gates and are
+    // never rejected tool calls, so they never reach here.
+    const policyConfirmed = policyViolations !== undefined;
+    // FIXER-PASS PREVENTED ATTEMPTS (A2/D3): the last-mile fixer runs a SECOND builder pass off-books
+    // (no recordRole; its result never enters `results`), so its blocked out-of-policy attempts are
+    // invisible to the integrator's `builder` result. The orchestrator threads them onto the builder
+    // detail as `fixerPreventedViolations` (kept SEPARATE from the builder's own `policyViolations` for
+    // provenance). Fold them into the RISK ACCOUNTING — the review threshold and the recorded risk
+    // signal — so a fixer that racks up blocked curl/ssh attempts cannot promote unreviewed/unrecorded.
+    const fixerPreventedViolations = Array.isArray(builderDetail.fixerPreventedViolations)
+      ? builderDetail.fixerPreventedViolations
+      : [];
+    // The COMBINED prevented set that drives the threshold + telemetry. Only meaningful once the builder
+    // confirmed its policy status (policyConfirmed); an absent field is fail-closed below regardless.
+    const preventedForRisk = policyConfirmed ? [...policyViolations, ...fixerPreventedViolations] : [];
+    const preventedCount = preventedForRisk.length;
+    const highRiskCount = preventedForRisk.filter(isHighRiskPrevented).length;
+    const reviewThreshold = workerModelConfig.preventedReviewThreshold ?? DEFAULT_PREVENTED_REVIEW_THRESHOLD;
+    const highRiskThreshold = workerModelConfig.preventedHighRiskReviewThreshold ?? DEFAULT_PREVENTED_HIGH_RISK_REVIEW_THRESHOLD;
+    // SEVERITY-TIERED: high-risk reaches (network/shell/privilege) escalate to review at a MUCH lower
+    // count than ordinary blocked improvisations — intent still matters even when the governor blocked it.
+    const withinRiskBudget = policyConfirmed && preventedCount < reviewThreshold && highRiskCount < highRiskThreshold;
+    const policyNote = preventedCount > 0 ? `${preventedCount} PREVENTED policy attempt(s)${highRiskCount > 0 ? ` (${highRiskCount} high-risk)` : ""} recorded as risk signal (no effect)` : "no policy violations";
     const criticPass = detailOf(critic).pass === true;
     const verifierPass = detailOf(verifier).verdict === "pass";
 
-    // REAL TEST EVIDENCE (single-run only). The verifier classifies test signal four ways
-    // (executed / zero / unverified / absent — see readVerifier in orchestrator.ts, stamped onto
-    // the verifier result detail). A SINGLE-RUN build that VERIFIES but ran no real tests (zero
-    // tests, an unparseable green like `echo done`, or no "test" check at all) proved nothing about
-    // behavior — promoting it would forge a passing test signal. So require "executed" evidence for
-    // single-run promotes. ACCUMULATED builds (reuseWorkspace set) are EXEMPT: prior steps already
-    // verified, and this pass may legitimately run no tests.
+    // REAL EXECUTED-TEST EVIDENCE (Phase 10, IKBI-REAUDIT-001). The verifier classifies test signal four
+    // ways (executed / zero / unverified / absent — see readVerifier in orchestrator.ts, stamped onto the
+    // verifier result). A build that VERIFIES but ran no real tests (zero tests, an unparseable green like
+    // `echo done`, or no "test" check at all) proved nothing about behavior — promoting it would forge a
+    // passing test signal. Require AUTHENTIC `executed` evidence; a no-tests-configured (`absent`) tree may
+    // promote ONLY under an explicit named policy (task.noTestsPolicy / IKBI_ALLOW_NO_TESTS).
     //
-    // FAIL-CLOSED (Codex C1): a MISSING testEvidence field is NOT exempted. The production
-    // orchestrator stamps testEvidence onto every verifier result, so a real single-run promote
-    // always reports "executed"; an absent field means we cannot confirm a real test signal, which
-    // must block promote exactly like "zero"/"unverified" — never promote on unproven evidence.
-    const testEvidence = detailOf(verifier).testEvidence;
-    const testEvidenceOk = accumulatedPass || testEvidence === "executed";
+    // MULTI-STEP FIX: the FINAL accumulated pass (reuseWorkspace) runs the full verifier on the whole
+    // accumulated tree, so it can and MUST produce its OWN executed evidence. The old blanket exemption
+    // (`accumulatedPass || …`) treated "reuse workspace" as a proxy for "prior steps verified" — but
+    // ordinary intermediate steps skip verification, so an accumulated final could land code no test ever
+    // exercised. The exemption is REMOVED here; the final candidate is held to the same executed-evidence
+    // bar as a single run. (accumulatedPass still relaxes the filesWritten>0 builder gate above — a final
+    // verify pass may legitimately write nothing — but it can no longer waive the test-evidence gate.)
+    //
+    // FAIL-CLOSED (Codex C1): a MISSING testEvidence field is NOT exempted — an absent field means we
+    // cannot confirm a real signal, which blocks exactly like "zero"/"unverified".
+    const testEvidence = detailOf(verifier).testEvidence as TestEvidence | undefined;
+    const testEvidenceDecision = evaluateExecutedTestEvidence(testEvidence, { allowNoTests: noTestsPolicyEnabled(ctx.task) });
+    const testEvidenceOk = testEvidenceDecision.acceptable;
 
-    if (builderOk && noPolicyViolations && criticPass && verifierPass && testEvidenceOk && !refuterRefuted) {
+    if (builderOk && policyConfirmed && withinRiskBudget && criticPass && verifierPass && testEvidenceOk && !refuterRefuted) {
       const rationale =
         accumulatedPass && filesWritten.length === 0
-          ? "promote: accumulated multi-step build (this pass wrote 0 files — prior steps did the work), no policy violations, critic pass, verifier pass"
+          ? `promote: accumulated multi-step build (this pass wrote 0 files — prior steps did the work), ${policyNote}, critic pass, verifier pass`
           : noChangeRequired && filesWritten.length === 0
-            ? "promote: no-change build (goal already satisfied — builder declared noChangeRequired, 0 files written), no policy violations, critic pass, verifier pass"
-            : `promote: builder wrote ${filesWritten.length} file(s), no policy violations, critic pass, verifier pass`;
+            ? `promote: no-change build (goal already satisfied — builder declared noChangeRequired, 0 files written), ${policyNote}, critic pass, verifier pass`
+            : `promote: builder wrote ${filesWritten.length} file(s), ${policyNote}, critic pass, verifier pass`;
       return {
         role: "integrator",
         outcome: "success", // "did its job" — the verdict is in detail.decision
         summary: rationale,
-        detail: { decision: "promote", rationale, evaluation: { approved: true } },
+        detail: {
+          decision: "promote",
+          rationale,
+          evaluation: { approved: true },
+          // RISK SIGNAL: prevented attempts promoted-with-warning are recorded (not erased) so severity
+          // can accrue over time — the receipt/audit trail carries what was blocked and that it had no effect.
+          ...(preventedCount > 0
+            ? { preventedViolations: preventedForRisk, ...(fixerPreventedViolations.length > 0 ? { fixerPreventedViolations } : {}), preventedCount, highRiskCount, riskSignal: { kind: "prevented_policy_attempt", effect: "none", promotionImpact: "warning", count: preventedCount, highRiskCount } }
+            : {}),
+        },
       };
     }
 
@@ -143,15 +213,32 @@ export const integrator: RoleFn = async (ctx) => {
       if (builder === undefined) failures.push("no builder result");
       else if (builder.outcome !== "success") failures.push(`builder outcome "${builder.outcome}"`);
       else failures.push("builder wrote no files");
-    } else if (!noPolicyViolations) {
-      if (policyViolations === undefined) failures.push("builder did not report tool-call policy status (cannot confirm clean)");
-      else failures.push(`builder attempted ${policyViolations.length} out-of-policy tool call(s)`);
+    } else if (!policyConfirmed) {
+      // FAIL-CLOSED: the builder did not report its tool-call status, so we cannot confirm no EFFECTIVE
+      // breach landed. (A PRESENT-but-non-empty list of PREVENTED attempts does NOT reach here — that
+      // promotes-with-warning above; only an ABSENT field, or crossing the review threshold, discards.)
+      failures.push("builder did not report tool-call policy status (cannot confirm clean)");
+    } else if (!withinRiskBudget) {
+      // REVIEW (not a quality discard): prevented attempts crossed the threshold. NAME the offending
+      // call(s) so the risk is auditable from the final output without a --verbose re-run.
+      const named = preventedForRisk
+        .map((v) => {
+          const o = (v ?? {}) as { tool?: unknown; path?: unknown; error?: unknown };
+          const tool = typeof o.tool === "string" ? o.tool : "tool";
+          const where = typeof o.path === "string" && o.path.length > 0 ? ` \`${o.path}\`` : "";
+          return `${tool}${where}`;
+        })
+        .join(", ");
+      const which = highRiskCount >= highRiskThreshold
+        ? `${highRiskCount} HIGH-RISK (network/shell/privilege) prevented attempt(s) reached the high-risk review threshold (${highRiskThreshold})`
+        : `${preventedCount} prevented policy attempt(s) reached the review threshold (${reviewThreshold})`;
+      failures.push(`requires review: ${which} — held for human review, not auto-promoted: ${named}`);
     }
     if (!criticPass) failures.push(critic === undefined ? "no critic result" : "critic pass=false");
     if (!verifierPass) failures.push(verifier === undefined ? "no verifier result" : "verifier verdict=fail");
     // Only an ADDITIONAL constraint on an otherwise-passing verifier: a RED verifier already names
     // its own failure above, so the test-evidence note is redundant noise there.
-    else if (!testEvidenceOk) failures.push(`single-run build has no real test evidence (test evidence "${String(testEvidence)}")`);
+    else if (!testEvidenceOk) failures.push(`no authentic executed-test evidence for autonomous promotion (${testEvidenceDecision.reason}) — a green with test evidence "${String(testEvidence ?? "missing")}" proved nothing about behavior`);
     // REFUTER (HIGH-1): an adversarial REFUTAL is an independent discard reason — it can hold even
     // when every other gate is green (the whole point of the adversarial gate), so it is reported
     // unconditionally (not chained behind the verifier like the test-evidence note).
@@ -161,11 +248,19 @@ export const integrator: RoleFn = async (ctx) => {
     }
 
     const rationale = `discard: ${failures.join("; ")}`;
+    const overThreshold = policyConfirmed && !withinRiskBudget;
     return {
       role: "integrator",
       outcome: "success", // it reached a decision — discard is a valid, successful decision
       summary: rationale,
-      detail: { decision: "discard", rationale, evaluation: { approved: false } },
+      detail: {
+        decision: "discard",
+        rationale,
+        evaluation: { approved: false },
+        // A review-hold is a RISK escalation, not a code-quality failure — mark it so trust/audit can
+        // distinguish "too many prevented attempts, needs a human" from "the build was actually broken".
+        ...(overThreshold ? { requiresReview: true, preventedCount, highRiskCount, preventedViolations: preventedForRisk, ...(fixerPreventedViolations.length > 0 ? { fixerPreventedViolations } : {}) } : {}),
+      },
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

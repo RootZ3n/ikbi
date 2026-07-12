@@ -79,6 +79,17 @@ export function installRoot(): string {
   return resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 }
 
+/**
+ * LOW (config precedence): key → the .env FILE that supplied it (first file wins, matching load order).
+ * A key set by the real shell environment is NOT here (loadDotenv skips already-set keys). `doctor`
+ * reads this to show WHERE each config value came from — .env file, shell export, or a built-in default —
+ * so a surprising value ("why is it using that model?") is diagnosable instead of a mystery.
+ */
+const dotenvProvenance = new Map<string, string>();
+export function getDotenvProvenance(): ReadonlyMap<string, string> {
+  return dotenvProvenance;
+}
+
 export function loadBootstrapEnv(
   env: NodeJS.ProcessEnv = process.env,
   cwd: string = process.cwd(),
@@ -86,10 +97,15 @@ export function loadBootstrapEnv(
 ): void {
   const root = opts.installRoot ?? installRoot();
   const home = opts.homeDir ?? homedir();
-  loadDotenv(resolve(root, ".env"), env);
-  loadDotenv(resolve(home, ".ikbi", "env"), env);
+  const record = (path: string, keys: readonly string[]): void => {
+    for (const k of keys) if (!dotenvProvenance.has(k)) dotenvProvenance.set(k, path); // first file to set a key wins
+  };
+  const rootEnv = resolve(root, ".env");
+  record(rootEnv, loadDotenv(rootEnv, env));
+  const homeEnv = resolve(home, ".ikbi", "env");
+  record(homeEnv, loadDotenv(homeEnv, env));
   const cwdEnv = resolve(cwd, ".env");
-  if (cwdEnv !== resolve(root, ".env")) loadDotenv(cwdEnv, env, { forbiddenKeys: CWD_DOTENV_FORBIDDEN_KEYS });
+  if (cwdEnv !== rootEnv) record(cwdEnv, loadDotenv(cwdEnv, env, { forbiddenKeys: CWD_DOTENV_FORBIDDEN_KEYS }));
 }
 
 /** Read-only info commands that perform NO trust operations (safe on the built-in dev keys). */

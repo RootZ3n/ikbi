@@ -1,0 +1,14 @@
+// ikbi-shipped Gradle init script. Gradle prints NO test count on a passing `test` run (only
+// "BUILD SUCCESSFUL"), so ikbi's evidence gate would discard a green build for "no test evidence".
+// This afterSuite hook emits the canonical JUnit/Surefire summary line for the ROOT suite, which
+// parseTestCount recognizes. Applied via `--init-script`; combined with `--rerun-tasks` it also
+// defeats Gradle's UP-TO-DATE task caching (which would otherwise skip execution on a re-run).
+allprojects {
+  tasks.withType(Test).configureEach {
+    afterSuite { desc, result ->
+      if (desc.parent == null) {
+        println "Tests run: ${result.testCount}, Failures: ${result.failedTestCount}, Errors: 0, Skipped: ${result.skippedTestCount}"
+      }
+    }
+  }
+}

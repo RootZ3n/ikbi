@@ -204,6 +204,30 @@ export interface WorkerTask {
    */
   readonly builderModelOverride?: string;
   /**
+   * MIXTURE OF EXPERTS (cheap tier): when true AND no explicit `builderModelOverride` is set, the
+   * builder model for THIS sub-task is RENTED per difficulty via model-router's cheapest-sufficient
+   * gate (see expert-rental.ts) instead of using one fixed builder for the whole build. The cheap
+   * tier sets this so its 4-model pool acts as one virtual builder — mechanical steps rent the
+   * worker roster, harder steps rent the mid roster, up front (no escalation event). Absent/false =
+   * the single-builder path, byte-unchanged.
+   */
+  readonly moeExpertRental?: boolean;
+  /**
+   * MoE DUEL: restrict this attempt's expert rentals to one vendor lane (a model-id prefix, e.g.
+   * "deepseek" or "mimo"). The duel-on-failure runs the primary attempt in one lane and, if it
+   * fails to promote, a second PEER attempt in the other lane — two genuinely different builds, not
+   * a stronger rung of the same ladder. Only meaningful with `moeExpertRental`. Absent = full pool.
+   */
+  readonly moeVendorLane?: string;
+  /**
+   * MoE HAND-OFF: an evidence-dense brief of what PRIOR steps already built on this shared
+   * workspace, threaded into a step's builder so a freshly-rented expert collaborates with the
+   * team instead of restarting cold (re-discovering or redoing prior work). Set by the multi-step
+   * coordinator from the completed steps; neutralized before it reaches the model. Absent = no prior
+   * steps (the first step, or a single-step build).
+   */
+  readonly handoffBrief?: string;
+  /**
    * TIER PRESET (`--tier`): force the CRITIC role's model for this run, overriding the config
    * default. Set by a tier preset. Absent = use the config critic model.
    */
@@ -241,6 +265,14 @@ export interface WorkerTask {
    */
   readonly reuseWorkspace?: import("../../core/workspace/contract.js").WorkspaceHandle;
   /**
+   * EXPLICIT NO-TESTS POLICY (Phase 10, IKBI-REAUDIT-001). Autonomous promotion requires authentic
+   * `executed` test evidence; a candidate whose target has NO tests configured (`absent`) may promote
+   * only when the operator EXPLICITLY declares this repo/task has no tests. Default (unset) is FALSE —
+   * fail-closed: a no-tests build does NOT autonomously promote. (Also settable via IKBI_ALLOW_NO_TESTS.)
+   * A `zero`/`unverified`/missing evidence state ALWAYS blocks, regardless of this flag.
+   */
+  readonly noTestsPolicy?: boolean;
+  /**
    * STEP-PLANNER: run the full role pipeline (scout → builder → critic → verifier)
    * but SKIP the promote/discard lifecycle at the end. The workspace stays alive
    * on disk so the next step (or a final verification pass) can continue.
@@ -253,6 +285,16 @@ export interface WorkerTask {
    * project — no tests exist yet). The final step runs verification normally.
    */
   readonly skipVerifier?: boolean;
+  /**
+   * GREENFIELD SCAFFOLD (opt-in): when the target is a genuinely EMPTY repo (no manifest, no
+   * source), allow the build to proceed so the builder can scaffold a verifiable project (a
+   * manifest + tests) instead of fast-failing the unverifiable-target check before the builder
+   * runs. Verification is resolved POST-build from the populated workspace, and promotion STILL
+   * requires a green verify — a build that fails to produce a verifiable project simply does not
+   * promote. Only an EMPTY target qualifies; loose source without a manifest still fast-fails.
+   * The CLI auto-sets this for an empty target; default undefined keeps the fail-closed reject.
+   */
+  readonly allowGreenfieldScaffold?: boolean;
   /**
    * REPO COMPLEXITY HINT: when "large", the orchestrator skips the worker-tier (flash)
    * builder entirely and starts with the mid-tier (pro) model. Avoids wasting a flash
@@ -350,6 +392,8 @@ export interface WorkerResult {
   readonly promoted: boolean;
   /** Human reason on a non-success / partial terminal. */
   readonly reason?: string;
+  /** Free-form run metadata for non-contract-critical observability. Never secrets. */
+  readonly metadata?: Readonly<Record<string, unknown>>;
   /**
    * Which verification path actually ran this run: "ladder" (HARDENED — stub detection,
    * no-vacuous-green, scope-stamped) or "legacy". Surfaced so an operator never has to inspect
@@ -367,6 +411,14 @@ export interface WorkerResult {
    * paths that never invoke a model (e.g. a pre-allocation kill). Surfaced for cost visibility.
    */
   readonly costUsd?: number;
+  /** Phase 14B: whether this run's cost is complete or partial (any unknown-cost provider attempt). */
+  readonly costStatus?: "complete" | "partial";
+  /**
+   * Phase 14B: a compact projection of this run's UNIQUE provider attempts (id + cost + status), so a PARENT
+   * composite operation (duel primary+peer, multi-step steps, CLI cognition+worker) can aggregate the union of
+   * unique attempts across child runs WITHOUT double-counting — losing/failed work included, never erased.
+   */
+  readonly providerAttempts?: readonly { readonly providerAttemptId: string; readonly costUsd?: number; readonly costStatus: "measured" | "measured-zero" | "unavailable" }[];
   /**
    * The escalation engine's recommendation for this run, surfaced so an operator can see the
    * strongest recommendation across the scoring roles (a `recommended` one wins over a declined one;
@@ -417,7 +469,35 @@ export interface WorkerResult {
     /** Operator-actionable next steps to make the target verifiable. */
     readonly nextSteps?: readonly string[];
   };
+  /**
+   * WHY a non-success attempt did not promote, classified at the terminal so the duel scheduler can
+   * decide truthfully whether a peer vendor lane is warranted (IKBI-RT-002 / Phase 2). Absent on a
+   * promoted (`outcome === "success"`) run. `duelEligible` is true ONLY for `candidate-rejected` — a
+   * real candidate the pipeline judged not-promotable, where a different vendor lane might do better.
+   * It is false for governance refusals, an unverifiable target, an injection block, an operator
+   * interrupt, or an unlandable promote conflict — a peer vendor cannot fix any of those, so the peer
+   * must NOT run. A thrown/transient infrastructure error never reaches here (it produces no result).
+   */
+  readonly nonPromotion?: {
+    readonly class: NonPromotionClass;
+    /** True ⇒ a peer vendor-lane attempt is warranted; false ⇒ a peer would be wasted/wrong. */
+    readonly duelEligible: boolean;
+  };
 }
+
+/**
+ * The classes of non-promoting terminal. Only `candidate-rejected` warrants a peer vendor lane; every
+ * other class is a refusal a different vendor cannot repair (governance, structural, security, or
+ * environmental) and must NOT silently escalate into a duel (Phase 2, requirement 7/9/10).
+ */
+export type NonPromotionClass =
+  | "candidate-rejected" // a real candidate ran the pipeline and was judged not-promotable (duel-eligible)
+  | "governance-refused" // gate-wall/approval/tier/drift/dirty-repo refusal (operator/policy decision)
+  | "unverifiable" // no derivable checks — a stronger/other model cannot make a verifier appear
+  | "injection-blocked" // the neutralization chokepoint blocked promotion (security gate)
+  | "interrupted" // a kill/budget interrupt halted the run
+  | "candidate-conflict" // verified work could not land due to a reconcilable merge conflict
+  | "semantic-indeterminate"; // the critic could not render a concrete verdict (indeterminate/infra) — a peer vendor cannot fix that (Phase 4)
 
 /**
  * The engine seams a role builds against. The orchestrator supplies these; roles
@@ -427,8 +507,12 @@ export interface WorkerResult {
  * physically has it and cannot design it out.
  */
 export interface RoleEngine {
-  /** Invoke a model (caching/egress are transparent below this call). */
-  readonly invokeModel: (request: ModelRequest) => Promise<ModelResponse>;
+  /**
+   * Invoke a model (caching/egress are transparent below this call). The optional `meta` lets a role tag a
+   * DISTINCT sub-invocation (Phase 11C) — e.g. the critic's structured-output recovery — so the invocation
+   * ledger records it under its own stage and its receipt can reference the exact invocation record.
+   */
+  readonly invokeModel: (request: ModelRequest, meta?: { readonly stage?: string; readonly retryKind?: string }) => Promise<ModelResponse>;
   /** #8: neutralize untrusted content (MCP results, tool output) before the model loop. */
   readonly neutralizeUntrusted: (content: string, context: UntrustedContext) => NeutralizedContent;
 }
@@ -451,6 +535,19 @@ export interface RoleContext {
   readonly priorResults: readonly RoleResult[];
   /** The engine seams (model + mandatory neutralization). */
   readonly engine: RoleEngine;
+  /**
+   * Bounded, provenance-bearing runtime-truth evidence for THIS role (Phase 5). Externally-grounded,
+   * scope-checked facts about the current build state — injected into the role's model context as
+   * untrusted DATA. Absent/empty ⇒ the role runs unchanged (evidence is advisory). Populated by the
+   * orchestrator from the production runtime-truth reader; already filtered to this task/candidate/tree.
+   */
+  readonly runtimeEvidence?: readonly import("../runtime-truth/index.js").RuntimeEvidence[];
+  /**
+   * Phase 13 (IKBI-REAUDIT2-001): a cooperative cancellation signal aborted when this role exceeds its
+   * wall-clock timeout. A role's tool loop / provider call MAY honor it to stop mutating early; ignoring it
+   * is safe (the orchestrator's non-cooperative mutation fence still blocks promotion of timed-out work).
+   */
+  readonly signal?: AbortSignal;
 }
 
 /** A role: a typed function the orchestrator dispatches. */

@@ -71,3 +71,96 @@ node scripts/proving-ground/runner.mjs --plan burnin --shared-trust
   Godot verifier) — that is correct fail-closed behavior, classified `SAFE_FAIL`, not an ikbi bug.
 - `real_project` scenarios are **read-only** (`audit` / `review` / `detect`) so the proving ground
   never promotes into a real repo.
+
+## Runtime-reachability self-coverage (anti-phantom audit)
+
+`reachability.mjs` answers a different question than the gauntlet: **which declared engine
+modules actually EXECUTE in a live flow, and which are phantoms** — declared/tested but never
+run. Unit tests prove a module works in isolation; code audits review files that exist; neither
+proves a module is reached. Grep is worse — it gave false confidence three separate times in the
+audit that motivated this (it missed relative barrel imports and mislabeled live modules).
+
+The ground-truth signal here is **V8 code coverage per surface, minus a construction floor**
+(the CLI loaded doing nothing). What executes ABOVE the floor is genuine operation, not
+import-time singleton construction. Coverage catches what receipts miss — e.g. `drift.check()`
+runs on every build but writes no receipt, so a receipt-only audit wrongly called it dead.
+
+```bash
+pnpm build                                        # coverage maps dist/ → src/modules
+node scripts/proving-ground/reachability.mjs all  # exercises 30 surfaces under coverage (spends model tokens on build/fix/batch/…)
+node scripts/proving-ground/reach-report.mjs --check   # classify + write REACHABILITY-REPORT.md; exit 1 on any true orphan
+# cheaper subsets:
+node scripts/proving-ground/reachability.mjs free   # no-model diagnostics only
+node scripts/proving-ground/reachability.mjs extra  # the per-command surfaces (mostly free)
+```
+
+Surfaces run against `dist/` (not tsx) so coverage URLs map 1:1 to `src/modules/<X>`. The
+server surface uses an in-process `buildServer()` + `app.inject()` probe (`server-probe.mjs`)
+to reach the HTTP route handlers the CLI can't touch — it imports the module barrel first,
+exactly as `ikbi serve` does, or the routes 404. Modules are classified LIVE-BUILD /
+LIVE-COGNITION / LIVE-COMMAND / DIAGNOSTIC-ONLY (reached at runtime) or, for the not-reached,
+CONDITIONAL (a live importer whose trigger wasn't exercised) / DORMANT-LABELED (`@status`) /
+TRUE-ORPHAN (wired nowhere). See `REACHABILITY-REPORT.md` for the current snapshot.
+
+**The cheap floor** — `src/modules/reachability-guard.test.ts` runs on every `pnpm test`: every
+module dir must have a non-test importer OR an `@status dormant/library-only` label. It cannot
+prove execution (that's the harness above) but it fails the instant a new declared-but-unwired
+module appears — so a phantom can never slip in silently again.
+
+## Dimensions of runtime truth (beyond reachability)
+
+Reachability is only the first of four questions you can ask about a module at runtime. Each is a
+deeper cut at "does this code EARN its place?":
+
+1. **Reachability** — *was it executed?* `cov-analyze.mjs` + `reach-report.mjs` (V8 coverage minus
+   a construction floor). **[DONE]**
+2. **Frequency** — *how OFTEN / how BROADLY is it used?* `frequency.mjs` aggregates the per-surface
+   operational matrix (`results.json`) into a breadth band per module — ubiquitous / common /
+   narrow / single / unused — plus op-fn intensity (max/avg). A `single`/`unused` module is the
+   first hint a module may not earn its place. PURE over `results.json` (no re-run); unit-tested by
+   `frequency.test.mjs`. Run: `node scripts/proving-ground/frequency.mjs` (reads the last
+   reachability `results.json`, writes `FREQUENCY-REPORT.md`). **[DONE]**
+3. **Influence** — *did its output change a DECISION?* (did a module's result flip a branch / gate /
+   route). `influence.mjs` reads the decision-bearing **receipt stream** (the outcome reachability
+   discards) and, per a decision catalog (gate `allow`, govexec `rejected`, promote, trust
+   `transition`, verifier `failure`, drift block), attributes each decision to its owning module and
+   measures how often that module's output took the flow OFF the default path — banding it
+   pivotal / active / passive / latent. `passive` (authority that never bit) and `latent` are the
+   ablation entry points for dimension 4. PURE over parsed receipts; unit-tested by
+   `influence.test.mjs`. Run: `node scripts/proving-ground/influence.mjs [receipts.ndjson]` (defaults
+   to `$IKBI_STATE_ROOT/receipts/receipts.ndjson`, writes `INFLUENCE-REPORT.md`). First real finding:
+   across every corpus **gate-wall is `passive` (0 denials of 11k+ evaluations)** — command
+   interdiction lives downstream in `governed-exec` (allowlist/policy/sandbox `rejected`), and
+   gate-wall ran in bypass. **[DONE]**
+4. **Value / ablation** — *would the outcome change if it didn't exist?* Run with the module
+   stubbed, diff promote/verdict/quality. Two subjects done:
+   - `ablate-drift.mjs` + `ABLATION-DRIFT.md` — drift-prevention (finding: structurally inert until
+     the first-class-governor rework — now partially addressed by the build-path drift governor).
+   - `ablate-gate-wall.mjs` + `ABLATION-GATE-WALL.md` — gate-wall, aimed by influence's `passive`
+     verdict. gate-wall's decision is a PURE function of the grant, so the counterfactual is
+     DETERMINISTIC + FREE (no model calls). PART A: over the receipt corpus gate-wall denied 0 of
+     2,155 evaluations (100% bypass-driven) ⇒ **realized value zero** (allow-constant == ablated).
+     PART B (real gate ON vs allow-all OFF): teeth in **3/7** scenarios — low-trust `requiresApproval`
+     grants, a narrow exec-policy set (`git push`), and package-script gating unless verifier-
+     authorized; NO teeth for dangerous commands (`rm -rf /`, `curl | bash`) — that interdiction is
+     governed-exec's job (scored `pivotal` by influence). Verdict: **not vestigial but narrow** —
+     zero value for a single trusted operator in bypass, real value for delegated/untrusted use.
+     PART A is PURE + unit-tested by `ablate-gate-wall.test.mjs`.
+   **[DONE for drift + gate-wall]**
+
+This completes the four-dimension arc for the two modules influence flagged: reachability→frequency
+prove PRESENCE, influence scores STEERING, and ablation quantifies VALUE. The pattern is reusable —
+point `influence.mjs` at a corpus, take its `passive`/`latent` modules, and ablate each one.
+
+**Non-bypassed influence proof:** `gate-influence-proof.mjs` answers "is `passive` a real verdict or a
+blind spot?" — it drives the REAL gate-wall with `bypass=false` over a mixed-trust workload (untrusted
+delegate + policy-denied operator actions), captures the authentic `gate.evaluate` receipts, and runs
+`computeInfluence` on them: gate-wall scores **pivotal** (21 denials of 59). So `passive` on the
+bypassed corpora is accurate, not a measurement gap. Deterministic + free; unit-tested against the real
+compiled gate (`gate-influence-proof.test.mjs`, 8 cases). → `GATE-INFLUENCE-PROOF.md`.
+
+**Roll-up:** `runtime-truth.mjs` composes the two receipt-based dimensions (influence + gate-wall
+value) over a single `receipts.ndjson` into one presence→steering→value table + a one-line verdict,
+so a fresh `ikbi build` can be graded end-to-end in one command:
+`node scripts/proving-ground/runtime-truth.mjs <state/receipts/receipts.ndjson>` → `RUNTIME-TRUTH.md`.
+Unit-tested by `runtime-truth.test.mjs` (composition is pure; the CLI injects the real dist gate).

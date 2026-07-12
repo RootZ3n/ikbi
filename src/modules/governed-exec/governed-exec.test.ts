@@ -172,7 +172,7 @@ test("package-manager scripts are allowed for verifier/check purposes", async ()
   const gate = capturingGate();
   const ge = createGovernedExec({ config: cfg(["pnpm"]), gateWall: gate.gateWall, execFile: ex.fn, receipts: fakeReceipts().receipts, publish: () => {} });
 
-  const r = await ge.run({ parentCtx: makeCtx("verified"), command: "pnpm", args: ["test"], purpose: "verifier check: test" });
+  const r = await ge.run({ parentCtx: makeCtx("verified"), command: "pnpm", args: ["test"], verifier: true, purpose: "verifier check: test" });
   assert.equal(r.executed, true);
   assert.equal(ex.calls.length, 1);
   assert.equal(gate.inputs.length, 1);
@@ -185,7 +185,7 @@ test("sudo on an allowlisted binary at a requiresApproval tier is DENIED by the 
   const gate = capturingGate();
   const ge = createGovernedExec({ config: cfg(["git"]), gateWall: gate.gateWall, execFile: ex.fn, receipts: fakeReceipts().receipts, publish: () => {} });
 
-  const r = await ge.run({ parentCtx: makeCtx("probation"), command: "git", args: ["pull"], sudo: true });
+  const r = await ge.run({ parentCtx: makeCtx("probation"), command: "git", args: ["status"], sudo: true });
   assert.equal(r.denied, true, "probation + sudo → gate-wall denies");
   assert.equal(ex.calls.length, 0, "nothing ran");
   assert.equal(gate.inputs.length, 1, "the gate was consulted");
@@ -199,7 +199,7 @@ test("sudo at a non-approval tier is allowed by the gate and executes (still gat
   const gate = capturingGate();
   const ge = createGovernedExec({ config: cfg(["git"]), gateWall: gate.gateWall, execFile: ex.fn, receipts: fakeReceipts().receipts, publish: () => {} });
 
-  const r = await ge.run({ parentCtx: makeCtx("verified"), command: "git", args: ["pull"], sudo: true });
+  const r = await ge.run({ parentCtx: makeCtx("verified"), command: "git", args: ["status"], sudo: true });
   assert.equal(r.executed, true);
   assert.equal(gate.inputs.length, 1, "sudo still went through the gate");
   const action = gate.inputs[0]?.action;
@@ -249,7 +249,17 @@ test("exec children receive a scrubbed env allowlist only", async () => {
     const ex = fakeExecFile();
     const ge = createGovernedExec({ config: cfg(["echo"]), gateWall: capturingGate().gateWall, execFile: ex.fn, receipts: fakeReceipts().receipts, publish: () => {} });
     await ge.run({ parentCtx: makeCtx("verified"), command: "echo", args: ["hi"] });
-    assert.deepEqual(ex.calls[0]?.opts.env, { PATH: "/usr/bin", HOME: "/home/test", LANG: "C.UTF-8" });
+    const childEnv = (ex.calls[0]?.opts.env ?? {}) as NodeJS.ProcessEnv;
+    // The allowlisted host vars pass through; the process SECRET does NOT leak (the security property).
+    assert.equal(childEnv.PATH, "/usr/bin");
+    assert.equal(childEnv.HOME, "/home/test");
+    assert.equal(childEnv.LANG, "C.UTF-8");
+    assert.equal(childEnv.IKBI_SECRET_TEST_VALUE, undefined, "process secrets must not leak into the child env");
+    // Git hardening is injected for EVERY governed command (harmless to non-git): repo hooks disabled,
+    // system git config ignored. (Constant flags, not host secrets.)
+    assert.equal(childEnv.GIT_CONFIG_NOSYSTEM, "1");
+    assert.equal(childEnv.GIT_CONFIG_KEY_0, "core.hooksPath");
+    assert.equal(childEnv.GIT_CONFIG_VALUE_0, "/dev/null");
   } finally {
     if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
     if (oldHome === undefined) delete process.env.HOME; else process.env.HOME = oldHome;
@@ -258,17 +268,41 @@ test("exec children receive a scrubbed env allowlist only", async () => {
   }
 });
 
+test("F2: a risky command under sandbox mode=off runs but is LOUDLY receipted (never a silent skip)", async () => {
+  const ex = fakeExecFile();
+  const rc = fakeReceipts();
+  // cfg() sets sandbox.mode "off"; python3 is a risky interpreter (does its own filesystem syscalls).
+  const ge = createGovernedExec({ config: cfg(["python3"]), gateWall: capturingGate().gateWall, execFile: ex.fn, receipts: rc.receipts, publish: () => {} });
+  const r = await ge.run({ parentCtx: makeCtx("verified"), command: "python3", args: ["script.py"] });
+  assert.equal(r.executed, true, "mode=off still runs the command (unsandboxed)");
+  // The unsandboxed run is recorded loudly — 'off' cannot masquerade as safe in the audit trail.
+  const loud = rc.calls.some((c) => /SANDBOX OFF/.test((c.input.outcome as { detail?: string }).detail ?? ""));
+  assert.ok(loud, "a loud 'SANDBOX OFF' receipt is written for the risky unsandboxed command");
+});
+
 test("operator-allowed interpreters still reject direct code-eval flags", async () => {
   const ex = fakeExecFile();
-  const ge = createGovernedExec({ config: cfg(["node", "npm", "pnpm"]), gateWall: capturingGate().gateWall, execFile: ex.fn, receipts: fakeReceipts().receipts, publish: () => {} });
+  const ge = createGovernedExec({ config: cfg(["node", "npm", "pnpm", "python3", "ruby", "perl", "php"]), gateWall: capturingGate().gateWall, execFile: ex.fn, receipts: fakeReceipts().receipts, publish: () => {} });
   for (const [command, args] of [
     ["node", ["-e", "process.env"]],
     ["node", ["-p", "1+1"]],
+    // Codex C4: python3 -c is the reachable vector (python3 is on the default allowlist for pytest).
+    ["python3", ["-c", "open('/root/.ssh/id_rsa').read()"]],
+    ["ruby", ["-e", "puts 1"]],
+    ["perl", ["-e", "print 1"]],
+    ["php", ["-r", "echo 1;"]],
   ] as const) {
     const r = await ge.run({ parentCtx: makeCtx("verified"), command, args });
     assert.equal(r.denied, true, `${command} ${args.join(" ")} should be denied`);
   }
   assert.equal(ex.calls.length, 0);
+});
+
+test("python3 -m <module> (e.g. pytest) is NOT an eval flag — stays allowed", async () => {
+  const ex = fakeExecFile();
+  const ge = createGovernedExec({ config: cfg(["python3"]), gateWall: capturingGate().gateWall, execFile: ex.fn, receipts: fakeReceipts().receipts, publish: () => {} });
+  const r = await ge.run({ parentCtx: makeCtx("verified"), command: "python3", args: ["-m", "pytest", "-q"] });
+  assert.notEqual(r.denied, true, "python3 -m pytest must not be denied as inline-eval");
 });
 
 // ── curl / HTTP through the egress guard ─────────────────────────────────────
@@ -358,7 +392,7 @@ test("an executed command writes an attributed exec receipt with argCount+sudo+e
   const rc = fakeReceipts();
   const ge = createGovernedExec({ config: cfg(["git"]), gateWall: capturingGate().gateWall, execFile: ex.fn, receipts: rc.receipts, publish: () => {} });
 
-  await ge.run({ parentCtx: makeCtx("verified"), command: "git", args: ["commit", "-m", "SUPERSECRET-VALUE"] });
+  await ge.run({ parentCtx: makeCtx("verified"), command: "git", args: ["log", "--grep", "SUPERSECRET-VALUE"] });
   const last = rc.calls.at(-1)!;
   assert.equal(last.input.metadata?.action, "exec");
   assert.equal(last.input.metadata?.argCount, 3);
@@ -372,7 +406,7 @@ test("events never carry the full args", async () => {
   const ev = captureEvents();
   const ge = createGovernedExec({ config: cfg(["git"]), gateWall: capturingGate().gateWall, execFile: fakeExecFile().fn, receipts: fakeReceipts().receipts, publish: ev.publish });
 
-  await ge.run({ parentCtx: makeCtx("verified"), command: "git", args: ["commit", "-m", "SUPERSECRET-VALUE"] });
+  await ge.run({ parentCtx: makeCtx("verified"), command: "git", args: ["log", "--grep", "SUPERSECRET-VALUE"] });
   for (const e of ev.sent) assert.equal(e.source, "governed-exec");
   assert.ok(ev.types().includes("govexec.executed"));
   assert.ok(!JSON.stringify(ev.sent).includes("SUPERSECRET-VALUE"), "full args are NOT logged in events");

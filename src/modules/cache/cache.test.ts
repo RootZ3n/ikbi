@@ -33,8 +33,8 @@ function resp(content = "hi"): ModelResponse {
   };
 }
 
-const ON: CacheConfig = { enabled: true, ttlMs: 1000 };
-const OFF: CacheConfig = { enabled: false, ttlMs: 1000 };
+const ON: CacheConfig = { enabled: true, ttlMs: 1000, maxEntries: 1000 };
+const OFF: CacheConfig = { enabled: false, ttlMs: 1000, maxEntries: 1000 };
 
 /** A `next` that returns a fixed response and counts its calls. */
 function countingNext(r: ModelResponse = resp()) {
@@ -63,6 +63,18 @@ test("cacheKey changes when keyed content changes", () => {
     cacheKey(req({ tools: [{ name: "f", description: "d", parameters: {} }] })),
     "tools-presence",
   );
+});
+
+test("H7: cacheKey keys on the FULL tool DEFINITIONS, not just presence (no cross-toolset poisoning)", () => {
+  const toolsA = [{ name: "search", description: "search the web", parameters: { type: "object" } }];
+  const toolsB = [{ name: "search", description: "search the FILESYSTEM", parameters: { type: "object" } }]; // same name, diff desc
+  const toolsC = [{ name: "search", description: "search the web", parameters: { type: "object", required: ["q"] } }]; // diff schema
+  const toolsD = [{ name: "other", description: "search the web", parameters: { type: "object" } }]; // diff name
+  const kA = cacheKey(req({ tools: toolsA }));
+  assert.notEqual(kA, cacheKey(req({ tools: toolsB })), "different tool description ⇒ different key");
+  assert.notEqual(kA, cacheKey(req({ tools: toolsC })), "different parameter schema ⇒ different key");
+  assert.notEqual(kA, cacheKey(req({ tools: toolsD })), "different tool name ⇒ different key");
+  assert.equal(kA, cacheKey(req({ tools: [...toolsA] })), "identical tool defs ⇒ same key");
 });
 
 test("the prompt form and the equivalent messages form key the same", () => {
@@ -126,7 +138,7 @@ test("a failing invocation is NOT stored (errors / denials never cached)", async
 
 test("an entry expires after the TTL and triggers a re-fetch", async () => {
   let clock = 1000;
-  const cache = createModelCache({ config: { enabled: true, ttlMs: 500 }, now: () => clock });
+  const cache = createModelCache({ config: { enabled: true, ttlMs: 500, maxEntries: 1000 }, now: () => clock });
 
   const first = countingNext(resp("v1"));
   await cache.wrap(req(), first.next); // stored, expiresAt = 1500
@@ -182,4 +194,51 @@ test("M1: a text-only `parts` array does not change the key (equivalent to plain
   const plain = cacheKey(req({ messages: [{ role: "user", content: "hi" }] }));
   const textParts = cacheKey(req({ messages: [{ role: "user", content: "hi", parts: [{ type: "text", text: "hi" }] }] }));
   assert.equal(plain, textParts, "text-only parts carry no image content → no key change");
+});
+
+// --- H7: size bound (LRU) + stampede guard ----------------------------------
+
+test("H7: the store is bounded — LRU eviction past maxEntries", async () => {
+  const cache = createModelCache({ config: { enabled: true, ttlMs: 10_000, maxEntries: 3 }, now: () => 1000 });
+  const mkReq = (n: number) => req({ messages: [{ role: "user", content: `msg-${n}` }] });
+  // Fill to the cap: msg-0,1,2.
+  for (const n of [0, 1, 2]) await cache.wrap(mkReq(n), countingNext(resp(`r${n}`)).next);
+  assert.equal(cache.size(), 3, "at the cap");
+  // Touch msg-0 (LRU refresh) so it is now most-recently-used.
+  assert.notEqual(cache.lookup(cacheKey(mkReq(0))), undefined, "msg-0 is a hit");
+  // Insert msg-3 ⇒ over cap ⇒ evict the LRU, which is now msg-1 (msg-0 was refreshed).
+  await cache.wrap(mkReq(3), countingNext(resp("r3")).next);
+  assert.equal(cache.size(), 3, "still bounded");
+  assert.notEqual(cache.lookup(cacheKey(mkReq(0))), undefined, "msg-0 survived (recently used)");
+  assert.equal(cache.lookup(cacheKey(mkReq(1))), undefined, "msg-1 evicted (least recently used)");
+  assert.notEqual(cache.lookup(cacheKey(mkReq(3))), undefined, "msg-3 present");
+});
+
+test("H7: concurrent identical misses COALESCE onto one model call (stampede guard)", async () => {
+  const cache = createModelCache({ config: ON, now: () => 1000 });
+  let calls = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  const slowNext = async (): Promise<ModelResponse> => { calls += 1; await gate; return resp("shared"); };
+  // Fire 5 identical requests concurrently BEFORE the single in-flight call resolves.
+  const all = Promise.all(Array.from({ length: 5 }, () => cache.wrap(req(), slowNext)));
+  release();
+  const results = await all;
+  assert.equal(calls, 1, "only ONE model call for 5 concurrent identical misses");
+  for (const r of results) assert.equal(r.content, "shared", "every waiter got the shared response");
+  // After settling, the result is cached (a subsequent call is a hit, no new call).
+  await cache.wrap(req(), slowNext);
+  assert.equal(calls, 1, "the settled result was stored — the follow-up is a hit");
+});
+
+test("H7: a failed in-flight call does not wedge the key and stores nothing (store-on-success held)", async () => {
+  const cache = createModelCache({ config: ON, now: () => 1000 });
+  let calls = 0;
+  const failing = async (): Promise<ModelResponse> => { calls += 1; throw new Error("provider down"); };
+  await assert.rejects(() => cache.wrap(req(), failing), /provider down/);
+  assert.equal(cache.size(), 0, "nothing stored on failure");
+  // The key is not wedged: a fresh call proceeds (the inflight entry was cleared in finally).
+  await cache.wrap(req(), countingNext(resp("ok")).next);
+  assert.notEqual(cache.lookup(cacheKey(req())), undefined, "a later success stores normally");
+  assert.equal(calls, 1, "the failed call did not leave a live in-flight entry");
 });

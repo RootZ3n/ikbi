@@ -27,6 +27,14 @@
 
 import type { FastifyInstance } from "fastify";
 
+import { apiAuth } from "./auth.js";
+
+/**
+ * Modules that install their OWN authentication (a distinct credential/scope) and must
+ * NOT also receive the shared bearer gate. `chat` enforces IKBI_CHAT_TOKEN via chatAuth.
+ */
+const SELF_AUTHED_MODULES: ReadonlySet<string> = new Set(["chat"]);
+
 /** A module's route registrar: receives an (encapsulated) Fastify instance to add routes to. */
 export type RouteRegistrar = (app: FastifyInstance) => void | Promise<void>;
 
@@ -76,7 +84,17 @@ class RouteRegistry {
       // prefix). `instance` is the same concrete Fastify type as `app`; modules
       // type their registrar against the standard `FastifyInstance`, so narrow it.
       app.register(async (instance) => {
-        await entry.register(instance as unknown as FastifyInstance);
+        const scoped = instance as unknown as FastifyInstance;
+        // GLOBAL AUTH MOUNT (Codex C6): install the shared bearer gate on EVERY module's
+        // encapsulation BEFORE its routes exist, so no module can be reached unauthenticated
+        // by forgetting to add its own hook (correction-approve, job-card run, spec exec, fs
+        // scans were all open). Idempotent — composes with modules that also add apiAuth.
+        // Skipped only for self-authed modules (chat → IKBI_CHAT_TOKEN). Public root routes
+        // (/health…) and the static UI live on the root app, outside this seam, so they stay open.
+        if (!SELF_AUTHED_MODULES.has(entry.module)) {
+          scoped.addHook("preHandler", apiAuth);
+        }
+        await entry.register(scoped);
       });
     }
   }

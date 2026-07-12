@@ -13,16 +13,25 @@
  * receives the full proposal at approve-time, so it can dispatch by surface type.
  */
 
-import { writeFileSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { writeFileSync, mkdirSync, readFileSync, renameSync } from "node:fs";
+import { dirname, basename, join } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
 import type { MemoryProposal } from "./contract.js";
 import type { GbrainBridge } from "../../core/gbrain-bridge.js";
 
+function sha256(s: string): string {
+  return createHash("sha256").update(s, "utf8").digest("hex");
+}
+
 /**
- * Apply function for FILE surfaces. Writes `proposal.content` to `proposal.target`
- * (which must be an absolute path by the time a proposal is approved).
+ * Apply function for FILE surfaces. Writes `proposal.content` — the COMPLETE resulting
+ * file (patch/multi_edit were resolved to whole-file content at propose-time) — to
+ * `proposal.target` (which must be absolute by approve-time).
  *
- * Creates parent directories if needed. Throws on write failure.
+ * COMPARE-AND-SWAP (Codex C8): if the proposal carries a `baseSha256`, the target's
+ * CURRENT content must still hash to it. If the file changed since the proposal was
+ * made, apply FAILS CLOSED rather than overwriting the newer content. The write itself
+ * is atomic (temp file + rename) so a crash can never leave a truncated target.
  */
 export async function applyFileProposal(proposal: MemoryProposal): Promise<void> {
   const target = proposal.target;
@@ -32,8 +41,22 @@ export async function applyFileProposal(proposal: MemoryProposal): Promise<void>
   if (!target.startsWith("/")) {
     throw new Error(`memory-governor apply: file target "${target}" is not absolute — cannot apply safely`);
   }
+  if (proposal.baseSha256 !== undefined) {
+    let current = "";
+    try { current = readFileSync(target, "utf8"); } catch { current = ""; }
+    const currentHash = sha256(current);
+    if (currentHash !== proposal.baseSha256) {
+      throw new Error(
+        `memory-governor apply: target "${target}" changed since the proposal was made ` +
+          `(expected base ${proposal.baseSha256.slice(0, 12)}, found ${currentHash.slice(0, 12)}) — refusing to overwrite. Re-propose against the current file.`,
+      );
+    }
+  }
   mkdirSync(dirname(target), { recursive: true });
-  writeFileSync(target, proposal.content, "utf8");
+  // Atomic replace: write a sibling temp then rename over the target.
+  const tmp = join(dirname(target), `.${basename(target)}.tmp.${randomUUID()}`);
+  writeFileSync(tmp, proposal.content, "utf8");
+  renameSync(tmp, target);
 }
 
 /**

@@ -68,6 +68,53 @@ test("diff falls back to the WORKING-TREE diff for uncommitted retained work (no
   }
 });
 
+test("H3: discard rehydrates the git targets from the DURABLE record — a STALE handle cannot misdirect the teardown", async () => {
+  const repo = await makeRepo();
+  const { mgr, root } = makeManager();
+  try {
+    const ws = await mgr.allocate({ targetRepo: repo, identity: ID });
+    await writeFile(join(ws.path, "work.txt"), "real work\n");
+
+    // A BYSTANDER scratch branch that a stale/wrong handle would wrongly name as the teardown target.
+    const victimBranch = "ikbi/ws/bystander-should-survive";
+    await runGit(repo, ["branch", victimBranch]);
+
+    // A caller passes a handle with the CORRECT opaque id but WRONG git fields (points the destructive
+    // op at the bystander branch + a bogus path). Only the durable record must drive the teardown.
+    const staleHandle = { ...ws, scratchBranch: victimBranch, path: join(root, "nonexistent-stale-path") };
+    const r = await mgr.discard(staleHandle);
+    assert.equal(r.removed, true);
+
+    // The REAL scratch branch (from the record) was deleted; the bystander the stale handle named survives.
+    const branches = (await runGit(repo, ["branch", "--list"])).stdout;
+    assert.ok(!branches.includes(ws.scratchBranch), "the record's real scratch branch was torn down");
+    assert.ok(branches.includes(victimBranch), "the bystander branch the stale handle named was NOT touched");
+    // The real worktree dir is gone (rehydrated path), and the durable record is now discarded.
+    assert.equal(await exists(ws.path), false, "the record's real worktree dir was removed");
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
+test("C-3: diff() reveals an UNCOMMITTED runner rewrite even when a committed base..scratch range exists (integrity)", async () => {
+  const repo = await makeRepo();
+  const { mgr, root } = makeManager();
+  try {
+    const ws = await mgr.allocate({ targetRepo: repo, identity: ID });
+    // Step 1 of an accumulated build: write + COMMIT a real test runner (base..scratch now non-empty).
+    await writeFile(join(ws.path, "run-tests.sh"), "#!/bin/sh\nnode --test\n");
+    assert.equal(await mgr.commit(ws, "add test runner"), true);
+    // Step 2: rewrite the runner UNCOMMITTED to fake a green tally + exit 0 — the shell-out tamper a
+    // committed-range-only diff would MISS (→ false GREEN). The verifier's integrity check reads diff().
+    await writeFile(join(ws.path, "run-tests.sh"), "#!/bin/sh\necho '# tests 5'\necho '# pass 5'\nexit 0\n");
+    const d = await mgr.diff(ws);
+    assert.ok(d.includes("run-tests.sh"), "the runner appears in the diff");
+    assert.ok(d.includes("exit 0") && d.includes("# pass 5"), "the UNCOMMITTED tamper is visible (not just the committed content)");
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
 test("cleanOrphans({force:false}) PRESERVES retained work; {force:true} sweeps it", async () => {
   const repo = await makeRepo();
   const { mgr, root } = makeManager();

@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, realpathSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -84,6 +84,76 @@ test("resolveChecks: a Python repo with pytest config gets pytest checks", () =>
     assert.ok(r.checks[0]?.args.includes("pytest"), "runs pytest");
     assert.ok(!r.checks.some((c) => c.command === "pnpm"), "no pnpm against Python");
   }
+});
+
+test("resolveChecks: a stdlib Python repo (test*.py, no pytest) gets NATIVE unittest checks", () => {
+  const wt = repo("py-unittest");
+  writeFileSync(join(wt, "rpn.py"), "def evaluate(e):\n    return 0\n");
+  writeFileSync(join(wt, "test_rpn.py"), "import unittest\nclass T(unittest.TestCase):\n    def test_x(self): self.assertEqual(1, 1)\n");
+  const r = resolveChecks(wt, NOENV);
+  assert.ok(r.ok, "stdlib unittest project resolves (does not fail closed)");
+  if (r.ok) {
+    assert.equal(r.checks[0]?.command, "python3");
+    assert.ok(r.checks[0]?.args.includes("unittest"), "runs unittest, not pytest");
+    assert.ok(!r.checks.some((c) => c.args.includes("pytest")), "no pytest (needs pip/network)");
+  }
+});
+
+test("resolveChecks: unittest is detected in a tests/ subdir too", () => {
+  const wt = repo("py-unittest-dir");
+  writeFileSync(join(wt, "app.py"), "x = 1\n");
+  mkdirSync(join(wt, "tests"));
+  writeFileSync(join(wt, "tests", "test_app.py"), "import unittest\nclass T(unittest.TestCase):\n    def test_x(self): pass\n");
+  const r = resolveChecks(wt, NOENV);
+  assert.ok(r.ok && r.checks.some((c) => c.args.includes("unittest")));
+});
+
+test("resolveChecks: a Maven repo (pom.xml) gets NATIVE `mvn test` checks (not -q, so Surefire summary shows)", () => {
+  const wt = repo("maven");
+  writeFileSync(join(wt, "pom.xml"), "<project><modelVersion>4.0.0</modelVersion></project>");
+  const r = resolveChecks(wt, NOENV);
+  assert.ok(r.ok);
+  if (r.ok) {
+    assert.equal(r.checks[0]?.command, "mvn");
+    assert.deepEqual(r.checks[0]?.args, ["test"]);
+    assert.ok(!r.checks.some((c) => c.args.includes("-q")), "must not use -q (hides the Tests run: summary)");
+  }
+});
+
+test("resolveChecks: a Gradle repo (build.gradle) gets `gradle test` with --rerun-tasks + the shipped init script", () => {
+  const wt = repo("gradle");
+  writeFileSync(join(wt, "build.gradle"), "plugins { id 'java' }");
+  writeFileSync(join(wt, "settings.gradle"), "rootProject.name='x'");
+  const r = resolveChecks(wt, NOENV);
+  assert.ok(r.ok);
+  if (r.ok) {
+    const c = r.checks[0]!;
+    assert.equal(c.command, "gradle");
+    assert.ok(c.args.includes("test") && c.args.includes("--rerun-tasks"), "forces a real re-run (defeats UP-TO-DATE)");
+    const idx = c.args.indexOf("--init-script");
+    assert.ok(idx >= 0, "applies the summary init script");
+    assert.ok(existsSync(c.args[idx + 1]!), "the shipped init script exists on disk");
+  }
+});
+
+test("resolveChecks: a .NET repo (*.csproj) gets NATIVE `dotnet test` checks", () => {
+  const wt = repo("dotnet-proj");
+  writeFileSync(join(wt, "Calc.csproj"), "<Project Sdk=\"Microsoft.NET.Sdk\"></Project>");
+  writeFileSync(join(wt, "CalcTests.cs"), "// tests");
+  const r = resolveChecks(wt, NOENV);
+  assert.ok(r.ok, "a .csproj project resolves (does not fail closed)");
+  if (r.ok) {
+    assert.equal(r.checks[0]?.command, "dotnet");
+    assert.ok(r.checks[0]?.args.includes("test"), "runs dotnet test");
+  }
+});
+
+test("resolveChecks: a .NET solution in a subdir is detected too (.sln one level down)", () => {
+  const wt = repo("dotnet-sln");
+  mkdirSync(join(wt, "src"));
+  writeFileSync(join(wt, "src", "App.sln"), "Microsoft Visual Studio Solution File");
+  const r = resolveChecks(wt, NOENV);
+  assert.ok(r.ok && r.checks.some((c) => c.command === "dotnet"));
 });
 
 test("resolveChecks: a Python repo with NO test runner FAILS CLOSED with guidance (not pnpm)", () => {

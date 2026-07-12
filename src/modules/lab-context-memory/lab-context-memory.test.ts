@@ -40,7 +40,7 @@ function identities() {
 }
 
 function cfg(over: Partial<LabContextMemoryConfig> = {}): LabContextMemoryConfig {
-  return { enabled: true, memoryDir: "/unused-in-fake-store", maxReceiptsPerProjection: 1000, maxValueBytes: 16_384, ...over };
+  return { enabled: true, memoryDir: "/unused-in-fake-store", storeScope: "test-scope", maxReceiptsPerProjection: 1000, maxValueBytes: 16_384, ...over };
 }
 
 /** An in-memory MemoryStore (the API proof; a real DocumentStore round-trip is tested separately). */
@@ -50,6 +50,7 @@ function memStore() {
     get: async (id) => m.get(id),
     put: async (id, v) => void m.set(id, v),
     list: async () => [...m.keys()],
+    update: async (id, mutate) => { const next = mutate(m.get(id)); m.set(id, next); return next; },
   };
   return { store, m };
 }
@@ -181,6 +182,105 @@ test("pattern projection aggregates success/failure per (agent, project, operati
   assert.equal(pattern?.value.successes, 2);
   assert.equal(pattern?.value.failures, 1);
   assert.equal(pattern?.value.lastOutcome, "success");
+  assert.equal(pattern?.value.lastSeq, 3, "high-water seq is recorded for incremental accumulation");
+});
+
+test("pattern projection ACCUMULATES across projections + is idempotent (durable baseline, not overwrite)", async () => {
+  const { ikbi } = identities();
+  const ms = memStore();
+  // Build 1: 5 successes (seq 1..5). Baseline established at 100%.
+  const list: Receipt[] = [1, 2, 3, 4, 5].map((seq) => receipt({ seq, operation: "build.run", outcome: { status: "success" } }));
+  const rc = fakeReceipts(list);
+  const mem = createLabMemory({ config: cfg(), store: ms.store, receipts: rc.receipts, publish: () => {}, now: () => 1000 });
+  await mem.projectFromReceipts({ identity: ikbi });
+  const p1 = [...ms.m.values()].find((e) => e.kind === "pattern" && e.key === "op-build.run");
+  assert.equal(p1?.value.total, 5);
+  assert.equal(p1?.value.successes, 5);
+
+  // Re-projecting the SAME receipts must NOT double-count (idempotent via lastSeq).
+  await mem.projectFromReceipts({ identity: ikbi });
+  const p1b = [...ms.m.values()].find((e) => e.kind === "pattern" && e.key === "op-build.run");
+  assert.equal(p1b?.value.total, 5, "same receipts re-projected → baseline unchanged");
+
+  // Build 2 appends 3 failures (seq 6..8). Baseline ACCUMULATES: 5 succ + 3 fail = 8 total.
+  list.push(...[6, 7, 8].map((seq) => receipt({ seq, operation: "build.run", outcome: { status: "failure" } })));
+  await mem.projectFromReceipts({ identity: ikbi });
+  const p2 = [...ms.m.values()].find((e) => e.kind === "pattern" && e.key === "op-build.run");
+  assert.equal(p2?.value.total, 8, "baseline accumulated across builds");
+  assert.equal(p2?.value.successes, 5);
+  assert.equal(p2?.value.failures, 3);
+  assert.equal(p2?.value.lastOutcome, "failure");
+  assert.equal(p2?.value.lastSeq, 8);
+});
+
+test("C1: two installs SHARING the lab-memory dir keep PER-STORE high-water marks — a second store's low seqs are NOT dropped", async () => {
+  const { ikbi } = identities();
+  const ms = memStore(); // ONE shared lab-memory dir, two installs projecting into it.
+  // Install A: its receipt store has seqs 1..5 (all success). Baseline established at 100%.
+  const memA = createLabMemory({ config: cfg({ storeScope: "install-A" }), store: ms.store, receipts: fakeReceipts([1, 2, 3, 4, 5].map((seq) => receipt({ seq, operation: "build.run", outcome: { status: "success" } }))).receipts, publish: () => {}, now: () => 1000 });
+  // Install B: an INDEPENDENT receipt store whose seqs restart at 1..3 (all failure). Under a single
+  // scalar high-water these low seqs (≤ A's mark of 5) would be silently dropped — the C1 bug.
+  const memB = createLabMemory({ config: cfg({ storeScope: "install-B" }), store: ms.store, receipts: fakeReceipts([1, 2, 3].map((seq) => receipt({ seq, operation: "build.run", outcome: { status: "failure" } }))).receipts, publish: () => {}, now: () => 1000 });
+
+  await memA.projectFromReceipts({ identity: ikbi });
+  const pA = [...ms.m.values()].find((e) => e.kind === "pattern" && e.key === "op-build.run");
+  assert.equal(pA?.value.total, 5, "install A's baseline");
+
+  await memB.projectFromReceipts({ identity: ikbi });
+  const p = [...ms.m.values()].find((e) => e.kind === "pattern" && e.key === "op-build.run");
+  assert.equal(p?.value.total, 8, "install B's low seqs accrued (NOT dropped) → 5 + 3 = 8");
+  assert.equal(p?.value.successes, 5);
+  assert.equal(p?.value.failures, 3);
+  const byStore = p?.value.lastSeqByStore as Record<string, number>;
+  assert.equal(byStore["install-A"], 5, "A's high-water tracked independently");
+  assert.equal(byStore["install-B"], 3, "B's high-water tracked independently");
+
+  // Idempotent per store: re-projecting B's same receipts adds nothing (its own mark now gates them).
+  await memB.projectFromReceipts({ identity: ikbi });
+  const p2 = [...ms.m.values()].find((e) => e.kind === "pattern" && e.key === "op-build.run");
+  assert.equal(p2?.value.total, 8, "re-projecting B is idempotent against B's own high-water");
+});
+
+test("M5: CONCURRENT projections into a shared pattern counter do not lose an increment (atomic RMW)", async () => {
+  // Two installs project into the SAME (agent, project, operation) pattern entry AT THE SAME TIME.
+  // The old get-then-merge-then-put would interleave and drop one install's increment; the atomic
+  // update() RMW re-derives the counts from the fresh entry under the lock, so BOTH accrue.
+  const { ikbi } = identities();
+  const ms = memStore();
+  const memA = createLabMemory({ config: cfg({ storeScope: "install-A" }), store: ms.store, receipts: fakeReceipts([1, 2, 3, 4, 5].map((seq) => receipt({ seq, operation: "build.run", outcome: { status: "success" } }))).receipts, publish: () => {}, now: () => 1000 });
+  const memB = createLabMemory({ config: cfg({ storeScope: "install-B" }), store: ms.store, receipts: fakeReceipts([1, 2, 3].map((seq) => receipt({ seq, operation: "build.run", outcome: { status: "failure" } }))).receipts, publish: () => {}, now: () => 1000 });
+
+  await Promise.all([memA.projectFromReceipts({ identity: ikbi }), memB.projectFromReceipts({ identity: ikbi })]);
+
+  const p = [...ms.m.values()].find((e) => e.kind === "pattern" && e.key === "op-build.run");
+  assert.equal(p?.value.total, 8, "BOTH installs' increments accrued (5 + 3) — no lost update");
+  assert.equal(p?.value.successes, 5);
+  assert.equal(p?.value.failures, 3);
+});
+
+test("C2: two long project paths sharing a 32-char slug prefix get DISTINCT baseline entries (no collision)", async () => {
+  const { ikbi } = identities();
+  const ms = memStore();
+  // A shared prefix well over the 32-char slug cap; the paths differ only in the SUFFIX.
+  const prefix = "/home/user/projects/really-long-shared-prefix-directory/";
+  const projA = `${prefix}alpha`;
+  const projB = `${prefix}beta`;
+  const rc = fakeReceipts([
+    receipt({ seq: 1, project: projA, operation: "build.run", outcome: { status: "success" } }),
+    receipt({ seq: 2, project: projB, operation: "build.run", outcome: { status: "failure" } }),
+  ]);
+  const mem = createLabMemory({ config: cfg(), store: ms.store, receipts: rc.receipts, publish: () => {}, now: () => 1000 });
+
+  await mem.projectFromReceipts({ identity: ikbi });
+
+  const patterns = [...ms.m.values()].filter((e) => e.kind === "pattern");
+  assert.equal(patterns.length, 2, "the two long paths did NOT collide into one shared baseline");
+  assert.equal(new Set(patterns.map((e) => e.id)).size, 2, "distinct ids (the hash suffix disambiguates the truncated slug prefix)");
+  // Fields (not the id) drive drift's reads — each path's baseline is intact and separately queryable.
+  const a = (await mem.byProject(projA)).find((e) => e.kind === "pattern");
+  const b = (await mem.byProject(projB)).find((e) => e.kind === "pattern");
+  assert.equal(a?.value.successes, 1, "alpha's baseline");
+  assert.equal(b?.value.failures, 1, "beta's baseline — not merged into alpha");
 });
 
 // ── query scoping ────────────────────────────────────────────────────────────
@@ -345,6 +445,7 @@ test("IKBI_LAB_CONTEXT_MEMORY_DIR override still wins (operator points at a shar
   const reader = {
     bool: (_s: string, fb: boolean) => fb,
     int: (_s: string, fb: number) => fb,
+    str: (_s: string, fb: string) => fb,
     path: (_s: string, _fb: string) => "/srv/lab/shared-memory",
   } as unknown as Parameters<typeof loadLabContextMemoryConfig>[0];
   const cfg = loadLabContextMemoryConfig(reader);

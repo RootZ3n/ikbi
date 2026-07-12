@@ -140,3 +140,31 @@ test("findCustomAgent: case-insensitive lookup", () => {
   assert.equal(findCustomAgent(repo, "reviewer")?.name, "Reviewer");
   assert.equal(findCustomAgent(repo, "nope"), undefined);
 });
+
+// ── BUILT-IN AGENTS (Pehlichi ships with ikbi; custom overrides by name) ──────────────────────────
+
+test("getBuiltinAgents ships Pehlichi with a system prompt, read-only tools, and a model", async () => {
+  const { getBuiltinAgents } = await import("./agent-directory.js");
+  const peh = getBuiltinAgents().find((a) => a.name.toLowerCase() === "pehlichi");
+  assert.ok(peh, "Pehlichi is a built-in");
+  assert.ok(peh.systemPrompt.length > 100, "has a real teaching system prompt");
+  assert.equal(peh.source, "builtin");
+  assert.ok((peh.allowedTools ?? []).includes("read_file") && !(peh.allowedTools ?? []).includes("write_file"), "read-only tools");
+  assert.ok((peh.modelPreference ?? "").length > 0, "runs on its own model");
+});
+
+test("loadAllAgents surfaces built-in Pehlichi with ZERO custom setup (no .ikbi/agents/)", async () => {
+  const { loadAllAgents, findCustomAgent } = await import("./agent-directory.js");
+  const empty = mkdtempSync(join(tmpdir(), "ikbi-noagents-"));
+  assert.ok(loadAllAgents(empty).agents.some((a) => a.name === "Pehlichi"), "Pehlichi available with no agents dir");
+  assert.ok(findCustomAgent(empty, "peh") === undefined || findCustomAgent(empty, "pehlichi")?.name === "Pehlichi");
+  assert.equal(findCustomAgent(empty, "PEHLICHI")?.name, "Pehlichi", "case-insensitive lookup finds the built-in");
+});
+
+test("a custom .ikbi/agents/ entry OVERRIDES a built-in of the same name", async () => {
+  const { loadAllAgents } = await import("./agent-directory.js");
+  const repo = repoWithAgents({ "pehlichi.yaml": "name: Pehlichi\nsystem_prompt: my own reskinned Peh\n" });
+  const peh = loadAllAgents(repo).agents.find((a) => a.name === "Pehlichi");
+  assert.equal(peh?.systemPrompt, "my own reskinned Peh", "custom wins over built-in");
+  assert.equal(peh?.source !== "builtin", true);
+});

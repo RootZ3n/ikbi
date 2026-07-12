@@ -12,7 +12,7 @@ import type { ReceiptInput } from "../../core/receipt/contract.js";
 import type { PromoteGovernance } from "../../core/workspace/contract.js";
 import type { WorkspaceHandle } from "../../core/workspace/contract.js";
 import { createGateWall, type GateWall, type GateWallEvaluateInput } from "../gate-wall/index.js";
-import { createDependencyInstall, type ExecFileFn, type ReadLockfileFn } from "./install.js";
+import { createDependencyInstall, registryHosts, validateLockfileTargets, type ExecFileFn, type ReadLockfileFn } from "./install.js";
 import type { DependencyInstallConfig } from "./config.js";
 import type { DepInstallEventPayload } from "./events.js";
 
@@ -302,4 +302,35 @@ test("an unsupported packageManager (caller bypassing the TS type) is denied, NO
   assert.equal(gate.inputs.length, 0, "the guard is before the gate — no gate call");
   assert.equal(ex.calls.length, 0, "no execFile");
   assert.equal(rc.calls.at(-1)?.input.outcome.status, "rejected", "a rejected receipt is written");
+});
+
+
+// ── C11: lockfile fetch-target validation ──────────────────────────────────────
+test("validateLockfileTargets rejects an off-registry tarball host", () => {
+  const hosts = registryHosts(["https://registry.npmjs.org/"]);
+  const lock = 'resolution: {tarball: https://evil.example/pkg/-/pkg-1.0.0.tgz}\n';
+  const r = validateLockfileTargets(lock, hosts, { allowVcsDeps: false });
+  assert.equal(r.ok, false);
+  assert.match(r.ok === false ? r.reason : "", /off-registry host "evil.example"/);
+});
+
+test("validateLockfileTargets allows registry-host URLs", () => {
+  const hosts = registryHosts(["https://registry.npmjs.org/"]);
+  const lock = "/-/pkg/1.0.0: {resolution: {integrity: sha512-x, tarball: https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz}}\n";
+  assert.deepEqual(validateLockfileTargets(lock, hosts, { allowVcsDeps: false }), { ok: true });
+});
+
+test("validateLockfileTargets rejects a git/VCS dependency unless opted in", () => {
+  const hosts = registryHosts(["https://registry.npmjs.org/"]);
+  const lock = "pkg: git+https://github.com/evil/pkg.git#deadbeef\n";
+  assert.equal(validateLockfileTargets(lock, hosts, { allowVcsDeps: false }).ok, false);
+  // github: shorthand too
+  assert.equal(validateLockfileTargets("dep: github:evil/pkg\n", hosts, { allowVcsDeps: false }).ok, false);
+  // opted in → allowed (host still validated: github is not http here, so ok)
+  assert.deepEqual(validateLockfileTargets(lock, hosts, { allowVcsDeps: true }), { ok: true });
+});
+
+test("validateLockfileTargets passes an empty/minimal lockfile", () => {
+  const hosts = registryHosts(["https://registry.npmjs.org/"]);
+  assert.deepEqual(validateLockfileTargets("lockfileVersion: 9\n", hosts, { allowVcsDeps: false }), { ok: true });
 });

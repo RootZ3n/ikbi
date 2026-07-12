@@ -79,6 +79,14 @@ const UNREADABLE_LATCH_KILL: KillSignal = Object.freeze({
 export interface LatchStore {
   get(id: string): Promise<KillState | undefined>;
   put(id: string, value: KillState): Promise<void>;
+  /**
+   * H4 — atomic READ-MODIFY-WRITE under a CROSS-PROCESS lock (no lost updates). The latch is written
+   * from separate processes (a build/server AND the `ikbi kill` / `ikbi unkill` CLI), so engage/clear
+   * must not do a get-then-put on a possibly-stale in-memory copy: two concurrent kills would clobber
+   * one another. `mutate` sees the FRESH durable value under the lock; the real store is the substrate
+   * DocumentStore.update.
+   */
+  update(id: string, mutate: (current: KillState | undefined) => KillState): Promise<KillState>;
 }
 
 /** Injectable dependencies. */
@@ -90,46 +98,55 @@ export interface KillSwitchDeps {
   readonly now?: () => number;
   /** Warm the durable latch from the store at construction (default true; tests set false). */
   readonly subscribe?: boolean;
+  /** H5: max age (ms) of the in-memory latch before isKilled re-reads the durable store, so a
+   *  long-running loop SEES a kill engaged AFTER it started. Default 2000; 0 ⇒ re-read every check. */
+  readonly reloadTtlMs?: number;
 }
 
 /** Build the kill-switch. Defaults wire the live substrate + seam. */
 export function createKillSwitch(deps: KillSwitchDeps = {}): KillSwitch {
   const config = deps.config ?? killSwitchConfig;
-  const store: LatchStore = deps.store ?? createDocumentStore<KillState>({ dir: config.latchDir });
+  // H4: CROSS-PROCESS latch — the CLI (`ikbi kill`/`unkill`) and the running engine touch the same
+  // durable latch from different processes, so it takes cross-process file locks (get + the update RMW).
+  const store: LatchStore = deps.store ?? createDocumentStore<KillState>({ dir: config.latchDir, crossProcess: true });
   const doPublishKill = deps.publishKill ?? ((signal: KillSignal, opts?: { source?: string }) => void corePublishKill(signal, opts));
   const publish = deps.publish ?? ((input: EventInput<unknown>) => void coreEvents.publish(input));
   const now = deps.now ?? Date.now;
 
+  const reloadTtlMs = deps.reloadTtlMs ?? 2000;
   let signals: KillSignal[] = [];
   let loaded = false;
+  let lastLoadedAt = 0;
   let loadPromise: Promise<void> | undefined;
 
   async function ensureLoaded(): Promise<void> {
-    if (loaded) return;
-    if (loadPromise === undefined) {
-      loadPromise = (async () => {
-        try {
-          const s = await store.get(LATCH_ID);
-          // A successful read returning undefined is a genuine "no latch" (not killed).
-          signals = s !== undefined ? [...s.signals] : [];
-        } catch (err) {
-          // FAIL CLOSED (blocker 4): an UNREADABLE latch (store error / corruption) must
-          // NOT be silently treated as "not killed" — that would let a killed engine
-          // forget it was killed. Assume an engine-scope soft kill (prevent new work) +
-          // emit a LOUD event, until an operator clears or a restart recovers the read.
-          signals = [UNREADABLE_LATCH_KILL];
-          emit(killswitchUnreadable, { why: err instanceof Error ? err.message : String(err) });
-        }
-        loaded = true;
-      })();
+    // H5: the durable latch is the SOLE source of truth, so a long-running loop must SEE a kill
+    // engaged AFTER it started — the in-memory copy is refreshed on a short TTL, not warmed ONCE at
+    // boot and never re-read (which made `ikbi kill` a no-op against the very build you'd use it on).
+    if (loaded && now() - lastLoadedAt < reloadTtlMs) return; // fresh enough
+    if (loadPromise !== undefined) { await loadPromise; return; } // a read is already in flight
+    loadPromise = (async () => {
+      try {
+        const s = await store.get(LATCH_ID);
+        // A successful read returning undefined is a genuine "no latch" (not killed).
+        signals = s !== undefined ? [...s.signals] : [];
+      } catch (err) {
+        // FAIL CLOSED (blocker 4): an UNREADABLE latch (store error / corruption) must
+        // NOT be silently treated as "not killed" — that would let a killed engine
+        // forget it was killed. Assume an engine-scope soft kill (prevent new work) +
+        // emit a LOUD event, until an operator clears or a restart recovers the read.
+        signals = [UNREADABLE_LATCH_KILL];
+        emit(killswitchUnreadable, { why: err instanceof Error ? err.message : String(err) });
+      }
+      loaded = true;
+      lastLoadedAt = now();
+    })();
+    try {
+      await loadPromise;
+    } finally {
+      loadPromise = undefined; // clear so the NEXT stale check can trigger a fresh re-read
     }
-    await loadPromise;
   }
-
-  async function persist(): Promise<void> {
-    await store.put(LATCH_ID, { signals: [...signals], updatedAt: now() });
-  }
-
 
   function emit<P>(event: { create: (p: P, o?: { source?: string }) => EventInput<P> }, payload: P): void {
     publish(event.create(payload, { source: EVENT_SOURCE }));
@@ -156,19 +173,21 @@ export function createKillSwitch(deps: KillSwitchDeps = {}): KillSwitch {
       emit(killswitchRejected, { reason: signal.reason, scope: signal.scope, why: "a work-halting kill requires an operator-tier identity" });
       return { engaged: false, reason: "a work-halting kill requires an operator-tier identity" };
     }
-    await ensureLoaded();
-    // L4: PERSIST before mutating the in-memory latch. The durable store is the source of
-    // truth honored on boot; if persist() throws AFTER an in-memory push we would hold a
-    // phantom kill that the next restart silently loses (memory says halted, disk does not).
-    // Persisting the candidate set first means a write failure leaves memory == disk (no kill
-    // recorded) and surfaces the error to the caller, instead of a divergent latch.
+    // H4 — atomic CROSS-PROCESS read-modify-write. `mutate` sees the FRESH durable signals under the
+    // lock, so a concurrent engage in ANOTHER process (or the CLI) can never lose an update: we add our
+    // signal to whatever is currently latched. This subsumes the old L4 "persist before in-memory push"
+    // ordering — the durable store is still written first (it IS the write), and the in-memory copy is
+    // synced FROM the persisted result afterwards, so a write failure throws before any memory mutation
+    // and leaves memory == disk. Idempotent: an already-latched signal is a no-op-content rewrite.
     const key = signalKey(signal);
-    const newlyLatched = !signals.some((s) => signalKey(s) === key);
-    if (newlyLatched) {
-      const next = [...signals, signal];
-      await store.put(LATCH_ID, { signals: next, updatedAt: now() });
-      signals = next;
-    }
+    const persisted = await store.update(LATCH_ID, (current) => {
+      const currentSignals = current?.signals ?? [];
+      const next = currentSignals.some((s) => signalKey(s) === key) ? currentSignals : [...currentSignals, signal];
+      return { signals: next, updatedAt: now() };
+    });
+    signals = [...persisted.signals];
+    loaded = true;
+    lastLoadedAt = now();
     doPublishKill(signal, { source: EVENT_SOURCE }); // the seam event (now a real halt)
     emit(killswitchEngaged, { reason: signal.reason, mode: signal.mode, scope: signal.scope, ...(signal.target !== undefined ? { target: signal.target } : {}), ...(signal.note !== undefined ? { note: signal.note } : {}) });
     return { engaged: true };
@@ -197,10 +216,16 @@ export function createKillSwitch(deps: KillSwitchDeps = {}): KillSwitch {
       emit(killswitchRejected, { reason: "operator", scope: "engine", why: "clear requires an operator-tier identity" });
       return { cleared: false, reason: "clear requires an operator-tier identity" };
     }
-    await ensureLoaded();
-    const clearedCount = signals.length;
+    // H4 — atomic cross-process RMW: read the CURRENT durable count under the lock (not a stale
+    // in-memory copy) and clear it, so a clear can never race-lose against a concurrent engage.
+    let clearedCount = 0;
+    await store.update(LATCH_ID, (current) => {
+      clearedCount = current?.signals.length ?? 0;
+      return { signals: [], updatedAt: now() };
+    });
     signals = [];
-    await persist();
+    loaded = true;
+    lastLoadedAt = now();
     emit(killswitchCleared, { clearedCount });
     return { cleared: true };
   }

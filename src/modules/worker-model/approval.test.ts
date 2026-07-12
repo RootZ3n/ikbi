@@ -48,7 +48,9 @@ const roles = (): Partial<Record<WorkerRole, RoleFn>> => {
     r[role] = async () =>
       role === "integrator"
         ? { role, outcome: "success", summary: role, detail: { decision: "promote", rationale: "ok", evaluation: { approved: true } } }
-        : { role, outcome: "success", summary: role };
+        : role === "verifier"
+          ? { role, outcome: "success", summary: role, detail: { verdict: "pass", checks: [{ name: "test", command: "pnpm test", exitCode: 0, testCount: { passed: 1, total: 1 } }] } }
+          : { role, outcome: "success", summary: role };
   }
   return r;
 };

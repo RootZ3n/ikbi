@@ -378,3 +378,80 @@ test("ALLOWLIST default: unset ⇒ the default host set; set ⇒ the operator li
   const restricted = loadEgressConfig(moduleEnv("egress", { IKBI_EGRESS_ALLOWLIST: "Internal.Corp" }));
   assert.deepEqual(restricted.allowlist, ["internal.corp"], "set ⇒ operator list replaces default");
 });
+
+// ── Redirect credential scoping (Codex C10) ────────────────────────────────────
+// The old guard replayed the ORIGINAL init on every hop, leaking a provider's
+// Authorization/Cookie (and POST body) to another allowlisted origin.
+
+test("cross-origin redirect strips credential headers + applies 30x method semantics (C10)", async () => {
+  const seen: Array<{ input: string; auth?: string; cookie?: string; method: string; body: string }> = [];
+  const transport: FetchLike = async (input, i) => {
+    seen.push({
+      input,
+      ...(i.headers["Authorization"] !== undefined ? { auth: i.headers["Authorization"] } : {}),
+      ...(i.headers["Cookie"] !== undefined ? { cookie: i.headers["Cookie"] } : {}),
+      method: i.method,
+      body: i.body,
+    });
+    if (input === "https://api.example.com/start") {
+      return {
+        ok: false,
+        status: 302,
+        headers: { get: (n: string) => (n.toLowerCase() === "location" ? "https://other.example.com/next" : null) },
+        json: async () => ({}),
+        text: async () => "",
+      };
+    }
+    return okResponse;
+  };
+  const guard = createGuardedFetch({
+    allowlist: ["api.example.com", "other.example.com"],
+    localEndpoints: [],
+    resolve: async () => ["93.184.216.34"],
+    transport,
+  });
+  await guard("https://api.example.com/start", {
+    method: "POST",
+    headers: { Authorization: "Bearer secret", Cookie: "sid=1" },
+    body: "payload",
+    signal: new AbortController().signal,
+  });
+  assert.equal(seen.length, 2, "two hops reach the transport");
+  assert.equal(seen[0]?.auth, "Bearer secret", "origin A carries its own credential");
+  assert.equal(seen[1]?.auth, undefined, "credential is NOT replayed to origin B");
+  assert.equal(seen[1]?.cookie, undefined, "cookie is NOT replayed to origin B");
+  assert.equal(seen[1]?.method, "GET", "302 on POST downgrades to GET");
+  assert.equal(seen[1]?.body, "", "body dropped on the GET downgrade");
+});
+
+test("same-origin redirect preserves credentials + method (C10 not over-broad)", async () => {
+  const seen: Array<{ auth?: string; method: string; body: string }> = [];
+  const transport: FetchLike = async (input, i) => {
+    seen.push({ ...(i.headers["Authorization"] !== undefined ? { auth: i.headers["Authorization"] } : {}), method: i.method, body: i.body });
+    if (input === "https://api.example.com/a") {
+      return {
+        ok: false,
+        status: 307,
+        headers: { get: (n: string) => (n.toLowerCase() === "location" ? "https://api.example.com/b" : null) },
+        json: async () => ({}),
+        text: async () => "",
+      };
+    }
+    return okResponse;
+  };
+  const guard = createGuardedFetch({
+    allowlist: ["api.example.com"],
+    localEndpoints: [],
+    resolve: async () => ["93.184.216.34"],
+    transport,
+  });
+  await guard("https://api.example.com/a", {
+    method: "POST",
+    headers: { Authorization: "Bearer secret" },
+    body: "payload",
+    signal: new AbortController().signal,
+  });
+  assert.equal(seen[1]?.auth, "Bearer secret", "same-origin hop keeps the credential");
+  assert.equal(seen[1]?.method, "POST", "307 preserves method");
+  assert.equal(seen[1]?.body, "payload", "307 preserves body");
+});

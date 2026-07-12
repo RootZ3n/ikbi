@@ -42,15 +42,36 @@ test("a typecheck-failing candidate is disqualified even with otherwise PERFECT 
   assert.match(v?.overrideReason ?? "", /typecheck/);
 });
 
-test("testsPass:false and rejectedToolCalls>0 each disqualify (override reasons surfaced)", () => {
+test("a NO-WORK candidate (0 files, 0 diff) is disqualified — a do-nothing cannot outscore real work", () => {
+  // The exact competitive-mode trap: on an already-green base repo, a do-nothing candidate inherits
+  // typecheckPass/testsPass AND maxes the files+diff families (0/max ⇒ 1.0). Without the override it
+  // would OUTSCORE and discard the candidate that actually did the verified work.
+  const noop = cand({ workspaceId: "did-nothing", filesWritten: 0, diffLines: 0, toolRounds: 0, testCount: { passed: 10, total: 10 } });
+  const real = cand({ workspaceId: "did-the-work", filesWritten: 4, diffLines: 250, toolRounds: 8, testCount: { passed: 10, total: 10 } });
+  const r = newJudge().judge([noop, real]);
+  assert.equal(r.winner?.workspaceId, "did-the-work", "the real-work candidate wins");
+  const v = r.ranking.find((x) => x.workspaceId === "did-nothing");
+  assert.equal(v?.disqualified, true);
+  assert.match(v?.overrideReason ?? "", /no work/i);
+  // A candidate with 0 files but a real diff (modified existing files) is NOT disqualified.
+  const modifiedOnly = cand({ workspaceId: "modified", filesWritten: 0, diffLines: 120 });
+  const r2 = newJudge().judge([modifiedOnly]);
+  assert.equal(r2.ranking.find((x) => x.workspaceId === "modified")?.disqualified, false, "0 files but a real diff is real work");
+});
+
+test("testsPass:false disqualifies; a PREVENTED (rejected) tool call does NOT — it ranks lower, not out", () => {
   const r = newJudge().judge([
     cand({ workspaceId: "a", testsPass: false }),
     cand({ workspaceId: "b", rejectedToolCalls: 2 }),
     cand({ workspaceId: "c" }),
   ]);
+  // The clean candidate wins; "b" (a blocked attempt) is NOT disqualified but loses the tie to "c".
   assert.equal(r.winner?.workspaceId, "c");
+  // A real failure (tests) still disqualifies.
   assert.match(r.ranking.find((x) => x.workspaceId === "a")?.overrideReason ?? "", /tests/);
-  assert.match(r.ranking.find((x) => x.workspaceId === "b")?.overrideReason ?? "", /rejected/);
+  // A prevented attempt is a recorded warning + ranking penalty, NOT a disqualification (judge by effect).
+  const b = r.ranking.find((x) => x.workspaceId === "b");
+  assert.notEqual(b?.disqualified, true, "a prevented (blocked) tool call does not disqualify a candidate");
 });
 
 // ── LAYER 2: weighted ranking + composite math ───────────────────────────────
@@ -60,14 +81,18 @@ test("weights sum to exactly 1.0 (Luak invariant)", () => {
   assert.ok(Math.abs(sum - 1) < 1e-9, `family weights must sum to 1.0 (got ${sum})`);
 });
 
-test("a perfect candidate scores composite 1.0; the better-signal candidate wins", () => {
-  const perfect = cand({ workspaceId: "perfect", testCount: { passed: 5, total: 5 }, toolRounds: 0, diffLines: 0, filesWritten: 0, stopReason: "stop" });
+test("a strong-signal real-work candidate beats a worse one (a no-op can no longer game composite 1.0)", () => {
+  // Composite 1.0 requires 0 files AND 0 diff (the families score 0/max ⇒ 1.0) — but that is a NO-OP,
+  // now disqualified. So the perfect-composite scenario is intentionally unreachable by legitimate
+  // work; what remains is the real contract: a strong-signal candidate with REAL work beats a worse one.
+  const strong = cand({ workspaceId: "strong", testCount: { passed: 5, total: 5 }, toolRounds: 1, diffLines: 20, filesWritten: 2, stopReason: "stop" });
   const worse = cand({ workspaceId: "worse", testCount: { passed: 3, total: 5 }, toolRounds: 18, diffLines: 1500, filesWritten: 40, stopReason: "max_iterations" });
-  const r = newJudge().judge([worse, perfect]);
-  assert.equal(r.winner?.workspaceId, "perfect");
-  assert.ok(Math.abs((r.winner?.composite ?? 0) - 1.0) < 1e-9, "all-best signals ⇒ composite 1.0");
+  const r = newJudge().judge([worse, strong]);
+  assert.equal(r.winner?.workspaceId, "strong");
+  const strongComposite = r.winner?.composite ?? 0;
   const worseComposite = r.ranking.find((x) => x.workspaceId === "worse")?.composite ?? 1;
-  assert.ok(worseComposite < 1.0, "the worse candidate scores below the perfect one");
+  assert.ok(strongComposite > worseComposite, "the stronger-signal candidate scores higher");
+  assert.ok(strongComposite > 0.5 && strongComposite < 1.0, "real work scores high but not the no-op's gamed 1.0");
 });
 
 test("among survivors, more passing tests wins (all else equal)", () => {
@@ -166,33 +191,31 @@ function testsFamily(r: ReturnType<ReturnType<typeof newJudge>["judge"]>, ws: st
   return r.ranking.find((x) => x.workspaceId === ws)?.familyScores?.tests ?? -1;
 }
 
-test("F6: a real executed suite outranks zero-test / unverified / custom-check success on the tests family", () => {
-  // All four PASS the gate (testsPass true) — none is disqualified — but their tests-family
-  // CONFIDENCE must differ so a passing `echo done` / `ci` cannot tie a real suite.
+test("C3: non-executed evidence (zero/unverified/absent) is DISQUALIFIED — only a real executed suite is admissible", () => {
+  // C3 supersedes Finding D's down-ranking: a candidate whose tests did not actually run has NOT
+  // earned promotable confidence, so it is disqualified outright (LAYER 1) — the judge ranks only
+  // admissible candidates and can never crown a vacuous-green winner over one with real evidence.
   const real = cand({ workspaceId: "real", testsPass: true, testEvidence: "executed", testCount: { passed: 10, total: 10 } });
   const unverified = cand({ workspaceId: "unverified", testsPass: true, testEvidence: "unverified" }); // e.g. `echo done`
   const absent = cand({ workspaceId: "absent", testsPass: true, testEvidence: "absent" });             // only a `ci` check
   const zero = cand({ workspaceId: "zero", testsPass: true, testEvidence: "zero" });                   // runner executed 0 tests
   const r = newJudge().judge([unverified, absent, zero, real]);
 
-  // Distinguishable, deterministic, strictly ordered: executed > unverified > absent > zero.
-  const tReal = testsFamily(r, "real"), tUnver = testsFamily(r, "unverified"), tAbsent = testsFamily(r, "absent"), tZero = testsFamily(r, "zero");
-  assert.ok(tReal > tUnver && tUnver > tAbsent && tAbsent > tZero, `tests-family ordering executed>unverified>absent>zero (got ${tReal},${tUnver},${tAbsent},${tZero})`);
-  assert.equal(tReal, 1.0, "a fully-passing real suite earns full tests confidence");
-  assert.ok(tUnver < 1.0 && tZero < 1.0, "no non-executed signal earns the real suite's confidence");
-  // The real suite wins outright (it leads the load-bearing tests family).
-  assert.equal(r.winner?.workspaceId, "real", "the real executed suite wins over the zero-test/custom passers");
+  for (const ws of ["unverified", "absent", "zero"]) {
+    const v = r.ranking.find((x) => x.workspaceId === ws);
+    assert.equal(v?.disqualified, true, `${ws} is disqualified (inadmissible)`);
+    assert.match(v?.overrideReason ?? "", /test-evidence:/);
+  }
+  assert.equal(r.ranking.find((x) => x.workspaceId === "real")?.disqualified, false, "the executed suite survives");
+  assert.equal(r.winner?.workspaceId, "real", "the only admissible candidate wins");
 });
 
-test("F6: a zero-test success scores STRICTLY below an identical real-suite candidate", () => {
-  const base = { typecheckPass: true as const, testsPass: true as const, toolRounds: 1, maxToolRounds: 20, rejectedToolCalls: 0, filesWritten: 1, diffLines: 100, stopReason: "stop" as const };
-  const real = { ...base, workspaceId: "real", testEvidence: "executed" as const, testCount: { passed: 5, total: 5 } };
-  const zero = { ...base, workspaceId: "zero", testEvidence: "zero" as const };
-  const r = newJudge().judge([zero, real]);
-  const realComposite = r.ranking.find((x) => x.workspaceId === "real")?.composite ?? 0;
-  const zeroComposite = r.ranking.find((x) => x.workspaceId === "zero")?.composite ?? 1;
-  assert.ok(realComposite > zeroComposite, "a real suite must never collapse to the same confidence as zero tests");
-  assert.equal(r.winner?.workspaceId, "real");
+test("C3: every candidate non-executed ⇒ rejectedAll (fail-closed; judge grants no promotability)", () => {
+  const unverified = cand({ workspaceId: "unverified", testsPass: true, testEvidence: "unverified" });
+  const zero = cand({ workspaceId: "zero", testsPass: true, testEvidence: "zero" });
+  const r = newJudge().judge([unverified, zero]);
+  assert.equal(r.winner, null, "no admissible candidate ⇒ no winner");
+  assert.equal(r.rejectedAll, true, "promote nothing — the judge never launders non-executed work into a winner");
 });
 
 test("F8 (back-compat): a candidate with NO testEvidence keeps the prior full-marks tests score", () => {

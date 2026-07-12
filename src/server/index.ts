@@ -14,7 +14,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { existsSync } from "node:fs";
 
-import { config } from "../core/config.js";
+import { config, assertBindAuthorized } from "../core/config.js";
 import { log } from "../core/log.js";
 import { trust } from "../core/trust/index.js";
 import { routes } from "./registry.js";
@@ -37,6 +37,9 @@ export function buildServer() {
     // Reuse our structured root logger rather than letting Fastify spin up its own.
     loggerInstance: log,
     disableRequestLogging: false,
+    // Allow image uploads on /chat (data-URL photos exceed Fastify's 1 MB default). Default 16 MB;
+    // override via IKBI_MAX_BODY_BYTES. The /chat images cap (max 8) bounds the worst case.
+    bodyLimit: Number(process.env.IKBI_MAX_BODY_BYTES) > 0 ? Number(process.env.IKBI_MAX_BODY_BYTES) : 16 * 1024 * 1024,
   });
 
   // Velum: AI privacy/injection defense middleware
@@ -131,12 +134,23 @@ export function buildServer() {
   const __dirname = dirname(fileURLToPath(import.meta.url));
   const uiDir = join(__dirname, "..", "..", "ui");
   if (existsSync(join(uiDir, "index.html"))) {
+    // Deployment-configurable UI flags, read by index.html BEFORE the app boots. The Pehlichi guided
+    // onboarding defaults ON (good for the PUBLIC deployment — new users get a warm intro); set
+    // IKBI_ONBOARDING=off to hide it by default in the private LAB. A per-user settings toggle can
+    // still override this client-side either way.
+    const onboardingDefault = (process.env["IKBI_ONBOARDING"] ?? "on").toLowerCase() !== "off";
+    app.get("/peh-config.js", (_req, reply) => {
+      reply.header("content-type", "application/javascript; charset=utf-8");
+      reply.header("cache-control", "no-store");
+      return `window.PEH_CONFIG={onboarding:${onboardingDefault ? "true" : "false"}};`;
+    });
+
     void app.register(fastifyStatic, {
       root: uiDir,
       prefix: "/",
       decorateReply: false,
     });
-    log.info({ uiDir }, "UI served from ui/");
+    log.info({ uiDir, onboardingDefault }, "UI served from ui/");
   }
 
   return app;
@@ -152,6 +166,9 @@ export async function startServer(options?: { port?: number }) {
   // broken roster surfaces at boot rather than silently degrading every request.
   await trust.preload();
   const port = options?.port ?? config.port;
+  // #1: fail closed if we're about to expose /api on a non-loopback interface with no API token.
+  // Enforced HERE (at bind), not at config load, so offline commands with a public-bind env still run.
+  assertBindAuthorized(config.bindHost);
   await app.listen({ host: config.bindHost, port });
   setReady(true);
   log.info(

@@ -1,10 +1,18 @@
 # Recommendations — ikbi RC1 proving ground
 
-## Weekend verdict: NOT_READY (one well-characterized blocker; otherwise a strong safety posture)
+> **⚠️ SUPERSEDED — the NOT_READY verdict below was resolved on 2026-06-26.** The single blocker (F1
+> workspace escape) was fixed the same afternoon this was written: commit `ece4624` sandboxes risky
+> governed-exec subprocesses under bubblewrap (fail-closed). The post-fix volume re-proof is
+> **501 runs, `UNSAFE_FAIL = 0`, every hard gate PASS** (`rc1-500-aggregate/summary.md`, `9a1c8d7`);
+> live re-verified 2026-07-06 (both escape vectors → EROFS, 21/21 sandbox tests green). Current
+> readiness label lives in `docs/RC1-RELEASE.md` (**RC1_READY_FOR_JEFF**), not here. This file is
+> retained as the pre-fix record. **Item 1 (decide F1) and item 2 (fix F1) below are DONE.**
+
+## ~~Weekend verdict: NOT_READY~~ → RESOLVED (one well-characterized blocker, now fixed)
 
 A reproducible **workspace escape** (F1) trips the `UNSAFE_FAIL = 0` / "no workspace escape" hard
 gate, so the strict label is **NOT_READY**. It is a *single* exec-layer confinement gap, not a
-systemic failure — every other safety gate held across 73 runs.
+systemic failure — every other safety gate held across 73 runs. *(← resolved by `ece4624`; see banner.)*
 
 ## What Jeff should do next
 

@@ -86,7 +86,9 @@ export class EventBus implements EventBusSurface {
       id,
       opts,
       handler: handler as EventHandler,
-      maxQueue: opts.maxQueue ?? this.defaultMaxQueue,
+      // Clamp to ≥1 (Codex M4): a nonpositive maxQueue would make enqueue drop EVERY event
+      // (`queue.length >= 0` is always true), silently starving the subscriber.
+      maxQueue: Math.max(1, Math.floor(opts.maxQueue ?? this.defaultMaxQueue)),
       dropPolicy: opts.dropPolicy ?? "drop_oldest",
       queue: [],
       draining: false,
@@ -136,7 +138,17 @@ export class EventBus implements EventBusSurface {
     if (o.typePrefix !== undefined && !event.type.startsWith(o.typePrefix)) return false;
     if (o.source !== undefined && event.source !== o.source) return false;
     if (o.agentId !== undefined && event.attribution?.identity?.agentId !== o.agentId) return false;
-    if (o.predicate !== undefined && !o.predicate(event)) return false;
+    if (o.predicate !== undefined) {
+      // Contain a throwing predicate (Codex M4): it must never break publication to OTHER
+      // subscribers or throw back to the publisher. Fail closed — a predicate that throws does
+      // NOT match, so the event is simply not delivered to this subscription.
+      try {
+        if (!o.predicate(event)) return false;
+      } catch (err) {
+        this.log.warn({ err, type: event.type, sub: sub.id }, "event-bus: subscription predicate threw — treating as no-match");
+        return false;
+      }
+    }
     return true;
   }
 

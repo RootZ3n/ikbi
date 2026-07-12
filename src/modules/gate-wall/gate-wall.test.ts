@@ -35,10 +35,10 @@ function input(tier: TrustTier): GateWallEvaluateInput {
 }
 
 /** An exec action at the given tier — gated by the SAME grant logic. */
-function execInput(tier: TrustTier, over: Partial<{ command: string; args: string[]; sudo: boolean; purpose: string }> = {}): GateWallEvaluateInput {
+function execInput(tier: TrustTier, over: Partial<{ command: string; args: string[]; sudo: boolean; purpose: string; verifier: boolean }> = {}): GateWallEvaluateInput {
   return {
     grant: autonomyForTier(tier),
-    action: { kind: "exec", command: over.command ?? "curl", args: over.args ?? ["-s", "https://example.com"], sudo: over.sudo ?? false, ...(over.purpose !== undefined ? { purpose: over.purpose } : {}) },
+    action: { kind: "exec", command: over.command ?? "curl", args: over.args ?? ["-s", "https://example.com"], sudo: over.sudo ?? false, ...(over.verifier !== undefined ? { verifier: over.verifier } : {}), ...(over.purpose !== undefined ? { purpose: over.purpose } : {}) },
     identity: IDENTITY,
   };
 }
@@ -140,7 +140,7 @@ test("exec action: effect policy denies git ref mutation and non-check package s
 
 test("exec action: package scripts are allowed for verifier check purposes", async () => {
   const { gw } = harness();
-  const g = await gw.evaluate(execInput("trusted", { command: "pnpm", args: ["test"], purpose: "verifier check: test" }));
+  const g = await gw.evaluate(execInput("trusted", { command: "pnpm", args: ["test"], verifier: true, purpose: "verifier check: test" }));
   assert.equal(g.allow, true);
 });
 

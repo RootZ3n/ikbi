@@ -71,7 +71,7 @@ test("undo reverts a promotion: branch ref AND working tree return to the prior 
 
     const mem = memReceipts([promoteReceipt(repo, "main", beforeRef, afterRef)]);
     const cap = capture();
-    await createUndoCli({ receipts: mem.store, operatorToken: "op-token", resolveIdentity: () => VALIDATED, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit }).undo(["promo-1"]);
+    await createUndoCli({ receipts: mem.store, operatorToken: "op-token", resolveIdentity: () => VALIDATED, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit }).undo(["promo-1", "--yes"]);
 
     assert.equal(cap.exit, undefined, "undo succeeded");
     assert.equal((await runGit(repo, ["rev-parse", "main"])).stdout.trim(), beforeRef, "branch ref reset to before");
@@ -98,7 +98,7 @@ function fakeGit(over: Partial<UndoGit> = {}): { git: UndoGit; cas: Array<{ ref:
     worktreeForBranch: async () => "/wt/main",
     isWorktreeClean: async () => true,
     updateRefCas: async (_r, ref, newSha, oldSha) => { cas.push({ ref, newSha, oldSha }); },
-    syncWorktreeToRef: async (p) => { synced.push(p); },
+    syncWorktreeToRef: async (p) => { synced.push(p); return { stashed: false }; },
     ...over,
   };
   return { git, cas, synced };
@@ -109,10 +109,20 @@ test("undo CAS-resets after→before and syncs the worktree (with fakes)", async
   const mem = memReceipts(REC());
   const g = fakeGit();
   const cap = capture();
-  await createUndoCli({ receipts: mem.store, git: g.git, operatorToken: "op-token", resolveIdentity: () => VALIDATED, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit }).undo(["promo-1"]);
+  await createUndoCli({ receipts: mem.store, git: g.git, operatorToken: "op-token", resolveIdentity: () => VALIDATED, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit }).undo(["promo-1", "--yes"]);
   assert.deepEqual(g.cas, [{ ref: "refs/heads/main", newSha: "BEFORE", oldSha: "AFTER" }], "atomic after→before reset");
   assert.deepEqual(g.synced, ["/wt/main"], "the checked-out tree was synced");
   assert.equal(cap.exit, undefined);
+});
+
+test("undo WITHOUT --yes previews only and does NOT revert (confirmation gate)", async () => {
+  const mem = memReceipts(REC());
+  const g = fakeGit();
+  const cap = capture();
+  await createUndoCli({ receipts: mem.store, git: g.git, operatorToken: "op-token", resolveIdentity: () => VALIDATED, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit }).undo(["promo-1"]);
+  assert.equal(g.cas.length, 0, "no revert without --yes");
+  assert.equal(mem.appended.length, 0, "no undo recorded");
+  assert.match(cap.out, /Re-run with --yes/, "the preview points at the --yes gate");
 });
 
 test("undo refuses when the branch has moved on (no clobber)", async () => {
@@ -176,7 +186,7 @@ test("undo --latest undoes the most recent successful promotion", async () => {
   const mem = memReceipts(REC());
   const g = fakeGit();
   const cap = capture();
-  await createUndoCli({ receipts: mem.store, git: g.git, operatorToken: "op-token", resolveIdentity: () => VALIDATED, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit }).undo(["--latest"]);
+  await createUndoCli({ receipts: mem.store, git: g.git, operatorToken: "op-token", resolveIdentity: () => VALIDATED, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit , cwd: () => "/repo" }).undo(["--latest", "--yes"]);
   assert.equal(cap.exit, undefined, "--latest succeeded");
   assert.deepEqual(g.cas, [{ ref: "refs/heads/main", newSha: "BEFORE", oldSha: "AFTER" }], "the promoted commit was reset");
   assert.match(cap.out, /undone: "main" reset/, "success message is printed");
@@ -184,11 +194,21 @@ test("undo --latest undoes the most recent successful promotion", async () => {
   assert.equal(mem.appended[0]?.corrects, "promo-1");
 });
 
+test("undo --latest is SCOPED to the current repo — a promote in another repo is NOT reverted", async () => {
+  const mem = memReceipts([promoteReceipt("/other-repo", "main", "BEFORE", "AFTER")]);
+  const g = fakeGit();
+  const cap = capture();
+  // The operator is in /repo, but the only promote is in /other-repo → nothing to revert HERE.
+  await createUndoCli({ receipts: mem.store, git: g.git, operatorToken: "op-token", resolveIdentity: () => VALIDATED, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit, cwd: () => "/repo" }).undo(["--latest", "--yes"]);
+  assert.equal(cap.exit, 1, "no revertible promote in THIS repo");
+  assert.equal(g.cas.length, 0, "the other repo's promote was NOT reverted");
+});
+
 test("undo --latest fails cleanly when there are no successful promotions", async () => {
   const mem = memReceipts([]); // empty receipt log
   const g = fakeGit();
   const cap = capture();
-  await createUndoCli({ receipts: mem.store, git: g.git, operatorToken: "op-token", resolveIdentity: () => VALIDATED, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit }).undo(["--latest"]);
+  await createUndoCli({ receipts: mem.store, git: g.git, operatorToken: "op-token", resolveIdentity: () => VALIDATED, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit , cwd: () => "/repo" }).undo(["--latest"]);
   assert.equal(cap.exit, 1);
   assert.match(cap.err, /no revertible promotion/);
   assert.equal(g.cas.length, 0, "no ref was reset");
@@ -201,7 +221,7 @@ test("undo --latest picks the most recent of multiple promotions", async () => {
   const mem = memReceipts([older, next]);
   const g = fakeGit({ revParse: async () => "V2" }); // branch is at V2 (the newer promotion)
   const cap = capture();
-  await createUndoCli({ receipts: mem.store, git: g.git, operatorToken: "op-token", resolveIdentity: () => VALIDATED, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit }).undo(["--latest"]);
+  await createUndoCli({ receipts: mem.store, git: g.git, operatorToken: "op-token", resolveIdentity: () => VALIDATED, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit , cwd: () => "/repo" }).undo(["--latest", "--yes"]);
   assert.equal(cap.exit, undefined, "succeeded");
   assert.deepEqual(g.cas, [{ ref: "refs/heads/main", newSha: "V1", oldSha: "V2" }], "reverted V2 → V1, not BASE → V1");
   assert.equal(mem.appended[0]?.corrects, "new-promo", "corrects the newer receipt");

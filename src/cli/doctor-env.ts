@@ -61,8 +61,9 @@ export interface DoctorEnvInputs {
   readonly stateDir?: string;
 }
 
-/** The minimum Node major ikbi supports. */
-const MIN_NODE_MAJOR = 18;
+/** The minimum Node major ikbi supports — MUST match package.json "engines".node (>=22). Doctor was
+ *  passing Node 18 while the engine requires 22 (native test runner, structuredClone, etc.). */
+const MIN_NODE_MAJOR = 22;
 /** Warn when free disk drops below this (1 GiB). */
 const LOW_DISK_BYTES = 1024 * 1024 * 1024;
 

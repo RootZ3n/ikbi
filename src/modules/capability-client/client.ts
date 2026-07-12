@@ -25,6 +25,7 @@ import type { EventInput } from "../../core/events/index.js";
 import { capabilityClientConfig, type CapabilityClientConfig } from "./config.js";
 import { capabilityFetched, capabilityUnavailable, type CapabilityEventPayload } from "./events.js";
 import type { CapabilityClient, CapabilityScore } from "./contract.js";
+import { resolveFetchGuard } from "../../core/provider/fetch-guard.js";
 
 const log = childLogger("capability-client");
 const EVENT_SOURCE = "capability-client";
@@ -89,7 +90,9 @@ function extractScores(body: unknown): CapabilityScore[] {
 /** Build a capability client. Default deps wire the live config, global fetch, and event bus. */
 export function createCapabilityClient(deps: CapabilityClientDeps = {}): CapabilityClient {
   const config = deps.config ?? capabilityClientConfig;
-  const fetchImpl: FetchLike = deps.fetchImpl ?? ((url, init) => fetch(url, init) as ReturnType<FetchLike>);
+  // Default to the EGRESS-GUARDED fetch (SSRF floor + allowlist), lazily resolved so a missing
+  // guard fails closed instead of making an ungoverned raw fetch (Codex H5).
+  const fetchImpl: FetchLike = deps.fetchImpl ?? ((url, init) => (resolveFetchGuard() as unknown as FetchLike)(url, init));
   const now = deps.now ?? (() => Date.now());
   const publish = deps.publish ?? ((input: EventInput<CapabilityEventPayload>) => void coreEvents.publish(input));
 

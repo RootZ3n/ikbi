@@ -19,11 +19,40 @@
  */
 
 import type { RoleResult } from "./contract.js";
+import type { SemanticVerdict } from "./semantic-verdict.js";
 
 /** Safe accessor for a role result's open detail bag. */
 function detailOf(result: RoleResult | undefined): Record<string, unknown> {
   const d = result?.detail;
   return typeof d === "object" && d !== null ? (d as Record<string, unknown>) : {};
+}
+
+/**
+ * Format the critic's VALIDATED semantic defects (Phase 9) as a builder fix goal. The fixer receives
+ * the parser-validated blocking defects + missing requirements — each a concrete, evidence-backed,
+ * candidate-bound problem — NOT the raw critic prose. This is the authentic repair evidence Phase 6
+ * requires; malformed/generic/invented claims never reach the fixer because the parser dropped them.
+ */
+export function formatValidatedFixGoal(verdict: SemanticVerdict): string {
+  const parts: string[] = ["The critic REJECTED your work. Fix the VALIDATED defects below — each is a concrete, evidence-backed problem the reviewer confirmed:", ""];
+  if (verdict.summary.trim().length > 0) parts.push(`Summary: ${verdict.summary.trim()}`, "");
+  if (verdict.blockingDefects.length > 0) {
+    parts.push(`Blocking defects (${verdict.blockingDefects.length}):`);
+    verdict.blockingDefects.forEach((d, i) => {
+      const loc = d.location?.file !== undefined
+        ? ` [${d.location.file}${d.location.symbol !== undefined ? `:${d.location.symbol}` : ""}${typeof d.location.line === "number" ? `:${d.location.line}` : ""}]`
+        : "";
+      parts.push(`${i + 1}. ${d.claim}${loc}`);
+      if (d.requirement.trim().length > 0) parts.push(`   requirement not met: ${d.requirement.trim()}`);
+      if (d.evidence.trim().length > 0) parts.push(`   evidence: ${d.evidence.trim()}`);
+    });
+  }
+  if (verdict.incompleteRequirements.length > 0) {
+    parts.push("", `Missing requirements (${verdict.incompleteRequirements.length}):`);
+    verdict.incompleteRequirements.forEach((r, i) => parts.push(`${i + 1}. ${r}`));
+  }
+  parts.push("", "Make the minimal change that resolves these validated defects without breaking the passing checks.");
+  return parts.join("\n");
 }
 
 /**
@@ -81,10 +110,19 @@ export interface CriticFixLoopOutcome {
  * gates (`detail.objectiveFailure`: empty diff, missing files, unparseable verdict,
  * truncated response, no diff source) are NOT subjective feedback the builder can
  * act on — retrying them is pointless and risks churn, so they are excluded.
+ *
+ * Phase 6 (IKBI-RT-012 trigger discipline): a repair may fire only from AUTHENTIC repair evidence — a
+ * CONCRETE semantic verdict (`fail`/`incomplete`). A bare or unparsable critic FAIL classifies as
+ * `indeterminate` (Phase 4), and an infrastructure failure is not candidate evidence — neither may
+ * trigger the fixer/critic-fix loop. When the critic stamped a canonical `semanticVerdict`, gate on it;
+ * when absent (a legacy/injected critic double), preserve the prior pass-based behavior.
  */
 export function isRetryableCriticFail(criticResult: RoleResult): boolean {
   const d = detailOf(criticResult);
-  return criticResult.outcome === "success" && d.pass === false && d.objectiveFailure !== true;
+  if (criticResult.outcome !== "success" || d.pass !== false || d.objectiveFailure === true) return false;
+  const sv = d.semanticVerdict as { kind?: unknown } | undefined;
+  if (sv !== undefined && sv !== null && typeof sv.kind === "string") return sv.kind === "fail" || sv.kind === "incomplete";
+  return true;
 }
 
 /**
@@ -105,9 +143,14 @@ export async function runCriticFixLoop(
   }
 
   const d = detailOf(criticResult);
+  // Phase 9: prefer the parser-VALIDATED semantic defects (concrete, candidate-bound, evidence-backed).
+  // Fall back to the legacy feedback+issues only when no structured verdict with defects is present
+  // (a legacy/injected critic double). The fixer must repair validated defects, not raw critic prose.
+  const sv = d.semanticVerdict as SemanticVerdict | undefined;
+  const hasValidatedDefects = typeof sv === "object" && sv !== null && Array.isArray(sv.blockingDefects) && (sv.blockingDefects.length > 0 || sv.incompleteRequirements.length > 0);
   const feedback = typeof d.feedback === "string" ? d.feedback : "";
   const issues = Array.isArray(d.issues) ? d.issues.filter((x): x is string => typeof x === "string") : [];
-  const fixGoal = formatCriticFixGoal(feedback, issues);
+  const fixGoal = hasValidatedDefects ? formatValidatedFixGoal(sv!) : formatCriticFixGoal(feedback, issues);
 
   const builderResult = await deps.builder(fixGoal);
   if (builderResult.outcome !== "success") {

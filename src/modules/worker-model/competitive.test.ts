@@ -124,6 +124,8 @@ function compRoles(outcomes: (wsId: string) => { builderOk?: boolean; toolRounds
       const c = checks(o.typecheck ?? 0, o.test ?? 0, o.passed ?? 10);
       return { role: "verifier", outcome: "success", summary: "v", detail: { verdict: "pass", checks: c } };
     },
+    // Phase 4: the competitive winner receives canonical semantic evaluation before promotion.
+    critic: async () => ({ role: "critic", outcome: "success", summary: "c", detail: { pass: true } }),
   };
   return { roles, builderTiers };
 }
@@ -156,12 +158,66 @@ test("competitive OFF ⇒ single-workspace path (one allocate), unchanged behavi
   // capturing roles that succeed; single-mode reads the integrator decision.
   const roles: Partial<Record<WorkerRole, RoleFn>> = {
     ...cap.roles,
-    critic: async () => ({ role: "critic", outcome: "success", summary: "c" }),
+    critic: async () => ({ role: "critic", outcome: "success", summary: "c", detail: { pass: true } }),
     integrator: async () => ({ role: "integrator", outcome: "success", summary: "i", detail: { decision: "promote", evaluation: { approved: true } } }),
   };
   const orch = createOrchestrator(deps({ config: SINGLE, resolveIdentity, roleClaim, workspaces: ws.workspaces, roles }));
   await orch.run(task, parentCtx);
   assert.equal(ws.allocated.length, 1, "single mode allocates exactly ONE workspace");
+});
+
+// ── C-A1: injection/policy-taint fail-closed gate for the competitive winner ──
+
+// The TAINTED candidate (ws0) is the only one that PASSES verification, so it is unambiguously the
+// winner — leaving the fail-closed taint gate as the ONLY thing that can stop its promote. ws1 fails.
+function taintedWinnerRoles(taintDetail: Record<string, unknown>): Partial<Record<WorkerRole, RoleFn>> {
+  return {
+    scout: async () => ({ role: "scout", outcome: "success", summary: "s" }),
+    builder: async (ctx: RoleContext) => ({
+      role: "builder", outcome: "success", summary: "b",
+      detail: { toolRounds: 2, filesWritten: ["a.ts"], rejectedToolCalls: [], stopReason: "stop", ...(ctx.workspace.id === "ws0" ? taintDetail : {}) },
+    }),
+    verifier: async (ctx: RoleContext) => ({
+      role: "verifier", outcome: "success", summary: "v",
+      // ws0 passes; ws1 has a failing test ⇒ disqualified ⇒ ws0 is the sole winner.
+      detail: { verdict: ctx.workspace.id === "ws0" ? "pass" : "fail", checks: checks(0, ctx.workspace.id === "ws0" ? 0 : 1, 10) },
+    }),
+    critic: async () => ({ role: "critic", outcome: "success", summary: "c", detail: { pass: true } }),
+  };
+}
+
+test("C-A1: a competitive winner whose build had prompt-injection is NOT promoted (fail-closed)", async () => {
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = compWorkspaces();
+  const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: taintedWinnerRoles({ injectionDetected: true, externalInjectionDetected: true }) }));
+  const r = await orch.run(task, parentCtx);
+  assert.equal(r.promoted, false, "a winner injected from OUTSIDE content must NOT promote");
+  assert.equal(r.outcome, "rejected");
+  assert.deepEqual(ws.promoted, [], "nothing was promoted");
+  assert.match(r.reason ?? "", /injection/i, "the reason names the fail-closed injection gate");
+});
+
+test("C-A1: a competitive winner with only OWN-worktree (neutralized) injection IS promoted (judge by effect)", async () => {
+  // Self-hosting: the winner's run_checks re-detected ikbi's own injection-test fixtures in its own
+  // output. injectionDetected is set (audit) but not externalInjectionDetected — neutralized-and-inert.
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = compWorkspaces();
+  const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: taintedWinnerRoles({ injectionDetected: true }) }));
+  const r = await orch.run(task, parentCtx);
+  assert.equal(r.promoted, true, "a green winner with only own-worktree injection promotes (judge by effect)");
+});
+
+test("C-A1: a competitive candidate that attempted a PREVENTED out-of-policy call is STILL promotable (judge by effect)", async () => {
+  // JUDGE BY EFFECT, NOT INTENT: a blocked (prevented) tool attempt had no effect — the governor
+  // stopped it. ws0 is verifier-green with a blocked `pnpm run evil`; it is a recorded warning + a
+  // ranking penalty, NOT a disqualifier or a discard, so the green winner still promotes. (The INJECTION
+  // gate — a distinct, content-hijack defense — is unaffected and still blocks; see the sibling test.)
+  const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
+  const ws = compWorkspaces();
+  const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: taintedWinnerRoles({ policyViolations: ["terminal: pnpm run evil"] }) }));
+  const r = await orch.run(task, parentCtx);
+  assert.equal(r.promoted, true, "a prevented attempt does not block a verifier-green competitive winner");
+  assert.deepEqual(ws.promoted, ["ws0"], "the green winner promoted despite the blocked attempt");
 });
 
 // ── COMPETITIVE WINNER: best promoted, losers discarded, no leak ─────────────
@@ -209,10 +265,11 @@ test("competitive: a candidate that never reaches a successful verifier is NOT c
 });
 
 test("competitive: a non-autoCommit tier (verified) commits NO candidate (autonomy respected)", async () => {
+  // Tier-gated autoCommit is LADDER machinery (opt-in; default OFF for building), so enable it here.
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("verified", "verified");
   const ws = compWorkspaces();
   const cap = compRoles(() => ({ typecheck: 0, test: 0 }));
-  const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: cap.roles }));
+  const orch = createOrchestrator(deps({ config: { ...COMP, trustLadder: true }, resolveIdentity, roleClaim, workspaces: ws.workspaces, roles: cap.roles }));
   await orch.run(task, parentCtx);
   assert.equal(ws.committed.length, 0, "verified tier → autoCommit false → no candidate committed");
 });
@@ -347,11 +404,16 @@ test("C1: a candidate whose builder mutated package.json scripts → verifier UN
   // The REAL governed + integrity-guarded verifier (no roles.verifier override). The
   // governed exec passes the clean candidate's checks; the mutated one never reaches it.
   const governedRuns: ExecRequest[] = [];
-  const governedExec = { run: async (req: ExecRequest): Promise<ExecResult> => { governedRuns.push(req); return { executed: true, exitCode: 0, stdoutTail: "ok" }; } };
+  // The clean candidate's real test check emits a parseable tally ⇒ testEvidence "executed" (admissible
+  // under the C3 gate). The git integrity PROBE keeps its plain output (mutation detection is via
+  // workspaces.diff, below). Only the executed suite must carry a count for the clean candidate to win.
+  const governedExec = { run: async (req: ExecRequest): Promise<ExecResult> => { governedRuns.push(req); return req.command === "git" ? { executed: true, exitCode: 0, stdoutTail: "ok" } : { executed: true, exitCode: 0, stdoutTail: "# tests 3\n# pass 3\n# fail 0\n" }; } };
   const roles: Partial<Record<WorkerRole, RoleFn>> = {
     scout: async () => ({ role: "scout", outcome: "success", summary: "s" }),
     builder: async () => ({ role: "builder", outcome: "success", summary: "b", detail: { toolRounds: 2, filesWritten: ["a.ts"], rejectedToolCalls: [], stopReason: "stop" } }),
     // NO verifier override — the orchestrator wires the real governed/integrity verifier.
+    // Phase 4: a pass critic on the winner (the semantic gate is exercised separately).
+    critic: async () => ({ role: "critic", outcome: "success", summary: "c", detail: { pass: true } }),
   };
   const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces, roles, governedExec }));
 
@@ -392,7 +454,13 @@ test("competitive: the judge receives correctly-mapped BuildCandidates", async (
   assert.equal(c0.diffLines, 3, "diff line count from workspaces.diff");
 });
 
-test("competitive: verifier verdict pass with custom check name is authoritative", async () => {
+test("C3: a custom-check-only pass (no executed test suite) is NOT admissible in competitive — consistent with the single-run integrator gate", async () => {
+  // A verifier pass whose only check is a custom `ci` (no check named "test") yields testEvidence
+  // "absent". The single-run integrator ALREADY blocks promote on absent evidence (Codex C1: "an absent
+  // field means we cannot confirm a real test signal — block promote exactly like zero/unverified").
+  // C3 brings the competitive judge into line: absent evidence is DISQUALIFIED, so a shootout can never
+  // crown a candidate the single-run path would reject. The gate MAPPING is still correct (an
+  // authoritative pass verdict ⇒ typecheck/tests gates pass); it is the ADMISSIBILITY that now fails.
   const { parentCtx, resolveIdentity, roleClaim } = makeIdentities("trusted", "trusted");
   const ws = compWorkspaces();
   const roles: Partial<Record<WorkerRole, RoleFn>> = {
@@ -404,11 +472,11 @@ test("competitive: verifier verdict pass with custom check name is authoritative
   const judge = { judge: (c: readonly BuildCandidate[]) => { seen = c; return deterministicJudge.judge(c); } };
   const orch = createOrchestrator(deps({ resolveIdentity, roleClaim, workspaces: ws.workspaces, roles, judge }));
   const r = await orch.run(task, parentCtx);
-  assert.equal(r.outcome, "success");
-  assert.equal(r.promoted, true);
+  assert.equal(r.promoted, false, "no executed evidence ⇒ nothing promotes (fail-closed, matches single-run)");
   for (const c of seen) {
-    assert.equal(c.typecheckPass, true, "custom-check verifier pass maps to typecheck gate pass");
-    assert.equal(c.testsPass, true, "custom-check verifier pass maps to tests gate pass");
+    assert.equal(c.typecheckPass, true, "custom-check verifier pass still maps to typecheck gate pass");
+    assert.equal(c.testsPass, true, "custom-check verifier pass still maps to tests gate pass");
+    assert.equal(c.testEvidence, "absent", "no check named \"test\" ⇒ absent evidence");
   }
 });
 
@@ -457,7 +525,7 @@ function builderDriver() {
 function nonBuilderRoles(verifierFor: (wsId: string) => { typecheck: number; test: number }): Partial<Record<WorkerRole, RoleFn>> {
   return {
     scout: async () => ({ role: "scout", outcome: "success", summary: "s" }),
-    critic: async () => ({ role: "critic", outcome: "success", summary: "c" }),
+    critic: async () => ({ role: "critic", outcome: "success", summary: "c", detail: { pass: true } }),
     verifier: async (ctx: RoleContext) => { const o = verifierFor(ctx.workspace.id); return { role: "verifier", outcome: "success", summary: "v", detail: { verdict: o.typecheck === 0 && o.test === 0 ? "pass" : "fail", checks: checks(o.typecheck, o.test) } }; },
     integrator: async () => ({ role: "integrator", outcome: "success", summary: "i", detail: { decision: "promote", evaluation: { approved: true } } }),
   };

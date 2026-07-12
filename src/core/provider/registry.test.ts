@@ -154,6 +154,45 @@ test("per-route cost is accepted; a route with neither route- nor model-cost is 
   );
 });
 
+test("applyRoster REJECTS an Anthropic base URL routed through the OpenAI-compat shim", () => {
+  // The exact silent misconfiguration this release migrates away from: native features forfeited.
+  assert.throws(
+    () =>
+      new ModelRegistry().applyRoster({
+        providers: [{ id: "anthropic", kind: "openai-compatible", baseUrl: "https://api.anthropic.com/v1", apiKey: "sk" }],
+      }),
+    /native tool_use and prompt caching|kind": "anthropic"/,
+  );
+});
+
+test("applyRoster ACCEPTS the native Anthropic kind for the Anthropic base URL", () => {
+  const applied = new ModelRegistry().applyRoster({
+    providers: [{ id: "anthropic", kind: "anthropic", baseUrl: "https://api.anthropic.com/v1", apiKey: "sk" }],
+  });
+  assert.equal(applied.providers, 1);
+});
+
+test("applyRoster allows the Anthropic shim ONLY with the explicit opt-out env", () => {
+  const prev = process.env.IKBI_ALLOW_ANTHROPIC_SHIM;
+  process.env.IKBI_ALLOW_ANTHROPIC_SHIM = "true";
+  try {
+    const applied = new ModelRegistry().applyRoster({
+      providers: [{ id: "anthropic", kind: "openai-compatible", baseUrl: "https://api.anthropic.com/v1", apiKey: "sk" }],
+    });
+    assert.equal(applied.providers, 1);
+  } finally {
+    if (prev === undefined) delete process.env.IKBI_ALLOW_ANTHROPIC_SHIM;
+    else process.env.IKBI_ALLOW_ANTHROPIC_SHIM = prev;
+  }
+});
+
+test("a non-Anthropic OpenAI-compat provider is unaffected by the shim guard", () => {
+  const applied = new ModelRegistry().applyRoster({
+    providers: [{ id: "deepseek", kind: "openai-compatible", baseUrl: "https://api.deepseek.com/v1", apiKey: "sk" }],
+  });
+  assert.equal(applied.providers, 1);
+});
+
 test("loadRosterFile is a no-op when the file is absent", () => {
   const reg = new ModelRegistry();
   const applied = reg.loadRosterFile("/nonexistent/ikbi-roster-does-not-exist.json");
