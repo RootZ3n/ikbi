@@ -43,6 +43,7 @@ import { join } from "node:path";
 
 import { runCapabilities } from "./capabilities.js";
 import { postureLines } from "./posture.js";
+import { printGateStatus } from "./gate-status.js";
 import { writeStderr, writeStdout } from "./io.js";
 import { translateError, formatFriendlyError } from "../core/errors/index.js";
 import { helpForTopic } from "./help-pages.js";
@@ -377,6 +378,16 @@ async function coldStartPreload(): Promise<void> {
 
 async function run(argv: readonly string[]): Promise<void> {
   const cmd = argv[0];
+  // Gate posture diagnostic for promotion-relevant commands. Printed to stderr
+  // so --json output stays clean; skipped for read-only info commands.
+  if (
+    cmd === "build" ||
+    cmd === "fix" ||
+    cmd === "repl" ||
+    cmd === undefined
+  ) {
+    printGateStatus();
+  }
   switch (cmd) {
     case "version":
     case "--version":
