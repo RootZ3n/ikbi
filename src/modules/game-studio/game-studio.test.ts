@@ -10,7 +10,14 @@ import { test } from "node:test";
 
 import { commands } from "../../cli/registry.js";
 import { checkCompatibility } from "../../core/contracts/index.js";
-import { createGameStudioCli, generateGameBible, inspectGodotProject, validateGameFeatureContract } from "./index.js";
+import {
+  AbonulliClient,
+  createGameStudioCli,
+  generateGameBible,
+  inspectGodotProject,
+  validateAnimationRequestContract,
+  validateGameFeatureContract,
+} from "./index.js";
 
 async function createGodotFixture(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "ikbi-game-studio-"));
@@ -65,6 +72,34 @@ async function createGodotFixture(): Promise<string> {
     "export_path=\"build/game.x86_64\"",
   ].join("\n"));
   return root;
+}
+
+interface MockFetchCall {
+  readonly method: string;
+  readonly path: string;
+  readonly body?: unknown;
+}
+
+function createAbonulliMockFetch(
+  handler: (call: MockFetchCall) => { readonly status: number; readonly body: unknown },
+): { readonly fetchImpl: typeof fetch; readonly calls: MockFetchCall[] } {
+  const calls: MockFetchCall[] = [];
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url = new URL(String(input));
+    const body = typeof init?.body === "string" ? JSON.parse(init.body) as unknown : undefined;
+    const call: MockFetchCall = {
+      method: init?.method ?? "GET",
+      path: url.pathname,
+      ...(body !== undefined ? { body } : {}),
+    };
+    calls.push(call);
+    const response = handler(call);
+    return new Response(JSON.stringify(response.body), {
+      status: response.status,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  return { fetchImpl, calls };
 }
 
 test("pins compatible frozen-core contracts", () => {
@@ -178,4 +213,167 @@ test("rejects invalid feature contracts and CLI exits nonzero", async () => {
   await cli.run(["contract", "validate", file]);
   assert.equal(exitCode, 1);
   assert.match(stderr, /contract: invalid/);
+});
+
+test("validates animation contracts in the Abonulli integration shape", () => {
+  const result = validateAnimationRequestContract({
+    character: "worm_scout",
+    animation: "deployment_backfire",
+    duration: 7,
+    frame_rate: 12,
+    camera: "fixed",
+    background: "transparent",
+    output: ["png_sequence", "sprite_sheet", "godot_animation_metadata"],
+    beats: ["Egg shakes.", "Mechanism backfires.", "Smoke clears."],
+  });
+  assert.equal(result.valid, true);
+  assert.deepEqual(result.contract?.output, ["png_sequence", "sprite_sheet", "godot_animation_metadata"]);
+  assert.equal(result.contract?.beats?.length, 3);
+});
+
+test("rejects invalid animation contracts and CLI exits nonzero", async () => {
+  const invalid = validateAnimationRequestContract({
+    character: "",
+    animation: "deployment_backfire",
+    duration: 0,
+    frame_rate: 12.5,
+    camera: "",
+    background: "transparent",
+    output: ["mp4_preview"],
+  });
+  assert.equal(invalid.valid, false);
+  assert.equal(invalid.errors.some((error) => error.includes("character")), true);
+  assert.equal(invalid.errors.some((error) => error.includes("frame_rate")), true);
+  assert.equal(invalid.errors.some((error) => error.includes("output[0]")), true);
+
+  const root = await mkdtemp(join(tmpdir(), "ikbi-game-studio-animation-contract-"));
+  const file = join(root, "bad-animation.json");
+  await writeFile(file, JSON.stringify({ character: "", output: [] }));
+  let stderr = "";
+  let exitCode = 0;
+  const cli = createGameStudioCli({
+    stderr: (s) => { stderr += s; },
+    setExit: (code) => { exitCode = code; },
+  });
+  await cli.run(["animation-contract", "validate", file]);
+  assert.equal(exitCode, 1);
+  assert.match(stderr, /animation-contract: invalid/);
+});
+
+test("Abonulli client checks health against a mock server", async () => {
+  const mock = createAbonulliMockFetch((call) => {
+    assert.equal(call.method, "GET");
+    assert.equal(call.path, "/health");
+    return { status: 200, body: { status: "ok" } };
+  });
+  const health = await new AbonulliClient({ baseUrl: "http://abonulli.test", fetchImpl: mock.fetchImpl }).health();
+  assert.deepEqual(health, { status: "ok" });
+});
+
+test("Abonulli client creates project, sequence with beats, and export requests", async () => {
+  const mock = createAbonulliMockFetch((call) => {
+    if (call.method === "POST" && call.path === "/api/projects") {
+      const body = call.body as Record<string, unknown>;
+      assert.equal(body.name, "worm_scout deployment_backfire");
+      return { status: 201, body: { id: "project-1", name: body.name, slug: body.slug, description: body.description } };
+    }
+    if (call.method === "POST" && call.path === "/api/projects/project-1/sequences") {
+      const body = call.body as Record<string, unknown>;
+      assert.equal(body.name, "deployment_backfire");
+      assert.equal(body.fps, 12);
+      return { status: 201, body: { id: "sequence-1", project_id: "project-1", name: body.name, description: body.description, fps: body.fps } };
+    }
+    if (call.method === "POST" && call.path === "/api/projects/project-1/shots") {
+      const body = call.body as Record<string, unknown>;
+      assert.deepEqual(body.frame_range, { start_frame: 0, end_frame: 83 });
+      return { status: 201, body: {
+        id: "shot-1",
+        project_id: "project-1",
+        sequence_id: "sequence-1",
+        name: body.name,
+        order_index: body.order_index,
+        frame_range: body.frame_range,
+      } };
+    }
+    if (call.method === "POST" && call.path === "/api/projects/project-1/beats") {
+      const body = call.body as Record<string, unknown>;
+      return { status: 201, body: {
+        id: `beat-${Number(body.order_index) + 1}`,
+        project_id: "project-1",
+        shot_id: body.shot_id,
+        order_index: body.order_index,
+        description: body.description,
+      } };
+    }
+    if (call.method === "POST" && call.path === "/api/projects/project-1/sequences/sequence-1/exports") {
+      const body = call.body as Record<string, unknown>;
+      return { status: 201, body: [{
+        id: `export-${body.format as string}`,
+        project_id: "project-1",
+        preset_id: `preset-${body.format as string}`,
+        path: `/tmp/${body.format as string}`,
+        format: body.format,
+        provenance: { operation: "mock_export" },
+      }] };
+    }
+    if (call.method === "GET" && call.path === "/api/projects/project-1/exports") {
+      return { status: 200, body: [
+        { id: "export-png", project_id: "project-1", preset_id: "preset-png", path: "/tmp/png", format: "png_sequence" },
+        { id: "export-sheet", project_id: "project-1", preset_id: "preset-sheet", path: "/tmp/sheet", format: "sprite_sheet" },
+        { id: "export-godot", project_id: "project-1", preset_id: "preset-godot", path: "/tmp/godot", format: "godot_manifest" },
+      ] };
+    }
+    return { status: 404, body: { detail: "not found" } };
+  });
+  const client = new AbonulliClient({ baseUrl: "http://abonulli.test", fetchImpl: mock.fetchImpl });
+  const job = await client.requestAnimation({
+    character: "worm_scout",
+    animation: "deployment_backfire",
+    duration: 7,
+    frame_rate: 12,
+    camera: "fixed",
+    background: "transparent",
+    output: ["png_sequence", "sprite_sheet", "godot_animation_metadata"],
+    beats: ["Egg shakes.", "Mechanism backfires."],
+  });
+  assert.equal(job.project.id, "project-1");
+  assert.equal(job.sequence.fps, 12);
+  assert.equal(job.beats.length, 2);
+  assert.deepEqual(job.exports.map((item) => item.artifacts[0]?.format), ["png_sequence", "sprite_sheet", "godot_manifest"]);
+  const exportStatus = await client.pollExportStatus("project-1", ["png_sequence", "sprite_sheet", "godot_animation_metadata"]);
+  assert.equal(exportStatus.status, "succeeded");
+  assert.equal(mock.calls.some((call) => call.method === "POST" && call.path === "/api/projects/project-1/beats"), true);
+  assert.equal(mock.calls.filter((call) => call.method === "POST" && call.path.includes("/exports")).length, 3);
+});
+
+test("CLI Abonulli commands use injected client and validate request files", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ikbi-game-studio-abonulli-cli-"));
+  const file = join(root, "animation.json");
+  await writeFile(file, JSON.stringify({
+    character: "worm_scout",
+    animation: "deployment_backfire",
+    duration: 7,
+    frame_rate: 12,
+    camera: "fixed",
+    background: "transparent",
+    output: ["png_sequence"],
+  }));
+  let stdout = "";
+  const cli = createGameStudioCli({
+    stdout: (s) => { stdout += s; },
+    createAbonulliClient: () => ({
+      health: async () => ({ status: "ok" }),
+      requestAnimation: async (contract) => ({
+        project: { id: "project-1", name: contract.character, slug: "project-1" },
+        sequence: { id: "sequence-1", project_id: "project-1", name: contract.animation, fps: contract.frame_rate },
+        shot: { id: "shot-1", project_id: "project-1", sequence_id: "sequence-1", name: contract.animation, order_index: 0, frame_range: { start_frame: 0, end_frame: 83 } },
+        beats: [],
+        exports: [{ format: "png_sequence", artifacts: [] }],
+      }),
+    }),
+  });
+  await cli.run(["abonulli", "status", "--json"]);
+  await cli.run(["abonulli", "request", file, "--json"]);
+  assert.match(stdout, /"healthy": true/);
+  assert.match(stdout, /"sequence-1"/);
 });

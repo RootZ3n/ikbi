@@ -14,7 +14,41 @@ assertContractCompatible("substrate", "1.0.0");
 import "./cli.js";
 
 export { createGameStudioCli, gameStudioStatus, type GameStudioCliDeps } from "./cli.js";
-export { gameStudioConfig, loadGameStudioConfig, DEFAULT_GODOT_PATH, type GameStudioConfig } from "./config.js";
+export {
+  gameStudioConfig,
+  loadGameStudioConfig,
+  DEFAULT_ABONULLI_BASE_URL,
+  DEFAULT_GODOT_PATH,
+  type GameStudioConfig,
+} from "./config.js";
+export {
+  AbonulliClient,
+  AbonulliHttpError,
+  type AbonulliAnimationJob,
+  type AbonulliBeat,
+  type AbonulliClientOptions,
+  type AbonulliExportArtifact,
+  type AbonulliExportRequestResult,
+  type AbonulliExportStatus,
+  type AbonulliHealth,
+  type AbonulliProject,
+  type AbonulliSequence,
+  type AbonulliShot,
+} from "./abonulli-client.js";
+export {
+  readAndValidateAnimationRequestContract,
+  validateAnimationRequestContract,
+  validateAnimationResponseContract,
+  type AnimationCollisionSuggestion,
+  type AnimationContractValidationResult,
+  type AnimationEventMarker,
+  type AnimationFrameReference,
+  type AnimationFrameTiming,
+  type AnimationOutputFormat,
+  type AnimationRequestContract,
+  type AnimationResponseContract,
+  type AnimationReviewStatus,
+} from "./animation-contracts.js";
 export {
   CONTRACT_VERSION,
   type BrokenReferenceIndicator,
