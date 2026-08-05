@@ -18,7 +18,17 @@ export { gameStudioConfig, loadGameStudioConfig, DEFAULT_GODOT_PATH, type GameSt
 export {
   CONTRACT_VERSION,
   type BrokenReferenceIndicator,
+  type AnimationPlayerIndicator,
+  type ContractValidationResult,
   type ExportPresetInventoryItem,
+  type GameBible,
+  type GameBibleAssets,
+  type GameBibleGap,
+  type GameBibleScene,
+  type GameBibleSystems,
+  type GameFeatureAcceptanceTest,
+  type GameFeatureContract,
+  type GameFeatureGodotRequirements,
   type GameStudioStatus,
   type GodotAutoload,
   type GodotInputAction,
@@ -26,8 +36,17 @@ export {
   type GodotProjectSummary,
   type GodotScalar,
   type GodotValue,
+  type InputUsageIndicator,
   type SceneInventoryItem,
   type ScriptInventoryItem,
+  type SignalIndicator,
+  type StateMachineIndicator,
 } from "./contract.js";
 export { GAME_STUDIO_INSPECTED_EVENT } from "./events.js";
+export {
+  GAME_FEATURE_CONTRACT_SCHEMA,
+  readAndValidateGameFeatureContract,
+  validateGameFeatureContract,
+} from "./feature-contracts.js";
+export { generateGameBible, renderGameBibleMarkdown } from "./game-bible.js";
 export { inspectGodotProject } from "./project-inspector.js";

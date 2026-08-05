@@ -1,9 +1,9 @@
 /**
  * ikbi game-studio — module contract.
  *
- * GS-A is intentionally read-only: a module skeleton, CLI surface, and Godot
- * project inspector. Later phases can add game-bible, feature-contracts,
- * playtest, exporters, and UI contracts without changing this initial surface.
+ * The module is intentionally read-only through GS-B: project inspection, Game
+ * Bible generation, and feature-contract validation derive evidence from files
+ * without mutating Godot projects.
  */
 
 /** Semantic version of the game-studio contract. Bump on breaking change. */
@@ -82,4 +82,97 @@ export interface GameStudioStatus {
   readonly contractVersion: string;
   readonly healthy: boolean;
   readonly godotPath: string;
+}
+
+export interface GameBible {
+  readonly module: "game-studio";
+  readonly contractVersion: string;
+  readonly generatedAt: string;
+  readonly repoPath: string;
+  readonly project: GodotProjectSummary;
+  readonly sceneInventory: readonly GameBibleScene[];
+  readonly scripts: readonly ScriptInventoryItem[];
+  readonly systems: GameBibleSystems;
+  readonly assets: GameBibleAssets;
+  readonly tests: readonly string[];
+  readonly gapAnalysis: readonly GameBibleGap[];
+}
+
+export interface GameBibleScene extends SceneInventoryItem {
+  readonly rootNodeName?: string;
+  readonly rootNodeType?: string;
+  readonly nodeTypes: Readonly<Record<string, number>>;
+  readonly scriptPaths: readonly string[];
+  readonly animationPlayers: readonly string[];
+}
+
+export interface GameBibleSystems {
+  readonly autoloads: readonly GodotAutoload[];
+  readonly stateMachines: readonly StateMachineIndicator[];
+  readonly inputActions: readonly GodotInputAction[];
+  readonly inputUsage: readonly InputUsageIndicator[];
+  readonly signals: readonly SignalIndicator[];
+  readonly animationPlayers: readonly AnimationPlayerIndicator[];
+}
+
+export interface StateMachineIndicator {
+  readonly source: string;
+  readonly evidence: readonly string[];
+}
+
+export interface InputUsageIndicator {
+  readonly action: string;
+  readonly sources: readonly string[];
+}
+
+export interface SignalIndicator {
+  readonly source: string;
+  readonly name: string;
+  readonly kind: "declared" | "emitted" | "connected";
+}
+
+export interface AnimationPlayerIndicator {
+  readonly scene: string;
+  readonly nodeName: string;
+}
+
+export interface GameBibleAssets {
+  readonly total: number;
+  readonly byType: Readonly<Record<string, number>>;
+  readonly paths: readonly string[];
+}
+
+export interface GameBibleGap {
+  readonly severity: "info" | "warning" | "error";
+  readonly area: "project" | "scene" | "script" | "asset" | "test" | "system";
+  readonly message: string;
+  readonly evidence: readonly string[];
+}
+
+export interface GameFeatureContract {
+  readonly id: string;
+  readonly title?: string;
+  readonly player_experience: readonly string[];
+  readonly godot_requirements: GameFeatureGodotRequirements;
+  readonly acceptance_tests: readonly GameFeatureAcceptanceTest[];
+}
+
+export interface GameFeatureGodotRequirements {
+  readonly scene_type?: string;
+  readonly signals?: readonly string[];
+  readonly persistence_key?: string;
+  readonly required_assets?: readonly string[];
+  readonly input_actions?: readonly string[];
+  readonly scripts?: readonly string[];
+}
+
+export interface GameFeatureAcceptanceTest {
+  readonly name: string;
+  readonly steps: readonly string[];
+  readonly expected: string;
+}
+
+export interface ContractValidationResult {
+  readonly valid: boolean;
+  readonly errors: readonly string[];
 }

@@ -1,6 +1,8 @@
 import { registerCommand } from "../../cli/registry.js";
 import { gameStudioConfig } from "./config.js";
 import { CONTRACT_VERSION, type GameStudioStatus, type GodotProjectInspection } from "./contract.js";
+import { readAndValidateGameFeatureContract } from "./feature-contracts.js";
+import { generateGameBible, renderGameBibleMarkdown } from "./game-bible.js";
 import { inspectGodotProject } from "./project-inspector.js";
 
 function hasJson(argv: readonly string[]): boolean {
@@ -48,6 +50,8 @@ function renderInspection(report: GodotProjectInspection): string {
 
 export interface GameStudioCliDeps {
   readonly inspect?: typeof inspectGodotProject;
+  readonly generateBible?: typeof generateGameBible;
+  readonly validateContractFile?: typeof readAndValidateGameFeatureContract;
   readonly stdout?: (s: string) => void;
   readonly stderr?: (s: string) => void;
   readonly setExit?: (code: number) => void;
@@ -55,6 +59,8 @@ export interface GameStudioCliDeps {
 
 export function createGameStudioCli(deps: GameStudioCliDeps = {}) {
   const inspect = deps.inspect ?? inspectGodotProject;
+  const generateBible = deps.generateBible ?? generateGameBible;
+  const validateContractFile = deps.validateContractFile ?? readAndValidateGameFeatureContract;
   const out = deps.stdout ?? ((s: string) => void process.stdout.write(s));
   const err = deps.stderr ?? ((s: string) => void process.stderr.write(s));
   const setExit = deps.setExit ?? ((c: number) => void (process.exitCode = c));
@@ -83,7 +89,43 @@ export function createGameStudioCli(deps: GameStudioCliDeps = {}) {
       }
       return;
     }
-    err("ikbi: game-studio usage: ikbi game-studio <status|inspect> [args]\n");
+    if (command === "bible") {
+      const positional = withoutFlags(argv.slice(1));
+      const repoPath = positional[0];
+      if (repoPath === undefined) {
+        err("ikbi: game-studio bible needs a repo path — usage: ikbi game-studio bible <repo-path> [--json]\n");
+        setExit(1);
+        return;
+      }
+      try {
+        const bible = await generateBible(repoPath);
+        out(hasJson(argv) ? `${JSON.stringify(bible, null, 2)}\n` : renderGameBibleMarkdown(bible));
+      } catch (e) {
+        err(`ikbi: game-studio bible failed: ${e instanceof Error ? e.message : String(e)}\n`);
+        setExit(1);
+      }
+      return;
+    }
+    if (command === "contract" && argv[1] === "validate") {
+      const positional = withoutFlags(argv.slice(2));
+      const filePath = positional[0];
+      if (filePath === undefined) {
+        err("ikbi: game-studio contract validate needs a file — usage: ikbi game-studio contract validate <file.json> [--json]\n");
+        setExit(1);
+        return;
+      }
+      const result = await validateContractFile(filePath);
+      if (hasJson(argv)) {
+        out(`${JSON.stringify({ valid: result.valid, errors: result.errors }, null, 2)}\n`);
+      } else if (result.valid) {
+        out("contract: valid\n");
+      } else {
+        err(`contract: invalid\n${result.errors.map((error) => `- ${error}`).join("\n")}\n`);
+      }
+      if (!result.valid) setExit(1);
+      return;
+    }
+    err("ikbi: game-studio usage: ikbi game-studio <status|inspect|bible|contract validate> [args]\n");
     setExit(1);
   }
 
@@ -93,7 +135,7 @@ export function createGameStudioCli(deps: GameStudioCliDeps = {}) {
 const live = createGameStudioCli();
 registerCommand({
   name: "game-studio",
-  summary: "Inspect and report on Godot game projects",
-  usage: "ikbi game-studio <status|inspect> [args]",
+  summary: "Inspect, map, and validate Godot game projects",
+  usage: "ikbi game-studio <status|inspect|bible|contract validate> [args]",
   run: (argv) => live.run(argv),
 });
