@@ -3,7 +3,7 @@
 process.env.IKBI_ALLOW_INSECURE_DEV_KEYS ??= "true";
 
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
@@ -15,8 +15,11 @@ import {
   createGameStudioCli,
   generateGameBible,
   inspectGodotProject,
+  renderSliceReport,
+  runGameStudioSlice,
   validateAnimationRequestContract,
   validateGameFeatureContract,
+  WORM_DEPLOYMENT_BACKFIRE_BEATS,
 } from "./index.js";
 
 async function createGodotFixture(): Promise<string> {
@@ -376,4 +379,106 @@ test("CLI Abonulli commands use injected client and validate request files", asy
   await cli.run(["abonulli", "request", file, "--json"]);
   assert.match(stdout, /"healthy": true/);
   assert.match(stdout, /"sequence-1"/);
+});
+
+test("worm deployment backfire fixture contract validates", async () => {
+  const fixture = JSON.parse(await readFile(join(process.cwd(), "src/modules/game-studio/fixtures/worm-deployment-backfire.contract.json"), "utf-8")) as unknown;
+  const result = validateGameFeatureContract(fixture);
+  assert.deepEqual(result, { valid: true, errors: [] });
+  assert.deepEqual((fixture as { player_experience: readonly string[] }).player_experience, WORM_DEPLOYMENT_BACKFIRE_BEATS);
+});
+
+test("slice orchestrator chains mocked inspector, bible, Abonulli, additive files, and Godot evidence", async () => {
+  const root = await createGodotFixture();
+  const contractFile = join(root, "worm-deployment-backfire.contract.json");
+  await writeFile(contractFile, await readFile(join(process.cwd(), "src/modules/game-studio/fixtures/worm-deployment-backfire.contract.json"), "utf-8"));
+  const calls: string[] = [];
+
+  const report = await runGameStudioSlice(root, contractFile, { abonulliBaseUrl: "http://abonulli.test" }, {
+    now: () => new Date("2026-08-05T12:00:00.000Z"),
+    inspect: async (repoPath) => {
+      calls.push(`inspect:${repoPath}`);
+      const inspection = await inspectGodotProject(repoPath, () => new Date("2026-08-05T12:00:00.000Z"));
+      return inspection;
+    },
+    generateBible: async (repoPath) => {
+      calls.push(`bible:${repoPath}`);
+      return generateGameBible(repoPath, () => new Date("2026-08-05T12:00:00.000Z"));
+    },
+    requestAnimation: async (contract, baseUrl) => {
+      calls.push(`abonulli:${baseUrl}:${contract.animation}`);
+      return {
+        project: { id: "project-1", name: contract.project_name ?? "WvW", slug: "project-1" },
+        sequence: { id: "sequence-1", project_id: "project-1", name: contract.animation, fps: contract.frame_rate },
+        shot: { id: "shot-1", project_id: "project-1", sequence_id: "sequence-1", name: contract.animation, order_index: 0, frame_range: { start_frame: 0, end_frame: 83 } },
+        beats: contract.beats?.map((description, index) => ({ id: `beat-${index + 1}`, project_id: "project-1", shot_id: "shot-1", order_index: index, description })) ?? [],
+        exports: [{ format: "png_sequence", artifacts: [{ id: "export-1", project_id: "project-1", preset_id: "preset-1", path: "/tmp/png", format: "png_sequence" }] }],
+      };
+    },
+    runProcess: async (command, args, options) => {
+      calls.push(`godot:${command}:${args.join(" ")}`);
+      const screenshotPath = options.env.IKBI_GAME_STUDIO_SCREENSHOT_PATH;
+      return {
+        status: 0,
+        stdout: [
+          "[IKBI_SLICE] Worm Deployment Backfire start fps=12 total_frames=84",
+          ...WORM_DEPLOYMENT_BACKFIRE_BEATS.map((beat, index) => `[IKBI_SLICE] beat=${index + 1} frame=${index < 7 ? index * 12 : 80} text=${beat}`),
+          `[IKBI_SLICE] screenshot=${screenshotPath} status=0`,
+          "[IKBI_SLICE] sequence_completed beats=8 frames=84",
+        ].join("\n"),
+        stderr: "",
+      };
+    },
+    godotPath: "godot",
+  });
+
+  assert.equal(report.abonulli.mode, "requested");
+  assert.equal(report.godotRun.exitStatus, 0);
+  assert.equal(report.godotRun.beatLogs.length, 8);
+  assert.equal(report.godotRun.beatsLoggedInOrder, true);
+  assert.equal(report.godotRun.screenshotCaptured, true);
+  assert.deepEqual(report.implementationContract.additiveFiles, ["scenes/worm_deployment_backfire.tscn", "scripts/worm_deployment_backfire.gd"]);
+  assert.equal(calls.some((call) => call.startsWith("inspect:")), true);
+  assert.equal(calls.some((call) => call.startsWith("bible:")), true);
+  assert.equal(calls.some((call) => call.startsWith("abonulli:http://abonulli.test:deployment_backfire")), true);
+  assert.equal(calls.some((call) => call.includes("res://scenes/worm_deployment_backfire.tscn")), true);
+});
+
+test("slice report rendering summarizes evidence", () => {
+  const report = {
+    runId: "gsd-test",
+    repoPath: "/tmp/wvw",
+    contractPath: "/tmp/contract.json",
+    inspected: { repoPath: "/tmp/wvw", project: { path: "/tmp/wvw/project.godot", exists: true, name: "Wyrms vs Worms", features: [], autoloads: [], inputMap: [], display: {} } },
+    bible: { project: { path: "/tmp/wvw/project.godot", exists: true, name: "Wyrms vs Worms", features: [], autoloads: [], inputMap: [], display: {} }, tests: ["tests/test_hatch_sequence.gd"], gapAnalysis: [] },
+    featureContract: { id: "worm_deployment_backfire", player_experience: WORM_DEPLOYMENT_BACKFIRE_BEATS, godot_requirements: {}, acceptance_tests: [] },
+    animationRequest: { character: "worm", animation: "deployment_backfire", duration: 7, frame_rate: 12, camera: "fixed", background: "transparent", output: ["png_sequence"], beats: WORM_DEPLOYMENT_BACKFIRE_BEATS },
+    abonulli: { mode: "mock", baseUrl: "http://abonulli.test", error: "down" },
+    implementationContract: {
+      id: "worm_deployment_backfire",
+      repoPath: "/tmp/wvw",
+      additiveFiles: ["scenes/worm_deployment_backfire.tscn", "scripts/worm_deployment_backfire.gd"],
+      boundedChange: "additive proof",
+      scene: "res://scenes/worm_deployment_backfire.tscn",
+      script: "res://scripts/worm_deployment_backfire.gd",
+      timeline: { durationSeconds: 7, frameRate: 12, totalFrames: 84, beats: [] },
+    },
+    godotRun: {
+      command: ["godot", "--headless"],
+      cwd: "/tmp/wvw",
+      exitStatus: 0,
+      stdout: "",
+      stderr: "",
+      beatLogs: ["[IKBI_SLICE] beat=1 frame=0 text=An egg shakes."],
+      beatsLoggedInOrder: true,
+      screenshotPath: "/tmp/gsd-test.png",
+      screenshotCaptured: false,
+    },
+  } as const;
+
+  const rendered = renderSliceReport(report);
+  assert.match(rendered, /slice_run: gsd-test/);
+  assert.match(rendered, /beats_logged: 1\/8/);
+  assert.match(rendered, /beats_in_order: yes/);
+  assert.match(rendered, /scenes\/worm_deployment_backfire\.tscn/);
 });

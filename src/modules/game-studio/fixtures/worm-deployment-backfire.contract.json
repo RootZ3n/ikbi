@@ -1,0 +1,55 @@
+{
+  "id": "worm_deployment_backfire",
+  "title": "Worm Deployment Backfire",
+  "player_experience": [
+    "An egg shakes.",
+    "The shell cracks.",
+    "A worm emerges.",
+    "A deployment mechanism activates.",
+    "The mechanism malfunctions.",
+    "The worm launches upward.",
+    "The worm crashes back into the playfield.",
+    "Smoke clears and the worm reacts."
+  ],
+  "godot_requirements": {
+    "scene_type": "Node2D",
+    "signals": [
+      "beat_started",
+      "sequence_completed"
+    ],
+    "persistence_key": "ikbi.vertical_slice.worm_deployment_backfire",
+    "required_assets": [
+      "transparent_png_sequence_12fps"
+    ],
+    "scripts": [
+      "res://scripts/worm_deployment_backfire.gd"
+    ]
+  },
+  "acceptance_tests": [
+    {
+      "name": "eight beats execute in order",
+      "steps": [
+        "Run res://scenes/worm_deployment_backfire.tscn headless.",
+        "Capture stdout and stderr.",
+        "Inspect the beat log lines."
+      ],
+      "expected": "The process exits 0 and logs all eight Worm Deployment Backfire beats in order."
+    },
+    {
+      "name": "bounded additive proof scene",
+      "steps": [
+        "Inspect the generated implementation contract.",
+        "Check the Wyrms vs Worms project tree."
+      ],
+      "expected": "Only res://scenes/worm_deployment_backfire.tscn and res://scripts/worm_deployment_backfire.gd are added for the proof."
+    },
+    {
+      "name": "12 fps timeline",
+      "steps": [
+        "Run the proof scene.",
+        "Review the per-beat frame numbers."
+      ],
+      "expected": "The seven-second sequence uses a deterministic 84-frame, 12 fps timeline."
+    }
+  ]
+}

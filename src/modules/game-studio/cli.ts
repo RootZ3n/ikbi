@@ -6,6 +6,7 @@ import { CONTRACT_VERSION, type GameStudioStatus, type GodotProjectInspection } 
 import { readAndValidateGameFeatureContract } from "./feature-contracts.js";
 import { generateGameBible, renderGameBibleMarkdown } from "./game-bible.js";
 import { inspectGodotProject } from "./project-inspector.js";
+import { renderSliceReport, runGameStudioSlice } from "./slice.js";
 
 function hasJson(argv: readonly string[]): boolean {
   return argv.includes("--json");
@@ -56,6 +57,7 @@ export interface GameStudioCliDeps {
   readonly validateContractFile?: typeof readAndValidateGameFeatureContract;
   readonly validateAnimationContractFile?: typeof readAndValidateAnimationRequestContract;
   readonly createAbonulliClient?: (baseUrl: string) => Pick<AbonulliClient, "health" | "requestAnimation">;
+  readonly runSlice?: typeof runGameStudioSlice;
   readonly stdout?: (s: string) => void;
   readonly stderr?: (s: string) => void;
   readonly setExit?: (code: number) => void;
@@ -67,6 +69,7 @@ export function createGameStudioCli(deps: GameStudioCliDeps = {}) {
   const validateContractFile = deps.validateContractFile ?? readAndValidateGameFeatureContract;
   const validateAnimationContractFile = deps.validateAnimationContractFile ?? readAndValidateAnimationRequestContract;
   const createAbonulliClient = deps.createAbonulliClient ?? ((baseUrl: string) => new AbonulliClient({ baseUrl }));
+  const runSlice = deps.runSlice ?? runGameStudioSlice;
   const out = deps.stdout ?? ((s: string) => void process.stdout.write(s));
   const err = deps.stderr ?? ((s: string) => void process.stderr.write(s));
   const setExit = deps.setExit ?? ((c: number) => void (process.exitCode = c));
@@ -197,7 +200,28 @@ export function createGameStudioCli(deps: GameStudioCliDeps = {}) {
       }
       return;
     }
-    err("ikbi: game-studio usage: ikbi game-studio <status|inspect|bible|contract validate|animation-contract validate|abonulli status|abonulli request> [args]\n");
+    if (command === "slice" && argv[1] === "run") {
+      const positional = withoutFlags(argv.slice(2));
+      const repoPath = positional[0];
+      const contractFlagIndex = argv.indexOf("--contract");
+      const contractPath = contractFlagIndex >= 0 ? argv[contractFlagIndex + 1] : undefined;
+      const baseUrlFlagIndex = argv.indexOf("--abonulli-base-url");
+      const abonulliBaseUrl = baseUrlFlagIndex >= 0 ? argv[baseUrlFlagIndex + 1] : undefined;
+      if (repoPath === undefined || contractPath === undefined) {
+        err("ikbi: game-studio slice run needs repo path and contract — usage: ikbi game-studio slice run <repo-path> --contract <feature-contract.json> [--abonulli-base-url URL] [--json]\n");
+        setExit(1);
+        return;
+      }
+      try {
+        const report = await runSlice(repoPath, contractPath, abonulliBaseUrl !== undefined ? { abonulliBaseUrl } : {});
+        out(hasJson(argv) ? `${JSON.stringify(report, null, 2)}\n` : renderSliceReport(report));
+      } catch (e) {
+        err(`ikbi: game-studio slice run failed: ${e instanceof Error ? e.message : String(e)}\n`);
+        setExit(1);
+      }
+      return;
+    }
+    err("ikbi: game-studio usage: ikbi game-studio <status|inspect|bible|contract validate|animation-contract validate|abonulli status|abonulli request|slice run> [args]\n");
     setExit(1);
   }
 
@@ -208,6 +232,6 @@ const live = createGameStudioCli();
 registerCommand({
   name: "game-studio",
   summary: "Inspect, map, validate, and request Godot game assets",
-  usage: "ikbi game-studio <status|inspect|bible|contract validate|animation-contract validate|abonulli status|abonulli request> [args]",
+  usage: "ikbi game-studio <status|inspect|bible|contract validate|animation-contract validate|abonulli status|abonulli request|slice run> [args]",
   run: (argv) => live.run(argv),
 });

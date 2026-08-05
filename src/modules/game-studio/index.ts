@@ -84,3 +84,15 @@ export {
 } from "./feature-contracts.js";
 export { generateGameBible, renderGameBibleMarkdown } from "./game-bible.js";
 export { inspectGodotProject } from "./project-inspector.js";
+export {
+  WORM_DEPLOYMENT_BACKFIRE_BEATS,
+  WORM_DEPLOYMENT_BACKFIRE_SCENE,
+  WORM_DEPLOYMENT_BACKFIRE_SCRIPT,
+  renderSliceReport,
+  runGameStudioSlice,
+  type ProcessResult,
+  type SliceDeps,
+  type SliceGodotRunEvidence,
+  type SliceImplementationContract,
+  type SliceRunReport,
+} from "./slice.js";
