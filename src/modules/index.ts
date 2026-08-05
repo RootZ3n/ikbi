@@ -80,6 +80,8 @@ import "./spec-artifact/index.js";
 // Correction Library — reusable lessons learned from build failures (proposed, then
 // operator-approved). The refuter files proposals here; nothing auto-installs.
 import "./correction-library/index.js";
+// Game Studio — read-only Godot project inspection CLI (`ikbi game-studio ...`).
+import "./game-studio/index.js";
 // Kill-switch LAST — its index reads the durable latch at engine start (graceful
 // degradation), and registers the `kill`/`unkill`/`kill-status` operator commands.
 import "./kill-switch/index.js";
