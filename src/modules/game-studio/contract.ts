@@ -90,12 +90,28 @@ export interface GameBible {
   readonly generatedAt: string;
   readonly repoPath: string;
   readonly project: GodotProjectSummary;
+  readonly genre: GameBibleGenreAnalysis;
   readonly sceneInventory: readonly GameBibleScene[];
   readonly scripts: readonly ScriptInventoryItem[];
   readonly systems: GameBibleSystems;
   readonly assets: GameBibleAssets;
   readonly tests: readonly string[];
   readonly gapAnalysis: readonly GameBibleGap[];
+}
+
+export interface GameBibleGenreAnalysis {
+  readonly primaryGenre: string;
+  readonly confidence: "low" | "medium" | "high";
+  readonly gameplayModel: readonly string[];
+  readonly evidence: readonly string[];
+  readonly firstPlayableMilestone: readonly string[];
+  readonly milestoneBlockers: readonly GameBibleMilestoneBlocker[];
+}
+
+export interface GameBibleMilestoneBlocker {
+  readonly area: "project" | "scene" | "script" | "asset" | "test" | "system" | "data";
+  readonly message: string;
+  readonly evidence: readonly string[];
 }
 
 export interface GameBibleScene extends SceneInventoryItem {
@@ -144,7 +160,7 @@ export interface GameBibleAssets {
 
 export interface GameBibleGap {
   readonly severity: "info" | "warning" | "error";
-  readonly area: "project" | "scene" | "script" | "asset" | "test" | "system";
+  readonly area: "project" | "scene" | "script" | "asset" | "test" | "system" | "data";
   readonly message: string;
   readonly evidence: readonly string[];
 }

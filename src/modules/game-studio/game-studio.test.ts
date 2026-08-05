@@ -77,6 +77,106 @@ async function createGodotFixture(): Promise<string> {
   return root;
 }
 
+async function createGridlandsStyleFixture(): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "ikbi-game-studio-gridlands-"));
+  await mkdir(join(root, "data"), { recursive: true });
+  await mkdir(join(root, "docs"), { recursive: true });
+  await mkdir(join(root, "scenes", "world"), { recursive: true });
+  await mkdir(join(root, "scripts", "core"), { recursive: true });
+  await mkdir(join(root, "scripts", "world"), { recursive: true });
+  await writeFile(join(root, "README.md"), [
+    "# Gridlands Fixture",
+    "",
+    "Gridlands is a turn-based RPG with a top-down overworld, random encounters, and Dragon Warrior-style battle menus.",
+  ].join("\n"));
+  await writeFile(join(root, "docs", "GDD_GRIDLANDS.md"), [
+    "# GRIDLANDS - Game Design Document",
+    "",
+    "**Genre:** Turn-based RPG",
+    "",
+    "The first playable needs one overworld zone, one random encounter, a battle scene, turn-based combat, Circuit Blade EXP, save/load, dialog, and UI.",
+    "All enemy stats, skills, items, zones, and dialog are expected to be data-driven JSON files.",
+  ].join("\n"));
+  await writeFile(join(root, "docs", "ART_STYLE_GUIDE.md"), [
+    "# GRIDLANDS - Art Style Guide",
+    "",
+    "The game uses 16x16 overworld tiles, 16x16 Zenny sprites, battle enemy sprites, NES UI panels, and synthwave audio.",
+  ].join("\n"));
+  await writeFile(join(root, "project.godot"), [
+    "config_version=5",
+    "",
+    "[application]",
+    "config/name=\"Gridlands Fixture\"",
+    "run/main_scene=\"res://scenes/world/Overworld.tscn\"",
+    "config/features=PackedStringArray(\"4.5\", \"Forward Plus\")",
+    "",
+    "[autoload]",
+    "GameManager=\"*res://scripts/core/game_manager.gd\"",
+    "SaveManager=\"*res://scripts/core/save_manager.gd\"",
+    "EncounterTable=\"*res://scripts/core/encounter_table.gd\"",
+    "SfxManager=\"*res://scripts/core/sfx_manager.gd\"",
+    "",
+    "[input]",
+    "move_up={\"deadzone\":0.5}",
+    "move_down={\"deadzone\":0.5}",
+    "move_left={\"deadzone\":0.5}",
+    "move_right={\"deadzone\":0.5}",
+    "confirm={\"deadzone\":0.5}",
+    "cancel={\"deadzone\":0.5}",
+    "menu={\"deadzone\":0.5}",
+    "",
+    "[display]",
+    "window/size/viewport_width=256",
+    "window/size/viewport_height=240",
+    "window/stretch/scale_mode=\"integer\"",
+  ].join("\n"));
+  await writeFile(join(root, "scenes", "world", "Overworld.tscn"), [
+    "[gd_scene load_steps=2 format=3]",
+    "[ext_resource type=\"Script\" path=\"res://scripts/world/zenny_controller.gd\" id=\"1_zenny\"]",
+    "[node name=\"Overworld\" type=\"Node2D\"]",
+    "[node name=\"Camera2D\" type=\"Camera2D\" parent=\".\"]",
+    "[node name=\"Zenny\" type=\"CharacterBody2D\" parent=\".\"]",
+    "script = ExtResource(\"1_zenny\")",
+    "[node name=\"AnimationPlayer\" type=\"AnimationPlayer\" parent=\"Zenny\"]",
+  ].join("\n"));
+  await writeFile(join(root, "scripts", "world", "zenny_controller.gd"), [
+    "extends CharacterBody2D",
+    "var tile_size := 16",
+    "func _process(_delta: float) -> void:",
+    "\tif GameManager.current_state != GameManager.GameState.OVERWORLD:",
+    "\t\treturn",
+    "\tif Input.is_action_pressed(\"move_up\"):",
+    "\t\tGameManager.register_step()",
+    "\t\tif GameManager.should_encounter():",
+    "\t\t\tGameManager.trigger_encounter()",
+  ].join("\n"));
+  await writeFile(join(root, "scripts", "core", "game_manager.gd"), [
+    "extends Node",
+    "signal scene_transition_started",
+    "enum GameState { OVERWORLD, BATTLE, MENU, DIALOG }",
+    "var current_state: GameState = GameState.OVERWORLD",
+    "func register_step() -> void:",
+    "\tpass",
+    "func should_encounter() -> bool:",
+    "\treturn true",
+    "func trigger_encounter(enemy_id: String = \"\") -> void:",
+    "\tcurrent_state = GameState.BATTLE",
+    "\t# TODO: Transition to battle scene",
+  ].join("\n"));
+  await writeFile(join(root, "scripts", "core", "encounter_table.gd"), [
+    "extends Node",
+    "var encounter_data := { \"zone_1_arena\": [{ \"id\": \"worm_drone\", \"weight\": 40 }] }",
+    "func pick_encounter(zone: String) -> String:",
+    "\treturn encounter_data[zone][0][\"id\"]",
+  ].join("\n"));
+  await writeFile(join(root, "scripts", "core", "save_manager.gd"), "extends Node\nvar save_data := { \"blade_level\": 1, \"blade_exp\": 0 }\n");
+  await writeFile(join(root, "scripts", "core", "sfx_manager.gd"), "extends Node\nfunc play_music(track_name: String) -> void:\n\tprint(track_name)\n");
+  await writeFile(join(root, "data", "enemies.json"), JSON.stringify({
+    worm_drone: { name: "Worm Drone", zone: "zone_1_arena", hp: 15, exp_reward: 8, abilities: ["bite"] },
+  }, null, 2));
+  return root;
+}
+
 interface MockFetchCall {
   readonly method: string;
   readonly path: string;
@@ -153,6 +253,26 @@ test("bible generation derives systems, assets, tests, and gaps from fixture evi
   assert.deepEqual(bible.tests, ["tests/test_fixture.gd"]);
   assert.equal(bible.gapAnalysis.some((gap) => gap.severity === "error" && gap.message.includes("missing resource")), true);
   assert.equal(bible.gapAnalysis.some((gap) => gap.message.includes("TODO")), true);
+});
+
+test("Gridlands-style fixture is classified as RPG and reports first-playable blockers", async () => {
+  const root = await createGridlandsStyleFixture();
+  const inspection = await inspectGodotProject(root, () => new Date("2026-08-05T00:00:00.000Z"));
+  assert.equal(inspection.project.name, "Gridlands Fixture");
+  assert.equal(inspection.scenes.some((scene) => scene.path === "scenes/world/Overworld.tscn"), true);
+  assert.equal(inspection.scripts.some((script) => script.path === "scripts/core/encounter_table.gd"), true);
+  assert.equal(inspection.resources.includes("data/enemies.json"), true);
+  assert.equal(inspection.resources.includes("docs/GDD_GRIDLANDS.md"), true);
+
+  const bible = await generateGameBible(root, () => new Date("2026-08-05T00:00:00.000Z"));
+  assert.equal(bible.genre.primaryGenre, "turn-based RPG");
+  assert.equal(bible.genre.confidence, "high");
+  assert.equal(bible.genre.gameplayModel.includes("turn-based menu combat"), true);
+  assert.equal(bible.genre.evidence.some((line) => line.includes("turn-based RPG")), true);
+  assert.equal(bible.genre.milestoneBlockers.some((blocker) => blocker.message.includes("battle scene")), true);
+  assert.equal(bible.genre.milestoneBlockers.some((blocker) => blocker.area === "data" && blocker.message.includes("skills.json")), true);
+  assert.equal(bible.gapAnalysis.some((gap) => gap.message.includes("First playable blocker") && gap.area === "scene"), true);
+  assert.equal(bible.genre.gameplayModel.includes("tile swaps and cascades"), false);
 });
 
 test("bible generation reads the Wyrms vs Worms project when present", async (t) => {

@@ -28,6 +28,7 @@ const RESOURCE_EXTENSIONS = new Set([
   ".png",
   ".jpg",
   ".jpeg",
+  ".md",
   ".svg",
   ".tres",
   ".res",

@@ -58,6 +58,8 @@ export {
   type GameBible,
   type GameBibleAssets,
   type GameBibleGap,
+  type GameBibleGenreAnalysis,
+  type GameBibleMilestoneBlocker,
   type GameBibleScene,
   type GameBibleSystems,
   type GameFeatureAcceptanceTest,

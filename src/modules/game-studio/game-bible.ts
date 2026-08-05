@@ -7,6 +7,8 @@ import {
   type GameBible,
   type GameBibleAssets,
   type GameBibleGap,
+  type GameBibleGenreAnalysis,
+  type GameBibleMilestoneBlocker,
   type GameBibleScene,
   type InputUsageIndicator,
   type SceneInventoryItem,
@@ -30,6 +32,11 @@ interface ScriptDetails {
   readonly stateMachineEvidence: readonly string[];
   readonly todoLines: readonly string[];
   readonly passLines: readonly string[];
+}
+
+interface ProjectEvidence {
+  readonly docs: ReadonlyMap<string, string>;
+  readonly scripts: ReadonlyMap<string, string>;
 }
 
 function countBy(values: readonly string[]): Record<string, number> {
@@ -146,6 +153,145 @@ function buildStateMachines(scriptDetails: ReadonlyMap<string, ScriptDetails>): 
     .sort((a, b) => a.source.localeCompare(b.source));
 }
 
+function includesAny(text: string, terms: readonly string[]): boolean {
+  const lower = text.toLowerCase();
+  return terms.some((term) => lower.includes(term.toLowerCase()));
+}
+
+function evidenceLine(path: string, text: string, terms: readonly string[]): string | undefined {
+  const lines = text.split(/\r?\n/);
+  const index = lines.findIndex((line) => includesAny(line, terms));
+  if (index < 0) return undefined;
+  return `${path}:${index + 1}: ${lines[index]?.trim() ?? ""}`;
+}
+
+function hasPath(paths: readonly string[], pattern: RegExp): boolean {
+  return paths.some((path) => pattern.test(path));
+}
+
+function buildGenreAnalysis(
+  projectName: string | undefined,
+  scenes: readonly GameBibleScene[],
+  scripts: readonly ScriptInventoryItem[],
+  assets: GameBibleAssets,
+  evidence: ProjectEvidence,
+): GameBibleGenreAnalysis {
+  const allText = [
+    projectName ?? "",
+    ...evidence.docs.values(),
+    ...evidence.scripts.values(),
+    ...assets.paths,
+    ...scenes.map((scene) => `${scene.path} ${scene.rootNodeName ?? ""} ${scene.rootNodeType ?? ""} ${Object.keys(scene.nodeTypes).join(" ")}`),
+    ...scripts.map((script) => `${script.path} ${script.className ?? ""} ${script.extendsName ?? ""}`),
+  ].join("\n");
+
+  const rpgTerms = ["turn-based", "Dragon Warrior", "RPG", "overworld", "random encounter", "enemy", "EXP", "battle"];
+  const match3Terms = ["match-3", "swap", "cascade", "combo", "board", "score", "cutscene", "worm"];
+  const rpgScore = rpgTerms.filter((term) => includesAny(allText, [term])).length
+    + (hasPath(scripts.map((script) => script.path), /encounter|save_manager|game_manager/i) ? 2 : 0)
+    + (hasPath(assets.paths, /data\/enemies\.json$/i) ? 2 : 0);
+  const match3Score = match3Terms.filter((term) => includesAny(allText, [term])).length;
+  const primaryGenre = rpgScore >= Math.max(5, match3Score + 2)
+    ? "turn-based RPG"
+    : match3Score >= 5
+      ? "arcade match-3"
+      : includesAny(allText, ["grid", "tile"])
+        ? "grid-based game"
+        : "unknown";
+
+  const proofTerms = primaryGenre === "turn-based RPG" ? rpgTerms : primaryGenre === "arcade match-3" ? match3Terms : ["grid", "tile"];
+  const proofEvidence = [
+    ...[...evidence.docs.entries()].map(([path, text]) => evidenceLine(path, text, proofTerms)).filter((line): line is string => line !== undefined),
+    ...[...evidence.scripts.entries()].map(([path, text]) => evidenceLine(path, text, proofTerms)).filter((line): line is string => line !== undefined),
+    hasPath(assets.paths, /data\/enemies\.json$/i) ? "data/enemies.json: data-driven enemy database present" : undefined,
+    hasPath(scripts.map((script) => script.path), /scripts\/core\/encounter_table\.gd$/i) ? "scripts/core/encounter_table.gd: weighted random encounter table present" : undefined,
+  ].filter((line): line is string => line !== undefined);
+
+  const gameplayModel = primaryGenre === "turn-based RPG"
+    ? [
+      "top-down overworld traversal",
+      "tile/grid-aligned player movement",
+      "random encounters while walking",
+      "turn-based menu combat",
+      "data-driven enemies and companion/weapon progression",
+    ]
+    : primaryGenre === "arcade match-3"
+      ? [
+        "board-based matching",
+        "tile swaps and cascades",
+        "score/combo arcade feedback",
+        "sprite animation beats",
+      ]
+      : ["grid or tile-based play"];
+
+  const scenePaths = scenes.map((scene) => scene.path);
+  const scriptPaths = scripts.map((script) => script.path);
+  const blockers: GameBibleMilestoneBlocker[] = [];
+
+  if (primaryGenre === "turn-based RPG") {
+    if (!hasPath(scenePaths, /battle/i) || !hasPath(scriptPaths, /battle|combat/i)) {
+      blockers.push({
+        area: "scene",
+        message: "No battle scene or combat script inventory exists for the promised turn-based encounter loop.",
+        evidence: ["Expected scenes/battle or scripts/battle from RPG design; inventory only shows current scene/script paths."],
+      });
+    }
+    if (!hasPath(scenePaths, /ui|menu|dialog/i) || !hasPath(scriptPaths, /ui|menu|dialog/i)) {
+      blockers.push({
+        area: "scene",
+        message: "No menu, dialog, HUD, or battle UI scene/script inventory exists for Dragon Warrior-style choices.",
+        evidence: ["Expected action menu, status display, dialog boxes, and inventory/status screens."],
+      });
+    }
+    if (!hasPath(assets.paths, /assets\/(sprites|tilesets|audio|fonts)\//i)) {
+      blockers.push({
+        area: "asset",
+        message: "Playable RPG presentation assets are not present yet.",
+        evidence: ["Expected player sprite sheet, tileset, battle enemy art, UI font/panels, and synthwave audio assets."],
+      });
+    }
+    for (const requiredData of ["skills.json", "items.json", "zones.json", "dialog.json"]) {
+      if (!assets.paths.some((path) => path.endsWith(`data/${requiredData}`))) {
+        blockers.push({
+          area: "data",
+          message: `Missing ${requiredData}, needed for the planned data-driven RPG content model.`,
+          evidence: ["GDD section 7.3 says enemy stats, skills, items, zone configs, and dialog should live in JSON."],
+        });
+      }
+    }
+    if (!hasPath(scriptPaths, /companion|blade|weapon|skill/i)) {
+      blockers.push({
+        area: "system",
+        message: "Circuit Blade progression and weapon-form systems are not implemented as scripts.",
+        evidence: ["Save data stores blade fields, but no companion/blade/skill system script is present."],
+      });
+    }
+  }
+
+  return {
+    primaryGenre,
+    confidence: proofEvidence.length >= 3 ? "high" : proofEvidence.length >= 1 ? "medium" : "low",
+    gameplayModel,
+    evidence: proofEvidence.slice(0, 12),
+    firstPlayableMilestone: primaryGenre === "turn-based RPG"
+      ? [
+        "One small walkable overworld zone with collisions and encounter-safe tutorial space.",
+        "One random encounter that transitions from overworld to a battle scene.",
+        "One complete turn-based fight loop with Fight, Skill, Item, and Run outcomes.",
+        "Circuit Blade level/EXP reward applied after victory.",
+        "Save/load preserves zone, position, blade state, and first milestone progress.",
+        "Minimal RPG UI: dialog, battle command menu, HP/MP/status, inventory/status surfaces.",
+        "Placeholder or final sprites/tiles/audio wired through Godot resources without missing references.",
+      ]
+      : [
+        "One complete core loop scene.",
+        "A visible player objective, input path, win/lose or progress condition, and restart path.",
+        "Assets and tests covering the core loop.",
+      ],
+    milestoneBlockers: blockers,
+  };
+}
+
 function buildGaps(
   scenes: readonly GameBibleScene[],
   scripts: readonly ScriptInventoryItem[],
@@ -154,6 +300,7 @@ function buildGaps(
   scriptDetails: ReadonlyMap<string, ScriptDetails>,
   mainScene: string | undefined,
   autoloadPaths: readonly string[],
+  genre: GameBibleGenreAnalysis,
 ): GameBibleGap[] {
   const gaps: GameBibleGap[] = [];
   if (mainScene === undefined) {
@@ -199,6 +346,14 @@ function buildGaps(
       gaps.push({ severity: "info", area: "script", message: "Bare pass statements detected.", evidence: details.passLines.slice(0, 20) });
     }
   }
+  for (const blocker of genre.milestoneBlockers) {
+    gaps.push({
+      severity: blocker.area === "asset" || blocker.area === "data" ? "warning" : "error",
+      area: blocker.area,
+      message: `First playable blocker: ${blocker.message}`,
+      evidence: blocker.evidence,
+    });
+  }
   return gaps;
 }
 
@@ -212,6 +367,15 @@ export async function generateGameBible(repoPath: string, now: () => Date = () =
   }));
   await Promise.all(inspection.scripts.map(async (script) => {
     scriptDetails.set(script.path, parseScriptDetails(script.path, await readProjectFile(inspection.repoPath, script.path)));
+  }));
+
+  const docs = new Map<string, string>();
+  await Promise.all(inspection.resources.filter((path) => path.endsWith(".md")).map(async (path) => {
+    docs.set(path, await readProjectFile(inspection.repoPath, path));
+  }));
+  const scriptTexts = new Map<string, string>();
+  await Promise.all(inspection.scripts.map(async (script) => {
+    scriptTexts.set(script.path, await readProjectFile(inspection.repoPath, script.path));
   }));
 
   const sceneInventory: GameBibleScene[] = inspection.scenes.map((scene: SceneInventoryItem) => {
@@ -231,6 +395,8 @@ export async function generateGameBible(repoPath: string, now: () => Date = () =
   const animationPlayers: AnimationPlayerIndicator[] = sceneInventory.flatMap((scene) => (
     scene.animationPlayers.map((nodeName) => ({ scene: scene.path, nodeName }))
   ));
+  const assets = buildAssets(inspection.resources);
+  const genre = buildGenreAnalysis(inspection.project.name, sceneInventory, inspection.scripts, assets, { docs, scripts: scriptTexts });
 
   return {
     module: "game-studio",
@@ -238,6 +404,7 @@ export async function generateGameBible(repoPath: string, now: () => Date = () =
     generatedAt: now().toISOString(),
     repoPath: inspection.repoPath,
     project: inspection.project,
+    genre,
     sceneInventory,
     scripts: inspection.scripts,
     systems: {
@@ -248,7 +415,7 @@ export async function generateGameBible(repoPath: string, now: () => Date = () =
       signals,
       animationPlayers,
     },
-    assets: buildAssets(inspection.resources),
+    assets,
     tests: inspection.tests,
     gapAnalysis: buildGaps(
       sceneInventory,
@@ -258,6 +425,7 @@ export async function generateGameBible(repoPath: string, now: () => Date = () =
       scriptDetails,
       inspection.project.mainScene,
       inspection.project.autoloads.map((autoload) => autoload.path),
+      genre,
     ),
   };
 }
@@ -274,6 +442,23 @@ export function renderGameBibleMarkdown(bible: GameBible): string {
     `- generated_at: ${bible.generatedAt}`,
     `- main_scene: ${bible.project.mainScene ?? "(missing)"}`,
     `- godot_features: ${bible.project.features.join(", ") || "(none)"}`,
+    "",
+    "## Genre Analysis",
+    "",
+    `- primary_genre: ${bible.genre.primaryGenre}`,
+    `- confidence: ${bible.genre.confidence}`,
+    "",
+    "### Gameplay Model",
+    ...bullet(bible.genre.gameplayModel),
+    "",
+    "### Genre Evidence",
+    ...bullet(bible.genre.evidence),
+    "",
+    "### First Playable Milestone",
+    ...bullet(bible.genre.firstPlayableMilestone),
+    "",
+    "### Milestone Blockers",
+    ...bullet(bible.genre.milestoneBlockers.map((blocker) => `${blocker.area}: ${blocker.message} (${blocker.evidence.join("; ")})`)),
     "",
     "## Scene Inventory",
   ];
