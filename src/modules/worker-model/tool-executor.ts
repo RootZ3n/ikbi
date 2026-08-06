@@ -47,6 +47,14 @@ import { runPatch } from "./builder-tools/patch.js";
 import { runMultiEdit } from "./builder-tools/multi-edit.js";
 import { runTerminal, type JobControl } from "./builder-tools/terminal.js";
 import { runBrainTool } from "./builder-tools/brain-tools.js";
+import { runBoundNotebookEdit, runNotebookEdit } from "../agent-tools/notebook-tools.js";
+import { MutationError } from "../../core/workspace/mutation.js";
+import {
+  formatMutationToolError,
+  mutationToolError,
+  type MutationSessionLike,
+  type MutationToolError,
+} from "../../core/workspace/mutation-session.js";
 
 /** Max bytes returned by read_file (matches the chat/builder caps). */
 const MAX_READ_BYTES = 32_000;
@@ -80,6 +88,8 @@ export interface ToolExecutorDeps {
    * behavior is unchanged. Re-confined inside the terminal tool as defense-in-depth.
    */
   readonly terminalCwd?: string;
+  /** State-bound observation/mutation session for an isolated candidate workspace. */
+  readonly mutationSession?: MutationSessionLike;
 }
 
 /**
@@ -106,6 +116,11 @@ export interface ToolExecutionResult {
   readonly after?: string;
   readonly proposed?: boolean;
   readonly rejection?: ToolCallError;
+  /** Stable structured mutation failure, present when a bound mutation was refused. */
+  readonly mutationError?: MutationToolError;
+  /** A complete read established an observation; truncated reads are explicitly false. */
+  readonly observed?: boolean;
+  readonly completeObservation?: boolean;
 }
 
 /**
@@ -178,12 +193,33 @@ export async function interceptMemoryGovernor(deps: ToolExecutorDeps, call: Tool
     // Resolve to absolute path so the apply function can find the file at approve-time
     // (the worktree may be gone by then if it was a managed workspace).
     const absTarget = target.startsWith("/") ? target : `${deps.worktreeReal}/${target}`;
-    // Read the current target so patch/multi_edit are resolved to the COMPLETE resulting
-    // file (never a fragment) and the proposal carries a CAS base hash (Codex C8: approving
-    // a patch used to overwrite the whole file with just new_string).
-    let before: string | null = null;
-    try { before = readFileSync(absTarget, "utf8"); } catch { before = null; }
-    const write = computeProposalWrite(call.name, args, before);
+    // In a managed candidate, derive the proposal from the session's retained observation. This
+    // keeps even withheld/governed edits bound to the bytes the acting session observed. The
+    // legacy direct read remains only for non-candidate compatibility callers.
+    let write: ProposalWrite;
+    if (deps.mutationSession !== undefined) {
+      try {
+        const preview = call.name === "write_file"
+          ? await deps.mutationSession.previewWrite(target, typeof args.content === "string" ? args.content : "")
+          : await deps.mutationSession.previewText(target, (before) => {
+              const computed = computeProposalWrite(call.name, args, before);
+              if (!computed.ok) throw new MutationError("MUTATION_VALIDATION", computed.error, { path: target });
+              return computed.content;
+            });
+        write = { ok: true, content: preview.content, baseSha256: preview.baseSha256 };
+      } catch (error) {
+        return {
+          intercepted: true,
+          ok: false,
+          proposalId: "",
+          message: formatMutationToolError(error, deps.mutationSession.binding, target),
+        };
+      }
+    } else {
+      let before: string | null = null;
+      try { before = readFileSync(absTarget, "utf8"); } catch { before = null; }
+      write = computeProposalWrite(call.name, args, before);
+    }
     if (!write.ok) {
       // A governed write that cannot be cleanly resolved is WITHHELD (never falls through to
       // a direct write, never creates a clobbering proposal) and surfaces an actionable error.
@@ -268,6 +304,77 @@ function isFailure(output: string): boolean {
   return output.startsWith("ERROR") || output.startsWith("DENIED");
 }
 
+function boundFailure(
+  deps: ToolExecutorDeps,
+  callName: string,
+  error: unknown,
+  path: string,
+  confined?: { readonly rel: string; readonly full: string },
+): ToolExecutionResult {
+  const session = deps.mutationSession;
+  if (session === undefined) {
+    return { output: `ERROR: ${errMsg(error)}`, ok: false };
+  }
+  const data = mutationToolError(error, session.binding, path);
+  return {
+    output: formatMutationToolError(error, session.binding, path),
+    ok: false,
+    ...(confined !== undefined ? { rel: confined.rel, full: confined.full } : {}),
+    mutationError: data,
+    rejection: { tool: callName, path, error: `${data.code}: ${data.message}` },
+  };
+}
+
+function boundConfinementFailure(
+  deps: ToolExecutorDeps,
+  callName: string,
+  rawPath: unknown,
+  error: string,
+): ToolExecutionResult {
+  const path = typeof rawPath === "string" ? rawPath : String(rawPath ?? "");
+  return boundFailure(
+    deps,
+    callName,
+    new MutationError("MUTATION_CONFINEMENT", error, { path }),
+    path,
+  );
+}
+
+function bytesAsText(bytes: Readonly<Uint8Array>): string {
+  return Buffer.from(bytes).toString("utf8");
+}
+
+function parseBoundMultiEdits(raw: unknown, path: string): readonly { readonly find: string; readonly replace: string }[] {
+  if (!Array.isArray(raw) || raw.length === 0) throw new MutationError("MUTATION_VALIDATION", "multi_edit requires a non-empty 'edits' array", { path });
+  return raw.map((entry, index) => {
+    if (typeof entry !== "object" || entry === null) throw new MutationError("MUTATION_VALIDATION", `edit ${index} is not an object`, { path });
+    const item = entry as Record<string, unknown>;
+    const find = typeof item.find === "string" ? item.find : "";
+    const replace = typeof item.replace === "string" ? item.replace : "";
+    if (find.length === 0) throw new MutationError("MUTATION_VALIDATION", `edit ${index} has an empty 'find'`, { path });
+    return { find, replace };
+  });
+}
+
+function applyExactPatch(before: string, oldString: string, newString: string, path: string): string {
+  if (oldString.length === 0) throw new MutationError("MUTATION_VALIDATION", "patch requires a non-empty 'old_string'", { path });
+  const occurrences = before.split(oldString).length - 1;
+  if (occurrences === 0) throw new MutationError("MUTATION_VALIDATION", "old_string not found; it must match exactly, including whitespace", { path });
+  if (occurrences > 1) throw new MutationError("MUTATION_VALIDATION", `old_string occurs ${occurrences} times; it must be unique`, { path });
+  return before.replace(oldString, newString);
+}
+
+function applyExactMulti(before: string, edits: readonly { readonly find: string; readonly replace: string }[], path: string): string {
+  let next = before;
+  edits.forEach((edit, index) => {
+    const occurrences = next.split(edit.find).length - 1;
+    if (occurrences === 0) throw new MutationError("MUTATION_VALIDATION", `edit ${index} text not found; no changes applied`, { path });
+    if (occurrences > 1) throw new MutationError("MUTATION_VALIDATION", `edit ${index} anchor is not unique; no changes applied`, { path });
+    next = next.replace(edit.find, edit.replace);
+  });
+  return next;
+}
+
 /**
  * Execute one tool call through the shared path: parse → memory-governor → confine → execute.
  * Returns a RAW result the caller formats for its own surface. Handles the core confinement/
@@ -286,7 +393,26 @@ export async function executeTool(deps: ToolExecutorDeps, call: ToolCall): Promi
   switch (call.name) {
     case "read_file": {
       const c = confinePath(worktreeReal, args.path);
-      if (!c.ok) return { output: `ERROR: ${c.error}`, ok: false, rejection: { tool: "read_file", path: String(args.path ?? ""), error: c.error } };
+      if (!c.ok) {
+        return deps.mutationSession !== undefined
+          ? boundConfinementFailure(deps, "read_file", args.path, c.error)
+          : { output: `ERROR: ${c.error}`, ok: false, rejection: { tool: "read_file", path: String(args.path ?? ""), error: c.error } };
+      }
+      if (deps.mutationSession !== undefined) {
+        try {
+          const read = await deps.mutationSession.readText(c.rel, MAX_READ_BYTES);
+          return {
+            output: read.output,
+            ok: true,
+            rel: c.rel,
+            full: c.full,
+            observed: true,
+            completeObservation: read.complete,
+          };
+        } catch (error) {
+          return boundFailure(deps, "read_file", error, c.rel, c);
+        }
+      }
       try {
         const raw = readFileSync(c.full, "utf8");
         const body = raw.length > MAX_READ_BYTES
@@ -321,8 +447,28 @@ export async function executeTool(deps: ToolExecutorDeps, call: ToolCall): Promi
     }
     case "write_file": {
       const c = confinePath(worktreeReal, args.path);
-      if (!c.ok) return { output: `ERROR: ${c.error}`, ok: false, rejection: { tool: "write_file", path: String(args.path ?? ""), error: c.error } };
+      if (!c.ok) {
+        return deps.mutationSession !== undefined
+          ? boundConfinementFailure(deps, "write_file", args.path, c.error)
+          : { output: `ERROR: ${c.error}`, ok: false, rejection: { tool: "write_file", path: String(args.path ?? ""), error: c.error } };
+      }
       const content = typeof args.content === "string" ? args.content : "";
+      if (deps.mutationSession !== undefined) {
+        try {
+          const result = await deps.mutationSession.writeText(c.rel, content);
+          return {
+            output: `wrote ${result.afterBytes.byteLength} bytes to ${c.rel}`,
+            ok: true,
+            wrote: c.rel,
+            rel: c.rel,
+            full: c.full,
+            before: result.mutation.before.kind === "missing" ? null : bytesAsText(result.beforeBytes),
+            after: bytesAsText(result.afterBytes),
+          };
+        } catch (error) {
+          return boundFailure(deps, "write_file", error, c.rel, c);
+        }
+      }
       let before: string | null = null;
       try { before = readFileSync(c.full, "utf8"); } catch { before = null; }
       try {
@@ -334,10 +480,31 @@ export async function executeTool(deps: ToolExecutorDeps, call: ToolCall): Promi
     }
     case "patch": {
       const c = confinePath(worktreeReal, args.path);
-      let before: string | null = null;
-      if (c.ok) {
-        try { before = readFileSync(c.full, "utf8"); } catch { before = null; }
+      if (!c.ok) {
+        if (deps.mutationSession !== undefined) return boundConfinementFailure(deps, "patch", args.path, c.error);
+        const legacy = runPatch(worktreeReal, args);
+        return { output: legacy.output, ok: legacy.rejection === undefined, ...(legacy.rejection !== undefined ? { rejection: legacy.rejection } : {}) };
       }
+      if (deps.mutationSession !== undefined) {
+        const oldString = typeof args.old_string === "string" ? args.old_string : "";
+        const newString = typeof args.new_string === "string" ? args.new_string : "";
+        try {
+          const result = await deps.mutationSession.replaceText(c.rel, (observed) => applyExactPatch(observed, oldString, newString, c.rel));
+          return {
+            output: `patched ${c.rel} (replaced ${oldString.length} chars with ${newString.length})`,
+            ok: true,
+            wrote: c.rel,
+            rel: c.rel,
+            full: c.full,
+            before: bytesAsText(result.beforeBytes),
+            after: bytesAsText(result.afterBytes),
+          };
+        } catch (error) {
+          return boundFailure(deps, "patch", error, c.rel, c);
+        }
+      }
+      let before: string | null = null;
+      try { before = readFileSync(c.full, "utf8"); } catch { before = null; }
       const res = runPatch(worktreeReal, args);
       const ok = res.rejection === undefined;
       let after: string | undefined;
@@ -354,10 +521,34 @@ export async function executeTool(deps: ToolExecutorDeps, call: ToolCall): Promi
     }
     case "multi_edit": {
       const c = confinePath(worktreeReal, args.path);
-      let before: string | null = null;
-      if (c.ok) {
-        try { before = readFileSync(c.full, "utf8"); } catch { before = null; }
+      if (!c.ok) {
+        if (deps.mutationSession !== undefined) return boundConfinementFailure(deps, "multi_edit", args.path, c.error);
+        const legacy = runMultiEdit(worktreeReal, args);
+        return { output: legacy.output, ok: legacy.rejection === undefined, ...(legacy.rejection !== undefined ? { rejection: legacy.rejection } : {}) };
       }
+      if (deps.mutationSession !== undefined) {
+        try {
+          const edits = parseBoundMultiEdits(args.edits, c.rel);
+          const results = await deps.mutationSession.applyTextBatch([{
+            path: c.rel,
+            transform: (observed) => applyExactMulti(observed, edits, c.rel),
+          }]);
+          const result = results[0]!;
+          return {
+            output: `multi_edit applied ${edits.length} edit(s) to ${c.rel}`,
+            ok: true,
+            wrote: c.rel,
+            rel: c.rel,
+            full: c.full,
+            before: bytesAsText(result.beforeBytes),
+            after: bytesAsText(result.afterBytes),
+          };
+        } catch (error) {
+          return boundFailure(deps, "multi_edit", error, c.rel, c);
+        }
+      }
+      let before: string | null = null;
+      try { before = readFileSync(c.full, "utf8"); } catch { before = null; }
       const res = runMultiEdit(worktreeReal, args);
       const ok = res.rejection === undefined;
       let after: string | undefined;
@@ -370,6 +561,36 @@ export async function executeTool(deps: ToolExecutorDeps, call: ToolCall): Promi
         ...(res.wrote !== undefined ? { wrote: res.wrote } : {}),
         ...(res.rejection !== undefined ? { rejection: res.rejection } : {}),
         ...(ok && c.ok ? { rel: c.rel, full: c.full, before, after: after ?? "" } : {}),
+      };
+    }
+    case "notebook_edit": {
+      const c = confinePath(worktreeReal, args.path);
+      if (!c.ok) {
+        if (deps.mutationSession !== undefined) return boundConfinementFailure(deps, "notebook_edit", args.path, c.error);
+        const legacy = runNotebookEdit(worktreeReal, args);
+        return { output: legacy.output, ok: legacy.rejection === undefined, ...(legacy.rejection !== undefined ? { rejection: legacy.rejection } : {}) };
+      }
+      if (deps.mutationSession !== undefined) {
+        try {
+          const result = await runBoundNotebookEdit(deps.mutationSession, args);
+          return {
+            output: result.output,
+            ok: result.rejection === undefined,
+            ...(result.rejection === undefined && result.wrote !== undefined ? { wrote: result.wrote, rel: result.wrote, full: c.full } : {}),
+            ...(result.before !== undefined ? { before: result.before } : {}),
+            ...(result.after !== undefined ? { after: result.after } : {}),
+            ...(result.rejection !== undefined ? { rejection: result.rejection } : {}),
+          };
+        } catch (error) {
+          return boundFailure(deps, "notebook_edit", error, c.rel, c);
+        }
+      }
+      const result = runNotebookEdit(worktreeReal, args);
+      return {
+        output: result.output,
+        ok: result.rejection === undefined,
+        ...(result.wrote !== undefined ? { wrote: result.wrote, rel: result.wrote, full: c.full } : {}),
+        ...(result.rejection !== undefined ? { rejection: result.rejection } : {}),
       };
     }
     case "terminal": {
