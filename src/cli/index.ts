@@ -32,7 +32,7 @@ import {
 import { trust } from "../core/trust/index.js";
 import { commands } from "./registry.js";
 import { suggestCommand } from "./suggest.js";
-import { runDoctor, runDoctorFixCli } from "./doctor.js";
+import { runDoctor, runDoctorFixCli, runProviderPreflightCli } from "./doctor.js";
 import { runEnvironmentChecks, renderEnvironmentChecks } from "./doctor-env.js";
 import { runSandboxChecks, renderSandboxChecks } from "./doctor-sandbox.js";
 import { whatNextFooter } from "./what-next.js";
@@ -462,16 +462,22 @@ async function run(argv: readonly string[]): Promise<void> {
       // `--help` prints usage and exits 0 — it must NOT run the report (which reads config).
       if (wantsHelp(doctorArgs)) {
         writeStdout(
-          "Usage: ikbi doctor [--json] [--fix] [--force] [--self-repair]\n\n" +
+          "Usage: ikbi doctor [--json] [--check-providers [--json]] [--fix] [--force] [--self-repair]\n\n" +
             "Report bootstrap config + host environment: what's set, what's missing for a build,\n" +
             "and how to fix each gap. Read-only by default (no identity, no network).\n\n" +
             "Options:\n" +
             "  --json         Emit a machine-readable health report (for CI)\n" +
+            "  --check-providers  Resolve local provider/model/credential readiness (no network or paid invocation)\n" +
             "  --fix          Repair common gaps (.env / state dirs / deps); creates/repairs only\n" +
             "  --force        With --fix, also reclaim stale + aged workspaces\n" +
             "  --self-repair  Run the self-monitor: health/test/workspace/dependency checks;\n" +
             "                 file a work order for each problem found (does not promote/fix)\n",
         );
+        return;
+      }
+      if (doctorArgs.includes("--check-providers")) {
+        const code = runProviderPreflightCli(doctorArgs);
+        if (code !== 0) process.exitCode = code;
         return;
       }
       // `--self-repair` runs ikbi's self-monitor (Part 1): cheap read-only checks that
@@ -651,4 +657,3 @@ run(process.argv.slice(2)).catch((err: unknown) => {
   writeStderr(`ikbi: ${formatFriendlyError(fe, { verbose, ...(stack !== undefined ? { stack } : {}) })}\n`);
   process.exitCode = 1;
 });
-

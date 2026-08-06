@@ -795,6 +795,12 @@ lives in `IKBI_PROVIDER_CONFIG` (default `<stateRoot>/providers.json`).
 `IKBI_PROVIDER_MAX_RETRIES` (2), `IKBI_PROVIDER_RETRY_BASE_MS` (300),
 `IKBI_PROVIDER_RETRY_MAX_MS` (5000).
 
+Before a build, run `ikbi doctor --check-providers` to validate the effective
+local provider/model configuration for the active roles. Add `--json` for one
+machine-readable document. This mode does not contact provider endpoints,
+invoke models, create workspaces, or consume paid usage; remote reachability is
+always reported as `not_checked`.
+
 ### Model configuration (roles, dual-model, escalation)
 
 | Variable | Default | Purpose |

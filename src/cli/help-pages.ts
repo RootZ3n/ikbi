@@ -130,14 +130,16 @@ export const HELP_PAGES: Readonly<Record<string, HelpPage>> = {
   doctor: {
     name: "doctor",
     summary: "Report bootstrap config health — what's set, what's missing for a build, and how to fix each gap.",
-    usage: "ikbi doctor [--fix] [--force] [--self-repair]",
+    usage: "ikbi doctor [--check-providers [--json]] [--fix] [--force] [--self-repair]",
     flags: [
+      { flag: "--check-providers [--json]", desc: "Resolve local provider/model/credential readiness without contacting a provider or spending tokens." },
       { flag: "--fix", desc: "Repair common gaps (.env / state dirs / deps); creates/repairs only." },
       { flag: "--force", desc: "With --fix, also reclaim stale and aged workspaces." },
       { flag: "--self-repair", desc: "Run the self-monitor and file a work order for each problem found." },
     ],
     examples: [
       { cmd: "ikbi doctor", desc: "Read-only health report." },
+      { cmd: "ikbi doctor --check-providers --json", desc: "Machine-readable, local-only provider/model preflight." },
       { cmd: "ikbi doctor --fix", desc: "Repair common first-run gaps." },
     ],
     seeAlso: ["init", "capabilities"],

@@ -40,6 +40,17 @@ import type { ClearResult, KillCheck, KillResult, KillState, KillStatus, KillSwi
 
 const EVENT_SOURCE = "kill-switch";
 
+/**
+ * Provider preflight is a strictly read-only CLI mode. The normal process-wide
+ * kill-switch warms its durable latch at import, but that read acquires a lock
+ * and creates the latch parent directory. Do not perform that control-plane
+ * initialization for a command that cannot start work.
+ */
+function isProviderPreflightProcess(): boolean {
+  const argv = process.argv.slice(2);
+  return argv[0] === "doctor" && argv.includes("--check-providers");
+}
+
 /** Stable identity for a signal (so we never double-latch the same kill). */
 function signalKey(s: KillSignal): string {
   return `${s.reason}|${s.mode}|${s.scope}|${s.target ?? ""}`;
@@ -157,7 +168,7 @@ export function createKillSwitch(deps: KillSwitchDeps = {}): KillSwitch {
   // ungated). The obeyed latch is written ONLY by the authorized engage()/degrade()
   // path below. Here we merely warm from the DURABLE store on boot, so a persisted kill
   // is honored before the first operation (a raw event is observability, not a write path).
-  const warmOnBoot = deps.subscribe ?? true;
+  const warmOnBoot = deps.subscribe ?? !isProviderPreflightProcess();
   if (warmOnBoot) void ensureLoaded();
 
   async function engage(signal: KillSignal, identity: ValidatedIdentity): Promise<KillResult> {

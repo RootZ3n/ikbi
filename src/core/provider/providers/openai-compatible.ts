@@ -89,6 +89,10 @@ export interface OpenAICompatibleOptions {
    * endpoint. The `maxTokens` VALUE still flows from ModelRequest into this field.
    */
   readonly tokenFieldName?: "max_tokens" | "max_completion_tokens";
+  /** Non-secret provenance used by local provider preflight. */
+  readonly credentialSource?: string;
+  /** Non-secret provenance used by local provider preflight. */
+  readonly configurationSource?: string;
 }
 
 const DEFAULT_MAX_ERROR_DETAIL = 300;
@@ -328,6 +332,8 @@ export class OpenAICompatibleProvider implements ModelProvider {
   private readonly fetchImpl: FetchLike;
   private readonly maxErrorDetail: number;
   private readonly keyless: boolean;
+  private readonly credentialSource: string | undefined;
+  private readonly configurationSource: string | undefined;
 
   constructor(opts: OpenAICompatibleOptions) {
     this.id = opts.id;
@@ -338,6 +344,8 @@ export class OpenAICompatibleProvider implements ModelProvider {
     this.tokenFieldName = opts.tokenFieldName ?? "max_tokens";
     this.maxErrorDetail = opts.maxErrorDetail ?? DEFAULT_MAX_ERROR_DETAIL;
     this.keyless = opts.keyless ?? false;
+    this.credentialSource = opts.credentialSource;
+    this.configurationSource = opts.configurationSource;
     // Outbound HTTP is gated by the network-egress floor (the fetch-guard seam).
     // An explicit fetchImpl (tests) still wins; absent one, we resolve the
     // process-wide GUARDED fetch — FAIL-CLOSED: resolveFetchGuard() throws
@@ -350,6 +358,21 @@ export class OpenAICompatibleProvider implements ModelProvider {
   /** USABLE iff keyless or a non-empty API key is configured (mirrors the ensureAuth fail-closed). */
   ready(): boolean {
     return this.keyless || (this.apiKey !== undefined && this.apiKey.length > 0);
+  }
+
+  preflightInfo() {
+    return {
+      kind: "openai-compatible" as const,
+      baseUrl: this.baseUrl,
+      credentialRequired: !this.keyless,
+      credentialPresent: this.ready(),
+      ...(this.keyless
+        ? { credentialSource: this.credentialSource ?? "keyless" }
+        : this.credentialSource !== undefined
+          ? { credentialSource: this.credentialSource }
+          : {}),
+      ...(this.configurationSource !== undefined ? { configurationSource: this.configurationSource } : {}),
+    };
   }
 
   /** Fail closed when a keyed provider has no API key (a keyless one needs none). */

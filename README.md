@@ -99,6 +99,7 @@ pnpm build             # compile to dist/  (also typechecks)
 pnpm public:smoke      # fast, API-key-free sanity + safety check
 
 node dist/cli/index.js doctor    # first-run health + sandbox report
+node dist/cli/index.js doctor --check-providers --json  # local-only provider/model readiness
 ```
 
 Then configure a model provider (see [docs/INSTALL.md](docs/INSTALL.md)) and run your first build:

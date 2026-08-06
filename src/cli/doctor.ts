@@ -21,12 +21,20 @@ import { config, type IkbiConfig } from "../core/config.js";
 import { loadRepoRegistry } from "../core/repo-registry.js";
 import type { ModelProvider } from "../core/provider/contract.js";
 import { registry as defaultRegistry } from "../core/provider/index.js";
+import {
+  renderProviderPreflight,
+  resolveProviderPreflight,
+  type ProviderPreflightIssue,
+  type ProviderPreflightReport,
+  type ProviderPreflightRoleAssignment,
+} from "../core/provider/preflight.js";
 import { findUnclassifiedModels, FALLBACK_CAPABILITIES } from "../core/provider/capabilities.js";
 import type { ModelSpec } from "../core/provider/registry.js";
 import { workspaces as coreWorkspaces } from "../core/workspace/index.js";
 import { egressConfig } from "../modules/egress/config.js";
 import { governedExecConfig } from "../modules/governed-exec/config.js";
 import { workerModelConfig } from "../modules/worker-model/config.js";
+import { escalationConfig } from "../modules/escalation/config.js";
 import {
   isExplicitLegacyRetrieval,
   isExplicitLegacyVerify,
@@ -34,7 +42,7 @@ import {
   resolveVerificationMode,
   safetyPosture,
 } from "../modules/worker-model/modes.js";
-import { writeStdout } from "./io.js";
+import { writeStderr, writeStdout } from "./io.js";
 import { getDotenvProvenance as liveDotenvProvenance } from "./bootstrap.js";
 import { postureLines, productPosture } from "./posture.js";
 
@@ -70,12 +78,152 @@ export interface DoctorResult {
   readonly missingRequired: number;
 }
 
+export interface ProviderCheckInputs {
+  readonly config?: IkbiConfig;
+  readonly registry?: DoctorRegistry;
+  readonly env?: NodeJS.ProcessEnv;
+  readonly dotenvProvenance?: ReadonlyMap<string, string>;
+  readonly roles?: readonly ProviderPreflightRoleAssignment[];
+}
+
+export interface ProviderCheckCliDeps extends ProviderCheckInputs {
+  readonly out?: (text: string) => void;
+  readonly err?: (text: string) => void;
+}
+
 const OK = "✓";
 const BAD = "✗";
 const WARN = "⚠";
 
 /** The binary the verifier needs to run tsc/tests (the build's quality gate). */
 const REQUIRED_EXEC = "pnpm";
+
+/**
+ * The model assignments used by production paths. Standard build roles are required;
+ * repair/recovery roles are included when configured, while optional escalation candidates
+ * are reported without blocking the ordinary build.
+ */
+export function providerPreflightRoles(cfg: IkbiConfig = config): readonly ProviderPreflightRoleAssignment[] {
+  const builderSource = cfg.provider.defaultModels.builder === cfg.provider.defaultModels.driver
+    ? "IKBI_MODEL_BUILDER (falls back to IKBI_MODEL_DRIVER)"
+    : "IKBI_MODEL_BUILDER";
+  const roles: ProviderPreflightRoleAssignment[] = [
+    { role: "driver", required: true, model: cfg.provider.defaultModels.driver, configurationSource: "IKBI_MODEL_DRIVER" },
+    { role: "builder", required: true, model: cfg.provider.defaultModels.builder, configurationSource: builderSource },
+    { role: "critic", required: true, model: cfg.provider.defaultModels.critic, configurationSource: "IKBI_MODEL_CRITIC" },
+  ];
+
+  for (const model of cfg.provider.defaultModels.competitiveModels ?? []) {
+    roles.push({ role: "competitive", required: workerModelConfig.competitive === true, model, configurationSource: "IKBI_COMPETITIVE_MODELS" });
+  }
+
+  const fixer = workerModelConfig.fixerModel;
+  if (fixer !== undefined) {
+    roles.push({ role: "fixer", required: true, model: fixer, configurationSource: "IKBI_WORKER_MODEL_FIXER_MODEL" });
+    roles.push({ role: "rescue", required: true, model: fixer, configurationSource: "IKBI_WORKER_MODEL_FIXER_MODEL" });
+  }
+
+  if (workerModelConfig.enableRefuter) {
+    roles.push({ role: "refuter", required: true, model: cfg.provider.defaultModels.critic, configurationSource: "IKBI_MODEL_CRITIC" });
+  }
+
+  if (escalationConfig.enabled) {
+    for (const model of escalationConfig.tierModels.worker) {
+      roles.push({ role: "recovery-worker", required: false, model, configurationSource: "IKBI_ESCALATION_WORKER_MODELS" });
+    }
+    for (const model of escalationConfig.tierModels.mid) {
+      roles.push({ role: "recovery-mid", required: false, model, configurationSource: "IKBI_ESCALATION_MID_MODELS" });
+    }
+    for (const model of escalationConfig.tierModels.frontier) {
+      roles.push({ role: "consult", required: false, model, configurationSource: "IKBI_ESCALATION_FRONTIER_MODELS" });
+    }
+  }
+  return roles;
+}
+
+function providerPreflightErrorReport(err: unknown, context: ProviderCheckInputs = {}): ProviderPreflightReport {
+  const rawMessage = err instanceof Error ? err.message : String(err);
+  const secretValues = new Set<string>();
+  const env = context.env ?? process.env;
+  for (const [key, value] of Object.entries(env)) {
+    if (/(?:KEY|TOKEN|SECRET|PASSWORD|AUTH)/i.test(key) && value !== undefined && value.length >= 4) secretValues.add(value);
+  }
+  const cfg = context.config;
+  if (cfg !== undefined) {
+    for (const value of [cfg.identity.operatorToken, cfg.identity.workerToken, cfg.identity.tokenSalt, cfg.trust.hmacKey]) {
+      if (value !== undefined && value.length >= 4) secretValues.add(value);
+    }
+    for (const endpoint of Object.values(cfg.provider)) {
+      if (typeof endpoint === "object" && endpoint !== null && "apiKey" in endpoint && typeof endpoint.apiKey === "string" && endpoint.apiKey.length >= 4) {
+        secretValues.add(endpoint.apiKey);
+      }
+    }
+  }
+  const message = [...secretValues].sort((a, b) => b.length - a.length).reduce((safe, secret) => safe.split(secret).join("[redacted]"), rawMessage);
+  const problem: ProviderPreflightIssue = {
+    code: "PROVIDER_PREFLIGHT_INTERNAL_ERROR",
+    role: "provider-preflight",
+    provider: null,
+    model: null,
+    message: `Provider preflight could not resolve the effective local configuration: ${message}`,
+    retryable: false,
+    blocksBuild: true,
+    recovery: "Fix the reported configuration or provider-roster error, then rerun ikbi doctor --check-providers. No provider invocation was attempted.",
+    configurationSource: null,
+  };
+  return {
+    command: "doctor.checkProviders",
+    status: "error",
+    localOnly: true,
+    remoteReachability: "not_checked",
+    resolvedConfiguration: { sources: [], providerRosterSource: null },
+    roles: [],
+    issues: [problem],
+    recovery: [problem.recovery],
+    wouldStartPaidInvocation: false,
+  };
+}
+
+export function runProviderPreflight(inp: ProviderCheckInputs = {}): ProviderPreflightReport {
+  const cfg = inp.config ?? config;
+  return resolveProviderPreflight({
+    config: cfg,
+    registry: inp.registry ?? defaultRegistry,
+    roles: inp.roles ?? providerPreflightRoles(cfg),
+    ...(inp.env !== undefined ? { env: inp.env } : {}),
+    ...(inp.dotenvProvenance !== undefined ? { dotenvProvenance: inp.dotenvProvenance } : { dotenvProvenance: liveDotenvProvenance() }),
+  });
+}
+
+/** Parse and render only the additive `doctor --check-providers` mode. */
+export function runProviderPreflightCli(argv: readonly string[], deps: ProviderCheckCliDeps = {}): number {
+  const out = deps.out ?? writeStdout;
+  const err = deps.err ?? writeStderr;
+  const invalid = argv.filter((arg) => !["--check-providers", "--json"].includes(arg));
+  if (!argv.includes("--check-providers") || invalid.length > 0 || argv.filter((arg) => arg === "--check-providers").length !== 1 || argv.filter((arg) => arg === "--json").length > 1) {
+    const message = "Usage: ikbi doctor --check-providers [--json]";
+    if (argv.includes("--json")) {
+      const report = providerPreflightErrorReport(new Error(message), deps);
+      out(`${JSON.stringify(report)}\n`);
+    } else {
+      err(`ikbi doctor: invalid provider-preflight usage — ${message}\n`);
+    }
+    return 2;
+  }
+
+  let report: ProviderPreflightReport;
+  try {
+    report = runProviderPreflight(deps);
+  } catch (error) {
+    report = providerPreflightErrorReport(error, deps);
+  }
+  if (argv.includes("--json")) {
+    out(`${JSON.stringify(report)}\n`);
+  } else {
+    out(`${renderProviderPreflight(report).join("\n")}\n`);
+  }
+  return report.status === "ready" ? 0 : report.status === "blocked" ? 1 : 2;
+}
 
 /** Build the doctor report. Pure over its inputs (singletons by default). */
 export function runDoctor(inp: DoctorInputs = {}): DoctorResult {

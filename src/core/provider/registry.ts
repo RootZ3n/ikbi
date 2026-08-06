@@ -294,6 +294,8 @@ function parseProviderEntry(v: unknown, source: string): ModelProvider {
       id: asString(r.id, "provider.id", source),
       baseUrl: asString(r.baseUrl, "provider.baseUrl", source),
       apiKey: apiKeyA,
+      credentialSource: apiKeyA !== undefined ? "provider roster" : "provider roster (missing)",
+      configurationSource: source,
     });
   }
   // FAIL CLEARLY (not silently): routing an Anthropic base URL through the OpenAI-compatible shim
@@ -339,5 +341,7 @@ function parseProviderEntry(v: unknown, source: string): ModelProvider {
     keyless,
     ...(extraBody !== undefined ? { extraBody } : {}),
     ...(tokenFieldName !== undefined ? { tokenFieldName } : {}),
+    credentialSource: keyless ? "keyless (provider roster)" : apiKey !== undefined ? "provider roster" : "provider roster (missing)",
+    configurationSource: source,
   });
 }

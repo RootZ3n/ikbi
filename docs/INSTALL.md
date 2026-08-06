@@ -107,6 +107,25 @@ IKBI_MODEL_CRITIC=deepseek-v4-pro
 node dist/cli/index.js doctor
 ```
 
+Before starting a build, use the provider-only preflight to resolve the effective
+role models, local roster routes, endpoints, and credential presence without
+contacting a provider or spending tokens:
+
+```bash
+node dist/cli/index.js doctor --check-providers
+node dist/cli/index.js doctor --check-providers --json
+```
+
+This check is local-only: `remoteReachability` is reported as `not_checked`, and
+exit status `1` means a required role is locally blocked. It never proves that a
+provider endpoint is reachable. The JSON form is intended for external agents
+and contains credential sources, never credential values.
+
+An eventual `ikbi doctor --check-providers --live` mode is deliberately not
+enabled by this slice. It must be an explicit opt-in that warns before contact,
+separates authentication/network/rate-limit/model-access failures, and states
+whether any billable operation may occur.
+
 `doctor` reports, with a one-line fix for each gap:
 - **REQUIRED FOR A BUILD** — operator/worker tokens, worker-model enabled, provider role models
   resolve.

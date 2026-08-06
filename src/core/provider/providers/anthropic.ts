@@ -55,6 +55,10 @@ export interface AnthropicOptions {
    * long agentic sessions. Default ON; disable via the constructor or IKBI_ANTHROPIC_CONVERSATION_CACHE=0.
    */
   readonly conversationCache?: boolean;
+  /** Non-secret provenance used by local provider preflight. */
+  readonly credentialSource?: string;
+  /** Non-secret provenance used by local provider preflight. */
+  readonly configurationSource?: string;
 }
 
 /** Anthropic's minimum cacheable prefix; a breakpoint below this is ignored by the API (no charge).
@@ -242,6 +246,8 @@ export class AnthropicProvider implements ModelProvider {
   private readonly maxErrorDetail: number;
   private readonly anthropicVersion: string;
   private readonly conversationCache: boolean;
+  private readonly credentialSource: string | undefined;
+  private readonly configurationSource: string | undefined;
 
   constructor(opts: AnthropicOptions) {
     this.id = opts.id;
@@ -249,6 +255,8 @@ export class AnthropicProvider implements ModelProvider {
     this.apiKey = opts.apiKey;
     this.maxErrorDetail = opts.maxErrorDetail ?? DEFAULT_MAX_ERROR_DETAIL;
     this.anthropicVersion = opts.anthropicVersion ?? ANTHROPIC_VERSION;
+    this.credentialSource = opts.credentialSource;
+    this.configurationSource = opts.configurationSource;
     // Default ON; an explicit constructor value wins, else the env kill-switch, else true.
     this.conversationCache =
       opts.conversationCache ?? process.env.IKBI_ANTHROPIC_CONVERSATION_CACHE !== "0";
@@ -261,6 +269,17 @@ export class AnthropicProvider implements ModelProvider {
   /** USABLE iff an API key is configured (the native Anthropic adapter is never keyless). */
   ready(): boolean {
     return this.apiKey !== undefined && this.apiKey.length > 0;
+  }
+
+  preflightInfo() {
+    return {
+      kind: "anthropic" as const,
+      baseUrl: this.baseUrl,
+      credentialRequired: true,
+      credentialPresent: this.ready(),
+      ...(this.credentialSource !== undefined ? { credentialSource: this.credentialSource } : {}),
+      ...(this.configurationSource !== undefined ? { configurationSource: this.configurationSource } : {}),
+    };
   }
 
   private ensureAuth(): void {

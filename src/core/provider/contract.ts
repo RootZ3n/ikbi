@@ -391,6 +391,12 @@ export interface ModelProvider {
    * that omit it are assumed ready (back-compat) — doctor then falls back to its structural check.
    */
   ready?(): boolean;
+  /**
+   * ADDITIVE, read-only local-preflight metadata. This deliberately contains no
+   * credential value and never performs I/O. Older/fake providers may omit it;
+   * callers must retain the structural `ready()` fallback in that case.
+   */
+  preflightInfo?(): ProviderPreflightInfo;
   /** Perform a single invocation. MUST throw `ProviderError` on failure. */
   invoke(invocation: ProviderInvocation): Promise<ProviderResult>;
   /**
@@ -401,6 +407,18 @@ export interface ModelProvider {
    * MID-stream fails the call (no mid-stream retry/fallback).
    */
   invokeStream?(invocation: ProviderInvocation): Promise<ModelStream>;
+}
+
+/** Non-secret provider facts that can be inspected without contacting the provider. */
+export interface ProviderPreflightInfo {
+  readonly kind: "openai-compatible" | "anthropic" | string;
+  readonly baseUrl: string;
+  readonly credentialRequired: boolean;
+  readonly credentialPresent: boolean;
+  /** e.g. keyless, environment, .env (/path), or provider roster. */
+  readonly credentialSource?: string;
+  /** e.g. built-in provider config or the provider-roster path. */
+  readonly configurationSource?: string;
 }
 
 // ---------------------------------------------------------------------------
