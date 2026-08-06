@@ -109,3 +109,38 @@ test("a diff whose context doesn't match fails closed (patch_did_not_apply)", as
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("consult mutation is bound to the exact pre-consult snapshot", async () => {
+  const root = await makeRepo();
+  try {
+    let sourceBytes: Uint8Array | undefined;
+    const res = await applyConsultPatch(
+      { workspacePath: root, request: { question: "fix add", identity: IDENTITY } },
+      {
+        runConsult: async (req): Promise<ConsultResult> => {
+          sourceBytes = req.sourceSnapshot?.get("src/math.ts") as Uint8Array | undefined;
+          await writeFile(path.join(root, "src", "math.ts"), "human edit after consult observation\n");
+          return {
+            modelId: "sonnet-4.6",
+            tier: "frontier",
+            mode: "patch",
+            answer: GOOD_DIFF,
+            packet: {} as unknown as ConsultResult["packet"],
+            usage: {} as unknown as ConsultResult["usage"],
+            cost: {} as unknown as ConsultResult["cost"],
+            retrieval: { files: 1, lowConfidence: false }
+          };
+        }
+      }
+    );
+    assert.equal(Buffer.from(sourceBytes ?? []).toString("utf8").includes("return a - b;"), true);
+    assert.equal(res.applied, false);
+    assert.equal(res.stopReason, "stale_repair");
+    assert.equal(res.repairError?.code, "STALE_REPAIR");
+    assert.equal(res.mutationApplied, false);
+    assert.equal(res.partialMutation, false);
+    assert.equal(await readFile(path.join(root, "src", "math.ts"), "utf8"), "human edit after consult observation\n");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

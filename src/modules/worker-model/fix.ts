@@ -22,7 +22,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
+import { readFileSync, readdirSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 
 import { neutralizeUntrusted, toUntrustedMessage } from "../../core/injection/index.js";
@@ -30,13 +30,17 @@ import type { NeutralizedContent, UntrustedContext } from "../../core/injection/
 import type { AgentIdentity, ModelMessage, ModelRequest, ModelResponse } from "../../core/provider/contract.js";
 import { resolveChecks } from "./checks.js";
 import { parseCheckOutput } from "../check-triage/index.js";
-import { confinePath, writeConfinedFile } from "./builder-tools/confine.js";
+import { confinePath } from "./builder-tools/confine.js";
 import { antiCheatCheck, isTestFile, type FileChange } from "./fix-anti-cheat.js";
 import { diagnoseFailure, type Diagnosis, type DiagnosisFile } from "./fix-diagnosis.js";
 import { FixReceiptBuilder, type FixReceipt, type FixResult, type ParsedOutcomes } from "./fix-receipt.js";
 import { applyFilePatch, extractDiff, parseUnifiedDiff } from "./patchsmith.js";
 import { builderModel } from "./role-models.js";
 import { escalationConfig } from "../escalation/config.js";
+import type { WorkspaceHandle } from "../../core/workspace/contract.js";
+import type { MutationActor, MutationCause, MutationSessionBinding, WorkspaceMutationSession, BoundMutationResult } from "../../core/workspace/index.js";
+import { applyRepairPlan, createRepairPlan, repairFailure, restoreRepairMutations, type RepairMutationFailure } from "../../core/workspace/repair-plan.js";
+import { createRepairSession, standaloneRepairBinding, standaloneRepairWorkspace } from "./repair-runtime.js";
 
 /** A check command fix mode runs to reproduce/verify (e.g. `pytest -q`). */
 export interface FixCheckCommand {
@@ -119,6 +123,13 @@ export interface FixOptions {
    * `defaultEscalationModels`). e.g. ["deepseek-v4-flash", "deepseek-v4-flash", "deepseek-v4-pro"].
    */
   readonly escalationModels?: readonly string[];
+  /** Managed candidate workspace identity, when fix runs inside a worker candidate. */
+  readonly mutationWorkspace?: WorkspaceHandle;
+  /** Source-generation binding for the repair attempt. */
+  readonly mutationBinding?: MutationSessionBinding;
+  /** Cause for standalone repair calls; orchestrated model repairs supply this in mutationBinding. */
+  readonly mutationActor?: MutationActor;
+  readonly mutationCause?: MutationCause;
 }
 
 export interface FixDeps {
@@ -134,10 +145,6 @@ export interface FixDeps {
   readonly invokeModel?: (request: ModelRequest) => Promise<ModelResponse>;
   /** #8 neutralization seam. Default: the core chokepoint. */
   readonly neutralize?: (content: string, context: UntrustedContext) => NeutralizedContent;
-  /** Read a worktree-relative file. Default: confined fs read (null when absent/unreadable). */
-  readonly readFile?: (repo: string, rel: string) => string | null;
-  /** Write a worktree-relative file. Default: confined fs write. */
-  readonly writeFile?: (repo: string, rel: string, content: string) => void;
   /** Resolve the repo HEAD sha for the snapshot. Default: `git rev-parse HEAD`. */
   readonly head?: (repo: string) => string;
   /** Wall-clock for receipt timestamps. Default: ISO now. */
@@ -162,6 +169,7 @@ export interface FixOutcome {
   readonly promoted: boolean;
   readonly filesModified: readonly string[];
   readonly diagnosis: Diagnosis;
+  readonly repairError?: RepairMutationFailure;
 }
 
 function errMsg(e: unknown): string {
@@ -225,24 +233,6 @@ function defaultCandidateFiles(repo: string): DiagnosisFile[] {
   };
   walk(repo, 0);
   return out;
-}
-
-/** Default confined fs read (worktree-relative). */
-function fsReadFile(repo: string, rel: string): string | null {
-  const c = confinePath(realpathSync(repo), rel);
-  if (!c.ok || !existsSync(c.full)) return null;
-  try {
-    return readFileSync(c.full, "utf8");
-  } catch {
-    return null;
-  }
-}
-
-/** Default confined fs write (worktree-relative). Throws on a confinement violation. */
-function fsWriteFile(repo: string, rel: string, content: string): void {
-  const c = confinePath(realpathSync(repo), rel);
-  if (!c.ok) throw new Error(c.error);
-  writeConfinedFile(realpathSync(repo), c, content);
 }
 
 /** Default HEAD resolution (read-only). */
@@ -338,8 +328,6 @@ async function runFixPipelineInner(opts: FixOptions, deps: FixDeps): Promise<Fix
 
   const invokeModel = deps.invokeModel ?? (async (req: ModelRequest) => (await import("../../core/provider/index.js")).invokeModel(req));
   const neutralize = deps.neutralize ?? neutralizeUntrusted;
-  const readFile = deps.readFile ?? fsReadFile;
-  const writeFile = deps.writeFile ?? fsWriteFile;
   const headOf = deps.head ?? gitHead;
   const now = deps.now ?? (() => new Date().toISOString());
   const candidateFiles = deps.candidateFiles ?? defaultCandidateFiles;
@@ -352,10 +340,17 @@ async function runFixPipelineInner(opts: FixOptions, deps: FixDeps): Promise<Fix
 
   // A refusal/terminal that ran NO edits still runs anti-cheat (over zero changes) — §"anti-cheat
   // runs on EVERY attempt". Returns the assembled outcome.
-  const terminalNoEdit = (result: FixResult, diagnosis: Diagnosis): FixOutcome => {
+  const terminalNoEdit = (result: FixResult, diagnosis: Diagnosis, repairError?: RepairMutationFailure): FixOutcome => {
     const verdict = antiCheatCheck({ changes: [], allowedFiles: diagnosis.affectedFiles, allowTestEdits });
     builder.recordAntiCheat(verdict.passed, verdict.checks);
-    return { result, receipt: builder.finalize(result), promoted: false, filesModified: [], diagnosis };
+    return {
+      result,
+      receipt: builder.finalize(result),
+      promoted: false,
+      filesModified: [],
+      diagnosis,
+      ...(repairError === undefined ? {} : { repairError }),
+    };
   };
 
   // A cancellation terminal: the operator cancelled before this boundary — stop cleanly with a
@@ -416,16 +411,57 @@ async function runFixPipelineInner(opts: FixOptions, deps: FixDeps): Promise<Fix
   if (planFiles.length === 0) return terminalNoEdit("NEEDS_HUMAN", diagnosis);
   if (diagnosis.affectedFiles.length > maxFiles) return terminalNoEdit("NEEDS_HUMAN", diagnosis);
 
-  // Snapshot the planned files' BEFORE content ONCE. Each retry regenerates its patch against this
-  // original snapshot (and the disk is reset to it first), so every attempt is independent and a
-  // diff authored against the original always applies to a clean base.
-  const before = new Map<string, string | null>();
-  const fileBlocks: Array<{ path: string; body: string }> = [];
-  for (const f of planFiles) {
-    const content = readFile(opts.repo, f);
-    before.set(f, content);
-    if (content !== null) fileBlocks.push({ path: f, body: content.slice(0, MAX_FILE_BYTES) });
+  // A caller that supplies a managed workspace must also supply its exact
+  // candidate/generation binding. Do not manufacture a standalone repair
+  // identity for an already-managed candidate; the standalone envelope is
+  // reserved for the CLI path that owns the workspace construction itself.
+  if (opts.mutationWorkspace !== undefined && opts.mutationBinding === undefined) {
+    const repairError: RepairMutationFailure = {
+      code: "REPAIR_GENERATION_REVOKED",
+      workspaceId: opts.mutationWorkspace.id,
+      paths: [...planFiles],
+      mutationApplied: false,
+      partialMutation: false,
+      retryable: false,
+      recommendedRecovery: "Provide a fresh candidate generation binding before starting repair.",
+      message: "managed repair workspace has no candidate-generation binding",
+    };
+    return terminalNoEdit("SAFE_FAIL", diagnosis, repairError);
   }
+
+  // Capture exact raw observations once for this attempt. The model receives
+  // bounded prompt text, but authority is retained in the complete byte
+  // observation held by the mutation session.
+  const mutationWorkspace = opts.mutationWorkspace ?? standaloneRepairWorkspace(opts.repo, identity);
+  const repairBinding = opts.mutationBinding ?? {
+    ...standaloneRepairBinding(mutationWorkspace, "fixer", "1"),
+    actor: opts.mutationActor ?? "human",
+    cause: opts.mutationCause ?? "human",
+  };
+  let mutationSession: WorkspaceMutationSession = await createRepairSession(mutationWorkspace, "fixer", repairBinding, "1");
+  const observePlanFiles = async (): Promise<{ blocks: Array<{ path: string; body: string }>; beforeText: Map<string, string | null> }> => {
+    const blocks: Array<{ path: string; body: string }> = [];
+    const beforeText = new Map<string, string | null>();
+    for (const f of planFiles) {
+      const observed = await mutationSession.observeBytes(f);
+      if (observed.bytes === null) {
+        beforeText.set(f, null);
+        continue;
+      }
+      let content: string;
+      try {
+        content = new TextDecoder("utf-8", { fatal: true }).decode(observed.bytes);
+      } catch {
+        throw new Error(`repair target is binary or not valid UTF-8: ${f}`);
+      }
+      beforeText.set(f, content);
+      blocks.push({ path: f, body: content.slice(0, MAX_FILE_BYTES) });
+    }
+    return { blocks, beforeText };
+  };
+  let observedPlan = await observePlanFiles();
+  let fileBlocks = observedPlan.blocks;
+  let before = observedPlan.beforeText;
 
   const worktreeReal = (() => {
     try {
@@ -436,16 +472,10 @@ async function runFixPipelineInner(opts: FixOptions, deps: FixDeps): Promise<Fix
   })();
   const planSet = new Set(planFiles.map((p) => p.replace(/\\/g, "/")));
 
-  // Restore every file a prior attempt wrote back to its original snapshot — guarantees the next
-  // attempt starts from a clean base (so a partial earlier patch never leaks across attempts).
-  const restore = (touched: readonly string[]): void => {
-    for (const rel of touched) {
-      try {
-        writeFile(opts.repo, rel, before.get(rel) ?? "");
-      } catch {
-        /* best-effort revert; the next apply overwrites the planned files anyway */
-      }
-    }
+  // Restore is itself a state-bound repair operation: it succeeds only while
+  // every file still equals the prior operation's exact after-state.
+  const restore = async (applied: readonly BoundMutationResult[]): Promise<void> => {
+    await restoreRepairMutations(mutationSession, [...applied].reverse());
   };
 
   // Assemble a SAFE_FAIL outcome that left the disk clean (anti-cheat over zero changes).
@@ -466,7 +496,7 @@ async function runFixPipelineInner(opts: FixOptions, deps: FixDeps): Promise<Fix
   // would not help). Anti-cheat runs on EVERY attempt, including each retry.
   let feedbackOutput = reproduce.output; // verification output fed back to the next attempt
   let previousDiff: string | undefined; // the prior failed patch, shown to the model on a retry
-  let everModified: string[] = []; // files written by the most-recent attempt (reset before the next)
+  let lastApplied: readonly BoundMutationResult[] = [];
   let lastVerdict = antiCheatCheck({ changes: [], allowedFiles: planFiles, allowTestEdits });
   let lastFilesModified: string[] = [];
 
@@ -479,7 +509,13 @@ async function runFixPipelineInner(opts: FixOptions, deps: FixDeps): Promise<Fix
     // Kill-check #3 — at each patch/verify boundary. Revert any patch a prior attempt wrote so a
     // cancelled run leaves the repo clean, then terminate (the caller settles status to cancelled).
     if (isCancelled()) {
-      if (everModified.length > 0) restore(everModified);
+      if (lastApplied.length > 0) {
+        try { await restore(lastApplied); }
+        catch (error) {
+          const repairError = repairFailure(error, { session: mutationSession, paths: lastApplied.map((m) => m.mutation.path) });
+          return { ...safeFailNoChange("", `repair cancellation cleanup refused: ${repairError.message}`, attempt - 1), repairError };
+        }
+      }
       builder.recordAttempts(attempt - 1);
       return terminalNoEdit("SAFE_FAIL", diagnosis);
     }
@@ -487,10 +523,20 @@ async function runFixPipelineInner(opts: FixOptions, deps: FixDeps): Promise<Fix
     const currentModel = attemptModels[Math.min(attempt - 1, attemptModels.length - 1)] ?? modelId;
     builder.recordAttemptModel(currentModel);
 
-    // Reset the disk to the original snapshot before regenerating (no-op on the first attempt).
-    if (everModified.length > 0) {
-      restore(everModified);
-      everModified = [];
+    // Every retry gets a fresh generation and fresh complete observations.
+    if (attempt > 1) {
+      if (lastApplied.length > 0) {
+        try { await restore(lastApplied); }
+        catch (error) {
+          const repairError = repairFailure(error, { session: mutationSession, paths: lastApplied.map((m) => m.mutation.path) });
+          return { ...safeFailNoChange("", `repair retry cleanup refused: ${repairError.message}`, attempt - 1), repairError };
+        }
+      }
+      mutationSession = await createRepairSession(mutationWorkspace, "fixer", repairBinding, String(attempt));
+      observedPlan = await observePlanFiles();
+      fileBlocks = observedPlan.blocks;
+      before = observedPlan.beforeText;
+      lastApplied = [];
     }
 
     // ── STAGE 7: APPLY (generate -> validate every path -> apply) ──────────────
@@ -512,7 +558,7 @@ async function runFixPipelineInner(opts: FixOptions, deps: FixDeps): Promise<Fix
     const changes: FileChange[] = [];
     const filesModified: string[] = [];
     let violation: string | undefined;
-    const writes: Array<{ rel: string; content: string }> = [];
+    const plannedMutations: Array<{ path: string; operation: "create" | "replace" | "delete"; afterBytes: Uint8Array | null }> = [];
     for (const fp of parsed.files) {
       const c = confinePath(worktreeReal, fp.path);
       if (!c.ok) {
@@ -532,15 +578,22 @@ async function runFixPipelineInner(opts: FixOptions, deps: FixDeps): Promise<Fix
         violation = `patch edits a config file without --allow-config-edits: ${rel}`;
         break;
       }
-      // Always patch against the ORIGINAL snapshot (the disk was reset above), so a diff authored
-      // against the original applies cleanly even after a prior attempt touched the same file.
-      const original = before.has(rel) ? before.get(rel) ?? "" : readFile(opts.repo, rel) ?? "";
+      const observed = mutationSession.currentObservation(rel) ?? await mutationSession.observeBytes(rel);
+      if (fp.deleted) {
+        plannedMutations.push({ path: rel, operation: "delete", afterBytes: null });
+        continue;
+      }
+      let original = "";
+      if (observed.bytes !== null) {
+        try { original = new TextDecoder("utf-8", { fatal: true }).decode(observed.bytes); }
+        catch { violation = `repair target is binary or not valid UTF-8: ${rel}`; break; }
+      }
       const applied = applyFilePatch(original, fp);
       if (!applied.ok) {
         violation = applied.error;
         break;
       }
-      writes.push({ rel, content: applied.content });
+      plannedMutations.push({ path: rel, operation: fp.created ? "create" : "replace", afterBytes: Buffer.from(applied.content, "utf8") });
     }
 
     if (violation !== undefined) {
@@ -548,19 +601,32 @@ async function runFixPipelineInner(opts: FixOptions, deps: FixDeps): Promise<Fix
       return safeFailNoChange(patchResult.diff, `(patch rejected: ${violation})`, attempt);
     }
 
+    let repairPlan;
+    let appliedPlan;
     try {
-      for (const w of writes) {
-        writeFile(opts.repo, w.rel, w.content);
-        filesModified.push(w.rel);
-        changes.push({ path: w.rel, before: before.get(w.rel) ?? null, after: w.content });
-      }
-    } catch (e) {
-      // A write failure mid-apply (e.g. confinement / fs error) — revert what we wrote and fail
-      // closed with a complete receipt. The pipeline NEVER throws past this boundary.
-      restore(filesModified);
-      return safeFailNoChange(patchResult.diff, `(patch write failed: ${errMsg(e)})`, attempt);
+      repairPlan = createRepairPlan({
+        session: mutationSession,
+        producingAttemptId: mutationSession.binding.attemptId ?? `fixer:${attempt}`,
+        producingRole: "fixer",
+        ...((mutationSession.binding.invocationId === undefined) ? {} : { producingInvocationId: mutationSession.binding.invocationId }),
+        files: plannedMutations,
+        rationale: "fixer unified diff computed from complete observed candidate bytes",
+      });
+      appliedPlan = await applyRepairPlan(mutationSession, repairPlan);
+    } catch (error) {
+      const repairError = repairFailure(error, { session: mutationSession, paths: plannedMutations.map((p) => p.path) });
+      return { ...safeFailNoChange(patchResult.diff, `${repairError.code}: ${repairError.message}`, attempt), repairError };
     }
-    everModified = [...filesModified];
+    lastApplied = appliedPlan.mutations;
+    for (const mutation of appliedPlan.mutations) {
+      const rel = mutation.mutation.path;
+      const beforeText = before.get(rel) ?? null;
+      let afterText: string;
+      try { afterText = new TextDecoder("utf-8", { fatal: true }).decode(mutation.afterBytes); }
+      catch { afterText = ""; }
+      filesModified.push(rel);
+      changes.push({ path: rel, before: beforeText, after: afterText });
+    }
     builder.recordPatch(patchResult.diff, filesModified);
 
     // ── STAGE 8: TARGETED_CHECK ───────────────────────────────────────────────

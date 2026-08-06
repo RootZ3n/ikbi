@@ -34,6 +34,17 @@ import { receipts as coreReceipts } from "../../core/receipt/index.js";
 import { trust as coreTrust } from "../../core/trust/index.js";
 import { workspaces as coreWorkspaces } from "../../core/workspace/index.js";
 import type { DiscardResult, PromoteGovernance, PromoteResult, WorkspaceEvaluation, WorkspaceHandle } from "../../core/workspace/contract.js";
+import type { MutationSessionBinding } from "../../core/workspace/mutation-session.js";
+import type { RepairPlan } from "../../core/workspace/repair-plan.js";
+import {
+  createWorkspaceMutationSession,
+  createRepairPlanFromSnapshot,
+  importRepairPlan,
+  repairFailure,
+  restoreRepairMutations,
+  sha256Bytes,
+} from "../../core/workspace/index.js";
+import type { FileState } from "../../core/workspace/file-state.js";
 import type { ModelRequest, ModelResponse } from "../../core/provider/contract.js";
 
 import { deterministicJudge } from "../deterministic-judge/index.js";
@@ -84,7 +95,7 @@ import type { DependencyInstall } from "../dependency-install/contract.js";
 import { builder, createBuilder, MAX_TOOL_ITERATIONS } from "./builder.js";
 import { createPatchsmith } from "./patchsmith.js";
 import { runTournament } from "./tournament.js";
-import type { CandidateRun, CandidateSpec, ShadowVerification, TournamentEngine, TournamentEvent } from "./tournament.js";
+import type { CandidateRun, CandidateSpec, ShadowVerification, TournamentApplyResult, TournamentEngine, TournamentEvent } from "./tournament.js";
 import { captureStreamedStdout, classifyUnresolvableReason, committedPackageJsonDiff, parseChecksEnv, parseTestCount, PROJECT_MANIFESTS, resolveChecks, resolveCheckTimeoutMs, UNRESOLVABLE_NEXT_STEPS, type VerificationKind, workingTreePackageJsonDiff, workingTreePlanningDiff } from "./checks.js";
 import { builderModel, competitiveBuilderModels, criticModel } from "./role-models.js";
 import { estimatePromptTokens, contextExceedsWindow } from "./context-preflight.js";
@@ -163,6 +174,9 @@ const CONTEXT_PREFLIGHT_FRACTION = 0.7;
 /** Repair budget (Phase 6): the hard per-run cap on fixer/rescue model passes — prevents repair loops. */
 const MAX_FIXER_ROUNDS = 2;
 
+/** Whether a builder factory participates in Phase 2 text mutation binding. */
+type BuilderMutationScope = "ordinary" | "deferred";
+
 /** A mutable signal accumulator folded across roles within one run (see observeEscalation). */
 interface MutableEscalationSignals {
   schemaFailures: number;
@@ -187,9 +201,9 @@ interface EscalationHandoffFields {
 // ── DEPENDENCY INSTALL: ensure worktree has node_modules ──────────────────────
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, symlinkSync, mkdirSync, type Dirent } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync, symlinkSync, mkdirSync, type Dirent } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, basename } from "node:path";
+import { join, basename, isAbsolute, relative, resolve, sep } from "node:path";
 
 import { computeWorkProduct, decidePromotability, type Decision, type GitRunner, type SafetyAssessment, type Verdict, type WorkAssessment } from "./adjudication/index.js";
 
@@ -697,10 +711,9 @@ export interface OrchestratorDeps {
    */
   readonly candidateModels?: readonly string[];
   /**
-   * Apply a unified diff into a CLEAN workspace and commit it (the tournament's SHADOW REPLAY).
-   * Default: a governed `git apply` + commit (see `defaultApplyDiff`). Injectable for tests so the
-   * tournament's shadow-replay can be driven without a real worktree. Returns whether the diff both
-   * applied AND produced a committed change (an empty/failed apply ⇒ `applied: false`).
+   * Legacy test seam for tournament shadow replay. Production uses the
+   * source-bound `applyWinner` path; an injected function is retained so the
+   * deterministic tournament algorithm remains testable without a worktree.
    */
   readonly applyDiff?: (workspace: WorkspaceHandle, diff: string) => Promise<{ applied: boolean; reason?: string }>;
   /**
@@ -1253,16 +1266,37 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     // as "builder"); its timeout is a mutation fence, its clean completion supersedes a prior fence.
     const fence = activeMutationFences.get(ctx.task.taskId);
     const mutating = role === "builder";
+    const recordMutationLifecycle = (result: RoleResult): void => {
+      if (!mutating) return;
+      const registry = activeLeaseRegistries.get(ctx.task.taskId);
+      if ((result.detail as Record<string, unknown> | undefined)?.timedOut === true) {
+        if (ctx.mutationBinding?.generationId !== undefined) registry?.revokeGeneration(ctx.mutationBinding.generationId, "timed-out");
+        else registry?.recordMutatingTimeout(ctx.workspace.id);
+      }
+      if (fence !== undefined) {
+        if ((result.detail as Record<string, unknown> | undefined)?.timedOut === true) fence.recordMutatingTimeout(ctx.workspace.id);
+        else if (result.outcome === "success") fence.recordCleanMutation(ctx.workspace.id);
+      }
+    };
     if (!(effectiveTimeout > 0)) {
       const r = await Promise.resolve(roleFn(ctx));
-      if (mutating && fence !== undefined) { if ((r.detail as Record<string, unknown> | undefined)?.timedOut === true) fence.recordMutatingTimeout(ctx.workspace.id); else if (r.outcome === "success") fence.recordCleanMutation(ctx.workspace.id); }
+      recordMutationLifecycle(r);
       return r;
     }
     // COOPERATIVE CANCELLATION (Phase 13): an abort signal the role/tools/provider CAN honor to stop early.
     // It is best-effort — a role that ignores it still cannot promote timed-out work (the fence below is the
     // non-cooperative final authority). Threaded onto the RoleContext so honoring callers see it.
     const controller = new AbortController();
-    const signalCtx: RoleContext = { ...ctx, signal: controller.signal };
+    const signalBinding = ctx.mutationBinding === undefined
+      ? undefined
+      : {
+          ...ctx.mutationBinding,
+          assertActive: () => {
+            ctx.mutationBinding!.assertActive?.();
+            if (controller.signal.aborted) throw new Error("mutating role was cancelled or timed out");
+          },
+        };
+    const signalCtx: RoleContext = { ...ctx, signal: controller.signal, ...(signalBinding === undefined ? {} : { mutationBinding: signalBinding }) };
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<RoleResult>((resolve) => {
       timer = setTimeout(() => {
@@ -1274,10 +1308,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       const result = await Promise.race([Promise.resolve(roleFn(signalCtx)), timeout]);
       // FENCE (non-cooperative): a mutating-role TIMEOUT quarantines this workspace's tree (the losing promise
       // is uncancellable and may still write); a mutating-role CLEAN success supersedes a prior fence.
-      if (mutating && fence !== undefined) {
-        if ((result.detail as Record<string, unknown> | undefined)?.timedOut === true) fence.recordMutatingTimeout(ctx.workspace.id);
-        else if (result.outcome === "success") fence.recordCleanMutation(ctx.workspace.id);
-      }
+      recordMutationLifecycle(result);
       return result;
     } finally {
       if (timer !== undefined) clearTimeout(timer);
@@ -1538,12 +1569,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     return task.builderMode ?? config.builderMode ?? "agent";
   }
 
-  function builderFor(parentCtx: OperationContext, mode: BuilderMode = "agent"): RoleFn {
-    return builderForModel(parentCtx, undefined, mode);
+  function builderFor(parentCtx: OperationContext, mode: BuilderMode = "agent", mutationScope: BuilderMutationScope = "ordinary"): RoleFn {
+    return builderForModel(parentCtx, undefined, mode, mutationScope);
   }
 
   /** Like `builderFor`, but for a specific per-candidate model (the head-to-head shootout). */
-  function builderForModel(parentCtx: OperationContext, modelOverride?: string, mode: BuilderMode = "agent"): RoleFn {
+  function builderForModel(parentCtx: OperationContext, modelOverride?: string, mode: BuilderMode = "agent", mutationScope: BuilderMutationScope = "ordinary"): RoleFn {
     if (deps.roles?.builder !== undefined) return deps.roles.builder;
     // The Patchsmith lane and the agent lane share the SAME module-internal deps (governed checks,
     // parent identity, the verifier's resolved check set). The lane only changes which RoleFn runs.
@@ -1557,6 +1588,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       ...(activeCheckHalt !== undefined ? { checkHalt: activeCheckHalt } : {}),
       // Memory governor: intercepts governed writes into proposals.
       ...(deps.memoryGovernor !== undefined ? { memoryGovernor: deps.memoryGovernor } : {}),
+      ...(mutationScope === "deferred" ? { allowUnboundManagedMutations: true } : {}),
     };
     return mode === "patch" ? createPatchsmith(builderDeps) : createBuilder(builderDeps);
   }
@@ -2914,6 +2946,69 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       ...(task.baseBranch !== undefined ? { baseBranch: task.baseBranch } : {}),
       label: `worker:${task.taskId}`,
     });
+    // Ordinary builder text mutation receives an explicit candidate/generation binding. A task
+    // without candidateId is intentionally left unbound; the managed builder then fails closed
+    // instead of substituting taskId or workspaceId for the missing candidate identity.
+    const normalMutationGeneration = task.candidateId === undefined
+      ? undefined
+      : activeLeaseRegistries.get(task.taskId)?.openGeneration({
+          attemptId: task.taskId,
+          candidateId: task.candidateId,
+          workspaceId: workspace.id,
+          workspacePath: workspace.path,
+        });
+    /**
+     * Build the mutation binding for one exact candidate generation. The
+     * assertion is deliberately evaluated at the write boundary by the shared
+     * mutation session; a timed-out, revoked, frozen, or superseded generation
+     * therefore cannot land a late repair.
+     */
+    const mutationBindingForGeneration = (
+      generation: NonNullable<typeof normalMutationGeneration>,
+      identity: AgentIdentity,
+      suffix: string,
+      role: string,
+    ): MutationSessionBinding => ({
+      sessionId: `${task.taskId}:${suffix}:${generation.generationId}`,
+      workspaceId: workspace.id,
+      candidateId: generation.candidateId,
+      generationId: generation.generationId,
+      actor: "model",
+      cause: "model",
+      ...(parentCtx.requestId !== undefined ? { requestId: parentCtx.requestId } : {}),
+      attemptId: generation.attemptId,
+      role,
+      validatedIdentity: identity.agentId,
+      assertActive: () => {
+        const registry = activeLeaseRegistries.get(task.taskId);
+        if (registry === undefined) return;
+        const lifecycle = registry.lifecycleOf(generation.generationId);
+        const current = registry.currentGeneration(workspace.id);
+        if (lifecycle !== "active" || current?.generationId !== generation.generationId) {
+          throw new Error(
+            `candidate generation ${generation.generationId} is ${lifecycle ?? "unknown"} or superseded; mutation refused`,
+          );
+        }
+      },
+      fork: ({ attemptId, role: forkRole, suffix: forkSuffix }) => {
+        const registry = activeLeaseRegistries.get(task.taskId);
+        if (registry === undefined) {
+          throw new Error(`candidate generation registry unavailable for ${task.taskId}`);
+        }
+        const next = registry.openGeneration({
+          attemptId,
+          candidateId: generation.candidateId,
+          workspaceId: workspace.id,
+          workspacePath: workspace.path,
+          sourceGenerationId: generation.generationId,
+        });
+        return mutationBindingForGeneration(next, identity, `${suffix}:${forkSuffix}`, forkRole);
+      },
+    });
+    const normalMutationBindingFor = (spawned: Pick<SpawnedRole, "identity">, suffix = "builder", role = "builder") =>
+      normalMutationGeneration === undefined
+        ? undefined
+        : mutationBindingForGeneration(normalMutationGeneration, spawned.identity, suffix, role);
 
     // MANIFEST CHECK: warn early when no project manifest exists in the worktree root.
     // Without a manifest, `resolveChecks` will fail with "no recognizable project manifest"
@@ -3186,6 +3281,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           priorResults: [...results],
           engine: runEngine,
           ...(roleRuntimeEvidence.length > 0 ? { runtimeEvidence: roleRuntimeEvidence } : {}),
+          ...(role === "builder" ? (() => {
+            const mutationBinding = normalMutationBindingFor(spawned);
+            return mutationBinding === undefined ? {} : { mutationBinding };
+          })() : {}),
         };
         // PRE-FLIGHT CONTEXT SIZE (proactive) — the ONE legitimate post-rental model change. The scout
         // has run, so its brief is known. If the base builder context (goal + project instructions +
@@ -3295,6 +3394,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             const sourceTree = await readTreeHash(workspace.path);
             const failingChecks = readVerifier(redVerify).checks.filter((c) => c.passed === false).map((c) => c.name);
             const fixSpawn = spawnRole("builder", parentCtx);
+            const fixerBaseBinding = normalMutationBindingFor(fixSpawn, "fixer", "fixer");
+            const fixerMutationBinding = fixerBaseBinding?.fork?.({
+              attemptId: `${task.taskId}:fixer:${fixerRound}`,
+              role: "fixer",
+              suffix: `fixer:${fixerRound}`,
+            }) ?? fixerBaseBinding;
             const fixGoal = [
               task.goal,
               "",
@@ -3321,6 +3426,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               workspace,
               priorResults: [...results],
               engine: runEngine,
+              ...(fixerMutationBinding === undefined ? {} : { mutationBinding: fixerMutationBinding }),
               ...(fixerEvidence.length > 0 ? { runtimeEvidence: fixerEvidence } : {}),
             };
             // COST: bill the fixer's provider calls to the fixer model, separately from the builder role.
@@ -3330,7 +3436,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             const fixerRecordsBefore = runLedger.all().length;
             const fixResult = await runLedger.withContext(
               { role: "builder", stage: "fixer", retryKind: "fixer", attemptId: task.taskId, requestedAlias: fixerModel, ...(modelDecision.vendorLane !== undefined ? { vendorLane: modelDecision.vendorLane } : {}) },
-              () => runRoleFn("builder", builderForModel(parentCtx, fixerModel, resolveBuilderMode(task)), fixCtx),
+              () => runRoleFn("builder", builderForModel(parentCtx, fixerModel, resolveBuilderMode(task), "ordinary"), fixCtx),
             );
             const fixerCost = runCost() - costBeforeFixer;
             const fixerRecords = runLedger.all().slice(fixerRecordsBefore).filter((r) => r.stage === "fixer" && r.resolvedModel !== undefined);
@@ -3540,6 +3646,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           // loop only returns the distilled pass/fail). If that last verify is GREEN we reuse this
           // result for the main verifier role instead of re-running the suite (see fixLoopVerifierResult).
           let lastFullVerifierResult: RoleResult | undefined;
+          let iterativeFixRound = 0;
           const fixLoopOutcome = await runIterativeLoop(result, {
             maxFixIterations: DEFAULT_MAX_FIX_ITERATIONS,
             verifier: async () => {
@@ -3557,9 +3664,16 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               return extractVerifierCheckResult(vResult);
             },
             builder: async (fixGoal: string) => {
+              iterativeFixRound += 1;
               // Phase 11 (IKBI-REAUDIT-002): lane-pure repair — the iterative fix builder runs the ATTEMPT's
               // own model, not `builderFor()`'s global default (which could cross the attempt's vendor lane).
-              const fixBuilderFn = builderForModel(parentCtx, modelDecision.model, resolveBuilderMode(task));
+              const fixBuilderFn = builderForModel(parentCtx, modelDecision.model, resolveBuilderMode(task), "ordinary");
+              const fixBaseBinding = normalMutationBindingFor(spawned, "builder:iterative-fix", "fixer");
+              const fixMutationBinding = fixBaseBinding?.fork?.({
+                attemptId: `${task.taskId}:iterative-fix:${iterativeFixRound}`,
+                role: "fixer",
+                suffix: `iterative-fix:${iterativeFixRound}`,
+              }) ?? fixBaseBinding;
               const fixCtx: RoleContext = {
                 task: { ...task, goal: fixGoal },
                 role: "builder",
@@ -3568,6 +3682,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 workspace,
                 priorResults: [...results],
                 engine: runEngine,
+                ...(fixMutationBinding === undefined ? {} : { mutationBinding: fixMutationBinding }),
               };
               const br = await runRoleFn("builder", fixBuilderFn, fixCtx);
               noteBuilderSignals(br); // injection/taint on a verifier-driven fix retry must reach the promote gate
@@ -3686,6 +3801,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           const retryBuilder = spawnRole("builder", parentCtx);
           const retryVerifier = spawnRole("verifier", parentCtx);
           const retryCritic = spawnRole("critic", parentCtx);
+          const criticFixBaseBinding = normalMutationBindingFor(retryBuilder, "builder:critic-fix", "fixer");
+          const criticFixMutationBinding = criticFixBaseBinding?.fork?.({
+            attemptId: `${task.taskId}:critic-fix`,
+            role: "fixer",
+            suffix: "critic-fix",
+          }) ?? criticFixBaseBinding;
           const fix = await runCriticFixLoop(result, {
             builder: async (fixGoal: string) => {
               const fixCtx: RoleContext = {
@@ -3696,8 +3817,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 workspace,
                 priorResults: [...carriedPrior],
                 engine: runEngine,
+                ...(criticFixMutationBinding === undefined ? {} : { mutationBinding: criticFixMutationBinding }),
               };
-              const br = await runRoleFn("builder", builderForModel(parentCtx, modelDecision.model, resolveBuilderMode(task)), fixCtx); // Phase 11: lane-pure repair (attempt's model, not the global default)
+              const br = await runRoleFn("builder", builderForModel(parentCtx, modelDecision.model, resolveBuilderMode(task), "ordinary"), fixCtx); // Phase 11: lane-pure repair (attempt's model, not the global default)
               noteBuilderSignals(br); // injection/taint on a critic-fix retry must reach the promote gate
               return br;
             },
@@ -3840,6 +3962,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               ),
             );
             const costBeforeEsc = runCost();
+            const escBaseBinding = normalMutationBindingFor(escBuilder, "builder:critic-escalation", "fixer");
+            const escMutationBinding = escBaseBinding?.fork?.({
+              attemptId: `${task.taskId}:critic-escalation`,
+              role: "fixer",
+              suffix: "critic-escalation",
+            }) ?? escBaseBinding;
             const escBuilderFn = builderForModel(parentCtx, midModel, resolveBuilderMode(task));
             let escBuilderResult = await runRoleFn("builder", escBuilderFn, {
               task: { ...task, goal: escalatedGoal },
@@ -3849,6 +3977,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               workspace,
               priorResults: [...carriedPrior],
               engine: runEngine,
+              ...(escMutationBinding === undefined ? {} : { mutationBinding: escMutationBinding }),
             });
             const escBuilderCost = runCost() - costBeforeEsc;
             // Stamp the escalated model (+ marker) so the cost breakdown + audit show this builder ran
@@ -4075,6 +4204,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
               // (IKBI-RT-001). Passing `undefined` would drop a bumped builder back to the weaker default,
               // so a "same-model retry" would silently retry a WEAKER model than the one that failed.
               const cheapRetryBuilder = builderForModel(parentCtx, failedModel, resolveBuilderMode(task));
+              const cheapRetryBaseBinding = normalMutationBindingFor(cheapRetrySpawn, "builder:cheap-retry");
+              const cheapRetryMutationBinding = cheapRetryBaseBinding?.fork?.({
+                attemptId: `${task.taskId}:cheap-retry`,
+                role: "builder",
+                suffix: "cheap-retry",
+              }) ?? cheapRetryBaseBinding;
               const cheapRetryCtx: RoleContext = {
                 task: { ...task, goal: cheapRetryGoal },
                 role: "builder",
@@ -4083,6 +4218,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 workspace,
                 priorResults: [...results],
                 engine: runEngine,
+                ...(cheapRetryMutationBinding === undefined ? {} : { mutationBinding: cheapRetryMutationBinding }),
               };
               const costBeforeCheapRetry = runCost();
               let cheapRetryResult = await runRoleFn("builder", cheapRetryBuilder, cheapRetryCtx);
@@ -4212,8 +4348,18 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 const triedSummary = recAttempts.map((a) => ({ role: "builder", summary: `${a.tier}/${a.model}`, outcome: a.outcome === "green" ? "verified green" : "failed" }));
                 let applyRes: ApplyConsultPatchResult;
                 try {
+                  const consultBaseBinding = normalMutationBindingFor({ identity: parentIdentity }, "consult", "consult");
+                  const consultMutationBinding = consultBaseBinding?.fork?.({
+                    attemptId: `${task.taskId}:consult`,
+                    role: "consult",
+                    suffix: "consult",
+                  }) ?? consultBaseBinding;
                   applyRes = await (deps.applyConsultPatch ?? applyConsultPatch)({
                     workspacePath: workspace.path,
+                    workspace,
+                    ...(consultMutationBinding === undefined ? {} : { mutationBinding: consultMutationBinding }),
+                    producingAttemptId: `${task.taskId}:consult`,
+                    producingRole: "consult",
                     request: {
                       question: `Cheaper models exhausted the worker+mid pool on this task. Provide the minimal fix as a unified diff.`,
                       identity: parentIdentity,
@@ -4223,7 +4369,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                     },
                   });
                 } catch (e) {
-                  applyRes = { applied: false, filesChanged: [], error: e instanceof Error ? e.message : String(e) };
+                  applyRes = { applied: false, mutationApplied: false, partialMutation: false, filesChanged: [], error: e instanceof Error ? e.message : String(e) };
                 }
                 // Gap B / A2: the frontier consult uses the RAW provider, NOT the run's costing engine.
                 // Its spend must be (a) reflected in this receipt's costUsd, (b) folded into the run total
@@ -4328,6 +4474,12 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 ),
               );
               const escalatedBuilder = builderForModel(parentCtx, swapModel, resolveBuilderMode(task));
+              const escalatedBaseBinding = normalMutationBindingFor(escalatedSpawn, "builder:escalation");
+              const escalatedMutationBinding = escalatedBaseBinding?.fork?.({
+                attemptId: `${task.taskId}:escalation`,
+                role: "builder",
+                suffix: "escalation",
+              }) ?? escalatedBaseBinding;
               const escalatedCtx: RoleContext = {
                 task: { ...task, goal: escalatedGoal },
                 role: "builder",
@@ -4336,6 +4488,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
                 workspace,
                 priorResults: [...results],
                 engine: runEngine,
+                ...(escalatedMutationBinding === undefined ? {} : { mutationBinding: escalatedMutationBinding }),
               };
               const costBeforeRetry = runCost();
               let escalatedResult = await runRoleFn("builder", escalatedBuilder, escalatedCtx);
@@ -5347,9 +5500,64 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
 
   // ── COMPETITIVE BUILD MODE (AMG) ────────────────────────────────────────────
 
+  /**
+   * Open one candidate generation for a competitive/tournament builder and
+   * bind all repair writes to that generation. The returned binding is also
+   * forkable by patchsmith/fixer retries, so a retry supersedes the prior
+   * generation instead of reusing its observations.
+   */
+  function openCandidateMutationBinding(
+    task: WorkerTask,
+    workspace: WorkspaceHandle,
+    parentCtx: OperationContext,
+    spawned: Pick<SpawnedRole, "identity">,
+    role = "builder",
+    suffix = "candidate",
+  ): MutationSessionBinding | undefined {
+    const registry = activeLeaseRegistries.get(task.taskId);
+    if (registry === undefined) return undefined;
+    const attemptId = `${task.taskId}:${suffix}:${workspace.id}`;
+    const generation = registry.openGeneration({
+      attemptId,
+      candidateId: workspace.id,
+      workspaceId: workspace.id,
+      workspacePath: workspace.path,
+    });
+    const makeBinding = (current: typeof generation, currentRole: string, currentSuffix: string): MutationSessionBinding => ({
+      sessionId: `${task.taskId}:${currentSuffix}:${current.generationId}`,
+      workspaceId: workspace.id,
+      candidateId: current.candidateId,
+      generationId: current.generationId,
+      actor: "model",
+      cause: "model",
+      ...(parentCtx.requestId !== undefined ? { requestId: parentCtx.requestId } : {}),
+      attemptId: current.attemptId,
+      role: currentRole,
+      validatedIdentity: spawned.identity.agentId,
+      assertActive: () => {
+        const lifecycle = registry.lifecycleOf(current.generationId);
+        const active = registry.currentGeneration(workspace.id);
+        if (lifecycle !== "active" || active?.generationId !== current.generationId) {
+          throw new Error(`candidate generation ${current.generationId} is ${lifecycle ?? "unknown"} or superseded; mutation refused`);
+        }
+      },
+      fork: ({ attemptId: nextAttemptId, role: nextRole, suffix: nextSuffix }) => {
+        const next = registry.openGeneration({
+          attemptId: nextAttemptId,
+          candidateId: current.candidateId,
+          workspaceId: workspace.id,
+          workspacePath: workspace.path,
+          sourceGenerationId: current.generationId,
+        });
+        return makeBinding(next, nextRole, `${currentSuffix}:${nextSuffix}`);
+      },
+    });
+    return makeBinding(generation, role, suffix);
+  }
+
   /** Dispatch one role in one workspace (events + recordRole), returning its result.
    *  `roleFnOverride` lets the competitive loop inject a per-candidate builder (its own model). */
-  async function dispatchRole(role: WorkerRole, spawned: SpawnedRole, task: WorkerTask, workspace: WorkspaceHandle, priorResults: readonly RoleResult[], parentCtx: OperationContext, engine: RoleEngine, roleFnOverride?: RoleFn, cost?: () => number, ledger?: InvocationLedger): Promise<RoleResult> {
+  async function dispatchRole(role: WorkerRole, spawned: SpawnedRole, task: WorkerTask, workspace: WorkspaceHandle, priorResults: readonly RoleResult[], parentCtx: OperationContext, engine: RoleEngine, roleFnOverride?: RoleFn, cost?: () => number, ledger?: InvocationLedger, mutationBinding?: MutationSessionBinding): Promise<RoleResult> {
     events.publish(
       workerRoleDispatched.create(
         { taskId: task.taskId, role, ...(spawned.identity.trustTier !== undefined ? { tier: spawned.identity.trustTier } : {}) },
@@ -5367,10 +5575,25 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
             needsVerifiedTree: role === "critic",
           })
         : [];
-    const ctx: RoleContext = { task, role, identity: spawned.identity, autonomy: spawned.autonomy, workspace, priorResults: [...priorResults], engine, ...(dispatchRuntimeEvidence.length > 0 ? { runtimeEvidence: dispatchRuntimeEvidence } : {}) };
+    const candidateMutationBinding = mutationBinding ?? (role === "builder" ? openCandidateMutationBinding(task, workspace, parentCtx, spawned) : undefined);
+    const ctx: RoleContext = {
+      task,
+      role,
+      identity: spawned.identity,
+      autonomy: spawned.autonomy,
+      workspace,
+      priorResults: [...priorResults],
+      engine,
+      ...(candidateMutationBinding === undefined ? {} : { mutationBinding: candidateMutationBinding }),
+      ...(dispatchRuntimeEvidence.length > 0 ? { runtimeEvidence: dispatchRuntimeEvidence } : {}),
+    };
     // The verifier (C1) and the builder (its in-loop run_checks) run the governed path
     // bound to the run ctx (parentCtx is the minted ValidatedIdentity governed-exec needs).
-    const roleFn = roleFnOverride ?? (role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderFor(parentCtx, resolveBuilderMode(task)) : roles[role]);
+    // Candidate builders, including tournament/competitive candidates, are
+    // ordinary managed mutations. They must receive the explicit generation
+    // binding above; the deferred/unbound escape hatch is not valid for a
+    // production candidate writer. Test seams may still inject a RoleFn.
+    const roleFn = roleFnOverride ?? (role === "verifier" ? verifierFor(parentCtx) : role === "builder" ? builderFor(parentCtx, resolveBuilderMode(task), "ordinary") : roles[role]);
     // H4: floor the verifier's role timeout at the per-check budget (same as the cooperative path).
     const verifierTimeout = role === "verifier" ? Math.max(roleTimeoutMs, resolveCheckTimeoutMs(modeEnv)) : undefined;
     const costBeforeRole = cost?.() ?? 0;
@@ -5525,7 +5748,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
         // HEAD-TO-HEAD: candidate ci races its OWN model (the Nth listed model, or the single
         // builder model as fallback) in its OWN worktree — each with the full run_checks rail.
         const candidateModel = competitiveModelList?.[ci] ?? singleBuilderModel;
-        const candidateBuilder = builderForModel(parentCtx, candidateModel, resolveBuilderMode(task));
+        const candidateBuilder = builderForModel(parentCtx, candidateModel, resolveBuilderMode(task), "ordinary");
         const builderResult = await dispatchRole("builder", spawnRole("builder", parentCtx), task, ws, [scoutResult], parentCtx, runEngine, candidateBuilder, runCost, runLedger);
         // AUTO-VERIFY RESCUE: if the builder wrote files but hit a protocol termination,
         // try the verifier. On GREEN, reclassify the builder so the candidate proceeds.
@@ -5727,49 +5950,302 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
     }
   }
 
-  /**
-   * DEFAULT shadow-replay applier: apply the winner's unified diff into a clean workspace via a
-   * GOVERNED `git apply` (the same governed-exec the verifier routes its checks through — defense in
-   * depth, auditable), then COMMIT it so the shadow's scratch branch advances and the existing
-   * promote path sees the change. An empty diff, a failed apply, or a no-op commit ⇒ `applied: false`
-   * (the tournament then fails closed). Git-mutation governance still applies: `git apply` is
-   * allowlisted but cannot redirect the worktree (the `-C`/`--work-tree` flags are denied upstream).
-   */
-  async function defaultApplyDiff(parentCtx: OperationContext, workspace: WorkspaceHandle, diff: string, goal: string, taskId?: string): Promise<{ applied: boolean; reason?: string }> {
-    if (diff.trim().length === 0) return { applied: false, reason: "winner produced an empty diff" };
-    // WRITE-BOUNDARY LEASE (Phase 13B): a candidate-mutating diff apply holds a lease bound to the workspace's
-    // current generation. If that generation was revoked/timed-out (fenced), the write is REJECTED here —
-    // before it mutates the candidate — and a truthful receipt is written. A revoked operation cannot land work.
-    const registry = taskId !== undefined ? activeLeaseRegistries.get(taskId) : undefined;
-    if (registry !== undefined) {
-      const gen = registry.currentGeneration(workspace.id) ?? registry.openGeneration({ attemptId: taskId!, candidateId: workspace.id, workspaceId: workspace.id, workspacePath: workspace.path });
-      if (registry.isFenced(workspace.id)) {
-        await receipts.append(
-          { operation: "worker.write_fenced", outcome: { status: "failure", detail: "candidate-mutating diff apply rejected: the workspace generation is revoked/timed-out (write-boundary lease invalid)" }, requestId: taskId!, metadata: { taskId, workspaceId: workspace.id, generationId: gen.generationId }, project: workspace.targetRepo },
-          parentCtx.identity.identity,
-        ).catch(() => {});
-        return { applied: false, reason: "write-boundary: the candidate generation is fenced (revoked/timed-out) — diff apply rejected" };
+  /** Extract the complete changed path set from a git diff without applying it. */
+  function replayDiffFiles(diff: string): readonly { path: string; created: boolean; deleted: boolean }[] {
+    const files: Array<{ path: string; created: boolean; deleted: boolean }> = [];
+    let headerPath: string | undefined;
+    let headerEmitted = false;
+    let oldPath: string | undefined;
+    let headerCreated = false;
+    let headerDeleted = false;
+    const flushHeader = (): void => {
+      if (headerPath !== undefined && !headerEmitted) files.push({ path: headerPath, created: headerCreated, deleted: headerDeleted });
+      headerPath = undefined;
+      headerEmitted = false;
+      oldPath = undefined;
+      headerCreated = false;
+      headerDeleted = false;
+    };
+    for (const line of diff.split(/\r?\n/)) {
+      if (line.startsWith("diff --git ")) {
+        flushHeader();
+        const header = /^a\/(.+) b\/(.+)$/.exec(line.slice("diff --git ".length));
+        headerPath = header?.[2];
+        continue;
       }
+      if (line.startsWith("new file mode ")) {
+        headerCreated = true;
+        continue;
+      }
+      if (line.startsWith("deleted file mode ")) {
+        headerDeleted = true;
+        continue;
+      }
+      if (line.startsWith("--- ")) {
+        oldPath = line.slice(4).trim().replace(/^a\//, "");
+        continue;
+      }
+      if (!line.startsWith("+++ ") || oldPath === undefined) continue;
+      const newPath = line.slice(4).trim().replace(/^b\//, "");
+      if (newPath === "/dev/null" && oldPath === "/dev/null") continue;
+      const path = newPath === "/dev/null" ? oldPath : newPath;
+      if (path === "/dev/null" || path.length === 0) continue;
+      files.push({ path, created: oldPath === "/dev/null" || headerCreated, deleted: newPath === "/dev/null" || headerDeleted });
+      headerEmitted = true;
+      oldPath = undefined;
     }
-    const gov = govExecForRoles ?? (await import("../governed-exec/index.js")).governedExec;
-    const os = await import("node:os");
-    const fs = await import("node:fs/promises");
-    const path = await import("node:path");
-    const patchPath = path.join(os.tmpdir(), `ikbi-tournament-${workspace.id}.patch`);
-    await fs.writeFile(patchPath, diff.endsWith("\n") ? diff : `${diff}\n`, "utf8");
-    try {
-      const res = await gov.run({ parentCtx, command: "git", args: ["apply", "--whitespace=nowarn", patchPath], cwd: workspace.path, purpose: "tournament: shadow replay (git apply)" });
-      if (!res.executed || res.exitCode !== 0) {
-        const detail = res.reason ?? res.stderrTail ?? `git apply exited ${res.exitCode ?? "unknown"}`;
-        return { applied: false, reason: detail };
+    flushHeader();
+    const unique = new Map<string, { path: string; created: boolean; deleted: boolean }>();
+    for (const file of files) unique.set(file.path, file);
+    return [...unique.values()];
+  }
+
+  function stateForBytes(bytes: Readonly<Uint8Array>): FileState {
+    return {
+      kind: bytes.byteLength === 0 ? "empty" : "regular",
+      byteLength: bytes.byteLength,
+      sha256: sha256Bytes(new Uint8Array(bytes)),
+      symlinkTarget: null,
+      mode: null,
+    };
+  }
+
+  /**
+   * Create an immutable replay plan from the winner's base ref and exact
+   * resulting disk bytes. The diff is used only to identify paths; it never
+   * authorizes relocation or supplies the after-state.
+   */
+  async function buildTournamentReplayPlan(
+    workspace: WorkspaceHandle,
+    diff: string,
+    sourceBinding: MutationSessionBinding,
+    producingAttemptId: string,
+    producingInvocationId?: string,
+  ): Promise<RepairPlan | undefined> {
+    sourceBinding.assertActive?.();
+    const files = replayDiffFiles(diff);
+    if (files.length === 0) return undefined;
+    const root = realpathSync(workspace.path);
+    const sourceSession = await createWorkspaceMutationSession(workspace, sourceBinding);
+    const planFiles: Array<{
+      path: string;
+      operation: "create" | "replace" | "delete";
+      observationId: string;
+      before: FileState;
+      beforeBytes: Readonly<Uint8Array> | null;
+      afterBytes: Readonly<Uint8Array> | null;
+    }> = [];
+    for (const file of files) {
+      const full = resolve(root, file.path);
+      const rel = relative(root, full);
+      if (isAbsolute(rel) || rel === ".." || rel.startsWith(`..${sep}`) || rel.length === 0) {
+        throw new Error(`tournament replay path escapes the winner workspace: ${file.path}`);
       }
-      const committed = workspaces.commit !== undefined ? await workspaces.commit(workspace, `ikbi: ${goal}`) : false;
-      if (!committed) return { applied: false, reason: "diff applied but produced no committed change" };
-      return { applied: true };
-    } catch (err) {
-      return { applied: false, reason: err instanceof Error ? err.message : String(err) };
-    } finally {
-      await fs.rm(patchPath, { force: true }).catch(() => {});
+      const normalized = rel.split(sep).join("/");
+      let beforeBytes: Buffer | null = null;
+      if (!file.created) {
+        try {
+          beforeBytes = Buffer.from(execFileSync("git", ["-C", workspace.targetRepo, "show", `${workspace.baseRef}:${normalized}`], { encoding: "buffer", maxBuffer: 64 * 1024 * 1024 }) as Buffer);
+        } catch (error) {
+          throw new Error(`could not obtain immutable tournament base bytes for ${normalized}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      const before = beforeBytes === null
+        ? { kind: "missing" as const, byteLength: null, sha256: null, symlinkTarget: null, mode: null }
+        : stateForBytes(beforeBytes);
+      // Observe the winner through the same managed-workspace confinement and
+      // no-symlink-ancestor checks as every other repair source. The diff only
+      // identifies paths; this observation supplies the exact after-bytes.
+      const after = await sourceSession.observeBytes(normalized);
+      if (file.deleted) {
+        if (after.observation.kind !== "missing") throw new Error(`winner replay says ${normalized} was deleted, but the winner still has ${after.observation.kind}`);
+        planFiles.push({ path: normalized, operation: "delete", observationId: after.observation.observationId, before, beforeBytes, afterBytes: null });
+        continue;
+      }
+      if (after.observation.kind !== "empty" && after.observation.kind !== "regular" || after.bytes === null) {
+        throw new Error(`winner replay requires exact regular after-bytes at ${normalized}, found ${after.observation.kind}`);
+      }
+      planFiles.push({
+        path: normalized,
+        operation: file.created ? "create" : "replace",
+        observationId: after.observation.observationId,
+        before,
+        beforeBytes,
+        afterBytes: Buffer.from(after.bytes),
+      });
+    }
+    sourceBinding.assertActive?.();
+    return createRepairPlanFromSnapshot({
+      sourceWorkspaceId: workspace.id,
+      sourceCandidateId: workspace.id,
+      sourceGenerationId: sourceBinding.generationId,
+      producingAttemptId,
+      producingRole: "tournament-replay-source",
+      ...(producingInvocationId === undefined ? {} : { producingInvocationId }),
+      files: planFiles,
+      rationale: "winner replay plan derived from immutable base bytes and exact winner disk observations",
+    });
+  }
+
+  /**
+   * Legacy diff injection remains a test seam only. Production tournament
+   * replay uses `defaultApplyWinner`, which refuses an unbound diff.
+   */
+  async function defaultApplyDiff(_parentCtx: OperationContext, _workspace: WorkspaceHandle, _diff: string, _goal: string, _taskId?: string): Promise<TournamentApplyResult> {
+    return {
+      applied: false,
+      code: "REPAIR_PLAN_INVALID",
+      reason: "unbound tournament diff replay is not an authorized mutation path",
+      mutationApplied: false,
+      partialMutation: false,
+      retryable: false,
+      recommendedRecovery: "Use the source-bound tournament winner import path.",
+    };
+  }
+
+  /** Apply one exact winner plan to a fresh target generation, transactionally. */
+  async function defaultApplyWinner(
+    parentCtx: OperationContext,
+    workspace: WorkspaceHandle,
+    winner: CandidateRun,
+    taskId: string,
+    goal: string,
+  ): Promise<TournamentApplyResult> {
+    const plan = winner.replayPlan;
+    if (plan === undefined) {
+      return {
+        applied: false,
+        code: "REPAIR_PLAN_INVALID",
+        reason: "winner has no exact source-bound replay plan",
+        workspaceId: workspace.id,
+        candidateId: workspace.id,
+        mutationApplied: false,
+        partialMutation: false,
+        retryable: false,
+        recommendedRecovery: "Regenerate the winner replay plan from exact source bytes.",
+      };
+    }
+    const registry = activeLeaseRegistries.get(taskId);
+    if (registry === undefined) {
+      return {
+        applied: false,
+        code: "REPAIR_GENERATION_REVOKED",
+        reason: "candidate-generation registry unavailable for tournament replay",
+        planId: plan.planId,
+        operationId: plan.operationId,
+        sourceWorkspaceId: plan.sourceWorkspaceId,
+        sourceCandidateId: plan.sourceCandidateId,
+        sourceGenerationId: plan.sourceGenerationId,
+        attemptId: plan.producingAttemptId,
+        role: plan.producingRole,
+        ...(plan.producingInvocationId === undefined ? {} : { invocationId: plan.producingInvocationId }),
+        paths: plan.files.map((file) => file.path),
+        mutationApplied: false,
+        partialMutation: false,
+        retryable: false,
+        recommendedRecovery: "Open a fresh candidate generation and regenerate the winner replay plan.",
+      };
+    }
+    const generation = registry.openGeneration({
+      attemptId: `${taskId}:tournament-import`,
+      candidateId: workspace.id,
+      workspaceId: workspace.id,
+      workspacePath: workspace.path,
+      sourceGenerationId: plan.sourceGenerationId,
+    });
+    const binding: MutationSessionBinding = {
+      sessionId: `${taskId}:tournament-import:${generation.generationId}`,
+      workspaceId: workspace.id,
+      candidateId: workspace.id,
+      generationId: generation.generationId,
+      actor: "deterministic-system",
+      cause: "deterministic-system",
+      ...(parentCtx.requestId !== undefined ? { requestId: parentCtx.requestId } : {}),
+      attemptId: generation.attemptId,
+      role: "tournament-replay",
+      validatedIdentity: parentCtx.identity.identity.agentId,
+      assertActive: () => {
+        const lifecycle = registry.lifecycleOf(generation.generationId);
+        const current = registry.currentGeneration(workspace.id);
+        if (lifecycle !== "active" || current?.generationId !== generation.generationId) {
+          throw new Error(`tournament target generation ${generation.generationId} is ${lifecycle ?? "unknown"} or superseded`);
+        }
+      },
+    };
+    const session = await createWorkspaceMutationSession(workspace, binding);
+    try {
+      const applied = await importRepairPlan(session, plan, { targetGenerationId: generation.generationId });
+      if (workspaces.commit !== undefined) {
+        const committed = await workspaces.commit(workspace, `ikbi: ${goal}`);
+        if (!committed) {
+          // A failed control-plane commit must not leave the successfully
+          // applied candidate bytes behind as an ambiguous partial import.
+          await restoreRepairMutations(session, [...applied.mutations].reverse(), { planId: plan.planId, operationId: plan.operationId });
+          registry.revokeGeneration(generation.generationId, "revoked");
+          return {
+            applied: false,
+            code: "REPAIR_PARTIAL_APPLY_PREVENTED",
+            reason: "winner bytes applied but the target candidate could not be committed; exact restore completed",
+            planId: plan.planId,
+            operationId: plan.operationId,
+            workspaceId: workspace.id,
+            candidateId: workspace.id,
+            sourceWorkspaceId: plan.sourceWorkspaceId,
+            sourceCandidateId: plan.sourceCandidateId,
+            sourceGenerationId: plan.sourceGenerationId,
+            targetGenerationId: generation.generationId,
+            attemptId: plan.producingAttemptId,
+            role: plan.producingRole,
+            ...(plan.producingInvocationId === undefined ? {} : { invocationId: plan.producingInvocationId }),
+            paths: plan.files.map((file) => file.path),
+            mutationApplied: false,
+            partialMutation: false,
+            retryable: false,
+            recommendedRecovery: "Require explicit recovery; the target was restored transactionally.",
+          };
+        }
+      }
+      return {
+        applied: true,
+        planId: plan.planId,
+        operationId: plan.operationId,
+        workspaceId: workspace.id,
+        candidateId: workspace.id,
+        sourceWorkspaceId: plan.sourceWorkspaceId,
+        sourceCandidateId: plan.sourceCandidateId,
+        sourceGenerationId: plan.sourceGenerationId,
+        targetGenerationId: generation.generationId,
+        attemptId: plan.producingAttemptId,
+        role: plan.producingRole,
+        ...(plan.producingInvocationId === undefined ? {} : { invocationId: plan.producingInvocationId }),
+        paths: plan.files.map((file) => file.path),
+        mutationApplied: true,
+        partialMutation: false,
+        retryable: false,
+      };
+    } catch (error) {
+      const failure = repairFailure(error, { session, plan, targetGenerationId: generation.generationId });
+      return {
+        applied: false,
+        code: failure.code,
+        reason: failure.message,
+        ...(failure.planId === undefined ? {} : { planId: failure.planId }),
+        ...(failure.operationId === undefined ? {} : { operationId: failure.operationId }),
+        ...(failure.workspaceId === undefined ? {} : { workspaceId: failure.workspaceId }),
+        ...(failure.candidateId === undefined ? {} : { candidateId: failure.candidateId }),
+        ...(failure.sourceWorkspaceId === undefined ? {} : { sourceWorkspaceId: failure.sourceWorkspaceId }),
+        ...(failure.sourceCandidateId === undefined ? {} : { sourceCandidateId: failure.sourceCandidateId }),
+        ...(failure.sourceGenerationId === undefined ? {} : { sourceGenerationId: failure.sourceGenerationId }),
+        ...(failure.targetGenerationId === undefined ? {} : { targetGenerationId: failure.targetGenerationId }),
+        ...(failure.attemptId === undefined ? {} : { attemptId: failure.attemptId }),
+        ...(failure.role === undefined ? {} : { role: failure.role }),
+        ...(failure.invocationId === undefined ? {} : { invocationId: failure.invocationId }),
+        paths: failure.paths,
+        mutationApplied: failure.mutationApplied,
+        partialMutation: failure.partialMutation,
+        retryable: failure.retryable,
+        recommendedRecovery: failure.recommendedRecovery,
+      };
     }
   }
 
@@ -5806,8 +6282,10 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       const scoutSpawn = spawnRole("scout", parentCtx);
       if (tournWorkerSpawned === undefined) tournWorkerSpawned = scoutSpawn;
       const scoutResult = await dispatchRole("scout", scoutSpawn, t, ws, [], parentCtx, runEngine, undefined, runCost, runLedger);
-      const candidateBuilder = builderForModel(parentCtx, spec.model, spec.mode);
-      const builderResult = await dispatchRole("builder", spawnRole("builder", parentCtx), t, ws, [scoutResult], parentCtx, runEngine, candidateBuilder, runCost, runLedger);
+      const candidateBuilder = builderForModel(parentCtx, spec.model, spec.mode, "ordinary");
+      const builderSpawn = spawnRole("builder", parentCtx);
+      const candidateMutationBinding = openCandidateMutationBinding(t, ws, parentCtx, builderSpawn, "builder", "tournament-candidate");
+      const builderResult = await dispatchRole("builder", builderSpawn, t, ws, [scoutResult], parentCtx, runEngine, candidateBuilder, runCost, runLedger, candidateMutationBinding);
       // AUTO-VERIFY RESCUE: if the builder wrote files but hit a protocol termination,
       // try the verifier. On GREEN, reclassify the builder so the candidate proceeds.
       const rescue = await maybeAutoVerifyRescueBuilderResult(builderResult, async () => {
@@ -5827,7 +6305,16 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       const diffText = workspaces.diff !== undefined ? await workspaces.diff(ws).catch(() => "") : "";
       const candidate = buildCandidate(ws, finalBuilderResult, verifierResult, await safeDiffLines(ws));
       const roles = [scoutResult, finalBuilderResult, ...(verifierResult !== undefined ? [verifierResult] : [])];
-      return { spec, workspace: ws, roles, candidate, diff: diffText };
+      const replayPlan = candidateMutationBinding === undefined
+        ? undefined
+        : await buildTournamentReplayPlan(
+            ws,
+            diffText,
+            candidateMutationBinding,
+            candidateMutationBinding.attemptId ?? `${t.taskId}:tournament-candidate`,
+            runLedger.lastFor("builder", "candidate-role")?.invocationId,
+          );
+      return { spec, workspace: ws, roles, candidate, diff: diffText, ...(replayPlan === undefined ? {} : { replayPlan }) };
     };
 
     const verifyShadow = async (t: WorkerTask, ws: WorkspaceHandle): Promise<ShadowVerification> => {
@@ -5906,6 +6393,9 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
       runCandidate,
       judge: (candidates) => judge.judge(candidates),
       applyDiff: async (ws, diff) => (deps.applyDiff !== undefined ? deps.applyDiff(ws, diff) : defaultApplyDiff(parentCtx, ws, diff, task.goal, task.taskId)),
+      ...(deps.applyDiff === undefined
+        ? { applyWinner: async (ws: WorkspaceHandle, winner: CandidateRun) => defaultApplyWinner(parentCtx, ws, winner, task.taskId, task.goal) }
+        : {}),
       verifyShadow,
       promote,
       discard: async (ws) => safeDiscard(workspaces, ws),

@@ -17,7 +17,7 @@
  * invocation with no tools.
  */
 
-import { readCodeSlice } from "./codeSlice.js";
+import { readCodeSlice, readCodeSliceFromBytes } from "./codeSlice.js";
 import type {
   CodeSlice,
   CodeSliceSkip,
@@ -120,9 +120,13 @@ export async function buildConsultPacket(input: ConsultPacketInput): Promise<Con
       continue;
     }
     // Cap this slice by the smaller of the per-slice budget and what remains of the total.
-    const result = await readCodeSlice(input.repoRoot, request, {
-      maxSliceBytes: Math.min(maxSliceBytes, remaining)
-    });
+    const sliceOptions = { maxSliceBytes: Math.min(maxSliceBytes, remaining) };
+    const snapshotBytes = input.sourceSnapshot?.get(request.path.split(/[\\/]+/).filter(Boolean).join("/"));
+    const result = input.sourceSnapshot === undefined
+      ? await readCodeSlice(input.repoRoot, request, sliceOptions)
+      : snapshotBytes === undefined
+        ? { skip: { path: request.path, startLine: request.startLine, endLine: request.endLine, reason: "file was not present in the exact source snapshot" } }
+        : readCodeSliceFromBytes(request, snapshotBytes, sliceOptions);
     if (result.slice !== undefined) {
       slices.push(result.slice);
       totalSliceBytes += result.slice.bytes;

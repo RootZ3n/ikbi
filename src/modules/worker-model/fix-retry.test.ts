@@ -18,6 +18,8 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import type { ModelRequest, ModelResponse } from "../../core/provider/contract.js";
+import type { MutationSessionBinding } from "../../core/workspace/mutation-session.js";
+import type { WorkspaceHandle } from "../../core/workspace/contract.js";
 import { MAX_FIX_ATTEMPTS, runFixPipeline, type CheckRun, type FixCheckCommand } from "./fix.js";
 import type { DiagnosisFile } from "./fix-diagnosis.js";
 
@@ -76,6 +78,50 @@ function makeRepo(files: Record<string, string>): string {
   const dir = mkdtempSync(join(tmpdir(), "ikbi-fix-retry-"));
   for (const [name, content] of Object.entries(files)) writeFileSync(join(dir, name), content, "utf8");
   return dir;
+}
+
+function managedWorkspace(repo: string, suffix: string): WorkspaceHandle {
+  const targetRepo = mkdtempSync(join(tmpdir(), `ikbi-fix-target-${suffix}-`));
+  const id = `fix-workspace-${suffix}`;
+  return {
+    id,
+    targetRepo,
+    baseBranch: "main",
+    baseRef: "base",
+    scratchBranch: `ikbi/ws/${id}`,
+    path: repo,
+    identity: { agentId: "fixer-test", functionalRole: "fixer", trustTier: "verified" },
+    state: "allocated",
+    createdAt: Date.now(),
+  };
+}
+
+function repairBinding(workspace: WorkspaceHandle, forks: string[]): MutationSessionBinding {
+  let base: MutationSessionBinding;
+  const fork = ({ attemptId, role, suffix }: { readonly attemptId: string; readonly role: string; readonly suffix: string }): MutationSessionBinding => {
+    forks.push(suffix);
+    return {
+      ...base,
+      sessionId: `fix-session-${forks.length + 1}`,
+      generationId: `fix-generation-${forks.length + 1}`,
+      attemptId,
+      role,
+      fork,
+    };
+  };
+  base = {
+    sessionId: "fix-session-1",
+    workspaceId: workspace.id,
+    candidateId: "fix-candidate",
+    generationId: "fix-generation-1",
+    actor: "model",
+    cause: "model",
+    attemptId: "fix-attempt-1",
+    role: "fixer",
+    validatedIdentity: "fixer-test",
+    fork,
+  };
+  return base;
 }
 
 function candidates(repo: string, names: Array<{ path: string; isTest: boolean }>): () => DiagnosisFile[] {
@@ -219,4 +265,77 @@ test("fix-retry: a first-attempt fix records attempts === 1 (no needless retry)"
   assert.equal(outcome.result, "FIXED_NARROWLY");
   assert.equal(outcome.receipt.attempts, 1);
   assert.equal(model.patchRequests.length, 1, "no retry was triggered on a clean first fix");
+});
+
+test("Phase 3: fixer refuses an externally changed file and reports no successful write", async () => {
+  const repo = makeRepo({
+    "calculator.py": "def add(a, b):\n    return a - b\n",
+    "test_calculator.py": "def test_add():\n    assert add(2, 3) == 5\n",
+  });
+  const workspace = managedWorkspace(repo, "stale");
+  const forks: string[] = [];
+  let injected = false;
+  const runCheck = async (): Promise<CheckRun> => ({ exitCode: 1, output: failingOutput("-1") });
+  const invokeModel = async (req: ModelRequest): Promise<ModelResponse> => {
+    const stage = (req.metadata as Record<string, unknown> | undefined)?.fixStage;
+    if (stage === "diagnose") return modelResponse(DIAGNOSIS);
+    if (stage === "patch") {
+      if (!injected) {
+        injected = true;
+        writeFileSync(join(repo, "calculator.py"), "def add(a, b):\n    return human_edit\n", "utf8");
+      }
+      return modelResponse(patchTo("a + b"));
+    }
+    return modelResponse("");
+  };
+  const outcome = await runFixPipeline(
+    { repo, check: CHECK, mutationWorkspace: workspace, mutationBinding: repairBinding(workspace, forks) },
+    { runCheck, invokeModel, candidateFiles: candidates(repo, [{ path: "calculator.py", isTest: false }, { path: "test_calculator.py", isTest: true }]), ...STABLE_DEPS },
+  );
+  assert.equal(outcome.result, "SAFE_FAIL");
+  assert.equal(outcome.repairError?.code, "STALE_REPAIR");
+  assert.deepEqual(outcome.filesModified, []);
+  assert.equal(readFileSync(join(repo, "calculator.py"), "utf8"), "def add(a, b):\n    return human_edit\n");
+});
+
+test("Phase 3: fixer retries fork a fresh generation instead of reusing the prior plan", async () => {
+  const repo = makeRepo({
+    "calculator.py": "def add(a, b):\n    return a - b\n",
+    "test_calculator.py": "def test_add():\n    assert add(2, 3) == 5\n",
+  });
+  const workspace = managedWorkspace(repo, "retry-generation");
+  const forks: string[] = [];
+  const runCheck = async (r: string): Promise<CheckRun> => readFileSync(join(r, "calculator.py"), "utf8").includes("a + b")
+    ? { exitCode: 0, output: PASSING_OUTPUT }
+    : { exitCode: 1, output: failingOutput("?") };
+  const model = makeRetryModel({ diagnose: DIAGNOSIS, patches: [patchTo("a * b"), patchTo("a + b")] });
+  const outcome = await runFixPipeline(
+    { repo, check: CHECK, mutationWorkspace: workspace, mutationBinding: repairBinding(workspace, forks) },
+    { runCheck, invokeModel: model.invokeModel, candidateFiles: candidates(repo, [{ path: "calculator.py", isTest: false }, { path: "test_calculator.py", isTest: true }]), ...STABLE_DEPS },
+  );
+  assert.equal(outcome.result, "FIXED_NARROWLY");
+  assert.equal(forks.length, 1);
+  assert.match(forks[0]!, /repair:2/);
+});
+
+test("Phase 3: a supplied managed fixer workspace without a generation binding fails closed", async () => {
+  const repo = makeRepo({
+    "calculator.py": "def add(a, b):\n    return a - b\n",
+    "test_calculator.py": "def test_add():\n    assert add(2, 3) == 5\n",
+  });
+  const workspace = managedWorkspace(repo, "unbound");
+  const model = makeRetryModel({ diagnose: DIAGNOSIS, patches: [patchTo("a + b")] });
+  const outcome = await runFixPipeline(
+    { repo, check: CHECK, mutationWorkspace: workspace },
+    {
+      runCheck: async (): Promise<CheckRun> => ({ exitCode: 1, output: failingOutput("-1") }),
+      invokeModel: model.invokeModel,
+      candidateFiles: candidates(repo, [{ path: "calculator.py", isTest: false }, { path: "test_calculator.py", isTest: true }]),
+      ...STABLE_DEPS,
+    },
+  );
+  assert.equal(outcome.result, "SAFE_FAIL");
+  assert.equal(outcome.repairError?.code, "REPAIR_GENERATION_REVOKED");
+  assert.equal(model.patchRequests.length, 0, "no patch may be generated without a candidate generation binding");
+  assert.equal(readFileSync(join(repo, "calculator.py"), "utf8"), "def add(a, b):\n    return a - b\n");
 });

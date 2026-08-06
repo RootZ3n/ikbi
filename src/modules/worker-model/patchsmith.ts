@@ -27,8 +27,7 @@
  * path is rejected WHOLE (no partial apply).
  */
 
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync, rmSync } from "node:fs";
-import { dirname } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
 
 import type { OperationContext } from "../../core/identity/index.js";
 import { toUntrustedMessage } from "../../core/injection/index.js";
@@ -42,6 +41,9 @@ import { confinePath, type ToolCallError } from "./builder-tools/confine.js";
 import { type CheckResult, type ChecksResolution, mapExec, resolveCheckTimeoutMs, VERIFIER_CHECKS } from "./checks.js";
 import type { RoleFn, WorkerOutcome } from "./contract.js";
 import { builderModel } from "./role-models.js";
+import { applyRepairPlan, createRepairPlan, repairFailure, restoreRepairMutations, type RepairMutationFailure, type RepairPlan } from "../../core/workspace/repair-plan.js";
+import { createRoleRepairSession } from "./repair-runtime.js";
+import type { BoundMutationResult, WorkspaceMutationSession } from "../../core/workspace/index.js";
 
 const log = childLogger("worker-model:patchsmith");
 
@@ -233,9 +235,10 @@ function hunkBeforeAfter(h: Hunk): { before: string[]; after: string[] } {
 }
 
 /**
- * Apply one file's hunks to its current content (or "" for a new file). Locates each hunk's
- * BEFORE block (tolerating drifted line numbers by searching when the hinted position misses),
- * splices in the AFTER block, and fails CLOSED if any hunk does not match exactly.
+ * Apply one file's hunks to the exact observed content (or "" for a new file).
+ * Hunk line numbers are part of the source-state contract: if the before block
+ * is not present at the declared position, the patch is stale. There is no
+ * scan, offset, fuzz, or unique-block relocation fallback.
  */
 export function applyFilePatch(original: string, patch: FilePatch): { ok: true; content: string } | { ok: false; error: string } {
   if (patch.created) {
@@ -247,6 +250,7 @@ export function applyFilePatch(original: string, patch: FilePatch): { ok: true; 
   const hadTrailingNewline = original.endsWith("\n");
   const fileLines = original.length === 0 ? [] : original.replace(/\n$/, "").split("\n");
   let searchFrom = 0;
+  let lineDelta = 0;
 
   for (const h of patch.hunks) {
     const { before, after } = hunkBeforeAfter(h);
@@ -256,36 +260,26 @@ export function applyFilePatch(original: string, patch: FilePatch): { ok: true; 
       return true;
     };
     if (before.length === 0) {
-      // Pure insertion — place at the hinted line (clamped), preferring not to rewind.
-      const at = Math.max(searchFrom, Math.min(Math.max(h.oldStart - 1, 0), fileLines.length));
+      // Pure insertion — use the exact position declared by the diff after
+      // accounting only for edits from earlier hunks in this same diff. An
+      // out-of-range position is stale; it is never clamped or relocated.
+      const sourceAt = h.oldStart === 0 ? 0 : h.oldStart - 1;
+      const at = sourceAt + lineDelta;
+      if (at < searchFrom || at > fileLines.length) {
+        return { ok: false, error: `hunk is stale for ${patch.path} (insertion line ${h.oldStart} is outside the observed file; relocation is not implicit)` };
+      }
       fileLines.splice(at, 0, ...after);
       searchFrom = at + after.length;
+      lineDelta += after.length;
       continue;
     }
     let pos = -1;
-    const hint = Math.max(0, h.oldStart - 1);
+    const hint = (h.oldStart === 0 ? 0 : h.oldStart - 1) + lineDelta;
     if (hint >= searchFrom && matchesAt(hint)) pos = hint;
-    if (pos === -1) {
-      // DRIFTED CONTEXT: the hinted line did not match, so scan for the before-block. Mirror the
-      // agent patch tool's UNIQUENESS guard — if the before-block matches more than one location in
-      // the remaining file, the splice site is ambiguous and applying the first match risks editing
-      // the wrong place. Reject and ask the builder for more surrounding context. (An exact hint
-      // match above is already unambiguous by line number, so it skips this scan.)
-      let matchCount = 0;
-      for (let p = searchFrom; p <= fileLines.length - before.length; p += 1) {
-        if (matchesAt(p)) {
-          matchCount += 1;
-          if (pos === -1) pos = p;
-          if (matchCount > 1) break;
-        }
-      }
-      if (matchCount > 1) {
-        return { ok: false, error: `hunk context is not unique in ${patch.path} (matches multiple locations near line ${h.oldStart}) — add more surrounding context lines to disambiguate` };
-      }
-    }
-    if (pos === -1) return { ok: false, error: `hunk does not apply to ${patch.path} (context not found near line ${h.oldStart})` };
+    if (pos === -1) return { ok: false, error: `hunk is stale for ${patch.path} (observed context is not at line ${h.oldStart}; relocation is not implicit)` };
     fileLines.splice(pos, before.length, ...after);
     searchFrom = pos + after.length;
+    lineDelta += after.length - before.length;
   }
 
   const joined = fileLines.join("\n");
@@ -401,6 +395,44 @@ export function createPatchsmith(deps: PatchsmithDeps = {}): RoleFn {
       };
     }
 
+    // A production candidate worktree must arrive with the orchestrator's
+    // candidate/generation binding. Patchsmith is otherwise a separate RoleFn
+    // from the ordinary builder executor and could accidentally manufacture a
+    // standalone repair identity for a managed workspace.
+    let managedCandidate = ctx.mutationBinding !== undefined;
+    try {
+      managedCandidate = realpathSync(ctx.workspace.targetRepo) !== realpathSync(ctx.workspace.path);
+    } catch {
+      managedCandidate = ctx.mutationBinding !== undefined;
+    }
+    if (managedCandidate && ctx.mutationBinding === undefined) {
+      return {
+        role: "builder",
+        outcome: "failure",
+        summary: "patchsmith refused: candidate generation binding is unavailable",
+        detail: {
+          builderMode: "patch",
+          filesSupplied: [],
+          filesChanged: [],
+          filesWritten: [],
+          patchAttempts: 0,
+          repairAttempts: 0,
+          verificationResult: "not_run",
+          stopReason: "repair_generation_revoked",
+          repairError: {
+            code: "REPAIR_GENERATION_REVOKED",
+            workspaceId: ctx.workspace.id,
+            paths: [],
+            mutationApplied: false,
+            partialMutation: false,
+            retryable: false,
+            recommendedRecovery: "Provide a fresh candidate generation binding before starting repair.",
+            message: "candidate generation binding is unavailable",
+          } satisfies RepairMutationFailure,
+        },
+      };
+    }
+
     const modelId = deps.modelOverride ?? builderModel();
     const filesSupplied: string[] = [];
     const filesChanged = new Set<string>();
@@ -411,24 +443,32 @@ export function createPatchsmith(deps: PatchsmithDeps = {}): RoleFn {
     let lastVerification: { allPass: boolean; output: string; ran: boolean } = { allPass: false, output: "", ran: false };
     let needContext: readonly string[] | undefined;
     let stopReason = "no_patch";
+    let lastRepairError: RepairMutationFailure | undefined;
 
     try {
       const worktreeReal = realpathSync(ctx.workspace.path);
+      let mutationSession: WorkspaceMutationSession = await createRoleRepairSession(ctx, "patchsmith");
       const writeScope = ctx.task.writeScope ?? "all";
       const forbidden = readForbiddenFiles(ctx.task.metadata);
       const allowTests = readAllowTestEdits(ctx.task.metadata);
       const caps = getCapabilities(modelId);
       const effectiveMaxTokens = adaptMaxTokens(PATCHSMITH_MAX_TOKENS, caps);
+      const observedContextPaths = new Set<string>();
 
       // ── gather context: the goal-named targets + any caller-supplied context files ──
       const targets = [...new Set([...extractTargetFiles(ctx.task.goal), ...readContextFiles(ctx.task.metadata)])];
       const contextFiles: Array<{ path: string; body: string }> = [];
       for (const t of targets) {
         const c = confinePath(worktreeReal, t);
-        if (!c.ok || !existsSync(c.full)) continue;
+        if (!c.ok) continue;
         try {
-          contextFiles.push({ path: c.rel, body: readFileSync(c.full, "utf8").slice(0, MAX_CONTEXT_BYTES) });
-          filesSupplied.push(c.rel);
+          const observed = await mutationSession.observeBytes(c.rel);
+          observedContextPaths.add(c.rel);
+          if ((observed.observation.kind === "empty" || observed.observation.kind === "regular") && observed.bytes !== null) {
+            const text = new TextDecoder("utf-8", { fatal: true }).decode(observed.bytes);
+            contextFiles.push({ path: c.rel, body: text.slice(0, MAX_CONTEXT_BYTES) });
+            filesSupplied.push(c.rel);
+          }
         } catch {
           /* unreadable file — skip; the model gets the rest */
         }
@@ -448,7 +488,32 @@ export function createPatchsmith(deps: PatchsmithDeps = {}): RoleFn {
       const messages: ModelMessage[] = [{ role: "system", content: PATCHSMITH_SYSTEM }, untrusted(contextBody, "patchsmith_context")];
 
       // ── attempt loop: one initial patch, then up to PATCHSMITH_MAX_REPAIRS repairs ──
+      let lastApplied: readonly BoundMutationResult[] = [];
+      let lastPlan: RepairPlan | undefined;
       for (let attempt = 0; attempt <= PATCHSMITH_MAX_REPAIRS; attempt += 1) {
+        if (attempt > 0) {
+          // A retry starts from a fresh observed generation. Restore only the
+          // exact after-state produced by the prior attempt; a human/agent edit
+          // makes restore stale and stops the lane without overwriting it.
+          try {
+            await restoreRepairMutations(mutationSession, [...lastApplied].reverse(), lastPlan === undefined ? {} : { planId: lastPlan.planId, operationId: lastPlan.operationId });
+          } catch (error) {
+            lastRepairError = repairFailure(error, { session: mutationSession, paths: lastApplied.map((m) => m.mutation.path) });
+            stopReason = lastRepairError.code.toLowerCase();
+            rejected.push({ tool: "patch", error: JSON.stringify(lastRepairError) });
+            break;
+          }
+          mutationSession = await createRoleRepairSession(ctx, "patchsmith", String(attempt + 1));
+          // Re-observe all context files for every repair attempt. The prompt
+          // remains conversational, but authority comes only from this fresh
+          // session's complete raw observations.
+          for (const file of contextFiles) {
+            try { await mutationSession.observeBytes(file.path); } catch { /* patch validation reports the path */ }
+          }
+          lastApplied = [];
+          lastPlan = undefined;
+          filesChanged.clear();
+        }
         const response = await ctx.engine.invokeModel({
           model: modelId,
           temperature: PATCHSMITH_TEMPERATURE,
@@ -490,8 +555,9 @@ export function createPatchsmith(deps: PatchsmithDeps = {}): RoleFn {
           break;
         }
 
-        // VALIDATE every touched path BEFORE writing a single byte (reject the patch WHOLE).
-        const plans: Array<{ patch: FilePatch; rel: string; full: string; exists: boolean }> = [];
+        // VALIDATE every touched path and compute complete after-bytes BEFORE
+        // applying a single byte. The repair plan is the only write authority.
+        const plannedFiles: Array<{ patch: FilePatch; rel: string; exists: boolean }> = [];
         let violation: string | undefined;
         for (const fp of parsed.files) {
           const c = confinePath(worktreeReal, fp.path);
@@ -499,13 +565,31 @@ export function createPatchsmith(deps: PatchsmithDeps = {}): RoleFn {
             violation = c.error;
             break;
           }
-          const exists = existsSync(c.full);
-          const v = patchPathViolation(c.rel, { forbidden, allowTests, writeScope, exists });
-          if (v !== undefined) {
-            violation = v;
+          // Policy checks are independent of mutation authority. Preserve a
+          // forbidden/read-only refusal even when the model named a path that
+          // was not part of the pre-call context. `existsSync` is used only to
+          // classify the policy decision; it never supplies bytes or grants an
+          // observation token.
+          const pathExistsForPolicy = existsSync(c.full);
+          const policyViolation = patchPathViolation(c.rel, { forbidden, allowTests, writeScope, exists: pathExistsForPolicy });
+          if (policyViolation !== undefined) {
+            violation = policyViolation;
             break;
           }
-          plans.push({ patch: fp, rel: c.rel, full: c.full, exists });
+          let observed = observedContextPaths.has(c.rel) ? mutationSession.currentObservation(c.rel) : undefined;
+          if (observed === undefined) {
+            // Existing-file authority must be established before the model
+            // call. A returned diff is not a read operation and cannot grant
+            // itself a fresh base observation. New-file creation is the one
+            // explicit exception: observe the missing state as create intent.
+            if (!fp.created) {
+              violation = `existing patch target ${c.rel} was not observed before the model call`;
+              break;
+            }
+            observed = await mutationSession.observeBytes(c.rel);
+          }
+          const exists = observed.observation.kind !== "missing";
+          plannedFiles.push({ patch: fp, rel: c.rel, exists });
         }
         if (violation !== undefined) {
           rejected.push({ tool: "patch", error: violation });
@@ -514,21 +598,34 @@ export function createPatchsmith(deps: PatchsmithDeps = {}): RoleFn {
           break;
         }
 
-        // APPLY — compute new contents first (fail closed if any hunk misses), then write atomically.
-        const writes: Array<{ full: string; rel: string; content: string | null }> = [];
+        // PLAN — derive each complete result from the retained exact bytes.
+        const plannedMutations: Array<{ path: string; operation: "create" | "replace" | "delete"; afterBytes: Uint8Array | null }> = [];
         let applyError: string | undefined;
-        for (const p of plans) {
+        for (const p of plannedFiles) {
+          const observed = mutationSession.currentObservation(p.rel);
+          if (observed === undefined) {
+            applyError = `no exact observation retained for ${p.rel}`;
+            break;
+          }
           if (p.patch.deleted) {
-            writes.push({ full: p.full, rel: p.rel, content: null });
+            plannedMutations.push({ path: p.rel, operation: "delete", afterBytes: null });
             continue;
           }
-          const original = p.exists ? readFileSync(p.full, "utf8") : "";
+          let original = "";
+          if (observed.bytes !== null) {
+            try {
+              original = new TextDecoder("utf-8", { fatal: true }).decode(observed.bytes);
+            } catch {
+              applyError = `textual patch cannot rewrite binary content at ${p.rel}`;
+              break;
+            }
+          }
           const applied = applyFilePatch(original, p.patch);
           if (!applied.ok) {
             applyError = applied.error;
             break;
           }
-          writes.push({ full: p.full, rel: p.rel, content: applied.content });
+          plannedMutations.push({ path: p.rel, operation: p.patch.created ? "create" : "replace", afterBytes: Buffer.from(applied.content, "utf8") });
         }
         if (applyError !== undefined) {
           rejected.push({ tool: "patch", error: applyError });
@@ -540,15 +637,29 @@ export function createPatchsmith(deps: PatchsmithDeps = {}): RoleFn {
           }
           break;
         }
-        for (const w of writes) {
-          if (w.content === null) {
-            if (existsSync(w.full)) rmSync(w.full);
-          } else {
-            mkdirSync(dirname(w.full), { recursive: true });
-            writeFileSync(w.full, w.content, "utf8");
-          }
-          filesChanged.add(w.rel);
+        let repairPlan: RepairPlan;
+        let appliedPlan;
+        try {
+          repairPlan = createRepairPlan({
+            session: mutationSession,
+            producingAttemptId: mutationSession.binding.attemptId ?? `patchsmith:${attempt + 1}`,
+            producingRole: "patchsmith",
+            ...(mutationSession.binding.invocationId === undefined ? {} : { producingInvocationId: mutationSession.binding.invocationId }),
+            files: plannedMutations,
+            rationale: "patchsmith unified diff computed from complete observed bytes",
+          });
+          appliedPlan = await applyRepairPlan(mutationSession, repairPlan);
+        } catch (error) {
+          const failure = repairFailure(error, { session: mutationSession, paths: plannedMutations.map((p) => p.path) });
+          lastRepairError = failure;
+          rejected.push({ tool: "patch", error: JSON.stringify(failure) });
+          stopReason = failure.code.toLowerCase();
+          break;
         }
+        repairPlan = repairPlan!;
+        lastPlan = repairPlan;
+        lastApplied = appliedPlan.mutations;
+        for (const mutation of appliedPlan.mutations) filesChanged.add(mutation.mutation.path);
         log.info({ filesChanged: [...filesChanged], attempt }, "patchsmith applied a patch");
 
         // VERIFY — the SAME governed ladder the verifier runs. A green verdict is the only success.
@@ -610,6 +721,7 @@ export function createPatchsmith(deps: PatchsmithDeps = {}): RoleFn {
         stopReason,
         neutralizedCount,
         rejectedPatches: rejected,
+        ...(lastRepairError === undefined ? {} : { repairError: lastRepairError }),
         routingReason,
         ...(needContext !== undefined ? { needContext } : {}),
         ...(lastVerification.ran ? { lastChecks: { allPass: lastVerification.allPass } } : {}),

@@ -28,6 +28,7 @@ import type { BuildCandidate, JudgeResult } from "../deterministic-judge/index.j
 import type { BuilderMode } from "./config.js";
 import { CONTRACT_VERSION } from "./contract.js";
 import type { RoleResult, WorkerResult, WorkerTask } from "./contract.js";
+import type { RepairPlan } from "../../core/workspace/repair-plan.js";
 
 /** One candidate's spec: which model races, in which builder lane. */
 export interface CandidateSpec {
@@ -46,6 +47,30 @@ export interface CandidateRun {
   readonly candidate: BuildCandidate;
   /** The candidate's committed diff vs base — replayed into the shadow if it wins. */
   readonly diff: string;
+  /** Exact source-bound plan used for safe replay when this is a production run. */
+  readonly replayPlan?: RepairPlan;
+}
+
+export interface TournamentApplyResult {
+  readonly applied: boolean;
+  readonly reason?: string;
+  readonly code?: string;
+  readonly planId?: string;
+  readonly operationId?: string;
+  readonly workspaceId?: string;
+  readonly candidateId?: string;
+  readonly sourceWorkspaceId?: string;
+  readonly sourceCandidateId?: string;
+  readonly sourceGenerationId?: string;
+  readonly targetGenerationId?: string;
+  readonly attemptId?: string;
+  readonly role?: string;
+  readonly invocationId?: string;
+  readonly paths?: readonly string[];
+  readonly mutationApplied?: boolean;
+  readonly partialMutation?: boolean;
+  readonly retryable?: boolean;
+  readonly recommendedRecovery?: string;
 }
 
 /** The verdict of verifying the shadow workspace (the winning diff in a pristine tree). */
@@ -101,7 +126,9 @@ export interface TournamentEngine {
   /** Score the candidates objectively (the deterministic judge — pure, no model). */
   judge(candidates: readonly BuildCandidate[]): JudgeResult;
   /** Apply a unified diff into a CLEAN workspace and commit it. Returns whether it applied + committed cleanly. */
-  applyDiff(workspace: WorkspaceHandle, diff: string): Promise<{ applied: boolean; reason?: string }>;
+  applyDiff(workspace: WorkspaceHandle, diff: string): Promise<TournamentApplyResult>;
+  /** Preferred production replay path: apply the winner's exact source-bound plan transactionally. */
+  readonly applyWinner?: (workspace: WorkspaceHandle, winner: CandidateRun) => Promise<TournamentApplyResult>;
   /** Verify a workspace with the SAME ladder verifier the candidates ran. */
   verifyShadow(task: WorkerTask, workspace: WorkspaceHandle): Promise<ShadowVerification>;
   /** Promote a workspace through the EXISTING promote path (gate-wall governs; fail-closed without it). */
@@ -297,7 +324,9 @@ export async function runTournament(
     return await fail(reason, id);
   }
 
-  const apply = await engine.applyDiff(shadow, winner.diff);
+  const apply = engine.applyWinner !== undefined
+    ? await engine.applyWinner(shadow, winner)
+    : await engine.applyDiff(shadow, winner.diff);
   if (!apply.applied) {
     const reason = `winner's diff failed to apply to the clean shadow workspace${apply.reason !== undefined ? `: ${apply.reason}` : ""} — tournament fails closed`;
     await engine.discard(shadow);

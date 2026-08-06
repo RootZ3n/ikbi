@@ -62,17 +62,6 @@ async function pathContainsSymlink(root: string, normalizedRelativePath: string)
   return undefined;
 }
 
-async function readBoundedUtf8(filePath: string, bytesToRead: number): Promise<string> {
-  const handle = await open(filePath, "r");
-  try {
-    const buffer = Buffer.alloc(bytesToRead);
-    const result = await handle.read(buffer, 0, bytesToRead, 0);
-    return buffer.subarray(0, result.bytesRead).toString("utf8");
-  } finally {
-    await handle.close();
-  }
-}
-
 /** Cap a string to a hard UTF-8 byte budget (may trim a trailing multibyte char). */
 function capBytes(text: string, maxBytes: number): { text: string; truncated: boolean } {
   const buffer = Buffer.from(text, "utf8");
@@ -88,75 +77,38 @@ function skip(request: ConsultSliceRequest, reason: string): CodeSliceReadResult
   };
 }
 
-/**
- * Read one slice request. Returns either a `slice` (success) or a `skip` (with reason).
- * Never throws on a per-file error — fs failures become a recorded skip.
- */
-export async function readCodeSlice(
-  repoRoot: string,
-  request: ConsultSliceRequest,
-  options: CodeSliceOptions = {}
-): Promise<CodeSliceReadResult> {
-  const maxSliceBytes = options.maxSliceBytes ?? defaultMaxSliceBytes;
-  const maxFileReadBytes = options.maxFileReadBytes ?? defaultMaxFileReadBytes;
-  const resolvedRoot = path.resolve(repoRoot);
+function validateSliceRequest(request: ConsultSliceRequest): { normalizedPath?: string; error?: CodeSliceReadResult } {
   const normalizedPath = normalizeRelativePath(request.path);
-
   if (request.path.length === 0 || normalizedPath.length === 0) {
-    return skip(request, "path must be a non-empty relative path");
+    return { error: skip(request, "path must be a non-empty relative path") };
   }
   if (!Number.isInteger(request.startLine) || !Number.isInteger(request.endLine) || request.startLine < 1 || request.endLine < 1) {
-    return skip(request, "line numbers must be positive integers");
+    return { error: skip(request, "line numbers must be positive integers") };
   }
   if (request.startLine > request.endLine) {
-    return skip(request, "startLine must be <= endLine");
+    return { error: skip(request, "startLine must be <= endLine") };
   }
   if (path.isAbsolute(request.path)) {
-    return skip(request, "absolute paths are not allowed");
+    return { error: skip(request, "absolute paths are not allowed") };
   }
   if (hasTraversal(request.path)) {
-    return skip(request, "path traversal is not allowed");
+    return { error: skip(request, "path traversal is not allowed") };
   }
+  return { normalizedPath };
+}
 
-  const resolvedPath = path.resolve(resolvedRoot, normalizedPath);
-  if (!isInsideRoot(resolvedRoot, resolvedPath)) {
-    return skip(request, "resolved path escapes repo root");
-  }
-
-  let symlinkPath: string | undefined;
-  try {
-    symlinkPath = await pathContainsSymlink(resolvedRoot, normalizedPath);
-  } catch (error) {
-    const nodeError = error as NodeJS.ErrnoException;
-    return skip(request, nodeError.code === "ENOENT" ? "file does not exist" : "path could not be inspected");
-  }
-  if (symlinkPath !== undefined) {
-    return skip(request, `symlinks are not followed (${symlinkPath})`);
-  }
-
-  let stats;
-  try {
-    stats = await lstat(resolvedPath);
-  } catch (error) {
-    const nodeError = error as NodeJS.ErrnoException;
-    return skip(request, nodeError.code === "ENOENT" ? "file does not exist" : "file could not be inspected");
-  }
-  if (stats.isDirectory()) {
-    return skip(request, "directories cannot be sliced");
-  }
-  if (!stats.isFile()) {
-    return skip(request, "path is not a regular file");
-  }
-
-  const bytesToRead = Math.min(stats.size, maxFileReadBytes);
-  const fileReadBounded = stats.size > maxFileReadBytes;
-  let content: string;
-  try {
-    content = await readBoundedUtf8(resolvedPath, bytesToRead);
-  } catch {
-    return skip(request, "file could not be read");
-  }
-
+function sliceBytes(
+  request: ConsultSliceRequest,
+  normalizedPath: string,
+  sourceBytes: Uint8Array,
+  options: CodeSliceOptions,
+  sourceByteLength = sourceBytes.byteLength,
+): CodeSliceReadResult {
+  const maxSliceBytes = options.maxSliceBytes ?? defaultMaxSliceBytes;
+  const maxFileReadBytes = options.maxFileReadBytes ?? defaultMaxFileReadBytes;
+  const bytesToRead = Math.min(sourceByteLength, maxFileReadBytes, sourceBytes.byteLength);
+  const fileReadBounded = sourceByteLength > maxFileReadBytes;
+  const content = Buffer.from(sourceBytes.subarray(0, bytesToRead)).toString("utf8");
   const lines = content.split("\n");
   // A terminating newline yields a trailing empty element that is not a real line.
   if (content.endsWith("\n")) {
@@ -190,4 +142,87 @@ export async function readCodeSlice(
       bytes: Buffer.byteLength(capped.text, "utf8")
     }
   };
+}
+
+/**
+ * Read a slice from immutable raw bytes retained by a state-bound caller.
+ * No filesystem access occurs in this variant; it is used when consult/recovery
+ * reasoning must remain tied to the exact bytes observed before the model call.
+ */
+export function readCodeSliceFromBytes(
+  request: ConsultSliceRequest,
+  sourceBytes: Readonly<Uint8Array>,
+  options: CodeSliceOptions = {},
+): CodeSliceReadResult {
+  const validated = validateSliceRequest(request);
+  if (validated.error !== undefined || validated.normalizedPath === undefined) {
+    return validated.error!;
+  }
+  return sliceBytes(request, validated.normalizedPath, Buffer.from(sourceBytes), options);
+}
+
+/**
+ * Read one slice request. Returns either a `slice` (success) or a `skip` (with reason).
+ * Never throws on a per-file error — fs failures become a recorded skip.
+ */
+export async function readCodeSlice(
+  repoRoot: string,
+  request: ConsultSliceRequest,
+  options: CodeSliceOptions = {}
+): Promise<CodeSliceReadResult> {
+  const resolvedRoot = path.resolve(repoRoot);
+  const validated = validateSliceRequest(request);
+  if (validated.error !== undefined || validated.normalizedPath === undefined) {
+    return validated.error!;
+  }
+  const normalizedPath = validated.normalizedPath;
+
+  const resolvedPath = path.resolve(resolvedRoot, normalizedPath);
+  if (!isInsideRoot(resolvedRoot, resolvedPath)) {
+    return skip(request, "resolved path escapes repo root");
+  }
+
+  let symlinkPath: string | undefined;
+  try {
+    symlinkPath = await pathContainsSymlink(resolvedRoot, normalizedPath);
+  } catch (error) {
+    const nodeError = error as NodeJS.ErrnoException;
+    return skip(request, nodeError.code === "ENOENT" ? "file does not exist" : "path could not be inspected");
+  }
+  if (symlinkPath !== undefined) {
+    return skip(request, `symlinks are not followed (${symlinkPath})`);
+  }
+
+  let stats;
+  try {
+    stats = await lstat(resolvedPath);
+  } catch (error) {
+    const nodeError = error as NodeJS.ErrnoException;
+    return skip(request, nodeError.code === "ENOENT" ? "file does not exist" : "file could not be inspected");
+  }
+  if (stats.isDirectory()) {
+    return skip(request, "directories cannot be sliced");
+  }
+  if (!stats.isFile()) {
+    return skip(request, "path is not a regular file");
+  }
+
+  const maxFileReadBytes = options.maxFileReadBytes ?? defaultMaxFileReadBytes;
+  const bytesToRead = Math.min(stats.size, maxFileReadBytes);
+  let bytes: Buffer;
+  try {
+    const handle = await open(resolvedPath, "r");
+    try {
+      bytes = Buffer.alloc(bytesToRead);
+      const result = await handle.read(bytes, 0, bytesToRead, 0);
+      bytes = bytes.subarray(0, result.bytesRead);
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return skip(request, "file could not be read");
+  }
+  // Preserve the original bounded-read behavior while sharing exact-byte slicing
+  // with state-bound consult snapshots.
+  return sliceBytes(request, normalizedPath, bytes, options, stats.size);
 }

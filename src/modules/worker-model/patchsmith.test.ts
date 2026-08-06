@@ -146,6 +146,23 @@ test("patchsmith: a patch that changes a forbidden file is rejected (whole patch
   assert.match(readFileSync(join(dir, "src/math.test.ts"), "utf8"), /add\(2,3\)!==5/);
 });
 
+test("Phase 3: patchsmith refuses an existing target that was not observed before the model call", async () => {
+  const dir = tmp();
+  mkdirp(dir, "src");
+  writeFileSync(join(dir, "src/math.ts"), "export const math = 1;\n");
+  writeFileSync(join(dir, "src/other.ts"), "export const other = 1;\n");
+  const unboundTargetDiff = "--- a/src/other.ts\n+++ b/src/other.ts\n@@ -1,1 +1,1 @@\n-export const other = 1;\n+export const other = 2;\n";
+  const { engine } = mockEngine([textResp(unboundTargetDiff)]);
+  const result = await createPatchsmith({ governedExec: greenExec(), parentCtx: PARENT_CTX, resolveChecks: oneCheck() })(
+    makeCtx(dir, "verified", engine, { metadata: { contextFiles: ["src/math.ts"] } }),
+  );
+  const detail = result.detail as { filesChanged?: readonly string[]; rejectedPatches?: readonly { error: string }[] };
+  assert.notEqual(result.outcome, "success");
+  assert.deepEqual(detail.filesChanged, []);
+  assert.ok((detail.rejectedPatches ?? []).some((entry) => /not observed before the model call/.test(entry.error)));
+  assert.equal(readFileSync(join(dir, "src/other.ts"), "utf8"), "export const other = 1;\n");
+});
+
 test("patchsmith: target check passes but full verification fails → does NOT promote", async () => {
   const dir = tmp();
   mkdirp(dir, "src");
@@ -211,28 +228,37 @@ function mkdirp(dir: string, sub: string): void {
   mkdirSync(join(dir, sub), { recursive: true });
 }
 
-// ── L5: drifted-context search rejects a non-unique before-block ─────────────
+// ── Phase 3: drifted context never receives invisible relocation authority ──
 
-test("L5: a drifted hunk whose before-block matches multiple locations is rejected as ambiguous", () => {
+test("Phase 3: a drifted hunk is rejected even when its before-block is ambiguous", () => {
   const original = "foo\ntarget\nbar\ntarget\nbaz\n";
-  // oldStart=1 (hint → line 0 = "foo") does NOT match the "target" before-block, so the apply
-  // falls into the drifted-context scan. "target" appears at two lines → ambiguous → reject.
+  // oldStart=1 (hint → line 0 = "foo") does not match the "target" before-block.
+  // Phase 3 deliberately removed the former drifted-context scan: ambiguity is refusal.
   const parsed = parseUnifiedDiff("--- a/f.txt\n+++ b/f.txt\n@@ -1,1 +1,1 @@\n-target\n+TARGET\n");
   assert.equal(parsed.ok, true);
   const patch = parsed.ok ? parsed.files[0]! : undefined;
   assert.ok(patch);
   const res = applyFilePatch(original, patch);
   assert.equal(res.ok, false, "non-unique drifted context must not be spliced");
-  if (!res.ok) assert.match(res.error, /not unique/, "the error tells the builder the context is ambiguous");
+  if (!res.ok) assert.match(res.error, /stale|relocation/i, "the error explicitly reports stale state rather than granting relocation authority");
 });
 
-test("L5: a drifted hunk whose before-block is unique still applies", () => {
+test("Phase 3: a drifted hunk is rejected even when its before-block is unique", () => {
   const original = "foo\ntarget\nbar\nqux\nbaz\n";
-  // "target" is unique; the hint (line 0) still misses, so the scan runs — and finds exactly one.
+  // "target" is unique, but uniqueness is diagnostic evidence only; it does not authorize relocation.
   const parsed = parseUnifiedDiff("--- a/f.txt\n+++ b/f.txt\n@@ -1,1 +1,1 @@\n-target\n+TARGET\n");
   assert.ok(parsed.ok);
   if (!parsed.ok) return;
   const res = applyFilePatch(original, parsed.files[0]!);
-  assert.equal(res.ok, true, "a unique before-block applies via the drift scan");
-  if (res.ok) assert.equal(res.content, "foo\nTARGET\nbar\nqux\nbaz\n");
+  assert.equal(res.ok, false, "a unique match is diagnostic evidence only; it cannot silently relocate a stale hunk");
+  if (!res.ok) assert.match(res.error, /stale|relocation/i);
+});
+
+test("Phase 3: an out-of-range insertion is stale rather than clamped", () => {
+  const parsed = parseUnifiedDiff("--- a/f.txt\n+++ b/f.txt\n@@ -99,0 +99,1 @@\n+inserted\n");
+  assert.ok(parsed.ok);
+  if (!parsed.ok) return;
+  const res = applyFilePatch("one\ntwo\n", parsed.files[0]!);
+  assert.equal(res.ok, false, "an insertion beyond the observed file must not be relocated to its end");
+  if (!res.ok) assert.match(res.error, /stale|relocation/i);
 });

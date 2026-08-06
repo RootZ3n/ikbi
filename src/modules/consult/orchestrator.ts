@@ -64,6 +64,8 @@ export interface ConsultRequest {
   readonly maxFiles?: number;
   /** Frontier output cap. Defaults by mode (advise smaller than patch). */
   readonly maxTokens?: number;
+  /** Internal state-bound source snapshot for repair consults; never supplied by the model. */
+  readonly sourceSnapshot?: ReadonlyMap<string, Readonly<Uint8Array>>;
 }
 
 export interface ConsultResult {
@@ -119,6 +121,7 @@ export async function runConsult(req: ConsultRequest, deps: ConsultDeps = {}): P
     ...(req.failingChecks !== undefined ? { failingChecks: req.failingChecks } : {}),
     ...(req.triedAndFailed !== undefined ? { triedAndFailed: req.triedAndFailed } : {}),
     allowedFiles: paths,
+    ...(req.sourceSnapshot === undefined ? {} : { sourceSnapshot: req.sourceSnapshot }),
     budget: { maxTotalSliceBytes: budgetBytes }
   });
 

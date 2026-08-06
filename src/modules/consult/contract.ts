@@ -177,4 +177,10 @@ export interface ConsultPacketInput {
     readonly maxTotalSliceBytes?: number;
     readonly maxPacketChars?: number;
   };
+  /**
+   * Optional immutable raw-byte source used by state-bound repair consults.
+   * When present, packet slices are read only from this snapshot; live
+   * filesystem reads are not an authority for a later candidate mutation.
+   */
+  readonly sourceSnapshot?: ReadonlyMap<string, Readonly<Uint8Array>>;
 }

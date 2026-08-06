@@ -15,7 +15,7 @@ export { buildConsultPacket } from "./consultPacket.js";
 export { runConsult } from "./orchestrator.js";
 export type { ConsultDeps, ConsultRequest, ConsultResult } from "./orchestrator.js";
 export { consultSystemPrompt, renderConsultPrompt } from "./prompt.js";
-export { readCodeSlice } from "./codeSlice.js";
+export { readCodeSlice, readCodeSliceFromBytes } from "./codeSlice.js";
 export type { CodeSliceOptions, CodeSliceReadResult } from "./codeSlice.js";
 export {
   CONSULT_PACKET_CONTRACT_VERSION
