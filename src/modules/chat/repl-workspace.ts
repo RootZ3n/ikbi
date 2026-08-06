@@ -117,15 +117,23 @@ function mapVerifierResult(r: RoleResult, requestedMode: string): ApplyVerificat
 
 /** Wrap a live `WorkspaceHandle` as the `SessionWorkspace` a managed chat session edits inside. */
 class ManagedWorkspace implements SessionWorkspace {
+  readonly candidateId?: string;
+  readonly generationId?: string;
+
   constructor(
     private readonly handle: WorkspaceHandle,
     private readonly mgr: WorkspaceManagerLike,
     private readonly sessionId: string,
+    candidateIdentity: string | undefined,
+    generationIdentity: string | undefined,
     /** Injectable verifier (tests). Default: the production-equivalent ladder verifier. */
     private readonly verifierOverride?: RoleFn,
     /** Injectable gate-wall (tests). Default: the live, fail-closed gate-wall the build path uses. */
     private readonly gateWall: GateWall = coreGateWall,
-  ) {}
+  ) {
+    if (candidateIdentity !== undefined) this.candidateId = candidateIdentity;
+    if (generationIdentity !== undefined) this.generationId = generationIdentity;
+  }
 
   get id(): string {
     return this.handle.id;
@@ -141,6 +149,9 @@ class ManagedWorkspace implements SessionWorkspace {
   }
   get baseRef(): string {
     return this.handle.baseRef;
+  }
+  get workspaceHandle(): WorkspaceHandle {
+    return this.handle;
   }
 
   diff(): Promise<string> {
@@ -313,14 +324,22 @@ export function resolveRepoTarget(cwd: string): string | undefined {
 }
 
 /** Allocate a managed workspace off `targetRepo` and return it as a `SessionWorkspace`. */
-export async function allocateSessionWorkspace(opts: { targetRepo: string; sessionId: string; label?: string; manager?: WorkspaceManagerLike; verifier?: RoleFn; gateWall?: GateWall }): Promise<SessionWorkspace> {
+export async function allocateSessionWorkspace(opts: { targetRepo: string; sessionId: string; candidateId?: string; generationId?: string; label?: string; manager?: WorkspaceManagerLike; verifier?: RoleFn; gateWall?: GateWall }): Promise<SessionWorkspace> {
   const mgr = opts.manager ?? workspaces;
   const handle = await mgr.allocate({
     targetRepo: opts.targetRepo,
     identity: chatIdentity(opts.sessionId),
     ...(opts.label !== undefined ? { label: opts.label } : {}),
   });
-  return new ManagedWorkspace(handle, mgr, opts.sessionId, opts.verifier, opts.gateWall ?? coreGateWall);
+  return new ManagedWorkspace(
+    handle,
+    mgr,
+    opts.sessionId,
+    opts.candidateId ?? `chat:${opts.sessionId}:candidate`,
+    opts.generationId ?? `chat:${opts.sessionId}:generation:1`,
+    opts.verifier,
+    opts.gateWall ?? coreGateWall,
+  );
 }
 
 /**
@@ -328,9 +347,18 @@ export async function allocateSessionWorkspace(opts: { targetRepo: string; sessi
  * undefined when the workspace is gone or no longer in an editable `allocated` state (promoted /
  * discarded / failed) — the caller then discloses that the managed lifecycle is unavailable.
  */
-export async function reconnectSessionWorkspace(workspaceId: string, opts: { manager?: WorkspaceManagerLike; sessionId?: string; verifier?: RoleFn; gateWall?: GateWall } = {}): Promise<SessionWorkspace | undefined> {
+export async function reconnectSessionWorkspace(workspaceId: string, opts: { manager?: WorkspaceManagerLike; sessionId?: string; candidateId?: string; generationId?: string; verifier?: RoleFn; gateWall?: GateWall } = {}): Promise<SessionWorkspace | undefined> {
   const mgr = opts.manager ?? workspaces;
   const rec = await mgr.get(workspaceId);
   if (rec === undefined || rec.state !== "allocated") return undefined;
-  return new ManagedWorkspace(rec, mgr, opts.sessionId ?? workspaceId, opts.verifier, opts.gateWall ?? coreGateWall);
+  const sessionId = opts.sessionId ?? workspaceId;
+  return new ManagedWorkspace(
+    rec,
+    mgr,
+    sessionId,
+    opts.candidateId,
+    opts.generationId,
+    opts.verifier,
+    opts.gateWall ?? coreGateWall,
+  );
 }

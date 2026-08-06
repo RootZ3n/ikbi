@@ -26,7 +26,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -51,7 +51,8 @@ import {
   type ToolCall,
   type TokenUsage,
 } from "../../core/provider/index.js";
-import type { DiscardResult, PromoteResult } from "../../core/workspace/index.js";
+import type { DiscardResult, PromoteResult, WorkspaceHandle } from "../../core/workspace/index.js";
+import { createWorkspaceMutationSession, type MutationSessionLike } from "../../core/workspace/mutation-session.js";
 import { getCapabilities } from "../../core/provider/capabilities.js";
 import { parseCheckOutput } from "../check-triage/index.js";
 import { governedExec } from "../governed-exec/index.js";
@@ -91,7 +92,7 @@ import {
 } from "../worker-model/builder-tools/phone-tools.js";
 import { runWebExtract, runWebSearch, webExtractTool, webSearchTool } from "../worker-model/builder-tools/web-tools.js";
 import { lspDiagnosticTool, runLspDiagnostic } from "../agent-tools/lsp-tools.js";
-import { notebookEditTool, runNotebookEdit } from "../agent-tools/notebook-tools.js";
+import { notebookEditTool } from "../agent-tools/notebook-tools.js";
 import { askUserTool, runAskUser } from "../agent-tools/ask-user.js";
 import { launchBuildTool, runLaunchBuild } from "../agent-tools/launch-build.js";
 import { buildReportTool, runBuildReport } from "../self-monitor/build-report-tool.js";
@@ -422,6 +423,11 @@ export interface SessionWorkspace {
   readonly baseBranch: string;
   /** The commit the workspace started from (the isolation base — `/diff` is computed against this). */
   readonly baseRef: string;
+  /** Explicit candidate and generation identities for state-bound text mutation. */
+  readonly candidateId?: string;
+  readonly generationId?: string;
+  /** Underlying managed handle, exposed only to the state-bound mutation adapter. */
+  readonly workspaceHandle?: WorkspaceHandle;
   /** Pending changes in the worktree vs the base (committed range, else working-tree fallback). */
   diff(): Promise<string>;
   /** Commit the current worktree state onto the scratch branch (advances it for promote). */
@@ -501,13 +507,12 @@ const MUTATING_TOOL_NAMES: ReadonlySet<string> = new Set([
   "write_file",
   "patch",
   "multi_edit",
+  "notebook_edit",
   "terminal",
   "delegate_task",
   "run_checks",
   "web_search",
   "web_extract",
-  // notebook_edit can insert/edit/delete cells (mutating); gated like the other writers.
-  "notebook_edit",
   // launch_build runs a REAL governed build that can promote to the target repo — a side effect
   // rollback cannot cover, so it is confirm-gated like terminal (a build never launches unapproved).
   "launch_build",
@@ -530,6 +535,7 @@ const SHARED_EXECUTOR_TOOLS: ReadonlySet<string> = new Set([
   "write_file",
   "patch",
   "multi_edit",
+  "notebook_edit",
   "terminal",
   "brain_search",
   "brain_think",
@@ -863,6 +869,8 @@ export interface PersistedSession {
   readonly targetRepo?: string;
   readonly baseBranch?: string;
   readonly baseRef?: string;
+  readonly candidateId?: string;
+  readonly generationId?: string;
   /** Persistent shell working directory (worktree-relative); carried across resume. */
   readonly shellCwd?: string;
 }
@@ -956,6 +964,9 @@ export class ChatSession {
   readonly targetRepo: string | undefined;
   readonly baseBranch: string | undefined;
   readonly baseRef: string | undefined;
+  readonly candidateId: string | undefined;
+  readonly generationId: string | undefined;
+  private readonly mutationWorkspace: WorkspaceHandle | undefined;
   /** Set once a managed workspace has been discarded — further lifecycle ops report it's gone. */
   private workspaceDiscarded = false;
   /** Key-fact memory across turns (files modified, command/test results, conclusions). */
@@ -1024,6 +1035,7 @@ export class ChatSession {
    */
   private mcpRegistry: McpToolRegistry | undefined;
   private mcpDiscoveryAttempted = false;
+  private mutationSessionPromise: Promise<MutationSessionLike | undefined> | undefined;
 
   constructor(id: string, deps: ChatSessionDeps = {}) {
     const restore = deps.restore;
@@ -1040,6 +1052,9 @@ export class ChatSession {
       this.targetRepo = deps.workspace.targetRepo;
       this.baseBranch = deps.workspace.baseBranch;
       this.baseRef = deps.workspace.baseRef;
+      this.candidateId = deps.workspace.candidateId;
+      this.generationId = deps.workspace.generationId;
+      this.mutationWorkspace = deps.workspace.workspaceHandle;
     } else if (restore?.workdirKind === "managed") {
       // A managed session resumed WITHOUT a live workspace (the worktree was discarded/cleaned, or
       // reconnect failed). Preserve the managed identity for honest /status, but disclose that the
@@ -1052,6 +1067,9 @@ export class ChatSession {
       this.targetRepo = restore.targetRepo;
       this.baseBranch = restore.baseBranch;
       this.baseRef = restore.baseRef;
+      this.candidateId = restore.candidateId;
+      this.generationId = restore.generationId;
+      this.mutationWorkspace = undefined;
     } else if (suppliedWorktree !== undefined) {
       this.worktree = resolveProvidedWorkdir(suppliedWorktree, deps.worktree !== undefined) ?? resolveWorkdir(deps.cwd, deps.scratch === true).path;
       this.workdirKind = restore?.workdirKind ?? (deps.worktree !== undefined ? "explicit" : "repo");
@@ -1061,6 +1079,9 @@ export class ChatSession {
       this.targetRepo = undefined;
       this.baseBranch = undefined;
       this.baseRef = undefined;
+      this.candidateId = undefined;
+      this.generationId = undefined;
+      this.mutationWorkspace = undefined;
     } else {
       const resolved = resolveWorkdir(deps.cwd, deps.scratch === true);
       this.worktree = resolved.path;
@@ -1071,6 +1092,9 @@ export class ChatSession {
       this.targetRepo = undefined;
       this.baseBranch = undefined;
       this.baseRef = undefined;
+      this.candidateId = undefined;
+      this.generationId = undefined;
+      this.mutationWorkspace = undefined;
     }
     this.identity = { agentId: "ikbi-chat", functionalRole: "assistant", trustTier: "trusted", sessionId: id };
     this.parentCtx = resolveParentCtx(id);
@@ -1347,24 +1371,6 @@ export class ChatSession {
         });
         return { output: res.output, activity: { name: "launch_build", ok: res.ok, summary: res.summary } };
       }
-      case "notebook_edit": {
-        // Cell-level .ipynb editing — confined to the worktree. Mutating ops are permission-gated
-        // above (MUTATING_TOOL_NAMES). The result (read output especially) is UNTRUSTED → chokepoint.
-        // Snapshot before/after so /rollback can restore (or delete) the notebook accurately.
-        const full = typeof args.path === "string" ? `${this.worktree}/${args.path}` : undefined;
-        let before: string | null = null;
-        if (full !== undefined) {
-          try { before = readFileSync(full, "utf8"); } catch { before = null; }
-        }
-        const res = runNotebookEdit(this.worktree, args);
-        const ok = res.rejection === undefined;
-        if (ok && res.wrote !== undefined && full !== undefined) {
-          let after = "";
-          try { after = readFileSync(full, "utf8"); } catch { after = ""; }
-          this.recordMutation({ path: res.wrote, full, beforeContent: before, afterContent: after, tool: "notebook_edit", timestamp: Date.now() });
-        }
-        return { output: res.output, activity: { name: "notebook_edit", ok, ...(typeof args.operation === "string" ? { summary: `${args.operation}${res.wrote !== undefined ? ` ${res.wrote}` : ""}` } : {}) } };
-      }
       case "scout_detail": {
         // SAME scout-disclosure logic as the builder, over an empty findings set (chat runs no
         // scout phase). The text is derived from scout output → UNTRUSTED → goes through the chokepoint.
@@ -1495,6 +1501,22 @@ export class ChatSession {
         return { output: `cwd is now ${shown}`, activity: { name: "terminal", ok: true, summary: `cd ${resolved.rel}` } };
       }
     }
+    const boundTextTool = call.name === "read_file" || call.name === "write_file" || call.name === "patch" || call.name === "multi_edit" || call.name === "notebook_edit";
+    const mutationSession = await this.getMutationSession();
+    if (this.workdirKind === "managed" && boundTextTool && mutationSession === undefined) {
+      const data = {
+        code: "MUTATION_VALIDATION",
+        path: typeof args.path === "string" ? args.path : undefined,
+        workspaceId: this.workspaceId ?? null,
+        candidateId: this.candidateId ?? null,
+        generationId: this.generationId ?? null,
+        mutationApplied: false,
+        retryGuidance: "Start or reconnect the managed candidate with explicit candidate/generation identity; no mutation was applied.",
+        message: "state-bound managed workspace mutation session is unavailable",
+      };
+      const output = `ERROR: ${data.code}: ${data.message}\n${JSON.stringify(data)}`;
+      return { output, activity: { name: call.name, ok: false, summary: "state-bound mutation unavailable" } };
+    }
     const deps: ToolExecutorDeps = {
       worktreeReal: this.worktree,
       agentId: this.identity.agentId,
@@ -1507,6 +1529,7 @@ export class ChatSession {
       gbrainBridge,
       ...(this.parentCtx !== undefined ? { parentCtx: this.parentCtx } : {}),
       ...(this.memoryGovernor !== undefined ? { memoryGovernor: this.memoryGovernor } : {}),
+      ...(mutationSession !== undefined ? { mutationSession } : {}),
     };
     const res = await executeTool(deps, call);
     const name = call.name;
@@ -1517,7 +1540,7 @@ export class ChatSession {
     }
 
     // MUTATORS: record for /rollback and attach a colorizable diff (preserves the prior behavior).
-    if ((name === "write_file" || name === "patch" || name === "multi_edit") && res.ok && res.wrote !== undefined && res.full !== undefined) {
+    if ((name === "write_file" || name === "patch" || name === "multi_edit" || name === "notebook_edit") && res.ok && res.wrote !== undefined && res.full !== undefined) {
       this.recordMutation({ path: res.wrote, full: res.full, beforeContent: res.before ?? null, afterContent: res.after ?? "", tool: name, timestamp: Date.now() });
       const diff = boundDiff(computeLineDiff(res.before ?? "", res.after ?? ""));
       return { output: res.output, activity: { name, ok: true, summary: res.wrote, ...(diff.length > 0 ? { diff } : {}) } };
@@ -1526,6 +1549,27 @@ export class ChatSession {
     // Everything else: map the raw result to an activity, choosing the summary the chat surfaced before.
     const summary = sharedToolSummary(name, args, res);
     return { output: res.output, activity: { name, ok: res.ok, ...(summary !== undefined ? { summary } : {}) } };
+  }
+
+  private async getMutationSession(): Promise<MutationSessionLike | undefined> {
+    if (this.workdirKind !== "managed" || this.mutationWorkspace === undefined || this.workspaceId === undefined || this.candidateId === undefined || this.generationId === undefined) return undefined;
+    if (this.mutationSessionPromise === undefined) {
+      this.mutationSessionPromise = createWorkspaceMutationSession(this.mutationWorkspace, {
+        sessionId: this.id,
+        workspaceId: this.workspaceId,
+        candidateId: this.candidateId,
+        generationId: this.generationId,
+        actor: "model",
+        cause: "model",
+        ...(this.parentCtx?.requestId !== undefined ? { requestId: this.parentCtx.requestId } : {}),
+        role: "chat",
+        validatedIdentity: this.identity.agentId,
+      }).catch((error) => {
+        log.warn({ error: errMsg(error), workspaceId: this.workspaceId }, "state-bound chat mutation session unavailable");
+        return undefined;
+      });
+    }
+    return this.mutationSessionPromise;
   }
 
   /**
@@ -1960,6 +2004,8 @@ export class ChatSession {
       ...(this.targetRepo !== undefined ? { targetRepo: this.targetRepo } : {}),
       ...(this.baseBranch !== undefined ? { baseBranch: this.baseBranch } : {}),
       ...(this.baseRef !== undefined ? { baseRef: this.baseRef } : {}),
+      ...(this.candidateId !== undefined ? { candidateId: this.candidateId } : {}),
+      ...(this.generationId !== undefined ? { generationId: this.generationId } : {}),
       ...(this.shellCwd !== "." ? { shellCwd: this.shellCwd } : {}),
     };
   }

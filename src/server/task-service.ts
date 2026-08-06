@@ -240,6 +240,7 @@ export class TaskService {
       const ctx = this.beginOperation(state.taskId);
       const task: WorkerTask = {
         taskId: state.taskId,
+        candidateId: state.taskId,
         targetRepo: sub.repo,
         goal: sub.goal,
         ...(sub.builderMode !== undefined ? { builderMode: sub.builderMode } : {}),

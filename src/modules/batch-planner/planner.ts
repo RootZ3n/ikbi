@@ -262,7 +262,7 @@ export function createBatchPlanner(deps: BatchPlannerDeps = {}): BatchPlanner {
       const levelResults = await Promise.all(
         level.map(async (stId) => {
           const st = byId.get(stId)!;
-          const task: WorkerTask = { taskId: `${batchId}-${stId}`, targetRepo: input.targetRepo, goal: st.goal, ...(input.baseBranch !== undefined ? { baseBranch: input.baseBranch } : {}) };
+          const task: WorkerTask = { taskId: `${batchId}-${stId}`, candidateId: `${batchId}-${stId}`, targetRepo: input.targetRepo, goal: st.goal, ...(input.baseBranch !== undefined ? { baseBranch: input.baseBranch } : {}) };
           try {
             return { st, result: await runWorker(task, input.parentCtx), error: undefined };
           } catch (e) {

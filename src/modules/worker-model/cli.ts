@@ -1244,6 +1244,7 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
 
     const task: WorkerTask = {
       taskId: id,
+      candidateId: id,
       targetRepo,
       goal: finalGoal,
       writeScope: detectWriteScope(finalGoal),
@@ -1417,6 +1418,7 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
             progress(`  → ${unit} ${step.index}/${buildStages.length}: ${step.goal}${step.verify ? " (verify)" : ""}\n`);
             const stepTask: WorkerTask = {
               taskId: `${id}:step${step.index}${laneSuffix}`,
+              ...(task.candidateId !== undefined ? { candidateId: task.candidateId } : {}),
               targetRepo,
               goal: step.goal,
               writeScope: detectWriteScope(step.goal),
@@ -1455,6 +1457,7 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
             progress(`  → final verification + promote\n`);
             const finalTask: WorkerTask = {
               taskId: `${id}:verify${laneSuffix}`,
+              ...(task.candidateId !== undefined ? { candidateId: task.candidateId } : {}),
               targetRepo,
               goal: `Verify all changes from the ${usingScope ? "staged build" : "multi-step plan"}: ${finalGoal}`,
               reuseWorkspace: sharedWorkspace,

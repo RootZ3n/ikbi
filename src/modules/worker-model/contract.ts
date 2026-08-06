@@ -49,6 +49,7 @@ import type { AgentIdentity } from "../../core/identity/contract.js";
 import type { NeutralizedContent, UntrustedContext } from "../../core/injection/contract.js";
 import type { ModelRequest, ModelResponse } from "../../core/provider/contract.js";
 import type { WorkspaceHandle } from "../../core/workspace/contract.js";
+import type { MutationSessionBinding } from "../../core/workspace/mutation-session.js";
 
 /** Semantic version of the worker-model contract. Bump on breaking change. */
 export const CONTRACT_VERSION = "1.0.0";
@@ -146,6 +147,8 @@ export function validateDelegationEnvelope(env: DelegationEnvelope): DelegationV
 export interface WorkerTask {
   /** Caller-provided correlation id (ties events/receipts together). */
   readonly taskId: string;
+  /** Explicit candidate identity for state-bound candidate mutations. */
+  readonly candidateId?: string;
   /** Absolute path to the target git repo the work runs against. */
   readonly targetRepo: string;
   /** Human description of the goal. */
@@ -531,6 +534,8 @@ export interface RoleContext {
   readonly autonomy: AutonomyGrant;
   /** The isolated workspace the run operates in. */
   readonly workspace: WorkspaceHandle;
+  /** Session binding for ordinary candidate text mutations, when this role has one. */
+  readonly mutationBinding?: MutationSessionBinding;
   /** Results of roles dispatched before this one (e.g. critic reads builder output). */
   readonly priorResults: readonly RoleResult[];
   /** The engine seams (model + mandatory neutralization). */

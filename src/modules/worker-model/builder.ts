@@ -74,11 +74,13 @@ import { loadProjectMemory } from "./project-memory.js";
 import { builderModel } from "./role-models.js";
 import type { ScoutFinding } from "./scout.js";
 import { workerToolCallStalled } from "./events.js";
-import { interceptMemoryGovernor, type ToolExecutorDeps } from "./tool-executor.js";
+import { executeTool, interceptMemoryGovernor, type ToolExecutorDeps } from "./tool-executor.js";
 import { discoverMcpTools, type McpToolRegistry } from "../mcp-model-loop/registry.js";
 import { lspDiagnosticTool, runLspDiagnostic } from "../agent-tools/lsp-tools.js";
 import { notebookEditTool, runNotebookEdit } from "../agent-tools/notebook-tools.js";
 import { askUserTool, runAskUser } from "../agent-tools/ask-user.js";
+import { MutationError } from "../../core/workspace/mutation.js";
+import { createWorkspaceMutationSession, type MutationSessionLike } from "../../core/workspace/mutation-session.js";
 
 // ToolCallError now lives in builder-tools/confine.ts (shared by every builder tool);
 // re-exported here so existing importers (and tests) keep `import { ToolCallError } from "./builder.js"`.
@@ -401,6 +403,12 @@ export interface BuilderDeps {
    * actually occurs, so the common path constructs nothing. Injectable for tests.
    */
   readonly receipts?: Pick<import("../../core/receipt/index.js").ReceiptStore, "append">;
+  /**
+   * Explicit compatibility escape for builder roles that are intentionally outside Phase 2
+   * (fixer/competitive/tournament lanes). Ordinary managed candidates leave this false and
+   * fail closed when no state-bound identity is present.
+   */
+  readonly allowUnboundManagedMutations?: boolean;
 }
 
 /** The last run_checks outcome — gates `done` (RAIL: no done while red). */
@@ -946,6 +954,40 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
     try { hooks = loadHooks(ctx.workspace.path); } catch { /* best-effort */ }
     // Canonical worktree root for confinement (realpath’d once).
     const worktreeReal = realpathSync(ctx.workspace.path);
+    // WorkspaceManager candidates always have an existing Git target. A few in-memory/test
+    // workspace doubles intentionally use a placeholder target path; do not let that fixture
+    // shape turn into an uncaught probe error. Existing but unreadable targets remain managed and
+    // therefore fail closed; an explicit binding is authoritative even when a test double has no
+    // target on disk.
+    let managedCandidate = ctx.mutationBinding !== undefined;
+    try {
+      managedCandidate = realpathSync(ctx.workspace.targetRepo) !== worktreeReal;
+    } catch {
+      managedCandidate = ctx.mutationBinding !== undefined || existsSync(ctx.workspace.targetRepo);
+    }
+    let mutationSession: MutationSessionLike | undefined;
+    let mutationSessionError: unknown;
+    if (ctx.mutationBinding !== undefined) {
+      try {
+        mutationSession = await createWorkspaceMutationSession(ctx.workspace, ctx.mutationBinding);
+      } catch (error) {
+        mutationSessionError = error;
+      }
+    } else if (managedCandidate && deps.allowUnboundManagedMutations !== true) {
+      // An isolated candidate must never fall back to the old direct writer. The normal
+      // orchestrator supplies this binding; deferred/fixer roles and legacy test doubles stay
+      // outside this Phase 2 migration and therefore cannot silently mutate a managed candidate.
+      mutationSessionError = new MutationError(
+        "MUTATION_VALIDATION",
+        "state-bound candidate mutation identity is unavailable (candidateId/generationId required)",
+        { path: "<candidate>" },
+      );
+    }
+    const legacyManagedMutationAllowed =
+      managedCandidate &&
+      deps.allowUnboundManagedMutations === true &&
+      ctx.mutationBinding === undefined &&
+      mutationSessionError === undefined;
     // MCP TOOL DISCOVERY: connect to any configured MCP servers and collect their tools. The
     // builder's clamped identity gates the session + every call; discovery is best-effort and
     // NEVER throws — a failed server is logged and skipped (no MCP servers ⇒ a no-op empty set).
@@ -958,6 +1000,12 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
       worktreeReal,
       agentId: ctx.identity.agentId,
       ...(deps.memoryGovernor !== undefined ? { memoryGovernor: deps.memoryGovernor } : {}),
+      ...(mutationSession !== undefined ? { mutationSession } : {}),
+    };
+    const boundExecutorDeps: ToolExecutorDeps = {
+      worktreeReal,
+      agentId: ctx.identity.agentId,
+      ...(mutationSession !== undefined ? { mutationSession } : {}),
     };
     // Builder self-bounds its loop against a wall-clock budget. A `--complexity large` build gets a
     // scaled budget (resolveBuilderTimeoutMs) so a big greenfield scaffold isn't cut off mid-tree; the
@@ -1048,12 +1096,10 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
     // --- the one tool: returns a raw result STRING; records side effects. It NEVER
     // builds a message — that is appendToolResult's exclusive job (the chokepoint). ---
     //
-    // DELIBERATE DUPLICATION (YELLOW / Issue 3 — dispatch unification is incomplete). This
-    // `runTool` and the per-tool dispatch in the loop below (terminal/git/brain/file) re-implement
-    // the SAME confine→govern→execute core as the shared `executeTool` (tool-executor.ts), which the
-    // chat dispatches through. The two paths share ONLY the governance chokepoint today
-    // (`interceptMemoryGovernor`, called below before every mutation), NOT the executor itself,
-    // because the builder needs surface-specific behavior the shared executor intentionally omits:
+    // Managed candidate ordinary textual tools use the shared `executeTool` path above. The
+    // remaining switch is intentionally retained for non-candidate worktrees and deferred
+    // mutation families; it is not an alternate ordinary candidate writer. The builder still
+    // owns surface-specific behavior the shared executor intentionally omits:
     //   - BATCH error handling: every rejection is pushed onto `rejectedToolCalls` (the integrator's
     //     policy gate reads it); the chat just formats a one-off `{output, activity}`.
     //   - WRITE-SCOPE + read-before-write: `write_scope` ("none"/"new_only"/"all") and the
@@ -1061,12 +1107,10 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
     //   - SIDE-EFFECT TRACKING: `filesRead` / `filesWritten` / `checksStale` feed `done`-gating and
     //     the verifier ladder — bookkeeping the shared executor does not own.
     //   - STEP-PLANNER / run_checks integration lives on this loop, not in the executor.
-    // CANONICAL PATH: the shared `executeTool` is the canonical dispatch for the CHAT surface.
-    // FUTURE CONSOLIDATION TARGET: fold the builder onto `executeTool` (threading the batch
-    // bookkeeping back through the `ToolExecutionResult` it already returns — `wrote`/`rel`/
-    // `rejection` are there for exactly this) so terminal/background/file behavior can never drift
-    // between the two surfaces. Until then, KEEP THE TWO IN SYNC by hand when changing either.
-    const runTool = (call: ToolCall): string => {
+    // CANONICAL TEXT PATH: both builder and chat ordinary candidate text tools call the shared
+    // `executeTool`; the switch below remains only for the explicitly deferred/non-candidate
+    // families listed above.
+    const runTool = async (call: ToolCall): Promise<string> => {
       let args: Record<string, unknown>;
       try {
         args = JSON.parse(call.arguments && call.arguments.length > 0 ? call.arguments : "{}") as Record<string, unknown>;
@@ -1082,6 +1126,71 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
           rejectedToolCalls.push({ tool: call.name, ...(typeof args.path === "string" ? { path: args.path } : {}), error: verr });
           return `ERROR: ${verr}`;
         }
+      }
+      const boundTextTool = call.name === "read_file" || call.name === "write_file" || call.name === "patch" || call.name === "multi_edit" || call.name === "notebook_edit";
+      if ((managedCandidate || ctx.mutationBinding !== undefined) && boundTextTool && mutationSession === undefined && !legacyManagedMutationAllowed) {
+        if (mutationSessionError !== undefined || mutationSession === undefined) {
+          const data = {
+            code: "MUTATION_VALIDATION",
+            path: typeof args.path === "string" ? args.path : undefined,
+            workspaceId: ctx.workspace.id,
+            candidateId: ctx.mutationBinding?.candidateId ?? null,
+            generationId: ctx.mutationBinding?.generationId ?? null,
+            mutationApplied: false,
+            retryGuidance: "Provide a validated candidate/generation binding; no mutation was applied.",
+            message: errMsg(mutationSessionError ?? "state-bound mutation session unavailable"),
+          };
+          rejectedToolCalls.push({ tool: call.name, ...(typeof args.path === "string" ? { path: args.path } : {}), error: `${data.code}: ${data.message}` });
+          return `ERROR: ${data.code}: ${data.message}\n${JSON.stringify(data)}`;
+        }
+      }
+      // Any successfully constructed mutation session is authoritative for
+      // candidate text tools, even when a test/in-memory workspace happens to
+      // report the same path for targetRepo and worktree. Do not let that
+      // fixture shape fall through to the legacy direct writer.
+      if (boundTextTool && mutationSession !== undefined) {
+        const c = confinePath(worktreeReal, args.path);
+        const relPath = c.ok ? c.rel.replace(/\\/g, "/") : "";
+        const dependencyPath = ["node_modules/", ".git/", "dist/", ".next/", ".cache/"].some((bp) => relPath.startsWith(bp) || relPath.includes(`/${bp}`));
+        if (call.name === "write_file") {
+          if (writeScope === "none") {
+            rejectedToolCalls.push({ tool: call.name, path: String(args.path ?? ""), error: "write_scope is 'none' — read-only mode" });
+            return "ERROR: This task is read-only — do not write files. Inspect with read_file, then call done.";
+          }
+          if (writeScope === "new_only" && c.ok && existsSync(c.full)) {
+            rejectedToolCalls.push({ tool: call.name, path: c.rel, error: "write_scope is 'new_only' — cannot modify existing file" });
+            return `ERROR: ${c.rel} already exists and this task only allows NEW files. Pick a new path and call write_file again.`;
+          }
+          if (dependencyPath) {
+            rejectedToolCalls.push({ tool: call.name, path: c.ok ? c.rel : String(args.path ?? ""), error: "cannot write to dependency directory" });
+            return `ERROR: Write to src/ (or scripts/, docs/) instead — ${String(args.path ?? "")} is a build/dependency directory and is off-limits.`;
+          }
+        } else if (call.name === "patch" || call.name === "multi_edit") {
+          if (writeScope === "none" || writeScope === "new_only") {
+            const targetPath = String(args.path ?? "");
+            rejectedToolCalls.push({ tool: call.name, path: targetPath, error: `write_scope is '${writeScope}' — cannot modify existing files` });
+            return `ERROR: Create a NEW file with write_file instead — this task does not allow editing existing files like ${targetPath}.`;
+          }
+          if (dependencyPath) {
+            rejectedToolCalls.push({ tool: call.name, path: c.ok ? c.rel : String(args.path ?? ""), error: `cannot edit dependency directory` });
+            return `ERROR: cannot edit dependency/build directory: ${String(args.path ?? "")}`;
+          }
+        } else if (call.name === "notebook_edit") {
+          const operation = typeof args.operation === "string" ? args.operation : "";
+          if (operation !== "read" && (writeScope === "none" || writeScope === "new_only")) {
+            const targetPath = String(args.path ?? "");
+            rejectedToolCalls.push({ tool: call.name, path: targetPath, error: `write_scope is '${writeScope}' — cannot modify notebooks` });
+            return `ERROR: This task does not allow editing existing files like ${targetPath} — only notebook_edit 'read' is available.`;
+          }
+        }
+        const result = await executeTool(boundExecutorDeps, call);
+        if (result.rejection !== undefined) rejectedToolCalls.push(result.rejection);
+        if (result.observed === true && result.completeObservation === true && result.rel !== undefined && !filesRead.includes(result.rel)) filesRead.push(result.rel);
+        if (result.ok && result.wrote !== undefined) {
+          if (!filesWritten.includes(result.wrote)) filesWritten.push(result.wrote);
+          checksStale = true;
+        }
+        return result.output;
       }
       switch (call.name) {
         case "read_file": {
@@ -1371,6 +1480,9 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
           model: builderModelId,
           worktreeReal,
           writeScope,
+          workspace: ctx.workspace,
+          ...(ctx.mutationBinding !== undefined ? { mutationBinding: ctx.mutationBinding } : {}),
+          mutationRequired: managedCandidate && !legacyManagedMutationAllowed,
         },
         args,
       );
@@ -1975,6 +2087,12 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
             const raw = await mcp.dispatch(call, ctx.identity);
             appendToolResult(raw, call);
           } else {
+            const boundTextTool = call.name === "read_file" || call.name === "write_file" || call.name === "patch" || call.name === "multi_edit" || call.name === "notebook_edit";
+            if ((managedCandidate || ctx.mutationBinding !== undefined) && boundTextTool && mutationSession === undefined && !legacyManagedMutationAllowed) {
+              const raw = await runTool(call);
+              appendToolResult(raw, call);
+              continue;
+            }
             // MEMORY GOVERNOR (shared chokepoint): a write_file/patch/multi_edit to a governed
             // surface becomes a proposal — otherwise fall through to the builder's specialized
             // runTool (write-scope, read-before-write, dependency guard). The SAME governance path
@@ -1985,7 +2103,7 @@ export function createBuilder(deps: BuilderDeps = {}): RoleFn {
               appendToolResult(gov.message, call);
               continue;
             }
-            const raw = runTool(call);
+            const raw = await runTool(call);
             // PostToolUse hook — fire-and-forget, best-effort
             if (hooks.length > 0) {
               fireHooks(hooks, {

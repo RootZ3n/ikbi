@@ -19,10 +19,13 @@
  *  - The capability profile shapes the sub-agent's completion budget too.
  */
 
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 import type { OperationContext } from "../../../core/identity/index.js";
+import type { WorkspaceHandle } from "../../../core/workspace/contract.js";
+import { createWorkspaceMutationSession, formatMutationToolError, type MutationSessionBinding, type MutationSessionLike } from "../../../core/workspace/mutation-session.js";
 import { toUntrustedMessage } from "../../../core/injection/index.js";
 import { adaptMaxTokens, getCapabilities } from "../../../core/provider/capabilities.js";
 import type { AgentIdentity, ModelMessage, ModelTool, ToolCall } from "../../../core/provider/contract.js";
@@ -50,6 +53,11 @@ export interface DelegateDeps {
   readonly maxIterations?: number;
   /** Write scope inherited from the parent builder — enforced on sub-agent writes. */
   readonly writeScope?: "all" | "new_only" | "none";
+  /** Parent's explicit candidate workspace/binding; a child receives its own session registry. */
+  readonly workspace?: WorkspaceHandle;
+  readonly mutationBinding?: MutationSessionBinding;
+  /** True for an isolated candidate: missing binding must fail closed, never use direct writes. */
+  readonly mutationRequired?: boolean;
 }
 
 export const delegateTaskTool: ModelTool = {
@@ -98,6 +106,24 @@ export async function runDelegateTask(deps: DelegateDeps, args: Record<string, u
   const maxTokens = adaptMaxTokens(SUB_MAX_TOKENS, caps);
   const maxIterations = deps.maxIterations ?? MAX_SUB_ITERATIONS;
   const filesWritten: string[] = [];
+  let mutationSession: MutationSessionLike | undefined;
+  if (deps.workspace !== undefined && deps.mutationBinding !== undefined) {
+    try {
+      mutationSession = await createWorkspaceMutationSession(deps.workspace, {
+        ...deps.mutationBinding,
+        sessionId: `${deps.mutationBinding.sessionId}:delegate:${randomUUID()}`,
+        role: "delegate",
+      });
+    } catch (error) {
+      if (deps.mutationRequired) return formatMutationToolError(error, deps.mutationBinding);
+    }
+  }
+  if (deps.mutationRequired && mutationSession === undefined) {
+    const binding = deps.mutationBinding;
+    if (binding !== undefined) return formatMutationToolError(new Error("state-bound delegated mutation session is unavailable"), binding);
+    return "ERROR: MUTATION_VALIDATION: delegated candidate mutation identity is unavailable\n{" +
+      `"code":"MUTATION_VALIDATION","mutationApplied":false,"retryGuidance":"Provide a validated candidate/generation binding; no mutation was applied."}`;
+  }
 
   // The task is the parent's delegation INSTRUCTION (it came from the parent model). It rides as
   // a user message; the sub-agent's own tool results are the untrusted data path below.
@@ -118,6 +144,14 @@ export async function runDelegateTask(deps: DelegateDeps, args: Record<string, u
       case "read_file": {
         const c = confinePath(deps.worktreeReal, toolArgs.path);
         if (!c.ok) return `ERROR: ${c.error}`;
+        if (mutationSession !== undefined) {
+          try {
+            const read = await mutationSession.readText(c.rel, MAX_READ_BYTES);
+            return read.output;
+          } catch (error) {
+            return formatMutationToolError(error, mutationSession.binding, c.rel);
+          }
+        }
         try {
           return readFileSync(c.full, "utf8").slice(0, MAX_READ_BYTES);
         } catch (e) {
@@ -135,9 +169,18 @@ export async function runDelegateTask(deps: DelegateDeps, args: Record<string, u
         const scope = deps.writeScope ?? "all";
         if (scope === "none") return `ERROR: writeScope is 'none' — sub-agent cannot write files`;
         if (scope === "new_only") {
-          try { readFileSync(c.full, "utf8"); return `ERROR: writeScope is 'new_only' — cannot overwrite existing file ${c.rel}`; } catch { /* file doesn't exist → allowed */ }
+          if (existsSync(c.full)) return `ERROR: writeScope is 'new_only' — cannot overwrite existing file ${c.rel}`;
         }
         const content = typeof toolArgs.content === "string" ? toolArgs.content : "";
+        if (mutationSession !== undefined) {
+          try {
+            const result = await mutationSession.writeText(c.rel, content);
+            if (!filesWritten.includes(c.rel)) filesWritten.push(c.rel);
+            return `wrote ${result.afterBytes.byteLength} bytes to ${c.rel}`;
+          } catch (error) {
+            return formatMutationToolError(error, mutationSession.binding, c.rel);
+          }
+        }
         try {
           mkdirSync(dirname(c.full), { recursive: true });
           writeFileSync(c.full, content, "utf8");

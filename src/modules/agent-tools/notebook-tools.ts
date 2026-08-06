@@ -17,8 +17,11 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { TextDecoder } from "node:util";
 
 import type { ModelTool } from "../../core/provider/contract.js";
+import { MutationError } from "../../core/workspace/mutation.js";
+import type { MutationSessionLike } from "../../core/workspace/mutation-session.js";
 import { confinePath, type BuilderToolResult } from "../worker-model/builder-tools/confine.js";
 
 /** The tool declared to the model. */
@@ -87,6 +90,179 @@ export function runNotebookEdit(worktreeReal: string, args: Record<string, unkno
     default:
       return { output: `ERROR: unknown notebook operation "${operation}" (use read | insert | edit | delete).`, rejection: { tool: "notebook_edit", path: c.rel, error: "unknown operation" } };
   }
+}
+
+/**
+ * State-bound notebook editing used by the managed builder/chat executor.
+ *
+ * The legacy synchronous helper above remains for non-candidate compatibility and its existing
+ * tests. Managed callers never use it for candidate content: this function derives the complete
+ * serialized notebook from the session's exact retained bytes and hands those bytes to Phase 1.
+ */
+export async function runBoundNotebookEdit(
+  session: MutationSessionLike,
+  args: Record<string, unknown>,
+): Promise<BuilderToolResult & { readonly before?: string; readonly after?: string }> {
+  const operation = typeof args.operation === "string" ? args.operation : "";
+  if (operation.length === 0) {
+    throw new MutationError("MUTATION_VALIDATION", "notebook_edit requires an 'operation'", { path: String(args.path ?? "") });
+  }
+  const requestedPath = typeof args.path === "string" ? args.path : "";
+  if (!requestedPath.endsWith(".ipynb")) {
+    throw new MutationError("MUTATION_VALIDATION", `notebook_edit only operates on .ipynb files (got "${requestedPath}")`, { path: requestedPath });
+  }
+
+  const prior = session.currentObservation(requestedPath);
+  const hasPriorFullObservation = prior !== undefined;
+  const observed = operation === "read" || prior === undefined ? await session.observeBytes(requestedPath) : prior;
+  const path = observed.path;
+  if (operation === "read") {
+    if (observed.observation.kind === "missing" || observed.bytes === null) {
+      session.discardObservation(path);
+      throw new MutationError("MUTATION_VALIDATION", `read failed: notebook does not exist at ${path}`, { path });
+    }
+    try {
+      const text = new TextDecoder("utf-8", { fatal: true }).decode(observed.bytes);
+      const parsed = parseNotebookText(text);
+      if (!parsed.ok) throw new MutationError("MUTATION_VALIDATION", parsed.error, { path });
+      const result = readNotebookObject(parsed.nb, path);
+      // A summary is not a whole-file observation. Do not let notebook read output authorize a
+      // later generic write_file/patch; a bound edit must follow a complete read_file or use an
+      // explicit create-intent for a missing file.
+      session.discardObservation(path);
+      return result;
+    } catch (error) {
+      session.discardObservation(path);
+      throw error;
+    }
+  }
+
+  let notebook: Notebook;
+  let beforeBytes: Buffer;
+  if (observed.observation.kind === "missing") {
+    if (operation !== "insert") {
+      session.discardObservation(path);
+      throw new MutationError("MUTATION_VALIDATION", `${operation} requires an observed existing notebook at ${path}`, { path });
+    }
+    notebook = freshNotebook();
+    beforeBytes = Buffer.alloc(0);
+  } else {
+    if (!hasPriorFullObservation) {
+      session.discardObservation(path);
+      throw new MutationError("MUTATION_VALIDATION", `complete read_file observation required before editing ${path}`, { path });
+    }
+    if (observed.bytes === null || (observed.observation.kind !== "empty" && observed.observation.kind !== "regular")) {
+      session.discardObservation(path);
+      throw new MutationError("MUTATION_VALIDATION", `notebook_edit requires a regular notebook file at ${path}`, { path });
+    }
+    beforeBytes = Buffer.from(observed.bytes);
+    let text: string;
+    try {
+      text = new TextDecoder("utf-8", { fatal: true }).decode(beforeBytes);
+      const parsed = parseNotebookText(text);
+      if (!parsed.ok) throw new MutationError("MUTATION_VALIDATION", parsed.error, { path });
+      notebook = parsed.nb;
+    } catch (error) {
+      session.discardObservation(path);
+      throw error;
+    }
+  }
+
+  const operationResult = applyNotebookOperation(notebook, operation, args, path);
+  if (!operationResult.ok) {
+    session.discardObservation(path);
+    throw new MutationError("MUTATION_VALIDATION", operationResult.error, { path });
+  }
+  const afterBytes = Buffer.from(serializeNotebook(notebook), "utf8");
+  if (observed.observation.kind === "missing") await session.createBytes(path, afterBytes);
+  else await session.replaceBytes(path, afterBytes);
+  return {
+    output: operationResult.output,
+    wrote: path,
+    ...(observed.observation.kind === "missing" ? {} : { before: beforeBytes.toString("utf8") }),
+    after: afterBytes.toString("utf8"),
+  };
+}
+
+function parseNotebookText(text: string): { ok: true; nb: Notebook } | { ok: false; error: string } {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (e) {
+    return { ok: false, error: `not a valid .ipynb (JSON parse failed): ${e instanceof Error ? e.message : String(e)}` };
+  }
+  if (typeof parsed !== "object" || parsed === null || !Array.isArray((parsed as Notebook).cells)) {
+    return { ok: false, error: "not a valid notebook (missing 'cells' array)" };
+  }
+  return { ok: true, nb: parsed as Notebook };
+}
+
+function serializeNotebook(nb: Notebook): string {
+  return `${JSON.stringify(nb, null, 1)}\n`;
+}
+
+function readNotebookObject(nb: Notebook, rel: string): BuilderToolResult {
+  if (nb.cells.length === 0) return { output: `Notebook ${rel} has no cells (nbformat ${nb.nbformat ?? "?"}).` };
+  const lines: string[] = [`Notebook ${rel} — ${nb.cells.length} cell(s), nbformat ${nb.nbformat ?? "?"}:`];
+  nb.cells.forEach((cell, i) => {
+    const src = sourceToString(cell.source);
+    const bounded = src.length > 1_000 ? `${src.slice(0, 1_000)}\n… [${src.length} chars total]` : src;
+    lines.push(`--- cell [${i}] (${cell.cell_type}) ---`);
+    lines.push(bounded.length > 0 ? bounded : "(empty)");
+    if (cell.cell_type === "code" && Array.isArray(cell.outputs) && cell.outputs.length > 0) {
+      const outSummary = summarizeOutputs(cell.outputs);
+      if (outSummary.length > 0) lines.push(`  outputs:\n${outSummary}`);
+    }
+  });
+  return { output: lines.join("\n") };
+}
+
+function applyNotebookOperation(
+  nb: Notebook,
+  operation: string,
+  args: Record<string, unknown>,
+  path: string,
+): { ok: true; output: string } | { ok: false; error: string } {
+  if (operation === "insert") {
+    const source = typeof args.source === "string" ? args.source : "";
+    const cell = makeCell(resolveCellType(args), source);
+    const idx = typeof args.cell_index === "number" ? clampIndex(args.cell_index, nb.cells.length) : nb.cells.length;
+    nb.cells.splice(idx, 0, cell);
+    return { ok: true, output: `Inserted ${cell.cell_type} cell at index ${idx} in ${path} (now ${nb.cells.length} cell(s)).` };
+  }
+  if (operation === "edit") {
+    if (typeof args.cell_index !== "number") return { ok: false, error: "edit requires a numeric 'cell_index'." };
+    const idx = args.cell_index;
+    if (idx < 0 || idx >= nb.cells.length) return { ok: false, error: `cell_index ${idx} out of range (notebook has ${nb.cells.length} cell(s)).` };
+    const cell = nb.cells[idx] as NotebookCell;
+    if (typeof args.source === "string") cell.source = stringToSource(args.source);
+    if (args.cell_type === "code" || args.cell_type === "markdown") {
+      const newType = args.cell_type;
+      if (newType !== cell.cell_type) {
+        cell.cell_type = newType;
+        if (newType === "code") {
+          if (cell.outputs === undefined) cell.outputs = [];
+          if (cell.execution_count === undefined) cell.execution_count = null;
+        } else {
+          delete cell.outputs;
+          delete cell.execution_count;
+        }
+      }
+    }
+    if (cell.cell_type === "code" && typeof args.source === "string") {
+      cell.outputs = [];
+      cell.execution_count = null;
+    }
+    return { ok: true, output: `Edited cell [${idx}] (${cell.cell_type}) in ${path}.` };
+  }
+  if (operation === "delete") {
+    if (typeof args.cell_index !== "number") return { ok: false, error: "delete requires a numeric 'cell_index'." };
+    const idx = args.cell_index;
+    if (idx < 0 || idx >= nb.cells.length) return { ok: false, error: `cell_index ${idx} out of range (notebook has ${nb.cells.length} cell(s)).` };
+    const [removed] = nb.cells.splice(idx, 1);
+    return { ok: true, output: `Deleted cell [${idx}] (${removed?.cell_type ?? "?"}) from ${path} (now ${nb.cells.length} cell(s)).` };
+  }
+  return { ok: false, error: `unknown notebook operation "${operation}" (use read | insert | edit | delete).` };
 }
 
 /** Load + parse a notebook from disk; returns an error string on failure. */

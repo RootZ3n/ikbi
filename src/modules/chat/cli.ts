@@ -77,6 +77,8 @@ export interface ReplSession {
   readonly targetRepo?: string | undefined;
   readonly baseBranch?: string | undefined;
   readonly baseRef?: string | undefined;
+  readonly candidateId?: string | undefined;
+  readonly generationId?: string | undefined;
   usage?(): { tokensIn: number; tokensOut: number; costUsd: number; cachedTokens?: number; cacheSavedUsd?: number };
   cacheHitPercent?(): number;
   rollback?(n: number): RollbackResult[];
@@ -911,7 +913,11 @@ export async function liveRepl(
     if (state === undefined) return undefined;
     let workspace;
     if (state.workdirKind === "managed" && state.workspaceId !== undefined) {
-      workspace = await reconnectSessionWorkspace(state.workspaceId, { sessionId: state.id });
+      workspace = await reconnectSessionWorkspace(state.workspaceId, {
+        sessionId: state.id,
+        ...(state.candidateId !== undefined ? { candidateId: state.candidateId } : {}),
+        ...(state.generationId !== undefined ? { generationId: state.generationId } : {}),
+      });
       if (workspace === undefined) {
         out(`[WARNING: managed workspace ${state.workspaceId} is gone — /diff, /apply, /discard are DISABLED]\n`);
         out(`[This session is read-only. Start a new session (ikbi repl) to make and apply changes.]\n`);

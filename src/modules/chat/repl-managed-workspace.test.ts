@@ -17,7 +17,7 @@ import { test } from "node:test";
 
 import "../egress/index.js";
 
-import type { ModelResponse, ToolCall } from "../../core/provider/contract.js";
+import type { ModelRequest, ModelResponse, ToolCall } from "../../core/provider/contract.js";
 import { LockManager } from "../../core/substrate/lock.js";
 import { DocumentStore } from "../../core/substrate/store.js";
 import type { WorkspaceRecord } from "../../core/workspace/contract.js";
@@ -93,6 +93,90 @@ test("repo mode allocates a managed workspace, and a file edit affects the works
     assert.ok(existsSync(join(s.worktree, "feature.ts")), "the new file exists in the managed worktree");
     // …and the TARGET REPO is untouched (no hidden live-direct editing).
     assert.ok(!existsSync(join(repo, "feature.ts")), "the target repo did NOT receive the edit");
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
+test("managed chat replace requires and consumes the exact full-read observation", async () => {
+  const repo = await makeRepo();
+  const { mgr, root } = makeManager();
+  try {
+    const ws = await allocateSessionWorkspace({ targetRepo: repo, sessionId: "mw-bound-replace", manager: mgr });
+    await writeFile(join(ws.path, "existing.ts"), "before\n");
+    const s = new ChatSession("mw-bound-replace", {
+      workspace: ws,
+      invoke: queued([
+        toolTurn(call("read_file", { path: "existing.ts" })),
+        toolTurn(call("write_file", { path: "existing.ts", content: "after\n" })),
+        stop("done"),
+      ]),
+    });
+    const response = await s.send("replace existing.ts");
+    assert.equal(readFileSync(join(ws.path, "existing.ts"), "utf8"), "after\n");
+    const writeActivity = response.tools.find((tool) => tool.name === "write_file");
+    assert.equal(writeActivity?.ok, true);
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
+test("managed chat and builder-facing text tools return the same stale refusal shape", async () => {
+  const repo = await makeRepo();
+  const { mgr, root } = makeManager();
+  try {
+    const ws = await allocateSessionWorkspace({ targetRepo: repo, sessionId: "mw-stale", manager: mgr });
+    await writeFile(join(ws.path, "stale.ts"), "anchor\nold\n");
+    let index = 0;
+    const requests: ModelRequest[] = [];
+    const responses = [
+      toolTurn(call("read_file", { path: "stale.ts" })),
+      toolTurn(call("patch", { path: "stale.ts", old_string: "anchor", new_string: "changed" })),
+      stop("done"),
+    ];
+    const s = new ChatSession("mw-stale", {
+      workspace: ws,
+      invoke: async (request) => {
+        requests.push(request);
+        if (index === 1) await writeFile(join(ws.path, "stale.ts"), "anchor\nexternal\n");
+        return responses[Math.min(index++, responses.length - 1)]!;
+      },
+    });
+    const response = await s.send("patch stale.ts");
+    const patchActivity = response.tools.find((tool) => tool.name === "patch");
+    assert.equal(patchActivity?.ok, false);
+    const patchOutput = requests.flatMap((request) => request.messages ?? []).map((message) => typeof message.content === "string" ? message.content : JSON.stringify(message.content)).join("\n");
+    assert.match(patchOutput, /STALE_MUTATION/);
+    assert.match(patchOutput, /mutationApplied[^\n]*false/);
+    assert.match(patchOutput, /Re-read the file and regenerate the edit/);
+    assert.equal(readFileSync(join(ws.path, "stale.ts"), "utf8"), "anchor\nexternal\n");
+  } finally {
+    await cleanup(repo, root);
+  }
+});
+
+test("a pre-Phase-2 managed session without persisted candidate/generation identity fails closed", async () => {
+  const repo = await makeRepo();
+  const { mgr, root } = makeManager();
+  try {
+    const ws = await allocateSessionWorkspace({ targetRepo: repo, sessionId: "mw-legacy", manager: mgr });
+    await writeFile(join(ws.path, "legacy.ts"), "keep\n");
+    const source = new ChatSession("mw-legacy", { workspace: ws, invoke: queued([stop("unused")]) });
+    const persisted = source.toPersisted();
+    const { candidateId: _candidateId, generationId: _generationId, ...legacyPersisted } = persisted;
+    const legacyWorkspace = await reconnectSessionWorkspace(ws.id, { manager: mgr, sessionId: "mw-legacy" });
+    assert.ok(legacyWorkspace !== undefined);
+    assert.equal(legacyWorkspace.candidateId, undefined);
+    assert.equal(legacyWorkspace.generationId, undefined);
+    const resumed = new ChatSession("mw-legacy", {
+      restore: legacyPersisted,
+      workspace: legacyWorkspace,
+      invoke: queued([toolTurn(call("write_file", { path: "legacy.ts", content: "must-not-land\n" })), stop("done")]),
+    });
+    const response = await resumed.send("overwrite legacy.ts");
+    const writeActivity = response.tools.find((tool) => tool.name === "write_file");
+    assert.equal(writeActivity?.ok, false);
+    assert.equal(readFileSync(join(ws.path, "legacy.ts"), "utf8"), "keep\n");
   } finally {
     await cleanup(repo, root);
   }
