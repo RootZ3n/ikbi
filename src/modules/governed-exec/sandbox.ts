@@ -212,6 +212,12 @@ export function toolchainSandboxEnv(command: string, env: NodeJS.ProcessEnv = pr
     // .NET: NuGet package cache + CLI home (first-run sentinels — else DotnetFirstTimeUseConfigurer
     // throws writing to a read-only HOME); telemetry/logo off to avoid extra writes/noise.
     case "dotnet": return [["NUGET_PACKAGES", join(b, "nuget")], ["DOTNET_CLI_HOME", join(b, "dotnet")], ["DOTNET_CLI_TELEMETRY_OPTOUT", "1"], ["DOTNET_NOLOGO", "1"]];
+    // Rust: cargo registry lives at $CARGO_HOME/registry — on a read-only HOME cargo cannot
+    // update/fetch the index or download crates and silently falls back to a stale local cache
+    // ("note: offline mode" / "no matching package named X found"). Redirect CARGO_HOME to the
+    // persistent writable base; target/ stays in-worktree by default. The registry cache is
+    // namespaced under <cache>/ikbi/toolchains, never the operator's real ~/.cargo.
+    case "cargo": return [["CARGO_HOME", join(b, "cargo")]];
     // Maven local repo, carried as a JVM system property via MAVEN_OPTS.
     case "mvn": return [["MAVEN_OPTS", `-Dmaven.repo.local=${join(b, "m2")}`]];
     // Gradle home (caches, wrapper, downloaded deps).
