@@ -47,6 +47,9 @@ import { printGateStatus } from "./gate-status.js";
 import { writeStderr, writeStdout } from "./io.js";
 import { translateError, formatFriendlyError } from "../core/errors/index.js";
 import { helpForTopic } from "./help-pages.js";
+import { runCanonical } from "./run.js";
+import { runInspect } from "./inspect.js";
+import { runSelfTest } from "./self-test.js";
 // Core-facing operator commands registered from their own files (read the receipt store /
 // workspace manager). Imported here so registerCommand fires before dispatch.
 import "./receipts.js";
@@ -78,7 +81,7 @@ import { createCognitionRouter } from "../modules/cognition-layer/index.js";
 import { liveRepl } from "../modules/chat/cli.js";
 
 /** Built-in command names — reserved, cannot be shadowed by a module command. */
-const BUILTINS = new Set(["version", "models", "providers", "init", "doctor", "capabilities", "help"]);
+const BUILTINS = new Set(["version", "models", "providers", "init", "doctor", "capabilities", "help", "run", "self-test", "inspect"]);
 
 /** Known command names for the "did you mean" suggester (built-ins + repl + registered modules). */
 function knownCommandNames(): string[] {
@@ -150,8 +153,13 @@ function printUsage(argv: readonly string[] = []): void {
       "  init               Guided first-run setup",
       "  doctor             Report bootstrap config",
       "  doctor --fix       Repair common gaps",
+      "  run --spec <file>  Canonical preflighted external-agent build",
+      "  self-test          Deterministic local installation test (provider-free by default)",
+      "  inspect <run-id>   Locate receipts and candidate evidence",
       "  doctor --self-repair  Run the self-monitor",
       "  capabilities       List the builder + chat tool inventory",
+      "",
+      "External-agent guide: docs/AGENT-QUICKSTART.md",
     ];
     if (allModuleCmds.length > 0) {
       lines.push("", "All registered commands:");
@@ -178,11 +186,15 @@ function printUsage(argv: readonly string[] = []): void {
       "",
       "  ikbi                      Start interactive REPL (default)",
       "  ikbi init                 Guided first-run setup",
+      "  ikbi run --spec <file>    Canonical preflighted external-agent build",
+      "  ikbi self-test            Deterministic local installation test (provider-free by default)",
       "  ikbi build <description>  Build/repair code",
+      "  ikbi inspect <run-id>     Locate receipts and candidate evidence",
       "  ikbi models               Show model configuration",
       "  ikbi serve                Start HTTP server",
       "  ikbi help                 Show this help",
       "",
+      "External-agent guide: docs/AGENT-QUICKSTART.md",
       "Type `ikbi help <command>` for detailed usage (e.g. `ikbi help build`).",
       "Type `ikbi help --advanced` for all commands and flags.",
       "",
@@ -389,6 +401,15 @@ async function run(argv: readonly string[]): Promise<void> {
     printGateStatus();
   }
   switch (cmd) {
+    case "run":
+      await runCanonical(argv.slice(1));
+      return;
+    case "inspect":
+      await runInspect(argv.slice(1));
+      return;
+    case "self-test":
+      await runSelfTest(argv.slice(1));
+      return;
     case "version":
     case "--version":
     case "-V":

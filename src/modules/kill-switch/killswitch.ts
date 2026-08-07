@@ -48,7 +48,25 @@ const EVENT_SOURCE = "kill-switch";
  */
 function isProviderPreflightProcess(): boolean {
   const argv = process.argv.slice(2);
-  return argv[0] === "doctor" && argv.includes("--check-providers");
+  // Offline/read-only CLI surfaces own their reads explicitly. Avoid a background
+  // import-time latch warm-up competing for a restricted state lock; canonical
+  // `run` calls status() in its ordered preflight, while help/self-test/inspect do
+  // not need the latch at all.
+  return (
+    (argv[0] === "doctor" && (argv.includes("--check-providers") || argv.includes("--help"))) ||
+    argv[0] === "run" ||
+    argv[0] === "self-test" ||
+    argv[0] === "inspect" ||
+    argv[0] === "version" ||
+    argv[0] === "--version" ||
+    argv[0] === "-V" ||
+    argv[0] === "models" ||
+    argv[0] === "providers" ||
+    argv[0] === "capabilities" ||
+    argv[0] === "help" ||
+    argv[0] === "--help" ||
+    argv[0] === "-h"
+  );
 }
 
 /** Stable identity for a signal (so we never double-latch the same kill). */

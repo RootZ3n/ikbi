@@ -583,7 +583,7 @@ export function detectWriteScope(goal: string): "all" | "new_only" | "none" {
  * every progress/diagnostic/hint/repair/cost line is routed to STDERR so a caller can pipe
  * stdout straight into a JSON parser without log noise interleaved (FIX 3).
  */
-export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbose?: boolean; cost?: boolean; yes?: boolean; json?: boolean; delegation?: string; noMemory?: boolean; memoryDiff?: boolean; check?: string; maxBudgetUsd?: number; fallbackModel?: string; complexity?: "small" | "medium" | "large"; tier?: BuildTier; scope?: string; bare?: boolean; effort?: "low" | "medium" | "high" | "max"; fromPr?: number; escalate?: boolean; unknownFlags: string[]; rest: string[] } {
+export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbose?: boolean; cost?: boolean; yes?: boolean; json?: boolean; delegation?: string; noMemory?: boolean; memoryDiff?: boolean; check?: string; maxBudgetUsd?: number; fallbackModel?: string; complexity?: "small" | "medium" | "large"; tier?: BuildTier; scope?: string; bare?: boolean; effort?: "low" | "medium" | "high" | "max"; fromPr?: number; escalate?: boolean; taskId?: string; baseBranch?: string; noTestsPolicy?: boolean; unknownFlags: string[]; rest: string[] } {
   const rest: string[] = [];
   // #9: unknown FLAG-LIKE tokens (a typo'd `--no-promote`, `--dry-run`, `--modle=x`) were silently
   // folded into the GOAL prose — the flag did nothing and the operator never knew. Collect them so the
@@ -612,6 +612,9 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
   let bare = false;
   let effort: "low" | "medium" | "high" | "max" | undefined;
   let fromPr: number | undefined;
+  let taskId: string | undefined;
+  let baseBranch: string | undefined;
+  let noTestsPolicy = false;
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i] as string;
     if (endOfFlags) {
@@ -694,6 +697,18 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
     } else if (a.startsWith("--from-pr=")) {
       const n = Number.parseInt(a.slice("--from-pr=".length), 10);
       if (Number.isInteger(n) && n > 0) fromPr = n;
+    } else if (a === "--task-id") {
+      taskId = argv[i + 1];
+      i += 1;
+    } else if (a.startsWith("--task-id=")) {
+      taskId = a.slice("--task-id=".length);
+    } else if (a === "--base-branch") {
+      baseBranch = argv[i + 1];
+      i += 1;
+    } else if (a.startsWith("--base-branch=")) {
+      baseBranch = a.slice("--base-branch=".length);
+    } else if (a === "--allow-no-tests") {
+      noTestsPolicy = true;
     } else if (a === "--escalate") {
       escalate = true;
     } else if (a.length > 1 && a.startsWith("-")) {
@@ -702,7 +717,7 @@ export function parseBuildArgs(argv: readonly string[]): { repo?: string; verbos
       rest.push(a);
     }
   }
-  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), ...(verbose ? { verbose } : {}), ...(cost ? { cost } : {}), ...(yes ? { yes } : {}), ...(json ? { json } : {}), ...(delegation !== undefined ? { delegation } : {}), ...(noMemory ? { noMemory } : {}), ...(memoryDiff ? { memoryDiff } : {}), ...(check !== undefined && check.trim().length > 0 ? { check } : {}), ...(maxBudgetUsd !== undefined ? { maxBudgetUsd } : {}), ...(fallbackModel !== undefined ? { fallbackModel } : {}), ...(complexity !== undefined ? { complexity } : {}), ...(tier !== undefined ? { tier } : {}), ...(scope !== undefined ? { scope } : {}), ...(bare ? { bare } : {}), ...(effort !== undefined ? { effort } : {}), ...(fromPr !== undefined ? { fromPr } : {}), ...(escalate ? { escalate } : {}), unknownFlags, rest };
+  return { ...(repo !== undefined && repo.length > 0 ? { repo } : {}), ...(verbose ? { verbose } : {}), ...(cost ? { cost } : {}), ...(yes ? { yes } : {}), ...(json ? { json } : {}), ...(delegation !== undefined ? { delegation } : {}), ...(noMemory ? { noMemory } : {}), ...(memoryDiff ? { memoryDiff } : {}), ...(check !== undefined && check.trim().length > 0 ? { check } : {}), ...(maxBudgetUsd !== undefined ? { maxBudgetUsd } : {}), ...(fallbackModel !== undefined ? { fallbackModel } : {}), ...(complexity !== undefined ? { complexity } : {}), ...(tier !== undefined ? { tier } : {}), ...(scope !== undefined ? { scope } : {}), ...(bare ? { bare } : {}), ...(effort !== undefined ? { effort } : {}), ...(fromPr !== undefined ? { fromPr } : {}), ...(escalate ? { escalate } : {}), ...(taskId !== undefined && taskId.length > 0 ? { taskId } : {}), ...(baseBranch !== undefined && baseBranch.length > 0 ? { baseBranch } : {}), ...(noTestsPolicy ? { noTestsPolicy } : {}), unknownFlags, rest };
 }
 
 /**
@@ -963,8 +978,12 @@ export interface WorkerCliDeps {
   readonly stdout?: (s: string) => void;
   readonly stderr?: (s: string) => void;
   readonly setExit?: (code: number) => void;
+  /** Receive the authoritative worker result without parsing human/JSON output. */
+  readonly resultSink?: (result: WorkerResult) => void;
   readonly now?: () => number;
   readonly cwd?: () => string;
+  /** Override piped-stdin context. Canonical non-interactive callers provide an empty reader. */
+  readonly readPipedStdin?: () => Promise<string>;
   /** Workspace surface for the post-build diff summary (SG-2). Default: the live manager. */
   readonly workspaces?: DiffWorkspaceSurface;
   /**
@@ -1013,6 +1032,8 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
   const out = deps.stdout ?? writeStdout;
   const err = deps.stderr ?? writeStderr;
   const setExit = deps.setExit ?? ((c: number) => void (process.exitCode = c));
+  const resultSink = deps.resultSink;
+  const readPipedInput = deps.readPipedStdin ?? (() => readPipedStdin());
   const now = deps.now ?? Date.now;
   const cwd = deps.cwd ?? (() => process.cwd());
   const summaryWorkspaces: DiffWorkspaceSurface = deps.workspaces ?? coreWorkspaces;
@@ -1069,7 +1090,7 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       return;
     }
 
-    const { repo, verbose, cost, yes, json, delegation: delegationJson, noMemory, memoryDiff, check, maxBudgetUsd, fallbackModel, complexity, tier, scope, bare, effort, fromPr, escalate, unknownFlags, rest } = parseBuildArgs(argv);
+    const { repo, verbose, cost, yes, json, delegation: delegationJson, noMemory, memoryDiff, check, maxBudgetUsd, fallbackModel, complexity, tier, scope, bare, effort, fromPr, escalate, taskId: requestedTaskId, baseBranch, noTestsPolicy, unknownFlags, rest } = parseBuildArgs(argv);
     // #9: reject typo'd/unknown flags instead of silently folding them into the build goal (where they
     // do nothing). A legit goal that really needs a leading dash goes after `--`.
     if (unknownFlags.length > 0) {
@@ -1125,7 +1146,7 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
     const rawGoal = envelope !== undefined ? envelope.objective : rest.join(" ").trim();
     // PIPED INPUT (CC parity): `cat file | ikbi build "analyze this"` prepends the piped text to the
     // goal as context. When the goal is empty, the piped text becomes the goal. No-op for a TTY.
-    const pipedContext = (await readPipedStdin()).trim();
+    const pipedContext = (await readPipedInput()).trim();
     const goal = pipedContext.length > 0 ? `${pipedContext}\n\n${rawGoal}`.trim() : rawGoal;
     if (goal.length === 0) {
       err("ikbi: build needs a goal — usage: ikbi build <goal...> [--repo <path>]\n");
@@ -1173,7 +1194,7 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       return;
     }
 
-    const id = `build-${now()}`;
+    const id = requestedTaskId !== undefined && requestedTaskId.trim().length > 0 ? requestedTaskId.trim() : `build-${now()}`;
     const ctx = beginOperation(who, { requestId: id });
 
     // ── LAYER 1: Pre-build deliberation ─────────────────────────────────────
@@ -1247,6 +1268,8 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       candidateId: id,
       targetRepo,
       goal: finalGoal,
+      ...(baseBranch !== undefined ? { baseBranch } : {}),
+      ...(noTestsPolicy === true ? { noTestsPolicy: true } : {}),
       writeScope: detectWriteScope(finalGoal),
       // GREENFIELD: when the target has no project manifest at its root, opt this build into
       // greenfield scaffolding. The orchestrator only acts on it when the target is genuinely
@@ -1551,6 +1574,10 @@ export function createWorkerCli(deps: WorkerCliDeps = {}) {
       // subscriber drain can never suppress the result envelope below (a promoted build that
       // prints nothing reads as a failure and invites a duplicate re-run).
       if (sub !== undefined) await flushBestEffort(eventBus, 2000);
+      // The canonical `run` adapter consumes the typed result directly. Keep the existing
+      // stdout/stderr contracts unchanged for `ikbi build`; this seam avoids reparsing either
+      // the human narrative or the legacy build JSON envelope.
+      resultSink?.(result);
       if (json === true) {
         // H3: --json now HONORED — stdout carries ONLY the machine-readable result envelope; ALL
         // narrative, cost, diff, and hints go to stderr so `ikbi build --json | jq` is a real contract.

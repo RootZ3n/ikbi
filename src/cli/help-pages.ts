@@ -31,6 +31,49 @@ export interface HelpPage {
 }
 
 export const HELP_PAGES: Readonly<Record<string, HelpPage>> = {
+  run: {
+    name: "run",
+    summary: "Canonical external-agent workflow: validate a task locally, then delegate to the authoritative worker/orchestrator path.",
+    usage: "ikbi run --spec <task-file> [--repo <path-or-name>] [--json]",
+    flags: [
+      { flag: "--spec <task-file>", desc: "Readable JSON task specification; required." },
+      { flag: "--repo <path-or-name>", desc: "Explicit target repository path or registered alias; otherwise spec.repository, then the current Git repository." },
+      { flag: "--json", desc: "Emit exactly one terminal JSON document on stdout; incidental diagnostics go to stderr." },
+    ],
+    examples: [
+      { cmd: "ikbi run --spec task.json", desc: "Preflight and run against the repository named by the task or current repository." },
+      { cmd: "ikbi run --spec task.json --repo ../service --json", desc: "Machine-readable run for an explicit target." },
+    ],
+    seeAlso: ["doctor", "self-test", "inspect"],
+  },
+  "self-test": {
+    name: "self-test",
+    summary: "Deterministic local test of host/config reads, Git workspaces, state-bound mutation, stale refusal, verification, receipts, and cleanup; provider access is opt-in.",
+    usage: "ikbi self-test [--json] [--provider-smoke]",
+    flags: [
+      { flag: "--json", desc: "Emit one machine-readable self-test result." },
+      { flag: "--provider-smoke", desc: "Explicitly permit one bounded provider request after local preflight; may incur cost and is never enabled by default." },
+    ],
+    examples: [
+      { cmd: "ikbi self-test", desc: "Exercise the local deterministic layers without a model or paid provider." },
+      { cmd: "ikbi self-test --json", desc: "Use the result in an installation check." },
+    ],
+    seeAlso: ["run", "doctor"],
+  },
+  inspect: {
+    name: "inspect",
+    summary: "Summarize existing canonical-run receipts, workspace/candidate state, invocation evidence, verification, promotion, and diagnostics.",
+    usage: "ikbi inspect <run-id> [--json]",
+    flags: [
+      { flag: "<run-id>", desc: "The stable run id returned by ikbi run." },
+      { flag: "--json", desc: "Emit one machine-readable evidence summary." },
+    ],
+    examples: [
+      { cmd: "ikbi inspect run-mr4f-abc123", desc: "Read the authoritative evidence for a prior run." },
+      { cmd: "ikbi inspect run-mr4f-abc123 --json", desc: "Feed evidence locations to another agent." },
+    ],
+    seeAlso: ["run", "receipts", "workspace"],
+  },
   build: {
     name: "build",
     summary: "Headless build/repair: a 5-role pipeline in an isolated worktree, promoted only on a verified pass.",
