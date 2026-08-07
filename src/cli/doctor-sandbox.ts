@@ -19,8 +19,10 @@
  * the posture so an operator understands, before their first build, exactly what will and won't run.
  */
 
-import { accessSync, constants as fsConstants } from "node:fs";
+import { closeSync, constants as fsConstants, openSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { release, type as osType } from "node:os";
+import { dirname, join, resolve } from "node:path";
 
 import { config } from "../core/config.js";
 import { dependencyInstallConfig } from "../modules/dependency-install/config.js";
@@ -58,8 +60,10 @@ export interface SandboxDoctorPorts {
   dependencyInstall(): { mode: "auto" | "off" | "required"; allowScripts: boolean; trustedLocalOverride: boolean };
   /** Directories whose writability matters (state + receipts). */
   dirs(): { stateRoot: string; receiptsDir: string };
-  /** True iff `dir` is writable (or creatable) by this process. */
-  isWritable(dir: string): boolean;
+  /** True iff this existing directory itself can accept a bounded write probe. */
+  isExistingDirectoryWritable(dir: string): boolean;
+  /** True iff this path is an existing writable directory or can be created below a writable parent. */
+  isCreatablePath(path: string): boolean;
 }
 
 export interface SandboxDoctorInputs {
@@ -240,7 +244,7 @@ export function runSandboxChecks(inp: SandboxDoctorInputs = {}): {
     ["state-dir-writable", "State directory writable", stateRoot],
     ["receipts-dir-writable", "Receipts directory writable", receiptsDir],
   ] as const) {
-    const writable = ports.isWritable(dir);
+    const writable = ports.isExistingDirectoryWritable(dir);
     checks.push({
       id,
       label,
@@ -267,17 +271,60 @@ export function renderSandboxChecks(checks: readonly SandboxCheck[]): string {
   return lines.join("\n");
 }
 
-/** True iff `dir` (or its nearest existing ancestor) is writable by this process. */
-function probeWritable(dir: string): boolean {
-  let d = dir;
-  for (let i = 0; i < 24; i++) {
+/**
+ * Probe the exact existing directory. This intentionally does not climb to a
+ * parent: state and receipt directories must themselves be able to persist
+ * evidence. The short-lived file makes this stronger than an access-bit check.
+ */
+export function probeExistingDirectoryWritable(dir: string): boolean {
+  const target = resolve(dir);
+  try {
+    if (!statSync(target).isDirectory()) return false;
+  } catch {
+    return false;
+  }
+
+  const probe = join(target, `.ikbi-write-probe-${process.pid}-${randomBytes(6).toString("hex")}`);
+  let fd = -1;
+  let writable = false;
+  try {
+    fd = openSync(probe, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY, 0o600);
+    writeSync(fd, "ikbi\n");
+    writable = true;
+  } catch {
+    writable = false;
+  } finally {
+    if (fd !== -1) {
+      try {
+        closeSync(fd);
+      } catch {
+        writable = false;
+      }
+    }
     try {
-      accessSync(d, fsConstants.W_OK);
-      return true;
+      unlinkSync(probe);
     } catch {
-      const parent = d.replace(/\/[^/]+\/?$/, "");
-      if (parent === d || parent === "") return false;
-      d = parent;
+      writable = false;
+    }
+  }
+  return writable;
+}
+
+/**
+ * Probe a path that may not exist yet, such as a workspace root. Existing
+ * directories still require an exact-directory probe; only ENOENT permits the
+ * search for a nearest existing, writable parent.
+ */
+export function probeCreatablePath(path: string): boolean {
+  let current = resolve(path);
+  for (let i = 0; i < 24; i += 1) {
+    try {
+      return statSync(current).isDirectory() && probeExistingDirectoryWritable(current);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") return false;
+      const parent = dirname(current);
+      if (parent === current) return false;
+      current = parent;
     }
   }
   return false;
@@ -299,6 +346,7 @@ export function liveSandboxDoctorPorts(): SandboxDoctorPorts {
       trustedLocalOverride: dependencyInstallConfig.sandboxTrustedLocalOverride,
     }),
     dirs: () => ({ stateRoot: config.stateRoot, receiptsDir: config.receipt.dir }),
-    isWritable: (dir) => probeWritable(dir),
+    isExistingDirectoryWritable: (dir) => probeExistingDirectoryWritable(dir),
+    isCreatablePath: (path) => probeCreatablePath(path),
   };
 }

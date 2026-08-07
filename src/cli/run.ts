@@ -8,9 +8,9 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { accessSync, constants as fsConstants, existsSync, readdirSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
-import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
+import { basename, extname, isAbsolute, join, resolve } from "node:path";
 
 import { config, type IkbiConfig } from "../core/config.js";
 import { resolveIdentity as coreResolveIdentity, type ValidatedIdentity } from "../core/identity/index.js";
@@ -72,6 +72,7 @@ export type RunCode = (typeof RUN_CODES)[number];
 export type RunStatus = "completed" | "blocked" | "failed" | "cancelled";
 export type VerificationStatus = "not_started" | "passed" | "failed";
 export type PromotionStatus = "not_attempted" | "promoted" | "refused";
+type BlockedRunCode = Exclude<RunCode, "RUN_COMPLETED" | "RUN_INTERNAL_ERROR" | "RUN_CANCELLED" | "RUN_INVOCATION_FAILED" | "RUN_VERIFICATION_FAILED">;
 
 export interface RunSpec {
   readonly taskId: string;
@@ -286,7 +287,7 @@ function baseResult(
 
 function blockedResult(
   base: RunTerminalResult,
-  code: RunCode,
+  code: BlockedRunCode,
   subsystem: string,
   message: string,
   recovery: readonly string[],
@@ -309,6 +310,42 @@ function blockedResult(
     exitCode: RUN_EXIT_CODES.blocked,
     phase: subsystem,
     retryable: cause.retryable,
+    recovery: cause.recovery,
+    causes: [cause],
+  };
+}
+
+function internalResult(
+  base: RunTerminalResult,
+  subsystem: string,
+  message: string,
+  recovery: readonly string[] = ["Inspect the run diagnostics and report this internal failure with the run ID; do not retry configuration changes blindly."],
+  opts: { readonly paidInvocationStarted?: boolean; readonly mutationApplied?: boolean; readonly partialMutation?: boolean } = {},
+): RunTerminalResult {
+  const safeMessage = redact(message).slice(0, 2_000);
+  const paidInvocationStarted = opts.paidInvocationStarted ?? base.paidInvocationStarted;
+  const mutationApplied = opts.mutationApplied ?? base.mutationApplied;
+  const partialMutation = opts.partialMutation ?? base.partialMutation;
+  const candidateStateChanged = mutationApplied || partialMutation;
+  const cause: RunCause = {
+    code: "RUN_INTERNAL_ERROR",
+    subsystem,
+    message: safeMessage,
+    paidInvocationStarted,
+    candidateStateChanged,
+    retryable: false,
+    recovery: recovery.map((item) => redact(item)),
+  };
+  return {
+    ...base,
+    status: "failed",
+    code: "RUN_INTERNAL_ERROR",
+    exitCode: RUN_EXIT_CODES.internal,
+    phase: subsystem,
+    paidInvocationStarted,
+    mutationApplied,
+    partialMutation,
+    retryable: false,
     recovery: cause.recovery,
     causes: [cause],
   };
@@ -412,21 +449,6 @@ function isGreenfieldRoot(root: string): boolean {
   } catch {
     return false;
   }
-}
-
-function probeWritable(dir: string): boolean {
-  let current = dir;
-  for (let i = 0; i < 32; i += 1) {
-    try {
-      accessSync(current, fsConstants.W_OK);
-      return true;
-    } catch {
-      const parent = dirname(current);
-      if (parent === current) return false;
-      current = parent;
-    }
-  }
-  return false;
 }
 
 function providerNestedIssues(report: ProviderPreflightReport): RunCause["nested"] {
@@ -575,20 +597,23 @@ export async function preflightRun(
   const sandboxPorts = deps.sandboxPorts ?? liveSandboxDoctorPorts();
   const sandboxReport = runSandboxChecks({ ports: sandboxPorts });
   const envRequired = envReport.checks.filter((check) => !check.ok && check.level === "required");
-  const sandboxRequired = sandboxReport.checks.filter((check) => !check.ok && check.level === "required");
+  // State and receipt writability have dedicated stable run codes below. Do not
+  // collapse either resource failure into the generic host-capability result.
+  const sandboxRequired = sandboxReport.checks.filter((check) =>
+    !check.ok && check.level === "required" && check.id !== "state-dir-writable" && check.id !== "receipts-dir-writable",
+  );
   if (envRequired.length > 0 || sandboxRequired.length > 0) {
     const failed = [...envRequired, ...sandboxRequired].map((check) => `${check.label}${check.fix ? ` — ${check.fix}` : ""}`).join("; ");
     return { result: blockedResult(base, "RUN_HOST_CAPABILITY_MISSING", "preflight.host", failed, ["Run ikbi doctor --json, satisfy every required host/sandbox check, and rerun."]) };
   }
 
-  const writable = sandboxPorts.isWritable;
-  if (!writable(cfg.stateRoot)) {
+  if (!sandboxPorts.isExistingDirectoryWritable(cfg.stateRoot)) {
     return { result: blockedResult(base, "RUN_STATE_ROOT_UNWRITABLE", "preflight.state", `state root is not writable: ${cfg.stateRoot}`, [`Set IKBI_STATE_ROOT to a writable directory, then rerun ikbi doctor and ikbi run.`]) };
   }
-  if (!writable(cfg.receipt.dir)) {
+  if (!sandboxPorts.isExistingDirectoryWritable(cfg.receipt.dir)) {
     return { result: blockedResult(base, "RUN_RECEIPT_STORE_UNWRITABLE", "preflight.receipts", `receipt store is not writable: ${cfg.receipt.dir}`, [`Set IKBI_RECEIPT_DIR to a writable directory, then rerun ikbi doctor and ikbi run.`]) };
   }
-  if (!probeWritable(cfg.workspace.root)) {
+  if (!sandboxPorts.isCreatablePath(cfg.workspace.root)) {
     return { result: blockedResult(base, "RUN_WORKSPACE_ALLOCATION_FAILED", "preflight.workspace", `workspace root is not writable: ${cfg.workspace.root}`, [`Set IKBI_WORKSPACE_ROOT to a writable directory, then rerun.`]) };
   }
 
@@ -886,6 +911,33 @@ function emitResult(result: RunTerminalResult, json: boolean, out: (text: string
   if (json && result.status !== "completed") err(`ikbi run: ${result.code} — ${result.recovery.join(" ")}\n`);
 }
 
+function noTypedWorkerResult(base: RunTerminalResult, processExitCode: number | undefined): RunTerminalResult {
+  const cancelled = processExitCode === 130;
+  const code: RunCode = cancelled ? "RUN_CANCELLED" : "RUN_INVOCATION_FAILED";
+  const recovery = cancelled
+    ? ["Inspect preserved workspace state and kill status; report the cancellation before retrying."]
+    : ["Inspect stderr and rerun only after confirming no preserved workspace requires recovery."];
+  const cause: RunCause = {
+    code,
+    subsystem: cancelled ? "cancellation" : "execution",
+    message: "the authoritative build path returned no typed worker result",
+    paidInvocationStarted: base.paidInvocationStarted,
+    candidateStateChanged: base.mutationApplied || base.partialMutation,
+    retryable: !cancelled,
+    recovery,
+  };
+  return {
+    ...base,
+    status: cancelled ? "cancelled" : "failed",
+    code,
+    exitCode: cancelled ? RUN_EXIT_CODES.cancelled : RUN_EXIT_CODES.failed,
+    phase: cancelled ? "cancelled" : "execution",
+    retryable: !cancelled,
+    recovery,
+    causes: [cause],
+  };
+}
+
 export async function runCanonical(argv: readonly string[], deps: RunCliDeps = {}): Promise<RunTerminalResult | undefined> {
   const out = deps.stdout ?? writeStdout;
   const err = deps.stderr ?? writeStderr;
@@ -907,7 +959,7 @@ export async function runCanonical(argv: readonly string[], deps: RunCliDeps = {
   try {
     preflightOutcome = await preflight(argv, context);
   } catch (e) {
-    const result = blockedResult(baseResult(runId, null, null, null), "RUN_INTERNAL_ERROR", "preflight", `preflight failed unexpectedly: ${text(e)}`, ["Run ikbi doctor --json, inspect the diagnostic, and retry when the local state is healthy."], { retryable: false });
+    const result = internalResult(baseResult(runId, null, null, null), "preflight", `preflight failed unexpectedly: ${text(e)}`);
     emitResult(result, parsed.json, out, err);
     (deps.setExit ?? ((code: number) => { process.exitCode = code; }))(result.exitCode);
     return result;
@@ -919,7 +971,7 @@ export async function runCanonical(argv: readonly string[], deps: RunCliDeps = {
   }
   const ready = preflightOutcome.ready;
   if (ready === undefined) {
-    const result = blockedResult(baseResult(runId, null, null, null), "RUN_INTERNAL_ERROR", "preflight", "preflight returned neither a ready context nor a terminal result", ["Run ikbi doctor --json and retry."], { retryable: false });
+    const result = internalResult(baseResult(runId, null, null, null), "preflight", "preflight returned neither a ready context nor a terminal result");
     emitResult(result, parsed.json, out, err);
     (deps.setExit ?? ((code: number) => { process.exitCode = code; }))(result.exitCode);
     return result;
@@ -961,24 +1013,7 @@ export async function runCanonical(argv: readonly string[], deps: RunCliDeps = {
 
   let result: RunTerminalResult;
   if (execution.result === undefined) {
-    result = {
-      ...baseResult(runId, ready.spec.taskId, ready.repository, ready.providerPreflight),
-      status: "failed",
-      code: execution.processExitCode === 130 ? "RUN_CANCELLED" : "RUN_INVOCATION_FAILED",
-      exitCode: execution.processExitCode === 130 ? RUN_EXIT_CODES.cancelled : RUN_EXIT_CODES.failed,
-      phase: execution.processExitCode === 130 ? "cancelled" : "execution",
-      retryable: execution.processExitCode !== 130,
-      recovery: ["Inspect stderr and rerun only after confirming no preserved workspace requires recovery."],
-      causes: [{
-        code: execution.processExitCode === 130 ? "RUN_CANCELLED" : "RUN_INVOCATION_FAILED",
-        subsystem: execution.processExitCode === 130 ? "cancellation" : "execution",
-        message: "the authoritative build path returned no typed worker result",
-        paidInvocationStarted: false,
-        candidateStateChanged: false,
-        retryable: execution.processExitCode !== 130,
-        recovery: ["Inspect stderr and rerun only after confirming no preserved workspace requires recovery."],
-      }],
-    };
+    result = noTypedWorkerResult(baseResult(runId, ready.spec.taskId, ready.repository, ready.providerPreflight), execution.processExitCode);
   } else {
     result = workerTerminal(execution.result, runId, ready.spec.taskId, ready.repository, ready.providerPreflight);
     const path = await workspacePath(result.workspace.id);

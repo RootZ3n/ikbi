@@ -4,6 +4,9 @@
  */
 
 import assert from "node:assert/strict";
+import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 
 import {
@@ -11,6 +14,8 @@ import {
   renderSandboxChecks,
   riskyExecPrediction,
   dependencyInstallPrediction,
+  probeCreatablePath,
+  probeExistingDirectoryWritable,
   type SandboxDoctorPorts,
 } from "./doctor-sandbox.js";
 import type { SandboxAvailability } from "../modules/governed-exec/sandbox.js";
@@ -35,7 +40,8 @@ function ports(overrides: Partial<{
     governedExec: () => ge,
     dependencyInstall: () => di,
     dirs: () => ({ stateRoot: "/state", receiptsDir: "/state/receipts" }),
-    isWritable: () => writable,
+    isExistingDirectoryWritable: () => writable,
+    isCreatablePath: () => writable,
   };
 }
 
@@ -108,6 +114,26 @@ test("non-writable state/receipts dir is a required failure", () => {
   assert.equal(byId(checks, "state-dir-writable").ok, false);
   assert.equal(byId(checks, "state-dir-writable").level, "required");
   assert.equal(byId(checks, "receipts-dir-writable").ok, false);
+});
+
+test("real probes require exact existing directories and retain creatable-parent semantics", async () => {
+  if (process.platform === "win32") return;
+  const root = await mkdtemp(join(tmpdir(), "ikbi-doctor-writability-"));
+  const existing = join(root, "state");
+  const notYetCreated = join(root, "future", "workspace");
+  await mkdir(existing);
+  try {
+    assert.equal(probeExistingDirectoryWritable(existing), true);
+    assert.equal(probeCreatablePath(existing), true);
+    await chmod(existing, 0o555);
+    assert.equal(probeExistingDirectoryWritable(existing), false);
+    assert.equal(probeCreatablePath(existing), false, "a writable ancestor must not make an existing directory pass");
+    assert.equal(probeExistingDirectoryWritable(notYetCreated), false);
+    assert.equal(probeCreatablePath(notYetCreated), true, "a missing workspace root may use its writable parent");
+  } finally {
+    await chmod(existing, 0o755);
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("dependency install with scripts ON + no sandbox + no override: FAILS CLOSED", () => {
