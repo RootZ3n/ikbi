@@ -4,7 +4,7 @@
  */
 
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -16,6 +16,7 @@ import {
   dependencyInstallPrediction,
   probeCreatablePath,
   probeExistingDirectoryWritable,
+  probeReceiptDirectory,
   type SandboxDoctorPorts,
 } from "./doctor-sandbox.js";
 import type { SandboxAvailability } from "../modules/governed-exec/sandbox.js";
@@ -42,6 +43,7 @@ function ports(overrides: Partial<{
     dirs: () => ({ stateRoot: "/state", receiptsDir: "/state/receipts" }),
     isExistingDirectoryWritable: () => writable,
     isCreatablePath: () => writable,
+    probeReceiptDirectory: (path) => ({ path, state: writable ? "existing-writable" : "existing-unwritable", ready: writable }),
   };
 }
 
@@ -132,6 +134,55 @@ test("real probes require exact existing directories and retain creatable-parent
     assert.equal(probeCreatablePath(notYetCreated), true, "a missing workspace root may use its writable parent");
   } finally {
     await chmod(existing, 0o755);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("receipt probe accepts a missing exact path only when it is safely creatable, and doctor reports the same truth", async () => {
+  if (process.platform === "win32") return;
+  const root = await mkdtemp(join(tmpdir(), "ikbi-doctor-receipt-probe-"));
+  const state = join(root, "state");
+  const receipts = join(state, "receipts");
+  const blockedParent = join(root, "blocked");
+  const blockedReceipts = join(blockedParent, "receipts");
+  const receiptFile = join(root, "receipt-file");
+  await mkdir(state);
+  await mkdir(blockedParent);
+  await writeFile(receiptFile, "not a directory\n");
+  try {
+    assert.deepEqual(probeReceiptDirectory(receipts), { path: receipts, state: "missing-creatable", ready: true });
+    const report = runSandboxChecks({
+      ports: {
+        ...ports(),
+        dirs: () => ({ stateRoot: state, receiptsDir: receipts }),
+        isExistingDirectoryWritable: (dir) => probeExistingDirectoryWritable(dir),
+        isCreatablePath: (path) => probeCreatablePath(path),
+        probeReceiptDirectory,
+      },
+    });
+    assert.equal(byId(report.checks, "receipts-dir-writable").ok, true);
+    assert.match(byId(report.checks, "receipts-dir-writable").detail ?? "", /missing; creatable/);
+
+    await mkdir(receipts);
+    assert.equal(probeReceiptDirectory(receipts).state, "existing-writable");
+    await chmod(receipts, 0o555);
+    try {
+      const unwritable = probeReceiptDirectory(receipts);
+      assert.equal(unwritable.state, "existing-unwritable", "an existing unwritable receipt directory is never rescued by its parent");
+      assert.equal(unwritable.ready, false);
+      assert.equal(probeReceiptDirectory(blockedReceipts).state, "missing-creatable", "the blocked-parent case is checked after its permission change");
+    } finally {
+      await chmod(receipts, 0o755);
+    }
+
+    await chmod(blockedParent, 0o555);
+    try {
+      assert.equal(probeReceiptDirectory(blockedReceipts).state, "missing-uncreatable");
+      assert.equal(probeReceiptDirectory(receiptFile).state, "invalid-path");
+    } finally {
+      await chmod(blockedParent, 0o755);
+    }
+  } finally {
     await rm(root, { recursive: true, force: true });
   }
 });

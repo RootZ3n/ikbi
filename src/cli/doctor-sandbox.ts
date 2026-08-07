@@ -64,10 +64,25 @@ export interface SandboxDoctorPorts {
   isExistingDirectoryWritable(dir: string): boolean;
   /** True iff this path is an existing writable directory or can be created below a writable parent. */
   isCreatablePath(path: string): boolean;
+  /** Receipt-store readiness: an existing directory must itself be writable; a missing one must be safely creatable. */
+  probeReceiptDirectory(path: string): ReceiptDirectoryProbe;
 }
 
 export interface SandboxDoctorInputs {
   readonly ports?: SandboxDoctorPorts;
+}
+
+export type ReceiptDirectoryState =
+  | "existing-writable"
+  | "existing-unwritable"
+  | "missing-creatable"
+  | "missing-uncreatable"
+  | "invalid-path";
+
+export interface ReceiptDirectoryProbe {
+  readonly path: string;
+  readonly state: ReceiptDirectoryState;
+  readonly ready: boolean;
 }
 
 /** A compact, human description of what will happen to RISKY project code on this host. */
@@ -240,20 +255,37 @@ export function runSandboxChecks(inp: SandboxDoctorInputs = {}): {
 
   // 7. Writable state + receipts directories.
   const { stateRoot, receiptsDir } = ports.dirs();
-  for (const [id, label, dir] of [
-    ["state-dir-writable", "State directory writable", stateRoot],
-    ["receipts-dir-writable", "Receipts directory writable", receiptsDir],
-  ] as const) {
-    const writable = ports.isExistingDirectoryWritable(dir);
-    checks.push({
-      id,
-      label,
-      detail: dir,
-      ok: writable,
-      level: writable ? "info" : "required",
-      fix: `ensure ${dir} is writable (set IKBI_STATE_ROOT to a writable location), or run \`ikbi doctor --fix\``,
-    });
-  }
+  const stateWritable = ports.isExistingDirectoryWritable(stateRoot);
+  checks.push({
+    id: "state-dir-writable",
+    label: "State directory writable",
+    detail: stateRoot,
+    ok: stateWritable,
+    level: stateWritable ? "info" : "required",
+    fix: `ensure ${stateRoot} is writable (set IKBI_STATE_ROOT to a writable location), or run \`ikbi doctor --fix\``,
+  });
+
+  const receipt = ports.probeReceiptDirectory(receiptsDir);
+  const receiptDetail = receipt.state === "missing-creatable"
+    ? `${receiptsDir} (missing; creatable)`
+    : receipt.state === "existing-writable"
+      ? `${receiptsDir} (existing; writable)`
+      : receiptsDir;
+  const receiptFix = receipt.state === "existing-unwritable"
+    ? `make the existing receipt directory writable: ${receiptsDir}; an ancestor being writable is insufficient`
+    : receipt.state === "missing-uncreatable"
+      ? `create the receipt directory beneath a writable parent, or set IKBI_RECEIPT_DIR to a safely creatable path: ${receiptsDir}`
+      : receipt.state === "invalid-path"
+        ? `replace the receipt path with a directory (not a regular file or invalid path), or set IKBI_RECEIPT_DIR to a valid path: ${receiptsDir}`
+        : `ensure ${receiptsDir} is writable, or run \`ikbi doctor --fix\``;
+  checks.push({
+    id: "receipts-dir-writable",
+    label: "Receipts directory writable",
+    detail: receiptDetail,
+    ok: receipt.ready,
+    level: receipt.ready ? "info" : "required",
+    fix: receiptFix,
+  });
 
   const issues = checks.filter((c) => !c.ok && c.level !== "info").length;
   return { checks, issues };
@@ -330,6 +362,50 @@ export function probeCreatablePath(path: string): boolean {
   return false;
 }
 
+/**
+ * Probe the receipt store's two valid states without confusing them:
+ *
+ * - an existing path must be the exact writable directory;
+ * - a missing path may use the nearest existing parent only to establish that
+ *   the exact missing directory can be created there.
+ *
+ * This never treats an existing unwritable directory as creatable through an
+ * ancestor, and it never changes the filesystem.
+ */
+export function probeReceiptDirectory(path: string): ReceiptDirectoryProbe {
+  const target = resolve(path);
+  try {
+    const targetStat = statSync(target);
+    if (!targetStat.isDirectory()) return { path: target, state: "invalid-path", ready: false };
+    const writable = probeExistingDirectoryWritable(target);
+    return { path: target, state: writable ? "existing-writable" : "existing-unwritable", ready: writable };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      return { path: target, state: "invalid-path", ready: false };
+    }
+  }
+
+  // The target is absent. Walk only to find the parent in which mkdir(target)
+  // would operate; do not accept a non-directory or an unwritable parent.
+  let current = dirname(target);
+  for (let i = 0; i < 24; i += 1) {
+    try {
+      const parentStat = statSync(current);
+      if (!parentStat.isDirectory()) return { path: target, state: "invalid-path", ready: false };
+      const ready = probeExistingDirectoryWritable(current);
+      return { path: target, state: ready ? "missing-creatable" : "missing-uncreatable", ready };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        return { path: target, state: "invalid-path", ready: false };
+      }
+      const parent = dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
+  }
+  return { path: target, state: "missing-uncreatable", ready: false };
+}
+
 /** Wire the production ports (real platform, the real sandbox probe, loaded module configs). */
 export function liveSandboxDoctorPorts(): SandboxDoctorPorts {
   return {
@@ -348,5 +424,6 @@ export function liveSandboxDoctorPorts(): SandboxDoctorPorts {
     dirs: () => ({ stateRoot: config.stateRoot, receiptsDir: config.receipt.dir }),
     isExistingDirectoryWritable: (dir) => probeExistingDirectoryWritable(dir),
     isCreatablePath: (path) => probeCreatablePath(path),
+    probeReceiptDirectory: (path) => probeReceiptDirectory(path),
   };
 }

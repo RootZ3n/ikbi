@@ -616,6 +616,7 @@ export async function runDoctorFix(ports: DoctorFixPorts, inp: DoctorFixInputs =
   push("STATE DIRECTORIES");
   const dirs: Array<{ label: string; path: string }> = [
     { label: "state root", path: cfg.stateRoot },
+    { label: "receipt directory", path: cfg.receipt.dir },
     { label: "trust dir", path: cfg.trust.dir },
     { label: "workspace root", path: cfg.workspace.root },
   ];

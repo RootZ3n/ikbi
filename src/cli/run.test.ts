@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -13,7 +13,7 @@ import type { ProviderPreflightReport } from "../core/provider/preflight.js";
 import type { ValidatedIdentity } from "../core/identity/index.js";
 import type { WorkerResult } from "../modules/worker-model/contract.js";
 import { runGit } from "../core/workspace/git.js";
-import { probeCreatablePath, probeExistingDirectoryWritable, runSandboxChecks } from "./doctor-sandbox.js";
+import { probeCreatablePath, probeExistingDirectoryWritable, probeReceiptDirectory, runSandboxChecks } from "./doctor-sandbox.js";
 import {
   preflightRun,
   runCanonical,
@@ -95,6 +95,7 @@ function preflightPorts(stateRoot = "/tmp/ikbi-test-state", receiptsDir = "/tmp/
       dirs: () => ({ stateRoot, receiptsDir }),
       isExistingDirectoryWritable: (dir: string) => probeExistingDirectoryWritable(dir),
       isCreatablePath: (path: string) => probeCreatablePath(path),
+      probeReceiptDirectory: (path: string) => probeReceiptDirectory(path),
     },
   };
 }
@@ -353,6 +354,88 @@ test("real creatable-path probe accepts a not-yet-created workspace root", async
     const outcome = await preflightRun(["--spec", spec], { runId: "run-workspace-creatable", cwd: process.cwd(), json: true }, readyDeps(root));
     assert.ok(outcome.ready, "preflight should accept a workspace root whose parent is writable");
     assert.equal(outcome.result, undefined);
+  } finally {
+    await rm(specRoot, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("fresh-install receipt directory is missing-but-creatable: doctor and run agree and preflight proceeds", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ikbi-run-fresh-receipts-"));
+  const specRoot = await mkdtemp(join(tmpdir(), "ikbi-run-fresh-receipts-spec-"));
+  try {
+    await fixtureRepo(root);
+    const deps = readyDeps(root);
+    const cfg = deps.config!;
+    await mkdir(cfg.stateRoot, { recursive: true });
+    const spec = join(specRoot, "task.json");
+    await writeFile(spec, JSON.stringify({ taskId: "fresh-receipts", goal: "do the task", repository: root }));
+    assert.equal(await access(cfg.receipt.dir).then(() => true).catch(() => false), false);
+    assert.ok(deps.sandboxPorts);
+    const report = runSandboxChecks({ ports: deps.sandboxPorts });
+    assert.equal(report.checks.find((check) => check.id === "receipts-dir-writable")?.ok, true);
+    assert.match(report.checks.find((check) => check.id === "receipts-dir-writable")?.detail ?? "", /missing; creatable/);
+    const outcome = await preflightRun(["--spec", spec], { runId: "run-fresh-receipts", cwd: process.cwd(), json: true }, deps);
+    assert.ok(outcome.ready, "fresh documented state should proceed when the receipt directory is safely creatable");
+    assert.equal(outcome.result, undefined);
+  } finally {
+    await rm(specRoot, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("missing receipt directory beneath an unwritable parent blocks locally with no workspace or invocation", async () => {
+  if (process.platform === "win32") return;
+  const root = await mkdtemp(join(tmpdir(), "ikbi-run-receipt-parent-"));
+  const specRoot = await mkdtemp(join(tmpdir(), "ikbi-run-receipt-parent-spec-"));
+  const blockedParent = join(root, "blocked");
+  try {
+    await fixtureRepo(root);
+    await mkdir(blockedParent);
+    const base = readyDeps(root);
+    const cfg = { ...base.config!, receipt: { ...base.config!.receipt, dir: join(blockedParent, "receipts") } };
+    const deps = { ...base, config: cfg, ...preflightPorts(cfg.stateRoot, cfg.receipt.dir) };
+    await mkdir(cfg.stateRoot, { recursive: true });
+    const spec = join(specRoot, "task.json");
+    await writeFile(spec, JSON.stringify({ taskId: "missing-receipts-parent", goal: "do the task", repository: root }));
+    await chmod(blockedParent, 0o555);
+    try {
+      assert.equal(probeReceiptDirectory(cfg.receipt.dir).state, "missing-uncreatable");
+      const report = runSandboxChecks({ ports: deps.sandboxPorts });
+      assert.equal(report.checks.find((check) => check.id === "receipts-dir-writable")?.ok, false);
+      const outcome = await preflightRun(["--spec", spec], { runId: "run-missing-receipts-parent", cwd: process.cwd(), json: true }, deps);
+      assert.equal(outcome.result?.code, "RUN_RECEIPT_STORE_UNWRITABLE");
+      assert.equal(outcome.result?.exitCode, 10);
+      assert.equal(outcome.result?.paidInvocationStarted, false);
+      assert.equal(outcome.result?.mutationApplied, false);
+      assert.equal(outcome.result?.workspace.id, null);
+    } finally {
+      await chmod(blockedParent, 0o755);
+    }
+  } finally {
+    await rm(specRoot, { recursive: true, force: true });
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("receipt path that is a regular file blocks with RUN_RECEIPT_STORE_UNWRITABLE", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ikbi-run-receipt-file-"));
+  const specRoot = await mkdtemp(join(tmpdir(), "ikbi-run-receipt-file-spec-"));
+  try {
+    await fixtureRepo(root);
+    const base = readyDeps(root);
+    const cfg = { ...base.config!, receipt: { ...base.config!.receipt, dir: join(specRoot, "receipt-file") } };
+    const deps = { ...base, config: cfg, ...preflightPorts(cfg.stateRoot, cfg.receipt.dir) };
+    await mkdir(cfg.stateRoot, { recursive: true });
+    await writeFile(cfg.receipt.dir, "not a directory\n");
+    const spec = join(specRoot, "task.json");
+    await writeFile(spec, JSON.stringify({ taskId: "receipt-file", goal: "do the task", repository: root }));
+    assert.equal(probeReceiptDirectory(cfg.receipt.dir).state, "invalid-path");
+    const outcome = await preflightRun(["--spec", spec], { runId: "run-receipt-file", cwd: process.cwd(), json: true }, deps);
+    assert.equal(outcome.result?.code, "RUN_RECEIPT_STORE_UNWRITABLE");
+    assert.equal(outcome.result?.exitCode, 10);
+    assert.equal(outcome.result?.workspace.id, null);
+    assert.equal(outcome.result?.paidInvocationStarted, false);
   } finally {
     await rm(specRoot, { recursive: true, force: true });
     await rm(root, { recursive: true, force: true });

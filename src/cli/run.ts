@@ -610,8 +610,23 @@ export async function preflightRun(
   if (!sandboxPorts.isExistingDirectoryWritable(cfg.stateRoot)) {
     return { result: blockedResult(base, "RUN_STATE_ROOT_UNWRITABLE", "preflight.state", `state root is not writable: ${cfg.stateRoot}`, [`Set IKBI_STATE_ROOT to a writable directory, then rerun ikbi doctor and ikbi run.`]) };
   }
-  if (!sandboxPorts.isExistingDirectoryWritable(cfg.receipt.dir)) {
-    return { result: blockedResult(base, "RUN_RECEIPT_STORE_UNWRITABLE", "preflight.receipts", `receipt store is not writable: ${cfg.receipt.dir}`, [`Set IKBI_RECEIPT_DIR to a writable directory, then rerun ikbi doctor and ikbi run.`]) };
+  const receiptProbe = sandboxPorts.probeReceiptDirectory(cfg.receipt.dir);
+  if (!receiptProbe.ready) {
+    const detail = receiptProbe.state === "existing-unwritable"
+      ? `existing receipt directory is not writable: ${cfg.receipt.dir}`
+      : receiptProbe.state === "missing-uncreatable"
+        ? `receipt directory is missing and cannot be safely created: ${cfg.receipt.dir}`
+        : receiptProbe.state === "invalid-path"
+          ? `receipt path is not a usable directory: ${cfg.receipt.dir}`
+          : `receipt store is not writable: ${cfg.receipt.dir}`;
+    const recovery = receiptProbe.state === "existing-unwritable"
+      ? [`Make the existing receipt directory writable, or set IKBI_RECEIPT_DIR to another writable directory, then rerun ikbi doctor and ikbi run.`]
+      : receiptProbe.state === "missing-uncreatable"
+        ? [`Create the receipt directory beneath a writable parent, or set IKBI_RECEIPT_DIR to a safely creatable path, then rerun ikbi doctor and ikbi run.`]
+        : receiptProbe.state === "invalid-path"
+          ? [`Replace IKBI_RECEIPT_DIR with a directory path (not a regular file), then rerun ikbi doctor and ikbi run.`]
+          : [`Set IKBI_RECEIPT_DIR to a writable directory, then rerun ikbi doctor and ikbi run.`];
+    return { result: blockedResult(base, "RUN_RECEIPT_STORE_UNWRITABLE", "preflight.receipts", detail, recovery) };
   }
   if (!sandboxPorts.isCreatablePath(cfg.workspace.root)) {
     return { result: blockedResult(base, "RUN_WORKSPACE_ALLOCATION_FAILED", "preflight.workspace", `workspace root is not writable: ${cfg.workspace.root}`, [`Set IKBI_WORKSPACE_ROOT to a writable directory, then rerun.`]) };

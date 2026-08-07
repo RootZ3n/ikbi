@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
@@ -421,16 +424,16 @@ function fakeFixPorts(
 
 /** All paths --fix inspects, so a test can declare "everything is healthy". */
 function allHealthyPaths(cfg = fixConfig(), projectRoot = "/proj"): string[] {
-  return [`${projectRoot}/.env`, `${projectRoot}/node_modules`, cfg.stateRoot, cfg.trust.dir, cfg.workspace.root];
+  return [`${projectRoot}/.env`, `${projectRoot}/node_modules`, cfg.stateRoot, cfg.receipt.dir, cfg.trust.dir, cfg.workspace.root];
 }
 
 test("doctor --fix CREATES a missing state directory (mkdir -p), leaving present paths alone", async () => {
   const cfg = fixConfig();
-  // env + node_modules present; the three state dirs are MISSING.
+  // env + node_modules present; the four state dirs are MISSING.
   const { ports, effects } = fakeFixPorts(["/proj/.env", "/proj/node_modules"]);
   const r = await runDoctorFix(ports, { config: cfg, projectRoot: "/proj" });
 
-  assert.deepEqual([...effects.mkdirs].sort(), [cfg.stateRoot, cfg.trust.dir, cfg.workspace.root].sort());
+  assert.deepEqual([...effects.mkdirs].sort(), [cfg.stateRoot, cfg.receipt.dir, cfg.trust.dir, cfg.workspace.root].sort());
   assert.equal(effects.writes.length, 0, "an existing .env is NOT rewritten");
   assert.equal(effects.installs.length, 0, "existing node_modules is NOT reinstalled");
   const text = r.lines.join("\n");
@@ -440,10 +443,39 @@ test("doctor --fix CREATES a missing state directory (mkdir -p), leaving present
   assert.equal(r.exitCode, 0);
 });
 
+test("doctor --fix bootstraps a fresh receipt directory, so a fresh state root has a documented path forward", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ikbi-doctor-fresh-state-"));
+  const projectRoot = join(root, "project");
+  const stateRoot = join(root, "home", ".ikbi", "state");
+  const cfg = loadConfig({ IKBI_ALLOW_INSECURE_DEV_KEYS: "true", IKBI_STATE_ROOT: stateRoot });
+  await mkdir(projectRoot, { recursive: true });
+  await writeFile(join(projectRoot, ".env"), "# test\n");
+  await mkdir(join(projectRoot, "node_modules"));
+  const ports: DoctorFixPorts = {
+    exists: (path) => existsSync(path),
+    mkdirp: async (path) => { await mkdir(path, { recursive: true }); },
+    writeFile: async (path, content) => { await writeFile(path, content, { flag: "wx" }); },
+    detectManager: () => "pnpm",
+    install: async () => ({ ok: true, detail: "" }),
+    countStaleWorkspaces: async () => 0,
+    cleanWorkspaces: async () => ({ removed: 0, skipped: 0 }),
+  };
+  try {
+    assert.equal(await access(join(stateRoot, "receipts")).then(() => true).catch(() => false), false);
+    const result = await runDoctorFix(ports, { config: cfg, projectRoot, repoLister: { list: () => [] } });
+    assert.equal(result.exitCode, 0);
+    assert.equal(await access(stateRoot).then(() => true).catch(() => false), true);
+    assert.equal(await access(cfg.receipt.dir).then(() => true).catch(() => false), true);
+    assert.match(result.lines.join("\n"), /created receipt directory/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("doctor --fix CREATES a .env template when none exists — secrets stay COMMENTED (bootstrap forbids them in a cwd .env)", async () => {
   const cfg = fixConfig();
   // everything present EXCEPT the .env.
-  const { ports, effects } = fakeFixPorts([cfg.stateRoot, cfg.trust.dir, cfg.workspace.root, "/proj/node_modules"]);
+  const { ports, effects } = fakeFixPorts([cfg.stateRoot, cfg.receipt.dir, cfg.trust.dir, cfg.workspace.root, "/proj/node_modules"]);
   const r = await runDoctorFix(ports, { config: cfg, projectRoot: "/proj" });
 
   assert.equal(effects.writes.length, 1, "exactly one file written — the .env template");
@@ -529,7 +561,7 @@ test("doctor --fix FIRST BUILD falls back to guidance when no repos are register
 test("doctor --fix RUNS the detected package manager install for missing node_modules", async () => {
   const cfg = fixConfig();
   // node_modules MISSING; everything else present. Manager detected as npm.
-  const { ports, effects } = fakeFixPorts([cfg.stateRoot, cfg.trust.dir, cfg.workspace.root, "/proj/.env"], { detectManager: () => "npm" });
+  const { ports, effects } = fakeFixPorts([cfg.stateRoot, cfg.receipt.dir, cfg.trust.dir, cfg.workspace.root, "/proj/.env"], { detectManager: () => "npm" });
   const r = await runDoctorFix(ports, { config: cfg, projectRoot: "/proj" });
 
   assert.deepEqual(effects.installs, [{ manager: "npm", root: "/proj" }]);
@@ -539,7 +571,7 @@ test("doctor --fix RUNS the detected package manager install for missing node_mo
 
 test("doctor --fix returns exit 1 when a repair FAILS (install error surfaces, non-zero exit)", async () => {
   const cfg = fixConfig();
-  const { ports } = fakeFixPorts([cfg.stateRoot, cfg.trust.dir, cfg.workspace.root, "/proj/.env"], {
+  const { ports } = fakeFixPorts([cfg.stateRoot, cfg.receipt.dir, cfg.trust.dir, cfg.workspace.root, "/proj/.env"], {
     detectManager: () => "pnpm",
     install: async () => ({ ok: false, detail: "registry unreachable" }),
   });
