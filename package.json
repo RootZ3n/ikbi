@@ -43,6 +43,9 @@
     "SUPPORT.md",
     "SECURITY.md",
     "docs/INSTALL.md",
+    "docs/AGENT-QUICKSTART.md",
+    "docs/RELEASE-CONTRACT.md",
+    "docs/RELEASE-CANDIDATE-ACCEPTANCE.md",
     "docs/KNOWN-LIMITATIONS.md",
     "docs/RC1-RELEASE.md",
     "docs/MANUAL.md",
@@ -65,6 +68,7 @@
     "test:doctor": "node --import tsx scripts/test-doctor.ts --json",
     "test:order": "bash scripts/test-runner.sh order",
     "test:repeat": "bash scripts/test-runner.sh repeat",
+    "test:release-candidate": "bash scripts/release-candidate-acceptance.sh",
     "test:abina": "sh -c 'IKBI_STATE_ROOT=$(mktemp -d /tmp/ikbi-abina-state.XXXXXX) env -u IKBI_OPERATOR_TOKEN -u IKBI_WORKER_TOKEN IKBI_ALLOW_INSECURE_DEV_KEYS=true node --import tsx --test src/modules/abina/*.test.ts'",
     "public:smoke": "bash scripts/public-smoke.sh"
   },

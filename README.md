@@ -100,13 +100,20 @@ pnpm public:smoke      # fast, API-key-free sanity + safety check
 
 node dist/cli/index.js doctor    # first-run health + sandbox report
 node dist/cli/index.js doctor --check-providers --json  # local-only provider/model readiness
+node dist/cli/index.js self-test --json                   # deterministic local workflow test (provider-free by default)
 ```
 
-Then configure a model provider (see [docs/INSTALL.md](docs/INSTALL.md)) and run your first build:
+Then configure a model provider (see [docs/INSTALL.md](docs/INSTALL.md)) and run the canonical external-agent workflow:
 
 ```bash
-node dist/cli/index.js build "add a unit test for parseConfig" --repo /path/to/your/repo
+node dist/cli/index.js run --spec task.json --repo /path/to/your/repo
+node dist/cli/index.js run --spec task.json --repo /path/to/your/repo --json
+node dist/cli/index.js inspect <run-id> --json
 ```
+
+The short operator guide is [docs/AGENT-QUICKSTART.md](docs/AGENT-QUICKSTART.md). It is the
+authoritative onboarding path for an unfamiliar external agent; the legacy `build` command remains
+available for advanced/operator use.
 
 > On Linux without bubblewrap, install it first: `sudo apt install bubblewrap`
 > (Debian/Ubuntu) or `sudo dnf install bubblewrap` (Fedora/Rocky). Without it, `doctor`
@@ -117,6 +124,11 @@ node dist/cli/index.js build "add a unit test for parseConfig" --repo /path/to/y
 - **`ikbi build "<goal>" --repo <path>`** — the golden batch path: a 5-role pipeline
   (scout → builder → critic → verifier → integrator) in an isolated git worktree; promotes only
   on a ladder-verified pass.
+- **`ikbi run --spec <file>`** — the canonical preflighted external-agent path. It resolves the
+  repository and task, performs local provider/host/state checks before allocation or invocation,
+  then delegates to the same authoritative worker/orchestrator path and returns one terminal result.
+- **`ikbi self-test` / `ikbi inspect <run-id>`** — deterministic local readiness test and bounded
+  inspection of the existing run receipts/workspace evidence.
 - **`ikbi repl`** — interactive, multi-turn, tool-calling session (the closest analog to Claude
   Code's REPL).
 - **`ikbi fix <repo>`** — diagnose a failing check and repair it narrowly (or correctly refuse);
@@ -143,6 +155,7 @@ Full detail: **[SECURITY.md](SECURITY.md)** · threat model & what is/ isn't pro
 
 | Doc | What it covers |
 |---|---|
+| [docs/AGENT-QUICKSTART.md](docs/AGENT-QUICKSTART.md) | Concise external-agent installation, run, recovery, JSON, and evidence guide |
 | [docs/INSTALL.md](docs/INSTALL.md) | Prereqs, bubblewrap setup, provider/API setup, first build, troubleshooting |
 | [SECURITY.md](SECURITY.md) | Sandbox model, governed-exec, dependency-install sandbox, trusted-local warning, receipts, threat model, residuals |
 | [docs/RC1-RELEASE.md](docs/RC1-RELEASE.md) | Evidence summary, hard gates, the 501-run proof, how to reproduce key checks |
