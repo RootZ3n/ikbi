@@ -18,6 +18,7 @@ PROFILE="${1:-deterministic}"
 ORDER="${IKBI_TEST_ORDER:-normal}"
 KEEP_LOGS="${IKBI_TEST_KEEP_LOGS:-false}"
 TEST_CONCURRENCY=""
+TEST_TIMEOUT_SECONDS="${IKBI_TEST_GROUP_TIMEOUT_SECONDS:-180}"
 RUN_ROOT="$(mktemp -d /tmp/ikbi-test-runner.XXXXXX)"
 
 cleanup() {
@@ -189,7 +190,7 @@ run_group() {
   mkdir -p "$state_root"
   echo "# RUN group=$mode suites=${#suite_files[@]}"
 
-  timeout --foreground --kill-after=10s 180s env \
+  timeout --foreground --kill-after=10s "${TEST_TIMEOUT_SECONDS}s" env \
     -u IKBI_OPERATOR_TOKEN -u IKBI_WORKER_TOKEN \
     IKBI_STATE_ROOT="$state_root" \
     IKBI_ALLOW_INSECURE_DEV_KEYS=true \
@@ -256,6 +257,7 @@ run_profile() {
 
 run_order() {
   TEST_CONCURRENCY=1
+  TEST_TIMEOUT_SECONDS="${IKBI_TEST_ORDER_TIMEOUT_SECONDS:-600}"
   ORDER=normal
   run_profile deterministic || return 1
   ORDER=reverse
