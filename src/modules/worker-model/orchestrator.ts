@@ -201,7 +201,7 @@ interface EscalationHandoffFields {
 // ── DEPENDENCY INSTALL: ensure worktree has node_modules ──────────────────────
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, realpathSync, symlinkSync, mkdirSync, type Dirent } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, mkdirSync, type Dirent } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, basename, isAbsolute, relative, resolve, sep } from "node:path";
 
@@ -251,7 +251,7 @@ function liveCheckTargetDirty(targetRepo: string): string | undefined {
  * replacement for the builder's self-reported `filesWritten` ledger. Used by the Step-2 shadow
  * instrumentation (wrapped in try/catch) AND by the auto-verify rescue's work detection.
  */
-async function computeWorktreeWorkProduct(workspacePath: string, baseRef: string, taskId: string): Promise<import("./adjudication/index.js").WorkProduct> {
+export async function computeWorktreeWorkProduct(workspacePath: string, baseRef: string, taskId: string): Promise<import("./adjudication/index.js").WorkProduct> {
   const git: GitRunner = async (args, opts) =>
     execFileSync("git", ["-C", workspacePath, ...args], {
       encoding: "utf8",
@@ -259,7 +259,25 @@ async function computeWorktreeWorkProduct(workspacePath: string, baseRef: string
       maxBuffer: 32 * 1024 * 1024,
       env: opts?.env !== undefined ? { ...process.env, ...opts.env } : process.env,
     });
-  return computeWorkProduct(git, { baseRef, tempIndexPath: join(tmpdir(), `ikbi-adj-${taskId}.index`) });
+  // The index is a per-computation resource. taskId is a correlation label, not
+  // an execution identity: it can be reused by concurrent runs and repositories.
+  const tempDir = mkdtempSync(join(tmpdir(), "ikbi-adj-"));
+  const tempIndexPath = join(tempDir, "index");
+  try {
+    return await computeWorkProduct(git, { baseRef, tempIndexPath });
+  } finally {
+    // rmSync removes the index, any Git-created index.lock, and the unique
+    // directory. Cleanup is deliberately best-effort: it must not replace a
+    // computed product or mask the primary Git error.
+    try {
+      rmSync(tempDir, { recursive: true, force: true });
+    } catch (cleanupErr) {
+      log.warn(
+        { taskId, workspacePath, tempDir, error: cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr) },
+        "adjudication temporary index cleanup failed",
+      );
+    }
+  }
 }
 
 /**
