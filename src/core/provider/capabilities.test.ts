@@ -21,7 +21,7 @@ test("getCapabilities resolves a known model id exactly", () => {
 
 test("getCapabilities resolves an unknown member of a known family by pattern", () => {
   const c = getCapabilities("deepseek-reasoner-lite-v9");
-  assert.equal(c.supports_tools, false, "the reasoner family is non-tool");
+  assert.equal(c.supports_tools, true, "DeepSeek V4+ reasoner family supports tools");
   assert.equal(c.reasoning_level, "high");
 });
 

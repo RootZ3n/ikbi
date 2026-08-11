@@ -62,8 +62,12 @@ export const FALLBACK_CAPABILITIES: ModelCapabilities = Object.freeze({
 const KNOWN_CAPABILITIES: Readonly<Record<string, ModelCapabilities>> = Object.freeze({
   "mimo-v2.5": { context_window: 32_768, supports_tools: true, reasoning_level: "medium", speed_class: "fast" },
   "mimo-v2.5-pro": { context_window: 65_536, supports_tools: true, reasoning_level: "high", speed_class: "medium" },
-  "deepseek-chat": { context_window: 65_536, supports_tools: true, reasoning_level: "medium", speed_class: "medium" },
-  "deepseek-reasoner": { context_window: 65_536, supports_tools: false, reasoning_level: "high", speed_class: "slow" },
+  // Legacy DeepSeek V3 model IDs (now aliased to V4 Flash on DeepSeek's API).
+  "deepseek-chat": { context_window: 1_048_576, supports_tools: true, reasoning_level: "medium", speed_class: "medium" },
+  "deepseek-reasoner": { context_window: 1_048_576, supports_tools: true, reasoning_level: "high", speed_class: "slow" },
+  // DeepSeek V4 — 1M context, 384K max output, tool-calling, thinking mode.
+  "deepseek-v4-flash": { context_window: 1_048_576, supports_tools: true, reasoning_level: "medium", speed_class: "fast" },
+  "deepseek-v4-pro": { context_window: 1_048_576, supports_tools: true, reasoning_level: "high", speed_class: "medium" },
   "MiniMax-M1": { context_window: 131_072, supports_tools: true, reasoning_level: "high", speed_class: "medium" },
 });
 
@@ -71,8 +75,10 @@ const KNOWN_CAPABILITIES: Readonly<Record<string, ModelCapabilities>> = Object.f
 const FAMILY_PATTERNS: ReadonlyArray<{ readonly match: RegExp; readonly caps: ModelCapabilities }> = [
   { match: /mimo.*pro/i, caps: { context_window: 65_536, supports_tools: true, reasoning_level: "high", speed_class: "medium" } },
   { match: /mimo/i, caps: { context_window: 32_768, supports_tools: true, reasoning_level: "medium", speed_class: "fast" } },
-  { match: /deepseek.*(reason|r1)/i, caps: { context_window: 65_536, supports_tools: false, reasoning_level: "high", speed_class: "slow" } },
-  { match: /deepseek/i, caps: { context_window: 65_536, supports_tools: true, reasoning_level: "medium", speed_class: "medium" } },
+  { match: /deepseek.*v4.*(flash)/i, caps: { context_window: 1_048_576, supports_tools: true, reasoning_level: "medium", speed_class: "fast" } },
+  { match: /deepseek.*v4/i, caps: { context_window: 1_048_576, supports_tools: true, reasoning_level: "high", speed_class: "medium" } },
+  { match: /deepseek.*(reason|r1)/i, caps: { context_window: 1_048_576, supports_tools: true, reasoning_level: "high", speed_class: "slow" } },
+  { match: /deepseek/i, caps: { context_window: 1_048_576, supports_tools: true, reasoning_level: "medium", speed_class: "medium" } },
   // `o[134]` is ANCHORED (\bo[134]\b): unanchored, it matched "o1/o3/o4" as a substring of any id
   // (e.g. a custom "yolo3-*") and mis-profiled it as a 128k OpenAI reasoning model.
   { match: /gpt-4o|gpt-4\.1|\bo[134]\b/i, caps: { context_window: 128_000, supports_tools: true, reasoning_level: "high", speed_class: "medium" } },
