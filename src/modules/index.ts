@@ -67,6 +67,8 @@ import "./batch-planner/index.js";
 import "./capability-recovery/index.js";
 // Trust operator CLI (registers the `trust` grant/status command — the cold-start on-ramp).
 import "./trust/index.js";
+// Profiles — named model-strategy profiles (registers the `profile` command).
+import "./profiles/index.js";
 // Self-repair — ikbi watching itself: read-only health checks that file work orders to
 // the shared queue. Library-only at import (no command/route); its operator surface is
 // `ikbi doctor --self-repair`, wired in src/cli/index.ts.
