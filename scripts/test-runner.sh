@@ -60,6 +60,7 @@ done <<< "$doctor_shell"
 
 GIT_SUITES=(
   "src/acceptance/verifier-target.test.ts"
+  "src/v2/runtime/workspace-authority.test.ts"
   "src/modules/worker-model/checks-nonjs.test.ts"
   "src/modules/worker-model/critic-recovery-conformance.test.ts"
   "src/modules/worker-model/invocation-ledger-conformance.test.ts"
@@ -83,6 +84,7 @@ SUBPROCESS_SUITES=(
   "src/v2/cli/inventory-truth.test.ts"
   "src/v2/cli/context-truth.test.ts"
   "src/v2/cli/invocation-truth.test.ts"
+  "src/v2/cli/workspace-truth.test.ts"
 )
 LOCALHOST_SUITES=("src/server/tasks.test.ts")
 

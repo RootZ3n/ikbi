@@ -22,7 +22,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,6 +30,7 @@ import { after, test } from "node:test";
 
 import type { V2RunResult } from "../core/result.js";
 import { loopbackEgressEnv, startFakeOpenAIProvider } from "./fake-provider-server.js";
+import { initGitRepo } from "./fixture-repo.js";
 
 const ENTRY = fileURLToPath(new URL("../../../dist/cli/index.js", import.meta.url));
 
@@ -68,13 +69,15 @@ function makeStateRoot(roster: unknown = ROSTER): string {
 
 /** A git repository carrying the three markers. */
 function makeRepo(over: Partial<Record<"agents" | "widget" | "unrelated", string>> = {}): string {
-  const repo = mkdtempSync(join(tmpdir(), "ikbi-v2-ctxrepo-"));
+  // A REAL git repository with everything COMMITTED: V2-006 allocates a worktree from
+  // HEAD and re-observes the context artifact there, so an uncommitted file would be
+  // (correctly) reported as drift.
+  const repo = initGitRepo({
+    "AGENTS.md": over.agents ?? `# conventions\n${MARKER_A}\n`,
+    "src/widget.ts": over.widget ?? `export const widget = "${MARKER_B}";\n`,
+    "src/unrelated.ts": over.unrelated ?? `export const other = "${MARKER_C}";\n`,
+  });
   repos.push(repo);
-  mkdirSync(join(repo, ".git"), { recursive: true });
-  mkdirSync(join(repo, "src"), { recursive: true });
-  writeFileSync(join(repo, "AGENTS.md"), over.agents ?? `# conventions\n${MARKER_A}\n`);
-  writeFileSync(join(repo, "src/widget.ts"), over.widget ?? `export const widget = "${MARKER_B}";\n`);
-  writeFileSync(join(repo, "src/unrelated.ts"), over.unrelated ?? `export const other = "${MARKER_C}";\n`);
   return repo;
 }
 
@@ -288,7 +291,7 @@ test("context truth: exactly ONE package, exactly one invocation, and nothing wr
   assert.equal(result.receipt.evidence.invocations, 1);
   assert.equal(result.receipt.evidence.candidatesCreated, 0);
   assert.equal(result.receipt.evidence.repositoryMutated, false);
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "invocation"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "invocation", "candidate_strategy"]);
   assert.equal(spawnSync("git", ["status", "--porcelain"], { cwd: repo, encoding: "utf8" }).stdout, before.stdout, "the repo is untouched");
 });
 

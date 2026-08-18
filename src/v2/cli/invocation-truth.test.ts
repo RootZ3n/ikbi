@@ -29,6 +29,7 @@ import { after, test } from "node:test";
 
 import type { V2RunResult } from "../core/result.js";
 import { loopbackEgressEnv, startFakeOpenAIProvider, type FakeProviderOptions, type FakeProviderServer } from "./fake-provider-server.js";
+import { initGitRepo, writeFiles } from "./fixture-repo.js";
 
 const ENTRY = fileURLToPath(new URL("../../../dist/cli/index.js", import.meta.url));
 
@@ -82,12 +83,9 @@ function makeStateRoot(server: FakeProviderServer): string {
 }
 
 function makeRepo(): string {
-  const repo = mkdtempSync(join(tmpdir(), "ikbi-v2-invrepo-"));
+  // A REAL git repository, fully committed — the canonical path now allocates a worktree.
+  const repo = initGitRepo({ "AGENTS.md": `# conventions\n${MARKER}\n`, "src/widget.ts": "export const widget = 1;\n" });
   dirs.push(repo);
-  mkdirSync(join(repo, ".git"), { recursive: true });
-  mkdirSync(join(repo, "src"), { recursive: true });
-  writeFileSync(join(repo, "AGENTS.md"), `# conventions\n${MARKER}\n`);
-  writeFileSync(join(repo, "src/widget.ts"), "export const widget = 1;\n");
   return repo;
 }
 
@@ -318,7 +316,7 @@ test("invocation truth: nothing is built, verified or written", async () => {
   const before = spawnSync("git", ["status", "--porcelain"], { cwd: repo, encoding: "utf8" }).stdout;
   const { result } = v2Run(server, root, repo);
   const e = result.receipt.evidence;
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "invocation"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "invocation", "candidate_strategy"]);
   assert.equal(e.providerInvoked, true);
   assert.equal(e.invocations, 1);
   assert.equal(e.candidatesCreated, 0, "no candidate was created");
@@ -326,7 +324,7 @@ test("invocation truth: nothing is built, verified or written", async () => {
   assert.equal(e.promoted, false);
   assert.equal(e.repositoryMutated, false);
   assert.ok(result.outcome.kind === "failed");
-  assert.equal(result.outcome.failure.detail?.missingStage, "candidate_strategy");
+  assert.equal(result.outcome.failure.detail?.missingStage, "candidate_generation");
   assert.equal(spawnSync("git", ["status", "--porcelain"], { cwd: repo, encoding: "utf8" }).stdout, before, "the repo is untouched");
 });
 
@@ -335,7 +333,7 @@ test("invocation truth: context is not reread — only the package's artifacts t
   const root = makeStateRoot(server);
   const repo = makeRepo();
   // A file the goal does not name and no source offers must not appear on the wire.
-  writeFileSync(join(repo, "src/unrelated.ts"), "export const secretish = 'NEVER-SENT-MARKER';\n");
+  writeFiles(repo, { "src/unrelated.ts": "export const secretish = 'NEVER-SENT-MARKER';\n" });
   activate(server, root, "prof-a");
   v2Run(server, root, repo);
   const body = (await server.received()).flatMap((r) => r.messages.map((m) => m.content)).join("\n");

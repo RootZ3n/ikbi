@@ -26,6 +26,9 @@ import type { ContextSource } from "../core/context.js";
 import type { InvocationTransport } from "../core/invocation.js";
 import { PRODUCTION_CONTEXT_SOURCES } from "./context-sources.js";
 import { createInvocationTransport } from "./invocation-transport.js";
+import { createProductionWorkspaceAuthorities } from "./workspace-authority.js";
+import type { StateBoundMutationAuthority, WorkspaceAuthority } from "../core/workspace.js";
+import { createIdFactory } from "../core/identity.js";
 import type { V2TaskRequest } from "../core/contract.js";
 import { buildCanonicalCatalog } from "./model-catalog.js";
 import { capabilityFacts } from "./provider-inventory.js";
@@ -119,7 +122,23 @@ export interface ProductionRunDeps {
   readonly configuration?: ConfigurationSource;
   readonly contextSources?: readonly ContextSource[];
   readonly transport?: InvocationTransport;
+  readonly workspaces?: WorkspaceAuthority;
+  readonly mutations?: StateBoundMutationAuthority;
   readonly probe?: RepoProbe;
+}
+
+/**
+ * THE production workspace + state-bound mutation authorities, over v1's workspace
+ * manager singleton. Imported dynamically for the same reason the provider registry is:
+ * the module constructs durable stores at load.
+ *
+ * Both authorities are built together and share one handle table — a mutation cannot be
+ * performed in a workspace this process did not allocate.
+ */
+async function productionWorkspaceAuthorities(): Promise<{ workspaces: WorkspaceAuthority; mutations: StateBoundMutationAuthority }> {
+  const { workspaces: manager } = await import("../../core/workspace/index.js");
+  const ids = createIdFactory();
+  return createProductionWorkspaceAuthorities({ manager, mintWorkspaceId: () => ids.mint("workspace") });
 }
 
 /**
@@ -141,7 +160,13 @@ export function productionTransport(): InvocationTransport {
 
 /** THE production entry every v2 surface uses. One wiring, one configuration truth. */
 export async function runV2BuildProduction(request: V2TaskRequest, deps: ProductionRunDeps = {}): Promise<V2RunResult> {
+  const wired =
+    deps.workspaces !== undefined && deps.mutations !== undefined
+      ? { workspaces: deps.workspaces, mutations: deps.mutations }
+      : await productionWorkspaceAuthorities();
   return runV2Build(request, {
+    workspaces: deps.workspaces ?? wired.workspaces,
+    mutations: deps.mutations ?? wired.mutations,
     configuration: deps.configuration ?? createConfigurationSource(),
     contextSources: deps.contextSources ?? PRODUCTION_CONTEXT_SOURCES,
     transport: deps.transport ?? productionTransport(),

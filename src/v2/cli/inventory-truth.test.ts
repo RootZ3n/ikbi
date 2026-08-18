@@ -30,9 +30,16 @@ import { after, test } from "node:test";
 
 import type { V2RunResult } from "../core/result.js";
 import { loopbackEgressEnv, startFakeOpenAIProvider } from "./fake-provider-server.js";
+import { initGitRepo } from "./fixture-repo.js";
 
 const ENTRY = fileURLToPath(new URL("../../../dist/cli/index.js", import.meta.url));
-const REPO = fileURLToPath(new URL("../../../", import.meta.url));
+/**
+ * A small COMMITTED fixture repository. V2-006 allocates a worktree from HEAD and
+ * re-observes a context artifact there, so pointing these suites at the ikbi checkout
+ * would make them fail whenever the operator has an uncommitted CLAUDE.md — a real
+ * behavior, but not what these suites are about.
+ */
+const REPO = initGitRepo({ "AGENTS.md": "# fixture conventions\nBe terse.\n", "src/widget.ts": "export const widget = 1;\n" });
 
 /** A dummy credential. Never sent anywhere; only its PRESENCE is ever read. */
 const OPENAI_KEY = "sk-test-INVENTORYTRUTHNEVERPRINTTHIS";

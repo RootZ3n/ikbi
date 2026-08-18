@@ -28,9 +28,16 @@ import { after, test } from "node:test";
 
 import type { V2RunResult } from "../core/result.js";
 import { loopbackEgressEnv, startFakeOpenAIProvider } from "./fake-provider-server.js";
+import { initGitRepo } from "./fixture-repo.js";
 
 const ENTRY = fileURLToPath(new URL("../../../dist/cli/index.js", import.meta.url));
-const REPO = fileURLToPath(new URL("../../../", import.meta.url));
+/**
+ * A small COMMITTED fixture repository. V2-006 allocates a worktree from HEAD and
+ * re-observes a context artifact there, so pointing these suites at the ikbi checkout
+ * would make them fail whenever the operator has an uncommitted CLAUDE.md — a real
+ * behavior, but not what these suites are about.
+ */
+const REPO = initGitRepo({ "AGENTS.md": "# fixture conventions\nBe terse.\n", "src/widget.ts": "export const widget = 1;\n" });
 
 /** A key that must never appear in any v2 output. Planted in a provider AND a profile. */
 const PLANTED_SECRET = "sk-live-V2SHOULDNEVERPRINTTHIS";
@@ -253,14 +260,14 @@ test("config truth: configuration, resolution, context and invocation all really
   const root = makeStateRoot();
   assert.equal(runCli(root, ["profile", "use", "prof-alpha"]).status, 0);
   const { result } = v2Run(root);
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "invocation"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "invocation", "candidate_strategy"]);
   assert.equal(result.receipt.evidence.configurationResolved, true);
   assert.equal(result.receipt.evidence.modelResolutionCompleted, true, "a route was authorized");
   assert.equal(result.receipt.evidence.contextAssemblyCompleted, true, "context was assembled");
   assert.equal(result.receipt.evidence.providerInvoked, true, "and the authorized route was really called");
   assert.equal(result.receipt.evidence.invocations, 1);
   assert.ok(result.outcome.kind === "failed");
-  assert.equal(result.outcome.failure.detail?.missingStage, "candidate_strategy", "the next unimplemented stage");
+  assert.equal(result.outcome.failure.detail?.missingStage, "candidate_generation", "the next unimplemented stage");
 });
 
 test("config truth: configuration never mutates state — the pointer and repo are untouched", () => {

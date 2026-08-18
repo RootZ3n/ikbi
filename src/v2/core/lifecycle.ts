@@ -46,6 +46,8 @@ import type {
   V2CandidateId,
   V2ContextDigest,
   V2DecisionDigest,
+  V2MutationDigest,
+  V2ObservationDigest,
   V2InvocationId,
   V2PolicyDigest,
   V2PromotionId,
@@ -137,6 +139,9 @@ export type LifecycleEvidence =
   | { readonly kind: "resolution"; readonly decisionId: V2DecisionDigest; readonly role: string }
   | { readonly kind: "context"; readonly packageId: V2ContextDigest; readonly artifacts: number }
   | { readonly kind: "invocation"; readonly id: V2InvocationId; readonly role: string }
+  | { readonly kind: "workspace"; readonly id: V2WorkspaceId; readonly baseTree: string }
+  | { readonly kind: "observation"; readonly id: V2ObservationDigest; readonly workspaceId: V2WorkspaceId; readonly path: string }
+  | { readonly kind: "mutation"; readonly id: V2MutationDigest; readonly workspaceId: V2WorkspaceId; readonly path: string }
   | { readonly kind: "candidate"; readonly id: V2CandidateId; readonly workspaceId: V2WorkspaceId }
   | { readonly kind: "verification"; readonly id: V2VerificationId; readonly candidateId: V2CandidateId }
   | {
@@ -160,6 +165,13 @@ const EVIDENCE_STAGE: Record<LifecycleEvidence["kind"], readonly LifecycleStage[
   // qualification stage; when the builder loop arrives, `candidate_generation` will
   // legitimately invoke too and joins this list — deliberately, not by default.
   invocation: ["invocation"],
+  // A workspace is allocated by the stage that decides WHERE a candidate would be
+  // produced. Observations may be taken there and, later, while a candidate is built.
+  workspace: ["candidate_strategy"],
+  observation: ["candidate_strategy", "candidate_generation"],
+  // A MUTATION can only happen where a candidate is actually produced. No earlier stage
+  // may write, which is why the qualification path cannot claim a repository change.
+  mutation: ["candidate_generation"],
   candidate: ["candidate_generation"],
   verification: ["verification"],
   promotion: ["promotion"],
@@ -179,6 +191,8 @@ const STAGE_REQUIRES: Partial<Record<LifecycleStage, LifecycleEvidence["kind"]>>
   // A candidate is produced BY a model, so a route must have been proven invocable
   // before any strategy starts producing them.
   candidate_strategy: "invocation",
+  // Nothing may be built without an isolated workspace to build it in.
+  candidate_generation: "workspace",
   // Nothing to verify without at least one candidate. (One OR MANY — see contract.ts.)
   verification: "candidate",
   // Nothing to promote without a verdict from the canonical verification authority.
@@ -190,6 +204,9 @@ export interface RunLedgerView {
   readonly configurations: readonly V2PolicyDigest[];
   readonly resolutions: readonly V2DecisionDigest[];
   readonly contexts: readonly V2ContextDigest[];
+  readonly workspaces: readonly V2WorkspaceId[];
+  readonly observations: readonly V2ObservationDigest[];
+  readonly mutations: readonly V2MutationDigest[];
   readonly invocations: readonly V2InvocationId[];
   readonly candidates: readonly V2CandidateId[];
   readonly verifications: readonly V2VerificationId[];
@@ -295,6 +312,9 @@ export class RunLifecycle {
       configurations: this.evidence.filter((e) => e.kind === "configuration").map((e) => e.policyId),
       resolutions: this.evidence.filter((e) => e.kind === "resolution").map((e) => e.decisionId),
       contexts: this.evidence.filter((e) => e.kind === "context").map((e) => e.packageId),
+      workspaces: this.evidence.filter((e) => e.kind === "workspace").map((e) => e.id),
+      observations: this.evidence.filter((e) => e.kind === "observation").map((e) => e.id),
+      mutations: this.evidence.filter((e) => e.kind === "mutation").map((e) => e.id),
       invocations: this.evidence.filter((e) => e.kind === "invocation").map((e) => e.id),
       candidates: this.evidence.filter((e) => e.kind === "candidate").map((e) => e.id),
       verifications: this.evidence.filter((e) => e.kind === "verification").map((e) => e.id),

@@ -13,6 +13,8 @@ import { test } from "node:test";
 import type { ConfigurationSource } from "./config.js";
 import type { ContextSource } from "./context.js";
 import type { InvocationTransport } from "./invocation.js";
+import type { StateBoundMutationAuthority, V2WorkspaceRecord, WorkspaceAuthority } from "./workspace.js";
+import { observationDigest } from "./workspace.js";
 import { V2_001_FAILURE_CODES } from "./failure.js";
 import { createSequentialIdFactory, isV2Id } from "./identity.js";
 import { LIFECYCLE_STAGES } from "./lifecycle.js";
@@ -92,14 +94,77 @@ function fakeTransport(over: { servedModelId?: string | null; attempts?: number 
   return { transport, sent };
 }
 
+/**
+ * In-memory workspace + mutation authorities. These tests are about the SPINE; the real
+ * authorities have their own integration suite against real git worktrees.
+ */
+function fakeWorkspaces(over: { discardFails?: boolean } = {}) {
+  const allocated: V2WorkspaceRecord[] = [];
+  const dispositions: string[] = [];
+  const authority: WorkspaceAuthority = {
+    allocate: async ({ runId, repoPath }) => {
+      const workspace: V2WorkspaceRecord = {
+        workspaceId: `ws_fake-${allocated.length + 1}0000000` as V2WorkspaceRecord["workspaceId"],
+        runId,
+        donorWorkspaceId: `donor-${allocated.length + 1}`,
+        source: { repositoryPath: repoPath, baseBranch: "main", baseCommit: "c".repeat(40), baseTree: "t".repeat(40) },
+        path: `/scratch/${allocated.length + 1}`,
+        status: "allocated",
+        allocatedAt: 1,
+      };
+      allocated.push(workspace);
+      return { ok: true, workspace };
+    },
+    discard: async () => {
+      dispositions.push("discard");
+      return over.discardFails === true
+        ? { kind: "failed", attempted: "discard", detail: "worktree busy" }
+        : { kind: "discarded" };
+    },
+    retain: async (_r, reason) => {
+      dispositions.push("retain");
+      return { kind: "retained", reason };
+    },
+  };
+  return { authority, allocated, dispositions };
+}
+
+/** An observation authority whose observed hash is configurable, to exercise drift. */
+function fakeMutations(sha: string | undefined = undefined) {
+  const observed: string[] = [];
+  const authority: StateBoundMutationAuthority = {
+    observe: async ({ runId, workspace, path }) => {
+      observed.push(path);
+      const state = { kind: "regular" as const, contentSha256: sha ?? "matching", byteLength: 3, symlinkTarget: null };
+      return {
+        ok: true,
+        observation: {
+          observationId: observationDigest({ workspaceId: workspace.workspaceId, path, state }),
+          runId,
+          workspaceId: workspace.workspaceId,
+          path,
+          state,
+          observedAt: 1,
+        },
+      };
+    },
+    mutate: async () => {
+      throw new Error("the production skeleton must never mutate");
+    },
+  };
+  return { authority, observed };
+}
+
 function deps(
   probe: RepoProbe,
   configuration: ConfigurationSource = workingConfiguration,
   contextSources: readonly ContextSource[] = noSources,
   transport: InvocationTransport = fakeTransport().transport,
+  workspaces: WorkspaceAuthority = fakeWorkspaces().authority,
+  mutations: StateBoundMutationAuthority = fakeMutations().authority,
 ) {
   let tick = 0;
-  return { ids: createSequentialIdFactory("run"), now: () => (tick += 1), probe, configuration, contextSources, transport };
+  return { ids: createSequentialIdFactory("run"), now: () => (tick += 1), probe, configuration, contextSources, transport, workspaces, mutations };
 }
 
 test("run: a valid request mints task + run identities and enters the lifecycle", async () => {
@@ -107,7 +172,7 @@ test("run: a valid request mints task + run identities and enters the lifecycle"
   assert.ok(isV2Id("task", result.taskId));
   assert.ok(isV2Id("run", result.runId));
   assert.ok(isV2Id("receipt", result.receipt.receiptId));
-  assert.deepEqual([...result.receipt.stagesEntered], ["preflight", "model_resolution", "context", "invocation"]);
+  assert.deepEqual([...result.receipt.stagesEntered], ["preflight", "model_resolution", "context", "invocation", "candidate_strategy"]);
   assert.equal(result.journal[0]?.from, "pending");
   assert.equal(result.journal[0]?.to, "preflight");
   assert.equal(result.journal.at(-1)?.to, "terminal");
@@ -133,6 +198,8 @@ test("run: NO FAKE SUCCESS — the receipt reports exactly what happened, counte
   assert.equal(e.contextPackages, 1, "exactly one package");
   assert.equal(e.providerInvoked, true, "V2-005: a model IS invoked now");
   assert.equal(e.invocations, 1, "exactly one");
+  assert.equal(e.workspacesAllocated, 1, "V2-006: one isolated workspace");
+  assert.equal(e.mutationsApplied, 0, "and NOTHING was written");
   assert.equal(e.candidatesCreated, 0, "no candidate was created");
   assert.equal(e.verificationsPerformed, 0, "nothing was verified");
   assert.equal(e.promotionsAttempted, 0);
@@ -142,7 +209,7 @@ test("run: NO FAKE SUCCESS — the receipt reports exactly what happened, counte
 
 test("run: the skeleton never claims to have reached a stage it did not run", async () => {
   const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo));
-  const implemented = new Set<string>(["preflight", "model_resolution", "context", IMPLEMENTED_THROUGH_STAGE]);
+  const implemented = new Set<string>(["preflight", "model_resolution", "context", "invocation", IMPLEMENTED_THROUGH_STAGE]);
   for (const stage of LIFECYCLE_STAGES) {
     if (implemented.has(stage)) continue;
     assert.equal(result.receipt.stagesEntered.includes(stage), false, `"${stage}" was never entered`);
@@ -299,8 +366,124 @@ test("run: a not_implemented stop is a non-zero exit — it is not success", asy
 test("run: the real (unstubbed) probe accepts THIS repository and still refuses to build", async () => {
   // Uses the production RepoProbe against ikbi's own checkout: proves the default
   // path is wired, and that even a perfectly good repo yields no build in this slice.
-  const result = await runV2Build({ goal: "inspect ikbi itself", repoPath: process.cwd() }, { configuration: workingConfiguration, contextSources: noSources, transport: fakeTransport().transport });
+  const result = await runV2Build(
+    { goal: "inspect ikbi itself", repoPath: process.cwd() },
+    { configuration: workingConfiguration, contextSources: noSources, transport: fakeTransport().transport, workspaces: fakeWorkspaces().authority, mutations: fakeMutations().authority },
+  );
   assert.ok(result.outcome.kind === "failed");
   assert.equal(result.outcome.failure.category, "not_implemented");
   assert.equal(result.receipt.evidence.repositoryMutated, false);
+});
+
+// ── workspace strategy (V2-006) ─────────────────────────────────────────────
+
+test("run: exactly ONE workspace is allocated, bound to the run and the source tree", async () => {
+  const ws = fakeWorkspaces();
+  const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo, workingConfiguration, noSources, fakeTransport().transport, ws.authority));
+  assert.equal(ws.allocated.length, 1, "the SINGLE strategy allocates one workspace");
+  assert.equal(ws.allocated[0]?.runId, result.runId);
+  assert.equal(result.receipt.workspace?.baseTree, "t".repeat(40), "the exact source tree is recorded");
+  assert.equal(result.receipt.workspace?.baseCommit, "c".repeat(40));
+});
+
+test("run: the workspace is DISCARDED at the normal stop — nothing was produced", async () => {
+  const ws = fakeWorkspaces();
+  const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo, workingConfiguration, noSources, fakeTransport().transport, ws.authority));
+  assert.deepEqual(ws.dispositions, ["discard"]);
+  assert.equal(result.receipt.workspace?.disposition, "discarded");
+});
+
+test("run: a cleanup that FAILS is reported as failed, never as if it worked", async () => {
+  const ws = fakeWorkspaces({ discardFails: true });
+  const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo, workingConfiguration, noSources, fakeTransport().transport, ws.authority));
+  assert.equal(result.receipt.workspace?.disposition, "failed");
+  assert.match(result.receipt.workspace?.dispositionDetail ?? "", /discard failed: worktree busy/);
+});
+
+test("run: a context artifact is RE-OBSERVED in the workspace before it could be trusted", async () => {
+  const source: ContextSource = {
+    id: "fixture",
+    collect: async () => ({
+      candidates: [
+        {
+          category: "target_file",
+          sourceId: "fixture",
+          path: "src/widget.ts",
+          origin: "repository",
+          content: "abc",
+          originalBytes: 3,
+          truncated: false,
+          observedSha256: "matching",
+          reason: "the goal names this file",
+        },
+      ],
+      omissions: [],
+    }),
+  };
+  const mut = fakeMutations("matching");
+  const result = await runV2Build(
+    { goal: "edit src/widget.ts", repoPath: "/repo" },
+    deps(goodRepo, workingConfiguration, [source], fakeTransport().transport, fakeWorkspaces().authority, mut.authority),
+  );
+  assert.deepEqual(mut.observed, ["src/widget.ts"], "the artifact a builder would edit");
+  assert.equal(result.receipt.evidence.observationsTaken, 1);
+  assert.equal(result.receipt.workspace?.observations, 1);
+  assert.ok(result.outcome.kind === "failed");
+  assert.equal(result.outcome.failure.category, "not_implemented", "and the run stops normally");
+});
+
+test("run: workspace bytes that DIFFER from the context artifact fail — context is not rebuilt", async () => {
+  const source: ContextSource = {
+    id: "fixture",
+    collect: async () => ({
+      candidates: [
+        {
+          category: "target_file",
+          sourceId: "fixture",
+          path: "src/widget.ts",
+          origin: "repository",
+          content: "abc",
+          originalBytes: 3,
+          truncated: false,
+          observedSha256: "what-the-model-saw",
+          reason: "the goal names this file",
+        },
+      ],
+      omissions: [],
+    }),
+  };
+  const result = await runV2Build(
+    { goal: "edit src/widget.ts", repoPath: "/repo" },
+    deps(goodRepo, workingConfiguration, [source], fakeTransport().transport, fakeWorkspaces().authority, fakeMutations("what-is-actually-there").authority),
+  );
+  assert.ok(result.outcome.kind === "failed");
+  assert.equal(result.outcome.failure.category, "mutation");
+  assert.equal(result.outcome.failure.code, "workspace.context_artifact_drift");
+  assert.equal(result.outcome.failure.detail?.contextSha256, "what-the-model-saw");
+  assert.equal(result.outcome.failure.detail?.workspaceSha256, "what-is-actually-there");
+});
+
+test("run: a package with no rebindable artifact yields ZERO observations, not a probe file", async () => {
+  const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo));
+  assert.equal(result.receipt.evidence.observationsTaken, 0, "nothing was invented to look at");
+  assert.equal(result.receipt.workspace?.observations, 0);
+});
+
+test("run: the workspace is cleaned up even when the run FAILS", async () => {
+  const ws = fakeWorkspaces();
+  const drifting: ContextSource = {
+    id: "fixture",
+    collect: async () => ({
+      candidates: [
+        { category: "target_file", sourceId: "fixture", path: "a.ts", origin: "repository", content: "a", originalBytes: 1, truncated: false, observedSha256: "one", reason: "r" },
+      ],
+      omissions: [],
+    }),
+  };
+  const result = await runV2Build(
+    { goal: "edit a.ts", repoPath: "/repo" },
+    deps(goodRepo, workingConfiguration, [drifting], fakeTransport().transport, ws.authority, fakeMutations("two").authority),
+  );
+  assert.ok(result.outcome.kind === "failed");
+  assert.deepEqual(ws.dispositions, ["discard"], "an allocated workspace never outlives its run");
 });

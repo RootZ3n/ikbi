@@ -23,9 +23,17 @@ import { after, test } from "node:test";
 
 import type { V2RunResult } from "../core/result.js";
 import { loopbackEgressEnv, startFakeOpenAIProvider } from "./fake-provider-server.js";
+import { initGitRepo } from "./fixture-repo.js";
 
 const ENTRY = fileURLToPath(new URL("../../../dist/cli/index.js", import.meta.url));
-const REPO = fileURLToPath(new URL("../../../", import.meta.url));
+const IKBI_REPO = fileURLToPath(new URL("../../../", import.meta.url));
+/**
+ * A small COMMITTED fixture repository. V2-006 allocates a worktree from HEAD and
+ * re-observes a context artifact there, so pointing these suites at the ikbi checkout
+ * would make them fail whenever the operator has an uncommitted CLAUDE.md — a real
+ * behavior, but not what these suites are about.
+ */
+const REPO = initGitRepo({ "AGENTS.md": "# fixture conventions\nBe terse.\n", "src/widget.ts": "export const widget = 1;\n" });
 
 /**
  * An isolated state root carrying a minimal, keyless roster. Isolation matters twice
@@ -98,7 +106,7 @@ test("v2 cli: `ikbi v2 build` reaches the canonical v2 lifecycle end-to-end", ()
   assert.equal(result.journal[0]?.from, "pending");
   assert.equal(result.journal[0]?.to, "preflight");
   assert.equal(result.journal.at(-1)?.to, "terminal");
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "invocation"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "invocation", "candidate_strategy"]);
 });
 
 test("v2 cli: the end-to-end run claims NOTHING it did not do", () => {
@@ -117,6 +125,10 @@ test("v2 cli: the end-to-end run claims NOTHING it did not do", () => {
     // V2-005: a real HTTP call to a protocol-faithful local provider really happened.
     providerInvoked: true,
     invocations: 1,
+    // V2-006: one isolated workspace was allocated — and nothing was written in it.
+    workspacesAllocated: 1,
+    observationsTaken: 1,
+    mutationsApplied: 0,
     candidatesCreated: 0,
     verificationsPerformed: 0,
     promotionsAttempted: 0,
@@ -125,12 +137,15 @@ test("v2 cli: the end-to-end run claims NOTHING it did not do", () => {
   });
 });
 
-test("v2 cli: it is safe to point at a real repository — nothing is written", () => {
-  const before = spawnSync("git", ["status", "--porcelain"], { cwd: REPO, encoding: "utf8" }).stdout;
-  const head = spawnSync("git", ["rev-parse", "HEAD"], { cwd: REPO, encoding: "utf8" }).stdout;
-  runCli(["v2", "build", "rewrite the world", "--repo", REPO]);
-  assert.equal(spawnSync("git", ["status", "--porcelain"], { cwd: REPO, encoding: "utf8" }).stdout, before, "working tree unchanged");
-  assert.equal(spawnSync("git", ["rev-parse", "HEAD"], { cwd: REPO, encoding: "utf8" }).stdout, head, "HEAD unchanged");
+test("v2 cli: it is safe to point at THIS repository — nothing is written", () => {
+  // Deliberately the real ikbi checkout: whatever the run decides to do, the source
+  // repository must be byte-identical afterwards. This holds even if the run stops early
+  // (e.g. a locally-modified instruction file is correctly reported as context drift).
+  const before = spawnSync("git", ["status", "--porcelain"], { cwd: IKBI_REPO, encoding: "utf8" }).stdout;
+  const head = spawnSync("git", ["rev-parse", "HEAD"], { cwd: IKBI_REPO, encoding: "utf8" }).stdout;
+  runCli(["v2", "build", "rewrite the world", "--repo", IKBI_REPO]);
+  assert.equal(spawnSync("git", ["status", "--porcelain"], { cwd: IKBI_REPO, encoding: "utf8" }).stdout, before, "working tree unchanged");
+  assert.equal(spawnSync("git", ["rev-parse", "HEAD"], { cwd: IKBI_REPO, encoding: "utf8" }).stdout, head, "HEAD unchanged");
 });
 
 test("v2 cli: shadow and tournament strategies are accepted by the spine", () => {

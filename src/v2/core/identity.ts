@@ -152,6 +152,10 @@ export type V2ContextDigest = V2Digest<"context">;
 export type V2ArtifactDigest = V2Digest<"artifact">;
 /** Digest of the exact model input placed on the wire. */
 export type V2PromptDigest = V2Digest<"prompt">;
+/** Digest of one exact observation of workspace file state. */
+export type V2ObservationDigest = V2Digest<"observation">;
+/** Digest of one applied mutation. */
+export type V2MutationDigest = V2Digest<"mutation">;
 
 /**
  * Canonical JSON: object keys sorted, `undefined` dropped, array ORDER PRESERVED

@@ -3,7 +3,8 @@
 Produced during **V2-001** (canonical lifecycle foundation) and updated by **V2-002**
 (provider + profile configuration boundary), **V2-003** (single model-resolution
 authority), **V2-003A** (provider inventory truth) **V2-004** (canonical context
-authority) and **V2-005** (canonical model invocation authority). This is an **advisory input to future work
+authority) **V2-005** (canonical model invocation authority) and **V2-006** (workspace + state-bound
+mutation authority). This is an **advisory input to future work
 orders**, not a change plan and not permission to delete anything. Nothing in v1 was
 removed, disabled, or altered to produce it.
 
@@ -104,6 +105,21 @@ project-retrieval output reaches the builder prompt directly.**
 | Streaming (`invokeStream`, SSE) | **YES** — the builder loop | incremental deltas | **PARK** — this slice makes one complete request. Streaming belongs with the conversation loop. |
 | Circuit breakers | **YES** — inside `ProviderInvoker` | per-route failure suppression | **PARK** — a recovery concern, and inseparable from the routing it guards. |
 
+## Workspace + mutation systems *(V2-006)*
+
+| v1 system | Production reachability | Verdict |
+| --- | --- | --- |
+| `WorkspaceManager.allocate` | **YES** — every build | **ADOPT** — cross-process allocation lock, bound enforcement, pid-owned records, crash reaping. v2 adds a run binding and the exact base COMMIT+TREE (a branch name is not a binding). |
+| `WorkspaceManager.discard` / `retain` | **YES** | **ADOPT** — v2 wraps both so a cleanup that does not finish is reported `failed`, never silently as if it had. |
+| `WorkspaceManager.promote` (ref-level CAS `update-ref`) | **YES** | **PARK — not called by v2.** Genuinely careful, and still parked: promotion is its own authority in a later slice, and reaching for it here would create the second promote path v2 exists to prevent. A static guard fails the build on `.promote(` anywhere in v2. |
+| Crash-durable intent (`allocating`/`promoting`, `ownerPid`, SIGINT/SIGTERM retain) | **YES** | **ADOPT as-is** — v2 inherits it by using the donor manager. v2 adds only that its own runs discard on the normal stop. |
+| `file-state.ts` `observeFileState` | **YES** | **ADOPT** — opens with `O_NOFOLLOW`, hashes exact bytes, distinguishes missing/empty/regular/directory/symlink, and re-stats through the descriptor. Exactly the observation v2 needs. |
+| `mutation.ts` (the state-bound CORE) | **YES** — managed candidates | **ADOPT — the strongest donor in the codebase.** Observations live in the core's PRIVATE table (a caller cannot alter the expected bytes); `apply` takes a cross-process lock, re-reads, and compares raw byte identity before writing; writes go through `atomicWriteFile`; paths are normalized, the root re-`realpath`ed, and every existing parent component checked for symlinks. v2 adds a run binding, a workspace-scoped content-addressed observation id, and structured failures. |
+| `mutation-session.ts` | **YES** — builder/chat text tools | **PARK** — a useful session/observation-cache layer over the core, but v2's authority is the core itself. Migrate when a builder needs session-scoped observation reuse. |
+| `repair-plan.ts` | **YES** — repair paths | **PARK** — already state-bound (it consumes `STALE_MUTATION`); belongs to the recovery slice. |
+| Builder/chat mutation integration (`tool-executor.ts`) | **YES** | **REFINE** — routes managed-candidate text tools through the session, and `builder.ts:977` states plainly that "an isolated candidate must never fall back to the old direct writer". The routing is right; in v2 it becomes "tools receive the mutation authority, never `fs`". |
+| **Raw write paths** — `builder-tools/patch.ts:90`, `multi-edit.ts:108`, `delegate.ts:186`, `confine.ts:92`, `agent-tools/notebook-tools.ts:291` | **YES**, for NON-candidate worktrees | **REPLACE for v2 (preserve for v1).** The finding of this recon: these are confined but **not state-bound** — they `writeFileSync` after a path check, with no observation and no compare-and-swap. They are the reason "the donor machinery is wired" cannot be assumed globally. v2 has no equivalent, and a static guard fails the build if any v2 file performs a filesystem write outside the workspace adapter. |
+
 ## Standing constraints for later slices
 
 1. **No second promote path.** Any strategy that wants to promote must do it by
@@ -136,5 +152,10 @@ project-retrieval output reaches the builder prompt directly.**
    and records what actually served it. No fallback, no retry, no second resolution. The
    four identities — requested, authorized, sent, served — are never collapsed, and
    `served` is only ever read from the provider's own response.
-9. **Nothing is "done" because it exists.** A migrated subsystem is done when a test
+9. **One workspace authority, one mutation authority.** *(V2-006)* No component creates
+   its own worktree, and nothing writes a file except through `mutate`, which requires an
+   OBSERVATION rather than a path. Observations are workspace-scoped: identical bytes in a
+   sibling candidate are not identical authority. A stale observation is refused — never
+   merged, overwritten, silently re-observed or retried.
+10. **Nothing is "done" because it exists.** A migrated subsystem is done when a test
    enters through the canonical v2 entrypoint and proves the subsystem is what ran.

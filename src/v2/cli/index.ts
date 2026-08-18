@@ -23,6 +23,7 @@ import { writeStdout, writeStderr } from "../../cli/io.js";
 import type { ConfigurationSource } from "../core/config.js";
 import type { ContextSource } from "../core/context.js";
 import type { InvocationTransport } from "../core/invocation.js";
+import type { StateBoundMutationAuthority, WorkspaceAuthority } from "../core/workspace.js";
 import { CANDIDATE_STRATEGIES } from "../core/contract.js";
 import { exitCodeForOutcome, formatOutcome, type V2RunResult } from "../core/result.js";
 import { runV2BuildProduction } from "../runtime/index.js";
@@ -78,6 +79,20 @@ export function parseV2Args(argv: readonly string[], cwd: string): V2Args {
   };
 }
 
+/**
+ * The isolated workspace. Rendered as the exact source state it was cut from, what was
+ * observed there, and how it ended — including a cleanup that did not finish.
+ */
+function workspaceLines(result: V2RunResult): string[] {
+  const w = result.receipt.workspace;
+  if (w === undefined) return [];
+  return [
+    `workspace   ${w.workspaceId} (donor ${w.donorWorkspaceId}) · ${w.observations} observation(s) · ${w.disposition}` +
+      (w.dispositionDetail !== undefined ? ` — ${w.dispositionDetail}` : ""),
+    `source      ${w.baseBranch} @ ${w.baseCommit.slice(0, 12)} · tree ${w.baseTree.slice(0, 12)}`,
+  ];
+}
+
 /** Human rendering of a run. Every line is derived from the result — nothing is asserted. */
 export function renderRun(result: V2RunResult): string {
   const e = result.receipt.evidence;
@@ -90,6 +105,7 @@ export function renderRun(result: V2RunResult): string {
     ...resolutionLines(result),
     ...contextLines(result),
     ...invocationLines(result),
+    ...workspaceLines(result),
     `outcome     ${formatOutcome(result.outcome)}`,
     "evidence    " +
       `provider_invoked=${e.providerInvoked} candidates=${e.candidatesCreated} ` +
@@ -196,6 +212,8 @@ export async function runV2Cli(
     readonly configuration?: ConfigurationSource;
     readonly contextSources?: readonly ContextSource[];
     readonly transport?: InvocationTransport;
+    readonly workspaces?: WorkspaceAuthority;
+    readonly mutations?: StateBoundMutationAuthority;
   } = {},
 ): Promise<number> {
   const out = io.stdout ?? writeStdout;
@@ -220,6 +238,8 @@ export async function runV2Cli(
       ...(io.configuration !== undefined ? { configuration: io.configuration } : {}),
       ...(io.contextSources !== undefined ? { contextSources: io.contextSources } : {}),
       ...(io.transport !== undefined ? { transport: io.transport } : {}),
+      ...(io.workspaces !== undefined ? { workspaces: io.workspaces } : {}),
+      ...(io.mutations !== undefined ? { mutations: io.mutations } : {}),
     },
   );
   out(args.json ? `${JSON.stringify(result, null, 2)}\n` : renderRun(result));

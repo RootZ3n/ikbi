@@ -17,6 +17,7 @@ import { test } from "node:test";
 import { commands } from "../../cli/registry.js";
 import type { ConfigurationSource } from "../core/config.js";
 import type { InvocationTransport } from "../core/invocation.js";
+import type { StateBoundMutationAuthority, V2WorkspaceRecord, WorkspaceAuthority } from "../core/workspace.js";
 import { LIFECYCLE_STAGES } from "../core/lifecycle.js";
 import type { V2RunResult } from "../core/result.js";
 import { FIRST_UNIMPLEMENTED_STAGE } from "../core/run.js";
@@ -55,6 +56,33 @@ const fakeTransport: InvocationTransport = {
   }),
 };
 
+/** Hermetic workspace + mutation authorities: no git, no filesystem, no worktree. */
+const fakeWorkspaces: WorkspaceAuthority = {
+  allocate: async ({ runId, repoPath }) => ({
+    ok: true,
+    workspace: {
+      workspaceId: "ws_reach-00000001" as V2WorkspaceRecord["workspaceId"],
+      runId,
+      donorWorkspaceId: "donor-reach",
+      source: { repositoryPath: repoPath, baseBranch: "main", baseCommit: "c".repeat(40), baseTree: "t".repeat(40) },
+      path: "/scratch/reach",
+      status: "allocated",
+      allocatedAt: 1,
+    },
+  }),
+  discard: async () => ({ kind: "discarded" }),
+  retain: async (_r, reason) => ({ kind: "retained", reason }),
+};
+
+const fakeMutations: StateBoundMutationAuthority = {
+  observe: async () => {
+    throw new Error("no context artifact exists in these tests, so nothing should be observed");
+  },
+  mutate: async () => {
+    throw new Error("the production skeleton must never mutate");
+  },
+};
+
 function capture() {
   let out = "";
   let err = "";
@@ -67,6 +95,8 @@ function capture() {
     // stay about CLI dispatch rather than about this repository's files.
     contextSources: [] as const,
     transport: fakeTransport,
+    workspaces: fakeWorkspaces,
+    mutations: fakeMutations,
     get out() {
       return out;
     },
@@ -98,7 +128,7 @@ test("reachability: the command body enters the canonical lifecycle and reports 
   const cap = capture();
   const code = await runV2Cli(["build", "add", "a", "thing"], cap);
   assert.equal(cap.err, V2_BANNER, "the experimental banner goes to stderr, not stdout");
-  assert.match(cap.out, /stages\s+preflight -> model_resolution -> context -> invocation$/m, "the run walked the whole implemented spine");
+  assert.match(cap.out, /stages\s+preflight -> model_resolution -> context -> invocation -> candidate_strategy$/m, "the run walked the whole implemented spine");
   assert.match(cap.out, /not implemented/, "and said so truthfully");
   assert.notEqual(code, 0, "an unimplemented lifecycle is not a success");
 });
@@ -112,7 +142,7 @@ test("reachability: the JSON surface carries the lifecycle journal + a counted r
   assert.equal(result.journal[0]?.from, "pending");
   assert.equal(result.journal[0]?.to, "preflight");
   assert.equal(result.journal.at(-1)?.to, "terminal");
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "invocation"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "invocation", "candidate_strategy"]);
   assert.equal(result.outcome.kind, "failed");
   assert.deepEqual(result.receipt.evidence, {
     // Configuration (V2-002) and route authorization (V2-003) happen — and nothing else.
@@ -123,6 +153,9 @@ test("reachability: the JSON surface carries the lifecycle journal + a counted r
     contextPackages: 1,
     providerInvoked: true,
     invocations: 1,
+    workspacesAllocated: 1,
+    observationsTaken: 0,
+    mutationsApplied: 0,
     candidatesCreated: 0,
     verificationsPerformed: 0,
     promotionsAttempted: 0,
@@ -136,7 +169,7 @@ test("reachability: the CLI never claims a stage it did not run", async () => {
   await runV2Cli(["build", "x", "--json"], cap);
   const result = JSON.parse(cap.out) as V2RunResult;
   for (const stage of LIFECYCLE_STAGES) {
-    if (stage === "preflight" || stage === "model_resolution" || stage === "context" || stage === "invocation") continue;
+    if (stage === "preflight" || stage === "model_resolution" || stage === "context" || stage === "invocation" || stage === "candidate_strategy") continue;
     assert.equal(result.receipt.stagesEntered.includes(stage), false, `never entered ${stage}`);
   }
   assert.ok(result.outcome.kind === "failed");

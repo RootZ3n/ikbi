@@ -22,8 +22,13 @@
  *   7. enter `invocation` and ask THE invocation authority to call EXACTLY that route,
  *      once, recording what was authorized, what was sent, and what the provider says
  *      actually served it
- *   8. STOP, because `candidate_strategy` (the next stage) has no implementation
- *   9. terminalize as `failed` with category `not_implemented`, and emit a receipt
+ *   8. enter `candidate_strategy`: choose the SINGLE strategy, allocate ONE isolated
+ *      workspace bound to the exact source commit and tree, and RE-OBSERVE the context
+ *      artifact it would edit through the state-bound authority — proving the bytes the
+ *      model saw are the bytes that are actually there
+ *   9. discard the workspace (nothing was produced) and STOP, because
+ *      `candidate_generation` has no implementation
+ *  10. terminalize as `failed` with category `not_implemented`, and emit a receipt
  *      whose evidence block is counted from the ledger: zero invocations, zero
  *      candidates, zero verifications, not promoted, repository not mutated
  *
@@ -53,6 +58,14 @@ import {
 } from "./resolver.js";
 import { assembleContext, manifestOf, type ContextPackage, type ContextSource } from "./context.js";
 import {
+  V2_WORKSPACE_FAILURE_CODES,
+  workspaceFailure,
+  type StateBoundMutationAuthority,
+  type V2WorkspaceRecord,
+  type WorkspaceAuthority,
+  type WorkspaceDisposition,
+} from "./workspace.js";
+import {
   invokeAuthorized,
   type InvocationTransport,
   type ServedModelAlias,
@@ -67,6 +80,7 @@ import {
   summarizeEvidence,
   summarizeInvocation,
   summarizeResolution,
+  summarizeWorkspace,
   type V2RunReceipt,
   type V2RunResult,
   type RunTerminalOutcome,
@@ -101,11 +115,27 @@ export const QUALIFICATION_MAX_OUTPUT_TOKENS = 128;
 /** Per-attempt timeout. One attempt; no retry follows it. */
 export const QUALIFICATION_TIMEOUT_MS = 60_000;
 
+/**
+ * The context artifact whose workspace copy is re-observed.
+ *
+ * A real, already-authorized artifact — never a probe file invented to have something to
+ * look at. A goal-named target file is preferred (it is what a builder would edit first);
+ * a repository instruction file is the fallback; and a package with neither yields no
+ * observation at all, which the receipt then truthfully counts as zero.
+ */
+export function rebindableArtifact(pkg: ContextPackage): { path: string; observedSha256: string } | undefined {
+  const chosen =
+    pkg.artifacts.find((a) => a.category === "target_file" && a.path !== undefined) ??
+    pkg.artifacts.find((a) => a.category === "repository_instructions" && a.path !== undefined);
+  if (chosen?.path === undefined) return undefined;
+  return { path: chosen.path, observedSha256: chosen.observedSha256 };
+}
+
 /** The furthest stage this build of ikbi implements. */
-export const IMPLEMENTED_THROUGH_STAGE: LifecycleStage = "invocation";
+export const IMPLEMENTED_THROUGH_STAGE: LifecycleStage = "candidate_strategy";
 
 /** The stage the run would need next, and does not have. */
-export const FIRST_UNIMPLEMENTED_STAGE: LifecycleStage = "candidate_strategy";
+export const FIRST_UNIMPLEMENTED_STAGE: LifecycleStage = "candidate_generation";
 
 /** Upper bound on a goal, so an accidental file paste is rejected as input, not as a build. */
 export const MAX_GOAL_LENGTH = 8000;
@@ -161,6 +191,12 @@ export interface V2RunDeps {
   readonly transport: InvocationTransport;
   /** Declared served-model alias relations. Defaults to the (empty) production table. */
   readonly aliases?: readonly ServedModelAlias[];
+  /**
+   * The workspace and state-bound mutation authorities. REQUIRED and injected, like the
+   * others: they perform I/O, and this layer imports no v1 code.
+   */
+  readonly workspaces: WorkspaceAuthority;
+  readonly mutations: StateBoundMutationAuthority;
   readonly ids?: V2IdFactory;
   readonly now?: () => number;
   readonly probe?: RepoProbe;
@@ -287,6 +323,9 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
   let decision: ModelResolutionDecision | undefined;
   let contextPackage: ContextPackage | undefined;
   let invocation: V2InvocationRecord | undefined;
+  let workspace: V2WorkspaceRecord | undefined;
+  let workspaceObservations = 0;
+  let disposition: WorkspaceDisposition | undefined;
 
   const failure = await (async (): Promise<RunFailure> => {
     const checked = preflight(request, probe);
@@ -365,10 +404,59 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     invocation = called.record;
     lifecycle.record(runId, { kind: "invocation", id: invocationId, role: decision.role });
 
-    // The route is proven invocable and attributable. The next stage does not exist in
+    // Stage 5 — CANDIDATE STRATEGY. "Where and how would a candidate be produced?" For
+    // the SINGLE strategy that is one isolated workspace. A workspace is not a candidate:
+    // allocating one produces nothing, and this run will produce nothing.
+    lifecycle.enter(runId, "candidate_strategy");
+    const allocated = await deps.workspaces.allocate({ runId, repoPath: task.repoPath, label: `v2-${DEMONSTRATED_ROLE}` });
+    if (!allocated.ok) return allocated.failure;
+    workspace = allocated.workspace;
+    lifecycle.record(runId, { kind: "workspace", id: workspace.workspaceId, baseTree: workspace.source.baseTree });
+
+    // RE-OBSERVE. The context package was assembled from the TARGET REPOSITORY before any
+    // workspace existed; the workspace is a worktree at the base commit. Those are not
+    // guaranteed to agree — an uncommitted change in the source repo is exactly the case
+    // where they do not. So the bytes the model saw are checked against the bytes that
+    // are actually here, through the same authority any future edit must use.
+    const anchor = rebindableArtifact(contextPackage);
+    if (anchor !== undefined) {
+      const observed = await deps.mutations.observe({ runId, workspace, path: anchor.path });
+      if (!observed.ok) return observed.failure;
+      workspaceObservations += 1;
+      lifecycle.record(runId, {
+        kind: "observation",
+        id: observed.observation.observationId,
+        workspaceId: workspace.workspaceId,
+        path: observed.observation.path,
+      });
+      if (observed.observation.state.contentSha256 !== anchor.observedSha256) {
+        // Do NOT silently rebuild context. Re-contextualization is a recovery decision,
+        // and pretending the model saw what is on disk would make every downstream
+        // state-bound edit rest on a lie.
+        return workspaceFailure({
+          code: V2_WORKSPACE_FAILURE_CODES.contextDrift,
+          message:
+            `the workspace copy of ${anchor.path} does not match the bytes the context package recorded ` +
+            `— the model was shown a state this workspace does not have`,
+          detail: {
+            path: anchor.path,
+            workspaceId: workspace.workspaceId,
+            contextSha256: anchor.observedSha256,
+            workspaceSha256: observed.observation.state.contentSha256 ?? "none",
+          },
+        });
+      }
+    }
+
+    // Nothing was produced, so nothing is worth keeping. The next stage does not exist in
     // this build, so the run stops here and says so.
     return stageNotImplemented(FIRST_UNIMPLEMENTED_STAGE, IMPLEMENTED_THROUGH_STAGE);
   })();
+
+  // CLEANUP runs whatever the outcome — an allocated workspace must not outlive the run
+  // that owns it just because the run failed. A cleanup that does not finish is reported
+  // as `failed`, never silently as if it had.
+  if (workspace !== undefined) disposition = await deps.workspaces.discard(workspace);
 
   const outcome: RunTerminalOutcome = { kind: "failed", failure };
   lifecycle.terminalize(runId, outcome);
@@ -385,6 +473,9 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     ...(decision !== undefined ? { resolution: summarizeResolution(decision) } : {}),
     ...(contextPackage !== undefined ? { context: summarizeContext(contextPackage) } : {}),
     ...(invocation !== undefined ? { invocation: summarizeInvocation(invocation) } : {}),
+    ...(workspace !== undefined && disposition !== undefined
+      ? { workspace: summarizeWorkspace({ workspace, observations: workspaceObservations, disposition }) }
+      : {}),
     startedAt,
     endedAt,
   };

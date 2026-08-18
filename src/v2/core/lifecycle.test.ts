@@ -31,6 +31,8 @@ const DECISION = "1".repeat(64) as V2DecisionDigest;
 const CONTEXT = "2".repeat(64) as V2ContextDigest;
 /** A stand-in invocation id. Invocation identity is the invocation suite's concern. */
 const INVOCATION = ids.mint("invocation");
+/** A stand-in workspace id. Workspace identity is the workspace suite's concern. */
+const WORKSPACE = ids.mint("workspace");
 
 function fresh() {
   const ids = createSequentialIdFactory("lc");
@@ -60,6 +62,8 @@ function walkTo(target: LifecycleStage) {
     // V2-005: `candidate_strategy` REQUIRES a proven invocation — a candidate is
     // produced BY a model, so a route must have been shown to be invocable.
     if (stage === "invocation") lifecycle.record(runId, { kind: "invocation", id: INVOCATION, role: "builder" });
+    // V2-006: `candidate_generation` REQUIRES an isolated workspace to build in.
+    if (stage === "candidate_strategy") lifecycle.record(runId, { kind: "workspace", id: WORKSPACE, baseTree: "t" });
     if (stage === "candidate_generation") lifecycle.record(runId, { kind: "candidate", id: candidateId, workspaceId });
     if (stage === "verification") lifecycle.record(runId, { kind: "verification", id: verificationId, candidateId });
     if (stage === "promotion") lifecycle.record(runId, { kind: "promotion", id: promotionId, candidateId, verificationId });
@@ -150,9 +154,9 @@ test("lifecycle: VERIFICATION cannot be entered before a candidate exists", () =
   lifecycle.record(runId, { kind: "context", packageId: CONTEXT, artifacts: 3 });
   lifecycle.enter(runId, "invocation");
   lifecycle.record(runId, { kind: "invocation", id: INVOCATION, role: "builder" });
-  for (const stage of ["candidate_strategy", "candidate_generation"] as const) {
-    lifecycle.enter(runId, stage);
-  }
+  lifecycle.enter(runId, "candidate_strategy");
+  lifecycle.record(runId, { kind: "workspace", id: WORKSPACE, baseTree: "t" });
+  lifecycle.enter(runId, "candidate_generation");
   // candidate_generation ran but produced nothing — there is nothing to verify.
   assert.equal(violation(() => lifecycle.enter(runId, "verification")), "missing_required_evidence");
 });
@@ -486,4 +490,47 @@ test("lifecycle: a recorded invocation is counted, and it is a real call", () =>
   assert.equal(summary.providerInvoked, true, "for the first time in v2, this IS true");
   assert.equal(summary.invocations, 1);
   assert.equal(summary.candidatesCreated, 0, "and still nothing was built");
+});
+
+// ── workspace precondition (V2-006) ─────────────────────────────────────────
+
+test("lifecycle: CANDIDATE_GENERATION cannot be entered without a workspace", () => {
+  const { lifecycle, runId } = walkTo("invocation");
+  lifecycle.enter(runId, "candidate_strategy");
+  assert.equal(violation(() => lifecycle.enter(runId, "candidate_generation")), "missing_required_evidence");
+});
+
+test("lifecycle: a workspace is CANDIDATE_STRATEGY's to record and no one else's", () => {
+  const { lifecycle, runId } = walkTo("invocation");
+  assert.equal(
+    violation(() => lifecycle.record(runId, { kind: "workspace", id: WORKSPACE, baseTree: "t" })),
+    "stage_not_permitted_for_evidence",
+    "invocation may not allocate a workspace",
+  );
+});
+
+test("lifecycle: a MUTATION may only be recorded where a candidate is produced", () => {
+  const { lifecycle, runId } = walkTo("invocation");
+  lifecycle.enter(runId, "candidate_strategy");
+  lifecycle.record(runId, { kind: "workspace", id: WORKSPACE, baseTree: "t" });
+  // Observations are permitted here; writes are NOT.
+  lifecycle.record(runId, { kind: "observation", id: "o".repeat(64) as never, workspaceId: WORKSPACE, path: "a.ts" });
+  assert.equal(
+    violation(() => lifecycle.record(runId, { kind: "mutation", id: "m".repeat(64) as never, workspaceId: WORKSPACE, path: "a.ts" })),
+    "stage_not_permitted_for_evidence",
+    "the strategy stage observes; it does not write",
+  );
+});
+
+test("lifecycle: workspace/observation/mutation counts are counted, not assumed", () => {
+  const { lifecycle, runId } = walkTo("invocation");
+  lifecycle.enter(runId, "candidate_strategy");
+  lifecycle.record(runId, { kind: "workspace", id: WORKSPACE, baseTree: "t" });
+  lifecycle.record(runId, { kind: "observation", id: "o".repeat(64) as never, workspaceId: WORKSPACE, path: "a.ts" });
+  lifecycle.terminalize(runId, { kind: "rejected", reason: "aborted" });
+  const summary = summarizeEvidence(lifecycle.ledger, lifecycle.outcome!);
+  assert.equal(summary.workspacesAllocated, 1);
+  assert.equal(summary.observationsTaken, 1);
+  assert.equal(summary.mutationsApplied, 0, "nothing was written");
+  assert.equal(summary.repositoryMutated, false, "and the source repository is untouched");
 });

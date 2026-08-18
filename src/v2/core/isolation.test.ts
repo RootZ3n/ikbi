@@ -43,6 +43,14 @@ const V2_RUNTIME_ALLOWED_V1_IMPORTS = new Set([
   "../../core/provider/registry.js", //            ModelSpec / ModelRegistry types
   "../../core/provider/capabilities.js", //        static capability classification (V2-003)
   "../../core/provider/providers/openai-compatible.js", // the transport, for the adapter's own tests (V2-005)
+  "../../core/workspace/contract.js", //           WorkspaceHandle type (V2-006)
+  "../../core/workspace/git.js", //                reading the base tree of a new workspace
+  "../../core/workspace/index.js", //              the workspace manager singleton (dynamic)
+  "../../core/workspace/manager.js", //            WorkspaceManager type + test construction
+  "../../core/workspace/mutation.js", //           THE state-bound mutation core
+  "../../core/substrate/lock.js", //               lock manager, for the adapter's own tests
+  "../../core/substrate/store.js", //              document store, for the adapter's own tests
+  "pino", //                                       the logger the donor manager requires (tests only)
   "../../modules/profiles/contract.js", //         Profile shape + the role vocabulary
   "../../modules/profiles/storage.js", //          READ-ONLY profile loading + the active pointer
 ]);
@@ -123,6 +131,17 @@ function importSpecifiers(source: string): string[] {
 }
 
 const isBuiltin = (spec: string): boolean => spec.startsWith("node:");
+
+/**
+ * Strip comments before scanning source for forbidden CALLS.
+ *
+ * These guards look for what code DOES. A doc comment explaining that `writeFile(path,
+ * content)` deliberately does not exist is the opposite of a violation, and a guard that
+ * cannot tell the difference teaches people to stop writing the explanation.
+ */
+function stripComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/(^|[^:])\/\/[^\n]*/g, "$1 ");
+}
 
 test("isolation: the import scanner is not vacuous (it really finds imports)", () => {
   // A guard that silently matches nothing would pass every other test in this file.
@@ -239,6 +258,58 @@ test("single authority: only the resolver CHOOSES among routes or mints a decisi
   }
   assert.deepEqual(chooses, [], "walking a fallback chain for a winner belongs to src/v2/core/resolver.ts alone");
   assert.deepEqual(mints, [], "only the resolver may construct a ModelResolutionDecision");
+});
+
+test("single authority: only the workspace adapter may create a worktree or write a file", () => {
+  // The rule V2-006 exists to make structural: no v2 component writes a repository or
+  // workspace file except through the state-bound mutation authority. A `writeFileSync`
+  // or a `git worktree` anywhere else is how that would quietly stop being true.
+  const allowed = new Set([join(V2_DIR, "runtime", "workspace-authority.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    // Test fixtures legitimately create repositories and plant files to be observed.
+    if (allowed.has(file) || file.endsWith(".test.ts") || file.endsWith("fixture-repo.ts") || file.endsWith("fake-provider-server.ts")) continue;
+    const source = stripComments(readFileSync(file, "utf8"));
+    if (/\bwriteFileSync?\s*\(|\bwriteFile\s*\(|\bunlinkSync?\s*\(|\brenameSync?\s*\(|\brmSync?\s*\(/.test(source)) {
+      offenders.push(`${relative(SRC, file)} (filesystem write)`);
+    }
+    if (/["']worktree["']/.test(source)) offenders.push(`${relative(SRC, file)} (git worktree)`);
+  }
+  assert.deepEqual(offenders, [], "repository and workspace writes go through src/v2/runtime/workspace-authority.ts alone");
+});
+
+test("single authority: no v2 file uses v1 mutation SESSION primitives directly", () => {
+  // v1 has two write surfaces: the state-bound core (adopted) and a session layer plus
+  // several raw `writeFileSync` tool paths (parked). v2 uses the core and nothing else.
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    for (const spec of importSpecifiers(readFileSync(file, "utf8"))) {
+      if (/mutation-session|repair-plan|builder-tools|tool-executor/.test(spec)) offenders.push(`${relative(SRC, file)} -> ${spec}`);
+    }
+  }
+  assert.deepEqual(offenders, [], "v2 adopts the mutation CORE; the session and tool write paths are parked");
+});
+
+test("single authority: only the workspace module mints an observation or mutation identity", () => {
+  const allowed = new Set([join(V2_DIR, "core", "workspace.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    const source = stripComments(readFileSync(file, "utf8"));
+    if (/contentDigest\s*\(\s*"(observation|mutation)"/.test(source)) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "observation and mutation identity belong to src/v2/core/workspace.ts alone");
+});
+
+test("single authority: v2 never calls the donor PROMOTE path", () => {
+  // Promotion is its own authority in a later slice. Reaching for the donor's promote
+  // here would create exactly the second promote path v2 exists to prevent.
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (file.endsWith(".test.ts")) continue;
+    if (/\.promote\s*\(/.test(stripComments(readFileSync(file, "utf8")))) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "promotion is parked for its own slice");
 });
 
 test("single authority: only the transport adapter may reach a provider TRANSPORT", () => {
