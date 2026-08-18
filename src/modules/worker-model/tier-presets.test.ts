@@ -12,8 +12,8 @@ import { parseBuildArgs } from "./cli.js";
 test("tier presets: cheap = flash builder + pro critic, escalation ON to pro", () => {
   const cheap = TIER_PRESETS.cheap;
   assert.equal(cheap.tier, "cheap");
-  assert.equal(cheap.builderModel, "deepseek-v4-flash");
-  assert.equal(cheap.criticModel, "deepseek-v4-pro");
+  assert.equal(cheap.builderModel, "mimo-v2.5");
+  assert.equal(cheap.criticModel, "mimo-v2.5-pro");
   assert.equal(cheap.escalation, true, "cheap tier auto-escalates");
   assert.equal(cheap.fallbackModel, "mimo-v2.5-pro", "cheap escalates to the preferred pro (mid[0], Mimo first)");
 });

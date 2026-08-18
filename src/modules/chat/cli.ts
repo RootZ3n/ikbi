@@ -1044,7 +1044,7 @@ export function resolvePehModel(argv: readonly string[] = []): string {
   const flag = flagIdx >= 0 ? argv[flagIdx + 1] : undefined;
   if (flag !== undefined && flag.length > 0 && !flag.startsWith("--")) return flag;
   const env = process.env.IKBI_PEH_MODEL?.trim();
-  return env !== undefined && env.length > 0 ? env : "deepseek-v4-pro";
+  return env !== undefined && env.length > 0 ? env : "mimo-v2.5-pro";
 }
 
 /**

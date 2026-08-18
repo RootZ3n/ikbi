@@ -215,15 +215,15 @@ interface RecommendProfile {
 const RECOMMENDED: RecommendProfile[] = [
   {
     label: "Budget",
-    builder: "deepseek-v4-flash",
-    critic: "deepseek-v4-flash",
+    builder: "mimo-v2.5",
+    critic: "mimo-v2.5",
     caveats: "Fastest/cheapest. Good for experiments and low-stakes work. May miss complex patterns.",
   },
   {
     label: "Balanced",
-    builder: "sonnet-4.6",
-    critic: "deepseek-v4-pro",
-    fallback: "deepseek-v4-pro",
+    builder: "mimo-v2.5-pro",
+    critic: "mimo-v2.5-pro",
+    fallback: "mimo-v2.5",
     caveats: "Best quality-to-price. Recommended for daily use. Critic catches most issues.",
   },
   {

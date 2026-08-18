@@ -65,8 +65,8 @@ export interface TierPreset {
 export const TIER_PRESETS: Readonly<Record<BuildTier, TierPreset>> = Object.freeze({
   cheap: Object.freeze({
     tier: "cheap",
-    builderModel: "deepseek-v4-flash",
-    criticModel: "deepseek-v4-pro",
+    builderModel: "mimo-v2.5",
+    criticModel: "mimo-v2.5-pro",
     escalation: true,
     fallbackModel: "mimo-v2.5-pro",
     // The cheap tier is a 4-model MIXTURE OF EXPERTS: a coordinator rents the cheapest-sufficient

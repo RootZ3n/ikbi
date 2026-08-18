@@ -56,16 +56,16 @@ const RECOMMENDATIONS: Record<string, Recommendation> = {
   budget: {
     label: "Budget",
     desc: "Cheapest functional setup — good for experiments and low-stakes work",
-    builder: "deepseek-v4-flash",
-    critic: "deepseek-v4-flash",
+    builder: "mimo-v2.5",
+    critic: "mimo-v2.5",
     cost: "~$0.05/task",
   },
   balanced: {
     label: "Balanced",
     desc: "Best quality-to-price ratio — recommended for daily use",
-    builder: "sonnet-4.6",
-    critic: "deepseek-v4-pro",
-    fallback: "deepseek-v4-pro",
+    builder: "mimo-v2.5-pro",
+    critic: "mimo-v2.5-pro",
+    fallback: "mimo-v2.5",
     cost: "~$0.50/task",
   },
   quality: {

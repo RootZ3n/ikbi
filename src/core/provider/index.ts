@@ -6,7 +6,7 @@
  * with the roster file (if present) applied on top.
  */
 
-import { config } from "../config.js";
+import { config, type ProviderConfig } from "../config.js";
 import { childLogger } from "../log.js";
 import { wrapModelInvocation } from "./invoke-wrapper.js";
 import { computeCost, ProviderInvoker } from "./invoke.js";
@@ -39,6 +39,84 @@ const log = childLogger("provider");
  */
 const STUB_PROVIDER_ID = "stub";
 
+/**
+ * Provider auto-discovery: for any provider with a configured API key but no
+ * models routed to it in the registry, add a basic model spec. This makes
+ * env-key-only setups work without manually editing providers.json.
+ *
+ * The model id and provider model id are taken from the provider's canonical
+ * defaults. If the provider is already wired (has models), this is a no-op.
+ */
+function autoDiscoverProviders(reg: ModelRegistry, pc: ProviderConfig): void {
+  // Map of provider id → { modelId, role, providerModelId, cost }
+  // These are the "obvious" defaults for providers that have API keys configured.
+  const AUTO_DISCOVER: Record<string, { modelId: string; role: string; providerModelId: string; cost: CostRate }> = {
+    minimax: {
+      modelId: "minimax-m3",
+      role: "driver",
+      providerModelId: "MiniMax-M3",
+      cost: { promptPerMTok: 0.3, completionPerMTok: 1.2 },
+    },
+    openai: {
+      modelId: "gpt-4o",
+      role: "frontier",
+      providerModelId: "gpt-4o",
+      cost: { promptPerMTok: 2.5, completionPerMTok: 10.0 },
+    },
+    anthropic: {
+      modelId: "claude-sonnet-4-5",
+      role: "frontier",
+      providerModelId: "claude-sonnet-4-5",
+      cost: { promptPerMTok: 3.0, completionPerMTok: 15.0 },
+    },
+    google: {
+      modelId: "gemini-2.5-flash",
+      role: "driver",
+      providerModelId: "gemini-2.5-flash",
+      cost: { promptPerMTok: 0.15, completionPerMTok: 0.6 },
+    },
+    groq: {
+      modelId: "llama-3.3-70b",
+      role: "driver",
+      providerModelId: "llama-3.3-70b-versatile",
+      cost: { promptPerMTok: 0.05, completionPerMTok: 0.08 },
+    },
+  };
+
+  // Check which providers have API keys configured
+  const providerChecks: Array<{ id: string; hasKey: boolean }> = [
+    { id: "minimax", hasKey: pc.minimax.apiKey !== undefined },
+    { id: "openai", hasKey: pc.openai.apiKey !== undefined },
+    { id: "anthropic", hasKey: pc.anthropic.apiKey !== undefined },
+    { id: "google", hasKey: pc.google.apiKey !== undefined },
+    { id: "groq", hasKey: pc.groq.apiKey !== undefined },
+  ];
+
+  for (const { id, hasKey } of providerChecks) {
+    if (!hasKey) continue;
+    const spec = AUTO_DISCOVER[id];
+    if (spec === undefined) continue;
+
+    // Check if this model is already in the registry
+    if (reg.getModel(spec.modelId) !== undefined) continue;
+
+    // Check if the provider is registered
+    if (reg.getProvider(id) === undefined) continue;
+
+    // Auto-add the model spec
+    reg.upsertModel({
+      id: spec.modelId,
+      role: spec.role,
+      cost: spec.cost,
+      providers: [{ provider: id, providerModelId: spec.providerModelId }],
+    });
+    log.info(
+      { provider: id, model: spec.modelId, source: "auto-discovery (API key detected)" },
+      "auto-discovered provider model route",
+    );
+  }
+}
+
 /** Build the default registry: built-in roster + configured providers, then the roster file.
  *  Exported for tests that pin the built-in default routes (before any roster file overrides). */
 export function buildDefaultRegistry(): ModelRegistry {
@@ -59,15 +137,12 @@ export function buildDefaultRegistry(): ModelRegistry {
     {
       id: critic,
       role: "critic",
-      // Route the default critic / mid-tier model (deepseek-v4-pro) to the REAL DeepSeek endpoint —
-      // the same provider the deepseek-v4-flash driver uses, and the route proven to carry a large
-      // build. It is NOT routed to MiniMax: that placeholder route dead-ended EVERY --complexity-large
-      // build (the mid tier bumps the builder to this model) with `minimax=permanent_error` whenever
-      // the roster file was absent — a config-shaped footgun that failed the run before a line was
-      // written. DeepSeek is the working route and minimax is not needed here. Cost is a placeholder
-      // (the roster file overrides it with the real per-Mtok rate when present).
-      cost: { promptPerMTok: 0.5, completionPerMTok: 1.5 },
+      // MiMo is the default cheap workhorse. DeepSeek remains available as an
+      // alternate via providers.json or IKBI_MODEL_CRITIC=deepseek-v4-pro.
+      // Cost is a placeholder (the roster file overrides it with the real rate).
+      cost: { promptPerMTok: 0.435, completionPerMTok: 0.87 },
       providers: [
+        { provider: MIMO_PROVIDER_ID, providerModelId: critic },
         { provider: DEEPSEEK_PROVIDER_ID, providerModelId: critic },
       ],
     },
@@ -138,6 +213,11 @@ export function buildDefaultRegistry(): ModelRegistry {
     log.error({ err, file: pc.rosterFile }, "failed to load provider roster file");
     throw err;
   }
+
+  // Auto-discover: for any provider with a configured API key but no models
+  // routed to it, add a basic model spec. This makes env-key-only setups
+  // work without manually editing providers.json.
+  autoDiscoverProviders(reg, pc);
 
   // Silent-degradation guard: a roster model whose id matches no capability table/pattern
   // and carries no explicit override resolves to the conservative fallback (small window,

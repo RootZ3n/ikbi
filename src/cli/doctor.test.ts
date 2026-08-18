@@ -43,7 +43,7 @@ function fakeRegistry(
 const DEV_ENV = { IKBI_ALLOW_INSECURE_DEV_KEYS: "true" } as const;
 
 /** The default role models (loadConfig defaults) both resolve to a roster-declared provider. */
-const resolvingRegistry = (): DoctorRegistry => fakeRegistry({ "mimo-v2.5": ["mimo"], "deepseek-v4-pro": ["deepseek"] }, ["mimo", "deepseek"]);
+const resolvingRegistry = (): DoctorRegistry => fakeRegistry({ "mimo-v2.5": ["mimo"], "mimo-v2.5-pro": ["mimo"] }, ["mimo"]);
 /** Nothing resolves (no models / no registered providers). */
 const emptyRegistry = (): DoctorRegistry => fakeRegistry({}, []);
 
@@ -96,7 +96,7 @@ test("doctor REPORTS MISSING required settings and ends NOT ready (cold start)",
   assert.match(text, /✗ IKBI_WORKER_MODEL_ENABLED/);
   assert.match(text, /export IKBI_WORKER_MODEL_ENABLED=true/);
   assert.match(text, /✗ IKBI_GOVERNED_EXEC_ALLOWLIST/);
-  assert.match(text, /✗ the driver model 'mimo-v2.5' and builder model 'mimo-v2.5' and critic model 'deepseek-v4-pro' aren't usable \(no registered provider\)/);
+  assert.match(text, /✗ the driver model 'mimo-v2.5' and builder model 'mimo-v2.5' and critic model 'mimo-v2.5-pro' aren't usable \(no registered provider\)/);
   assert.match(text, /NOT ready — 5 required settings missing/);
 });
 
@@ -106,16 +106,16 @@ test("ROSTER PROVIDER SEEN: role models resolving via a roster provider (no env 
   const r = runDoctor(
     readyInputs({
       config: loadConfig({ IKBI_OPERATOR_TOKEN: "op-strong-value-here", IKBI_WORKER_TOKEN: "worker-strong-value-here", IKBI_TRUST_HMAC_KEY: "h", IKBI_IDENTITY_TOKEN_SALT: "s" }),
-      registry: fakeRegistry({ "mimo-v2.5": ["mimo", "deepseek"], "deepseek-v4-pro": ["deepseek"] }, ["mimo", "deepseek"]),
+      registry: fakeRegistry({ "mimo-v2.5": ["mimo"], "mimo-v2.5-pro": ["mimo"] }, ["mimo"]),
     }),
   );
   const text = r.lines.join("\n");
-  assert.match(text, /✓ provider — all role models resolve to a usable provider \(driver 'mimo-v2.5', builder 'mimo-v2.5', critic 'deepseek-v4-pro'\)/);
+  assert.match(text, /✓ provider — all role models resolve to a usable provider \(driver 'mimo-v2.5', builder 'mimo-v2.5', critic 'mimo-v2.5-pro'\)/);
   assert.equal(r.ready, true, "a roster setup that just ran a build is correctly reported ready");
 });
 
 test("BUILT-IN KEY STILL WORKS: models resolving via a built-in keyed provider ⇒ ✓ (regression)", () => {
-  const r = runDoctor(readyInputs({ registry: fakeRegistry({ "mimo-v2.5": ["mimo"], "deepseek-v4-pro": ["deepseek"] }, ["mimo", "openrouter", "deepseek"]) }));
+  const r = runDoctor(readyInputs({ registry: fakeRegistry({ "mimo-v2.5": ["mimo"], "mimo-v2.5-pro": ["mimo"] }, ["mimo", "openrouter"]) }));
   assert.match(r.lines.join("\n"), /✓ provider — all role models resolve to a usable provider/);
   assert.equal(r.ready, true);
 });
@@ -124,7 +124,7 @@ test("UNRESOLVABLE MODEL FLAGGED: a driver model with no registered provider ⇒
   const r = runDoctor(
     readyInputs({
       // driver model declared but its provider isn't registered; critic resolves.
-      registry: fakeRegistry({ "mimo-v2.5": ["ghost"], "deepseek-v4-pro": ["deepseek"] }, ["mimo", "deepseek"]),
+      registry: fakeRegistry({ "mimo-v2.5": ["ghost"], "mimo-v2.5-pro": ["mimo"] }, ["mimo"]),
     }),
   );
   const text = r.lines.join("\n");
@@ -138,7 +138,7 @@ test("H1: a provider REGISTERED but with NO API KEY (ready()===false) is NOT rea
   // Here mimo is registered but unkeyed (ready false); deepseek is keyed.
   const r = runDoctor(
     readyInputs({
-      registry: fakeRegistry({ "mimo-v2.5": ["mimo"], "deepseek-v4-pro": ["deepseek"] }, ["mimo", "deepseek"], {}, ["mimo"]),
+      registry: fakeRegistry({ "mimo-v2.5": ["mimo"], "mimo-v2.5-pro": ["mimo"] }, ["mimo"], {}, ["mimo"]),
     }),
   );
   const text = r.lines.join("\n");
@@ -154,7 +154,7 @@ test("WHICH MODEL FLAGGED: driver resolves but critic doesn't ⇒ the CRITIC mod
     }),
   );
   const text = r.lines.join("\n");
-  assert.match(text, /✗ the critic model 'deepseek-v4-pro' isn't usable \(no registered provider\)/);
+  assert.match(text, /✗ the critic model 'mimo-v2.5-pro' isn't usable \(no registered provider\)/);
   assert.doesNotMatch(text, /driver model 'mimo-v2.5' (?:and|doesn't)/, "the resolving driver is NOT flagged");
   assert.equal(r.ready, false);
 });
@@ -165,7 +165,7 @@ test("INJECTABLE REGISTRY: doctor uses the fake registry passed in (not the real
   const spy: DoctorRegistry = {
     getModel: (id) => {
       getModelCalls += 1;
-      return id === "mimo-v2.5" || id === "deepseek-v4-pro" ? { id, providers: [{ provider: "p", providerModelId: id }] } : undefined;
+      return id === "mimo-v2.5" || id === "mimo-v2.5-pro" ? { id, providers: [{ provider: "p", providerModelId: id }] } : undefined;
     },
     getProvider: (id) => (id === "p" ? ({ id } as unknown as ModelProvider) : undefined),
   };
@@ -245,7 +245,7 @@ test("doctor SHOWS the competitive shootout list and resolution-CHECKS each race
     readyInputs({
       config: loadConfig({ IKBI_OPERATOR_TOKEN: "op-strong-value-here", IKBI_WORKER_TOKEN: "worker-strong-value-here", IKBI_TRUST_HMAC_KEY: "h", IKBI_IDENTITY_TOKEN_SALT: "s", IKBI_COMPETITIVE_MODELS: "mimo-v2.5, qwen3:14b" }),
       // mimo-v2.5 resolves; qwen3:14b is NOT registered → flagged.
-      registry: fakeRegistry({ "mimo-v2.5": ["mimo", "deepseek"], "deepseek-v4-pro": ["deepseek"] }, ["mimo", "deepseek"]),
+      registry: fakeRegistry({ "mimo-v2.5": ["mimo"], "mimo-v2.5-pro": ["mimo"] }, ["mimo"]),
     }),
   );
   const text = r.lines.join("\n");
@@ -259,7 +259,7 @@ test("doctor SHOWS the competitive shootout list and resolution-CHECKS each race
 test("doctor REPORTS all roster models classified when none silently degrade", () => {
   const r = runDoctor(
     readyInputs({
-      registry: fakeRegistry({ "mimo-v2.5": ["mimo"], "opus-4.8": ["anthropic"], "deepseek-v4-pro": ["deepseek"] }, ["mimo", "anthropic", "deepseek"]),
+      registry: fakeRegistry({ "mimo-v2.5": ["mimo"], "opus-4.8": ["anthropic"], "mimo-v2.5-pro": ["mimo"] }, ["mimo", "anthropic"]),
     }),
   );
   const text = r.lines.join("\n");
@@ -272,7 +272,7 @@ test("doctor FLAGS a roster model that silently degrades to the 8k/no-tools fall
   const r = runDoctor(
     readyInputs({
       // "mystery-frontier-x" matches no table/pattern and carries no override → silent 8k.
-      registry: fakeRegistry({ "mimo-v2.5": ["mimo"], "mystery-frontier-x": ["custom"], "deepseek-v4-pro": ["deepseek"] }, ["mimo", "custom", "deepseek"]),
+      registry: fakeRegistry({ "mimo-v2.5": ["mimo"], "mystery-frontier-x": ["custom"], "mimo-v2.5-pro": ["mimo"] }, ["mimo", "custom"]),
     }),
   );
   const text = r.lines.join("\n");
@@ -285,8 +285,8 @@ test("doctor does NOT flag a small local model with an explicit capabilities ove
     readyInputs({
       // An operator running a genuine small local model declares it explicitly → intentional, not flagged.
       registry: fakeRegistry(
-        { "mimo-v2.5": ["mimo"], "local-tiny": ["ollama"], "deepseek-v4-pro": ["deepseek"] },
-        ["mimo", "ollama", "deepseek"],
+        { "mimo-v2.5": ["mimo"], "local-tiny": ["ollama"], "mimo-v2.5-pro": ["mimo"] },
+        ["mimo", "ollama"],
         { "local-tiny": { context_window: 8_192, supports_tools: false } },
       ),
     }),
