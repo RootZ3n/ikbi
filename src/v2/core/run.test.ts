@@ -239,6 +239,9 @@ function deps(
     // This suite drives the SPINE, so both are hermetic — the real ones are proven in
     // `runtime/builder-tools.test.ts` and `cli/builder-truth.test.ts`.
     buildTools: () => ({ execute: async () => ({ outcome: { kind: "rejected" as const, reason: "unknown_tool" as const, detail: "no tools in this suite" } }) }),
+    // V2-007A: the boundary is required but never exercised here — this suite's fake
+    // builders finish immediately or only nudge, so no tool result carries a payload.
+    untrustedBoundary: { wrap: (i: { content: string }) => i.content },
     captureTree: async () => ({
       ok: true as const,
       tree: { treeId: "tree".repeat(10), baseTreeId: "t".repeat(40), materializedStateDigest: "m".repeat(64), changed: false },

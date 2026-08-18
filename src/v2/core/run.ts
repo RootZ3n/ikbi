@@ -60,7 +60,7 @@ import {
 } from "./resolver.js";
 import { assembleContext, manifestOf, type ContextPackage, type ContextSource } from "./context.js";
 import { candidateDigest, summarizeCandidate, type CandidateRecord, type TreeCaptureResult } from "./candidate.js";
-import { generateCandidate, type BuilderBudget, type BuilderToolExecutor, type BuilderToolExecutorDeps } from "./builder.js";
+import { generateCandidate, type BuilderBudget, type BuilderToolExecutor, type BuilderToolExecutorDeps, type UntrustedBoundary } from "./builder.js";
 import { summarizeRetrieval, type RetrievalReporter, type RetrievalSummary } from "./retrieval.js";
 import { summarizeSnapshot, type SourceSnapshotAuthority, type SourceSnapshotReader } from "./source.js";
 import {
@@ -214,6 +214,12 @@ export interface V2RunDeps {
    * shells out to git; wired once, in `src/v2/runtime/index.ts`.
    */
   readonly captureTree: (workspace: V2WorkspaceRecord) => Promise<TreeCaptureResult>;
+  /**
+   * THE untrusted-data boundary every tool result crosses on its way back to the model.
+   * REQUIRED and injected: it is v1's neutralization fence, which is I/O-adjacent and
+   * cannot live in this pure layer. Wired once, in `src/v2/runtime/index.ts`.
+   */
+  readonly untrustedBoundary: UntrustedBoundary;
   /** Bounds on the builder loop. Defaults to `DEFAULT_BUILDER_BUDGET`. */
   readonly builderBudget?: BuilderBudget;
   readonly ids?: V2IdFactory;
@@ -503,6 +509,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
       contextPackage,
       transport: deps.transport,
       executor,
+      untrustedBoundary: deps.untrustedBoundary,
       mintInvocationId: () => ids.mint("invocation"),
       ...(deps.builderBudget !== undefined ? { budget: deps.builderBudget } : {}),
       ...(deps.aliases !== undefined ? { aliases: deps.aliases } : {}),

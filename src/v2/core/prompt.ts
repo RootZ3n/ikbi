@@ -44,6 +44,12 @@ export interface RenderedMessage {
   readonly toolCalls?: readonly BuilderToolCall[];
   /** For a tool result: the id of the call it answers. */
   readonly toolCallId?: string;
+  /**
+   * STRUCTURAL ISOLATION metadata. True when the message carries repository- or
+   * tool-derived content wrapped by the untrusted-data boundary, so nothing downstream can
+   * treat it as a trusted instruction even by accident. It does not change the wire body.
+   */
+  readonly untrusted?: boolean;
 }
 
 /** The exact input placed on the wire, plus its identity. */
@@ -127,6 +133,7 @@ export function renderBuilderInput(pkg: ContextPackage, conversation: readonly R
         content: m.content,
         toolCalls: m.toolCalls?.map((c) => ({ id: c.id, name: c.name, arguments: c.arguments })),
         toolCallId: m.toolCallId,
+        untrusted: m.untrusted,
       })),
     }),
     messages,

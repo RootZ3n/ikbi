@@ -43,7 +43,7 @@ import {
   buildFailure,
   type BuilderCompletionClaim,
 } from "./candidate.js";
-import { BUILDER_TOOLS, isToolFailure, parseToolCall, renderToolOutcome, type BuilderToolCall, type ParsedToolCall, type ToolOutcome } from "./tools.js";
+import { BUILDER_TOOLS, isToolFailure, parseToolCall, renderToolProvenance, untrustedToolPayload, type BuilderToolCall, type ParsedToolCall, type ToolOutcome } from "./tools.js";
 import { renderBuilderInput, type RenderedMessage } from "./prompt.js";
 import { invokeAuthorized, type InvocationTransport, type ServedModelAlias, type V2InvocationRecord } from "./invocation.js";
 import type { ContextPackage } from "./context.js";
@@ -165,6 +165,29 @@ export type BuilderResult =
       readonly mutationIds: readonly V2MutationDigest[];
     };
 
+/**
+ * THE UNTRUSTED-DATA BOUNDARY.
+ *
+ * Repository and tool-derived content — file bytes, mutation-failure detail, rejection
+ * text, and any future search/list/terminal output — is DATA, not instruction authority.
+ * It re-enters the builder conversation through this one seam, which wraps it as
+ * structurally-isolated untrusted data so the exact tokens a model keys on (role tags,
+ * fake tool syntax, "ignore previous instructions") cannot act as commands.
+ *
+ * It is INJECTED because `core/builder.ts` is pure: the real implementation
+ * (`runtime/untrusted-boundary.ts`) is v1's verified-absent-nonce neutralization fence,
+ * which is I/O-adjacent (it logs and reads config). The controller holds a function, never
+ * the machinery — the same discipline as the transport and the tool executor.
+ *
+ * CONTRACT: `wrap` is LOSSLESS for `source: "repo"` (source code survives byte-for-byte and
+ * stays recoverable) and returns a string that a model cannot use to close its own
+ * wrapper. It never rewrites the bytes a hash was computed over — the hash is in the
+ * trusted provenance, outside the wrapped region.
+ */
+export interface UntrustedBoundary {
+  wrap(input: { readonly content: string; readonly source: "repo" | "tool_result"; readonly origin?: string }): string;
+}
+
 export interface BuilderRunInput {
   readonly runId: V2RunId;
   readonly taskId: V2TaskId;
@@ -172,6 +195,12 @@ export interface BuilderRunInput {
   readonly contextPackage: ContextPackage;
   readonly transport: InvocationTransport;
   readonly executor: BuilderToolExecutor;
+  /**
+   * THE one boundary every tool result crosses on its way back to the model. Required:
+   * there is no un-neutralized path, and a default here would have to live in this pure
+   * layer where the real fence cannot.
+   */
+  readonly untrustedBoundary: UntrustedBoundary;
   /** Mints one fresh invocation id per turn. */
   readonly mintInvocationId: () => V2InvocationId;
   readonly budget?: BuilderBudget;
@@ -284,7 +313,7 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
         // A MALFORMED CALL IS A TOOL FAILURE, NOT A CRASH. The model is told precisely
         // what was wrong and may correct itself; the loop stays bounded either way.
         toolFailures += 1;
-        appendToolResult(conversation, call, { kind: "rejected", reason: parsed.reason, detail: parsed.detail });
+        appendToolResult(conversation, input.untrustedBoundary, call, { kind: "rejected", reason: parsed.reason, detail: parsed.detail });
         continue;
       }
 
@@ -293,7 +322,7 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
           summary: parsed.summary.slice(0, MAX_COMPLETION_SUMMARY_CHARS),
           believesComplete: parsed.believesComplete,
         };
-        appendToolResult(conversation, call, { kind: "finished", summary: finished.summary, believesComplete: finished.believesComplete });
+        appendToolResult(conversation, input.untrustedBoundary, call, { kind: "finished", summary: finished.summary, believesComplete: finished.believesComplete });
         // Stop dispatching this round: anything the model queued after declaring itself
         // done is work it has already said it does not need.
         break;
@@ -314,7 +343,7 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
           );
         }
       }
-      appendToolResult(conversation, call, executed.outcome);
+      appendToolResult(conversation, input.untrustedBoundary, call, executed.outcome);
     }
 
     if (finished !== undefined) {
@@ -346,12 +375,41 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
 }
 
 /**
- * Append exactly what a tool did, bound to the call it answers.
+ * THE ONE CHOKEPOINT. Append exactly what a tool did, bound to the call it answers.
  *
- * The only path from a tool result into the conversation. Repository content re-enters
- * the model here and nowhere else, which is what makes that boundary one place a future
- * neutralization pass can be added rather than a dozen.
+ * The only path from a tool result into the conversation. It composes each message from
+ * two parts kept deliberately apart:
+ *
+ *   TRUSTED PROVENANCE  — ikbi-authored structured facts (tool, path, ids, hashes). The
+ *                         model relies on these; the observationId it quotes back lives
+ *                         here, outside the fence.
+ *   UNTRUSTED PAYLOAD   — repository/tool-derived free text (file bytes, failure detail),
+ *                         wrapped by the injected boundary as isolated untrusted data.
+ *
+ * A message that carries a wrapped payload is marked `untrusted`, so it can never be read
+ * as a system/assistant instruction even structurally. A pure acknowledgement (an applied
+ * write, a missing-file read, a finish) has no payload and is plain provenance.
+ *
+ * The observed content hash is unchanged by any of this: it was computed by the mutation
+ * authority over the real bytes and sits in the provenance, not over the wrapper.
  */
-function appendToolResult(conversation: RenderedMessage[], call: BuilderToolCall, outcome: ToolOutcome): void {
-  conversation.push({ role: "tool", toolCallId: call.id, content: renderToolOutcome(outcome) });
+function appendToolResult(
+  conversation: RenderedMessage[],
+  boundary: UntrustedBoundary,
+  call: BuilderToolCall,
+  outcome: ToolOutcome,
+): void {
+  const provenance = renderToolProvenance(outcome);
+  const payload = untrustedToolPayload(outcome);
+  if (payload === undefined) {
+    conversation.push({ role: "tool", toolCallId: call.id, content: provenance });
+    return;
+  }
+  const wrapped = boundary.wrap({
+    content: payload.content,
+    source: payload.source,
+    ...(payload.origin !== undefined ? { origin: payload.origin } : {}),
+  });
+  conversation.push({ role: "tool", toolCallId: call.id, content: `${provenance}
+${wrapped}`, untrusted: true });
 }

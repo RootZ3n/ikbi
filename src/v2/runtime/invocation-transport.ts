@@ -125,6 +125,9 @@ export function createInvocationTransport(lookup: TransportProviderLookup): Invo
           content: m.content,
           ...(m.toolCalls !== undefined ? { toolCalls: m.toolCalls } : {}),
           ...(m.toolCallId !== undefined ? { toolCallId: m.toolCallId } : {}),
+          // Structural-isolation metadata (v1 ModelMessage.untrusted). It does not change
+          // the wire body — the fence in `content` is what contains the data.
+          ...(m.untrusted === true ? { untrusted: true } : {}),
         })),
         ...(input.tools !== undefined ? { tools: input.tools } : {}),
         maxTokens: input.parameters.maxOutputTokens,

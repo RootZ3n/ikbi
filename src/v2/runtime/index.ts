@@ -28,6 +28,7 @@ import { PRODUCTION_CONTEXT_SOURCES } from "./context-sources.js";
 import { createRetrievalSource } from "./retrieval-source.js";
 import { createBuilderToolExecutor } from "./builder-tools.js";
 import { captureCandidateTree } from "./candidate-capture.js";
+import { createUntrustedBoundary } from "./untrusted-boundary.js";
 import { createInvocationTransport } from "./invocation-transport.js";
 import { createProductionWorkspaceAuthorities } from "./workspace-authority.js";
 import { createSourceSnapshotAuthority } from "./source-snapshot.js";
@@ -130,6 +131,7 @@ export interface ProductionRunDeps {
   readonly buildTools?: V2RunDeps["buildTools"];
   readonly captureTree?: V2RunDeps["captureTree"];
   readonly builderBudget?: V2RunDeps["builderBudget"];
+  readonly untrustedBoundary?: V2RunDeps["untrustedBoundary"];
   readonly transport?: InvocationTransport;
   readonly workspaces?: WorkspaceAuthority;
   readonly mutations?: StateBoundMutationAuthority;
@@ -205,6 +207,9 @@ export async function runV2BuildProduction(request: V2TaskRequest, deps: Product
     // model is ever holding the authority itself.
     buildTools: deps.buildTools ?? createBuilderToolExecutor,
     captureTree: deps.captureTree ?? captureCandidateTree,
+    // THE untrusted-data boundary — v1's neutralization fence. Every tool result crosses
+    // it before re-entering the builder conversation.
+    untrustedBoundary: deps.untrustedBoundary ?? createUntrustedBoundary(),
     ...(deps.builderBudget !== undefined ? { builderBudget: deps.builderBudget } : {}),
     ...(deps.probe !== undefined ? { probe: deps.probe } : {}),
   });

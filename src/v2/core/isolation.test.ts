@@ -48,6 +48,7 @@ const V2_RUNTIME_ALLOWED_V1_IMPORTS = new Set([
   "../../core/workspace/index.js", //              the workspace manager singleton (dynamic)
   "../../core/workspace/manager.js", //            WorkspaceManager type + test construction
   "../../core/workspace/mutation.js", //           THE state-bound mutation core
+  "../../core/injection/index.js", //              THE untrusted-data neutralization fence (V2-007A)
   "../../core/substrate/lock.js", //               lock manager, for the adapter's own tests
   "../../core/substrate/store.js", //              document store, for the adapter's own tests
   "pino", //                                       the logger the donor manager requires (tests only)
@@ -348,7 +349,7 @@ test("single authority: the BUILDER cannot import a filesystem, a provider, a re
   // "the builder is not an authority over infrastructure".
   const file = join(V2_DIR, "core", "builder.ts");
   const specs = importSpecifiers(readFileSync(file, "utf8"));
-  for (const forbidden of ["node:fs", "node:child_process", "node:path", "../runtime/source-materializer.js", "./source.js"]) {
+  for (const forbidden of ["node:fs", "node:child_process", "node:path", "../runtime/source-materializer.js", "./source.js", "../../core/injection/index.js"]) {
     assert.equal(specs.includes(forbidden), false, `the builder must not import ${forbidden}; it imports: ${specs.join(", ")}`);
   }
   assert.equal(
@@ -374,6 +375,53 @@ test("single authority: only the TOOL EXECUTOR writes candidate files, and it ho
   );
   const source = stripComments(readFileSync(file, "utf8"));
   assert.equal(/writeFileSync|readFileSync|rmSync|unlinkSync|mkdirSync/.test(source), false, "no raw filesystem call");
+});
+
+test("single chokepoint: only the boundary adapter imports v1 neutralization (V2-007A)", () => {
+  // Untrusted content is wrapped in exactly one place. A second importer of
+  // neutralizeUntrusted would be a second, divergent neutralization policy.
+  const allowed = new Set([join(V2_DIR, "runtime", "untrusted-boundary.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    for (const spec of importSpecifiers(readFileSync(file, "utf8"))) {
+      if (spec.includes("core/injection")) offenders.push(`${relative(SRC, file)} -> ${spec}`);
+    }
+  }
+  assert.deepEqual(offenders, [], "the neutralization fence is reached through the injected boundary alone");
+});
+
+test("single chokepoint: only the builder controller appends a tool-role message (V2-007A)", () => {
+  // Every ToolExecutionResult becomes a conversation message in ONE function. A tool that
+  // constructed its own `role: "tool"` message would bypass the neutralization boundary.
+  const allowed = new Set([join(V2_DIR, "core", "builder.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    const source = stripComments(readFileSync(file, "utf8"));
+    if (/role:\s*["']tool["']/.test(source)) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "tool-role messages are appended only by the builder's one chokepoint");
+});
+
+test("single chokepoint: repository-derived tool payload is consumed only by the chokepoint (V2-007A)", () => {
+  // `untrustedToolPayload` is the ONLY source of repository/tool-derived free text destined
+  // for the conversation. `tools.ts` declares it; only `builder.ts` may consume it, and it
+  // does so by wrapping through the boundary. Anywhere else would be a second, un-fenced path.
+  const allowed = new Set([join(V2_DIR, "core", "tools.ts"), join(V2_DIR, "core", "builder.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    if (/untrustedToolPayload\s*\(/.test(stripComments(readFileSync(file, "utf8")))) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "untrusted tool payload never reaches the conversation through another path");
+});
+
+test("single chokepoint: the tool executor builds NO conversation message (V2-007A)", () => {
+  // The executor returns a structured ToolExecutionResult; turning it into a message —
+  // and neutralizing it — is the builder's job. The executor must not touch prompt shapes.
+  const source = stripComments(readFileSync(join(V2_DIR, "runtime", "builder-tools.ts"), "utf8"));
+  assert.equal(/RenderedMessage|renderBuilderInput|role:\s*["'](tool|system|assistant)["']/.test(source), false, "the executor produces results, not messages");
 });
 
 test("single authority: no v2 file offers the builder a SHELL", () => {
