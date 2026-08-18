@@ -316,15 +316,15 @@ test("invocation truth: nothing is built, verified or written", async () => {
   const before = spawnSync("git", ["status", "--porcelain"], { cwd: repo, encoding: "utf8" }).stdout;
   const { result } = v2Run(server, root, repo);
   const e = result.receipt.evidence;
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification"]);
   assert.equal(e.providerInvoked, true);
   assert.equal(e.invocations, 1);
   assert.equal(e.candidatesCreated, 1, "no candidate was created");
-  assert.equal(e.verificationsPerformed, 0);
+  assert.equal(e.verificationsPerformed, 1, "V2-008: the candidate WAS verified (no_checks)");
   assert.equal(e.promoted, false);
   assert.equal(e.sourceRepositoryMutated, false);
   assert.ok(result.outcome.kind === "failed");
-  assert.equal(result.outcome.failure.detail?.missingStage, "verification");
+  assert.equal(result.outcome.failure.detail?.missingStage, "disposition");
   assert.equal(spawnSync("git", ["status", "--porcelain"], { cwd: repo, encoding: "utf8" }).stdout, before, "the repo is untouched");
 });
 

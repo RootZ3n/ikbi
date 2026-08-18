@@ -242,6 +242,12 @@ function deps(
     // V2-007A: the boundary is required but never exercised here — this suite's fake
     // builders finish immediately or only nudge, so no tool result carries a payload.
     untrustedBoundary: { wrap: (i: { content: string }) => i.content },
+    // V2-008: verification runs on the produced candidate. Hermetic seams — the tree
+    // probe returns the SAME id captureTree froze (no drift, no mutation), one check that
+    // launches and passes. The real governed path is proven in `cli/verification-truth`.
+    checksSource: { resolve: async () => ({ ok: true as const, source: "default" as const, checks: [{ name: "test", command: "faketest", args: [] }] }) },
+    checkRunner: { run: async () => ({ launched: true as const, exitCode: 0, timedOut: false, durationMs: 1, outputSha256: "0".repeat(64), outputExcerpt: "" }) },
+    treeProbe: { treeOf: async () => "tree".repeat(10) },
     captureTree: async () => ({
       ok: true as const,
       tree: { treeId: "tree".repeat(10), baseTreeId: "t".repeat(40), materializedStateDigest: "m".repeat(64), changed: false },
@@ -254,7 +260,7 @@ test("run: a valid request mints task + run identities and enters the lifecycle"
   assert.ok(isV2Id("task", result.taskId));
   assert.ok(isV2Id("run", result.runId));
   assert.ok(isV2Id("receipt", result.receipt.receiptId));
-  assert.deepEqual([...result.receipt.stagesEntered], ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation"]);
+  assert.deepEqual([...result.receipt.stagesEntered], ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification"]);
   assert.equal(result.journal[0]?.from, "pending");
   assert.equal(result.journal[0]?.to, "preflight");
   assert.equal(result.journal.at(-1)?.to, "terminal");
@@ -285,7 +291,7 @@ test("run: NO FAKE SUCCESS — the receipt reports exactly what happened, counte
   assert.equal(e.candidateMutated, false);
   // V2-007: a candidate now EXISTS. It has still been verified by nothing.
   assert.equal(e.candidatesCreated, 1, "the builder finished, so there is a candidate");
-  assert.equal(e.verificationsPerformed, 0, "nothing was verified");
+  assert.equal(e.verificationsPerformed, 1, "V2-008: the produced candidate WAS verified");
   assert.equal(e.promotionsAttempted, 0);
   assert.equal(e.promoted, false, "nothing was promoted");
   assert.equal(e.sourceRepositoryMutated, false, "the operator's repository was not touched");
@@ -301,12 +307,12 @@ test("run: a no-change candidate is LEGITIMATE — 'no diff' is not the builder'
   // Whether "no edit" satisfies the task is a VERIFICATION question, and verification
   // has not run. The candidate exists so that question can be asked of something real.
   assert.ok(result.outcome.kind === "failed");
-  assert.equal(result.outcome.failure.detail?.missingStage, "verification");
+  assert.equal(result.outcome.failure.detail?.missingStage, "disposition");
 });
 
 test("run: the skeleton never claims to have reached a stage it did not run", async () => {
   const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo));
-  const implemented = new Set<string>(["preflight", "model_resolution", "context", "candidate_strategy", IMPLEMENTED_THROUGH_STAGE]);
+  const implemented = new Set<string>(["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", IMPLEMENTED_THROUGH_STAGE]);
   for (const stage of LIFECYCLE_STAGES) {
     if (implemented.has(stage)) continue;
     assert.equal(result.receipt.stagesEntered.includes(stage), false, `"${stage}" was never entered`);
@@ -492,7 +498,7 @@ test("run: the workspace is RETAINED once a candidate exists — verification ne
   const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo, workingConfiguration, noSources, fakeTransport().transport, ws.authority));
   assert.deepEqual(ws.dispositions, ["retain"], "a candidate is the only copy of the work — discarding it would throw it away");
   assert.equal(result.receipt.workspace?.disposition, "retained");
-  assert.match(result.receipt.workspace?.dispositionDetail ?? "", /awaits verification/);
+  assert.match(result.receipt.workspace?.dispositionDetail ?? "", /verified pass; awaits disposition/);
   // RETENTION IS NOT PROMOTION. The worktree stays on disk; nothing was landed.
   assert.equal(result.receipt.evidence.promoted, false);
   assert.equal(result.receipt.evidence.sourceRepositoryMutated, false);

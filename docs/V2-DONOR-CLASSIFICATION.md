@@ -5,8 +5,9 @@ Produced during **V2-001** (canonical lifecycle foundation) and updated by **V2-
 authority), **V2-003A** (provider inventory truth) **V2-004** (canonical context
 authority) **V2-005** (canonical model invocation authority) **V2-006** (workspace + state-bound
 mutation authority), **V2-006A** (canonical source snapshot authority), **V2-006B**
-(deterministic snapshot-bound retrieval) and **V2-007** (canonical builder + governed tool
-loop). This is an **advisory input to future work
+(deterministic snapshot-bound retrieval), **V2-007** (canonical builder + governed tool
+loop), **V2-007A** (untrusted tool-result neutralization) and **V2-008** (canonical
+verification authority). This is an **advisory input to future work
 orders**, not a change plan and not permission to delete anything. Nothing in v1 was
 removed, disabled, or altered to produce it.
 
@@ -181,6 +182,30 @@ from; the POLICY is a set of authorities v2 has not established yet.
 | `done` self-check + substance validation | **YES** | **ADOPT as PRINCIPLE, simplified.** v1 validates the `done` claim for substance and rejects rubber-stamps. v2 keeps the ESSENTIAL half — finishing requires an explicit tool call, and prose is not a finish — but records the claim rather than judging it, because judging it is verification's job. |
 | Workspace lifecycle (`builder.ts` never promotes or discards) | **YES** | **ADOPT.** v1's builder writes files and nothing else; lifecycle is the orchestrator's. v2 keeps exactly that separation: the controller cannot allocate, retain, discard or promote. |
 
+## Verification systems *(V2-008)*
+
+v1's verifier (`worker-model/verifier.ts`, 1265 lines) is where deterministic checking,
+repair coupling, the escalation ladder, script-integrity guarding and promotion adjacency
+all live together. V2-008 keeps the deterministic CHECKING and throws away the coupling.
+
+| v1 system | Production reachability | Verdict |
+| --- | --- | --- |
+| `checks.ts` — `resolveChecks` / `parseChecksEnv` / project-root guard | **YES** — every verify | **ADOPT (refined behind a seam).** The strongest deterministic check DISCOVERY in the codebase: operator `IKBI_CHECKS` (never model-chosen, never read from the worktree) or a recognized manifest (pnpm/npm/yarn, cargo, go, pytest/unittest, dotnet, maven, gradle, godot), fail-closed with a reason — never a vacuous pass — and an ANCESTOR-manifest guard so a nested worktree cannot run the wrong repo's suite. `runtime/verification-checks.ts` wraps it. |
+| `governed-exec` (allowlist + gate-wall + F1 OS sandbox + receipts) | **YES** — every check | **ADOPT (behind a seam).** Verification commands run through the SAME execution authority as everything else — default-deny allowlist, worktree-writable/host-read-only sandbox, network-deny, `verifier: true` for package scripts (a flag a model cannot set). `runtime/check-runner.ts` mints a self-contained deterministic-system identity (its own one-agent registry + fresh token — it borrows no operator credential) and maps `ExecResult` → `CheckExecution`. The model never reaches it. |
+| `checks.ts` — `mapExec` / `CheckResult` / `resolveCheckTimeoutMs` / `DEFAULT_CHECK_TIMEOUT_MS` | **YES** | **ADOPT as SEMANTICS.** The timeout knob (`IKBI_CHECK_TIMEOUT_MS`), the 124 timeout-kill exit code, the bounded output tail, and the exit-code → status mapping. v2 does NOT adopt `parseTestCount`/vacuous-green gating — that is a critic concern, not deterministic verification. |
+| `verifier.ts` — the loop, the script-integrity diff guard, the ladder, DRY-RUN handling | **YES** | **REPLACE.** 1265 lines coupled to `RoleFn`/`OperationContext`, a diff-based script guard, and a promotion-adjacent verdict. v2's verifier is ~200 pure lines: subject binding, two tree rechecks, plan, run-all, classify. The script guard is subsumed by the AFTER tree recheck — a check that rewrites anything (package.json included) changes the tree and is caught, without parsing a diff. |
+| `verifier.ts` — corrections / fixer-on-verifier-fail / dual-model escalation | **YES** | **PARK.** A failed verification ENDS the run in v2. Repair, builder re-entry and escalation are a recovery authority that does not exist yet — establishing verification TRUTH first is the point of the slice. |
+| `verification-ladder` | **YES** — multi-package | **PARK.** Per-package ladder over the same governed path. v2 verifies ONE candidate's ONE tree. |
+| `deterministic-judge` / `quality-checks` / `semantic-*` | **YES** | **PARK — critic-adjacent.** These interpret check results into a promote/withhold judgement; that is V2-009's critic/disposition authority. |
+| `check-triage` | **YES** | **PARK.** Parses failures into repair hypotheses for the fixer — a recovery input. v2 records bounded output for a future critic through the untrusted-data discipline (V2-007A); it feeds no model here. |
+
+**The load-bearing v2 additions v1 has no equivalent of:** the candidate is IDENTITY-BOUND
+(a `VerificationSubject` refuses a foreign run/candidate/tree/workspace); the tree is
+rechecked BEFORE (drift ⇒ no checks run) and AFTER (mutation ⇒ the verdict is invalid
+whatever the exit codes); and the `VerificationRecord` is content-addressed over
+(candidate, tree, plan, ordered per-check verdicts) — never a timestamp, never the output
+text — so it is provably about one candidate and no other.
+
 ## Standing constraints for later slices
 
 1. **No second promote path.** Any strategy that wants to promote must do it by
@@ -203,43 +228,50 @@ from; the POLICY is a set of authorities v2 has not established yet.
    output may not sort, re-score or mint an identity, and may not enumerate source by
    any means other than `SourceSnapshotReader.list()`. Retrieval introduces no model
    call — the production skeleton still performs exactly one invocation.
-7. **The builder is not an authority over infrastructure.** *(V2-007)* It may reason,
+7. **Verification is bound to ONE candidate tree.** *(V2-008)* The verifier recomputes
+   the candidate tree before checks (drift ⇒ no checks) and after (mutation-by-checks ⇒
+   invalid), and `VerificationRecord` is content-addressed over the candidate tree, the
+   plan and the ordered per-check verdicts. `NO_CHECKS` is never coerced to `PASS`, a
+   timeout/infrastructure failure is never an ordinary fail, and a failed verification
+   ends the run — no critic, no repair, no builder re-entry. Deterministic only: no model
+   is invoked, and the verifier neither mutates nor calls the invocation authority.
+8. **The builder is not an authority over infrastructure.** *(V2-007)* It may reason,
    inspect, request tools and finish. It may not select a model, choose a provider, create
    a workspace, write a file, invoke a provider, verify itself, promote, or retry itself.
    Enforced structurally: `core/builder.ts` imports no `node:` module and no resolver
    call; `runtime/builder-tools.ts` imports no filesystem API; every effect is a
    `StateBoundMutationAuthority.mutate`, and every model turn an `invokeAuthorized`.
-8. **No observation, no write.** *(V2-007)* Every builder write names the observation that
+9. **No observation, no write.** *(V2-007)* Every builder write names the observation that
    authorized it — creation included. There is no path-only create/replace/delete anywhere
    in v2, and a refused write is reported to the MODEL rather than retried by
    infrastructure.
-9. **A candidate is the work, not the event.** *(V2-007)* Candidate identity is a content
+10. **A candidate is the work, not the event.** *(V2-007)* Candidate identity is a content
    address over (source snapshot, resulting tree). The run, workspace, model, turn count
    and mutation sequence are provenance on the record — all of them can differ while the
    work is identical, and a tournament has to be able to see that.
-10. **Inventory is not preference.** *(V2-003, enforced V2-003A)* Nothing an operator
+11. **Inventory is not preference.** *(V2-003, enforced V2-003A)* Nothing an operator
    PREFERS may add, rename, reroute, remove, or suppress a model. Enforced structurally:
    `buildCanonicalCatalog`'s input type has no field a preference fits into, and the
    catalog module imports nothing that could supply one. Only the roster, the provider
    set, a credential genuinely appearing/disappearing, or real capability data may move
    `inventoryDigest`.
-11. **No raw context downstream.** *(V2-004)* Anything that will face a model receives a
+12. **No raw context downstream.** *(V2-004)* Anything that will face a model receives a
    `ContextPackage`, never a context source, a repository file, or an ad-hoc string. One
    assembler admits; every omission and truncation is recorded; nothing overflows
    silently.
-12. **Selection and invocation are different authorities.** *(V2-005)* The resolver says
+13. **Selection and invocation are different authorities.** *(V2-005)* The resolver says
    which route is authorized; the invocation authority sends exactly that route, once,
    and records what actually served it. No fallback, no retry, no second resolution. The
    four identities — requested, authorized, sent, served — are never collapsed, and
    `served` is only ever read from the provider's own response.
-13. **One workspace authority, one mutation authority.** *(V2-006)* No component creates
+14. **One workspace authority, one mutation authority.** *(V2-006)* No component creates
    its own worktree, and nothing writes a file except through `mutate`, which requires an
    OBSERVATION rather than a path. Observations are workspace-scoped: identical bytes in a
    sibling candidate are not identical authority. A stale observation is refused — never
    merged, overwritten, silently re-observed or retried.
-14. **One run, one source snapshot.** *(V2-006A)* Context reads it, the workspace is
+15. **One run, one source snapshot.** *(V2-006A)* Context reads it, the workspace is
    materialized from it, and nothing recaptures — silently or otherwise. Reproducing the
    operator's existing uncommitted work in isolation is MATERIALIZATION, never a model
    mutation, and never counts as one.
-15. **Nothing is "done" because it exists.** A migrated subsystem is done when a test
+16. **Nothing is "done" because it exists.** A migrated subsystem is done when a test
    enters through the canonical v2 entrypoint and proves the subsystem is what ran.

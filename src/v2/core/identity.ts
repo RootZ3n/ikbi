@@ -49,8 +49,19 @@ export type V2WorkspaceId = V2Id<"workspace">;
 export type V2CandidateId = V2Digest<"candidate">;
 /** ONE observation of exact file state — the anchor a state-bound mutation compares against. */
 export type V2ObservationId = V2Id<"observation">;
-/** ONE verification verdict, bound to the candidate it judged. */
-export type V2VerificationId = V2Id<"verification">;
+/**
+ * ONE verification verdict, bound to the candidate it judged.
+ *
+ * V2-008 made this CONTENT-ADDRESSED. A verification is not an event that happened to
+ * occur; it is a statement about an exact candidate tree, an exact plan, and the exact
+ * ordered results those checks produced. Two verifications of the same tree by the same
+ * plan with the same per-check verdicts ARE the same verification — and a different
+ * candidate tree necessarily produces a different id, which is the property that makes a
+ * VerificationRecord provably applicable to one candidate and no other.
+ */
+export type V2VerificationId = V2Digest<"verification">;
+/** Content address of ONE verification plan — which checks, in which order, how bounded. */
+export type V2PlanDigest = V2Digest<"verification_plan">;
 /** ONE promotion attempt. */
 export type V2PromotionId = V2Id<"promotion">;
 /** ONE receipt record. */

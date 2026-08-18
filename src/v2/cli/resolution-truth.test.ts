@@ -306,10 +306,10 @@ test("resolution truth: model_resolution is ENTERED, and nothing beyond context 
   const root = makeStateRoot();
   activate(root, "prof-a");
   const { result } = v2Run(root);
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification"]);
   assert.ok(result.outcome.kind === "failed");
   assert.equal(result.outcome.failure.category, "not_implemented");
-  assert.equal(result.outcome.failure.detail?.missingStage, "verification");
+  assert.equal(result.outcome.failure.detail?.missingStage, "disposition");
 });
 
 test("resolution truth: exactly ONE decision is recorded, and exactly one invocation", () => {

@@ -28,18 +28,20 @@
  *      workspace bound to the exact source commit and tree, and RE-OBSERVE the context
  *      artifact it would edit through the state-bound authority — proving the bytes the
  *      model saw are the bytes that are actually there
- *   9. discard the workspace (nothing was produced) and STOP, because
- *      `candidate_generation` has no implementation
- *  10. terminalize as `failed` with category `not_implemented`, and emit a receipt
- *      whose evidence block is counted from the ledger: zero invocations, zero
- *      candidates, zero verifications, not promoted, repository not mutated
+ *   9. enter `candidate_generation` and run the governed builder loop, capturing the
+ *      resulting tree as ONE content-addressed Candidate
+ *  10. enter `verification` and ask THE verifier for a deterministic verdict bound to that
+ *      exact candidate tree — recheck the tree, plan the checks, run them through
+ *      governed-exec, recheck the tree, classify — with no model call
+ *  11. retain the candidate workspace and STOP, because `disposition` has no implementation
+ *  12. terminalize as `failed` with category `not_implemented`, and emit a receipt whose
+ *      evidence block is counted from the ledger: the candidate and verification are real,
+ *      but nothing was adjudicated or promoted
  *
- * It performs NO model call, NO workspace allocation, NO mutation, NO promotion.
- * Configuration and resolution are read-only decisions — reading a roster file, reading
- * a profile file, and CHOOSING a route are not invoking anything. An authorization is
- * not a call: the receipt reports `modelResolutionCompleted: true` beside
- * `providerInvoked: false`, and no `V2InvocationId` is minted, because no invocation
- * happened.
+ * It performs NO promotion and NO source-repository mutation. The builder's edits land in
+ * an isolated worktree; verification runs deterministic checks there and never touches the
+ * operator's checkout. A red verdict ends the run — there is no critic, no repair, and no
+ * builder re-entry, because those authorities do not exist yet.
  */
 
 import { statSync } from "node:fs";
@@ -60,6 +62,15 @@ import {
 } from "./resolver.js";
 import { assembleContext, manifestOf, type ContextPackage, type ContextSource } from "./context.js";
 import { candidateDigest, summarizeCandidate, type CandidateRecord, type TreeCaptureResult } from "./candidate.js";
+import {
+  summarizeVerification,
+  verificationSubjectOf,
+  verifyCandidate,
+  type ChecksSource,
+  type CheckRunner,
+  type TreeProbe,
+  type VerificationRecord,
+} from "./verification.js";
 import { generateCandidate, type BuilderBudget, type BuilderToolExecutor, type BuilderToolExecutorDeps, type UntrustedBoundary } from "./builder.js";
 import { summarizeRetrieval, type RetrievalReporter, type RetrievalSummary } from "./retrieval.js";
 import { summarizeSnapshot, type SourceSnapshotAuthority, type SourceSnapshotReader } from "./source.js";
@@ -127,13 +138,20 @@ export function rebindableArtifact(pkg: ContextPackage): { path: string; observe
 }
 
 /** The furthest stage this build of ikbi implements. */
-export const IMPLEMENTED_THROUGH_STAGE: LifecycleStage = "candidate_generation";
+export const IMPLEMENTED_THROUGH_STAGE: LifecycleStage = "verification";
 
 /** The stage the run would need next, and does not have. */
-export const FIRST_UNIMPLEMENTED_STAGE: LifecycleStage = "verification";
+export const FIRST_UNIMPLEMENTED_STAGE: LifecycleStage = "disposition";
 
 /** Upper bound on a goal, so an accidental file paste is rejected as input, not as a build. */
 export const MAX_GOAL_LENGTH = 8000;
+
+/**
+ * The default per-check wall-clock bound (10 minutes), mirroring the donor's
+ * `DEFAULT_CHECK_TIMEOUT_MS`. A test suite that takes longer is killed and classified as a
+ * timeout, never as an ordinary failure. Overridable per run via `V2RunDeps.checkTimeoutMs`.
+ */
+export const DEFAULT_CHECK_TIMEOUT_MS = 600_000;
 
 /** Read-only repository inspection — a seam so preflight is testable without a real repo. */
 export interface RepoProbe {
@@ -222,6 +240,16 @@ export interface V2RunDeps {
   readonly untrustedBoundary: UntrustedBoundary;
   /** Bounds on the builder loop. Defaults to `DEFAULT_BUILDER_BUDGET`. */
   readonly builderBudget?: BuilderBudget;
+  /**
+   * THE deterministic verification seams. REQUIRED and injected: check discovery reads the
+   * filesystem, the runner shells out through governed-exec, and the tree probe runs git —
+   * none of which belongs in this pure layer. Wired once, in `src/v2/runtime/index.ts`.
+   */
+  readonly checksSource: ChecksSource;
+  readonly checkRunner: CheckRunner;
+  readonly treeProbe: TreeProbe;
+  /** Per-check wall-clock bound. Defaults to the donor's shared `resolveCheckTimeoutMs`. */
+  readonly checkTimeoutMs?: number;
   readonly ids?: V2IdFactory;
   readonly now?: () => number;
   readonly probe?: RepoProbe;
@@ -351,6 +379,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
   let contextPackage: ContextPackage | undefined;
   let invocations: readonly V2InvocationRecord[] = [];
   let candidate: CandidateRecord | undefined;
+  let verification: VerificationRecord | undefined;
   let workspace: V2WorkspaceRecord | undefined;
   let workspaceObservations = 0;
   let disposition: WorkspaceDisposition | undefined;
@@ -558,8 +587,29 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     });
     lifecycle.record(runId, { kind: "candidate", id: candidate.candidateId, workspaceId: workspace.workspaceId });
 
-    // A CANDIDATE NOW EXISTS. It has not been verified, judged or promoted — the stage
-    // that would do that does not exist in this build, and the run says exactly that.
+    // Stage 6 — VERIFICATION. THE deterministic authority over THIS exact candidate. It
+    // recomputes the candidate tree (drift guard), plans the checks, runs them bounded
+    // through governed-exec, recomputes the tree (mutation guard), and classifies. No
+    // model is consulted; a red verdict ends the run — recovery is a later authority.
+    lifecycle.enter(runId, "verification");
+    const verified = await verifyCandidate({
+      runId,
+      subject: verificationSubjectOf(candidate),
+      candidate,
+      workspacePath: workspace.path,
+      checksSource: deps.checksSource,
+      runner: deps.checkRunner,
+      tree: deps.treeProbe,
+      checkTimeoutMs: deps.checkTimeoutMs ?? DEFAULT_CHECK_TIMEOUT_MS,
+      now,
+    });
+    if (!verified.ok) return verified.failure;
+    verification = verified.record;
+    lifecycle.record(runId, { kind: "verification", id: verification.verificationId, candidateId: candidate.candidateId });
+
+    // A candidate has now been VERIFIED — a truthful deterministic verdict exists and is
+    // bound to this exact tree. It has NOT been adjudicated or promoted: the critic and
+    // disposition authorities do not exist in this build, and the run says exactly that.
     return stageNotImplemented(FIRST_UNIMPLEMENTED_STAGE, IMPLEMENTED_THROUGH_STAGE);
   })();
 
@@ -575,10 +625,16 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
   // Retention is NOT promotion and NOT a claim of quality: the worktree simply stays on
   // disk, findable through the existing `ikbi workspace ls`.
   if (workspace !== undefined) {
+    // A candidate that was VERIFIED (pass OR fail) is retained: disposition and recovery
+    // are the next authorities and both want the exact tree that was judged. A candidate
+    // that never reached verification (a generation failure) leaves a half-built tree
+    // nothing is entitled to read, and is discarded. Retention is not promotion.
     disposition =
-      candidate !== undefined
-        ? await deps.workspaces.retain(workspace, `candidate ${candidate.candidateId} awaits verification`)
-        : await deps.workspaces.discard(workspace);
+      verification !== undefined
+        ? await deps.workspaces.retain(workspace, `candidate ${candidate!.candidateId} verified ${verification.verdict}; awaits disposition`)
+        : candidate !== undefined
+          ? await deps.workspaces.retain(workspace, `candidate ${candidate.candidateId} awaits verification`)
+          : await deps.workspaces.discard(workspace);
   }
 
   const outcome: RunTerminalOutcome = { kind: "failed", failure };
@@ -599,6 +655,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     ...(retrieval !== undefined ? { retrieval } : {}),
     invocations: invocations.map(summarizeInvocation),
     ...(candidate !== undefined ? { candidate: summarizeCandidate(candidate) } : {}),
+    ...(verification !== undefined ? { verification: summarizeVerification(verification) } : {}),
     ...(workspace !== undefined && disposition !== undefined
       ? { workspace: summarizeWorkspace({ workspace, observations: workspaceObservations, disposition }) }
       : {}),
@@ -617,6 +674,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     ...(contextPackage !== undefined ? { context: manifestOf(contextPackage) } : {}),
     invocations,
     ...(candidate !== undefined ? { candidate } : {}),
+    ...(verification !== undefined ? { verification } : {}),
     journal: lifecycle.journal,
     receipt,
   };

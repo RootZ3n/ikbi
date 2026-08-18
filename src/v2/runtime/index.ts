@@ -29,6 +29,16 @@ import { createRetrievalSource } from "./retrieval-source.js";
 import { createBuilderToolExecutor } from "./builder-tools.js";
 import { captureCandidateTree } from "./candidate-capture.js";
 import { createUntrustedBoundary } from "./untrusted-boundary.js";
+import { createChecksSource } from "./verification-checks.js";
+import { createCheckRunner } from "./check-runner.js";
+import { createTreeProbe } from "./verification-tree.js";
+
+/** The operator's per-check timeout knob, when set to a positive integer. */
+function envCheckTimeoutMs(): number | undefined {
+  const raw = (process.env.IKBI_CHECK_TIMEOUT_MS ?? "").trim();
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
 import { createInvocationTransport } from "./invocation-transport.js";
 import { createProductionWorkspaceAuthorities } from "./workspace-authority.js";
 import { createSourceSnapshotAuthority } from "./source-snapshot.js";
@@ -132,6 +142,10 @@ export interface ProductionRunDeps {
   readonly captureTree?: V2RunDeps["captureTree"];
   readonly builderBudget?: V2RunDeps["builderBudget"];
   readonly untrustedBoundary?: V2RunDeps["untrustedBoundary"];
+  readonly checksSource?: V2RunDeps["checksSource"];
+  readonly checkRunner?: V2RunDeps["checkRunner"];
+  readonly treeProbe?: V2RunDeps["treeProbe"];
+  readonly checkTimeoutMs?: V2RunDeps["checkTimeoutMs"];
   readonly transport?: InvocationTransport;
   readonly workspaces?: WorkspaceAuthority;
   readonly mutations?: StateBoundMutationAuthority;
@@ -188,6 +202,7 @@ export async function runV2BuildProduction(request: V2TaskRequest, deps: Product
   const wired = complete
     ? { workspaces: deps.workspaces!, mutations: deps.mutations!, sources: deps.sources! }
     : await productionAuthorities();
+  const resolvedCheckTimeout = deps.checkTimeoutMs ?? envCheckTimeoutMs();
   // The retrieval source is built PER RUN and is the reporter for that same run, so the
   // receipt can never describe a retrieval some other run performed.
   const retrieval = createRetrievalSource();
@@ -210,6 +225,15 @@ export async function runV2BuildProduction(request: V2TaskRequest, deps: Product
     // THE untrusted-data boundary — v1's neutralization fence. Every tool result crosses
     // it before re-entering the builder conversation.
     untrustedBoundary: deps.untrustedBoundary ?? createUntrustedBoundary(),
+    // THE deterministic verification seams — check discovery, governed execution, and the
+    // git tree probe. All three do I/O, so they are wired here, once.
+    checksSource: deps.checksSource ?? createChecksSource(),
+    checkRunner: deps.checkRunner ?? createCheckRunner(),
+    treeProbe: deps.treeProbe ?? createTreeProbe(),
+    // Per-check timeout: an explicit override wins, else the operator's IKBI_CHECK_TIMEOUT_MS
+    // (the donor's shared knob), else the run default. A hung check is killed and classified
+    // as a timeout, never as an ordinary failure.
+    ...(resolvedCheckTimeout !== undefined ? { checkTimeoutMs: resolvedCheckTimeout } : {}),
     ...(deps.builderBudget !== undefined ? { builderBudget: deps.builderBudget } : {}),
     ...(deps.probe !== undefined ? { probe: deps.probe } : {}),
   });

@@ -209,6 +209,10 @@ const STAGE_REQUIRES: Partial<Record<LifecycleStage, readonly LifecycleEvidence[
   candidate_generation: ["workspace"],
   // Nothing to verify without at least one candidate. (One OR MANY — see contract.ts.)
   verification: ["candidate"],
+  // Disposition adjudicates a VERIFIED candidate. It cannot be entered without a
+  // verification verdict on the ledger — critic/disposition never runs on a candidate that
+  // deterministic verification has not judged.
+  disposition: ["verification"],
   // Nothing to promote without a verdict from the canonical verification authority.
   promotion: ["verification"],
 };

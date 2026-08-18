@@ -72,7 +72,7 @@ after(() => {
   for (const root of roots) rmSync(root, { recursive: true, force: true });
 });
 
-function runCli(args: readonly string[]): { status: number | null; stdout: string; stderr: string } {
+function runCli(args: readonly string[], extraEnv: Record<string, string> = {}): { status: number | null; stdout: string; stderr: string } {
   const home = mkdtempSync(join(tmpdir(), "ikbi-v2-home-"));
   const res = spawnSync(process.execPath, [ENTRY, ...args], {
     cwd: mkdtempSync(join(tmpdir(), "ikbi-v2-cwd-")),
@@ -85,6 +85,7 @@ function runCli(args: readonly string[]): { status: number | null; stdout: strin
       IKBI_MODEL_DRIVER: "alpha-1",
       IKBI_MODEL_BUILDER: "alpha-1",
       IKBI_MODEL_CRITIC: "alpha-1",
+      ...extraEnv,
       ...loopbackEgressEnv(PROVIDER),
     },
     encoding: "utf8",
@@ -106,7 +107,7 @@ test("v2 cli: `ikbi v2 build` reaches the canonical v2 lifecycle end-to-end", ()
   assert.equal(result.journal[0]?.from, "pending");
   assert.equal(result.journal[0]?.to, "preflight");
   assert.equal(result.journal.at(-1)?.to, "terminal");
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification"]);
 });
 
 test("v2 cli: the end-to-end run claims NOTHING it did not do", () => {
@@ -138,7 +139,7 @@ test("v2 cli: the end-to-end run claims NOTHING it did not do", () => {
     // legitimate no-change candidate. It has still been verified by nothing.
     candidatesCreated: 1,
     candidateMutated: false,
-    verificationsPerformed: 0,
+    verificationsPerformed: 1,
     promotionsAttempted: 0,
     promoted: false,
     sourceRepositoryMutated: false,
@@ -151,7 +152,10 @@ test("v2 cli: it is safe to point at THIS repository — nothing is written", ()
   // (e.g. a locally-modified instruction file is correctly reported as context drift).
   const before = spawnSync("git", ["status", "--porcelain"], { cwd: IKBI_REPO, encoding: "utf8" }).stdout;
   const head = spawnSync("git", ["rev-parse", "HEAD"], { cwd: IKBI_REPO, encoding: "utf8" }).stdout;
-  runCli(["v2", "build", "rewrite the world", "--repo", IKBI_REPO]);
+  // A trivial, allowlisted verification check so the run does NOT discover and execute
+  // ikbi's OWN full test suite in the candidate worktree — which would be a recursive
+  // build. The source-safety property is independent of which checks run.
+  runCli(["v2", "build", "rewrite the world", "--repo", IKBI_REPO], { IKBI_CHECKS: '[{"name":"noop","command":"echo","args":["ok"]}]' });
   assert.equal(spawnSync("git", ["status", "--porcelain"], { cwd: IKBI_REPO, encoding: "utf8" }).stdout, before, "working tree unchanged");
   assert.equal(spawnSync("git", ["rev-parse", "HEAD"], { cwd: IKBI_REPO, encoding: "utf8" }).stdout, head, "HEAD unchanged");
 });

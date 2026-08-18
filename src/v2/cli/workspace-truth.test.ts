@@ -138,7 +138,7 @@ test("workspace truth: candidate_strategy allocates ONE workspace bound to the r
   const repo = makeRepo();
   const { result } = v2Run(state, repo);
 
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification"]);
   assert.equal(result.receipt.evidence.workspacesAllocated, 1, "the SINGLE strategy allocates exactly one");
 
   const ws = result.receipt.workspace!;
@@ -199,12 +199,12 @@ test("workspace truth: a workspace is NOT a candidate, and NOTHING was written",
   assert.equal(e.candidatesCreated, 1, "the builder finished, so a candidate exists — unverified");
   assert.equal(e.sourceRepositoryMutated, false);
   assert.equal(e.promoted, false);
-  assert.equal(e.verificationsPerformed, 0);
+  assert.equal(e.verificationsPerformed, 1, "V2-008: the candidate WAS verified (no_checks)");
 
   assert.equal(gitStatus(repo), before, "the source working tree is unchanged");
   assert.equal(headCommit(repo), head, "and so is HEAD");
   assert.ok(result.outcome.kind === "failed");
-  assert.equal(result.outcome.failure.detail?.missingStage, "verification");
+  assert.equal(result.outcome.failure.detail?.missingStage, "disposition");
 });
 
 test("workspace truth: the source repository gains no stray files or branches", () => {
@@ -224,7 +224,7 @@ test("workspace truth: the workspace is RETAINED once a candidate exists (V2-007
   const state = makeStateRoot();
   const { result } = v2Run(state, makeRepo());
   assert.equal(result.receipt.workspace?.disposition, "retained");
-  assert.match(result.receipt.workspace?.dispositionDetail ?? "", /awaits verification/);
+  assert.match(result.receipt.workspace?.dispositionDetail ?? "", /verified no_checks; awaits disposition/);
   // RETENTION IS NOT PROMOTION.
   assert.equal(result.receipt.evidence.promoted, false);
   assert.equal(result.receipt.evidence.sourceRepositoryMutated, false);

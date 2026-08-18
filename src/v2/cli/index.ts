@@ -119,6 +119,7 @@ export function renderRun(result: V2RunResult): string {
     ...invocationLines(result),
     ...workspaceLines(result),
     ...candidateLines(result),
+    ...verificationLines(result),
     `outcome     ${formatOutcome(result.outcome)}`,
     "evidence    " +
       `provider_invoked=${e.providerInvoked} invocations=${e.invocations} mutations=${e.mutationsApplied} ` +
@@ -238,8 +239,27 @@ function candidateLines(result: V2RunResult): string[] {
     `  work      ${c.turns} turn(s), ${c.toolCalls} tool call(s), ${c.toolFailures} refused/rejected, ${c.mutations} mutation(s)`,
     ...(c.changedPaths.length > 0 ? [`  paths     ${c.changedPaths.join(", ")}`] : []),
     `  claim     ${c.claimBelievesComplete ? "believes complete" : "does NOT believe complete"} — ${c.claimSummary.split("\n")[0] ?? ""}`,
-    `  status    NOT VERIFIED, NOT PROMOTED — the candidate workspace is retained for verification`,
   ];
+}
+
+/**
+ * The verification, when one ran. States the verdict, the exact tree it applies to, and
+ * each check's status — never a raw log. Refuses to imply a critic verdict or a promotion.
+ */
+function verificationLines(result: V2RunResult): string[] {
+  const v = result.receipt.verification;
+  if (v === undefined) return [];
+  const lines = [
+    `verified    ${v.verdict.toUpperCase()} · ${v.checks.length} check(s) · plan ${v.planId.slice(0, 12)}`,
+    `  subject   candidate ${v.candidateId.slice(0, 16)} @ tree ${v.candidateTreeId.slice(0, 12)}`,
+    `  tree      before ${v.treeBeforeChecks.slice(0, 12)} → after ${v.treeAfterChecks.slice(0, 12)} · ${v.treeUnchanged ? "unchanged" : "CHANGED BY CHECKS"}`,
+  ];
+  for (const c of v.checks) {
+    lines.push(`  ${c.status.padEnd(22)} ${c.name} (${c.command})${c.exitCode !== null ? ` · exit ${c.exitCode}` : ""} · ${c.durationMs}ms`);
+  }
+  lines.push(`  id        ${v.verificationId}`);
+  lines.push(`  status    ${v.verdict === "pass" ? "VERIFIED — but NOT adjudicated, NOT promoted" : "NOT PROMOTED"} · workspace ${v.workspaceDisposition}`);
+  return lines;
 }
 
 
@@ -263,6 +283,9 @@ export async function runV2Cli(
     /** Builder seams, for the hermetic reachability suite. Production passes none. */
     readonly buildTools?: ProductionRunDeps["buildTools"];
     readonly captureTree?: ProductionRunDeps["captureTree"];
+    readonly checksSource?: ProductionRunDeps["checksSource"];
+    readonly checkRunner?: ProductionRunDeps["checkRunner"];
+    readonly treeProbe?: ProductionRunDeps["treeProbe"];
   } = {},
 ): Promise<number> {
   const out = io.stdout ?? writeStdout;
@@ -292,6 +315,9 @@ export async function runV2Cli(
       ...(io.sources !== undefined ? { sources: io.sources } : {}),
       ...(io.buildTools !== undefined ? { buildTools: io.buildTools } : {}),
       ...(io.captureTree !== undefined ? { captureTree: io.captureTree } : {}),
+      ...(io.checksSource !== undefined ? { checksSource: io.checksSource } : {}),
+      ...(io.checkRunner !== undefined ? { checkRunner: io.checkRunner } : {}),
+      ...(io.treeProbe !== undefined ? { treeProbe: io.treeProbe } : {}),
     },
   );
   out(args.json ? `${JSON.stringify(result, null, 2)}\n` : renderRun(result));

@@ -304,7 +304,7 @@ test("context truth: exactly ONE package, exactly one invocation, and nothing wr
   assert.equal(result.receipt.evidence.invocations, 1);
   assert.equal(result.receipt.evidence.candidatesCreated, 1, "the builder finished — the candidate is unverified, not absent");
   assert.equal(result.receipt.evidence.sourceRepositoryMutated, false);
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification"]);
   assert.equal(spawnSync("git", ["status", "--porcelain"], { cwd: repo, encoding: "utf8" }).stdout, before.stdout, "the repo is untouched");
 });
 

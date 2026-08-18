@@ -63,6 +63,7 @@ GIT_SUITES=(
   "src/v2/runtime/workspace-authority.test.ts"
   "src/v2/runtime/source-snapshot.test.ts"
   "src/v2/runtime/builder-tools.test.ts"
+  "src/v2/runtime/check-runner.test.ts"
   "src/modules/worker-model/checks-nonjs.test.ts"
   "src/modules/worker-model/critic-recovery-conformance.test.ts"
   "src/modules/worker-model/invocation-ledger-conformance.test.ts"
@@ -90,6 +91,7 @@ SUBPROCESS_SUITES=(
   "src/v2/cli/source-truth.test.ts"
   "src/v2/cli/retrieval-truth.test.ts"
   "src/v2/cli/builder-truth.test.ts"
+  "src/v2/cli/verification-truth.test.ts"
 )
 LOCALHOST_SUITES=("src/server/tasks.test.ts")
 

@@ -19,7 +19,7 @@ import {
   type LifecycleStage,
   type LifecycleViolationCode,
 } from "./lifecycle.js";
-import type { V2CandidateId } from "./identity.js";
+import type { V2CandidateId, V2VerificationId } from "./identity.js";
 import { summarizeEvidence } from "./result.js";
 
 const ids = createSequentialIdFactory("lcx");
@@ -47,6 +47,13 @@ const SNAPSHOT = "5".repeat(64) as V2SnapshotDigest;
 let candidateSeed = 0;
 const fakeCandidateId = (seed: string): V2CandidateId => (`${seed}`.repeat(64).slice(0, 64) as V2CandidateId);
 
+/**
+ * A distinct content-addressed verification id. V2-008 made verification identity a DIGEST
+ * (a verification IS a statement about an exact candidate tree + plan + results).
+ */
+let verificationSeed = 0;
+const fakeVerificationId = (seed: string): V2VerificationId => (`${seed}`.repeat(64).slice(0, 64) as V2VerificationId);
+
 function fresh() {
   const ids = createSequentialIdFactory("lc");
   const runId = ids.mint("run");
@@ -62,7 +69,7 @@ function walkTo(target: LifecycleStage) {
   // that occurred. The test mints distinct digests the same way the real code does.
   const candidateId = fakeCandidateId("a");
   const workspaceId = ids.mint("workspace");
-  const verificationId = ids.mint("verification");
+  const verificationId = fakeVerificationId("v");
   const promotionId = ids.mint("promotion");
   for (const stage of LIFECYCLE_STAGES) {
     lifecycle.enter(runId, stage);
@@ -180,11 +187,12 @@ test("lifecycle: VERIFICATION cannot be entered before a candidate exists", () =
   assert.equal(violation(() => lifecycle.enter(runId, "verification")), "missing_required_evidence");
 });
 
-test("lifecycle: PROMOTION cannot be entered before a verification exists", () => {
+test("lifecycle: DISPOSITION cannot be entered before a verification VERDICT exists (V2-008)", () => {
   const { lifecycle, runId } = walkTo("candidate_generation");
+  // The verification STAGE is entered, but no verdict is recorded — disposition/critic
+  // must not run on a candidate deterministic verification has not judged.
   lifecycle.enter(runId, "verification");
-  lifecycle.enter(runId, "disposition");
-  assert.equal(violation(() => lifecycle.enter(runId, "promotion")), "missing_required_evidence");
+  assert.equal(violation(() => lifecycle.enter(runId, "disposition")), "missing_required_evidence");
 });
 
 test("lifecycle: a stage may only record the evidence it owns", () => {
@@ -203,10 +211,10 @@ test("lifecycle: a stage may only record the evidence it owns", () => {
 });
 
 test("lifecycle: a verification must name a candidate that was actually recorded", () => {
-  const { lifecycle, ids, runId } = walkTo("verification");
+  const { lifecycle, runId } = walkTo("verification");
   assert.equal(
     violation(() =>
-      lifecycle.record(runId, { kind: "verification", id: ids.mint("verification"), candidateId: fakeCandidateId(String(candidateSeed += 1)) }),
+      lifecycle.record(runId, { kind: "verification", id: fakeVerificationId(String(verificationSeed += 1)), candidateId: fakeCandidateId(String(candidateSeed += 1)) }),
     ),
     "unrecorded_evidence",
   );
@@ -329,7 +337,7 @@ test("lifecycle: MANY candidates are first-class — the spine never assumes one
   lifecycle.enter(runId, "verification");
   // The SAME verification authority judges every candidate — no per-strategy verifier.
   for (const candidateId of lifecycle.ledger.candidates) {
-    lifecycle.record(runId, { kind: "verification", id: ids.mint("verification"), candidateId });
+    lifecycle.record(runId, { kind: "verification", id: fakeVerificationId(String(verificationSeed += 1)), candidateId });
   }
   assert.equal(lifecycle.ledger.candidates.length, 3);
   assert.equal(lifecycle.ledger.verifications.length, 3);

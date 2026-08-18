@@ -47,6 +47,7 @@ import type { V2InvocationRecord } from "./invocation.js";
 import type { V2WorkspaceRecord, WorkspaceDisposition } from "./workspace.js";
 import type { SourceSnapshotSummary } from "./source.js";
 import type { CandidateRecord, RunCandidateSummary } from "./candidate.js";
+import type { RunVerificationSummary, VerificationRecord } from "./verification.js";
 import type { RetrievalSummary } from "./retrieval.js";
 
 /** Why verified-good work was withheld instead of promoted. Closed set. */
@@ -393,6 +394,12 @@ export interface V2RunReceipt {
    * and the receipt must not imply otherwise.
    */
   readonly candidate?: RunCandidateSummary;
+  /**
+   * Absent unless verification actually ran on a candidate. Present with a truthful
+   * verdict (pass / fail / no_checks / candidate_drift / …) bound to the exact candidate
+   * tree — never optimistic, always counted from the ledger.
+   */
+  readonly verification?: RunVerificationSummary;
   readonly startedAt: number;
   readonly endedAt: number;
 }
@@ -463,6 +470,8 @@ export interface V2RunResult {
   readonly invocations: readonly V2InvocationRecord[];
   /** The candidate this run produced, when the builder finished and it was captured. */
   readonly candidate?: CandidateRecord;
+  /** The verification this run performed, when a candidate reached verification. */
+  readonly verification?: VerificationRecord;
   /** Every transition the run made, in order. The run's own account of itself. */
   readonly journal: readonly LifecycleTransition[];
   readonly receipt: V2RunReceipt;

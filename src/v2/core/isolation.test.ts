@@ -49,6 +49,11 @@ const V2_RUNTIME_ALLOWED_V1_IMPORTS = new Set([
   "../../core/workspace/manager.js", //            WorkspaceManager type + test construction
   "../../core/workspace/mutation.js", //           THE state-bound mutation core
   "../../core/injection/index.js", //              THE untrusted-data neutralization fence (V2-007A)
+  "../../modules/worker-model/checks.js", //       deterministic check DISCOVERY (V2-008)
+  "../../modules/governed-exec/index.js", //       THE governed check executor (V2-008)
+  "../../core/identity/registry.js", //            self-contained verifier identity (V2-008)
+  "../../core/identity/resolver.js", //            mint the verifier's OperationContext (V2-008)
+  "../../core/identity/index.js", //               OperationContext type (V2-008)
   "../../core/substrate/lock.js", //               lock manager, for the adapter's own tests
   "../../core/substrate/store.js", //              document store, for the adapter's own tests
   "pino", //                                       the logger the donor manager requires (tests only)
@@ -424,19 +429,21 @@ test("single chokepoint: the tool executor builds NO conversation message (V2-00
   assert.equal(/RenderedMessage|renderBuilderInput|role:\s*["'](tool|system|assistant)["']/.test(source), false, "the executor produces results, not messages");
 });
 
-test("single authority: no v2 file offers the builder a SHELL", () => {
+test("single authority: no v2 file offers the BUILDER a SHELL", () => {
   // A terminal would let `sed -i` and `echo >` write outside the mutation authority. That
-  // is not a missing tool, it is an architectural bypass — parked until governed exec has
-  // a slice of its own.
+  // is not a missing tool, it is an architectural bypass. The VERIFIER's governed check
+  // execution (V2-008) is a different thing — an infrastructure authority the MODEL never
+  // reaches — so its one adapter is excluded.
+  const allowed = new Set([join(V2_DIR, "runtime", "check-runner.ts")]);
   const offenders: string[] = [];
   for (const file of tsFiles(V2_DIR)) {
     // Test fixtures run `git init`; the fake provider spawns itself. Neither is reachable
     // by a model — the guard is about what the BUILDER can invoke.
-    if (file.endsWith(".test.ts") || file.endsWith("fixture-repo.ts") || file.endsWith("fake-provider-server.ts")) continue;
+    if (allowed.has(file) || file.endsWith(".test.ts") || file.endsWith("fixture-repo.ts") || file.endsWith("fake-provider-server.ts")) continue;
     const source = stripComments(readFileSync(file, "utf8"));
     if (/governed-exec|runTerminal|terminalTool|commandPolicy|execFile|spawnSync/.test(source)) offenders.push(relative(SRC, file));
   }
-  assert.deepEqual(offenders, [], "v2 exposes no command execution to a model in this slice");
+  assert.deepEqual(offenders, [], "v2 exposes no command execution to a MODEL in this slice");
 });
 
 test("single authority: only the candidate module mints a candidate identity", () => {
@@ -458,6 +465,77 @@ test("single authority: a candidate is CREATED only by the run spine, after gene
     if (/candidateDigest\s*\(/.test(stripComments(readFileSync(file, "utf8")))) offenders.push(relative(SRC, file));
   }
   assert.deepEqual(offenders, [], "no component may declare a candidate into existence on its own");
+});
+
+test("single authority: only the verification module mints a verification identity (V2-008)", () => {
+  const allowed = new Set([join(V2_DIR, "core", "verification.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    const source = stripComments(readFileSync(file, "utf8"));
+    if (/contentDigest\s*\(\s*"verification/.test(source)) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "verification + plan identity belong to src/v2/core/verification.ts alone");
+});
+
+test("single authority: a candidate is VERIFIED only by the run spine (V2-008)", () => {
+  // `verification.ts` declares `verifyCandidate`; `run.ts` is the only caller. A second
+  // caller would be a second verification path — the thing this authority exists to prevent.
+  const allowed = new Set([join(V2_DIR, "core", "run.ts"), join(V2_DIR, "core", "verification.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    if (/verifyCandidate\s*\(/.test(stripComments(readFileSync(file, "utf8")))) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "no component may run verification on its own");
+});
+
+test("single authority: only the check-runner adapter reaches governed-exec (V2-008)", () => {
+  // Verification commands run through ONE governed executor. A second importer would be a
+  // second, ungoverned execution path — and the model must never reach any of them.
+  const allowed = new Set([join(V2_DIR, "runtime", "check-runner.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    for (const spec of importSpecifiers(readFileSync(file, "utf8"))) {
+      if (spec.includes("governed-exec")) offenders.push(`${relative(SRC, file)} -> ${spec}`);
+    }
+  }
+  assert.deepEqual(offenders, [], "governed execution for verification is reached through the check-runner adapter alone");
+});
+
+test("single authority: no v2 file spawns a process for verification outside the adapter (V2-008)", () => {
+  // The check-runner adapter is the ONLY place a check command is executed. A stray
+  // child_process spawn/exec would be an ungoverned check path.
+  const allowed = new Set([join(V2_DIR, "runtime", "check-runner.ts"), join(V2_DIR, "runtime", "source-snapshot.ts"), join(V2_DIR, "runtime", "candidate-capture.ts"), join(V2_DIR, "runtime", "workspace-authority.ts"), join(V2_DIR, "runtime", "source-materializer.ts"), join(V2_DIR, "runtime", "verification-tree.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts") || file.endsWith("fixture-repo.ts") || file.endsWith("fake-provider-server.ts")) continue;
+    const source = stripComments(readFileSync(file, "utf8"));
+    if (/child_process|execFileSync|spawnSync|\bspawn\s*\(/.test(source)) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "verification never spawns a process outside the governed check-runner adapter");
+});
+
+test("single authority: the verifier neither mutates nor invokes a model (V2-008)", () => {
+  // Deterministic verification only: no StateBoundMutationAuthority.mutate, no
+  // InvocationAuthority, no critic/refuter/integrator/judge/fixer. The core verifier
+  // imports only pure contracts.
+  const specs = importSpecifiers(readFileSync(join(V2_DIR, "core", "verification.ts"), "utf8"));
+  for (const forbidden of ["./invocation.js", "./builder.js", "node:fs", "node:child_process"]) {
+    assert.equal(specs.includes(forbidden), false, `the verifier must not import ${forbidden}`);
+  }
+  const source = stripComments(readFileSync(join(V2_DIR, "core", "verification.ts"), "utf8"));
+  assert.equal(/\.mutate\s*\(|invokeAuthorized|generateCandidate/.test(source), false, "the verifier does not mutate or invoke a model");
+  // And nothing in v2 imports a v1 critic / refuter / integrator / judge / fixer.
+  const critics: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (file.endsWith(".test.ts")) continue;
+    for (const spec of importSpecifiers(readFileSync(file, "utf8"))) {
+      if (/worker-model\/(critic|refuter|integrator|fix|deterministic-judge|verifier)\b|semantic-judge/.test(spec)) critics.push(`${relative(SRC, file)} -> ${spec}`);
+    }
+  }
+  assert.deepEqual(critics, [], "V2-008 is deterministic — no critic/refuter/integrator/judge/fixer/verifier v1 import");
 });
 
 test("single authority: no v2 file imports the v1 BUILDER or its tools", () => {

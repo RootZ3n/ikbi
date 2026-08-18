@@ -125,6 +125,12 @@ function capture() {
       ok: true as const,
       tree: { treeId: "t".repeat(40), baseTreeId: "t".repeat(40), materializedStateDigest: "m".repeat(64), changed: false },
     }),
+    // V2-008: hermetic verification seams. The tree probe returns the SAME id captureTree
+    // froze (no drift), and there are no checks → verdict no_checks. This suite is about
+    // REACHABILITY of the spine, not about running real governed checks.
+    checksSource: { resolve: async () => ({ ok: false as const, reason: "hermetic reachability suite: no checks" }) },
+    checkRunner: { run: async () => ({ launched: false as const, timedOut: false, durationMs: 0, outputSha256: "0".repeat(64), outputExcerpt: "" }) },
+    treeProbe: { treeOf: async () => "t".repeat(40) },
     get out() {
       return out;
     },
@@ -158,7 +164,7 @@ test("reachability: the command body enters the canonical lifecycle and reports 
   assert.equal(cap.err, V2_BANNER, "the experimental banner goes to stderr, not stdout");
   assert.match(
     cap.out,
-    /stages\s+preflight -> model_resolution -> context -> candidate_strategy -> candidate_generation$/m,
+    /stages\s+preflight -> model_resolution -> context -> candidate_strategy -> candidate_generation -> verification$/m,
     "the run walked the whole implemented spine",
   );
   assert.match(cap.out, /not implemented/, "and said so truthfully");
@@ -174,7 +180,7 @@ test("reachability: the JSON surface carries the lifecycle journal + a counted r
   assert.equal(result.journal[0]?.from, "pending");
   assert.equal(result.journal[0]?.to, "preflight");
   assert.equal(result.journal.at(-1)?.to, "terminal");
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification"]);
   assert.equal(result.outcome.kind, "failed");
   assert.deepEqual(result.receipt.evidence, {
     // Configuration (V2-002) and route authorization (V2-003) happen — and nothing else.
@@ -197,7 +203,8 @@ test("reachability: the JSON surface carries the lifecycle journal + a counted r
     // candidate, and still verified by nothing.
     candidatesCreated: 1,
     candidateMutated: false,
-    verificationsPerformed: 0,
+    // V2-008: the candidate WAS verified (no_checks, hermetically).
+    verificationsPerformed: 1,
     promotionsAttempted: 0,
     promoted: false,
     sourceRepositoryMutated: false,
@@ -209,7 +216,7 @@ test("reachability: the CLI never claims a stage it did not run", async () => {
   await runV2Cli(["build", "x", "--json"], cap);
   const result = JSON.parse(cap.out) as V2RunResult;
   for (const stage of LIFECYCLE_STAGES) {
-    if (stage === "preflight" || stage === "model_resolution" || stage === "context" || stage === "candidate_strategy" || stage === "candidate_generation") continue;
+    if (stage === "preflight" || stage === "model_resolution" || stage === "context" || stage === "candidate_strategy" || stage === "candidate_generation" || stage === "verification") continue;
     assert.equal(result.receipt.stagesEntered.includes(stage), false, `never entered ${stage}`);
   }
   assert.ok(result.outcome.kind === "failed");
