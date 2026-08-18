@@ -56,8 +56,13 @@ import type { V2SnapshotDigest } from "./identity.js";
  *                            safety, routing, mutation or promotion.
  *   target_file              files the goal explicitly names: the most direct evidence
  *                            of what the task is actually about.
+ *   retrieved_repository_evidence
+ *                            files DISCOVERED by deterministic retrieval because they
+ *                            look relevant. Lowest band on purpose: a guess about
+ *                            relevance, however good, must never crowd out what the
+ *                            operator actually named. It fills the budget that is left.
  */
-export const CONTEXT_CATEGORIES = ["task", "repository_instructions", "target_file"] as const;
+export const CONTEXT_CATEGORIES = ["task", "repository_instructions", "target_file", "retrieved_repository_evidence"] as const;
 export type ContextCategory = (typeof CONTEXT_CATEGORIES)[number];
 
 /** Priority index of a category (lower = admitted earlier). */
@@ -111,7 +116,9 @@ export type ContextOmissionReason =
   | "unreadable"
   | "outside_repository"
   | "not_a_regular_file"
-  | "empty";
+  | "empty"
+  /** A higher band already carries these exact bytes; sending them twice buys nothing. */
+  | "duplicate";
 
 /** One recorded omission. Every candidate that did not become an artifact leaves one. */
 export interface ContextOmission {
@@ -138,6 +145,14 @@ export interface ContextOmission {
 export interface ContextSourceRequest {
   readonly goal: string;
   readonly source: SourceSnapshotReader;
+  /**
+   * Paths already offered by HIGHER-priority sources, sorted.
+   *
+   * Told to a source so it can spend its own limited slots on something new instead of
+   * re-offering what is already present. It is a hint for QUALITY, not the deduplication
+   * rule: the assembler enforces that itself below, because admission is its job.
+   */
+  readonly alreadyOffered: readonly string[];
 }
 
 /**
@@ -379,7 +394,10 @@ export async function assembleContext(
     sourcesConsulted.push(source.id);
     let collected: ContextSourceResult;
     try {
-      collected = await source.collect({ goal: request.goal, source: request.source });
+      // Sources are consulted highest-band-first, so what earlier ones offered is
+      // exactly what a later one should not bother repeating.
+      const alreadyOffered = [...new Set(candidates.map((c) => c.path).filter((p): p is string => p !== undefined))].sort();
+      collected = await source.collect({ goal: request.goal, source: request.source, alreadyOffered });
     } catch (err) {
       // A source that throws is a defect in that source, not a reason to silently
       // deliver a smaller context: the run fails and says which source broke.
@@ -403,8 +421,22 @@ export async function assembleContext(
     .map((entry) => entry.candidate);
 
   const artifacts: ContextArtifact[] = [];
+  const admittedPaths = new Set<string>();
   let spent = 0;
   for (const candidate of ordered) {
+    // DEDUPLICATION IS THE ASSEMBLER'S CALL. Two sources may legitimately find the same
+    // file; paying for it twice is never right, and the lower-priority offer is the one
+    // that loses because the walk is already in priority order.
+    if (candidate.path !== undefined && admittedPaths.has(candidate.path)) {
+      omissions.push({
+        category: candidate.category,
+        sourceId: candidate.sourceId,
+        path: candidate.path,
+        reason: "duplicate",
+        detail: "a higher-priority source already provided this file",
+      });
+      continue;
+    }
     const estimated = estimateTokens(candidate.content);
     if (spent + estimated > budget.availableInputTokens) {
       if (candidate.category === "task") {
@@ -430,6 +462,7 @@ export async function assembleContext(
       continue;
     }
     spent += estimated;
+    if (candidate.path !== undefined) admittedPaths.add(candidate.path);
     artifacts.push({
       artifactId: contentDigest("artifact", {
         category: candidate.category,

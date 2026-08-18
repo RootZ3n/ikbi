@@ -33,7 +33,7 @@ export const V2_USAGE = `Usage: ikbi v2 build "<goal>" [--repo <path>] [--strate
 
 /** The experimental banner. On stderr so `--json` stdout stays machine-clean. */
 export const V2_BANNER =
-  "ikbi v2: EXPERIMENTAL architecture probe — resolves a route, assembles context, and makes ONE model call to qualify the route. No build, no mutation, no promotion.\n";
+  "ikbi v2: EXPERIMENTAL architecture probe — resolves a route, retrieves relevant source, assembles context, and makes ONE model call to qualify the route. No build, no mutation, no promotion.\n";
 
 interface V2Args {
   readonly subcommand: string | undefined;
@@ -181,11 +181,20 @@ function contextLines(result: V2RunResult): string[] {
       `(window ${c.contextWindowTokens}); sources: ${c.sourcesConsulted.join(", ")}`,
     `package     ${c.packageId}`,
   ];
+  const r = result.receipt.retrieval;
+  if (r !== undefined) {
+    // Stated as an ACCOUNT, not a boast: how much source was searched, how much matched,
+    // and how much of that actually survived admission into the package.
+    lines.push(
+      `retrieval   ${r.algorithm} · examined ${r.examined} source file(s), ${r.matched} matched, ${r.offered} admitted` +
+        `${r.duplicatesSuppressed > 0 ? `, ${r.duplicatesSuppressed} already present` : ""}`,
+    );
+  }
   for (const a of result.context?.artifacts ?? []) {
-    lines.push(`  + ${a.category.padEnd(24)} ${a.path ?? "(task)"} · ${a.bytes}B${a.truncated ? " (truncated)" : ""} · ~${a.estimatedTokens}t`);
+    lines.push(`  + ${a.category.padEnd(29)} ${a.path ?? "(task)"} · ${a.bytes}B${a.truncated ? " (truncated)" : ""} · ~${a.estimatedTokens}t`);
   }
   for (const o of result.context?.omissions ?? []) {
-    lines.push(`  - ${o.category.padEnd(24)} ${o.path ?? ""} · omitted: ${o.reason}`);
+    lines.push(`  - ${o.category.padEnd(29)} ${o.path ?? ""} · omitted: ${o.reason}`);
   }
   return lines;
 }

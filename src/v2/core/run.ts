@@ -18,7 +18,9 @@
  *   5. enter `model_resolution` and ask THE resolver which exact model/provider route is
  *      AUTHORIZED for the builder role, recording the decision on the ledger
  *   6. enter `context` and ask THE assembler for the one bounded, content-addressed
- *      context package that route's capabilities permit, recording it on the ledger
+ *      context package that route's capabilities permit — deterministic retrieval runs
+ *      here as an ordinary source, DISCOVERING relevant files while the assembler alone
+ *      decides what is admitted — recording both on the ledger
  *   7. enter `invocation` and ask THE invocation authority to call EXACTLY that route,
  *      once, recording what was authorized, what was sent, and what the provider says
  *      actually served it
@@ -57,6 +59,7 @@ import {
   type ModelResolutionDecision,
 } from "./resolver.js";
 import { assembleContext, manifestOf, type ContextPackage, type ContextSource } from "./context.js";
+import { summarizeRetrieval, type RetrievalReporter, type RetrievalSummary } from "./retrieval.js";
 import { summarizeSnapshot, type SourceSnapshotAuthority, type SourceSnapshotReader } from "./source.js";
 import {
   V2_WORKSPACE_FAILURE_CODES,
@@ -184,6 +187,12 @@ export interface V2RunDeps {
    * the filesystem. The production list is wired once, in `src/v2/runtime/index.ts`.
    */
   readonly contextSources: readonly ContextSource[];
+  /**
+   * Where the run asks what deterministic retrieval actually did, once context is
+   * assembled. Optional: a run wired with no retrieval source truthfully reports none
+   * rather than an empty one, and the distinction stays visible in the receipt.
+   */
+  readonly retrieval?: RetrievalReporter;
   /**
    * The model transport. REQUIRED and injected for the same reason the other two are:
    * it performs I/O, and this layer imports no v1 code. Tests supply a fake and stay
@@ -328,6 +337,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
   let policy: RuntimeModelPolicy | undefined;
   let source: SourceSnapshotReader | undefined;
   let decision: ModelResolutionDecision | undefined;
+  let retrieval: RetrievalSummary | undefined;
   let contextPackage: ContextPackage | undefined;
   let invocation: V2InvocationRecord | undefined;
   let workspace: V2WorkspaceRecord | undefined;
@@ -389,6 +399,21 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     );
     if (!assembled.ok) return assembled.failure;
     contextPackage = assembled.package;
+    // Retrieval evidence is recorded BEFORE the package: what was searched for is a fact
+    // about how this package came to exist, and the ledger reads in causal order.
+    const retrieved = deps.retrieval?.lastResult();
+    if (retrieved !== undefined) {
+      retrieval = summarizeRetrieval(
+        retrieved,
+        contextPackage.artifacts.filter((a) => a.category === "retrieved_repository_evidence").length,
+      );
+      lifecycle.record(runId, {
+        kind: "retrieval",
+        id: retrieved.retrievalId,
+        offered: retrieved.candidates.length,
+        examined: retrieved.examinedCount,
+      });
+    }
     lifecycle.record(runId, { kind: "context", packageId: contextPackage.packageId, artifacts: contextPackage.artifacts.length });
 
     // Stage 4 — INVOCATION. Exactly the authorized route, exactly once. The id is minted
@@ -490,6 +515,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     ...(source !== undefined ? { sourceSnapshot: summarizeSnapshot(source.snapshot) } : {}),
     ...(decision !== undefined ? { resolution: summarizeResolution(decision) } : {}),
     ...(contextPackage !== undefined ? { context: summarizeContext(contextPackage) } : {}),
+    ...(retrieval !== undefined ? { retrieval } : {}),
     ...(invocation !== undefined ? { invocation: summarizeInvocation(invocation) } : {}),
     ...(workspace !== undefined && disposition !== undefined
       ? { workspace: summarizeWorkspace({ workspace, observations: workspaceObservations, disposition }) }

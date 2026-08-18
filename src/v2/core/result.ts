@@ -46,6 +46,7 @@ import type { ContextManifest, ContextPackage } from "./context.js";
 import type { V2InvocationRecord } from "./invocation.js";
 import type { V2WorkspaceRecord, WorkspaceDisposition } from "./workspace.js";
 import type { SourceSnapshotSummary } from "./source.js";
+import type { RetrievalSummary } from "./retrieval.js";
 
 /** Why verified-good work was withheld instead of promoted. Closed set. */
 export type WithheldReason = "governance" | "operator" | "policy" | "dry_run";
@@ -147,6 +148,8 @@ export interface RunEvidenceSummary {
   readonly observationsTaken: number;
   /** Mutations actually APPLIED through the state-bound authority. */
   readonly mutationsApplied: number;
+  /** True only when deterministic retrieval actually ran during context assembly. */
+  readonly retrievalPerformed: boolean;
   /** True only when the assembler actually produced an authorized context package. */
   readonly contextAssemblyCompleted: boolean;
   /** How many context packages exist. Exactly one, or none. */
@@ -355,6 +358,8 @@ export interface V2RunReceipt {
   readonly resolution?: RunResolutionSummary;
   /** Absent when the run ended before context was assembled. */
   readonly context?: RunContextSummary;
+  /** Absent when retrieval did not run. Present and empty when it ran and found nothing. */
+  readonly retrieval?: RetrievalSummary;
   /** Absent when no transport was reached, or when the invocation failed. */
   readonly invocation?: RunInvocationSummary;
   /** Absent when preflight did not capture a source snapshot. */
@@ -376,6 +381,7 @@ export function summarizeEvidence(ledger: RunLedgerView, outcome: RunTerminalOut
     configurationResolved: ledger.configurations.length > 0,
     modelResolutionCompleted: ledger.resolutions.length > 0,
     modelResolutions: ledger.resolutions.length,
+    retrievalPerformed: ledger.retrievals.length > 0,
     contextAssemblyCompleted: ledger.contexts.length > 0,
     contextPackages: ledger.contexts.length,
     sourceSnapshotCaptured: ledger.snapshots.length > 0,

@@ -4,7 +4,8 @@ Produced during **V2-001** (canonical lifecycle foundation) and updated by **V2-
 (provider + profile configuration boundary), **V2-003** (single model-resolution
 authority), **V2-003A** (provider inventory truth) **V2-004** (canonical context
 authority) **V2-005** (canonical model invocation authority) **V2-006** (workspace + state-bound
-mutation authority) and **V2-006A** (canonical source snapshot authority). This is an **advisory input to future work
+mutation authority), **V2-006A** (canonical source snapshot authority) and **V2-006B**
+(deterministic snapshot-bound retrieval). This is an **advisory input to future work
 orders**, not a change plan and not permission to delete anything. Nothing in v1 was
 removed, disabled, or altered to produce it.
 
@@ -85,8 +86,8 @@ project-retrieval output reaches the builder prompt directly.**
 | `context-layer` | **YES** — `builder.ts:71` | deterministic in-loop compression once a conversation grows | **PARK** — mid-conversation compaction. There is no conversation until invocation exists. |
 | `context-manager` | **YES** — `builder.ts:70` | model-produced summarisation of the middle of a conversation | **PARK — invokes a model.** Out of scope by construction for a read-only slice, and it belongs to the invocation loop, not to initial assembly. |
 | Scout context gathering | **YES** — the scout role | a model-written brief that carries retrieval results into `builder_prior_results` | **PARK — invokes a model.** This is the only path by which retrieval currently reaches a builder. A future builder strategy may request model-driven exploration through the canonical invocation path; it must not hide a model call inside "context". |
-| `project-retrieval` | **INDIRECT** — scout (index mode) + `consult` | deterministic, model-free relevance ranking over the index | **PARK (preserve)** — genuinely deterministic and the strongest retrieval candidate, but it reaches a builder only via the model-based scout. It becomes a `ContextSource` in a later slice, behind the same narrow interface. |
-| `project-index` | **INDIRECT** — verification-ladder, repo-doctor, project-retrieval | repository structure/graph | **PARK (preserve)** — real and used, but not a context contributor today. |
+| `project-retrieval` | **INDIRECT** — scout (index mode) + `consult` | deterministic, model-free relevance ranking over the index | **RESOLVED IN V2-006B — see below.** |
+| `project-index` | **INDIRECT** — verification-ladder, repo-doctor, project-retrieval | repository structure/graph | **RESOLVED IN V2-006B — see below.** |
 | `context-packets` | **NO** — no production consumer (only a doc-comment reference in `consult/codeSlice.ts`) | repo map + file previews | **PARK — dormant.** Nothing calls it. Migrating it would be adopting a second retrieval system on the strength of its existing, which is the habit v2 exists to break. |
 | `lab-context-memory` / `labmem-recall` | **YES**, but not to the builder — cognition-layer, drift-prevention, capability-recovery | cross-agent memory | **PARK** — speculative/global memory with unbounded relevance. Not imported into v2 context. |
 | gbrain recall | **OPT-IN**, default off (`IKBI_GBRAIN_CONTEXT`) — `builder.ts:1046` | external knowledge, injected beside project instructions | **PARK** — spawns an external process and is off by default. |
@@ -129,6 +130,28 @@ project-retrieval output reaches the builder prompt directly.**
 | `git status --porcelain` / `ls-files --others --exclude-standard` | **YES** — diff/summary helpers | **ADOPT as the fact source.** Git already knows which files are tracked, modified, deleted, untracked and ignored. v2 asks it rather than inventing a second opinion about what counts as source. |
 | `git show HEAD:<path>` | — | **ADOPT.** Serving unchanged files from the immutable HEAD blob is what makes mid-run source drift structurally impossible rather than merely detected. |
 
+## Retrieval systems *(V2-006B)*
+
+The gap V2-004 left open: with only instructions and goal-named targets as sources, a
+task that named no filename gave the model almost no repository evidence. v1 does have
+deterministic ranking — but it reaches a builder only through the MODEL-DRIVEN SCOUT, so
+adopting it as-is would have hidden a model call inside "context".
+
+| v1 system | Production reachability | Contributes | Verdict |
+| --- | --- | --- | --- |
+| `project-retrieval` scoring vocabulary (reason→weight table, stable sorts, decision trail) | **INDIRECT** — scout (index mode) + `consult` | an explainable score per file | **ADOPT as SEMANTICS.** v2 keeps the shape — a closed set of named reasons, each with a fixed weight, so a score always decomposes into stated evidence — and keeps the total-order sort. Weights and reason names are v2's own. |
+| `goalTokens` query mining + `STOPWORDS` | same | path-shaped tokens and stopworded prose terms from the goal | **ADOPT (refined).** v2 reuses the two-kind split and the stopword idea, and adds three corrections found by testing: identifiers are ALSO split into camel/snake fragments; terms match WHOLE WORDS (v1-style substring search reports a file about "nothing" as evidence for a task about "things"); and a path written in the goal has its text removed before prose is mined, so naming `src/widget.ts` does not make every file under `src/` a directory match. |
+| `project-retrieval`'s index INPUT (`projectIndex.refresh(repoPath)`) | same | the file set and graph it ranks over | **REPLACE.** This is the disqualifying coupling: ranking is deterministic, but its input is a live filesystem walk behind a mutable cache, so the same task could rank differently at two moments. v2 ranks over the run's `SourceSnapshot` via a new read-only `list()` seam — HEAD ∪ untracked − deleted − excluded. |
+| `project-index` | **INDIRECT** — verification-ladder, repo-doctor, project-retrieval | repository structure/graph, cached | **PARK (preserve).** 991 lines of direct `readdirSync`/`readFileSync`/`statSync` walking (`implementation.ts:211-529`), its own `.gitignore` parsing and a persisted cache with no snapshot binding. Real and used by v1; adopting it would reintroduce the mutable-source reread V2-006A removed. v2 derives the little structure it needs — import edges, colocated tests — from snapshot bytes, per run, with no cache. |
+| Scout context gathering | **YES** — the scout role | a model-written brief carrying retrieval into `builder_prior_results` | **STILL PARKED — invokes a model.** V2-006B removes the *reason* it was the only retrieval path; a future builder strategy may still request model-driven exploration, through the canonical invocation path. |
+| `context-packets` | **NO** — no production consumer | repo map + file previews | **STILL PARKED — dormant.** v2 now has one retrieval authority; adopting a second on the strength of its existing is the habit v2 exists to break. |
+
+**The division of labour, stated once.** RETRIEVAL DISCOVERS; THE CONTEXT AUTHORITY
+ADMITS. `rankFiles` proposes at most `maxCandidates` files with reasons; `assembleContext`
+decides what actually fits, in the lowest priority band, and records every omission. A
+retrieved file never displaces one the operator named, and a file a higher band already
+carries is never paid for twice.
+
 ## Standing constraints for later slices
 
 1. **No second promote path.** Any strategy that wants to promote must do it by
@@ -146,29 +169,34 @@ project-retrieval output reaches the builder prompt directly.**
    complexity routing and the cheapest-sufficient router may return as STRATEGIES called
    inside it; none may become an entry point. Static guards in
    `src/v2/core/isolation.test.ts` fail the build on a v2 import of any of them.
-6. **Inventory is not preference.** *(V2-003, enforced V2-003A)* Nothing an operator
+6. **Retrieval never admits.** *(V2-006B)* Relevance ranking lives in
+   `src/v2/core/retrieval.ts` and nowhere else; the context source that carries its
+   output may not sort, re-score or mint an identity, and may not enumerate source by
+   any means other than `SourceSnapshotReader.list()`. Retrieval introduces no model
+   call — the production skeleton still performs exactly one invocation.
+7. **Inventory is not preference.** *(V2-003, enforced V2-003A)* Nothing an operator
    PREFERS may add, rename, reroute, remove, or suppress a model. Enforced structurally:
    `buildCanonicalCatalog`'s input type has no field a preference fits into, and the
    catalog module imports nothing that could supply one. Only the roster, the provider
    set, a credential genuinely appearing/disappearing, or real capability data may move
    `inventoryDigest`.
-7. **No raw context downstream.** *(V2-004)* Anything that will face a model receives a
+8. **No raw context downstream.** *(V2-004)* Anything that will face a model receives a
    `ContextPackage`, never a context source, a repository file, or an ad-hoc string. One
    assembler admits; every omission and truncation is recorded; nothing overflows
    silently.
-8. **Selection and invocation are different authorities.** *(V2-005)* The resolver says
+9. **Selection and invocation are different authorities.** *(V2-005)* The resolver says
    which route is authorized; the invocation authority sends exactly that route, once,
    and records what actually served it. No fallback, no retry, no second resolution. The
    four identities — requested, authorized, sent, served — are never collapsed, and
    `served` is only ever read from the provider's own response.
-9. **One workspace authority, one mutation authority.** *(V2-006)* No component creates
+10. **One workspace authority, one mutation authority.** *(V2-006)* No component creates
    its own worktree, and nothing writes a file except through `mutate`, which requires an
    OBSERVATION rather than a path. Observations are workspace-scoped: identical bytes in a
    sibling candidate are not identical authority. A stale observation is refused — never
    merged, overwritten, silently re-observed or retried.
-10. **One run, one source snapshot.** *(V2-006A)* Context reads it, the workspace is
+11. **One run, one source snapshot.** *(V2-006A)* Context reads it, the workspace is
    materialized from it, and nothing recaptures — silently or otherwise. Reproducing the
    operator's existing uncommitted work in isolation is MATERIALIZATION, never a model
    mutation, and never counts as one.
-11. **Nothing is "done" because it exists.** A migrated subsystem is done when a test
+12. **Nothing is "done" because it exists.** A migrated subsystem is done when a test
    enters through the canonical v2 entrypoint and proves the subsystem is what ran.

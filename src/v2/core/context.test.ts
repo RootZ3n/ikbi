@@ -55,7 +55,7 @@ function reader(snapshotId = "s".repeat(64)): SourceSnapshotReader {
     counts: { modified: 0, deleted: 0, untrackedIncluded: 0, excluded: 0 },
     capturedAt: 1,
   } satisfies SourceSnapshot;
-  return { snapshot, read: async () => ({ ok: false, reason: "missing", detail: "not in this snapshot" }) };
+  return { snapshot, list: async () => [], read: async () => ({ ok: false, reason: "missing", detail: "not in this snapshot" }) };
 }
 
 const request = (over: Partial<ContextAssemblyRequest> = {}): ContextAssemblyRequest => ({
@@ -159,14 +159,41 @@ test("assembly: the operator's goal is always the first artifact", async () => {
 });
 
 test("assembly: priority bands are the ONE ordering policy", async () => {
-  assert.deepEqual([...CONTEXT_CATEGORIES], ["task", "repository_instructions", "target_file"]);
+  assert.deepEqual(
+    [...CONTEXT_CATEGORIES],
+    ["task", "repository_instructions", "target_file", "retrieved_repository_evidence"],
+  );
   const sources = [
+    // Offered in the WRONG order on purpose: the band decides, not the source list.
+    fakeSource("last", [{ category: "retrieved_repository_evidence", path: "guess.ts", content: "G" }]),
     fakeSource("late", [{ category: "target_file", path: "z.ts", content: "Z" }]),
     fakeSource("early", [{ category: "repository_instructions", path: "AGENTS.md", content: "I" }]),
   ];
   const pkg = await packageOf(sources);
-  assert.deepEqual(pkg.artifacts.map((a) => a.category), ["task", "repository_instructions", "target_file"]);
+  assert.deepEqual(pkg.artifacts.map((a) => a.category), [
+    "task",
+    "repository_instructions",
+    "target_file",
+    "retrieved_repository_evidence",
+  ]);
   assert.ok(categoryPriority("repository_instructions") < categoryPriority("target_file"));
+  assert.ok(
+    categoryPriority("target_file") < categoryPriority("retrieved_repository_evidence"),
+    "a guess about relevance never outranks a file the operator named",
+  );
+});
+
+test("assembly: a file a HIGHER band already carries is never paid for twice", async () => {
+  const pkg = await packageOf([
+    fakeSource("named", [{ category: "target_file", path: "z.ts", content: "Z" }]),
+    fakeSource("guessed", [{ category: "retrieved_repository_evidence", path: "z.ts", content: "Z" }]),
+  ]);
+  assert.deepEqual(pkg.artifacts.filter((a) => a.path === "z.ts").length, 1);
+  assert.deepEqual(
+    pkg.omissions.filter((o) => o.path === "z.ts").map((o) => `${o.sourceId}:${o.reason}`),
+    ["guessed:duplicate"],
+    "and the lower-priority offer is the one that loses, with the reason recorded",
+  );
 });
 
 test("assembly: within a band, the order candidates were offered is preserved", async () => {

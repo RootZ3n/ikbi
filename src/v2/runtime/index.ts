@@ -25,6 +25,7 @@ import { runV2Build, type RepoProbe } from "../core/run.js";
 import type { ContextSource } from "../core/context.js";
 import type { InvocationTransport } from "../core/invocation.js";
 import { PRODUCTION_CONTEXT_SOURCES } from "./context-sources.js";
+import { createRetrievalSource } from "./retrieval-source.js";
 import { createInvocationTransport } from "./invocation-transport.js";
 import { createProductionWorkspaceAuthorities } from "./workspace-authority.js";
 import { createSourceSnapshotAuthority } from "./source-snapshot.js";
@@ -179,12 +180,19 @@ export async function runV2BuildProduction(request: V2TaskRequest, deps: Product
   const wired = complete
     ? { workspaces: deps.workspaces!, mutations: deps.mutations!, sources: deps.sources! }
     : await productionAuthorities();
+  // The retrieval source is built PER RUN and is the reporter for that same run, so the
+  // receipt can never describe a retrieval some other run performed.
+  const retrieval = createRetrievalSource();
+  const sources = deps.contextSources ?? [...PRODUCTION_CONTEXT_SOURCES, retrieval];
   return runV2Build(request, {
     workspaces: deps.workspaces ?? wired.workspaces,
     mutations: deps.mutations ?? wired.mutations,
     sources: deps.sources ?? wired.sources,
     configuration: deps.configuration ?? createConfigurationSource(),
-    contextSources: deps.contextSources ?? PRODUCTION_CONTEXT_SOURCES,
+    contextSources: sources,
+    // Reported only when the run is actually using the production source list: a caller
+    // that injected its own sources gets no retrieval claim it did not earn.
+    ...(deps.contextSources === undefined ? { retrieval } : {}),
     transport: deps.transport ?? productionTransport(),
     ...(deps.probe !== undefined ? { probe: deps.probe } : {}),
   });

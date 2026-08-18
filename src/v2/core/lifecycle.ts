@@ -50,6 +50,7 @@ import type {
   V2ObservationDigest,
   V2InvocationId,
   V2PolicyDigest,
+  V2RetrievalDigest,
   V2SnapshotDigest,
   V2PromotionId,
   V2RunId,
@@ -139,6 +140,7 @@ export type LifecycleEvidence =
   | { readonly kind: "configuration"; readonly policyId: V2PolicyDigest }
   | { readonly kind: "snapshot"; readonly id: V2SnapshotDigest; readonly clean: boolean }
   | { readonly kind: "resolution"; readonly decisionId: V2DecisionDigest; readonly role: string }
+  | { readonly kind: "retrieval"; readonly id: V2RetrievalDigest; readonly offered: number; readonly examined: number }
   | { readonly kind: "context"; readonly packageId: V2ContextDigest; readonly artifacts: number }
   | { readonly kind: "invocation"; readonly id: V2InvocationId; readonly role: string }
   | { readonly kind: "workspace"; readonly id: V2WorkspaceId; readonly baseTree: string }
@@ -164,6 +166,9 @@ const EVIDENCE_STAGE: Record<LifecycleEvidence["kind"], readonly LifecycleStage[
   // A model-resolution decision may only be minted by the stage that owns resolution.
   // No later stage gets to re-decide which model serves a role.
   resolution: ["model_resolution"],
+  // Retrieval is part of assembling context and nowhere else. Recording it separately
+  // keeps "what was searched for" auditable without letting any other stage claim it.
+  retrieval: ["context"],
   // The authorized context package is minted by the stage that owns context, once.
   context: ["context"],
   // An INVOCATION is recorded only where one actually happens. Today that is the
@@ -211,6 +216,7 @@ export interface RunLedgerView {
   readonly configurations: readonly V2PolicyDigest[];
   readonly snapshots: readonly V2SnapshotDigest[];
   readonly resolutions: readonly V2DecisionDigest[];
+  readonly retrievals: readonly V2RetrievalDigest[];
   readonly contexts: readonly V2ContextDigest[];
   readonly workspaces: readonly V2WorkspaceId[];
   readonly observations: readonly V2ObservationDigest[];
@@ -237,6 +243,7 @@ export type LifecycleViolationCode =
   | "evidence_mismatch"
   | "duplicate_role_resolution"
   | "duplicate_source_snapshot"
+  | "duplicate_retrieval"
   | "outcome_stage_not_reached";
 
 /**
@@ -321,6 +328,7 @@ export class RunLifecycle {
       configurations: this.evidence.filter((e) => e.kind === "configuration").map((e) => e.policyId),
       snapshots: this.evidence.filter((e) => e.kind === "snapshot").map((e) => e.id),
       resolutions: this.evidence.filter((e) => e.kind === "resolution").map((e) => e.decisionId),
+      retrievals: this.evidence.filter((e) => e.kind === "retrieval").map((e) => e.id),
       contexts: this.evidence.filter((e) => e.kind === "context").map((e) => e.packageId),
       workspaces: this.evidence.filter((e) => e.kind === "workspace").map((e) => e.id),
       observations: this.evidence.filter((e) => e.kind === "observation").map((e) => e.id),
@@ -392,6 +400,17 @@ export class RunLifecycle {
           "duplicate_source_snapshot",
           this.runId,
           "this run already has an authoritative source snapshot; a second would make every downstream binding ambiguous",
+        );
+      }
+    }
+    if (entry.kind === "retrieval") {
+      // ONE retrieval per run, for the same reason there is one snapshot: two rankings
+      // would mean two answers to "what did ikbi decide was relevant here".
+      if (this.evidence.some((e) => e.kind === "retrieval")) {
+        throw new LifecycleViolationError(
+          "duplicate_retrieval",
+          this.runId,
+          "this run already recorded its deterministic retrieval; a second would mean two competing relevance answers",
         );
       }
     }

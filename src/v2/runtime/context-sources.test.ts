@@ -37,6 +37,7 @@ function readerOf(files: Readonly<Record<string, string>>, over: Readonly<Record
   } satisfies SourceSnapshot;
   return {
     snapshot,
+    list: async () => Object.keys(files).sort(),
     read: async (path) => {
       const forced = over[path];
       if (forced !== undefined) return forced;
@@ -48,7 +49,7 @@ function readerOf(files: Readonly<Record<string, string>>, over: Readonly<Record
 }
 
 const collect = (source: typeof repositoryInstructionsSource, reader: SourceSnapshotReader, goal = "do a thing") =>
-  source.collect({ goal, source: reader });
+  source.collect({ goal, source: reader, alreadyOffered: [] });
 
 // ── repository instructions ─────────────────────────────────────────────────
 

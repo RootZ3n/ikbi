@@ -119,8 +119,32 @@ export type CapturedBytes = ReadonlyMap<string, Buffer>;
 /** Build a reader over a snapshot and its captured delta bytes. */
 export function createSnapshotReader(snapshot: SourceSnapshot, captured: CapturedBytes): SourceSnapshotReader {
   const entries = new Map(snapshot.entries.map((e) => [e.path, e]));
+  let listed: readonly string[] | undefined;
+
   return {
     snapshot,
+
+    async list(): Promise<readonly string[]> {
+      if (listed !== undefined) return listed;
+      // HEAD's tree is the base; the delta adds untracked files and removes deletions.
+      // Computed once per reader and cached — the snapshot cannot change under it.
+      let headPaths: string[] = [];
+      try {
+        const result = await runGit(snapshot.repositoryRoot, ["ls-tree", "-r", "--name-only", "-z", snapshot.headCommit]);
+        headPaths = result.stdout.split("\0").filter((p) => p.length > 0);
+      } catch {
+        headPaths = [];
+      }
+      const universe = new Set(headPaths);
+      for (const entry of snapshot.entries) {
+        if (entry.kind === "deleted") universe.delete(entry.path);
+        else universe.add(entry.path);
+      }
+      // Excluded paths are not source: retrieval must not offer what cannot be read.
+      for (const exclusion of snapshot.exclusions) universe.delete(exclusion.path);
+      listed = [...universe].sort((a, b) => a.localeCompare(b));
+      return listed;
+    },
     async read(path: string): Promise<SourceReadOutcome> {
       if (!confined(path)) return { ok: false, reason: "outside_repository", detail: `"${path}" is not a repository-relative path` };
       const normalized = path.split(sep).join("/");

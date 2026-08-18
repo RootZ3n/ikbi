@@ -160,6 +160,9 @@ test("reachability: the JSON surface carries the lifecycle journal + a counted r
     modelResolutionCompleted: true,
     modelResolutions: 1,
     contextAssemblyCompleted: true,
+    // FALSE, honestly: this run injects its own context sources, so no retrieval was
+    // wired and none is claimed. A run only reports what it actually did.
+    retrievalPerformed: false,
     contextPackages: 1,
     providerInvoked: true,
     invocations: 1,

@@ -252,3 +252,43 @@ test("porcelain: untracked records are recognised by their double question mark"
     ["?? src/new.ts", " M src/a.ts"],
   );
 });
+
+// ── enumeration (V2-006B) ───────────────────────────────────────────────────
+
+test("enumeration: list() is HEAD plus untracked, minus deletions", async () => {
+  const r = repo({ "src/a.ts": "A\n", "src/b.ts": "B\n", "README.md": "R\n" });
+  writeFiles(r, { "src/new.ts": "N\n" });
+  rmSync(join(r, "src", "b.ts"));
+  const { reader } = await capture(r);
+  assert.deepEqual([...(await reader.list())], ["README.md", "src/a.ts", "src/new.ts"]);
+});
+
+test("enumeration: a file IGNORED by git is never listed", async () => {
+  const r = repo({ "src/a.ts": "A\n", ".gitignore": "secret.txt\n" });
+  writeFiles(r, { "secret.txt": "shh\n" });
+  const { reader } = await capture(r);
+  assert.equal((await reader.list()).includes("secret.txt"), false, "git's ignore rules are the exclusion policy");
+});
+
+test("enumeration: every listed path is actually READABLE through the snapshot", async () => {
+  const r = repo({ "src/a.ts": "A\n", "docs/x.md": "X\n" });
+  writeFiles(r, { "src/added.ts": "ADD\n", "src/a.ts": "A2\n" });
+  const { reader } = await capture(r);
+  for (const path of await reader.list()) {
+    assert.ok((await reader.read(path)).ok, `listed but unreadable: ${path}`);
+  }
+});
+
+test("enumeration: a file created AFTER capture is not discoverable", async () => {
+  const r = repo({ "src/a.ts": "A\n" });
+  const { reader } = await capture(r);
+  writeFiles(r, { "src/appeared-later.ts": "LATER\n" });
+  assert.equal((await reader.list()).includes("src/appeared-later.ts"), false, "a run is bound to the state it started from");
+});
+
+test("enumeration: list() is stable and sorted, and repeated calls agree", async () => {
+  const { reader } = await capture(repo({ "z.ts": "Z\n", "a.ts": "A\n", "m/n.ts": "N\n" }));
+  const first = await reader.list();
+  assert.deepEqual([...first], [...first].sort((a, b) => a.localeCompare(b)));
+  assert.deepEqual([...(await reader.list())], [...first]);
+});

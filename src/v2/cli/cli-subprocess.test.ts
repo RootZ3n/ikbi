@@ -124,6 +124,9 @@ test("v2 cli: the end-to-end run claims NOTHING it did not do", () => {
     modelResolutions: 1,
     contextAssemblyCompleted: true,
     contextPackages: 1,
+    // V2-006B: deterministic retrieval ran while context was assembled. Ranking is not
+    // an invocation either — note `invocations` below is still exactly one.
+    retrievalPerformed: true,
     // V2-005: a real HTTP call to a protocol-faithful local provider really happened.
     providerInvoked: true,
     invocations: 1,

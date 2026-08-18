@@ -191,6 +191,16 @@ export type SourceReadOutcome =
 export interface SourceSnapshotReader {
   readonly snapshot: SourceSnapshot;
   read(path: string): Promise<SourceReadOutcome>;
+  /**
+   * Every source path the snapshot logically contains, sorted.
+   *
+   *   HEAD tree + included untracked files − deleted files − excluded entries
+   *
+   * The ONLY sanctioned way to enumerate source. Retrieval and anything after it use
+   * this rather than walking a working tree that may have moved on — a file created
+   * after capture is not part of this run's source and must not be discoverable.
+   */
+  list(): Promise<readonly string[]>;
 }
 
 /** The seam that captures source state. Exactly one implementation. */
@@ -209,6 +219,7 @@ export type SourceCaptureResult =
 export const V2_SOURCE_FAILURE_CODES = {
   captureFailed: "preflight.source_snapshot_failed",
   notAGitRepository: "preflight.source_not_a_git_repository",
+  enumerationFailed: "context.source_enumeration_failed",
   materializationFailed: "workspace.source_materialization_failed",
   materializationMismatch: "workspace.source_materialization_mismatch",
   snapshotMismatch: "workspace.source_snapshot_mismatch",

@@ -112,6 +112,7 @@ function fakeSources(files: Readonly<Record<string, string>> = {}, snapshotId = 
   } satisfies SourceSnapshot;
   const reader: SourceSnapshotReader = {
     snapshot,
+    list: async () => Object.keys(files).sort(),
     read: async (path) => {
       const content = files[path];
       if (content === undefined) return { ok: false, reason: "missing", detail: "not in the snapshot" };

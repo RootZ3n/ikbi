@@ -320,6 +320,51 @@ test("single authority: context sources never touch the filesystem", () => {
   );
 });
 
+test("single authority: only the retrieval module RANKS repository relevance", () => {
+  // Retrieval discovers; context admits. A second place computing relevance would mean
+  // two silent opinions about what the builder should see.
+  const allowed = new Set([join(V2_DIR, "core", "retrieval.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    const source = stripComments(readFileSync(file, "utf8"));
+    if (/REASON_WEIGHT|\bscore\s*[:=+]|rankFiles\s*=|function\s+rank/.test(source)) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "relevance scoring belongs to src/v2/core/retrieval.ts alone");
+});
+
+test("single authority: the retrieval SOURCE ranks nothing and re-sorts nothing", () => {
+  // It reads bytes and converts a ranking into candidates. Sorting here would be a
+  // second ranking that no test of `rankFiles` could ever catch.
+  const source = stripComments(readFileSync(join(V2_DIR, "runtime", "retrieval-source.ts"), "utf8"));
+  assert.equal(/\.sort\s*\(/.test(source), false, "the retrieval source must not impose an order of its own");
+  assert.equal(/contentDigest\s*\(/.test(source), false, "retrieval identity is minted in core, not in the adapter");
+});
+
+test("single authority: retrieval enumerates source ONLY through the snapshot reader", () => {
+  // No `node:fs`, no `git ls-files`, no `find`, no ripgrep. A file created after capture
+  // is not part of this run's source and must not become discoverable.
+  const file = join(V2_DIR, "runtime", "retrieval-source.ts");
+  const specs = importSpecifiers(readFileSync(file, "utf8"));
+  assert.equal(
+    specs.some((spec) => spec.startsWith("node:")),
+    false,
+    `retrieval reads through the snapshot only, but imports: ${specs.join(", ")}`,
+  );
+  const source = stripComments(readFileSync(file, "utf8"));
+  assert.equal(/readdir|readFileSync|execFile|spawn|ripgrep|ls-files/.test(source), false, "retrieval must not walk a filesystem");
+});
+
+test("single authority: only the retrieval module mints a retrieval identity", () => {
+  const allowed = new Set([join(V2_DIR, "core", "retrieval.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    if (/contentDigest\s*\(\s*"retrieval"/.test(stripComments(readFileSync(file, "utf8")))) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "retrieval identity belongs to src/v2/core/retrieval.ts");
+});
+
 test("single authority: only the source module mints a snapshot identity", () => {
   // The materializer also digests under this kind — for its materialization PROOF, which
   // is a statement about a workspace rather than a new source identity.
@@ -441,7 +486,9 @@ test("single authority: only the context module assembles or mints a context pac
 test("single authority: a context SOURCE cannot reach downstream — only the assembler can", () => {
   // The structural guarantee: `ContextSource` is consumed by the assembler and wired in
   // exactly one place. Nothing else may hold the production source list.
-  const allowed = new Set([join(V2_DIR, "runtime", "context-sources.ts"), join(V2_DIR, "runtime", "index.ts"), join(V2_DIR, "core", "context.ts"), join(V2_DIR, "core", "run.ts"), join(V2_DIR, "cli", "index.ts")]);
+  // `retrieval-source.ts` joins the list because it IS one of the production sources —
+  // the guard is about who may HOLD the list, not about how many sources exist.
+  const allowed = new Set([join(V2_DIR, "runtime", "context-sources.ts"), join(V2_DIR, "runtime", "retrieval-source.ts"), join(V2_DIR, "runtime", "index.ts"), join(V2_DIR, "core", "context.ts"), join(V2_DIR, "core", "run.ts"), join(V2_DIR, "cli", "index.ts")]);
   const offenders: string[] = [];
   for (const file of tsFiles(V2_DIR)) {
     if (allowed.has(file) || file.endsWith(".test.ts")) continue;

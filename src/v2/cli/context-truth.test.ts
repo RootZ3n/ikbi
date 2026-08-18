@@ -125,7 +125,8 @@ test("context truth: the package contains exactly what the policy says, bound to
   const { result } = v2Run(state, repo);
   const ctx = result.context!;
 
-  // Priority order: the goal, then repository instructions, then the named file.
+  // Priority order: the goal, then repository instructions, then the named file. Nothing
+  // is retrieved here — the goal names its target and no other file is relevant to it.
   assert.deepEqual(ctx.artifacts.map((a) => a.category), ["task", "repository_instructions", "target_file"]);
   assert.deepEqual(ctx.artifacts.map((a) => a.path ?? "(task)"), ["(task)", "AGENTS.md", "src/widget.ts"]);
 
@@ -307,8 +308,12 @@ test("context truth: exactly ONE package, exactly one invocation, and nothing wr
   assert.equal(spawnSync("git", ["status", "--porcelain"], { cwd: repo, encoding: "utf8" }).stdout, before.stdout, "the repo is untouched");
 });
 
-test("context truth: the sources consulted are named, and they are the production two", () => {
+test("context truth: the sources consulted are named, and they are the production three", () => {
+  // V2-006B added deterministic retrieval as the LAST source, in the lowest band.
   const state = makeStateRoot();
   const { result } = v2Run(state, makeRepo());
-  assert.deepEqual([...result.context!.sourcesConsulted], ["task", "repository_instructions", "goal_target_files"]);
+  assert.deepEqual(
+    [...result.context!.sourcesConsulted],
+    ["task", "repository_instructions", "goal_target_files", "retrieved_repository_evidence"],
+  );
 });

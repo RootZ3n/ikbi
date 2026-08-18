@@ -158,6 +158,8 @@ export type V2ObservationDigest = V2Digest<"observation">;
 export type V2MutationDigest = V2Digest<"mutation">;
 /** Digest of one captured source snapshot — the state a run started from. */
 export type V2SnapshotDigest = V2Digest<"snapshot">;
+/** Digest of one deterministic retrieval: which source, which query, which ranking. */
+export type V2RetrievalDigest = V2Digest<"retrieval">;
 
 /**
  * Canonical JSON: object keys sorted, `undefined` dropped, array ORDER PRESERVED

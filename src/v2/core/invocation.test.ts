@@ -42,7 +42,7 @@ function snapshotReader(): SourceSnapshotReader {
     counts: { modified: 0, deleted: 0, untrackedIncluded: 0, excluded: 0 },
     capturedAt: 1,
   } satisfies SourceSnapshot;
-  return { snapshot, read: async () => ({ ok: false, reason: "missing", detail: "not in this snapshot" }) };
+  return { snapshot, list: async () => [], read: async () => ({ ok: false, reason: "missing", detail: "not in this snapshot" }) };
 }
 
 const ids = createSequentialIdFactory("inv");
