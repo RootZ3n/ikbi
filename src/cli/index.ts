@@ -73,6 +73,12 @@ import "./detect.js";
 import "./health.js";
 import "./spec.js";
 import "./job-cards.js";
+// V2 REGISTRATION SEAM — the ONLY line of v1 that knows v2 exists. `src/v2/` is the new
+// canonical spine being built one architectural slice at a time; it registers `ikbi v2`
+// through the same command-registrar every module uses, so no existing command changes.
+// This side-effect import is deliberately the whole of the v1→v2 coupling: v2 core imports
+// nothing from v1, and nothing else in v1 imports v2 (guarded by src/v2/core/isolation.test.ts).
+import "../v2/cli/index.js";
 import { workspaces as coreWorkspaces } from "../core/workspace/index.js";
 // The DEFAULT router — no-args or bare text opens the interactive REPL (golden path).
 // The cognition-layer router is still available behind `--headless` for headless/CI use.

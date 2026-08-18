@@ -75,7 +75,10 @@ GIT_SUITES=(
   "src/modules/worker-model/promotion-authority-conformance.test.ts"
   "src/modules/worker-model/safety-evidence-conformance.test.ts"
 )
-SUBPROCESS_SUITES=("src/acceptance/cli-smoke.test.ts")
+SUBPROCESS_SUITES=(
+  "src/acceptance/cli-smoke.test.ts"
+  "src/v2/cli/cli-subprocess.test.ts"
+)
 LOCALHOST_SUITES=("src/server/tasks.test.ts")
 
 required_capability() {
