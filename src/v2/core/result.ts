@@ -41,6 +41,7 @@ import type {
   V2VerificationId,
 } from "./identity.js";
 import type { RuntimeModelPolicy } from "./config.js";
+import type { ModelResolutionDecision } from "./resolver.js";
 
 /** Why verified-good work was withheld instead of promoted. Closed set. */
 export type WithheldReason = "governance" | "operator" | "policy" | "dry_run";
@@ -128,6 +129,10 @@ export function formatOutcome(outcome: RunTerminalOutcome): string {
 export interface RunEvidenceSummary {
   /** True only when preflight actually built and recorded a runtime model policy. */
   readonly configurationResolved: boolean;
+  /** True only when the resolver actually authorized a route. NOT an invocation. */
+  readonly modelResolutionCompleted: boolean;
+  /** How many routes were authorized. A skeleton run authorizes exactly one. */
+  readonly modelResolutions: number;
   readonly providerInvoked: boolean;
   readonly invocations: number;
   readonly candidatesCreated: number;
@@ -169,6 +174,42 @@ export function summarizeConfiguration(policy: RuntimeModelPolicy): RunConfigura
   };
 }
 
+/**
+ * The route this run was AUTHORIZED to invoke, as a receipt-safe summary.
+ *
+ * Present only when the resolver actually authorized one. An authorization is not an
+ * invocation, and this block never implies otherwise — `providerInvoked` stays false
+ * beside it until a real call happens.
+ */
+export interface RunResolutionSummary {
+  readonly decisionId: string;
+  readonly role: string;
+  readonly modelId: string;
+  readonly providerId: string;
+  readonly providerModelId: string;
+  readonly preferenceSource: string;
+  readonly providerReadiness: string;
+  readonly basis: string;
+  readonly routeOrdinal: number;
+  readonly routeCount: number;
+}
+
+/** Summarize a decision for a receipt. Derived from the decision — nothing is asserted. */
+export function summarizeResolution(decision: ModelResolutionDecision): RunResolutionSummary {
+  return {
+    decisionId: decision.decisionId,
+    role: decision.role,
+    modelId: decision.modelId,
+    providerId: decision.providerId,
+    providerModelId: decision.providerModelId,
+    preferenceSource: decision.preferenceSource,
+    providerReadiness: decision.providerReadiness,
+    basis: decision.basis,
+    routeOrdinal: decision.routeOrdinal,
+    routeCount: decision.routeCount,
+  };
+}
+
 /** The durable account of ONE run: where it went, what it produced, how it ended. */
 export interface V2RunReceipt {
   readonly receiptId: V2ReceiptId;
@@ -179,6 +220,8 @@ export interface V2RunReceipt {
   readonly evidence: RunEvidenceSummary;
   /** Absent when the run ended before configuration was established. */
   readonly configuration?: RunConfigurationSummary;
+  /** Absent when the run ended before a route was authorized. */
+  readonly resolution?: RunResolutionSummary;
   readonly startedAt: number;
   readonly endedAt: number;
 }
@@ -192,6 +235,8 @@ export function summarizeEvidence(ledger: RunLedgerView, outcome: RunTerminalOut
   const accepted = outcome.kind === "accepted";
   return {
     configurationResolved: ledger.configurations.length > 0,
+    modelResolutionCompleted: ledger.resolutions.length > 0,
+    modelResolutions: ledger.resolutions.length,
     providerInvoked: ledger.invocations.length > 0,
     invocations: ledger.invocations.length,
     candidatesCreated: ledger.candidates.length,
@@ -218,6 +263,11 @@ export interface V2RunResult {
    * resolver receives. Absent when the run failed before configuration was built.
    */
   readonly policy?: RuntimeModelPolicy;
+  /**
+   * THE authorized route for this run's demonstrated role. An authorization only —
+   * no invocation has occurred. Absent when resolution did not complete.
+   */
+  readonly decision?: ModelResolutionDecision;
   /** Every transition the run made, in order. The run's own account of itself. */
   readonly journal: readonly LifecycleTransition[];
   readonly receipt: V2RunReceipt;

@@ -10,8 +10,8 @@
  *
  *   pending
  *     -> preflight            can this run legally start at all?
+ *     -> model_resolution     which exact model/provider route is authorized?
  *     -> context              what does the run get to know?
- *     -> model_resolution     which model identities will be used?
  *     -> candidate_strategy   single / shadow / tournament — chosen ONCE, here
  *     -> candidate_generation zero or more Candidates are produced
  *     -> verification         every candidate is judged by the SAME authority
@@ -43,6 +43,7 @@
 import type { RunFailure } from "./failure.js";
 import type {
   V2CandidateId,
+  V2DecisionDigest,
   V2InvocationId,
   V2PolicyDigest,
   V2PromotionId,
@@ -53,10 +54,25 @@ import type {
 import type { RunTerminalOutcome } from "./result.js";
 
 /** The ordered, non-terminal stages of the canonical lifecycle. Order is authority. */
+/**
+ * ORDERING NOTE (V2-003). `model_resolution` precedes `context`, correcting the
+ * placeholder order V2-001 sketched.
+ *
+ * The dependency runs one way only. Deterministic role resolution needs nothing but the
+ * runtime policy and a role name. CONTEXT ASSEMBLY, by contrast, cannot be sized without
+ * knowing the model: v1 budgets the packet from the resolved model's window
+ * (`worker-model/context-manager.ts:161,193` compute the budget from
+ * `caps.context_window`) and `worker-model/context-preflight.ts` exists precisely to
+ * estimate "how much of the BUILDER MODEL's context window the assembled base context
+ * occupies". Assembling context before knowing the model would mean sizing it against a
+ * guess and re-cutting it afterwards.
+ *
+ * The correction is a single swap; the lifecycle's transition rules are untouched.
+ */
 export const LIFECYCLE_STAGES = [
   "preflight",
-  "context",
   "model_resolution",
+  "context",
   "candidate_strategy",
   "candidate_generation",
   "verification",
@@ -115,6 +131,7 @@ export interface LifecycleTransition {
  */
 export type LifecycleEvidence =
   | { readonly kind: "configuration"; readonly policyId: V2PolicyDigest }
+  | { readonly kind: "resolution"; readonly decisionId: V2DecisionDigest; readonly role: string }
   | { readonly kind: "invocation"; readonly id: V2InvocationId }
   | { readonly kind: "candidate"; readonly id: V2CandidateId; readonly workspaceId: V2WorkspaceId }
   | { readonly kind: "verification"; readonly id: V2VerificationId; readonly candidateId: V2CandidateId }
@@ -130,6 +147,9 @@ const EVIDENCE_STAGE: Record<LifecycleEvidence["kind"], readonly LifecycleStage[
   // Configuration truth is established ONCE, by preflight. No later stage may
   // re-resolve it, which is what makes the policy the single input to model choice.
   configuration: ["preflight"],
+  // A model-resolution decision may only be minted by the stage that owns resolution.
+  // No later stage gets to re-decide which model serves a role.
+  resolution: ["model_resolution"],
   // Invocations may happen anywhere from model resolution onward (scout, builder,
   // critic, judge…). They are attribution, not authority.
   invocation: ["model_resolution", "candidate_strategy", "candidate_generation", "verification", "disposition", "promotion"],
@@ -144,6 +164,9 @@ const STAGE_REQUIRES: Partial<Record<LifecycleStage, LifecycleEvidence["kind"]>>
   // This is the structural half of "every model decision has exactly one normalized
   // configuration input" — a resolver cannot run in a world where none was built.
   model_resolution: "configuration",
+  // Context cannot be assembled before the model is known — its budget is a function of
+  // the resolved model's window. See the ORDERING NOTE above.
+  context: "resolution",
   // Nothing to verify without at least one candidate. (One OR MANY — see contract.ts.)
   verification: "candidate",
   // Nothing to promote without a verdict from the canonical verification authority.
@@ -153,6 +176,7 @@ const STAGE_REQUIRES: Partial<Record<LifecycleStage, LifecycleEvidence["kind"]>>
 /** The read-only view of what a run produced. */
 export interface RunLedgerView {
   readonly configurations: readonly V2PolicyDigest[];
+  readonly resolutions: readonly V2DecisionDigest[];
   readonly invocations: readonly V2InvocationId[];
   readonly candidates: readonly V2CandidateId[];
   readonly verifications: readonly V2VerificationId[];
@@ -255,6 +279,7 @@ export class RunLifecycle {
   get ledger(): RunLedgerView {
     return {
       configurations: this.evidence.filter((e) => e.kind === "configuration").map((e) => e.policyId),
+      resolutions: this.evidence.filter((e) => e.kind === "resolution").map((e) => e.decisionId),
       invocations: this.evidence.filter((e) => e.kind === "invocation").map((e) => e.id),
       candidates: this.evidence.filter((e) => e.kind === "candidate").map((e) => e.id),
       verifications: this.evidence.filter((e) => e.kind === "verification").map((e) => e.id),

@@ -15,22 +15,63 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { test } from "node:test";
+import { after, test } from "node:test";
 
 import type { V2RunResult } from "../core/result.js";
 
 const ENTRY = fileURLToPath(new URL("../../../dist/cli/index.js", import.meta.url));
 const REPO = fileURLToPath(new URL("../../../", import.meta.url));
 
+/**
+ * An isolated state root carrying a minimal, keyless roster. Isolation matters twice
+ * over: the operator's real ~/.ikbi is never touched, and the run's configuration is
+ * fixed here rather than inherited from whatever this machine happens to be set up for.
+ */
+const roots: string[] = [];
+function makeStateRoot(): string {
+  const root = mkdtempSync(join(tmpdir(), "ikbi-v2-smoke-"));
+  roots.push(root);
+  mkdirSync(root, { recursive: true });
+  writeFileSync(
+    join(root, "providers.json"),
+    JSON.stringify({
+      providers: [{ id: "alpha", kind: "openai-compatible", baseUrl: "https://alpha.test/v1", keyless: true }],
+      models: [
+        {
+          id: "alpha-1",
+          role: "builder",
+          cost: { promptPerMTok: 0, completionPerMTok: 0 },
+          providers: [{ provider: "alpha", providerModelId: "a1" }],
+        },
+      ],
+    }),
+  );
+  return root;
+}
+const STATE_ROOT = makeStateRoot();
+
+after(() => {
+  for (const root of roots) rmSync(root, { recursive: true, force: true });
+});
+
 function runCli(args: readonly string[]): { status: number | null; stdout: string; stderr: string } {
   const home = mkdtempSync(join(tmpdir(), "ikbi-v2-home-"));
   const res = spawnSync(process.execPath, [ENTRY, ...args], {
     cwd: mkdtempSync(join(tmpdir(), "ikbi-v2-cwd-")),
-    env: { PATH: process.env.PATH ?? "", HOME: home },
+    // The tier vars pin the operator-configuration precedence layer at the fixture
+    // model, so this suite tests the SPINE rather than this machine's model setup.
+    env: {
+      PATH: process.env.PATH ?? "",
+      HOME: home,
+      IKBI_STATE_ROOT: STATE_ROOT,
+      IKBI_MODEL_DRIVER: "alpha-1",
+      IKBI_MODEL_BUILDER: "alpha-1",
+      IKBI_MODEL_CRITIC: "alpha-1",
+    },
     encoding: "utf8",
   });
   return { status: res.status, stdout: res.stdout, stderr: res.stderr };
@@ -50,7 +91,7 @@ test("v2 cli: `ikbi v2 build` reaches the canonical v2 lifecycle end-to-end", ()
   assert.equal(result.journal[0]?.from, "pending");
   assert.equal(result.journal[0]?.to, "preflight");
   assert.equal(result.journal.at(-1)?.to, "terminal");
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution"]);
 });
 
 test("v2 cli: the end-to-end run claims NOTHING it did not do", () => {
@@ -58,8 +99,12 @@ test("v2 cli: the end-to-end run claims NOTHING it did not do", () => {
   const result = JSON.parse(r.stdout) as V2RunResult;
   assert.equal(result.outcome.kind, "failed");
   assert.deepEqual(result.receipt.evidence, {
-    // Configuration IS resolved in preflight (V2-002) — and it is the only thing that is.
+    // Configuration (V2-002) and route authorization (V2-003) happen — and nothing else.
     configurationResolved: true,
+    // A route WAS authorized. That is not an invocation, and the two counters sitting
+    // side by side is exactly how the receipt keeps that distinction honest.
+    modelResolutionCompleted: true,
+    modelResolutions: 1,
     providerInvoked: false,
     invocations: 0,
     candidatesCreated: 0,

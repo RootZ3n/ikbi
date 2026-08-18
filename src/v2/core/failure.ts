@@ -32,6 +32,9 @@ import type { LifecycleStage } from "./lifecycle.js";
  *   verification    — verification could not produce a trustworthy verdict.
  *   recovery        — recovery/retry budget exhausted without a good candidate.
  *   policy          — an authority said no (gate-wall, trust tier, kill switch, budget).
+ *   resolution      — no model/provider route could be AUTHORIZED for a role. Distinct
+ *                     from `provider`: nothing was contacted, nothing failed in flight —
+ *                     the selection itself is impossible or forbidden.
  *   promotion       — the decision could not be enacted (conflict, CAS lost, stale tree).
  *   internal        — an engine defect or infrastructure fault. Nobody's build was wrong.
  *   not_implemented — this build of ikbi does not implement a stage the run requires.
@@ -45,6 +48,7 @@ export const RUN_FAILURE_CATEGORIES = [
   "build",
   "verification",
   "recovery",
+  "resolution",
   "policy",
   "promotion",
   "internal",

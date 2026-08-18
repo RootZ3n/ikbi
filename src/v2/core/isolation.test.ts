@@ -41,9 +41,27 @@ const V2_RUNTIME_ALLOWED_V1_IMPORTS = new Set([
   "../../core/provider/index.js", //               the process-wide model registry (dynamic)
   "../../core/provider/contract.js", //            ModelProvider / preflight metadata types
   "../../core/provider/registry.js", //            ModelSpec / ModelRegistry types
+  "../../core/provider/capabilities.js", //        static capability classification (V2-003)
   "../../modules/profiles/contract.js", //         Profile shape + the role vocabulary
   "../../modules/profiles/storage.js", //          READ-ONLY profile loading + the active pointer
 ]);
+
+/**
+ * v1 model-SELECTION machinery. Every one of these is a way v1 decides which model to
+ * use; in v2 that decision has exactly one owner (`src/v2/core/resolver.ts`). They are
+ * parked donors — each may one day become a STRATEGY INSIDE the resolver, and none may
+ * ever become a second path to a model.
+ */
+const V1_SELECTION_AUTHORITIES: readonly string[] = [
+  "model-router", //     resolveModel / cheapest-sufficient routing
+  "expert-rental", //    MoE expert selection
+  "role-models", //      driverModel / builderModel / criticModel
+  "tier-presets", //     --tier cheap/mid/frontier
+  "model-evaluation", // Luak leaderboard ranking
+  "escalation", //       up-the-ladder model escalation
+  "consult", //          consultModel
+  "orchestrator", //     the v1 build-path model decisions
+];
 
 /** The ONLY v1 file permitted to know v2 exists. */
 const V1_REGISTRATION_FILE = "cli/index.ts";
@@ -153,6 +171,54 @@ test("isolation: the adapter layer is the ONLY part of v2 that touches v1 donor 
       }
     }
   }
+});
+
+test("single authority: no v2 file imports v1 model-SELECTION machinery", () => {
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    for (const spec of importSpecifiers(readFileSync(file, "utf8"))) {
+      const authority = V1_SELECTION_AUTHORITIES.find((name) => spec.includes(`/${name}`) || spec.endsWith(`${name}.js`));
+      if (authority !== undefined) offenders.push(`${relative(SRC, file)} -> ${spec}`);
+    }
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    "model selection has exactly one owner in v2 (src/v2/core/resolver.ts); these belong to v1 and are parked",
+  );
+});
+
+test("single authority: only the configuration adapter may read IKBI_MODEL_* variables", () => {
+  // Configuration is captured ONCE, into RuntimeModelPolicy. Anything downstream that
+  // reached for an env var would be a second, unaudited source of model truth.
+  const allowed = join(V2_DIR, "runtime", "operator-defaults.ts");
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (file === allowed || file.endsWith(".test.ts")) continue;
+    const source = readFileSync(file, "utf8");
+    if (/\bIKBI_MODEL_[A-Z_]*\b/.test(source) && !/^\s*(\*|\/\/)/m.test(source.split("\n").find((l) => /IKBI_MODEL_/.test(l)) ?? "")) {
+      offenders.push(relative(SRC, file));
+    }
+  }
+  assert.deepEqual(offenders, [], `only ${relative(SRC, allowed)} may name the model env vars`);
+});
+
+test("single authority: only the resolver CHOOSES among routes or mints a decision", () => {
+  // Two crisp signatures of a second selection path: scanning a fallback chain for a
+  // winner (`routes.findIndex`), and constructing a ModelResolutionDecision at all.
+  const resolverFile = join(V2_DIR, "core", "resolver.ts");
+  const chooses: string[] = [];
+  const mints: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (file === resolverFile || file.endsWith(".test.ts")) continue;
+    const source = readFileSync(file, "utf8");
+    if (/routes\s*\.\s*findIndex\s*\(/.test(source)) chooses.push(relative(SRC, file));
+    // Computing a decision's content address IS minting a decision. Recording an
+    // already-minted id as lifecycle evidence (which run.ts does) is not.
+    if (/contentDigest\s*\(\s*"decision"/.test(source)) mints.push(relative(SRC, file));
+  }
+  assert.deepEqual(chooses, [], "walking a fallback chain for a winner belongs to src/v2/core/resolver.ts alone");
+  assert.deepEqual(mints, [], "only the resolver may construct a ModelResolutionDecision");
 });
 
 test("isolation: v1 does not import v2, except the single registration line", () => {

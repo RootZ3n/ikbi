@@ -17,10 +17,14 @@
  * moment a run actually asks for configuration keeps v2 loadable on its own.
  */
 
+import { readFileSync } from "node:fs";
+
 import type { ConfigurationInputs, ConfigurationSource } from "../core/config.js";
 import type { V2RunResult } from "../core/result.js";
 import { runV2Build, type RepoProbe } from "../core/run.js";
 import type { V2TaskRequest } from "../core/contract.js";
+import { stabilizeInventory } from "./model-catalog.js";
+import { capabilityFacts } from "./provider-inventory.js";
 import { readOperatorDefaults, readOperatorEnvPresence } from "./operator-defaults.js";
 import { fileProfileStore, readActiveProfile, type ProfileStore } from "./profile-source.js";
 import { readProviderInventory, type InventoryRegistry } from "./provider-inventory.js";
@@ -31,7 +35,26 @@ export interface ConfigurationSourceDeps {
   readonly profiles?: ProfileStore;
   readonly stateRoot?: string;
   readonly defaultModels?: { readonly driver: string; readonly builder: string; readonly critic: string };
+  readonly rosterFile?: string;
   readonly env?: NodeJS.ProcessEnv;
+}
+
+/**
+ * Model ids the operator's roster file DECLARES. Read independently of the registry
+ * because the registry merges every source into one map, losing which entries were
+ * declared and which were synthesized. A declared id is always real, whatever any
+ * preference happens to be set to.
+ */
+export function rosterDeclaredIds(rosterFile: string): readonly string[] {
+  try {
+    const doc = JSON.parse(readFileSync(rosterFile, "utf8")) as { models?: readonly { id?: unknown }[] };
+    if (!Array.isArray(doc.models)) return [];
+    return doc.models.map((m) => m?.id).filter((id): id is string => typeof id === "string");
+  } catch {
+    // Absent or unreadable: v1 already fails loudly at startup for a malformed roster,
+    // so by the time v2 runs an unreadable file means there is no roster to declare from.
+    return [];
+  }
 }
 
 /** The v1 facts the production source needs, loaded on first use. */
@@ -39,9 +62,10 @@ async function v1Facts(deps: ConfigurationSourceDeps): Promise<{
   registry: InventoryRegistry;
   profiles: ProfileStore;
   defaultModels: { driver: string; builder: string; critic: string };
+  rosterFile: string;
 }> {
   const needsRegistry = deps.registry === undefined;
-  const needsConfig = deps.stateRoot === undefined || deps.defaultModels === undefined;
+  const needsConfig = deps.stateRoot === undefined || deps.defaultModels === undefined || deps.rosterFile === undefined;
   const [providerModule, configModule] = await Promise.all([
     needsRegistry ? import("../../core/provider/index.js") : Promise.resolve(undefined),
     needsConfig ? import("../../core/config.js") : Promise.resolve(undefined),
@@ -51,6 +75,7 @@ async function v1Facts(deps: ConfigurationSourceDeps): Promise<{
     registry: deps.registry ?? providerModule!.registry,
     profiles: deps.profiles ?? fileProfileStore(stateRoot),
     defaultModels: deps.defaultModels ?? configModule!.config.provider.defaultModels,
+    rosterFile: deps.rosterFile ?? configModule!.config.provider.rosterFile,
   };
 }
 
@@ -65,8 +90,16 @@ export function createConfigurationSource(deps: ConfigurationSourceDeps = {}): C
   return {
     async load(request): Promise<ConfigurationInputs> {
       const facts = await v1Facts(deps);
+      // INVENTORY INDEPENDENCE: what this machine can reach is computed WITHOUT letting
+      // the operator's model preference add, rename, or delete a catalog entry. See
+      // model-catalog.ts for the v1 defect this closes.
+      const inventory = stabilizeInventory(readProviderInventory(facts.registry), {
+        preferenceDerivedIds: [facts.defaultModels.driver, facts.defaultModels.critic],
+        rosterDeclaredIds: rosterDeclaredIds(facts.rosterFile),
+        capabilitiesFor: (model) => capabilityFacts(model.id),
+      });
       return {
-        inventory: readProviderInventory(facts.registry),
+        inventory,
         activeProfile: readActiveProfile(facts.profiles, request.profileOverride),
         operatorDefaults: readOperatorDefaults(facts.defaultModels, readOperatorEnvPresence(deps.env ?? process.env)),
       };

@@ -15,19 +15,19 @@
  *      (provider inventory), what strategy the operator selected (active profile),
  *      and whether the two are coherent — producing ONE immutable
  *      `RuntimeModelPolicy`, recorded on the lifecycle ledger
- *   5. STOP, because `context` (the next stage) has no implementation in this build
- *   6. terminalize as `failed` with category `not_implemented`, and emit a receipt
+ *   5. enter `model_resolution` and ask THE resolver which exact model/provider route is
+ *      AUTHORIZED for the builder role, recording the decision on the ledger
+ *   6. STOP, because `context` (the next stage) has no implementation in this build
+ *   7. terminalize as `failed` with category `not_implemented`, and emit a receipt
  *      whose evidence block is counted from the ledger: zero invocations, zero
  *      candidates, zero verifications, not promoted, repository not mutated
  *
  * It performs NO model call, NO workspace allocation, NO mutation, NO promotion.
- * Configuration is read-only observation — reading a roster file and a profile file
- * is not invoking anything. The receipt says exactly that, because the receipt has no
- * way to say anything else.
- *
- * `model_resolution` is NOT entered. The lifecycle would now permit it (configuration
- * has been recorded), which is the point: the precondition is real and satisfied, and
- * the stage is still absent because V2-003 has not been written.
+ * Configuration and resolution are read-only decisions — reading a roster file, reading
+ * a profile file, and CHOOSING a route are not invoking anything. An authorization is
+ * not a call: the receipt reports `modelResolutionCompleted: true` beside
+ * `providerInvoked: false`, and no `V2InvocationId` is minted, because no invocation
+ * happened.
  */
 
 import { statSync } from "node:fs";
@@ -41,19 +41,44 @@ import {
   type V2TaskRequest,
 } from "./contract.js";
 import { buildRuntimeModelPolicy, type ConfigurationSource, type RuntimeModelPolicy } from "./config.js";
+import {
+  resolveModelRoute,
+  type ModelRequirements,
+  type ModelResolutionDecision,
+} from "./resolver.js";
 import { V2_001_FAILURE_CODES, runFailure, stageNotImplemented, type RunFailure } from "./failure.js";
 import { createIdFactory, type V2IdFactory } from "./identity.js";
 import { RunLifecycle, type LifecycleStage } from "./lifecycle.js";
 import {
   summarizeConfiguration,
   summarizeEvidence,
+  summarizeResolution,
   type V2RunReceipt,
   type V2RunResult,
   type RunTerminalOutcome,
 } from "./result.js";
 
-/** The furthest stage this build of ikbi implements. Slice 001 implements preflight only. */
-export const IMPLEMENTED_THROUGH_STAGE: LifecycleStage = "preflight";
+/**
+ * The ONE role this skeleton actually resolves end to end.
+ *
+ * `builder` on purpose: it is the role whose served identity matters most once real
+ * invocation exists, so it is the one worth proving through the production entrypoint.
+ * The resolver itself supports the whole role vocabulary — demonstrating every role in a
+ * single run would be theatre, not evidence.
+ */
+export const DEMONSTRATED_ROLE = "builder" as const;
+
+/**
+ * Requirements the skeleton states for that role: none.
+ *
+ * A requirement here would have to be a real architectural claim about what a builder
+ * needs, and this slice has no builder to make that claim on behalf of. Stating none is
+ * the truthful position; the resolver's requirement handling is covered by its own tests.
+ */
+export const DEMONSTRATED_REQUIREMENTS: ModelRequirements | undefined = undefined;
+
+/** The furthest stage this build of ikbi implements. */
+export const IMPLEMENTED_THROUGH_STAGE: LifecycleStage = "model_resolution";
 
 /** The stage the run would need next, and does not have. */
 export const FIRST_UNIMPLEMENTED_STAGE: LifecycleStage = "context";
@@ -221,6 +246,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
 
   let task: V2Task | undefined;
   let policy: RuntimeModelPolicy | undefined;
+  let decision: ModelResolutionDecision | undefined;
 
   const failure = await (async (): Promise<RunFailure> => {
     const checked = preflight(request, probe);
@@ -237,7 +263,21 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     policy = built.policy;
     lifecycle.record(runId, { kind: "configuration", policyId: policy.policyId });
 
-    // Preflight is complete and the next stage does not exist in this build, so the
+    // Stage 2 — MODEL RESOLUTION. One authority, one request, one authorized route.
+    // The request names the policy it expects, so a decision cannot be computed against
+    // configuration other than the one this run just recorded.
+    lifecycle.enter(runId, "model_resolution");
+    const resolved = resolveModelRoute(policy, {
+      runId,
+      policyId: policy.policyId,
+      role: DEMONSTRATED_ROLE,
+      ...(DEMONSTRATED_REQUIREMENTS !== undefined ? { requirements: DEMONSTRATED_REQUIREMENTS } : {}),
+    });
+    if (!resolved.ok) return resolved.failure;
+    decision = resolved.decision;
+    lifecycle.record(runId, { kind: "resolution", decisionId: decision.decisionId, role: decision.role });
+
+    // Resolution is complete and the next stage does not exist in this build, so the
     // run stops here and says so. It does not enter `context` — a stage is only ever
     // recorded as entered when it actually ran.
     return stageNotImplemented(FIRST_UNIMPLEMENTED_STAGE, IMPLEMENTED_THROUGH_STAGE);
@@ -255,6 +295,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     stagesEntered: lifecycle.stagesEntered,
     evidence: summarizeEvidence(lifecycle.ledger, outcome),
     ...(policy !== undefined ? { configuration: summarizeConfiguration(policy) } : {}),
+    ...(decision !== undefined ? { resolution: summarizeResolution(decision) } : {}),
     startedAt,
     endedAt,
   };
@@ -266,6 +307,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     repoPath: task?.repoPath ?? request.repoPath,
     outcome,
     ...(policy !== undefined ? { policy } : {}),
+    ...(decision !== undefined ? { decision } : {}),
     journal: lifecycle.journal,
     receipt,
   };

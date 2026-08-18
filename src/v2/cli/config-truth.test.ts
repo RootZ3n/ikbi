@@ -230,16 +230,17 @@ test("config truth: inheritance is resolved BEFORE validation", () => {
 
 // ── boundaries this slice must not cross ────────────────────────────────────
 
-test("config truth: the run resolves configuration and STILL does not enter model_resolution", () => {
+test("config truth: configuration and resolution run, and NOTHING is invoked", () => {
   const root = makeStateRoot();
   assert.equal(runCli(root, ["profile", "use", "prof-alpha"]).status, 0);
   const { result } = v2Run(root);
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution"]);
   assert.equal(result.receipt.evidence.configurationResolved, true);
-  assert.equal(result.receipt.evidence.providerInvoked, false, "no model was invoked");
-  assert.equal(result.receipt.evidence.invocations, 0);
+  assert.equal(result.receipt.evidence.modelResolutionCompleted, true, "a route was authorized");
+  assert.equal(result.receipt.evidence.providerInvoked, false, "and still nothing was invoked");
+  assert.equal(result.receipt.evidence.invocations, 0, "no V2InvocationId was minted for an authorization");
   assert.ok(result.outcome.kind === "failed");
-  assert.equal(result.outcome.failure.detail?.missingStage, "context");
+  assert.equal(result.outcome.failure.detail?.missingStage, "context", "context is the next unimplemented stage");
 });
 
 test("config truth: configuration never mutates state — the pointer and repo are untouched", () => {

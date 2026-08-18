@@ -84,6 +84,7 @@ export function renderRun(result: V2RunResult): string {
     `repo        ${result.repoPath}`,
     `stages      ${result.receipt.stagesEntered.join(" -> ") || "<none>"}`,
     ...configurationLines(result),
+    ...resolutionLines(result),
     `outcome     ${formatOutcome(result.outcome)}`,
     "evidence    " +
       `provider_invoked=${e.providerInvoked} candidates=${e.candidatesCreated} ` +
@@ -119,6 +120,20 @@ function configurationLines(result: V2RunResult): string[] {
     lines.push(`warning     required role(s) not currently invocable: ${summary.unsatisfiableRequiredRoles.join(", ")}`);
   }
   return lines;
+}
+
+/**
+ * The authorized route. Rendered only when the resolver really produced one, and worded
+ * as an authorization: nothing has been invoked at this point in the lifecycle.
+ */
+function resolutionLines(result: V2RunResult): string[] {
+  const r = result.receipt.resolution;
+  if (r === undefined) return [];
+  return [
+    `resolved    ${r.role} -> ${r.modelId} via ${r.providerId} (wire id: ${r.providerModelId})`,
+    `route       ${r.basis}, ordinal ${r.routeOrdinal + 1}/${r.routeCount}, provider ${r.providerReadiness}, preference ${r.preferenceSource}`,
+    `decision    ${r.decisionId}  (authorized, NOT invoked)`,
+  ];
 }
 
 /**

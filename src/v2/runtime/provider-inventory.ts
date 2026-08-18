@@ -12,9 +12,10 @@
  * exactly one place (`runtime/index.ts`).
  */
 
+import { getCapabilities, isModelClassified, type ModelCapabilities } from "../../core/provider/capabilities.js";
 import type { ModelProvider } from "../../core/provider/contract.js";
 import type { ModelSpec } from "../../core/provider/registry.js";
-import type { ProviderFactsInput, ProviderInventoryInput, ModelFactsInput } from "../core/config.js";
+import type { ModelCapabilityFacts, ProviderFactsInput, ProviderInventoryInput, ModelFactsInput } from "../core/config.js";
 
 /** The narrow slice of the v1 registry this adapter needs. `ModelRegistry` satisfies it. */
 export interface InventoryRegistry {
@@ -49,11 +50,40 @@ export function providerFacts(provider: ModelProvider): ProviderFactsInput {
   };
 }
 
+/**
+ * Capability facts for a model id — or NOTHING.
+ *
+ * v1's `getCapabilities` always returns a profile, falling back to a conservative
+ * 8k/no-tools guess for an id it does not recognize. That guess is a safety default for
+ * DRIVING a model, not a fact about it, so v2 publishes facts only when the roster
+ * declares them or v1's classification table genuinely matched. The "declared" test
+ * mirrors v1's own rule in `findUnclassifiedModels`: an override counts as intentional
+ * when it sets either of the two fields the fallback degrades.
+ */
+export function capabilityFacts(modelId: string, override?: Partial<ModelCapabilities>): ModelCapabilityFacts | undefined {
+  const declared =
+    override !== undefined &&
+    ((typeof override.context_window === "number" && override.context_window > 0) || typeof override.supports_tools === "boolean");
+  const classified = isModelClassified(modelId);
+  if (!declared && !classified) return undefined;
+  const caps = getCapabilities(modelId, override);
+  return {
+    contextWindow: caps.context_window,
+    supportsTools: caps.supports_tools,
+    ...(caps.supports_thinking !== undefined ? { supportsThinking: caps.supports_thinking } : {}),
+    reasoningLevel: caps.reasoning_level,
+    speedClass: caps.speed_class,
+    provenance: declared ? "declared" : "known",
+  };
+}
+
 /** Restate one v1 roster model, preserving its ordered fallback chain. */
 export function modelFacts(spec: ModelSpec): ModelFactsInput {
+  const capabilities = capabilityFacts(spec.id, spec.capabilities);
   return {
     id: spec.id,
     ...(spec.role !== undefined ? { role: spec.role } : {}),
+    ...(capabilities !== undefined ? { capabilities } : {}),
     routes: spec.providers.map((route) => ({
       providerId: route.provider,
       providerModelId: route.providerModelId,

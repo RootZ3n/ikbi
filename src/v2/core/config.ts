@@ -112,11 +112,31 @@ export interface ModelRouteInput {
   readonly providerModelId: string;
 }
 
+/**
+ * Static capability facts for one model, with their PROVENANCE.
+ *
+ * v2 publishes these only when they are actually known: `declared` means the operator's
+ * roster states them, `known` means v1's classification table matched the model id. A
+ * model that matches neither carries NO facts at all — v1 falls back to a conservative
+ * 8k/no-tools profile for such ids, and republishing that guess as a fact is precisely
+ * the "invented capability data" the resolver must never act on.
+ */
+export interface ModelCapabilityFacts {
+  readonly contextWindow: number;
+  readonly supportsTools: boolean;
+  readonly supportsThinking?: boolean;
+  readonly reasoningLevel: "low" | "medium" | "high";
+  readonly speedClass: "fast" | "medium" | "slow";
+  readonly provenance: "declared" | "known";
+}
+
 /** A model as the roster declares it. */
 export interface ModelFactsInput {
   readonly id: string;
   readonly role?: string;
   readonly routes: readonly ModelRouteInput[];
+  /** Omitted when the model is unclassified and the roster declares nothing. */
+  readonly capabilities?: ModelCapabilityFacts;
 }
 
 /** Everything an adapter observed about what this machine can invoke. */
@@ -237,6 +257,8 @@ export interface AvailableModel {
   /** The LOGICAL roster id a profile or an operator default names. */
   readonly id: string;
   readonly role?: string;
+  /** Static facts the resolver may evaluate requirements against. Absent when unknown. */
+  readonly capabilities?: ModelCapabilityFacts;
   /** The ordered fallback chain. Order is semantic and preserved. */
   readonly routes: readonly ModelRoute[];
   /** At least one route points at a REGISTERED provider. */
@@ -288,7 +310,8 @@ export interface ResolvedRolePreference {
   readonly required: boolean;
   readonly modelInInventory: boolean;
   readonly providerRegistered: boolean;
-  readonly providerReadiness: ProviderReadiness;
+  /** Present only when the preference PINS a provider. Absent means none was chosen yet. */
+  readonly providerReadiness?: ProviderReadiness;
   /** Structurally sound AND backed by a provider that is configured or keyless. */
   readonly satisfiable: boolean;
 }
@@ -449,6 +472,7 @@ export function buildProviderInventory(input: ProviderInventoryInput): ProviderI
       return {
         id: model.id,
         ...(model.role !== undefined ? { role: model.role } : {}),
+        ...(model.capabilities !== undefined ? { capabilities: model.capabilities } : {}),
         routes,
         routable: routes.some((r) => r.providerRegistered),
         invocable: routes.some((r) => r.providerRegistered && isUsableReadiness(r.providerReadiness)),
@@ -470,6 +494,9 @@ export function buildProviderInventory(input: ProviderInventoryInput): ProviderI
     models: models.map((m) => ({
       id: m.id,
       role: m.role,
+      // Capability facts ARE part of what this machine can do, so a changed window or a
+      // newly declared tool capability moves the digest.
+      capabilities: m.capabilities,
       routes: m.routes.map((r) => ({ providerId: r.providerId, providerModelId: r.providerModelId })),
     })),
   });
@@ -575,30 +602,41 @@ function validateAgainstInventory(profile: ActiveModelProfile, inventory: Provid
   return undefined;
 }
 
-/** The availability facts for one (model, provider) pair, read off the inventory. */
+/**
+ * Availability facts for one (model, provider) pair.
+ *
+ * NOTE WHAT THIS DELIBERATELY DOES NOT DO: when no provider is named, it does not walk
+ * the fallback chain looking for a winner. Choosing among routes is the RESOLVER's job
+ * and its alone (`src/v2/core/resolver.ts`); pre-empting it here — even just to label a
+ * readiness — would be a second, quieter route-selection path. Availability for an
+ * unconstrained preference is therefore a property of the MODEL, and `providerReadiness`
+ * is simply absent, because no provider has been chosen yet.
+ */
 function availability(
   inventory: ProviderInventory,
   modelId: string,
   providerId: string | undefined,
-): { modelInInventory: boolean; providerRegistered: boolean; providerReadiness: ProviderReadiness } {
+): {
+  modelInInventory: boolean;
+  providerRegistered: boolean;
+  providerReadiness?: ProviderReadiness;
+  satisfiable: boolean;
+} {
   const model = inventory.models.find((m) => m.id === modelId);
-  if (model === undefined) return { modelInInventory: false, providerRegistered: false, providerReadiness: "unknown" };
+  if (model === undefined) {
+    return { modelInInventory: false, providerRegistered: false, providerReadiness: "unknown", satisfiable: false };
+  }
   if (providerId === undefined) {
-    // No provider was named — the roster's own fallback chain decides. Report the best
-    // readiness any route offers, which is what a resolver would actually get.
-    const best = model.routes.find((r) => r.providerRegistered && isUsableReadiness(r.providerReadiness)) ?? model.routes[0];
-    return {
-      modelInInventory: true,
-      providerRegistered: best?.providerRegistered ?? false,
-      providerReadiness: best?.providerReadiness ?? "unknown",
-    };
+    return { modelInInventory: true, providerRegistered: model.routable, satisfiable: model.invocable };
   }
   const route = model.routes.find((r) => r.providerId === providerId);
   const provider = inventory.providers.find((p) => p.id === providerId);
+  const readiness = route?.providerReadiness ?? provider?.readiness ?? "unknown";
   return {
     modelInInventory: true,
     providerRegistered: provider !== undefined,
-    providerReadiness: route?.providerReadiness ?? provider?.readiness ?? "unknown",
+    providerReadiness: readiness,
+    satisfiable: provider !== undefined && route !== undefined && isUsableReadiness(readiness),
   };
 }
 
@@ -656,7 +694,6 @@ export function buildRuntimeModelPolicy(inputs: ConfigurationInputs): PolicyResu
         source: profileLayer,
         required: preference.required,
         ...avail,
-        satisfiable: avail.modelInInventory && avail.providerRegistered && isUsableReadiness(avail.providerReadiness),
       });
     }
   }
@@ -671,7 +708,6 @@ export function buildRuntimeModelPolicy(inputs: ConfigurationInputs): PolicyResu
         source: fallback.explicit ? "operator_env" : "builtin_default",
         required: V2_REQUIRED_ROLES.includes(role),
         ...avail,
-        satisfiable: avail.modelInInventory && avail.providerRegistered && isUsableReadiness(avail.providerReadiness),
       });
     }
   }

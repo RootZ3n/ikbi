@@ -25,8 +25,7 @@ const notGit: RepoProbe = { inspect: () => ({ exists: true, isDirectory: true, h
 
 /**
  * A configuration source that observes an empty machine: no providers, no models, no
- * profile, no operator defaults. These tests are about the SPINE, so configuration is
- * held at its most boring — the configuration boundary has its own suite.
+ * profile, no operator defaults. Used for the cases that must fail BEFORE resolution.
  */
 const emptyConfiguration: ConfigurationSource = {
   load: async () => ({
@@ -36,7 +35,26 @@ const emptyConfiguration: ConfigurationSource = {
   }),
 };
 
-function deps(probe: RepoProbe, configuration: ConfigurationSource = emptyConfiguration) {
+/**
+ * The smallest machine on which the builder role can actually be authorized: one keyless
+ * provider, one model routed through it, and an operator default naming that model.
+ * These tests are about the SPINE, so configuration is held at its most boring — the
+ * configuration boundary and the resolver each have their own suite.
+ */
+const workingConfiguration: ConfigurationSource = {
+  load: async () => ({
+    inventory: {
+      providers: [
+        { id: "alpha", introspectable: true, kind: "openai-compatible", baseUrl: "https://alpha.test/v1", credentialRequired: false, credentialPresent: false },
+      ],
+      models: [{ id: "alpha-1", routes: [{ providerId: "alpha", providerModelId: "a1" }] }],
+    },
+    activeProfile: { kind: "none" },
+    operatorDefaults: { models: [{ tier: "builder", modelId: "alpha-1", explicit: true }] },
+  }),
+};
+
+function deps(probe: RepoProbe, configuration: ConfigurationSource = workingConfiguration) {
   let tick = 0;
   return { ids: createSequentialIdFactory("run"), now: () => (tick += 1), probe, configuration };
 }
@@ -46,7 +64,7 @@ test("run: a valid request mints task + run identities and enters the lifecycle"
   assert.ok(isV2Id("task", result.taskId));
   assert.ok(isV2Id("run", result.runId));
   assert.ok(isV2Id("receipt", result.receipt.receiptId));
-  assert.deepEqual([...result.receipt.stagesEntered], ["preflight"]);
+  assert.deepEqual([...result.receipt.stagesEntered], ["preflight", "model_resolution"]);
   assert.equal(result.journal[0]?.from, "pending");
   assert.equal(result.journal[0]?.to, "preflight");
   assert.equal(result.journal.at(-1)?.to, "terminal");
@@ -66,6 +84,8 @@ test("run: the skeleton STOPS truthfully — not_implemented, naming the missing
 test("run: NO FAKE SUCCESS — the receipt reports zero work, counted not asserted", async () => {
   const result = await runV2Build({ goal: "build the whole product", repoPath: "/repo" }, deps(goodRepo));
   const e = result.receipt.evidence;
+  assert.equal(e.modelResolutionCompleted, true, "a route WAS authorized");
+  assert.equal(e.modelResolutions, 1, "exactly one");
   assert.equal(e.providerInvoked, false, "no model was invoked");
   assert.equal(e.invocations, 0);
   assert.equal(e.candidatesCreated, 0, "no candidate was created");
@@ -77,10 +97,31 @@ test("run: NO FAKE SUCCESS — the receipt reports zero work, counted not assert
 
 test("run: the skeleton never claims to have reached a stage it did not run", async () => {
   const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo));
+  const implemented = new Set<string>(["preflight", IMPLEMENTED_THROUGH_STAGE]);
   for (const stage of LIFECYCLE_STAGES) {
-    if (stage === IMPLEMENTED_THROUGH_STAGE) continue;
+    if (implemented.has(stage)) continue;
     assert.equal(result.receipt.stagesEntered.includes(stage), false, `"${stage}" was never entered`);
   }
+});
+
+test("run: an AUTHORIZATION is not an invocation — no InvocationId is minted", async () => {
+  const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo));
+  assert.ok(result.decision !== undefined, "a route was authorized");
+  assert.equal(result.receipt.evidence.providerInvoked, false);
+  assert.equal(result.receipt.evidence.invocations, 0, "no V2InvocationId exists — nothing was invoked");
+  assert.equal(result.receipt.resolution?.modelId, "alpha-1");
+  assert.equal(result.receipt.resolution?.providerId, "alpha");
+});
+
+test("run: a role with NO configured preference fails truthfully at resolution", async () => {
+  const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo, emptyConfiguration));
+  assert.ok(result.outcome.kind === "failed");
+  assert.equal(result.outcome.failure.category, "resolution");
+  assert.equal(result.outcome.failure.code, "resolution.role_not_configured");
+  assert.equal(result.outcome.failure.stage, "model_resolution");
+  assert.equal(result.decision, undefined, "no decision is invented for a failed resolution");
+  assert.equal(result.receipt.evidence.modelResolutionCompleted, false);
+  assert.deepEqual([...result.receipt.stagesEntered], ["preflight", "model_resolution"], "the stage really ran and really refused");
 });
 
 test("run: an empty goal fails as a TASK error, inside the lifecycle", async () => {
@@ -150,7 +191,7 @@ test("run: a not_implemented stop is a non-zero exit — it is not success", asy
 test("run: the real (unstubbed) probe accepts THIS repository and still refuses to build", async () => {
   // Uses the production RepoProbe against ikbi's own checkout: proves the default
   // path is wired, and that even a perfectly good repo yields no build in this slice.
-  const result = await runV2Build({ goal: "inspect ikbi itself", repoPath: process.cwd() }, { configuration: emptyConfiguration });
+  const result = await runV2Build({ goal: "inspect ikbi itself", repoPath: process.cwd() }, { configuration: workingConfiguration });
   assert.ok(result.outcome.kind === "failed");
   assert.equal(result.outcome.failure.category, "not_implemented");
   assert.equal(result.receipt.evidence.repositoryMutated, false);

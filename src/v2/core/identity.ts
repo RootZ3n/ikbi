@@ -142,8 +142,10 @@ export type V2Digest<TKind extends string> = string & { readonly [V2_DIGEST_BRAN
 export type V2InventoryDigest = V2Digest<"inventory">;
 /** Digest of a resolved, normalized profile. */
 export type V2ProfileDigest = V2Digest<"profile">;
-/** Digest of a complete runtime model policy — the id V2-003 receives. */
+/** Digest of a complete runtime model policy — the id the model resolver receives. */
 export type V2PolicyDigest = V2Digest<"policy">;
+/** Digest of one authorized model-resolution decision. */
+export type V2DecisionDigest = V2Digest<"decision">;
 
 /**
  * Canonical JSON: object keys sorted, `undefined` dropped, array ORDER PRESERVED

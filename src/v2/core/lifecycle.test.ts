@@ -7,13 +7,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { createSequentialIdFactory, type V2PolicyDigest } from "./identity.js";
+import { createSequentialIdFactory, type V2DecisionDigest, type V2PolicyDigest } from "./identity.js";
 import {
   LIFECYCLE_STAGES,
   LifecycleViolationError,
   RunLifecycle,
   canEnter,
   isLifecycleStage,
+  stageIndex,
   successorStage,
   type LifecycleStage,
   type LifecycleViolationCode,
@@ -22,6 +23,8 @@ import { summarizeEvidence } from "./result.js";
 
 /** A stand-in policy digest. Content-addressed identity is the config suite's concern. */
 const POLICY = "0".repeat(64) as V2PolicyDigest;
+/** A stand-in decision digest. Decision identity is the resolver suite's concern. */
+const DECISION = "1".repeat(64) as V2DecisionDigest;
 
 function fresh() {
   const ids = createSequentialIdFactory("lc");
@@ -43,6 +46,9 @@ function walkTo(target: LifecycleStage) {
     // V2-002: model_resolution now REQUIRES a recorded configuration, so a full walk
     // must establish one in preflight — the stage that owns configuration truth.
     if (stage === "preflight") lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
+    // V2-003: `context` REQUIRES a recorded resolution — its budget is a function of the
+    // resolved model's window, so a full walk must authorize a route first.
+    if (stage === "model_resolution") lifecycle.record(runId, { kind: "resolution", decisionId: DECISION, role: "builder" });
     if (stage === "candidate_generation") lifecycle.record(runId, { kind: "candidate", id: candidateId, workspaceId });
     if (stage === "verification") lifecycle.record(runId, { kind: "verification", id: verificationId, candidateId });
     if (stage === "promotion") lifecycle.record(runId, { kind: "promotion", id: promotionId, candidateId, verificationId });
@@ -66,8 +72,8 @@ function violation(fn: () => void): LifecycleViolationCode {
 test("lifecycle: the canonical order is preflight -> … -> promotion", () => {
   assert.deepEqual([...LIFECYCLE_STAGES], [
     "preflight",
-    "context",
     "model_resolution",
+    "context",
     "candidate_strategy",
     "candidate_generation",
     "verification",
@@ -96,20 +102,25 @@ test("lifecycle: a run must start at preflight — no entering the middle", () =
 test("lifecycle: stages cannot be SKIPPED", () => {
   const { lifecycle, runId } = fresh();
   lifecycle.enter(runId, "preflight");
-  assert.equal(violation(() => lifecycle.enter(runId, "model_resolution")), "illegal_stage_order");
+  lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
+  lifecycle.enter(runId, "model_resolution");
+  assert.equal(violation(() => lifecycle.enter(runId, "candidate_strategy")), "illegal_stage_order");
 });
 
 test("lifecycle: stages cannot be RE-ENTERED or walked backwards", () => {
   const { lifecycle, runId } = fresh();
   lifecycle.enter(runId, "preflight");
-  lifecycle.enter(runId, "context");
-  assert.equal(violation(() => lifecycle.enter(runId, "context")), "illegal_stage_order");
+  lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
+  lifecycle.enter(runId, "model_resolution");
+  assert.equal(violation(() => lifecycle.enter(runId, "model_resolution")), "illegal_stage_order");
   assert.equal(violation(() => lifecycle.enter(runId, "preflight")), "illegal_stage_order");
 });
 
 test("lifecycle: canEnter is the pure twin of enter", () => {
   assert.equal(canEnter({ kind: "pending" }, "preflight"), true);
   assert.equal(canEnter({ kind: "pending" }, "context"), false);
+  assert.equal(canEnter({ kind: "pending" }, "model_resolution"), false);
+  assert.equal(canEnter({ kind: "running", stage: "preflight" }, "model_resolution"), true);
   assert.equal(canEnter({ kind: "running", stage: "verification" }, "disposition"), true);
   assert.equal(canEnter({ kind: "running", stage: "verification" }, "promotion"), false);
   assert.equal(canEnter({ kind: "terminal", outcome: { kind: "rejected", reason: "no_work" } }, "preflight"), false);
@@ -121,7 +132,9 @@ test("lifecycle: VERIFICATION cannot be entered before a candidate exists", () =
   const { lifecycle, runId } = fresh();
   lifecycle.enter(runId, "preflight");
   lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
-  for (const stage of ["context", "model_resolution", "candidate_strategy", "candidate_generation"] as const) {
+  lifecycle.enter(runId, "model_resolution");
+  lifecycle.record(runId, { kind: "resolution", decisionId: DECISION, role: "builder" });
+  for (const stage of ["context", "candidate_strategy", "candidate_generation"] as const) {
     lifecycle.enter(runId, stage);
   }
   // candidate_generation ran but produced nothing — there is nothing to verify.
@@ -291,7 +304,6 @@ test("lifecycle: MANY candidates are first-class — the spine never assumes one
 test("lifecycle: MODEL_RESOLUTION cannot be entered before configuration is recorded", () => {
   const { lifecycle, runId } = fresh();
   lifecycle.enter(runId, "preflight");
-  lifecycle.enter(runId, "context");
   // No configuration was established, so there is no policy a resolver could read.
   assert.equal(violation(() => lifecycle.enter(runId, "model_resolution")), "missing_required_evidence");
 });
@@ -300,7 +312,7 @@ test("lifecycle: configuration is PREFLIGHT's to record and no one else's", () =
   const { lifecycle, runId } = fresh();
   lifecycle.enter(runId, "preflight");
   lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
-  lifecycle.enter(runId, "context");
+  lifecycle.enter(runId, "model_resolution");
   assert.equal(
     violation(() => lifecycle.record(runId, { kind: "configuration", policyId: POLICY })),
     "stage_not_permitted_for_evidence",
@@ -312,10 +324,53 @@ test("lifecycle: a recorded configuration unlocks model_resolution", () => {
   const { lifecycle, runId } = fresh();
   lifecycle.enter(runId, "preflight");
   lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
-  lifecycle.enter(runId, "context");
   lifecycle.enter(runId, "model_resolution");
   assert.equal(lifecycle.stage, "model_resolution");
   assert.deepEqual([...lifecycle.ledger.configurations], [POLICY]);
+});
+
+// ── resolution precondition + ordering correction (V2-003) ──────────────────
+
+test("lifecycle: MODEL_RESOLUTION now precedes CONTEXT — context needs the model", () => {
+  // The dependency is one-way: resolution needs only the policy, while context sizing is
+  // computed from the resolved model's window. V2-001's placeholder order was backwards.
+  assert.ok(stageIndex("model_resolution") < stageIndex("context"));
+});
+
+test("lifecycle: CONTEXT cannot be entered before a route is authorized", () => {
+  const { lifecycle, runId } = fresh();
+  lifecycle.enter(runId, "preflight");
+  lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
+  lifecycle.enter(runId, "model_resolution");
+  // The stage ran but authorized nothing — there is no model to size a context against.
+  assert.equal(violation(() => lifecycle.enter(runId, "context")), "missing_required_evidence");
+});
+
+test("lifecycle: a resolution is MODEL_RESOLUTION's to record and no one else's", () => {
+  const { lifecycle, runId } = fresh();
+  lifecycle.enter(runId, "preflight");
+  assert.equal(
+    violation(() => lifecycle.record(runId, { kind: "resolution", decisionId: DECISION, role: "builder" })),
+    "stage_not_permitted_for_evidence",
+    "preflight may not authorize a route",
+  );
+});
+
+test("lifecycle: a recorded resolution unlocks context and is counted", () => {
+  const { lifecycle, runId } = fresh();
+  lifecycle.enter(runId, "preflight");
+  lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
+  lifecycle.enter(runId, "model_resolution");
+  lifecycle.record(runId, { kind: "resolution", decisionId: DECISION, role: "builder" });
+  lifecycle.enter(runId, "context");
+  assert.equal(lifecycle.stage, "context");
+  assert.deepEqual([...lifecycle.ledger.resolutions], [DECISION]);
+  lifecycle.terminalize(runId, { kind: "rejected", reason: "aborted" });
+  const summary = summarizeEvidence(lifecycle.ledger, lifecycle.outcome!);
+  assert.equal(summary.modelResolutionCompleted, true);
+  assert.equal(summary.modelResolutions, 1);
+  assert.equal(summary.providerInvoked, false, "authorizing a route is not invoking one");
+  assert.equal(summary.invocations, 0);
 });
 
 test("lifecycle: the receipt counts configuration rather than assuming it", () => {

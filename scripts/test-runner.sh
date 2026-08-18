@@ -79,6 +79,7 @@ SUBPROCESS_SUITES=(
   "src/acceptance/cli-smoke.test.ts"
   "src/v2/cli/cli-subprocess.test.ts"
   "src/v2/cli/config-truth.test.ts"
+  "src/v2/cli/resolution-truth.test.ts"
 )
 LOCALHOST_SUITES=("src/server/tasks.test.ts")
 
