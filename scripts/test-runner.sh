@@ -80,6 +80,7 @@ SUBPROCESS_SUITES=(
   "src/v2/cli/cli-subprocess.test.ts"
   "src/v2/cli/config-truth.test.ts"
   "src/v2/cli/resolution-truth.test.ts"
+  "src/v2/cli/inventory-truth.test.ts"
 )
 LOCALHOST_SUITES=("src/server/tasks.test.ts")
 

@@ -1,159 +1,199 @@
 /**
- * INVENTORY INDEPENDENCE — the remediation for v1's preference/availability conflation.
+ * THE CANONICAL CATALOG — inventory as fact.
  *
- * The requirement, stated as tests: expressing a PREFERENCE must not add, rename, or
- * delete anything from the set of models this machine can reach. Only a change to the
- * actual roster or provider set may do that.
+ * Two defects are pinned here. Preference must not suppress a genuinely available
+ * model, and preference must not reroute a real one. Both are impossible by
+ * construction now — `buildCanonicalCatalog` has no parameter a preference fits into —
+ * so these tests assert the composition rules that replace the old filtering.
  */
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { buildProviderInventory, type ModelFactsInput, type ProviderFactsInput, type ProviderInventoryInput } from "../core/config.js";
-import { STABLE_BUILTIN_MODEL_IDS, V2_BUILTIN_CATALOG, isPreferenceArtifact, stabilizeInventory } from "./model-catalog.js";
+import { buildProviderInventory, type ModelFactsInput, type ProviderFactsInput } from "../core/config.js";
+import {
+  V2_AUTO_DISCOVERY_FACTS,
+  V2_BUILTIN_CATALOG,
+  buildCanonicalCatalog,
+  discoveredModels,
+} from "./model-catalog.js";
 
-const provider = (id: string): ProviderFactsInput => ({
+const provider = (id: string, over: Partial<ProviderFactsInput> = {}): ProviderFactsInput => ({
   id,
   introspectable: true,
   kind: "openai-compatible",
   baseUrl: `https://${id}.test/v1`,
-  credentialRequired: false,
-  credentialPresent: false,
+  credentialRequired: true,
+  credentialPresent: true,
+  ...over,
 });
 
-const PROVIDERS = [provider("mimo"), provider("openrouter"), provider("deepseek")];
+const BASE_PROVIDERS = [provider("mimo"), provider("openrouter"), provider("deepseek")];
+const idsOf = (models: readonly ModelFactsInput[]) => models.map((m) => m.id);
 
-/**
- * What v1's registry looks like for a given configured tier pair — the built-in driver
- * and critic entries are NAMED AFTER the preference, exactly as `buildDefaultRegistry`
- * does at `src/core/provider/index.ts:128-146`.
- */
-function v1Observed(driver: string, critic: string, extra: readonly ModelFactsInput[] = []): ProviderInventoryInput {
-  return {
-    providers: PROVIDERS,
-    models: [
-      { id: driver, role: "driver", routes: [{ providerId: "mimo", providerModelId: driver }, { providerId: "openrouter", providerModelId: driver }] },
-      { id: critic, role: "critic", routes: [{ providerId: "mimo", providerModelId: critic }, { providerId: "deepseek", providerModelId: critic }] },
-      { id: "deepseek-chat", role: "driver", routes: [{ providerId: "deepseek", providerModelId: "deepseek-chat" }] },
-      ...extra,
-    ],
-  };
-}
+// ── built-in catalog ────────────────────────────────────────────────────────
 
-const stabilize = (observed: ProviderInventoryInput, driver: string, critic: string, rosterIds: readonly string[] = []) =>
-  stabilizeInventory(observed, { preferenceDerivedIds: [driver, critic], rosterDeclaredIds: rosterIds });
-
-const idsOf = (inv: ProviderInventoryInput) => inv.models.map((m) => m.id).sort();
-
-// ── the defect, restated ────────────────────────────────────────────────────
-
-test("catalog: v1's observed inventory really does change with a mere preference", () => {
-  // Not a v2 assertion — a statement of the problem, so the fix has something to fix.
-  assert.notDeepEqual(idsOf(v1Observed("mimo-v2.5", "mimo-v2.5-pro")), idsOf(v1Observed("totally-made-up", "mimo-v2.5-pro")));
+test("catalog: every shipped built-in is present, with its true routes", () => {
+  const catalog = buildCanonicalCatalog({ providers: BASE_PROVIDERS, rosterModels: [] });
+  const byId = new Map(catalog.models.map((m) => [m.id, m]));
+  for (const builtin of V2_BUILTIN_CATALOG) {
+    const found = byId.get(builtin.id);
+    assert.ok(found !== undefined, `built-in ${builtin.id} is in the catalog`);
+    assert.deepEqual(found.routes.map((r) => `${r.providerId}/${r.providerModelId}`), builtin.routes.map((r) => `${r.providerId}/${r.providerModelId}`));
+  }
 });
 
-// ── the fix ─────────────────────────────────────────────────────────────────
-
-test("catalog: a preference for a model that exists NOWHERE cannot invent it", () => {
-  const stabilized = stabilize(v1Observed("totally-made-up", "mimo-v2.5-pro"), "totally-made-up", "mimo-v2.5-pro");
-  assert.equal(stabilized.models.some((m) => m.id === "totally-made-up"), false, "the fabricated entry is gone");
-  assert.ok(stabilized.models.some((m) => m.id === "mimo-v2.5"), "the real built-in is restored");
-});
-
-test("catalog: changing IKBI_MODEL_* alone does NOT change inventory membership", () => {
-  const asShipped = stabilize(v1Observed("mimo-v2.5", "mimo-v2.5-pro"), "mimo-v2.5", "mimo-v2.5-pro");
-  const preferred = stabilize(v1Observed("totally-made-up", "another-invention"), "totally-made-up", "another-invention");
-  assert.deepEqual(idsOf(asShipped), idsOf(preferred));
-});
-
-test("catalog: changing IKBI_MODEL_* alone does NOT change the inventory DIGEST", () => {
-  const a = buildProviderInventory(stabilize(v1Observed("mimo-v2.5", "mimo-v2.5-pro"), "mimo-v2.5", "mimo-v2.5-pro"));
-  const b = buildProviderInventory(stabilize(v1Observed("totally-made-up", "another-invention"), "totally-made-up", "another-invention"));
-  assert.equal(a.digest, b.digest, "preference is not capability");
-});
-
-test("catalog: preferring a STABLE BUILT-IN does not delete it", () => {
-  // v1 renames the driver slot to `deepseek-v4-flash`; that id is a real shipped entry,
-  // so it must survive rather than being mistaken for an artifact.
-  const observed = v1Observed("deepseek-v4-flash", "mimo-v2.5-pro");
-  const stabilized = stabilize(observed, "deepseek-v4-flash", "mimo-v2.5-pro");
-  assert.ok(stabilized.models.some((m) => m.id === "deepseek-v4-flash"));
-  assert.ok(stabilized.models.some((m) => m.id === "mimo-v2.5"), "and the built-in driver is back");
-});
-
-test("catalog: a ROSTER-DECLARED model is always real, whatever the preference says", () => {
-  const observed = v1Observed("custom-local", "mimo-v2.5-pro", [
-    { id: "custom-local", routes: [{ providerId: "mimo", providerModelId: "custom-local" }] },
+test("catalog: the built-ins cover the DeepSeek family and the escalation stub, not just MiMo", () => {
+  // The V2-003 catalog knew only about MiMo; a preference colliding with any other
+  // built-in could make it vanish. All six shipped entries are now first-class.
+  assert.deepEqual(idsOf(V2_BUILTIN_CATALOG), [
+    "mimo-v2.5",
+    "mimo-v2.5-pro",
+    "deepseek-chat",
+    "deepseek-reasoner",
+    "deepseek-v4-flash",
+    "opus-4.8",
   ]);
-  const stabilized = stabilize(observed, "custom-local", "mimo-v2.5-pro", ["custom-local"]);
-  assert.ok(stabilized.models.some((m) => m.id === "custom-local"), "the operator declared it — it exists");
 });
 
-test("catalog: a roster declaration WINS over the seeded built-in of the same id", () => {
-  const observed: ProviderInventoryInput = {
-    providers: PROVIDERS,
-    models: [{ id: "mimo-v2.5", routes: [{ providerId: "deepseek", providerModelId: "operator-override" }] }],
+test("catalog: the escalation stub is present but honestly unroutable", () => {
+  const inventory = buildProviderInventory(buildCanonicalCatalog({ providers: BASE_PROVIDERS, rosterModels: [] }));
+  const opus = inventory.models.find((m) => m.id === "opus-4.8")!;
+  assert.equal(opus.routes[0]?.providerId, "stub");
+  assert.equal(opus.routable, false, "the stub provider is deliberately unregistered");
+  assert.equal(opus.invocable, false);
+});
+
+// ── auto-discovery ──────────────────────────────────────────────────────────
+
+test("catalog: a credentialed provider contributes its model", () => {
+  const discovered = discoveredModels([...BASE_PROVIDERS, provider("openai")]);
+  const gpt = discovered.find((m) => m.id === "gpt-4o");
+  assert.ok(gpt !== undefined, "an OpenAI credential makes gpt-4o available");
+  assert.equal(gpt.routes[0]?.providerId, "openai");
+  assert.equal(gpt.routes[0]?.providerModelId, "gpt-4o");
+});
+
+test("catalog: an UNCREDENTIALED provider contributes nothing", () => {
+  assert.deepEqual(idsOf(discoveredModels([provider("openai", { credentialPresent: false })])), []);
+});
+
+test("catalog: an UNINTROSPECTABLE provider contributes nothing — unknown is not usable", () => {
+  assert.deepEqual(idsOf(discoveredModels([provider("openai", { introspectable: false })])), []);
+});
+
+test("catalog: an unregistered provider contributes nothing", () => {
+  assert.deepEqual(idsOf(discoveredModels(BASE_PROVIDERS)), [], "no minimax/openai/anthropic/google/groq registered");
+});
+
+test("catalog: a keyless provider still contributes", () => {
+  const discovered = discoveredModels([provider("groq", { credentialRequired: false, credentialPresent: false })]);
+  assert.deepEqual(idsOf(discovered), ["llama-3.3-70b"]);
+});
+
+test("catalog: every auto-discovery fact names a distinct provider and model", () => {
+  const providers = V2_AUTO_DISCOVERY_FACTS.map((f) => f.providerId);
+  const models = V2_AUTO_DISCOVERY_FACTS.map((f) => f.modelId);
+  assert.equal(new Set(providers).size, providers.length, "one contribution per provider");
+  assert.equal(new Set(models).size, models.length, "no duplicate semantic entries");
+  const builtinIds = new Set(idsOf(V2_BUILTIN_CATALOG));
+  for (const id of models) assert.equal(builtinIds.has(id), false, `${id} is not also a built-in`);
+});
+
+// ── precedence ──────────────────────────────────────────────────────────────
+
+test("catalog: the ROSTER overrides a built-in of the same id", () => {
+  const roster: ModelFactsInput = { id: "mimo-v2.5", routes: [{ providerId: "deepseek", providerModelId: "operator-choice" }] };
+  const catalog = buildCanonicalCatalog({ providers: BASE_PROVIDERS, rosterModels: [roster] });
+  assert.equal(catalog.models.find((m) => m.id === "mimo-v2.5")?.routes[0]?.providerModelId, "operator-choice");
+});
+
+test("catalog: the ROSTER overrides an auto-discovered model of the same id", () => {
+  const roster: ModelFactsInput = { id: "gpt-4o", routes: [{ providerId: "openrouter", providerModelId: "openai/gpt-4o" }] };
+  const catalog = buildCanonicalCatalog({ providers: [...BASE_PROVIDERS, provider("openai")], rosterModels: [roster] });
+  assert.equal(catalog.models.find((m) => m.id === "gpt-4o")?.routes[0]?.providerId, "openrouter");
+});
+
+test("catalog: auto-discovery FILLS GAPS only — it never displaces a built-in", () => {
+  // Mirrors v1's own rule (`autoDiscoverProviders` skips a model already present).
+  const withEverything = buildCanonicalCatalog({ providers: [...BASE_PROVIDERS, provider("openai")], rosterModels: [] });
+  assert.equal(withEverything.models.find((m) => m.id === "mimo-v2.5")?.routes[0]?.providerId, "mimo");
+});
+
+test("catalog: membership is deterministically ordered", () => {
+  const a = buildCanonicalCatalog({ providers: [...BASE_PROVIDERS, provider("openai")], rosterModels: [] });
+  const b = buildCanonicalCatalog({ providers: [provider("openai"), ...[...BASE_PROVIDERS].reverse()], rosterModels: [] });
+  assert.deepEqual(idsOf(a.models), idsOf(b.models));
+  assert.deepEqual(idsOf(a.models), [...idsOf(a.models)].sort());
+});
+
+// ── capability facts ────────────────────────────────────────────────────────
+
+test("catalog: capability facts fill only entries that have none", () => {
+  const roster: ModelFactsInput = {
+    id: "declared",
+    routes: [{ providerId: "mimo", providerModelId: "d" }],
+    capabilities: { contextWindow: 1, supportsTools: false, reasoningLevel: "low", speedClass: "fast", provenance: "declared" },
   };
-  const stabilized = stabilize(observed, "mimo-v2.5", "mimo-v2.5-pro", ["mimo-v2.5"]);
-  const entry = stabilized.models.find((m) => m.id === "mimo-v2.5")!;
-  assert.equal(entry.routes[0]?.providerModelId, "operator-override", "v2 restores a default, it does not override the operator");
+  const catalog = buildCanonicalCatalog({
+    providers: BASE_PROVIDERS,
+    rosterModels: [roster],
+    capabilitiesFor: () => ({ contextWindow: 999, supportsTools: true, reasoningLevel: "high", speedClass: "slow", provenance: "known" }),
+  });
+  assert.equal(catalog.models.find((m) => m.id === "declared")?.capabilities?.contextWindow, 1, "declared facts survive");
+  assert.equal(catalog.models.find((m) => m.id === "mimo-v2.5")?.capabilities?.contextWindow, 999, "built-ins get theirs");
 });
 
-test("catalog: a REAL roster change DOES move the inventory digest", () => {
-  const base = buildProviderInventory(stabilize(v1Observed("mimo-v2.5", "mimo-v2.5-pro"), "mimo-v2.5", "mimo-v2.5-pro"));
-  const extended = buildProviderInventory(
-    stabilize(
-      v1Observed("mimo-v2.5", "mimo-v2.5-pro", [{ id: "new-model", routes: [{ providerId: "mimo", providerModelId: "nm" }] }]),
-      "mimo-v2.5",
-      "mimo-v2.5-pro",
-      ["new-model"],
-    ),
+// ── digest semantics ────────────────────────────────────────────────────────
+
+test("digest: a REAL capability change moves the digest", () => {
+  const base = buildProviderInventory(buildCanonicalCatalog({ providers: BASE_PROVIDERS, rosterModels: [] }));
+  const withKey = buildProviderInventory(buildCanonicalCatalog({ providers: [...BASE_PROVIDERS, provider("openai")], rosterModels: [] }));
+  assert.notEqual(base.digest, withKey.digest, "a newly reachable provider IS a capability change");
+});
+
+test("digest: losing a credential moves the digest — the model really is gone", () => {
+  const withKey = buildProviderInventory(buildCanonicalCatalog({ providers: [...BASE_PROVIDERS, provider("openai")], rosterModels: [] }));
+  const without = buildProviderInventory(
+    buildCanonicalCatalog({ providers: [...BASE_PROVIDERS, provider("openai", { credentialPresent: false })], rosterModels: [] }),
   );
-  assert.notEqual(base.digest, extended.digest);
+  assert.notEqual(withKey.digest, without.digest);
+  assert.equal(without.models.some((m) => m.id === "gpt-4o"), false);
 });
 
-test("catalog: a provider change moves the digest too", () => {
-  const base = buildProviderInventory(stabilize(v1Observed("mimo-v2.5", "mimo-v2.5-pro"), "mimo-v2.5", "mimo-v2.5-pro"));
-  const observed = v1Observed("mimo-v2.5", "mimo-v2.5-pro");
+test("digest: a roster addition moves the digest", () => {
+  const base = buildProviderInventory(buildCanonicalCatalog({ providers: BASE_PROVIDERS, rosterModels: [] }));
   const more = buildProviderInventory(
-    stabilize({ ...observed, providers: [...observed.providers, provider("groq")] }, "mimo-v2.5", "mimo-v2.5-pro"),
+    buildCanonicalCatalog({ providers: BASE_PROVIDERS, rosterModels: [{ id: "new", routes: [{ providerId: "mimo", providerModelId: "n" }] }] }),
   );
   assert.notEqual(base.digest, more.digest);
 });
 
-// ── the rule itself ─────────────────────────────────────────────────────────
-
-test("catalog: the artifact rule requires ALL THREE conditions", () => {
-  const ctx = { preferenceDerivedIds: ["x"], rosterDeclaredIds: ["y"] };
-  assert.equal(isPreferenceArtifact("x", ctx), true, "preference-named, undeclared, not a built-in");
-  assert.equal(isPreferenceArtifact("y", ctx), false, "not preference-named");
-  assert.equal(isPreferenceArtifact("x", { ...ctx, rosterDeclaredIds: ["x"] }), false, "roster-declared");
-  for (const id of STABLE_BUILTIN_MODEL_IDS) {
-    assert.equal(isPreferenceArtifact(id, { preferenceDerivedIds: [id], rosterDeclaredIds: [] }), false, `${id} is a real built-in`);
-  }
-});
-
-test("catalog: the seeded built-ins carry their SHIPPED ids and routes", () => {
-  assert.deepEqual(V2_BUILTIN_CATALOG.map((m) => m.id), ["mimo-v2.5", "mimo-v2.5-pro"]);
-  const driver = V2_BUILTIN_CATALOG[0]!;
-  assert.deepEqual(driver.routes.map((r) => r.providerId), ["mimo", "openrouter"]);
-  assert.deepEqual(driver.routes.map((r) => r.providerModelId), ["mimo-v2.5", "mimo-v2.5"], "the wire id is the shipped id, not a preference");
-});
-
-test("catalog: capability facts are filled in for SEEDED entries only", () => {
-  const declared: ModelFactsInput = {
-    id: "already-known",
-    routes: [{ providerId: "mimo", providerModelId: "ak" }],
-    capabilities: { contextWindow: 1, supportsTools: false, reasoningLevel: "low", speedClass: "fast", provenance: "declared" },
-  };
-  const stabilized = stabilizeInventory(
-    { providers: PROVIDERS, models: [declared] },
-    {
-      preferenceDerivedIds: [],
-      rosterDeclaredIds: ["already-known"],
-      capabilitiesFor: () => ({ contextWindow: 999, supportsTools: true, reasoningLevel: "high", speedClass: "slow", provenance: "known" }),
-    },
+test("digest: a route change on an existing model moves the digest", () => {
+  const base = buildProviderInventory(buildCanonicalCatalog({ providers: BASE_PROVIDERS, rosterModels: [] }));
+  const rerouted = buildProviderInventory(
+    buildCanonicalCatalog({
+      providers: BASE_PROVIDERS,
+      rosterModels: [{ id: "mimo-v2.5", routes: [{ providerId: "openrouter", providerModelId: "mimo-v2.5" }] }],
+    }),
   );
-  assert.equal(stabilized.models.find((m) => m.id === "already-known")?.capabilities?.contextWindow, 1, "observed facts are not overwritten");
-  assert.equal(stabilized.models.find((m) => m.id === "mimo-v2.5")?.capabilities?.contextWindow, 999, "seeded entries get theirs");
+  assert.notEqual(base.digest, rerouted.digest);
+});
+
+test("digest: identical facts assembled in a different order give an identical digest", () => {
+  const a = buildProviderInventory(buildCanonicalCatalog({ providers: [...BASE_PROVIDERS, provider("openai")], rosterModels: [] }));
+  const b = buildProviderInventory(buildCanonicalCatalog({ providers: [provider("openai"), ...BASE_PROVIDERS], rosterModels: [] }));
+  assert.equal(a.digest, b.digest);
+});
+
+// ── the structural guarantee ────────────────────────────────────────────────
+
+test("catalog: the builder's inputs cannot express a preference at all", () => {
+  // The real guarantee is a type, not a runtime check: `CanonicalCatalogSources` has
+  // fields for providers, roster models and a capability lookup — and nothing else.
+  // This test documents the invariant the signature enforces.
+  const sources = { providers: BASE_PROVIDERS, rosterModels: [] };
+  assert.deepEqual(Object.keys(sources).sort(), ["providers", "rosterModels"]);
+  const withPreference = buildCanonicalCatalog({ ...sources, ...({ preferredModel: "anything" } as object) });
+  assert.deepEqual(idsOf(withPreference.models), idsOf(buildCanonicalCatalog(sources).models), "an extra field changes nothing");
 });

@@ -23,7 +23,7 @@ import type { ConfigurationInputs, ConfigurationSource } from "../core/config.js
 import type { V2RunResult } from "../core/result.js";
 import { runV2Build, type RepoProbe } from "../core/run.js";
 import type { V2TaskRequest } from "../core/contract.js";
-import { stabilizeInventory } from "./model-catalog.js";
+import { buildCanonicalCatalog } from "./model-catalog.js";
 import { capabilityFacts } from "./provider-inventory.js";
 import { readOperatorDefaults, readOperatorEnvPresence } from "./operator-defaults.js";
 import { fileProfileStore, readActiveProfile, type ProfileStore } from "./profile-source.js";
@@ -90,13 +90,16 @@ export function createConfigurationSource(deps: ConfigurationSourceDeps = {}): C
   return {
     async load(request): Promise<ConfigurationInputs> {
       const facts = await v1Facts(deps);
-      // INVENTORY INDEPENDENCE: what this machine can reach is computed WITHOUT letting
-      // the operator's model preference add, rename, or delete a catalog entry. See
-      // model-catalog.ts for the v1 defect this closes.
-      const inventory = stabilizeInventory(readProviderInventory(facts.registry), {
-        preferenceDerivedIds: [facts.defaultModels.driver, facts.defaultModels.critic],
-        rosterDeclaredIds: rosterDeclaredIds(facts.rosterFile),
-        capabilitiesFor: (model) => capabilityFacts(model.id),
+      // INVENTORY IS FACT. The catalog is COMPOSED from declarative sources — shipped
+      // built-ins, provider auto-discovery, and the operator's declared roster — rather
+      // than read out of v1's assembled model map, which a preference has already
+      // contaminated by the time anyone can look at it. See model-catalog.ts.
+      const observed = readProviderInventory(facts.registry);
+      const declared = new Set(rosterDeclaredIds(facts.rosterFile));
+      const inventory = buildCanonicalCatalog({
+        providers: observed.providers,
+        rosterModels: observed.models.filter((model) => declared.has(model.id)),
+        capabilitiesFor: (modelId) => capabilityFacts(modelId),
       });
       return {
         inventory,

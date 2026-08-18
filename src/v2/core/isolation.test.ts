@@ -221,6 +221,40 @@ test("single authority: only the resolver CHOOSES among routes or mints a decisi
   assert.deepEqual(mints, [], "only the resolver may construct a ModelResolutionDecision");
 });
 
+test("single authority: only the catalog module declares catalog or discovery FACTS", () => {
+  // A second built-in list or a second auto-discovery mapping appearing anywhere else is
+  // how inventory truth would quietly fork. There is one of each, in one file.
+  const catalogFile = join(V2_DIR, "runtime", "model-catalog.ts");
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (file === catalogFile || file.endsWith(".test.ts")) continue;
+    for (const m of readFileSync(file, "utf8").matchAll(/^export const (\w*(?:CATALOG|AUTO_DISCOVERY|BUILTIN)\w*)/gm)) {
+      offenders.push(`${relative(SRC, file)} -> ${m[1] ?? ""}`);
+    }
+  }
+  assert.deepEqual(offenders, [], "the shipped catalog and the discovery mapping live in src/v2/runtime/model-catalog.ts alone");
+});
+
+test("single authority: only the catalog + provider adapter may build model entries", () => {
+  // `ModelFactsInput` IS a catalog entry. Anything else handling one would be a second
+  // way for a model to enter the inventory.
+  const allowed = new Set([join(V2_DIR, "runtime", "model-catalog.ts"), join(V2_DIR, "runtime", "provider-inventory.ts"), join(V2_DIR, "core", "config.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    if (/\bModelFactsInput\b/.test(readFileSync(file, "utf8"))) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "catalog entries are produced by the catalog module and the provider adapter only");
+});
+
+test("single authority: the catalog module cannot even IMPORT a preference", () => {
+  // Membership independence is structural: `CanonicalCatalogSources` has no field a
+  // preference fits into, and this file imports nothing that could supply one — no
+  // config singleton, no profile store, no operator defaults.
+  const specs = importSpecifiers(readFileSync(join(V2_DIR, "runtime", "model-catalog.ts"), "utf8"));
+  assert.deepEqual([...new Set(specs)].sort(), ["../core/config.js"], "the catalog module reads facts only");
+});
+
 test("isolation: v1 does not import v2, except the single registration line", () => {
   const offenders: string[] = [];
   for (const file of tsFiles(SRC)) {
