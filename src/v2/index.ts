@@ -12,6 +12,7 @@
  */
 
 export * from "./core/identity.js";
+export * from "./core/config.js";
 export * from "./core/failure.js";
 export * from "./core/lifecycle.js";
 export * from "./core/result.js";

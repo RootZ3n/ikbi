@@ -15,10 +15,24 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { commands } from "../../cli/registry.js";
+import type { ConfigurationSource } from "../core/config.js";
 import { LIFECYCLE_STAGES } from "../core/lifecycle.js";
 import type { V2RunResult } from "../core/result.js";
 import { FIRST_UNIMPLEMENTED_STAGE } from "../core/run.js";
 import { V2_BANNER, parseV2Args, renderRun, runV2Cli } from "./index.js";
+
+/**
+ * A hermetic configuration source. These tests are about CLI dispatch reaching the
+ * spine; they must not read (or depend on) the operator's real ~/.ikbi state. The
+ * subprocess suite covers the real production wiring.
+ */
+const hermeticConfiguration: ConfigurationSource = {
+  load: async () => ({
+    inventory: { providers: [], models: [] },
+    activeProfile: { kind: "none" },
+    operatorDefaults: { models: [] },
+  }),
+};
 
 function capture() {
   let out = "";
@@ -27,6 +41,7 @@ function capture() {
     stdout: (s: string) => void (out += s),
     stderr: (s: string) => void (err += s),
     cwd: process.cwd(),
+    configuration: hermeticConfiguration,
     get out() {
       return out;
     },
@@ -75,6 +90,8 @@ test("reachability: the JSON surface carries the lifecycle journal + a counted r
   assert.deepEqual(result.receipt.stagesEntered, ["preflight"]);
   assert.equal(result.outcome.kind, "failed");
   assert.deepEqual(result.receipt.evidence, {
+    // Configuration IS resolved in preflight (V2-002) — and it is the only thing that is.
+    configurationResolved: true,
     providerInvoked: false,
     invocations: 0,
     candidatesCreated: 0,

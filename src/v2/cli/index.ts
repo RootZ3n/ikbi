@@ -19,11 +19,12 @@
 
 import { registerCommand } from "../../cli/registry.js";
 import { writeStdout, writeStderr } from "../../cli/io.js";
+import type { ConfigurationSource } from "../core/config.js";
 import { CANDIDATE_STRATEGIES } from "../core/contract.js";
 import { exitCodeForOutcome, formatOutcome, type V2RunResult } from "../core/result.js";
-import { runV2Build } from "../core/run.js";
+import { runV2BuildProduction } from "../runtime/index.js";
 
-export const V2_USAGE = `Usage: ikbi v2 build "<goal>" [--repo <path>] [--strategy ${CANDIDATE_STRATEGIES.join("|")}] [--json]`;
+export const V2_USAGE = `Usage: ikbi v2 build "<goal>" [--repo <path>] [--strategy ${CANDIDATE_STRATEGIES.join("|")}] [--profile <name>] [--json]`;
 
 /** The experimental banner. On stderr so `--json` stdout stays machine-clean. */
 export const V2_BANNER =
@@ -34,6 +35,8 @@ interface V2Args {
   readonly goal: string;
   readonly repo: string;
   readonly strategy: string | undefined;
+  /** Per-run profile override. Absent means "use the operator's standing selection". */
+  readonly profile: string | undefined;
   readonly json: boolean;
 }
 
@@ -43,6 +46,7 @@ export function parseV2Args(argv: readonly string[], cwd: string): V2Args {
   const words: string[] = [];
   let repo = cwd;
   let strategy: string | undefined;
+  let profile: string | undefined;
   let json = false;
   for (let i = 1; i < argv.length; i += 1) {
     const a = argv[i] as string;
@@ -55,6 +59,10 @@ export function parseV2Args(argv: readonly string[], cwd: string): V2Args {
       const v = argv[i + 1];
       if (v !== undefined) strategy = v;
       i += 1;
+    } else if (a === "--profile") {
+      const v = argv[i + 1];
+      if (v !== undefined) profile = v;
+      i += 1;
     } else if (!a.startsWith("-")) words.push(a);
   }
   return {
@@ -62,6 +70,7 @@ export function parseV2Args(argv: readonly string[], cwd: string): V2Args {
     goal: words.join(" "),
     repo,
     strategy,
+    profile,
     json,
   };
 }
@@ -74,6 +83,7 @@ export function renderRun(result: V2RunResult): string {
     `run         ${result.runId}`,
     `repo        ${result.repoPath}`,
     `stages      ${result.receipt.stagesEntered.join(" -> ") || "<none>"}`,
+    ...configurationLines(result),
     `outcome     ${formatOutcome(result.outcome)}`,
     "evidence    " +
       `provider_invoked=${e.providerInvoked} candidates=${e.candidatesCreated} ` +
@@ -86,10 +96,44 @@ export function renderRun(result: V2RunResult): string {
   return `${lines.join("\n")}\n`;
 }
 
-/** Test seam: the command body, with injectable output sinks. */
+/**
+ * The configuration block — the answer to "what strategy did this run actually see?".
+ * Rendered from the resolved policy, so it is silent when no policy was built and
+ * never speculates about one that was not.
+ */
+function configurationLines(result: V2RunResult): string[] {
+  const summary = result.receipt.configuration;
+  if (summary === undefined) return [];
+  const policy = result.policy;
+  const roles = (policy?.rolePreferences ?? [])
+    .map((p) => `${p.role}=${p.modelId}${p.satisfiable ? "" : " (unsatisfiable)"} [${p.source}]`)
+    .join(", ");
+  const lines = [
+    `profile     ${summary.profile ?? "(none)"} [${summary.profileSource}]`,
+    `policy      ${summary.policyId}`,
+    `providers   ${summary.providersConfigured} configured / ${policy?.inventory.providers.length ?? 0} registered` +
+      ` · ${summary.modelsInvocable} invocable model(s)`,
+  ];
+  if (roles.length > 0) lines.push(`roles       ${roles}`);
+  if (summary.unsatisfiableRequiredRoles.length > 0) {
+    lines.push(`warning     required role(s) not currently invocable: ${summary.unsatisfiableRequiredRoles.join(", ")}`);
+  }
+  return lines;
+}
+
+/**
+ * Test seam: the command body, with injectable output sinks and — for hermetic tests —
+ * an injectable configuration source. The REGISTERED command passes none of these, so
+ * production always runs the real wiring; the subprocess suite is what proves that.
+ */
 export async function runV2Cli(
   argv: readonly string[],
-  io: { readonly stdout?: (s: string) => void; readonly stderr?: (s: string) => void; readonly cwd?: string } = {},
+  io: {
+    readonly stdout?: (s: string) => void;
+    readonly stderr?: (s: string) => void;
+    readonly cwd?: string;
+    readonly configuration?: ConfigurationSource;
+  } = {},
 ): Promise<number> {
   const out = io.stdout ?? writeStdout;
   const err = io.stderr ?? writeStderr;
@@ -102,11 +146,15 @@ export async function runV2Cli(
   }
 
   err(V2_BANNER);
-  const result = await runV2Build({
-    goal: args.goal,
-    repoPath: args.repo,
-    ...(args.strategy !== undefined ? { candidateStrategy: args.strategy } : {}),
-  });
+  const result = await runV2BuildProduction(
+    {
+      goal: args.goal,
+      repoPath: args.repo,
+      ...(args.strategy !== undefined ? { candidateStrategy: args.strategy } : {}),
+      ...(args.profile !== undefined ? { profile: args.profile } : {}),
+    },
+    io.configuration !== undefined ? { configuration: io.configuration } : {},
+  );
   out(args.json ? `${JSON.stringify(result, null, 2)}\n` : renderRun(result));
   return exitCodeForOutcome(result.outcome);
 }

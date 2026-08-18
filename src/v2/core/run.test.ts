@@ -10,6 +10,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import type { ConfigurationSource } from "./config.js";
 import { V2_001_FAILURE_CODES } from "./failure.js";
 import { createSequentialIdFactory, isV2Id } from "./identity.js";
 import { LIFECYCLE_STAGES } from "./lifecycle.js";
@@ -22,9 +23,22 @@ const missingRepo: RepoProbe = { inspect: () => ({ exists: false, isDirectory: f
 const fileNotDir: RepoProbe = { inspect: () => ({ exists: true, isDirectory: false, hasGitDir: false }) };
 const notGit: RepoProbe = { inspect: () => ({ exists: true, isDirectory: true, hasGitDir: false }) };
 
-function deps(probe: RepoProbe) {
+/**
+ * A configuration source that observes an empty machine: no providers, no models, no
+ * profile, no operator defaults. These tests are about the SPINE, so configuration is
+ * held at its most boring — the configuration boundary has its own suite.
+ */
+const emptyConfiguration: ConfigurationSource = {
+  load: async () => ({
+    inventory: { providers: [], models: [] },
+    activeProfile: { kind: "none" },
+    operatorDefaults: { models: [] },
+  }),
+};
+
+function deps(probe: RepoProbe, configuration: ConfigurationSource = emptyConfiguration) {
   let tick = 0;
-  return { ids: createSequentialIdFactory("run"), now: () => (tick += 1), probe };
+  return { ids: createSequentialIdFactory("run"), now: () => (tick += 1), probe, configuration };
 }
 
 test("run: a valid request mints task + run identities and enters the lifecycle", async () => {
@@ -136,7 +150,7 @@ test("run: a not_implemented stop is a non-zero exit — it is not success", asy
 test("run: the real (unstubbed) probe accepts THIS repository and still refuses to build", async () => {
   // Uses the production RepoProbe against ikbi's own checkout: proves the default
   // path is wired, and that even a perfectly good repo yields no build in this slice.
-  const result = await runV2Build({ goal: "inspect ikbi itself", repoPath: process.cwd() });
+  const result = await runV2Build({ goal: "inspect ikbi itself", repoPath: process.cwd() }, { configuration: emptyConfiguration });
   assert.ok(result.outcome.kind === "failed");
   assert.equal(result.outcome.failure.category, "not_implemented");
   assert.equal(result.receipt.evidence.repositoryMutated, false);

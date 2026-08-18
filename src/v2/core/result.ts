@@ -33,12 +33,14 @@ import type { RunFailure } from "./failure.js";
 import type { LifecycleStage, LifecycleTransition, RunLedgerView } from "./lifecycle.js";
 import type {
   V2CandidateId,
+  V2PolicyDigest,
   V2PromotionId,
   V2ReceiptId,
   V2RunId,
   V2TaskId,
   V2VerificationId,
 } from "./identity.js";
+import type { RuntimeModelPolicy } from "./config.js";
 
 /** Why verified-good work was withheld instead of promoted. Closed set. */
 export type WithheldReason = "governance" | "operator" | "policy" | "dry_run";
@@ -124,6 +126,8 @@ export function formatOutcome(outcome: RunTerminalOutcome): string {
  * zeroes and falses — which is the entire point of shipping this in slice 001.
  */
 export interface RunEvidenceSummary {
+  /** True only when preflight actually built and recorded a runtime model policy. */
+  readonly configurationResolved: boolean;
   readonly providerInvoked: boolean;
   readonly invocations: number;
   readonly candidatesCreated: number;
@@ -131,6 +135,38 @@ export interface RunEvidenceSummary {
   readonly promotionsAttempted: number;
   readonly promoted: boolean;
   readonly repositoryMutated: boolean;
+}
+
+/**
+ * The configuration a run actually used, as a receipt-safe summary.
+ *
+ * Present only when preflight really resolved one. Everything here is a digest, a
+ * name or a count — never an endpoint credential and never a raw parameter value.
+ */
+export interface RunConfigurationSummary {
+  readonly policyId: V2PolicyDigest;
+  readonly inventoryDigest: string;
+  /** The active profile's name, or null when the operator selected none. */
+  readonly profile: string | null;
+  readonly profileSource: string;
+  readonly providersConfigured: number;
+  readonly modelsInvocable: number;
+  readonly rolesResolved: number;
+  readonly unsatisfiableRequiredRoles: readonly string[];
+}
+
+/** Summarize a policy for a receipt. Derived from the policy — nothing is asserted. */
+export function summarizeConfiguration(policy: RuntimeModelPolicy): RunConfigurationSummary {
+  return {
+    policyId: policy.policyId,
+    inventoryDigest: policy.inventory.digest,
+    profile: policy.profile?.name ?? null,
+    profileSource: policy.profileSource,
+    providersConfigured: policy.inventory.providersConfigured,
+    modelsInvocable: policy.inventory.modelsInvocable,
+    rolesResolved: policy.rolePreferences.length,
+    unsatisfiableRequiredRoles: policy.unsatisfiableRequiredRoles,
+  };
 }
 
 /** The durable account of ONE run: where it went, what it produced, how it ended. */
@@ -141,6 +177,8 @@ export interface V2RunReceipt {
   readonly outcome: RunTerminalOutcome;
   readonly stagesEntered: readonly LifecycleStage[];
   readonly evidence: RunEvidenceSummary;
+  /** Absent when the run ended before configuration was established. */
+  readonly configuration?: RunConfigurationSummary;
   readonly startedAt: number;
   readonly endedAt: number;
 }
@@ -153,6 +191,7 @@ export interface V2RunReceipt {
 export function summarizeEvidence(ledger: RunLedgerView, outcome: RunTerminalOutcome): RunEvidenceSummary {
   const accepted = outcome.kind === "accepted";
   return {
+    configurationResolved: ledger.configurations.length > 0,
     providerInvoked: ledger.invocations.length > 0,
     invocations: ledger.invocations.length,
     candidatesCreated: ledger.candidates.length,
@@ -174,6 +213,11 @@ export interface V2RunResult {
   readonly goal: string;
   readonly repoPath: string;
   readonly outcome: RunTerminalOutcome;
+  /**
+   * THE normalized configuration this run resolved — the single input a future model
+   * resolver receives. Absent when the run failed before configuration was built.
+   */
+  readonly policy?: RuntimeModelPolicy;
   /** Every transition the run made, in order. The run's own account of itself. */
   readonly journal: readonly LifecycleTransition[];
   readonly receipt: V2RunReceipt;

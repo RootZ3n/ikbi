@@ -58,6 +58,8 @@ test("v2 cli: the end-to-end run claims NOTHING it did not do", () => {
   const result = JSON.parse(r.stdout) as V2RunResult;
   assert.equal(result.outcome.kind, "failed");
   assert.deepEqual(result.receipt.evidence, {
+    // Configuration IS resolved in preflight (V2-002) — and it is the only thing that is.
+    configurationResolved: true,
     providerInvoked: false,
     invocations: 0,
     candidatesCreated: 0,

@@ -5,9 +5,13 @@
  * the obvious one: a slow drift into a tangled hybrid where neither architecture is
  * intact and neither can be reasoned about. So the boundary is a TEST, not a habit.
  *
- *   - `src/v2/core/**` imports nothing but node builtins and other v2 files.
+ *   - `src/v2/core/**` (and the `src/v2/index.ts` barrel) imports nothing but node
+ *     builtins and other v2 files.
  *   - `src/v2/cli/**` may additionally import the v1 CLI command registrar and its
  *     io helpers — that is how a v2 command becomes reachable at all.
+ *   - `src/v2/runtime/**` is the ADAPTER layer and may import a NAMED, enumerated set
+ *     of v1 donor modules. It exists so that "v2 reads v1" is a short, reviewable list
+ *     in one place instead of an ambient habit.
  *   - No v1 file imports v2, with exactly ONE sanctioned exception: the side-effect
  *     registration line in `src/cli/index.ts`.
  *
@@ -26,6 +30,20 @@ const V2_DIR = join(SRC, "v2");
 
 /** v1 modules `src/v2/cli/**` is allowed to import (relative to the importing file). */
 const V2_CLI_ALLOWED_V1_IMPORTS = new Set(["../../cli/registry.js", "../../cli/io.js"]);
+
+/**
+ * v1 donor modules the ADAPTER layer may import. Every entry is a deliberate decision
+ * recorded in docs/V2-DONOR-CLASSIFICATION.md. Growing this list is how v2 legitimately
+ * adopts a v1 primitive — in review, on purpose, never by drift.
+ */
+const V2_RUNTIME_ALLOWED_V1_IMPORTS = new Set([
+  "../../core/config.js", //                       operator/provider configuration + state root
+  "../../core/provider/index.js", //               the process-wide model registry (dynamic)
+  "../../core/provider/contract.js", //            ModelProvider / preflight metadata types
+  "../../core/provider/registry.js", //            ModelSpec / ModelRegistry types
+  "../../modules/profiles/contract.js", //         Profile shape + the role vocabulary
+  "../../modules/profiles/storage.js", //          READ-ONLY profile loading + the active pointer
+]);
 
 /** The ONLY v1 file permitted to know v2 exists. */
 const V1_REGISTRATION_FILE = "cli/index.ts";
@@ -74,11 +92,15 @@ test("isolation: the import scanner is not vacuous (it really finds imports)", (
   assert.deepEqual(identity, ["node:crypto"]);
   const cli = importSpecifiers(readFileSync(join(V2_DIR, "cli", "index.ts"), "utf8"));
   assert.ok(cli.includes("../../cli/registry.js"), `expected the registrar import, saw ${cli.join(", ")}`);
-  assert.ok(cli.includes("../core/run.js"), `expected the canonical run import, saw ${cli.join(", ")}`);
+  assert.ok(cli.includes("../runtime/index.js"), `expected the production run import, saw ${cli.join(", ")}`);
+  const runtime = importSpecifiers(readFileSync(join(V2_DIR, "runtime", "index.ts"), "utf8"));
+  assert.ok(runtime.includes("../core/run.js"), `expected the canonical run import, saw ${runtime.join(", ")}`);
+  assert.ok(runtime.includes("../../core/provider/index.js"), "the dynamic v1 provider import is seen by the scanner");
 });
 
-test("isolation: nothing under src/v2/core imports v1", () => {
-  for (const file of tsFiles(join(V2_DIR, "core"))) {
+test("isolation: nothing under src/v2/core (or the barrel) imports v1", () => {
+  const barrel = join(V2_DIR, "index.ts");
+  for (const file of [...tsFiles(join(V2_DIR, "core")), barrel]) {
     for (const spec of importSpecifiers(readFileSync(file, "utf8"))) {
       if (isBuiltin(spec)) continue;
       assert.ok(spec.startsWith("."), `${relative(SRC, file)} imports a bare package "${spec}"`);
@@ -98,6 +120,37 @@ test("isolation: src/v2/cli imports only v2 + the sanctioned v1 CLI registrar/io
         target.startsWith(`${V2_DIR}/`),
         `${relative(SRC, file)} imports v1 "${spec}" — add it to V2_CLI_ALLOWED_V1_IMPORTS deliberately, or don't`,
       );
+    }
+  }
+});
+
+test("isolation: src/v2/runtime imports only v2 + the ENUMERATED v1 donor modules", () => {
+  for (const file of tsFiles(join(V2_DIR, "runtime"))) {
+    for (const spec of importSpecifiers(readFileSync(file, "utf8"))) {
+      if (isBuiltin(spec) || V2_RUNTIME_ALLOWED_V1_IMPORTS.has(spec)) continue;
+      assert.ok(spec.startsWith("."), `${relative(SRC, file)} imports a bare package "${spec}"`);
+      const target = resolve(file, "..", spec);
+      assert.ok(
+        target.startsWith(`${V2_DIR}/`),
+        `${relative(SRC, file)} imports un-enumerated v1 module "${spec}" — add it to ` +
+          "V2_RUNTIME_ALLOWED_V1_IMPORTS deliberately, and record the decision in the donor classification",
+      );
+    }
+  }
+});
+
+test("isolation: the adapter layer is the ONLY part of v2 that touches v1 donor code", () => {
+  // A guard against the easy mistake: reaching for v1 from core or cli because the
+  // adapter did not expose quite the right shape yet.
+  for (const dir of ["core", "cli"] as const) {
+    for (const file of tsFiles(join(V2_DIR, dir))) {
+      for (const spec of importSpecifiers(readFileSync(file, "utf8"))) {
+        assert.equal(
+          V2_RUNTIME_ALLOWED_V1_IMPORTS.has(spec),
+          false,
+          `${relative(SRC, file)} imports donor module "${spec}" directly — that belongs in src/v2/runtime`,
+        );
+      }
     }
   }
 });

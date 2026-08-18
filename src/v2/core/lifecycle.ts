@@ -44,6 +44,7 @@ import type { RunFailure } from "./failure.js";
 import type {
   V2CandidateId,
   V2InvocationId,
+  V2PolicyDigest,
   V2PromotionId,
   V2RunId,
   V2VerificationId,
@@ -113,6 +114,7 @@ export interface LifecycleTransition {
  * the candidate and the verification it rests on.
  */
 export type LifecycleEvidence =
+  | { readonly kind: "configuration"; readonly policyId: V2PolicyDigest }
   | { readonly kind: "invocation"; readonly id: V2InvocationId }
   | { readonly kind: "candidate"; readonly id: V2CandidateId; readonly workspaceId: V2WorkspaceId }
   | { readonly kind: "verification"; readonly id: V2VerificationId; readonly candidateId: V2CandidateId }
@@ -125,6 +127,9 @@ export type LifecycleEvidence =
 
 /** Which stage is allowed to record which evidence. A stage cannot vouch for another's work. */
 const EVIDENCE_STAGE: Record<LifecycleEvidence["kind"], readonly LifecycleStage[]> = {
+  // Configuration truth is established ONCE, by preflight. No later stage may
+  // re-resolve it, which is what makes the policy the single input to model choice.
+  configuration: ["preflight"],
   // Invocations may happen anywhere from model resolution onward (scout, builder,
   // critic, judge…). They are attribution, not authority.
   invocation: ["model_resolution", "candidate_strategy", "candidate_generation", "verification", "disposition", "promotion"],
@@ -135,6 +140,10 @@ const EVIDENCE_STAGE: Record<LifecycleEvidence["kind"], readonly LifecycleStage[
 
 /** Stage-entry preconditions expressed as evidence that must already exist. */
 const STAGE_REQUIRES: Partial<Record<LifecycleStage, LifecycleEvidence["kind"]>> = {
+  // No model may be resolved before configuration has been established and recorded.
+  // This is the structural half of "every model decision has exactly one normalized
+  // configuration input" — a resolver cannot run in a world where none was built.
+  model_resolution: "configuration",
   // Nothing to verify without at least one candidate. (One OR MANY — see contract.ts.)
   verification: "candidate",
   // Nothing to promote without a verdict from the canonical verification authority.
@@ -143,6 +152,7 @@ const STAGE_REQUIRES: Partial<Record<LifecycleStage, LifecycleEvidence["kind"]>>
 
 /** The read-only view of what a run produced. */
 export interface RunLedgerView {
+  readonly configurations: readonly V2PolicyDigest[];
   readonly invocations: readonly V2InvocationId[];
   readonly candidates: readonly V2CandidateId[];
   readonly verifications: readonly V2VerificationId[];
@@ -244,6 +254,7 @@ export class RunLifecycle {
   /** What the run actually produced. Empty until a stage records something. */
   get ledger(): RunLedgerView {
     return {
+      configurations: this.evidence.filter((e) => e.kind === "configuration").map((e) => e.policyId),
       invocations: this.evidence.filter((e) => e.kind === "invocation").map((e) => e.id),
       candidates: this.evidence.filter((e) => e.kind === "candidate").map((e) => e.id),
       verifications: this.evidence.filter((e) => e.kind === "verification").map((e) => e.id),

@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { createSequentialIdFactory } from "./identity.js";
+import { createSequentialIdFactory, type V2PolicyDigest } from "./identity.js";
 import {
   LIFECYCLE_STAGES,
   LifecycleViolationError,
@@ -19,6 +19,9 @@ import {
   type LifecycleViolationCode,
 } from "./lifecycle.js";
 import { summarizeEvidence } from "./result.js";
+
+/** A stand-in policy digest. Content-addressed identity is the config suite's concern. */
+const POLICY = "0".repeat(64) as V2PolicyDigest;
 
 function fresh() {
   const ids = createSequentialIdFactory("lc");
@@ -37,6 +40,9 @@ function walkTo(target: LifecycleStage) {
   const promotionId = ids.mint("promotion");
   for (const stage of LIFECYCLE_STAGES) {
     lifecycle.enter(runId, stage);
+    // V2-002: model_resolution now REQUIRES a recorded configuration, so a full walk
+    // must establish one in preflight — the stage that owns configuration truth.
+    if (stage === "preflight") lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
     if (stage === "candidate_generation") lifecycle.record(runId, { kind: "candidate", id: candidateId, workspaceId });
     if (stage === "verification") lifecycle.record(runId, { kind: "verification", id: verificationId, candidateId });
     if (stage === "promotion") lifecycle.record(runId, { kind: "promotion", id: promotionId, candidateId, verificationId });
@@ -113,7 +119,9 @@ test("lifecycle: canEnter is the pure twin of enter", () => {
 
 test("lifecycle: VERIFICATION cannot be entered before a candidate exists", () => {
   const { lifecycle, runId } = fresh();
-  for (const stage of ["preflight", "context", "model_resolution", "candidate_strategy", "candidate_generation"] as const) {
+  lifecycle.enter(runId, "preflight");
+  lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
+  for (const stage of ["context", "model_resolution", "candidate_strategy", "candidate_generation"] as const) {
     lifecycle.enter(runId, stage);
   }
   // candidate_generation ran but produced nothing — there is nothing to verify.
@@ -276,4 +284,43 @@ test("lifecycle: MANY candidates are first-class — the spine never assumes one
   lifecycle.enter(runId, "disposition");
   lifecycle.enter(runId, "promotion");
   assert.equal(lifecycle.stage, "promotion", "N candidates converge on ONE promotion stage");
+});
+
+// ── configuration precondition (V2-002) ─────────────────────────────────────
+
+test("lifecycle: MODEL_RESOLUTION cannot be entered before configuration is recorded", () => {
+  const { lifecycle, runId } = fresh();
+  lifecycle.enter(runId, "preflight");
+  lifecycle.enter(runId, "context");
+  // No configuration was established, so there is no policy a resolver could read.
+  assert.equal(violation(() => lifecycle.enter(runId, "model_resolution")), "missing_required_evidence");
+});
+
+test("lifecycle: configuration is PREFLIGHT's to record and no one else's", () => {
+  const { lifecycle, runId } = fresh();
+  lifecycle.enter(runId, "preflight");
+  lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
+  lifecycle.enter(runId, "context");
+  assert.equal(
+    violation(() => lifecycle.record(runId, { kind: "configuration", policyId: POLICY })),
+    "stage_not_permitted_for_evidence",
+    "no later stage may re-resolve configuration",
+  );
+});
+
+test("lifecycle: a recorded configuration unlocks model_resolution", () => {
+  const { lifecycle, runId } = fresh();
+  lifecycle.enter(runId, "preflight");
+  lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
+  lifecycle.enter(runId, "context");
+  lifecycle.enter(runId, "model_resolution");
+  assert.equal(lifecycle.stage, "model_resolution");
+  assert.deepEqual([...lifecycle.ledger.configurations], [POLICY]);
+});
+
+test("lifecycle: the receipt counts configuration rather than assuming it", () => {
+  const { lifecycle, runId } = fresh();
+  lifecycle.enter(runId, "preflight");
+  lifecycle.terminalize(runId, { kind: "rejected", reason: "no_work" });
+  assert.equal(summarizeEvidence(lifecycle.ledger, lifecycle.outcome!).configurationResolved, false);
 });

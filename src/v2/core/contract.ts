@@ -57,6 +57,13 @@ export interface V2TaskRequest {
   readonly repoPath: string;
   /** How candidates should be produced. Defaults to "single". Validated in preflight. */
   readonly candidateStrategy?: string;
+  /**
+   * PER-RUN PROFILE OVERRIDE — the highest configuration precedence layer. When set,
+   * it replaces the operator's standing active-profile selection for this run only,
+   * and it never writes the active-profile pointer. An override that cannot be
+   * resolved fails preflight exactly like a broken standing selection would.
+   */
+  readonly profile?: string;
 }
 
 /** The task after normalization/validation. What the lifecycle actually carries. */

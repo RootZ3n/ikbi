@@ -11,14 +11,23 @@
  *   2. open the canonical lifecycle
  *   3. enter `preflight` and validate the request (goal, strategy, repository) —
  *      READ-ONLY: it stats paths, nothing more
- *   4. STOP, because `context` (the next stage) has no implementation in this build
- *   5. terminalize as `failed` with category `not_implemented`, and emit a receipt
- *      whose evidence block is counted from a ledger nothing wrote to: zero
- *      invocations, zero candidates, zero verifications, not promoted, repository
- *      not mutated
+ *   4. resolve CONFIGURATION TRUTH inside preflight: what this machine can invoke
+ *      (provider inventory), what strategy the operator selected (active profile),
+ *      and whether the two are coherent — producing ONE immutable
+ *      `RuntimeModelPolicy`, recorded on the lifecycle ledger
+ *   5. STOP, because `context` (the next stage) has no implementation in this build
+ *   6. terminalize as `failed` with category `not_implemented`, and emit a receipt
+ *      whose evidence block is counted from the ledger: zero invocations, zero
+ *      candidates, zero verifications, not promoted, repository not mutated
  *
- * It performs NO model call, NO workspace allocation, NO mutation, NO promotion. The
- * receipt says exactly that, because the receipt has no way to say anything else.
+ * It performs NO model call, NO workspace allocation, NO mutation, NO promotion.
+ * Configuration is read-only observation — reading a roster file and a profile file
+ * is not invoking anything. The receipt says exactly that, because the receipt has no
+ * way to say anything else.
+ *
+ * `model_resolution` is NOT entered. The lifecycle would now permit it (configuration
+ * has been recorded), which is the point: the precondition is real and satisfied, and
+ * the stage is still absent because V2-003 has not been written.
  */
 
 import { statSync } from "node:fs";
@@ -31,10 +40,17 @@ import {
   type V2Task,
   type V2TaskRequest,
 } from "./contract.js";
+import { buildRuntimeModelPolicy, type ConfigurationSource, type RuntimeModelPolicy } from "./config.js";
 import { V2_001_FAILURE_CODES, runFailure, stageNotImplemented, type RunFailure } from "./failure.js";
 import { createIdFactory, type V2IdFactory } from "./identity.js";
 import { RunLifecycle, type LifecycleStage } from "./lifecycle.js";
-import { summarizeEvidence, type V2RunReceipt, type V2RunResult, type RunTerminalOutcome } from "./result.js";
+import {
+  summarizeConfiguration,
+  summarizeEvidence,
+  type V2RunReceipt,
+  type V2RunResult,
+  type RunTerminalOutcome,
+} from "./result.js";
 
 /** The furthest stage this build of ikbi implements. Slice 001 implements preflight only. */
 export const IMPLEMENTED_THROUGH_STAGE: LifecycleStage = "preflight";
@@ -71,8 +87,17 @@ export const nodeRepoProbe: RepoProbe = {
   },
 };
 
-/** Injectable collaborators. Production passes none; tests pin the clock and the ids. */
+/**
+ * Injectable collaborators.
+ *
+ * `configuration` is REQUIRED and has no default. That is deliberate: a default would
+ * have to live in `src/v2/core/`, which imports no v1 code, so the only way to give it
+ * one would be to smuggle v1 into the pure layer. Instead the production source is
+ * wired in exactly one place — `src/v2/runtime/index.ts` — and every surface enters
+ * through `runV2BuildProduction`. Tests pass a fake and get a hermetic run.
+ */
 export interface V2RunDeps {
+  readonly configuration: ConfigurationSource;
   readonly ids?: V2IdFactory;
   readonly now?: () => number;
   readonly probe?: RepoProbe;
@@ -180,7 +205,7 @@ export function planFor(task: V2Task): CandidateStrategyPlan {
  * once through the same machine no matter which branch was taken. Later slices add
  * stages between step 3 and terminalization — they do not add exits.
  */
-export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps = {}): Promise<V2RunResult> {
+export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promise<V2RunResult> {
   const ids = deps.ids ?? createIdFactory();
   const now = deps.now ?? Date.now;
   const probe = deps.probe ?? nodeRepoProbe;
@@ -193,14 +218,32 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps = {}): 
   // Stage 1 — PREFLIGHT. Everything, including a rejected request, goes through the
   // lifecycle: there is no path that ends a run outside the machine.
   lifecycle.enter(runId, "preflight");
-  const checked = preflight(request, probe);
 
-  const outcome: RunTerminalOutcome = checked.ok
-    ? // Preflight passed. The next stage does not exist in this build, so the run stops
-      // here and says so. It does not enter `context` — a stage is only ever recorded as
-      // entered when it actually ran.
-      { kind: "failed", failure: stageNotImplemented(FIRST_UNIMPLEMENTED_STAGE, IMPLEMENTED_THROUGH_STAGE) }
-    : { kind: "failed", failure: checked.failure };
+  let task: V2Task | undefined;
+  let policy: RuntimeModelPolicy | undefined;
+
+  const failure = await (async (): Promise<RunFailure> => {
+    const checked = preflight(request, probe);
+    if (!checked.ok) return checked.failure;
+    task = checked.task;
+
+    // CONFIGURATION TRUTH. Read-only: the source observes a provider roster and a
+    // profile file. A structurally incoherent selection fails HERE, rather than
+    // surfacing as a confusing model error three stages later.
+    const built = buildRuntimeModelPolicy(
+      await deps.configuration.load(request.profile !== undefined ? { profileOverride: request.profile } : {}),
+    );
+    if (!built.ok) return built.failure;
+    policy = built.policy;
+    lifecycle.record(runId, { kind: "configuration", policyId: policy.policyId });
+
+    // Preflight is complete and the next stage does not exist in this build, so the
+    // run stops here and says so. It does not enter `context` — a stage is only ever
+    // recorded as entered when it actually ran.
+    return stageNotImplemented(FIRST_UNIMPLEMENTED_STAGE, IMPLEMENTED_THROUGH_STAGE);
+  })();
+
+  const outcome: RunTerminalOutcome = { kind: "failed", failure };
   lifecycle.terminalize(runId, outcome);
 
   const endedAt = now();
@@ -211,6 +254,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps = {}): 
     outcome,
     stagesEntered: lifecycle.stagesEntered,
     evidence: summarizeEvidence(lifecycle.ledger, outcome),
+    ...(policy !== undefined ? { configuration: summarizeConfiguration(policy) } : {}),
     startedAt,
     endedAt,
   };
@@ -218,9 +262,10 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps = {}): 
   return {
     taskId,
     runId,
-    goal: checked.ok ? checked.task.goal : request.goal,
-    repoPath: checked.ok ? checked.task.repoPath : request.repoPath,
+    goal: task?.goal ?? request.goal,
+    repoPath: task?.repoPath ?? request.repoPath,
     outcome,
+    ...(policy !== undefined ? { policy } : {}),
     journal: lifecycle.journal,
     receipt,
   };

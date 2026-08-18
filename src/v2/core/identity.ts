@@ -22,7 +22,7 @@
  * This module has no dependencies inside ikbi. It is the bottom of the v2 stack.
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 /** Brand carrier. Never exists at runtime — the emitted value is a plain string. */
 declare const V2_ID_BRAND: unique symbol;
@@ -118,6 +118,63 @@ export function createIdFactory(nextToken: () => string = randomUUID): V2IdFacto
       return id as V2Id<K>;
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Content digests — DERIVED identity, not minted identity
+// ---------------------------------------------------------------------------
+
+/** Brand carrier for content-addressed digests. Erased at runtime. */
+declare const V2_DIGEST_BRAND: unique symbol;
+
+/**
+ * A CONTENT-ADDRESSED identity: sha256 of a canonical serialization.
+ *
+ * Deliberately a separate species from `V2Id`. A minted id answers "which one is
+ * this?" and is unique per occurrence; a digest answers "what is this made of?" and
+ * is stable across runs whenever the content is. Configuration uses digests so a
+ * receipt can say "this run used THIS normalized configuration" and two runs of the
+ * same configuration say the same thing.
+ */
+export type V2Digest<TKind extends string> = string & { readonly [V2_DIGEST_BRAND]: TKind };
+
+/** Digest of a normalized provider inventory. */
+export type V2InventoryDigest = V2Digest<"inventory">;
+/** Digest of a resolved, normalized profile. */
+export type V2ProfileDigest = V2Digest<"profile">;
+/** Digest of a complete runtime model policy — the id V2-003 receives. */
+export type V2PolicyDigest = V2Digest<"policy">;
+
+/**
+ * Canonical JSON: object keys sorted, `undefined` dropped, array ORDER PRESERVED
+ * (order is semantic wherever v2 keeps an array — e.g. a model's fallback chain).
+ * Callers that hold an unordered collection must sort it themselves BEFORE hashing,
+ * so the choice of what counts as semantic ordering stays visible at the call site.
+ */
+export function canonicalJson(value: unknown): string {
+  return JSON.stringify(canonicalize(value));
+}
+
+function canonicalize(value: unknown): unknown {
+  if (value === null || typeof value !== "object") return value === undefined ? null : value;
+  if (Array.isArray(value)) return value.map(canonicalize);
+  const source = value as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(source).sort()) {
+    const v = source[key];
+    if (v === undefined) continue;
+    out[key] = canonicalize(v);
+  }
+  return out;
+}
+
+/**
+ * Content digest of a value. NEVER pass credential material to this — a digest is
+ * published in receipts and CLI output, and a hash of a secret is still a fact about
+ * the secret. The configuration layer strips credentials before it gets here.
+ */
+export function contentDigest<K extends string>(_kind: K, value: unknown): V2Digest<K> {
+  return createHash("sha256").update(canonicalJson(value)).digest("hex") as V2Digest<K>;
 }
 
 /** A counter-based factory for deterministic tests (`task_seed-00000001`, …). */

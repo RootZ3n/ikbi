@@ -1,8 +1,11 @@
 # ikbi v2 — V1 Donor Classification (advisory)
 
-Produced during **V2-001** (canonical lifecycle foundation). This is an **advisory
-input to future work orders**, not a change plan and not permission to delete
-anything. Nothing in v1 was removed, disabled, or altered to produce it.
+Produced during **V2-001** (canonical lifecycle foundation) and updated by **V2-002**
+(provider + profile configuration boundary). This is an **advisory input to future work
+orders**, not a change plan and not permission to delete anything. Nothing in v1 was
+removed, disabled, or altered to produce it.
+
+Rows revised by a later slice are marked with the slice that revised them.
 
 ## What the four verdicts mean
 
@@ -22,8 +25,12 @@ preserved** and the v2 lifecycle was designed around them (see "Candidate strate
 | v1 system | Where | Verdict | Why |
 | --- | --- | --- | --- |
 | Provider transports (`anthropic.ts`, `openai-compatible.ts`, `sse-parse.ts`) | `src/core/provider/providers/` | **ADOPT** | Narrow, well-tested I/O adapters with no authority of their own. Two transports + an SSE parser is exactly the right surface; nothing about v2 changes what an HTTP call to a model looks like. |
-| Provider registry / capabilities / preflight / circuit-breaker | `src/core/provider/` | **REFINE** | The mechanism is good, but "model identity" in v2 must be resolved once, by one owner, and carried as a `V2InvocationId`-bearing record. v1 resolves capability in several places (`capabilities.ts` classification gaps are a known source of silent degradation). Keep the code, put one resolver in front of it. |
-| Profiles (named model strategies) | `src/modules/profiles/` | **ADOPT** | Recent, self-contained, storage-backed, no authority over promotion. It is a naming layer over model selection — precisely the shape v2 wants. |
+| Provider registry / capabilities / preflight / circuit-breaker | `src/core/provider/` | **REFINE** *(V2-002 confirmed)* | The mechanism is good, but "model identity" in v2 must be resolved once, by one owner, and carried as a `V2InvocationId`-bearing record. v1 resolves capability in several places (`capabilities.ts` classification gaps are a known source of silent degradation). Keep the code, put one resolver in front of it. **V2-002 finding:** `ProviderPreflightInfo` is excellent — non-secret, no I/O, and exactly the right shape for a truthful inventory; v2 adopts it verbatim. Two gaps: the registry does **not retain per-model route provenance** (built-in default vs roster file vs key-triggered auto-discovery are merged into one map by `buildDefaultRegistry`), and the singleton **constructs every transport at module import** and requires the egress guard to be installed first — which is why v2 imports it dynamically. |
+| Provider auto-discovery | `core/provider/index.ts` `autoDiscoverProviders` | **REFINE** *(V2-002)* | Adding a model route because an API key exists is convenient and is why key-only setups work. But it means the roster silently changes shape with the environment, and the resulting route is indistinguishable from a declared one. v2 records the resulting models truthfully; a later slice should make the origin explicit rather than removing the convenience. |
+| Operator model configuration (`IKBI_MODEL_*`, `config.provider.defaultModels`) | `src/core/config.ts` | **REFINE** *(V2-002)* | Correct as a source; wrong as an authority. v1 lets any call site read it independently (`role-models.ts` is a thin wrapper over the singleton). v2 captures it ONCE into `RuntimeModelPolicy` as the `operator_env` / `builtin_default` precedence layers, so no later v2 code has a reason to reread it. The three-tier vocabulary (`driver`/`builder`/`critic`) is normalized onto named roles by an explicit table. |
+| Tier presets (`--tier cheap/mid/frontier`) | `worker-model/tier-presets.ts` | **PARK → future policy INPUT** *(V2-002)* | A pure, well-documented lookup that pins builder+critic and decides whether auto-escalation may fire. It is **not** a competing configuration authority today (it is a per-run flag consumed by `worker-model/cli.ts`), so it needs no v2 change yet. When migrated it should become a named policy preset feeding `RuntimeModelPolicy` — the same precedence layer as a profile — and must not remain a parallel way to pin models. Its escalation flag belongs to V2-003's resolver, not to configuration. |
+| Profiles — the FILE FORMAT and CLI | `src/modules/profiles/` | **ADOPT** *(V2-002)* | The profile document (roles, `extends`, routing, `max_run_cost`) and the `list/show/use/current/init/clear` CLI are sound and are now v2's real input. v2 reads the same files and the same `active-profile` pointer `ikbi profile use` writes; activation stays entirely v1's. |
+| Profiles — ACTIVATION SEMANTICS | `src/modules/profiles/storage.ts`, `cli.ts` | **REFINE** *(V2-002, was ADOPT)* | **Downgraded on evidence.** `profile use` wrote the pointer and then printed `export IKBI_MODEL_*` instructions; **no production path read the pointer** — a repo-wide search found no consumer of `getActiveProfile`, `resolveProfile`, or the pointer file outside `src/modules/profiles/` itself. Actual build behavior depended on the operator's shell. Two further defects surfaced while adapting it: `resolveProfile` **silently drops inheritance** when a parent is missing (logs a warning, returns the child unmerged) and returns `undefined` for an over-deep chain (indistinguishable from "not found"); and profile names are not validated as path-safe stems. v2 therefore resolves inheritance in its own adapter (mirroring v1's merge, pinned by an equivalence test) and fails truthfully. **`profileToEnv` is the artifact of the defect** — v2 does not use it and must never mutate the operator's environment. |
 | Model router (`resolveModel`, cheapest-sufficient) | `src/modules/model-router/` | **REFINE** | Genuinely wired (expert-rental, consult, recovery, orchestrator). But in v2 model resolution is a *lifecycle stage* with one owner; the router should become that stage's policy engine rather than something several callers consult independently. |
 | Workspace isolation (worktrees, allocate/promote/discard, CAS `update-ref`) | `src/core/workspace/` | **ADOPT** | The strongest thing in v1. Crash-durable intent states, pid-owned allocations, ref-level atomic promote, retain-on-signal. v2 should bind `V2WorkspaceId` to it and otherwise leave it alone. |
 | **State-bound / hash-anchored mutation** (`file-state.ts`, `mutation.ts`, `mutation-session.ts`, `repair-plan.ts`) | `src/core/workspace/` | **ADOPT (refine the surface)** | Evidence: `observeFileState` reads with `O_NOFOLLOW`, hashes exact bytes, distinguishes missing/empty/regular/directory/symlink; `STALE_MUTATION` is a real compare-and-swap rejection consumed by `repair-plan.ts`; and the session layer is production-wired into `builder.ts`, `tool-executor.ts`, `builder-tools/delegate.ts`, `chat/session.ts`, and `agent-tools/notebook-tools.ts`. This is the capability v2 must *strengthen*, not rebuild. The refinement is convergence: v2 exposes ONE `StateBoundMutationAuthority` (see `src/v2/core/contract.ts`) that every mode — builder, repair, shadow, tournament candidate, REPL — must route through, so no mode can acquire a private write path. |
@@ -55,8 +62,13 @@ preserved** and the v2 lifecycle was designed around them (see "Candidate strate
 
 1. **No second promote path.** Any strategy that wants to promote must do it by
    producing candidates and letting the spine adjudicate.
-2. **No mutation outside the state-bound authority.** A path-only write API must not
+2. **No second configuration source.** *(V2-002)* Model decisions read
+   `RuntimeModelPolicy` and nothing else — not `process.env`, not `config.provider`,
+   not the profile files, not a hard-coded constant. The lifecycle enforces the
+   structural half: `model_resolution` cannot be entered until a configuration has been
+   recorded by preflight.
+3. **No mutation outside the state-bound authority.** A path-only write API must not
    exist in v2 for any mode.
-3. **No receipt field that is asserted rather than counted.**
-4. **Nothing is "done" because it exists.** A migrated subsystem is done when a test
+4. **No receipt field that is asserted rather than counted.**
+5. **Nothing is "done" because it exists.** A migrated subsystem is done when a test
    enters through the canonical v2 entrypoint and proves the subsystem is what ran.
