@@ -29,6 +29,7 @@ import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
 
 import type { V2RunResult } from "../core/result.js";
+import { loopbackEgressEnv, startFakeOpenAIProvider } from "./fake-provider-server.js";
 
 const ENTRY = fileURLToPath(new URL("../../../dist/cli/index.js", import.meta.url));
 
@@ -39,8 +40,11 @@ const MARKER_C = "MARKER-C-nothing-should-read-this";
 const GOAL = "make src/widget.ts do the thing";
 
 /** One keyless provider and one model with a DECLARED window, so the budget is factual. */
+const PROVIDER = await startFakeOpenAIProvider();
+after(() => PROVIDER.close());
+
 const ROSTER = {
-  providers: [{ id: "p1", kind: "openai-compatible", baseUrl: "https://p1.test/v1", keyless: true }],
+  providers: [{ id: "p1", kind: "openai-compatible", baseUrl: PROVIDER.baseUrl, keyless: true }],
   models: [
     {
       id: "m1",
@@ -86,6 +90,7 @@ function runCli(stateRoot: string, args: readonly string[]): { status: number | 
       IKBI_MODEL_DRIVER: "m1",
       IKBI_MODEL_BUILDER: "m1",
       IKBI_MODEL_CRITIC: "m1",
+      ...loopbackEgressEnv(PROVIDER),
     },
     encoding: "utf8",
   });
@@ -272,18 +277,18 @@ test("context truth: a symlink escaping the repository is refused and recorded",
   assert.equal(omission?.reason, "outside_repository");
 });
 
-test("context truth: exactly ONE package, and still NOTHING is invoked or written", () => {
+test("context truth: exactly ONE package, exactly one invocation, and nothing written", () => {
   const state = makeStateRoot();
   const repo = makeRepo();
   const before = spawnSync("git", ["status", "--porcelain"], { cwd: repo, encoding: "utf8" });
   const { result } = v2Run(state, repo);
   assert.equal(result.receipt.evidence.contextPackages, 1);
   assert.equal(result.receipt.evidence.contextAssemblyCompleted, true);
-  assert.equal(result.receipt.evidence.providerInvoked, false, "no model was invoked");
-  assert.equal(result.receipt.evidence.invocations, 0);
+  assert.equal(result.receipt.evidence.providerInvoked, true, "V2-005: the route was really called");
+  assert.equal(result.receipt.evidence.invocations, 1);
   assert.equal(result.receipt.evidence.candidatesCreated, 0);
   assert.equal(result.receipt.evidence.repositoryMutated, false);
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "invocation"]);
   assert.equal(spawnSync("git", ["status", "--porcelain"], { cwd: repo, encoding: "utf8" }).stdout, before.stdout, "the repo is untouched");
 });
 

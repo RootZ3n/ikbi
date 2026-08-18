@@ -150,6 +150,8 @@ export type V2DecisionDigest = V2Digest<"decision">;
 export type V2ContextDigest = V2Digest<"context">;
 /** Digest of one context artifact's observed content. */
 export type V2ArtifactDigest = V2Digest<"artifact">;
+/** Digest of the exact model input placed on the wire. */
+export type V2PromptDigest = V2Digest<"prompt">;
 
 /**
  * Canonical JSON: object keys sorted, `undefined` dropped, array ORDER PRESERVED

@@ -7,11 +7,12 @@
  * every other existing command are byte-unchanged. It is marked `advanced` so it does
  * not appear in the default help, and it announces itself as experimental on stderr.
  *
- * WHAT IT DOES TODAY: enters the canonical v2 lifecycle and reports, truthfully, that
- * the run stopped after preflight because the next stage is not implemented in this
- * build. It makes no model call, allocates no workspace, mutates no file, and promotes
- * nothing — and the receipt it prints is COUNTED from the lifecycle's evidence ledger,
- * so it cannot claim otherwise.
+ * WHAT IT DOES TODAY: enters the canonical v2 lifecycle — resolving one authorized
+ * model route, assembling one bounded context package, and making ONE real model call to
+ * qualify that route — then reports, truthfully, that it stopped because candidate
+ * generation is not implemented in this build. It allocates no workspace, mutates no
+ * file, and promotes nothing; the receipt it prints is COUNTED from the lifecycle's
+ * evidence ledger, so it cannot claim otherwise.
  *
  * This file is intentionally thin: argv parsing plus rendering. All authority lives in
  * `src/v2/core/run.ts`, which is what makes the production-reachability test meaningful.
@@ -21,6 +22,7 @@ import { registerCommand } from "../../cli/registry.js";
 import { writeStdout, writeStderr } from "../../cli/io.js";
 import type { ConfigurationSource } from "../core/config.js";
 import type { ContextSource } from "../core/context.js";
+import type { InvocationTransport } from "../core/invocation.js";
 import { CANDIDATE_STRATEGIES } from "../core/contract.js";
 import { exitCodeForOutcome, formatOutcome, type V2RunResult } from "../core/result.js";
 import { runV2BuildProduction } from "../runtime/index.js";
@@ -29,7 +31,7 @@ export const V2_USAGE = `Usage: ikbi v2 build "<goal>" [--repo <path>] [--strate
 
 /** The experimental banner. On stderr so `--json` stdout stays machine-clean. */
 export const V2_BANNER =
-  "ikbi v2: EXPERIMENTAL architecture probe — the v2 lifecycle skeleton. No model call, no mutation, no promotion.\n";
+  "ikbi v2: EXPERIMENTAL architecture probe — resolves a route, assembles context, and makes ONE model call to qualify the route. No build, no mutation, no promotion.\n";
 
 interface V2Args {
   readonly subcommand: string | undefined;
@@ -87,6 +89,7 @@ export function renderRun(result: V2RunResult): string {
     ...configurationLines(result),
     ...resolutionLines(result),
     ...contextLines(result),
+    ...invocationLines(result),
     `outcome     ${formatOutcome(result.outcome)}`,
     "evidence    " +
       `provider_invoked=${e.providerInvoked} candidates=${e.candidatesCreated} ` +
@@ -160,6 +163,26 @@ function contextLines(result: V2RunResult): string[] {
 }
 
 /**
+ * The one invocation. Rendered as the four identities kept apart, because "what we asked
+ * for", "what we sent" and "what actually served it" are different facts.
+ */
+function invocationLines(result: V2RunResult): string[] {
+  const i = result.receipt.invocation;
+  if (i === undefined) return [];
+  const lines = [
+    `invoked     ${i.role} -> ${i.sentProviderId}/${i.sentProviderModelId} (authorized model ${i.authorizedModelId})`,
+    `served      ${i.servedModelId ?? "(not reported by the provider)"} [${i.identityStatus}] · ${i.attempts} attempt · finish ${i.finishReason}`,
+    `invocation  ${i.invocationId}`,
+  ];
+  if (i.usage !== undefined) {
+    const reported = Object.entries(i.usage).map(([k, v]) => `${k}=${String(v)}`).join(" ");
+    lines.push(`usage       ${reported.length > 0 ? reported : "(none reported)"}  (as the provider reported it)`);
+  }
+  return lines;
+}
+
+
+/**
  * Test seam: the command body, with injectable output sinks and — for hermetic tests —
  * an injectable configuration source. The REGISTERED command passes none of these, so
  * production always runs the real wiring; the subprocess suite is what proves that.
@@ -172,6 +195,7 @@ export async function runV2Cli(
     readonly cwd?: string;
     readonly configuration?: ConfigurationSource;
     readonly contextSources?: readonly ContextSource[];
+    readonly transport?: InvocationTransport;
   } = {},
 ): Promise<number> {
   const out = io.stdout ?? writeStdout;
@@ -195,6 +219,7 @@ export async function runV2Cli(
     {
       ...(io.configuration !== undefined ? { configuration: io.configuration } : {}),
       ...(io.contextSources !== undefined ? { contextSources: io.contextSources } : {}),
+      ...(io.transport !== undefined ? { transport: io.transport } : {}),
     },
   );
   out(args.json ? `${JSON.stringify(result, null, 2)}\n` : renderRun(result));

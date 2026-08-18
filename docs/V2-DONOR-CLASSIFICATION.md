@@ -2,8 +2,8 @@
 
 Produced during **V2-001** (canonical lifecycle foundation) and updated by **V2-002**
 (provider + profile configuration boundary), **V2-003** (single model-resolution
-authority), **V2-003A** (provider inventory truth) and **V2-004** (canonical context
-authority). This is an **advisory input to future work
+authority), **V2-003A** (provider inventory truth) **V2-004** (canonical context
+authority) and **V2-005** (canonical model invocation authority). This is an **advisory input to future work
 orders**, not a change plan and not permission to delete anything. Nothing in v1 was
 removed, disabled, or altered to produce it.
 
@@ -92,6 +92,18 @@ project-retrieval output reaches the builder prompt directly.**
 | Team hand-off brief | **YES** — `builder.ts:1083` | prior steps' summary in a multi-step build | **PARK** — belongs to the step-planner, which v2 has not reached. |
 | Runtime-truth evidence | **YES** — `builder.ts:1089` | executed-evidence block | **PARK** — belongs to verification, which v2 has not reached. |
 
+## Invocation systems *(V2-005)*
+
+| v1 system | Production reachability | Contributes | Verdict |
+| --- | --- | --- | --- |
+| OpenAI-compatible + Anthropic HTTP transports | **YES** | protocol, auth headers, SSE parsing, response validation, timeout, typed `ProviderError` | **ADOPT** — mature and single-shot. Audited: one `fetchImpl` call per `invoke` (`openai-compatible.ts:438`), no internal retry. v2 calls `provider.invoke` directly through a narrow adapter. |
+| `ProviderInvoker.invokeModel` | **YES** — the whole v1 build path | registry route lookup, ORDERED FALLBACK across `spec.providers`, circuit breakers, same-route retry | **REPLACE for v2 (preserve for v1)** — this is *routing*, and routing already happened at V2-003. Fallback, retry and escalation are recovery decisions; v2's invocation authority bypasses it entirely and a static guard fails the build if any v2 file calls `invokeModel`. |
+| `ProviderError` taxonomy | **YES** | timeout / http / network / auth / rate_limit / bad_response / config | **ADOPT** — mapped onto v2 codes rather than collapsed, including the 4xx-vs-5xx split. |
+| `TokenUsage` accounting | **YES** | prompt/completion/total/cached tokens as the provider reported them | **ADOPT** — carried verbatim; absent fields stay absent rather than becoming zeroes. |
+| **Served model identity** | **WAS DISCARDED** — both transports parsed the response and dropped `parsed.model` | nothing | **REFINE (the one v1 change)** — `ProviderResult.servedModelId` added as an additive optional field and populated in both transports. Without it a caller can only restate what it sent and call that attribution. Inert in v1; nothing there reads it. |
+| Streaming (`invokeStream`, SSE) | **YES** — the builder loop | incremental deltas | **PARK** — this slice makes one complete request. Streaming belongs with the conversation loop. |
+| Circuit breakers | **YES** — inside `ProviderInvoker` | per-route failure suppression | **PARK** — a recovery concern, and inseparable from the routing it guards. |
+
 ## Standing constraints for later slices
 
 1. **No second promote path.** Any strategy that wants to promote must do it by
@@ -119,5 +131,10 @@ project-retrieval output reaches the builder prompt directly.**
    `ContextPackage`, never a context source, a repository file, or an ad-hoc string. One
    assembler admits; every omission and truncation is recorded; nothing overflows
    silently.
-8. **Nothing is "done" because it exists.** A migrated subsystem is done when a test
+8. **Selection and invocation are different authorities.** *(V2-005)* The resolver says
+   which route is authorized; the invocation authority sends exactly that route, once,
+   and records what actually served it. No fallback, no retry, no second resolution. The
+   four identities — requested, authorized, sent, served — are never collapsed, and
+   `served` is only ever read from the provider's own response.
+9. **Nothing is "done" because it exists.** A migrated subsystem is done when a test
    enters through the canonical v2 entrypoint and proves the subsystem is what ran.

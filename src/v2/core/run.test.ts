@@ -12,6 +12,7 @@ import { test } from "node:test";
 
 import type { ConfigurationSource } from "./config.js";
 import type { ContextSource } from "./context.js";
+import type { InvocationTransport } from "./invocation.js";
 import { V2_001_FAILURE_CODES } from "./failure.js";
 import { createSequentialIdFactory, isV2Id } from "./identity.js";
 import { LIFECYCLE_STAGES } from "./lifecycle.js";
@@ -66,9 +67,39 @@ const workingConfiguration: ConfigurationSource = {
 /** No context sources: the package then contains exactly the operator's goal. */
 const noSources: readonly ContextSource[] = [];
 
-function deps(probe: RepoProbe, configuration: ConfigurationSource = workingConfiguration, contextSources: readonly ContextSource[] = noSources) {
+
+/**
+ * A transport that records what it was asked to send and answers deterministically.
+ * It reaches no network — these tests are about the SPINE.
+ */
+function fakeTransport(over: { servedModelId?: string | null; attempts?: number } = {}) {
+  const sent: { providerId: string; providerModelId: string; messages: readonly { role: string; content: string }[] }[] = [];
+  const transport: InvocationTransport = {
+    send: async (input) => {
+      sent.push({ providerId: input.providerId, providerModelId: input.providerModelId, messages: input.messages });
+      return {
+        ok: true,
+        response: {
+          content: "acknowledged",
+          finishReason: "stop",
+          ...(over.servedModelId === null ? {} : { servedModelId: over.servedModelId ?? input.providerModelId }),
+          usage: { promptTokens: 11, completionTokens: 3, totalTokens: 14 },
+          attempts: over.attempts ?? 1,
+        },
+      };
+    },
+  };
+  return { transport, sent };
+}
+
+function deps(
+  probe: RepoProbe,
+  configuration: ConfigurationSource = workingConfiguration,
+  contextSources: readonly ContextSource[] = noSources,
+  transport: InvocationTransport = fakeTransport().transport,
+) {
   let tick = 0;
-  return { ids: createSequentialIdFactory("run"), now: () => (tick += 1), probe, configuration, contextSources };
+  return { ids: createSequentialIdFactory("run"), now: () => (tick += 1), probe, configuration, contextSources, transport };
 }
 
 test("run: a valid request mints task + run identities and enters the lifecycle", async () => {
@@ -76,7 +107,7 @@ test("run: a valid request mints task + run identities and enters the lifecycle"
   assert.ok(isV2Id("task", result.taskId));
   assert.ok(isV2Id("run", result.runId));
   assert.ok(isV2Id("receipt", result.receipt.receiptId));
-  assert.deepEqual([...result.receipt.stagesEntered], ["preflight", "model_resolution", "context"]);
+  assert.deepEqual([...result.receipt.stagesEntered], ["preflight", "model_resolution", "context", "invocation"]);
   assert.equal(result.journal[0]?.from, "pending");
   assert.equal(result.journal[0]?.to, "preflight");
   assert.equal(result.journal.at(-1)?.to, "terminal");
@@ -93,15 +124,15 @@ test("run: the skeleton STOPS truthfully — not_implemented, naming the missing
   assert.equal(result.outcome.failure.retryable, false, "re-running does not make an unimplemented stage exist");
 });
 
-test("run: NO FAKE SUCCESS — the receipt reports zero work, counted not asserted", async () => {
+test("run: NO FAKE SUCCESS — the receipt reports exactly what happened, counted", async () => {
   const result = await runV2Build({ goal: "build the whole product", repoPath: "/repo" }, deps(goodRepo));
   const e = result.receipt.evidence;
   assert.equal(e.modelResolutionCompleted, true, "a route WAS authorized");
   assert.equal(e.modelResolutions, 1, "exactly one");
   assert.equal(e.contextAssemblyCompleted, true, "context WAS assembled");
   assert.equal(e.contextPackages, 1, "exactly one package");
-  assert.equal(e.providerInvoked, false, "no model was invoked");
-  assert.equal(e.invocations, 0);
+  assert.equal(e.providerInvoked, true, "V2-005: a model IS invoked now");
+  assert.equal(e.invocations, 1, "exactly one");
   assert.equal(e.candidatesCreated, 0, "no candidate was created");
   assert.equal(e.verificationsPerformed, 0, "nothing was verified");
   assert.equal(e.promotionsAttempted, 0);
@@ -111,20 +142,51 @@ test("run: NO FAKE SUCCESS — the receipt reports zero work, counted not assert
 
 test("run: the skeleton never claims to have reached a stage it did not run", async () => {
   const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo));
-  const implemented = new Set<string>(["preflight", "model_resolution", IMPLEMENTED_THROUGH_STAGE]);
+  const implemented = new Set<string>(["preflight", "model_resolution", "context", IMPLEMENTED_THROUGH_STAGE]);
   for (const stage of LIFECYCLE_STAGES) {
     if (implemented.has(stage)) continue;
     assert.equal(result.receipt.stagesEntered.includes(stage), false, `"${stage}" was never entered`);
   }
 });
 
-test("run: an AUTHORIZATION is not an invocation — no InvocationId is minted", async () => {
-  const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo));
-  assert.ok(result.decision !== undefined, "a route was authorized");
-  assert.equal(result.receipt.evidence.providerInvoked, false);
-  assert.equal(result.receipt.evidence.invocations, 0, "no V2InvocationId exists — nothing was invoked");
+test("run: the invocation sends EXACTLY the authorized route, once", async () => {
+  const fake = fakeTransport();
+  const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo, workingConfiguration, noSources, fake.transport));
+  assert.equal(fake.sent.length, 1, "one outbound attempt, no retry and no fallback");
+  assert.equal(fake.sent[0]?.providerId, "alpha");
+  assert.equal(fake.sent[0]?.providerModelId, "a1", "the WIRE id from the decision, not the logical id");
   assert.equal(result.receipt.resolution?.modelId, "alpha-1");
-  assert.equal(result.receipt.resolution?.providerId, "alpha");
+  assert.equal(result.invocation?.identity.authorizedModelId, "alpha-1");
+  assert.equal(result.invocation?.identity.sentProviderModelId, "a1");
+});
+
+test("run: a failure BEFORE the wire is not counted as an invocation", async () => {
+  const refusing: InvocationTransport = {
+    send: async () => ({
+      ok: false,
+      failure: { code: "invocation.provider_not_available", message: "no such provider", providerId: "alpha", attempts: 0 },
+    }),
+  };
+  const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo, workingConfiguration, noSources, refusing));
+  assert.ok(result.outcome.kind === "failed");
+  assert.equal(result.outcome.failure.category, "provider");
+  assert.equal(result.receipt.evidence.providerInvoked, false, "intention is not an invocation");
+  assert.equal(result.receipt.evidence.invocations, 0);
+  assert.equal(result.invocation, undefined);
+});
+
+test("run: a failure that REACHED the wire IS counted as an invocation", async () => {
+  const failing: InvocationTransport = {
+    send: async () => ({
+      ok: false,
+      failure: { code: "invocation.transport_failure", message: "connection reset", providerId: "alpha", attempts: 1 },
+    }),
+  };
+  const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo, workingConfiguration, noSources, failing));
+  assert.ok(result.outcome.kind === "failed");
+  assert.equal(result.receipt.evidence.providerInvoked, true, "a provider WAS contacted");
+  assert.equal(result.receipt.evidence.invocations, 1);
+  assert.equal(result.invocation, undefined, "but there is no successful record");
 });
 
 test("run: the context package is bound to the run, task and the resolution it was sized by", async () => {
@@ -237,7 +299,7 @@ test("run: a not_implemented stop is a non-zero exit — it is not success", asy
 test("run: the real (unstubbed) probe accepts THIS repository and still refuses to build", async () => {
   // Uses the production RepoProbe against ikbi's own checkout: proves the default
   // path is wired, and that even a perfectly good repo yields no build in this slice.
-  const result = await runV2Build({ goal: "inspect ikbi itself", repoPath: process.cwd() }, { configuration: workingConfiguration, contextSources: noSources });
+  const result = await runV2Build({ goal: "inspect ikbi itself", repoPath: process.cwd() }, { configuration: workingConfiguration, contextSources: noSources, transport: fakeTransport().transport });
   assert.ok(result.outcome.kind === "failed");
   assert.equal(result.outcome.failure.category, "not_implemented");
   assert.equal(result.receipt.evidence.repositoryMutated, false);

@@ -29,6 +29,7 @@ import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
 
 import type { V2RunResult } from "../core/result.js";
+import { loopbackEgressEnv, startFakeOpenAIProvider } from "./fake-provider-server.js";
 
 const ENTRY = fileURLToPath(new URL("../../../dist/cli/index.js", import.meta.url));
 const REPO = fileURLToPath(new URL("../../../", import.meta.url));
@@ -37,10 +38,13 @@ const REPO = fileURLToPath(new URL("../../../", import.meta.url));
 const OPENAI_KEY = "sk-test-INVENTORYTRUTHNEVERPRINTTHIS";
 
 /** A roster declaring two keyless models, so profiles have something real to pin. */
+const PROVIDER = await startFakeOpenAIProvider();
+after(() => PROVIDER.close());
+
 const ROSTER = {
   providers: [
-    { id: "p1", kind: "openai-compatible", baseUrl: "https://p1.test/v1", keyless: true },
-    { id: "p2", kind: "openai-compatible", baseUrl: "https://p2.test/v1", keyless: true },
+    { id: "p1", kind: "openai-compatible", baseUrl: PROVIDER.baseUrl, keyless: true },
+    { id: "p2", kind: "openai-compatible", baseUrl: PROVIDER.baseUrl, keyless: true },
   ],
   models: [
     { id: "alpha", role: "builder", cost: { promptPerMTok: 0, completionPerMTok: 0 }, providers: [{ provider: "p1", providerModelId: "alpha-wire" }] },
@@ -86,6 +90,7 @@ function runCli(root: string, args: readonly string[], extraEnv: Record<string, 
       IKBI_GROQ_API_KEY: "",
       // A configured OpenAI credential — the auto-discovery precondition for gpt-4o.
       IKBI_OPENAI_API_KEY: OPENAI_KEY,
+      ...loopbackEgressEnv(PROVIDER),
       ...extraEnv,
     },
     encoding: "utf8",

@@ -19,8 +19,11 @@
  *      AUTHORIZED for the builder role, recording the decision on the ledger
  *   6. enter `context` and ask THE assembler for the one bounded, content-addressed
  *      context package that route's capabilities permit, recording it on the ledger
- *   7. STOP, because `candidate_strategy` (the next stage) has no implementation
- *   8. terminalize as `failed` with category `not_implemented`, and emit a receipt
+ *   7. enter `invocation` and ask THE invocation authority to call EXACTLY that route,
+ *      once, recording what was authorized, what was sent, and what the provider says
+ *      actually served it
+ *   8. STOP, because `candidate_strategy` (the next stage) has no implementation
+ *   9. terminalize as `failed` with category `not_implemented`, and emit a receipt
  *      whose evidence block is counted from the ledger: zero invocations, zero
  *      candidates, zero verifications, not promoted, repository not mutated
  *
@@ -49,6 +52,12 @@ import {
   type ModelResolutionDecision,
 } from "./resolver.js";
 import { assembleContext, manifestOf, type ContextPackage, type ContextSource } from "./context.js";
+import {
+  invokeAuthorized,
+  type InvocationTransport,
+  type ServedModelAlias,
+  type V2InvocationRecord,
+} from "./invocation.js";
 import { V2_001_FAILURE_CODES, runFailure, stageNotImplemented, type RunFailure } from "./failure.js";
 import { createIdFactory, type V2IdFactory } from "./identity.js";
 import { RunLifecycle, type LifecycleStage } from "./lifecycle.js";
@@ -56,6 +65,7 @@ import {
   summarizeConfiguration,
   summarizeContext,
   summarizeEvidence,
+  summarizeInvocation,
   summarizeResolution,
   type V2RunReceipt,
   type V2RunResult,
@@ -81,8 +91,18 @@ export const DEMONSTRATED_ROLE = "builder" as const;
  */
 export const DEMONSTRATED_REQUIREMENTS: ModelRequirements | undefined = undefined;
 
+/**
+ * Completion cap for the qualification call. Small on purpose: this slice proves a route
+ * is invocable and attributable, and a long answer would only cost money to prove the
+ * same thing. It is additionally clamped to the budget the resolved model reserved.
+ */
+export const QUALIFICATION_MAX_OUTPUT_TOKENS = 128;
+
+/** Per-attempt timeout. One attempt; no retry follows it. */
+export const QUALIFICATION_TIMEOUT_MS = 60_000;
+
 /** The furthest stage this build of ikbi implements. */
-export const IMPLEMENTED_THROUGH_STAGE: LifecycleStage = "context";
+export const IMPLEMENTED_THROUGH_STAGE: LifecycleStage = "invocation";
 
 /** The stage the run would need next, and does not have. */
 export const FIRST_UNIMPLEMENTED_STAGE: LifecycleStage = "candidate_strategy";
@@ -133,6 +153,14 @@ export interface V2RunDeps {
    * the filesystem. The production list is wired once, in `src/v2/runtime/index.ts`.
    */
   readonly contextSources: readonly ContextSource[];
+  /**
+   * The model transport. REQUIRED and injected for the same reason the other two are:
+   * it performs I/O, and this layer imports no v1 code. Tests supply a fake and stay
+   * hermetic; the production adapter is wired once, in `src/v2/runtime/index.ts`.
+   */
+  readonly transport: InvocationTransport;
+  /** Declared served-model alias relations. Defaults to the (empty) production table. */
+  readonly aliases?: readonly ServedModelAlias[];
   readonly ids?: V2IdFactory;
   readonly now?: () => number;
   readonly probe?: RepoProbe;
@@ -258,6 +286,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
   let policy: RuntimeModelPolicy | undefined;
   let decision: ModelResolutionDecision | undefined;
   let contextPackage: ContextPackage | undefined;
+  let invocation: V2InvocationRecord | undefined;
 
   const failure = await (async (): Promise<RunFailure> => {
     const checked = preflight(request, probe);
@@ -308,8 +337,36 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     contextPackage = assembled.package;
     lifecycle.record(runId, { kind: "context", packageId: contextPackage.packageId, artifacts: contextPackage.artifacts.length });
 
-    // Context is complete and the next stage does not exist in this build, so the run
-    // stops here and says so. A stage is only ever recorded as entered when it ran.
+    // Stage 4 — INVOCATION. Exactly the authorized route, exactly once. The id is minted
+    // HERE, not at resolution: it identifies an actual attempt, and an authorization
+    // that never reached a transport is owed no invocation identity.
+    lifecycle.enter(runId, "invocation");
+    const invocationId = ids.mint("invocation");
+    const called = await invokeAuthorized({
+      runId,
+      taskId,
+      invocationId,
+      decision,
+      contextPackage,
+      parameters: {
+        maxOutputTokens: Math.min(QUALIFICATION_MAX_OUTPUT_TOKENS, contextPackage.budget.reservedCompletionTokens),
+        timeoutMs: QUALIFICATION_TIMEOUT_MS,
+      },
+      transport: deps.transport,
+      ...(deps.aliases !== undefined ? { aliases: deps.aliases } : {}),
+      now,
+    });
+    if (!called.ok) {
+      // A failure that reached the wire IS an invocation and is recorded as one — the
+      // receipt must not claim a provider was never contacted when it was.
+      if (called.attempted) lifecycle.record(runId, { kind: "invocation", id: invocationId, role: decision.role });
+      return called.failure;
+    }
+    invocation = called.record;
+    lifecycle.record(runId, { kind: "invocation", id: invocationId, role: decision.role });
+
+    // The route is proven invocable and attributable. The next stage does not exist in
+    // this build, so the run stops here and says so.
     return stageNotImplemented(FIRST_UNIMPLEMENTED_STAGE, IMPLEMENTED_THROUGH_STAGE);
   })();
 
@@ -327,6 +384,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     ...(policy !== undefined ? { configuration: summarizeConfiguration(policy) } : {}),
     ...(decision !== undefined ? { resolution: summarizeResolution(decision) } : {}),
     ...(contextPackage !== undefined ? { context: summarizeContext(contextPackage) } : {}),
+    ...(invocation !== undefined ? { invocation: summarizeInvocation(invocation) } : {}),
     startedAt,
     endedAt,
   };
@@ -340,6 +398,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     ...(policy !== undefined ? { policy } : {}),
     ...(decision !== undefined ? { decision } : {}),
     ...(contextPackage !== undefined ? { context: manifestOf(contextPackage) } : {}),
+    ...(invocation !== undefined ? { invocation } : {}),
     journal: lifecycle.journal,
     receipt,
   };

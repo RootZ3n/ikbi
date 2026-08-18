@@ -427,3 +427,39 @@ test("FULL MiMo roster shape: keyless api-key auth + max_completion_tokens + thi
   assert.equal(body.max_tokens, undefined, "not the standard field");
   assert.equal(body.model, "wire-model");
 });
+
+// ── served model identity (additive, 1.5.0) ─────────────────────────────────
+
+test("invoke: reports the served model VERBATIM when the response carries one", async () => {
+  const { fetchImpl } = jsonFetch(200, {
+    model: "mimo-v2.5-pro-2026-08-01",
+    choices: [{ message: { content: "ok" }, finish_reason: "stop" }],
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+  });
+  const p = new OpenAICompatibleProvider({ id: "mimo", baseUrl: "https://x/v1", apiKey: "k", fetchImpl });
+  const r = await p.invoke(invocation());
+  assert.equal(r.servedModelId, "mimo-v2.5-pro-2026-08-01", "the provider's own id, not the one we sent");
+  assert.equal(r.content, "ok", "everything else is unchanged");
+});
+
+test("invoke: omits servedModelId when the provider reports none — never the sent id", async () => {
+  const { fetchImpl } = jsonFetch(200, {
+    choices: [{ message: { content: "ok" }, finish_reason: "stop" }],
+    usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+  });
+  const p = new OpenAICompatibleProvider({ id: "mimo", baseUrl: "https://x/v1", apiKey: "k", fetchImpl });
+  const r = await p.invoke(invocation());
+  assert.equal(r.servedModelId, undefined, "an absent report stays absent");
+});
+
+test("invoke: a non-string or empty model field is treated as no report", async () => {
+  for (const model of [42, "", null]) {
+    const { fetchImpl } = jsonFetch(200, {
+      model,
+      choices: [{ message: { content: "ok" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    });
+    const p = new OpenAICompatibleProvider({ id: "mimo", baseUrl: "https://x/v1", apiKey: "k", fetchImpl });
+    assert.equal((await p.invoke(invocation())).servedModelId, undefined, `model=${JSON.stringify(model)}`);
+  }
+});

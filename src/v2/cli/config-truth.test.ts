@@ -27,6 +27,7 @@ import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
 
 import type { V2RunResult } from "../core/result.js";
+import { loopbackEgressEnv, startFakeOpenAIProvider } from "./fake-provider-server.js";
 
 const ENTRY = fileURLToPath(new URL("../../../dist/cli/index.js", import.meta.url));
 const REPO = fileURLToPath(new URL("../../../", import.meta.url));
@@ -35,10 +36,16 @@ const REPO = fileURLToPath(new URL("../../../", import.meta.url));
 const PLANTED_SECRET = "sk-live-V2SHOULDNEVERPRINTTHIS";
 
 /** Two keyless providers with one model each — the minimum needed to tell A from B. */
+const PROVIDER = await startFakeOpenAIProvider();
+after(() => PROVIDER.close());
+
 const ROSTER = {
   providers: [
-    { id: "alpha", kind: "openai-compatible", baseUrl: "https://alpha.test/v1", keyless: true },
-    { id: "beta", kind: "openai-compatible", baseUrl: "https://beta.test/v1", keyless: true },
+    // A REAL local endpoint: every run in this suite performs a real HTTP invocation
+    // against a protocol-faithful server (V2-005), so these tests still prove the
+    // configuration facts they were written for while exercising the whole spine.
+    { id: "alpha", kind: "openai-compatible", baseUrl: PROVIDER.baseUrl, keyless: true },
+    { id: "beta", kind: "openai-compatible", baseUrl: PROVIDER.baseUrl, keyless: true },
     // A provider that DOES carry a credential, so the redaction assertion is meaningful.
     { id: "keyed", kind: "openai-compatible", baseUrl: "https://keyed.test/v1", apiKey: PLANTED_SECRET },
   ],
@@ -83,15 +90,20 @@ function writeProfile(root: string, doc: Record<string, unknown>): void {
  * no IKBI_MODEL_CRITIC. If v2 only observed a profile through exported variables, every
  * assertion below would fail.
  */
-function runCli(root: string, args: readonly string[]): { status: number | null; stdout: string; stderr: string } {
-  const env: Record<string, string> = {
+function runCli(root: string, args: readonly string[], extraEnv: Record<string, string> = {}): { status: number | null; stdout: string; stderr: string } {
+  const base: Record<string, string> = {
     PATH: process.env.PATH ?? "",
     HOME: mkdtempSync(join(tmpdir(), "ikbi-v2-home-")),
     IKBI_STATE_ROOT: root,
+    ...loopbackEgressEnv(PROVIDER),
   };
-  for (const key of Object.keys(env)) {
-    assert.equal(key.startsWith("IKBI_MODEL_"), false, "the test environment exports no model variables");
+  // THE BASE environment exports no model variables — that is what makes every
+  // profile-switching assertion in this suite meaningful. A test that deliberately
+  // exercises the operator-configuration LAYER passes them through `extraEnv`.
+  for (const key of Object.keys(base)) {
+    assert.equal(key.startsWith("IKBI_MODEL_"), false, "the base test environment exports no model variables");
   }
+  const env: Record<string, string> = { ...base, ...extraEnv };
   const res = spawnSync(process.execPath, [ENTRY, ...args], {
     cwd: mkdtempSync(join(tmpdir(), "ikbi-v2-cwd-")),
     env,
@@ -100,8 +112,8 @@ function runCli(root: string, args: readonly string[]): { status: number | null;
   return { status: res.status, stdout: res.stdout, stderr: res.stderr };
 }
 
-function v2Run(root: string, args: readonly string[] = []): { result: V2RunResult; stdout: string; stderr: string; status: number | null } {
-  const r = runCli(root, ["v2", "build", "a configuration probe", "--repo", REPO, "--json", ...args]);
+function v2Run(root: string, args: readonly string[] = [], extraEnv: Record<string, string> = {}): { result: V2RunResult; stdout: string; stderr: string; status: number | null } {
+  const r = runCli(root, ["v2", "build", "a configuration probe", "--repo", REPO, "--json", ...args], extraEnv);
   assert.ok(r.stdout.trim().startsWith("{"), `expected JSON on stdout, got:\n${r.stdout}\n---\n${r.stderr}`);
   return { result: JSON.parse(r.stdout) as V2RunResult, stdout: r.stdout, stderr: r.stderr, status: r.status };
 }
@@ -206,7 +218,12 @@ test("config truth: a broken selection is NEVER silently swapped for a working o
 
 test("config truth: a missing pointer is the documented NO-PROFILE rule, not a failure", () => {
   const root = makeStateRoot();
-  const { result } = v2Run(root);
+  // ONE deliberate exception to this suite's no-exports rule: with no profile the
+  // operator layer supplies the builder model, and on this machine that would be
+  // whatever the INSTALL-ROOT `.env` prefers — an endpoint this test cannot reach.
+  // Pinning it keeps the assertion about the no-profile RULE rather than about this
+  // machine's provider setup. Every other test here still exports nothing.
+  const { result } = v2Run(root, [], { IKBI_MODEL_DRIVER: "alpha-1", IKBI_MODEL_BUILDER: "alpha-1", IKBI_MODEL_CRITIC: "alpha-1" });
   assert.equal(result.receipt.configuration?.profile, null, "no profile selected");
   assert.equal(result.receipt.configuration?.profileSource, "none");
   assert.ok(result.outcome.kind === "failed");
@@ -232,16 +249,16 @@ test("config truth: inheritance is resolved BEFORE validation", () => {
 
 // ── boundaries this slice must not cross ────────────────────────────────────
 
-test("config truth: configuration, resolution and context run, and NOTHING is invoked", () => {
+test("config truth: configuration, resolution, context and invocation all really run", () => {
   const root = makeStateRoot();
   assert.equal(runCli(root, ["profile", "use", "prof-alpha"]).status, 0);
   const { result } = v2Run(root);
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "invocation"]);
   assert.equal(result.receipt.evidence.configurationResolved, true);
   assert.equal(result.receipt.evidence.modelResolutionCompleted, true, "a route was authorized");
   assert.equal(result.receipt.evidence.contextAssemblyCompleted, true, "context was assembled");
-  assert.equal(result.receipt.evidence.providerInvoked, false, "and still nothing was invoked");
-  assert.equal(result.receipt.evidence.invocations, 0, "no V2InvocationId was minted for an authorization");
+  assert.equal(result.receipt.evidence.providerInvoked, true, "and the authorized route was really called");
+  assert.equal(result.receipt.evidence.invocations, 1);
   assert.ok(result.outcome.kind === "failed");
   assert.equal(result.outcome.failure.detail?.missingStage, "candidate_strategy", "the next unimplemented stage");
 });

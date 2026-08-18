@@ -12,6 +12,7 @@
  *     -> preflight            can this run legally start at all?
  *     -> model_resolution     which exact model/provider route is authorized?
  *     -> context              what does the run get to know?
+ *     -> invocation           can that exact route actually be invoked, and what served it?
  *     -> candidate_strategy   single / shadow / tournament — chosen ONCE, here
  *     -> candidate_generation zero or more Candidates are produced
  *     -> verification         every candidate is judged by the SAME authority
@@ -74,6 +75,7 @@ export const LIFECYCLE_STAGES = [
   "preflight",
   "model_resolution",
   "context",
+  "invocation",
   "candidate_strategy",
   "candidate_generation",
   "verification",
@@ -134,7 +136,7 @@ export type LifecycleEvidence =
   | { readonly kind: "configuration"; readonly policyId: V2PolicyDigest }
   | { readonly kind: "resolution"; readonly decisionId: V2DecisionDigest; readonly role: string }
   | { readonly kind: "context"; readonly packageId: V2ContextDigest; readonly artifacts: number }
-  | { readonly kind: "invocation"; readonly id: V2InvocationId }
+  | { readonly kind: "invocation"; readonly id: V2InvocationId; readonly role: string }
   | { readonly kind: "candidate"; readonly id: V2CandidateId; readonly workspaceId: V2WorkspaceId }
   | { readonly kind: "verification"; readonly id: V2VerificationId; readonly candidateId: V2CandidateId }
   | {
@@ -154,9 +156,10 @@ const EVIDENCE_STAGE: Record<LifecycleEvidence["kind"], readonly LifecycleStage[
   resolution: ["model_resolution"],
   // The authorized context package is minted by the stage that owns context, once.
   context: ["context"],
-  // Invocations may happen anywhere from model resolution onward (scout, builder,
-  // critic, judge…). They are attribution, not authority.
-  invocation: ["model_resolution", "candidate_strategy", "candidate_generation", "verification", "disposition", "promotion"],
+  // An INVOCATION is recorded only where one actually happens. Today that is the
+  // qualification stage; when the builder loop arrives, `candidate_generation` will
+  // legitimately invoke too and joins this list — deliberately, not by default.
+  invocation: ["invocation"],
   candidate: ["candidate_generation"],
   verification: ["verification"],
   promotion: ["promotion"],
@@ -171,9 +174,11 @@ const STAGE_REQUIRES: Partial<Record<LifecycleStage, LifecycleEvidence["kind"]>>
   // Context cannot be assembled before the model is known — its budget is a function of
   // the resolved model's window. See the ORDERING NOTE above.
   context: "resolution",
-  // Nothing downstream of context may run without an authorized context package —
-  // a candidate cannot be produced from context that was never assembled.
-  candidate_strategy: "context",
+  // Nothing may be invoked without an authorized context package to invoke it with.
+  invocation: "context",
+  // A candidate is produced BY a model, so a route must have been proven invocable
+  // before any strategy starts producing them.
+  candidate_strategy: "invocation",
   // Nothing to verify without at least one candidate. (One OR MANY — see contract.ts.)
   verification: "candidate",
   // Nothing to promote without a verdict from the canonical verification authority.

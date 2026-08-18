@@ -21,12 +21,16 @@ import {
 } from "./lifecycle.js";
 import { summarizeEvidence } from "./result.js";
 
+const ids = createSequentialIdFactory("lcx");
+
 /** A stand-in policy digest. Content-addressed identity is the config suite's concern. */
 const POLICY = "0".repeat(64) as V2PolicyDigest;
 /** A stand-in decision digest. Decision identity is the resolver suite's concern. */
 const DECISION = "1".repeat(64) as V2DecisionDigest;
 /** A stand-in context digest. Package identity is the context suite's concern. */
 const CONTEXT = "2".repeat(64) as V2ContextDigest;
+/** A stand-in invocation id. Invocation identity is the invocation suite's concern. */
+const INVOCATION = ids.mint("invocation");
 
 function fresh() {
   const ids = createSequentialIdFactory("lc");
@@ -53,6 +57,9 @@ function walkTo(target: LifecycleStage) {
     if (stage === "model_resolution") lifecycle.record(runId, { kind: "resolution", decisionId: DECISION, role: "builder" });
     // V2-004: `candidate_strategy` REQUIRES an authorized context package.
     if (stage === "context") lifecycle.record(runId, { kind: "context", packageId: CONTEXT, artifacts: 3 });
+    // V2-005: `candidate_strategy` REQUIRES a proven invocation — a candidate is
+    // produced BY a model, so a route must have been shown to be invocable.
+    if (stage === "invocation") lifecycle.record(runId, { kind: "invocation", id: INVOCATION, role: "builder" });
     if (stage === "candidate_generation") lifecycle.record(runId, { kind: "candidate", id: candidateId, workspaceId });
     if (stage === "verification") lifecycle.record(runId, { kind: "verification", id: verificationId, candidateId });
     if (stage === "promotion") lifecycle.record(runId, { kind: "promotion", id: promotionId, candidateId, verificationId });
@@ -78,6 +85,7 @@ test("lifecycle: the canonical order is preflight -> … -> promotion", () => {
     "preflight",
     "model_resolution",
     "context",
+    "invocation",
     "candidate_strategy",
     "candidate_generation",
     "verification",
@@ -140,6 +148,8 @@ test("lifecycle: VERIFICATION cannot be entered before a candidate exists", () =
   lifecycle.record(runId, { kind: "resolution", decisionId: DECISION, role: "builder" });
   lifecycle.enter(runId, "context");
   lifecycle.record(runId, { kind: "context", packageId: CONTEXT, artifacts: 3 });
+  lifecycle.enter(runId, "invocation");
+  lifecycle.record(runId, { kind: "invocation", id: INVOCATION, role: "builder" });
   for (const stage of ["candidate_strategy", "candidate_generation"] as const) {
     lifecycle.enter(runId, stage);
   }
@@ -163,9 +173,9 @@ test("lifecycle: a stage may only record the evidence it owns", () => {
     "preflight cannot mint candidates",
   );
   assert.equal(
-    violation(() => lifecycle.record(runId, { kind: "invocation", id: ids.mint("invocation") })),
+    violation(() => lifecycle.record(runId, { kind: "invocation", id: ids.mint("invocation"), role: "builder" })),
     "stage_not_permitted_for_evidence",
-    "no model may be invoked before model resolution",
+    "no model may be invoked from preflight",
   );
 });
 
@@ -210,7 +220,7 @@ test("lifecycle: nothing may happen after a run terminalizes", () => {
   lifecycle.enter(runId, "preflight");
   lifecycle.terminalize(runId, { kind: "quarantined", reason: "operator_hold", detail: "held" });
   assert.equal(violation(() => lifecycle.enter(runId, "context")), "already_terminal");
-  assert.equal(violation(() => lifecycle.record(runId, { kind: "invocation", id: ids.mint("invocation") })), "already_terminal");
+  assert.equal(violation(() => lifecycle.record(runId, { kind: "invocation", id: ids.mint("invocation"), role: "builder" })), "already_terminal");
 });
 
 test("lifecycle: ACCEPTED requires a promotion that was really recorded", () => {
@@ -281,7 +291,7 @@ test("lifecycle: a foreign run id is rejected on every mutating call", () => {
   assert.notEqual(foreign, runId);
   assert.equal(violation(() => lifecycle.enter(foreign, "preflight")), "run_identity_mismatch");
   lifecycle.enter(runId, "preflight");
-  assert.equal(violation(() => lifecycle.record(foreign, { kind: "invocation", id: ids.mint("invocation") })), "run_identity_mismatch");
+  assert.equal(violation(() => lifecycle.record(foreign, { kind: "invocation", id: ids.mint("invocation"), role: "builder" })), "run_identity_mismatch");
   assert.equal(violation(() => lifecycle.terminalize(foreign, { kind: "rejected", reason: "aborted" })), "run_identity_mismatch");
 });
 
@@ -388,15 +398,15 @@ test("lifecycle: the receipt counts configuration rather than assuming it", () =
 
 // ── context precondition + resolution ambiguity (V2-004) ────────────────────
 
-test("lifecycle: CANDIDATE_STRATEGY cannot be entered before context is assembled", () => {
+test("lifecycle: INVOCATION cannot be entered before context is assembled (V2-004 rule)", () => {
   const { lifecycle, runId } = fresh();
   lifecycle.enter(runId, "preflight");
   lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
   lifecycle.enter(runId, "model_resolution");
   lifecycle.record(runId, { kind: "resolution", decisionId: DECISION, role: "builder" });
   lifecycle.enter(runId, "context");
-  // The stage ran but assembled nothing — there is no context to build a candidate from.
-  assert.equal(violation(() => lifecycle.enter(runId, "candidate_strategy")), "missing_required_evidence");
+  // The stage ran but assembled nothing — there is nothing to invoke a model with.
+  assert.equal(violation(() => lifecycle.enter(runId, "invocation")), "missing_required_evidence");
 });
 
 test("lifecycle: a context package is CONTEXT's to record and no one else's", () => {
@@ -434,4 +444,46 @@ test("lifecycle: the receipt counts context assembly rather than assuming it", (
   const summary = summarizeEvidence(lifecycle.ledger, lifecycle.outcome!);
   assert.equal(summary.contextAssemblyCompleted, false);
   assert.equal(summary.contextPackages, 0);
+});
+
+// ── invocation stage (V2-005) ───────────────────────────────────────────────
+
+test("lifecycle: INVOCATION cannot be entered before context is assembled", () => {
+  const { lifecycle, runId } = fresh();
+  lifecycle.enter(runId, "preflight");
+  lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
+  lifecycle.enter(runId, "model_resolution");
+  lifecycle.record(runId, { kind: "resolution", decisionId: DECISION, role: "builder" });
+  lifecycle.enter(runId, "context");
+  assert.equal(violation(() => lifecycle.enter(runId, "invocation")), "missing_required_evidence");
+});
+
+test("lifecycle: an invocation is INVOCATION's to record and no one else's", () => {
+  const { lifecycle, runId } = fresh();
+  lifecycle.enter(runId, "preflight");
+  lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
+  lifecycle.enter(runId, "model_resolution");
+  lifecycle.record(runId, { kind: "resolution", decisionId: DECISION, role: "builder" });
+  lifecycle.enter(runId, "context");
+  assert.equal(
+    violation(() => lifecycle.record(runId, { kind: "invocation", id: INVOCATION, role: "builder" })),
+    "stage_not_permitted_for_evidence",
+    "context assembly may not invoke a model",
+  );
+});
+
+test("lifecycle: CANDIDATE_STRATEGY cannot be entered before a route was invoked", () => {
+  const { lifecycle, runId } = walkTo("context");
+  lifecycle.enter(runId, "invocation");
+  assert.equal(violation(() => lifecycle.enter(runId, "candidate_strategy")), "missing_required_evidence");
+});
+
+test("lifecycle: a recorded invocation is counted, and it is a real call", () => {
+  const { lifecycle, runId } = walkTo("invocation");
+  assert.deepEqual([...lifecycle.ledger.invocations], [INVOCATION]);
+  lifecycle.terminalize(runId, { kind: "rejected", reason: "aborted" });
+  const summary = summarizeEvidence(lifecycle.ledger, lifecycle.outcome!);
+  assert.equal(summary.providerInvoked, true, "for the first time in v2, this IS true");
+  assert.equal(summary.invocations, 1);
+  assert.equal(summary.candidatesCreated, 0, "and still nothing was built");
 });

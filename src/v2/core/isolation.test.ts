@@ -42,6 +42,7 @@ const V2_RUNTIME_ALLOWED_V1_IMPORTS = new Set([
   "../../core/provider/contract.js", //            ModelProvider / preflight metadata types
   "../../core/provider/registry.js", //            ModelSpec / ModelRegistry types
   "../../core/provider/capabilities.js", //        static capability classification (V2-003)
+  "../../core/provider/providers/openai-compatible.js", // the transport, for the adapter's own tests (V2-005)
   "../../modules/profiles/contract.js", //         Profile shape + the role vocabulary
   "../../modules/profiles/storage.js", //          READ-ONLY profile loading + the active pointer
 ]);
@@ -238,6 +239,51 @@ test("single authority: only the resolver CHOOSES among routes or mints a decisi
   }
   assert.deepEqual(chooses, [], "walking a fallback chain for a winner belongs to src/v2/core/resolver.ts alone");
   assert.deepEqual(mints, [], "only the resolver may construct a ModelResolutionDecision");
+});
+
+test("single authority: only the transport adapter may reach a provider TRANSPORT", () => {
+  // Generation is the invocation authority's alone. Anything else instantiating a
+  // transport, calling `provider.invoke`, or reaching for the v1 INVOKER (which is a
+  // routing authority, not a transport) would be a second way to call a model.
+  const allowed = new Set([join(V2_DIR, "runtime", "invocation-transport.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    const source = readFileSync(file, "utf8");
+    if (/\.invoke\s*\(|\bnew (OpenAICompatible|Anthropic)Provider\b|\binvokeModel\s*\(/.test(source)) {
+      offenders.push(relative(SRC, file));
+    }
+  }
+  assert.deepEqual(offenders, [], "model generation goes through src/v2/runtime/invocation-transport.ts alone");
+});
+
+test("single authority: only the invocation authority mints an invocation identity", () => {
+  // `ids.mint("invocation")` in the run is the one place an attempt gets an identity,
+  // and only because that is where an attempt actually happens.
+  const allowed = new Set([join(V2_DIR, "core", "run.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    if (/mint\s*\(\s*"invocation"\s*\)/.test(readFileSync(file, "utf8"))) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "a V2InvocationId is minted where an invocation is performed, nowhere else");
+});
+
+test("single authority: only the invocation module builds an invocation record", () => {
+  const invocationFile = join(V2_DIR, "core", "invocation.ts");
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (file === invocationFile || file.endsWith(".test.ts")) continue;
+    if (/classifyServedIdentity\s*\(/.test(readFileSync(file, "utf8"))) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "served-identity classification belongs to src/v2/core/invocation.ts alone");
+});
+
+test("single authority: the model-input renderer consumes the package and nothing else", () => {
+  // V2-004's rule, enforced at the point it now matters most: the thing that builds a
+  // prompt must not be able to reach a repository reader.
+  const specs = importSpecifiers(readFileSync(join(V2_DIR, "core", "prompt.ts"), "utf8"));
+  assert.deepEqual([...new Set(specs)].sort(), ["./context.js", "./identity.js"], "the renderer reads the authorized package only");
 });
 
 test("single authority: no v2 file imports v1 CONTEXT machinery", () => {

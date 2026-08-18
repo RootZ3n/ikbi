@@ -501,10 +501,17 @@ export class OpenAICompatibleProvider implements ModelProvider {
 
     const toolCalls = parseToolCalls(message.tool_calls, this.id);
 
+    // SERVED IDENTITY: the response's own `model`, verbatim and only when the provider
+    // actually sent one. Never defaulted to the id we requested — an absent field means
+    // "this provider does not report what served the request", which is a different
+    // fact from "it served what we asked for".
+    const servedModelId = typeof parsed.model === "string" && parsed.model.length > 0 ? parsed.model : undefined;
+
     const result: ProviderResult = {
       content: contentText,
       finishReason: mapFinishReason(choice.finish_reason),
       usage,
+      ...(servedModelId !== undefined ? { servedModelId } : {}),
       ...(typeof reasoningRaw === "string" && reasoningRaw.length > 0 ? { reasoning: reasoningRaw } : {}),
       ...(toolCalls.length > 0 ? { toolCalls } : {}),
     };

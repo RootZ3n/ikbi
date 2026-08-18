@@ -322,6 +322,21 @@ export interface ProviderInvocation {
 /** Raw result returned by a provider; the orchestrator computes cost and assembles the response. */
 export interface ProviderResult {
   readonly content: string;
+  /**
+   * ADDITIVE (1.5.0, OPTIONAL): the model identity the PROVIDER reported serving this
+   * response, verbatim, when the wire response carries one. Populated from the response
+   * body's `model` field; absent when the provider does not report it.
+   *
+   * WHY: the id we SEND and the id that actually SERVED are different facts, and the
+   * second is the only one that is evidence. A provider may canonicalize an alias to a
+   * dated snapshot, or (the case worth catching) serve something else entirely. Without
+   * this field a caller can only re-state what it sent and call that attribution.
+   *
+   * NOTHING in v1 reads it — the field is inert here and v1 behavior is unchanged. It
+   * exists so a caller that cares about served identity can observe it rather than
+   * fabricate it. NEVER synthesize this from the requested/sent id.
+   */
+  readonly servedModelId?: string;
   /** Separate reasoning text, when the model emits it distinctly from content. */
   readonly reasoning?: string;
   /** ADDITIVE (1.4.0): opaque signature for the reasoning block (Anthropic thinking), for verbatim round-trip. */

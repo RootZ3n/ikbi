@@ -448,3 +448,28 @@ test("flushes tail buffer content when stream ends without trailing newline", as
   assert.equal(final.usage.promptTokens, 5);
   assert.equal(final.usage.completionTokens, 3);
 });
+
+// ── served model identity (additive, 1.5.0) ─────────────────────────────────
+
+test("invoke: reports the served model VERBATIM when the response carries one", async () => {
+  const { fetchImpl } = jsonFetch(200, {
+    model: "claude-sonnet-4-5-20260801",
+    content: [{ type: "text", text: "ok" }],
+    stop_reason: "end_turn",
+    usage: { input_tokens: 1, output_tokens: 1 },
+  });
+  const p = new AnthropicProvider({ id: "anthropic", baseUrl: "https://x/v1", apiKey: "sk", fetchImpl });
+  const r = await p.invoke(invocation());
+  assert.equal(r.servedModelId, "claude-sonnet-4-5-20260801", "the provider's own id, not the one we sent");
+  assert.equal(r.content, "ok", "everything else is unchanged");
+});
+
+test("invoke: omits servedModelId when the provider reports none — never the sent id", async () => {
+  const { fetchImpl } = jsonFetch(200, {
+    content: [{ type: "text", text: "ok" }],
+    stop_reason: "end_turn",
+    usage: { input_tokens: 1, output_tokens: 1 },
+  });
+  const p = new AnthropicProvider({ id: "anthropic", baseUrl: "https://x/v1", apiKey: "sk", fetchImpl });
+  assert.equal((await p.invoke(invocation())).servedModelId, undefined, "an absent report stays absent");
+});

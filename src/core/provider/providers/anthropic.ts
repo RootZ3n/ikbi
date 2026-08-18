@@ -430,10 +430,16 @@ export class AnthropicProvider implements ModelProvider {
       }
     }
 
+    // SERVED IDENTITY: verbatim from the response, and only when present. Anthropic
+    // echoes the resolved model on `/messages` responses. Never defaulted to what we
+    // sent — see the field's note on ProviderResult.
+    const servedModelId = typeof parsed.model === "string" && parsed.model.length > 0 ? parsed.model : undefined;
+
     const result: ProviderResult = {
       content: contentText,
       finishReason: mapStopReason(parsed.stop_reason),
       usage,
+      ...(servedModelId !== undefined ? { servedModelId } : {}),
       ...(reasoningText.length > 0 ? { reasoning: reasoningText } : {}),
       ...(reasoningSignature !== undefined ? { reasoningSignature } : {}),
       ...(toolCalls.length > 0 ? { toolCalls } : {}),

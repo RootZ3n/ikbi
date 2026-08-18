@@ -30,6 +30,7 @@ import { after, test } from "node:test";
 
 import { contentDigest } from "../core/identity.js";
 import type { V2RunResult } from "../core/result.js";
+import { loopbackEgressEnv, startFakeOpenAIProvider } from "./fake-provider-server.js";
 
 const ENTRY = fileURLToPath(new URL("../../../dist/cli/index.js", import.meta.url));
 const REPO = fileURLToPath(new URL("../../../", import.meta.url));
@@ -44,12 +45,16 @@ const zeroCost = { promptPerMTok: 0, completionPerMTok: 0 };
  * so it is a real `not_configured` route. `chained` puts `dry` FIRST so route ordering
  * has to skip it rather than merely happening to pick the right one.
  */
+// A REAL local endpoint (V2-005): every run here now performs a real HTTP invocation.
+const PROVIDER = await startFakeOpenAIProvider();
+after(() => PROVIDER.close());
+
 const ROSTER = {
   providers: [
-    { id: "p1", kind: "openai-compatible", baseUrl: "https://p1.test/v1", keyless: true },
-    { id: "p2", kind: "openai-compatible", baseUrl: "https://p2.test/v1", keyless: true },
-    { id: "dry", kind: "openai-compatible", baseUrl: "https://dry.test/v1" },
-    { id: "keyed", kind: "openai-compatible", baseUrl: "https://keyed.test/v1", apiKey: PLANTED_SECRET },
+    { id: "p1", kind: "openai-compatible", baseUrl: PROVIDER.baseUrl, keyless: true },
+    { id: "p2", kind: "openai-compatible", baseUrl: PROVIDER.baseUrl, keyless: true },
+    { id: "dry", kind: "openai-compatible", baseUrl: PROVIDER.baseUrl },
+    { id: "keyed", kind: "openai-compatible", baseUrl: PROVIDER.baseUrl, apiKey: PLANTED_SECRET },
   ],
   models: [
     // Declared windows so the downstream context budget can be derived from facts.
@@ -101,6 +106,7 @@ function runCli(root: string, args: readonly string[], extraEnv: Record<string, 
       PATH: process.env.PATH ?? "",
       HOME: mkdtempSync(join(tmpdir(), "ikbi-v2-resolve-home-")),
       IKBI_STATE_ROOT: root,
+      ...loopbackEgressEnv(PROVIDER),
       ...extraEnv,
     },
     encoding: "utf8",
@@ -293,20 +299,20 @@ test("resolution truth: model_resolution is ENTERED, and nothing beyond context 
   const root = makeStateRoot();
   activate(root, "prof-a");
   const { result } = v2Run(root);
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "invocation"]);
   assert.ok(result.outcome.kind === "failed");
   assert.equal(result.outcome.failure.category, "not_implemented");
   assert.equal(result.outcome.failure.detail?.missingStage, "candidate_strategy");
 });
 
-test("resolution truth: exactly ONE decision is recorded, and NOTHING is invoked", () => {
+test("resolution truth: exactly ONE decision is recorded, and exactly one invocation", () => {
   const root = makeStateRoot();
   activate(root, "prof-a");
   const { result } = v2Run(root);
   assert.equal(result.receipt.evidence.modelResolutions, 1, "one role was demonstrated, once");
   assert.equal(result.receipt.evidence.modelResolutionCompleted, true);
-  assert.equal(result.receipt.evidence.providerInvoked, false);
-  assert.equal(result.receipt.evidence.invocations, 0, "an authorization mints no V2InvocationId");
+  assert.equal(result.receipt.evidence.providerInvoked, true, "V2-005: the authorized route was really called");
+  assert.equal(result.receipt.evidence.invocations, 1);
   assert.equal(result.receipt.evidence.candidatesCreated, 0);
   assert.equal(result.receipt.evidence.repositoryMutated, false);
 });

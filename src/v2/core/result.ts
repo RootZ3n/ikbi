@@ -43,6 +43,7 @@ import type {
 import type { RuntimeModelPolicy } from "./config.js";
 import type { ModelResolutionDecision } from "./resolver.js";
 import type { ContextManifest, ContextPackage } from "./context.js";
+import type { V2InvocationRecord } from "./invocation.js";
 
 /** Why verified-good work was withheld instead of promoted. Closed set. */
 export type WithheldReason = "governance" | "operator" | "policy" | "dry_run";
@@ -244,6 +245,46 @@ export function summarizeContext(pkg: ContextPackage): RunContextSummary {
   };
 }
 
+/**
+ * The invocation a run actually performed. The four identities are kept apart because
+ * they are four different facts; `servedModelId` is absent when the provider reported
+ * none, and is never filled in from what was sent.
+ */
+export interface RunInvocationSummary {
+  readonly invocationId: string;
+  readonly role: string;
+  readonly resolutionDecisionId: string;
+  readonly contextPackageId: string;
+  readonly promptId: string;
+  readonly authorizedModelId: string;
+  readonly sentProviderId: string;
+  readonly sentProviderModelId: string;
+  readonly servedModelId: string | null;
+  readonly identityStatus: string;
+  readonly attempts: number;
+  readonly finishReason: string;
+  readonly usage?: V2InvocationRecord["usage"];
+}
+
+/** Summarize an invocation for a receipt. Derived — nothing is asserted. */
+export function summarizeInvocation(record: V2InvocationRecord): RunInvocationSummary {
+  return {
+    invocationId: record.invocationId,
+    role: record.identity.requestedRole,
+    resolutionDecisionId: record.resolutionDecisionId,
+    contextPackageId: record.contextPackageId,
+    promptId: record.promptId,
+    authorizedModelId: record.identity.authorizedModelId,
+    sentProviderId: record.identity.sentProviderId,
+    sentProviderModelId: record.identity.sentProviderModelId,
+    servedModelId: record.identity.servedModelId ?? null,
+    identityStatus: record.identity.identityStatus,
+    attempts: record.attempts,
+    finishReason: record.finishReason,
+    ...(record.usage !== undefined ? { usage: record.usage } : {}),
+  };
+}
+
 /** The durable account of ONE run: where it went, what it produced, how it ended. */
 export interface V2RunReceipt {
   readonly receiptId: V2ReceiptId;
@@ -258,6 +299,8 @@ export interface V2RunReceipt {
   readonly resolution?: RunResolutionSummary;
   /** Absent when the run ended before context was assembled. */
   readonly context?: RunContextSummary;
+  /** Absent when no transport was reached, or when the invocation failed. */
+  readonly invocation?: RunInvocationSummary;
   readonly startedAt: number;
   readonly endedAt: number;
 }
@@ -313,6 +356,8 @@ export interface V2RunResult {
    * return value, and is what a future builder consumes at the same call site.
    */
   readonly context?: ContextManifest;
+  /** The full record of the one invocation this run performed, when it succeeded. */
+  readonly invocation?: V2InvocationRecord;
   /** Every transition the run made, in order. The run's own account of itself. */
   readonly journal: readonly LifecycleTransition[];
   readonly receipt: V2RunReceipt;

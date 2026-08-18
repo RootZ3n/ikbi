@@ -22,6 +22,7 @@ import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
 
 import type { V2RunResult } from "../core/result.js";
+import { loopbackEgressEnv, startFakeOpenAIProvider } from "./fake-provider-server.js";
 
 const ENTRY = fileURLToPath(new URL("../../../dist/cli/index.js", import.meta.url));
 const REPO = fileURLToPath(new URL("../../../", import.meta.url));
@@ -31,6 +32,9 @@ const REPO = fileURLToPath(new URL("../../../", import.meta.url));
  * over: the operator's real ~/.ikbi is never touched, and the run's configuration is
  * fixed here rather than inherited from whatever this machine happens to be set up for.
  */
+const PROVIDER = await startFakeOpenAIProvider();
+after(() => PROVIDER.close());
+
 const roots: string[] = [];
 function makeStateRoot(): string {
   const root = mkdtempSync(join(tmpdir(), "ikbi-v2-smoke-"));
@@ -39,7 +43,7 @@ function makeStateRoot(): string {
   writeFileSync(
     join(root, "providers.json"),
     JSON.stringify({
-      providers: [{ id: "alpha", kind: "openai-compatible", baseUrl: "https://alpha.test/v1", keyless: true }],
+      providers: [{ id: "alpha", kind: "openai-compatible", baseUrl: PROVIDER.baseUrl, keyless: true }],
       models: [
         {
           id: "alpha-1",
@@ -73,6 +77,7 @@ function runCli(args: readonly string[]): { status: number | null; stdout: strin
       IKBI_MODEL_DRIVER: "alpha-1",
       IKBI_MODEL_BUILDER: "alpha-1",
       IKBI_MODEL_CRITIC: "alpha-1",
+      ...loopbackEgressEnv(PROVIDER),
     },
     encoding: "utf8",
   });
@@ -93,7 +98,7 @@ test("v2 cli: `ikbi v2 build` reaches the canonical v2 lifecycle end-to-end", ()
   assert.equal(result.journal[0]?.from, "pending");
   assert.equal(result.journal[0]?.to, "preflight");
   assert.equal(result.journal.at(-1)?.to, "terminal");
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "invocation"]);
 });
 
 test("v2 cli: the end-to-end run claims NOTHING it did not do", () => {
@@ -109,8 +114,9 @@ test("v2 cli: the end-to-end run claims NOTHING it did not do", () => {
     modelResolutions: 1,
     contextAssemblyCompleted: true,
     contextPackages: 1,
-    providerInvoked: false,
-    invocations: 0,
+    // V2-005: a real HTTP call to a protocol-faithful local provider really happened.
+    providerInvoked: true,
+    invocations: 1,
     candidatesCreated: 0,
     verificationsPerformed: 0,
     promotionsAttempted: 0,

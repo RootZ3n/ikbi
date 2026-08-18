@@ -23,7 +23,9 @@ import type { ConfigurationInputs, ConfigurationSource } from "../core/config.js
 import type { V2RunResult } from "../core/result.js";
 import { runV2Build, type RepoProbe } from "../core/run.js";
 import type { ContextSource } from "../core/context.js";
+import type { InvocationTransport } from "../core/invocation.js";
 import { PRODUCTION_CONTEXT_SOURCES } from "./context-sources.js";
+import { createInvocationTransport } from "./invocation-transport.js";
 import type { V2TaskRequest } from "../core/contract.js";
 import { buildCanonicalCatalog } from "./model-catalog.js";
 import { capabilityFacts } from "./provider-inventory.js";
@@ -116,7 +118,25 @@ export function createConfigurationSource(deps: ConfigurationSourceDeps = {}): C
 export interface ProductionRunDeps {
   readonly configuration?: ConfigurationSource;
   readonly contextSources?: readonly ContextSource[];
+  readonly transport?: InvocationTransport;
   readonly probe?: RepoProbe;
+}
+
+/**
+ * THE production transport. Deliberately built over the v1 provider REGISTRY only as a
+ * lookup — `getProvider(id)` — never as a router: the route was decided by the resolver,
+ * and `ProviderInvoker` (v1's fallback/retry/circuit-breaker path) is not in the picture.
+ *
+ * The registry import is dynamic for the same reason the configuration source's is: it
+ * constructs every transport at module load and needs the egress guard installed first.
+ */
+export function productionTransport(): InvocationTransport {
+  return {
+    async send(input) {
+      const { registry } = await import("../../core/provider/index.js");
+      return createInvocationTransport(registry).send(input);
+    },
+  };
 }
 
 /** THE production entry every v2 surface uses. One wiring, one configuration truth. */
@@ -124,6 +144,7 @@ export async function runV2BuildProduction(request: V2TaskRequest, deps: Product
   return runV2Build(request, {
     configuration: deps.configuration ?? createConfigurationSource(),
     contextSources: deps.contextSources ?? PRODUCTION_CONTEXT_SOURCES,
+    transport: deps.transport ?? productionTransport(),
     ...(deps.probe !== undefined ? { probe: deps.probe } : {}),
   });
 }
