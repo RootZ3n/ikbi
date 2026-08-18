@@ -170,11 +170,12 @@ test("reachability: the command body enters the canonical lifecycle and reports 
   assert.equal(cap.err, V2_BANNER, "the experimental banner goes to stderr, not stdout");
   assert.match(
     cap.out,
-    /stages\s+preflight -> model_resolution -> context -> candidate_strategy -> candidate_generation -> verification -> criticism$/m,
+    /stages\s+preflight -> model_resolution -> context -> candidate_strategy -> candidate_generation -> verification -> criticism -> disposition$/m,
     "the run walked the whole implemented spine",
   );
-  assert.match(cap.out, /not implemented/, "and said so truthfully");
-  assert.notEqual(code, 0, "an unimplemented lifecycle is not a success");
+  assert.match(cap.out, /disposition (ELIGIBLE FOR PROMOTION|WITHHELD)/, "and adjudicated a lawful disposition");
+  assert.match(cap.out, /NOT PROMOTED|NOT promoted/, "without promoting anything");
+  assert.equal(code, 0, "an adjudicated-and-withheld candidate is a correct result");
 });
 
 test("reachability: the JSON surface carries the lifecycle journal + a counted receipt", async () => {
@@ -186,8 +187,8 @@ test("reachability: the JSON surface carries the lifecycle journal + a counted r
   assert.equal(result.journal[0]?.from, "pending");
   assert.equal(result.journal[0]?.to, "preflight");
   assert.equal(result.journal.at(-1)?.to, "terminal");
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism"]);
-  assert.equal(result.outcome.kind, "failed");
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism", "disposition"]);
+  assert.equal(result.outcome.kind, "withheld");
   assert.deepEqual(result.receipt.evidence, {
     // Configuration (V2-002) and route authorization (V2-003) happen — and nothing else.
     configurationResolved: true,
@@ -224,11 +225,12 @@ test("reachability: the CLI never claims a stage it did not run", async () => {
   await runV2Cli(["build", "x", "--json"], cap);
   const result = JSON.parse(cap.out) as V2RunResult;
   for (const stage of LIFECYCLE_STAGES) {
-    if (stage === "preflight" || stage === "model_resolution" || stage === "context" || stage === "candidate_strategy" || stage === "candidate_generation" || stage === "verification" || stage === "criticism") continue;
+    if (stage === "preflight" || stage === "model_resolution" || stage === "context" || stage === "candidate_strategy" || stage === "candidate_generation" || stage === "verification" || stage === "criticism" || stage === "disposition") continue;
     assert.equal(result.receipt.stagesEntered.includes(stage), false, `never entered ${stage}`);
   }
-  assert.ok(result.outcome.kind === "failed");
-  assert.equal(result.outcome.failure.detail?.missingStage, FIRST_UNIMPLEMENTED_STAGE);
+  // The spine adjudicates and stops before the one unimplemented stage — promotion.
+  assert.ok(result.outcome.kind === "withheld");
+  assert.equal(result.receipt.stagesEntered.includes(FIRST_UNIMPLEMENTED_STAGE), false);
 });
 
 test("reachability: an unknown v2 subcommand is refused, not silently built", async () => {

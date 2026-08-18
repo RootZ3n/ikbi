@@ -78,6 +78,15 @@ export type V2DefectId = V2Digest<"defect">;
 export type V2ReviewDigest = V2Digest<"review">;
 /** Content address of ONE candidate diff — model-caused change vs the source snapshot. */
 export type V2DiffDigest = V2Digest<"candidate_diff">;
+/**
+ * Content address of ONE lawful disposition — the adjudication of a candidate's
+ * deterministic + semantic evidence under an explicit policy. Same evidence + same
+ * policy + same decision + same reasons ⇒ same id. The execution event (the run, the
+ * clock) is provenance, never identity.
+ */
+export type V2DispositionId = V2Digest<"disposition">;
+/** Content address of ONE disposition policy — the explicit rules an adjudication applied. */
+export type V2DispositionPolicyDigest = V2Digest<"disposition_policy">;
 /** ONE promotion attempt. */
 export type V2PromotionId = V2Id<"promotion">;
 /** ONE receipt record. */

@@ -99,7 +99,9 @@ test("v2 cli: the built CLI exists (run `pnpm build` first)", () => {
 
 test("v2 cli: `ikbi v2 build` reaches the canonical v2 lifecycle end-to-end", () => {
   const r = runCli(["v2", "build", "a real goal", "--repo", REPO, "--json"]);
-  assert.equal(r.status, 1, `expected a non-zero exit for an unimplemented lifecycle\n${r.stderr}`);
+  // No manifest / no IKBI_CHECKS ⇒ NO_CHECKS ⇒ the candidate is WITHHELD (a correct,
+  // intended result), so the exit code is 0. Nothing was promoted.
+  assert.equal(r.status, 0, `expected a zero exit for a withheld candidate\n${r.stderr}`);
   const result = JSON.parse(r.stdout) as V2RunResult;
   assert.ok(result.taskId.startsWith("task_"));
   assert.ok(result.runId.startsWith("run_"));
@@ -107,13 +109,14 @@ test("v2 cli: `ikbi v2 build` reaches the canonical v2 lifecycle end-to-end", ()
   assert.equal(result.journal[0]?.from, "pending");
   assert.equal(result.journal[0]?.to, "preflight");
   assert.equal(result.journal.at(-1)?.to, "terminal");
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism", "disposition"]);
+  assert.equal(result.receipt.stagesEntered.includes("promotion"), false, "stops before the one unimplemented stage");
 });
 
 test("v2 cli: the end-to-end run claims NOTHING it did not do", () => {
   const r = runCli(["v2", "build", "promote everything", "--repo", REPO, "--json"]);
   const result = JSON.parse(r.stdout) as V2RunResult;
-  assert.equal(result.outcome.kind, "failed");
+  assert.equal(result.outcome.kind, "withheld");
   assert.deepEqual(result.receipt.evidence, {
     // Configuration (V2-002) and route authorization (V2-003) happen — and nothing else.
     configurationResolved: true,
@@ -164,8 +167,8 @@ test("v2 cli: shadow and tournament strategies are accepted by the spine", () =>
   for (const strategy of ["shadow", "tournament"]) {
     const r = runCli(["v2", "build", "race it", "--repo", REPO, "--strategy", strategy, "--json"]);
     const result = JSON.parse(r.stdout) as V2RunResult;
-    assert.ok(result.outcome.kind === "failed");
-    assert.equal(result.outcome.failure.category, "not_implemented", `${strategy} passed preflight`);
+    assert.ok(result.outcome.kind === "withheld", `${strategy} passed preflight and adjudicated`);
+    assert.equal(result.receipt.stagesEntered.includes("disposition"), true, `${strategy} reached disposition`);
   }
 });
 

@@ -384,6 +384,74 @@ test("single authority: only the TOOL EXECUTOR writes candidate files, and it ho
   assert.equal(/writeFileSync|readFileSync|rmSync|unlinkSync|mkdirSync/.test(source), false, "no raw filesystem call");
 });
 
+test("single authority: only the disposition module mints a disposition identity (V2-010)", () => {
+  const allowed = new Set([join(V2_DIR, "core", "disposition.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    const source = stripComments(readFileSync(file, "utf8"));
+    if (/contentDigest\s*\(\s*"disposition/.test(source)) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "the disposition + policy identity belong to src/v2/core/disposition.ts alone");
+});
+
+test("single authority: a candidate is ADJUDICATED only by the run spine (V2-010)", () => {
+  // `disposition.ts` declares `judgeDisposition`; `run.ts` is the only caller. A second
+  // caller would be a second adjudication path.
+  const allowed = new Set([join(V2_DIR, "core", "run.ts"), join(V2_DIR, "core", "disposition.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    if (/judgeDisposition\s*\(/.test(stripComments(readFileSync(file, "utf8")))) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "no component may adjudicate on its own");
+});
+
+test("single authority: the DISPOSITION neither mutates, invokes, verifies, promotes nor repairs (V2-010)", () => {
+  // Pure adjudication: it reads evidence + policy and returns a decision. Type-only imports of
+  // the evidence records (CriticRecord/VerificationRecord/CandidateRecord) are legitimate — it
+  // NAMES the evidence it judges. What it must not import is the MACHINERY that invokes,
+  // mutates, verifies, promotes or repairs; the content check below proves it calls none of it.
+  const specs = importSpecifiers(readFileSync(join(V2_DIR, "core", "disposition.ts"), "utf8"));
+  for (const forbidden of ["./invocation", "governed-exec", "./builder", "runtime/check-runner", "runtime/candidate-capture", "./promotion", "./recovery"]) {
+    assert.equal(specs.some((sp) => sp.includes(forbidden)), false, `disposition.ts must not import ${forbidden}`);
+  }
+  const source = stripComments(readFileSync(join(V2_DIR, "core", "disposition.ts"), "utf8"));
+  assert.equal(/\.mutate\s*\(|invokeAuthorized|judgeCandidate|writeFileSync|execFile|spawn\s*\(|\.promote\s*\(|update-ref/.test(source), false, "disposition.ts must not mutate, invoke, verify, promote or spawn");
+});
+
+test("single authority: the disposition module enacts NO promotion and NO git ref move (V2-010)", () => {
+  // `eligibleForPromotion=true` is an AUTHORIZATION fact. The disposition module must contain
+  // no promotion mechanics whatsoever — no ref update, no merge, no commit, no promote call.
+  const source = stripComments(readFileSync(join(V2_DIR, "core", "disposition.ts"), "utf8"));
+  assert.equal(/update-ref|git\s+merge|git\s+commit|WorkspaceManager|\.promote\b/.test(source), false, "no promotion side effect lives in the adjudication authority");
+});
+
+test("single authority: no v2 file imports a v1 integrator / adjudication / refuter (V2-010)", () => {
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (file.endsWith(".test.ts")) continue;
+    for (const spec of importSpecifiers(readFileSync(file, "utf8"))) {
+      if (/worker-model\/(integrator|adjudication|refuter|critic-fix-loop)/.test(spec)) {
+        offenders.push(`${relative(SRC, file)} -> ${spec}`);
+      }
+    }
+  }
+  assert.deepEqual(offenders, [], "v2's disposition is rebuilt, not borrowed from v1's integrator/adjudication blob");
+});
+
+test("single authority: the disposition flags are DERIVED, never independently set (V2-010)", () => {
+  // The three secondary facts must be produced only by `deriveDispositionFlags`; no other v2
+  // code may assemble a record by writing `eligibleForPromotion:` etc. directly. Confining the
+  // literal to disposition.ts is what makes an impossible flag combination unconstructable.
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (file.endsWith(".test.ts") || file === join(V2_DIR, "core", "disposition.ts")) continue;
+    if (/eligibleForPromotion\s*:/.test(stripComments(readFileSync(file, "utf8")))) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "only disposition.ts writes the derived promotion-eligibility flag");
+});
+
 test("single authority: only the critic module mints a critic/defect identity (V2-009)", () => {
   const allowed = new Set([join(V2_DIR, "core", "critic.ts")]);
   const offenders: string[] = [];

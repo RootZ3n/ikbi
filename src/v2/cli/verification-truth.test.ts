@@ -150,9 +150,11 @@ test("verification truth: a candidate whose checks PASS is verified PASS, tree u
   assert.equal(v.checks[0]?.status, "pass");
   assert.equal(v.checks[0]?.exitCode, 0);
 
-  // Stops before disposition; nothing promoted; operator repo untouched.
-  assert.ok(result.outcome.kind === "failed");
-  assert.equal(result.outcome.failure.detail?.missingStage, "disposition");
+  // PASS + satisfied ⇒ eligible-for-promotion, reported as withheld (awaiting_promotion).
+  // Stops before promotion; nothing promoted; operator repo untouched.
+  assert.ok(result.outcome.kind === "withheld");
+  assert.equal(result.receipt.disposition?.decision, "acceptable_for_promotion");
+  assert.equal(result.receipt.stagesEntered.includes("promotion"), false);
   assert.equal(result.receipt.evidence.verificationsPerformed, 1);
   assert.equal(result.receipt.evidence.promoted, false);
   assert.equal(readFileSync(join(repo, "src", "widget.ts"), "utf8"), WIDGET_1, "the operator's file is untouched");
@@ -301,5 +303,8 @@ test("verification truth: the human rendering states the verdict and refuses to 
   });
   assert.match(res.stdout, /verified {4}PASS · 1 check\(s\)/);
   assert.match(res.stdout, /pass +widget \(grep/);
-  assert.match(res.stdout, /VERIFIED — but NOT adjudicated, NOT promoted/);
+  assert.match(res.stdout, /VERIFIED — deterministic evidence for adjudication/);
+  // PASS + satisfied ⇒ the disposition is ELIGIBLE, but the render refuses to imply promotion.
+  assert.match(res.stdout, /disposition ELIGIBLE FOR PROMOTION/);
+  assert.match(res.stdout, /AUTHORIZED — but NOT promoted; awaiting the promotion authority/);
 });

@@ -49,10 +49,18 @@ import type { SourceSnapshotSummary } from "./source.js";
 import type { CandidateRecord, RunCandidateSummary } from "./candidate.js";
 import type { RunVerificationSummary, VerificationRecord } from "./verification.js";
 import type { RunCriticSummary, CriticRecord } from "./critic.js";
+import type { RunDispositionSummary, DispositionRecord } from "./disposition.js";
 import type { RetrievalSummary } from "./retrieval.js";
 
-/** Why verified-good work was withheld instead of promoted. Closed set. */
-export type WithheldReason = "governance" | "operator" | "policy" | "dry_run";
+/**
+ * Why verified-good work was withheld instead of promoted. Closed set.
+ *
+ * `awaiting_promotion` is the V2-010 disposition outcome: the candidate is ELIGIBLE for
+ * promotion (deterministic pass + satisfied critic), but this build stops at disposition —
+ * the promotion authority (V2-012) has not enacted anything. Eligibility is an authorization
+ * fact, never a promotion; the source is unchanged and the candidate is retained.
+ */
+export type WithheldReason = "awaiting_promotion" | "governance" | "operator" | "policy" | "dry_run";
 
 /** Why produced work was rejected. Closed set (mirrors v1's DiscardReason vocabulary). */
 export type RejectedReason = "verification_red" | "no_work" | "vacuous_green" | "unresolvable" | "aborted";
@@ -115,7 +123,9 @@ export function formatOutcome(outcome: RunTerminalOutcome): string {
     case "accepted":
       return `accepted — promoted (${outcome.promotionId})`;
     case "withheld":
-      return `withheld — verified work retained, not promoted (${outcome.reason})`;
+      return outcome.reason === "awaiting_promotion"
+        ? "withheld — ELIGIBLE for promotion, retained pending the promotion authority (not yet enacted)"
+        : `withheld — verified work retained, not promoted (${outcome.reason})`;
     case "rejected":
       return `rejected — ${outcome.reason}`;
     case "quarantined":
@@ -407,6 +417,14 @@ export interface V2RunReceipt {
    * bound to the exact candidate tree and verification the critic read.
    */
   readonly critic?: RunCriticSummary;
+  /**
+   * Absent unless the disposition authority actually adjudicated the candidate. Present with
+   * the ONE lawful decision (acceptable_for_promotion / withhold / reject / quarantine), the
+   * machine-readable reasons, and the derived flags — bound to the exact candidate,
+   * verification, critic, and policy it weighed. `eligibleForPromotion=true` is an
+   * authorization fact; NOTHING was promoted.
+   */
+  readonly disposition?: RunDispositionSummary;
   readonly startedAt: number;
   readonly endedAt: number;
 }
@@ -481,6 +499,8 @@ export interface V2RunResult {
   readonly verification?: VerificationRecord;
   /** The critic judgment this run performed, when a candidate reached criticism. */
   readonly critic?: CriticRecord;
+  /** The lawful disposition this run adjudicated, when a candidate reached disposition. */
+  readonly disposition?: DispositionRecord;
   /** Every transition the run made, in order. The run's own account of itself. */
   readonly journal: readonly LifecycleTransition[];
   readonly receipt: V2RunReceipt;

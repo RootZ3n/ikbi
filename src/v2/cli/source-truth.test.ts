@@ -103,8 +103,7 @@ test("source truth: a CLEAN repository behaves exactly as before", () => {
   assert.equal(result.receipt.sourceSnapshot?.clean, true);
   assert.equal(result.receipt.workspace?.materializedEntries, 0, "a clean worktree already matches HEAD");
   assert.equal(result.receipt.evidence.mutationsApplied, 0);
-  assert.ok(result.outcome.kind === "failed");
-  assert.equal(result.outcome.failure.category, "not_implemented", "it stops for the ordinary reason");
+  assert.ok(result.outcome.kind === "withheld", "it stops for the ordinary reason");
   assert.equal(gitStatus(repo), "", "the source is untouched");
 });
 
@@ -133,8 +132,7 @@ test("source truth: a DIRTY tracked file flows end to end — context, workspace
 
   // 4. The workspace observation hashed the SAME bytes — the drift failure is gone.
   assert.equal(result.receipt.evidence.observationsTaken, 1);
-  assert.ok(result.outcome.kind === "failed");
-  assert.equal(result.outcome.failure.category, "not_implemented", "no context_artifact_drift");
+  assert.ok(result.outcome.kind === "withheld", "no context_artifact_drift");
 
   // 5. Reproducing the operator's own work is NOT a model mutation.
   assert.equal(result.receipt.evidence.mutationsApplied, 0);
@@ -194,8 +192,7 @@ test("source truth: an UNTRACKED source file is part of the run and reaches the 
   assert.equal(result.receipt.sourceSnapshot?.counts.untrackedIncluded, 1);
   assert.equal(artifactAt(result, "src/new.ts")?.observedSha256, sha(body), "uncommitted new work is not invisible");
   assert.equal(result.receipt.workspace?.materializedEntries, 1);
-  assert.ok(result.outcome.kind === "failed");
-  assert.equal(result.outcome.failure.category, "not_implemented", "and it re-observed cleanly in the workspace");
+  assert.ok(result.outcome.kind === "withheld", "and it re-observed cleanly in the workspace");
 });
 
 test("source truth: an IGNORED file is neither snapshotted nor materialized", () => {
@@ -218,8 +215,7 @@ test("source truth: HEAD=A, index=B, working tree=C — the run sees C", () => {
 
   const { result } = v2Run(state, repo);
   assert.equal(artifactAt(result, "src/a.ts")?.observedSha256, sha(seen), "what the operator sees, not what is staged");
-  assert.ok(result.outcome.kind === "failed");
-  assert.equal(result.outcome.failure.category, "not_implemented", "and the workspace agrees");
+  assert.ok(result.outcome.kind === "withheld", "and the workspace agrees");
 });
 
 // ── boundaries ──────────────────────────────────────────────────────────────
@@ -251,7 +247,7 @@ test("source truth: exactly ONE snapshot, and the whole spine agrees on it", () 
   assert.equal(result.receipt.evidence.sourceSnapshots, 1);
   assert.equal(result.context?.sourceSnapshotId, id, "context came from it");
   assert.equal(result.receipt.workspace?.sourceSnapshotId, id, "the workspace was materialized from it");
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism", "disposition"]);
 });
 
 test("source truth: the human rendering states the snapshot and what was materialized", () => {

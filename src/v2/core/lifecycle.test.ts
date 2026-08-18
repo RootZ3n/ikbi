@@ -19,7 +19,7 @@ import {
   type LifecycleStage,
   type LifecycleViolationCode,
 } from "./lifecycle.js";
-import type { V2CandidateId, V2VerificationId, V2CriticId } from "./identity.js";
+import type { V2CandidateId, V2VerificationId, V2CriticId, V2DispositionId } from "./identity.js";
 import { summarizeEvidence } from "./result.js";
 
 const ids = createSequentialIdFactory("lcx");
@@ -55,6 +55,7 @@ const fakeCandidateId = (seed: string): V2CandidateId => (`${seed}`.repeat(64).s
 let verificationSeed = 0;
 const fakeVerificationId = (seed: string): V2VerificationId => (`${seed}`.repeat(64).slice(0, 64) as V2VerificationId);
 const fakeCriticId = (seed: string): V2CriticId => (`${seed}`.repeat(64).slice(0, 64) as V2CriticId);
+const fakeDispositionId = (seed: string): V2DispositionId => (`${seed}`.repeat(64).slice(0, 64) as V2DispositionId);
 
 function fresh() {
   const ids = createSequentialIdFactory("lc");
@@ -73,6 +74,7 @@ function walkTo(target: LifecycleStage) {
   const workspaceId = ids.mint("workspace");
   const verificationId = fakeVerificationId("v");
   const criticId = fakeCriticId("c");
+  const dispositionId = fakeDispositionId("p");
   const promotionId = ids.mint("promotion");
   for (const stage of LIFECYCLE_STAGES) {
     lifecycle.enter(runId, stage);
@@ -100,10 +102,14 @@ function walkTo(target: LifecycleStage) {
       lifecycle.record(runId, { kind: "invocation", id: CRITIC_INVOCATION, role: "critic" });
       lifecycle.record(runId, { kind: "critic", id: criticId, candidateId, verificationId });
     }
+    // V2-010: the disposition adjudicates the candidate on BOTH evidence classes.
+    if (stage === "disposition") {
+      lifecycle.record(runId, { kind: "disposition", id: dispositionId, candidateId, verificationId, criticId, decision: "acceptable_for_promotion" });
+    }
     if (stage === "promotion") lifecycle.record(runId, { kind: "promotion", id: promotionId, candidateId, verificationId });
     if (stage === target) break;
   }
-  return { ...ctx, candidateId, verificationId, criticId, promotionId };
+  return { ...ctx, candidateId, verificationId, criticId, dispositionId, promotionId };
 }
 
 function violation(fn: () => void): LifecycleViolationCode {
@@ -253,6 +259,38 @@ test("lifecycle: a promotion cannot ride a verification of a DIFFERENT candidate
   assert.equal(
     violation(() =>
       lifecycle.record(runId, { kind: "promotion", id: ids.mint("promotion"), candidateId: other, verificationId }),
+    ),
+    "evidence_mismatch",
+  );
+});
+
+test("lifecycle: a disposition cannot cite a critic of a DIFFERENT candidate (V2-010)", () => {
+  const { lifecycle, runId, candidateId, verificationId } = walkTo("criticism");
+  // A disposition entry whose criticId was never recorded is refused — a decision cannot
+  // rest on evidence the run did not produce.
+  lifecycle.enter(runId, "disposition");
+  assert.equal(
+    violation(() =>
+      lifecycle.record(runId, { kind: "disposition", id: fakeDispositionId("z"), candidateId, verificationId, criticId: fakeCriticId("q"), decision: "acceptable_for_promotion" }),
+    ),
+    "unrecorded_evidence",
+  );
+});
+
+test("lifecycle: a disposition cannot cite a verification of a DIFFERENT candidate (V2-010)", () => {
+  const { lifecycle, ids, runId, verificationId, criticId } = walkTo("candidate_generation");
+  const other = fakeCandidateId(String(candidateSeed += 1));
+  lifecycle.record(runId, { kind: "candidate", id: other, workspaceId: ids.mint("workspace") });
+  lifecycle.enter(runId, "verification");
+  const firstCandidate = lifecycle.ledger.candidates[0]!;
+  lifecycle.record(runId, { kind: "verification", id: verificationId, candidateId: firstCandidate });
+  lifecycle.enter(runId, "criticism");
+  lifecycle.record(runId, { kind: "critic", id: criticId, candidateId: firstCandidate, verificationId });
+  lifecycle.enter(runId, "disposition");
+  // The disposition names `other`, but the verification it cites judged `firstCandidate`.
+  assert.equal(
+    violation(() =>
+      lifecycle.record(runId, { kind: "disposition", id: fakeDispositionId("z"), candidateId: other, verificationId, criticId, decision: "reject" }),
     ),
     "evidence_mismatch",
   );

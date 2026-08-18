@@ -121,6 +121,7 @@ export function renderRun(result: V2RunResult): string {
     ...candidateLines(result),
     ...verificationLines(result),
     ...criticLines(result),
+    ...dispositionLines(result),
     `outcome     ${formatOutcome(result.outcome)}`,
     "evidence    " +
       `provider_invoked=${e.providerInvoked} invocations=${e.invocations} mutations=${e.mutationsApplied} ` +
@@ -259,7 +260,7 @@ function verificationLines(result: V2RunResult): string[] {
     lines.push(`  ${c.status.padEnd(22)} ${c.name} (${c.command})${c.exitCode !== null ? ` · exit ${c.exitCode}` : ""} · ${c.durationMs}ms`);
   }
   lines.push(`  id        ${v.verificationId}`);
-  lines.push(`  status    ${v.verdict === "pass" ? "VERIFIED — but NOT adjudicated, NOT promoted" : "NOT PROMOTED"} · workspace ${v.workspaceDisposition}`);
+  lines.push(`  status    ${v.verdict === "pass" ? "VERIFIED — deterministic evidence for adjudication" : "NOT VERIFIED-GOOD"} · workspace ${v.workspaceDisposition}`);
   return lines;
 }
 
@@ -282,6 +283,30 @@ function criticLines(result: V2RunResult): string[] {
   }
   lines.push(`  id        ${c.criticId}`);
   lines.push(`  status    SEMANTIC EVIDENCE ONLY — NOT a disposition, NOT a promotion`);
+  return lines;
+}
+
+/**
+ * The lawful disposition, when adjudication ran. It states the ONE decision and its reasons,
+ * and — critically — refuses to imply that anything was PROMOTED. `acceptable_for_promotion`
+ * is an ELIGIBILITY fact; the source is unchanged and nothing was published.
+ */
+function dispositionLines(result: V2RunResult): string[] {
+  const d = result.receipt.disposition;
+  if (d === undefined) return [];
+  const label =
+    d.decision === "acceptable_for_promotion" ? "ELIGIBLE FOR PROMOTION"
+      : d.decision === "withhold" ? "WITHHELD"
+        : d.decision === "reject" ? "REJECTED"
+          : "QUARANTINED";
+  const reasons = [d.primaryReason, ...d.supportingReasons].join(", ");
+  const lines = [
+    `disposition ${label} · ${reasons} · policy ${d.policyId.slice(0, 12)}`,
+    `  weighs    verification ${d.verificationVerdict.toUpperCase()} + critic ${d.criticVerdict.toUpperCase()}`,
+    `  flags     eligible=${d.eligibleForPromotion} requires_recovery=${d.requiresRecovery} requires_operator=${d.requiresOperator}`,
+    `  id        ${d.dispositionId}`,
+    `  status    ${d.eligibleForPromotion ? "AUTHORIZED — but NOT promoted; awaiting the promotion authority" : "NOT PROMOTED"}`,
+  ];
   return lines;
 }
 

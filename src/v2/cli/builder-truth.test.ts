@@ -144,13 +144,16 @@ test("builder truth: IKBI PRODUCES CODE — read, replace, finish, candidate cap
   assert.equal(readFileSync(join(repo, "src", "widget.ts"), "utf8"), WIDGET);
 });
 
-test("builder truth: the run VERIFIES the candidate then stops before disposition (V2-008)", async () => {
-  // This fixture has no manifest and no IKBI_CHECKS, so verification is truthful NO_CHECKS
-  // — not a pass. The run stops at the (unimplemented) disposition stage.
+test("builder truth: the run VERIFIES, CRITIQUES and ADJUDICATES, then stops before promotion (V2-010)", async () => {
+  // This fixture has no manifest and no IKBI_CHECKS, so verification is truthful NO_CHECKS —
+  // not a pass. Under the default policy a NO_CHECKS candidate is WITHHELD (no deterministic
+  // evidence), and the run stops before the (unimplemented) promotion stage.
   const { result } = await editRun();
-  assert.ok(result.outcome.kind === "failed");
-  assert.equal(result.outcome.failure.category, "not_implemented");
-  assert.equal(result.outcome.failure.detail?.missingStage, "disposition");
+  assert.ok(result.outcome.kind === "withheld");
+  assert.equal(result.receipt.disposition?.decision, "withhold");
+  assert.equal(result.receipt.disposition?.primaryReason, "no_checks");
+  assert.equal(result.receipt.disposition?.eligibleForPromotion, false);
+  assert.equal(result.receipt.stagesEntered.includes("promotion"), false);
   const e = result.receipt.evidence;
   assert.equal(e.verificationsPerformed, 1);
   assert.equal(result.receipt.verification?.verdict, "no_checks");
@@ -169,7 +172,7 @@ test("builder truth: the receipt states EXACTLY what happened", async () => {
   assert.equal(e.sourceRepositoryMutated, false, "and the operator's repository was NOT");
   assert.deepEqual(
     [...result.receipt.stagesEntered],
-    ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism"],
+    ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism", "disposition"],
   );
 });
 
@@ -421,10 +424,10 @@ test("SOURCE SAFETY: an operator's UNCOMMITTED work is reproduced, and is not co
 
 // ── workspace ownership ─────────────────────────────────────────────────────
 
-test("builder truth: a verified candidate's workspace is RETAINED for disposition", async () => {
+test("builder truth: an ADJUDICATED candidate's workspace is RETAINED (eligibility is not promotion)", async () => {
   const { result } = await editRun();
   assert.equal(result.receipt.workspace!.disposition, "retained");
-  assert.match(result.receipt.workspace!.dispositionDetail ?? "", /verified no_checks; awaits disposition/);
+  assert.match(result.receipt.workspace!.dispositionDetail ?? "", /adjudicated withhold \(no_checks\); retained/);
 });
 
 test("builder truth: a generation that FAILS retains nothing", async () => {

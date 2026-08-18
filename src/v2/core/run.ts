@@ -36,15 +36,21 @@
  *  11. enter `criticism` and ask a SEPARATELY resolved critic model to judge the SAME tree
  *      against the operator's intent and that verification evidence — semantic evidence,
  *      strictly parsed (a bare "fail" cannot become a verdict), deciding nothing
- *  12. retain the candidate workspace and STOP, because `disposition` has no implementation
- *  13. terminalize as `failed` with category `not_implemented`, and emit a receipt whose
- *      evidence block is counted from the ledger: candidate, verification and critic are all
- *      real, but nothing was adjudicated or promoted
+ *  12. enter `disposition` and ask THE adjudication authority for the ONE lawful decision:
+ *      it weighs the deterministic verification AND the semantic critic against ONE explicit
+ *      policy, re-probes the tree at this fresh authority boundary, and returns
+ *      acceptable_for_promotion / withhold / reject / quarantine — invoking no model,
+ *      mutating nothing, promoting nothing, repairing nothing
+ *  13. terminalize with the disposition's lawful outcome and STOP before `promotion`, which
+ *      has no implementation — `acceptable_for_promotion` becomes `withheld (awaiting_promotion)`,
+ *      an ELIGIBILITY fact, never a promotion — and emit a receipt whose evidence block is
+ *      counted from the ledger: candidate, verification, critic and disposition are all real
  *
  * It performs NO promotion and NO source-repository mutation. The builder's edits land in
  * an isolated worktree; verification runs deterministic checks there and never touches the
- * operator's checkout. A red verdict ends the run — there is no critic, no repair, and no
- * builder re-entry, because those authorities do not exist yet.
+ * operator's checkout. The disposition decides what SHOULD happen next; it does not itself
+ * do it. Repair, retry and the mechanical publication are later authorities that do not
+ * exist yet.
  */
 
 import { statSync } from "node:fs";
@@ -76,6 +82,13 @@ import {
 } from "./verification.js";
 import { generateCandidate, type BuilderBudget, type BuilderToolExecutor, type BuilderToolExecutorDeps, type UntrustedBoundary } from "./builder.js";
 import { judgeCandidate, summarizeCritic, type CriticRecord } from "./critic.js";
+import {
+  judgeDisposition,
+  summarizeDisposition,
+  DEFAULT_DISPOSITION_POLICY,
+  type DispositionPolicy,
+  type DispositionRecord,
+} from "./disposition.js";
 import { DEFAULT_DIFF_BUDGET, type CandidateDiffSource } from "./candidate-diff.js";
 import { summarizeRetrieval, type RetrievalReporter, type RetrievalSummary } from "./retrieval.js";
 import { summarizeSnapshot, type SourceSnapshotAuthority, type SourceSnapshotReader } from "./source.js";
@@ -92,7 +105,7 @@ import {
   type ServedModelAlias,
   type V2InvocationRecord,
 } from "./invocation.js";
-import { V2_001_FAILURE_CODES, runFailure, stageNotImplemented, type RunFailure } from "./failure.js";
+import { V2_001_FAILURE_CODES, runFailure, type RunFailure } from "./failure.js";
 import { createIdFactory, type V2IdFactory } from "./identity.js";
 import { RunLifecycle, type LifecycleStage } from "./lifecycle.js";
 import {
@@ -143,10 +156,47 @@ export function rebindableArtifact(pkg: ContextPackage): { path: string; observe
 }
 
 /** The furthest stage this build of ikbi implements. */
-export const IMPLEMENTED_THROUGH_STAGE: LifecycleStage = "criticism";
+export const IMPLEMENTED_THROUGH_STAGE: LifecycleStage = "disposition";
 
 /** The stage the run would need next, and does not have. */
-export const FIRST_UNIMPLEMENTED_STAGE: LifecycleStage = "disposition";
+export const FIRST_UNIMPLEMENTED_STAGE: LifecycleStage = "promotion";
+
+/**
+ * Map the ONE lawful disposition decision onto the run's terminal outcome vocabulary. This
+ * is a pure projection — it enacts nothing.
+ *
+ *   acceptable_for_promotion → withheld (awaiting_promotion): ELIGIBLE, not promoted. The
+ *                              promotion authority (V2-012) is the only thing that could make
+ *                              this `accepted`, and it has not run. The source is unchanged.
+ *   withhold                 → withheld, with the policy/operator reason preserved.
+ *   reject                   → rejected (deterministic red is not verified-good work).
+ *   quarantine               → quarantined, retained for a later recovery authority.
+ */
+export function terminalOutcomeForDisposition(
+  record: DispositionRecord,
+  candidateId: import("./identity.js").V2CandidateId,
+  verificationId: import("./identity.js").V2VerificationId,
+): RunTerminalOutcome {
+  switch (record.decision) {
+    case "acceptable_for_promotion":
+      return { kind: "withheld", candidateId, verificationId, reason: "awaiting_promotion" };
+    case "withhold":
+      return {
+        kind: "withheld",
+        candidateId,
+        verificationId,
+        reason: record.primaryReason === "policy_requires_operator" ? "operator" : "policy",
+      };
+    case "reject":
+      return { kind: "rejected", reason: "verification_red", candidateId };
+    case "quarantine":
+      // Timeout / infrastructure failure ⇒ incomplete evidence (recovery-needed). A drift or
+      // check-mutated candidate ⇒ the tree itself is suspect ⇒ hold for forensics.
+      return record.primaryReason === "verification_timeout" || record.primaryReason === "verification_infrastructure_failure"
+        ? { kind: "quarantined", reason: "adjudication_incomplete", detail: `${record.primaryReason}` }
+        : { kind: "quarantined", reason: "safety_forensics", detail: `${record.primaryReason}` };
+  }
+}
 
 /** Upper bound on a goal, so an accidental file paste is rejected as input, not as a build. */
 export const MAX_GOAL_LENGTH = 8000;
@@ -265,6 +315,12 @@ export interface V2RunDeps {
   readonly treeProbe: TreeProbe;
   /** Per-check wall-clock bound. Defaults to the donor's shared `resolveCheckTimeoutMs`. */
   readonly checkTimeoutMs?: number;
+  /**
+   * THE explicit disposition policy the adjudication authority applies. ONE normalized
+   * policy, injected — the authority never reads env or repository prose. Defaults to the
+   * SAFE `DEFAULT_DISPOSITION_POLICY` (deterministic pass AND satisfied critic required).
+   */
+  readonly dispositionPolicy?: DispositionPolicy;
   readonly ids?: V2IdFactory;
   readonly now?: () => number;
   readonly probe?: RepoProbe;
@@ -397,11 +453,16 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
   let candidate: CandidateRecord | undefined;
   let verification: VerificationRecord | undefined;
   let critic: CriticRecord | undefined;
+  let dispositionRecord: DispositionRecord | undefined;
   let workspace: V2WorkspaceRecord | undefined;
   let workspaceObservations = 0;
   let disposition: WorkspaceDisposition | undefined;
+  // The terminal outcome computed BY the disposition authority. Set on the one path that
+  // reaches a real adjudication; left undefined when the run failed earlier (then the
+  // outcome is `failed` with the recorded failure).
+  let dispositionOutcome: RunTerminalOutcome | undefined;
 
-  const failure = await (async (): Promise<RunFailure> => {
+  const failure = await (async (): Promise<RunFailure | null> => {
     const checked = preflight(request, probe);
     if (!checked.ok) return checked.failure;
     const task = checked.task;
@@ -672,18 +733,57 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
       // never reached the wire, so there is nothing to record.)
     }
     if (!judged.ok) return judged.failure;
-    critic = judged.generation.record;
+    const criticRecord = judged.generation.record;
+    critic = criticRecord;
     lifecycle.record(runId, {
       kind: "critic",
-      id: critic.criticId,
+      id: criticRecord.criticId,
       candidateId: candidate.candidateId,
       verificationId: verification.verificationId,
     });
 
-    // A candidate has now been VERIFIED and CRITIQUED — deterministic AND semantic evidence
-    // both exist, bound to this exact tree. Nothing has been adjudicated or promoted: the
-    // disposition authority does not exist in this build, and the run says exactly that.
-    return stageNotImplemented(FIRST_UNIMPLEMENTED_STAGE, IMPLEMENTED_THROUGH_STAGE);
+    // Stage 8 — DISPOSITION. THE one adjudication authority. It weighs BOTH evidence classes
+    // — the deterministic verification AND the semantic critic — against ONE explicit policy,
+    // and returns the ONE lawful disposition. It invokes no model, mutates nothing, re-runs
+    // nothing, promotes nothing, and repairs nothing. It re-probes the tree at this fresh
+    // authority boundary (drift ⇒ quarantine over a stale subject, never an ordinary
+    // decision) and refuses incoherent evidence outright.
+    lifecycle.enter(runId, "disposition");
+    const disposed = await judgeDisposition({
+      runId,
+      taskId,
+      candidate,
+      verification,
+      critic: criticRecord,
+      policy: deps.dispositionPolicy ?? DEFAULT_DISPOSITION_POLICY,
+      workspacePath: workspace.path,
+      probeTree: (path: string) => deps.treeProbe.treeOf(path),
+    });
+    // A coherence break is an engine defect, not a candidate outcome — the run FAILS.
+    if (!disposed.ok && disposed.kind === "mismatch") return disposed.failure;
+    // A tree that moved since the critic looked is a stale subject: QUARANTINE it. We do not
+    // adjudicate over it and we do not auto-reverify — recovery is a later authority.
+    if (!disposed.ok) {
+      dispositionOutcome = { kind: "quarantined", reason: "safety_forensics", detail: disposed.detail };
+      return null;
+    }
+    dispositionRecord = disposed.record;
+    lifecycle.record(runId, {
+      kind: "disposition",
+      id: dispositionRecord.dispositionId,
+      candidateId: candidate.candidateId,
+      verificationId: verification.verificationId,
+      criticId: criticRecord.criticId,
+      decision: dispositionRecord.decision,
+    });
+
+    // The candidate has been VERIFIED, CRITIQUED and ADJUDICATED. The disposition says what
+    // SHOULD happen next; it does not itself do it. We terminalize with the lawful outcome and
+    // STOP before promotion — the promotion authority (V2-012) does not exist in this build.
+    // `acceptable_for_promotion` becomes `withheld (awaiting_promotion)`: ELIGIBILITY, never a
+    // promotion; the source is unchanged and the candidate is retained.
+    dispositionOutcome = terminalOutcomeForDisposition(dispositionRecord, candidate.candidateId, verification.verificationId);
+    return null;
   })();
 
   // OWNERSHIP TRANSITION. Until V2-007 a workspace was always discarded, because nothing
@@ -698,19 +798,25 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
   // Retention is NOT promotion and NOT a claim of quality: the worktree simply stays on
   // disk, findable through the existing `ikbi workspace ls`.
   if (workspace !== undefined) {
-    // A candidate that was VERIFIED (pass OR fail) is retained: disposition and recovery
-    // are the next authorities and both want the exact tree that was judged. A candidate
-    // that never reached verification (a generation failure) leaves a half-built tree
-    // nothing is entitled to read, and is discarded. Retention is not promotion.
+    // A candidate that was ADJUDICATED is retained — no matter the decision. Even a rejected
+    // or quarantined candidate is kept for now: a later recovery authority may reuse it, and
+    // deleting evidence is not disposition's job. An eligible-for-promotion candidate is
+    // likewise retained (eligibility is not promotion — the tree stays on disk for V2-012).
+    // A candidate that reached only verification (disposition never ran) is still retained;
+    // one that never reached verification leaves a half-built tree and is discarded.
     disposition =
-      verification !== undefined
-        ? await deps.workspaces.retain(workspace, `candidate ${candidate!.candidateId} verified ${verification.verdict}; awaits disposition`)
-        : candidate !== undefined
-          ? await deps.workspaces.retain(workspace, `candidate ${candidate.candidateId} awaits verification`)
-          : await deps.workspaces.discard(workspace);
+      dispositionRecord !== undefined
+        ? await deps.workspaces.retain(workspace, `candidate ${candidate!.candidateId} adjudicated ${dispositionRecord.decision} (${dispositionRecord.primaryReason}); retained`)
+        : verification !== undefined
+          ? await deps.workspaces.retain(workspace, `candidate ${candidate!.candidateId} verified ${verification.verdict}; awaits disposition`)
+          : candidate !== undefined
+            ? await deps.workspaces.retain(workspace, `candidate ${candidate.candidateId} awaits verification`)
+            : await deps.workspaces.discard(workspace);
   }
 
-  const outcome: RunTerminalOutcome = { kind: "failed", failure };
+  // The ONE authoritative outcome: the disposition's lawful decision when the run reached
+  // adjudication, otherwise `failed` with the recorded failure.
+  const outcome: RunTerminalOutcome = dispositionOutcome ?? { kind: "failed", failure: failure as RunFailure };
   lifecycle.terminalize(runId, outcome);
 
   const endedAt = now();
@@ -730,6 +836,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     ...(candidate !== undefined ? { candidate: summarizeCandidate(candidate) } : {}),
     ...(verification !== undefined ? { verification: summarizeVerification(verification) } : {}),
     ...(critic !== undefined ? { critic: summarizeCritic(critic) } : {}),
+    ...(dispositionRecord !== undefined ? { disposition: summarizeDisposition(dispositionRecord) } : {}),
     ...(workspace !== undefined && disposition !== undefined
       ? { workspace: summarizeWorkspace({ workspace, observations: workspaceObservations, disposition }) }
       : {}),
@@ -750,6 +857,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     ...(candidate !== undefined ? { candidate } : {}),
     ...(verification !== undefined ? { verification } : {}),
     ...(critic !== undefined ? { critic } : {}),
+    ...(dispositionRecord !== undefined ? { disposition: dispositionRecord } : {}),
     journal: lifecycle.journal,
     receipt,
   };

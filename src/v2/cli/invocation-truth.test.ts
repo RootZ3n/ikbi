@@ -133,7 +133,10 @@ test("invocation truth: a REAL request reaches the provider carrying the authori
   activate(server, root, "prof-a");
 
   const { result, status } = v2Run(server, root, repo);
-  assert.notEqual(status, 0, "the run still stops truthfully before building");
+  // The candidate is adjudicated and withheld (nothing promoted) — a correct, intended
+  // result, so the exit code is 0. What matters here is what reached the wire.
+  assert.ok(result.outcome.kind === "withheld", "the run adjudicates and withholds");
+  assert.equal(status, 0);
 
   // What the SERVER actually received — not what the CLI says it sent.
   const received = await server.received();
@@ -321,15 +324,15 @@ test("invocation truth: nothing is built, verified or written", async () => {
   const before = spawnSync("git", ["status", "--porcelain"], { cwd: repo, encoding: "utf8" }).stdout;
   const { result } = v2Run(server, root, repo);
   const e = result.receipt.evidence;
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism", "disposition"]);
   assert.equal(e.providerInvoked, true);
   assert.equal(e.invocations, 2, "V2-009: the builder call AND the critic call");
   assert.equal(e.candidatesCreated, 1, "no candidate was created");
   assert.equal(e.verificationsPerformed, 1, "V2-008: the candidate WAS verified (no_checks)");
   assert.equal(e.promoted, false);
   assert.equal(e.sourceRepositoryMutated, false);
-  assert.ok(result.outcome.kind === "failed");
-  assert.equal(result.outcome.failure.detail?.missingStage, "disposition");
+  assert.ok(result.outcome.kind === "withheld", "the candidate is adjudicated and withheld — nothing promoted");
+  assert.equal(result.receipt.stagesEntered.includes("promotion"), false, "the run stops before promotion");
   assert.equal(spawnSync("git", ["status", "--porcelain"], { cwd: repo, encoding: "utf8" }).stdout, before, "the repo is untouched");
 });
 

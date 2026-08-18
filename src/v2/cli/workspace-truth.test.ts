@@ -138,7 +138,7 @@ test("workspace truth: candidate_strategy allocates ONE workspace bound to the r
   const repo = makeRepo();
   const { result } = v2Run(state, repo);
 
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism", "disposition"]);
   assert.equal(result.receipt.evidence.workspacesAllocated, 1, "the SINGLE strategy allocates exactly one");
 
   const ws = result.receipt.workspace!;
@@ -155,8 +155,7 @@ test("workspace truth: the context artifact is RE-OBSERVED in the workspace and 
   assert.equal(result.receipt.workspace?.observations, 1);
   // The observation succeeded, which means the workspace bytes equalled the bytes the
   // context package recorded — the reconciliation a future builder depends on.
-  assert.ok(result.outcome.kind === "failed");
-  assert.equal(result.outcome.failure.category, "not_implemented", "so the run stops for the ordinary reason");
+  assert.ok(result.outcome.kind === "withheld", "so the run stops for the ordinary reason");
 });
 
 test("workspace truth: an UNCOMMITTED source change no longer causes drift (V2-006A)", () => {
@@ -166,8 +165,7 @@ test("workspace truth: an UNCOMMITTED source change no longer causes drift (V2-0
   // Both now come from the one source snapshot, so the run proceeds normally.
   writeFiles(repo, { "src/widget.ts": "export const widget = 999; // uncommitted\n" });
   const { result } = v2Run(state, repo);
-  assert.ok(result.outcome.kind === "failed");
-  assert.equal(result.outcome.failure.category, "not_implemented", "it stops for the ordinary reason");
+  assert.ok(result.outcome.kind === "withheld", "it stops for the ordinary reason");
   assert.equal(result.receipt.sourceSnapshot?.clean, false);
   assert.equal(result.receipt.workspace?.materializedEntries, 1, "the operator's edit was reproduced in isolation");
   assert.equal(result.receipt.evidence.mutationsApplied, 0, "and reproducing it is not a mutation");
@@ -178,8 +176,7 @@ test("workspace truth: committing that change makes the run proceed again", () =
   const repo = makeRepo();
   commitFiles(repo, { "src/widget.ts": "export const widget = 2;\n" }, "committed");
   const { result } = v2Run(state, repo);
-  assert.ok(result.outcome.kind === "failed");
-  assert.equal(result.outcome.failure.category, "not_implemented");
+  assert.ok(result.outcome.kind === "withheld", "the candidate is adjudicated and withheld");
   assert.equal(result.receipt.workspace?.baseCommit, headCommit(repo), "bound to the NEW head");
 });
 
@@ -203,8 +200,8 @@ test("workspace truth: a workspace is NOT a candidate, and NOTHING was written",
 
   assert.equal(gitStatus(repo), before, "the source working tree is unchanged");
   assert.equal(headCommit(repo), head, "and so is HEAD");
-  assert.ok(result.outcome.kind === "failed");
-  assert.equal(result.outcome.failure.detail?.missingStage, "disposition");
+  assert.ok(result.outcome.kind === "withheld", "adjudicated and withheld");
+  assert.equal(result.receipt.stagesEntered.includes("promotion"), false, "stops before promotion");
 });
 
 test("workspace truth: the source repository gains no stray files or branches", () => {
@@ -224,7 +221,7 @@ test("workspace truth: the workspace is RETAINED once a candidate exists (V2-007
   const state = makeStateRoot();
   const { result } = v2Run(state, makeRepo());
   assert.equal(result.receipt.workspace?.disposition, "retained");
-  assert.match(result.receipt.workspace?.dispositionDetail ?? "", /verified no_checks; awaits disposition/);
+  assert.match(result.receipt.workspace?.dispositionDetail ?? "", /adjudicated withhold/);
   // RETENTION IS NOT PROMOTION.
   assert.equal(result.receipt.evidence.promoted, false);
   assert.equal(result.receipt.evidence.sourceRepositoryMutated, false);
@@ -262,8 +259,7 @@ test("workspace truth: a repo with no instructions and no named target yields ZE
   const { result } = v2Run(state, repo, "do something unnamed");
   assert.equal(result.receipt.evidence.workspacesAllocated, 1, "a workspace is still allocated");
   assert.equal(result.receipt.evidence.observationsTaken, 0, "but no probe file was invented to look at");
-  assert.ok(result.outcome.kind === "failed");
-  assert.equal(result.outcome.failure.category, "not_implemented");
+  assert.ok(result.outcome.kind === "withheld", "the candidate is adjudicated and withheld");
 });
 
 test("workspace truth: the human rendering states the source binding and the disposition", () => {

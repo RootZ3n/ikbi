@@ -302,14 +302,13 @@ test("inventory independence: changing the REAL roster DOES move the inventory d
 
 // ── boundaries this slice must not cross ────────────────────────────────────
 
-test("resolution truth: model_resolution is ENTERED, and nothing beyond context is", () => {
+test("resolution truth: model_resolution is ENTERED, and the run adjudicates through to disposition", () => {
   const root = makeStateRoot();
   activate(root, "prof-a");
   const { result } = v2Run(root);
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism"]);
-  assert.ok(result.outcome.kind === "failed");
-  assert.equal(result.outcome.failure.category, "not_implemented");
-  assert.equal(result.outcome.failure.detail?.missingStage, "disposition");
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism", "disposition"]);
+  assert.ok(result.outcome.kind === "withheld", "the candidate is adjudicated and withheld — nothing promoted");
+  assert.equal(result.receipt.stagesEntered.includes("promotion"), false, "and the run stops before promotion");
 });
 
 test("resolution truth: builder AND critic decisions are recorded, one invocation each", () => {

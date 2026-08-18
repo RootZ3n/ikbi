@@ -57,6 +57,7 @@ import type {
   V2RunId,
   V2VerificationId,
   V2CriticId,
+  V2DispositionId,
   V2WorkspaceId,
 } from "./identity.js";
 import type { RunTerminalOutcome } from "./result.js";
@@ -157,6 +158,14 @@ export type LifecycleEvidence =
       readonly verificationId: V2VerificationId;
     }
   | {
+      readonly kind: "disposition";
+      readonly id: V2DispositionId;
+      readonly candidateId: V2CandidateId;
+      readonly verificationId: V2VerificationId;
+      readonly criticId: V2CriticId;
+      readonly decision: string;
+    }
+  | {
       readonly kind: "promotion";
       readonly id: V2PromotionId;
       readonly candidateId: V2CandidateId;
@@ -202,6 +211,8 @@ const EVIDENCE_STAGE: Record<LifecycleEvidence["kind"], readonly LifecycleStage[
   verification: ["verification"],
   // A critic judgment is recordable only by the stage that owns semantic review.
   critic: ["criticism"],
+  // A disposition is recordable only by the stage that owns adjudication.
+  disposition: ["disposition"],
   promotion: ["promotion"],
 };
 
@@ -246,6 +257,7 @@ export interface RunLedgerView {
   readonly candidates: readonly V2CandidateId[];
   readonly verifications: readonly V2VerificationId[];
   readonly critics: readonly V2CriticId[];
+  readonly dispositions: readonly V2DispositionId[];
   readonly promotions: readonly V2PromotionId[];
   readonly entries: readonly LifecycleEvidence[];
 }
@@ -359,6 +371,7 @@ export class RunLifecycle {
       candidates: this.evidence.filter((e) => e.kind === "candidate").map((e) => e.id),
       verifications: this.evidence.filter((e) => e.kind === "verification").map((e) => e.id),
       critics: this.evidence.filter((e) => e.kind === "critic").map((e) => e.id),
+      dispositions: this.evidence.filter((e) => e.kind === "disposition").map((e) => e.id),
       promotions: this.evidence.filter((e) => e.kind === "promotion").map((e) => e.id),
       entries: this.evidence,
     };
@@ -467,6 +480,35 @@ export class RunLifecycle {
           "evidence_mismatch",
           this.runId,
           `the critic cites verification ${entry.verificationId}, which judged candidate ${verification.candidateId}, not ${entry.candidateId}`,
+        );
+      }
+    }
+    if (entry.kind === "disposition") {
+      // A disposition adjudicates a candidate that was recorded, the verification it weighed,
+      // AND the critic it weighed — and those must be the SAME candidate/verification the
+      // critic already bound. This is what makes a DispositionRecord provably about the exact
+      // deterministic + semantic evidence of one tree, not a reconciliation of two.
+      this.assertCandidateRecorded(entry.candidateId);
+      const verification = this.evidence.find((e) => e.kind === "verification" && e.id === entry.verificationId);
+      if (verification === undefined) {
+        throw new LifecycleViolationError("unrecorded_evidence", this.runId, `verification ${entry.verificationId} was never recorded`);
+      }
+      if (verification.kind === "verification" && verification.candidateId !== entry.candidateId) {
+        throw new LifecycleViolationError(
+          "evidence_mismatch",
+          this.runId,
+          `the disposition cites verification ${entry.verificationId}, which judged candidate ${verification.candidateId}, not ${entry.candidateId}`,
+        );
+      }
+      const critic = this.evidence.find((e) => e.kind === "critic" && e.id === entry.criticId);
+      if (critic === undefined) {
+        throw new LifecycleViolationError("unrecorded_evidence", this.runId, `critic ${entry.criticId} was never recorded`);
+      }
+      if (critic.kind === "critic" && (critic.candidateId !== entry.candidateId || critic.verificationId !== entry.verificationId)) {
+        throw new LifecycleViolationError(
+          "evidence_mismatch",
+          this.runId,
+          `the disposition cites critic ${entry.criticId}, which judged candidate ${critic.candidateId} on verification ${critic.verificationId}`,
         );
       }
     }

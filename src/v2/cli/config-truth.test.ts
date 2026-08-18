@@ -233,8 +233,7 @@ test("config truth: a missing pointer is the documented NO-PROFILE rule, not a f
   const { result } = v2Run(root, [], { IKBI_MODEL_DRIVER: "alpha-1", IKBI_MODEL_BUILDER: "alpha-1", IKBI_MODEL_CRITIC: "alpha-1" });
   assert.equal(result.receipt.configuration?.profile, null, "no profile selected");
   assert.equal(result.receipt.configuration?.profileSource, "none");
-  assert.ok(result.outcome.kind === "failed");
-  assert.equal(result.outcome.failure.category, "not_implemented", "the run stops for the ordinary reason");
+  assert.ok(result.outcome.kind === "withheld", "the run adjudicates and stops for the ordinary reason");
   // With no profile, the operator/builtin layer still supplies role preferences, so a
   // future resolver is never handed an empty policy just because nothing was selected.
   assert.ok((result.policy?.rolePreferences.length ?? 0) > 0);
@@ -260,14 +259,14 @@ test("config truth: configuration, resolution, context and invocation all really
   const root = makeStateRoot();
   assert.equal(runCli(root, ["profile", "use", "prof-alpha"]).status, 0);
   const { result } = v2Run(root);
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism", "disposition"]);
   assert.equal(result.receipt.evidence.configurationResolved, true);
   assert.equal(result.receipt.evidence.modelResolutionCompleted, true, "a route was authorized");
   assert.equal(result.receipt.evidence.contextAssemblyCompleted, true, "context was assembled");
   assert.equal(result.receipt.evidence.providerInvoked, true, "and the authorized route was really called");
   assert.equal(result.receipt.evidence.invocations, 2, "V2-009: builder + critic");
-  assert.ok(result.outcome.kind === "failed");
-  assert.equal(result.outcome.failure.detail?.missingStage, "disposition", "the next unimplemented stage");
+  assert.ok(result.outcome.kind === "withheld", "the candidate is adjudicated and withheld — nothing promoted");
+  assert.equal(result.receipt.stagesEntered.includes("promotion"), false, "and the run stops before promotion");
 });
 
 test("config truth: configuration never mutates state — the pointer and repo are untouched", () => {

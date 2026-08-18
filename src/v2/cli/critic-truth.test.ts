@@ -150,9 +150,11 @@ test("critic truth: a green candidate judged SATISFIED yields a bound critic rec
   assert.equal(c.candidateTreeId, result.receipt.candidate!.treeId);
   assert.equal(c.verificationId, result.receipt.verification!.verificationId);
   assert.match(c.criticId, /^[0-9a-f]{64}$/);
-  // The run still stops truthfully at the unimplemented disposition.
-  assert.ok(result.outcome.kind === "failed");
-  assert.equal(result.outcome.failure.detail?.missingStage, "disposition");
+  // PASS + satisfied ⇒ the candidate is adjudicated ELIGIBLE and the run withholds it
+  // pending the promotion authority. Nothing was promoted.
+  assert.ok(result.outcome.kind === "withheld");
+  assert.equal(result.receipt.disposition?.decision, "acceptable_for_promotion");
+  assert.equal(result.receipt.stagesEntered.includes("promotion"), false);
 });
 
 test("critic truth: DEFECTS_FOUND names a concrete material defect", async () => {
@@ -308,7 +310,7 @@ test("critic truth: the receipt records the critic without leaking prompt or fil
   assert.ok(result.receipt.critic !== undefined);
   assert.deepEqual(
     [...result.receipt.stagesEntered],
-    ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism"],
+    ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism", "disposition"],
   );
 });
 

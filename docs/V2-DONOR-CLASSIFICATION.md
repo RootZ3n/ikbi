@@ -7,8 +7,8 @@ authority) **V2-005** (canonical model invocation authority) **V2-006** (workspa
 mutation authority), **V2-006A** (canonical source snapshot authority), **V2-006B**
 (deterministic snapshot-bound retrieval), **V2-007** (canonical builder + governed tool
 loop), **V2-007A** (untrusted tool-result neutralization), **V2-008** (canonical
-verification authority) and **V2-009** (canonical critic / intent-alignment
-authority). This is an **advisory input to future work
+verification authority), **V2-009** (canonical critic / intent-alignment
+authority) and **V2-010** (canonical disposition / adjudication authority). This is an **advisory input to future work
 orders**, not a change plan and not permission to delete anything. Nothing in v1 was
 removed, disabled, or altered to produce it.
 
@@ -54,7 +54,7 @@ preserved** and the v2 lifecycle was designed around them (see "Candidate strate
 | Builder (agent lane + patchsmith lane) | `worker-model/builder.ts`, `patchsmith.ts` | **REFINE** | Becomes a candidate *producer* with no verdict authority. v1 already asserts "the builder is a worker, not a witness"; v2 makes the signature unable to express a verdict. |
 | Verifier / check runners / verification ladder | `worker-model/verifier.ts`, `checks.ts`, `src/modules/verification-ladder/` | **ADOPT (single owner)** | The ladder, stub-detection and no-vacuous-green logic are the crown jewels. In v2 there is exactly one verification authority and every candidate — single, shadow, tournament — goes through it. |
 | Critic / critic-fix-loop / critic-recovery | `worker-model/critic*.ts` | **REFINE (done V2-009)** | The semantic-judgment capability is now v2's canonical critic — see *Critic systems (V2-009)* below. The judgment posture is ADOPTed; the best-effort PARSER is REPLACEd by a strict one (no naked rejection); the fix/recovery loop and skip-on-red are PARK/REMOVED. |
-| Adjudication core | `worker-model/adjudication/` | **ADOPT — it is the v2 blueprint** | `WorkProduct` / `ProtocolExit` / `WorkAssessment` / `SafetyAssessment` → one `decidePromotability`, with a signature that *cannot* express a protocol exit, and `treeHash` binding a verdict to the exact tree. v2's `RunTerminalOutcome` and evidence ledger are a direct generalization of it (promote/retain/discard → accepted/withheld/rejected). |
+| Adjudication core | `worker-model/adjudication/` | **ADOPT — the v2 blueprint, realized V2-010** | `WorkProduct` / `ProtocolExit` / `WorkAssessment` / `SafetyAssessment` → one `decidePromotability`, with a signature that *cannot* express a protocol exit, and `treeHash` binding a verdict to the exact tree. V2-010 rebuilds exactly this posture as `src/v2/core/disposition.ts`: one pure `adjudicate` + `judgeDisposition`, a signature that takes evidence + policy and returns a decision (no model, no mutation, no promotion), and identity content-addressed over (candidate/tree, verification, critic, policy, decision, reasons). The v1 core's key ideas are all here — greenness-on-merit, tree-bound verdict, "green work is never discarded" (defects ⇒ withhold, not reject). See *Disposition systems (V2-010)* below. |
 | Recovery / retry systems | `src/modules/recovery/`, `worker-model/critic-recovery.ts`, `fix-recovery-lab.ts`, escalation | **REPLACE (capability preserved)** | Retry policy currently lives in at least three places with different rules. v2 needs one recovery policy reading `RunFailure.retryable` and one attempt ledger. The *decision core* in `src/modules/recovery/` is the best starting point. |
 | Refuter | `worker-model/refuter.ts` | **PARK** | Off by default and correctly optional. It is a safety-evidence contributor; migrate with the disposition slice. |
 | Correction library | `src/modules/correction-library/` | **PARK** | Operator-approved lessons, nothing auto-installs. Governance posture is already right; no v2 pressure on it yet. |
@@ -63,7 +63,8 @@ preserved** and the v2 lifecycle was designed around them (see "Candidate strate
 | Governed exec + sandbox | `src/modules/governed-exec/`, bubblewrap path | **ADOPT** | Allowlist + gate-wall + receipts + OS sandbox, fail-closed off-Linux. No reason to redesign. |
 | Trust (earned tiers, MAC-protected) | `src/core/trust/` | **ADOPT** | Fail-closed, MAC-protected, floor-by-default. Feeds v2's `policy` failure category unchanged. |
 | Identity (claim / verified peer / validated) | `src/core/identity/` | **ADOPT** | The claim-vs-validated posture is exactly what v2's `V2TaskRequest` → `V2Task` boundary imitates. |
-| Promotion | `worker-model/integrator.ts` + `workspace.promote` CAS | **REFINE** | The CAS promote itself is ADOPT-grade. What must change is that promotion is *enacted only by the spine*, from a disposition, never called from a mode. |
+| Promotion | `worker-model/integrator.ts` + `workspace.promote` CAS | **REFINE (mechanics PARK → V2-012)** | The CAS promote itself is ADOPT-grade. V2-010 makes the disposition *decide* eligibility (`acceptable_for_promotion`) without enacting anything — a guard fails the build if the disposition module contains any promote/ref-move. The mechanical publication (the CAS promote, enacted only by the spine from a disposition) is PARKED for V2-012. |
+| Integrator (orchestration blob) | `worker-model/integrator.ts` | **REPLACE (done V2-010)** | 274 lines that re-decide promotability by reaching into role-result detail bags (`filesWritten`, `policyViolations`, `testEvidence`, prevented-attempt thresholds, refuter) — a second adjudication path beside `decidePromotability`, coupled to `RoleFn`/`ctx.task`/`workerModelConfig`. v2 keeps the QUESTION and throws away the blob: `disposition.ts` reads only the three canonical evidence records + one explicit policy, and a guard forbids any v2 import of `worker-model/integrator`. The prevented-attempt / risk-threshold logic is safety-evidence for the disposition/recovery slices, not adjudication core. |
 | Receipts | `src/core/receipt/` | **REFINE** | Durable, attributed, ordered, append-only — keep. The refinement is truth-by-construction: v2 receipts must be *counted* from a lifecycle ledger (as `summarizeEvidence` already does) rather than assembled by callers. |
 | Cost accounting | `worker-model` costing + budget caps | **PARK** | Needs `V2InvocationId` to exist first. Migrating cost before invocation identity would reintroduce attribution-by-coincidence. |
 | MCP model loop | `src/modules/mcp-model-loop/` | **PARK** | Self-contained and off the golden path. Migrate as a tool-surface slice. |
@@ -236,6 +237,35 @@ every untrusted payload (goal, diff, check output, builder claim) crosses the V2
 id kept as provenance, never identity — the SAME judgment of the SAME evidence is the SAME
 record whichever call produced it.
 
+## Disposition systems *(V2-010)*
+
+v1's promote decision lives in two places that partly overlap: the clean pure
+`adjudication/decidePromotability` (the blueprint) and the `integrator.ts` orchestration
+blob that re-derives the same judgement from role-result detail bags. V2-010 keeps the
+QUESTION — "given this candidate, this deterministic verdict, this semantic verdict and
+this explicit policy, what is the lawful disposition?" — and gives it ONE owner.
+
+| v1 system | Production reachability | Verdict |
+| --- | --- | --- |
+| `adjudication/core.ts` — `decidePromotability` (pure, total, tree-bound) | **YES** — the authoritative decision | **ADOPT (rebuilt as `disposition.ts`).** Same posture: deterministic greenness assessed first, a signature that cannot express a protocol exit, verdict bound to the exact tree, and "green work is never discarded" (a defect ⇒ withhold, not reject). v2 generalizes promote/retain/discard into `acceptable_for_promotion / withhold / reject / quarantine`, adds an explicit content-addressed `DispositionPolicy`, and binds the decision to the three canonical evidence records. |
+| `adjudication/contract.ts` — `WorkAssessment.treeHash` / `SafetyAssessment` monotone vetoes | **YES** | **ADOPT as SEMANTICS.** The tree-hash binding is the model for the V2-010 subject re-probe (drift ⇒ quarantine over a stale subject). The safety vetoes are an ADDITIONAL evidence source the disposition input is designed to accept later (a refuter, V2-011+) WITHOUT becoming a second critic — no source overrides another. |
+| `integrator.ts` — the promote/discard ORCHESTRATION | **YES** — every build | **REPLACE.** A second adjudication path that reaches into `builderDetail.filesWritten` / `policyViolations` / `testEvidence`, applies prevented-attempt review thresholds, and consults the refuter — all coupled to `RoleFn`/`ctx.task`/`workerModelConfig`. v2's disposition reads ONLY the `CandidateRecord`, `VerificationRecord`, `CriticRecord` and one `DispositionPolicy`. A guard forbids any v2 import of `worker-model/integrator`. |
+| `integrator.ts` — prevented-attempt risk thresholds / review escalation | **YES** | **PARK → safety-evidence for V2-011.** Real signal, wrong home. It is recovery/operator-review policy, not the promote decision; it returns as a safety-evidence contributor to the disposition input, never as adjudication logic. |
+| skip-critic-on-red / promote-adjacent verdict coupling | **YES** | **REPLACE (removed).** In v2 the critic already runs after every verdict (V2-009) and the disposition weighs both classes explicitly; there is no place where one evidence source silently overrides another. |
+| `workspace.promote` CAS + `integrator` enactment | **YES** | **PARK → V2-012.** The disposition AUTHORIZES eligibility; it never moves a ref. The mechanical publication (CAS promote, enacted only by the spine from a disposition) is the next slice. A guard fails the build if the disposition module contains any promote/merge/commit/ref-move. |
+
+**The load-bearing v2 additions v1 has no equivalent of:** the disposition is PURE (no
+model, no mutation, no check re-run, no promotion, no repair — the invocation count is
+unchanged from builder+critic); it binds an immutable `DispositionSubject`
+(run/task/snapshot/candidate/tree/verification/critic/policy) and refuses incoherent
+evidence outright (`subject_mismatch` ⇒ the run fails); it RE-PROBES the tree at its own
+authority boundary (drift ⇒ quarantine over a stale subject, never an ordinary decision, and
+never an auto-reverify); the policy is an explicit content-addressed input, so the SAME
+evidence under a DIFFERENT policy is a DIFFERENT disposition identity; the secondary flags
+(`eligibleForPromotion` / `requiresRecovery` / `requiresOperator`) are DERIVED from the one
+decision, so an impossible combination cannot be constructed; and `acceptable_for_promotion`
+is reported as `withheld (awaiting_promotion)` — an ELIGIBILITY fact that changes no ref.
+
 ## Standing constraints for later slices
 
 1. **No second promote path.** Any strategy that wants to promote must do it by
@@ -312,3 +342,13 @@ record whichever call produced it.
    verdict; deterministic red does not suppress the semantic judgment. The critic is
    semantic EVIDENCE only: it resolves its own model role, holds no tools, judges an
    immutable review package, and decides nothing about promotion.
+18. **No evidence source overrides another, and eligibility is not promotion.** *(V2-010)*
+   The disposition weighs the deterministic verification AND the semantic critic against ONE
+   explicit content-addressed policy and returns the ONE lawful decision. A red verifier is
+   never overridden by a happy critic; a concrete defect is never erased by a passing
+   verifier (green work is withheld, not discarded). The authority is PURE — no model, no
+   mutation, no check re-run, no promotion, no repair. `acceptable_for_promotion` is an
+   AUTHORIZATION fact reported as `withheld (awaiting_promotion)`; it moves no ref. The
+   derived flags (`eligibleForPromotion`/`requiresRecovery`/`requiresOperator`) come from the
+   one decision, so an impossible combination is unconstructable, and a tree that moved since
+   the critic looked is quarantined over a stale subject, never adjudicated.
