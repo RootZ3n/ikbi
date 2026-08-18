@@ -28,7 +28,7 @@
  * second selection authority inside the invocation path.
  */
 
-import { contentDigest, type V2ContextDigest, type V2DecisionDigest, type V2InvocationId, type V2PromptDigest, type V2RunId, type V2TaskId } from "./identity.js";
+import { contentDigest, type V2DecisionDigest, type V2InvocationId, type V2PromptDigest, type V2RunId, type V2TaskId } from "./identity.js";
 import { runFailure, type RunFailure } from "./failure.js";
 import type { ContextPackage } from "./context.js";
 import type { BuilderToolCall, BuilderToolDefinition } from "./tools.js";
@@ -116,7 +116,8 @@ export interface V2InvocationRequest {
   readonly taskId: V2TaskId;
   readonly role: V2ModelRole;
   readonly resolutionDecisionId: V2DecisionDigest;
-  readonly contextPackageId: V2ContextDigest;
+  /** The authorized input id — a context package (builder) or review package (critic). */
+  readonly contextPackageId: string;
   /** The LOGICAL model the policy preferred and the resolver authorized. */
   readonly authorizedModelId: string;
   readonly authorizedProviderId: string;
@@ -215,7 +216,8 @@ export interface V2InvocationRecord {
   readonly runId: V2RunId;
   readonly taskId: V2TaskId;
   readonly resolutionDecisionId: V2DecisionDigest;
-  readonly contextPackageId: V2ContextDigest;
+  /** The authorized input id — a context package (builder) or review package (critic). */
+  readonly contextPackageId: string;
   readonly promptId: V2PromptDigest;
   readonly identity: InvocationIdentityRecord;
   readonly parameters: V2InvocationParameters;
@@ -273,12 +275,32 @@ function invocationFailure(code: string, message: string, detail?: Readonly<Reco
 // The authority
 // ---------------------------------------------------------------------------
 
+/**
+ * The four facts the invocation authority binds against, for a caller that has an
+ * authorized immutable input which is NOT a context package (the critic's review package).
+ * It carries exactly what the authority checks — nothing it could use to compose input.
+ */
+export interface AuthorizedInputBinding {
+  readonly runId: V2RunId;
+  readonly taskId: V2TaskId;
+  readonly resolutionDecisionId: V2DecisionDigest;
+  /** The id of the authorized input (e.g. the review package id). Stored on the record. */
+  readonly inputId: string;
+}
+
 export interface InvocationAuthorityInput {
   readonly runId: V2RunId;
   readonly taskId: V2TaskId;
   readonly invocationId: V2InvocationId;
   readonly decision: ModelResolutionDecision;
-  readonly contextPackage: ContextPackage;
+  /**
+   * The AUTHORIZED input this call was built from — the builder's context package, or any
+   * other content-addressed immutable input (the critic's review package). Exactly one of
+   * `contextPackage` / `binding` is supplied; both carry the same four facts the authority
+   * binds against, and the record stores the input's id either way.
+   */
+  readonly contextPackage?: ContextPackage;
+  readonly binding?: AuthorizedInputBinding;
   /**
    * EXACTLY what goes on the wire, rendered by the caller.
    *
@@ -305,25 +327,41 @@ export interface InvocationAuthorityInput {
  */
 export async function invokeAuthorized(input: InvocationAuthorityInput): Promise<InvocationResult> {
   const now = input.now ?? Date.now;
-  const { decision, contextPackage: pkg } = input;
+  const { decision } = input;
+
+  // The one authorized input this call binds against — a context package OR a raw binding.
+  // Exactly one must be supplied.
+  const bound =
+    input.contextPackage !== undefined
+      ? { runId: input.contextPackage.runId, taskId: input.contextPackage.taskId, resolutionDecisionId: input.contextPackage.resolutionDecisionId, inputId: input.contextPackage.packageId as string }
+      : input.binding;
+  if (bound === undefined) {
+    return {
+      ok: false,
+      attempted: false,
+      failure: invocationFailure(V2_INVOCATION_FAILURE_CODES.bindingMismatch, "refusing to invoke: no authorized input (context package or binding) was supplied", {
+        decisionId: decision.decisionId,
+      }),
+    };
+  }
 
   // 1. BINDING. Every mismatch here means the caller assembled an inconsistent run.
   const bindingProblem =
-    pkg.runId !== input.runId
-      ? `the context package belongs to run ${pkg.runId}, not ${input.runId}`
-      : pkg.taskId !== input.taskId
-        ? `the context package belongs to task ${pkg.taskId}, not ${input.taskId}`
+    bound.runId !== input.runId
+      ? `the authorized input belongs to run ${bound.runId}, not ${input.runId}`
+      : bound.taskId !== input.taskId
+        ? `the authorized input belongs to task ${bound.taskId}, not ${input.taskId}`
         : decision.runId !== input.runId
           ? `the resolution decision belongs to run ${decision.runId}, not ${input.runId}`
-          : pkg.resolutionDecisionId !== decision.decisionId
-            ? `the context package was sized by decision ${pkg.resolutionDecisionId}, not by the authorized ${decision.decisionId}`
+          : bound.resolutionDecisionId !== decision.decisionId
+            ? `the authorized input was sized by decision ${bound.resolutionDecisionId}, not by the authorized ${decision.decisionId}`
             : undefined;
   if (bindingProblem !== undefined) {
     return {
       ok: false,
       attempted: false,
       failure: invocationFailure(V2_INVOCATION_FAILURE_CODES.bindingMismatch, `refusing to invoke: ${bindingProblem}`, {
-        contextPackageId: pkg.packageId,
+        contextPackageId: bound.inputId,
         decisionId: decision.decisionId,
       }),
     };
@@ -339,7 +377,7 @@ export async function invokeAuthorized(input: InvocationAuthorityInput): Promise
     taskId: input.taskId,
     role: decision.role,
     resolutionDecisionId: decision.decisionId,
-    contextPackageId: pkg.packageId,
+    contextPackageId: bound.inputId,
     authorizedModelId: decision.modelId,
     authorizedProviderId: decision.providerId,
     authorizedProviderModelId: decision.providerModelId,
@@ -440,7 +478,7 @@ export async function invokeAuthorized(input: InvocationAuthorityInput): Promise
       runId: input.runId,
       taskId: input.taskId,
       resolutionDecisionId: decision.decisionId,
-      contextPackageId: pkg.packageId,
+      contextPackageId: bound.inputId,
       promptId: rendered.promptId,
       identity: Object.freeze(identity),
       parameters: Object.freeze(input.parameters),

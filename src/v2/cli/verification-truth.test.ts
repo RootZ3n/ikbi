@@ -171,7 +171,7 @@ test("verification truth: a candidate whose checks FAIL is verified FAIL, retain
   assert.equal(v.workspaceDisposition, "retained", "a failed candidate is kept for recovery/forensics");
   assert.equal(result.receipt.evidence.promoted, false);
   // No repair, no builder re-entry: exactly the builder's turns, no more.
-  assert.equal(result.receipt.evidence.invocations, 3);
+  assert.equal(result.receipt.evidence.invocations, 4, "V2-009: three builder turns AND the critic's one judgment");
 });
 
 // ── NO CHECKS ────────────────────────────────────────────────────────────────

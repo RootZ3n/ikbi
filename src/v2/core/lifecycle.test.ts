@@ -19,7 +19,7 @@ import {
   type LifecycleStage,
   type LifecycleViolationCode,
 } from "./lifecycle.js";
-import type { V2CandidateId, V2VerificationId } from "./identity.js";
+import type { V2CandidateId, V2VerificationId, V2CriticId } from "./identity.js";
 import { summarizeEvidence } from "./result.js";
 
 const ids = createSequentialIdFactory("lcx");
@@ -32,6 +32,7 @@ const DECISION = "1".repeat(64) as V2DecisionDigest;
 const CONTEXT = "2".repeat(64) as V2ContextDigest;
 /** A stand-in invocation id. Invocation identity is the invocation suite's concern. */
 const INVOCATION = ids.mint("invocation");
+const CRITIC_INVOCATION = ids.mint("invocation");
 /** A stand-in workspace id. Workspace identity is the workspace suite's concern. */
 const WORKSPACE = ids.mint("workspace");
 /** A stand-in snapshot digest. Snapshot identity is the source suite's concern. */
@@ -53,6 +54,7 @@ const fakeCandidateId = (seed: string): V2CandidateId => (`${seed}`.repeat(64).s
  */
 let verificationSeed = 0;
 const fakeVerificationId = (seed: string): V2VerificationId => (`${seed}`.repeat(64).slice(0, 64) as V2VerificationId);
+const fakeCriticId = (seed: string): V2CriticId => (`${seed}`.repeat(64).slice(0, 64) as V2CriticId);
 
 function fresh() {
   const ids = createSequentialIdFactory("lc");
@@ -70,6 +72,7 @@ function walkTo(target: LifecycleStage) {
   const candidateId = fakeCandidateId("a");
   const workspaceId = ids.mint("workspace");
   const verificationId = fakeVerificationId("v");
+  const criticId = fakeCriticId("c");
   const promotionId = ids.mint("promotion");
   for (const stage of LIFECYCLE_STAGES) {
     lifecycle.enter(runId, stage);
@@ -92,10 +95,15 @@ function walkTo(target: LifecycleStage) {
     if (stage === "candidate_strategy") lifecycle.record(runId, { kind: "workspace", id: WORKSPACE, baseTree: "t" });
     if (stage === "candidate_generation") lifecycle.record(runId, { kind: "candidate", id: candidateId, workspaceId });
     if (stage === "verification") lifecycle.record(runId, { kind: "verification", id: verificationId, candidateId });
+    // V2-009: the critic's judgment (and its one invocation) belong to the criticism stage.
+    if (stage === "criticism") {
+      lifecycle.record(runId, { kind: "invocation", id: CRITIC_INVOCATION, role: "critic" });
+      lifecycle.record(runId, { kind: "critic", id: criticId, candidateId, verificationId });
+    }
     if (stage === "promotion") lifecycle.record(runId, { kind: "promotion", id: promotionId, candidateId, verificationId });
     if (stage === target) break;
   }
-  return { ...ctx, candidateId, verificationId, promotionId };
+  return { ...ctx, candidateId, verificationId, criticId, promotionId };
 }
 
 function violation(fn: () => void): LifecycleViolationCode {
@@ -120,6 +128,7 @@ test("lifecycle: the canonical order is preflight -> … -> promotion", () => {
     "candidate_strategy",
     "candidate_generation",
     "verification",
+    "criticism",
     "disposition",
     "promotion",
   ]);
@@ -164,8 +173,9 @@ test("lifecycle: canEnter is the pure twin of enter", () => {
   assert.equal(canEnter({ kind: "pending" }, "context"), false);
   assert.equal(canEnter({ kind: "pending" }, "model_resolution"), false);
   assert.equal(canEnter({ kind: "running", stage: "preflight" }, "model_resolution"), true);
-  assert.equal(canEnter({ kind: "running", stage: "verification" }, "disposition"), true);
-  assert.equal(canEnter({ kind: "running", stage: "verification" }, "promotion"), false);
+  assert.equal(canEnter({ kind: "running", stage: "verification" }, "criticism"), true);
+  assert.equal(canEnter({ kind: "running", stage: "verification" }, "disposition"), false);
+  assert.equal(canEnter({ kind: "running", stage: "criticism" }, "disposition"), true);
   assert.equal(canEnter({ kind: "terminal", outcome: { kind: "rejected", reason: "no_work" } }, "preflight"), false);
 });
 
@@ -187,11 +197,20 @@ test("lifecycle: VERIFICATION cannot be entered before a candidate exists", () =
   assert.equal(violation(() => lifecycle.enter(runId, "verification")), "missing_required_evidence");
 });
 
-test("lifecycle: DISPOSITION cannot be entered before a verification VERDICT exists (V2-008)", () => {
+test("lifecycle: CRITICISM cannot be entered before a verification VERDICT exists (V2-008)", () => {
   const { lifecycle, runId } = walkTo("candidate_generation");
-  // The verification STAGE is entered, but no verdict is recorded — disposition/critic
-  // must not run on a candidate deterministic verification has not judged.
+  // The verification STAGE is entered, but no verdict is recorded — criticism must not run
+  // on a candidate deterministic verification has not judged.
   lifecycle.enter(runId, "verification");
+  assert.equal(violation(() => lifecycle.enter(runId, "criticism")), "missing_required_evidence");
+});
+
+test("lifecycle: DISPOSITION cannot be entered before a CRITIC VERDICT exists (V2-009)", () => {
+  const { lifecycle, runId, candidateId, verificationId } = walkTo("verification");
+  // Verification recorded, criticism entered — but no critic judgment yet. Disposition
+  // needs BOTH evidence classes.
+  void candidateId; void verificationId;
+  lifecycle.enter(runId, "criticism");
   assert.equal(violation(() => lifecycle.enter(runId, "disposition")), "missing_required_evidence");
 });
 
@@ -227,6 +246,8 @@ test("lifecycle: a promotion cannot ride a verification of a DIFFERENT candidate
   lifecycle.enter(runId, "verification");
   const firstCandidate = lifecycle.ledger.candidates[0]!;
   lifecycle.record(runId, { kind: "verification", id: verificationId, candidateId: firstCandidate });
+  lifecycle.enter(runId, "criticism");
+  lifecycle.record(runId, { kind: "critic", id: fakeCriticId(String(candidateSeed += 1)), candidateId: firstCandidate, verificationId });
   lifecycle.enter(runId, "disposition");
   lifecycle.enter(runId, "promotion");
   assert.equal(
@@ -341,6 +362,13 @@ test("lifecycle: MANY candidates are first-class — the spine never assumes one
   }
   assert.equal(lifecycle.ledger.candidates.length, 3);
   assert.equal(lifecycle.ledger.verifications.length, 3);
+  lifecycle.enter(runId, "criticism");
+  // The SAME critic authority judges every candidate — no per-strategy critic.
+  for (const candidateId of lifecycle.ledger.candidates) {
+    const v = lifecycle.ledger.entries.find((e) => e.kind === "verification" && e.candidateId === candidateId)!;
+    lifecycle.record(runId, { kind: "critic", id: fakeCriticId(String(candidateSeed += 1)), candidateId, verificationId: (v as { id: V2VerificationId }).id });
+  }
+  assert.equal(lifecycle.ledger.critics.length, 3);
   lifecycle.enter(runId, "disposition");
   lifecycle.enter(runId, "promotion");
   assert.equal(lifecycle.stage, "promotion", "N candidates converge on ONE promotion stage");
@@ -531,7 +559,7 @@ test("lifecycle: THE STANDALONE INVOCATION STAGE IS GONE (V2-007)", () => {
   );
   assert.deepEqual(
     [...LIFECYCLE_STAGES],
-    ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "disposition", "promotion"],
+    ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism", "disposition", "promotion"],
   );
 });
 

@@ -120,6 +120,7 @@ export function renderRun(result: V2RunResult): string {
     ...workspaceLines(result),
     ...candidateLines(result),
     ...verificationLines(result),
+    ...criticLines(result),
     `outcome     ${formatOutcome(result.outcome)}`,
     "evidence    " +
       `provider_invoked=${e.providerInvoked} invocations=${e.invocations} mutations=${e.mutationsApplied} ` +
@@ -262,6 +263,28 @@ function verificationLines(result: V2RunResult): string[] {
   return lines;
 }
 
+/**
+ * The critic judgment, when one ran. A MODEL JUDGMENT — semantic evidence, not proof — so
+ * the render says "critic thinks", names each concrete defect, and refuses to imply a
+ * disposition or a promotion.
+ */
+function criticLines(result: V2RunResult): string[] {
+  const c = result.receipt.critic;
+  if (c === undefined) return [];
+  const label = c.verdict === "satisfied" ? "SATISFIED" : c.verdict === "defects_found" ? "DEFECTS_FOUND" : "INDETERMINATE";
+  const lines = [
+    `critic      ${label} (model judgment) · ${c.defects.length} defect(s) · review ${c.reviewPackageId.slice(0, 12)}`,
+    `  route     ${c.criticDecisionId.slice(0, 12)} · invocation ${c.invocationId}`,
+    `  summary   ${c.summary.split("\n")[0] ?? ""}`,
+  ];
+  for (const d of c.defects) {
+    lines.push(`  ${d.severity.padEnd(9)} ${d.category}${d.paths.length > 0 ? ` [${d.paths.join(", ")}]` : ""}: ${d.description}`);
+  }
+  lines.push(`  id        ${c.criticId}`);
+  lines.push(`  status    SEMANTIC EVIDENCE ONLY — NOT a disposition, NOT a promotion`);
+  return lines;
+}
+
 
 /**
  * Test seam: the command body, with injectable output sinks and — for hermetic tests —
@@ -286,6 +309,7 @@ export async function runV2Cli(
     readonly checksSource?: ProductionRunDeps["checksSource"];
     readonly checkRunner?: ProductionRunDeps["checkRunner"];
     readonly treeProbe?: ProductionRunDeps["treeProbe"];
+    readonly candidateDiff?: ProductionRunDeps["candidateDiff"];
   } = {},
 ): Promise<number> {
   const out = io.stdout ?? writeStdout;
@@ -318,6 +342,7 @@ export async function runV2Cli(
       ...(io.checksSource !== undefined ? { checksSource: io.checksSource } : {}),
       ...(io.checkRunner !== undefined ? { checkRunner: io.checkRunner } : {}),
       ...(io.treeProbe !== undefined ? { treeProbe: io.treeProbe } : {}),
+      ...(io.candidateDiff !== undefined ? { candidateDiff: io.candidateDiff } : {}),
     },
   );
   out(args.json ? `${JSON.stringify(result, null, 2)}\n` : renderRun(result));

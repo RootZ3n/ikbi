@@ -74,6 +74,8 @@ export interface FakeProviderOptions {
    * a plain stop — which the builder correctly treats as "stopped without finishing".
    */
   readonly script?: readonly ScriptedTurn[];
+  /** The exact content served for the CRITIC call (a no-tools request). Default: SATISFIED. */
+  readonly criticResponse?: string;
   /**
    * What the response reports as having served the request.
    *   a string → that id
@@ -151,6 +153,35 @@ const server = http.createServer((req, res) => {
     // fail the run for a reason unrelated to what they are testing. Suites that care about
     // the builder pass their own script; transport-failure suites set a status or a body
     // override and never reach this line.
+    // CRITIC vs BUILDER. The critic call carries NO tools (it holds none) AND its system
+    // turn is the critic contract; the builder's turns always offer tools. Both facts are
+    // required so this does not hijack a plain no-tools adapter request (a raw transport
+    // test sends "system"/"user" and expects the generic default body). A real critic call
+    // is the critic's single judgment: serve the scripted critic JSON, or a valid SATISFIED
+    // default so a candidate-producing suite that does not care about the critic still
+    // passes criticism.
+    const hasTools = Array.isArray(parsed.tools) && parsed.tools.length > 0;
+    const isCriticCall =
+      !hasTools &&
+      Array.isArray(parsed.messages) &&
+      parsed.messages.some((m) => typeof m.content === "string" && m.content.includes("You are ikbi's critic"));
+    if (isCriticCall && options.bodyOverride === undefined && options.status === undefined) {
+      const criticContent = typeof options.criticResponse === "string"
+        ? options.criticResponse
+        : JSON.stringify({ verdict: "satisfied", summary: "The candidate appears to satisfy the operator task.", defects: [] });
+      const requestedModel = typeof parsed.model === "string" ? parsed.model : "";
+      const servedId = options.servedModelId === undefined || options.servedModelId === "echo" ? requestedModel : options.servedModelId;
+      const criticBody = {
+        id: "chatcmpl-fake-critic", object: "chat.completion", created: 0,
+        choices: [{ index: 0, message: { role: "assistant", content: criticContent }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 50, completion_tokens: 20, total_tokens: 70 },
+      };
+      if (servedId !== null) criticBody.model = servedId;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(criticBody));
+      return;
+    }
+
     // The default answer is STATELESS on purpose: these suites share one server across
     // many runs, so an indexed script would answer only the first run and leave every
     // later builder talking to a model that had run out of things to say.

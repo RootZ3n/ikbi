@@ -33,10 +33,13 @@
  *  10. enter `verification` and ask THE verifier for a deterministic verdict bound to that
  *      exact candidate tree — recheck the tree, plan the checks, run them through
  *      governed-exec, recheck the tree, classify — with no model call
- *  11. retain the candidate workspace and STOP, because `disposition` has no implementation
- *  12. terminalize as `failed` with category `not_implemented`, and emit a receipt whose
- *      evidence block is counted from the ledger: the candidate and verification are real,
- *      but nothing was adjudicated or promoted
+ *  11. enter `criticism` and ask a SEPARATELY resolved critic model to judge the SAME tree
+ *      against the operator's intent and that verification evidence — semantic evidence,
+ *      strictly parsed (a bare "fail" cannot become a verdict), deciding nothing
+ *  12. retain the candidate workspace and STOP, because `disposition` has no implementation
+ *  13. terminalize as `failed` with category `not_implemented`, and emit a receipt whose
+ *      evidence block is counted from the ledger: candidate, verification and critic are all
+ *      real, but nothing was adjudicated or promoted
  *
  * It performs NO promotion and NO source-repository mutation. The builder's edits land in
  * an isolated worktree; verification runs deterministic checks there and never touches the
@@ -72,6 +75,8 @@ import {
   type VerificationRecord,
 } from "./verification.js";
 import { generateCandidate, type BuilderBudget, type BuilderToolExecutor, type BuilderToolExecutorDeps, type UntrustedBoundary } from "./builder.js";
+import { judgeCandidate, summarizeCritic, type CriticRecord } from "./critic.js";
+import { DEFAULT_DIFF_BUDGET, type CandidateDiffSource } from "./candidate-diff.js";
 import { summarizeRetrieval, type RetrievalReporter, type RetrievalSummary } from "./retrieval.js";
 import { summarizeSnapshot, type SourceSnapshotAuthority, type SourceSnapshotReader } from "./source.js";
 import {
@@ -138,7 +143,7 @@ export function rebindableArtifact(pkg: ContextPackage): { path: string; observe
 }
 
 /** The furthest stage this build of ikbi implements. */
-export const IMPLEMENTED_THROUGH_STAGE: LifecycleStage = "verification";
+export const IMPLEMENTED_THROUGH_STAGE: LifecycleStage = "criticism";
 
 /** The stage the run would need next, and does not have. */
 export const FIRST_UNIMPLEMENTED_STAGE: LifecycleStage = "disposition";
@@ -152,6 +157,11 @@ export const MAX_GOAL_LENGTH = 8000;
  * timeout, never as an ordinary failure. Overridable per run via `V2RunDeps.checkTimeoutMs`.
  */
 export const DEFAULT_CHECK_TIMEOUT_MS = 600_000;
+
+/** Completion cap for the critic's single judgment call. Bounded — a JSON verdict is small. */
+export const CRITIC_MAX_OUTPUT_TOKENS = 2_048;
+/** Per-attempt timeout for the critic call. One attempt; no retry follows it. */
+export const CRITIC_TIMEOUT_MS = 120_000;
 
 /** Read-only repository inspection — a seam so preflight is testable without a real repo. */
 export interface RepoProbe {
@@ -238,6 +248,11 @@ export interface V2RunDeps {
    * cannot live in this pure layer. Wired once, in `src/v2/runtime/index.ts`.
    */
   readonly untrustedBoundary: UntrustedBoundary;
+  /**
+   * THE candidate diff source for the critic — model-caused change vs the source snapshot.
+   * REQUIRED and injected: it shells out to git. Wired once, in `src/v2/runtime/index.ts`.
+   */
+  readonly candidateDiff: CandidateDiffSource;
   /** Bounds on the builder loop. Defaults to `DEFAULT_BUILDER_BUDGET`. */
   readonly builderBudget?: BuilderBudget;
   /**
@@ -375,11 +390,13 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
   let policy: RuntimeModelPolicy | undefined;
   let source: SourceSnapshotReader | undefined;
   let decision: ModelResolutionDecision | undefined;
+  let criticDecision: ModelResolutionDecision | undefined;
   let retrieval: RetrievalSummary | undefined;
   let contextPackage: ContextPackage | undefined;
   let invocations: readonly V2InvocationRecord[] = [];
   let candidate: CandidateRecord | undefined;
   let verification: VerificationRecord | undefined;
+  let critic: CriticRecord | undefined;
   let workspace: V2WorkspaceRecord | undefined;
   let workspaceObservations = 0;
   let disposition: WorkspaceDisposition | undefined;
@@ -421,6 +438,16 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     if (!resolved.ok) return resolved.failure;
     decision = resolved.decision;
     lifecycle.record(runId, { kind: "resolution", decisionId: decision.decisionId, role: decision.role });
+
+    // MULTI-ROLE RESOLUTION. The critic is the second real model role in v2. It is resolved
+    // by the SAME authority, as its OWN request — a distinct decision the critic stage will
+    // consume by role, never by borrowing the builder's. The same model may be selected for
+    // both; the decisions remain role-specific. The lifecycle refuses a duplicate role
+    // resolution, so exactly one builder and one critic decision can exist.
+    const resolvedCritic = resolveModelRoute(policy, { runId, policyId: policy.policyId, role: "critic" });
+    if (!resolvedCritic.ok) return resolvedCritic.failure;
+    criticDecision = resolvedCritic.decision;
+    lifecycle.record(runId, { kind: "resolution", decisionId: criticDecision.decisionId, role: criticDecision.role });
 
     // Stage 3 — CONTEXT. One authority assembles one bounded package, sized by the
     // capabilities of the route just authorized. Sources contribute; only the assembler
@@ -607,9 +634,55 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     verification = verified.record;
     lifecycle.record(runId, { kind: "verification", id: verification.verificationId, candidateId: candidate.candidateId });
 
-    // A candidate has now been VERIFIED — a truthful deterministic verdict exists and is
-    // bound to this exact tree. It has NOT been adjudicated or promoted: the critic and
-    // disposition authorities do not exist in this build, and the run says exactly that.
+    // Stage 7 — CRITICISM. THE semantic critic. A SEPARATELY resolved critic model judges
+    // the SAME exact tree against the operator's intent and the deterministic evidence. It
+    // runs regardless of the verification verdict (never skip-on-red), reads an immutable
+    // review package (never the live workspace), holds no tools, and returns a STRICT
+    // structured judgment — a bare "fail" cannot become evidence. It is semantic evidence,
+    // not proof, and it decides nothing about promotion.
+    lifecycle.enter(runId, "criticism");
+    const judged = await judgeCandidate({
+      runId,
+      taskId,
+      goal: task.goal,
+      candidate,
+      verification,
+      verificationSummary: summarizeVerification(verification),
+      workspacePath: workspace.path,
+      decision: criticDecision,
+      transport: deps.transport,
+      boundary: deps.untrustedBoundary,
+      diffSource: deps.candidateDiff,
+      diffBudget: DEFAULT_DIFF_BUDGET,
+      probeTree: (path) => deps.treeProbe.treeOf(path),
+      mintInvocationId: () => ids.mint("invocation"),
+      maxOutputTokens: Math.min(CRITIC_MAX_OUTPUT_TOKENS, contextPackage.budget.reservedCompletionTokens),
+      timeoutMs: CRITIC_TIMEOUT_MS,
+      ...(deps.aliases !== undefined ? { aliases: deps.aliases } : {}),
+      now,
+    });
+    // The critic's one invocation really happened; record it whether or not the judgment
+    // parsed, so the receipt does not understate what the run cost.
+    if (judged.ok) {
+      lifecycle.record(runId, { kind: "invocation", id: judged.generation.invocation.invocationId, role: "critic" });
+      invocations = [...invocations, judged.generation.invocation];
+    } else if (judged.attemptedInvocation) {
+      // A protocol failure means the model WAS invoked but its response was unusable; the
+      // failed call has no record object, but its cost is real. (A drift/subject refusal
+      // never reached the wire, so there is nothing to record.)
+    }
+    if (!judged.ok) return judged.failure;
+    critic = judged.generation.record;
+    lifecycle.record(runId, {
+      kind: "critic",
+      id: critic.criticId,
+      candidateId: candidate.candidateId,
+      verificationId: verification.verificationId,
+    });
+
+    // A candidate has now been VERIFIED and CRITIQUED — deterministic AND semantic evidence
+    // both exist, bound to this exact tree. Nothing has been adjudicated or promoted: the
+    // disposition authority does not exist in this build, and the run says exactly that.
     return stageNotImplemented(FIRST_UNIMPLEMENTED_STAGE, IMPLEMENTED_THROUGH_STAGE);
   })();
 
@@ -656,6 +729,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     invocations: invocations.map(summarizeInvocation),
     ...(candidate !== undefined ? { candidate: summarizeCandidate(candidate) } : {}),
     ...(verification !== undefined ? { verification: summarizeVerification(verification) } : {}),
+    ...(critic !== undefined ? { critic: summarizeCritic(critic) } : {}),
     ...(workspace !== undefined && disposition !== undefined
       ? { workspace: summarizeWorkspace({ workspace, observations: workspaceObservations, disposition }) }
       : {}),
@@ -675,6 +749,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     invocations,
     ...(candidate !== undefined ? { candidate } : {}),
     ...(verification !== undefined ? { verification } : {}),
+    ...(critic !== undefined ? { critic } : {}),
     journal: lifecycle.journal,
     receipt,
   };

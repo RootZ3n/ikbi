@@ -69,6 +69,12 @@ export interface CandidateTreeIdentity {
   /** The tree the workspace started from: HEAD's tree, before materialization. */
   readonly baseTreeId: string;
   /**
+   * The tree the BUILDER started from — HEAD plus the operator's materialized uncommitted
+   * work, captured at allocation. `treeId` vs THIS is the model-caused change; `treeId` vs
+   * `baseTreeId` would wrongly attribute the operator's own work-in-progress to the model.
+   */
+  readonly startTree: string;
+  /**
    * Digest over the materialized source state — the operator's uncommitted work as it was
    * reproduced. Recorded so the model's delta can be separated from the operator's.
    */

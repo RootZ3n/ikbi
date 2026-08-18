@@ -251,7 +251,7 @@ test("source truth: exactly ONE snapshot, and the whole spine agrees on it", () 
   assert.equal(result.receipt.evidence.sourceSnapshots, 1);
   assert.equal(result.context?.sourceSnapshotId, id, "context came from it");
   assert.equal(result.receipt.workspace?.sourceSnapshotId, id, "the workspace was materialized from it");
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism"]);
 });
 
 test("source truth: the human rendering states the snapshot and what was materialized", () => {

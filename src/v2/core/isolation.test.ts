@@ -312,8 +312,10 @@ test("single authority: only the workspace authority may import the SOURCE MATER
 
 test("single authority: only the snapshot module captures working-tree state", () => {
   // Everything else reads through the run's SourceSnapshotReader. A second component
-  // asking git what the working tree looks like would be a second source reality.
-  const allowed = new Set([join(V2_DIR, "runtime", "source-snapshot.ts")]);
+  // asking git what the working TREE looks like would be a second source reality.
+  // `candidate-diff.ts` diffs two immutable TREE OBJECTS (start vs candidate) — it never
+  // reads the working tree — so it is allowed to run `git diff <tree> <tree>`.
+  const allowed = new Set([join(V2_DIR, "runtime", "source-snapshot.ts"), join(V2_DIR, "runtime", "candidate-diff.ts")]);
   const offenders: string[] = [];
   for (const file of tsFiles(V2_DIR)) {
     if (allowed.has(file) || file.endsWith(".test.ts") || file.endsWith("fixture-repo.ts")) continue;
@@ -380,6 +382,74 @@ test("single authority: only the TOOL EXECUTOR writes candidate files, and it ho
   );
   const source = stripComments(readFileSync(file, "utf8"));
   assert.equal(/writeFileSync|readFileSync|rmSync|unlinkSync|mkdirSync/.test(source), false, "no raw filesystem call");
+});
+
+test("single authority: only the critic module mints a critic/defect identity (V2-009)", () => {
+  const allowed = new Set([join(V2_DIR, "core", "critic.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    const source = stripComments(readFileSync(file, "utf8"));
+    if (/contentDigest\s*\(\s*"critic|contentDigest\s*\(\s*"defect/.test(source)) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "critic + defect identity belong to src/v2/core/critic.ts alone");
+});
+
+test("single authority: a candidate is JUDGED only by the run spine (V2-009)", () => {
+  // `critic.ts` declares `judgeCandidate`; `run.ts` is the only caller. A second caller
+  // would be a second semantic-review path.
+  const allowed = new Set([join(V2_DIR, "core", "run.ts"), join(V2_DIR, "core", "critic.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    if (/judgeCandidate\s*\(/.test(stripComments(readFileSync(file, "utf8")))) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "no component may run the critic on its own");
+});
+
+test("single authority: the CRITIC neither mutates, verifies, nor holds a tool (V2-009)", () => {
+  // Deterministic-evidence separation: the critic reads a review package and returns a
+  // judgment. It must not import the mutation authority, governed-exec, the builder tools,
+  // a check runner, or any disposition/promotion — and it invokes only through the one
+  // invocation authority.
+  const criticFiles = [join(V2_DIR, "core", "critic.ts"), join(V2_DIR, "core", "critic-review.ts")];
+  for (const file of criticFiles) {
+    const specs = importSpecifiers(readFileSync(file, "utf8"));
+    for (const forbidden of ["governed-exec", "./builder-tools", "runtime/check-runner", "runtime/candidate-capture"]) {
+      assert.equal(specs.some((sp) => sp.includes(forbidden)), false, `${relative(SRC, file)} must not import ${forbidden}`);
+    }
+    const source = stripComments(readFileSync(file, "utf8"));
+    assert.equal(/\.mutate\s*\(|verifyCandidate|writeFileSync|execFile|spawn\s*\(/.test(source), false, `${relative(SRC, file)} must not mutate, verify or spawn`);
+  }
+});
+
+test("single authority: no v2 file imports a v1 critic / refuter / integrator / semantic judge (V2-009)", () => {
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (file.endsWith(".test.ts")) continue;
+    for (const spec of importSpecifiers(readFileSync(file, "utf8"))) {
+      if (/worker-model\/(critic|refuter|integrator|critic-fix-loop|semantic-verdict|semantic-evidence|deterministic-judge)/.test(spec)) {
+        offenders.push(`${relative(SRC, file)} -> ${spec}`);
+      }
+    }
+  }
+  assert.deepEqual(offenders, [], "v2's critic is rebuilt, not borrowed — and no bare PASS/FAIL parser is imported");
+});
+
+test("single authority: critic input crosses the untrusted boundary (V2-009)", () => {
+  // The critic's review render must wrap its untrusted payloads (goal, diff, check output,
+  // builder claim) through the injected boundary — never raw-concatenate them.
+  const source = stripComments(readFileSync(join(V2_DIR, "core", "critic-review.ts"), "utf8"));
+  assert.ok(/boundary\.wrap\s*\(/.test(source), "the review render wraps untrusted payloads through the boundary");
+});
+
+test("single authority: consumers request a model decision BY ROLE, never by array position (V2-009)", () => {
+  // Multi-role resolution: the critic must resolve its OWN decision (role: "critic"), not
+  // borrow the builder's. A `role: "critic"` request appears; no code indexes a decisions
+  // array positionally to pick a role.
+  const runSource = stripComments(readFileSync(join(V2_DIR, "core", "run.ts"), "utf8"));
+  assert.ok(/role:\s*["']critic["']/.test(runSource), "the critic route is resolved as its own role request");
+  assert.ok(/role:\s*DEMONSTRATED_ROLE|role:\s*["']builder["']/.test(runSource), "the builder route is resolved as its own role request");
 });
 
 test("single chokepoint: only the boundary adapter imports v1 neutralization (V2-007A)", () => {

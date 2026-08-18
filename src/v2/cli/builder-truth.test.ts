@@ -162,14 +162,14 @@ test("builder truth: the receipt states EXACTLY what happened", async () => {
   const { result } = await editRun();
   const e = result.receipt.evidence;
   assert.equal(e.providerInvoked, true);
-  assert.equal(e.invocations, 3, "three model turns");
+  assert.equal(e.invocations, 4, "three builder turns AND the critic's one judgment");
   assert.equal(e.mutationsApplied, 1);
   assert.equal(e.candidatesCreated, 1);
   assert.equal(e.candidateMutated, true, "the ISOLATED workspace was changed");
   assert.equal(e.sourceRepositoryMutated, false, "and the operator's repository was NOT");
   assert.deepEqual(
     [...result.receipt.stagesEntered],
-    ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification"],
+    ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism"],
   );
 });
 
@@ -179,10 +179,12 @@ test("builder truth: EVERY model turn went over the wire, on the SAME authorized
   const { result, server } = await editRun();
   const received = await server.received();
   const completions = received.filter((r) => r.path.includes("chat/completions"));
-  assert.equal(completions.length, 3, "three real HTTP requests");
+  // Three builder turns (with tools) plus the critic's one judgment (no tools).
+  const builderTurns = completions.filter((r) => r.toolNames.length > 0);
+  assert.equal(builderTurns.length, 3, "three real builder HTTP requests");
   assert.deepEqual([...new Set(completions.map((r) => r.wireModelId))], ["m1-wire"], "no fallback, no second route");
-  assert.equal(result.receipt.invocations.length, 3);
-  assert.equal(new Set(result.receipt.invocations.map((i) => i.invocationId)).size, 3, "each turn has its OWN invocation id");
+  assert.equal(result.receipt.invocations.length, 4, "three builder turns + one critic");
+  assert.equal(new Set(result.receipt.invocations.map((i) => i.invocationId)).size, 4, "each call has its OWN invocation id");
   for (const i of result.receipt.invocations) {
     assert.equal(i.servedModelId, "m1-wire");
     assert.equal(i.identityStatus, "match");
@@ -193,9 +195,13 @@ test("builder truth: EVERY model turn went over the wire, on the SAME authorized
 test("builder truth: the provider was offered exactly the five builder tools, every turn", async () => {
   const { server } = await editRun();
   const completions = (await server.received()).filter((r) => r.path.includes("chat/completions"));
-  for (const request of completions) {
+  const builderTurns = completions.filter((r) => r.toolNames.length > 0);
+  assert.equal(builderTurns.length, 3, "the three builder turns carry tools");
+  for (const request of builderTurns) {
     assert.deepEqual([...request.toolNames], ["read_file", "replace_file", "create_file", "delete_file", "finish_candidate"]);
   }
+  // The critic call is the one with NO tools.
+  assert.equal(completions.filter((r) => r.toolNames.length === 0).length, 1, "the critic is offered no tools");
 });
 
 test("builder truth: the conversation GREW — turn 3 carries the tool results of turns 1-2", async () => {
@@ -304,7 +310,10 @@ test("builder truth: the candidate is bound to the source snapshot and the build
   assert.equal(candidate.sourceSnapshotId, result.receipt.sourceSnapshot!.snapshotId);
   assert.equal(candidate.builderDecisionId, result.receipt.resolution!.decisionId);
   assert.equal(candidate.workspaceId, result.receipt.workspace!.workspaceId);
-  assert.deepEqual([...candidate.invocationIds], result.receipt.invocations.map((i) => i.invocationId));
+  // The candidate is made of the BUILDER's invocations only; the receipt additionally
+  // carries the critic's call (V2-009), so the candidate's ids are a PREFIX of the receipt's.
+  assert.deepEqual([...candidate.invocationIds], result.receipt.invocations.slice(0, candidate.invocationIds.length).map((i) => i.invocationId));
+  assert.equal(result.receipt.invocations.length, candidate.invocationIds.length + 1, "the receipt adds exactly the critic call");
   assert.equal(candidate.mutationIds.length, candidate.mutations, "the ledger ids are real, not a count");
 });
 

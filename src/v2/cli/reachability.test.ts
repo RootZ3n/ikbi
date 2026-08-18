@@ -43,25 +43,30 @@ const hermeticConfiguration: ConfigurationSource = {
       ],
     },
     activeProfile: { kind: "none" },
-    operatorDefaults: { models: [{ tier: "builder", modelId: "alpha-1", explicit: true }] },
+    operatorDefaults: { models: [{ tier: "builder", modelId: "alpha-1", explicit: true }, { tier: "critic", modelId: "alpha-1", explicit: true }] },
   }),
 };
 
 
 /** A hermetic transport: no network, deterministic answer, echoes the wire model id. */
 const fakeTransport: InvocationTransport = {
-  send: async (input) => ({
-    ok: true,
-    // V2-007: a builder that immediately declares itself finished. This suite is about
-    // REACHABILITY of the spine, not about what a model does inside it.
-    response: {
-      content: "",
-      finishReason: "tool_calls",
-      toolCalls: [{ id: "f1", name: "finish_candidate", arguments: JSON.stringify({ summary: "nothing asked of me", believesComplete: true }) }],
-      servedModelId: input.providerModelId,
-      attempts: 1,
-    },
-  }),
+  send: async (input) => {
+    // V2-009: the CRITIC call (no tools) gets a valid SATISFIED judgment; the builder call
+    // (with tools) finishes immediately. This suite is about REACHABILITY of the spine.
+    if (input.tools === undefined || input.tools.length === 0) {
+      return { ok: true, response: { content: JSON.stringify({ verdict: "satisfied", summary: "ok", defects: [] }), finishReason: "stop", servedModelId: input.providerModelId, attempts: 1 } };
+    }
+    return {
+      ok: true,
+      response: {
+        content: "",
+        finishReason: "tool_calls",
+        toolCalls: [{ id: "f1", name: "finish_candidate", arguments: JSON.stringify({ summary: "nothing asked of me", believesComplete: true }) }],
+        servedModelId: input.providerModelId,
+        attempts: 1,
+      },
+    };
+  },
 };
 
 /** Hermetic workspace + mutation authorities: no git, no filesystem, no worktree. */
@@ -123,7 +128,7 @@ function capture() {
     buildTools: () => ({ execute: async () => ({ outcome: { kind: "rejected" as const, reason: "unknown_tool" as const, detail: "no tools here" } }) }),
     captureTree: async () => ({
       ok: true as const,
-      tree: { treeId: "t".repeat(40), baseTreeId: "t".repeat(40), materializedStateDigest: "m".repeat(64), changed: false },
+      tree: { treeId: "t".repeat(40), baseTreeId: "t".repeat(40), startTree: "t".repeat(40), materializedStateDigest: "m".repeat(64), changed: false },
     }),
     // V2-008: hermetic verification seams. The tree probe returns the SAME id captureTree
     // froze (no drift), and there are no checks → verdict no_checks. This suite is about
@@ -131,6 +136,7 @@ function capture() {
     checksSource: { resolve: async () => ({ ok: false as const, reason: "hermetic reachability suite: no checks" }) },
     checkRunner: { run: async () => ({ launched: false as const, timedOut: false, durationMs: 0, outputSha256: "0".repeat(64), outputExcerpt: "" }) },
     treeProbe: { treeOf: async () => "t".repeat(40) },
+    candidateDiff: { diff: async (i: { candidateId: string; sourceSnapshotId: string; fromTree: string; toTree: string }) => ({ diffId: "d".repeat(64) as never, candidateId: i.candidateId as never, sourceSnapshotId: i.sourceSnapshotId as never, fromTree: i.fromTree, toTree: i.toTree, files: [], empty: true, truncated: false }) },
     get out() {
       return out;
     },
@@ -164,7 +170,7 @@ test("reachability: the command body enters the canonical lifecycle and reports 
   assert.equal(cap.err, V2_BANNER, "the experimental banner goes to stderr, not stdout");
   assert.match(
     cap.out,
-    /stages\s+preflight -> model_resolution -> context -> candidate_strategy -> candidate_generation -> verification$/m,
+    /stages\s+preflight -> model_resolution -> context -> candidate_strategy -> candidate_generation -> verification -> criticism$/m,
     "the run walked the whole implemented spine",
   );
   assert.match(cap.out, /not implemented/, "and said so truthfully");
@@ -180,7 +186,7 @@ test("reachability: the JSON surface carries the lifecycle journal + a counted r
   assert.equal(result.journal[0]?.from, "pending");
   assert.equal(result.journal[0]?.to, "preflight");
   assert.equal(result.journal.at(-1)?.to, "terminal");
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism"]);
   assert.equal(result.outcome.kind, "failed");
   assert.deepEqual(result.receipt.evidence, {
     // Configuration (V2-002) and route authorization (V2-003) happen — and nothing else.
@@ -188,14 +194,16 @@ test("reachability: the JSON surface carries the lifecycle journal + a counted r
     sourceSnapshotCaptured: true,
     sourceSnapshots: 1,
     modelResolutionCompleted: true,
-    modelResolutions: 1,
+    // V2-009: builder AND critic roles are each resolved once.
+    modelResolutions: 2,
     contextAssemblyCompleted: true,
     // FALSE, honestly: this run injects its own context sources, so no retrieval was
     // wired and none is claimed. A run only reports what it actually did.
     retrievalPerformed: false,
     contextPackages: 1,
     providerInvoked: true,
-    invocations: 1,
+    // V2-009: the builder's finish turn AND the critic's one judgment.
+    invocations: 2,
     workspacesAllocated: 1,
     observationsTaken: 0,
     mutationsApplied: 0,
@@ -216,7 +224,7 @@ test("reachability: the CLI never claims a stage it did not run", async () => {
   await runV2Cli(["build", "x", "--json"], cap);
   const result = JSON.parse(cap.out) as V2RunResult;
   for (const stage of LIFECYCLE_STAGES) {
-    if (stage === "preflight" || stage === "model_resolution" || stage === "context" || stage === "candidate_strategy" || stage === "candidate_generation" || stage === "verification") continue;
+    if (stage === "preflight" || stage === "model_resolution" || stage === "context" || stage === "candidate_strategy" || stage === "candidate_generation" || stage === "verification" || stage === "criticism") continue;
     assert.equal(result.receipt.stagesEntered.includes(stage), false, `never entered ${stage}`);
   }
   assert.ok(result.outcome.kind === "failed");

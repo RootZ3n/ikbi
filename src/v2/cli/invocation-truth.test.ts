@@ -138,9 +138,11 @@ test("invocation truth: a REAL request reaches the provider carrying the authori
   // What the SERVER actually received — not what the CLI says it sent.
   const received = await server.received();
   const calls = received.filter((r) => r.path.includes("chat/completions"));
-  assert.equal(calls.length, 1, "exactly one outbound call: no retry, no fallback");
-  assert.equal(calls[0]?.wireModelId, "alpha-v1", "the authorized WIRE id, not the logical model id");
-  assert.equal(calls[0]?.method, "POST");
+  // Two outbound calls: the builder (with tools) and the critic (no tools). No retry.
+  assert.equal(calls.length, 2, "one builder call, one critic call — no retry, no fallback");
+  const builderCall = calls.find((c) => c.toolNames.length > 0)!;
+  assert.equal(builderCall.wireModelId, "alpha-v1", "the authorized WIRE id, not the logical model id");
+  assert.equal(builderCall.method, "POST");
 
   // The context really travelled — the repository marker is in the request body.
   const body = (calls[0]?.messages ?? []).map((m) => m.content).join("\n");
@@ -179,7 +181,10 @@ test("invocation truth: switching the profile changes the WIRE model actually se
   v2Run(server, root, repo);
 
   const calls = (await server.received()).filter((r) => r.path.includes("chat/completions"));
-  assert.deepEqual(calls.map((c) => c.wireModelId), ["alpha-v1", "beta-v1"], "the operator's strategy decided what left the process");
+  // Each run makes a builder call (with tools) and a critic call; the BUILDER call is the
+  // one whose wire model the operator's strategy decides.
+  const builderCalls = calls.filter((c) => c.toolNames.length > 0);
+  assert.deepEqual(builderCalls.map((c) => c.wireModelId), ["alpha-v1", "beta-v1"], "the operator's strategy decided what left the process");
 });
 
 // ── the identity hostile cases ──────────────────────────────────────────────
@@ -316,9 +321,9 @@ test("invocation truth: nothing is built, verified or written", async () => {
   const before = spawnSync("git", ["status", "--porcelain"], { cwd: repo, encoding: "utf8" }).stdout;
   const { result } = v2Run(server, root, repo);
   const e = result.receipt.evidence;
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism"]);
   assert.equal(e.providerInvoked, true);
-  assert.equal(e.invocations, 1);
+  assert.equal(e.invocations, 2, "V2-009: the builder call AND the critic call");
   assert.equal(e.candidatesCreated, 1, "no candidate was created");
   assert.equal(e.verificationsPerformed, 1, "V2-008: the candidate WAS verified (no_checks)");
   assert.equal(e.promoted, false);

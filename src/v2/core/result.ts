@@ -48,6 +48,7 @@ import type { V2WorkspaceRecord, WorkspaceDisposition } from "./workspace.js";
 import type { SourceSnapshotSummary } from "./source.js";
 import type { CandidateRecord, RunCandidateSummary } from "./candidate.js";
 import type { RunVerificationSummary, VerificationRecord } from "./verification.js";
+import type { RunCriticSummary, CriticRecord } from "./critic.js";
 import type { RetrievalSummary } from "./retrieval.js";
 
 /** Why verified-good work was withheld instead of promoted. Closed set. */
@@ -400,6 +401,12 @@ export interface V2RunReceipt {
    * tree — never optimistic, always counted from the ledger.
    */
   readonly verification?: RunVerificationSummary;
+  /**
+   * Absent unless the critic actually judged the candidate. Present with a structured
+   * semantic verdict and named material defects — a MODEL JUDGMENT (evidence, not proof),
+   * bound to the exact candidate tree and verification the critic read.
+   */
+  readonly critic?: RunCriticSummary;
   readonly startedAt: number;
   readonly endedAt: number;
 }
@@ -472,6 +479,8 @@ export interface V2RunResult {
   readonly candidate?: CandidateRecord;
   /** The verification this run performed, when a candidate reached verification. */
   readonly verification?: VerificationRecord;
+  /** The critic judgment this run performed, when a candidate reached criticism. */
+  readonly critic?: CriticRecord;
   /** Every transition the run made, in order. The run's own account of itself. */
   readonly journal: readonly LifecycleTransition[];
   readonly receipt: V2RunReceipt;

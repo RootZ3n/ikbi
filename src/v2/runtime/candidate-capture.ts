@@ -73,6 +73,7 @@ export async function captureCandidateTree(workspace: V2WorkspaceRecord): Promis
       tree: {
         treeId,
         baseTreeId: workspace.source.baseTree,
+        startTree: workspace.source.startTree,
         materializedStateDigest: workspace.source.materializedStateDigest,
         // Compared against the tree recorded at ALLOCATION — HEAD plus the operator's
         // materialized work. Comparing against HEAD instead would report the operator's

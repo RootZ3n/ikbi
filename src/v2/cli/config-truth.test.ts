@@ -260,12 +260,12 @@ test("config truth: configuration, resolution, context and invocation all really
   const root = makeStateRoot();
   assert.equal(runCli(root, ["profile", "use", "prof-alpha"]).status, 0);
   const { result } = v2Run(root);
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism"]);
   assert.equal(result.receipt.evidence.configurationResolved, true);
   assert.equal(result.receipt.evidence.modelResolutionCompleted, true, "a route was authorized");
   assert.equal(result.receipt.evidence.contextAssemblyCompleted, true, "context was assembled");
   assert.equal(result.receipt.evidence.providerInvoked, true, "and the authorized route was really called");
-  assert.equal(result.receipt.evidence.invocations, 1);
+  assert.equal(result.receipt.evidence.invocations, 2, "V2-009: builder + critic");
   assert.ok(result.outcome.kind === "failed");
   assert.equal(result.outcome.failure.detail?.missingStage, "disposition", "the next unimplemented stage");
 });

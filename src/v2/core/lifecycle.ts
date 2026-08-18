@@ -16,6 +16,7 @@
  *     -> candidate_generation zero or more Candidates are produced — the builder loop
  *                             runs HERE, so this is where model invocations happen
  *     -> verification         every candidate is judged by the SAME authority
+ *     -> criticism             a semantic critic judges intent against the same tree
  *     -> disposition          the adjudication decision (promote / withhold / discard)
  *     -> promotion            the decision is enacted
  *     -> terminal             exactly one authoritative outcome
@@ -55,6 +56,7 @@ import type {
   V2PromotionId,
   V2RunId,
   V2VerificationId,
+  V2CriticId,
   V2WorkspaceId,
 } from "./identity.js";
 import type { RunTerminalOutcome } from "./result.js";
@@ -82,6 +84,7 @@ export const LIFECYCLE_STAGES = [
   "candidate_strategy",
   "candidate_generation",
   "verification",
+  "criticism",
   "disposition",
   "promotion",
 ] as const;
@@ -148,6 +151,12 @@ export type LifecycleEvidence =
   | { readonly kind: "candidate"; readonly id: V2CandidateId; readonly workspaceId: V2WorkspaceId }
   | { readonly kind: "verification"; readonly id: V2VerificationId; readonly candidateId: V2CandidateId }
   | {
+      readonly kind: "critic";
+      readonly id: V2CriticId;
+      readonly candidateId: V2CandidateId;
+      readonly verificationId: V2VerificationId;
+    }
+  | {
       readonly kind: "promotion";
       readonly id: V2PromotionId;
       readonly candidateId: V2CandidateId;
@@ -179,7 +188,9 @@ const EVIDENCE_STAGE: Record<LifecycleEvidence["kind"], readonly LifecycleStage[
   // for a qualification call whose only finding — "the route works" — the builder's first
   // turn establishes anyway. A stage that exists to be redundant is not a safeguard.
   // InvocationAuthority is untouched and is still the only doorway to a model.
-  invocation: ["candidate_generation"],
+  // An invocation happens where a model is actually called: the builder loop, and now the
+  // critic's single semantic call in `criticism`. Nowhere else.
+  invocation: ["candidate_generation", "criticism"],
   // A workspace is allocated by the stage that decides WHERE a candidate would be
   // produced. Observations may be taken there and, later, while a candidate is built.
   workspace: ["candidate_strategy"],
@@ -189,6 +200,8 @@ const EVIDENCE_STAGE: Record<LifecycleEvidence["kind"], readonly LifecycleStage[
   mutation: ["candidate_generation"],
   candidate: ["candidate_generation"],
   verification: ["verification"],
+  // A critic judgment is recordable only by the stage that owns semantic review.
+  critic: ["criticism"],
   promotion: ["promotion"],
 };
 
@@ -209,10 +222,12 @@ const STAGE_REQUIRES: Partial<Record<LifecycleStage, readonly LifecycleEvidence[
   candidate_generation: ["workspace"],
   // Nothing to verify without at least one candidate. (One OR MANY — see contract.ts.)
   verification: ["candidate"],
-  // Disposition adjudicates a VERIFIED candidate. It cannot be entered without a
-  // verification verdict on the ledger — critic/disposition never runs on a candidate that
-  // deterministic verification has not judged.
-  disposition: ["verification"],
+  // Semantic criticism judges a VERIFIED candidate. It needs the deterministic verdict on
+  // the ledger; it runs regardless of what that verdict WAS (pass, fail, no_checks, …).
+  criticism: ["verification"],
+  // Disposition adjudicates on BOTH evidence classes — the deterministic verification AND
+  // the semantic critic judgment. It cannot run on a candidate that either has not judged.
+  disposition: ["verification", "critic"],
   // Nothing to promote without a verdict from the canonical verification authority.
   promotion: ["verification"],
 };
@@ -230,6 +245,7 @@ export interface RunLedgerView {
   readonly invocations: readonly V2InvocationId[];
   readonly candidates: readonly V2CandidateId[];
   readonly verifications: readonly V2VerificationId[];
+  readonly critics: readonly V2CriticId[];
   readonly promotions: readonly V2PromotionId[];
   readonly entries: readonly LifecycleEvidence[];
 }
@@ -342,6 +358,7 @@ export class RunLifecycle {
       invocations: this.evidence.filter((e) => e.kind === "invocation").map((e) => e.id),
       candidates: this.evidence.filter((e) => e.kind === "candidate").map((e) => e.id),
       verifications: this.evidence.filter((e) => e.kind === "verification").map((e) => e.id),
+      critics: this.evidence.filter((e) => e.kind === "critic").map((e) => e.id),
       promotions: this.evidence.filter((e) => e.kind === "promotion").map((e) => e.id),
       entries: this.evidence,
     };
@@ -436,6 +453,23 @@ export class RunLifecycle {
       }
     }
     if (entry.kind === "verification") this.assertCandidateRecorded(entry.candidateId);
+    if (entry.kind === "critic") {
+      // A critic judgment must name a candidate that was recorded AND the verification it
+      // read — and that verification must have judged the SAME candidate. This is what
+      // makes a CriticRecord provably about the same tree the verifier saw.
+      this.assertCandidateRecorded(entry.candidateId);
+      const verification = this.evidence.find((e) => e.kind === "verification" && e.id === entry.verificationId);
+      if (verification === undefined) {
+        throw new LifecycleViolationError("unrecorded_evidence", this.runId, `verification ${entry.verificationId} was never recorded`);
+      }
+      if (verification.kind === "verification" && verification.candidateId !== entry.candidateId) {
+        throw new LifecycleViolationError(
+          "evidence_mismatch",
+          this.runId,
+          `the critic cites verification ${entry.verificationId}, which judged candidate ${verification.candidateId}, not ${entry.candidateId}`,
+        );
+      }
+    }
     if (entry.kind === "promotion") {
       this.assertCandidateRecorded(entry.candidateId);
       const verification = this.evidence.find((e) => e.kind === "verification" && e.id === entry.verificationId);

@@ -224,8 +224,10 @@ test("retrieval truth: editing the source between runs changes the retrieval ide
 test("retrieval truth: retrieval introduces NO extra model call", async () => {
   const before = (await PROVIDER.received()).length;
   const result = v2Run(makeStateRoot(), makeRepo(), "refresh the session token");
-  assert.equal((await PROVIDER.received()).length - before, 1, "exactly ONE invocation, as before this slice");
-  assert.equal(result.receipt.evidence.invocations, 1, "and the receipt counts one too");
+  // Retrieval adds NO model call: the two calls are the builder and the critic, exactly as
+  // without retrieval. (Retrieval is deterministic — it never invokes a model.)
+  assert.equal((await PROVIDER.received()).length - before, 2, "builder + critic, and retrieval added neither");
+  assert.equal(result.receipt.evidence.invocations, 2, "and the receipt counts both");
 });
 
 test("retrieval truth: retrieval writes nothing and promotes nothing", () => {

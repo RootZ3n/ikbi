@@ -138,7 +138,7 @@ test("workspace truth: candidate_strategy allocates ONE workspace bound to the r
   const repo = makeRepo();
   const { result } = v2Run(state, repo);
 
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism"]);
   assert.equal(result.receipt.evidence.workspacesAllocated, 1, "the SINGLE strategy allocates exactly one");
 
   const ws = result.receipt.workspace!;

@@ -6,8 +6,9 @@ authority), **V2-003A** (provider inventory truth) **V2-004** (canonical context
 authority) **V2-005** (canonical model invocation authority) **V2-006** (workspace + state-bound
 mutation authority), **V2-006A** (canonical source snapshot authority), **V2-006B**
 (deterministic snapshot-bound retrieval), **V2-007** (canonical builder + governed tool
-loop), **V2-007A** (untrusted tool-result neutralization) and **V2-008** (canonical
-verification authority). This is an **advisory input to future work
+loop), **V2-007A** (untrusted tool-result neutralization), **V2-008** (canonical
+verification authority) and **V2-009** (canonical critic / intent-alignment
+authority). This is an **advisory input to future work
 orders**, not a change plan and not permission to delete anything. Nothing in v1 was
 removed, disabled, or altered to produce it.
 
@@ -52,7 +53,7 @@ preserved** and the v2 lifecycle was designed around them (see "Candidate strate
 | Builder tools (22 tools) | `worker-model/builder-tools/`, `tool-executor.ts` | **REFINE** | Keep the tool set. The refinement is that every mutating tool must go through the single state-bound mutation authority, and every tool RESULT must keep re-entering through the neutralization chokepoint — enforced by construction rather than by convention. |
 | Builder (agent lane + patchsmith lane) | `worker-model/builder.ts`, `patchsmith.ts` | **REFINE** | Becomes a candidate *producer* with no verdict authority. v1 already asserts "the builder is a worker, not a witness"; v2 makes the signature unable to express a verdict. |
 | Verifier / check runners / verification ladder | `worker-model/verifier.ts`, `checks.ts`, `src/modules/verification-ladder/` | **ADOPT (single owner)** | The ladder, stub-detection and no-vacuous-green logic are the crown jewels. In v2 there is exactly one verification authority and every candidate — single, shadow, tournament — goes through it. |
-| Critic / critic-fix-loop / critic-recovery | `worker-model/critic*.ts` | **REFINE** | Keep as a work-fact contributor to disposition. Its retry/fix loop overlaps the recovery system and should not remain a second recovery engine. |
+| Critic / critic-fix-loop / critic-recovery | `worker-model/critic*.ts` | **REFINE (done V2-009)** | The semantic-judgment capability is now v2's canonical critic — see *Critic systems (V2-009)* below. The judgment posture is ADOPTed; the best-effort PARSER is REPLACEd by a strict one (no naked rejection); the fix/recovery loop and skip-on-red are PARK/REMOVED. |
 | Adjudication core | `worker-model/adjudication/` | **ADOPT — it is the v2 blueprint** | `WorkProduct` / `ProtocolExit` / `WorkAssessment` / `SafetyAssessment` → one `decidePromotability`, with a signature that *cannot* express a protocol exit, and `treeHash` binding a verdict to the exact tree. v2's `RunTerminalOutcome` and evidence ledger are a direct generalization of it (promote/retain/discard → accepted/withheld/rejected). |
 | Recovery / retry systems | `src/modules/recovery/`, `worker-model/critic-recovery.ts`, `fix-recovery-lab.ts`, escalation | **REPLACE (capability preserved)** | Retry policy currently lives in at least three places with different rules. v2 needs one recovery policy reading `RunFailure.retryable` and one attempt ledger. The *decision core* in `src/modules/recovery/` is the best starting point. |
 | Refuter | `worker-model/refuter.ts` | **PARK** | Off by default and correctly optional. It is a safety-evidence contributor; migrate with the disposition slice. |
@@ -206,6 +207,35 @@ whatever the exit codes); and the `VerificationRecord` is content-addressed over
 (candidate, tree, plan, ordered per-check verdicts) — never a timestamp, never the output
 text — so it is provably about one candidate and no other.
 
+## Critic systems *(V2-009)*
+
+v1's critic answers a genuine question — does the work materially satisfy the operator's
+intent? — but wraps it in machinery that dilutes the answer: a best-effort parser that
+downgrades a malformed judgment to `indeterminate` (so a bare "FAIL" becomes a soft
+non-answer instead of a protocol error), a fix loop that overlaps recovery, and a
+skip-on-red path that lets a failing verification suppress the semantic judgment entirely.
+V2-009 keeps exactly the semantic-judgment CAPABILITY and rebuilds its authority: ONE
+critic, one strict verdict, defects that must be named, and no second recovery engine.
+
+| v1 system | Production reachability | Verdict |
+| --- | --- | --- |
+| `worker-model/critic.ts` — the semantic-judgment CAPABILITY (does the candidate satisfy intent, given the checks?) | **YES** — every build's assessment | **REFINE → the v2 blueprint.** The question and its posture (green checks are necessary-not-sufficient; a preference is not a defect) are exactly right and are v2's critic contract. In v2 it is one authority resolved as its OWN model role, judging an immutable review package, holding no tools, deciding nothing about promotion. |
+| `worker-model/critic.ts` — the response PARSER (fence-stripping, prose tolerance, downgrade-to-indeterminate) | **YES** | **REPLACE.** The load-bearing v1 defect: a negative judgment with no defect, or an unparseable response, is best-effort-downgraded to a soft verdict. v2's parser is strict — not-JSON, a bare `defects_found`, a plain "FAIL", a `satisfied` that carries a material defect, an unknown category/severity are all HARD protocol failures that STOP the run; they never become evidence. No naked rejection can survive. |
+| `worker-model/critic-fix-loop.ts` / `critic-recovery.ts` | **YES** — on adverse critic | **PARK.** A second retry/repair engine beside `src/modules/recovery/`. A critic verdict in v2 is semantic EVIDENCE; acting on it (retry, repair, escalate) is a disposition/recovery authority that does not exist yet. Migrate with the recovery slice, folded into the one recovery policy — never as a critic-owned loop. |
+| skip-critic-on-red (verifier RED ⇒ no critic) | **YES** | **REPLACE (removed).** In v2 the critic runs after ANY `VerificationRecord` — PASS, FAIL, NO_CHECKS, TIMEOUT, INFRASTRUCTURE_FAILURE. Deterministic red and a semantic judgment are different evidence; suppressing one because the other is adverse is exactly the coupling V2-009 ends. |
+| `worker-model/refuter.ts` / `integrator.ts` | off by default / promote-adjacent | **PARK.** Neither is the semantic critic. The refuter is optional safety evidence (disposition slice); the integrator's CAS promote is spine-only (already classified REFINE above). A static guard fails the build if any v2 file imports a v1 critic, refuter or integrator. |
+
+**The load-bearing v2 additions v1 has no equivalent of:** the critic judges an immutable
+`CriticInputPackage`, never the live workspace; its subject BINDS run/task/snapshot/
+candidate/tree/verification and rechecks the tree before the call (drift ⇒ `subject_drift`,
+no model call); the candidate diff it reads is MODEL-CAUSED only — `startTree`→`candidateTree`,
+never `HEAD`→candidate, so the operator's own uncommitted work is never charged to the model;
+every untrusted payload (goal, diff, check output, builder claim) crosses the V2-007A
+`UntrustedBoundary` while trusted provenance (ids, verdicts, hashes) stays plain; and the
+`CriticRecord` is content-addressed over (evidence + verdict + defects) with the invocation
+id kept as provenance, never identity — the SAME judgment of the SAME evidence is the SAME
+record whichever call produced it.
+
 ## Standing constraints for later slices
 
 1. **No second promote path.** Any strategy that wants to promote must do it by
@@ -275,3 +305,10 @@ text — so it is provably about one candidate and no other.
    mutation, and never counts as one.
 16. **Nothing is "done" because it exists.** A migrated subsystem is done when a test
    enters through the canonical v2 entrypoint and proves the subsystem is what ran.
+17. **No naked rejection, and no skip-on-red.** *(V2-009)* A negative critic verdict must
+   name at least one concrete material defect; a `defects_found` with no material defect, a
+   non-JSON response, or a `satisfied` carrying a defect is a HARD protocol failure that
+   stops the run — never a downgraded soft verdict. The critic runs after EVERY verification
+   verdict; deterministic red does not suppress the semantic judgment. The critic is
+   semantic EVIDENCE only: it resolves its own model role, holds no tools, judges an
+   immutable review package, and decides nothing about promotion.

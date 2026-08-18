@@ -64,7 +64,7 @@ const workingConfiguration: ConfigurationSource = {
       ],
     },
     activeProfile: { kind: "none" },
-    operatorDefaults: { models: [{ tier: "builder", modelId: "alpha-1", explicit: true }] },
+    operatorDefaults: { models: [{ tier: "builder", modelId: "alpha-1", explicit: true }, { tier: "critic", modelId: "alpha-1", explicit: true }] },
   }),
 };
 
@@ -81,9 +81,21 @@ function fakeTransport(over: { servedModelId?: string | null; attempts?: number 
   const transport: InvocationTransport = {
     send: async (input) => {
       sent.push({ providerId: input.providerId, providerModelId: input.providerModelId, messages: input.messages });
-      // V2-007: the SPINE suite wants a builder that finishes immediately, so the run
-      // reaches its real stop point (verification) rather than exhausting its turns. The
-      // loop's own behaviour is `core/builder.test.ts`; the tools' is elsewhere.
+      // V2-009: the CRITIC call carries no tools — serve a valid SATISFIED judgment so the
+      // spine reaches its stop point (disposition). The builder call (with tools) finishes
+      // immediately, as before.
+      if (input.tools === undefined || input.tools.length === 0) {
+        return {
+          ok: true,
+          response: {
+            content: JSON.stringify({ verdict: "satisfied", summary: "the candidate satisfies the task", defects: [] }),
+            finishReason: "stop",
+            ...(over.servedModelId === null ? {} : { servedModelId: over.servedModelId ?? input.providerModelId }),
+            usage: { promptTokens: 20, completionTokens: 8, totalTokens: 28 },
+            attempts: over.attempts ?? 1,
+          },
+        };
+      }
       return {
         ok: true,
         response: {
@@ -248,9 +260,12 @@ function deps(
     checksSource: { resolve: async () => ({ ok: true as const, source: "default" as const, checks: [{ name: "test", command: "faketest", args: [] }] }) },
     checkRunner: { run: async () => ({ launched: true as const, exitCode: 0, timedOut: false, durationMs: 1, outputSha256: "0".repeat(64), outputExcerpt: "" }) },
     treeProbe: { treeOf: async () => "tree".repeat(10) },
+    // V2-009: the critic diffs the candidate. Hermetic — no git; an empty model-caused
+    // diff. The real governed path is proven in `cli/critic-truth.test.ts`.
+    candidateDiff: { diff: async (i: { candidateId: string; sourceSnapshotId: string; fromTree: string; toTree: string }) => ({ diffId: "d".repeat(64) as never, candidateId: i.candidateId as never, sourceSnapshotId: i.sourceSnapshotId as never, fromTree: i.fromTree, toTree: i.toTree, files: [], empty: true, truncated: false }) },
     captureTree: async () => ({
       ok: true as const,
-      tree: { treeId: "tree".repeat(10), baseTreeId: "t".repeat(40), materializedStateDigest: "m".repeat(64), changed: false },
+      tree: { treeId: "tree".repeat(10), baseTreeId: "t".repeat(40), startTree: "tree".repeat(10), materializedStateDigest: "m".repeat(64), changed: false },
     }),
   };
 }
@@ -260,7 +275,7 @@ test("run: a valid request mints task + run identities and enters the lifecycle"
   assert.ok(isV2Id("task", result.taskId));
   assert.ok(isV2Id("run", result.runId));
   assert.ok(isV2Id("receipt", result.receipt.receiptId));
-  assert.deepEqual([...result.receipt.stagesEntered], ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification"]);
+  assert.deepEqual([...result.receipt.stagesEntered], ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism"]);
   assert.equal(result.journal[0]?.from, "pending");
   assert.equal(result.journal[0]?.to, "preflight");
   assert.equal(result.journal.at(-1)?.to, "terminal");
@@ -281,11 +296,11 @@ test("run: NO FAKE SUCCESS — the receipt reports exactly what happened, counte
   const result = await runV2Build({ goal: "build the whole product", repoPath: "/repo" }, deps(goodRepo));
   const e = result.receipt.evidence;
   assert.equal(e.modelResolutionCompleted, true, "a route WAS authorized");
-  assert.equal(e.modelResolutions, 1, "exactly one");
+  assert.equal(e.modelResolutions, 2, "V2-009: builder AND critic roles are each resolved once");
   assert.equal(e.contextAssemblyCompleted, true, "context WAS assembled");
   assert.equal(e.contextPackages, 1, "exactly one package");
   assert.equal(e.providerInvoked, true, "a model IS invoked");
-  assert.equal(e.invocations, 1, "this fake builder finishes on its first turn");
+  assert.equal(e.invocations, 2, "V2-009: the builder's finish turn AND the critic's one judgment");
   assert.equal(e.workspacesAllocated, 1, "one isolated workspace");
   assert.equal(e.mutationsApplied, 0, "this builder wrote nothing — and says so");
   assert.equal(e.candidateMutated, false);
@@ -312,22 +327,26 @@ test("run: a no-change candidate is LEGITIMATE — 'no diff' is not the builder'
 
 test("run: the skeleton never claims to have reached a stage it did not run", async () => {
   const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo));
-  const implemented = new Set<string>(["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", IMPLEMENTED_THROUGH_STAGE]);
+  const implemented = new Set<string>(["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", IMPLEMENTED_THROUGH_STAGE]);
   for (const stage of LIFECYCLE_STAGES) {
     if (implemented.has(stage)) continue;
     assert.equal(result.receipt.stagesEntered.includes(stage), false, `"${stage}" was never entered`);
   }
 });
 
-test("run: the invocation sends EXACTLY the authorized route, once", async () => {
+test("run: each authorized route is sent EXACTLY as authorized — builder then critic", async () => {
   const fake = fakeTransport();
   const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo, workingConfiguration, noSources, fake.transport));
-  assert.equal(fake.sent.length, 1, "one outbound attempt, no retry and no fallback");
-  assert.equal(fake.sent[0]?.providerId, "alpha");
-  assert.equal(fake.sent[0]?.providerModelId, "a1", "the WIRE id from the decision, not the logical id");
+  // Two outbound attempts: the builder's finish turn, then the critic's judgment. No retry.
+  assert.equal(fake.sent.length, 2, "one builder call, one critic call — no retry, no fallback");
+  for (const sent of fake.sent) {
+    assert.equal(sent.providerId, "alpha");
+    assert.equal(sent.providerModelId, "a1", "the WIRE id from the decision, not the logical id");
+  }
   assert.equal(result.receipt.resolution?.modelId, "alpha-1");
-  assert.equal(result.invocations[0]?.identity.authorizedModelId, "alpha-1");
-  assert.equal(result.invocations[0]?.identity.sentProviderModelId, "a1");
+  assert.equal(result.invocations.length, 2);
+  assert.equal(result.invocations[0]?.identity.requestedRole, "builder");
+  assert.equal(result.invocations[1]?.identity.requestedRole, "critic", "the critic invocation is role-tagged critic");
 });
 
 test("run: a failure BEFORE the wire is not counted as an invocation", async () => {
@@ -379,7 +398,7 @@ test("run: a model with NO known window fails context truthfully rather than gue
         models: [{ id: "mystery", routes: [{ providerId: "alpha", providerModelId: "m" }] }],
       },
       activeProfile: { kind: "none" },
-      operatorDefaults: { models: [{ tier: "builder", modelId: "mystery", explicit: true }] },
+      operatorDefaults: { models: [{ tier: "builder", modelId: "mystery", explicit: true }, { tier: "critic", modelId: "mystery", explicit: true }] },
     }),
   };
   const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo, unclassified));

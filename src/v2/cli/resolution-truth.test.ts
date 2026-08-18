@@ -306,20 +306,20 @@ test("resolution truth: model_resolution is ENTERED, and nothing beyond context 
   const root = makeStateRoot();
   activate(root, "prof-a");
   const { result } = v2Run(root);
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism"]);
   assert.ok(result.outcome.kind === "failed");
   assert.equal(result.outcome.failure.category, "not_implemented");
   assert.equal(result.outcome.failure.detail?.missingStage, "disposition");
 });
 
-test("resolution truth: exactly ONE decision is recorded, and exactly one invocation", () => {
+test("resolution truth: builder AND critic decisions are recorded, one invocation each", () => {
   const root = makeStateRoot();
   activate(root, "prof-a");
   const { result } = v2Run(root);
-  assert.equal(result.receipt.evidence.modelResolutions, 1, "one role was demonstrated, once");
+  assert.equal(result.receipt.evidence.modelResolutions, 2, "V2-009: builder and critic roles each resolved once");
   assert.equal(result.receipt.evidence.modelResolutionCompleted, true);
-  assert.equal(result.receipt.evidence.providerInvoked, true, "V2-005: the authorized route was really called");
-  assert.equal(result.receipt.evidence.invocations, 1);
+  assert.equal(result.receipt.evidence.providerInvoked, true, "the authorized routes were really called");
+  assert.equal(result.receipt.evidence.invocations, 2, "the builder's finish turn AND the critic's judgment");
   assert.equal(result.receipt.evidence.candidatesCreated, 1, "the builder finished — the candidate is unverified, not absent");
   assert.equal(result.receipt.evidence.sourceRepositoryMutated, false);
 });

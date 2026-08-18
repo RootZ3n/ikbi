@@ -107,7 +107,7 @@ test("v2 cli: `ikbi v2 build` reaches the canonical v2 lifecycle end-to-end", ()
   assert.equal(result.journal[0]?.from, "pending");
   assert.equal(result.journal[0]?.to, "preflight");
   assert.equal(result.journal.at(-1)?.to, "terminal");
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism"]);
 });
 
 test("v2 cli: the end-to-end run claims NOTHING it did not do", () => {
@@ -122,7 +122,7 @@ test("v2 cli: the end-to-end run claims NOTHING it did not do", () => {
     // A route WAS authorized and context WAS assembled. Neither is an invocation, and
     // the counters sitting side by side is how the receipt keeps that distinction honest.
     modelResolutionCompleted: true,
-    modelResolutions: 1,
+    modelResolutions: 2,
     contextAssemblyCompleted: true,
     contextPackages: 1,
     // V2-006B: deterministic retrieval ran while context was assembled. Ranking is not
@@ -130,7 +130,7 @@ test("v2 cli: the end-to-end run claims NOTHING it did not do", () => {
     retrievalPerformed: true,
     // V2-005: a real HTTP call to a protocol-faithful local provider really happened.
     providerInvoked: true,
-    invocations: 1,
+    invocations: 2,
     // V2-006: one isolated workspace was allocated — and nothing was written in it.
     workspacesAllocated: 1,
     observationsTaken: 1,

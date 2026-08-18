@@ -62,6 +62,22 @@ export type V2ObservationId = V2Id<"observation">;
 export type V2VerificationId = V2Digest<"verification">;
 /** Content address of ONE verification plan — which checks, in which order, how bounded. */
 export type V2PlanDigest = V2Digest<"verification_plan">;
+/**
+ * ONE semantic critic judgment, bound to the exact candidate/tree/verification it judged.
+ *
+ * V2-009 makes this CONTENT-ADDRESSED, like a verification: a critic judgment is a
+ * statement about an exact candidate tree, an exact verification verdict, an exact review
+ * package, and an exact ordered set of material defects. The invocation event that
+ * produced it is PROVENANCE, not identity — two identical judgments over identical
+ * evidence are the same judgment.
+ */
+export type V2CriticId = V2Digest<"critic">;
+/** Content address of ONE material defect — deterministic from its semantic content. */
+export type V2DefectId = V2Digest<"defect">;
+/** Content address of the immutable review package the critic was authorized to judge. */
+export type V2ReviewDigest = V2Digest<"review">;
+/** Content address of ONE candidate diff — model-caused change vs the source snapshot. */
+export type V2DiffDigest = V2Digest<"candidate_diff">;
 /** ONE promotion attempt. */
 export type V2PromotionId = V2Id<"promotion">;
 /** ONE receipt record. */
