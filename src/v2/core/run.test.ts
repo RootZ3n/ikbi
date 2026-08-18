@@ -15,6 +15,8 @@ import type { ContextSource } from "./context.js";
 import type { InvocationTransport } from "./invocation.js";
 import type { StateBoundMutationAuthority, V2WorkspaceRecord, WorkspaceAuthority } from "./workspace.js";
 import { observationDigest } from "./workspace.js";
+import type { SourceSnapshot, SourceSnapshotAuthority, SourceSnapshotReader } from "./source.js";
+import { DEFAULT_SOURCE_POLICY } from "./source.js";
 import { V2_001_FAILURE_CODES } from "./failure.js";
 import { createSequentialIdFactory, isV2Id } from "./identity.js";
 import { LIFECYCLE_STAGES } from "./lifecycle.js";
@@ -94,6 +96,32 @@ function fakeTransport(over: { servedModelId?: string | null; attempts?: number 
   return { transport, sent };
 }
 
+/** An in-memory source snapshot: a clean HEAD with a configurable set of readable files. */
+function fakeSources(files: Readonly<Record<string, string>> = {}, snapshotId = "s".repeat(64)) {
+  const snapshot = {
+    snapshotId: snapshotId as SourceSnapshot["snapshotId"],
+    repositoryRoot: "/repo",
+    headCommit: "c".repeat(40),
+    headTree: "t".repeat(40),
+    clean: true,
+    policy: DEFAULT_SOURCE_POLICY,
+    entries: [],
+    exclusions: [],
+    counts: { modified: 0, deleted: 0, untrackedIncluded: 0, excluded: 0 },
+    capturedAt: 1,
+  } satisfies SourceSnapshot;
+  const reader: SourceSnapshotReader = {
+    snapshot,
+    read: async (path) => {
+      const content = files[path];
+      if (content === undefined) return { ok: false, reason: "missing", detail: "not in the snapshot" };
+      return { ok: true, content, byteLength: Buffer.byteLength(content), contentSha256: `sha-${path}`, origin: "snapshot_delta" };
+    },
+  };
+  const authority: SourceSnapshotAuthority = { capture: async () => ({ ok: true, reader }) };
+  return { authority, reader, snapshot };
+}
+
 /**
  * In-memory workspace + mutation authorities. These tests are about the SPINE; the real
  * authorities have their own integration suite against real git worktrees.
@@ -102,12 +130,20 @@ function fakeWorkspaces(over: { discardFails?: boolean } = {}) {
   const allocated: V2WorkspaceRecord[] = [];
   const dispositions: string[] = [];
   const authority: WorkspaceAuthority = {
-    allocate: async ({ runId, repoPath }) => {
+    allocate: async ({ runId, source: sourceSnapshot }) => {
       const workspace: V2WorkspaceRecord = {
         workspaceId: `ws_fake-${allocated.length + 1}0000000` as V2WorkspaceRecord["workspaceId"],
         runId,
         donorWorkspaceId: `donor-${allocated.length + 1}`,
-        source: { repositoryPath: repoPath, baseBranch: "main", baseCommit: "c".repeat(40), baseTree: "t".repeat(40) },
+        source: {
+          repositoryPath: "/repo",
+          baseBranch: "main",
+          baseCommit: "c".repeat(40),
+          baseTree: "t".repeat(40),
+          sourceSnapshotId: sourceSnapshot.snapshotId,
+          materializedStateDigest: "m".repeat(64),
+          materializedEntries: 0,
+        },
         path: `/scratch/${allocated.length + 1}`,
         status: "allocated",
         allocatedAt: 1,
@@ -162,9 +198,10 @@ function deps(
   transport: InvocationTransport = fakeTransport().transport,
   workspaces: WorkspaceAuthority = fakeWorkspaces().authority,
   mutations: StateBoundMutationAuthority = fakeMutations().authority,
+  sources: SourceSnapshotAuthority = fakeSources().authority,
 ) {
   let tick = 0;
-  return { ids: createSequentialIdFactory("run"), now: () => (tick += 1), probe, configuration, contextSources, transport, workspaces, mutations };
+  return { ids: createSequentialIdFactory("run"), now: () => (tick += 1), probe, configuration, contextSources, transport, workspaces, mutations, sources };
 }
 
 test("run: a valid request mints task + run identities and enters the lifecycle", async () => {
@@ -368,7 +405,7 @@ test("run: the real (unstubbed) probe accepts THIS repository and still refuses 
   // path is wired, and that even a perfectly good repo yields no build in this slice.
   const result = await runV2Build(
     { goal: "inspect ikbi itself", repoPath: process.cwd() },
-    { configuration: workingConfiguration, contextSources: noSources, transport: fakeTransport().transport, workspaces: fakeWorkspaces().authority, mutations: fakeMutations().authority },
+    { configuration: workingConfiguration, contextSources: noSources, transport: fakeTransport().transport, workspaces: fakeWorkspaces().authority, mutations: fakeMutations().authority, sources: fakeSources().authority },
   );
   assert.ok(result.outcome.kind === "failed");
   assert.equal(result.outcome.failure.category, "not_implemented");
@@ -486,4 +523,51 @@ test("run: the workspace is cleaned up even when the run FAILS", async () => {
   );
   assert.ok(result.outcome.kind === "failed");
   assert.deepEqual(ws.dispositions, ["discard"], "an allocated workspace never outlives its run");
+});
+
+// ── source snapshot (V2-006A) ───────────────────────────────────────────────
+
+test("run: exactly ONE source snapshot is captured, in preflight", async () => {
+  const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo));
+  assert.equal(result.receipt.evidence.sourceSnapshotCaptured, true);
+  assert.equal(result.receipt.evidence.sourceSnapshots, 1);
+  assert.equal(result.receipt.sourceSnapshot?.clean, true);
+  assert.equal(result.receipt.sourceSnapshot?.headCommit, "c".repeat(40));
+});
+
+test("run: the context package is BOUND to the run's source snapshot", async () => {
+  const src = fakeSources({});
+  const result = await runV2Build(
+    { goal: "x", repoPath: "/repo" },
+    deps(goodRepo, workingConfiguration, noSources, fakeTransport().transport, fakeWorkspaces().authority, fakeMutations().authority, src.authority),
+  );
+  assert.equal(result.context?.sourceSnapshotId, src.snapshot.snapshotId);
+});
+
+test("run: the workspace materializes THE SAME snapshot context came from", async () => {
+  const src = fakeSources({});
+  const ws = fakeWorkspaces();
+  const result = await runV2Build(
+    { goal: "x", repoPath: "/repo" },
+    deps(goodRepo, workingConfiguration, noSources, fakeTransport().transport, ws.authority, fakeMutations().authority, src.authority),
+  );
+  assert.equal(ws.allocated[0]?.source.sourceSnapshotId, src.snapshot.snapshotId);
+  assert.equal(result.receipt.workspace?.sourceSnapshotId, result.context?.sourceSnapshotId, "one source reality, end to end");
+});
+
+test("run: a capture failure stops the run before any model resolution", async () => {
+  const failing: SourceSnapshotAuthority = {
+    capture: async () => ({
+      ok: false,
+      failure: { category: "preflight", code: "preflight.source_snapshot_failed", message: "no git here", retryable: false },
+    }),
+  };
+  const result = await runV2Build(
+    { goal: "x", repoPath: "/repo" },
+    deps(goodRepo, workingConfiguration, noSources, fakeTransport().transport, fakeWorkspaces().authority, fakeMutations().authority, failing),
+  );
+  assert.ok(result.outcome.kind === "failed");
+  assert.equal(result.outcome.failure.code, "preflight.source_snapshot_failed");
+  assert.deepEqual([...result.receipt.stagesEntered], ["preflight"], "nothing downstream ran");
+  assert.equal(result.receipt.evidence.sourceSnapshotCaptured, false);
 });

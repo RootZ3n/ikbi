@@ -264,7 +264,10 @@ test("single authority: only the workspace adapter may create a worktree or writ
   // The rule V2-006 exists to make structural: no v2 component writes a repository or
   // workspace file except through the state-bound mutation authority. A `writeFileSync`
   // or a `git worktree` anywhere else is how that would quietly stop being true.
-  const allowed = new Set([join(V2_DIR, "runtime", "workspace-authority.ts")]);
+  // The materializer writes too, and is allowed to: it CONSTRUCTS a workspace's initial
+  // state from the run's source snapshot. That is a different act from mutating an
+  // existing candidate, and the next guard keeps it from becoming a general write API.
+  const allowed = new Set([join(V2_DIR, "runtime", "workspace-authority.ts"), join(V2_DIR, "runtime", "source-materializer.ts")]);
   const offenders: string[] = [];
   for (const file of tsFiles(V2_DIR)) {
     // Test fixtures legitimately create repositories and plant files to be observed.
@@ -276,6 +279,57 @@ test("single authority: only the workspace adapter may create a worktree or writ
     if (/["']worktree["']/.test(source)) offenders.push(`${relative(SRC, file)} (git worktree)`);
   }
   assert.deepEqual(offenders, [], "repository and workspace writes go through src/v2/runtime/workspace-authority.ts alone");
+});
+
+test("single authority: only the workspace authority may import the SOURCE MATERIALIZER", () => {
+  // Materialization is allowed to write because it builds a workspace's INITIAL state
+  // from the snapshot. A future builder importing it would turn "set up the starting
+  // state" into a general write API — the exact escape hatch state-bound mutation removes.
+  const allowed = new Set([join(V2_DIR, "runtime", "workspace-authority.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts") || file.endsWith("source-materializer.ts")) continue;
+    for (const spec of importSpecifiers(readFileSync(file, "utf8"))) {
+      if (spec.includes("source-materializer")) offenders.push(`${relative(SRC, file)} -> ${spec}`);
+    }
+  }
+  assert.deepEqual(offenders, [], "only src/v2/runtime/workspace-authority.ts may materialize a snapshot");
+});
+
+test("single authority: only the snapshot module captures working-tree state", () => {
+  // Everything else reads through the run's SourceSnapshotReader. A second component
+  // asking git what the working tree looks like would be a second source reality.
+  const allowed = new Set([join(V2_DIR, "runtime", "source-snapshot.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts") || file.endsWith("fixture-repo.ts")) continue;
+    const source = stripComments(readFileSync(file, "utf8"));
+    if (/["']status["']\s*,\s*["']--porcelain|ls-files|["']diff["']/.test(source)) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "working-tree capture belongs to src/v2/runtime/source-snapshot.ts alone");
+});
+
+test("single authority: context sources never touch the filesystem", () => {
+  // V2-006A moved every repository read behind the snapshot reader. A context source
+  // importing `node:fs` would be reading a source reality the run is not bound to.
+  const specs = importSpecifiers(readFileSync(join(V2_DIR, "runtime", "context-sources.ts"), "utf8"));
+  assert.equal(
+    specs.some((spec) => spec.startsWith("node:")),
+    false,
+    `context sources read through the snapshot only, but import: ${specs.join(", ")}`,
+  );
+});
+
+test("single authority: only the source module mints a snapshot identity", () => {
+  // The materializer also digests under this kind — for its materialization PROOF, which
+  // is a statement about a workspace rather than a new source identity.
+  const allowed = new Set([join(V2_DIR, "core", "source.ts"), join(V2_DIR, "runtime", "source-materializer.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    if (/contentDigest\s*\(\s*"snapshot"/.test(stripComments(readFileSync(file, "utf8")))) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "source snapshot identity belongs to src/v2/core/source.ts");
 });
 
 test("single authority: no v2 file uses v1 mutation SESSION primitives directly", () => {

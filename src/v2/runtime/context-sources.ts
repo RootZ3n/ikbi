@@ -18,13 +18,17 @@
  * contributors — repository instructions, and the files the goal names — and parks the
  * rest, each for a stated reason (see docs/V2-DONOR-CLASSIFICATION.md). Nothing here
  * invokes a model, spawns a process, or writes.
+ *
+ * V2-006A: sources no longer touch the filesystem at all. Every read goes through the
+ * run's `SourceSnapshotReader`, so an artifact always comes from the one state the run is
+ * bound to — including the operator's uncommitted work — and a source repository edited
+ * mid-run cannot change what the model is shown. Path confinement, symlink policy and
+ * the byte cap now live in the snapshot layer, which is the only thing that reads a
+ * working tree.
  */
 
-import { createHash } from "node:crypto";
-import { lstatSync, readFileSync, realpathSync } from "node:fs";
-import { isAbsolute, join, sep } from "node:path";
-
 import type { ContextCandidate, ContextOmission, ContextSource, ContextSourceRequest, ContextSourceResult } from "../core/context.js";
+import type { SourceReadOutcome, SourceSnapshotReader } from "../core/source.js";
 
 /**
  * Per-file byte cap, adopted from v1's `MAX_PROJECT_INSTRUCTION_BYTES`
@@ -54,82 +58,42 @@ export const TARGET_FILE_EXTENSIONS: ReadonlySet<string> = new Set([
 /** Upper bound on goal-named targets. Mirrors v1's cap — a goal naming 50 files is not a targeted edit. */
 export const MAX_TARGET_FILES = 10;
 
-/** The outcome of a bounded, confined read. */
-type ReadOutcome =
-  | { readonly ok: true; readonly content: string; readonly originalBytes: number; readonly truncated: boolean; readonly sha256: string }
-  | { readonly ok: false; readonly reason: ContextOmission["reason"]; readonly detail: string };
-
-/**
- * Read one repository-relative path, confined to the repository.
- *
- * POLICY, stated rather than implied:
- *   - an absolute path or one containing a `..` segment is refused before any I/O;
- *   - the resolved real path must remain inside the repository's real path, so a symlink
- *     that POINTS OUTSIDE is refused (a symlink that stays inside is followed and read,
- *     and is indistinguishable from the file it names — which is the intent);
- *   - anything that is not a regular file is refused rather than read;
- *   - a missing or unreadable file is represented truthfully, never silently skipped.
- *
- * The SHA-256 is of the exact bytes on disk, before truncation, so the artifact names the
- * real observed state even when the content it carries is bounded.
- */
-export function readConfined(repoPath: string, relative: string): ReadOutcome {
-  if (isAbsolute(relative)) return { ok: false, reason: "outside_repository", detail: `"${relative}" is an absolute path` };
-  if (relative.split(/[/\\]/).includes("..")) return { ok: false, reason: "outside_repository", detail: `"${relative}" traverses outside the repository` };
-
-  let repoReal: string;
-  try {
-    repoReal = realpathSync(repoPath);
-  } catch {
-    return { ok: false, reason: "unreadable", detail: `the repository path could not be resolved` };
+/** Map a snapshot read onto the omission vocabulary context already speaks. */
+function omissionReason(reason: Exclude<SourceReadOutcome, { ok: true }>["reason"]): ContextOmission["reason"] {
+  switch (reason) {
+    case "missing":
+      return "not_found";
+    case "not_a_regular_file":
+      return "not_a_regular_file";
+    case "outside_repository":
+      return "outside_repository";
+    case "unreadable":
+    default:
+      return "unreadable";
   }
+}
 
-  const target = join(repoReal, relative);
-  let stat;
-  try {
-    stat = lstatSync(target);
-  } catch {
-    return { ok: false, reason: "not_found", detail: `no such file` };
-  }
-
-  if (stat.isSymbolicLink()) {
-    let linkReal: string;
-    try {
-      linkReal = realpathSync(target);
-    } catch {
-      return { ok: false, reason: "not_found", detail: `symlink target does not exist` };
-    }
-    if (!linkReal.startsWith(repoReal + sep)) {
-      return { ok: false, reason: "outside_repository", detail: `symlink escapes the repository` };
-    }
-    if (!lstatSync(linkReal).isFile()) return { ok: false, reason: "not_a_regular_file", detail: `symlink does not point at a regular file` };
-  } else if (!stat.isFile()) {
-    return { ok: false, reason: "not_a_regular_file", detail: `not a regular file` };
-  }
-
-  let raw: Buffer;
-  try {
-    raw = readFileSync(target);
-  } catch (err) {
-    return { ok: false, reason: "unreadable", detail: err instanceof Error ? err.message : String(err) };
-  }
-  const text = raw.toString("utf8");
-  if (text.trim().length === 0) return { ok: false, reason: "empty", detail: `the file is empty` };
-
-  const truncated = raw.byteLength > MAX_ARTIFACT_BYTES;
+/** A bounded read of one snapshot path. Truncation is a CONTEXT concern, applied here. */
+async function readFromSnapshot(source: SourceSnapshotReader, path: string): Promise<
+  | { ok: true; content: string; originalBytes: number; truncated: boolean; sha256: string }
+  | { ok: false; reason: ContextOmission["reason"]; detail: string }
+> {
+  const result = await source.read(path);
+  if (!result.ok) return { ok: false, reason: omissionReason(result.reason), detail: result.detail };
+  if (result.content.trim().length === 0) return { ok: false, reason: "empty", detail: "the file is empty" };
+  const truncated = result.byteLength > MAX_ARTIFACT_BYTES;
   return {
     ok: true,
-    content: truncated ? `${text.slice(0, MAX_ARTIFACT_BYTES)}${TRUNCATION_MARKER}` : text,
-    originalBytes: raw.byteLength,
+    content: truncated ? `${result.content.slice(0, MAX_ARTIFACT_BYTES)}${TRUNCATION_MARKER}` : result.content,
+    originalBytes: result.byteLength,
     truncated,
-    // The digest is of the bytes AS OBSERVED — truncation bounds what is carried, not
-    // what was seen, so the state binding stays exact.
-    sha256: createHash("sha256").update(raw).digest("hex"),
+    // The digest names the WHOLE state as the snapshot captured it, not the bounded copy.
+    sha256: result.contentSha256,
   };
 }
 
 function candidateFrom(
-  read: Extract<ReadOutcome, { ok: true }>,
+  read: { content: string; originalBytes: number; truncated: boolean; sha256: string },
   input: { category: ContextCandidate["category"]; sourceId: string; path: string; reason: string },
 ): ContextCandidate {
   return {
@@ -163,7 +127,7 @@ export const repositoryInstructionsSource: ContextSource = {
     let primaryFound = false;
     for (const name of PRIMARY_INSTRUCTION_FILES) {
       if (primaryFound) break;
-      const read = readConfined(request.repoPath, name);
+      const read = await readFromSnapshot(request.source, name);
       if (read.ok) {
         primaryFound = true;
         candidates.push(candidateFrom(read, { category: "repository_instructions", sourceId: "repository_instructions", path: name, reason: "the repository's primary instruction file" }));
@@ -173,7 +137,7 @@ export const repositoryInstructionsSource: ContextSource = {
     }
 
     for (const name of ADDITIVE_INSTRUCTION_FILES) {
-      const read = readConfined(request.repoPath, name);
+      const read = await readFromSnapshot(request.source, name);
       if (read.ok) {
         candidates.push(candidateFrom(read, { category: "repository_instructions", sourceId: "repository_instructions", path: name, reason: "an additive ikbi project instruction file" }));
       } else if (read.reason !== "not_found") {
@@ -226,7 +190,7 @@ export const goalTargetFilesSource: ContextSource = {
     const candidates: ContextCandidate[] = [];
     const omissions: ContextOmission[] = [];
     for (const path of extractGoalTargets(request.goal)) {
-      const read = readConfined(request.repoPath, path);
+      const read = await readFromSnapshot(request.source, path);
       if (read.ok) {
         candidates.push(candidateFrom(read, { category: "target_file", sourceId: "goal_target_files", path, reason: "the goal names this file" }));
       } else {

@@ -45,6 +45,7 @@ import type { ModelResolutionDecision } from "./resolver.js";
 import type { ContextManifest, ContextPackage } from "./context.js";
 import type { V2InvocationRecord } from "./invocation.js";
 import type { V2WorkspaceRecord, WorkspaceDisposition } from "./workspace.js";
+import type { SourceSnapshotSummary } from "./source.js";
 
 /** Why verified-good work was withheld instead of promoted. Closed set. */
 export type WithheldReason = "governance" | "operator" | "policy" | "dry_run";
@@ -136,6 +137,10 @@ export interface RunEvidenceSummary {
   readonly modelResolutionCompleted: boolean;
   /** How many routes were authorized. A skeleton run authorizes exactly one. */
   readonly modelResolutions: number;
+  /** True only when preflight actually captured the run's source snapshot. */
+  readonly sourceSnapshotCaptured: boolean;
+  /** How many source snapshots exist. Exactly one, or none. */
+  readonly sourceSnapshots: number;
   /** Isolated workspaces actually allocated. */
   readonly workspacesAllocated: number;
   /** State-bound observations actually taken. */
@@ -302,6 +307,8 @@ export interface RunWorkspaceSummary {
   readonly baseCommit: string;
   readonly baseTree: string;
   readonly baseBranch: string;
+  readonly sourceSnapshotId: string;
+  readonly materializedEntries: number;
   readonly observations: number;
   /** How the workspace ended: discarded, retained, or a cleanup that did NOT finish. */
   readonly disposition: string;
@@ -326,6 +333,8 @@ export function summarizeWorkspace(input: {
     baseCommit: input.workspace.source.baseCommit,
     baseTree: input.workspace.source.baseTree,
     baseBranch: input.workspace.source.baseBranch,
+    sourceSnapshotId: input.workspace.source.sourceSnapshotId,
+    materializedEntries: input.workspace.source.materializedEntries,
     observations: input.observations,
     disposition: input.disposition.kind,
     ...(detail !== undefined ? { dispositionDetail: detail } : {}),
@@ -348,6 +357,8 @@ export interface V2RunReceipt {
   readonly context?: RunContextSummary;
   /** Absent when no transport was reached, or when the invocation failed. */
   readonly invocation?: RunInvocationSummary;
+  /** Absent when preflight did not capture a source snapshot. */
+  readonly sourceSnapshot?: SourceSnapshotSummary;
   /** Absent when no workspace was allocated. */
   readonly workspace?: RunWorkspaceSummary;
   readonly startedAt: number;
@@ -367,6 +378,8 @@ export function summarizeEvidence(ledger: RunLedgerView, outcome: RunTerminalOut
     modelResolutions: ledger.resolutions.length,
     contextAssemblyCompleted: ledger.contexts.length > 0,
     contextPackages: ledger.contexts.length,
+    sourceSnapshotCaptured: ledger.snapshots.length > 0,
+    sourceSnapshots: ledger.snapshots.length,
     workspacesAllocated: ledger.workspaces.length,
     observationsTaken: ledger.observations.length,
     mutationsApplied: ledger.mutations.length,

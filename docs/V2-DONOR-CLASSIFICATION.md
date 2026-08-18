@@ -3,8 +3,8 @@
 Produced during **V2-001** (canonical lifecycle foundation) and updated by **V2-002**
 (provider + profile configuration boundary), **V2-003** (single model-resolution
 authority), **V2-003A** (provider inventory truth) **V2-004** (canonical context
-authority) **V2-005** (canonical model invocation authority) and **V2-006** (workspace + state-bound
-mutation authority). This is an **advisory input to future work
+authority) **V2-005** (canonical model invocation authority) **V2-006** (workspace + state-bound
+mutation authority) and **V2-006A** (canonical source snapshot authority). This is an **advisory input to future work
 orders**, not a change plan and not permission to delete anything. Nothing in v1 was
 removed, disabled, or altered to produce it.
 
@@ -120,6 +120,15 @@ project-retrieval output reaches the builder prompt directly.**
 | Builder/chat mutation integration (`tool-executor.ts`) | **YES** | **REFINE** — routes managed-candidate text tools through the session, and `builder.ts:977` states plainly that "an isolated candidate must never fall back to the old direct writer". The routing is right; in v2 it becomes "tools receive the mutation authority, never `fs`". |
 | **Raw write paths** — `builder-tools/patch.ts:90`, `multi-edit.ts:108`, `delegate.ts:186`, `confine.ts:92`, `agent-tools/notebook-tools.ts:291` | **YES**, for NON-candidate worktrees | **REPLACE for v2 (preserve for v1).** The finding of this recon: these are confined but **not state-bound** — they `writeFileSync` after a path check, with no observation and no compare-and-swap. They are the reason "the donor machinery is wired" cannot be assumed globally. v2 has no equivalent, and a static guard fails the build if any v2 file performs a filesystem write outside the workspace adapter. |
 
+## Source-state systems *(V2-006A)*
+
+| v1 system | Production reachability | Verdict |
+| --- | --- | --- |
+| `addWorktree` (`git worktree add <path> -b <branch> <baseBranch>`) | **YES** — every build | **ADOPT as the base, EXTEND for source truth.** It checks out the BRANCH TIP, so v1 silently builds against committed state while the operator sees uncommitted work — a build can succeed on code the operator does not have. v2 keeps the worktree as the isolation primitive and materializes the run's source snapshot on top of it. |
+| Dirty-source handling | **none** | **REPLACE for v2 (v1 untouched).** v1 has no synchronization, staging, patch generation or copy path for uncommitted work; there is simply nothing there. `syncWorktreeToRef` (`git.ts:318`) stashes INSIDE a worktree, which is a different concern. |
+| `git status --porcelain` / `ls-files --others --exclude-standard` | **YES** — diff/summary helpers | **ADOPT as the fact source.** Git already knows which files are tracked, modified, deleted, untracked and ignored. v2 asks it rather than inventing a second opinion about what counts as source. |
+| `git show HEAD:<path>` | — | **ADOPT.** Serving unchanged files from the immutable HEAD blob is what makes mid-run source drift structurally impossible rather than merely detected. |
+
 ## Standing constraints for later slices
 
 1. **No second promote path.** Any strategy that wants to promote must do it by
@@ -157,5 +166,9 @@ project-retrieval output reaches the builder prompt directly.**
    OBSERVATION rather than a path. Observations are workspace-scoped: identical bytes in a
    sibling candidate are not identical authority. A stale observation is refused — never
    merged, overwritten, silently re-observed or retried.
-10. **Nothing is "done" because it exists.** A migrated subsystem is done when a test
+10. **One run, one source snapshot.** *(V2-006A)* Context reads it, the workspace is
+   materialized from it, and nothing recaptures — silently or otherwise. Reproducing the
+   operator's existing uncommitted work in isolation is MATERIALIZATION, never a model
+   mutation, and never counts as one.
+11. **Nothing is "done" because it exists.** A migrated subsystem is done when a test
    enters through the canonical v2 entrypoint and proves the subsystem is what ran.

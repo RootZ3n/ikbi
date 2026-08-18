@@ -27,7 +27,9 @@ import type { InvocationTransport } from "../core/invocation.js";
 import { PRODUCTION_CONTEXT_SOURCES } from "./context-sources.js";
 import { createInvocationTransport } from "./invocation-transport.js";
 import { createProductionWorkspaceAuthorities } from "./workspace-authority.js";
+import { createSourceSnapshotAuthority } from "./source-snapshot.js";
 import type { StateBoundMutationAuthority, WorkspaceAuthority } from "../core/workspace.js";
+import type { SourceSnapshotAuthority } from "../core/source.js";
 import { createIdFactory } from "../core/identity.js";
 import type { V2TaskRequest } from "../core/contract.js";
 import { buildCanonicalCatalog } from "./model-catalog.js";
@@ -124,6 +126,7 @@ export interface ProductionRunDeps {
   readonly transport?: InvocationTransport;
   readonly workspaces?: WorkspaceAuthority;
   readonly mutations?: StateBoundMutationAuthority;
+  readonly sources?: SourceSnapshotAuthority;
   readonly probe?: RepoProbe;
 }
 
@@ -135,10 +138,22 @@ export interface ProductionRunDeps {
  * Both authorities are built together and share one handle table — a mutation cannot be
  * performed in a workspace this process did not allocate.
  */
-async function productionWorkspaceAuthorities(): Promise<{ workspaces: WorkspaceAuthority; mutations: StateBoundMutationAuthority }> {
+async function productionAuthorities(): Promise<{
+  workspaces: WorkspaceAuthority;
+  mutations: StateBoundMutationAuthority;
+  sources: SourceSnapshotAuthority;
+}> {
   const { workspaces: manager } = await import("../../core/workspace/index.js");
   const ids = createIdFactory();
-  return createProductionWorkspaceAuthorities({ manager, mintWorkspaceId: () => ids.mint("workspace") });
+  // ONE snapshot authority per run assembly: the workspace authority materializes from
+  // the very bytes it captured, so context and the candidate cannot disagree.
+  const sources = createSourceSnapshotAuthority();
+  const built = createProductionWorkspaceAuthorities({
+    manager,
+    mintWorkspaceId: () => ids.mint("workspace"),
+    capturedBytes: (snapshotId) => sources.capturedBytes(snapshotId),
+  });
+  return { ...built, sources };
 }
 
 /**
@@ -160,13 +175,14 @@ export function productionTransport(): InvocationTransport {
 
 /** THE production entry every v2 surface uses. One wiring, one configuration truth. */
 export async function runV2BuildProduction(request: V2TaskRequest, deps: ProductionRunDeps = {}): Promise<V2RunResult> {
-  const wired =
-    deps.workspaces !== undefined && deps.mutations !== undefined
-      ? { workspaces: deps.workspaces, mutations: deps.mutations }
-      : await productionWorkspaceAuthorities();
+  const complete = deps.workspaces !== undefined && deps.mutations !== undefined && deps.sources !== undefined;
+  const wired = complete
+    ? { workspaces: deps.workspaces!, mutations: deps.mutations!, sources: deps.sources! }
+    : await productionAuthorities();
   return runV2Build(request, {
     workspaces: deps.workspaces ?? wired.workspaces,
     mutations: deps.mutations ?? wired.mutations,
+    sources: deps.sources ?? wired.sources,
     configuration: deps.configuration ?? createConfigurationSource(),
     contextSources: deps.contextSources ?? PRODUCTION_CONTEXT_SOURCES,
     transport: deps.transport ?? productionTransport(),

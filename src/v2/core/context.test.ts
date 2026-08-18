@@ -26,6 +26,7 @@ import {
   type ContextSource,
 } from "./context.js";
 import { createSequentialIdFactory } from "./identity.js";
+import { DEFAULT_SOURCE_POLICY, type SourceSnapshot, type SourceSnapshotReader } from "./source.js";
 
 const ids = createSequentialIdFactory("ctx");
 const RUN = ids.mint("run");
@@ -40,11 +41,28 @@ const caps = (contextWindow: number, provenance: ModelCapabilityFacts["provenanc
   provenance,
 });
 
+/** A snapshot reader that serves nothing — these tests inject candidates directly. */
+function reader(snapshotId = "s".repeat(64)): SourceSnapshotReader {
+  const snapshot = {
+    snapshotId: snapshotId as SourceSnapshot["snapshotId"],
+    repositoryRoot: "/repo",
+    headCommit: "c".repeat(40),
+    headTree: "t".repeat(40),
+    clean: true,
+    policy: DEFAULT_SOURCE_POLICY,
+    entries: [],
+    exclusions: [],
+    counts: { modified: 0, deleted: 0, untrackedIncluded: 0, excluded: 0 },
+    capturedAt: 1,
+  } satisfies SourceSnapshot;
+  return { snapshot, read: async () => ({ ok: false, reason: "missing", detail: "not in this snapshot" }) };
+}
+
 const request = (over: Partial<ContextAssemblyRequest> = {}): ContextAssemblyRequest => ({
   runId: RUN,
   taskId: TASK,
   goal: "make the widget green",
-  repoPath: "/repo",
+  source: reader(),
   resolutionDecisionId: DECISION,
   capabilities: caps(100_000),
   ...over,
@@ -277,10 +295,14 @@ test("identity: an omission is part of the identity — what was left out matter
   assert.notEqual(withOmission.packageId, without.packageId);
 });
 
-test("identity: the repository PATH is not part of the identity", async () => {
+test("identity: a DIFFERENT source snapshot changes the package id", async () => {
+  // The V2-006A binding: two packages assembled from different dirty states can never
+  // collide merely because the artifacts they happened to include looked the same.
   const a = await packageOf([fakeSource("s", [{ category: "target_file", path: "a.ts", content: "A" }])]);
-  const b = await packageOf([fakeSource("s", [{ category: "target_file", path: "a.ts", content: "A" }])], { repoPath: "/somewhere/else" });
-  assert.equal(a.packageId, b.packageId, "relocating a checkout does not change what the builder sees");
+  const b = await packageOf([fakeSource("s", [{ category: "target_file", path: "a.ts", content: "A" }])], { source: reader("d".repeat(64)) });
+  assert.notEqual(a.packageId, b.packageId);
+  assert.equal(a.sourceSnapshotId, "s".repeat(64));
+  assert.equal(b.sourceSnapshotId, "d".repeat(64));
 });
 
 test("identity: observed digests are raw SHA-256 of the bytes, comparable with the mutation core", () => {

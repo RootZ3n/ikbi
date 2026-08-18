@@ -123,18 +123,18 @@ test("workspace truth: the context artifact is RE-OBSERVED in the workspace and 
   assert.equal(result.outcome.failure.category, "not_implemented", "so the run stops for the ordinary reason");
 });
 
-test("workspace truth: an UNCOMMITTED source change is reported as context drift, not papered over", () => {
+test("workspace truth: an UNCOMMITTED source change no longer causes drift (V2-006A)", () => {
   const state = makeStateRoot();
   const repo = makeRepo();
-  // The context assembler reads the WORKING TREE; the workspace is a worktree at HEAD.
-  // An uncommitted edit makes those disagree, and v2 refuses rather than silently
-  // rebuilding context against whatever is in the workspace.
+  // This used to fail: context read the working tree while the workspace held HEAD.
+  // Both now come from the one source snapshot, so the run proceeds normally.
   writeFiles(repo, { "src/widget.ts": "export const widget = 999; // uncommitted\n" });
   const { result } = v2Run(state, repo);
   assert.ok(result.outcome.kind === "failed");
-  assert.equal(result.outcome.failure.category, "mutation");
-  assert.equal(result.outcome.failure.code, "workspace.context_artifact_drift");
-  assert.equal(result.outcome.failure.detail?.path, "src/widget.ts");
+  assert.equal(result.outcome.failure.category, "not_implemented", "it stops for the ordinary reason");
+  assert.equal(result.receipt.sourceSnapshot?.clean, false);
+  assert.equal(result.receipt.workspace?.materializedEntries, 1, "the operator's edit was reproduced in isolation");
+  assert.equal(result.receipt.evidence.mutationsApplied, 0, "and reproducing it is not a mutation");
 });
 
 test("workspace truth: committing that change makes the run proceed again", () => {
@@ -200,14 +200,11 @@ test("workspace truth: the worktree is really gone from disk afterwards", () => 
   assert.deepEqual(leftovers, [], "a discarded workspace leaves no checkout behind");
 });
 
-test("workspace truth: a FAILING run still cleans up its workspace", () => {
+test("workspace truth: an allocated workspace never outlives its run", () => {
   const state = makeStateRoot();
-  const repo = makeRepo();
-  writeFiles(repo, { "src/widget.ts": "uncommitted drift\n" });
-  const { result } = v2Run(state, repo);
-  assert.ok(result.outcome.kind === "failed");
-  assert.equal(result.outcome.failure.code, "workspace.context_artifact_drift");
-  assert.equal(result.receipt.workspace?.disposition, "discarded", "an allocated workspace never outlives its run");
+  const { result } = v2Run(state, makeRepo());
+  assert.ok(result.outcome.kind === "failed", "the run always stops before candidate generation");
+  assert.equal(result.receipt.workspace?.disposition, "discarded");
 });
 
 // ── observations only where they are real ───────────────────────────────────
@@ -228,5 +225,5 @@ test("workspace truth: the human rendering states the source binding and the dis
   const repo = makeRepo();
   const r = runCli(state, ["v2", "build", GOAL, "--repo", repo]);
   assert.match(r.stdout, /workspace {3}ws_[\w-]+ \(donor [\w-]+\) · 1 observation\(s\) · discarded/);
-  assert.match(r.stdout, new RegExp(`source {6}main @ ${headCommit(repo).slice(0, 12)} · tree ${headTree(repo).slice(0, 12)}`));
+  assert.match(r.stdout, new RegExp(`materialized 0 source entries from the snapshot · base main @ ${headCommit(repo).slice(0, 12)}`));
 });

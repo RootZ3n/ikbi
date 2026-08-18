@@ -24,6 +24,7 @@ import type { ConfigurationSource } from "../core/config.js";
 import type { ContextSource } from "../core/context.js";
 import type { InvocationTransport } from "../core/invocation.js";
 import type { StateBoundMutationAuthority, WorkspaceAuthority } from "../core/workspace.js";
+import type { SourceSnapshotAuthority } from "../core/source.js";
 import { CANDIDATE_STRATEGIES } from "../core/contract.js";
 import { exitCodeForOutcome, formatOutcome, type V2RunResult } from "../core/result.js";
 import { runV2BuildProduction } from "../runtime/index.js";
@@ -84,13 +85,24 @@ export function parseV2Args(argv: readonly string[], cwd: string): V2Args {
  * observed there, and how it ended — including a cleanup that did not finish.
  */
 function workspaceLines(result: V2RunResult): string[] {
+  const lines: string[] = [];
+  const snap = result.receipt.sourceSnapshot;
+  if (snap !== undefined) {
+    const c = snap.counts;
+    lines.push(
+      `snapshot    ${snap.snapshotId} · ${snap.clean ? "clean" : "dirty"} @ ${snap.headCommit.slice(0, 12)}` +
+        (snap.clean ? "" : ` · +${c.modified} modified, ${c.deleted} deleted, ${c.untrackedIncluded} untracked, ${c.excluded} excluded`),
+    );
+  }
   const w = result.receipt.workspace;
-  if (w === undefined) return [];
-  return [
-    `workspace   ${w.workspaceId} (donor ${w.donorWorkspaceId}) · ${w.observations} observation(s) · ${w.disposition}` +
-      (w.dispositionDetail !== undefined ? ` — ${w.dispositionDetail}` : ""),
-    `source      ${w.baseBranch} @ ${w.baseCommit.slice(0, 12)} · tree ${w.baseTree.slice(0, 12)}`,
-  ];
+  if (w !== undefined) {
+    lines.push(
+      `workspace   ${w.workspaceId} (donor ${w.donorWorkspaceId}) · ${w.observations} observation(s) · ${w.disposition}` +
+        (w.dispositionDetail !== undefined ? ` — ${w.dispositionDetail}` : ""),
+      `materialized ${w.materializedEntries} source entr${w.materializedEntries === 1 ? "y" : "ies"} from the snapshot · base ${w.baseBranch} @ ${w.baseCommit.slice(0, 12)}`,
+    );
+  }
+  return lines;
 }
 
 /** Human rendering of a run. Every line is derived from the result — nothing is asserted. */
@@ -214,6 +226,7 @@ export async function runV2Cli(
     readonly transport?: InvocationTransport;
     readonly workspaces?: WorkspaceAuthority;
     readonly mutations?: StateBoundMutationAuthority;
+    readonly sources?: SourceSnapshotAuthority;
   } = {},
 ): Promise<number> {
   const out = io.stdout ?? writeStdout;
@@ -240,6 +253,7 @@ export async function runV2Cli(
       ...(io.transport !== undefined ? { transport: io.transport } : {}),
       ...(io.workspaces !== undefined ? { workspaces: io.workspaces } : {}),
       ...(io.mutations !== undefined ? { mutations: io.mutations } : {}),
+      ...(io.sources !== undefined ? { sources: io.sources } : {}),
     },
   );
   out(args.json ? `${JSON.stringify(result, null, 2)}\n` : renderRun(result));

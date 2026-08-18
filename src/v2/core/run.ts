@@ -57,6 +57,7 @@ import {
   type ModelResolutionDecision,
 } from "./resolver.js";
 import { assembleContext, manifestOf, type ContextPackage, type ContextSource } from "./context.js";
+import { summarizeSnapshot, type SourceSnapshotAuthority, type SourceSnapshotReader } from "./source.js";
 import {
   V2_WORKSPACE_FAILURE_CODES,
   workspaceFailure,
@@ -197,6 +198,11 @@ export interface V2RunDeps {
    */
   readonly workspaces: WorkspaceAuthority;
   readonly mutations: StateBoundMutationAuthority;
+  /**
+   * THE source snapshot authority. Captured once, in preflight, and every downstream
+   * component reads that answer instead of asking the filesystem again.
+   */
+  readonly sources: SourceSnapshotAuthority;
   readonly ids?: V2IdFactory;
   readonly now?: () => number;
   readonly probe?: RepoProbe;
@@ -320,6 +326,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
 
   let resolvedTask: V2Task | undefined;
   let policy: RuntimeModelPolicy | undefined;
+  let source: SourceSnapshotReader | undefined;
   let decision: ModelResolutionDecision | undefined;
   let contextPackage: ContextPackage | undefined;
   let invocation: V2InvocationRecord | undefined;
@@ -342,6 +349,14 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     if (!built.ok) return built.failure;
     policy = built.policy;
     lifecycle.record(runId, { kind: "configuration", policyId: policy.policyId });
+
+    // THE SOURCE SNAPSHOT. Captured here, once, and never recaptured: everything after
+    // this point reads the state the operator had when the run began — including their
+    // uncommitted work — rather than whatever the working tree happens to hold later.
+    const captured = await deps.sources.capture({ repoPath: task.repoPath });
+    if (!captured.ok) return captured.failure;
+    source = captured.reader;
+    lifecycle.record(runId, { kind: "snapshot", id: source.snapshot.snapshotId, clean: source.snapshot.clean });
 
     // Stage 2 — MODEL RESOLUTION. One authority, one request, one authorized route.
     // The request names the policy it expects, so a decision cannot be computed against
@@ -366,7 +381,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
         runId,
         taskId,
         goal: task.goal,
-        repoPath: task.repoPath,
+        source,
         resolutionDecisionId: decision.decisionId,
         capabilities: decision.capabilities,
       },
@@ -408,7 +423,9 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     // the SINGLE strategy that is one isolated workspace. A workspace is not a candidate:
     // allocating one produces nothing, and this run will produce nothing.
     lifecycle.enter(runId, "candidate_strategy");
-    const allocated = await deps.workspaces.allocate({ runId, repoPath: task.repoPath, label: `v2-${DEMONSTRATED_ROLE}` });
+    // The workspace materializes THE SAME snapshot context was assembled from, so the
+    // candidate starts from exactly the state the model was shown.
+    const allocated = await deps.workspaces.allocate({ runId, source: source.snapshot, label: `v2-${DEMONSTRATED_ROLE}` });
     if (!allocated.ok) return allocated.failure;
     workspace = allocated.workspace;
     lifecycle.record(runId, { kind: "workspace", id: workspace.workspaceId, baseTree: workspace.source.baseTree });
@@ -470,6 +487,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     stagesEntered: lifecycle.stagesEntered,
     evidence: summarizeEvidence(lifecycle.ledger, outcome),
     ...(policy !== undefined ? { configuration: summarizeConfiguration(policy) } : {}),
+    ...(source !== undefined ? { sourceSnapshot: summarizeSnapshot(source.snapshot) } : {}),
     ...(decision !== undefined ? { resolution: summarizeResolution(decision) } : {}),
     ...(contextPackage !== undefined ? { context: summarizeContext(contextPackage) } : {}),
     ...(invocation !== undefined ? { invocation: summarizeInvocation(invocation) } : {}),

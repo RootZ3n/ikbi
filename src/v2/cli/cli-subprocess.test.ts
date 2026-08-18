@@ -116,6 +116,8 @@ test("v2 cli: the end-to-end run claims NOTHING it did not do", () => {
   assert.deepEqual(result.receipt.evidence, {
     // Configuration (V2-002) and route authorization (V2-003) happen — and nothing else.
     configurationResolved: true,
+    sourceSnapshotCaptured: true,
+    sourceSnapshots: 1,
     // A route WAS authorized and context WAS assembled. Neither is an invocation, and
     // the counters sitting side by side is how the receipt keeps that distinction honest.
     modelResolutionCompleted: true,

@@ -57,6 +57,8 @@ import {
   type WorkspaceAuthority,
   type WorkspaceDisposition,
 } from "../core/workspace.js";
+import { materializeSnapshot } from "./source-materializer.js";
+import type { CapturedBytes } from "./source-snapshot.js";
 
 /** The identity v2 allocates workspaces under until it has its own identity system. */
 const V2_IDENTITY: AgentIdentity = { agentId: "ikbi-v2", functionalRole: "builder", trustTier: "trusted" } as AgentIdentity;
@@ -115,6 +117,8 @@ function mapMutationError(err: unknown, context: { workspaceId: V2WorkspaceId; p
 export function createWorkspaceAuthority(deps: {
   readonly manager: WorkspaceManagerLike;
   readonly mintWorkspaceId: () => V2WorkspaceId;
+  /** Captured delta bytes for a snapshot, so its state can be reproduced in the worktree. */
+  readonly capturedBytes: (snapshotId: string) => CapturedBytes | undefined;
   readonly now?: () => number;
 }): WorkspaceAuthority & { handleOf(record: V2WorkspaceRecord): WorkspaceHandle | undefined } {
   const now = deps.now ?? Date.now;
@@ -126,10 +130,11 @@ export function createWorkspaceAuthority(deps: {
     handleOf: (record) => handles.get(record.workspaceId),
 
     async allocate(input): Promise<WorkspaceAllocationResult> {
+      const snapshot = input.source;
       let handle: WorkspaceHandle;
       try {
         handle = await deps.manager.allocate({
-          targetRepo: input.repoPath,
+          targetRepo: snapshot.repositoryRoot,
           identity: V2_IDENTITY,
           ...(input.label !== undefined ? { label: input.label } : {}),
         });
@@ -139,7 +144,7 @@ export function createWorkspaceAuthority(deps: {
           failure: workspaceFailure({
             code: V2_WORKSPACE_FAILURE_CODES.allocationFailed,
             message: `could not allocate an isolated workspace: ${err instanceof Error ? err.message : String(err)}`,
-            detail: { repoPath: input.repoPath },
+            detail: { repoPath: snapshot.repositoryRoot },
           }),
         };
       }
@@ -147,7 +152,7 @@ export function createWorkspaceAuthority(deps: {
       // The TREE of the base commit — content identity, independent of commit metadata.
       let baseTree: string;
       try {
-        baseTree = (await runGit(input.repoPath, ["rev-parse", `${handle.baseRef}^{tree}`])).stdout.trim();
+        baseTree = (await runGit(snapshot.repositoryRoot, ["rev-parse", `${handle.baseRef}^{tree}`])).stdout.trim();
       } catch (err) {
         // The workspace exists but cannot be truthfully bound. Rather than record a
         // half-known binding, hand it back and fail.
@@ -157,9 +162,22 @@ export function createWorkspaceAuthority(deps: {
           failure: workspaceFailure({
             code: V2_WORKSPACE_FAILURE_CODES.sourceUnreadable,
             message: `allocated a workspace but could not read the source tree of ${handle.baseRef}: ${err instanceof Error ? err.message : String(err)}`,
-            detail: { repoPath: input.repoPath, baseRef: handle.baseRef },
+            detail: { repoPath: snapshot.repositoryRoot, baseRef: handle.baseRef },
           }),
         };
+      }
+
+      // MATERIALIZE the snapshot. The worktree arrives at HEAD; for a dirty checkout the
+      // operator's uncommitted work is reproduced on top, then VERIFIED. A workspace that
+      // does not actually hold the snapshot is handed back rather than handed on.
+      const materialized = materializeSnapshot({
+        snapshot,
+        captured: deps.capturedBytes(snapshot.snapshotId) ?? new Map(),
+        workspacePath: handle.path,
+      });
+      if (!materialized.ok) {
+        await deps.manager.discard(handle).catch(() => undefined);
+        return { ok: false, failure: materialized.failure };
       }
 
       const workspaceId = deps.mintWorkspaceId();
@@ -175,6 +193,9 @@ export function createWorkspaceAuthority(deps: {
             baseBranch: handle.baseBranch,
             baseCommit: handle.baseRef,
             baseTree,
+            sourceSnapshotId: snapshot.snapshotId,
+            materializedStateDigest: materialized.proof.materializedStateDigest,
+            materializedEntries: materialized.proof.applied,
           }),
           path: handle.path,
           status: "allocated" as const,
@@ -386,11 +407,13 @@ export function createMutationAuthority(deps: {
 export function createProductionWorkspaceAuthorities(deps: {
   readonly manager: WorkspaceManager | WorkspaceManagerLike;
   readonly mintWorkspaceId: () => V2WorkspaceId;
+  readonly capturedBytes: (snapshotId: string) => CapturedBytes | undefined;
   readonly now?: () => number;
 }): { workspaces: ReturnType<typeof createWorkspaceAuthority>; mutations: StateBoundMutationAuthority } {
   const workspaces = createWorkspaceAuthority({
     manager: deps.manager as WorkspaceManagerLike,
     mintWorkspaceId: deps.mintWorkspaceId,
+    capturedBytes: deps.capturedBytes,
     ...(deps.now !== undefined ? { now: deps.now } : {}),
   });
   const mutations = createMutationAuthority({

@@ -33,6 +33,7 @@ import {
 } from "../core/workspace.js";
 import { commitFiles, headCommit, headTree, initGitRepo } from "../cli/fixture-repo.js";
 import { createProductionWorkspaceAuthorities } from "./workspace-authority.js";
+import { createSourceSnapshotAuthority } from "./source-snapshot.js";
 
 const silent = () => pino({ level: "silent" });
 const ids = createSequentialIdFactory("wsx");
@@ -46,14 +47,22 @@ after(() => {
 });
 
 /** A REAL WorkspaceManager over a fresh scratch root, plus the v2 authorities over it. */
-function authorities(): { workspaces: WorkspaceAuthority; mutations: StateBoundMutationAuthority } {
+function authorities(): { workspaces: WorkspaceAuthority; mutations: StateBoundMutationAuthority; sources: ReturnType<typeof createSourceSnapshotAuthority> } {
   const root = join(tmpdir(), `ikbi-v2-ws-${randomBytes(8).toString("hex")}`);
   scratch.push(root);
   const locks = new LockManager({ logger: silent(), defaultTimeoutMs: 5_000, defaultStaleMs: 30_000 });
   const store = new DocumentStore<WorkspaceRecord>({ dir: join(root, "registry"), locks, logger: silent(), fsync: false });
   const manager = new WorkspaceManager({ root, max: 16, locks, store, logger: silent() });
   const wsIds = createSequentialIdFactory(`w${scratch.length}`);
-  return createProductionWorkspaceAuthorities({ manager, mintWorkspaceId: () => wsIds.mint("workspace") });
+  // Each set of authorities gets its OWN snapshot authority, so a workspace is always
+  // materialized from bytes captured by the same component that will verify them.
+  const sources = createSourceSnapshotAuthority();
+  const built = createProductionWorkspaceAuthorities({
+    manager,
+    mintWorkspaceId: () => wsIds.mint("workspace"),
+    capturedBytes: (id) => sources.capturedBytes(id),
+  });
+  return { ...built, sources };
 }
 
 function repo(files: Readonly<Record<string, string>> = {}): string {
@@ -62,8 +71,15 @@ function repo(files: Readonly<Record<string, string>> = {}): string {
   return r;
 }
 
-async function allocate(a: { workspaces: WorkspaceAuthority }, repoPath: string, runId: V2RunId = RUN): Promise<V2WorkspaceRecord> {
-  const result = await a.workspaces.allocate({ runId, repoPath });
+/** Capture the source snapshot, then allocate a workspace materialized from it. */
+async function allocate(
+  a: { workspaces: WorkspaceAuthority; sources: ReturnType<typeof createSourceSnapshotAuthority> },
+  repoPath: string,
+  runId: V2RunId = RUN,
+): Promise<V2WorkspaceRecord> {
+  const captured = await a.sources.capture({ repoPath });
+  assert.ok(captured.ok, `capture failed: ${captured.ok ? "" : captured.failure.message}`);
+  const result = await a.workspaces.allocate({ runId, source: captured.reader.snapshot });
   assert.ok(result.ok, `allocation failed: ${result.ok ? "" : result.failure.message}`);
   return result.workspace;
 }

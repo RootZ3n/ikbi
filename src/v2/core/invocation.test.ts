@@ -26,6 +26,25 @@ import {
 import { QUALIFICATION_SYSTEM_INSTRUCTION, renderModelInput } from "./prompt.js";
 import type { ModelResolutionDecision } from "./resolver.js";
 
+import { DEFAULT_SOURCE_POLICY, type SourceSnapshot, type SourceSnapshotReader } from "./source.js";
+
+/** A snapshot reader serving nothing — this suite injects no repository artifacts. */
+function snapshotReader(): SourceSnapshotReader {
+  const snapshot = {
+    snapshotId: "s".repeat(64) as SourceSnapshot["snapshotId"],
+    repositoryRoot: "/repo",
+    headCommit: "c".repeat(40),
+    headTree: "t".repeat(40),
+    clean: true,
+    policy: DEFAULT_SOURCE_POLICY,
+    entries: [],
+    exclusions: [],
+    counts: { modified: 0, deleted: 0, untrackedIncluded: 0, excluded: 0 },
+    capturedAt: 1,
+  } satisfies SourceSnapshot;
+  return { snapshot, read: async () => ({ ok: false, reason: "missing", detail: "not in this snapshot" }) };
+}
+
 const ids = createSequentialIdFactory("inv");
 const RUN = ids.mint("run");
 const TASK = ids.mint("task");
@@ -67,7 +86,7 @@ async function contextPackage(over: { runId?: typeof RUN; taskId?: typeof TASK; 
       runId: over.runId ?? RUN,
       taskId: over.taskId ?? TASK,
       goal: "make the widget green",
-      repoPath: "/repo",
+      source: snapshotReader(),
       resolutionDecisionId: (over.decisionId ?? "d".repeat(64)) as ModelResolutionDecision["decisionId"],
       capabilities: CAPS,
     },

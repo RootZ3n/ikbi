@@ -58,13 +58,21 @@ const fakeTransport: InvocationTransport = {
 
 /** Hermetic workspace + mutation authorities: no git, no filesystem, no worktree. */
 const fakeWorkspaces: WorkspaceAuthority = {
-  allocate: async ({ runId, repoPath }) => ({
+  allocate: async ({ runId, source }) => ({
     ok: true,
     workspace: {
       workspaceId: "ws_reach-00000001" as V2WorkspaceRecord["workspaceId"],
       runId,
       donorWorkspaceId: "donor-reach",
-      source: { repositoryPath: repoPath, baseBranch: "main", baseCommit: "c".repeat(40), baseTree: "t".repeat(40) },
+      source: {
+        repositoryPath: source.repositoryRoot,
+        baseBranch: "main",
+        baseCommit: "c".repeat(40),
+        baseTree: "t".repeat(40),
+        sourceSnapshotId: source.snapshotId,
+        materializedStateDigest: "m".repeat(64),
+        materializedEntries: 0,
+      },
       path: "/scratch/reach",
       status: "allocated",
       allocatedAt: 1,
@@ -147,6 +155,8 @@ test("reachability: the JSON surface carries the lifecycle journal + a counted r
   assert.deepEqual(result.receipt.evidence, {
     // Configuration (V2-002) and route authorization (V2-003) happen — and nothing else.
     configurationResolved: true,
+    sourceSnapshotCaptured: true,
+    sourceSnapshots: 1,
     modelResolutionCompleted: true,
     modelResolutions: 1,
     contextAssemblyCompleted: true,

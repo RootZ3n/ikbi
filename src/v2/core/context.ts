@@ -38,6 +38,8 @@ import { createHash } from "node:crypto";
 import { contentDigest, type V2ArtifactDigest, type V2ContextDigest, type V2DecisionDigest, type V2RunId, type V2TaskId } from "./identity.js";
 import { runFailure, type RunFailure } from "./failure.js";
 import type { ModelCapabilityFacts } from "./config.js";
+import type { SourceSnapshotReader } from "./source.js";
+import type { V2SnapshotDigest } from "./identity.js";
 
 // ---------------------------------------------------------------------------
 // Artifacts
@@ -126,10 +128,16 @@ export interface ContextOmission {
 // Sources
 // ---------------------------------------------------------------------------
 
-/** What a source is told. Deliberately minimal — a source decides nothing about fit. */
+/**
+ * What a source is told.
+ *
+ * NOTE WHAT IS ABSENT: a repository path. Sources read through the run's
+ * `SourceSnapshotReader`, so every artifact comes from the one state the run is bound to
+ * — never from the mutable working tree, which may have moved on since capture.
+ */
 export interface ContextSourceRequest {
   readonly goal: string;
-  readonly repoPath: string;
+  readonly source: SourceSnapshotReader;
 }
 
 /**
@@ -241,6 +249,12 @@ export interface ContextPackage {
   readonly packageId: V2ContextDigest;
   readonly runId: V2RunId;
   readonly taskId: V2TaskId;
+  /**
+   * The source snapshot every repository artifact came from. Bound into the package
+   * identity, so two packages assembled from different dirty states can never collide
+   * merely because the artifacts they happened to include looked the same.
+   */
+  readonly sourceSnapshotId: V2SnapshotDigest;
   /** The model-resolution decision whose capabilities bounded this package. */
   readonly resolutionDecisionId: V2DecisionDigest;
   readonly budget: ContextBudget;
@@ -304,7 +318,8 @@ export interface ContextAssemblyRequest {
   readonly runId: V2RunId;
   readonly taskId: V2TaskId;
   readonly goal: string;
-  readonly repoPath: string;
+  /** The one source state this run is bound to. Every repository artifact comes from it. */
+  readonly source: SourceSnapshotReader;
   readonly resolutionDecisionId: V2DecisionDigest;
   readonly capabilities: ModelCapabilityFacts | undefined;
 }
@@ -364,7 +379,7 @@ export async function assembleContext(
     sourcesConsulted.push(source.id);
     let collected: ContextSourceResult;
     try {
-      collected = await source.collect({ goal: request.goal, repoPath: request.repoPath });
+      collected = await source.collect({ goal: request.goal, source: request.source });
     } catch (err) {
       // A source that throws is a defect in that source, not a reason to silently
       // deliver a smaller context: the run fails and says which source broke.
@@ -443,6 +458,7 @@ export async function assembleContext(
   // what the builder would see.
   const packageId = contentDigest("context", {
     resolutionDecisionId: request.resolutionDecisionId,
+    sourceSnapshotId: request.source.snapshot.snapshotId,
     goalSha256: sha256Text(request.goal),
     budget: {
       contextWindowTokens: budget.contextWindowTokens,
@@ -469,6 +485,7 @@ export async function assembleContext(
       packageId,
       runId: request.runId,
       taskId: request.taskId,
+      sourceSnapshotId: request.source.snapshot.snapshotId,
       resolutionDecisionId: request.resolutionDecisionId,
       budget,
       artifacts,

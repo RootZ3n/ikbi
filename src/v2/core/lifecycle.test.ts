@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { createSequentialIdFactory, type V2ContextDigest, type V2DecisionDigest, type V2PolicyDigest } from "./identity.js";
+import { createSequentialIdFactory, type V2ContextDigest, type V2DecisionDigest, type V2PolicyDigest, type V2SnapshotDigest } from "./identity.js";
 import {
   LIFECYCLE_STAGES,
   LifecycleViolationError,
@@ -33,6 +33,8 @@ const CONTEXT = "2".repeat(64) as V2ContextDigest;
 const INVOCATION = ids.mint("invocation");
 /** A stand-in workspace id. Workspace identity is the workspace suite's concern. */
 const WORKSPACE = ids.mint("workspace");
+/** A stand-in snapshot digest. Snapshot identity is the source suite's concern. */
+const SNAPSHOT = "5".repeat(64) as V2SnapshotDigest;
 
 function fresh() {
   const ids = createSequentialIdFactory("lc");
@@ -53,7 +55,11 @@ function walkTo(target: LifecycleStage) {
     lifecycle.enter(runId, stage);
     // V2-002: model_resolution now REQUIRES a recorded configuration, so a full walk
     // must establish one in preflight — the stage that owns configuration truth.
-    if (stage === "preflight") lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
+    if (stage === "preflight") {
+      lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
+      // V2-006A: context and candidate_strategy both require the run's source snapshot.
+      lifecycle.record(runId, { kind: "snapshot", id: SNAPSHOT, clean: true });
+    }
     // V2-003: `context` REQUIRES a recorded resolution — its budget is a function of the
     // resolved model's window, so a full walk must authorize a route first.
     if (stage === "model_resolution") lifecycle.record(runId, { kind: "resolution", decisionId: DECISION, role: "builder" });
@@ -148,6 +154,7 @@ test("lifecycle: VERIFICATION cannot be entered before a candidate exists", () =
   const { lifecycle, runId } = fresh();
   lifecycle.enter(runId, "preflight");
   lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
+  lifecycle.record(runId, { kind: "snapshot", id: SNAPSHOT, clean: true });
   lifecycle.enter(runId, "model_resolution");
   lifecycle.record(runId, { kind: "resolution", decisionId: DECISION, role: "builder" });
   lifecycle.enter(runId, "context");
@@ -380,6 +387,7 @@ test("lifecycle: a recorded resolution unlocks context and is counted", () => {
   const { lifecycle, runId } = fresh();
   lifecycle.enter(runId, "preflight");
   lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
+  lifecycle.record(runId, { kind: "snapshot", id: SNAPSHOT, clean: true });
   lifecycle.enter(runId, "model_resolution");
   lifecycle.record(runId, { kind: "resolution", decisionId: DECISION, role: "builder" });
   lifecycle.enter(runId, "context");
@@ -406,6 +414,7 @@ test("lifecycle: INVOCATION cannot be entered before context is assembled (V2-00
   const { lifecycle, runId } = fresh();
   lifecycle.enter(runId, "preflight");
   lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
+  lifecycle.record(runId, { kind: "snapshot", id: SNAPSHOT, clean: true });
   lifecycle.enter(runId, "model_resolution");
   lifecycle.record(runId, { kind: "resolution", decisionId: DECISION, role: "builder" });
   lifecycle.enter(runId, "context");
@@ -456,6 +465,7 @@ test("lifecycle: INVOCATION cannot be entered before context is assembled", () =
   const { lifecycle, runId } = fresh();
   lifecycle.enter(runId, "preflight");
   lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
+  lifecycle.record(runId, { kind: "snapshot", id: SNAPSHOT, clean: true });
   lifecycle.enter(runId, "model_resolution");
   lifecycle.record(runId, { kind: "resolution", decisionId: DECISION, role: "builder" });
   lifecycle.enter(runId, "context");
@@ -466,6 +476,7 @@ test("lifecycle: an invocation is INVOCATION's to record and no one else's", () 
   const { lifecycle, runId } = fresh();
   lifecycle.enter(runId, "preflight");
   lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
+  lifecycle.record(runId, { kind: "snapshot", id: SNAPSHOT, clean: true });
   lifecycle.enter(runId, "model_resolution");
   lifecycle.record(runId, { kind: "resolution", decisionId: DECISION, role: "builder" });
   lifecycle.enter(runId, "context");
@@ -533,4 +544,48 @@ test("lifecycle: workspace/observation/mutation counts are counted, not assumed"
   assert.equal(summary.observationsTaken, 1);
   assert.equal(summary.mutationsApplied, 0, "nothing was written");
   assert.equal(summary.repositoryMutated, false, "and the source repository is untouched");
+});
+
+// ── one source snapshot per run (V2-006A) ───────────────────────────────────
+
+test("lifecycle: CONTEXT cannot be entered without the run's source snapshot", () => {
+  const { lifecycle, runId } = fresh();
+  lifecycle.enter(runId, "preflight");
+  lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
+  lifecycle.enter(runId, "model_resolution");
+  lifecycle.record(runId, { kind: "resolution", decisionId: DECISION, role: "builder" });
+  // A model is resolved, but nothing has said what source state this run describes.
+  assert.equal(violation(() => lifecycle.enter(runId, "context")), "missing_required_evidence");
+});
+
+test("lifecycle: at most ONE source snapshot — a second is refused, not preferred", () => {
+  const { lifecycle, runId } = fresh();
+  lifecycle.enter(runId, "preflight");
+  lifecycle.record(runId, { kind: "snapshot", id: SNAPSHOT, clean: true });
+  assert.equal(
+    violation(() => lifecycle.record(runId, { kind: "snapshot", id: "6".repeat(64) as V2SnapshotDigest, clean: false })),
+    "duplicate_source_snapshot",
+    "two answers to 'what did this run start from' is no answer at all",
+  );
+});
+
+test("lifecycle: a snapshot is PREFLIGHT's to capture — no later stage may recapture", () => {
+  const { lifecycle, runId } = fresh();
+  lifecycle.enter(runId, "preflight");
+  lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
+  lifecycle.record(runId, { kind: "snapshot", id: SNAPSHOT, clean: true });
+  lifecycle.enter(runId, "model_resolution");
+  assert.equal(
+    violation(() => lifecycle.record(runId, { kind: "snapshot", id: "7".repeat(64) as V2SnapshotDigest, clean: true })),
+    "stage_not_permitted_for_evidence",
+  );
+});
+
+test("lifecycle: the receipt counts the source snapshot rather than assuming it", () => {
+  const { lifecycle, runId } = fresh();
+  lifecycle.enter(runId, "preflight");
+  lifecycle.terminalize(runId, { kind: "rejected", reason: "no_work" });
+  const summary = summarizeEvidence(lifecycle.ledger, lifecycle.outcome!);
+  assert.equal(summary.sourceSnapshotCaptured, false);
+  assert.equal(summary.sourceSnapshots, 0);
 });

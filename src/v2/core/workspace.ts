@@ -34,6 +34,7 @@
 
 import { contentDigest, type V2MutationDigest, type V2ObservationDigest, type V2RunId, type V2WorkspaceId } from "./identity.js";
 import { runFailure, type RunFailure } from "./failure.js";
+import type { SourceSnapshot } from "./source.js";
 
 // ---------------------------------------------------------------------------
 // Workspace
@@ -58,6 +59,16 @@ export interface WorkspaceSourceBinding {
   readonly baseCommit: string;
   /** The exact tree of that commit — content identity, independent of commit metadata. */
   readonly baseTree: string;
+  /**
+   * The SOURCE SNAPSHOT this workspace was materialized from — the operator-visible
+   * starting state, which on a dirty checkout is NOT the same thing as HEAD. The commit
+   * and tree above remain valuable ancestry; this is what the workspace actually holds.
+   */
+  readonly sourceSnapshotId: string;
+  /** Proof the workspace really matches that snapshot, produced by verifying it. */
+  readonly materializedStateDigest: string;
+  /** How many delta entries were reproduced. Zero for a clean snapshot. */
+  readonly materializedEntries: number;
 }
 
 /** The durable account of one allocated workspace. */
@@ -84,10 +95,10 @@ export interface V2WorkspaceRecord {
 export function workspaceBindingDigest(record: Pick<V2WorkspaceRecord, "runId" | "source">): string {
   return contentDigest("artifact", {
     runId: record.runId,
-    repositoryPath: record.source.repositoryPath,
     baseBranch: record.source.baseBranch,
     baseCommit: record.source.baseCommit,
     baseTree: record.source.baseTree,
+    sourceSnapshotId: record.source.sourceSnapshotId,
   });
 }
 
@@ -99,9 +110,16 @@ export type WorkspaceDisposition =
 
 /** The workspace lifecycle seam. One implementation; no component allocates its own worktree. */
 export interface WorkspaceAuthority {
+  /**
+   * Allocate an isolated workspace and materialize the run's source snapshot into it.
+   *
+   * The snapshot is REQUIRED: there is no way to ask for a workspace without saying what
+   * source state it must hold, which is what stops a candidate from starting from a
+   * different reality than the context that described it.
+   */
   allocate(input: {
     readonly runId: V2RunId;
-    readonly repoPath: string;
+    readonly source: SourceSnapshot;
     readonly label?: string;
   }): Promise<WorkspaceAllocationResult>;
   discard(record: V2WorkspaceRecord): Promise<WorkspaceDisposition>;

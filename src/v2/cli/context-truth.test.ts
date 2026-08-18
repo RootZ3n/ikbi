@@ -158,11 +158,21 @@ test("context truth: changing the TARGET FILE marker changes the package identit
   assert.notEqual(before, after_);
 });
 
-test("context truth: changing an UNSELECTED file does NOT change the package identity", () => {
-  const state = makeStateRoot();
-  const before = v2Run(state, makeRepo()).result.context!.packageId;
-  const after_ = v2Run(state, makeRepo({ unrelated: `export const other = "${MARKER_C}-CHANGED";\n` })).result.context!.packageId;
-  assert.equal(before, after_, "context identity reflects what was included, not what exists");
+test("context truth: an unselected file changes SOURCE identity, and therefore package identity", () => {
+  // A DELIBERATE change from V2-004. The package now binds the run's source snapshot, so
+  // its identity answers "what source state was this assembled from?" as well as "what
+  // did it include?". That is what makes context/workspace agreement provable — and it
+  // means an unrelated change to the repository moves the package id even though the
+  // included artifacts are byte-identical. The artifacts themselves still are:
+  const before = v2Run(makeStateRoot(), makeRepo()).result;
+  const after_ = v2Run(makeStateRoot(), makeRepo({ unrelated: `export const other = "${MARKER_C}-CHANGED";\n` })).result;
+  assert.deepEqual(
+    after_.context!.artifacts.map((a) => a.observedSha256),
+    before.context!.artifacts.map((a) => a.observedSha256),
+    "the same artifacts, unchanged",
+  );
+  assert.notEqual(before.context!.sourceSnapshotId, after_.context!.sourceSnapshotId, "but a different source state");
+  assert.notEqual(before.context!.packageId, after_.context!.packageId);
 });
 
 test("context truth: REMOVING a source's contribution changes the accounting truthfully", () => {
@@ -276,8 +286,10 @@ test("context truth: a symlink escaping the repository is refused and recorded",
   symlinkSync(join(outside, "secret.md"), join(repo, "AGENTS.md"));
   const { result, stdout } = v2Run(state, repo);
   assert.equal(stdout.includes("OUTSIDE-SECRET-CONTENT"), false, "nothing outside the repository was read");
+  // V2-006A: the snapshot records a symlink AS a symlink rather than following it, so
+  // context sees "this is not a regular file" instead of reading through the escape.
   const omission = result.context?.omissions.find((o) => o.path === "AGENTS.md");
-  assert.equal(omission?.reason, "outside_repository");
+  assert.equal(omission?.reason, "not_a_regular_file");
 });
 
 test("context truth: exactly ONE package, exactly one invocation, and nothing written", () => {

@@ -50,6 +50,7 @@ import type {
   V2ObservationDigest,
   V2InvocationId,
   V2PolicyDigest,
+  V2SnapshotDigest,
   V2PromotionId,
   V2RunId,
   V2VerificationId,
@@ -136,6 +137,7 @@ export interface LifecycleTransition {
  */
 export type LifecycleEvidence =
   | { readonly kind: "configuration"; readonly policyId: V2PolicyDigest }
+  | { readonly kind: "snapshot"; readonly id: V2SnapshotDigest; readonly clean: boolean }
   | { readonly kind: "resolution"; readonly decisionId: V2DecisionDigest; readonly role: string }
   | { readonly kind: "context"; readonly packageId: V2ContextDigest; readonly artifacts: number }
   | { readonly kind: "invocation"; readonly id: V2InvocationId; readonly role: string }
@@ -156,6 +158,9 @@ const EVIDENCE_STAGE: Record<LifecycleEvidence["kind"], readonly LifecycleStage[
   // Configuration truth is established ONCE, by preflight. No later stage may
   // re-resolve it, which is what makes the policy the single input to model choice.
   configuration: ["preflight"],
+  // THE source snapshot is captured once, by preflight. No later stage may recapture:
+  // a run stays bound to the state it started from.
+  snapshot: ["preflight"],
   // A model-resolution decision may only be minted by the stage that owns resolution.
   // No later stage gets to re-decide which model serves a role.
   resolution: ["model_resolution"],
@@ -178,30 +183,33 @@ const EVIDENCE_STAGE: Record<LifecycleEvidence["kind"], readonly LifecycleStage[
 };
 
 /** Stage-entry preconditions expressed as evidence that must already exist. */
-const STAGE_REQUIRES: Partial<Record<LifecycleStage, LifecycleEvidence["kind"]>> = {
+const STAGE_REQUIRES: Partial<Record<LifecycleStage, readonly LifecycleEvidence["kind"][]>> = {
   // No model may be resolved before configuration has been established and recorded.
   // This is the structural half of "every model decision has exactly one normalized
   // configuration input" — a resolver cannot run in a world where none was built.
-  model_resolution: "configuration",
+  model_resolution: ["configuration"],
   // Context cannot be assembled before the model is known — its budget is a function of
   // the resolved model's window. See the ORDERING NOTE above.
-  context: "resolution",
+  // Context needs a resolved model to size itself AND the one source state it describes.
+  context: ["resolution", "snapshot"],
   // Nothing may be invoked without an authorized context package to invoke it with.
-  invocation: "context",
+  invocation: ["context"],
   // A candidate is produced BY a model, so a route must have been proven invocable
   // before any strategy starts producing them.
-  candidate_strategy: "invocation",
+  // A workspace must be materialized from the SAME source state context came from.
+  candidate_strategy: ["invocation", "snapshot"],
   // Nothing may be built without an isolated workspace to build it in.
-  candidate_generation: "workspace",
+  candidate_generation: ["workspace"],
   // Nothing to verify without at least one candidate. (One OR MANY — see contract.ts.)
-  verification: "candidate",
+  verification: ["candidate"],
   // Nothing to promote without a verdict from the canonical verification authority.
-  promotion: "verification",
+  promotion: ["verification"],
 };
 
 /** The read-only view of what a run produced. */
 export interface RunLedgerView {
   readonly configurations: readonly V2PolicyDigest[];
+  readonly snapshots: readonly V2SnapshotDigest[];
   readonly resolutions: readonly V2DecisionDigest[];
   readonly contexts: readonly V2ContextDigest[];
   readonly workspaces: readonly V2WorkspaceId[];
@@ -228,6 +236,7 @@ export type LifecycleViolationCode =
   | "unrecorded_evidence"
   | "evidence_mismatch"
   | "duplicate_role_resolution"
+  | "duplicate_source_snapshot"
   | "outcome_stage_not_reached";
 
 /**
@@ -310,6 +319,7 @@ export class RunLifecycle {
   get ledger(): RunLedgerView {
     return {
       configurations: this.evidence.filter((e) => e.kind === "configuration").map((e) => e.policyId),
+      snapshots: this.evidence.filter((e) => e.kind === "snapshot").map((e) => e.id),
       resolutions: this.evidence.filter((e) => e.kind === "resolution").map((e) => e.decisionId),
       contexts: this.evidence.filter((e) => e.kind === "context").map((e) => e.packageId),
       workspaces: this.evidence.filter((e) => e.kind === "workspace").map((e) => e.id),
@@ -345,13 +355,14 @@ export class RunLifecycle {
         `cannot enter "${stage}" from "${stateName(this.current)}" (only "${expected ?? "<none>"}" is legal)`,
       );
     }
-    const required = STAGE_REQUIRES[stage];
-    if (required !== undefined && !this.evidence.some((e) => e.kind === required)) {
-      throw new LifecycleViolationError(
-        "missing_required_evidence",
-        this.runId,
-        `stage "${stage}" requires at least one recorded ${required}`,
-      );
+    for (const required of STAGE_REQUIRES[stage] ?? []) {
+      if (!this.evidence.some((e) => e.kind === required)) {
+        throw new LifecycleViolationError(
+          "missing_required_evidence",
+          this.runId,
+          `stage "${stage}" requires at least one recorded ${required}`,
+        );
+      }
     }
     this.transitionTo({ kind: "running", stage });
   }
@@ -372,6 +383,17 @@ export class RunLifecycle {
         this.runId,
         `stage "${stateName(this.current)}" may not record ${entry.kind} evidence`,
       );
+    }
+    if (entry.kind === "snapshot") {
+      // EXACTLY ONE source snapshot per run. A second would mean two competing answers
+      // to "what did this run start from", and every downstream binding would be a guess.
+      if (this.evidence.some((e) => e.kind === "snapshot")) {
+        throw new LifecycleViolationError(
+          "duplicate_source_snapshot",
+          this.runId,
+          "this run already has an authoritative source snapshot; a second would make every downstream binding ambiguous",
+        );
+      }
     }
     if (entry.kind === "resolution") {
       // AT MOST ONE resolution per role. Without this, two builder decisions could
