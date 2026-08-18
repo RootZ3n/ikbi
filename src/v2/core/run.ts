@@ -59,6 +59,8 @@ import {
   type ModelResolutionDecision,
 } from "./resolver.js";
 import { assembleContext, manifestOf, type ContextPackage, type ContextSource } from "./context.js";
+import { candidateDigest, summarizeCandidate, type CandidateRecord, type TreeCaptureResult } from "./candidate.js";
+import { generateCandidate, type BuilderBudget, type BuilderToolExecutor, type BuilderToolExecutorDeps } from "./builder.js";
 import { summarizeRetrieval, type RetrievalReporter, type RetrievalSummary } from "./retrieval.js";
 import { summarizeSnapshot, type SourceSnapshotAuthority, type SourceSnapshotReader } from "./source.js";
 import {
@@ -70,7 +72,6 @@ import {
   type WorkspaceDisposition,
 } from "./workspace.js";
 import {
-  invokeAuthorized,
   type InvocationTransport,
   type ServedModelAlias,
   type V2InvocationRecord,
@@ -110,17 +111,7 @@ export const DEMONSTRATED_ROLE = "builder" as const;
 export const DEMONSTRATED_REQUIREMENTS: ModelRequirements | undefined = undefined;
 
 /**
- * Completion cap for the qualification call. Small on purpose: this slice proves a route
- * is invocable and attributable, and a long answer would only cost money to prove the
- * same thing. It is additionally clamped to the budget the resolved model reserved.
- */
-export const QUALIFICATION_MAX_OUTPUT_TOKENS = 128;
-
-/** Per-attempt timeout. One attempt; no retry follows it. */
-export const QUALIFICATION_TIMEOUT_MS = 60_000;
-
-/**
- * The context artifact whose workspace copy is re-observed.
+ * The context artifact whose workspace copy is re-observed before generation starts.
  *
  * A real, already-authorized artifact — never a probe file invented to have something to
  * look at. A goal-named target file is preferred (it is what a builder would edit first);
@@ -136,10 +127,10 @@ export function rebindableArtifact(pkg: ContextPackage): { path: string; observe
 }
 
 /** The furthest stage this build of ikbi implements. */
-export const IMPLEMENTED_THROUGH_STAGE: LifecycleStage = "candidate_strategy";
+export const IMPLEMENTED_THROUGH_STAGE: LifecycleStage = "candidate_generation";
 
 /** The stage the run would need next, and does not have. */
-export const FIRST_UNIMPLEMENTED_STAGE: LifecycleStage = "candidate_generation";
+export const FIRST_UNIMPLEMENTED_STAGE: LifecycleStage = "verification";
 
 /** Upper bound on a goal, so an accidental file paste is rejected as input, not as a build. */
 export const MAX_GOAL_LENGTH = 8000;
@@ -212,6 +203,19 @@ export interface V2RunDeps {
    * component reads that answer instead of asking the filesystem again.
    */
   readonly sources: SourceSnapshotAuthority;
+  /**
+   * Builds the tool executor for one workspace. REQUIRED and injected for the same reason
+   * the rest are: it holds the mutation authority and performs I/O, and this pure layer
+   * imports no v1 code and no filesystem API.
+   */
+  readonly buildTools: (deps: BuilderToolExecutorDeps) => BuilderToolExecutor;
+  /**
+   * Addresses the exact resulting state of a candidate workspace. Injected because it
+   * shells out to git; wired once, in `src/v2/runtime/index.ts`.
+   */
+  readonly captureTree: (workspace: V2WorkspaceRecord) => Promise<TreeCaptureResult>;
+  /** Bounds on the builder loop. Defaults to `DEFAULT_BUILDER_BUDGET`. */
+  readonly builderBudget?: BuilderBudget;
   readonly ids?: V2IdFactory;
   readonly now?: () => number;
   readonly probe?: RepoProbe;
@@ -339,7 +343,8 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
   let decision: ModelResolutionDecision | undefined;
   let retrieval: RetrievalSummary | undefined;
   let contextPackage: ContextPackage | undefined;
-  let invocation: V2InvocationRecord | undefined;
+  let invocations: readonly V2InvocationRecord[] = [];
+  let candidate: CandidateRecord | undefined;
   let workspace: V2WorkspaceRecord | undefined;
   let workspaceObservations = 0;
   let disposition: WorkspaceDisposition | undefined;
@@ -416,40 +421,12 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     }
     lifecycle.record(runId, { kind: "context", packageId: contextPackage.packageId, artifacts: contextPackage.artifacts.length });
 
-    // Stage 4 — INVOCATION. Exactly the authorized route, exactly once. The id is minted
-    // HERE, not at resolution: it identifies an actual attempt, and an authorization
-    // that never reached a transport is owed no invocation identity.
-    lifecycle.enter(runId, "invocation");
-    const invocationId = ids.mint("invocation");
-    const called = await invokeAuthorized({
-      runId,
-      taskId,
-      invocationId,
-      decision,
-      contextPackage,
-      parameters: {
-        maxOutputTokens: Math.min(QUALIFICATION_MAX_OUTPUT_TOKENS, contextPackage.budget.reservedCompletionTokens),
-        timeoutMs: QUALIFICATION_TIMEOUT_MS,
-      },
-      transport: deps.transport,
-      ...(deps.aliases !== undefined ? { aliases: deps.aliases } : {}),
-      now,
-    });
-    if (!called.ok) {
-      // A failure that reached the wire IS an invocation and is recorded as one — the
-      // receipt must not claim a provider was never contacted when it was.
-      if (called.attempted) lifecycle.record(runId, { kind: "invocation", id: invocationId, role: decision.role });
-      return called.failure;
-    }
-    invocation = called.record;
-    lifecycle.record(runId, { kind: "invocation", id: invocationId, role: decision.role });
-
-    // Stage 5 — CANDIDATE STRATEGY. "Where and how would a candidate be produced?" For
-    // the SINGLE strategy that is one isolated workspace. A workspace is not a candidate:
-    // allocating one produces nothing, and this run will produce nothing.
+    // Stage 4 — CANDIDATE STRATEGY. "Where and how is a candidate produced?" For the
+    // SINGLE strategy that is one isolated workspace. A workspace is not a candidate:
+    // allocating one produces nothing.
     lifecycle.enter(runId, "candidate_strategy");
     // The workspace materializes THE SAME snapshot context was assembled from, so the
-    // candidate starts from exactly the state the model was shown.
+    // builder starts from exactly the state it was shown.
     const allocated = await deps.workspaces.allocate({ runId, source: source.snapshot, label: `v2-${DEMONSTRATED_ROLE}` });
     if (!allocated.ok) return allocated.failure;
     workspace = allocated.workspace;
@@ -459,7 +436,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     // workspace existed; the workspace is a worktree at the base commit. Those are not
     // guaranteed to agree — an uncommitted change in the source repo is exactly the case
     // where they do not. So the bytes the model saw are checked against the bytes that
-    // are actually here, through the same authority any future edit must use.
+    // are actually here, through the same authority every edit must use.
     const anchor = rebindableArtifact(contextPackage);
     if (anchor !== undefined) {
       const observed = await deps.mutations.observe({ runId, workspace, path: anchor.path });
@@ -490,15 +467,112 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
       }
     }
 
-    // Nothing was produced, so nothing is worth keeping. The next stage does not exist in
-    // this build, so the run stops here and says so.
+    // Stage 5 — CANDIDATE GENERATION. The builder loop. EVERY model turn goes through the
+    // one invocation authority, EVERY file read produces an observation, and EVERY write
+    // names the observation that authorized it. This function holds none of that
+    // machinery itself — it wires the authorities together and records what they did.
+    lifecycle.enter(runId, "candidate_generation");
+
+    const executor = deps.buildTools({
+      runId,
+      workspace,
+      mutations: deps.mutations,
+      onObservation: (observation) => {
+        workspaceObservations += 1;
+        lifecycle.record(runId, {
+          kind: "observation",
+          id: observation.observationId,
+          workspaceId: observation.workspaceId,
+          path: observation.path,
+        });
+      },
+      onMutation: (applied) => {
+        lifecycle.record(runId, {
+          kind: "mutation",
+          id: applied.mutationId,
+          workspaceId: workspace!.workspaceId,
+          path: applied.path,
+        });
+      },
+    });
+
+    const generated = await generateCandidate({
+      runId,
+      taskId,
+      decision,
+      contextPackage,
+      transport: deps.transport,
+      executor,
+      mintInvocationId: () => ids.mint("invocation"),
+      ...(deps.builderBudget !== undefined ? { budget: deps.builderBudget } : {}),
+      ...(deps.aliases !== undefined ? { aliases: deps.aliases } : {}),
+      now,
+    });
+
+    // Invocations are recorded whether generation succeeded or not: the provider really
+    // was contacted, and a receipt that omitted the calls a failed build paid for would
+    // be understating the run's cost.
+    for (const record of generated.ok ? generated.generation.invocations : generated.invocations) {
+      lifecycle.record(runId, { kind: "invocation", id: record.invocationId, role: decision.role });
+    }
+    // A turn that reached the wire and then failed has no record — but it happened, and
+    // the receipt must not report the provider as never contacted.
+    if (!generated.ok) {
+      for (const id of generated.attemptedInvocationIds) lifecycle.record(runId, { kind: "invocation", id, role: decision.role });
+    }
+    invocations = generated.ok ? generated.generation.invocations : generated.invocations;
+    if (!generated.ok) return generated.failure;
+
+    // CAPTURE. The builder said it is done; now the exact resulting state is addressed,
+    // so verification inspects a tree rather than a description of one.
+    const capturedTree = await deps.captureTree(workspace);
+    if (!capturedTree.ok) return capturedTree.failure;
+
+    const generation = generated.generation;
+    candidate = Object.freeze({
+      candidateId: candidateDigest({ sourceSnapshotId: source.snapshot.snapshotId, tree: capturedTree.tree }),
+      runId,
+      sourceSnapshotId: source.snapshot.snapshotId,
+      workspaceId: workspace.workspaceId,
+      builderDecisionId: decision.decisionId,
+      invocationIds: generation.invocationIds,
+      mutationIds: generation.mutationIds,
+      changedPaths: generation.changedPaths,
+      tree: capturedTree.tree,
+      completion: "finished",
+      claim: generation.claim,
+      metadata: {
+        turns: generation.turns,
+        toolCalls: generation.toolCalls,
+        toolFailures: generation.toolFailures,
+        startedAt: generation.startedAt,
+        endedAt: generation.endedAt,
+      },
+    });
+    lifecycle.record(runId, { kind: "candidate", id: candidate.candidateId, workspaceId: workspace.workspaceId });
+
+    // A CANDIDATE NOW EXISTS. It has not been verified, judged or promoted — the stage
+    // that would do that does not exist in this build, and the run says exactly that.
     return stageNotImplemented(FIRST_UNIMPLEMENTED_STAGE, IMPLEMENTED_THROUGH_STAGE);
   })();
 
-  // CLEANUP runs whatever the outcome — an allocated workspace must not outlive the run
-  // that owns it just because the run failed. A cleanup that does not finish is reported
-  // as `failed`, never silently as if it had.
-  if (workspace !== undefined) disposition = await deps.workspaces.discard(workspace);
+  // OWNERSHIP TRANSITION. Until V2-007 a workspace was always discarded, because nothing
+  // was ever produced in one. Now the question has a real answer:
+  //
+  //   a CANDIDATE exists  → the workspace becomes candidate-owned and is RETAINED. It is
+  //                         the thing verification will inspect, and discarding it would
+  //                         throw away the only copy of the work the run just paid for.
+  //   no candidate        → DISCARDED. A generation that failed leaves a half-edited tree
+  //                         nothing is entitled to read, and leaking it is a workspace leak.
+  //
+  // Retention is NOT promotion and NOT a claim of quality: the worktree simply stays on
+  // disk, findable through the existing `ikbi workspace ls`.
+  if (workspace !== undefined) {
+    disposition =
+      candidate !== undefined
+        ? await deps.workspaces.retain(workspace, `candidate ${candidate.candidateId} awaits verification`)
+        : await deps.workspaces.discard(workspace);
+  }
 
   const outcome: RunTerminalOutcome = { kind: "failed", failure };
   lifecycle.terminalize(runId, outcome);
@@ -516,7 +590,8 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     ...(decision !== undefined ? { resolution: summarizeResolution(decision) } : {}),
     ...(contextPackage !== undefined ? { context: summarizeContext(contextPackage) } : {}),
     ...(retrieval !== undefined ? { retrieval } : {}),
-    ...(invocation !== undefined ? { invocation: summarizeInvocation(invocation) } : {}),
+    invocations: invocations.map(summarizeInvocation),
+    ...(candidate !== undefined ? { candidate: summarizeCandidate(candidate) } : {}),
     ...(workspace !== undefined && disposition !== undefined
       ? { workspace: summarizeWorkspace({ workspace, observations: workspaceObservations, disposition }) }
       : {}),
@@ -533,7 +608,8 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     ...(policy !== undefined ? { policy } : {}),
     ...(decision !== undefined ? { decision } : {}),
     ...(contextPackage !== undefined ? { context: manifestOf(contextPackage) } : {}),
-    ...(invocation !== undefined ? { invocation } : {}),
+    invocations,
+    ...(candidate !== undefined ? { candidate } : {}),
     journal: lifecycle.journal,
     receipt,
   };

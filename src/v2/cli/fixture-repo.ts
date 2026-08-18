@@ -24,6 +24,12 @@ function git(cwd: string, args: readonly string[]): void {
       GIT_AUTHOR_EMAIL: "fixture@ikbi.local",
       GIT_COMMITTER_NAME: "ikbi v2 fixture",
       GIT_COMMITTER_EMAIL: "fixture@ikbi.local",
+      // PINNED DATES. Without these, two fixtures created either side of a second
+      // boundary get different commit SHAs for identical content — which makes any test
+      // comparing two repositories' source identity fail intermittently, and only under
+      // load. A fixture's timestamps are not what any test is about.
+      GIT_AUTHOR_DATE: "2020-01-01T00:00:00Z",
+      GIT_COMMITTER_DATE: "2020-01-01T00:00:00Z",
     },
   });
 }

@@ -117,7 +117,16 @@ export function createInvocationTransport(lookup: TransportProviderLookup): Invo
         // The WIRE id. The donor transports send `providerModelId` from the invocation,
         // not this field, but keeping them equal means nothing can diverge silently.
         model: input.providerModelId,
-        messages: input.messages.map((m) => ({ role: m.role, content: m.content })),
+        // The donor `ModelMessage` already round-trips a full tool loop: an assistant turn
+        // carries the calls it made, and a tool message names the call it answers. v2
+        // carries both across verbatim rather than inventing a second representation.
+        messages: input.messages.map((m) => ({
+          role: m.role,
+          content: m.content,
+          ...(m.toolCalls !== undefined ? { toolCalls: m.toolCalls } : {}),
+          ...(m.toolCallId !== undefined ? { toolCallId: m.toolCallId } : {}),
+        })),
+        ...(input.tools !== undefined ? { tools: input.tools } : {}),
         maxTokens: input.parameters.maxOutputTokens,
         // v1's request contract requires a calling identity. The v2 spine has no agent
         // identity system yet, so this states plainly what is making the call rather
@@ -140,6 +149,9 @@ export function createInvocationTransport(lookup: TransportProviderLookup): Invo
           response: {
             content: result.content,
             finishReason: result.finishReason,
+            // PROVIDER-NATIVE ONLY. What the donor parsed out of a structured
+            // `tool_calls` field, and nothing scraped out of prose.
+            ...(result.toolCalls !== undefined && result.toolCalls.length > 0 ? { toolCalls: result.toolCalls } : {}),
             ...(result.servedModelId !== undefined ? { servedModelId: result.servedModelId } : {}),
             ...(observedUsage(result.usage) !== undefined ? { usage: observedUsage(result.usage)! } : {}),
             // One call to `provider.invoke` is one outbound attempt: the donor

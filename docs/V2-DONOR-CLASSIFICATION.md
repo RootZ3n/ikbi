@@ -4,8 +4,9 @@ Produced during **V2-001** (canonical lifecycle foundation) and updated by **V2-
 (provider + profile configuration boundary), **V2-003** (single model-resolution
 authority), **V2-003A** (provider inventory truth) **V2-004** (canonical context
 authority) **V2-005** (canonical model invocation authority) **V2-006** (workspace + state-bound
-mutation authority), **V2-006A** (canonical source snapshot authority) and **V2-006B**
-(deterministic snapshot-bound retrieval). This is an **advisory input to future work
+mutation authority), **V2-006A** (canonical source snapshot authority), **V2-006B**
+(deterministic snapshot-bound retrieval) and **V2-007** (canonical builder + governed tool
+loop). This is an **advisory input to future work
 orders**, not a change plan and not permission to delete anything. Nothing in v1 was
 removed, disabled, or altered to produce it.
 
@@ -152,6 +153,34 @@ decides what actually fits, in the lowest priority band, and records every omiss
 retrieved file never displaces one the operator named, and a file a higher band already
 carries is never paid for twice.
 
+## Builder systems *(V2-007)*
+
+v1's builder (`worker-model/builder.ts`, 2327 lines) is the most capable thing in the
+donor codebase and also the most entangled: the model+tool loop is interleaved with
+recovery policy, check interpretation, stall detection and completion rescue, all bound to
+the v1 orchestrator's `RoleFn`/`OperationContext`. The loop MECHANICS are worth learning
+from; the POLICY is a set of authorities v2 has not established yet.
+
+| v1 system | Production reachability | Verdict |
+| --- | --- | --- |
+| The model+tool loop shape (send → tool_calls → execute → append result → repeat, bounded) | **YES** — every build | **ADOPT as SHAPE, REBUILD.** v2's controller is ~120 lines because it is *only* the loop. v1's is 2327 because it is the loop plus everything listed below. |
+| Bounded iteration (`MAX_TOOL_ITERATIONS`, default 40, `IKBI_MAX_TOOL_ITERATIONS`) | **YES** | **ADOPT as PRINCIPLE, tighter.** v2 bounds turns, tool calls AND mutations, all as hard structured failures. The default is deliberately small (12 turns) while there is no recovery authority to grow it against. |
+| AUTO-ACCEPT on green checks (`builder.ts`, the protocol-termination rescue) | **YES** | **PARK — it is a RECOVERY authority in disguise.** A loop that ran out of iterations consults the last `run_checks` result and, if green, synthesizes the `done` the model never emitted. That is a completion decision made by the builder on the strength of a verification v2 has not built. v2 fails instead. |
+| Stall / stuck / no-progress detection, bare-stop nudges | **YES** | **PARTIALLY ADOPTED.** The bare-stop NUDGE is adopted (a prose completion is answered with "call the finish tool"); stall and no-progress classification are parked — they are recovery signals, and v2 has nothing to hand them to. |
+| The neutralization CHOKEPOINT (`appendToolResult` is the only path from a tool result to a message) | **YES** | **ADOPT as SHAPE.** v2's controller has exactly one such function for exactly this reason. The v1 chokepoint additionally routes through `neutralizeUntrusted`; v2's does not yet, and that is a stated gap — repository content re-enters the model at one place, so adding it is a change to one function rather than a dozen. |
+| Text-protocol tool emulation (`builder-tools/text-tool-protocol.ts`) | **YES** — for no-tool-API models | **PARK — REFUSED for v2.** Parsing tool intent out of markdown can execute a "call" the model never made. v2 uses provider-native `tool_calls` only; a route without them is a capability fact about the route, not a reason for a weaker second protocol. Guarded. |
+| Normalized `ToolCall` + `ModelMessage.toolCalls` / `toolCallId` (`core/provider/contract.ts`) | **YES** | **ADOPT VERBATIM.** The donor contract already round-trips a full tool loop and both transports already serialize and parse it. v2 carries it across unchanged — this is the one place where reusing v1 is strictly better than rebuilding. |
+| `tool-executor.ts` (shared builder+chat dispatch) | **YES** | **PARK.** Genuinely good governance work (the memory-governor chokepoint), but it dispatches v1's 22-tool set including raw `writeConfinedFile` paths, and it is bound to `OperationContext`. v2 has its own four-verb executor over the state-bound authority. |
+| `WorkspaceMutationSession` / `mutation-session.ts` | **YES** — builder + chat | **PARK; the CORE beneath it is ADOPTED.** V2-006 already adopted `core/workspace/mutation.ts` (observe → CAS → atomic write), which is the part that matters. The session layer adds v1-shaped tool errors and batching v2 does not need. |
+| `patch` / `multi_edit` | **YES** | **PARK.** Both express a partial edit, which makes "the state I am replacing" ambiguous. v2's replace takes the COMPLETE resulting bytes, which is what makes the compare-and-swap meaningful. They can return later expressed as complete-content mutations. |
+| `terminal` + `governed-exec` (allowlist, gate-wall, receipts) | **YES** | **PARK — deliberately, and it is the notable omission.** A coding builder ultimately needs command execution, and governed-exec is mature. But a shell is a write path: `sed -i`, `echo >`, `git checkout <path>` and any script all mutate files outside `StateBoundMutationAuthority`, which would silently void this slice's central invariant. Exposing a "read-only subset" means proving a command cannot write, which is a slice of work in itself. Guarded until then. |
+| `delegate_task`, MCP, web/vision tools, `brain_*`, git tools | **YES** | **PARK.** Each is capability rather than correctness, and `delegate` additionally invokes a model outside the one invocation doorway. |
+| `context-manager` (model-produced conversation summarisation) | **YES** — `builder.ts:70` | **PARK — invokes a model.** A second, hidden model call inside the builder loop. v2 fails with `build.context_exhausted` rather than quietly summarising; compaction returns when it can be a declared, budgeted authority. |
+| `context-layer` (deterministic in-loop compression) | **YES** | **PARK.** Deterministic and therefore adoptable later, but unnecessary while turns are bounded at 12. |
+| Streaming (`invokeStream`, `ToolCallDelta`) | **YES** | **PARK.** Real and useful for operator experience; it changes nothing about what is sent or what comes back, and a partial tool call must never execute. |
+| `done` self-check + substance validation | **YES** | **ADOPT as PRINCIPLE, simplified.** v1 validates the `done` claim for substance and rejects rubber-stamps. v2 keeps the ESSENTIAL half — finishing requires an explicit tool call, and prose is not a finish — but records the claim rather than judging it, because judging it is verification's job. |
+| Workspace lifecycle (`builder.ts` never promotes or discards) | **YES** | **ADOPT.** v1's builder writes files and nothing else; lifecycle is the orchestrator's. v2 keeps exactly that separation: the controller cannot allocate, retain, discard or promote. |
+
 ## Standing constraints for later slices
 
 1. **No second promote path.** Any strategy that wants to promote must do it by
@@ -174,29 +203,43 @@ carries is never paid for twice.
    output may not sort, re-score or mint an identity, and may not enumerate source by
    any means other than `SourceSnapshotReader.list()`. Retrieval introduces no model
    call — the production skeleton still performs exactly one invocation.
-7. **Inventory is not preference.** *(V2-003, enforced V2-003A)* Nothing an operator
+7. **The builder is not an authority over infrastructure.** *(V2-007)* It may reason,
+   inspect, request tools and finish. It may not select a model, choose a provider, create
+   a workspace, write a file, invoke a provider, verify itself, promote, or retry itself.
+   Enforced structurally: `core/builder.ts` imports no `node:` module and no resolver
+   call; `runtime/builder-tools.ts` imports no filesystem API; every effect is a
+   `StateBoundMutationAuthority.mutate`, and every model turn an `invokeAuthorized`.
+8. **No observation, no write.** *(V2-007)* Every builder write names the observation that
+   authorized it — creation included. There is no path-only create/replace/delete anywhere
+   in v2, and a refused write is reported to the MODEL rather than retried by
+   infrastructure.
+9. **A candidate is the work, not the event.** *(V2-007)* Candidate identity is a content
+   address over (source snapshot, resulting tree). The run, workspace, model, turn count
+   and mutation sequence are provenance on the record — all of them can differ while the
+   work is identical, and a tournament has to be able to see that.
+10. **Inventory is not preference.** *(V2-003, enforced V2-003A)* Nothing an operator
    PREFERS may add, rename, reroute, remove, or suppress a model. Enforced structurally:
    `buildCanonicalCatalog`'s input type has no field a preference fits into, and the
    catalog module imports nothing that could supply one. Only the roster, the provider
    set, a credential genuinely appearing/disappearing, or real capability data may move
    `inventoryDigest`.
-8. **No raw context downstream.** *(V2-004)* Anything that will face a model receives a
+11. **No raw context downstream.** *(V2-004)* Anything that will face a model receives a
    `ContextPackage`, never a context source, a repository file, or an ad-hoc string. One
    assembler admits; every omission and truncation is recorded; nothing overflows
    silently.
-9. **Selection and invocation are different authorities.** *(V2-005)* The resolver says
+12. **Selection and invocation are different authorities.** *(V2-005)* The resolver says
    which route is authorized; the invocation authority sends exactly that route, once,
    and records what actually served it. No fallback, no retry, no second resolution. The
    four identities — requested, authorized, sent, served — are never collapsed, and
    `served` is only ever read from the provider's own response.
-10. **One workspace authority, one mutation authority.** *(V2-006)* No component creates
+13. **One workspace authority, one mutation authority.** *(V2-006)* No component creates
    its own worktree, and nothing writes a file except through `mutate`, which requires an
    OBSERVATION rather than a path. Observations are workspace-scoped: identical bytes in a
    sibling candidate are not identical authority. A stale observation is refused — never
    merged, overwritten, silently re-observed or retried.
-11. **One run, one source snapshot.** *(V2-006A)* Context reads it, the workspace is
+14. **One run, one source snapshot.** *(V2-006A)* Context reads it, the workspace is
    materialized from it, and nothing recaptures — silently or otherwise. Reproducing the
    operator's existing uncommitted work in isolation is MATERIALIZATION, never a model
    mutation, and never counts as one.
-12. **Nothing is "done" because it exists.** A migrated subsystem is done when a test
+15. **Nothing is "done" because it exists.** A migrated subsystem is done when a test
    enters through the canonical v2 entrypoint and proves the subsystem is what ran.

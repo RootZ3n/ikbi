@@ -48,6 +48,7 @@ import {
   validateObservationBinding,
   workspaceFailure,
   type MutationOutcome,
+  type FileReadOutcome,
   type ObservationOutcome,
   type ObservedState,
   type StateBoundMutationAuthority,
@@ -58,6 +59,7 @@ import {
   type WorkspaceDisposition,
 } from "../core/workspace.js";
 import { materializeSnapshot } from "./source-materializer.js";
+import { writeWorktreeTree } from "./candidate-capture.js";
 import type { CapturedBytes } from "./source-snapshot.js";
 
 /** The identity v2 allocates workspaces under until it has its own identity system. */
@@ -180,6 +182,24 @@ export function createWorkspaceAuthority(deps: {
         return { ok: false, failure: materialized.failure };
       }
 
+      // THE STARTING TREE, recorded before any model turn exists. This is what a
+      // candidate's `changed` is measured against, so the operator's own uncommitted work
+      // can never be reported as something the builder did.
+      let startTree: string;
+      try {
+        startTree = await writeWorktreeTree(handle.path);
+      } catch (err) {
+        await deps.manager.discard(handle).catch(() => undefined);
+        return {
+          ok: false,
+          failure: workspaceFailure({
+            code: V2_WORKSPACE_FAILURE_CODES.sourceUnreadable,
+            message: `allocated a workspace but could not record its starting state: ${err instanceof Error ? err.message : String(err)}`,
+            detail: { workspacePath: handle.path },
+          }),
+        };
+      }
+
       const workspaceId = deps.mintWorkspaceId();
       handles.set(workspaceId, handle);
       return {
@@ -196,6 +216,7 @@ export function createWorkspaceAuthority(deps: {
             sourceSnapshotId: snapshot.snapshotId,
             materializedStateDigest: materialized.proof.materializedStateDigest,
             materializedEntries: materialized.proof.applied,
+            startTree,
           }),
           path: handle.path,
           status: "allocated" as const,
@@ -324,6 +345,25 @@ export function createMutationAuthority(deps: {
           observedAt: now(),
         }),
       };
+    },
+
+    async read(input): Promise<FileReadOutcome> {
+      // ONE ACT. The donor observation already retains the exact bytes it saw
+      // (`mutation.ts` `FileObservation.bytes`), so the content handed back and the
+      // observation that anchors it come from the same instant. Reading the file again
+      // separately would open a window in which they disagree — precisely the window a
+      // state-bound edit exists to close.
+      const observed = await this.observe({ runId: input.runId, workspace: input.workspace, path: input.path });
+      if (!observed.ok) return observed;
+
+      const donor = observations.get(key(input.workspace.workspaceId, observed.observation.observationId));
+      const bytes = donor?.bytes ?? null;
+      if (observed.observation.state.kind !== "regular" || bytes === null) {
+        // Missing, empty, a directory or a symlink: a real observation with nothing to
+        // show. The caller still holds an anchor — which is how `create_file` works.
+        return { ok: true, observation: observed.observation };
+      }
+      return { ok: true, observation: observed.observation, content: Buffer.from(bytes).toString("utf8").slice(0, input.maxChars) };
     },
 
     async mutate(input): Promise<MutationOutcome> {

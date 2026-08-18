@@ -106,7 +106,7 @@ test("v2 cli: `ikbi v2 build` reaches the canonical v2 lifecycle end-to-end", ()
   assert.equal(result.journal[0]?.from, "pending");
   assert.equal(result.journal[0]?.to, "preflight");
   assert.equal(result.journal.at(-1)?.to, "terminal");
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "invocation", "candidate_strategy"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation"]);
 });
 
 test("v2 cli: the end-to-end run claims NOTHING it did not do", () => {
@@ -134,11 +134,14 @@ test("v2 cli: the end-to-end run claims NOTHING it did not do", () => {
     workspacesAllocated: 1,
     observationsTaken: 1,
     mutationsApplied: 0,
-    candidatesCreated: 0,
+    // V2-007: the fake model finishes immediately having done nothing, which is a
+    // legitimate no-change candidate. It has still been verified by nothing.
+    candidatesCreated: 1,
+    candidateMutated: false,
     verificationsPerformed: 0,
     promotionsAttempted: 0,
     promoted: false,
-    repositoryMutated: false,
+    sourceRepositoryMutated: false,
   });
 });
 

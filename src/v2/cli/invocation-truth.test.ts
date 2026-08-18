@@ -148,7 +148,7 @@ test("invocation truth: a REAL request reaches the provider carrying the authori
   assert.ok(body.includes(GOAL), "so did the operator's goal");
 
   // And the run's own account agrees, identity by identity.
-  const inv = result.receipt.invocation!;
+  const inv = result.receipt.invocations[0]!;
   assert.equal(inv.authorizedModelId, "alpha");
   assert.equal(inv.sentProviderId, "p1");
   assert.equal(inv.sentProviderModelId, "alpha-v1");
@@ -157,7 +157,7 @@ test("invocation truth: a REAL request reaches the provider carrying the authori
   assert.equal(inv.attempts, 1);
   assert.equal(inv.resolutionDecisionId, result.decision!.decisionId);
   assert.equal(inv.contextPackageId, result.context!.packageId);
-  assert.equal(result.invocation?.runId, result.runId);
+  assert.equal(result.invocations[0]?.runId, result.runId);
 });
 
 test("invocation truth: the provider reported usage is carried, not estimated", async () => {
@@ -165,7 +165,7 @@ test("invocation truth: the provider reported usage is carried, not estimated", 
   const root = makeStateRoot(server);
   activate(server, root, "prof-a");
   const { result } = v2Run(server, root, makeRepo());
-  assert.deepEqual(result.receipt.invocation?.usage, { promptTokens: 42, completionTokens: 7, totalTokens: 49 });
+  assert.deepEqual(result.receipt.invocations[0]?.usage, { promptTokens: 42, completionTokens: 7, totalTokens: 49 });
 });
 
 test("invocation truth: switching the profile changes the WIRE model actually sent", async () => {
@@ -189,8 +189,8 @@ test("identity CASE A: an exact served report is a MATCH", async () => {
   const root = makeStateRoot(server);
   activate(server, root, "prof-a");
   const { result } = v2Run(server, root, makeRepo());
-  assert.equal(result.receipt.invocation?.identityStatus, "match");
-  assert.equal(result.receipt.invocation?.servedModelId, "alpha-v1");
+  assert.equal(result.receipt.invocations[0]?.identityStatus, "match");
+  assert.equal(result.receipt.invocations[0]?.servedModelId, "alpha-v1");
 });
 
 test("identity CASE B: a DECLARED alias is an ALIASED_MATCH", async () => {
@@ -224,7 +224,7 @@ test("identity CASE C: a different served model FAILS and preserves every fact",
   assert.equal(result.outcome.failure.detail?.authorizedModelId, "alpha");
   assert.equal(result.outcome.failure.detail?.sentProviderModelId, "alpha-v1");
   assert.equal(result.outcome.failure.detail?.servedModelId, "beta-v9");
-  assert.equal(result.invocation, undefined, "a mismatched call yields no successful record");
+  assert.equal(result.invocations[0], undefined, "a mismatched call yields no successful record");
   assert.equal(result.receipt.evidence.providerInvoked, true, "but the provider WAS contacted");
 });
 
@@ -233,7 +233,7 @@ test("identity CASE D: a response with NO model is NOT_REPORTED, never fabricate
   const root = makeStateRoot(server);
   activate(server, root, "prof-a");
   const { result } = v2Run(server, root, makeRepo());
-  const inv = result.receipt.invocation!;
+  const inv = result.receipt.invocations[0]!;
   assert.equal(inv.identityStatus, "not_reported");
   assert.equal(inv.servedModelId, null, "absent, not backfilled from what was sent");
   assert.equal(inv.sentProviderModelId, "alpha-v1", "while what WAS sent is still recorded");
@@ -305,7 +305,7 @@ test("invocation truth: the egress floor is NOT bypassed — loopback needs an o
   });
   const result = JSON.parse(r.stdout) as V2RunResult;
   assert.ok(result.outcome.kind === "failed", "the SSRF floor still applies to v2");
-  assert.equal(result.invocation, undefined);
+  assert.equal(result.invocations[0], undefined);
 });
 
 test("invocation truth: nothing is built, verified or written", async () => {
@@ -316,15 +316,15 @@ test("invocation truth: nothing is built, verified or written", async () => {
   const before = spawnSync("git", ["status", "--porcelain"], { cwd: repo, encoding: "utf8" }).stdout;
   const { result } = v2Run(server, root, repo);
   const e = result.receipt.evidence;
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "invocation", "candidate_strategy"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation"]);
   assert.equal(e.providerInvoked, true);
   assert.equal(e.invocations, 1);
-  assert.equal(e.candidatesCreated, 0, "no candidate was created");
+  assert.equal(e.candidatesCreated, 1, "no candidate was created");
   assert.equal(e.verificationsPerformed, 0);
   assert.equal(e.promoted, false);
-  assert.equal(e.repositoryMutated, false);
+  assert.equal(e.sourceRepositoryMutated, false);
   assert.ok(result.outcome.kind === "failed");
-  assert.equal(result.outcome.failure.detail?.missingStage, "candidate_generation");
+  assert.equal(result.outcome.failure.detail?.missingStage, "verification");
   assert.equal(spawnSync("git", ["status", "--porcelain"], { cwd: repo, encoding: "utf8" }).stdout, before, "the repo is untouched");
 });
 
@@ -354,7 +354,7 @@ test("secrets: a provider credential never appears in output, the record, or an 
   // The credential WAS used — the server saw an auth header — and still never came back.
   const calls = (await server.received()).filter((r) => r.path.includes("chat/completions"));
   assert.equal(calls[0]?.hadAuthorization, true, "the transport did authenticate");
-  assert.equal(result.receipt.invocation?.sentProviderId, "keyed");
+  assert.equal(result.receipt.invocations[0]?.sentProviderId, "keyed");
 });
 
 test("secrets: a credential does not leak through a provider ERROR either", async () => {

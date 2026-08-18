@@ -267,7 +267,15 @@ test("single authority: only the workspace adapter may create a worktree or writ
   // The materializer writes too, and is allowed to: it CONSTRUCTS a workspace's initial
   // state from the run's source snapshot. That is a different act from mutating an
   // existing candidate, and the next guard keeps it from becoming a general write API.
-  const allowed = new Set([join(V2_DIR, "runtime", "workspace-authority.ts"), join(V2_DIR, "runtime", "source-materializer.ts")]);
+  // `candidate-capture.ts` writes NOTHING in a repository: its only filesystem calls
+  // create and remove a throwaway git index in the OS temp directory, so that staging a
+  // candidate's tree never touches the worktree's own index. The next guard proves it
+  // holds no repository write.
+  const allowed = new Set([
+    join(V2_DIR, "runtime", "workspace-authority.ts"),
+    join(V2_DIR, "runtime", "source-materializer.ts"),
+    join(V2_DIR, "runtime", "candidate-capture.ts"),
+  ]);
   const offenders: string[] = [];
   for (const file of tsFiles(V2_DIR)) {
     // Test fixtures legitimately create repositories and plant files to be observed.
@@ -318,6 +326,133 @@ test("single authority: context sources never touch the filesystem", () => {
     false,
     `context sources read through the snapshot only, but import: ${specs.join(", ")}`,
   );
+});
+
+test("single authority: only the BUILDER CONTROLLER drives a candidate-generation loop", () => {
+  // A second loop would be a second answer to "what counts as finished" and a second
+  // place budgets are enforced — which is how a rescue path gets added quietly.
+  const allowed = new Set([join(V2_DIR, "core", "builder.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    const source = stripComments(readFileSync(file, "utf8"));
+    if (/generateCandidate\s*\(|while\s*\(\s*turns|finish_candidate["']?\s*:/.test(source) && !file.endsWith("run.ts") && !file.endsWith("tools.ts")) {
+      offenders.push(relative(SRC, file));
+    }
+  }
+  assert.deepEqual(offenders, [], "the candidate-generation loop belongs to src/v2/core/builder.ts alone");
+});
+
+test("single authority: the BUILDER cannot import a filesystem, a provider, a resolver or the materializer", () => {
+  // The controller is handed capability; it never holds it. This is the enforcement of
+  // "the builder is not an authority over infrastructure".
+  const file = join(V2_DIR, "core", "builder.ts");
+  const specs = importSpecifiers(readFileSync(file, "utf8"));
+  for (const forbidden of ["node:fs", "node:child_process", "node:path", "../runtime/source-materializer.js", "./source.js"]) {
+    assert.equal(specs.includes(forbidden), false, `the builder must not import ${forbidden}; it imports: ${specs.join(", ")}`);
+  }
+  assert.equal(
+    specs.some((spec) => spec.startsWith("node:")),
+    false,
+    "the builder controller performs no I/O of its own",
+  );
+  // It imports the resolver's DECISION TYPE — it has to name what it was authorized to
+  // use — but it may never CHOOSE. A type is not a capability; a call is.
+  const source = stripComments(readFileSync(file, "utf8"));
+  assert.equal(/resolveModelRoute\s*\(|buildRuntimeModelPolicy\s*\(/.test(source), false, "the builder never resolves a model");
+});
+
+test("single authority: only the TOOL EXECUTOR writes candidate files, and it holds no fs", () => {
+  // Every effect goes through StateBoundMutationAuthority.mutate. A `node:fs` import here
+  // would be a path around the compare-and-swap.
+  const file = join(V2_DIR, "runtime", "builder-tools.ts");
+  const specs = importSpecifiers(readFileSync(file, "utf8"));
+  assert.equal(
+    specs.some((spec) => spec.startsWith("node:")),
+    false,
+    `the tool executor writes only through the mutation authority, but imports: ${specs.join(", ")}`,
+  );
+  const source = stripComments(readFileSync(file, "utf8"));
+  assert.equal(/writeFileSync|readFileSync|rmSync|unlinkSync|mkdirSync/.test(source), false, "no raw filesystem call");
+});
+
+test("single authority: no v2 file offers the builder a SHELL", () => {
+  // A terminal would let `sed -i` and `echo >` write outside the mutation authority. That
+  // is not a missing tool, it is an architectural bypass — parked until governed exec has
+  // a slice of its own.
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    // Test fixtures run `git init`; the fake provider spawns itself. Neither is reachable
+    // by a model — the guard is about what the BUILDER can invoke.
+    if (file.endsWith(".test.ts") || file.endsWith("fixture-repo.ts") || file.endsWith("fake-provider-server.ts")) continue;
+    const source = stripComments(readFileSync(file, "utf8"));
+    if (/governed-exec|runTerminal|terminalTool|commandPolicy|execFile|spawnSync/.test(source)) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "v2 exposes no command execution to a model in this slice");
+});
+
+test("single authority: only the candidate module mints a candidate identity", () => {
+  const allowed = new Set([join(V2_DIR, "core", "candidate.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    if (/contentDigest\s*\(\s*"candidate"/.test(stripComments(readFileSync(file, "utf8")))) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "candidate identity belongs to src/v2/core/candidate.ts");
+});
+
+test("single authority: a candidate is CREATED only by the run spine, after generation", () => {
+  // `candidate.ts` declares the function; `run.ts` is the only caller.
+  const allowed = new Set([join(V2_DIR, "core", "run.ts"), join(V2_DIR, "core", "candidate.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    if (/candidateDigest\s*\(/.test(stripComments(readFileSync(file, "utf8")))) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "no component may declare a candidate into existence on its own");
+});
+
+test("single authority: no v2 file imports the v1 BUILDER or its tools", () => {
+  // v1's builder is 2327 lines of loop AND policy — auto-accept on green checks, stuck
+  // detection, text-protocol emulation. Importing any of it would import that policy.
+  const forbidden = [
+    "worker-model/builder.js",
+    "worker-model/tool-executor.js",
+    "worker-model/builder-tools/",
+    "worker-model/context-manager.js",
+    "worker-model/orchestrator.js",
+    "worker-model/tournament.js",
+  ];
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (file.endsWith(".test.ts")) continue;
+    for (const spec of importSpecifiers(readFileSync(file, "utf8"))) {
+      if (forbidden.some((f) => spec.includes(f))) offenders.push(`${relative(SRC, file)} -> ${spec}`);
+    }
+  }
+  assert.deepEqual(offenders, [], "v2's builder is rebuilt, not borrowed");
+});
+
+test("single authority: TOOL SCHEMAS are declared in exactly one place", () => {
+  const allowed = new Set([join(V2_DIR, "core", "tools.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    if (/BUILDER_TOOLS\s*[:=]|additionalProperties/.test(stripComments(readFileSync(file, "utf8")))) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "a second tool schema is a second contract with the model");
+});
+
+test("single authority: no v2 file parses tool calls out of PROSE", () => {
+  // v1 emulates tool calls by regexing markdown for models without a tool API. That path
+  // can execute a "call" the model never made; v2 uses provider-native calls only.
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (file.endsWith(".test.ts")) continue;
+    const source = stripComments(readFileSync(file, "utf8"));
+    if (/parseTextToolCalls|text-tool-protocol|emulateTools/.test(source)) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "tool intent is never inferred from text in v2");
 });
 
 test("single authority: only the retrieval module RANKS repository relevance", () => {
@@ -383,7 +518,11 @@ test("single authority: no v2 file uses v1 mutation SESSION primitives directly"
   const offenders: string[] = [];
   for (const file of tsFiles(V2_DIR)) {
     for (const spec of importSpecifiers(readFileSync(file, "utf8"))) {
-      if (/mutation-session|repair-plan|builder-tools|tool-executor/.test(spec)) offenders.push(`${relative(SRC, file)} -> ${spec}`);
+      // Scoped to the v1 paths: v2 has its own `runtime/builder-tools.ts`, which IS the
+      // sanctioned executor and writes only through the adopted core.
+      if (/mutation-session|repair-plan|worker-model\/builder-tools|worker-model\/tool-executor/.test(spec)) {
+        offenders.push(`${relative(SRC, file)} -> ${spec}`);
+      }
     }
   }
   assert.deepEqual(offenders, [], "v2 adopts the mutation CORE; the session and tool write paths are parked");
@@ -452,8 +591,11 @@ test("single authority: only the invocation module builds an invocation record",
 test("single authority: the model-input renderer consumes the package and nothing else", () => {
   // V2-004's rule, enforced at the point it now matters most: the thing that builds a
   // prompt must not be able to reach a repository reader.
+  // `./tools.js` is TYPES ONLY (`BuilderToolCall`): a rendered assistant turn has to be
+  // able to carry the calls the model made, or the tool loop cannot round-trip. It is not
+  // a way to reach a repository, which is what this guard is about.
   const specs = importSpecifiers(readFileSync(join(V2_DIR, "core", "prompt.ts"), "utf8"));
-  assert.deepEqual([...new Set(specs)].sort(), ["./context.js", "./identity.js"], "the renderer reads the authorized package only");
+  assert.deepEqual([...new Set(specs)].sort(), ["./context.js", "./identity.js", "./tools.js"], "the renderer reads the authorized package only");
 });
 
 test("single authority: no v2 file imports v1 CONTEXT machinery", () => {

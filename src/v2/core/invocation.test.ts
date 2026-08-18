@@ -23,7 +23,7 @@ import {
   type InvocationTransport,
   type ServedModelAlias,
 } from "./invocation.js";
-import { QUALIFICATION_SYSTEM_INSTRUCTION, renderModelInput } from "./prompt.js";
+import { BUILDER_SYSTEM_INSTRUCTION, renderBuilderInput } from "./prompt.js";
 import type { ModelResolutionDecision } from "./resolver.js";
 
 import { DEFAULT_SOURCE_POLICY, type SourceSnapshot, type SourceSnapshotReader } from "./source.js";
@@ -118,16 +118,21 @@ function transportOf(over: { servedModelId?: string | null; attempts?: number } 
 }
 
 async function invoke(over: Partial<InvocationAuthorityInput> = {}, transport?: InvocationTransport) {
+  // V2-007 moved RENDERING out of the authority: a builder takes many turns, and an
+  // authority that composed them would have to understand tool protocol and conversation
+  // state. It now checks binding, sends what it was handed, and attributes the answer.
+  const pkg = (over.contextPackage ?? (await contextPackage())) as Awaited<ReturnType<typeof contextPackage>>;
   return invokeAuthorized({
     runId: RUN,
     taskId: TASK,
     invocationId: ids.mint("invocation"),
     decision: decision(),
-    contextPackage: await contextPackage(),
     parameters: { maxOutputTokens: 128, timeoutMs: 1_000 },
     transport: transport ?? transportOf().transport,
     now: () => 1_000,
     ...over,
+    contextPackage: pkg,
+    rendered: renderBuilderInput(pkg, []),
   });
 }
 
@@ -300,20 +305,24 @@ test("usage: a provider that reports nothing yields no usage block", async () =>
 
 test("prompt: the model input comes only from the authorized context package", async () => {
   const pkg = await contextPackage();
-  const rendered = renderModelInput(pkg);
+  const rendered = renderBuilderInput(pkg, []);
   assert.equal(rendered.messages[0]?.role, "system");
-  assert.equal(rendered.messages[0]?.content, QUALIFICATION_SYSTEM_INSTRUCTION);
+  assert.equal(rendered.messages[0]?.content, BUILDER_SYSTEM_INSTRUCTION);
   assert.match(rendered.messages[1]?.content ?? "", /make the widget green/, "the goal artifact");
   assert.match(rendered.messages[1]?.content ?? "", /sha256:/, "each block names the state it came from");
 });
 
-test("prompt: the qualification instruction forbids proposing or performing work", () => {
-  assert.match(QUALIFICATION_SYSTEM_INSTRUCTION, /Do NOT propose changes/);
-  assert.match(QUALIFICATION_SYSTEM_INSTRUCTION, /Do NOT execute anything/);
+test("prompt: the BUILDER contract states the rules that are actually enforced", () => {
+  // V2-007 replaced the qualification instruction — which forbade doing any work — with
+  // the real builder contract. What it must NOT do is let a model finish by wording.
+  assert.match(BUILDER_SYSTEM_INSTRUCTION, /Every write must name the state it is replacing/);
+  assert.match(BUILDER_SYSTEM_INSTRUCTION, /your write is REFUSED and nothing is written/);
+  assert.match(BUILDER_SYSTEM_INSTRUCTION, /do not describe the work as tested, verified or correct/i);
+  assert.match(BUILDER_SYSTEM_INSTRUCTION, /operator's own checkout is untouched/);
 });
 
 test("prompt: identical packages render an identical prompt id", async () => {
-  assert.equal(renderModelInput(await contextPackage()).promptId, renderModelInput(await contextPackage()).promptId);
+  assert.equal(renderBuilderInput(await contextPackage(), []).promptId, renderBuilderInput(await contextPackage(), []).promptId);
 });
 
 test("prompt: the rendered prompt reaches the transport verbatim", async () => {
@@ -321,8 +330,8 @@ test("prompt: the rendered prompt reaches the transport verbatim", async () => {
   const t = transportOf();
   const result = await invoke({ contextPackage: pkg }, t.transport);
   assert.ok(result.ok);
-  assert.deepEqual(t.sent[0]?.messages, renderModelInput(pkg).messages);
-  assert.equal(result.record.promptId, renderModelInput(pkg).promptId);
+  assert.deepEqual(t.sent[0]?.messages, renderBuilderInput(pkg, []).messages);
+  assert.equal(result.record.promptId, renderBuilderInput(pkg, []).promptId);
 });
 
 // ── request identity ────────────────────────────────────────────────────────
@@ -341,7 +350,7 @@ test("request identity: the same semantic request digests the same", async () =>
     authorizedProviderModelId: "alpha-v1",
     sentProviderId: "p1",
     sentProviderModelId: "alpha-v1",
-    promptId: renderModelInput(pkg).promptId,
+    promptId: renderBuilderInput(pkg, []).promptId,
     parameters: { maxOutputTokens: 128, timeoutMs: 1_000 },
   };
   // A different invocation id is a different ATTEMPT of the same request.

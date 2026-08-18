@@ -46,6 +46,7 @@ import type { ContextManifest, ContextPackage } from "./context.js";
 import type { V2InvocationRecord } from "./invocation.js";
 import type { V2WorkspaceRecord, WorkspaceDisposition } from "./workspace.js";
 import type { SourceSnapshotSummary } from "./source.js";
+import type { CandidateRecord, RunCandidateSummary } from "./candidate.js";
 import type { RetrievalSummary } from "./retrieval.js";
 
 /** Why verified-good work was withheld instead of promoted. Closed set. */
@@ -160,7 +161,21 @@ export interface RunEvidenceSummary {
   readonly verificationsPerformed: number;
   readonly promotionsAttempted: number;
   readonly promoted: boolean;
-  readonly repositoryMutated: boolean;
+  /**
+   * Did the builder change files IN THE ISOLATED CANDIDATE WORKSPACE?
+   *
+   * V2-007 SPLIT THIS. It used to be one field named `repositoryMutated`, which was
+   * unambiguous only while nothing could write anywhere: with a real builder, "the
+   * repository was mutated" would be read as the operator's repository, and it would be
+   * TRUE on every successful build. Two facts, two fields, neither able to stand in for
+   * the other.
+   */
+  readonly candidateMutated: boolean;
+  /**
+   * Did anything reach the OPERATOR'S repository? True only when a promotion both
+   * happened and became the terminal outcome. Nothing in this build can make it true.
+   */
+  readonly sourceRepositoryMutated: boolean;
 }
 
 /**
@@ -360,12 +375,24 @@ export interface V2RunReceipt {
   readonly context?: RunContextSummary;
   /** Absent when retrieval did not run. Present and empty when it ran and found nothing. */
   readonly retrieval?: RetrievalSummary;
-  /** Absent when no transport was reached, or when the invocation failed. */
-  readonly invocation?: RunInvocationSummary;
+  /**
+   * Every model turn the builder took, in order. Empty when nothing reached a provider.
+   *
+   * V2-005 recorded ONE invocation because a run made one call. A builder takes as many
+   * turns as the work needs, and a receipt that reported only the first — or only the
+   * last — would understate what the run actually did and what it cost.
+   */
+  readonly invocations: readonly RunInvocationSummary[];
   /** Absent when preflight did not capture a source snapshot. */
   readonly sourceSnapshot?: SourceSnapshotSummary;
   /** Absent when no workspace was allocated. */
   readonly workspace?: RunWorkspaceSummary;
+  /**
+   * Absent unless the builder actually finished and a candidate was captured. A build
+   * that failed mid-generation has invocations and possibly mutations, but no candidate —
+   * and the receipt must not imply otherwise.
+   */
+  readonly candidate?: RunCandidateSummary;
   readonly startedAt: number;
   readonly endedAt: number;
 }
@@ -395,7 +422,12 @@ export function summarizeEvidence(ledger: RunLedgerView, outcome: RunTerminalOut
     verificationsPerformed: ledger.verifications.length,
     promotionsAttempted: ledger.promotions.length,
     promoted: accepted && ledger.promotions.length > 0,
-    repositoryMutated: accepted && ledger.promotions.length > 0,
+    // The candidate workspace was written to iff a builder mutation was applied. This is
+    // the model's work, in isolation — it says nothing about the operator's checkout.
+    candidateMutated: ledger.mutations.length > 0,
+    // The operator's repository. Reachable only through promotion, which no build of ikbi
+    // performs yet, so this is structurally false rather than conventionally false.
+    sourceRepositoryMutated: accepted && ledger.promotions.length > 0,
   };
 }
 
@@ -427,8 +459,10 @@ export interface V2RunResult {
    * return value, and is what a future builder consumes at the same call site.
    */
   readonly context?: ContextManifest;
-  /** The full record of the one invocation this run performed, when it succeeded. */
-  readonly invocation?: V2InvocationRecord;
+  /** The full records of every model turn this run performed, in order. */
+  readonly invocations: readonly V2InvocationRecord[];
+  /** The candidate this run produced, when the builder finished and it was captured. */
+  readonly candidate?: CandidateRecord;
   /** Every transition the run made, in order. The run's own account of itself. */
   readonly journal: readonly LifecycleTransition[];
   readonly receipt: V2RunReceipt;

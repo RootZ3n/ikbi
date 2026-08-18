@@ -21,11 +21,13 @@ import { readFileSync } from "node:fs";
 
 import type { ConfigurationInputs, ConfigurationSource } from "../core/config.js";
 import type { V2RunResult } from "../core/result.js";
-import { runV2Build, type RepoProbe } from "../core/run.js";
+import { runV2Build, type RepoProbe , type V2RunDeps } from "../core/run.js";
 import type { ContextSource } from "../core/context.js";
 import type { InvocationTransport } from "../core/invocation.js";
 import { PRODUCTION_CONTEXT_SOURCES } from "./context-sources.js";
 import { createRetrievalSource } from "./retrieval-source.js";
+import { createBuilderToolExecutor } from "./builder-tools.js";
+import { captureCandidateTree } from "./candidate-capture.js";
 import { createInvocationTransport } from "./invocation-transport.js";
 import { createProductionWorkspaceAuthorities } from "./workspace-authority.js";
 import { createSourceSnapshotAuthority } from "./source-snapshot.js";
@@ -124,6 +126,10 @@ export function createConfigurationSource(deps: ConfigurationSourceDeps = {}): C
 export interface ProductionRunDeps {
   readonly configuration?: ConfigurationSource;
   readonly contextSources?: readonly ContextSource[];
+  /** Test seams. Production uses the canonical executor and git tree capture. */
+  readonly buildTools?: V2RunDeps["buildTools"];
+  readonly captureTree?: V2RunDeps["captureTree"];
+  readonly builderBudget?: V2RunDeps["builderBudget"];
   readonly transport?: InvocationTransport;
   readonly workspaces?: WorkspaceAuthority;
   readonly mutations?: StateBoundMutationAuthority;
@@ -194,6 +200,12 @@ export async function runV2BuildProduction(request: V2TaskRequest, deps: Product
     // that injected its own sources gets no retrieval claim it did not earn.
     ...(deps.contextSources === undefined ? { retrieval } : {}),
     transport: deps.transport ?? productionTransport(),
+    // THE BUILDER'S CAPABILITY, wired once. The controller is handed an executor it
+    // cannot construct and a tree-capture it cannot perform, so neither the loop nor the
+    // model is ever holding the authority itself.
+    buildTools: deps.buildTools ?? createBuilderToolExecutor,
+    captureTree: deps.captureTree ?? captureCandidateTree,
+    ...(deps.builderBudget !== undefined ? { builderBudget: deps.builderBudget } : {}),
     ...(deps.probe !== undefined ? { probe: deps.probe } : {}),
   });
 }

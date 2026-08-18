@@ -12,9 +12,9 @@
  *     -> preflight            can this run legally start at all?
  *     -> model_resolution     which exact model/provider route is authorized?
  *     -> context              what does the run get to know?
- *     -> invocation           can that exact route actually be invoked, and what served it?
  *     -> candidate_strategy   single / shadow / tournament — chosen ONCE, here
- *     -> candidate_generation zero or more Candidates are produced
+ *     -> candidate_generation zero or more Candidates are produced — the builder loop
+ *                             runs HERE, so this is where model invocations happen
  *     -> verification         every candidate is judged by the SAME authority
  *     -> disposition          the adjudication decision (promote / withhold / discard)
  *     -> promotion            the decision is enacted
@@ -79,7 +79,6 @@ export const LIFECYCLE_STAGES = [
   "preflight",
   "model_resolution",
   "context",
-  "invocation",
   "candidate_strategy",
   "candidate_generation",
   "verification",
@@ -171,10 +170,16 @@ const EVIDENCE_STAGE: Record<LifecycleEvidence["kind"], readonly LifecycleStage[
   retrieval: ["context"],
   // The authorized context package is minted by the stage that owns context, once.
   context: ["context"],
-  // An INVOCATION is recorded only where one actually happens. Today that is the
-  // qualification stage; when the builder loop arrives, `candidate_generation` will
-  // legitimately invoke too and joins this list — deliberately, not by default.
-  invocation: ["invocation"],
+  // An INVOCATION is recorded only where one actually happens — which, now that a real
+  // builder exists, is candidate generation and nowhere else.
+  //
+  // V2-007 REMOVED THE STANDALONE `invocation` STAGE. V2-005 introduced it to prove one
+  // authorized route could really be called, at a time when nothing downstream called
+  // anything. Keeping it beside a builder that invokes N times would mean every run paid
+  // for a qualification call whose only finding — "the route works" — the builder's first
+  // turn establishes anyway. A stage that exists to be redundant is not a safeguard.
+  // InvocationAuthority is untouched and is still the only doorway to a model.
+  invocation: ["candidate_generation"],
   // A workspace is allocated by the stage that decides WHERE a candidate would be
   // produced. Observations may be taken there and, later, while a candidate is built.
   workspace: ["candidate_strategy"],
@@ -197,12 +202,9 @@ const STAGE_REQUIRES: Partial<Record<LifecycleStage, readonly LifecycleEvidence[
   // the resolved model's window. See the ORDERING NOTE above.
   // Context needs a resolved model to size itself AND the one source state it describes.
   context: ["resolution", "snapshot"],
-  // Nothing may be invoked without an authorized context package to invoke it with.
-  invocation: ["context"],
-  // A candidate is produced BY a model, so a route must have been proven invocable
-  // before any strategy starts producing them.
-  // A workspace must be materialized from the SAME source state context came from.
-  candidate_strategy: ["invocation", "snapshot"],
+  // A strategy decides WHERE a candidate would be produced. It needs the authorized
+  // context the builder will be given, and the one source state a workspace must hold.
+  candidate_strategy: ["context", "snapshot"],
   // Nothing may be built without an isolated workspace to build it in.
   candidate_generation: ["workspace"],
   // Nothing to verify without at least one candidate. (One OR MANY — see contract.ts.)

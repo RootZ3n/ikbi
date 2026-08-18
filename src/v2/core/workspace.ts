@@ -67,6 +67,15 @@ export interface WorkspaceSourceBinding {
   readonly sourceSnapshotId: string;
   /** Proof the workspace really matches that snapshot, produced by verifying it. */
   readonly materializedStateDigest: string;
+  /**
+   * Git tree of the workspace as the BUILDER FOUND IT — HEAD plus the operator's
+   * materialized work, captured before any model turn.
+   *
+   * This is what a candidate's `changed` is measured against. Measuring against
+   * `baseTree` instead would count the operator's own uncommitted work as the model's,
+   * which is exactly the conflation the candidate record exists to prevent.
+   */
+  readonly startTree: string;
   /** How many delta entries were reproduced. Zero for a clean snapshot. */
   readonly materializedEntries: number;
 }
@@ -250,6 +259,27 @@ export type ObservationOutcome =
   | { readonly ok: false; readonly failure: RunFailure };
 
 /**
+ * An observation PLUS the bytes that were observed.
+ *
+ * V2-007 needs this because a builder cannot edit what it cannot see, and the bytes must
+ * come from the same act that produced the observation — reading the file separately
+ * would create a window in which the content and the anchor disagree.
+ *
+ * It does not weaken the invariant. The observation id is content-addressed over the
+ * state, the authority keeps its own copy of what it saw, and `mutate` still compares
+ * against the disk rather than against anything a caller hands back. A caller that
+ * doctored `content` would simply be lying to itself.
+ */
+export type FileReadOutcome =
+  | {
+      readonly ok: true;
+      readonly observation: V2FileObservation;
+      /** Present only for a regular file. A missing/empty/directory/symlink read has none. */
+      readonly content?: string;
+    }
+  | { readonly ok: false; readonly failure: RunFailure };
+
+/**
  * THE single state-bound mutation authority.
  *
  * Note what the signature makes impossible: `mutate` takes an OBSERVATION, not a path.
@@ -262,6 +292,20 @@ export interface StateBoundMutationAuthority {
     readonly workspace: V2WorkspaceRecord;
     readonly path: string;
   }): Promise<ObservationOutcome>;
+  /**
+   * Observe a path AND return what was observed.
+   *
+   * The builder's `read_file` is this and only this. There is no separate file-reading
+   * capability anywhere in the builder path, which is what makes "every read the model
+   * performed produced an observation" true by construction rather than by convention.
+   */
+  read(input: {
+    readonly runId: V2RunId;
+    readonly workspace: V2WorkspaceRecord;
+    readonly path: string;
+    /** Characters returned at most. The observation always describes the WHOLE file. */
+    readonly maxChars: number;
+  }): Promise<FileReadOutcome>;
   /**
    * Apply an operation against an observation.
    *

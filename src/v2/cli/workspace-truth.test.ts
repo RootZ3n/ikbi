@@ -30,9 +30,11 @@ const GOAL = "acknowledge src/widget.ts";
 
 const PROVIDER: FakeProviderServer = await startFakeOpenAIProvider();
 const dirs: string[] = [];
+const extraServers: FakeProviderServer[] = [];
 
 after(async () => {
   await PROVIDER.close();
+  for (const server of extraServers) await server.close();
   for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -83,6 +85,40 @@ function runCli(root: string, args: readonly string[]) {
   return { status: res.status, stdout: res.stdout, stderr: res.stderr };
 }
 
+/**
+ * A provider that only ever talks — it never emits a tool call, so the builder nudges,
+ * exhausts its turns and produces no candidate. Its own server, because this suite's
+ * shared one deliberately finishes immediately.
+ */
+async function proseOnlyProvider(): Promise<FakeProviderServer> {
+  const server = await startFakeOpenAIProvider({ content: "I am still thinking about it." });
+  extraServers.push(server);
+  return server;
+}
+
+/** Run the CLI against a specific provider rather than the suite's shared one. */
+function v2RunAgainst(server: FakeProviderServer, root: string, repo: string, goal = GOAL) {
+  writeFileSync(
+    join(root, "providers.json"),
+    JSON.stringify({ ...ROSTER, providers: [{ ...ROSTER.providers[0], baseUrl: server.baseUrl }] }, null, 2),
+  );
+  const res = spawnSync(process.execPath, [ENTRY, "v2", "build", goal, "--repo", repo, "--json"], {
+    cwd: mkdtempSync(join(tmpdir(), "ikbi-v2-wscwd-")),
+    env: {
+      PATH: process.env.PATH ?? "",
+      HOME: mkdtempSync(join(tmpdir(), "ikbi-v2-wshome-")),
+      IKBI_STATE_ROOT: root,
+      IKBI_MODEL_DRIVER: "m1",
+      IKBI_MODEL_BUILDER: "m1",
+      IKBI_MODEL_CRITIC: "m1",
+      ...loopbackEgressEnv(server),
+    },
+    encoding: "utf8",
+  });
+  assert.ok(res.stdout.trim().startsWith("{"), `expected JSON on stdout, got:\n${res.stdout}\n---\n${res.stderr}`);
+  return { result: JSON.parse(res.stdout) as V2RunResult };
+}
+
 function v2Run(root: string, repo: string, goal = GOAL) {
   const r = runCli(root, ["v2", "build", goal, "--repo", repo, "--json"]);
   assert.ok(r.stdout.trim().startsWith("{"), `expected JSON on stdout, got:\n${r.stdout}\n---\n${r.stderr}`);
@@ -102,7 +138,7 @@ test("workspace truth: candidate_strategy allocates ONE workspace bound to the r
   const repo = makeRepo();
   const { result } = v2Run(state, repo);
 
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "invocation", "candidate_strategy"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation"]);
   assert.equal(result.receipt.evidence.workspacesAllocated, 1, "the SINGLE strategy allocates exactly one");
 
   const ws = result.receipt.workspace!;
@@ -160,15 +196,15 @@ test("workspace truth: a workspace is NOT a candidate, and NOTHING was written",
   assert.equal(e.workspacesAllocated, 1);
   assert.equal(e.observationsTaken, 1);
   assert.equal(e.mutationsApplied, 0, "the production skeleton performs NO mutation");
-  assert.equal(e.candidatesCreated, 0, "a workspace existing is not a candidate existing");
-  assert.equal(e.repositoryMutated, false);
+  assert.equal(e.candidatesCreated, 1, "the builder finished, so a candidate exists — unverified");
+  assert.equal(e.sourceRepositoryMutated, false);
   assert.equal(e.promoted, false);
   assert.equal(e.verificationsPerformed, 0);
 
   assert.equal(gitStatus(repo), before, "the source working tree is unchanged");
   assert.equal(headCommit(repo), head, "and so is HEAD");
   assert.ok(result.outcome.kind === "failed");
-  assert.equal(result.outcome.failure.detail?.missingStage, "candidate_generation");
+  assert.equal(result.outcome.failure.detail?.missingStage, "verification");
 });
 
 test("workspace truth: the source repository gains no stray files or branches", () => {
@@ -181,11 +217,17 @@ test("workspace truth: the source repository gains no stray files or branches", 
 
 // ── cleanup ─────────────────────────────────────────────────────────────────
 
-test("workspace truth: the workspace is DISCARDED at the normal stop", () => {
+test("workspace truth: the workspace is RETAINED once a candidate exists (V2-007)", () => {
+  // Until a builder existed, a workspace was always discarded because nothing was ever
+  // produced in one. A candidate is the only copy of the work the run just paid for, and
+  // it is what verification will inspect — so retention is the honest disposition.
   const state = makeStateRoot();
   const { result } = v2Run(state, makeRepo());
-  assert.equal(result.receipt.workspace?.disposition, "discarded", "nothing useful was produced, so nothing is kept");
-  assert.equal(result.receipt.workspace?.dispositionDetail, undefined);
+  assert.equal(result.receipt.workspace?.disposition, "retained");
+  assert.match(result.receipt.workspace?.dispositionDetail ?? "", /awaits verification/);
+  // RETENTION IS NOT PROMOTION.
+  assert.equal(result.receipt.evidence.promoted, false);
+  assert.equal(result.receipt.evidence.sourceRepositoryMutated, false);
 });
 
 test("workspace truth: the worktree is really gone from disk afterwards", () => {
@@ -200,10 +242,14 @@ test("workspace truth: the worktree is really gone from disk afterwards", () => 
   assert.deepEqual(leftovers, [], "a discarded workspace leaves no checkout behind");
 });
 
-test("workspace truth: an allocated workspace never outlives its run", () => {
+test("workspace truth: a workspace with NO candidate never outlives its run", async () => {
   const state = makeStateRoot();
-  const { result } = v2Run(state, makeRepo());
-  assert.ok(result.outcome.kind === "failed", "the run always stops before candidate generation");
+  // A model that never finishes: the builder exhausts its turns and no candidate exists,
+  // so the half-built tree is not left behind.
+  const { result } = await v2RunAgainst(await proseOnlyProvider(), state, makeRepo());
+  assert.ok(result.outcome.kind === "failed");
+  assert.equal(result.outcome.failure.category, "build");
+  assert.equal(result.receipt.candidate, undefined);
   assert.equal(result.receipt.workspace?.disposition, "discarded");
 });
 
@@ -224,6 +270,6 @@ test("workspace truth: the human rendering states the source binding and the dis
   const state = makeStateRoot();
   const repo = makeRepo();
   const r = runCli(state, ["v2", "build", GOAL, "--repo", repo]);
-  assert.match(r.stdout, /workspace {3}ws_[\w-]+ \(donor [\w-]+\) · 1 observation\(s\) · discarded/);
+  assert.match(r.stdout, /workspace {3}ws_[\w-]+ \(donor [\w-]+\) · 1 observation\(s\) · retained/);
   assert.match(r.stdout, new RegExp(`materialized 0 source entries from the snapshot · base main @ ${headCommit(repo).slice(0, 12)}`));
 });

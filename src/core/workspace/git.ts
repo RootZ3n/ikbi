@@ -24,10 +24,25 @@ export interface GitResult {
   readonly code: number;
 }
 
-/** Run a git command in `cwd`. Throws WorkspaceError("git") on non-zero unless the code is in `okCodes`. */
-export async function runGit(cwd: string, args: readonly string[], opts?: { okCodes?: readonly number[] }): Promise<GitResult> {
+/**
+ * Run a git command in `cwd`. Throws WorkspaceError("git") on non-zero unless the code is in `okCodes`.
+ *
+ * `env` is ADDITIVE (v2-007) and merges over `process.env`. It exists because a couple of
+ * git facilities are configurable only by environment — `GIT_INDEX_FILE` above all, which
+ * is the sanctioned way to stage into a throwaway index instead of the operator's. Callers
+ * that omit it get exactly the previous behavior.
+ */
+export async function runGit(
+  cwd: string,
+  args: readonly string[],
+  opts?: { okCodes?: readonly number[]; env?: Readonly<Record<string, string>> },
+): Promise<GitResult> {
   try {
-    const { stdout, stderr } = await exec("git", args as string[], { cwd, maxBuffer: MAX_BUFFER });
+    const { stdout, stderr } = await exec("git", args as string[], {
+      cwd,
+      maxBuffer: MAX_BUFFER,
+      ...(opts?.env !== undefined ? { env: { ...process.env, ...opts.env } } : {}),
+    });
     return { stdout, stderr, code: 0 };
   } catch (err) {
     const e = err as { code?: number | string; stdout?: string; stderr?: string };

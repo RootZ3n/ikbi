@@ -38,8 +38,15 @@ export type V2RunId = V2Id<"run">;
 export type V2InvocationId = V2Id<"invocation">;
 /** ONE isolated mutation space (a worktree, in the v1 donor). */
 export type V2WorkspaceId = V2Id<"workspace">;
-/** ONE proposed body of work. A task may have MANY (shadow, tournament) — see contract.ts. */
-export type V2CandidateId = V2Id<"candidate">;
+/**
+ * ONE proposed body of work. A task may have MANY (shadow, tournament) — see contract.ts.
+ *
+ * V2-007 made this CONTENT-ADDRESSED rather than minted. A candidate is not an event that
+ * happened to occur; it is the exact resulting state produced from an exact source state
+ * by exact mutations. Two runs that arrive at the same work ARE the same candidate, and a
+ * minted id would have hidden that — which is precisely what a tournament needs to see.
+ */
+export type V2CandidateId = V2Digest<"candidate">;
 /** ONE observation of exact file state — the anchor a state-bound mutation compares against. */
 export type V2ObservationId = V2Id<"observation">;
 /** ONE verification verdict, bound to the candidate it judged. */

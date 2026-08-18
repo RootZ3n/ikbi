@@ -52,7 +52,15 @@ const hermeticConfiguration: ConfigurationSource = {
 const fakeTransport: InvocationTransport = {
   send: async (input) => ({
     ok: true,
-    response: { content: "acknowledged", finishReason: "stop", servedModelId: input.providerModelId, attempts: 1 },
+    // V2-007: a builder that immediately declares itself finished. This suite is about
+    // REACHABILITY of the spine, not about what a model does inside it.
+    response: {
+      content: "",
+      finishReason: "tool_calls",
+      toolCalls: [{ id: "f1", name: "finish_candidate", arguments: JSON.stringify({ summary: "nothing asked of me", believesComplete: true }) }],
+      servedModelId: input.providerModelId,
+      attempts: 1,
+    },
   }),
 };
 
@@ -72,6 +80,7 @@ const fakeWorkspaces: WorkspaceAuthority = {
         sourceSnapshotId: source.snapshotId,
         materializedStateDigest: "m".repeat(64),
         materializedEntries: 0,
+        startTree: "t".repeat(40),
       },
       path: "/scratch/reach",
       status: "allocated",
@@ -85,6 +94,9 @@ const fakeWorkspaces: WorkspaceAuthority = {
 const fakeMutations: StateBoundMutationAuthority = {
   observe: async () => {
     throw new Error("no context artifact exists in these tests, so nothing should be observed");
+  },
+  read: async () => {
+    throw new Error("no context artifact exists in these tests, so nothing should be read");
   },
   mutate: async () => {
     throw new Error("the production skeleton must never mutate");
@@ -105,6 +117,14 @@ function capture() {
     transport: fakeTransport,
     workspaces: fakeWorkspaces,
     mutations: fakeMutations,
+    // The builder seams, hermetic like the rest: this suite has no worktree to capture a
+    // tree from. What the real ones do is `runtime/builder-tools.test.ts` and
+    // `cli/builder-truth.test.ts`.
+    buildTools: () => ({ execute: async () => ({ outcome: { kind: "rejected" as const, reason: "unknown_tool" as const, detail: "no tools here" } }) }),
+    captureTree: async () => ({
+      ok: true as const,
+      tree: { treeId: "t".repeat(40), baseTreeId: "t".repeat(40), materializedStateDigest: "m".repeat(64), changed: false },
+    }),
     get out() {
       return out;
     },
@@ -136,7 +156,11 @@ test("reachability: the command body enters the canonical lifecycle and reports 
   const cap = capture();
   const code = await runV2Cli(["build", "add", "a", "thing"], cap);
   assert.equal(cap.err, V2_BANNER, "the experimental banner goes to stderr, not stdout");
-  assert.match(cap.out, /stages\s+preflight -> model_resolution -> context -> invocation -> candidate_strategy$/m, "the run walked the whole implemented spine");
+  assert.match(
+    cap.out,
+    /stages\s+preflight -> model_resolution -> context -> candidate_strategy -> candidate_generation$/m,
+    "the run walked the whole implemented spine",
+  );
   assert.match(cap.out, /not implemented/, "and said so truthfully");
   assert.notEqual(code, 0, "an unimplemented lifecycle is not a success");
 });
@@ -150,7 +174,7 @@ test("reachability: the JSON surface carries the lifecycle journal + a counted r
   assert.equal(result.journal[0]?.from, "pending");
   assert.equal(result.journal[0]?.to, "preflight");
   assert.equal(result.journal.at(-1)?.to, "terminal");
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "invocation", "candidate_strategy"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation"]);
   assert.equal(result.outcome.kind, "failed");
   assert.deepEqual(result.receipt.evidence, {
     // Configuration (V2-002) and route authorization (V2-003) happen — and nothing else.
@@ -169,11 +193,14 @@ test("reachability: the JSON surface carries the lifecycle journal + a counted r
     workspacesAllocated: 1,
     observationsTaken: 0,
     mutationsApplied: 0,
-    candidatesCreated: 0,
+    // V2-007: the builder finished having changed nothing — a legitimate no-change
+    // candidate, and still verified by nothing.
+    candidatesCreated: 1,
+    candidateMutated: false,
     verificationsPerformed: 0,
     promotionsAttempted: 0,
     promoted: false,
-    repositoryMutated: false,
+    sourceRepositoryMutated: false,
   });
 });
 
@@ -182,7 +209,7 @@ test("reachability: the CLI never claims a stage it did not run", async () => {
   await runV2Cli(["build", "x", "--json"], cap);
   const result = JSON.parse(cap.out) as V2RunResult;
   for (const stage of LIFECYCLE_STAGES) {
-    if (stage === "preflight" || stage === "model_resolution" || stage === "context" || stage === "invocation" || stage === "candidate_strategy") continue;
+    if (stage === "preflight" || stage === "model_resolution" || stage === "context" || stage === "candidate_strategy" || stage === "candidate_generation") continue;
     assert.equal(result.receipt.stagesEntered.includes(stage), false, `never entered ${stage}`);
   }
   assert.ok(result.outcome.kind === "failed");

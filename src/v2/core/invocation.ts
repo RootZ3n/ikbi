@@ -31,9 +31,10 @@
 import { contentDigest, type V2ContextDigest, type V2DecisionDigest, type V2InvocationId, type V2PromptDigest, type V2RunId, type V2TaskId } from "./identity.js";
 import { runFailure, type RunFailure } from "./failure.js";
 import type { ContextPackage } from "./context.js";
+import type { BuilderToolCall, BuilderToolDefinition } from "./tools.js";
 import type { ModelResolutionDecision } from "./resolver.js";
 import type { V2ModelRole } from "./config.js";
-import { renderModelInput, type RenderedModelInput } from "./prompt.js";
+import { type RenderedModelInput } from "./prompt.js";
 
 // ---------------------------------------------------------------------------
 // Served identity
@@ -144,6 +145,15 @@ export interface ObservedUsage {
 export interface TransportResponse {
   readonly content: string;
   readonly finishReason: string;
+  /**
+   * Tool calls the model emitted, verbatim and provider-NATIVE.
+   *
+   * v2 does not parse tool intent out of prose. If a model cannot emit structured calls,
+   * that is a capability fact about the route, not a reason to invent a second, weaker
+   * protocol out of markdown — which is exactly how a "tool call" the model never made
+   * gets executed.
+   */
+  readonly toolCalls?: readonly BuilderToolCall[];
   /** Verbatim from the response body, or absent when the provider reported none. */
   readonly servedModelId?: string;
   readonly usage?: ObservedUsage;
@@ -174,6 +184,8 @@ export interface InvocationTransport {
     readonly providerModelId: string;
     readonly messages: RenderedModelInput["messages"];
     readonly parameters: V2InvocationParameters;
+    /** Tools the model may call this turn. Absent when the caller offers none. */
+    readonly tools?: readonly BuilderToolDefinition[];
   }): Promise<TransportOutcome>;
 }
 
@@ -218,7 +230,13 @@ export interface V2InvocationRecord {
 }
 
 export type InvocationResult =
-  | { readonly ok: true; readonly record: V2InvocationRecord; readonly content: string }
+  | {
+      readonly ok: true;
+      readonly record: V2InvocationRecord;
+      readonly content: string;
+      /** Provider-native tool calls, verbatim. Empty when the model called nothing. */
+      readonly toolCalls: readonly BuilderToolCall[];
+    }
   | { readonly ok: false; readonly failure: RunFailure; readonly attempted: boolean };
 
 // ---------------------------------------------------------------------------
@@ -245,7 +263,7 @@ function invocationFailure(code: string, message: string, detail?: Readonly<Reco
     category: "provider",
     code,
     message,
-    stage: "invocation",
+    stage: "candidate_generation",
     retryable: false,
     ...(detail !== undefined ? { detail } : {}),
   });
@@ -261,6 +279,16 @@ export interface InvocationAuthorityInput {
   readonly invocationId: V2InvocationId;
   readonly decision: ModelResolutionDecision;
   readonly contextPackage: ContextPackage;
+  /**
+   * EXACTLY what goes on the wire, rendered by the caller.
+   *
+   * The authority does not build this. It checks that the caller assembled a coherent run
+   * and then sends what it was handed — which is why a builder can take many turns
+   * without this file learning anything about builders.
+   */
+  readonly rendered: RenderedModelInput;
+  /** Tools the model may call this turn. */
+  readonly tools?: readonly BuilderToolDefinition[];
   readonly parameters: V2InvocationParameters;
   readonly transport: InvocationTransport;
   readonly aliases?: readonly ServedModelAlias[];
@@ -301,8 +329,9 @@ export async function invokeAuthorized(input: InvocationAuthorityInput): Promise
     };
   }
 
-  // 2. RENDER. The authorized package is the only source of repository content.
-  const rendered = renderModelInput(pkg);
+  // 2. The caller rendered the input from the authorized package. This authority sends
+  // it; it does not compose it, and it has no way to add anything to it.
+  const rendered = input.rendered;
 
   const request: V2InvocationRequest = {
     invocationId: input.invocationId,
@@ -330,6 +359,7 @@ export async function invokeAuthorized(input: InvocationAuthorityInput): Promise
     providerModelId: request.sentProviderModelId,
     messages: rendered.messages,
     parameters: input.parameters,
+    ...(input.tools !== undefined ? { tools: input.tools } : {}),
   });
   const endedAt = now();
 
@@ -404,6 +434,7 @@ export async function invokeAuthorized(input: InvocationAuthorityInput): Promise
   return {
     ok: true,
     content: response.content,
+    toolCalls: response.toolCalls ?? [],
     record: Object.freeze({
       invocationId: input.invocationId,
       runId: input.runId,

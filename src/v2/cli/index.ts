@@ -27,13 +27,13 @@ import type { StateBoundMutationAuthority, WorkspaceAuthority } from "../core/wo
 import type { SourceSnapshotAuthority } from "../core/source.js";
 import { CANDIDATE_STRATEGIES } from "../core/contract.js";
 import { exitCodeForOutcome, formatOutcome, type V2RunResult } from "../core/result.js";
-import { runV2BuildProduction } from "../runtime/index.js";
+import { runV2BuildProduction, type ProductionRunDeps } from "../runtime/index.js";
 
 export const V2_USAGE = `Usage: ikbi v2 build "<goal>" [--repo <path>] [--strategy ${CANDIDATE_STRATEGIES.join("|")}] [--profile <name>] [--json]`;
 
 /** The experimental banner. On stderr so `--json` stdout stays machine-clean. */
 export const V2_BANNER =
-  "ikbi v2: EXPERIMENTAL architecture probe — resolves a route, retrieves relevant source, assembles context, and makes ONE model call to qualify the route. No build, no mutation, no promotion.\n";
+  "ikbi v2: EXPERIMENTAL — resolves a route, retrieves relevant source, assembles context, and runs a governed builder loop in an ISOLATED workspace. Produces a candidate; verifies nothing, promotes nothing, and never touches your repository.\n";
 
 interface V2Args {
   readonly subcommand: string | undefined;
@@ -118,10 +118,12 @@ export function renderRun(result: V2RunResult): string {
     ...contextLines(result),
     ...invocationLines(result),
     ...workspaceLines(result),
+    ...candidateLines(result),
     `outcome     ${formatOutcome(result.outcome)}`,
     "evidence    " +
-      `provider_invoked=${e.providerInvoked} candidates=${e.candidatesCreated} ` +
-      `verifications=${e.verificationsPerformed} promoted=${e.promoted} repo_mutated=${e.repositoryMutated}`,
+      `provider_invoked=${e.providerInvoked} invocations=${e.invocations} mutations=${e.mutationsApplied} ` +
+      `candidates=${e.candidatesCreated} verifications=${e.verificationsPerformed} promoted=${e.promoted} ` +
+      `candidate_mutated=${e.candidateMutated} source_repo_mutated=${e.sourceRepositoryMutated}`,
     `receipt     ${result.receipt.receiptId}`,
   ];
   // The outcome line already carries the failure sentence; what it lacks is the stable
@@ -200,22 +202,44 @@ function contextLines(result: V2RunResult): string[] {
 }
 
 /**
- * The one invocation. Rendered as the four identities kept apart, because "what we asked
- * for", "what we sent" and "what actually served it" are different facts.
+ * The builder's model turns. The route is stated once — it is the same authorized route
+ * for every turn, by design — and then each turn's served identity and usage, because
+ * "what we asked for", "what we sent" and "what actually served it" are different facts
+ * and a provider can answer differently on any turn.
  */
 function invocationLines(result: V2RunResult): string[] {
-  const i = result.receipt.invocation;
-  if (i === undefined) return [];
+  const calls = result.receipt.invocations;
+  const first = calls[0];
+  if (first === undefined) return [];
   const lines = [
-    `invoked     ${i.role} -> ${i.sentProviderId}/${i.sentProviderModelId} (authorized model ${i.authorizedModelId})`,
-    `served      ${i.servedModelId ?? "(not reported by the provider)"} [${i.identityStatus}] · ${i.attempts} attempt · finish ${i.finishReason}`,
-    `invocation  ${i.invocationId}`,
+    `invoked     ${first.role} -> ${first.sentProviderId}/${first.sentProviderModelId} (authorized model ${first.authorizedModelId}) · ${calls.length} turn(s)`,
   ];
-  if (i.usage !== undefined) {
-    const reported = Object.entries(i.usage).map(([k, v]) => `${k}=${String(v)}`).join(" ");
-    lines.push(`usage       ${reported.length > 0 ? reported : "(none reported)"}  (as the provider reported it)`);
+  for (const [index, i] of calls.entries()) {
+    lines.push(
+      `  turn ${String(index + 1).padStart(2)}   served ${i.servedModelId ?? "(not reported)"} [${i.identityStatus}] · ${i.attempts} attempt · finish ${i.finishReason}` +
+        (i.usage !== undefined
+          ? ` · ${Object.entries(i.usage).map(([k, v]) => `${k}=${String(v)}`).join(" ") || "(no usage reported)"}`
+          : ""),
+    );
   }
   return lines;
+}
+
+/**
+ * The candidate, when one exists. Ids, paths and counts — never a file body and never the
+ * conversation. The claim is labelled as the builder's own words, because it is.
+ */
+function candidateLines(result: V2RunResult): string[] {
+  const c = result.receipt.candidate;
+  if (c === undefined) return [];
+  return [
+    `candidate   ${c.candidateId}`,
+    `  tree      ${c.treeId} (from ${c.baseTreeId.slice(0, 12)}) · ${c.changed ? "CHANGED" : "unchanged"}`,
+    `  work      ${c.turns} turn(s), ${c.toolCalls} tool call(s), ${c.toolFailures} refused/rejected, ${c.mutations} mutation(s)`,
+    ...(c.changedPaths.length > 0 ? [`  paths     ${c.changedPaths.join(", ")}`] : []),
+    `  claim     ${c.claimBelievesComplete ? "believes complete" : "does NOT believe complete"} — ${c.claimSummary.split("\n")[0] ?? ""}`,
+    `  status    NOT VERIFIED, NOT PROMOTED — the candidate workspace is retained for verification`,
+  ];
 }
 
 
@@ -236,6 +260,9 @@ export async function runV2Cli(
     readonly workspaces?: WorkspaceAuthority;
     readonly mutations?: StateBoundMutationAuthority;
     readonly sources?: SourceSnapshotAuthority;
+    /** Builder seams, for the hermetic reachability suite. Production passes none. */
+    readonly buildTools?: ProductionRunDeps["buildTools"];
+    readonly captureTree?: ProductionRunDeps["captureTree"];
   } = {},
 ): Promise<number> {
   const out = io.stdout ?? writeStdout;
@@ -263,6 +290,8 @@ export async function runV2Cli(
       ...(io.workspaces !== undefined ? { workspaces: io.workspaces } : {}),
       ...(io.mutations !== undefined ? { mutations: io.mutations } : {}),
       ...(io.sources !== undefined ? { sources: io.sources } : {}),
+      ...(io.buildTools !== undefined ? { buildTools: io.buildTools } : {}),
+      ...(io.captureTree !== undefined ? { captureTree: io.captureTree } : {}),
     },
   );
   out(args.json ? `${JSON.stringify(result, null, 2)}\n` : renderRun(result));
@@ -272,7 +301,7 @@ export async function runV2Cli(
 registerCommand({
   name: "v2",
   category: "advanced",
-  summary: "EXPERIMENTAL: enter the v2 canonical lifecycle (skeleton — builds nothing yet)",
+  summary: "EXPERIMENTAL: enter the v2 canonical lifecycle (builds a candidate; verifies and promotes nothing)",
   usage: V2_USAGE,
   run: async (argv) => {
     const code = await runV2Cli(argv);

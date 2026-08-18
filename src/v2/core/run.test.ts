@@ -81,11 +81,17 @@ function fakeTransport(over: { servedModelId?: string | null; attempts?: number 
   const transport: InvocationTransport = {
     send: async (input) => {
       sent.push({ providerId: input.providerId, providerModelId: input.providerModelId, messages: input.messages });
+      // V2-007: the SPINE suite wants a builder that finishes immediately, so the run
+      // reaches its real stop point (verification) rather than exhausting its turns. The
+      // loop's own behaviour is `core/builder.test.ts`; the tools' is elsewhere.
       return {
         ok: true,
         response: {
-          content: "acknowledged",
-          finishReason: "stop",
+          content: "",
+          finishReason: "tool_calls",
+          toolCalls: [
+            { id: "f1", name: "finish_candidate", arguments: JSON.stringify({ summary: "nothing to change", believesComplete: true }) },
+          ],
           ...(over.servedModelId === null ? {} : { servedModelId: over.servedModelId ?? input.providerModelId }),
           usage: { promptTokens: 11, completionTokens: 3, totalTokens: 14 },
           attempts: over.attempts ?? 1,
@@ -127,7 +133,7 @@ function fakeSources(files: Readonly<Record<string, string>> = {}, snapshotId = 
  * In-memory workspace + mutation authorities. These tests are about the SPINE; the real
  * authorities have their own integration suite against real git worktrees.
  */
-function fakeWorkspaces(over: { discardFails?: boolean } = {}) {
+function fakeWorkspaces(over: { discardFails?: boolean; retainFails?: boolean } = {}) {
   const allocated: V2WorkspaceRecord[] = [];
   const dispositions: string[] = [];
   const authority: WorkspaceAuthority = {
@@ -143,6 +149,7 @@ function fakeWorkspaces(over: { discardFails?: boolean } = {}) {
           baseTree: "t".repeat(40),
           sourceSnapshotId: sourceSnapshot.snapshotId,
           materializedStateDigest: "m".repeat(64),
+          startTree: "t".repeat(40),
           materializedEntries: 0,
         },
         path: `/scratch/${allocated.length + 1}`,
@@ -160,7 +167,7 @@ function fakeWorkspaces(over: { discardFails?: boolean } = {}) {
     },
     retain: async (_r, reason) => {
       dispositions.push("retain");
-      return { kind: "retained", reason };
+      return over.retainFails === true ? { kind: "failed", attempted: "retain", detail: "worktree busy" } : { kind: "retained", reason };
     },
   };
   return { authority, allocated, dispositions };
@@ -185,8 +192,24 @@ function fakeMutations(sha: string | undefined = undefined) {
         },
       };
     },
+    read: async ({ runId, workspace, path }) => {
+      const state = { kind: "regular" as const, contentSha256: sha ?? "matching", byteLength: 3, symlinkTarget: null };
+      observed.push(path);
+      return {
+        ok: true,
+        observation: {
+          observationId: observationDigest({ workspaceId: workspace.workspaceId, path, state }),
+          runId,
+          workspaceId: workspace.workspaceId,
+          path,
+          state,
+          observedAt: 1,
+        },
+        content: "abc",
+      };
+    },
     mutate: async () => {
-      throw new Error("the production skeleton must never mutate");
+      throw new Error("this suite's builder never writes");
     },
   };
   return { authority, observed };
@@ -202,7 +225,25 @@ function deps(
   sources: SourceSnapshotAuthority = fakeSources().authority,
 ) {
   let tick = 0;
-  return { ids: createSequentialIdFactory("run"), now: () => (tick += 1), probe, configuration, contextSources, transport, workspaces, mutations, sources };
+  return {
+    ids: createSequentialIdFactory("run"),
+    now: () => (tick += 1),
+    probe,
+    configuration,
+    contextSources,
+    transport,
+    workspaces,
+    mutations,
+    sources,
+    // V2-007: the builder needs a tool executor and a way to address the resulting tree.
+    // This suite drives the SPINE, so both are hermetic — the real ones are proven in
+    // `runtime/builder-tools.test.ts` and `cli/builder-truth.test.ts`.
+    buildTools: () => ({ execute: async () => ({ outcome: { kind: "rejected" as const, reason: "unknown_tool" as const, detail: "no tools in this suite" } }) }),
+    captureTree: async () => ({
+      ok: true as const,
+      tree: { treeId: "tree".repeat(10), baseTreeId: "t".repeat(40), materializedStateDigest: "m".repeat(64), changed: false },
+    }),
+  };
 }
 
 test("run: a valid request mints task + run identities and enters the lifecycle", async () => {
@@ -210,7 +251,7 @@ test("run: a valid request mints task + run identities and enters the lifecycle"
   assert.ok(isV2Id("task", result.taskId));
   assert.ok(isV2Id("run", result.runId));
   assert.ok(isV2Id("receipt", result.receipt.receiptId));
-  assert.deepEqual([...result.receipt.stagesEntered], ["preflight", "model_resolution", "context", "invocation", "candidate_strategy"]);
+  assert.deepEqual([...result.receipt.stagesEntered], ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation"]);
   assert.equal(result.journal[0]?.from, "pending");
   assert.equal(result.journal[0]?.to, "preflight");
   assert.equal(result.journal.at(-1)?.to, "terminal");
@@ -234,20 +275,35 @@ test("run: NO FAKE SUCCESS — the receipt reports exactly what happened, counte
   assert.equal(e.modelResolutions, 1, "exactly one");
   assert.equal(e.contextAssemblyCompleted, true, "context WAS assembled");
   assert.equal(e.contextPackages, 1, "exactly one package");
-  assert.equal(e.providerInvoked, true, "V2-005: a model IS invoked now");
-  assert.equal(e.invocations, 1, "exactly one");
-  assert.equal(e.workspacesAllocated, 1, "V2-006: one isolated workspace");
-  assert.equal(e.mutationsApplied, 0, "and NOTHING was written");
-  assert.equal(e.candidatesCreated, 0, "no candidate was created");
+  assert.equal(e.providerInvoked, true, "a model IS invoked");
+  assert.equal(e.invocations, 1, "this fake builder finishes on its first turn");
+  assert.equal(e.workspacesAllocated, 1, "one isolated workspace");
+  assert.equal(e.mutationsApplied, 0, "this builder wrote nothing — and says so");
+  assert.equal(e.candidateMutated, false);
+  // V2-007: a candidate now EXISTS. It has still been verified by nothing.
+  assert.equal(e.candidatesCreated, 1, "the builder finished, so there is a candidate");
   assert.equal(e.verificationsPerformed, 0, "nothing was verified");
   assert.equal(e.promotionsAttempted, 0);
   assert.equal(e.promoted, false, "nothing was promoted");
-  assert.equal(e.repositoryMutated, false, "the repository was not touched");
+  assert.equal(e.sourceRepositoryMutated, false, "the operator's repository was not touched");
+});
+
+test("run: a no-change candidate is LEGITIMATE — 'no diff' is not the builder's to fail", async () => {
+  const result = await runV2Build({ goal: "check something", repoPath: "/repo" }, deps(goodRepo));
+  const candidate = result.receipt.candidate!;
+  assert.equal(candidate.mutations, 0);
+  assert.deepEqual([...candidate.changedPaths], []);
+  assert.equal(candidate.changed, false);
+  assert.equal(candidate.claimBelievesComplete, true, "the builder's belief, recorded as a claim");
+  // Whether "no edit" satisfies the task is a VERIFICATION question, and verification
+  // has not run. The candidate exists so that question can be asked of something real.
+  assert.ok(result.outcome.kind === "failed");
+  assert.equal(result.outcome.failure.detail?.missingStage, "verification");
 });
 
 test("run: the skeleton never claims to have reached a stage it did not run", async () => {
   const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo));
-  const implemented = new Set<string>(["preflight", "model_resolution", "context", "invocation", IMPLEMENTED_THROUGH_STAGE]);
+  const implemented = new Set<string>(["preflight", "model_resolution", "context", "candidate_strategy", IMPLEMENTED_THROUGH_STAGE]);
   for (const stage of LIFECYCLE_STAGES) {
     if (implemented.has(stage)) continue;
     assert.equal(result.receipt.stagesEntered.includes(stage), false, `"${stage}" was never entered`);
@@ -261,8 +317,8 @@ test("run: the invocation sends EXACTLY the authorized route, once", async () =>
   assert.equal(fake.sent[0]?.providerId, "alpha");
   assert.equal(fake.sent[0]?.providerModelId, "a1", "the WIRE id from the decision, not the logical id");
   assert.equal(result.receipt.resolution?.modelId, "alpha-1");
-  assert.equal(result.invocation?.identity.authorizedModelId, "alpha-1");
-  assert.equal(result.invocation?.identity.sentProviderModelId, "a1");
+  assert.equal(result.invocations[0]?.identity.authorizedModelId, "alpha-1");
+  assert.equal(result.invocations[0]?.identity.sentProviderModelId, "a1");
 });
 
 test("run: a failure BEFORE the wire is not counted as an invocation", async () => {
@@ -277,7 +333,7 @@ test("run: a failure BEFORE the wire is not counted as an invocation", async () 
   assert.equal(result.outcome.failure.category, "provider");
   assert.equal(result.receipt.evidence.providerInvoked, false, "intention is not an invocation");
   assert.equal(result.receipt.evidence.invocations, 0);
-  assert.equal(result.invocation, undefined);
+  assert.equal(result.invocations[0], undefined);
 });
 
 test("run: a failure that REACHED the wire IS counted as an invocation", async () => {
@@ -291,7 +347,7 @@ test("run: a failure that REACHED the wire IS counted as an invocation", async (
   assert.ok(result.outcome.kind === "failed");
   assert.equal(result.receipt.evidence.providerInvoked, true, "a provider WAS contacted");
   assert.equal(result.receipt.evidence.invocations, 1);
-  assert.equal(result.invocation, undefined, "but there is no successful record");
+  assert.equal(result.invocations[0], undefined, "but there is no successful record");
 });
 
 test("run: the context package is bound to the run, task and the resolution it was sized by", async () => {
@@ -376,7 +432,10 @@ test("run: shadow and tournament are ACCEPTED strategies and reach the same stop
     const result = await runV2Build({ goal: "go", repoPath: "/repo", candidateStrategy }, deps(goodRepo));
     assert.ok(result.outcome.kind === "failed");
     assert.equal(result.outcome.failure.category, "not_implemented", `${candidateStrategy} passes preflight`);
-    assert.equal(result.receipt.evidence.candidatesCreated, 0, `${candidateStrategy} produced nothing (nothing runs yet)`);
+    // Every strategy runs the SAME builder controller, executor and mutation authority.
+    // `single` is the only one that generates today; shadow/tournament are accepted at
+    // preflight and take the single path until they have their own slice.
+    assert.equal(result.receipt.evidence.candidatesCreated, 1, `${candidateStrategy} used the one canonical generator`);
   }
 });
 
@@ -406,11 +465,12 @@ test("run: the real (unstubbed) probe accepts THIS repository and still refuses 
   // path is wired, and that even a perfectly good repo yields no build in this slice.
   const result = await runV2Build(
     { goal: "inspect ikbi itself", repoPath: process.cwd() },
-    { configuration: workingConfiguration, contextSources: noSources, transport: fakeTransport().transport, workspaces: fakeWorkspaces().authority, mutations: fakeMutations().authority, sources: fakeSources().authority },
+    // Everything wired EXCEPT the probe, so the production RepoProbe is the one used.
+    (({ probe: _omitted, ...rest }) => rest)(deps(goodRepo)),
   );
   assert.ok(result.outcome.kind === "failed");
   assert.equal(result.outcome.failure.category, "not_implemented");
-  assert.equal(result.receipt.evidence.repositoryMutated, false);
+  assert.equal(result.receipt.evidence.sourceRepositoryMutated, false);
 });
 
 // ── workspace strategy (V2-006) ─────────────────────────────────────────────
@@ -424,16 +484,45 @@ test("run: exactly ONE workspace is allocated, bound to the run and the source t
   assert.equal(result.receipt.workspace?.baseCommit, "c".repeat(40));
 });
 
-test("run: the workspace is DISCARDED at the normal stop — nothing was produced", async () => {
+test("run: the workspace is RETAINED once a candidate exists — verification needs it", async () => {
   const ws = fakeWorkspaces();
   const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo, workingConfiguration, noSources, fakeTransport().transport, ws.authority));
-  assert.deepEqual(ws.dispositions, ["discard"]);
-  assert.equal(result.receipt.workspace?.disposition, "discarded");
+  assert.deepEqual(ws.dispositions, ["retain"], "a candidate is the only copy of the work — discarding it would throw it away");
+  assert.equal(result.receipt.workspace?.disposition, "retained");
+  assert.match(result.receipt.workspace?.dispositionDetail ?? "", /awaits verification/);
+  // RETENTION IS NOT PROMOTION. The worktree stays on disk; nothing was landed.
+  assert.equal(result.receipt.evidence.promoted, false);
+  assert.equal(result.receipt.evidence.sourceRepositoryMutated, false);
+});
+
+test("run: a generation that FAILS discards its workspace — no leak, no half-tree kept", async () => {
+  const ws = fakeWorkspaces();
+  // A transport that never lets the builder finish: the loop exhausts its turns.
+  const stubborn: InvocationTransport = {
+    send: async (input) => ({ ok: true, response: { content: "I am thinking about it.", finishReason: "stop", attempts: 1, servedModelId: input.providerModelId } }),
+  };
+  const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo, workingConfiguration, noSources, stubborn, ws.authority));
+  assert.ok(result.outcome.kind === "failed");
+  assert.equal(result.outcome.failure.category, "build");
+  assert.equal(result.receipt.candidate, undefined, "no candidate is claimed");
+  assert.deepEqual(ws.dispositions, ["discard"], "and the half-edited tree is not left behind");
 });
 
 test("run: a cleanup that FAILS is reported as failed, never as if it worked", async () => {
-  const ws = fakeWorkspaces({ discardFails: true });
+  // A successful build RETAINS, so a retention that could not complete is the cleanup
+  // failure this path now has to report honestly.
+  const ws = fakeWorkspaces({ retainFails: true });
   const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo, workingConfiguration, noSources, fakeTransport().transport, ws.authority));
+  assert.equal(result.receipt.workspace?.disposition, "failed");
+  assert.match(result.receipt.workspace?.dispositionDetail ?? "", /retain failed: worktree busy/);
+});
+
+test("run: a DISCARD that fails on a failed build is reported as failed too", async () => {
+  const ws = fakeWorkspaces({ discardFails: true });
+  const stubborn: InvocationTransport = {
+    send: async (input) => ({ ok: true, response: { content: "hmm", finishReason: "stop", attempts: 1, servedModelId: input.providerModelId } }),
+  };
+  const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo, workingConfiguration, noSources, stubborn, ws.authority));
   assert.equal(result.receipt.workspace?.disposition, "failed");
   assert.match(result.receipt.workspace?.dispositionDetail ?? "", /discard failed: worktree busy/);
 });

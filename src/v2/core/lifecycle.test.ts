@@ -19,6 +19,7 @@ import {
   type LifecycleStage,
   type LifecycleViolationCode,
 } from "./lifecycle.js";
+import type { V2CandidateId } from "./identity.js";
 import { summarizeEvidence } from "./result.js";
 
 const ids = createSequentialIdFactory("lcx");
@@ -36,6 +37,16 @@ const WORKSPACE = ids.mint("workspace");
 /** A stand-in snapshot digest. Snapshot identity is the source suite's concern. */
 const SNAPSHOT = "5".repeat(64) as V2SnapshotDigest;
 
+/**
+ * A distinct content-addressed candidate id.
+ *
+ * V2-007 made candidate identity a DIGEST rather than a minted id — a candidate IS the
+ * state it produced — so tests construct them instead of minting them. Candidate identity
+ * itself is the candidate suite's concern.
+ */
+let candidateSeed = 0;
+const fakeCandidateId = (seed: string): V2CandidateId => (`${seed}`.repeat(64).slice(0, 64) as V2CandidateId);
+
 function fresh() {
   const ids = createSequentialIdFactory("lc");
   const runId = ids.mint("run");
@@ -47,7 +58,9 @@ function fresh() {
 function walkTo(target: LifecycleStage) {
   const ctx = fresh();
   const { lifecycle, ids, runId } = ctx;
-  const candidateId = ids.mint("candidate");
+  // V2-007: a candidate is CONTENT-ADDRESSED — it is the state it produced, not an event
+  // that occurred. The test mints distinct digests the same way the real code does.
+  const candidateId = fakeCandidateId("a");
   const workspaceId = ids.mint("workspace");
   const verificationId = ids.mint("verification");
   const promotionId = ids.mint("promotion");
@@ -65,9 +78,9 @@ function walkTo(target: LifecycleStage) {
     if (stage === "model_resolution") lifecycle.record(runId, { kind: "resolution", decisionId: DECISION, role: "builder" });
     // V2-004: `candidate_strategy` REQUIRES an authorized context package.
     if (stage === "context") lifecycle.record(runId, { kind: "context", packageId: CONTEXT, artifacts: 3 });
-    // V2-005: `candidate_strategy` REQUIRES a proven invocation — a candidate is
-    // produced BY a model, so a route must have been shown to be invocable.
-    if (stage === "invocation") lifecycle.record(runId, { kind: "invocation", id: INVOCATION, role: "builder" });
+    // V2-007: invocation evidence belongs to candidate_generation — the builder loop is
+    // where a model is actually called, and the standalone qualification stage is gone.
+    if (stage === "candidate_generation") lifecycle.record(runId, { kind: "invocation", id: INVOCATION, role: "builder" });
     // V2-006: `candidate_generation` REQUIRES an isolated workspace to build in.
     if (stage === "candidate_strategy") lifecycle.record(runId, { kind: "workspace", id: WORKSPACE, baseTree: "t" });
     if (stage === "candidate_generation") lifecycle.record(runId, { kind: "candidate", id: candidateId, workspaceId });
@@ -91,11 +104,12 @@ function violation(fn: () => void): LifecycleViolationCode {
 // ── ordering ────────────────────────────────────────────────────────────────
 
 test("lifecycle: the canonical order is preflight -> … -> promotion", () => {
+  // V2-007 removed the standalone `invocation` stage: a model is invoked BY the builder,
+  // during candidate_generation, so invocation is an act rather than a place.
   assert.deepEqual([...LIFECYCLE_STAGES], [
     "preflight",
     "model_resolution",
     "context",
-    "invocation",
     "candidate_strategy",
     "candidate_generation",
     "verification",
@@ -159,8 +173,6 @@ test("lifecycle: VERIFICATION cannot be entered before a candidate exists", () =
   lifecycle.record(runId, { kind: "resolution", decisionId: DECISION, role: "builder" });
   lifecycle.enter(runId, "context");
   lifecycle.record(runId, { kind: "context", packageId: CONTEXT, artifacts: 3 });
-  lifecycle.enter(runId, "invocation");
-  lifecycle.record(runId, { kind: "invocation", id: INVOCATION, role: "builder" });
   lifecycle.enter(runId, "candidate_strategy");
   lifecycle.record(runId, { kind: "workspace", id: WORKSPACE, baseTree: "t" });
   lifecycle.enter(runId, "candidate_generation");
@@ -179,7 +191,7 @@ test("lifecycle: a stage may only record the evidence it owns", () => {
   const { lifecycle, ids, runId } = fresh();
   lifecycle.enter(runId, "preflight");
   assert.equal(
-    violation(() => lifecycle.record(runId, { kind: "candidate", id: ids.mint("candidate"), workspaceId: ids.mint("workspace") })),
+    violation(() => lifecycle.record(runId, { kind: "candidate", id: fakeCandidateId(String(candidateSeed += 1)), workspaceId: ids.mint("workspace") })),
     "stage_not_permitted_for_evidence",
     "preflight cannot mint candidates",
   );
@@ -194,7 +206,7 @@ test("lifecycle: a verification must name a candidate that was actually recorded
   const { lifecycle, ids, runId } = walkTo("verification");
   assert.equal(
     violation(() =>
-      lifecycle.record(runId, { kind: "verification", id: ids.mint("verification"), candidateId: ids.mint("candidate") }),
+      lifecycle.record(runId, { kind: "verification", id: ids.mint("verification"), candidateId: fakeCandidateId(String(candidateSeed += 1)) }),
     ),
     "unrecorded_evidence",
   );
@@ -202,7 +214,7 @@ test("lifecycle: a verification must name a candidate that was actually recorded
 
 test("lifecycle: a promotion cannot ride a verification of a DIFFERENT candidate", () => {
   const { lifecycle, ids, runId, verificationId } = walkTo("candidate_generation");
-  const other = ids.mint("candidate");
+  const other = fakeCandidateId(String(candidateSeed += 1));
   lifecycle.record(runId, { kind: "candidate", id: other, workspaceId: ids.mint("workspace") });
   lifecycle.enter(runId, "verification");
   const firstCandidate = lifecycle.ledger.candidates[0]!;
@@ -261,18 +273,18 @@ test("lifecycle: ACCEPTED on real evidence is allowed, and the receipt counts it
   const outcome = lifecycle.outcome!;
   const summary = summarizeEvidence(lifecycle.ledger, outcome);
   assert.equal(summary.promoted, true);
-  assert.equal(summary.repositoryMutated, true);
+  assert.equal(summary.sourceRepositoryMutated, true);
   assert.equal(summary.candidatesCreated, 1);
   assert.equal(summary.verificationsPerformed, 1);
 });
 
 test("lifecycle: WITHHELD must cite the verification that judged its own candidate", () => {
-  const { lifecycle, ids, runId, candidateId, verificationId } = walkTo("disposition");
+  const { lifecycle, runId, candidateId, verificationId } = walkTo("disposition");
   assert.equal(
     violation(() =>
       lifecycle.terminalize(runId, {
         kind: "withheld",
-        candidateId: ids.mint("candidate"),
+        candidateId: fakeCandidateId(String(candidateSeed += 1)),
         verificationId,
         reason: "governance",
       }),
@@ -282,7 +294,7 @@ test("lifecycle: WITHHELD must cite the verification that judged its own candida
   lifecycle.terminalize(runId, { kind: "withheld", candidateId, verificationId, reason: "governance" });
   const summary = summarizeEvidence(lifecycle.ledger, lifecycle.outcome!);
   assert.equal(summary.promoted, false, "withheld work is verified but NOT promoted");
-  assert.equal(summary.repositoryMutated, false);
+  assert.equal(summary.sourceRepositoryMutated, false);
 });
 
 test("lifecycle: a recorded promotion that did not become the outcome never reads as landed", () => {
@@ -291,7 +303,7 @@ test("lifecycle: a recorded promotion that did not become the outcome never read
   const summary = summarizeEvidence(lifecycle.ledger, lifecycle.outcome!);
   assert.equal(summary.promotionsAttempted, 1, "the attempt is still recorded, honestly");
   assert.equal(summary.promoted, false, "but it did not land");
-  assert.equal(summary.repositoryMutated, false);
+  assert.equal(summary.sourceRepositoryMutated, false);
 });
 
 // ── run identity ────────────────────────────────────────────────────────────
@@ -310,8 +322,8 @@ test("lifecycle: a foreign run id is rejected on every mutating call", () => {
 
 test("lifecycle: MANY candidates are first-class — the spine never assumes one", () => {
   const { lifecycle, ids, runId } = walkTo("candidate_generation");
-  const second = ids.mint("candidate");
-  const third = ids.mint("candidate");
+  const second = fakeCandidateId(String(candidateSeed += 1));
+  const third = fakeCandidateId(String(candidateSeed += 1));
   lifecycle.record(runId, { kind: "candidate", id: second, workspaceId: ids.mint("workspace") });
   lifecycle.record(runId, { kind: "candidate", id: third, workspaceId: ids.mint("workspace") });
   lifecycle.enter(runId, "verification");
@@ -418,8 +430,8 @@ test("lifecycle: INVOCATION cannot be entered before context is assembled (V2-00
   lifecycle.enter(runId, "model_resolution");
   lifecycle.record(runId, { kind: "resolution", decisionId: DECISION, role: "builder" });
   lifecycle.enter(runId, "context");
-  // The stage ran but assembled nothing — there is nothing to invoke a model with.
-  assert.equal(violation(() => lifecycle.enter(runId, "invocation")), "missing_required_evidence");
+  // The stage ran but assembled nothing — there is nothing to build a candidate from.
+  assert.equal(violation(() => lifecycle.enter(runId, "candidate_strategy")), "missing_required_evidence");
 });
 
 test("lifecycle: a context package is CONTEXT's to record and no one else's", () => {
@@ -469,10 +481,10 @@ test("lifecycle: INVOCATION cannot be entered before context is assembled", () =
   lifecycle.enter(runId, "model_resolution");
   lifecycle.record(runId, { kind: "resolution", decisionId: DECISION, role: "builder" });
   lifecycle.enter(runId, "context");
-  assert.equal(violation(() => lifecycle.enter(runId, "invocation")), "missing_required_evidence");
+  assert.equal(violation(() => lifecycle.enter(runId, "candidate_strategy")), "missing_required_evidence");
 });
 
-test("lifecycle: an invocation is INVOCATION's to record and no one else's", () => {
+test("lifecycle: an invocation is CANDIDATE_GENERATION's to record and no one else's", () => {
   const { lifecycle, runId } = fresh();
   lifecycle.enter(runId, "preflight");
   lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
@@ -487,41 +499,57 @@ test("lifecycle: an invocation is INVOCATION's to record and no one else's", () 
   );
 });
 
-test("lifecycle: CANDIDATE_STRATEGY cannot be entered before a route was invoked", () => {
-  const { lifecycle, runId } = walkTo("context");
-  lifecycle.enter(runId, "invocation");
-  assert.equal(violation(() => lifecycle.enter(runId, "candidate_strategy")), "missing_required_evidence");
+test("lifecycle: CANDIDATE_GENERATION cannot be entered without a workspace to build in", () => {
+  const { lifecycle, runId } = fresh();
+  lifecycle.enter(runId, "preflight");
+  lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
+  lifecycle.record(runId, { kind: "snapshot", id: SNAPSHOT, clean: true });
+  lifecycle.enter(runId, "model_resolution");
+  lifecycle.record(runId, { kind: "resolution", decisionId: DECISION, role: "builder" });
+  lifecycle.enter(runId, "context");
+  lifecycle.record(runId, { kind: "context", packageId: CONTEXT, artifacts: 3 });
+  lifecycle.enter(runId, "candidate_strategy");
+  assert.equal(violation(() => lifecycle.enter(runId, "candidate_generation")), "missing_required_evidence");
+});
+
+test("lifecycle: THE STANDALONE INVOCATION STAGE IS GONE (V2-007)", () => {
+  // V2-005 introduced it to prove one authorized route could be called. With a real
+  // builder that invokes N times, keeping it would mean paying for a qualification call
+  // whose only finding the builder's first turn establishes anyway.
+  assert.equal(
+    (LIFECYCLE_STAGES as readonly string[]).includes("invocation"),
+    false,
+    "invocation is no longer a place a run can be — it is something candidate_generation does",
+  );
+  assert.deepEqual(
+    [...LIFECYCLE_STAGES],
+    ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "disposition", "promotion"],
+  );
 });
 
 test("lifecycle: a recorded invocation is counted, and it is a real call", () => {
-  const { lifecycle, runId } = walkTo("invocation");
+  const { lifecycle, runId } = walkTo("candidate_generation");
   assert.deepEqual([...lifecycle.ledger.invocations], [INVOCATION]);
   lifecycle.terminalize(runId, { kind: "rejected", reason: "aborted" });
   const summary = summarizeEvidence(lifecycle.ledger, lifecycle.outcome!);
   assert.equal(summary.providerInvoked, true, "for the first time in v2, this IS true");
   assert.equal(summary.invocations, 1);
-  assert.equal(summary.candidatesCreated, 0, "and still nothing was built");
+  assert.equal(summary.candidatesCreated, 1, "and V2-007 means candidate_generation really produces one");
 });
 
 // ── workspace precondition (V2-006) ─────────────────────────────────────────
 
-test("lifecycle: CANDIDATE_GENERATION cannot be entered without a workspace", () => {
-  const { lifecycle, runId } = walkTo("invocation");
-  lifecycle.enter(runId, "candidate_strategy");
-  assert.equal(violation(() => lifecycle.enter(runId, "candidate_generation")), "missing_required_evidence");
-});
-
 test("lifecycle: a workspace is CANDIDATE_STRATEGY's to record and no one else's", () => {
-  const { lifecycle, runId } = walkTo("invocation");
+  const { lifecycle, runId } = walkTo("context");
   assert.equal(
     violation(() => lifecycle.record(runId, { kind: "workspace", id: WORKSPACE, baseTree: "t" })),
     "stage_not_permitted_for_evidence",
-    "invocation may not allocate a workspace",
+    "context assembly may not allocate a workspace",
   );
 });
 
 test("lifecycle: a MUTATION may only be recorded where a candidate is produced", () => {
-  const { lifecycle, runId } = walkTo("invocation");
+  const { lifecycle, runId } = walkTo("context");
   lifecycle.enter(runId, "candidate_strategy");
   lifecycle.record(runId, { kind: "workspace", id: WORKSPACE, baseTree: "t" });
   // Observations are permitted here; writes are NOT.
@@ -534,7 +562,7 @@ test("lifecycle: a MUTATION may only be recorded where a candidate is produced",
 });
 
 test("lifecycle: workspace/observation/mutation counts are counted, not assumed", () => {
-  const { lifecycle, runId } = walkTo("invocation");
+  const { lifecycle, runId } = walkTo("context");
   lifecycle.enter(runId, "candidate_strategy");
   lifecycle.record(runId, { kind: "workspace", id: WORKSPACE, baseTree: "t" });
   lifecycle.record(runId, { kind: "observation", id: "o".repeat(64) as never, workspaceId: WORKSPACE, path: "a.ts" });
@@ -543,7 +571,7 @@ test("lifecycle: workspace/observation/mutation counts are counted, not assumed"
   assert.equal(summary.workspacesAllocated, 1);
   assert.equal(summary.observationsTaken, 1);
   assert.equal(summary.mutationsApplied, 0, "nothing was written");
-  assert.equal(summary.repositoryMutated, false, "and the source repository is untouched");
+  assert.equal(summary.sourceRepositoryMutated, false, "and the source repository is untouched");
 });
 
 // ── one source snapshot per run (V2-006A) ───────────────────────────────────

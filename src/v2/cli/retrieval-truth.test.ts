@@ -235,8 +235,8 @@ test("retrieval truth: retrieval writes nothing and promotes nothing", () => {
   assert.equal(execFileSync("git", ["status", "--porcelain"], { cwd: repo, encoding: "utf8" }), before);
   const e = result.receipt.evidence;
   assert.equal(e.mutationsApplied, 0);
-  assert.equal(e.candidatesCreated, 0);
-  assert.equal(e.repositoryMutated, false);
+  assert.equal(e.candidatesCreated, 1);
+  assert.equal(e.sourceRepositoryMutated, false);
   assert.equal(e.promoted, false);
 });
 

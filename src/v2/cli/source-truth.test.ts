@@ -138,8 +138,8 @@ test("source truth: a DIRTY tracked file flows end to end — context, workspace
 
   // 5. Reproducing the operator's own work is NOT a model mutation.
   assert.equal(result.receipt.evidence.mutationsApplied, 0);
-  assert.equal(result.receipt.evidence.candidatesCreated, 0);
-  assert.equal(result.receipt.evidence.repositoryMutated, false);
+  assert.equal(result.receipt.evidence.candidatesCreated, 1, "the builder finished — the candidate is unverified, not absent");
+  assert.equal(result.receipt.evidence.sourceRepositoryMutated, false);
 
   // 6. And the operator's checkout is exactly as they left it.
   assert.equal(execFileSync("cat", [join(repo, "src/a.ts")], { encoding: "utf8" }), dirty);
@@ -237,8 +237,8 @@ test("source truth: materialization is NOT counted as a mutation, however dirty 
   assert.equal(result.receipt.workspace?.materializedEntries, 3, "three source entries reproduced");
   const e = result.receipt.evidence;
   assert.equal(e.mutationsApplied, 0, "and zero mutations");
-  assert.equal(e.candidatesCreated, 0);
-  assert.equal(e.repositoryMutated, false);
+  assert.equal(e.candidatesCreated, 1);
+  assert.equal(e.sourceRepositoryMutated, false);
 });
 
 test("source truth: exactly ONE snapshot, and the whole spine agrees on it", () => {
@@ -251,7 +251,7 @@ test("source truth: exactly ONE snapshot, and the whole spine agrees on it", () 
   assert.equal(result.receipt.evidence.sourceSnapshots, 1);
   assert.equal(result.context?.sourceSnapshotId, id, "context came from it");
   assert.equal(result.receipt.workspace?.sourceSnapshotId, id, "the workspace was materialized from it");
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "invocation", "candidate_strategy"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation"]);
 });
 
 test("source truth: the human rendering states the snapshot and what was materialized", () => {
