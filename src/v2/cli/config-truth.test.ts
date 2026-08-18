@@ -43,8 +43,10 @@ const ROSTER = {
     { id: "keyed", kind: "openai-compatible", baseUrl: "https://keyed.test/v1", apiKey: PLANTED_SECRET },
   ],
   models: [
-    { id: "alpha-1", role: "builder", cost: { promptPerMTok: 0, completionPerMTok: 0 }, providers: [{ provider: "alpha", providerModelId: "a1" }] },
-    { id: "beta-1", role: "builder", cost: { promptPerMTok: 0, completionPerMTok: 0 }, providers: [{ provider: "beta", providerModelId: "b1" }] },
+    // A DECLARED context window: the context budget is derived from capability facts,
+    // and an unclassified model would (correctly) fail rather than be guessed at.
+    { id: "alpha-1", role: "builder", cost: { promptPerMTok: 0, completionPerMTok: 0 }, providers: [{ provider: "alpha", providerModelId: "a1" }], capabilities: { context_window: 100000, supports_tools: true } },
+    { id: "beta-1", role: "builder", cost: { promptPerMTok: 0, completionPerMTok: 0 }, providers: [{ provider: "beta", providerModelId: "b1" }], capabilities: { context_window: 100000, supports_tools: true } },
   ],
 };
 
@@ -230,17 +232,18 @@ test("config truth: inheritance is resolved BEFORE validation", () => {
 
 // ── boundaries this slice must not cross ────────────────────────────────────
 
-test("config truth: configuration and resolution run, and NOTHING is invoked", () => {
+test("config truth: configuration, resolution and context run, and NOTHING is invoked", () => {
   const root = makeStateRoot();
   assert.equal(runCli(root, ["profile", "use", "prof-alpha"]).status, 0);
   const { result } = v2Run(root);
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context"]);
   assert.equal(result.receipt.evidence.configurationResolved, true);
   assert.equal(result.receipt.evidence.modelResolutionCompleted, true, "a route was authorized");
+  assert.equal(result.receipt.evidence.contextAssemblyCompleted, true, "context was assembled");
   assert.equal(result.receipt.evidence.providerInvoked, false, "and still nothing was invoked");
   assert.equal(result.receipt.evidence.invocations, 0, "no V2InvocationId was minted for an authorization");
   assert.ok(result.outcome.kind === "failed");
-  assert.equal(result.outcome.failure.detail?.missingStage, "context", "context is the next unimplemented stage");
+  assert.equal(result.outcome.failure.detail?.missingStage, "candidate_strategy", "the next unimplemented stage");
 });
 
 test("config truth: configuration never mutates state — the pointer and repo are untouched", () => {

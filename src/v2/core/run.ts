@@ -17,8 +17,10 @@
  *      `RuntimeModelPolicy`, recorded on the lifecycle ledger
  *   5. enter `model_resolution` and ask THE resolver which exact model/provider route is
  *      AUTHORIZED for the builder role, recording the decision on the ledger
- *   6. STOP, because `context` (the next stage) has no implementation in this build
- *   7. terminalize as `failed` with category `not_implemented`, and emit a receipt
+ *   6. enter `context` and ask THE assembler for the one bounded, content-addressed
+ *      context package that route's capabilities permit, recording it on the ledger
+ *   7. STOP, because `candidate_strategy` (the next stage) has no implementation
+ *   8. terminalize as `failed` with category `not_implemented`, and emit a receipt
  *      whose evidence block is counted from the ledger: zero invocations, zero
  *      candidates, zero verifications, not promoted, repository not mutated
  *
@@ -46,11 +48,13 @@ import {
   type ModelRequirements,
   type ModelResolutionDecision,
 } from "./resolver.js";
+import { assembleContext, manifestOf, type ContextPackage, type ContextSource } from "./context.js";
 import { V2_001_FAILURE_CODES, runFailure, stageNotImplemented, type RunFailure } from "./failure.js";
 import { createIdFactory, type V2IdFactory } from "./identity.js";
 import { RunLifecycle, type LifecycleStage } from "./lifecycle.js";
 import {
   summarizeConfiguration,
+  summarizeContext,
   summarizeEvidence,
   summarizeResolution,
   type V2RunReceipt,
@@ -78,10 +82,10 @@ export const DEMONSTRATED_ROLE = "builder" as const;
 export const DEMONSTRATED_REQUIREMENTS: ModelRequirements | undefined = undefined;
 
 /** The furthest stage this build of ikbi implements. */
-export const IMPLEMENTED_THROUGH_STAGE: LifecycleStage = "model_resolution";
+export const IMPLEMENTED_THROUGH_STAGE: LifecycleStage = "context";
 
 /** The stage the run would need next, and does not have. */
-export const FIRST_UNIMPLEMENTED_STAGE: LifecycleStage = "context";
+export const FIRST_UNIMPLEMENTED_STAGE: LifecycleStage = "candidate_strategy";
 
 /** Upper bound on a goal, so an accidental file paste is rejected as input, not as a build. */
 export const MAX_GOAL_LENGTH = 8000;
@@ -123,6 +127,12 @@ export const nodeRepoProbe: RepoProbe = {
  */
 export interface V2RunDeps {
   readonly configuration: ConfigurationSource;
+  /**
+   * The context contributors, in consultation order. REQUIRED, for the same reason
+   * `configuration` is: a default would have to live in this pure layer, and these read
+   * the filesystem. The production list is wired once, in `src/v2/runtime/index.ts`.
+   */
+  readonly contextSources: readonly ContextSource[];
   readonly ids?: V2IdFactory;
   readonly now?: () => number;
   readonly probe?: RepoProbe;
@@ -244,14 +254,16 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
   // lifecycle: there is no path that ends a run outside the machine.
   lifecycle.enter(runId, "preflight");
 
-  let task: V2Task | undefined;
+  let resolvedTask: V2Task | undefined;
   let policy: RuntimeModelPolicy | undefined;
   let decision: ModelResolutionDecision | undefined;
+  let contextPackage: ContextPackage | undefined;
 
   const failure = await (async (): Promise<RunFailure> => {
     const checked = preflight(request, probe);
     if (!checked.ok) return checked.failure;
-    task = checked.task;
+    const task = checked.task;
+    resolvedTask = task;
 
     // CONFIGURATION TRUTH. Read-only: the source observes a provider roster and a
     // profile file. A structurally incoherent selection fails HERE, rather than
@@ -277,9 +289,27 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     decision = resolved.decision;
     lifecycle.record(runId, { kind: "resolution", decisionId: decision.decisionId, role: decision.role });
 
-    // Resolution is complete and the next stage does not exist in this build, so the
-    // run stops here and says so. It does not enter `context` — a stage is only ever
-    // recorded as entered when it actually ran.
+    // Stage 3 — CONTEXT. One authority assembles one bounded package, sized by the
+    // capabilities of the route just authorized. Sources contribute; only the assembler
+    // admits.
+    lifecycle.enter(runId, "context");
+    const assembled = await assembleContext(
+      {
+        runId,
+        taskId,
+        goal: task.goal,
+        repoPath: task.repoPath,
+        resolutionDecisionId: decision.decisionId,
+        capabilities: decision.capabilities,
+      },
+      deps.contextSources,
+    );
+    if (!assembled.ok) return assembled.failure;
+    contextPackage = assembled.package;
+    lifecycle.record(runId, { kind: "context", packageId: contextPackage.packageId, artifacts: contextPackage.artifacts.length });
+
+    // Context is complete and the next stage does not exist in this build, so the run
+    // stops here and says so. A stage is only ever recorded as entered when it ran.
     return stageNotImplemented(FIRST_UNIMPLEMENTED_STAGE, IMPLEMENTED_THROUGH_STAGE);
   })();
 
@@ -296,6 +326,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     evidence: summarizeEvidence(lifecycle.ledger, outcome),
     ...(policy !== undefined ? { configuration: summarizeConfiguration(policy) } : {}),
     ...(decision !== undefined ? { resolution: summarizeResolution(decision) } : {}),
+    ...(contextPackage !== undefined ? { context: summarizeContext(contextPackage) } : {}),
     startedAt,
     endedAt,
   };
@@ -303,11 +334,12 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
   return {
     taskId,
     runId,
-    goal: task?.goal ?? request.goal,
-    repoPath: task?.repoPath ?? request.repoPath,
+    goal: resolvedTask?.goal ?? request.goal,
+    repoPath: resolvedTask?.repoPath ?? request.repoPath,
     outcome,
     ...(policy !== undefined ? { policy } : {}),
     ...(decision !== undefined ? { decision } : {}),
+    ...(contextPackage !== undefined ? { context: manifestOf(contextPackage) } : {}),
     journal: lifecycle.journal,
     receipt,
   };

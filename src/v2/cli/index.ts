@@ -20,6 +20,7 @@
 import { registerCommand } from "../../cli/registry.js";
 import { writeStdout, writeStderr } from "../../cli/io.js";
 import type { ConfigurationSource } from "../core/config.js";
+import type { ContextSource } from "../core/context.js";
 import { CANDIDATE_STRATEGIES } from "../core/contract.js";
 import { exitCodeForOutcome, formatOutcome, type V2RunResult } from "../core/result.js";
 import { runV2BuildProduction } from "../runtime/index.js";
@@ -85,6 +86,7 @@ export function renderRun(result: V2RunResult): string {
     `stages      ${result.receipt.stagesEntered.join(" -> ") || "<none>"}`,
     ...configurationLines(result),
     ...resolutionLines(result),
+    ...contextLines(result),
     `outcome     ${formatOutcome(result.outcome)}`,
     "evidence    " +
       `provider_invoked=${e.providerInvoked} candidates=${e.candidatesCreated} ` +
@@ -137,6 +139,27 @@ function resolutionLines(result: V2RunResult): string[] {
 }
 
 /**
+ * The assembled context. Rendered as an account of what a future builder would see —
+ * paths, sizes and reasons — never the file bodies themselves.
+ */
+function contextLines(result: V2RunResult): string[] {
+  const c = result.receipt.context;
+  if (c === undefined) return [];
+  const lines = [
+    `context     ${c.artifacts} artifact(s), ~${c.estimatedInputTokens} of ${c.availableInputTokens} estimated tokens ` +
+      `(window ${c.contextWindowTokens}); sources: ${c.sourcesConsulted.join(", ")}`,
+    `package     ${c.packageId}`,
+  ];
+  for (const a of result.context?.artifacts ?? []) {
+    lines.push(`  + ${a.category.padEnd(24)} ${a.path ?? "(task)"} · ${a.bytes}B${a.truncated ? " (truncated)" : ""} · ~${a.estimatedTokens}t`);
+  }
+  for (const o of result.context?.omissions ?? []) {
+    lines.push(`  - ${o.category.padEnd(24)} ${o.path ?? ""} · omitted: ${o.reason}`);
+  }
+  return lines;
+}
+
+/**
  * Test seam: the command body, with injectable output sinks and — for hermetic tests —
  * an injectable configuration source. The REGISTERED command passes none of these, so
  * production always runs the real wiring; the subprocess suite is what proves that.
@@ -148,6 +171,7 @@ export async function runV2Cli(
     readonly stderr?: (s: string) => void;
     readonly cwd?: string;
     readonly configuration?: ConfigurationSource;
+    readonly contextSources?: readonly ContextSource[];
   } = {},
 ): Promise<number> {
   const out = io.stdout ?? writeStdout;
@@ -168,7 +192,10 @@ export async function runV2Cli(
       ...(args.strategy !== undefined ? { candidateStrategy: args.strategy } : {}),
       ...(args.profile !== undefined ? { profile: args.profile } : {}),
     },
-    io.configuration !== undefined ? { configuration: io.configuration } : {},
+    {
+      ...(io.configuration !== undefined ? { configuration: io.configuration } : {}),
+      ...(io.contextSources !== undefined ? { contextSources: io.contextSources } : {}),
+    },
   );
   out(args.json ? `${JSON.stringify(result, null, 2)}\n` : renderRun(result));
   return exitCodeForOutcome(result.outcome);

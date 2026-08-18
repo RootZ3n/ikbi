@@ -32,7 +32,13 @@ const hermeticConfiguration: ConfigurationSource = {
       providers: [
         { id: "alpha", introspectable: true, kind: "openai-compatible", baseUrl: "https://alpha.test/v1", credentialRequired: false, credentialPresent: false },
       ],
-      models: [{ id: "alpha-1", routes: [{ providerId: "alpha", providerModelId: "a1" }] }],
+      models: [
+        {
+          id: "alpha-1",
+          routes: [{ providerId: "alpha", providerModelId: "a1" }],
+          capabilities: { contextWindow: 100_000, supportsTools: true, reasoningLevel: "medium", speedClass: "medium", provenance: "declared" },
+        },
+      ],
     },
     activeProfile: { kind: "none" },
     operatorDefaults: { models: [{ tier: "builder", modelId: "alpha-1", explicit: true }] },
@@ -47,6 +53,9 @@ function capture() {
     stderr: (s: string) => void (err += s),
     cwd: process.cwd(),
     configuration: hermeticConfiguration,
+    // No context sources: the package is exactly the operator's goal, so these tests
+    // stay about CLI dispatch rather than about this repository's files.
+    contextSources: [] as const,
     get out() {
       return out;
     },
@@ -78,7 +87,7 @@ test("reachability: the command body enters the canonical lifecycle and reports 
   const cap = capture();
   const code = await runV2Cli(["build", "add", "a", "thing"], cap);
   assert.equal(cap.err, V2_BANNER, "the experimental banner goes to stderr, not stdout");
-  assert.match(cap.out, /stages\s+preflight -> model_resolution$/m, "the run walked preflight then resolution");
+  assert.match(cap.out, /stages\s+preflight -> model_resolution -> context$/m, "the run walked preflight, resolution, context");
   assert.match(cap.out, /not implemented/, "and said so truthfully");
   assert.notEqual(code, 0, "an unimplemented lifecycle is not a success");
 });
@@ -92,13 +101,15 @@ test("reachability: the JSON surface carries the lifecycle journal + a counted r
   assert.equal(result.journal[0]?.from, "pending");
   assert.equal(result.journal[0]?.to, "preflight");
   assert.equal(result.journal.at(-1)?.to, "terminal");
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context"]);
   assert.equal(result.outcome.kind, "failed");
   assert.deepEqual(result.receipt.evidence, {
     // Configuration (V2-002) and route authorization (V2-003) happen — and nothing else.
     configurationResolved: true,
     modelResolutionCompleted: true,
     modelResolutions: 1,
+    contextAssemblyCompleted: true,
+    contextPackages: 1,
     providerInvoked: false,
     invocations: 0,
     candidatesCreated: 0,
@@ -114,7 +125,7 @@ test("reachability: the CLI never claims a stage it did not run", async () => {
   await runV2Cli(["build", "x", "--json"], cap);
   const result = JSON.parse(cap.out) as V2RunResult;
   for (const stage of LIFECYCLE_STAGES) {
-    if (stage === "preflight" || stage === "model_resolution") continue;
+    if (stage === "preflight" || stage === "model_resolution" || stage === "context") continue;
     assert.equal(result.receipt.stagesEntered.includes(stage), false, `never entered ${stage}`);
   }
   assert.ok(result.outcome.kind === "failed");

@@ -52,6 +52,25 @@ const V2_RUNTIME_ALLOWED_V1_IMPORTS = new Set([
  * parked donors — each may one day become a STRATEGY INSIDE the resolver, and none may
  * ever become a second path to a model.
  */
+/**
+ * v1 CONTEXT machinery. Each of these can put text in front of a model. In v2 exactly
+ * one component assembles context (`src/v2/core/context.ts`), and downstream code
+ * receives a `ContextPackage` — never a raw source. They are parked donors; importing
+ * one into v2 would be a second way for content to reach a builder.
+ */
+const V1_CONTEXT_AUTHORITIES: readonly string[] = [
+  "context-manager", //   model-driven mid-conversation compaction
+  "context-preflight", // the pre-flight size heuristic
+  "context-layer", //     deterministic in-loop compression
+  "context-packets", //   dormant packet builder
+  "project-index", //     repository indexing
+  "project-retrieval", // index-backed relevance retrieval
+  "project-memory", //    v1's concatenated instruction loader
+  "lab-context-memory", //cross-agent memory
+  "labmem-recall",
+  "gbrain", //            external knowledge recall (spawns a process)
+];
+
 const V1_SELECTION_AUTHORITIES: readonly string[] = [
   "model-router", //     resolveModel / cheapest-sufficient routing
   "expert-rental", //    MoE expert selection
@@ -219,6 +238,45 @@ test("single authority: only the resolver CHOOSES among routes or mints a decisi
   }
   assert.deepEqual(chooses, [], "walking a fallback chain for a winner belongs to src/v2/core/resolver.ts alone");
   assert.deepEqual(mints, [], "only the resolver may construct a ModelResolutionDecision");
+});
+
+test("single authority: no v2 file imports v1 CONTEXT machinery", () => {
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    for (const spec of importSpecifiers(readFileSync(file, "utf8"))) {
+      const authority = V1_CONTEXT_AUTHORITIES.find((name) => spec.includes(`/${name}`) || spec.endsWith(`${name}.js`));
+      if (authority !== undefined) offenders.push(`${relative(SRC, file)} -> ${spec}`);
+    }
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    "context has exactly one owner in v2 (src/v2/core/context.ts); these belong to v1 and are parked",
+  );
+});
+
+test("single authority: only the context module assembles or mints a context package", () => {
+  // Computing a package's content address IS assembling context. Recording an already
+  // minted id as lifecycle evidence (which run.ts does) is not.
+  const contextFile = join(V2_DIR, "core", "context.ts");
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (file === contextFile || file.endsWith(".test.ts")) continue;
+    if (/contentDigest\s*\(\s*"context"/.test(readFileSync(file, "utf8"))) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "only src/v2/core/context.ts may construct a ContextPackage");
+});
+
+test("single authority: a context SOURCE cannot reach downstream — only the assembler can", () => {
+  // The structural guarantee: `ContextSource` is consumed by the assembler and wired in
+  // exactly one place. Nothing else may hold the production source list.
+  const allowed = new Set([join(V2_DIR, "runtime", "context-sources.ts"), join(V2_DIR, "runtime", "index.ts"), join(V2_DIR, "core", "context.ts"), join(V2_DIR, "core", "run.ts"), join(V2_DIR, "cli", "index.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    if (/\bPRODUCTION_CONTEXT_SOURCES\b|\bContextSource\b/.test(readFileSync(file, "utf8"))) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "context sources are held by the assembler's wiring alone; everything else receives a ContextPackage");
 });
 
 test("single authority: only the catalog module declares catalog or discovery FACTS", () => {

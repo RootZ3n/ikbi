@@ -23,6 +23,7 @@ test("failure: the top-level category set is the stable interface", () => {
     "provider",
     "workspace",
     "mutation",
+    "context",
     "build",
     "verification",
     "recovery",

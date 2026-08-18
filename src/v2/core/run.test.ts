@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import type { ConfigurationSource } from "./config.js";
+import type { ContextSource } from "./context.js";
 import { V2_001_FAILURE_CODES } from "./failure.js";
 import { createSequentialIdFactory, isV2Id } from "./identity.js";
 import { LIFECYCLE_STAGES } from "./lifecycle.js";
@@ -47,16 +48,27 @@ const workingConfiguration: ConfigurationSource = {
       providers: [
         { id: "alpha", introspectable: true, kind: "openai-compatible", baseUrl: "https://alpha.test/v1", credentialRequired: false, credentialPresent: false },
       ],
-      models: [{ id: "alpha-1", routes: [{ providerId: "alpha", providerModelId: "a1" }] }],
+      models: [
+        {
+          id: "alpha-1",
+          routes: [{ providerId: "alpha", providerModelId: "a1" }],
+          // A KNOWN window: without capability facts the context budget cannot be
+          // derived, which is its own (separately tested) failure.
+          capabilities: { contextWindow: 100_000, supportsTools: true, reasoningLevel: "medium", speedClass: "medium", provenance: "declared" },
+        },
+      ],
     },
     activeProfile: { kind: "none" },
     operatorDefaults: { models: [{ tier: "builder", modelId: "alpha-1", explicit: true }] },
   }),
 };
 
-function deps(probe: RepoProbe, configuration: ConfigurationSource = workingConfiguration) {
+/** No context sources: the package then contains exactly the operator's goal. */
+const noSources: readonly ContextSource[] = [];
+
+function deps(probe: RepoProbe, configuration: ConfigurationSource = workingConfiguration, contextSources: readonly ContextSource[] = noSources) {
   let tick = 0;
-  return { ids: createSequentialIdFactory("run"), now: () => (tick += 1), probe, configuration };
+  return { ids: createSequentialIdFactory("run"), now: () => (tick += 1), probe, configuration, contextSources };
 }
 
 test("run: a valid request mints task + run identities and enters the lifecycle", async () => {
@@ -64,7 +76,7 @@ test("run: a valid request mints task + run identities and enters the lifecycle"
   assert.ok(isV2Id("task", result.taskId));
   assert.ok(isV2Id("run", result.runId));
   assert.ok(isV2Id("receipt", result.receipt.receiptId));
-  assert.deepEqual([...result.receipt.stagesEntered], ["preflight", "model_resolution"]);
+  assert.deepEqual([...result.receipt.stagesEntered], ["preflight", "model_resolution", "context"]);
   assert.equal(result.journal[0]?.from, "pending");
   assert.equal(result.journal[0]?.to, "preflight");
   assert.equal(result.journal.at(-1)?.to, "terminal");
@@ -86,6 +98,8 @@ test("run: NO FAKE SUCCESS — the receipt reports zero work, counted not assert
   const e = result.receipt.evidence;
   assert.equal(e.modelResolutionCompleted, true, "a route WAS authorized");
   assert.equal(e.modelResolutions, 1, "exactly one");
+  assert.equal(e.contextAssemblyCompleted, true, "context WAS assembled");
+  assert.equal(e.contextPackages, 1, "exactly one package");
   assert.equal(e.providerInvoked, false, "no model was invoked");
   assert.equal(e.invocations, 0);
   assert.equal(e.candidatesCreated, 0, "no candidate was created");
@@ -97,7 +111,7 @@ test("run: NO FAKE SUCCESS — the receipt reports zero work, counted not assert
 
 test("run: the skeleton never claims to have reached a stage it did not run", async () => {
   const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo));
-  const implemented = new Set<string>(["preflight", IMPLEMENTED_THROUGH_STAGE]);
+  const implemented = new Set<string>(["preflight", "model_resolution", IMPLEMENTED_THROUGH_STAGE]);
   for (const stage of LIFECYCLE_STAGES) {
     if (implemented.has(stage)) continue;
     assert.equal(result.receipt.stagesEntered.includes(stage), false, `"${stage}" was never entered`);
@@ -111,6 +125,38 @@ test("run: an AUTHORIZATION is not an invocation — no InvocationId is minted",
   assert.equal(result.receipt.evidence.invocations, 0, "no V2InvocationId exists — nothing was invoked");
   assert.equal(result.receipt.resolution?.modelId, "alpha-1");
   assert.equal(result.receipt.resolution?.providerId, "alpha");
+});
+
+test("run: the context package is bound to the run, task and the resolution it was sized by", async () => {
+  const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo));
+  const ctx = result.context!;
+  assert.equal(ctx.runId, result.runId);
+  assert.equal(ctx.taskId, result.taskId);
+  assert.equal(ctx.resolutionDecisionId, result.decision!.decisionId, "sized by the route that was authorized");
+  assert.equal(ctx.budget.contextWindowTokens, 100_000);
+  assert.equal(ctx.budget.estimated, true, "token counts are labelled as estimates");
+  assert.equal(ctx.artifacts.length, 1, "no sources were supplied, so only the goal is present");
+  assert.equal(ctx.artifacts[0]?.category, "task");
+});
+
+test("run: a model with NO known window fails context truthfully rather than guessing", async () => {
+  const unclassified: ConfigurationSource = {
+    load: async () => ({
+      inventory: {
+        providers: [{ id: "alpha", introspectable: true, kind: "openai-compatible", baseUrl: "https://alpha.test/v1", credentialRequired: false, credentialPresent: false }],
+        models: [{ id: "mystery", routes: [{ providerId: "alpha", providerModelId: "m" }] }],
+      },
+      activeProfile: { kind: "none" },
+      operatorDefaults: { models: [{ tier: "builder", modelId: "mystery", explicit: true }] },
+    }),
+  };
+  const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo, unclassified));
+  assert.ok(result.outcome.kind === "failed");
+  assert.equal(result.outcome.failure.category, "context");
+  assert.equal(result.outcome.failure.code, "context.model_capability_unknown");
+  assert.equal(result.context, undefined, "no package is invented for an unknown budget");
+  assert.equal(result.receipt.evidence.contextAssemblyCompleted, false);
+  assert.deepEqual([...result.receipt.stagesEntered], ["preflight", "model_resolution", "context"], "the stage really ran and really refused");
 });
 
 test("run: a role with NO configured preference fails truthfully at resolution", async () => {
@@ -191,7 +237,7 @@ test("run: a not_implemented stop is a non-zero exit — it is not success", asy
 test("run: the real (unstubbed) probe accepts THIS repository and still refuses to build", async () => {
   // Uses the production RepoProbe against ikbi's own checkout: proves the default
   // path is wired, and that even a perfectly good repo yields no build in this slice.
-  const result = await runV2Build({ goal: "inspect ikbi itself", repoPath: process.cwd() }, { configuration: workingConfiguration });
+  const result = await runV2Build({ goal: "inspect ikbi itself", repoPath: process.cwd() }, { configuration: workingConfiguration, contextSources: noSources });
   assert.ok(result.outcome.kind === "failed");
   assert.equal(result.outcome.failure.category, "not_implemented");
   assert.equal(result.receipt.evidence.repositoryMutated, false);

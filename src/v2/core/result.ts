@@ -42,6 +42,7 @@ import type {
 } from "./identity.js";
 import type { RuntimeModelPolicy } from "./config.js";
 import type { ModelResolutionDecision } from "./resolver.js";
+import type { ContextManifest, ContextPackage } from "./context.js";
 
 /** Why verified-good work was withheld instead of promoted. Closed set. */
 export type WithheldReason = "governance" | "operator" | "policy" | "dry_run";
@@ -133,6 +134,10 @@ export interface RunEvidenceSummary {
   readonly modelResolutionCompleted: boolean;
   /** How many routes were authorized. A skeleton run authorizes exactly one. */
   readonly modelResolutions: number;
+  /** True only when the assembler actually produced an authorized context package. */
+  readonly contextAssemblyCompleted: boolean;
+  /** How many context packages exist. Exactly one, or none. */
+  readonly contextPackages: number;
   readonly providerInvoked: boolean;
   readonly invocations: number;
   readonly candidatesCreated: number;
@@ -210,6 +215,35 @@ export function summarizeResolution(decision: ModelResolutionDecision): RunResol
   };
 }
 
+/**
+ * The context a run authorized, as a receipt-safe summary. Counts and digests only —
+ * the artifact bodies are never reproduced into a receipt.
+ */
+export interface RunContextSummary {
+  readonly packageId: string;
+  readonly resolutionDecisionId: string;
+  readonly artifacts: number;
+  readonly omissions: number;
+  readonly estimatedInputTokens: number;
+  readonly availableInputTokens: number;
+  readonly contextWindowTokens: number;
+  readonly sourcesConsulted: readonly string[];
+}
+
+/** Summarize a context package for a receipt. Derived — nothing is asserted. */
+export function summarizeContext(pkg: ContextPackage): RunContextSummary {
+  return {
+    packageId: pkg.packageId,
+    resolutionDecisionId: pkg.resolutionDecisionId,
+    artifacts: pkg.artifacts.length,
+    omissions: pkg.omissions.length,
+    estimatedInputTokens: pkg.estimatedInputTokens,
+    availableInputTokens: pkg.budget.availableInputTokens,
+    contextWindowTokens: pkg.budget.contextWindowTokens,
+    sourcesConsulted: pkg.sourcesConsulted,
+  };
+}
+
 /** The durable account of ONE run: where it went, what it produced, how it ended. */
 export interface V2RunReceipt {
   readonly receiptId: V2ReceiptId;
@@ -222,6 +256,8 @@ export interface V2RunReceipt {
   readonly configuration?: RunConfigurationSummary;
   /** Absent when the run ended before a route was authorized. */
   readonly resolution?: RunResolutionSummary;
+  /** Absent when the run ended before context was assembled. */
+  readonly context?: RunContextSummary;
   readonly startedAt: number;
   readonly endedAt: number;
 }
@@ -237,6 +273,8 @@ export function summarizeEvidence(ledger: RunLedgerView, outcome: RunTerminalOut
     configurationResolved: ledger.configurations.length > 0,
     modelResolutionCompleted: ledger.resolutions.length > 0,
     modelResolutions: ledger.resolutions.length,
+    contextAssemblyCompleted: ledger.contexts.length > 0,
+    contextPackages: ledger.contexts.length,
     providerInvoked: ledger.invocations.length > 0,
     invocations: ledger.invocations.length,
     candidatesCreated: ledger.candidates.length,
@@ -268,6 +306,13 @@ export interface V2RunResult {
    * no invocation has occurred. Absent when resolution did not complete.
    */
   readonly decision?: ModelResolutionDecision;
+  /**
+   * THE authorized context — published as a MANIFEST: every artifact's provenance,
+   * observed digest, size and admission reason, without reproducing the repository into
+   * terminals, logs and receipts. The full package (with content) is the assembler's
+   * return value, and is what a future builder consumes at the same call site.
+   */
+  readonly context?: ContextManifest;
   /** Every transition the run made, in order. The run's own account of itself. */
   readonly journal: readonly LifecycleTransition[];
   readonly receipt: V2RunReceipt;

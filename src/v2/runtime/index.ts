@@ -22,6 +22,8 @@ import { readFileSync } from "node:fs";
 import type { ConfigurationInputs, ConfigurationSource } from "../core/config.js";
 import type { V2RunResult } from "../core/result.js";
 import { runV2Build, type RepoProbe } from "../core/run.js";
+import type { ContextSource } from "../core/context.js";
+import { PRODUCTION_CONTEXT_SOURCES } from "./context-sources.js";
 import type { V2TaskRequest } from "../core/contract.js";
 import { buildCanonicalCatalog } from "./model-catalog.js";
 import { capabilityFacts } from "./provider-inventory.js";
@@ -113,6 +115,7 @@ export function createConfigurationSource(deps: ConfigurationSourceDeps = {}): C
 /** Optional overrides a caller may pass through to the canonical run. */
 export interface ProductionRunDeps {
   readonly configuration?: ConfigurationSource;
+  readonly contextSources?: readonly ContextSource[];
   readonly probe?: RepoProbe;
 }
 
@@ -120,6 +123,7 @@ export interface ProductionRunDeps {
 export async function runV2BuildProduction(request: V2TaskRequest, deps: ProductionRunDeps = {}): Promise<V2RunResult> {
   return runV2Build(request, {
     configuration: deps.configuration ?? createConfigurationSource(),
+    contextSources: deps.contextSources ?? PRODUCTION_CONTEXT_SOURCES,
     ...(deps.probe !== undefined ? { probe: deps.probe } : {}),
   });
 }

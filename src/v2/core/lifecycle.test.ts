@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { createSequentialIdFactory, type V2DecisionDigest, type V2PolicyDigest } from "./identity.js";
+import { createSequentialIdFactory, type V2ContextDigest, type V2DecisionDigest, type V2PolicyDigest } from "./identity.js";
 import {
   LIFECYCLE_STAGES,
   LifecycleViolationError,
@@ -25,6 +25,8 @@ import { summarizeEvidence } from "./result.js";
 const POLICY = "0".repeat(64) as V2PolicyDigest;
 /** A stand-in decision digest. Decision identity is the resolver suite's concern. */
 const DECISION = "1".repeat(64) as V2DecisionDigest;
+/** A stand-in context digest. Package identity is the context suite's concern. */
+const CONTEXT = "2".repeat(64) as V2ContextDigest;
 
 function fresh() {
   const ids = createSequentialIdFactory("lc");
@@ -49,6 +51,8 @@ function walkTo(target: LifecycleStage) {
     // V2-003: `context` REQUIRES a recorded resolution — its budget is a function of the
     // resolved model's window, so a full walk must authorize a route first.
     if (stage === "model_resolution") lifecycle.record(runId, { kind: "resolution", decisionId: DECISION, role: "builder" });
+    // V2-004: `candidate_strategy` REQUIRES an authorized context package.
+    if (stage === "context") lifecycle.record(runId, { kind: "context", packageId: CONTEXT, artifacts: 3 });
     if (stage === "candidate_generation") lifecycle.record(runId, { kind: "candidate", id: candidateId, workspaceId });
     if (stage === "verification") lifecycle.record(runId, { kind: "verification", id: verificationId, candidateId });
     if (stage === "promotion") lifecycle.record(runId, { kind: "promotion", id: promotionId, candidateId, verificationId });
@@ -134,7 +138,9 @@ test("lifecycle: VERIFICATION cannot be entered before a candidate exists", () =
   lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
   lifecycle.enter(runId, "model_resolution");
   lifecycle.record(runId, { kind: "resolution", decisionId: DECISION, role: "builder" });
-  for (const stage of ["context", "candidate_strategy", "candidate_generation"] as const) {
+  lifecycle.enter(runId, "context");
+  lifecycle.record(runId, { kind: "context", packageId: CONTEXT, artifacts: 3 });
+  for (const stage of ["candidate_strategy", "candidate_generation"] as const) {
     lifecycle.enter(runId, stage);
   }
   // candidate_generation ran but produced nothing — there is nothing to verify.
@@ -378,4 +384,54 @@ test("lifecycle: the receipt counts configuration rather than assuming it", () =
   lifecycle.enter(runId, "preflight");
   lifecycle.terminalize(runId, { kind: "rejected", reason: "no_work" });
   assert.equal(summarizeEvidence(lifecycle.ledger, lifecycle.outcome!).configurationResolved, false);
+});
+
+// ── context precondition + resolution ambiguity (V2-004) ────────────────────
+
+test("lifecycle: CANDIDATE_STRATEGY cannot be entered before context is assembled", () => {
+  const { lifecycle, runId } = fresh();
+  lifecycle.enter(runId, "preflight");
+  lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
+  lifecycle.enter(runId, "model_resolution");
+  lifecycle.record(runId, { kind: "resolution", decisionId: DECISION, role: "builder" });
+  lifecycle.enter(runId, "context");
+  // The stage ran but assembled nothing — there is no context to build a candidate from.
+  assert.equal(violation(() => lifecycle.enter(runId, "candidate_strategy")), "missing_required_evidence");
+});
+
+test("lifecycle: a context package is CONTEXT's to record and no one else's", () => {
+  const { lifecycle, runId } = fresh();
+  lifecycle.enter(runId, "preflight");
+  lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
+  lifecycle.enter(runId, "model_resolution");
+  assert.equal(
+    violation(() => lifecycle.record(runId, { kind: "context", packageId: CONTEXT, artifacts: 1 })),
+    "stage_not_permitted_for_evidence",
+    "model resolution may not assemble context",
+  );
+});
+
+test("lifecycle: at most ONE resolution per role — ambiguity is refused, not resolved", () => {
+  const { lifecycle, runId } = fresh();
+  lifecycle.enter(runId, "preflight");
+  lifecycle.record(runId, { kind: "configuration", policyId: POLICY });
+  lifecycle.enter(runId, "model_resolution");
+  lifecycle.record(runId, { kind: "resolution", decisionId: DECISION, role: "builder" });
+  assert.equal(
+    violation(() => lifecycle.record(runId, { kind: "resolution", decisionId: "3".repeat(64) as V2DecisionDigest, role: "builder" })),
+    "duplicate_role_resolution",
+    "a second builder route would make context binding ambiguous",
+  );
+  // A DIFFERENT role is still fine — this is not a one-resolution-per-run rule.
+  lifecycle.record(runId, { kind: "resolution", decisionId: "4".repeat(64) as V2DecisionDigest, role: "critic" });
+  assert.equal(lifecycle.ledger.resolutions.length, 2);
+});
+
+test("lifecycle: the receipt counts context assembly rather than assuming it", () => {
+  const { lifecycle, runId } = fresh();
+  lifecycle.enter(runId, "preflight");
+  lifecycle.terminalize(runId, { kind: "rejected", reason: "no_work" });
+  const summary = summarizeEvidence(lifecycle.ledger, lifecycle.outcome!);
+  assert.equal(summary.contextAssemblyCompleted, false);
+  assert.equal(summary.contextPackages, 0);
 });

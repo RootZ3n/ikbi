@@ -46,6 +46,8 @@ function makeStateRoot(): string {
           role: "builder",
           cost: { promptPerMTok: 0, completionPerMTok: 0 },
           providers: [{ provider: "alpha", providerModelId: "a1" }],
+          // A declared window, so the context budget can be derived truthfully.
+          capabilities: { context_window: 100000, supports_tools: true },
         },
       ],
     }),
@@ -91,7 +93,7 @@ test("v2 cli: `ikbi v2 build` reaches the canonical v2 lifecycle end-to-end", ()
   assert.equal(result.journal[0]?.from, "pending");
   assert.equal(result.journal[0]?.to, "preflight");
   assert.equal(result.journal.at(-1)?.to, "terminal");
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context"]);
 });
 
 test("v2 cli: the end-to-end run claims NOTHING it did not do", () => {
@@ -101,10 +103,12 @@ test("v2 cli: the end-to-end run claims NOTHING it did not do", () => {
   assert.deepEqual(result.receipt.evidence, {
     // Configuration (V2-002) and route authorization (V2-003) happen — and nothing else.
     configurationResolved: true,
-    // A route WAS authorized. That is not an invocation, and the two counters sitting
-    // side by side is exactly how the receipt keeps that distinction honest.
+    // A route WAS authorized and context WAS assembled. Neither is an invocation, and
+    // the counters sitting side by side is how the receipt keeps that distinction honest.
     modelResolutionCompleted: true,
     modelResolutions: 1,
+    contextAssemblyCompleted: true,
+    contextPackages: 1,
     providerInvoked: false,
     invocations: 0,
     candidatesCreated: 0,

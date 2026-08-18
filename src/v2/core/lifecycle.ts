@@ -43,6 +43,7 @@
 import type { RunFailure } from "./failure.js";
 import type {
   V2CandidateId,
+  V2ContextDigest,
   V2DecisionDigest,
   V2InvocationId,
   V2PolicyDigest,
@@ -132,6 +133,7 @@ export interface LifecycleTransition {
 export type LifecycleEvidence =
   | { readonly kind: "configuration"; readonly policyId: V2PolicyDigest }
   | { readonly kind: "resolution"; readonly decisionId: V2DecisionDigest; readonly role: string }
+  | { readonly kind: "context"; readonly packageId: V2ContextDigest; readonly artifacts: number }
   | { readonly kind: "invocation"; readonly id: V2InvocationId }
   | { readonly kind: "candidate"; readonly id: V2CandidateId; readonly workspaceId: V2WorkspaceId }
   | { readonly kind: "verification"; readonly id: V2VerificationId; readonly candidateId: V2CandidateId }
@@ -150,6 +152,8 @@ const EVIDENCE_STAGE: Record<LifecycleEvidence["kind"], readonly LifecycleStage[
   // A model-resolution decision may only be minted by the stage that owns resolution.
   // No later stage gets to re-decide which model serves a role.
   resolution: ["model_resolution"],
+  // The authorized context package is minted by the stage that owns context, once.
+  context: ["context"],
   // Invocations may happen anywhere from model resolution onward (scout, builder,
   // critic, judge…). They are attribution, not authority.
   invocation: ["model_resolution", "candidate_strategy", "candidate_generation", "verification", "disposition", "promotion"],
@@ -167,6 +171,9 @@ const STAGE_REQUIRES: Partial<Record<LifecycleStage, LifecycleEvidence["kind"]>>
   // Context cannot be assembled before the model is known — its budget is a function of
   // the resolved model's window. See the ORDERING NOTE above.
   context: "resolution",
+  // Nothing downstream of context may run without an authorized context package —
+  // a candidate cannot be produced from context that was never assembled.
+  candidate_strategy: "context",
   // Nothing to verify without at least one candidate. (One OR MANY — see contract.ts.)
   verification: "candidate",
   // Nothing to promote without a verdict from the canonical verification authority.
@@ -177,6 +184,7 @@ const STAGE_REQUIRES: Partial<Record<LifecycleStage, LifecycleEvidence["kind"]>>
 export interface RunLedgerView {
   readonly configurations: readonly V2PolicyDigest[];
   readonly resolutions: readonly V2DecisionDigest[];
+  readonly contexts: readonly V2ContextDigest[];
   readonly invocations: readonly V2InvocationId[];
   readonly candidates: readonly V2CandidateId[];
   readonly verifications: readonly V2VerificationId[];
@@ -197,6 +205,7 @@ export type LifecycleViolationCode =
   | "missing_required_evidence"
   | "unrecorded_evidence"
   | "evidence_mismatch"
+  | "duplicate_role_resolution"
   | "outcome_stage_not_reached";
 
 /**
@@ -280,6 +289,7 @@ export class RunLifecycle {
     return {
       configurations: this.evidence.filter((e) => e.kind === "configuration").map((e) => e.policyId),
       resolutions: this.evidence.filter((e) => e.kind === "resolution").map((e) => e.decisionId),
+      contexts: this.evidence.filter((e) => e.kind === "context").map((e) => e.packageId),
       invocations: this.evidence.filter((e) => e.kind === "invocation").map((e) => e.id),
       candidates: this.evidence.filter((e) => e.kind === "candidate").map((e) => e.id),
       verifications: this.evidence.filter((e) => e.kind === "verification").map((e) => e.id),
@@ -337,6 +347,21 @@ export class RunLifecycle {
         this.runId,
         `stage "${stateName(this.current)}" may not record ${entry.kind} evidence`,
       );
+    }
+    if (entry.kind === "resolution") {
+      // AT MOST ONE resolution per role. Without this, two builder decisions could
+      // coexist and a downstream consumer — context assembly, first — would have to pick
+      // one arbitrarily. Refusing the ambiguity is the whole fix; per-candidate
+      // resolution, when it arrives, will need its own identity rather than a second
+      // decision for the same role.
+      const existing = this.evidence.find((e) => e.kind === "resolution" && e.role === entry.role);
+      if (existing !== undefined) {
+        throw new LifecycleViolationError(
+          "duplicate_role_resolution",
+          this.runId,
+          `role "${entry.role}" already has an authorized route; a second decision would make downstream binding ambiguous`,
+        );
+      }
     }
     if (entry.kind === "verification") this.assertCandidateRecorded(entry.candidateId);
     if (entry.kind === "promotion") {

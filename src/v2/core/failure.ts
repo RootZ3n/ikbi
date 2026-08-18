@@ -28,6 +28,7 @@ import type { LifecycleStage } from "./lifecycle.js";
  *   provider        — a model invocation failed (transport, auth, context overflow, refusal).
  *   workspace       — isolation failed (worktree allocation, lock, stale/dirty state).
  *   mutation        — a state-bound edit was refused (stale observation, unobserved target).
+ *   context         — the authorized context package could not be assembled or bounded.
  *   build           — candidate generation failed (builder gave up, protocol stop, no work).
  *   verification    — verification could not produce a trustworthy verdict.
  *   recovery        — recovery/retry budget exhausted without a good candidate.
@@ -45,6 +46,7 @@ export const RUN_FAILURE_CATEGORIES = [
   "provider",
   "workspace",
   "mutation",
+  "context",
   "build",
   "verification",
   "recovery",

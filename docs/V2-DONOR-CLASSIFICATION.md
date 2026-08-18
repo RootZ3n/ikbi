@@ -2,7 +2,8 @@
 
 Produced during **V2-001** (canonical lifecycle foundation) and updated by **V2-002**
 (provider + profile configuration boundary), **V2-003** (single model-resolution
-authority) and **V2-003A** (provider inventory truth). This is an **advisory input to future work
+authority), **V2-003A** (provider inventory truth) and **V2-004** (canonical context
+authority). This is an **advisory input to future work
 orders**, not a change plan and not permission to delete anything. Nothing in v1 was
 removed, disabled, or altered to produce it.
 
@@ -64,6 +65,33 @@ preserved** and the v2 lifecycle was designed around them (see "Candidate strate
 | REPL mutation path | `src/modules/chat/session.ts` | **REFINE** | Already uses the mutation-session layer — good. It must converge on the same v2 mutation authority as the builder, so "the REPL edits files differently from a build" stops being possible. |
 | CLI command registrar | `src/cli/registry.ts` | **ADOPT** | v2 registers through it today. A genuinely good seam. |
 
+## Context systems *(V2-004)*
+
+**What a v1 builder actually receives**, established by reading prompt construction
+(`worker-model/builder.ts:1076-1094`) rather than documentation. In order: a trusted
+system prompt carrying a PRIMARY TARGETS addendum built from paths named in the goal
+(`builder.ts:797-824`); then untrusted blocks for project instructions
+(`loadProjectMemory`), a multi-step team hand-off, gbrain recall, runtime-truth
+evidence, the goal, the success condition, and prior role results — which is where the
+model-driven scout's brief arrives. **No context-packet, project-index or
+project-retrieval output reaches the builder prompt directly.**
+
+| v1 system | Production reachability | Contributes | Verdict |
+| --- | --- | --- | --- |
+| `loadProjectMemory` | **YES** — `builder.ts:1041` | CLAUDE.md/AGENTS.md (first wins) + IKBI.md + `.ikbi/project.md`/`checks.yaml`/`ignore`, concatenated, 16KB per file | **ADOPT (refined)** — deterministic, read-only, bounded, never throws. v2 adopts the file set, the first-present-wins rule and the byte cap, but emits ONE ARTIFACT PER FILE so each carries its own path and observed digest, and adds symlink/traversal confinement v1 does not have. |
+| Goal-named target files (`extractTargetFiles`) | **YES** — `builder.ts:1052` | path-shaped tokens from the goal, extension-filtered, capped at 10, named to the builder as PRIMARY TARGETS | **ADOPT (refined)** — v2 reuses the selection rules and additionally READS and digests the files. One correction: v1's regex cannot capture a leading `/`, so `/etc/passwd.ts` reaches its filter as a relative path; v2 matches the slash and declines to call an absolute path a target. |
+| `context-preflight` | **YES** — `orchestrator.ts:101` | a chars/4 estimate of base prompt size, used to pre-emptively escalate to a bigger window | **ADOPT as SEMANTICS** — v2 adopts the chars/4 heuristic and the constant, and LABELS every token number `estimated`. The escalation decision itself is recovery policy, not context. |
+| `context-layer` | **YES** — `builder.ts:71` | deterministic in-loop compression once a conversation grows | **PARK** — mid-conversation compaction. There is no conversation until invocation exists. |
+| `context-manager` | **YES** — `builder.ts:70` | model-produced summarisation of the middle of a conversation | **PARK — invokes a model.** Out of scope by construction for a read-only slice, and it belongs to the invocation loop, not to initial assembly. |
+| Scout context gathering | **YES** — the scout role | a model-written brief that carries retrieval results into `builder_prior_results` | **PARK — invokes a model.** This is the only path by which retrieval currently reaches a builder. A future builder strategy may request model-driven exploration through the canonical invocation path; it must not hide a model call inside "context". |
+| `project-retrieval` | **INDIRECT** — scout (index mode) + `consult` | deterministic, model-free relevance ranking over the index | **PARK (preserve)** — genuinely deterministic and the strongest retrieval candidate, but it reaches a builder only via the model-based scout. It becomes a `ContextSource` in a later slice, behind the same narrow interface. |
+| `project-index` | **INDIRECT** — verification-ladder, repo-doctor, project-retrieval | repository structure/graph | **PARK (preserve)** — real and used, but not a context contributor today. |
+| `context-packets` | **NO** — no production consumer (only a doc-comment reference in `consult/codeSlice.ts`) | repo map + file previews | **PARK — dormant.** Nothing calls it. Migrating it would be adopting a second retrieval system on the strength of its existing, which is the habit v2 exists to break. |
+| `lab-context-memory` / `labmem-recall` | **YES**, but not to the builder — cognition-layer, drift-prevention, capability-recovery | cross-agent memory | **PARK** — speculative/global memory with unbounded relevance. Not imported into v2 context. |
+| gbrain recall | **OPT-IN**, default off (`IKBI_GBRAIN_CONTEXT`) — `builder.ts:1046` | external knowledge, injected beside project instructions | **PARK** — spawns an external process and is off by default. |
+| Team hand-off brief | **YES** — `builder.ts:1083` | prior steps' summary in a multi-step build | **PARK** — belongs to the step-planner, which v2 has not reached. |
+| Runtime-truth evidence | **YES** — `builder.ts:1089` | executed-evidence block | **PARK** — belongs to verification, which v2 has not reached. |
+
 ## Standing constraints for later slices
 
 1. **No second promote path.** Any strategy that wants to promote must do it by
@@ -87,5 +115,9 @@ preserved** and the v2 lifecycle was designed around them (see "Candidate strate
    catalog module imports nothing that could supply one. Only the roster, the provider
    set, a credential genuinely appearing/disappearing, or real capability data may move
    `inventoryDigest`.
-7. **Nothing is "done" because it exists.** A migrated subsystem is done when a test
+7. **No raw context downstream.** *(V2-004)* Anything that will face a model receives a
+   `ContextPackage`, never a context source, a repository file, or an ad-hoc string. One
+   assembler admits; every omission and truncation is recorded; nothing overflows
+   silently.
+8. **Nothing is "done" because it exists.** A migrated subsystem is done when a test
    enters through the canonical v2 entrypoint and proves the subsystem is what ran.

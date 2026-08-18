@@ -146,6 +146,10 @@ export type V2ProfileDigest = V2Digest<"profile">;
 export type V2PolicyDigest = V2Digest<"policy">;
 /** Digest of one authorized model-resolution decision. */
 export type V2DecisionDigest = V2Digest<"decision">;
+/** Digest of one assembled context package. */
+export type V2ContextDigest = V2Digest<"context">;
+/** Digest of one context artifact's observed content. */
+export type V2ArtifactDigest = V2Digest<"artifact">;
 
 /**
  * Canonical JSON: object keys sorted, `undefined` dropped, array ORDER PRESERVED

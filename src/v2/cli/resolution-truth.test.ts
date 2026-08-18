@@ -52,8 +52,9 @@ const ROSTER = {
     { id: "keyed", kind: "openai-compatible", baseUrl: "https://keyed.test/v1", apiKey: PLANTED_SECRET },
   ],
   models: [
-    { id: "alpha", role: "builder", cost: zeroCost, providers: [{ provider: "p1", providerModelId: "alpha-wire" }] },
-    { id: "beta", role: "builder", cost: zeroCost, providers: [{ provider: "p2", providerModelId: "beta-wire" }] },
+    // Declared windows so the downstream context budget can be derived from facts.
+    { id: "alpha", role: "builder", cost: zeroCost, providers: [{ provider: "p1", providerModelId: "alpha-wire" }], capabilities: { context_window: 100000, supports_tools: true } },
+    { id: "beta", role: "builder", cost: zeroCost, providers: [{ provider: "p2", providerModelId: "beta-wire" }], capabilities: { context_window: 100000, supports_tools: true } },
     {
       id: "chained",
       role: "builder",
@@ -63,8 +64,9 @@ const ROSTER = {
         { provider: "p1", providerModelId: "chained-p1" },
         { provider: "p2", providerModelId: "chained-p2" },
       ],
+      capabilities: { context_window: 100000, supports_tools: true },
     },
-    { id: "dry-only", role: "builder", cost: zeroCost, providers: [{ provider: "dry", providerModelId: "dry-wire" }] },
+    { id: "dry-only", role: "builder", cost: zeroCost, providers: [{ provider: "dry", providerModelId: "dry-wire" }], capabilities: { context_window: 100000, supports_tools: true } },
   ],
 };
 
@@ -287,14 +289,14 @@ test("inventory independence: changing the REAL roster DOES move the inventory d
 
 // ── boundaries this slice must not cross ────────────────────────────────────
 
-test("resolution truth: model_resolution is ENTERED, and nothing after it is", () => {
+test("resolution truth: model_resolution is ENTERED, and nothing beyond context is", () => {
   const root = makeStateRoot();
   activate(root, "prof-a");
   const { result } = v2Run(root);
-  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution"]);
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context"]);
   assert.ok(result.outcome.kind === "failed");
   assert.equal(result.outcome.failure.category, "not_implemented");
-  assert.equal(result.outcome.failure.detail?.missingStage, "context");
+  assert.equal(result.outcome.failure.detail?.missingStage, "candidate_strategy");
 });
 
 test("resolution truth: exactly ONE decision is recorded, and NOTHING is invoked", () => {
