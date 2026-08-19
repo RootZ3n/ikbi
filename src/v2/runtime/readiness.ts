@@ -19,7 +19,7 @@ import { realpathSync } from "node:fs";
 import { resolveChecks } from "../../modules/checks/index.js";
 import { governedExecConfig } from "../../modules/governed-exec/config.js";
 
-import { buildRuntimeModelPolicy } from "../core/config.js";
+import { buildRuntimeModelPolicy, isUsableReadiness, type ProviderReadiness } from "../core/config.js";
 import { createConfigurationSource } from "./index.js";
 
 export type ReadinessLevel = "required" | "recommended";
@@ -42,6 +42,65 @@ export interface V2ReadinessReport {
 export interface RouteReadiness {
   readonly modelId: string;
   readonly satisfiable: boolean;
+  /**
+   * The provider the winning preference PINS, when it pins one. An operator default that
+   * names only a model leaves routing to the roster and reports no provider here.
+   */
+  readonly providerId?: string;
+  /** Does a model with this id exist in the canonical inventory at all? */
+  readonly modelInInventory?: boolean;
+  /** Is the PINNED provider registered on this host? Meaningless when nothing is pinned. */
+  readonly providerRegistered?: boolean;
+  /** Readiness of the PINNED provider. Absent when the preference pins none. */
+  readonly providerReadiness?: ProviderReadiness;
+  /** Provider ids the model actually declares routes through, in declared order. */
+  readonly availableRoutes?: readonly string[];
+}
+
+/**
+ * Say WHY a route is unselectable, naming the role, the model, the requested provider and
+ * the routes that DO exist.
+ *
+ * This exists because a single sentence ("no registered/ready provider route") was true of
+ * four structurally different configurations and therefore diagnosed none of them. The live
+ * failure this closes: an active profile pinned `provider: mimo / model: mimo-v2.5-pro`
+ * while the roster re-declared that same logical model behind a model-specific provider id
+ * (`mimo-v2.5-pro`), so the roster's model upsert REPLACED the built-in route through
+ * `mimo` and the pinned provider served no route at all. Doctor correctly refused — but an
+ * operator could not tell that from the message, so the mismatch was chased into the
+ * resolver instead of being fixed in the roster where it lived.
+ *
+ * Gating is unchanged: this only sharpens the explanation of a refusal already being made.
+ */
+function unselectableCause(role: string, route: RouteReadiness): string {
+  const model = `'${route.modelId}'`;
+  const declared = route.availableRoutes ?? [];
+  const routeList = declared.length > 0 ? declared.map((p) => `'${p}'`).join(", ") : "none";
+
+  if (route.modelInInventory === false) {
+    return `no model ${model} exists in the canonical inventory on this machine`;
+  }
+  if (route.providerId !== undefined) {
+    const pinned = `'${route.providerId}'`;
+    if (route.providerRegistered === false) {
+      return `the ${role} role pins provider ${pinned}, which is not registered on this machine`;
+    }
+    // THE live failure: the pinned provider exists, but not on this model's route chain.
+    if (declared.length > 0 && !declared.includes(route.providerId)) {
+      return (
+        `the ${role} role pins provider ${pinned}, but model ${model} declares routes only through ` +
+        `${routeList} — give ${model} a route through ${pinned}, or repoint the profile role`
+      );
+    }
+    if (route.providerReadiness !== undefined && !isUsableReadiness(route.providerReadiness)) {
+      return `the ${role} role pins provider ${pinned}, which is ${route.providerReadiness} (no usable credential)`;
+    }
+    return `the ${role} role pins provider ${pinned}, which serves no usable route for model ${model}`;
+  }
+  if (route.availableRoutes !== undefined) {
+    return `none of model ${model}'s declared routes (${routeList}) is backed by a configured or keyless provider`;
+  }
+  return "no registered/ready provider route";
 }
 
 /** The host + configuration facts readiness classifies. Injected so the classifier needs no host. */
@@ -139,8 +198,8 @@ export async function assessV2Readiness(probe: V2ReadinessProbe, repoPath: strin
           ok: route.satisfiable,
           level: "required",
           detail: route.satisfiable
-            ? `${role} model '${route.modelId}' is selectable`
-            : `${role} model '${route.modelId}' is NOT selectable (no registered/ready provider route) — fix the roster; there is NO fallback`,
+            ? `${role} model '${route.modelId}' is selectable${route.providerId !== undefined ? ` via provider '${route.providerId}'` : ""}`
+            : `${role} model '${route.modelId}' is NOT selectable — ${unselectableCause(role, route)}; fix the roster, there is NO fallback`,
         });
       }
     }
@@ -205,7 +264,20 @@ export function liveV2ReadinessProbe(): V2ReadinessProbe {
         if (!built.ok) return { ok: false as const, detail: built.failure.message };
         const find = (role: string): RouteReadiness | undefined => {
           const pref = built.policy.rolePreferences.find((p) => p.role === role);
-          return pref === undefined ? undefined : { modelId: pref.modelId, satisfiable: pref.satisfiable };
+          if (pref === undefined) return undefined;
+          // Report the routes the model ACTUALLY declares, so a pinned-provider mismatch is
+          // legible as the roster problem it is. Read-only: this states inventory facts and
+          // selects nothing (route selection remains the resolver's sole authority).
+          const model = built.policy.inventory.models.find((m) => m.id === pref.modelId);
+          return {
+            modelId: pref.modelId,
+            satisfiable: pref.satisfiable,
+            modelInInventory: pref.modelInInventory,
+            providerRegistered: pref.providerRegistered,
+            ...(pref.providerId !== undefined ? { providerId: pref.providerId } : {}),
+            ...(pref.providerReadiness !== undefined ? { providerReadiness: pref.providerReadiness } : {}),
+            ...(model !== undefined ? { availableRoutes: model.routes.map((r) => r.providerId) } : {}),
+          };
         };
         return { ok: true as const, builder: find("builder"), critic: find("critic") };
       } catch (err) {

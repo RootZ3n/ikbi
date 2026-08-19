@@ -91,6 +91,72 @@ test("readiness: an UNSELECTABLE builder route is a required failure with NO fal
   assert.match(text, /NOT READY/);
 });
 
+// ── the live profile/provider/model mismatch doctor must diagnose, not merely refuse ──
+
+test("readiness: a profile-pinned provider that serves NO route for the model is named exactly", async () => {
+  // THE reproduced live failure: the active profile pins `provider: mimo / model: mimo-v2.5-pro`,
+  // but the roster re-declared that logical model behind a model-specific provider id, so its
+  // only route is through 'mimo-v2.5-pro'. Doctor already refused; what it could not do was say
+  // WHY, which sent the investigation into the resolver instead of the roster.
+  const r = await assessV2Readiness(probe({
+    routes: {
+      ok: true,
+      builder: {
+        modelId: "mimo-v2.5-pro",
+        satisfiable: false,
+        providerId: "mimo",
+        modelInInventory: true,
+        providerRegistered: true,
+        availableRoutes: ["mimo-v2.5-pro"],
+      },
+      critic: { modelId: "mimo-v2.5", satisfiable: true },
+    },
+  }));
+  assert.equal(r.ready, false, "an impossible profile/provider/model pairing is NOT READY");
+  const builder = r.checks.find((c) => c.name === "builder route");
+  assert.equal(builder?.level, "required");
+  assert.equal(builder?.ok, false);
+  const detail = builder?.detail ?? "";
+  assert.match(detail, /builder/, "it names the ROLE");
+  assert.match(detail, /'mimo-v2\.5-pro'/, "it names the MODEL");
+  assert.match(detail, /pins provider 'mimo'/, "it names the REQUESTED provider");
+  assert.match(detail, /declares routes only through 'mimo-v2\.5-pro'/, "it names the AVAILABLE routes");
+  assert.match(detail, /NO fallback/, "the no-fallback contract is still stated");
+});
+
+test("readiness: a pinned provider that is not registered is diagnosed differently from one with no route", async () => {
+  // Two structurally different configurations that the single old sentence conflated.
+  const unregistered = await assessV2Readiness(probe({
+    routes: {
+      ok: true,
+      builder: { modelId: "mimo-v2.5-pro", satisfiable: false, providerId: "mimo", modelInInventory: true, providerRegistered: false, availableRoutes: ["mimo-v2.5-pro"] },
+      critic: { modelId: "mimo-v2.5", satisfiable: true },
+    },
+  }));
+  assert.match(unregistered.checks.find((c) => c.name === "builder route")?.detail ?? "", /not registered on this machine/);
+
+  const uncredentialed = await assessV2Readiness(probe({
+    routes: {
+      ok: true,
+      builder: { modelId: "mimo-v2.5-pro", satisfiable: false, providerId: "mimo", modelInInventory: true, providerRegistered: true, providerReadiness: "not_configured", availableRoutes: ["mimo"] },
+      critic: { modelId: "mimo-v2.5", satisfiable: true },
+    },
+  }));
+  assert.match(uncredentialed.checks.find((c) => c.name === "builder route")?.detail ?? "", /not_configured \(no usable credential\)/);
+});
+
+test("readiness: a selectable route reports the provider that will actually serve it", async () => {
+  const r = await assessV2Readiness(probe({
+    routes: {
+      ok: true,
+      builder: { modelId: "mimo-v2.5-pro", satisfiable: true, providerId: "mimo", availableRoutes: ["mimo"] },
+      critic: { modelId: "mimo-v2.5-pro", satisfiable: true, providerId: "mimo", availableRoutes: ["mimo"] },
+    },
+  }));
+  assert.equal(r.ready, true);
+  assert.match(r.checks.find((c) => c.name === "builder route")?.detail ?? "", /selectable via provider 'mimo'/);
+});
+
 test("readiness: an unresolved configuration marks BOTH routes as required failures", async () => {
   const r = await assessV2Readiness(probe({ routes: { ok: false, detail: "no providers configured" } }));
   assert.equal(r.ready, false);
