@@ -9,6 +9,7 @@
  * Capability: git (registered in scripts/test-runner.sh).
  */
 
+import "../test-env.js"; // MUST be first: hermetic synthetic dev-key opt-in, before core config loads
 import assert from "node:assert/strict";
 import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";

@@ -364,3 +364,46 @@ export async function syncWorktreeToRef(worktreePath: string, ref: string): Prom
   // that silently resets the user's checkout is a nasty surprise, even though nothing is lost.
   return { stashed };
 }
+
+/**
+ * Synchronize a checked-out worktree's index + working tree to its OWN CURRENT HEAD, WITHOUT
+ * EVER MOVING A REF (V2-019/HIGH-01).
+ *
+ * WHY THIS EXISTS SEPARATELY FROM `syncWorktreeToRef`. `git reset --hard <commit>` on a worktree
+ * with a branch checked out does two things: it rewrites the index/working tree AND it moves that
+ * branch to <commit>. After ikbi's ONE authorized publication CAS that second effect is a second
+ * ref mutation, and it is a silent data-loss race:
+ *
+ *     base B → ikbi CAS lands I → another actor advances the branch I → C
+ *              → ikbi syncs the worktree with `reset --hard I` → the branch moves BACKWARD C → I
+ *
+ * The concurrent publication C is overwritten by a step that was only ever supposed to touch the
+ * working tree. So the post-CAS caller uses THIS helper instead: a bare `git reset --hard` (NO
+ * commit argument) resets index + working tree to whatever HEAD currently is and leaves
+ * `refs/heads/<branch>` exactly where it was — proven against real repositories, not assumed.
+ *
+ * The late-work guarantee is unchanged: if uncommitted work appeared in the TOCTOU window since
+ * the caller's cleanliness check, it is STASHED (including untracked files) before the reset and
+ * the stash fact is returned, so the operator can recover it with `git stash pop`.
+ *
+ * Returns the HEAD it actually synchronized to, so the caller can report the truth when that is
+ * NOT the commit it published (another actor won the race) rather than forcing the tree back.
+ */
+export async function syncWorktreeToCurrentHead(worktreePath: string): Promise<{ stashed: boolean; head: string }> {
+  let stashed = false;
+  if (!(await isWorktreeClean(worktreePath))) {
+    await runGit(worktreePath, [
+      "stash",
+      "push",
+      "--include-untracked",
+      "--quiet",
+      "-m",
+      "ikbi: auto-stashed late uncommitted work before promote-sync to the current HEAD",
+    ]);
+    stashed = true;
+  }
+  // NO commit argument, on purpose: this resets to HEAD and CANNOT move the checked-out branch.
+  await runGit(worktreePath, ["reset", "--hard", "--quiet"]);
+  const head = (await runGit(worktreePath, ["rev-parse", "HEAD"])).stdout.trim();
+  return { stashed, head };
+}

@@ -405,6 +405,7 @@ export type { VerificationRecord, RunVerificationSummary, CandidateDiff };
 // ---------------------------------------------------------------------------
 
 import { invokeAuthorized, type InvocationTransport, type ServedModelAlias, type V2InvocationRecord } from "./invocation.js";
+import type { InvocationAdmission } from "./cost.js";
 import type { ModelResolutionDecision } from "./resolver.js";
 import type { UntrustedBoundary } from "./builder.js";
 import type { CandidateDiffSource, DiffBudget } from "./candidate-diff.js";
@@ -422,6 +423,14 @@ export type CriticResult =
       readonly ok: false;
       readonly failure: RunFailure;
       readonly attemptedInvocation: boolean;
+      /**
+       * V2-019/HIGH-02: the InvocationId of a call that REACHED THE WIRE, so a transport failure
+       * that produced no record still ESCAPES this function and stays visible in the run's
+       * lifecycle ledger and the session attempt ledger. Present iff `attemptedInvocation` is
+       * true. Without it a failed critic call was invisible to the invocation cap — the provider
+       * had really been dialled, but nothing counted it, so recovery could exceed maxInvocations.
+       */
+      readonly attemptedInvocationId?: V2InvocationId;
       /**
        * V2-016A/M1: the SUCCESSFUL provider invocation record, when the wire call completed but its
        * response later failed strict critic parsing. Separating INVOCATION RESULT from CRITIC PARSE
@@ -445,7 +454,17 @@ export interface JudgeCandidateInput {
   readonly diffSource: CandidateDiffSource;
   readonly diffBudget: DiffBudget;
   readonly probeTree: (workspacePath: string) => Promise<string>;
-  readonly mintInvocationId: () => V2InvocationId;
+  /**
+   * V2-019/HIGH-02: the critic's InvocationId is minted by the CALLER, not hidden in here. The
+   * run therefore knows the identity of the call BEFORE it is made and can account for it even
+   * when this function returns a transport failure carrying no record.
+   */
+  readonly invocationId: V2InvocationId;
+  /**
+   * The SAME session invocation/cost authority the builder uses — never a critic-private ledger.
+   * The attempt is recorded through it immediately BEFORE the wire send.
+   */
+  readonly admission?: InvocationAdmission;
   readonly maxOutputTokens: number;
   readonly timeoutMs: number;
   readonly aliases?: readonly ServedModelAlias[];
@@ -532,7 +551,11 @@ export async function judgeCandidate(input: JudgeCandidateInput): Promise<Critic
   const rendered = renderCriticInput(reviewPackage, input.boundary);
 
   // 4. INVOKE THE CRITIC — once, through the one authority, on the critic route. No tools.
-  const invocationId = input.mintInvocationId();
+  const invocationId = input.invocationId;
+  // V2-019/HIGH-02: this call is ABOUT TO REACH THE WIRE. Count it against the session invocation
+  // cap BEFORE the send — exactly as the builder does — so a critic call that fails in transport
+  // still consumes its slot instead of being a free retry the provider nonetheless served.
+  input.admission?.recordAttempt(invocationId);
   const called = await invokeAuthorized({
     runId: input.runId,
     taskId: input.taskId,
@@ -546,8 +569,9 @@ export async function judgeCandidate(input: JudgeCandidateInput): Promise<Critic
     now,
   });
   if (!called.ok) {
-    // NO FALLBACK, NO RETRY. Recovery is a later authority.
-    return { ok: false, failure: called.failure, attemptedInvocation: called.attempted };
+    // NO FALLBACK, NO RETRY. Recovery is a later authority. The attempted identity escapes so the
+    // run can ledger a real, unpriced provider call rather than losing it.
+    return { ok: false, failure: called.failure, attemptedInvocation: called.attempted, ...(called.attempted ? { attemptedInvocationId: invocationId } : {}) };
   }
 
   // 5. STRICT PARSE. A malformed or self-contradictory judgment is a protocol failure —
@@ -560,6 +584,7 @@ export async function judgeCandidate(input: JudgeCandidateInput): Promise<Critic
     return {
       ok: false,
       attemptedInvocation: true,
+      attemptedInvocationId: invocationId,
       invocation: called.record,
       failure: criticFailure(
         V2_CRITIC_FAILURE_CODES.protocolFailure,

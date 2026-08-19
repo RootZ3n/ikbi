@@ -13,6 +13,7 @@
  * Capability: subprocess (registered in scripts/test-runner.sh).
  */
 
+import { HERMETIC_DEV_KEY_ENV } from "../test-env.js";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -85,6 +86,10 @@ function runCli(args: readonly string[], extraEnv: Record<string, string> = {}):
       IKBI_MODEL_DRIVER: "alpha-1",
       IKBI_MODEL_BUILDER: "alpha-1",
       IKBI_MODEL_CRITIC: "alpha-1",
+      // MEDIUM-01: the child env is deliberately sanitized (no inherited developer shell), so the
+      // synthetic-credential opt-in must be injected EXPLICITLY rather than leaked in from the
+      // outer test runner. One owner for both the in-process and child paths.
+      ...HERMETIC_DEV_KEY_ENV,
       ...extraEnv,
       ...loopbackEgressEnv(PROVIDER),
     },

@@ -66,8 +66,25 @@ function adjudicationArtifacts(): Set<string> {
   return new Set(readdirSync(tmpdir()).filter((name) => name.startsWith("ikbi-adj-")));
 }
 
-function assertNoNewArtifacts(before: Set<string>, label: string): void {
-  const leaked = [...adjudicationArtifacts()].filter((name) => !before.has(name));
+/**
+ * `tmpdir()` is a SHARED, PROCESS-GLOBAL namespace. `mkdtemp` names are random, so a set
+ * difference cannot tell OUR leak apart from another concurrently-running test process's
+ * IN-FLIGHT `ikbi-adj-*` directory — which is created and removed inside one adjudication.
+ * Asserting on the raw difference made this test fail whenever the suite's scheduling happened
+ * to overlap another orchestrator test with this one.
+ *
+ * The contract being pinned is that no artifact SURVIVES, and surviving is a property of time:
+ * a real leak persists forever, another process's transient disappears. So we poll for a bounded
+ * settle window and require the leaked set to become empty. A genuine leak still fails — it never
+ * clears — and the assertion no longer depends on which other tests happen to be running.
+ */
+async function assertNoNewArtifacts(before: Set<string>, label: string): Promise<void> {
+  const leakedNow = (): string[] => [...adjudicationArtifacts()].filter((name) => !before.has(name));
+  let leaked = leakedNow();
+  for (let waited = 0; leaked.length > 0 && waited < 5_000; waited += 50) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    leaked = leakedNow();
+  }
   assert.deepEqual(leaked, [], `${label}: no temporary adjudication index, lock, or directory survives`);
 }
 
@@ -94,7 +111,7 @@ test("same taskId and same repository compute concurrently without sharing an in
     ]);
     assert.deepEqual(products.map((product) => product.treeHash), [expected, expected]);
     assert.ok(products.every((product) => product.nonEmpty));
-    assertNoNewArtifacts(before, "same repository concurrency");
+    await assertNoNewArtifacts(before, "same repository concurrency");
   } finally {
     await removeRepos([repo]);
   }
@@ -111,7 +128,7 @@ test("same taskId across repositories returns each repository's independent tree
     const products = await Promise.all(repos.map((repo) => computeWorktreeWorkProduct(repo.path, repo.baseRef, "same-task-different-repo")));
     assert.deepEqual(products.map((product) => product.treeHash), expected);
     assert.notEqual(products[0]!.treeHash, products[1]!.treeHash);
-    assertNoNewArtifacts(before, "cross-repository concurrency");
+    await assertNoNewArtifacts(before, "cross-repository concurrency");
   } finally {
     await removeRepos(repos);
   }
@@ -126,7 +143,7 @@ test("a stale taskId-derived index is ignored by a new computation", async () =>
     const product = await computeWorktreeWorkProduct(repo.path, repo.baseRef, "stale-task");
     assert.equal(product.treeHash, expectedTree(repo));
     assert.equal(product.nonEmpty, true);
-    assertNoNewArtifacts(withStaleIndex, "stale index isolation");
+    await assertNoNewArtifacts(withStaleIndex, "stale index isolation");
     assert.ok(adjudicationArtifacts().has("ikbi-adj-stale-task.index"), "the unrelated stale artifact was not selected or rewritten");
   } finally {
     await rm(stalePath, { force: true });
@@ -142,7 +159,7 @@ test("failed adjudication cleans its unique index directory without masking the 
       computeWorktreeWorkProduct(repo.path, "not-a-real-base-ref", "failed-cleanup-task"),
       /git|fatal|bad object|unknown revision/i,
     );
-    assertNoNewArtifacts(before, "failed adjudication cleanup");
+    await assertNoNewArtifacts(before, "failed adjudication cleanup");
   } finally {
     await removeRepos([repo]);
   }
@@ -159,7 +176,7 @@ test("high-concurrency same-taskId adjudications preserve every repository work 
     assert.deepEqual(products.map((product) => product.treeHash), expected);
     assert.equal(new Set(products.map((product) => product.treeHash)).size, repos.length);
     assert.ok(products.every((product) => product.nonEmpty));
-    assertNoNewArtifacts(before, "high concurrency");
+    await assertNoNewArtifacts(before, "high concurrency");
   } finally {
     await removeRepos(repos);
   }

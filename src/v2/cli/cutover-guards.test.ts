@@ -7,8 +7,10 @@
  * structural backstop behind the behavioral proofs in cli-subprocess.test.ts.
  */
 
+import "../test-env.js"; // MUST be first: hermetic synthetic dev-key opt-in, before core config loads
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
+import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
@@ -57,4 +59,45 @@ test("guard: the strategy DEFAULT is explicit `single` (tournament is never the 
 test("guard: the README documents `ikbi build` (not `ikbi v2 build`) as the canonical command", () => {
   assert.match(README, /ikbi build\b/, "README shows the canonical command");
   assert.doesNotMatch(README, /`ikbi v2 build`.*(?:daily|canonical|normal|primary)/i, "README does not present the alias as the primary command");
+});
+
+// ── V2-019/MEDIUM-01: the hermetic test-env opt-in stays a TEST concern ──────
+
+test("guard: the synthetic dev-key opt-in is TEST-ONLY — no product module imports it", () => {
+  // `src/v2/test-env.ts` mutates process.env, so it must never be reachable from shipped runtime.
+  // Product code proving itself with a test helper's environment would be exactly the kind of
+  // quiet weakening this guard exists to prevent.
+  const v2Root = fileURLToPath(new URL("..", import.meta.url));
+  const offenders: string[] = [];
+  const walk = (dir: string): void => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const abs = join(dir, entry.name);
+      if (entry.isDirectory()) { walk(abs); continue; }
+      if (!entry.name.endsWith(".ts")) continue;
+      if (entry.name.endsWith(".test.ts")) continue; // tests are the sanctioned importer
+      if (abs === join(v2Root, "test-env.ts")) continue;
+      // The subprocess fixtures are test infrastructure, not product runtime.
+      if (/(fixture-repo|fake-provider-server|session-json)\.ts$/.test(entry.name)) continue;
+      if (/\btest-env\.js\b/.test(readFileSync(abs, "utf8"))) offenders.push(relative(v2Root, abs));
+    }
+  };
+  walk(v2Root);
+  assert.deepEqual(offenders, [], "only *.test.ts may import the dev-key opt-in");
+});
+
+test("guard: the opt-in never weakens production config, and yields to a real operator value", () => {
+  const src = readFileSync(join(fileURLToPath(new URL("..", import.meta.url)), "test-env.ts"), "utf8");
+  // `??=` means an operator's real setting always wins; a bare `=` would override it.
+  assert.match(src, /process\.env\.IKBI_ALLOW_INSECURE_DEV_KEYS \?\?= "true";/, "the opt-in must not clobber a real value");
+  assert.doesNotMatch(src, /process\.env\.IKBI_ALLOW_INSECURE_DEV_KEYS\s*=\s*"/, "no unconditional assignment");
+  // The FIX is scoped to tests: core config keeps its refusal.
+  const config = readFileSync(fileURLToPath(new URL("../../core/config.ts", import.meta.url)), "utf8");
+  assert.match(config, /Refusing to start with insecure default trust keys/, "production still fails closed on default keys");
+  assert.match(config, /parseBool\(env\.IKBI_ALLOW_INSECURE_DEV_KEYS, false\)/, "the default is still FALSE in production config");
+});
+
+test("guard: the v2 CLI subprocess suite injects the dev-key opt-in EXPLICITLY into its child env", () => {
+  const src = readFileSync(fileURLToPath(new URL("./cli-subprocess.test.ts", import.meta.url)), "utf8");
+  assert.match(src, /HERMETIC_DEV_KEY_ENV/, "the sanitized child env opts in through the ONE shared owner");
+  assert.doesNotMatch(src, /IKBI_ALLOW_INSECURE_DEV_KEYS:\s*"true"/, "no second, drifting copy of the flag");
 });

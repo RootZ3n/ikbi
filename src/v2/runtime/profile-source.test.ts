@@ -8,6 +8,7 @@
  * error instead of v1's silent degradation.
  */
 
+import "../test-env.js"; // MUST be first: hermetic synthetic dev-key opt-in, before core config loads
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";

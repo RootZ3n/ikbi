@@ -9,6 +9,7 @@
  * No capability required — pure in-process wrapping (it logs to stderr).
  */
 
+import "../test-env.js"; // MUST be first: hermetic synthetic dev-key opt-in, before core config loads
 import assert from "node:assert/strict";
 import { test } from "node:test";
 

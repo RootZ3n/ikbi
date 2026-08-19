@@ -27,6 +27,7 @@ import type { CandidateDiff, CandidateDiffSource } from "./candidate-diff.js";
 import type { InvocationTransport, TransportOutcome } from "./invocation.js";
 import type { ModelResolutionDecision } from "./resolver.js";
 import type { UntrustedBoundary } from "./builder.js";
+import type { InvocationAdmission } from "./cost.js";
 import type { V2CandidateId, V2InvocationId, V2RunId, V2SnapshotDigest, V2TaskId, V2VerificationId } from "./identity.js";
 
 const RUN = "run_c" as V2RunId;
@@ -97,12 +98,16 @@ function critic(content: string, over: { fail?: boolean } = {}) {
 }
 
 let idSeq = 0;
-function judge(content: string, over: { trees?: string[]; decisionRole?: string; fail?: boolean } = {}) {
+function judge(content: string, over: { trees?: string[]; decisionRole?: string; fail?: boolean; admission?: InvocationAdmission } = {}) {
   const t = critic(content, { ...(over.fail !== undefined ? { fail: over.fail } : {}) });
   const trees = over.trees ?? [TREE];
   let call = 0;
+  // V2-019/HIGH-02: the CALLER mints the critic's InvocationId, so a test can assert the exact
+  // identity that reached the wire even when the call fails and returns no record.
+  const invocationId = `inv_${(idSeq += 1)}` as V2InvocationId;
   return {
     sent: t.sent,
+    invocationId,
     result: judgeCandidate({
       runId: RUN,
       taskId: TASK,
@@ -117,7 +122,8 @@ function judge(content: string, over: { trees?: string[]; decisionRole?: string;
       diffSource,
       diffBudget: { maxFilesWithHunks: 40, maxHunkChars: 4000 },
       probeTree: async () => trees[Math.min(call++, trees.length - 1)]!,
-      mintInvocationId: () => `inv_${(idSeq += 1)}` as V2InvocationId,
+      invocationId,
+      ...(over.admission !== undefined ? { admission: over.admission } : {}),
       maxOutputTokens: 2048,
       timeoutMs: 1000,
       now: () => 100,

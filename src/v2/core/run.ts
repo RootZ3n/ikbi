@@ -906,10 +906,16 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
         const admittedCritic = deps.admission.admitNext({ identity: { authorizedModelId: critDecision.modelId, sentProviderId: critDecision.providerId, sentProviderModelId: critDecision.providerModelId }, estimatedInputTokens: ctxPkg.budget.availableInputTokens, maxOutputTokens: criticMaxOutputTokens });
         if (!admittedCritic.admit) { s.failure = admittedCritic.failure; continue; }
       }
+      // V2-019/HIGH-02: the RUN mints the critic's InvocationId and hands the SAME session
+      // admission the builder uses down into the critic, which records the attempt immediately
+      // before the wire send. The identity therefore exists here before the call is made, so a
+      // transport failure carrying no record can still be ledgered.
+      const criticInvocationId = ids.mint("invocation");
       const judged = await judgeCandidate({
         runId, taskId, goal: task.goal, candidate: s.candidate, verification: s.verification, verificationSummary: summarizeVerification(s.verification), workspacePath: s.workspace!.path,
         decision: critDecision, transport: deps.transport, boundary: deps.untrustedBoundary, diffSource: deps.candidateDiff, diffBudget: DEFAULT_DIFF_BUDGET,
-        probeTree: (path) => deps.treeProbe.treeOf(path), mintInvocationId: () => ids.mint("invocation"), maxOutputTokens: criticMaxOutputTokens, timeoutMs: CRITIC_TIMEOUT_MS,
+        probeTree: (path) => deps.treeProbe.treeOf(path), invocationId: criticInvocationId, maxOutputTokens: criticMaxOutputTokens, timeoutMs: CRITIC_TIMEOUT_MS,
+        ...(deps.admission !== undefined ? { admission: deps.admission } : {}),
         ...(deps.aliases !== undefined ? { aliases: deps.aliases } : {}), now,
       });
       if (judged.ok) {
@@ -920,6 +926,11 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
         lifecycle.record(runId, { kind: "invocation", id: judged.invocation.invocationId, role: "critic" });
         s.invocations = [...s.invocations, judged.invocation];
         if (deps.admission !== undefined) deps.admission.charge(judged.invocation);
+      } else if (judged.attemptedInvocationId !== undefined) {
+        // The wire was reached and NOTHING came back. That is still a real provider call: ledger
+        // it (so `receipt.evidence.invocations` counts it and the session reconcile prices it as
+        // a failed-without-usage call), but fabricate no InvocationRecord and no CriticRecord.
+        lifecycle.record(runId, { kind: "invocation", id: judged.attemptedInvocationId, role: "critic" });
       }
       if (!judged.ok) { s.failure = judged.failure; continue; }
       s.critic = judged.generation.record;

@@ -213,11 +213,31 @@ export interface TreeProbe {
  */
 export interface VerificationDefinition {
   readonly files: Readonly<Record<string, string | null>>;
+  /**
+   * V2-019/HIGH-03: sha256 (or `null` when absent) of every repo-local path the SOURCE-resolved
+   * check command DIRECTLY references — the script that actually decides pass/fail. `null` is
+   * meaningful: a candidate that CREATES a bound path that did not exist in source is a change.
+   */
+  readonly referencedPaths?: Readonly<Record<string, string | null>>;
+  /**
+   * Command lines whose definition dependencies could not be safely determined. Non-empty means
+   * the bound scope is INCOMPLETE — the exam is not provably source-bound and the caller fails
+   * closed rather than granting a PASS it cannot justify.
+   */
+  readonly unresolvedDefinitions?: readonly string[];
 }
 
 /** Captures the verification-definition fingerprint of a workspace. Injected (reads the filesystem). */
 export interface VerificationDefinitionProbe {
-  capture(workspacePath: string): Promise<VerificationDefinition>;
+  /**
+   * Capture a workspace's definition fingerprint.
+   *
+   * `bindPaths` is how the SOURCE stays authoritative: the source capture omits it and the probe
+   * DERIVES the bound set from the source-resolved command; the candidate capture passes the set
+   * the source bound, so both sides are fingerprinted over exactly the same paths and a candidate
+   * can never shrink its own exam by deleting a reference.
+   */
+  capture(workspacePath: string, bindPaths?: readonly string[]): Promise<VerificationDefinition>;
 }
 
 /** The definition artifacts that constitute the manifest-derived exam. Order-independent. */
@@ -229,13 +249,232 @@ export const VERIFICATION_DEFINITION_FILES: readonly string[] = Object.freeze([
   "vitest.config.ts", "vitest.config.js", "jest.config.js", "jest.config.ts", ".mocharc.json", ".mocharc.cjs",
 ]);
 
-/** Do two definition fingerprints differ in ANY tracked file? (Added, removed, or changed.) */
+/**
+ * Do two definition fingerprints differ in ANY bound artifact? (Added, removed, or changed.)
+ *
+ * TWO BANDS are compared, and both are authority:
+ *   1. the fixed well-known manifest/config list (`VERIFICATION_DEFINITION_FILES`);
+ *   2. V2-019/HIGH-03 — the repo-local paths the SOURCE-resolved check command DIRECTLY
+ *      references (`referencedPaths`). The SOURCE decides which paths are bound; the candidate
+ *      never gets to shrink that set, so a candidate that ADDS or REWRITES a referenced verifier
+ *      script is caught even though the manifest naming it is untouched.
+ */
 export function definitionChanged(source: VerificationDefinition, candidate: VerificationDefinition): readonly string[] {
   const changed: string[] = [];
   for (const file of VERIFICATION_DEFINITION_FILES) {
     if ((source.files[file] ?? null) !== (candidate.files[file] ?? null)) changed.push(file);
   }
+  // The SOURCE's bound set is authoritative — iterate ITS keys, never the candidate's.
+  for (const path of Object.keys(source.referencedPaths ?? {})) {
+    if ((source.referencedPaths?.[path] ?? null) !== (candidate.referencedPaths?.[path] ?? null)) changed.push(path);
+  }
   return changed;
+}
+
+// ---------------------------------------------------------------------------
+// V2-019/HIGH-03 — binding the EXECUTABLE DEFINITION of the exam
+// ---------------------------------------------------------------------------
+
+/**
+ * WHY THIS EXISTS. Fingerprinting `package.json` proves the candidate did not rewrite the
+ * `scripts.test` STRING. It proves nothing about what that string RUNS. A manifest that says
+ *
+ *     "test": "node test-policy.js"
+ *
+ * delegates the whole exam to a repository-local file. A candidate that leaves package.json alone
+ * and rewrites `test-policy.js` from `exit 1` to `exit 0` has redefined its own exam and, before
+ * this, collected a clean PASS for it.
+ *
+ * WHAT THIS DOES NOT DO. It does NOT statically analyse arbitrary programs. It does not follow
+ * `require`/`import` graphs, resolve variables, or reason about what a script does at runtime. It
+ * binds ONE conservative, explicitly-specified thing: repository-local paths that appear
+ * DIRECTLY in the resolved command line, or directly in the package-manager script body that the
+ * command line names. Anything it cannot parse with confidence is reported as UNRESOLVED rather
+ * than silently treated as "nothing to bind" — the caller fails closed on that.
+ *
+ * The distinction the whole design rests on:
+ *
+ *     CHECK COMMAND DEFINITION  — what decides pass/fail. Source-authorized. BOUND here.
+ *     CHECK SUBJECT FILES       — the product and its tests. What the candidate is meant to
+ *                                 change. NOT bound (binding them would forbid the task).
+ */
+
+/**
+ * WHERE THE LINE IS DRAWN between "bind it" and "refuse to guess".
+ *
+ * The attack this closes is a manifest that DELEGATES the verdict to a repository file:
+ * `"test": "node test-policy.js"` — flip that file from `exit 1` to `exit 0` and the exam is
+ * rewritten with the manifest untouched. The defence is to bind the program files a check
+ * DIRECTLY names. Three cases are handled explicitly, and each one is a decision, not an omission:
+ *
+ *   BOUND      a repo-local program named directly on the command line — `node test-policy.js`,
+ *              `python scripts/check.py`, `bash scripts/test.sh`, `./scripts/verify`, and the same
+ *              via package-manager script indirection (`pnpm test` → the manifest's script body).
+ *
+ *   NOT BOUND  an INLINE program (`node -e "..."`, `bash -c "..."`): the program text lives in the
+ *              manifest, which is already fingerprinted — there is no second file to bind.
+ *              Likewise a GLOB target (`node --test "src/**\/*.test.ts"`): a glob expands to
+ *              SUBJECT files. Those are the product's own tests — exactly what a task is normally
+ *              asked to change — and binding them would forbid the work rather than protect it.
+ *
+ *   UNRESOLVED command substitution (`$(...)`, backticks) or variable expansion (`$VAR`, `${...}`).
+ *              These can name ANY file, so the definition genuinely cannot be determined and the
+ *              scope is reported INCOMPLETE — the caller fails closed rather than granting a PASS
+ *              it cannot justify.
+ */
+
+/** Package-manager binaries whose `run <script>` / `<script>` form indirects through a manifest. */
+const SCRIPT_RUNNERS = new Set(["npm", "pnpm", "yarn", "bun"]);
+
+/** Interpreters whose first non-flag argument is the repo-local program that defines the exam. */
+const INTERPRETERS = new Set(["node", "nodejs", "bun", "deno", "python", "python3", "py", "ruby", "perl", "bash", "sh", "zsh", "dash"]);
+
+/** Flags that mean "the program is INLINE, right here" — nothing further to bind. */
+const INLINE_PROGRAM_FLAGS = new Set(["-e", "--eval", "-p", "--print", "-c", "--command"]);
+
+/** File suffixes that mark a token as an executable definition artifact rather than a data path. */
+const SCRIPT_SUFFIXES = [".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", ".sh", ".bash", ".py", ".rb", ".pl"];
+
+/** What the SOURCE state authorized as the executable definition of its exam. */
+export interface VerificationDefinitionScope {
+  /** Repo-relative paths that DIRECTLY define the exam and must be fingerprinted. Sorted, deduped. */
+  readonly referencedPaths: readonly string[];
+  /**
+   * Command lines whose definition dependencies could NOT be determined (shell/command
+   * substitution). Non-empty means the bound scope is INCOMPLETE and the caller must not claim
+   * the exam is fully source-bound.
+   */
+  readonly unresolved: readonly string[];
+}
+
+/** Is this token a repo-local path we are willing to bind? Absolute paths, `..` escapes and globs are not. */
+function repoLocalPath(token: string): string | undefined {
+  if (token.length === 0 || token.startsWith("-")) return undefined;
+  if (/[*?]/.test(token)) return undefined; // a glob expands to SUBJECT files, not a definition
+  if (token.startsWith("/") || /^[A-Za-z]:[\\/]/.test(token)) return undefined; // absolute / system binary
+  const normalized = token.startsWith("./") ? token.slice(2) : token;
+  if (normalized.length === 0) return undefined;
+  if (normalized.split("/").some((seg) => seg === "..")) return undefined;
+  const looksLikeScript = SCRIPT_SUFFIXES.some((ext) => normalized.toLowerCase().endsWith(ext));
+  // Bound when it names a script FILE, or when it was written as an explicit path into the repo
+  // (`./scripts/verify`, `scripts/verify`) — i.e. the author pointed at something in the tree.
+  if (!looksLikeScript && !token.startsWith("./") && !normalized.includes("/")) return undefined;
+  return normalized;
+}
+
+/**
+ * Split one command line into segments of tokens, RESPECTING QUOTES.
+ *
+ * Quoting must be handled before operator splitting, or `node -e "a; b"` would be torn in half and
+ * its inline program mistaken for a second command. Returns `undefined` when the line contains
+ * substitution/expansion whose meaning we refuse to guess.
+ */
+function lexCommandLine(line: string): readonly (readonly string[])[] | undefined {
+  const segments: string[][] = [];
+  let tokens: string[] = [];
+  let token = "";
+  let quote: '"' | "'" | undefined;
+  let hasToken = false;
+  const endToken = (): void => {
+    if (hasToken) tokens.push(token);
+    token = "";
+    hasToken = false;
+  };
+  const endSegment = (): void => {
+    endToken();
+    if (tokens.length > 0) segments.push(tokens);
+    tokens = [];
+  };
+  for (let i = 0; i < line.length; i += 1) {
+    const ch = line[i]!;
+    if (quote !== undefined) {
+      if (ch === quote) { quote = undefined; continue; }
+      // Expansion inside DOUBLE quotes is live; inside single quotes it is literal and safe.
+      if (quote === '"' && (ch === "$" || ch === "`")) return undefined;
+      token += ch;
+      hasToken = true;
+      continue;
+    }
+    if (ch === '"' || ch === "'") { quote = ch; hasToken = true; continue; }
+    if (ch === "`") return undefined; // command substitution
+    if (ch === "$") return undefined; // variable / command expansion
+    if (ch === "&" || ch === "|" || ch === ";") {
+      // `&&`, `||`, `;`, `|` all end a command; a lone `&` (background) does too.
+      endSegment();
+      if ((ch === "&" || ch === "|") && line[i + 1] === ch) i += 1;
+      continue;
+    }
+    if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r") { endToken(); continue; }
+    token += ch;
+    hasToken = true;
+  }
+  if (quote !== undefined) return undefined; // unterminated quote — refuse to guess
+  endSegment();
+  return segments;
+}
+
+/**
+ * Bind the executable definition of the resolved check commands.
+ *
+ * `scripts` is the SOURCE manifest's script map (empty when there is none). Package-manager
+ * indirection is followed through it — the manifest itself is already fingerprinted, but the FILES
+ * its scripts name are not, and those are the point. There is NO program analysis: nothing follows
+ * `require`/`import`, resolves a variable, or reasons about runtime behaviour.
+ */
+export function bindVerificationDefinitionScope(input: {
+  readonly checks: readonly { readonly command: string; readonly args: readonly string[] }[];
+  readonly scripts: Readonly<Record<string, string>>;
+}): VerificationDefinitionScope {
+  const paths = new Set<string>();
+  const unresolved: string[] = [];
+  const visitedScripts = new Set<string>();
+
+  /** Walk one already-lexed segment. `depth` bounds package-script indirection. */
+  const walk = (tokens: readonly string[], depth: number, origin: string): void => {
+    if (tokens.length === 0) return;
+    if (depth > 4) { unresolved.push(origin); return; }
+    const [bin, ...rest] = tokens as [string, ...string[]];
+    const binName = bin.split("/").pop() ?? bin;
+
+    // (a) PACKAGE-MANAGER INDIRECTION: `pnpm test`, `npm run test`, `yarn check`.
+    if (SCRIPT_RUNNERS.has(binName)) {
+      const args = rest.filter((t) => !t.startsWith("-"));
+      const scriptName = args[0] === "run" || args[0] === "run-script" ? args[1] : args[0];
+      if (scriptName === undefined) return; // e.g. bare `pnpm install` — nothing to bind.
+      const body = input.scripts[scriptName];
+      if (body === undefined) return; // not a manifest script (e.g. `pnpm exec tsc`) — names nothing local.
+      if (visitedScripts.has(scriptName)) return; // cycle guard
+      visitedScripts.add(scriptName);
+      const inner = lexCommandLine(body);
+      if (inner === undefined) { unresolved.push(body); return; }
+      for (const seg of inner) walk(seg, depth + 1, body);
+      return;
+    }
+
+    // (b) INTERPRETER INDIRECTION: `node test-policy.js`, `python scripts/check.py`, `bash x.sh`.
+    if (INTERPRETERS.has(binName)) {
+      // An INLINE program is fully contained in the (already fingerprinted) manifest.
+      if (rest.some((t) => INLINE_PROGRAM_FLAGS.has(t))) return;
+      const target = rest.find((t) => !t.startsWith("-"));
+      if (target !== undefined) {
+        const local = repoLocalPath(target);
+        if (local !== undefined) paths.add(local);
+      }
+      return;
+    }
+
+    // (c) A REPO-LOCAL EXECUTABLE INVOKED DIRECTLY: `./scripts/verify`.
+    const local = repoLocalPath(bin);
+    if (local !== undefined) paths.add(local);
+  };
+
+  for (const check of input.checks) {
+    const line = [check.command, ...check.args].join(" ").trim();
+    const segments = lexCommandLine(line);
+    if (segments === undefined) { unresolved.push(line); continue; }
+    for (const seg of segments) walk(seg, 0, line);
+  }
+  return { referencedPaths: [...paths].sort(), unresolved };
 }
 
 // ---------------------------------------------------------------------------
@@ -516,11 +755,29 @@ export async function verifyCandidate(input: VerifyCandidateInput): Promise<Veri
   //     relative to the source snapshot, the exam is no longer source-authorized: fail-closed with a
   //     structured `verification_policy_changed` verdict — never a normal PASS. Operator IKBI_CHECKS
   //     (`source: "env"`) is trusted policy and is NOT subject to this.
-  if (resolved.source === "default" && input.sourceDefinition !== undefined && input.definitionProbe !== undefined) {
-    const candidateDefinition = await input.definitionProbe.capture(input.workspacePath);
-    const changed = definitionChanged(input.sourceDefinition, candidateDefinition);
-    if (changed.length > 0) {
+  if (input.sourceDefinition !== undefined && input.definitionProbe !== undefined) {
+    const source = input.sourceDefinition;
+    const boundPaths = Object.keys(source.referencedPaths ?? {});
+    // V2-019/HIGH-03: an exam whose executable definition could not be determined is NOT provably
+    // source-bound, so it cannot yield a PASS. Fail closed on an INCOMPLETE scope rather than
+    // pretending an unparseable command has no definition dependencies.
+    if ((source.unresolvedDefinitions ?? []).length > 0) {
       return finish({ planId: plan.planId, checks: [], verdict: "verification_policy_changed", treeAfterChecks: treeBefore });
+    }
+    // Operator IKBI_CHECKS (`source: "env"`) is trusted POLICY: its manifest band is not compared,
+    // because the operator — not the candidate — chose the command. But a repo-local script that
+    // operator policy DELEGATES the verdict to is still candidate-writable, so the referenced-path
+    // band applies to env checks too. (Default: bind the referenced verifier script.)
+    const compareManifest = resolved.source === "default";
+    if (compareManifest || boundPaths.length > 0) {
+      const candidateDefinition = await input.definitionProbe.capture(input.workspacePath, boundPaths);
+      const changed = definitionChanged(
+        compareManifest ? source : { files: {}, referencedPaths: source.referencedPaths ?? {} },
+        compareManifest ? candidateDefinition : { files: {}, referencedPaths: candidateDefinition.referencedPaths ?? {} },
+      );
+      if (changed.length > 0) {
+        return finish({ planId: plan.planId, checks: [], verdict: "verification_policy_changed", treeAfterChecks: treeBefore });
+      }
     }
   }
 

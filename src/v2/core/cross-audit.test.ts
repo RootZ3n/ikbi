@@ -6,6 +6,7 @@
  * real fs/git (runtime/cross-audit-runtime.test.ts: B2 terminal read, M3 reclaim, M5 snapshot).
  */
 
+import "../test-env.js"; // MUST be first: hermetic synthetic dev-key opt-in, before core config loads
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { test } from "node:test";

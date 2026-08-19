@@ -1,18 +1,25 @@
 /**
  * ADAPTER — the clean-ref CAS publication target, built on v1's git primitives.
  *
- * This is the ONLY thing in v2 that moves a target ref. It reuses the donor CAS primitive
- * (`updateRefCas`) and the donor worktree-sync (`syncWorktreeToRef`) rather than reinventing
- * them; it does NOT go through `WorkspaceManager.promote`, which auto-merges (forbidden here)
- * and requires a governed approval this authority does not use.
+ * This is the ONLY thing in v2 that moves a target ref, and it moves it EXACTLY ONCE. It reuses
+ * the donor CAS primitive (`updateRefCas`); it does NOT go through `WorkspaceManager.promote`,
+ * which auto-merges (forbidden here) and requires a governed approval this authority does not use.
+ *
+ * THE ONE-REF-MUTATION INVARIANT (V2-019/HIGH-01). After `updateRefCas` returns, NOTHING in this
+ * adapter may write `refs/heads/<target>` again. Worktree reconciliation is therefore done with
+ * `syncWorktreeToCurrentHead` — a bare `git reset --hard`, which touches only index/working
+ * tree/stash — and NEVER with `syncWorktreeToRef(path, ourCommit)`, whose explicit-commit reset
+ * would move a checked-out branch and could drag it BACKWARD over a concurrent actor's later
+ * publication. When the observed HEAD is no longer our commit we report `worktreeSynced: false`
+ * and degrade; we never force the ref back to what we published.
  *
  * The publish is exact-tree-only. Its authoritative landing proof is the GIT REF/TREE, NOT a
  * journal: the journal is BEST-EFFORT (V2-016) and its write status is REPORTED, never disguised
  * as crash durability. Sequence:
  *   commit(tree=candidateTreeId, parent=authorized base) → verify the built tree == candidate
  *   tree BEFORE any ref move → best-effort INTENT marker → updateRefCas(beforeRef→commit) →
- *   best-effort LANDED marker → sync a clean checked-out worktree → FRESH post-CAS reprobe of the
- *   authoritative ref/tree.
+ *   best-effort LANDED marker → FRESH post-CAS reprobe of the authoritative ref/tree → sync a
+ *   clean checked-out worktree to its own current HEAD (no ref write).
  *
  * A CAS that loses the race throws (git `update-ref` old-sha guard); we map that to a
  * `cas_conflict` outcome — no force, no retry against a new head. A worktree sync failure AFTER
@@ -25,7 +32,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { realpathSync } from "node:fs";
 
-import { revParse, updateRefCas, commitTree, worktreeForBranch, isWorktreeClean, syncWorktreeToRef, gitCommonDir } from "../../core/workspace/git.js";
+import { revParse, updateRefCas, commitTree, worktreeForBranch, isWorktreeClean, syncWorktreeToCurrentHead, gitCommonDir } from "../../core/workspace/git.js";
 import type { JournalWriteStatus, PostCasReprobe, PromotionTarget, PromotionTargetRef, PublicationOutcome } from "../core/promotion.js";
 
 /**
@@ -169,8 +176,13 @@ export function createCasPublicationTarget(journal: PublicationJournal = NO_JOUR
       let stashed = false;
       if (checkedOutPath !== undefined) {
         try {
-          const sync = await syncWorktreeToRef(checkedOutPath, commit);
-          worktreeSynced = true;
+          // HIGH-01: sync to the worktree's OWN CURRENT HEAD. After our one authorized CAS, ikbi
+          // may never move the target ref again — a `reset --hard <ourCommit>` here would drag the
+          // branch BACKWARD over a concurrent actor's later publication. The worktree therefore
+          // follows whatever the ref now says; `worktreeSynced` claims success only when that HEAD
+          // is still the commit WE published.
+          const sync = await syncWorktreeToCurrentHead(checkedOutPath);
+          worktreeSynced = sync.head === commit;
           stashed = sync.stashed;
         } catch (err) {
           return { kind: "landed_desynced", beforeRef: expectedHead, afterCommit: commit, publishedTree: candidateTreeId, detail: `the target ref moved ${expectedHead}→${commit} but the checked-out worktree at ${checkedOutPath} could not be synced: ${err instanceof Error ? err.message : String(err)}`, journalIntentStatus, journalLandedStatus, postCas };
