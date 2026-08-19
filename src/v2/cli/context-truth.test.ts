@@ -31,6 +31,7 @@ import { after, test } from "node:test";
 import type { V2RunResult } from "../core/result.js";
 import { loopbackEgressEnv, startFakeOpenAIProvider } from "./fake-provider-server.js";
 import { initGitRepo } from "./fixture-repo.js";
+import { sessionFinalAttempt } from "./session-json.js";
 
 const ENTRY = fileURLToPath(new URL("../../../dist/cli/index.js", import.meta.url));
 
@@ -103,7 +104,7 @@ function runCli(stateRoot: string, args: readonly string[]): { status: number | 
 function v2Run(stateRoot: string, repo: string, goal = GOAL): { result: V2RunResult; stdout: string; stderr: string; status: number | null } {
   const r = runCli(stateRoot, ["v2", "build", goal, "--repo", repo, "--json"]);
   assert.ok(r.stdout.trim().startsWith("{"), `expected JSON on stdout, got:\n${r.stdout}\n---\n${r.stderr}`);
-  return { result: JSON.parse(r.stdout) as V2RunResult, stdout: r.stdout, stderr: r.stderr, status: r.status };
+  return { result: sessionFinalAttempt(r.stdout), stdout: r.stdout, stderr: r.stderr, status: r.status };
 }
 
 const sha = (text: string): string => createHash("sha256").update(Buffer.from(text, "utf8")).digest("hex");

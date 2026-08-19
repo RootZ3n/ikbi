@@ -32,6 +32,13 @@ export type V2Id<TKind extends string> = string & { readonly [V2_ID_BRAND]: TKin
 
 /** The unit of OPERATOR INTENT: one goal. Stable across retries and across runs. */
 export type V2TaskId = V2Id<"task">;
+/**
+ * ONE operator invocation of `ikbi v2 build`. A session binds stable operator intent (task,
+ * target repo, frozen policy) and owns an ordered ledger of one OR MORE attempts — each a
+ * complete run with its own RunId and its own source snapshot. Recovery composes attempts
+ * under a session; it never recaptures inside one RunId.
+ */
+export type V2BuildSessionId = V2Id<"session">;
 /** ONE execution of a task through the canonical lifecycle. A retry is a new run. */
 export type V2RunId = V2Id<"run">;
 /** ONE model invocation. Exists so cost/provider truth can never be attributed by guesswork. */
@@ -87,6 +94,13 @@ export type V2DiffDigest = V2Digest<"candidate_diff">;
 export type V2DispositionId = V2Digest<"disposition">;
 /** Content address of ONE disposition policy — the explicit rules an adjudication applied. */
 export type V2DispositionPolicyDigest = V2Digest<"disposition_policy">;
+/** Content address of ONE recovery policy — the explicit rules the recovery controller applied. */
+export type V2RecoveryPolicyDigest = V2Digest<"recovery_policy">;
+/**
+ * Content address of ONE recovery decision — what a completed attempt's outcome, under this
+ * recovery policy, lawfully implies happens next. The clock/event is provenance, not identity.
+ */
+export type V2RecoveryDecisionId = V2Digest<"recovery_decision">;
 /**
  * Content address of ONE publication — what was AUTHORIZED and what actually LANDED. It binds
  * the candidate tree, the disposition, the target branch and the published tree; the commit
@@ -107,6 +121,7 @@ export const V2_ID_PREFIXES = {
   observation: "obs",
   verification: "ver",
   receipt: "rcpt",
+  session: "sess",
 } as const;
 
 /** The identity kind names (the keys of `V2_ID_PREFIXES`). */

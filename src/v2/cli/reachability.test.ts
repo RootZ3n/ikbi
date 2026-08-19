@@ -19,8 +19,8 @@ import type { ConfigurationSource } from "../core/config.js";
 import type { InvocationTransport } from "../core/invocation.js";
 import type { StateBoundMutationAuthority, V2WorkspaceRecord, WorkspaceAuthority } from "../core/workspace.js";
 import { LIFECYCLE_STAGES } from "../core/lifecycle.js";
-import type { V2RunResult } from "../core/result.js";
 import { V2_BANNER, parseV2Args, renderRun, runV2Cli } from "./index.js";
+import { sessionFinalAttempt } from "./session-json.js";
 
 /**
  * A hermetic configuration source. These tests are about CLI dispatch reaching the
@@ -180,7 +180,7 @@ test("reachability: the command body enters the canonical lifecycle and reports 
 test("reachability: the JSON surface carries the lifecycle journal + a counted receipt", async () => {
   const cap = capture();
   await runV2Cli(["build", "x", "--json"], cap);
-  const result = JSON.parse(cap.out) as V2RunResult;
+  const result = sessionFinalAttempt(cap.out);
   // Only the real lifecycle produces this: a journal that starts at `pending`, enters
   // preflight, and ends at `terminal`. A CLI that shortcut past the spine could not.
   assert.equal(result.journal[0]?.from, "pending");
@@ -222,7 +222,7 @@ test("reachability: the JSON surface carries the lifecycle journal + a counted r
 test("reachability: the CLI never claims a stage it did not run", async () => {
   const cap = capture();
   await runV2Cli(["build", "x", "--json"], cap);
-  const result = JSON.parse(cap.out) as V2RunResult;
+  const result = sessionFinalAttempt(cap.out);
   for (const stage of LIFECYCLE_STAGES) {
     if (stage === "preflight" || stage === "model_resolution" || stage === "context" || stage === "candidate_strategy" || stage === "candidate_generation" || stage === "verification" || stage === "criticism" || stage === "disposition") continue;
     assert.equal(result.receipt.stagesEntered.includes(stage), false, `never entered ${stage}`);

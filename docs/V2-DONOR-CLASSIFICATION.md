@@ -8,8 +8,9 @@ mutation authority), **V2-006A** (canonical source snapshot authority), **V2-006
 (deterministic snapshot-bound retrieval), **V2-007** (canonical builder + governed tool
 loop), **V2-007A** (untrusted tool-result neutralization), **V2-008** (canonical
 verification authority), **V2-009** (canonical critic / intent-alignment
-authority), **V2-010** (canonical disposition / adjudication authority) and **V2-011**
-(canonical promotion / publication authority). This is an **advisory input to future work
+authority), **V2-010** (canonical disposition / adjudication authority), **V2-011**
+(canonical promotion / publication authority) and **V2-012** (canonical recovery controller +
+attempt ledger). This is an **advisory input to future work
 orders**, not a change plan and not permission to delete anything. Nothing in v1 was
 removed, disabled, or altered to produce it.
 
@@ -56,7 +57,7 @@ preserved** and the v2 lifecycle was designed around them (see "Candidate strate
 | Verifier / check runners / verification ladder | `worker-model/verifier.ts`, `checks.ts`, `src/modules/verification-ladder/` | **ADOPT (single owner)** | The ladder, stub-detection and no-vacuous-green logic are the crown jewels. In v2 there is exactly one verification authority and every candidate — single, shadow, tournament — goes through it. |
 | Critic / critic-fix-loop / critic-recovery | `worker-model/critic*.ts` | **REFINE (done V2-009)** | The semantic-judgment capability is now v2's canonical critic — see *Critic systems (V2-009)* below. The judgment posture is ADOPTed; the best-effort PARSER is REPLACEd by a strict one (no naked rejection); the fix/recovery loop and skip-on-red are PARK/REMOVED. |
 | Adjudication core | `worker-model/adjudication/` | **ADOPT — the v2 blueprint, realized V2-010** | `WorkProduct` / `ProtocolExit` / `WorkAssessment` / `SafetyAssessment` → one `decidePromotability`, with a signature that *cannot* express a protocol exit, and `treeHash` binding a verdict to the exact tree. V2-010 rebuilds exactly this posture as `src/v2/core/disposition.ts`: one pure `adjudicate` + `judgeDisposition`, a signature that takes evidence + policy and returns a decision (no model, no mutation, no promotion), and identity content-addressed over (candidate/tree, verification, critic, policy, decision, reasons). The v1 core's key ideas are all here — greenness-on-merit, tree-bound verdict, "green work is never discarded" (defects ⇒ withhold, not reject). See *Disposition systems (V2-010)* below. |
-| Recovery / retry systems | `src/modules/recovery/`, `worker-model/critic-recovery.ts`, `fix-recovery-lab.ts`, escalation | **REPLACE (capability preserved)** | Retry policy currently lives in at least three places with different rules. v2 needs one recovery policy reading `RunFailure.retryable` and one attempt ledger. The *decision core* in `src/modules/recovery/` is the best starting point. |
+| Recovery / retry systems | `src/modules/recovery/`, `worker-model/critic-recovery.ts`, `fix-recovery-lab.ts`, escalation | **REPLACE (done V2-012)** | The ONE recovery authority is now v2's session controller — see *Recovery systems (V2-012)* below. v1's recovery decides a MODEL CASCADE (escalate up the tier ladder); v2's decides whether a FRESH ATTEMPT is lawful, on the SAME frozen policy — no escalation, no fallback. The v1 attempt-ledger + single-terminal-verdict + trust-deferral SHAPE was adopted; the model-selection decision was replaced. |
 | Refuter | `worker-model/refuter.ts` | **PARK** | Off by default and correctly optional. It is a safety-evidence contributor; migrate with the disposition slice. |
 | Correction library | `src/modules/correction-library/` | **PARK** | Operator-approved lessons, nothing auto-installs. Governance posture is already right; no v2 pressure on it yet. |
 | Runtime-truth (evidence) | `src/modules/runtime-truth/` | **REFINE** | Real executed-evidence layer; belongs under the single verification authority rather than beside it. |
@@ -298,6 +299,35 @@ AND after the ref move); it is IDEMPOTENT (a target already holding the candidat
 + what LANDED (candidate tree, disposition, target branch, published tree — the commit sha is
 provenance); and ONLY an actually-landed publication turns `withheld` into `accepted{promotionId}`.
 
+## Recovery systems *(V2-012)*
+
+v1 has retry logic in at least four places — a model-cascade escalation core
+(`src/modules/recovery/`), a critic-fix loop, a verifier-driven fix loop, and provider
+transport fallback — each able to try again on its own. That diffuse retry is exactly what v2
+eliminates: ONE authority decides, after a COMPLETE attempt, whether a FRESH attempt is lawful,
+and nothing else may try again.
+
+| v1 system | What it retries | Verdict |
+| --- | --- | --- |
+| `src/modules/recovery/` (`decideRecovery` + `runRecovery` driver) | escalates to the NEXT model up the tier ladder | **REPLACE (shape adopted).** The decision AXIS is wrong for v2 — it selects a model, which v2 forbids in recovery (no escalation, no fallback). But its ATTEMPT-LEDGER, single-terminal-verdict and trust-deferral posture are the right design, and v2's `AttemptLedger` + one `decideRecovery` generalize them. v2's recovery decides retry-vs-stop on the SAME frozen policy. |
+| `worker-model/critic-fix-loop.ts` | re-runs the builder with the critic's feedback as a fix goal | **PARK → semantic-repair extension.** A critic `defects_found` in v2 is a COMPLETED adverse judgment (`stop_withheld`), never an automatic retry. Feeding defects back into the builder is a separate, later recovery extension once this controller is proven. A guard forbids any v2 import of it. |
+| `worker-model/critic-recovery.ts` / `fix-recovery-lab.ts` / `fix*.ts` | fixer passes on a failed candidate | **PARK.** Same reason — semantic repair. Not in this slice. |
+| verifier-driven iterative loop (`runIterativeLoop`) | re-runs the builder on RED checks | **REPLACE.** A verification `fail` in v2 is `stop_rejected`; there is no builder re-entry. Objective-red repair folds into the semantic-repair extension. |
+| provider transport fallback / retry (`ProviderInvoker`, `invoke-retry`) | a different provider / a second HTTP attempt | **REPLACE (removed).** v2's `InvocationAuthority` is already single-shot (V2-005). A transient provider failure is handled by RECOVERY making a NEW ATTEMPT on the SAME frozen policy — never a provider swap, never an in-authority retry. Proven: the invocation authority makes ONE call; the second attempt is the controller's. |
+| prevented-attempt risk thresholds (`integrator.ts`) | (holds a build for review) | **PARK.** Future safety-evidence / operator gate, not recovery. |
+| promotion crash reconcile intent | reconciles a crashed promote | **ADOPT/REFINE as deterministic evidence.** v2's `classifyPublicationLanding` reads git ref/tree state as authoritative (journal is optional corroboration, NEVER required) and returns `not_landed` / `landed_exact` / `landed_degraded` / `ambiguous` — no mutation. `promoted_degraded` is `reconciliation_required`, NEVER re-published. |
+
+**The load-bearing v2 additions v1 has no equivalent of:** `ONE RUN = ONE SOURCE SNAPSHOT` is
+preserved — a recovery that needs fresh repository state does NOT recapture inside a RunId; it
+starts a NEW ATTEMPT with a new RunId and a new snapshot under one `BuildSession`. NO candidate,
+verification, critic, disposition, promotion, observation or mutation crosses the boundary. The
+retry is authorized ONLY by `decideRecovery` (only environmental triggers, only while budget
+remains); an adverse judgment (verification fail, critic defects) is never retried; a dirty
+source requires an operator (no endless recapture); a degraded landing is reconciliation, not a
+re-publish; and configuration is FROZEN at session start (a later attempt re-reads no profile or
+env). The invocation authority stays single-shot — the SECOND attempt exists because recovery
+authorized it, not because a lower subsystem quietly tried again.
+
 ## Standing constraints for later slices
 
 1. **No second promote path.** Any strategy that wants to promote must do it by
@@ -396,3 +426,15 @@ provenance); and ONLY an actually-landed publication turns `withheld` into `acce
    did not finish is a DEGRADED success, never reported as if nothing happened. The target ref
    is moved by exactly ONE adapter (`runtime/publication.ts`); no other v2 code calls
    `update-ref` or the v1 auto-merging `WorkspaceManager.promote`.
+20. **One recovery authority; a retry is a fresh attempt, never a quiet re-try.** *(V2-012)*
+   `ONE RUN = ONE SOURCE SNAPSHOT` holds — recovery never recaptures inside a RunId; it starts a
+   NEW ATTEMPT (new RunId, new snapshot, whole new evidence chain) under one `BuildSession`. Only
+   `decideRecovery` authorizes a new attempt, and only for an ENVIRONMENTAL trigger (moved
+   target, CAS conflict, candidate drift, verification timeout/infrastructure failure, transient
+   provider failure) while budget remains. An adverse JUDGMENT (verification fail, critic
+   defects) is NEVER retried — there is no semantic repair, no critic-fix loop, no verifier
+   re-run, no builder re-entry. There is no model escalation, no provider fallback, no profile
+   switch; the invocation authority stays single-shot and the session freezes configuration at
+   its start. NO evidence crosses the attempt boundary. A `promoted_degraded` landing is
+   `reconciliation_required`, NEVER re-published; git ref/tree state is authoritative over any
+   journal, which is never required.

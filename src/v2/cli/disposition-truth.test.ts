@@ -25,9 +25,9 @@ import { after, test } from "node:test";
 
 const ENTRY = fileURLToPath(new URL("../../../dist/cli/index.js", import.meta.url));
 
-import type { V2RunResult } from "../core/result.js";
 import { loopbackEgressEnv, startFakeOpenAIProvider, type FakeProviderServer, type ScriptedTurn } from "./fake-provider-server.js";
 import { initGitRepo } from "./fixture-repo.js";
+import { sessionFinalAttempt } from "./session-json.js";
 
 const dirs: string[] = [];
 const servers: FakeProviderServer[] = [];
@@ -96,6 +96,7 @@ function runCli(root: string, server: FakeProviderServer, repo: string, checks?:
       IKBI_MODEL_DRIVER: "m1",
       IKBI_MODEL_BUILDER: "m1",
       IKBI_MODEL_CRITIC: "m1",
+      IKBI_RECOVERY_MAX_ATTEMPTS: "1",
       ...(checks !== undefined ? { IKBI_CHECKS: checks } : {}),
       ...loopbackEgressEnv(server),
     },
@@ -110,7 +111,7 @@ async function run(criticResponse: string, checks?: string) {
   const repo = makeRepo();
   const r = runCli(root, server, repo, checks);
   assert.ok(r.stdout.trim().startsWith("{"), `expected JSON on stdout, got:\n${r.stdout}\n---\n${r.stderr}`);
-  return { server, root, repo, status: r.status, stdout: r.stdout, result: JSON.parse(r.stdout) as V2RunResult };
+  return { server, root, repo, status: r.status, stdout: r.stdout, result: sessionFinalAttempt(r.stdout) };
 }
 
 const headOf = (repo: string) => execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim();
@@ -206,7 +207,7 @@ test("disposition truth: an ELIGIBLE candidate on a clean repo is PUBLISHED — 
   const repo = makeRepo();
   const headBefore = headOf(repo);
   const r = runCli(root, server, repo, GREP_WIDGET_2);
-  const result = JSON.parse(r.stdout) as V2RunResult;
+  const result = sessionFinalAttempt(r.stdout);
   assert.equal(result.receipt.disposition!.eligibleForPromotion, true, "the candidate IS eligible");
   assert.ok(result.outcome.kind === "accepted");
   assert.notEqual(headOf(repo), headBefore, "HEAD moved — the candidate was published");
@@ -248,7 +249,8 @@ test("disposition truth: the human rendering states the decision and the landed 
   dirs.push(cwd);
   const res = spawnSync(process.execPath, [ENTRY, "v2", "build", "set widget to 2 in src/widget.ts", "--repo", repo], {
     cwd,
-    env: { PATH: process.env.PATH ?? "", HOME: mkdtempSync(join(tmpdir(), "ikbi-v2-dh-")), IKBI_STATE_ROOT: root, IKBI_MODEL_DRIVER: "m1", IKBI_MODEL_BUILDER: "m1", IKBI_MODEL_CRITIC: "m1", IKBI_CHECKS: GREP_WIDGET_2, ...loopbackEgressEnv(server) },
+    env: { PATH: process.env.PATH ?? "", HOME: mkdtempSync(join(tmpdir(), "ikbi-v2-dh-")), IKBI_STATE_ROOT: root, IKBI_MODEL_DRIVER: "m1", IKBI_MODEL_BUILDER: "m1", IKBI_MODEL_CRITIC: "m1",
+      IKBI_RECOVERY_MAX_ATTEMPTS: "1", IKBI_CHECKS: GREP_WIDGET_2, ...loopbackEgressEnv(server) },
     encoding: "utf8",
   });
   assert.match(res.stdout, /disposition ELIGIBLE FOR PROMOTION · acceptable/);

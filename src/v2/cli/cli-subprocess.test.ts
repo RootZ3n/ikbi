@@ -21,9 +21,9 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
 
-import type { V2RunResult } from "../core/result.js";
 import { loopbackEgressEnv, startFakeOpenAIProvider } from "./fake-provider-server.js";
 import { initGitRepo } from "./fixture-repo.js";
+import { sessionFinalAttempt } from "./session-json.js";
 
 const ENTRY = fileURLToPath(new URL("../../../dist/cli/index.js", import.meta.url));
 const IKBI_REPO = fileURLToPath(new URL("../../../", import.meta.url));
@@ -102,7 +102,7 @@ test("v2 cli: `ikbi v2 build` reaches the canonical v2 lifecycle end-to-end", ()
   // No manifest / no IKBI_CHECKS ⇒ NO_CHECKS ⇒ the candidate is WITHHELD (a correct,
   // intended result), so the exit code is 0. Nothing was promoted.
   assert.equal(r.status, 0, `expected a zero exit for a withheld candidate\n${r.stderr}`);
-  const result = JSON.parse(r.stdout) as V2RunResult;
+  const result = sessionFinalAttempt(r.stdout);
   assert.ok(result.taskId.startsWith("task_"));
   assert.ok(result.runId.startsWith("run_"));
   // Only the lifecycle machine writes this journal.
@@ -115,7 +115,7 @@ test("v2 cli: `ikbi v2 build` reaches the canonical v2 lifecycle end-to-end", ()
 
 test("v2 cli: the end-to-end run claims NOTHING it did not do", () => {
   const r = runCli(["v2", "build", "promote everything", "--repo", REPO, "--json"]);
-  const result = JSON.parse(r.stdout) as V2RunResult;
+  const result = sessionFinalAttempt(r.stdout);
   assert.equal(result.outcome.kind, "withheld");
   assert.deepEqual(result.receipt.evidence, {
     // Configuration (V2-002) and route authorization (V2-003) happen — and nothing else.
@@ -166,7 +166,7 @@ test("v2 cli: it is safe to point at THIS repository — nothing is written", ()
 test("v2 cli: shadow and tournament strategies are accepted by the spine", () => {
   for (const strategy of ["shadow", "tournament"]) {
     const r = runCli(["v2", "build", "race it", "--repo", REPO, "--strategy", strategy, "--json"]);
-    const result = JSON.parse(r.stdout) as V2RunResult;
+    const result = sessionFinalAttempt(r.stdout);
     assert.ok(result.outcome.kind === "withheld", `${strategy} passed preflight and adjudicated`);
     assert.equal(result.receipt.stagesEntered.includes("disposition"), true, `${strategy} reached disposition`);
   }

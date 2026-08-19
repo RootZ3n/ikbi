@@ -22,6 +22,8 @@ import { readFileSync } from "node:fs";
 import type { ConfigurationInputs, ConfigurationSource } from "../core/config.js";
 import type { V2RunResult } from "../core/result.js";
 import { runV2Build, type RepoProbe , type V2RunDeps } from "../core/run.js";
+import { executeV2BuildSession, type V2BuildSessionResult } from "../core/session.js";
+import { buildRecoveryPolicy, type RecoveryPolicy } from "../core/recovery.js";
 import type { ContextSource } from "../core/context.js";
 import type { InvocationTransport } from "../core/invocation.js";
 import { PRODUCTION_CONTEXT_SOURCES } from "./context-sources.js";
@@ -40,6 +42,16 @@ function envCheckTimeoutMs(): number | undefined {
   const raw = (process.env.IKBI_CHECK_TIMEOUT_MS ?? "").trim();
   const n = Number.parseInt(raw, 10);
   return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+/**
+ * The operator's recovery-attempt cap, read ONCE at session start (never between attempts).
+ * `IKBI_RECOVERY_MAX_ATTEMPTS` overrides the safe default; anything unparseable is ignored.
+ */
+function envRecoveryMaxAttempts(): number | undefined {
+  const raw = (process.env.IKBI_RECOVERY_MAX_ATTEMPTS ?? "").trim();
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n >= 1 ? n : undefined;
 }
 import { createInvocationTransport } from "./invocation-transport.js";
 import { createProductionWorkspaceAuthorities } from "./workspace-authority.js";
@@ -150,6 +162,8 @@ export interface ProductionRunDeps {
   readonly checkTimeoutMs?: V2RunDeps["checkTimeoutMs"];
   readonly candidateDiff?: V2RunDeps["candidateDiff"];
   readonly publisher?: V2RunDeps["publisher"];
+  /** The frozen recovery policy for a build session. Defaults to the safe development policy. */
+  readonly recoveryPolicy?: RecoveryPolicy;
   readonly transport?: InvocationTransport;
   readonly workspaces?: WorkspaceAuthority;
   readonly mutations?: StateBoundMutationAuthority;
@@ -200,8 +214,12 @@ export function productionTransport(): InvocationTransport {
   };
 }
 
-/** THE production entry every v2 surface uses. One wiring, one configuration truth. */
-export async function runV2BuildProduction(request: V2TaskRequest, deps: ProductionRunDeps = {}): Promise<V2RunResult> {
+/**
+ * Build the fully-wired single-attempt deps once, from the production defaults + any injected
+ * overrides. Shared by the single-run entry and the session entry so both surfaces wire exactly
+ * the same authorities.
+ */
+async function wireRunDeps(deps: ProductionRunDeps): Promise<V2RunDeps> {
   const complete = deps.workspaces !== undefined && deps.mutations !== undefined && deps.sources !== undefined;
   const wired = complete
     ? { workspaces: deps.workspaces!, mutations: deps.mutations!, sources: deps.sources! }
@@ -211,7 +229,7 @@ export async function runV2BuildProduction(request: V2TaskRequest, deps: Product
   // receipt can never describe a retrieval some other run performed.
   const retrieval = createRetrievalSource();
   const sources = deps.contextSources ?? [...PRODUCTION_CONTEXT_SOURCES, retrieval];
-  return runV2Build(request, {
+  return {
     workspaces: deps.workspaces ?? wired.workspaces,
     mutations: deps.mutations ?? wired.mutations,
     sources: deps.sources ?? wired.sources,
@@ -244,5 +262,27 @@ export async function runV2BuildProduction(request: V2TaskRequest, deps: Product
     ...(resolvedCheckTimeout !== undefined ? { checkTimeoutMs: resolvedCheckTimeout } : {}),
     ...(deps.builderBudget !== undefined ? { builderBudget: deps.builderBudget } : {}),
     ...(deps.probe !== undefined ? { probe: deps.probe } : {}),
+  };
+}
+
+/** THE production single-attempt entry. One wiring, one configuration truth. */
+export async function runV2BuildProduction(request: V2TaskRequest, deps: ProductionRunDeps = {}): Promise<V2RunResult> {
+  return runV2Build(request, await wireRunDeps(deps));
+}
+
+/**
+ * THE production BUILD SESSION entry every v2 surface uses. It wires the single-attempt deps
+ * once and hands them to the session controller, which composes one OR MORE attempts under the
+ * ONE recovery authority. A caller may inject a recovery policy; production uses the safe default.
+ */
+export async function runV2BuildSessionProduction(request: V2TaskRequest, deps: ProductionRunDeps = {}): Promise<V2BuildSessionResult> {
+  const runDeps = await wireRunDeps(deps);
+  // An explicit injected policy wins; otherwise the operator's env cap (read once) refines the
+  // safe default. Nothing rereads it between attempts.
+  const envMax = envRecoveryMaxAttempts();
+  const recoveryPolicy = deps.recoveryPolicy ?? (envMax !== undefined ? buildRecoveryPolicy({ maxAttempts: envMax }) : undefined);
+  return executeV2BuildSession(request, {
+    ...runDeps,
+    ...(recoveryPolicy !== undefined ? { recoveryPolicy } : {}),
   });
 }

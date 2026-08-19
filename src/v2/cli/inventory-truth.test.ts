@@ -31,6 +31,7 @@ import { after, test } from "node:test";
 import type { V2RunResult } from "../core/result.js";
 import { loopbackEgressEnv, startFakeOpenAIProvider } from "./fake-provider-server.js";
 import { initGitRepo } from "./fixture-repo.js";
+import { sessionFinalAttempt } from "./session-json.js";
 
 const ENTRY = fileURLToPath(new URL("../../../dist/cli/index.js", import.meta.url));
 /**
@@ -117,7 +118,7 @@ interface Snapshot {
 function inventory(root: string, extraEnv: Record<string, string> = {}): Snapshot {
   const r = runCli(root, ["v2", "build", "an inventory probe", "--repo", REPO, "--json"], extraEnv);
   assert.ok(r.stdout.trim().startsWith("{"), `expected JSON on stdout, got:\n${r.stdout}\n---\n${r.stderr}`);
-  const raw = JSON.parse(r.stdout) as V2RunResult;
+  const raw = sessionFinalAttempt(r.stdout);
   const models = raw.policy?.inventory.models ?? [];
   return {
     ids: models.map((m) => m.id).sort(),

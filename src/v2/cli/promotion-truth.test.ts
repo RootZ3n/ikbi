@@ -27,9 +27,9 @@ import { after, test } from "node:test";
 
 const ENTRY = fileURLToPath(new URL("../../../dist/cli/index.js", import.meta.url));
 
-import type { V2RunResult } from "../core/result.js";
 import { loopbackEgressEnv, startFakeOpenAIProvider, type FakeProviderServer, type ScriptedTurn } from "./fake-provider-server.js";
 import { initGitRepo } from "./fixture-repo.js";
+import { sessionFinalAttempt } from "./session-json.js";
 
 const dirs: string[] = [];
 const servers: FakeProviderServer[] = [];
@@ -98,7 +98,7 @@ async function run() {
   const repo = makeRepo();
   const r = runCli(root, server, repo);
   assert.ok(r.stdout.trim().startsWith("{"), `expected JSON on stdout, got:\n${r.stdout}\n---\n${r.stderr}`);
-  return { server, root, repo, status: r.status, result: JSON.parse(r.stdout) as V2RunResult };
+  return { server, root, repo, status: r.status, result: sessionFinalAttempt(r.stdout) };
 }
 
 const git = (repo: string, ...args: string[]) => execFileSync("git", args, { cwd: repo, encoding: "utf8" }).trim();
@@ -153,7 +153,7 @@ test("promotion truth: a DIRTY operator checkout is REFUSED without committing t
   const statusBefore = statusOf(repo);
 
   const r = runCli(root, server, repo);
-  const result = JSON.parse(r.stdout) as V2RunResult;
+  const result = sessionFinalAttempt(r.stdout);
 
   // The candidate is still eligible, but clean-ref CAS cannot publish a dirty source.
   assert.equal(result.receipt.disposition!.eligibleForPromotion, true, "the candidate IS eligible");
@@ -174,7 +174,7 @@ test("promotion truth: a REPEATED build of the same candidate does not publish t
   const server1 = await provider();
   const root1 = makeStateRoot(server1);
   const repo = makeRepo();
-  const first = JSON.parse(runCli(root1, server1, repo).stdout) as V2RunResult;
+  const first = sessionFinalAttempt(runCli(root1, server1, repo).stdout);
   assert.ok(first.outcome.kind === "accepted");
   const landedHead = headOf(repo);
 
@@ -182,7 +182,7 @@ test("promotion truth: a REPEATED build of the same candidate does not publish t
   // so the candidate tree already equals the target tree — an idempotent already-published.
   const server2 = await provider();
   const root2 = makeStateRoot(server2);
-  const second = JSON.parse(runCli(root2, server2, repo).stdout) as V2RunResult;
+  const second = sessionFinalAttempt(runCli(root2, server2, repo).stdout);
 
   assert.ok(second.outcome.kind === "accepted", "the truthful state is: this exact candidate tree is already landed");
   assert.equal(second.receipt.promotion!.idempotent, true, "detected as already-published — no second CAS");

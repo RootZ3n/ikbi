@@ -27,7 +27,8 @@ import type { StateBoundMutationAuthority, WorkspaceAuthority } from "../core/wo
 import type { SourceSnapshotAuthority } from "../core/source.js";
 import { CANDIDATE_STRATEGIES } from "../core/contract.js";
 import { exitCodeForOutcome, formatOutcome, type V2RunResult } from "../core/result.js";
-import { runV2BuildProduction, type ProductionRunDeps } from "../runtime/index.js";
+import { runV2BuildSessionProduction, type ProductionRunDeps } from "../runtime/index.js";
+import type { V2BuildSessionResult } from "../core/session.js";
 
 export const V2_USAGE = `Usage: ikbi v2 build "<goal>" [--repo <path>] [--strategy ${CANDIDATE_STRATEGIES.join("|")}] [--profile <name>] [--json]`;
 
@@ -133,6 +134,30 @@ export function renderRun(result: V2RunResult): string {
   // The outcome line already carries the failure sentence; what it lacks is the stable
   // machine code an operator can grep for or quote in a bug report.
   if (result.outcome.kind === "failed") lines.push(`code        ${result.outcome.failure.code}`);
+  return `${lines.join("\n")}\n`;
+}
+
+/**
+ * Render a BUILD SESSION: the recovery trail (only when there was more than one attempt or a
+ * recovery decision worth stating), then the final attempt in full. A single clean attempt looks
+ * exactly like the old one-attempt render, prefixed with the session id.
+ */
+export function renderSession(session: V2BuildSessionResult): string {
+  const lines: string[] = [`session     ${session.buildSessionId} · ${session.receipt.totalAttempts} attempt(s)`];
+  if (session.receipt.totalAttempts > 1 || session.recoveryDecisions.some((d) => d.authorizesNewAttempt || d.kind === "reconciliation_required")) {
+    for (let i = 0; i < session.ledger.length; i += 1) {
+      const a = session.ledger[i]!;
+      const d = session.recoveryDecisions[i];
+      const tail = d === undefined ? "" : ` — ${d.kind}${d.reason ? ` (${d.reason})` : ""}`;
+      lines.push(`  attempt ${a.attemptNumber}  ${a.outcomeKind} [${a.trigger}]${tail}`);
+    }
+    if (session.receipt.reconciliationRequired) {
+      lines.push("  NOTE      a publication landed but its post-CAS bookkeeping did not finish — RECONCILIATION REQUIRED (the ref moved; do NOT re-publish)");
+    }
+    lines.push("");
+  }
+  // The final attempt, in full — this is the authoritative outcome.
+  lines.push(renderRun(session.attempts[session.attempts.length - 1]!).trimEnd());
   return `${lines.join("\n")}\n`;
 }
 
@@ -356,6 +381,7 @@ export async function runV2Cli(
     readonly checkRunner?: ProductionRunDeps["checkRunner"];
     readonly treeProbe?: ProductionRunDeps["treeProbe"];
     readonly candidateDiff?: ProductionRunDeps["candidateDiff"];
+    readonly recoveryPolicy?: ProductionRunDeps["recoveryPolicy"];
   } = {},
 ): Promise<number> {
   const out = io.stdout ?? writeStdout;
@@ -369,7 +395,7 @@ export async function runV2Cli(
   }
 
   err(V2_BANNER);
-  const result = await runV2BuildProduction(
+  const session = await runV2BuildSessionProduction(
     {
       goal: args.goal,
       repoPath: args.repo,
@@ -389,10 +415,13 @@ export async function runV2Cli(
       ...(io.checkRunner !== undefined ? { checkRunner: io.checkRunner } : {}),
       ...(io.treeProbe !== undefined ? { treeProbe: io.treeProbe } : {}),
       ...(io.candidateDiff !== undefined ? { candidateDiff: io.candidateDiff } : {}),
+      ...(io.recoveryPolicy !== undefined ? { recoveryPolicy: io.recoveryPolicy } : {}),
     },
   );
-  out(args.json ? `${JSON.stringify(result, null, 2)}\n` : renderRun(result));
-  return exitCodeForOutcome(result.outcome);
+  // `--json` exposes the full session (every attempt + recovery decision). The human render
+  // shows the recovery trail (when there was one) then the final attempt in full.
+  out(args.json ? `${JSON.stringify(session, null, 2)}\n` : renderSession(session));
+  return exitCodeForOutcome(session.outcome);
 }
 
 registerCommand({

@@ -26,9 +26,9 @@ import { after, test } from "node:test";
 
 const ENTRY = fileURLToPath(new URL("../../../dist/cli/index.js", import.meta.url));
 
-import type { V2RunResult } from "../core/result.js";
 import { loopbackEgressEnv, startFakeOpenAIProvider, type FakeProviderServer, type ScriptedTurn } from "./fake-provider-server.js";
 import { initGitRepo } from "./fixture-repo.js";
+import { sessionFinalAttempt } from "./session-json.js";
 
 const dirs: string[] = [];
 const servers: FakeProviderServer[] = [];
@@ -118,7 +118,7 @@ function build(root: string, server: FakeProviderServer, repo: string, opts: { c
   const env = { ...(opts.checks !== undefined ? { IKBI_CHECKS: opts.checks } : {}), ...(opts.env ?? {}) };
   const r = runCli(root, server, ["v2", "build", opts.goal ?? "set widget to 2 in src/widget.ts", "--repo", repo, "--json"], env);
   assert.ok(r.stdout.trim().startsWith("{"), `expected JSON on stdout, got:\n${r.stdout}\n---\n${r.stderr}`);
-  return JSON.parse(r.stdout) as V2RunResult;
+  return sessionFinalAttempt(r.stdout);
 }
 
 /** A run with the standard edit, a fresh repo and server. */

@@ -27,9 +27,9 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
 
-import type { V2RunResult } from "../core/result.js";
 import { loopbackEgressEnv, startFakeOpenAIProvider, type FakeProviderOptions, type FakeProviderServer } from "./fake-provider-server.js";
 import { initGitRepo, writeFiles } from "./fixture-repo.js";
+import { sessionFinalAttempt } from "./session-json.js";
 
 const ENTRY = fileURLToPath(new URL("../../../dist/cli/index.js", import.meta.url));
 
@@ -96,6 +96,9 @@ function runCli(server: FakeProviderServer, root: string, args: readonly string[
       PATH: process.env.PATH ?? "",
       HOME: mkdtempSync(join(tmpdir(), "ikbi-v2-invhome-")),
       IKBI_STATE_ROOT: root,
+      // This suite exercises the INVOCATION AUTHORITY in isolation (one attempt). Recovery's
+      // session-level retry of a transient provider failure is proven in the recovery suites.
+      IKBI_RECOVERY_MAX_ATTEMPTS: "1",
       ...loopbackEgressEnv(server),
       ...extraEnv,
     },
@@ -107,7 +110,7 @@ function runCli(server: FakeProviderServer, root: string, args: readonly string[
 function v2Run(server: FakeProviderServer, root: string, repo: string, args: readonly string[] = [], extraEnv: Record<string, string> = {}) {
   const r = runCli(server, root, ["v2", "build", GOAL, "--repo", repo, "--json", ...args], extraEnv);
   assert.ok(r.stdout.trim().startsWith("{"), `expected JSON on stdout, got:\n${r.stdout}\n---\n${r.stderr}`);
-  return { result: JSON.parse(r.stdout) as V2RunResult, stdout: r.stdout, stderr: r.stderr, status: r.status };
+  return { result: sessionFinalAttempt(r.stdout), stdout: r.stdout, stderr: r.stderr, status: r.status };
 }
 
 const activate = (server: FakeProviderServer, root: string, name: string): void => {
@@ -311,7 +314,7 @@ test("invocation truth: the egress floor is NOT bypassed — loopback needs an o
     IKBI_EGRESS_ALLOWLIST: "",
     IKBI_EGRESS_ALLOW_LOCAL: "",
   });
-  const result = JSON.parse(r.stdout) as V2RunResult;
+  const result = sessionFinalAttempt(r.stdout);
   assert.ok(result.outcome.kind === "failed", "the SSRF floor still applies to v2");
   assert.equal(result.invocations[0], undefined);
 });

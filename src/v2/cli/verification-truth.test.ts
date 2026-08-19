@@ -22,9 +22,9 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
 
-import type { V2RunResult } from "../core/result.js";
 import { loopbackEgressEnv, startFakeOpenAIProvider, type FakeProviderServer, type ScriptedTurn } from "./fake-provider-server.js";
 import { initGitRepo, writeFiles } from "./fixture-repo.js";
+import { sessionFinalAttempt } from "./session-json.js";
 
 const ENTRY = fileURLToPath(new URL("../../../dist/cli/index.js", import.meta.url));
 
@@ -102,6 +102,7 @@ function build(root: string, server: FakeProviderServer, repo: string, ikbiCheck
       IKBI_MODEL_DRIVER: "m1",
       IKBI_MODEL_BUILDER: "m1",
       IKBI_MODEL_CRITIC: "m1",
+      IKBI_RECOVERY_MAX_ATTEMPTS: "1",
       ...(ikbiChecks !== undefined ? { IKBI_CHECKS: ikbiChecks } : {}),
       ...extraEnv,
       ...loopbackEgressEnv(server),
@@ -109,7 +110,7 @@ function build(root: string, server: FakeProviderServer, repo: string, ikbiCheck
     encoding: "utf8",
   });
   assert.ok(res.stdout.trim().startsWith("{"), `expected JSON on stdout, got:\n${res.stdout}\n---\n${res.stderr}`);
-  return JSON.parse(res.stdout) as V2RunResult;
+  return sessionFinalAttempt(res.stdout);
 }
 
 /** Build with the standard edit-to-2 script and a widget-is-2 check. */
@@ -295,6 +296,7 @@ test("verification truth: the human rendering states the verdict and refuses to 
     env: {
       PATH: process.env.PATH ?? "", HOME: mkdtempSync(join(tmpdir(), "ikbi-v2-vhome-")),
       IKBI_STATE_ROOT: root, IKBI_MODEL_DRIVER: "m1", IKBI_MODEL_BUILDER: "m1", IKBI_MODEL_CRITIC: "m1",
+      IKBI_RECOVERY_MAX_ATTEMPTS: "1",
       IKBI_CHECKS: GREP_WIDGET_2, ...loopbackEgressEnv(server),
     },
     encoding: "utf8",

@@ -19,9 +19,9 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
 
-import type { V2RunResult } from "../core/result.js";
 import { loopbackEgressEnv, startFakeOpenAIProvider, type FakeProviderServer } from "./fake-provider-server.js";
 import { commitFiles, headCommit, headTree, initGitRepo, writeFiles } from "./fixture-repo.js";
+import { sessionFinalAttempt } from "./session-json.js";
 
 const ENTRY = fileURLToPath(new URL("../../../dist/cli/index.js", import.meta.url));
 
@@ -116,13 +116,13 @@ function v2RunAgainst(server: FakeProviderServer, root: string, repo: string, go
     encoding: "utf8",
   });
   assert.ok(res.stdout.trim().startsWith("{"), `expected JSON on stdout, got:\n${res.stdout}\n---\n${res.stderr}`);
-  return { result: JSON.parse(res.stdout) as V2RunResult };
+  return { result: sessionFinalAttempt(res.stdout) };
 }
 
 function v2Run(root: string, repo: string, goal = GOAL) {
   const r = runCli(root, ["v2", "build", goal, "--repo", repo, "--json"]);
   assert.ok(r.stdout.trim().startsWith("{"), `expected JSON on stdout, got:\n${r.stdout}\n---\n${r.stderr}`);
-  return { result: JSON.parse(r.stdout) as V2RunResult, stdout: r.stdout, stderr: r.stderr, status: r.status };
+  return { result: sessionFinalAttempt(r.stdout), stdout: r.stdout, stderr: r.stderr, status: r.status };
 }
 
 const gitStatus = (repo: string): string => execFileSync("git", ["status", "--porcelain"], { cwd: repo, encoding: "utf8" });

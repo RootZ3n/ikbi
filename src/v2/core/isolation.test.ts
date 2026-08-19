@@ -388,6 +388,76 @@ test("single authority: only the TOOL EXECUTOR writes candidate files, and it ho
   assert.equal(/writeFileSync|readFileSync|rmSync|unlinkSync|mkdirSync/.test(source), false, "no raw filesystem call");
 });
 
+test("single authority: only the recovery module mints a recovery/policy identity (V2-012)", () => {
+  const allowed = new Set([join(V2_DIR, "core", "recovery.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    if (/contentDigest\s*\(\s*"recovery_decision|contentDigest\s*\(\s*"recovery_policy/.test(stripComments(readFileSync(file, "utf8")))) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "the recovery decision + policy identity belong to src/v2/core/recovery.ts alone");
+});
+
+test("single authority: only the session controller decides a RETRY (V2-012)", () => {
+  // `decideRecovery` is the ONLY thing that authorizes a new attempt; the session controller is
+  // its only caller. A second caller would be a second retry path.
+  const allowed = new Set([join(V2_DIR, "core", "session.ts"), join(V2_DIR, "core", "recovery.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    if (/decideRecovery\s*\(/.test(stripComments(readFileSync(file, "utf8")))) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "no component decides a retry on its own");
+});
+
+test("single authority: only the session controller mints a build-session identity and re-runs the spine (V2-012)", () => {
+  // `mint("session")` and the loop that calls `runV2Build` more than once both belong to the
+  // session controller. The single-run production entry calls it exactly once; nothing else may
+  // create a second attempt.
+  const sessionMinters: string[] = [];
+  const spineCallers: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (file.endsWith(".test.ts")) continue;
+    const source = stripComments(readFileSync(file, "utf8"));
+    if (/mint\s*\(\s*["']session["']\s*\)/.test(source) && file !== join(V2_DIR, "core", "session.ts")) sessionMinters.push(relative(SRC, file));
+    // `runV2Build(` may appear in run.ts (its declaration), session.ts (the attempt loop) and
+    // runtime/index.ts (the single entry) — nowhere else may CALL the attempt spine.
+    if (/\brunV2Build\s*\(/.test(source) && file !== join(V2_DIR, "core", "run.ts") && file !== join(V2_DIR, "core", "session.ts") && file !== join(V2_DIR, "runtime", "index.ts")) spineCallers.push(relative(SRC, file));
+  }
+  assert.deepEqual(sessionMinters, [], "only session.ts mints a build-session identity");
+  assert.deepEqual(spineCallers, [], "only the session controller and the production entry invoke the attempt spine");
+});
+
+test("single authority: recovery + session import no v1 recovery/fix machinery (V2-012)", () => {
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (file.endsWith(".test.ts")) continue;
+    for (const spec of importSpecifiers(readFileSync(file, "utf8"))) {
+      if (/modules\/recovery|worker-model\/(critic-recovery|critic-fix-loop|fix-recovery|fix-retry|fixer|escalation)/.test(spec)) {
+        offenders.push(`${relative(SRC, file)} -> ${spec}`);
+      }
+    }
+  }
+  assert.deepEqual(offenders, [], "v2's recovery is rebuilt, not borrowed from v1's cascade/fix loops");
+});
+
+test("single authority: the RECOVERY decision is pure — it invokes/mutates/publishes nothing (V2-012)", () => {
+  const source = stripComments(readFileSync(join(V2_DIR, "core", "recovery.ts"), "utf8"));
+  const specs = importSpecifiers(readFileSync(join(V2_DIR, "core", "recovery.ts"), "utf8"));
+  for (const forbidden of ["./invocation", "./builder", "./verification", "./promotion", "governed-exec", "runtime/"]) {
+    assert.equal(specs.some((sp) => sp.includes(forbidden)), false, `recovery.ts must not import ${forbidden}`);
+  }
+  assert.equal(/runV2Build|invokeAuthorized|\.mutate\s*\(|\.publish\s*\(|process\.env/.test(source), false, "recovery.ts is a pure decision — no run, invoke, mutate, publish or env read");
+});
+
+test("single authority: the session controller FREEZES config — it reads no env or profile (V2-012)", () => {
+  // The freeze is structural: an automatic attempt cannot re-read a profile or an env var,
+  // because the session hands every attempt the SAME loaded configuration and touches neither.
+  const source = stripComments(readFileSync(join(V2_DIR, "core", "session.ts"), "utf8"));
+  assert.equal(/process\.env|activeProfile|IKBI_MODEL_/.test(source), false, "session.ts must not read env/profile between attempts");
+  assert.ok(/attemptIdFactory/.test(source), "each attempt gets a fresh id factory (fresh RunId)");
+});
+
 test("single authority: only the promotion module mints a promotion identity (V2-011)", () => {
   const allowed = new Set([join(V2_DIR, "core", "promotion.ts")]);
   const offenders: string[] = [];

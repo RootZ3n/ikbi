@@ -29,9 +29,9 @@ import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
 
 import { contentDigest } from "../core/identity.js";
-import type { V2RunResult } from "../core/result.js";
 import { loopbackEgressEnv, startFakeOpenAIProvider } from "./fake-provider-server.js";
 import { initGitRepo } from "./fixture-repo.js";
+import { sessionFinalAttempt } from "./session-json.js";
 
 const ENTRY = fileURLToPath(new URL("../../../dist/cli/index.js", import.meta.url));
 /**
@@ -124,7 +124,7 @@ function runCli(root: string, args: readonly string[], extraEnv: Record<string, 
 function v2Run(root: string, args: readonly string[] = [], extraEnv: Record<string, string> = {}) {
   const r = runCli(root, ["v2", "build", "a resolution probe", "--repo", REPO, "--json", ...args], extraEnv);
   assert.ok(r.stdout.trim().startsWith("{"), `expected JSON on stdout, got:\n${r.stdout}\n---\n${r.stderr}`);
-  return { result: JSON.parse(r.stdout) as V2RunResult, stdout: r.stdout, stderr: r.stderr, status: r.status };
+  return { result: sessionFinalAttempt(r.stdout), stdout: r.stdout, stderr: r.stderr, status: r.status };
 }
 
 const activate = (root: string, name: string): void => {
