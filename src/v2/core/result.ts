@@ -45,6 +45,7 @@ import type { ModelResolutionDecision } from "./resolver.js";
 import type { ContextManifest, ContextPackage } from "./context.js";
 import type { V2InvocationRecord } from "./invocation.js";
 import type { BuilderCommandRecord } from "./command.js";
+import type { SelectionRecord, StrategyPolicy } from "./strategy.js";
 import type { V2WorkspaceRecord, WorkspaceDisposition } from "./workspace.js";
 import type { SourceSnapshotSummary } from "./source.js";
 import type { CandidateRecord, RunCandidateSummary } from "./candidate.js";
@@ -387,6 +388,79 @@ export function summarizeCommand(record: BuilderCommandRecord): RunCommandSummar
   };
 }
 
+// ---------------------------------------------------------------------------
+// Candidate strategy (V2-017)
+// ---------------------------------------------------------------------------
+
+/** The frozen candidate strategy an attempt used — the answer to "how many candidates, and how chosen?". */
+export interface RunStrategySummary {
+  readonly kind: string;
+  readonly policyId: string;
+  readonly candidateCount: number;
+  readonly partialCompletion: string;
+  readonly selectionRule: string;
+}
+
+/** Summarize a strategy policy for a receipt. Derived — nothing asserted. */
+export function summarizeStrategy(policy: StrategyPolicy): RunStrategySummary {
+  return {
+    kind: policy.kind,
+    policyId: policy.policyId,
+    candidateCount: policy.candidateCount,
+    partialCompletion: policy.partialCompletion,
+    selectionRule: policy.selectionRule,
+  };
+}
+
+/**
+ * ONE candidate's canonical evaluation, receipt-safe. Every loser stays visible here even after its
+ * workspace is reclaimed — the evidence ids (candidate/verification/critic/disposition) are retained.
+ */
+export interface RunCandidateEvaluationSummary {
+  readonly slot: number;
+  readonly candidateId: string | null;
+  readonly workspaceId: string | null;
+  readonly status: string;
+  readonly promotionEligible: boolean;
+  readonly decision: string | null;
+  readonly verificationId: string | null;
+  readonly verificationVerdict: string | null;
+  readonly criticId: string | null;
+  readonly criticVerdict: string | null;
+  readonly dispositionId: string | null;
+  readonly knownCostMicroUsd: number;
+  readonly hasUnknownCost: boolean;
+  readonly mutationCount: number;
+  readonly changedPathCount: number;
+  readonly failureCode: string | null;
+  /** Whether this candidate is the one selected for promotion. */
+  readonly selected: boolean;
+  /** The workspace cleanup outcome for a losing candidate (reclaimed/retained), or "retained" for the selected. */
+  readonly workspaceCleanup: string;
+}
+
+/** THE winner selection, receipt-safe — the pure selector's immutable record. */
+export interface RunSelectionSummary {
+  readonly selectionId: string;
+  readonly selectionRule: string;
+  readonly selectedCandidateId: string | null;
+  readonly reason: string;
+  readonly candidateEvaluationIds: readonly string[];
+  readonly eligiblePool: readonly string[];
+}
+
+/** Summarize a selection record for a receipt. Derived — nothing asserted. */
+export function summarizeSelection(record: SelectionRecord): RunSelectionSummary {
+  return {
+    selectionId: record.selectionId,
+    selectionRule: record.selectionRule,
+    selectedCandidateId: record.selectedCandidateId ?? null,
+    reason: record.reason,
+    candidateEvaluationIds: [...record.candidateEvaluationIds],
+    eligiblePool: [...record.eligiblePool],
+  };
+}
+
 /**
  * The isolated workspace a run allocated, and what it observed there. Counts, identities
  * and the exact source binding — never file contents.
@@ -460,6 +534,19 @@ export interface V2RunReceipt {
    * unused or unavailable. Each proves `workspaceUnchanged` (tree before == after).
    */
   readonly commands: readonly RunCommandSummary[];
+  /**
+   * V2-017 — the candidate strategy this attempt used. Absent only when the run failed before the
+   * strategy was frozen. `single` is one candidate; `shadow`/`tournament` are >1.
+   */
+  readonly strategy?: RunStrategySummary;
+  /**
+   * V2-017 — EVERY candidate the strategy generated, with its canonical evaluation. Losers stay
+   * visible here even after their workspaces are reclaimed. Empty/absent for a failed-before-strategy
+   * run; a single-candidate run lists exactly one (the same one as the singular `candidate` above).
+   */
+  readonly candidates?: readonly RunCandidateEvaluationSummary[];
+  /** V2-017 — the ONE winner selection. Absent when the run failed before selection. */
+  readonly selection?: RunSelectionSummary;
   /** Absent when preflight did not capture a source snapshot. */
   readonly sourceSnapshot?: SourceSnapshotSummary;
   /** Absent when no workspace was allocated. */
@@ -584,6 +671,8 @@ export interface V2RunResult {
   readonly disposition?: DispositionRecord;
   /** The publication this run landed, when an eligible candidate was actually promoted. */
   readonly promotion?: PromotionRecord;
+  /** V2-017 — the ONE winner selection record, when the strategy reached selection. */
+  readonly selection?: SelectionRecord;
   /** Every transition the run made, in order. The run's own account of itself. */
   readonly journal: readonly LifecycleTransition[];
   readonly receipt: V2RunReceipt;

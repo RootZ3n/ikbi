@@ -24,10 +24,11 @@
  *   7. enter `invocation` and ask THE invocation authority to call EXACTLY that route,
  *      once, recording what was authorized, what was sent, and what the provider says
  *      actually served it
- *   8. enter `candidate_strategy`: choose the SINGLE strategy, allocate ONE isolated
- *      workspace bound to the exact source commit and tree, and RE-OBSERVE the context
- *      artifact it would edit through the state-bound authority — proving the bytes the
- *      model saw are the bytes that are actually there
+ *   8. enter `candidate_strategy`: resolve the strategy (single=1, shadow=2, tournament=N,
+ *      bounded) and allocate EACH candidate its OWN isolated workspace bound to the exact
+ *      source commit and tree — sharing ONE RunId + ONE source snapshot but no sibling
+ *      workspace, observations or mutations — and RE-OBSERVE the context artifact it would
+ *      edit through the state-bound authority, proving the bytes the model saw are really there
  *   9. enter `candidate_generation` and run the governed builder loop, capturing the
  *      resulting tree as ONE content-addressed Candidate
  *  10. enter `verification` and ask THE verifier for a deterministic verdict bound to that
@@ -41,16 +42,23 @@
  *      policy, re-probes the tree at this fresh authority boundary, and returns
  *      acceptable_for_promotion / withhold / reject / quarantine — invoking no model,
  *      mutating nothing, promoting nothing, repairing nothing
- *  13. terminalize with the disposition's lawful outcome and STOP before `promotion`, which
- *      has no implementation — `acceptable_for_promotion` becomes `withheld (awaiting_promotion)`,
- *      an ELIGIBILITY fact, never a promotion — and emit a receipt whose evidence block is
- *      counted from the ledger: candidate, verification, critic and disposition are all real
+ *  13. SELECT: ask the ONE pure, deterministic selector to pick ≤1 promotion-eligible candidate
+ *      from the immutable per-candidate evaluations (only `acceptable_for_promotion` enters the
+ *      pool; correctness always outranks cost) — for `single` the one candidate is the trivial
+ *      choice, so the single path is byte-for-byte unchanged
+ *  14. enter `promotion` for the SELECTED candidate only (a losing/representative candidate never
+ *      reaches it) and ask THE promotion authority to publish EXACTLY that candidate's tree by
+ *      clean-ref CAS — no merge, no auto-resolve; reclaim the losing candidate workspaces (a
+ *      quarantined loser is retained) while every candidate's EVIDENCE stays on the receipt
+ *  15. terminalize with the promotion/disposition's lawful outcome and emit a receipt whose
+ *      evidence block is counted from the ledger — candidate(s), verification, critic, disposition,
+ *      selection and promotion are all real
  *
- * It performs NO promotion and NO source-repository mutation. The builder's edits land in
- * an isolated worktree; verification runs deterministic checks there and never touches the
- * operator's checkout. The disposition decides what SHOULD happen next; it does not itself
- * do it. Repair, retry and the mechanical publication are later authorities that do not
- * exist yet.
+ * Only the SELECTED, eligible, clean candidate mutates the operator's repository, and only through
+ * the promotion authority's compare-and-swap. Every builder's edits land in its OWN isolated
+ * worktree; verification runs deterministic checks there and never touches the operator's checkout.
+ * The disposition decides what SHOULD happen; the selector decides WHICH candidate; the promotion
+ * authority is the only thing that acts on the repository.
  */
 
 import { statSync } from "node:fs";
@@ -71,6 +79,14 @@ import {
 } from "./resolver.js";
 import { assembleContext, manifestOf, type ContextPackage, type ContextSource } from "./context.js";
 import { candidateDigest, summarizeCandidate, type CandidateRecord, type TreeCaptureResult } from "./candidate.js";
+import {
+  defaultStrategyPolicy,
+  selectCandidate,
+  type CandidateEvaluation,
+  type SelectionRecord,
+  type StrategyPolicy,
+} from "./strategy.js";
+import { buildInvocationCostRecord, pricingCatalogId, V2_SHIPPED_PRICING } from "./cost.js";
 import {
   summarizeVerification,
   verificationSubjectOf,
@@ -126,6 +142,9 @@ import {
   summarizeEvidence,
   summarizeInvocation,
   summarizeCommand,
+  summarizeStrategy,
+  summarizeSelection,
+  type RunCandidateEvaluationSummary,
   summarizeResolution,
   summarizeWorkspace,
   type V2RunReceipt,
@@ -369,6 +388,12 @@ export interface V2RunDeps {
    * `src/v2/runtime/index.ts`; absent ⇒ the guard is skipped.
    */
   readonly definitionProbe?: VerificationDefinitionProbe;
+  /**
+   * V2-017 — the frozen candidate strategy for this attempt. Defaults to the task's strategy kind
+   * (single/shadow/tournament) at its default width. The strategy decides how many independent
+   * candidates the attempt generates; it never verifies, adjudicates, promotes, or selects a model.
+   */
+  readonly strategyPolicy?: StrategyPolicy;
   /** Per-check wall-clock bound. Defaults to the donor's shared `resolveCheckTimeoutMs`. */
   readonly checkTimeoutMs?: number;
   /**
@@ -502,6 +527,117 @@ export function planFor(task: V2Task): CandidateStrategyPlan {
 }
 
 /**
+/**
+ * V2-017 — the outcome of ONE candidate's generation + canonical evaluation, inside one attempt.
+ *
+ * `status: "evaluated"` reached the disposition authority (carries a lawful disposition, and a
+ * `stopOutcome` for a non-eligible/quarantined verdict). `status: "incomplete"` hit a build/critic/
+ * engine failure or a budget denial before disposition (carries `failure`). Every candidate owns its
+ * OWN workspace/observations/mutations/invocations/CandidateId; all share the attempt's snapshot.
+ */
+interface CandidateResult {
+  readonly slot: number;
+  readonly workspace?: V2WorkspaceRecord;
+  readonly observations: number;
+  readonly invocations: readonly V2InvocationRecord[];
+  readonly commands: readonly BuilderCommandRecord[];
+  readonly candidate?: CandidateRecord;
+  readonly verification?: VerificationRecord;
+  readonly critic?: CriticRecord;
+  readonly disposition?: DispositionRecord;
+  readonly status: "evaluated" | "incomplete";
+  readonly eligible: boolean;
+  /** For an EVALUATED non-eligible/quarantined candidate: its truthful terminal outcome. */
+  readonly stopOutcome?: RunTerminalOutcome;
+  /** For an INCOMPLETE candidate: the structured engine/build/critic/budget failure. */
+  readonly failure?: RunFailure;
+}
+
+/** The pricing catalog used to compute a per-candidate cost TIE-BREAK signal (the SAME pure
+ *  calculator the session cost authority uses — not a second ledger). */
+const STRATEGY_TIEBREAK_CATALOG = V2_SHIPPED_PRICING;
+const STRATEGY_TIEBREAK_CATALOG_ID = pricingCatalogId(STRATEGY_TIEBREAK_CATALOG);
+
+/** One candidate's own known cost (a floor) + whether any of its calls is unpriced — for the selector. */
+function candidateKnownCost(invocations: readonly V2InvocationRecord[]): { readonly known: number; readonly hasUnknown: boolean } {
+  let known = 0;
+  let hasUnknown = false;
+  for (const inv of invocations) {
+    const c = buildInvocationCostRecord({ record: inv, catalog: STRATEGY_TIEBREAK_CATALOG, catalogId: STRATEGY_TIEBREAK_CATALOG_ID });
+    if (c.amountMicroUsd !== undefined) known += c.amountMicroUsd;
+    if (c.hasUnknownCost) hasUnknown = true;
+  }
+  return { known, hasUnknown };
+}
+
+/** Project a candidate result into the immutable evaluation the pure selector reads. */
+function candidateEvaluationOf(c: CandidateResult): CandidateEvaluation | undefined {
+  if (c.candidate === undefined) {
+    // A candidate that never even produced a tree (allocate/observe/generation failed). It has no
+    // CandidateId, so it cannot enter the selector; the attempt derives its outcome from `failure`.
+    return undefined;
+  }
+  const cost = candidateKnownCost(c.invocations);
+  return {
+    candidateId: c.candidate.candidateId,
+    workspaceId: c.candidate.workspaceId,
+    slot: c.slot,
+    status: c.status,
+    ...(c.disposition !== undefined ? { decision: c.disposition.decision } : {}),
+    promotionEligible: c.eligible,
+    ...(c.verification !== undefined ? { verificationVerdict: c.verification.verdict } : {}),
+    ...(c.critic !== undefined ? { criticVerdict: c.critic.verdict } : {}),
+    knownCostMicroUsd: cost.known,
+    hasUnknownCost: cost.hasUnknown,
+    mutationCount: c.candidate.mutationIds.length,
+    changedPathCount: c.candidate.changedPaths.length,
+    ...(c.failure !== undefined ? { failureCode: c.failure.code } : {}),
+  };
+}
+
+/** Build the receipt-safe evaluation summary for ONE candidate (loser evidence stays visible). */
+function candidateSummaryOf(c: CandidateResult, selectedCandidateId: string | undefined, cleanup: ReadonlyMap<string, string>): RunCandidateEvaluationSummary {
+  const cost = candidateKnownCost(c.invocations);
+  const selected = c.candidate !== undefined && c.candidate.candidateId === selectedCandidateId;
+  const wsId = c.workspace?.workspaceId;
+  // The ACTUAL disposition is recorded in the cleanup map for BOTH the representative (retention
+  // block) and every loser (cleanup loop). "retained" is the fallback for the (theoretical) case of
+  // a workspace that reached neither — never a claim that overrides a real discard.
+  const workspaceCleanup = wsId === undefined ? "none" : cleanup.get(wsId) ?? "retained";
+  return {
+    slot: c.slot,
+    candidateId: c.candidate?.candidateId ?? null,
+    workspaceId: wsId ?? null,
+    status: c.status,
+    promotionEligible: c.eligible,
+    decision: c.disposition?.decision ?? null,
+    verificationId: c.verification?.verificationId ?? null,
+    verificationVerdict: c.verification?.verdict ?? null,
+    criticId: c.critic?.criticId ?? null,
+    criticVerdict: c.critic?.verdict ?? null,
+    dispositionId: c.disposition?.dispositionId ?? null,
+    knownCostMicroUsd: cost.known,
+    hasUnknownCost: cost.hasUnknown,
+    mutationCount: c.candidate?.mutationIds.length ?? 0,
+    changedPathCount: c.candidate?.changedPaths.length ?? 0,
+    failureCode: c.failure?.code ?? null,
+    selected,
+    workspaceCleanup,
+  };
+}
+
+/** Deterministic rank of a NON-selected candidate for choosing the attempt's representative outcome:
+ *  a truthful adverse verdict outranks an incomplete failure; among adverse, withheld > rejected >
+ *  quarantined; ties break by slot. Lower is better. */
+function representativeRank(c: CandidateResult): number {
+  const kind = c.stopOutcome?.kind;
+  if (kind === "withheld") return 0;
+  if (kind === "rejected") return 1;
+  if (kind === "quarantined") return 2;
+  return 3; // incomplete / failed
+}
+
+/**
  * THE canonical v2 build run. One task in, one authoritative result out.
  *
  * The shape of this function is the shape of the whole engine: mint identity, open
@@ -545,6 +681,14 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
   // path that reaches a real adjudication (and, when eligible, a publication); left undefined
   // when the run failed earlier (then the outcome is `failed` with the recorded failure).
   let dispositionOutcome: RunTerminalOutcome | undefined;
+  // V2-017 — the frozen candidate strategy, the per-candidate results (each with its OWN workspace,
+  // candidate, evidence), and the ONE selection record. For `single` there is exactly one candidate
+  // and the singular `candidate`/`verification`/… above point at it, so the single path is unchanged.
+  let strategyPolicy: StrategyPolicy | undefined;
+  let selectionRecord: SelectionRecord | undefined;
+  const candidateResults: CandidateResult[] = [];
+  /** Per-candidate loser-workspace cleanup outcome (workspaceId → status), for receipt truth. */
+  const candidateWorkspaceDisposition = new Map<string, "reclaimed" | "retained" | "retain_failed">();
 
   const failure = await (async (): Promise<RunFailure | null> => {
     const checked = preflight(request, probe);
@@ -628,329 +772,243 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     }
     lifecycle.record(runId, { kind: "context", packageId: contextPackage.packageId, artifacts: contextPackage.artifacts.length });
 
-    // Stage 4 — CANDIDATE STRATEGY. "Where and how is a candidate produced?" For the
-    // SINGLE strategy that is one isolated workspace. A workspace is not a candidate:
-    // allocating one produces nothing.
-    lifecycle.enter(runId, "candidate_strategy");
-    // The workspace materializes THE SAME snapshot context was assembled from, so the
-    // builder starts from exactly the state it was shown.
-    const allocated = await deps.workspaces.allocate({ runId, source: source.snapshot, label: `v2-${DEMONSTRATED_ROLE}` });
-    if (!allocated.ok) return allocated.failure;
-    workspace = allocated.workspace;
-    lifecycle.record(runId, { kind: "workspace", id: workspace.workspaceId, baseTree: workspace.source.baseTree });
+    // Stage 4 — CANDIDATE STRATEGY (V2-017). Freeze the strategy for this attempt. `single` produces
+    // ONE candidate (behaviour unchanged); `shadow`/`tournament` produce N INDEPENDENT candidates —
+    // each with its OWN workspace/observations/mutations/invocations/CandidateId — ALL sharing this
+    // attempt's single RunId and SourceSnapshot. The strategy generates + compares; it never verifies,
+    // adjudicates, promotes, retries, or selects a model. The linear lifecycle is honoured by walking
+    // each stage ONCE and doing every candidate's work for that stage before advancing.
+    const strat = deps.strategyPolicy ?? defaultStrategyPolicy(task.candidateStrategy);
+    strategyPolicy = strat;
+    const ctxPkg = contextPackage;
+    const builderDecision = decision;
+    const critDecision = criticDecision;
+    const src = source;
 
-    // VERIFICATION-POLICY SOURCE TRUTH (V2-016A/B4). The freshly materialized workspace IS the source
-    // tree; fingerprint the verification-DEFINITION artifacts NOW, before the builder can touch them.
-    // A manifest-derived exam that the candidate later rewrote is caught against this source truth.
-    if (deps.definitionProbe !== undefined) {
-      sourceVerificationDefinition = await deps.definitionProbe.capture(workspace.path);
+    // Mutable per-candidate state, threaded across the shared stages. Each slot owns its workspace,
+    // observations, invocations, commands, and its candidate/verification/critic/disposition records.
+    interface Slot {
+      slot: number;
+      workspace?: V2WorkspaceRecord;
+      observations: number;
+      invocations: readonly V2InvocationRecord[];
+      commands: readonly BuilderCommandRecord[];
+      candidate?: CandidateRecord;
+      verification?: VerificationRecord;
+      critic?: CriticRecord;
+      disposition?: DispositionRecord;
+      status: "evaluated" | "incomplete";
+      eligible: boolean;
+      stopOutcome?: RunTerminalOutcome;
+      failure?: RunFailure;
     }
+    const slots: Slot[] = [];
+    for (let i = 0; i < strat.candidateCount; i += 1) slots.push({ slot: i, observations: 0, invocations: [], commands: [], status: "incomplete", eligible: false });
+    const live = (): Slot[] => slots.filter((s) => s.failure === undefined && s.stopOutcome === undefined);
 
-    // RE-OBSERVE. The context package was assembled from the TARGET REPOSITORY before any
-    // workspace existed; the workspace is a worktree at the base commit. Those are not
-    // guaranteed to agree — an uncommitted change in the source repo is exactly the case
-    // where they do not. So the bytes the model saw are checked against the bytes that
-    // are actually here, through the same authority every edit must use.
-    const anchor = rebindableArtifact(contextPackage);
-    if (anchor !== undefined) {
-      const observed = await deps.mutations.observe({ runId, workspace, path: anchor.path });
-      if (!observed.ok) return observed.failure;
-      workspaceObservations += 1;
-      lifecycle.record(runId, {
-        kind: "observation",
-        id: observed.observation.observationId,
-        workspaceId: workspace.workspaceId,
-        path: observed.observation.path,
-      });
-      if (observed.observation.state.contentSha256 !== anchor.observedSha256) {
-        // Do NOT silently rebuild context. Re-contextualization is a recovery decision,
-        // and pretending the model saw what is on disk would make every downstream
-        // state-bound edit rest on a lie.
-        return workspaceFailure({
-          code: V2_WORKSPACE_FAILURE_CODES.contextDrift,
-          message:
-            `the workspace copy of ${anchor.path} does not match the bytes the context package recorded ` +
-            `— the model was shown a state this workspace does not have`,
-          detail: {
-            path: anchor.path,
-            workspaceId: workspace.workspaceId,
-            contextSha256: anchor.observedSha256,
-            workspaceSha256: observed.observation.state.contentSha256 ?? "none",
-          },
-        });
+    // Phase A — WORKSPACES (candidate_strategy). Allocate each candidate its OWN isolated workspace
+    // from the SAME source snapshot, and re-observe the context anchor against it (drift guard).
+    lifecycle.enter(runId, "candidate_strategy");
+    for (const s of slots) {
+      const label = strat.candidateCount === 1 ? `v2-${DEMONSTRATED_ROLE}` : `v2-${DEMONSTRATED_ROLE}-c${s.slot}`;
+      const allocated = await deps.workspaces.allocate({ runId, source: src.snapshot, label });
+      if (!allocated.ok) { s.failure = allocated.failure; continue; }
+      s.workspace = allocated.workspace;
+      lifecycle.record(runId, { kind: "workspace", id: s.workspace.workspaceId, baseTree: s.workspace.source.baseTree });
+      if (deps.definitionProbe !== undefined && sourceVerificationDefinition === undefined) {
+        sourceVerificationDefinition = await deps.definitionProbe.capture(s.workspace.path);
+      }
+      const anchor = rebindableArtifact(ctxPkg);
+      if (anchor !== undefined) {
+        const observed = await deps.mutations.observe({ runId, workspace: s.workspace, path: anchor.path });
+        if (!observed.ok) { s.failure = observed.failure; continue; }
+        s.observations += 1;
+        lifecycle.record(runId, { kind: "observation", id: observed.observation.observationId, workspaceId: s.workspace.workspaceId, path: observed.observation.path });
+        if (observed.observation.state.contentSha256 !== anchor.observedSha256) {
+          s.failure = workspaceFailure({
+            code: V2_WORKSPACE_FAILURE_CODES.contextDrift,
+            message: `the workspace copy of ${anchor.path} does not match the bytes the context package recorded — the model was shown a state this workspace does not have`,
+            detail: { path: anchor.path, workspaceId: s.workspace.workspaceId, contextSha256: anchor.observedSha256, workspaceSha256: observed.observation.state.contentSha256 ?? "none" },
+          });
+        }
       }
     }
 
-    // Stage 5 — CANDIDATE GENERATION. The builder loop. EVERY model turn goes through the
-    // one invocation authority, EVERY file read produces an observation, and EVERY write
-    // names the observation that authorized it. This function holds none of that
-    // machinery itself — it wires the authorities together and records what they did.
+    // Phase B — CANDIDATE GENERATION (candidate_generation). Run the governed builder loop for each
+    // candidate INDEPENDENTLY. A candidate never sees a sibling; each write goes through the one
+    // mutation authority and each turn through the one invocation authority. Stages are entered ONLY
+    // when their precondition is met, so an attempt where every candidate failed earlier terminalizes
+    // at the last real stage — exactly as the single-candidate spine did (no empty stage entered).
+    if (slots.some((s) => s.workspace !== undefined)) {
     lifecycle.enter(runId, "candidate_generation");
-
-    const executor = deps.buildTools({
-      runId,
-      workspace,
-      mutations: deps.mutations,
-      onObservation: (observation) => {
-        workspaceObservations += 1;
-        lifecycle.record(runId, {
-          kind: "observation",
-          id: observation.observationId,
-          workspaceId: observation.workspaceId,
-          path: observation.path,
-        });
-      },
-      onMutation: (applied) => {
-        lifecycle.record(runId, {
-          kind: "mutation",
-          id: applied.mutationId,
-          workspaceId: workspace!.workspaceId,
-          path: applied.path,
-        });
-      },
-      // V2-015: the READ-ONLY command terminal, when wired. Absent ⇒ run_command is refused as
-      // unavailable. It mints no observation and holds no mutation authority.
-      ...(deps.commands !== undefined ? { commands: deps.commands } : {}),
-    });
-
-    const generated = await generateCandidate({
-      runId,
-      taskId,
-      decision,
-      contextPackage,
-      transport: deps.transport,
-      executor,
-      untrustedBoundary: deps.untrustedBoundary,
-      mintInvocationId: () => ids.mint("invocation"),
-      // V2-013: advisory repair evidence from a prior FAILED attempt, when this run is a
-      // semantic-repair attempt. Untrusted, fenced, carrying no prior authority.
-      ...(deps.repairBrief !== undefined ? { repairBrief: deps.repairBrief } : {}),
-      ...(deps.builderBudget !== undefined ? { budget: deps.builderBudget } : {}),
-      ...(deps.aliases !== undefined ? { aliases: deps.aliases } : {}),
-      ...(deps.admission !== undefined ? { admission: deps.admission } : {}),
-      now,
-    });
-
-    // Invocations are recorded whether generation succeeded or not: the provider really
-    // was contacted, and a receipt that omitted the calls a failed build paid for would
-    // be understating the run's cost.
-    for (const record of generated.ok ? generated.generation.invocations : generated.invocations) {
-      lifecycle.record(runId, { kind: "invocation", id: record.invocationId, role: decision.role });
+    for (const s of live()) {
+      const ws = s.workspace!;
+      const executor = deps.buildTools({
+        runId, workspace: ws, mutations: deps.mutations,
+        onObservation: (observation) => { s.observations += 1; lifecycle.record(runId, { kind: "observation", id: observation.observationId, workspaceId: observation.workspaceId, path: observation.path }); },
+        onMutation: (applied) => { lifecycle.record(runId, { kind: "mutation", id: applied.mutationId, workspaceId: ws.workspaceId, path: applied.path }); },
+        ...(deps.commands !== undefined ? { commands: deps.commands } : {}),
+      });
+      const generated = await generateCandidate({
+        runId, taskId, decision: builderDecision, contextPackage: ctxPkg, transport: deps.transport, executor,
+        untrustedBoundary: deps.untrustedBoundary, mintInvocationId: () => ids.mint("invocation"),
+        ...(deps.repairBrief !== undefined ? { repairBrief: deps.repairBrief } : {}),
+        ...(deps.builderBudget !== undefined ? { budget: deps.builderBudget } : {}),
+        ...(deps.aliases !== undefined ? { aliases: deps.aliases } : {}),
+        ...(deps.admission !== undefined ? { admission: deps.admission } : {}),
+        now,
+      });
+      for (const record of generated.ok ? generated.generation.invocations : generated.invocations) lifecycle.record(runId, { kind: "invocation", id: record.invocationId, role: builderDecision.role });
+      if (!generated.ok) for (const id of generated.attemptedInvocationIds) lifecycle.record(runId, { kind: "invocation", id, role: builderDecision.role });
+      s.invocations = generated.ok ? generated.generation.invocations : generated.invocations;
+      s.commands = generated.ok ? generated.generation.commands : generated.commands;
+      if (!generated.ok) { s.failure = generated.failure; continue; }
+      const capturedTree = await deps.captureTree(ws);
+      if (!capturedTree.ok) { s.failure = capturedTree.failure; continue; }
+      const generation = generated.generation;
+      s.candidate = Object.freeze({
+        candidateId: candidateDigest({ sourceSnapshotId: src.snapshot.snapshotId, tree: capturedTree.tree }),
+        runId, sourceSnapshotId: src.snapshot.snapshotId, workspaceId: ws.workspaceId, builderDecisionId: builderDecision.decisionId,
+        invocationIds: generation.invocationIds, mutationIds: generation.mutationIds, changedPaths: generation.changedPaths,
+        tree: capturedTree.tree, completion: "finished", claim: generation.claim,
+        metadata: { turns: generation.turns, toolCalls: generation.toolCalls, toolFailures: generation.toolFailures, startedAt: generation.startedAt, endedAt: generation.endedAt },
+      });
+      lifecycle.record(runId, { kind: "candidate", id: s.candidate.candidateId, workspaceId: ws.workspaceId });
     }
-    // A turn that reached the wire and then failed has no record — but it happened, and
-    // the receipt must not report the provider as never contacted.
-    if (!generated.ok) {
-      for (const id of generated.attemptedInvocationIds) lifecycle.record(runId, { kind: "invocation", id, role: decision.role });
     }
-    invocations = generated.ok ? generated.generation.invocations : generated.invocations;
-    // Read-only commands the builder ran (V2-015) — collected whether or not generation
-    // succeeded, so a failed build's terminal inspection is still on the receipt.
-    commands = generated.ok ? generated.generation.commands : generated.commands;
-    if (!generated.ok) return generated.failure;
 
-    // CAPTURE. The builder said it is done; now the exact resulting state is addressed,
-    // so verification inspects a tree rather than a description of one.
-    const capturedTree = await deps.captureTree(workspace);
-    if (!capturedTree.ok) return capturedTree.failure;
-
-    const generation = generated.generation;
-    candidate = Object.freeze({
-      candidateId: candidateDigest({ sourceSnapshotId: source.snapshot.snapshotId, tree: capturedTree.tree }),
-      runId,
-      sourceSnapshotId: source.snapshot.snapshotId,
-      workspaceId: workspace.workspaceId,
-      builderDecisionId: decision.decisionId,
-      invocationIds: generation.invocationIds,
-      mutationIds: generation.mutationIds,
-      changedPaths: generation.changedPaths,
-      tree: capturedTree.tree,
-      completion: "finished",
-      claim: generation.claim,
-      metadata: {
-        turns: generation.turns,
-        toolCalls: generation.toolCalls,
-        toolFailures: generation.toolFailures,
-        startedAt: generation.startedAt,
-        endedAt: generation.endedAt,
-      },
-    });
-    lifecycle.record(runId, { kind: "candidate", id: candidate.candidateId, workspaceId: workspace.workspaceId });
-
-    // Stage 6 — VERIFICATION. THE deterministic authority over THIS exact candidate. It
-    // recomputes the candidate tree (drift guard), plans the checks, runs them bounded
-    // through governed-exec, recomputes the tree (mutation guard), and classifies. No
-    // model is consulted; a red verdict ends the run — recovery is a later authority.
+    // Phase C — VERIFICATION (verification). THE deterministic authority, per candidate tree.
+    if (slots.some((s) => s.candidate !== undefined)) {
     lifecycle.enter(runId, "verification");
-    const verified = await verifyCandidate({
-      runId,
-      subject: verificationSubjectOf(candidate),
-      candidate,
-      workspacePath: workspace.path,
-      checksSource: deps.checksSource,
-      runner: deps.checkRunner,
-      tree: deps.treeProbe,
-      checkTimeoutMs: deps.checkTimeoutMs ?? DEFAULT_CHECK_TIMEOUT_MS,
-      // V2-016A/B4: the source-truth verification-definition fingerprint + the probe, so a candidate
-      // that rewrote its manifest-derived exam is caught (verification_policy_changed), fail-closed.
-      ...(sourceVerificationDefinition !== undefined ? { sourceDefinition: sourceVerificationDefinition } : {}),
-      ...(deps.definitionProbe !== undefined ? { definitionProbe: deps.definitionProbe } : {}),
-      now,
-    });
-    if (!verified.ok) return verified.failure;
-    verification = verified.record;
-    lifecycle.record(runId, { kind: "verification", id: verification.verificationId, candidateId: candidate.candidateId });
+    for (const s of live()) {
+      if (s.candidate === undefined) continue;
+      const verified = await verifyCandidate({
+        runId, subject: verificationSubjectOf(s.candidate), candidate: s.candidate, workspacePath: s.workspace!.path,
+        checksSource: deps.checksSource, runner: deps.checkRunner, tree: deps.treeProbe, checkTimeoutMs: deps.checkTimeoutMs ?? DEFAULT_CHECK_TIMEOUT_MS,
+        ...(sourceVerificationDefinition !== undefined ? { sourceDefinition: sourceVerificationDefinition } : {}),
+        ...(deps.definitionProbe !== undefined ? { definitionProbe: deps.definitionProbe } : {}),
+        now,
+      });
+      if (!verified.ok) { s.failure = verified.failure; continue; }
+      s.verification = verified.record;
+      lifecycle.record(runId, { kind: "verification", id: s.verification.verificationId, candidateId: s.candidate.candidateId });
+    }
+    }
 
-    // Stage 7 — CRITICISM. THE semantic critic. A SEPARATELY resolved critic model judges
-    // the SAME exact tree against the operator's intent and the deterministic evidence. It
-    // runs regardless of the verification verdict (never skip-on-red), reads an immutable
-    // review package (never the live workspace), holds no tools, and returns a STRICT
-    // structured judgment — a bare "fail" cannot become evidence. It is semantic evidence,
-    // not proof, and it decides nothing about promotion.
+    // Phase D — CRITICISM (criticism). THE semantic critic, per candidate; pre-call cost admission on
+    // the SAME session wallet. A candidate never sees a sibling's diff, claim, or defects.
+    if (slots.some((s) => s.verification !== undefined)) {
     lifecycle.enter(runId, "criticism");
-    // PRE-CALL COST ADMISSION for the critic's single call — the same session wallet the
-    // builder spends from. A denial stops the run with a non-retryable policy failure BEFORE
-    // the critic call is made; the candidate is retained (verified) but not adjudicated.
-    const criticMaxOutputTokens = Math.min(CRITIC_MAX_OUTPUT_TOKENS, contextPackage.budget.reservedCompletionTokens);
-    if (deps.admission !== undefined) {
-      const admittedCritic = deps.admission.admitNext({
-        identity: { authorizedModelId: criticDecision.modelId, sentProviderId: criticDecision.providerId, sentProviderModelId: criticDecision.providerModelId },
-        estimatedInputTokens: contextPackage.budget.availableInputTokens,
-        maxOutputTokens: criticMaxOutputTokens,
+    for (const s of live()) {
+      if (s.candidate === undefined || s.verification === undefined) continue;
+      const criticMaxOutputTokens = Math.min(CRITIC_MAX_OUTPUT_TOKENS, ctxPkg.budget.reservedCompletionTokens);
+      if (deps.admission !== undefined) {
+        const admittedCritic = deps.admission.admitNext({ identity: { authorizedModelId: critDecision.modelId, sentProviderId: critDecision.providerId, sentProviderModelId: critDecision.providerModelId }, estimatedInputTokens: ctxPkg.budget.availableInputTokens, maxOutputTokens: criticMaxOutputTokens });
+        if (!admittedCritic.admit) { s.failure = admittedCritic.failure; continue; }
+      }
+      const judged = await judgeCandidate({
+        runId, taskId, goal: task.goal, candidate: s.candidate, verification: s.verification, verificationSummary: summarizeVerification(s.verification), workspacePath: s.workspace!.path,
+        decision: critDecision, transport: deps.transport, boundary: deps.untrustedBoundary, diffSource: deps.candidateDiff, diffBudget: DEFAULT_DIFF_BUDGET,
+        probeTree: (path) => deps.treeProbe.treeOf(path), mintInvocationId: () => ids.mint("invocation"), maxOutputTokens: criticMaxOutputTokens, timeoutMs: CRITIC_TIMEOUT_MS,
+        ...(deps.aliases !== undefined ? { aliases: deps.aliases } : {}), now,
       });
-      if (!admittedCritic.admit) return admittedCritic.failure;
+      if (judged.ok) {
+        lifecycle.record(runId, { kind: "invocation", id: judged.generation.invocation.invocationId, role: "critic" });
+        s.invocations = [...s.invocations, judged.generation.invocation];
+        if (deps.admission !== undefined) deps.admission.charge(judged.generation.invocation);
+      } else if (judged.invocation !== undefined) {
+        lifecycle.record(runId, { kind: "invocation", id: judged.invocation.invocationId, role: "critic" });
+        s.invocations = [...s.invocations, judged.invocation];
+        if (deps.admission !== undefined) deps.admission.charge(judged.invocation);
+      }
+      if (!judged.ok) { s.failure = judged.failure; continue; }
+      s.critic = judged.generation.record;
+      lifecycle.record(runId, { kind: "critic", id: s.critic.criticId, candidateId: s.candidate.candidateId, verificationId: s.verification.verificationId });
     }
-    const judged = await judgeCandidate({
-      runId,
-      taskId,
-      goal: task.goal,
-      candidate,
-      verification,
-      verificationSummary: summarizeVerification(verification),
-      workspacePath: workspace.path,
-      decision: criticDecision,
-      transport: deps.transport,
-      boundary: deps.untrustedBoundary,
-      diffSource: deps.candidateDiff,
-      diffBudget: DEFAULT_DIFF_BUDGET,
-      probeTree: (path) => deps.treeProbe.treeOf(path),
-      mintInvocationId: () => ids.mint("invocation"),
-      maxOutputTokens: criticMaxOutputTokens,
-      timeoutMs: CRITIC_TIMEOUT_MS,
-      ...(deps.aliases !== undefined ? { aliases: deps.aliases } : {}),
-      now,
-    });
-    // The critic's one invocation really happened; record it whether or not the judgment
-    // parsed, so the receipt does not understate what the run cost.
-    if (judged.ok) {
-      lifecycle.record(runId, { kind: "invocation", id: judged.generation.invocation.invocationId, role: "critic" });
-      invocations = [...invocations, judged.generation.invocation];
-      // Charge the critic's observed usage to the session wallet (idempotent; reconcile repeats it).
-      if (deps.admission !== undefined) deps.admission.charge(judged.generation.invocation);
-    } else if (judged.invocation !== undefined) {
-      // M1: the critic's wire call SUCCEEDED but its response failed strict parsing. The call is
-      // real — RETAIN its InvocationRecord so the invocation ledger and session cost account it,
-      // exactly like a parsed one. It is NOT critic evidence (no CriticRecord); the run still fails.
-      lifecycle.record(runId, { kind: "invocation", id: judged.invocation.invocationId, role: "critic" });
-      invocations = [...invocations, judged.invocation];
-      if (deps.admission !== undefined) deps.admission.charge(judged.invocation);
     }
-    if (!judged.ok) return judged.failure;
-    const criticRecord = judged.generation.record;
-    critic = criticRecord;
-    lifecycle.record(runId, {
-      kind: "critic",
-      id: criticRecord.criticId,
-      candidateId: candidate.candidateId,
-      verificationId: verification.verificationId,
-    });
 
-    // Stage 8 — DISPOSITION. THE one adjudication authority. It weighs BOTH evidence classes
-    // — the deterministic verification AND the semantic critic — against ONE explicit policy,
-    // and returns the ONE lawful disposition. It invokes no model, mutates nothing, re-runs
-    // nothing, promotes nothing, and repairs nothing. It re-probes the tree at this fresh
-    // authority boundary (drift ⇒ quarantine over a stale subject, never an ordinary
-    // decision) and refuses incoherent evidence outright.
+    // Phase E — DISPOSITION (disposition). THE one adjudication authority, per candidate. No model,
+    // no mutation, no promotion. A drift quarantine or a non-eligible verdict sets the candidate's
+    // truthful stop outcome; an eligible candidate carries its disposition into selection.
+    if (slots.some((s) => s.critic !== undefined)) {
     lifecycle.enter(runId, "disposition");
-    const disposed = await judgeDisposition({
-      runId,
-      taskId,
-      candidate,
-      verification,
-      critic: criticRecord,
-      policy: deps.dispositionPolicy ?? DEFAULT_DISPOSITION_POLICY,
-      workspacePath: workspace.path,
-      probeTree: (path: string) => deps.treeProbe.treeOf(path),
-    });
-    // A coherence break is an engine defect, not a candidate outcome — the run FAILS.
-    if (!disposed.ok && disposed.kind === "mismatch") return disposed.failure;
-    // A tree that moved since the critic looked is a stale subject: QUARANTINE it. We do not
-    // adjudicate over it and we do not auto-reverify — recovery is a later authority.
-    if (!disposed.ok) {
-      dispositionOutcome = { kind: "quarantined", reason: "safety_forensics", detail: disposed.detail };
-      return null;
+    for (const s of live()) {
+      if (s.candidate === undefined || s.verification === undefined || s.critic === undefined) continue;
+      const disposed = await judgeDisposition({ runId, taskId, candidate: s.candidate, verification: s.verification, critic: s.critic, policy: deps.dispositionPolicy ?? DEFAULT_DISPOSITION_POLICY, workspacePath: s.workspace!.path, probeTree: (path: string) => deps.treeProbe.treeOf(path) });
+      if (!disposed.ok && disposed.kind === "mismatch") { s.failure = disposed.failure; continue; }
+      if (!disposed.ok) { s.stopOutcome = { kind: "quarantined", reason: "safety_forensics", detail: disposed.detail }; s.status = "evaluated"; continue; }
+      s.disposition = disposed.record;
+      lifecycle.record(runId, { kind: "disposition", id: s.disposition.dispositionId, candidateId: s.candidate.candidateId, verificationId: s.verification.verificationId, criticId: s.critic.criticId, decision: s.disposition.decision });
+      s.status = "evaluated";
+      s.eligible = s.disposition.eligibleForPromotion;
+      if (!s.eligible) s.stopOutcome = terminalOutcomeForDisposition(s.disposition, s.candidate.candidateId, s.verification.verificationId);
     }
-    dispositionRecord = disposed.record;
-    lifecycle.record(runId, {
-      kind: "disposition",
-      id: dispositionRecord.dispositionId,
-      candidateId: candidate.candidateId,
-      verificationId: verification.verificationId,
-      criticId: criticRecord.criticId,
-      decision: dispositionRecord.decision,
-    });
-
-    // The candidate has been VERIFIED, CRITIQUED and ADJUDICATED. If the disposition did NOT
-    // authorize publication, the run terminalizes here exactly as V2-010 did — withheld,
-    // rejected or quarantined — and never enters the promotion stage.
-    if (!dispositionRecord.eligibleForPromotion) {
-      dispositionOutcome = terminalOutcomeForDisposition(dispositionRecord, candidate.candidateId, verification.verificationId);
-      return null;
     }
 
-    // Stage 9 — PROMOTION. THE publication authority mechanically publishes the ALREADY-
-    // AUTHORIZED candidate. It re-adjudicates NOTHING: it proves authorization from the
-    // disposition, rechecks every mutable fact at this fresh boundary (candidate tree drift,
-    // target staleness), refuses anything unsafe WITHOUT touching git, and — only when all
-    // checks pass — lands EXACTLY the candidate tree by a clean-ref CAS. No model, no
-    // mutation, no verification, no merge. A dirty source checkout is refused (withheld); a
-    // moved target is refused (withheld) — recovery re-verifies, promotion never merges.
-    lifecycle.enter(runId, "promotion");
-    const promoted = await promoteAuthorized({
-      taskId,
-      candidate,
-      verification,
-      critic: criticRecord,
-      disposition: dispositionRecord,
-      target: {
-        repositoryPath: workspace.source.repositoryPath,
-        baseBranch: workspace.source.baseBranch,
-        baseCommit: workspace.source.baseCommit,
-      },
-      sourceClean: source.snapshot.clean,
-      workspacePath: workspace.path,
-      probeTree: (path: string) => deps.treeProbe.treeOf(path),
-      publisher: deps.publisher,
-      now,
-    });
-    // A landed publication (including an idempotent already-landed or a degraded landing) is
-    // recorded on the ledger, binding it to the disposition that authorized it — this is what
-    // the `accepted` terminal outcome cites.
-    if (promoted.kind === "promoted" || promoted.kind === "already_promoted" || promoted.kind === "promoted_degraded") {
-      promotionRecord = promoted.record;
-      lifecycle.record(runId, {
-        kind: "promotion",
-        id: promoted.record.promotionId,
-        candidateId: candidate.candidateId,
-        verificationId: verification.verificationId,
-        dispositionId: dispositionRecord.dispositionId,
+    // Aggregate cross-candidate accounting, then convert to immutable per-candidate results.
+    for (const s of slots) {
+      invocations = [...invocations, ...s.invocations];
+      commands = [...commands, ...s.commands];
+      workspaceObservations += s.observations;
+      candidateResults.push({
+        slot: s.slot, observations: s.observations, invocations: s.invocations, commands: s.commands, status: s.status, eligible: s.eligible,
+        ...(s.workspace !== undefined ? { workspace: s.workspace } : {}),
+        ...(s.candidate !== undefined ? { candidate: s.candidate } : {}),
+        ...(s.verification !== undefined ? { verification: s.verification } : {}),
+        ...(s.critic !== undefined ? { critic: s.critic } : {}),
+        ...(s.disposition !== undefined ? { disposition: s.disposition } : {}),
+        ...(s.stopOutcome !== undefined ? { stopOutcome: s.stopOutcome } : {}),
+        ...(s.failure !== undefined ? { failure: s.failure } : {}),
       });
     }
-    // A wrong-evidence refusal or a publication infrastructure fault is an engine/infra failure
-    // with NOTHING landed — the run FAILS with the structured failure.
-    if (promoted.kind === "refused_wrong_evidence" || promoted.kind === "infrastructure_failure") return promoted.failure;
-    // Every other outcome is a truthful terminal state: accepted (landed) or a specific
-    // withheld/quarantined refusal. NEVER `accepted` unless a publication actually landed.
-    dispositionOutcome = terminalOutcomeForPromotion(promoted, candidate.candidateId, verification.verificationId);
+
+    // SELECT — the ONE pure selector over the immutable canonical evaluations.
+    const evaluations = candidateResults.map(candidateEvaluationOf).filter((e): e is CandidateEvaluation => e !== undefined);
+    const selection = selectCandidate({ runId, policy: strat, evaluations, launchedCount: strat.candidateCount });
+    selectionRecord = selection;
+
+    const bindRep = (r: CandidateResult): void => {
+      if (r.workspace !== undefined) workspace = r.workspace;
+      if (r.candidate !== undefined) candidate = r.candidate;
+      if (r.verification !== undefined) verification = r.verification;
+      if (r.critic !== undefined) critic = r.critic;
+      if (r.disposition !== undefined) dispositionRecord = r.disposition;
+    };
+
+    const selected = selection.selectedCandidateId !== undefined
+      ? candidateResults.find((c) => c.candidate?.candidateId === selection.selectedCandidateId)
+      : undefined;
+
+    if (selected !== undefined && selected.candidate !== undefined && selected.verification !== undefined && selected.critic !== undefined && selected.disposition !== undefined && selected.workspace !== undefined) {
+      bindRep(selected);
+      const selVer = selected.verification; const selDisp = selected.disposition; const selWs = selected.workspace; const selCand = selected.candidate; const selCrit = selected.critic;
+      // Stage 9 — PROMOTION of the selected candidate. EXACTLY ONE candidate reaches promotion.
+      lifecycle.enter(runId, "promotion");
+      const promoted = await promoteAuthorized({
+        taskId, candidate: selCand, verification: selVer, critic: selCrit, disposition: selDisp,
+        target: { repositoryPath: selWs.source.repositoryPath, baseBranch: selWs.source.baseBranch, baseCommit: selWs.source.baseCommit },
+        sourceClean: src.snapshot.clean, workspacePath: selWs.path, probeTree: (path: string) => deps.treeProbe.treeOf(path), publisher: deps.publisher, now,
+      });
+      if (promoted.kind === "promoted" || promoted.kind === "already_promoted" || promoted.kind === "promoted_degraded") {
+        promotionRecord = promoted.record;
+        lifecycle.record(runId, { kind: "promotion", id: promoted.record.promotionId, candidateId: selCand.candidateId, verificationId: selVer.verificationId, dispositionId: selDisp.dispositionId });
+      }
+      if (promoted.kind === "refused_wrong_evidence" || promoted.kind === "infrastructure_failure") return promoted.failure;
+      dispositionOutcome = terminalOutcomeForPromotion(promoted, selCand.candidateId, selVer.verificationId);
+      return null;
+    }
+
+    // NO SELECTION — no promotion. Bind the singular fields to the deterministic REPRESENTATIVE
+    // candidate and derive the attempt's truthful terminal outcome. For `single` the representative
+    // IS the one candidate, reproducing withheld/rejected/quarantined/failed exactly.
+    if (selection.reason === "require_all_candidates_incomplete") {
+      const failed = candidateResults.find((c) => c.status === "incomplete" && c.failure !== undefined);
+      if (failed?.failure !== undefined) { bindRep(failed); return failed.failure; }
+    }
+    const adverse = [...candidateResults].filter((c) => c.stopOutcome !== undefined).sort((a, b) => representativeRank(a) - representativeRank(b) || a.slot - b.slot)[0];
+    if (adverse?.stopOutcome !== undefined) { bindRep(adverse); dispositionOutcome = adverse.stopOutcome; return null; }
+    const anyFailed = candidateResults.find((c) => c.failure !== undefined);
+    if (anyFailed?.failure !== undefined) { bindRep(anyFailed); return anyFailed.failure; }
     return null;
   })();
 
@@ -980,6 +1038,25 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
           : candidate !== undefined
             ? await deps.workspaces.retain(workspace, `candidate ${candidate.candidateId} awaits verification`)
             : await deps.workspaces.discard(workspace);
+    // Record the representative's ACTUAL cleanup so the receipt never claims a discarded
+    // (failed) representative workspace was retained.
+    if (disposition !== undefined) candidateWorkspaceDisposition.set(workspace.workspaceId, disposition.kind === "retained" ? "retained" : disposition.kind === "discarded" ? "reclaimed" : "retain_failed");
+  }
+
+  // V2-017 — SUPERSEDED CANDIDATE CLEANUP. In a shadow/tournament attempt the SELECTED/representative
+  // candidate's workspace is retained above; every OTHER (losing) candidate workspace is superseded.
+  // A QUARANTINED loser is retained (safety forensics); an ordinary loser worktree is reclaimed now —
+  // its EVIDENCE (candidate/verification/critic/disposition ids) stays on the receipt regardless.
+  const selectedWorkspaceId = workspace?.workspaceId;
+  for (const c of candidateResults) {
+    if (c.workspace === undefined || c.workspace.workspaceId === selectedWorkspaceId) continue;
+    if (c.stopOutcome?.kind === "quarantined") {
+      const kept = await deps.workspaces.retain(c.workspace, `candidate ${c.candidate?.candidateId ?? c.workspace.workspaceId} quarantined (safety forensics); retained`);
+      if (kept.kind === "retained") candidateWorkspaceDisposition.set(c.workspace.workspaceId, "retained");
+    } else {
+      const reclaimed = await deps.workspaces.discard(c.workspace);
+      candidateWorkspaceDisposition.set(c.workspace.workspaceId, reclaimed.kind === "discarded" ? "reclaimed" : "retain_failed");
+    }
   }
 
   // The ONE authoritative outcome: the disposition's lawful decision when the run reached
@@ -1002,6 +1079,9 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     ...(retrieval !== undefined ? { retrieval } : {}),
     invocations: invocations.map(summarizeInvocation),
     commands: commands.map(summarizeCommand),
+    ...(strategyPolicy !== undefined ? { strategy: summarizeStrategy(strategyPolicy) } : {}),
+    ...(candidateResults.length > 0 ? { candidates: candidateResults.map((c) => candidateSummaryOf(c, selectionRecord?.selectedCandidateId, candidateWorkspaceDisposition)) } : {}),
+    ...(selectionRecord !== undefined ? { selection: summarizeSelection(selectionRecord) } : {}),
     ...(candidate !== undefined ? { candidate: summarizeCandidate(candidate) } : {}),
     ...(verification !== undefined ? { verification: summarizeVerification(verification) } : {}),
     ...(critic !== undefined ? { critic: summarizeCritic(critic) } : {}),
@@ -1031,6 +1111,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     ...(critic !== undefined ? { critic } : {}),
     ...(dispositionRecord !== undefined ? { disposition: dispositionRecord } : {}),
     ...(promotionRecord !== undefined ? { promotion: promotionRecord } : {}),
+    ...(selectionRecord !== undefined ? { selection: selectionRecord } : {}),
     journal: lifecycle.journal,
     receipt,
   };

@@ -1286,6 +1286,68 @@ test("V2-016: workspace cleanup cannot erase the final / quarantined / degraded 
   assert.ok(/degraded/.test(body) && /retainDegradedPromotion/.test(body), "a degraded promotion is retained");
 });
 
+// ---------------------------------------------------------------------------
+// V2-017 — CANDIDATE STRATEGY / SELECTOR SINGLE-AUTHORITY GUARDS
+// ---------------------------------------------------------------------------
+
+test("V2-017: the candidate selector has ONE owner — only strategy.ts declares selectCandidate", () => {
+  const owner = join(V2_DIR, "core", "strategy.ts");
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (file === owner || file.endsWith(".test.ts")) continue;
+    if (/function\s+selectCandidate\b|contentDigest\s*\(\s*["']selection|contentDigest\s*\(\s*["']strategy_policy/.test(stripComments(readFileSync(file, "utf8")))) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "the winner selector + strategy/selection identity live in src/v2/core/strategy.ts alone");
+});
+
+test("V2-017: the strategy module is PURE — no I/O, no transport, no promotion/recovery/authority impl", () => {
+  // Candidate strategy is ORCHESTRATION, not governance. The pure module may import ONLY identity,
+  // the task contract, and the disposition DECISION type — never a transport, workspace, publisher,
+  // recovery controller, or a verifier/critic/disposition implementation.
+  const specs = new Set(importSpecifiers(readFileSync(join(V2_DIR, "core", "strategy.ts"), "utf8")));
+  const allowed = new Set(["./identity.js", "./contract.js", "./disposition.js"]);
+  for (const spec of specs) {
+    assert.ok(allowed.has(spec), `strategy.ts must not import "${spec}" — it is a pure policy+selector, not an authority`);
+  }
+  // Belt-and-braces: no node builtin (no filesystem/process/network), no forbidden authority names.
+  const source = stripComments(readFileSync(join(V2_DIR, "core", "strategy.ts"), "utf8"));
+  for (const forbidden of ["node:", "promoteAuthorized", "InvocationTransport", "\\.send\\(", "verifyCandidate", "judgeCandidate", "judgeDisposition", "decideRecovery", "executeV2BuildSession"]) {
+    assert.equal(new RegExp(forbidden).test(source), false, `the strategy module must not reference ${forbidden}`);
+  }
+});
+
+test("V2-017: candidate generation, verification, criticism and disposition have exactly ONE caller each (the run spine)", () => {
+  // The strategy never runs an authority itself. `generateCandidate`/`verifyCandidate`/`judgeCandidate`/
+  // `judgeDisposition`/`promoteAuthorized` are CALLED only by run.ts — a second caller would be a
+  // private pipeline. (The declaring modules are excluded; strategy.ts must never appear.)
+  const authorities: Record<string, string> = {
+    "generateCandidate\\(": "builder.ts",
+    "verifyCandidate\\(": "verification.ts",
+    "judgeCandidate\\(": "critic.ts",
+    "judgeDisposition\\(": "disposition.ts",
+    "promoteAuthorized\\(": "promotion.ts",
+  };
+  for (const [call, decl] of Object.entries(authorities)) {
+    const callers: string[] = [];
+    for (const file of tsFiles(V2_DIR)) {
+      if (file.endsWith(".test.ts") || file.endsWith(decl)) continue;
+      if (new RegExp(call).test(stripComments(readFileSync(file, "utf8")))) callers.push(relative(SRC, file));
+    }
+    assert.deepEqual(callers, ["v2/core/run.ts"], `${call} is invoked only by the run spine`);
+    assert.equal(callers.includes("v2/core/strategy.ts"), false, "the strategy module never invokes an authority");
+  }
+});
+
+test("V2-017: the promotion candidate id EQUALS the selection's selected candidate id (one winner)", () => {
+  // In run.ts, promotion is reached ONLY for `selected`, and it publishes `selCand` — so the promoted
+  // candidate is exactly the selector's chosen candidate. Pin that the promotion block is entered
+  // under the `selected` branch and uses the selected candidate's records.
+  const source = stripComments(readFileSync(join(V2_DIR, "core", "run.ts"), "utf8"));
+  const selBlock = source.slice(source.indexOf("const selected ="), source.indexOf("// NO SELECTION"));
+  assert.ok(/lifecycle\.enter\(runId, "promotion"\)/.test(selBlock), "promotion is entered only inside the selected-candidate branch");
+  assert.ok(/promoteAuthorized\(\{[\s\S]*candidate: selCand/.test(selBlock), "promotion publishes the SELECTED candidate");
+});
+
 test("isolation: v1 does not import v2, except the single registration line", () => {
   const offenders: string[] = [];
   for (const file of tsFiles(SRC)) {

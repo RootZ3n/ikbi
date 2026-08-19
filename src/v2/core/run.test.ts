@@ -23,6 +23,8 @@ import { LIFECYCLE_STAGES } from "./lifecycle.js";
 import { exitCodeForOutcome } from "./result.js";
 import { IMPLEMENTED_THROUGH_STAGE, MAX_GOAL_LENGTH, planFor, preflight, runV2Build, type RepoProbe } from "./run.js";
 import type { PromotionTarget, PublicationOutcome } from "./promotion.js";
+import { buildStrategyPolicy } from "./strategy.js";
+import { buildFailure, V2_BUILD_FAILURE_CODES } from "./candidate.js";
 
 /** A probe that answers "yes, a healthy git repo" without touching a filesystem. */
 const goodRepo: RepoProbe = { inspect: () => ({ exists: true, isDirectory: true, hasGitDir: true }) };
@@ -483,15 +485,26 @@ test("run: an unknown candidate strategy is refused rather than defaulted", asyn
   assert.equal(result.outcome.failure.code, V2_001_FAILURE_CODES.strategyUnknown);
 });
 
-test("run: shadow and tournament are ACCEPTED strategies and reach the same stop point", async () => {
-  for (const candidateStrategy of ["single", "shadow", "tournament"] as const) {
+test("run: single/shadow/tournament are REAL distinct strategies (V2-017) — 1/2/3 independent candidates", async () => {
+  // V2-017: the strategies are no longer cosmetic. Each generates a DISTINCT number of independent
+  // candidates through the SAME canonical builder/verify/critic/disposition, then ONE pure selector
+  // picks one to promote. All candidates here are eligible ⇒ one is selected and published.
+  for (const [candidateStrategy, expected] of [["single", 1], ["shadow", 2], ["tournament", 3]] as const) {
     const result = await runV2Build({ goal: "go", repoPath: "/repo", candidateStrategy }, deps(goodRepo));
-    assert.ok(result.outcome.kind === "accepted", `${candidateStrategy} passes preflight and publishes`);
-    assert.equal(result.receipt.disposition?.decision, "acceptable_for_promotion", `${candidateStrategy} reaches disposition`);
-    // Every strategy runs the SAME builder controller, executor and mutation authority.
-    // `single` is the only one that generates today; shadow/tournament are accepted at
-    // preflight and take the single path until they have their own slice.
-    assert.equal(result.receipt.evidence.candidatesCreated, 1, `${candidateStrategy} used the one canonical generator`);
+    assert.ok(result.outcome.kind === "accepted", `${candidateStrategy} publishes the selected candidate`);
+    assert.equal(result.receipt.strategy?.kind, candidateStrategy);
+    assert.equal(result.receipt.strategy?.candidateCount, expected, `${candidateStrategy} generates ${expected} candidate(s)`);
+    assert.equal(result.receipt.evidence.candidatesCreated, expected, `${candidateStrategy} produced ${expected} candidate(s)`);
+    assert.equal(result.receipt.candidates?.length, expected, `${candidateStrategy} evaluated ${expected} candidate(s)`);
+    // ONE candidate id is selected and promoted; all candidates share ONE RunId + snapshot.
+    assert.ok(result.selection?.selectedCandidateId !== undefined, "a winner was selected");
+    assert.equal(result.receipt.candidate?.candidateId, result.selection?.selectedCandidateId, "the singular receipt fields point at the selected candidate");
+    // Each candidate has its OWN workspace (the deterministic fixture yields identical trees, so the
+    // content-addressed CandidateIds coincide by design — but the WORKSPACES are always distinct).
+    const wsIds = new Set(result.receipt.candidates?.map((c) => c.workspaceId));
+    assert.equal(wsIds.size, expected, "each candidate has its OWN workspace");
+    // Exactly ONE promotion landed regardless of candidate count.
+    assert.ok(result.receipt.promotion !== undefined, "exactly one candidate was published");
   }
 });
 
@@ -720,4 +733,112 @@ test("run: a capture failure stops the run before any model resolution", async (
   assert.equal(result.outcome.failure.code, "preflight.source_snapshot_failed");
   assert.deepEqual([...result.receipt.stagesEntered], ["preflight"], "nothing downstream ran");
   assert.equal(result.receipt.evidence.sourceSnapshotCaptured, false);
+});
+
+// ── shadow + tournament candidate strategies (V2-017) ────────────────────────
+//
+// These are the END-TO-END wiring proofs: N candidates flow through the SAME canonical
+// builder → verify → critic → disposition, the ONE pure selector picks ≤1, exactly one
+// promotion (or none) happens, and losing workspaces are reclaimed while their EVIDENCE
+// stays on the receipt. The selector's RANKING logic is unit-tested in strategy.test.ts;
+// here we prove the spine honours it. Candidate trees are identical by construction (the
+// hermetic builder writes nothing), so this exercises the wiring, not the tie-break maths.
+
+/** A check runner that reports a RED (failed) check — every candidate then rejects. */
+const redRunner = { run: async () => ({ launched: true as const, exitCode: 1, timedOut: false, durationMs: 1, outputSha256: "1".repeat(64), outputExcerpt: "boom" }) };
+
+/** A tree-capture that FAILS for candidate slot 0's workspace (`/scratch/1`) and succeeds — with the
+ *  DEFAULT tree, so promotion still lands — for every other candidate. Simulates one candidate whose
+ *  generation collapses while its siblings finish. */
+const slotZeroCaptureFails = async (w: V2WorkspaceRecord) =>
+  w.path.endsWith("/1")
+    ? { ok: false as const, failure: buildFailure({ code: V2_BUILD_FAILURE_CODES.treeCaptureFailed, message: "candidate 0 tree capture failed" }) }
+    : { ok: true as const, tree: { treeId: "tree".repeat(10), baseTreeId: "t".repeat(40), startTree: "tree".repeat(10), materializedStateDigest: "m".repeat(64), changed: false } };
+
+test("v2-017 tournament: NO eligible candidate ⇒ nothing is promoted, source untouched", async () => {
+  // Every candidate verifies RED ⇒ rejected ⇒ ineligible. The selector finds an empty pool, no
+  // candidate reaches promotion, and the operator's repository is never mutated.
+  const result = await runV2Build(
+    { goal: "go", repoPath: "/repo", candidateStrategy: "tournament" },
+    { ...deps(goodRepo), checkRunner: redRunner },
+  );
+  assert.ok(result.outcome.kind !== "accepted", "no eligible candidate can be accepted");
+  assert.equal(result.selection?.reason, "no_eligible_candidate");
+  assert.equal(result.selection?.selectedCandidateId, undefined, "no candidate is selected");
+  assert.equal(result.receipt.promotion, undefined, "nothing is published");
+  assert.equal(result.receipt.evidence.promoted, false);
+  assert.equal(result.receipt.evidence.sourceRepositoryMutated, false, "a losing tournament never touches the repo");
+  assert.equal(result.receipt.candidates?.length, 3, "all three candidates were evaluated and kept on the receipt");
+  assert.ok(result.receipt.candidates?.every((c) => c.promotionEligible === false), "each was adjudicated ineligible");
+  // Losers reclaimed; the representative (slot 0) is retained for audit.
+  const reclaimed = result.receipt.candidates?.filter((c) => c.workspaceCleanup === "reclaimed").length ?? 0;
+  assert.equal(reclaimed, 2, "the two non-representative losing workspaces are reclaimed");
+});
+
+test("v2-017 tournament (allow_partial): one candidate FAILS generation, a survivor is promoted", async () => {
+  // Candidate 0's tree capture collapses; candidates 1 & 2 finish and are eligible. Under an
+  // explicit allow_partial policy the attempt proceeds over the completed pool and promotes ONE.
+  const result = await runV2Build(
+    { goal: "go", repoPath: "/repo", candidateStrategy: "tournament" },
+    { ...deps(goodRepo), captureTree: slotZeroCaptureFails, strategyPolicy: buildStrategyPolicy({ kind: "tournament", partialCompletion: "allow_partial" }) },
+  );
+  assert.ok(result.outcome.kind === "accepted", "a surviving eligible candidate is published");
+  assert.equal(result.receipt.candidates?.length, 3, "all three slots are accounted for");
+  assert.equal(result.receipt.evidence.candidatesCreated, 2, "only the two survivors produced a candidate");
+  const failed = result.receipt.candidates?.find((c) => c.slot === 0);
+  assert.equal(failed?.candidateId, null, "candidate 0 never produced a tree");
+  assert.equal(failed?.failureCode, V2_BUILD_FAILURE_CODES.treeCaptureFailed);
+  assert.equal(failed?.workspaceCleanup, "reclaimed", "the collapsed candidate's workspace is reclaimed");
+  assert.ok(result.selection?.selectedCandidateId !== undefined, "a survivor was selected");
+  assert.equal(result.receipt.candidate?.candidateId, result.selection?.selectedCandidateId);
+  const selected = result.receipt.candidates?.filter((c) => c.selected);
+  assert.ok((selected?.length ?? 0) >= 1, "the selected candidate is flagged on the receipt");
+  assert.equal(result.receipt.promotion !== undefined, true, "exactly one publication landed");
+});
+
+test("v2-017 tournament (require_all, the DEFAULT): one incomplete candidate BLOCKS promotion", async () => {
+  // Same collapse as above, but the conservative default is require_all: even though candidates 1 & 2
+  // are perfectly eligible, an incomplete sibling withholds the whole attempt. Cost of correctness.
+  const result = await runV2Build(
+    { goal: "go", repoPath: "/repo", candidateStrategy: "tournament" },
+    { ...deps(goodRepo), captureTree: slotZeroCaptureFails },
+  );
+  assert.ok(result.outcome.kind === "failed", "require_all refuses to promote past an incomplete candidate");
+  assert.equal(result.selection?.reason, "require_all_candidates_incomplete");
+  assert.equal(result.selection?.selectedCandidateId, undefined);
+  assert.equal(result.receipt.promotion, undefined, "nothing is published under the conservative default");
+  assert.equal(result.receipt.evidence.promoted, false);
+  assert.equal(result.receipt.candidates?.length, 3);
+  // The two eligible-but-blocked survivors' workspaces are reclaimed (no winner keeps them).
+  const survivors = result.receipt.candidates?.filter((c) => c.slot !== 0) ?? [];
+  assert.ok(survivors.every((c) => c.workspaceCleanup === "reclaimed"), "blocked survivors are cleaned up");
+});
+
+test("v2-017 tournament: every candidate is COUNTED — per-candidate cost + evidence on the one ledger", async () => {
+  // All three candidates are eligible. Each runs its OWN builder + critic pair through the ONE
+  // invocation ledger (2 calls × 3 candidates = 6), and each carries its own cost + evidence on the
+  // receipt. Exactly one is selected and its siblings are reclaimed.
+  const result = await runV2Build({ goal: "go", repoPath: "/repo", candidateStrategy: "tournament" }, deps(goodRepo));
+  assert.ok(result.outcome.kind === "accepted");
+  assert.equal(result.receipt.evidence.invocations, 6, "2 invocations per candidate, all counted on the one ledger");
+  const cands = result.receipt.candidates ?? [];
+  assert.equal(cands.length, 3);
+  for (const c of cands) {
+    assert.equal(typeof c.knownCostMicroUsd, "number", "each candidate carries its own known cost");
+    assert.equal(typeof c.hasUnknownCost, "boolean");
+    assert.ok(c.verificationId !== null && c.criticId !== null && c.dispositionId !== null, "each candidate has its own full evidence chain");
+  }
+  // ONE winner retained; the two losers reclaimed — but ALL evidence stays on the receipt.
+  assert.equal(cands.filter((c) => c.workspaceCleanup === "retained").length, 1, "exactly one workspace is retained");
+  assert.equal(cands.filter((c) => c.workspaceCleanup === "reclaimed").length, 2, "the two losers are reclaimed");
+});
+
+test("v2-017 tournament: candidates are ISOLATED — each owns a distinct workspace, no sibling sharing", async () => {
+  const result = await runV2Build({ goal: "go", repoPath: "/repo", candidateStrategy: "tournament" }, deps(goodRepo));
+  const cands = result.receipt.candidates ?? [];
+  const wsIds = new Set(cands.map((c) => c.workspaceId));
+  assert.equal(wsIds.size, 3, "three candidates ⇒ three DISTINCT workspaces (no sharing)");
+  assert.deepEqual(cands.map((c) => c.slot), [0, 1, 2], "each candidate keeps its own slot identity");
+  // The selector considered every candidate (none was silently dropped or merged away).
+  assert.equal(result.selection?.candidateEvaluationIds.length, 3, "all three evaluations entered the ONE selector");
 });

@@ -131,6 +131,7 @@ export function renderRun(result: V2RunResult): string {
     ...contextLines(result),
     ...invocationLines(result),
     ...commandLines(result),
+    ...strategyLines(result),
     ...workspaceLines(result),
     ...candidateLines(result),
     ...verificationLines(result),
@@ -306,6 +307,33 @@ function commandLines(result: V2RunResult): string[] {
       `  cmd ${String(index + 1).padStart(2)}    ${[c.program, ...c.args].join(" ")} · ${c.launched ? `exit ${c.exitCode ?? "?"}` : "refused"}` +
         `${c.timedOut ? " TIMED OUT" : ""} · workspace_unchanged=${c.workspaceUnchanged} · ${c.outputByteLength}B${c.outputTruncated ? " (truncated)" : ""}`,
     );
+  }
+  return lines;
+}
+
+/**
+ * The candidate STRATEGY (V2-017): the count, every candidate's canonical evaluation, and the ONE
+ * deterministic selection. Only shown for a multi-candidate strategy (shadow/tournament) — a single
+ * run adds no noise. Losers stay visible even after their workspaces are reclaimed.
+ */
+function strategyLines(result: V2RunResult): string[] {
+  const s = result.receipt.strategy;
+  const cands = result.receipt.candidates;
+  if (s === undefined || cands === undefined || s.candidateCount <= 1) return [];
+  const lines = [`strategy    ${s.kind} · ${s.candidateCount} candidates · rule ${s.selectionRule}`];
+  for (const c of cands) {
+    const evalStr = c.status === "evaluated"
+      ? `verification=${c.verificationVerdict ?? "?"} critic=${c.criticVerdict ?? "?"} disposition=${c.decision ?? "quarantined"}`
+      : `INCOMPLETE (${c.failureCode ?? "failed"})`;
+    lines.push(
+      `  cand ${c.slot}   ${evalStr}${c.selected ? " · SELECTED" : ""} · cost=${c.knownCostMicroUsd}µ${c.hasUnknownCost ? "+?" : ""} · workspace=${c.workspaceCleanup}`,
+    );
+  }
+  const sel = result.receipt.selection;
+  if (sel !== undefined) {
+    lines.push(sel.selectedCandidateId !== null
+      ? `selected    ${sel.selectedCandidateId.slice(0, 16)} · ${sel.reason}`
+      : `selected    NONE · ${sel.reason}`);
   }
   return lines;
 }
