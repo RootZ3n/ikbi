@@ -137,6 +137,22 @@ export function isMaterialSeverity(s: DefectSeverity): boolean {
 /** The minimum description length that counts as "concrete", not a hand-wave. */
 export const MIN_DEFECT_DESCRIPTION_CHARS = 12;
 
+/**
+ * V2-020/Phase 19 — EXPLICIT BOUNDS on critic text and shape.
+ *
+ * These are protocol limits, not style preferences. An unbounded `summary`/`description` is an
+ * unbounded UNTRUSTED string that flows into receipts, repair briefs and operator output; an
+ * unbounded defect list is an unbounded work item. Generous enough that no honest judgment is
+ * rejected, finite enough that a runaway or hostile response is refused rather than absorbed.
+ */
+export const MAX_CRITIC_SUMMARY_CHARS = 4_000;
+export const MAX_DEFECT_DESCRIPTION_CHARS = 4_000;
+export const MAX_CRITIC_DEFECTS = 100;
+
+/** Exactly the keys a critic judgment may carry. Anything else is refused, never ignored. */
+const ALLOWED_JUDGMENT_KEYS: ReadonlySet<string> = new Set(["verdict", "summary", "defects"]);
+const ALLOWED_DEFECT_KEYS: ReadonlySet<string> = new Set(["category", "severity", "description", "paths"]);
+
 /** One concrete, structured material defect. */
 export interface MaterialDefect {
   readonly defectId: V2DefectId;
@@ -187,7 +203,15 @@ export type CriticProtocolProblem =
   | "unknown_severity"
   | "empty_description"
   | "defects_found_without_material_defect"
-  | "satisfied_with_material_defect";
+  | "satisfied_with_material_defect"
+  // V2-020/Phase 19 — permissiveness closed. A judgment that carries fields we do not understand,
+  // a `paths` value that is not a list of strings, or unbounded text is not a stricter judgment;
+  // it is an unvalidated one, and it is the shape a prompt-injected or drifting model produces.
+  | "unknown_field"
+  | "malformed_paths"
+  | "summary_too_long"
+  | "description_too_long"
+  | "too_many_defects";
 
 export type CriticParseResult =
   | { readonly ok: true; readonly verdict: CriticVerdict; readonly summary: string; readonly defects: readonly MaterialDefect[] }
@@ -213,6 +237,13 @@ export function parseCriticResponse(content: string): CriticParseResult {
   }
   const obj = parsed as Record<string, unknown>;
 
+  // UNKNOWN FIELDS ARE REFUSED, not ignored. Silently dropping a key we do not understand means a
+  // model (or an injected payload) can carry state past this authority without adjudication.
+  const strayTop = Object.keys(obj).filter((k) => !ALLOWED_JUDGMENT_KEYS.has(k));
+  if (strayTop.length > 0) {
+    return { ok: false, problem: "unknown_field", detail: `the judgment carries unknown field(s): ${strayTop.sort().join(", ")}` };
+  }
+
   const verdictRaw = asString(obj["verdict"]);
   if (verdictRaw === undefined) return { ok: false, problem: "missing_verdict", detail: "no string `verdict`" };
   if (verdictRaw !== "satisfied" && verdictRaw !== "defects_found" && verdictRaw !== "indeterminate") {
@@ -224,9 +255,15 @@ export function parseCriticResponse(content: string): CriticParseResult {
   if (summary === undefined || summary.trim().length === 0) {
     return { ok: false, problem: "missing_summary", detail: "a non-empty string `summary` is required" };
   }
+  if (summary.length > MAX_CRITIC_SUMMARY_CHARS) {
+    return { ok: false, problem: "summary_too_long", detail: `\`summary\` exceeds ${MAX_CRITIC_SUMMARY_CHARS} characters (${summary.length})` };
+  }
 
   const rawDefects = obj["defects"] ?? [];
   if (!Array.isArray(rawDefects)) return { ok: false, problem: "defects_not_array", detail: "`defects` must be an array" };
+  if (rawDefects.length > MAX_CRITIC_DEFECTS) {
+    return { ok: false, problem: "too_many_defects", detail: `\`defects\` exceeds ${MAX_CRITIC_DEFECTS} entries (${rawDefects.length})` };
+  }
 
   const defects: MaterialDefect[] = [];
   for (const raw of rawDefects) {
@@ -234,6 +271,10 @@ export function parseCriticResponse(content: string): CriticParseResult {
       return { ok: false, problem: "malformed_defect", detail: "each defect must be an object" };
     }
     const d = raw as Record<string, unknown>;
+    const strayDefect = Object.keys(d).filter((k) => !ALLOWED_DEFECT_KEYS.has(k));
+    if (strayDefect.length > 0) {
+      return { ok: false, problem: "unknown_field", detail: `a defect carries unknown field(s): ${strayDefect.sort().join(", ")}` };
+    }
     const category = asString(d["category"]);
     if (category === undefined || !isDefectCategory(category)) {
       return { ok: false, problem: "unknown_category", detail: `defect category "${String(category)}" is not one of ${DEFECT_CATEGORIES.join(", ")}` };
@@ -246,7 +287,20 @@ export function parseCriticResponse(content: string): CriticParseResult {
     if (description === undefined || description.trim().length < MIN_DEFECT_DESCRIPTION_CHARS) {
       return { ok: false, problem: "empty_description", detail: `a defect needs a concrete description of at least ${MIN_DEFECT_DESCRIPTION_CHARS} characters` };
     }
-    const paths = Array.isArray(d["paths"]) ? d["paths"].filter((p): p is string => typeof p === "string").map((p) => p.trim()).filter((p) => p.length > 0) : [];
+    if (description.length > MAX_DEFECT_DESCRIPTION_CHARS) {
+      return { ok: false, problem: "description_too_long", detail: `a defect description exceeds ${MAX_DEFECT_DESCRIPTION_CHARS} characters (${description.length})` };
+    }
+    // `paths` was COERCED to [] for any non-array, and non-string members were silently dropped —
+    // so a judgment that named its evidence wrongly still parsed, having quietly lost that evidence.
+    // Absent is fine (no paths claimed); malformed is refused.
+    const rawPaths = d["paths"];
+    if (rawPaths !== undefined && !Array.isArray(rawPaths)) {
+      return { ok: false, problem: "malformed_paths", detail: "`paths` must be an array of strings when present" };
+    }
+    if (Array.isArray(rawPaths) && rawPaths.some((x) => typeof x !== "string")) {
+      return { ok: false, problem: "malformed_paths", detail: "`paths` must contain only strings" };
+    }
+    const paths = Array.isArray(rawPaths) ? (rawPaths as string[]).map((x) => x.trim()).filter((x) => x.length > 0) : [];
     defects.push({
       defectId: defectDigest({ category, severity, description: description.trim(), paths: [...paths].sort() }),
       category,

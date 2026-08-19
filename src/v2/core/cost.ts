@@ -280,7 +280,7 @@ export function pricingCatalogId(catalog: PricingCatalog): V2PricingCatalogId {
     version: catalog.version,
     entries: catalog.entries.map((e) => ({
       canonicalModelId: e.canonicalModelId,
-      routes: [...e.routes].map((r) => ({ providerId: r.providerId, providerModelId: r.providerModelId })).sort((a, b) => `${a.providerId} ${a.providerModelId}`.localeCompare(`${b.providerId} ${b.providerModelId}`)),
+      routes: [...e.routes].map((r) => ({ providerId: r.providerId, providerModelId: r.providerModelId })).sort((a, b) => `${a.providerId}\u0000${a.providerModelId}`.localeCompare(`${b.providerId}\u0000${b.providerModelId}`)),
       inputPerMillionMicroUsd: e.inputPerMillionMicroUsd,
       outputPerMillionMicroUsd: e.outputPerMillionMicroUsd,
       ...(e.cacheReadPerMillionMicroUsd !== undefined ? { cacheReadPerMillionMicroUsd: e.cacheReadPerMillionMicroUsd } : {}),

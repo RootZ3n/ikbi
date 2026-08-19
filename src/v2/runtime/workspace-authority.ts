@@ -276,10 +276,10 @@ export function createMutationAuthority(deps: {
 }): StateBoundMutationAuthority {
   const now = deps.now ?? Date.now;
   const cores = new Map<string, WorkspaceMutation>();
-  // Keyed by `${workspaceId} ${observationId}` — the workspace is PART of the key,
+  // Keyed by `${workspaceId}\u0000${observationId}` — the workspace is PART of the key,
   // so an observation cannot be looked up from a sibling workspace even by accident.
   const observations = new Map<string, FileObservation>();
-  const key = (workspaceId: string, observationId: string): string => `${workspaceId} ${observationId}`;
+  const key = (workspaceId: string, observationId: string): string => `${workspaceId}\u0000${observationId}`;
 
   async function coreFor(record: V2WorkspaceRecord): Promise<WorkspaceMutation | undefined> {
     const existing = cores.get(record.workspaceId);

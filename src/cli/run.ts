@@ -1,10 +1,22 @@
 /**
- * Canonical external-agent run workflow.
+ * External-agent run workflow — the LEGACY v1 delegate (V2-020/Phase 5).
  *
  * This file is intentionally an adapter, not another build engine. It owns the
  * task-file boundary, non-billable preflight, a bounded terminal result, and
  * evidence pointers. A ready run delegates to createWorkerCli(), whose
  * production default is createProductionWorker() -> createOrchestrator().
+ *
+ * ENGINE STATUS. That delegate is the RETIRED v1 five-role pipeline. `ikbi build` is the one
+ * canonical production engine (v2), and `ikbi legacy build` was removed in V2-020. `run` is kept —
+ * explicitly labelled in help and on stderr at every invocation — because what it actually provides
+ * is the external-agent CONTRACT that v2 does not yet expose: a readable JSON task spec in, local
+ * preflight that refuses before any spend, and exactly one terminal JSON document out with stable
+ * RUN_* codes and exit codes that external agents already depend on.
+ *
+ * Migrating that contract onto a v2 BuildSession is the next convergence step, and it is a real
+ * mapping job (WorkerResult role/promotion/cost shape → V2 session result), not a relabel. Doing it
+ * inside the retirement slice would have meant writing a second build adapter without review, so it
+ * is deferred deliberately and recorded in docs/IKBI-POST-V1-ARCHITECTURE.md.
  */
 
 import { randomBytes } from "node:crypto";
@@ -960,11 +972,23 @@ export async function runCanonical(argv: readonly string[], deps: RunCliDeps = {
   if (parsed.help) {
     out(
       "Usage: ikbi run --spec <task-file> [--repo <path-or-name>] [--json]\n\n" +
-        "Run one task through local preflight and the authoritative worker/orchestrator path.\n" +
-        "Preflight is local-only and refuses before workspace allocation or provider invocation.\n",
+        "Run one task-file through local preflight and the LEGACY v1 worker/orchestrator.\n" +
+        "Preflight is local-only and refuses before workspace allocation or provider invocation.\n\n" +
+        "ENGINE: this command still drives the v1 five-role pipeline. The canonical governed engine\n" +
+        "is v2: `ikbi build \"<goal>\" --repo <path>`. Use `run` only for the external-agent task-file\n" +
+        "contract (spec in, one terminal JSON document out), which v2 does not yet expose.\n",
     );
     return undefined;
   }
+  // V2-020/Phase 5: `run` is the ONE remaining user-facing surface that drives the v1 engine, and it
+  // says so out loud on every invocation. It is retained (not migrated) because its value is the
+  // external-agent TASK-FILE CONTRACT — a spec in, exactly one terminal JSON document out, with
+  // local preflight — and re-homing that contract onto a v2 BuildSession is a real migration, not a
+  // relabel. The notice goes to STDERR so `--json` stdout stays exactly one document.
+  err(
+    "ikbi run: LEGACY ENGINE — this drives the v1 five-role pipeline, not the canonical v2 engine.\n" +
+      "         For ordinary builds use: ikbi build \"<goal>\" --repo <path>\n",
+  );
   const now = deps.now ?? Date.now;
   const runId = deps.runId?.() ?? makeRunId(now);
   const cwd = deps.cwd?.() ?? process.cwd();

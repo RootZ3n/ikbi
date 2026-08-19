@@ -120,10 +120,14 @@ test("buildBwrapArgs: a `go` command redirects GOCACHE/GOPATH into the PERSISTEN
   assert.ok(gp >= 0 && a[gp - 1] === "--setenv" && (a[gp + 1] ?? "").startsWith(base), "GOPATH under the persistent cache base");
 });
 
-test("toolchainCacheWritable: cache toolchains get the base as an extraWritable bind; cargo does not", () => {
+test("toolchainCacheWritable: every CACHE toolchain gets the base as an extraWritable bind", () => {
   const base = toolchainCacheBase();
-  for (const c of ["go", "dotnet", "mvn", "gradle"]) assert.deepEqual(toolchainCacheWritable(c), [base], `${c} binds the persistent cache`);
-  assert.deepEqual(toolchainCacheWritable("cargo"), [], "cargo caches in-worktree — no extra bind");
+  // caab41e redirected CARGO_HOME to the persistent cache too (a read-only HOME left cargo unable to
+  // fetch its registry index), so cargo now binds the base exactly like the others. Only `target/`
+  // stays in-worktree — which is what the GOCACHE test below still pins separately.
+  for (const c of ["go", "dotnet", "mvn", "gradle", "cargo"]) assert.deepEqual(toolchainCacheWritable(c), [base], `${c} binds the persistent cache`);
+  // A toolchain with no cache redirect still gets no extra bind.
+  assert.deepEqual(toolchainCacheWritable("pnpm"), [], "a non-cache toolchain needs no extra bind");
 });
 
 test("buildBwrapArgs: a non-Go toolchain (cargo) gets NO GOCACHE redirect (cargo caches in-worktree)", () => {

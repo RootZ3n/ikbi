@@ -190,8 +190,9 @@ test("text emulation: a no-tool-API chat model drives write_file via a fenced JS
     stop('I will create it.\n```json\n{"tool":"write_file","args":{"path":"a.ts","content":"export const x = 1;\\n"}}\n```'),
     stop("Created a.ts."),
   ]);
-  // model "deepseek-reasoner" ⇒ getCapabilities → supports_tools:false ⇒ emulation on.
-  const s = new ChatSession("s-emul", { invoke, worktree: dir, model: "deepseek-reasoner" });
+  // model "llama3:8b" ⇒ getCapabilities → supports_tools:false ⇒ emulation on. (`deepseek-reasoner`
+  // used to be tool-less; e1ef626 correctly gave the V4 reasoner tools, silently disarming this test.)
+  const s = new ChatSession("s-emul", { invoke, worktree: dir, model: "llama3:8b" });
   const { tools } = await s.send("make a.ts");
 
   // The text-emitted tool call actually executed.

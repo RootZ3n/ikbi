@@ -143,7 +143,7 @@ With a provider configured:
 node dist/cli/index.js build "add a one-line note to the README" --repo /path/to/a/git/repo
 ```
 
-ikbi runs the 5-role pipeline in an isolated worktree and **promotes only on a ladder-verified
+ikbi runs the governed v2 engine in an isolated worktree and **promotes only on a verified
 pass**. Inspect afterwards: `ikbi diff <workspace-id>`, `ikbi receipts --latest`, `ikbi cost`.
 Undo a promotion with `ikbi undo --latest`.
 

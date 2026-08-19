@@ -11,7 +11,13 @@ competitive mode. It runs both as a long-running localhost/Tailscale service and
 - **Frozen core** (`src/core/`): provider (model invocation), injection (neutralization
   chokepoint), trust (earned tiers, MAC-protected), identity, workspace (git worktrees),
   events, receipt, substrate (atomic writes + locking), config, contracts.
-- **Engine modules** (`src/modules/`): worker-model (scout/builder/critic/verifier/integrator),
+- **Canonical engine** (`src/v2/`): the ONE production build engine — `core/` (pure authorities:
+  source, context, invocation, builder, verification, critic, disposition, selection, promotion,
+  recovery, cost), `runtime/` (adapters to git/providers/governed-exec), `cli/`.
+- **Neutral shared primitives**: `src/modules/checks/` (deterministic check DISCOVERY — owned by
+  no pipeline; v2 and v1-era callers both use it), `src/cli/terminal-io.ts`.
+- **Engine modules** (`src/modules/`): worker-model (RETIRED v1 5-role build spine — still hosts
+  the shared builder-tools inventory used by chat/repl/fix; its build COMMAND is gone),
   chat (the `ikbi repl` + `/chat` session loop), agent-router, batch-planner, step-planner,
   cognition-layer, mcp-model-loop, gate-wall, governed-exec, egress, escalation, cache,
   self-observation, capability-* , drift-prevention, lab-context-memory, kill-switch,
@@ -28,8 +34,10 @@ competitive mode. It runs both as a long-running localhost/Tailscale service and
   change when there are no unit tests (serve-grep + `scripts/ui-shot` headless screenshot).
 
 ## Surfaces (what to use)
-- `ikbi build "<goal>" --repo <path>` — the golden batch path: 5-role pipeline in an
-  isolated worktree, promotes only on ladder-verified pass.
+- `ikbi build "<goal>" --repo <path>` — THE canonical production build engine (v2): one
+  SourceSnapshot, isolated candidate workspace(s), deterministic verification, semantic
+  critic, one adjudicated disposition, and publication by a single clean-ref CAS. The v1
+  5-role pipeline it replaced was retired in V2-020 (`ikbi legacy` now only refuses).
 - `ikbi repl` — interactive, multi-turn, tool-calling session (managed worktree, slash
   commands, resume, permission prompts). The closest analog to Claude Code's REPL.
 - `ikbi fix <repo>` — diagnose a failing check and repair it narrowly (or correctly
@@ -50,7 +58,7 @@ through governed-exec (allowlist + gate-wall + receipts).
 cd /pehverse/repos/ecosystem/ikbi
 pnpm install
 pnpm build                     # tsc -> dist/  (also typechecks *.test.ts)
-pnpm test                      # node:test runner — 2671 tests, all passing
+pnpm test                      # node:test runner — 5163 tests, ZERO failures
 node dist/cli/index.js doctor  # pre-flight check
 node dist/cli/index.js repl    # interactive session
 ```

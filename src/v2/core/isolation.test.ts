@@ -49,9 +49,14 @@ const V2_RUNTIME_ALLOWED_V1_IMPORTS = new Set([
   "../../core/workspace/manager.js", //            WorkspaceManager type + test construction
   "../../core/workspace/mutation.js", //           THE state-bound mutation core
   "../../core/injection/index.js", //              THE untrusted-data neutralization fence (V2-007A)
-  "../../modules/worker-model/checks.js", //       deterministic check DISCOVERY (V2-008)
+  "../../modules/checks/index.js", //              deterministic check DISCOVERY — the NEUTRAL owner (V2-020/Phase 3;
+  //                                               extracted out of modules/worker-model so the one production
+  //                                               engine no longer depends on retired v1 orchestration)
   "../../modules/governed-exec/index.js", //       THE governed check executor (V2-008) + builder terminal (V2-015)
   "../../modules/governed-exec/sandbox.js", //     command risk classification for the read-only terminal (V2-015)
+  "../../modules/governed-exec/config.js", //      the ALLOWLIST as DATA — read by `doctor --v2` readiness to prove the
+  //                                               repository's real check commands are permitted (V2-020/Phase 20).
+  //                                               Config only: it carries no way to EXECUTE anything (see the guard below).
   "../../core/identity/registry.js", //            self-contained verifier identity (V2-008)
   "../../core/identity/resolver.js", //            mint the verifier's OperationContext (V2-008)
   "../../core/identity/index.js", //               OperationContext type (V2-008)
@@ -866,14 +871,26 @@ test("single authority: only the two enumerated adapters reach governed-exec (V2
   // command executor (the READ-ONLY terminal, verifier:false — a model requests a bounded,
   // structured, read-only command). Any THIRD importer would be an ungoverned execution path.
   const allowed = new Set([join(V2_DIR, "runtime", "check-runner.ts"), join(V2_DIR, "runtime", "command-executor.ts")]);
+  // V2-020/Phase 20: `readiness.ts` reads the ALLOWLIST as DATA (`governed-exec/config.js`) so
+  // `doctor --v2` can prove the repository's real check commands are permitted. That module exports
+  // configuration only — no runner, no spawn — so reading it is not an execution path. Every OTHER
+  // governed-exec entry point (the executor itself, the sandbox) remains forbidden to it.
+  const configOnly = new Map([[join(V2_DIR, "runtime", "readiness.ts"), "../../modules/governed-exec/config.js"]]);
   const offenders: string[] = [];
   for (const file of tsFiles(V2_DIR)) {
     if (allowed.has(file) || file.endsWith(".test.ts")) continue;
     for (const spec of importSpecifiers(readFileSync(file, "utf8"))) {
-      if (spec.includes("governed-exec")) offenders.push(`${relative(SRC, file)} -> ${spec}`);
+      if (!spec.includes("governed-exec")) continue;
+      if (configOnly.get(file) === spec) continue;
+      offenders.push(`${relative(SRC, file)} -> ${spec}`);
     }
   }
   assert.deepEqual(offenders, [], "governed execution is reached through the check-runner and command-executor adapters alone");
+
+  // And the concession is exactly that: the config module must export no way to execute.
+  // CODE, not prose — the config file's comments legitimately discuss spawned background jobs.
+  const cfgSrc = stripComments(readFileSync(join(SRC, "modules", "governed-exec", "config.ts"), "utf8"));
+  assert.doesNotMatch(cfgSrc, /child_process|spawn|execFile\b/, "governed-exec/config.js must be inert configuration");
 });
 
 test("single authority: no v2 file spawns a process for verification outside the adapter (V2-008)", () => {
@@ -1381,4 +1398,22 @@ test("isolation: the registration seam is actually present (v2 is reachable at a
   // file would be picked up by this suite's own scanner as a v1 import from v2/core.
   const registration = new RegExp(String.raw`import\s+"\.\./v2/cli/index\.js";`);
   assert.match(cli, registration, "src/cli/index.ts registers the v2 command");
+});
+
+// ── V2-020/Phase 3: the worker-model dependency is GONE, and stays gone ──────
+
+test("isolation: NO part of v2 imports modules/worker-model — check discovery has a neutral owner", () => {
+  // The one production build engine must not depend on a module whose conceptual owner is the
+  // retired v1 five-role pipeline. `resolveChecks` moved to the neutral `modules/checks`; this
+  // guard is what stops it (or anything else in worker-model) creeping back in.
+  const offenders: string[] = [];
+  for (const dir of ["core", "cli", "runtime"] as const) {
+    for (const file of tsFiles(join(V2_DIR, dir))) {
+      if (file.endsWith(".test.ts")) continue;
+      for (const spec of importSpecifiers(readFileSync(file, "utf8"))) {
+        if (/worker-model/.test(spec)) offenders.push(`${relative(SRC, file)} → ${spec}`);
+      }
+    }
+  }
+  assert.deepEqual(offenders, [], "v2 must not import worker-model; use the neutral modules/checks");
 });

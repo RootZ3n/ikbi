@@ -106,3 +106,25 @@ test("every declared module is WIRED (a non-test importer) or LABELED (@status d
       `label to their index. Silent phantoms: ${phantoms.join(", ")}`,
   );
 });
+
+// ── V2-020/Phase 17: TypeScript sources must be plain text ──────────────────
+
+test("guard: no .ts source file contains a raw NUL byte", () => {
+  // A raw NUL makes `file`, `grep` and most line-oriented tooling treat the file as BINARY and
+  // skip it SILENTLY. That is not cosmetic: `src/v2/core/cost.ts` — the canonical cost/accounting
+  // authority — carried two NULs as sort-key separators, and every grep-based static guard in this
+  // repository skipped the whole file without saying so. The escape sequence is byte-identical at
+  // runtime and keeps the file greppable, so there is no reason to write the literal byte.
+  const NUL = 0;
+  const offenders: string[] = [];
+  const walkAll = (dir: string): void => {
+    for (const e of readdirSync(dir, { withFileTypes: true })) {
+      const abs = join(dir, e.name);
+      if (e.isDirectory()) { walkAll(abs); continue; }
+      if (!e.name.endsWith(".ts")) continue;
+      if (readFileSync(abs).includes(NUL)) offenders.push(abs.slice(srcDir.length));
+    }
+  };
+  walkAll(srcDir);
+  assert.deepEqual(offenders, [], "write the \\u0000 escape sequence, never a literal NUL byte");
+});

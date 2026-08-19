@@ -128,12 +128,12 @@ available for advanced/operator use.
   `--strategy single|shadow|tournament` chooses one, two, or a bounded set of candidates (more
   candidates ⇒ more model spend; exactly one lawful winner is promoted). `--json` for the full
   session receipt; `ikbi doctor --v2` checks daily-driver readiness (no paid calls).
-  - _During the v2 qualification window the frozen v1 pipeline remains available as an explicit
-    emergency fallback under `ikbi legacy build "<goal>"` — never the default, never entered by
-    accident; it is slated for removal after the final independent audits._
-- **`ikbi run --spec <file>`** — the canonical preflighted external-agent path. It resolves the
-  repository and task, performs local provider/host/state checks before allocation or invocation,
-  then delegates to the same authoritative worker/orchestrator path and returns one terminal result.
+  - _The v1 build engine has been RETIRED (V2-020). `ikbi legacy build` no longer runs anything: it
+    refuses with a pointer here. `ikbi build` is the one production build authority._
+- **`ikbi run --spec <file>`** — the external-agent task-file path (spec in, exactly one terminal
+  JSON document out, with local provider/host/state preflight before any allocation or spend).
+  **It still drives the LEGACY v1 pipeline** and says so on every invocation; it is retained only
+  for that task-file contract, which v2 does not yet expose. For ordinary builds use `ikbi build`.
 - **`ikbi self-test` / `ikbi inspect <run-id>`** — deterministic local readiness test and bounded
   inspection of the existing run receipts/workspace evidence.
 - **`ikbi repl`** — interactive, multi-turn, tool-calling session (the closest analog to Claude

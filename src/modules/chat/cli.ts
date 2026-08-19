@@ -24,7 +24,7 @@ import { config } from "../../core/config.js";
 import { translateError, formatFriendlyError } from "../../core/errors/index.js";
 import { createContextManager } from "../../core/context/index.js";
 import { registry, invokeModelStream } from "../../core/provider/index.js";
-import { colorizeDiff, readPipedStdin } from "../worker-model/cli.js";
+import { colorizeDiff, readPipedStdin } from "../../cli/terminal-io.js";
 import type { ChatMode, ChatToolActivity } from "./contract.js";
 import { discoverProject, formatOverview } from "./project-discovery.js";
 import { detectLiveProject, summarize } from "../project-detection/index.js";

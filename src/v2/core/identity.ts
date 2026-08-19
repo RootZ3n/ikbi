@@ -264,12 +264,35 @@ function canonicalize(value: unknown): unknown {
 }
 
 /**
- * Content digest of a value. NEVER pass credential material to this — a digest is
- * published in receipts and CLI output, and a hash of a secret is still a fact about
- * the secret. The configuration layer strips credentials before it gets here.
+ * The domain-separation prefix for every v2 content-addressed identity. Versioned on purpose:
+ * changing it deliberately re-domains every id at once, and nothing in v2 assumes an id minted by
+ * an older build is still reproducible (there is no durable session resume — see
+ * docs/IKBI-POST-V1-ARCHITECTURE.md).
  */
-export function contentDigest<K extends string>(_kind: K, value: unknown): V2Digest<K> {
-  return createHash("sha256").update(canonicalJson(value)).digest("hex") as V2Digest<K>;
+const V2_DIGEST_DOMAIN = "ikbi/v2/";
+
+/**
+ * Content digest of a value, DOMAIN-SEPARATED BY KIND (V2-020/Phase 16).
+ *
+ * `kind` used to be accepted and then ignored, so two DIFFERENT kinds of thing that happened to
+ * canonicalize to the same JSON produced the SAME id — a `V2Digest<"candidate">` and a
+ * `V2Digest<"verification">` could collide, and the type parameter that was supposed to keep them
+ * apart existed only in the type system. The digest now commits to the kind:
+ *
+ *     sha256("ikbi/v2/" + kind + "\u0000" + canonicalJson(value))
+ *
+ * The NUL separator is what makes the framing unambiguous — without it `kind="ab"` + value `"c…"`
+ * and `kind="a"` + value `"bc…"` would hash the same bytes. NUL cannot appear in `kind` (a literal
+ * TypeScript string) and is escaped inside JSON strings, so no two (kind, value) pairs share input.
+ *
+ * NEVER pass credential material to this — a digest is published in receipts and CLI output, and a
+ * hash of a secret is still a fact about the secret. The configuration layer strips credentials
+ * before it gets here.
+ */
+export function contentDigest<K extends string>(kind: K, value: unknown): V2Digest<K> {
+  return createHash("sha256")
+    .update(`${V2_DIGEST_DOMAIN}${kind}\u0000${canonicalJson(value)}`)
+    .digest("hex") as V2Digest<K>;
 }
 
 /** A counter-based factory for deterministic tests (`task_seed-00000001`, …). */

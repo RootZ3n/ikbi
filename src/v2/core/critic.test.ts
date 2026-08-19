@@ -20,6 +20,9 @@ import {
   parseCriticResponse,
   validateCriticSubject,
   V2_CRITIC_FAILURE_CODES,
+  MAX_CRITIC_SUMMARY_CHARS,
+  MAX_DEFECT_DESCRIPTION_CHARS,
+  MAX_CRITIC_DEFECTS,
 } from "./critic.js";
 import type { CandidateRecord } from "./candidate.js";
 import type { VerificationRecord, RunVerificationSummary } from "./verification.js";
@@ -359,4 +362,72 @@ test("V2-016A/M1: a critic WIRE failure carries no invocation record (nothing co
   const r = await result;
   assert.equal(r.ok, false);
   if (!r.ok) assert.equal(r.invocation, undefined, "a failed wire call produced no record to account");
+});
+
+// ── V2-020/Phase 19: PARSER STRICTNESS ───────────────────────────────────────
+
+test("parse: an UNKNOWN top-level field is refused, never silently ignored", () => {
+  const r = parseCriticResponse(JSON.stringify({ verdict: "satisfied", summary: "ok", defects: [], confidence: 0.9 }));
+  assert.equal(r.ok, false);
+  assert.ok(!r.ok && r.problem === "unknown_field", `expected unknown_field, got ${!r.ok ? r.problem : "ok"}`);
+  assert.ok(!r.ok && /confidence/.test(r.detail));
+});
+
+test("parse: an UNKNOWN field inside a defect is refused", () => {
+  const r = parseCriticResponse(JSON.stringify({
+    verdict: "defects_found", summary: "a problem",
+    defects: [{ category: "wrong_behavior", severity: "major", description: "add() subtracts instead of adding", line: 42 }],
+  }));
+  assert.ok(!r.ok && r.problem === "unknown_field");
+});
+
+test("parse: a non-array `paths` is REFUSED rather than coerced to []", () => {
+  // The old parser coerced any non-array to [], so a judgment that named its evidence wrongly
+  // still parsed — having quietly discarded the evidence it claimed to have.
+  const r = parseCriticResponse(JSON.stringify({
+    verdict: "defects_found", summary: "a problem",
+    defects: [{ category: "wrong_behavior", severity: "major", description: "add() subtracts instead of adding", paths: "src/a.ts" }],
+  }));
+  assert.ok(!r.ok && r.problem === "malformed_paths");
+});
+
+test("parse: a `paths` array with non-string members is refused, not filtered", () => {
+  const r = parseCriticResponse(JSON.stringify({
+    verdict: "defects_found", summary: "a problem",
+    defects: [{ category: "wrong_behavior", severity: "major", description: "add() subtracts instead of adding", paths: ["src/a.ts", 7] }],
+  }));
+  assert.ok(!r.ok && r.problem === "malformed_paths");
+});
+
+test("parse: an ABSENT `paths` is still fine — claiming no evidence is a valid judgment", () => {
+  const r = parseCriticResponse(JSON.stringify({
+    verdict: "defects_found", summary: "a problem",
+    defects: [{ category: "wrong_behavior", severity: "major", description: "add() subtracts instead of adding" }],
+  }));
+  assert.ok(r.ok);
+  assert.deepEqual(r.defects[0]?.paths, []);
+});
+
+test("parse: summary, description and defect COUNT are bounded", () => {
+  const long = "x".repeat(MAX_CRITIC_SUMMARY_CHARS + 1);
+  assert.ok(!parseCriticResponse(JSON.stringify({ verdict: "satisfied", summary: long, defects: [] })).ok);
+  const r1 = parseCriticResponse(JSON.stringify({ verdict: "satisfied", summary: long, defects: [] }));
+  assert.ok(!r1.ok && r1.problem === "summary_too_long");
+
+  const bigDesc = "y".repeat(MAX_DEFECT_DESCRIPTION_CHARS + 1);
+  const r2 = parseCriticResponse(JSON.stringify({ verdict: "defects_found", summary: "s", defects: [{ category: "wrong_behavior", severity: "major", description: bigDesc }] }));
+  assert.ok(!r2.ok && r2.problem === "description_too_long");
+
+  const many = Array.from({ length: MAX_CRITIC_DEFECTS + 1 }, () => ({ category: "wrong_behavior", severity: "major", description: "add() subtracts instead of adding" }));
+  const r3 = parseCriticResponse(JSON.stringify({ verdict: "defects_found", summary: "s", defects: many }));
+  assert.ok(!r3.ok && r3.problem === "too_many_defects");
+});
+
+test("parse: an ordinary well-formed judgment at the bounds still PASSES (no valid provider broken)", () => {
+  const r = parseCriticResponse(JSON.stringify({
+    verdict: "defects_found",
+    summary: "x".repeat(MAX_CRITIC_SUMMARY_CHARS),
+    defects: [{ category: "wrong_behavior", severity: "major", description: "z".repeat(MAX_DEFECT_DESCRIPTION_CHARS), paths: ["src/a.ts"] }],
+  }));
+  assert.ok(r.ok, "the limits are bounds, not traps — a judgment exactly at them is valid");
 });

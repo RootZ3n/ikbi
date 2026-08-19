@@ -23,10 +23,14 @@
  */
 
 import { createInterface } from "node:readline";
-import { existsSync, fstatSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, join as pathJoin, resolve as pathResolve } from "node:path";
 
 import { registerCommand } from "../../cli/registry.js";
+// V2-020/Phase 8: these pure terminal helpers moved to a NEUTRAL home so `ikbi repl` no longer
+// pulls the whole v1 orchestrator in just to colour a diff. Re-exported for this module's callers.
+import { colorizeDiff, readPipedStdin } from "../../cli/terminal-io.js";
+export { colorizeDiff, readPipedStdin } from "../../cli/terminal-io.js";
 import { writeStderr, writeStdout } from "../../cli/io.js";
 import { config } from "../../core/config.js";
 import { beginOperation, resolveIdentity as coreResolveIdentity } from "../../core/identity/index.js";
@@ -85,22 +89,6 @@ function promptUser(prompt: string): Promise<string> {
  * descriptor) is left untouched. The fstat(0) gate is what makes this safe to call unconditionally:
  * only a FIFO/regular-file descriptor is drained, both of which reach EOF on their own.
  */
-export function readPipedStdin(stdin: NodeJS.ReadStream = process.stdin): Promise<string> {
-  return new Promise<string>((resolve) => {
-    try {
-      if (stdin.isTTY) return resolve("");
-      const st = fstatSync(0);
-      if (!st.isFIFO() && !st.isFile()) return resolve("");
-    } catch {
-      return resolve("");
-    }
-    let data = "";
-    stdin.setEncoding("utf8");
-    stdin.on("data", (c) => (data += c));
-    stdin.on("end", () => resolve(data));
-    stdin.on("error", () => resolve(data));
-  });
-}
 
 // ── SG-2: diff surfacing ──────────────────────────────────────────────────────
 
@@ -287,26 +275,11 @@ export function formatNextHints(r: WorkerResult): string {
 }
 
 // ── colored diff display (HUMAN-facing only) ──────────────────────────────────
-// Raw ANSI (no chalk dependency in the CLI context). Models never see this — the diff
-// TEXT handed to a model is unchanged; only the terminal display is colorized.
-const ANSI = { green: "\x1b[32m", red: "\x1b[31m", dim: "\x1b[2m", reset: "\x1b[0m" } as const;
 
 /**
  * Colorize a unified diff for terminal display: green for added (`+`) lines, red for
  * removed (`-`) lines, dim for `@@` hunk headers. File headers (`+++`/`---`) and context
  * lines are left plain. PURE — the input diff text is never mutated for the model. */
-export function colorizeDiff(text: string): string {
-  return text
-    .split("\n")
-    .map((line) => {
-      if (line.startsWith("+++") || line.startsWith("---")) return line; // file headers — plain
-      if (line.startsWith("@@")) return `${ANSI.dim}${line}${ANSI.reset}`;
-      if (line.startsWith("+")) return `${ANSI.green}${line}${ANSI.reset}`;
-      if (line.startsWith("-")) return `${ANSI.red}${line}${ANSI.reset}`;
-      return line;
-    })
-    .join("\n");
-}
 
 /** The minimal workspace surface the diff command + post-build summary read (get + diff). */
 export interface DiffWorkspaceSurface {
@@ -1662,28 +1635,43 @@ export async function flushBestEffort(bus: { flush(): Promise<void> }, ms: numbe
 }
 
 // Register the LIVE command at import time (the modules barrel triggers this).
-const live = createWorkerCli();
-// V2-018 CUTOVER: `ikbi build` is now the governed v2 daily-driver engine (registered by
-// src/v2/cli/index.ts). The v1 worker pipeline is FROZEN and reachable ONLY via the explicit
-// `ikbi legacy build ...` namespace — an emergency fallback during the v2 qualification window,
-// never the default and never enterable by accident. It is not deleted; final Fable/Codex audits
-// precede any V1 removal.
+// V2-020 RETIREMENT: the `ikbi legacy build` ENGINE is gone; what remains is a TOMBSTONE.
+//
+// Simply deleting the registration was worse than useless: with no `legacy` command, `ikbi legacy
+// build "…"` fell through to the default REPL and was read as a CHAT PROMPT, so an operator with
+// muscle memory from the previous release would silently start a conversational session about a
+// goal they thought they were building. A retired command must REFUSE, visibly, not be reinterpreted.
+//
+// So `legacy` is registered purely to say no. It constructs no worker, reaches no orchestrator, and
+// exits non-zero with the migration pointer.
 registerCommand({
   name: "legacy",
   category: "advanced",
-  summary: "FROZEN v1 build engine (emergency fallback during v2 qualification; `ikbi build` is the governed v2 daily driver)",
-  usage: "ikbi legacy build <goal...> [--repo <path>] [--verbose] [--cost] [--yes] [--no-memory] [--memory-diff]",
+  summary: "RETIRED — the v1 build engine was removed in V2-020; use `ikbi build` (governed v2)",
+  usage: "ikbi legacy  (retired — use: ikbi build \"<goal>\" [--repo <path>])",
   run: (argv) => {
-    const sub = argv[0];
-    if (sub === "build") return live.build(argv.slice(1));
     writeStderr(
-      "ikbi legacy: the only legacy subcommand is `legacy build` (the frozen v1 engine).\n" +
-        "For the governed v2 daily driver use `ikbi build \"<goal>\"`.\n",
+      "ikbi legacy: RETIRED.\n" +
+        "The v1 five-role build engine is no longer a production surface — it was removed after the\n" +
+        "v2 cutover completed its independent audits. Nothing was run.\n\n" +
+        `Use the canonical governed engine instead:\n  ikbi build "${argv.slice(1).join(" ") || "<goal>"}" --repo <path>\n`,
     );
     process.exitCode = 2;
     return Promise.resolve();
   },
 });
+
+// The removed registration, for the record: it used to build a live v1 worker CLI and dispatch
+// `legacy build` into it. It existed as an emergency fallback
+// for the v2 qualification window; that window closed when the independent audits completed, so a
+// second production build authority reachable from the CLI is no longer a safety net — it is the
+// "hidden v1 build authority" this repository is converging away from. `ikbi build` (the governed
+// v2 engine) is the ONE canonical build surface.
+//
+// `createWorkerCli()` itself is NOT deleted here: `ikbi run`, `ikbi heal`, the batch planner and the
+// HTTP task service still construct it directly, and deleting it would break retained surfaces
+// rather than retire dead code. What is removed is the COMMAND — the way an operator could enter
+// the v1 engine by typing it.
 
 // SG-2: `ikbi diff <workspace-id>` prints a workspace's git diff + a one-line change summary.
 const liveDiff = createDiffCli();

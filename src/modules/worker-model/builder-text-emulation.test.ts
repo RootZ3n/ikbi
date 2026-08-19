@@ -30,7 +30,7 @@ const greenExec = () => ({ run: async (_req: ExecRequest): Promise<ExecResult> =
 
 function base(): Omit<ModelResponse, "content" | "finishReason" | "toolCalls"> {
   return {
-    contractVersion: "1.1.0", model: "deepseek-reasoner", provider: "deepseek", providerModelId: "deepseek-reasoner",
+    contractVersion: "1.1.0", model: "llama3:8b", provider: "ollama", providerModelId: "llama3:8b",
     usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
     cost: { usd: 0, promptUsd: 0, cachedUsd: 0, completionUsd: 0, rate: { promptPerMTok: 0, completionPerMTok: 0 } },
     latencyMs: 1, fellBack: false, attempts: [],
@@ -62,8 +62,10 @@ test("text emulation: a no-tool-API model drives a write_file via a fenced JSON 
   const dir = tmp();
   const write = textResp('I will create the file.\n```json\n{"tool": "write_file", "args": {"path": "a.ts", "content": "export const x = 1;\\n"}}\n```');
   const { engine, requests } = mockEngine([write]);
-  // modelOverride "deepseek-reasoner" ⇒ getCapabilities → supports_tools:false ⇒ emulation on.
-  await createBuilder({ governedExec: greenExec(), parentCtx: PARENT_CTX, modelOverride: "deepseek-reasoner" })(makeCtx(dir, engine));
+  // modelOverride "llama3:8b" ⇒ getCapabilities → supports_tools:false ⇒ emulation on. (A model id
+  // with NO tool API is the point; `deepseek-reasoner` used to be one until e1ef626 correctly
+  // gave the V4 reasoner tool support, which silently switched this fixture off the emulation path.)
+  await createBuilder({ governedExec: greenExec(), parentCtx: PARENT_CTX, modelOverride: "llama3:8b" })(makeCtx(dir, engine));
 
   assert.ok(existsSync(join(dir, "a.ts")), "the text-emitted write_file actually wrote the file");
   // Emulated mode sends NO native tools array (the model can't use one).

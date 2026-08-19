@@ -1,8 +1,9 @@
 /**
- * CHECK DISCOVERY — v1's deterministic `resolveChecks`, behind the v2 seam.
+ * CHECK DISCOVERY — the neutral `modules/checks` `resolveChecks`, behind the v2 seam.
  *
- * WHAT IS ADOPTED. v1's `worker-model/checks.ts` is the mature, deterministic check
- * discovery in the codebase, and reimplementing it would be strictly worse. It:
+ * WHAT IS ADOPTED. `modules/checks` is the neutral, deterministic check discovery in the
+ * codebase (extracted from the retired v1 pipeline in V2-020 so the one production engine does not
+ * depend on v1-owned code), and reimplementing it would be strictly worse. It:
  *
  *   - lets an OPERATOR declare checks via `IKBI_CHECKS` (a JSON array, never model-chosen,
  *     never read from the worktree) — the only sanctioned way to authorize commands;
@@ -28,7 +29,7 @@ import { createHash } from "node:crypto";
 import { readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 
-import { resolveChecks } from "../../modules/worker-model/checks.js";
+import { resolveChecks } from "../../modules/checks/index.js";
 import { VERIFICATION_DEFINITION_FILES, bindVerificationDefinitionScope, type ChecksSource, type ResolvedChecks, type VerificationDefinition, type VerificationDefinitionProbe } from "../core/verification.js";
 
 /**

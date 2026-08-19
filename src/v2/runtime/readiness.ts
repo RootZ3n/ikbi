@@ -14,6 +14,10 @@
  */
 
 import { spawnSync } from "node:child_process";
+import { realpathSync } from "node:fs";
+
+import { resolveChecks } from "../../modules/checks/index.js";
+import { governedExecConfig } from "../../modules/governed-exec/config.js";
 
 import { buildRuntimeModelPolicy } from "../core/config.js";
 import { createConfigurationSource } from "./index.js";
@@ -46,8 +50,13 @@ export interface V2ReadinessProbe {
   git(): boolean;
   /** `bwrap` is on PATH — the governed read-only terminal + governed-exec sandbox use it when enabled. */
   bwrap(): boolean;
-  /** The governed-exec allowlist is configured — verification runs its checks through governed-exec. */
-  governedExecAllowlist(): boolean;
+  /**
+   * V2-020/Phase 20: does the governed-exec allowlist actually PERMIT the verification commands
+   * this repository would really run? A non-empty allowlist proved nothing — a repo whose checks
+   * are `cargo test` still failed at execution time while doctor reported green. This resolves the
+   * checks the way verification will (no execution, no spend) and answers about THOSE commands.
+   */
+  governedExecChecks(repoPath: string): GovernedExecReadiness;
   /** Resolve the builder + critic routes OFFLINE (the V2-016 readiness rules). Never invokes a model. */
   routes(): Promise<
     | { readonly ok: true; readonly builder: RouteReadiness | undefined; readonly critic: RouteReadiness | undefined }
@@ -56,9 +65,31 @@ export interface V2ReadinessProbe {
 }
 
 /**
+ * What the governed-exec readiness probe answers (V2-020/Phase 20).
+ *
+ *   resolved   the checks verification would run were derived from the repository.
+ *   permitted  every one of their command programs is on the governed-exec allowlist.
+ *
+ * The distinction is the whole point: `resolved: false` means this host cannot say what would run
+ * (no manifest, no IKBI_CHECKS) — DEGRADED, not broken. `resolved: true, permitted: false` means we
+ * know exactly what would run and it would be REFUSED at execution time — that is NOT READY, and it
+ * is precisely the state the old "is the allowlist non-empty?" check reported as green.
+ */
+export interface GovernedExecReadiness {
+  readonly resolved: boolean;
+  readonly permitted: boolean;
+  /** The check programs that would run (e.g. ["pnpm"]), when resolvable. */
+  readonly programs: readonly string[];
+  /** The subset NOT on the allowlist. */
+  readonly denied: readonly string[];
+  /** Why the checks could not be resolved, when they could not. */
+  readonly reason?: string;
+}
+
+/**
  * Classify readiness from probed facts. Pure: no host, no network, no config load of its own.
  */
-export async function assessV2Readiness(probe: V2ReadinessProbe): Promise<V2ReadinessReport> {
+export async function assessV2Readiness(probe: V2ReadinessProbe, repoPath: string = process.cwd()): Promise<V2ReadinessReport> {
   const checks: V2ReadinessCheck[] = [];
 
   const git = probe.git();
@@ -79,14 +110,19 @@ export async function assessV2Readiness(probe: V2ReadinessProbe): Promise<V2Read
       : "bubblewrap (bwrap) not found — governed execution falls closed where a sandbox is required (a build with no terminal/exec can still run)",
   });
 
-  const allowlist = probe.governedExecAllowlist();
+  // V2-020/Phase 20: prove the REAL check commands are permitted, not merely that a list exists.
+  const gx = probe.governedExecChecks(repoPath);
   checks.push({
     name: "governed-exec",
-    ok: allowlist,
-    level: "required",
-    detail: allowlist
-      ? "the governed-exec allowlist is configured — verification checks can run"
-      : "IKBI_GOVERNED_EXEC_ALLOWLIST is not configured — verification cannot run its checks",
+    // Unresolvable checks are DEGRADED (recommended), not a hard stop: this host simply cannot say
+    // what would run here. A KNOWN-and-DENIED command is a hard stop, because the build would fail.
+    ok: gx.resolved ? gx.permitted : true,
+    level: gx.resolved && !gx.permitted ? "required" : "recommended",
+    detail: !gx.resolved
+      ? `DEGRADED — cannot derive this project's checks (${gx.reason ?? "no manifest and no IKBI_CHECKS"}), so allowlist coverage is unproven`
+      : gx.permitted
+        ? `the checks that would run (${gx.programs.join(", ")}) are all permitted by governed-exec`
+        : `NOT READY — verification would run ${gx.denied.join(", ")}, which governed-exec would REFUSE; add to IKBI_GOVERNED_EXEC_ALLOWLIST`,
   });
 
   const routes = await probe.routes();
@@ -143,9 +179,24 @@ export function liveV2ReadinessProbe(): V2ReadinessProbe {
   return {
     git: () => onPath("git", "--version"),
     bwrap: () => onPath("bwrap", "--version"),
-    governedExecAllowlist: () => {
-      const v = process.env.IKBI_GOVERNED_EXEC_ALLOWLIST;
-      return v !== undefined && v.trim().length > 0;
+    governedExecChecks: (repoPath: string): GovernedExecReadiness => {
+      // Resolve the checks EXACTLY as verification will — same neutral discovery module, same
+      // operator precedence — then compare their programs against the live allowlist. Nothing is
+      // executed and no provider is contacted: this is a policy question, answered offline.
+      let real: string;
+      try {
+        real = realpathSync(repoPath);
+      } catch {
+        return { resolved: false, permitted: false, programs: [], denied: [], reason: "the repository path is not readable" };
+      }
+      const resolution = resolveChecks(real, process.env);
+      if (!resolution.ok) {
+        return { resolved: false, permitted: false, programs: [], denied: [], reason: resolution.reason };
+      }
+      const programs = [...new Set(resolution.checks.map((c) => c.command))];
+      const allowed = new Set(governedExecConfig.allowlist);
+      const denied = programs.filter((p) => !allowed.has(p));
+      return { resolved: true, permitted: denied.length === 0, programs, denied };
     },
     routes: async () => {
       try {

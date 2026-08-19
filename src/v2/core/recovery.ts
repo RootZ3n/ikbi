@@ -129,6 +129,14 @@ export type RecoveryTrigger =
   // semantic-REPAIR attempt (V2-013). `critic_indeterminate` and `no_checks` are NOT concrete
   // defects — there is nothing to repair — so they only ever stop.
   | "verification_failed"
+  /**
+   * V2-020/Phase 18: the candidate REDEFINED its own exam (`verification_policy_changed`). This is
+   * an INTEGRITY/POLICY finding, not a concrete defect: there is no defect evidence to repair, and
+   * re-running the builder over the same source cannot make the exam source-authorized again. It
+   * must never consume a semantic-repair attempt and must never retry automatically — the operator
+   * decides whether the definition change was legitimate.
+   */
+  | "verification_policy_changed"
   | "critic_defects"
   | "critic_indeterminate"
   | "no_checks"
@@ -180,7 +188,12 @@ export function classifyAttempt(result: V2RunResult): RecoveryTrigger {
           return "governance_withheld";
       }
     case "rejected":
-      return "verification_failed";
+      // V2-020/Phase 18: a rejection caused by the candidate REWRITING its verification definition
+      // is not an ordinary red check. It is read straight off the deterministic verdict so the
+      // distinction cannot drift from what verification actually decided.
+      return result.receipt.verification?.verdict === "verification_policy_changed"
+        ? "verification_policy_changed"
+        : "verification_failed";
     case "quarantined": {
       // A quarantine is either verification-incomplete (timeout/infra) or a drift/mutation of
       // the candidate/subject. The disposition's primary reason distinguishes them when it was
@@ -356,6 +369,10 @@ export function decideRecovery(input: {
     case "critic_defects":
       // Concrete critic defects — they may earn ONE semantic-repair attempt.
       return repairOrStop(input.policy.retryOnCriticDefectsForRepair, "critic_defects", "stop_withheld");
+    case "verification_policy_changed":
+      // NO repair entitlement and NO automatic retry: the exam itself is no longer source-authorized,
+      // so another attempt would be adjudicated by a definition the candidate supplied. Operator-only.
+      return derive("require_operator", "operator_must_resolve");
     case "critic_indeterminate":
     case "no_checks":
       // Neither is a concrete defect — there is nothing to repair. Disposition governed the stop.

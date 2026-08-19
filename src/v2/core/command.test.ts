@@ -213,3 +213,19 @@ test("policy identity: it is deterministic, and a changed rule/bound moves the p
   const tighter = buildCommandPolicy({ ...POLICY, maxCommands: POLICY.maxCommands + 1 });
   assert.notEqual(tighter.policyId, POLICY.policyId);
 });
+
+// ── V2-020/Phase 21: the sibling object-store channel is closed ──────────────
+
+test("policy: `git cat-file` is REFUSED — it enumerates the shared object store", () => {
+  // Tournament/shadow candidates are worktrees of ONE repository and share one object store.
+  // `cat-file` reads it by SHA, so allowing it is a cross-candidate read channel.
+  for (const args of [["cat-file", "-p", "HEAD"], ["cat-file", "--batch-all-objects", "--batch-check"], ["cat-file", "blob", "deadbeef"]]) {
+    assert.equal(ok("git", args).ok, false, `git ${args.join(" ")} must be refused`);
+  }
+});
+
+test("policy: ordinary read-only git inspection still works (no usefulness lost)", () => {
+  for (const args of [["status", "--porcelain"], ["diff", "HEAD"], ["log", "--oneline", "-5"], ["show", "HEAD:src/a.ts"], ["grep", "-n", "TODO"], ["ls-files"]]) {
+    assert.equal(ok("git", args).ok, true, `git ${args.join(" ")} must remain allowed`);
+  }
+});

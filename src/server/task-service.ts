@@ -283,15 +283,28 @@ export class TaskService {
     return beginOperation(who, { requestId: taskId });
   }
 
-  /** Live build: the governed production worker with a per-run cooperative kill-check. */
-  private async liveRunBuild(task: WorkerTask, ctx: OperationContext, isCancelled: () => boolean): Promise<WorkerResult> {
-    const { createProductionWorker } = await import("../modules/worker-model/cli.js");
-    const workerToken = "workerToken" in this.deps ? this.deps.workerToken : config.identity.workerToken;
-    const worker = createProductionWorker({
-      workerToken,
-      killCheck: async (target) => ({ killed: isCancelled() && (target.runId === task.taskId || target.requestId === task.taskId) }),
-    });
-    return worker.run(task, ctx);
+  /**
+   * Live build — DISABLED (V2-020/Phase 6).
+   *
+   * This endpoint used to launch the v1 five-role orchestrator over HTTP. After the v2 cutover that
+   * made `ikbi build` the one canonical engine, leaving it live meant `ikbi serve` could still start
+   * the RETIRED build spine — mutating and promoting into a real repository — while the CLI of the
+   * same binary ran v2. A server endpoint that quietly runs the old engine is precisely the hidden
+   * v1 build authority this repository converged away from, so it FAILS CLOSED.
+   *
+   * It is refused, not silently downgraded and not quietly re-routed: migrating the HTTP task
+   * contract onto a v2 BuildSession is a real piece of work (task lifecycle, streaming, cancellation
+   * and the `WorkerResult` shape all differ), and inventing that mapping here would be a second
+   * build architecture written without review. The operator is told exactly what happened and what
+   * to use instead. Every NON-BUILD server capability — receipts, timeline, task listing/status,
+   * capabilities, health — is untouched and still served.
+   */
+  private async liveRunBuild(_task: WorkerTask, _ctx: OperationContext, _isCancelled: () => boolean): Promise<WorkerResult> {
+    throw new Error(
+      "HTTP build tasks are retired: this endpoint ran the v1 build engine, which is no longer a " +
+        "production surface. Use the canonical v2 engine from the CLI — `ikbi build \"<goal>\" --repo <path>`. " +
+        "Read-only server capabilities (receipts, timeline, task status, capabilities) are unaffected.",
+    );
   }
 
   /**
@@ -301,7 +314,7 @@ export class TaskService {
    */
   private async liveRunFix(req: FixSubmission, ctx: OperationContext, isCancelled: () => boolean): Promise<FixOutcome> {
     const { runFixPipeline } = await import("../modules/worker-model/fix.js");
-    const { resolveCheckTimeoutMs } = await import("../modules/worker-model/checks.js");
+    const { resolveCheckTimeoutMs } = await import("../modules/checks/index.js");
     const { governedExec } = await import("../modules/governed-exec/index.js");
     const timeoutMs = resolveCheckTimeoutMs();
     const runCheck = async (repoPath: string, check: FixCheckCommand) => {

@@ -31,6 +31,7 @@ function result(over: {
   outcome: V2RunResult["outcome"];
   promotionDegraded?: boolean;
   dispositionPrimaryReason?: string;
+  verificationVerdict?: string;
 }): V2RunResult {
   return {
     runId: "run_x" as never,
@@ -41,6 +42,7 @@ function result(over: {
       evidence: { invocations: 2 },
       ...(over.promotionDegraded !== undefined ? { promotion: { degraded: over.promotionDegraded } } : {}),
       ...(over.dispositionPrimaryReason !== undefined ? { disposition: { primaryReason: over.dispositionPrimaryReason } } : {}),
+      ...(over.verificationVerdict !== undefined ? { verification: { verdict: over.verificationVerdict } } : {}),
     },
   } as unknown as V2RunResult;
 }
@@ -76,6 +78,9 @@ const CLASSIFY: readonly [string, V2RunResult, RecoveryTrigger][] = [
   ["withheld no_checks", result({ outcome: { kind: "withheld", candidateId: "c" as never, verificationId: "v" as never, reason: "policy" }, dispositionPrimaryReason: "no_checks" }), "no_checks"],
   ["withheld governance", result({ outcome: { kind: "withheld", candidateId: "c" as never, verificationId: "v" as never, reason: "governance" } }), "governance_withheld"],
   ["rejected", result({ outcome: { kind: "rejected", reason: "verification_red" } }), "verification_failed"],
+  // V2-020/Phase 18: a rejection caused by the candidate REWRITING its own exam is an integrity
+  // finding, not a red check — it is classified apart so it can never buy a repair attempt.
+  ["rejected policy-changed", result({ outcome: { kind: "rejected", reason: "verification_red" }, verificationVerdict: "verification_policy_changed" }), "verification_policy_changed"],
   ["quarantined timeout", result({ outcome: { kind: "quarantined", reason: "adjudication_incomplete", detail: "verification_timeout" }, dispositionPrimaryReason: "verification_timeout" }), "verification_timeout"],
   ["quarantined infra", result({ outcome: { kind: "quarantined", reason: "adjudication_incomplete", detail: "x" }, dispositionPrimaryReason: "verification_infrastructure_failure" }), "verification_infrastructure_failure"],
   ["quarantined drift (no disposition)", result({ outcome: { kind: "quarantined", reason: "safety_forensics", detail: "drift" } }), "candidate_drift"],
@@ -227,4 +232,22 @@ test("reconcile: ref still at the authorized base ⇒ not_landed", () => {
 
 test("reconcile: ref somewhere else entirely ⇒ ambiguous (never assume not-landed)", () => {
   assert.equal(classifyPublicationLanding({ candidateTree: "T", targetTree: "Z", targetHead: "H2" }), "ambiguous");
+});
+
+// ── V2-020/Phase 18: a redefined exam is OPERATOR territory, never a repair ───
+
+test("decide: verification_policy_changed NEVER grants a semantic repair, even with budget", () => {
+  const r = stub("rejected policy-changed");
+  // Same policy that WOULD authorize a repair for an ordinary verification failure.
+  const generous = buildRecoveryPolicy({ maxAttempts: 5, maxSemanticRepairAttempts: 3, retryOnVerificationFailureForRepair: true });
+  const d = decideRecovery({ attemptNumber: 1, result: r, policy: generous });
+  assert.equal(d.kind, "require_operator", "the exam is no longer source-authorized — a human decides");
+  assert.equal(d.reason, "operator_must_resolve");
+  assert.equal(d.nextAttemptNumber, undefined, "no automatic retry");
+  assert.notEqual(d.mode, "semantic_repair");
+
+  // The CONTRAST: an ordinary red check with the same policy does earn one repair.
+  const ordinary = decideRecovery({ attemptNumber: 1, result: stub("rejected"), policy: generous });
+  assert.equal(ordinary.kind, "retry_fresh_attempt");
+  assert.equal(ordinary.mode, "semantic_repair");
 });

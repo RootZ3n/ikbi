@@ -150,12 +150,23 @@ function capture() {
 
 // ── registration ─────────────────────────────────────────────────────────────
 
-test("the v1 worker pipeline is registered under the `legacy` namespace (V2-018 cutover)", () => {
-  // V2-018: `ikbi build` is now the governed v2 engine (registered by src/v2/cli). Importing THIS
-  // module registers the frozen v1 pipeline as `ikbi legacy build …` — an explicit namespace, never
-  // a built-in collision, never the default.
-  assert.ok(commands.has("legacy"));
-  for (const b of ["version", "models", "providers", "help"]) assert.notEqual(b, "legacy");
+test("the v1 worker pipeline registers NO build command at all (V2-020 retirement)", () => {
+  // V2-018 froze v1 behind `ikbi legacy build` for the qualification window. V2-020 removed that
+  // command: the audits are complete, and a second production build authority an operator can type
+  // is the hidden v1 authority this repository converged away from. Importing THIS module must now
+  // register no way to enter the v1 engine — `ikbi build` (v2) is the one build surface.
+  //
+  // The module is still imported for its NON-build exports (`createWorkerCli` for `ikbi run`, the
+  // `diff`/`repos` commands, `productionRoleClaim`), so "registers nothing at all" is not the claim.
+  // The NAME is still claimed, by a tombstone that refuses — otherwise `ikbi legacy build "…"`
+  // falls through to the REPL and is read as a chat prompt, which is worse than a clean refusal.
+  const legacy = commands.get("legacy");
+  assert.ok(legacy !== undefined, "the retired name is claimed so it cannot be reinterpreted");
+  assert.match(legacy!.summary ?? "", /RETIRED/, "and it says so");
+  assert.equal(commands.has("build"), false, "worker-model does not register `build` — v2 owns it");
+  for (const name of ["v1", "worker", "legacy-build"]) {
+    assert.equal(commands.has(name), false, `no v1 build surface may reappear as \`${name}\``);
+  }
 });
 
 test("productionRoleClaim returns the worker token for ALL roles; throws fail-closed when unset", () => {

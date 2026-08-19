@@ -99,6 +99,16 @@ export type V2CommandPolicyId = V2Digest<"command_policy">;
  *          verbs (fetch/pull/clone/ls-remote/push/remote) are ABSENT, so they are refused. The
  *          verb must be `args[0]` (no `git -C <dir>` / `git -c k=v` escape). `--output` (which
  *          would write a file) is denied.
+ *
+ *          `cat-file` is ALSO absent (V2-020/Phase 21). Tournament/shadow candidates are worktrees
+ *          of ONE repository and therefore share a single git OBJECT STORE. `cat-file` is the
+ *          object-enumeration primitive over that store — `--batch-all-objects` lists every object
+ *          in it, and `-p <sha>` prints any of them — so an allowed `cat-file` let one candidate
+ *          read a SIBLING candidate's blobs and quietly launder them into its own answer. That is a
+ *          real cross-candidate information channel, and candidate isolation is an authority
+ *          invariant here, not a nicety. Nothing ordinary is lost: a builder inspects its own tree
+ *          with `read_file`, `git show`, `git diff`, `git log` and `git grep`, all of which are
+ *          scoped to refs and paths it can legitimately name.
  *   grep/find/ls/head/tail/wc — read-only inspection. `find` write/exec actions are denied.
  *   echo — harmless; demonstrates that `>`/`|`/`$()` are literal argv, never shell.
  *
@@ -112,7 +122,7 @@ export const V2_DEFAULT_COMMAND_POLICY: BuilderCommandPolicy = buildCommandPolic
       mode: "subcommand",
       readOnlySubcommands: [
         "status", "diff", "log", "show", "grep", "rev-parse", "ls-files", "ls-tree",
-        "cat-file", "describe", "shortlog", "rev-list", "show-ref", "symbolic-ref",
+        "describe", "shortlog", "rev-list", "show-ref", "symbolic-ref",
         "name-rev", "diff-tree", "diff-index", "whatchanged", "blame",
       ],
       deniedArgTokens: ["--output", "-O", "-C", "--git-dir", "--work-tree", "-c", "--exec-path"],

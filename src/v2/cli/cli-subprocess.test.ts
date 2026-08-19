@@ -185,13 +185,16 @@ test("v2 cli: `ikbi v2 --help` prints help and does NOT execute a run", () => {
   assert.equal(r.stdout.includes('"journal"'), false, "help never enters the lifecycle");
 });
 
-test("v2 cli: v1 `build`, the `legacy` namespace, and the `v2` alias are all registered", () => {
+test("v2 cli: the normal commands and the `v2` alias are registered; `legacy` is only a tombstone", () => {
   const r = runCli(["help", "--advanced"]);
   assert.equal(r.status, 0, r.stderr);
-  for (const cmd of ["build", "fix", "repl", "doctor", "legacy"]) {
+  for (const cmd of ["build", "fix", "repl", "doctor"]) {
     assert.match(r.stdout, new RegExp(`\\b${cmd}\\b`), `\`ikbi ${cmd}\` is listed`);
   }
   assert.match(r.stdout, /\bv2\b/, "and the v2 alias appears in the advanced list");
+  // V2-020: `legacy` still appears in the ADVANCED list, but only as a retirement notice — the
+  // name is claimed so the old invocation refuses instead of being read as a REPL chat prompt.
+  assert.match(r.stdout, /legacy.*RETIRED/i, "the advanced list shows legacy as retired, not as an engine");
 });
 
 test("v2 cli: the default help does NOT advertise the advanced alias", () => {
@@ -260,14 +263,18 @@ test("cutover: `ikbi build --strategy tournament --json` shows all candidates + 
   assert.ok(result.receipt.selection !== undefined, "the ONE selection is recorded");
 });
 
-test("cutover: `ikbi legacy` is visibly legacy and cannot be entered by accident", () => {
-  // Bare `ikbi legacy` refuses with a pointer to the daily driver — it never runs anything.
+test("cutover: `ikbi legacy` is RETIRED — it is not a command and runs nothing", () => {
+  // V2-018 kept the v1 engine reachable as `ikbi legacy build` for the qualification window.
+  // V2-020 removed it. An unknown command must be refused, and it must not quietly do anything.
   const bare = runCli(["legacy"]);
-  assert.equal(bare.status, 2, "bare legacy refuses");
-  assert.match(bare.stderr, /legacy build/, "names the only legacy subcommand");
-  assert.match(bare.stderr, /ikbi build/, "points at the governed daily driver");
-  assert.equal(bare.stdout.includes('"journal"'), false, "legacy never enters the v2 lifecycle");
-  // And nothing about the golden-path help suggests legacy is the normal build.
-  const help = runCli(["help"]);
-  assert.doesNotMatch(help.stdout, /^\s*legacy\b/m, "legacy stays out of the golden-path help");
+  assert.equal(bare.status, 2, "`ikbi legacy` refuses");
+  assert.match(bare.stderr, /RETIRED/, "and says plainly that it is retired");
+  assert.match(bare.stderr, /ikbi build/, "pointing at the canonical engine");
+  assert.equal(bare.stdout.includes('"journal"'), false, "nothing entered any build lifecycle");
+
+  // The muscle-memory invocation must refuse too — never reinterpreted as a chat prompt, never run.
+  const build = runCli(["legacy", "build", "do a thing"]);
+  assert.equal(build.status, 2, "`ikbi legacy build` cannot start the retired v1 engine");
+  assert.match(build.stderr, /Nothing was run/, "it states that nothing happened");
+  assert.equal(build.stdout.includes('"journal"'), false, "and it started no run of any kind");
 });

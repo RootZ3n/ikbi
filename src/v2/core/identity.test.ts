@@ -10,6 +10,7 @@ import { test } from "node:test";
 import {
   V2IdentityError,
   V2_ID_PREFIXES,
+  contentDigest,
   createIdFactory,
   createSequentialIdFactory,
   isV2Id,
@@ -54,4 +55,33 @@ test("identity: minted ids are unique per call", () => {
   const seen = new Set<string>();
   for (let i = 0; i < 64; i += 1) seen.add(ids.mint("run"));
   assert.equal(seen.size, 64);
+});
+
+// ── V2-020/Phase 16: domain separation by kind ───────────────────────────────
+
+test("digest: the SAME value under DIFFERENT kinds yields DIFFERENT ids", () => {
+  // `kind` used to be ignored, so the type parameter that was supposed to keep a candidate id and
+  // a verification id apart existed only in the type system — at runtime they collided.
+  const value = { a: 1, b: ["x", "y"] };
+  const a = contentDigest("candidate", value);
+  const b = contentDigest("verification", value);
+  assert.notEqual(a, b, "the kind must be committed to, not merely declared");
+  assert.match(a, /^[0-9a-f]{64}$/);
+  assert.match(b, /^[0-9a-f]{64}$/);
+});
+
+test("digest: kind/value framing is UNAMBIGUOUS — no boundary-shift collision", () => {
+  // Without a separator, kind "ab" + value X and kind "a" + value "b"+X would hash the same bytes.
+  assert.notEqual(contentDigest("ab", "c"), contentDigest("a", "bc"));
+  assert.notEqual(contentDigest("run", "xy"), contentDigest("runx", "y"));
+});
+
+test("digest: it stays deterministic and canonical within one kind", () => {
+  // Key order and undefined members must not change the identity.
+  assert.equal(
+    contentDigest("candidate", { b: 2, a: 1, c: undefined }),
+    contentDigest("candidate", { a: 1, b: 2 }),
+    "canonicalization is unchanged by domain separation",
+  );
+  assert.equal(contentDigest("candidate", { a: 1 }), contentDigest("candidate", { a: 1 }));
 });

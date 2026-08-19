@@ -33,7 +33,7 @@ export interface HelpPage {
 export const HELP_PAGES: Readonly<Record<string, HelpPage>> = {
   run: {
     name: "run",
-    summary: "Canonical external-agent workflow: validate a task locally, then delegate to the authoritative worker/orchestrator path.",
+    summary: "External-agent task-file workflow: validate a task locally, then delegate to the LEGACY v1 worker/orchestrator. `ikbi build` is the canonical v2 engine.",
     usage: "ikbi run --spec <task-file> [--repo <path-or-name>] [--json]",
     flags: [
       { flag: "--spec <task-file>", desc: "Readable JSON task specification; required." },

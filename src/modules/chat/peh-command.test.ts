@@ -19,7 +19,7 @@ function withEnv(value: string | undefined, fn: () => void): void {
 }
 
 test("default is a pro model when nothing is configured", () => {
-  withEnv(undefined, () => assert.equal(resolvePehModel([]), "deepseek-v4-pro"));
+  withEnv(undefined, () => assert.equal(resolvePehModel([]), "mimo-v2.5-pro"));
 });
 
 test("IKBI_PEH_MODEL overrides the default", () => {
@@ -32,6 +32,6 @@ test("a --model flag wins over the env and the default", () => {
 });
 
 test("a dangling --model (no value) falls back to env/default, not a flag", () => {
-  withEnv(undefined, () => assert.equal(resolvePehModel(["--model"]), "deepseek-v4-pro"));
-  withEnv(undefined, () => assert.equal(resolvePehModel(["--model", "--continue"]), "deepseek-v4-pro"));
+  withEnv(undefined, () => assert.equal(resolvePehModel(["--model"]), "mimo-v2.5-pro"));
+  withEnv(undefined, () => assert.equal(resolvePehModel(["--model", "--continue"]), "mimo-v2.5-pro"));
 });

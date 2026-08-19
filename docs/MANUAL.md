@@ -75,7 +75,7 @@ missing). **Never do this in production.** Confirm everything is wired with `ikb
 ikbi build "fix the failing test" --repo /path/to/repo --verbose
 ```
 
-A 5-role pipeline (scout → builder → critic → verifier → integrator) runs in an isolated
+The governed v2 engine (builder → deterministic verification → semantic critic → disposition) runs in an isolated
 git worktree. Changes promote to your branch **only** if the verification ladder passes.
 Add `--cost` for a per-role cost breakdown.
 
@@ -114,7 +114,7 @@ as a **goal** and routed to the cognition layer, which decides the right path (b
 
 ### ikbi build
 
-Run the governed 5-role build pipeline toward a goal, in an isolated worktree. Promotes
+Run the governed v2 build engine toward a goal, in an isolated worktree. Promotes
 only on a ladder-verified pass.
 
 **Usage**

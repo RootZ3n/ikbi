@@ -131,7 +131,11 @@ test("P2 (req 19,21): the builder role receipt references its ledger invocation 
 
 test("P3 [MUTATION: no critic-lane guard] (req 6,14): a lane with NO valid critic model fails the attempt CLOSED before dispatch (lane-config error, no promotion)", async () => {
   // mimo-lane attempt but the mid roster has ONLY deepseek → no in-lane critic → config error before dispatch.
-  const h = realCriticRun({ vendorLane: "mimo", builderModelOverride: "mimo-v2.5", mid: ["deepseek-v4-pro"] });
+  // The operator critic preset is pinned OUT of the lane explicitly: without it this fixture inherits
+  // the ambient `criticModel()` default, and once 043d667 made that default `mimo-v2.5-pro` the mimo
+  // lane silently HAD an in-lane critic — so the guard correctly did not fire and the test, not the
+  // code, was wrong. Pinning it keeps the case hermetic and keeps pinning the real invariant.
+  const h = realCriticRun({ vendorLane: "mimo", builderModelOverride: "mimo-v2.5", mid: ["deepseek-v4-pro"], criticOverride: "deepseek-v4-pro" });
   const result = await h.run();
   assert.equal(result.promoted, false, "no lane-valid critic → never promotes");
   assert.equal(result.outcome, "rejected");
