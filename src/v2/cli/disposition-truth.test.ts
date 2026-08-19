@@ -124,17 +124,17 @@ test("disposition truth: the built CLI exists (run `pnpm build` first)", () => {
 
 test("disposition truth: PASS + SATISFIED ⇒ ELIGIBLE, but withheld and NOT promoted", async () => {
   const { result, repo } = await run(SATISFIED, GREP_WIDGET_2);
-  assert.ok(result.outcome.kind === "withheld");
-  assert.equal(result.outcome.reason, "awaiting_promotion");
+  // The disposition is acceptable_for_promotion; on a CLEAN repo V2-011 then PUBLISHES it, so
+  // the run is accepted and the operator's file now holds the candidate's change.
   const d = result.receipt.disposition!;
   assert.equal(d.decision, "acceptable_for_promotion");
   assert.equal(d.primaryReason, "acceptable");
   assert.equal(d.eligibleForPromotion, true);
   assert.equal(d.requiresRecovery, false);
-  // ELIGIBILITY IS NOT PROMOTION. The source is byte-for-byte untouched.
-  assert.equal(result.receipt.evidence.promoted, false);
-  assert.equal(result.receipt.stagesEntered.includes("promotion"), false, "the run stops before promotion");
-  assert.equal(readFileSync(join(repo, "src", "widget.ts"), "utf8"), WIDGET, "the operator's file never moved");
+  assert.ok(result.outcome.kind === "accepted");
+  assert.equal(result.receipt.evidence.promoted, true);
+  assert.equal(result.receipt.stagesEntered.includes("promotion"), true);
+  assert.equal(readFileSync(join(repo, "src", "widget.ts"), "utf8"), WIDGET_2, "the candidate's change landed on the operator's file");
 });
 
 test("disposition truth: GREEN + DEFECTS_FOUND ⇒ WITHHOLD — a passing verifier cannot erase a defect", async () => {
@@ -200,19 +200,19 @@ test("disposition truth: adjudication makes NO extra model call and NO extra che
   assert.equal(criticTurns.length, 1, "the critic's one judgment — and adjudication adds none");
 });
 
-test("disposition truth: an ELIGIBLE candidate leaves the operator's HEAD and working tree untouched", async () => {
+test("disposition truth: an ELIGIBLE candidate on a clean repo is PUBLISHED — HEAD moves to the candidate", async () => {
   const server = await provider(SATISFIED);
   const root = makeStateRoot(server);
   const repo = makeRepo();
   const headBefore = headOf(repo);
-  const statusBefore = statusOf(repo);
   const r = runCli(root, server, repo, GREP_WIDGET_2);
   const result = JSON.parse(r.stdout) as V2RunResult;
   assert.equal(result.receipt.disposition!.eligibleForPromotion, true, "the candidate IS eligible");
-  assert.equal(headOf(repo), headBefore, "HEAD did not move — eligibility is not promotion");
-  assert.equal(statusOf(repo), statusBefore, "the working tree is unchanged");
-  // Exit code 0: withholding an eligible candidate is a correct, intended result.
-  assert.equal(r.status, 0);
+  assert.ok(result.outcome.kind === "accepted");
+  assert.notEqual(headOf(repo), headBefore, "HEAD moved — the candidate was published");
+  assert.equal(headOf(repo), result.receipt.promotion!.afterRef, "HEAD is exactly the landed publication commit");
+  assert.equal(statusOf(repo).trim(), "", "and the checked-out worktree is clean after the sync");
+  assert.equal(r.status, 0, "an accepted publication is exit 0");
 });
 
 // ── the record is bound and the receipt is honest ────────────────────────────
@@ -236,11 +236,11 @@ test("disposition truth: the receipt records the decision without leaking prompt
   assert.ok(result.receipt.disposition !== undefined);
   assert.deepEqual(
     [...result.receipt.stagesEntered],
-    ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism", "disposition"],
+    ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism", "disposition", "promotion"],
   );
 });
 
-test("disposition truth: the human rendering states the decision and refuses to imply a promotion", async () => {
+test("disposition truth: the human rendering states the decision and the landed publication", async () => {
   const server = await provider(SATISFIED);
   const root = makeStateRoot(server);
   const repo = makeRepo();
@@ -252,6 +252,7 @@ test("disposition truth: the human rendering states the decision and refuses to 
     encoding: "utf8",
   });
   assert.match(res.stdout, /disposition ELIGIBLE FOR PROMOTION · acceptable/);
-  assert.match(res.stdout, /AUTHORIZED — but NOT promoted; awaiting the promotion authority/);
-  assert.match(res.stdout, /promoted=false/);
+  assert.match(res.stdout, /promotion {3}PUBLISHED · /);
+  assert.match(res.stdout, /the exact candidate tree is now authoritative/);
+  assert.match(res.stdout, /promoted=true/);
 });

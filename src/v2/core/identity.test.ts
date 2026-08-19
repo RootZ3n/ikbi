@@ -40,8 +40,8 @@ test("identity: parse rejects malformed outside-world strings (fail-closed)", ()
 });
 
 test("identity: parse accepts a well-formed id and returns it branded", () => {
-  const raw = "promo_0123456789abcdef";
-  assert.equal(parseV2Id("promotion", raw), raw);
+  const raw = "inv_0123456789abcdef";
+  assert.equal(parseV2Id("invocation", raw), raw);
 });
 
 test("identity: the factory refuses to mint from a token that would be malformed", () => {

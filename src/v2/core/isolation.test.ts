@@ -277,10 +277,14 @@ test("single authority: only the workspace adapter may create a worktree or writ
   // create and remove a throwaway git index in the OS temp directory, so that staging a
   // candidate's tree never touches the worktree's own index. The next guard proves it
   // holds no repository write.
+  // `publication.ts` writes a crash-durable promotion JOURNAL (intent/landed markers) under a
+  // dedicated directory — never a repository or workspace file. It is the publication
+  // authority's own audit trail, and the next guard proves it holds no candidate mutation.
   const allowed = new Set([
     join(V2_DIR, "runtime", "workspace-authority.ts"),
     join(V2_DIR, "runtime", "source-materializer.ts"),
     join(V2_DIR, "runtime", "candidate-capture.ts"),
+    join(V2_DIR, "runtime", "publication.ts"),
   ]);
   const offenders: string[] = [];
   for (const file of tsFiles(V2_DIR)) {
@@ -384,6 +388,74 @@ test("single authority: only the TOOL EXECUTOR writes candidate files, and it ho
   assert.equal(/writeFileSync|readFileSync|rmSync|unlinkSync|mkdirSync/.test(source), false, "no raw filesystem call");
 });
 
+test("single authority: only the promotion module mints a promotion identity (V2-011)", () => {
+  const allowed = new Set([join(V2_DIR, "core", "promotion.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    if (/contentDigest\s*\(\s*"promotion/.test(stripComments(readFileSync(file, "utf8")))) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "the promotion identity belongs to src/v2/core/promotion.ts alone");
+});
+
+test("single authority: a candidate is PUBLISHED only by the run spine (V2-011)", () => {
+  // `promotion.ts` declares `promoteAuthorized`; `run.ts` is the only caller. A second caller
+  // would be a second publication path.
+  const allowed = new Set([join(V2_DIR, "core", "run.ts"), join(V2_DIR, "core", "promotion.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    if (/promoteAuthorized\s*\(/.test(stripComments(readFileSync(file, "utf8")))) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "no component may publish on its own");
+});
+
+test("single authority: only the publication adapter moves a git ref (V2-011)", () => {
+  // The clean-ref CAS lives in exactly ONE adapter. `updateRefCas` / `update-ref` anywhere
+  // else in v2 would be a second, ungoverned way to move the target — the thing this slice
+  // exists to make singular. `.promote(` (the v1 WorkspaceManager promote, which auto-merges)
+  // must never be called from v2 at all.
+  const allowed = new Set([join(V2_DIR, "runtime", "publication.ts")]);
+  const refOffenders: string[] = [];
+  const promoteOffenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (file.endsWith(".test.ts")) continue;
+    const source = stripComments(readFileSync(file, "utf8"));
+    if (!allowed.has(file) && /updateRefCas\s*\(|["']update-ref["']/.test(source)) refOffenders.push(relative(SRC, file));
+    if (/\.promote\s*\(/.test(source)) promoteOffenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(refOffenders, [], "the target ref is moved only by src/v2/runtime/publication.ts");
+  assert.deepEqual(promoteOffenders, [], "no v2 file calls the v1 auto-merging WorkspaceManager.promote");
+});
+
+test("single authority: the PROMOTION authority invokes no model, mutates no candidate, re-runs no verification (V2-011)", () => {
+  // Publication is mechanical. `promotion.ts` (the pure authority) must not import the
+  // invocation authority, the mutation authority, the builder, the critic, the verifier, a
+  // check runner, or governed-exec, and must call none of them.
+  // Type-only imports of the evidence records (VerificationRecord/CriticRecord/…) are
+  // legitimate — the authority NAMES the evidence it enacts. What it must not import is the
+  // MACHINERY that invokes, mutates or verifies; the content check below proves it calls none.
+  const specs = importSpecifiers(readFileSync(join(V2_DIR, "core", "promotion.ts"), "utf8"));
+  for (const forbidden of ["./invocation", "governed-exec", "./builder", "runtime/check-runner", "runtime/candidate-capture"]) {
+    assert.equal(specs.some((sp) => sp.includes(forbidden)), false, `promotion.ts must not import ${forbidden}`);
+  }
+  const source = stripComments(readFileSync(join(V2_DIR, "core", "promotion.ts"), "utf8"));
+  assert.equal(/invokeAuthorized|judgeCandidate|judgeDisposition|\.mutate\s*\(|verifyCandidate/.test(source), false, "promotion.ts must not invoke, judge, mutate or verify");
+});
+
+test("single authority: promotion is downstream of disposition — earlier authorities cannot import it (V2-011)", () => {
+  // The disposition decides eligibility; the builder/critic/verifier produce evidence. None of
+  // them may reach the publication authority — promotion is strictly the spine's final act.
+  const forbiddenImporters = ["disposition.ts", "builder.ts", "critic.ts", "verification.ts"].map((f) => join(V2_DIR, "core", f));
+  const offenders: string[] = [];
+  for (const file of forbiddenImporters) {
+    for (const spec of importSpecifiers(readFileSync(file, "utf8"))) {
+      if (/\/promotion(\.js)?$/.test(spec) || spec.includes("runtime/publication")) offenders.push(`${relative(SRC, file)} -> ${spec}`);
+    }
+  }
+  assert.deepEqual(offenders, [], "no earlier authority imports the promotion/publication modules");
+});
+
 test("single authority: only the disposition module mints a disposition identity (V2-010)", () => {
   const allowed = new Set([join(V2_DIR, "core", "disposition.ts")]);
   const offenders: string[] = [];
@@ -442,11 +514,15 @@ test("single authority: no v2 file imports a v1 integrator / adjudication / refu
 
 test("single authority: the disposition flags are DERIVED, never independently set (V2-010)", () => {
   // The three secondary facts must be produced only by `deriveDispositionFlags`; no other v2
-  // code may assemble a record by writing `eligibleForPromotion:` etc. directly. Confining the
-  // literal to disposition.ts is what makes an impossible flag combination unconstructable.
+  // code may assemble a DispositionRecord by writing `eligibleForPromotion:` etc. directly.
+  // Confining the derivation to disposition.ts is what makes an impossible flag combination
+  // unconstructable. `promotion.ts` is exempt: it does not DERIVE the flag, it READS it FROM
+  // the disposition record to prove publication is authorized — the assertion below pins that.
+  const promotionSrc = stripComments(readFileSync(join(V2_DIR, "core", "promotion.ts"), "utf8"));
+  assert.ok(/input\.disposition\.eligibleForPromotion/.test(promotionSrc), "promotion.ts copies the eligibility fact FROM the disposition, never invents it");
   const offenders: string[] = [];
   for (const file of tsFiles(V2_DIR)) {
-    if (file.endsWith(".test.ts") || file === join(V2_DIR, "core", "disposition.ts")) continue;
+    if (file.endsWith(".test.ts") || file === join(V2_DIR, "core", "disposition.ts") || file === join(V2_DIR, "core", "promotion.ts")) continue;
     if (/eligibleForPromotion\s*:/.test(stripComments(readFileSync(file, "utf8")))) offenders.push(relative(SRC, file));
   }
   assert.deepEqual(offenders, [], "only disposition.ts writes the derived promotion-eligibility flag");

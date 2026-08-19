@@ -122,6 +122,7 @@ export function renderRun(result: V2RunResult): string {
     ...verificationLines(result),
     ...criticLines(result),
     ...dispositionLines(result),
+    ...promotionLines(result),
     `outcome     ${formatOutcome(result.outcome)}`,
     "evidence    " +
       `provider_invoked=${e.providerInvoked} invocations=${e.invocations} mutations=${e.mutationsApplied} ` +
@@ -300,14 +301,34 @@ function dispositionLines(result: V2RunResult): string[] {
         : d.decision === "reject" ? "REJECTED"
           : "QUARANTINED";
   const reasons = [d.primaryReason, ...d.supportingReasons].join(", ");
+  // Whether a landed publication followed decides how the eligibility line reads.
+  const landed = result.receipt.promotion !== undefined;
   const lines = [
     `disposition ${label} · ${reasons} · policy ${d.policyId.slice(0, 12)}`,
     `  weighs    verification ${d.verificationVerdict.toUpperCase()} + critic ${d.criticVerdict.toUpperCase()}`,
     `  flags     eligible=${d.eligibleForPromotion} requires_recovery=${d.requiresRecovery} requires_operator=${d.requiresOperator}`,
     `  id        ${d.dispositionId}`,
-    `  status    ${d.eligibleForPromotion ? "AUTHORIZED — but NOT promoted; awaiting the promotion authority" : "NOT PROMOTED"}`,
+    `  status    ${d.eligibleForPromotion ? (landed ? "AUTHORIZED — publication landed (see promotion)" : "AUTHORIZED — but NOT promoted") : "NOT PROMOTED"}`,
   ];
   return lines;
+}
+
+/**
+ * The publication, when one landed. It states the target, the exact tree that became
+ * authoritative (== the candidate tree), and — for a degraded landing — that the ref moved
+ * even though post-CAS bookkeeping did not fully complete.
+ */
+function promotionLines(result: V2RunResult): string[] {
+  const p = result.receipt.promotion;
+  if (p === undefined) return [];
+  const label = p.degraded ? "PUBLISHED (DEGRADED)" : p.idempotent ? "ALREADY PUBLISHED" : "PUBLISHED";
+  return [
+    `promotion   ${label} · ${p.targetBranch} · ${p.strategy}`,
+    `  landed    ${p.beforeRef.slice(0, 12)} -> ${p.afterRef.slice(0, 12)} · tree ${p.publishedTree.slice(0, 12)}`,
+    `  worktree  ${p.worktreeSynced ? "synced" : "not synced"}`,
+    `  id        ${p.promotionId}`,
+    `  status    ${p.degraded ? "THE REF MOVED — post-CAS bookkeeping incomplete; recover/audit via this record" : "the exact candidate tree is now authoritative"}`,
+  ];
 }
 
 

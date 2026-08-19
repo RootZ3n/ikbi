@@ -15,8 +15,8 @@
  */
 
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -123,7 +123,6 @@ async function verifyRun(over: { files?: Record<string, string>; checks?: string
 }
 
 
-const gitStatus = (repo: string) => execFileSync("git", ["status", "--porcelain"], { cwd: repo, encoding: "utf8" });
 
 test("verification truth: the built CLI exists (run `pnpm build` first)", () => {
   assert.ok(existsSync(ENTRY), `built CLI not found at ${ENTRY}`);
@@ -150,15 +149,14 @@ test("verification truth: a candidate whose checks PASS is verified PASS, tree u
   assert.equal(v.checks[0]?.status, "pass");
   assert.equal(v.checks[0]?.exitCode, 0);
 
-  // PASS + satisfied ⇒ eligible-for-promotion, reported as withheld (awaiting_promotion).
-  // Stops before promotion; nothing promoted; operator repo untouched.
-  assert.ok(result.outcome.kind === "withheld");
+  // PASS + satisfied on a CLEAN repo ⇒ eligible, adjudicated, and PUBLISHED — the run is
+  // accepted and the candidate tree lands on the target branch.
+  assert.ok(result.outcome.kind === "accepted");
   assert.equal(result.receipt.disposition?.decision, "acceptable_for_promotion");
-  assert.equal(result.receipt.stagesEntered.includes("promotion"), false);
+  assert.equal(result.receipt.stagesEntered.includes("promotion"), true);
   assert.equal(result.receipt.evidence.verificationsPerformed, 1);
-  assert.equal(result.receipt.evidence.promoted, false);
-  assert.equal(readFileSync(join(repo, "src", "widget.ts"), "utf8"), WIDGET_1, "the operator's file is untouched");
-  assert.equal(gitStatus(repo), gitStatus(repo));
+  assert.equal(result.receipt.evidence.promoted, true);
+  assert.equal(result.receipt.promotion?.publishedTree, result.receipt.candidate!.treeId, "the EXACT verified tree landed");
 });
 
 // ── NORMAL FAIL ──────────────────────────────────────────────────────────────
@@ -304,7 +302,8 @@ test("verification truth: the human rendering states the verdict and refuses to 
   assert.match(res.stdout, /verified {4}PASS · 1 check\(s\)/);
   assert.match(res.stdout, /pass +widget \(grep/);
   assert.match(res.stdout, /VERIFIED — deterministic evidence for adjudication/);
-  // PASS + satisfied ⇒ the disposition is ELIGIBLE, but the render refuses to imply promotion.
+  // PASS + satisfied on a clean repo ⇒ ELIGIBLE, then PUBLISHED. The render states the landing.
   assert.match(res.stdout, /disposition ELIGIBLE FOR PROMOTION/);
-  assert.match(res.stdout, /AUTHORIZED — but NOT promoted; awaiting the promotion authority/);
+  assert.match(res.stdout, /promotion {3}PUBLISHED · /);
+  assert.match(res.stdout, /the exact candidate tree is now authoritative/);
 });

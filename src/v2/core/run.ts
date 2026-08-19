@@ -89,6 +89,13 @@ import {
   type DispositionPolicy,
   type DispositionRecord,
 } from "./disposition.js";
+import {
+  promoteAuthorized,
+  summarizePromotion,
+  type PromotionResult,
+  type PromotionRecord,
+  type PromotionTarget,
+} from "./promotion.js";
 import { DEFAULT_DIFF_BUDGET, type CandidateDiffSource } from "./candidate-diff.js";
 import { summarizeRetrieval, type RetrievalReporter, type RetrievalSummary } from "./retrieval.js";
 import { summarizeSnapshot, type SourceSnapshotAuthority, type SourceSnapshotReader } from "./source.js";
@@ -155,11 +162,47 @@ export function rebindableArtifact(pkg: ContextPackage): { path: string; observe
   return { path: chosen.path, observedSha256: chosen.observedSha256 };
 }
 
-/** The furthest stage this build of ikbi implements. */
-export const IMPLEMENTED_THROUGH_STAGE: LifecycleStage = "disposition";
+/** The furthest stage this build of ikbi implements — now the whole spine, through publication. */
+export const IMPLEMENTED_THROUGH_STAGE: LifecycleStage = "promotion";
 
-/** The stage the run would need next, and does not have. */
-export const FIRST_UNIMPLEMENTED_STAGE: LifecycleStage = "promotion";
+/**
+ * Map the promotion RESULT onto the run's terminal outcome. ONLY an actually-landed
+ * publication (including an idempotent already-landed and a degraded landing — the ref DID
+ * move) becomes `accepted`; every refusal keeps the candidate withheld or quarantined and the
+ * source unchanged. This function is never called for `refused_wrong_evidence` /
+ * `infrastructure_failure` (those end the run as `failed`), but it handles them defensively.
+ */
+export function terminalOutcomeForPromotion(
+  result: PromotionResult,
+  candidateId: import("./identity.js").V2CandidateId,
+  verificationId: import("./identity.js").V2VerificationId,
+): RunTerminalOutcome {
+  switch (result.kind) {
+    case "promoted":
+    case "already_promoted":
+    case "promoted_degraded":
+      // The repository changed. The receipt's promotion summary carries the degraded flag when
+      // post-CAS bookkeeping did not fully complete; the outcome is still, truthfully, accepted.
+      return { kind: "accepted", candidateId, verificationId, promotionId: result.record.promotionId };
+    case "refused_dirty_source_unsupported":
+      return { kind: "withheld", candidateId, verificationId, reason: "unsupported_publication" };
+    case "refused_stale_target":
+    case "cas_conflict":
+      // The target moved — no auto-merge; recovery must re-verify against the new base.
+      return { kind: "withheld", candidateId, verificationId, reason: "target_moved" };
+    case "refused_target_worktree_dirty":
+      return { kind: "withheld", candidateId, verificationId, reason: "operator" };
+    case "refused_not_eligible":
+      // Defensive: disposition already gated this. Withhold rather than imply anything landed.
+      return { kind: "withheld", candidateId, verificationId, reason: "policy" };
+    case "refused_candidate_drift":
+      // The retained tree moved since adjudication — a stale subject. Quarantine for forensics.
+      return { kind: "quarantined", reason: "safety_forensics", detail: result.detail };
+    case "refused_wrong_evidence":
+    case "infrastructure_failure":
+      return { kind: "failed", failure: result.failure };
+  }
+}
 
 /**
  * Map the ONE lawful disposition decision onto the run's terminal outcome vocabulary. This
@@ -321,6 +364,12 @@ export interface V2RunDeps {
    * SAFE `DEFAULT_DISPOSITION_POLICY` (deterministic pass AND satisfied critic required).
    */
   readonly dispositionPolicy?: DispositionPolicy;
+  /**
+   * THE publication target — the ONLY thing that moves a target ref. REQUIRED and injected:
+   * it shells out to git and performs the atomic clean-ref CAS. Wired once, in
+   * `src/v2/runtime/index.ts`; tests supply a fake and stay hermetic.
+   */
+  readonly publisher: PromotionTarget;
   readonly ids?: V2IdFactory;
   readonly now?: () => number;
   readonly probe?: RepoProbe;
@@ -454,12 +503,13 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
   let verification: VerificationRecord | undefined;
   let critic: CriticRecord | undefined;
   let dispositionRecord: DispositionRecord | undefined;
+  let promotionRecord: PromotionRecord | undefined;
   let workspace: V2WorkspaceRecord | undefined;
   let workspaceObservations = 0;
   let disposition: WorkspaceDisposition | undefined;
-  // The terminal outcome computed BY the disposition authority. Set on the one path that
-  // reaches a real adjudication; left undefined when the run failed earlier (then the
-  // outcome is `failed` with the recorded failure).
+  // The terminal outcome computed BY the disposition/promotion authorities. Set on the one
+  // path that reaches a real adjudication (and, when eligible, a publication); left undefined
+  // when the run failed earlier (then the outcome is `failed` with the recorded failure).
   let dispositionOutcome: RunTerminalOutcome | undefined;
 
   const failure = await (async (): Promise<RunFailure | null> => {
@@ -777,12 +827,58 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
       decision: dispositionRecord.decision,
     });
 
-    // The candidate has been VERIFIED, CRITIQUED and ADJUDICATED. The disposition says what
-    // SHOULD happen next; it does not itself do it. We terminalize with the lawful outcome and
-    // STOP before promotion — the promotion authority (V2-012) does not exist in this build.
-    // `acceptable_for_promotion` becomes `withheld (awaiting_promotion)`: ELIGIBILITY, never a
-    // promotion; the source is unchanged and the candidate is retained.
-    dispositionOutcome = terminalOutcomeForDisposition(dispositionRecord, candidate.candidateId, verification.verificationId);
+    // The candidate has been VERIFIED, CRITIQUED and ADJUDICATED. If the disposition did NOT
+    // authorize publication, the run terminalizes here exactly as V2-010 did — withheld,
+    // rejected or quarantined — and never enters the promotion stage.
+    if (!dispositionRecord.eligibleForPromotion) {
+      dispositionOutcome = terminalOutcomeForDisposition(dispositionRecord, candidate.candidateId, verification.verificationId);
+      return null;
+    }
+
+    // Stage 9 — PROMOTION. THE publication authority mechanically publishes the ALREADY-
+    // AUTHORIZED candidate. It re-adjudicates NOTHING: it proves authorization from the
+    // disposition, rechecks every mutable fact at this fresh boundary (candidate tree drift,
+    // target staleness), refuses anything unsafe WITHOUT touching git, and — only when all
+    // checks pass — lands EXACTLY the candidate tree by a clean-ref CAS. No model, no
+    // mutation, no verification, no merge. A dirty source checkout is refused (withheld); a
+    // moved target is refused (withheld) — recovery re-verifies, promotion never merges.
+    lifecycle.enter(runId, "promotion");
+    const promoted = await promoteAuthorized({
+      taskId,
+      candidate,
+      verification,
+      critic: criticRecord,
+      disposition: dispositionRecord,
+      target: {
+        repositoryPath: workspace.source.repositoryPath,
+        baseBranch: workspace.source.baseBranch,
+        baseCommit: workspace.source.baseCommit,
+      },
+      sourceClean: source.snapshot.clean,
+      workspacePath: workspace.path,
+      probeTree: (path: string) => deps.treeProbe.treeOf(path),
+      publisher: deps.publisher,
+      now,
+    });
+    // A landed publication (including an idempotent already-landed or a degraded landing) is
+    // recorded on the ledger, binding it to the disposition that authorized it — this is what
+    // the `accepted` terminal outcome cites.
+    if (promoted.kind === "promoted" || promoted.kind === "already_promoted" || promoted.kind === "promoted_degraded") {
+      promotionRecord = promoted.record;
+      lifecycle.record(runId, {
+        kind: "promotion",
+        id: promoted.record.promotionId,
+        candidateId: candidate.candidateId,
+        verificationId: verification.verificationId,
+        dispositionId: dispositionRecord.dispositionId,
+      });
+    }
+    // A wrong-evidence refusal or a publication infrastructure fault is an engine/infra failure
+    // with NOTHING landed — the run FAILS with the structured failure.
+    if (promoted.kind === "refused_wrong_evidence" || promoted.kind === "infrastructure_failure") return promoted.failure;
+    // Every other outcome is a truthful terminal state: accepted (landed) or a specific
+    // withheld/quarantined refusal. NEVER `accepted` unless a publication actually landed.
+    dispositionOutcome = terminalOutcomeForPromotion(promoted, candidate.candidateId, verification.verificationId);
     return null;
   })();
 
@@ -837,6 +933,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     ...(verification !== undefined ? { verification: summarizeVerification(verification) } : {}),
     ...(critic !== undefined ? { critic: summarizeCritic(critic) } : {}),
     ...(dispositionRecord !== undefined ? { disposition: summarizeDisposition(dispositionRecord) } : {}),
+    ...(promotionRecord !== undefined ? { promotion: summarizePromotion(promotionRecord) } : {}),
     ...(workspace !== undefined && disposition !== undefined
       ? { workspace: summarizeWorkspace({ workspace, observations: workspaceObservations, disposition }) }
       : {}),
@@ -858,6 +955,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     ...(verification !== undefined ? { verification } : {}),
     ...(critic !== undefined ? { critic } : {}),
     ...(dispositionRecord !== undefined ? { disposition: dispositionRecord } : {}),
+    ...(promotionRecord !== undefined ? { promotion: promotionRecord } : {}),
     journal: lifecycle.journal,
     receipt,
   };

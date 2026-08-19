@@ -87,8 +87,13 @@ export type V2DiffDigest = V2Digest<"candidate_diff">;
 export type V2DispositionId = V2Digest<"disposition">;
 /** Content address of ONE disposition policy — the explicit rules an adjudication applied. */
 export type V2DispositionPolicyDigest = V2Digest<"disposition_policy">;
-/** ONE promotion attempt. */
-export type V2PromotionId = V2Id<"promotion">;
+/**
+ * Content address of ONE publication — what was AUTHORIZED and what actually LANDED. It binds
+ * the candidate tree, the disposition, the target branch and the published tree; the commit
+ * sha, clock and event are provenance, never identity. So publishing the SAME candidate to
+ * the SAME target is the SAME promotion — which is exactly what idempotency needs to see.
+ */
+export type V2PromotionId = V2Digest<"promotion">;
 /** ONE receipt record. */
 export type V2ReceiptId = V2Id<"receipt">;
 
@@ -101,7 +106,6 @@ export const V2_ID_PREFIXES = {
   candidate: "cand",
   observation: "obs",
   verification: "ver",
-  promotion: "promo",
   receipt: "rcpt",
 } as const;
 

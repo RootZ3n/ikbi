@@ -170,6 +170,7 @@ export type LifecycleEvidence =
       readonly id: V2PromotionId;
       readonly candidateId: V2CandidateId;
       readonly verificationId: V2VerificationId;
+      readonly dispositionId: V2DispositionId;
     };
 
 /** Which stage is allowed to record which evidence. A stage cannot vouch for another's work. */
@@ -239,8 +240,10 @@ const STAGE_REQUIRES: Partial<Record<LifecycleStage, readonly LifecycleEvidence[
   // Disposition adjudicates on BOTH evidence classes — the deterministic verification AND
   // the semantic critic judgment. It cannot run on a candidate that either has not judged.
   disposition: ["verification", "critic"],
-  // Nothing to promote without a verdict from the canonical verification authority.
-  promotion: ["verification"],
+  // V2-011: promotion enacts an ALREADY-AUTHORIZED disposition. It REQUIRES a recorded
+  // disposition — there is no verification→promotion path and no critic→promotion path.
+  // Publication cannot run on a candidate that was never adjudicated.
+  promotion: ["disposition"],
 };
 
 /** The read-only view of what a run produced. */
@@ -513,6 +516,10 @@ export class RunLifecycle {
       }
     }
     if (entry.kind === "promotion") {
+      // V2-011: a promotion enacts an AUTHORIZED disposition. It must name a recorded
+      // candidate, the verification it rests on, AND the disposition that authorized it — and
+      // that disposition must have adjudicated the SAME candidate/verification. This is what
+      // makes a landed publication provably the enactment of one lawful decision.
       this.assertCandidateRecorded(entry.candidateId);
       const verification = this.evidence.find((e) => e.kind === "verification" && e.id === entry.verificationId);
       if (verification === undefined) {
@@ -523,6 +530,17 @@ export class RunLifecycle {
           "evidence_mismatch",
           this.runId,
           `verification ${entry.verificationId} judged candidate ${verification.candidateId}, not ${entry.candidateId}`,
+        );
+      }
+      const disposition = this.evidence.find((e) => e.kind === "disposition" && e.id === entry.dispositionId);
+      if (disposition === undefined) {
+        throw new LifecycleViolationError("unrecorded_evidence", this.runId, `disposition ${entry.dispositionId} was never recorded`);
+      }
+      if (disposition.kind === "disposition" && (disposition.candidateId !== entry.candidateId || disposition.verificationId !== entry.verificationId)) {
+        throw new LifecycleViolationError(
+          "evidence_mismatch",
+          this.runId,
+          `the promotion cites disposition ${entry.dispositionId}, which adjudicated candidate ${disposition.candidateId} on verification ${disposition.verificationId}`,
         );
       }
     }

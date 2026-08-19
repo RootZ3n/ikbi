@@ -33,6 +33,7 @@ import { createChecksSource } from "./verification-checks.js";
 import { createCheckRunner } from "./check-runner.js";
 import { createTreeProbe } from "./verification-tree.js";
 import { createCandidateDiffSource } from "./candidate-diff.js";
+import { createCasPublicationTarget } from "./publication.js";
 
 /** The operator's per-check timeout knob, when set to a positive integer. */
 function envCheckTimeoutMs(): number | undefined {
@@ -148,6 +149,7 @@ export interface ProductionRunDeps {
   readonly treeProbe?: V2RunDeps["treeProbe"];
   readonly checkTimeoutMs?: V2RunDeps["checkTimeoutMs"];
   readonly candidateDiff?: V2RunDeps["candidateDiff"];
+  readonly publisher?: V2RunDeps["publisher"];
   readonly transport?: InvocationTransport;
   readonly workspaces?: WorkspaceAuthority;
   readonly mutations?: StateBoundMutationAuthority;
@@ -234,6 +236,8 @@ export async function runV2BuildProduction(request: V2TaskRequest, deps: Product
     treeProbe: deps.treeProbe ?? createTreeProbe(),
     // THE candidate diff source for the critic — model-caused change vs the source snapshot.
     candidateDiff: deps.candidateDiff ?? createCandidateDiffSource(),
+    // THE publication target — the ONLY thing that moves a target ref. Clean-ref CAS.
+    publisher: deps.publisher ?? createCasPublicationTarget(),
     // Per-check timeout: an explicit override wins, else the operator's IKBI_CHECK_TIMEOUT_MS
     // (the donor's shared knob), else the run default. A hung check is killed and classified
     // as a timeout, never as an ordinary failure.

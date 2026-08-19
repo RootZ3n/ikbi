@@ -20,7 +20,6 @@ import type { InvocationTransport } from "../core/invocation.js";
 import type { StateBoundMutationAuthority, V2WorkspaceRecord, WorkspaceAuthority } from "../core/workspace.js";
 import { LIFECYCLE_STAGES } from "../core/lifecycle.js";
 import type { V2RunResult } from "../core/result.js";
-import { FIRST_UNIMPLEMENTED_STAGE } from "../core/run.js";
 import { V2_BANNER, parseV2Args, renderRun, runV2Cli } from "./index.js";
 
 /**
@@ -230,7 +229,7 @@ test("reachability: the CLI never claims a stage it did not run", async () => {
   }
   // The spine adjudicates and stops before the one unimplemented stage — promotion.
   assert.ok(result.outcome.kind === "withheld");
-  assert.equal(result.receipt.stagesEntered.includes(FIRST_UNIMPLEMENTED_STAGE), false);
+  assert.equal(result.receipt.stagesEntered.includes("promotion"), false);
 });
 
 test("reachability: an unknown v2 subcommand is refused, not silently built", async () => {

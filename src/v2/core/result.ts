@@ -50,17 +50,27 @@ import type { CandidateRecord, RunCandidateSummary } from "./candidate.js";
 import type { RunVerificationSummary, VerificationRecord } from "./verification.js";
 import type { RunCriticSummary, CriticRecord } from "./critic.js";
 import type { RunDispositionSummary, DispositionRecord } from "./disposition.js";
+import type { RunPromotionSummary, PromotionRecord } from "./promotion.js";
 import type { RetrievalSummary } from "./retrieval.js";
 
 /**
  * Why verified-good work was withheld instead of promoted. Closed set.
  *
- * `awaiting_promotion` is the V2-010 disposition outcome: the candidate is ELIGIBLE for
- * promotion (deterministic pass + satisfied critic), but this build stops at disposition —
- * the promotion authority (V2-012) has not enacted anything. Eligibility is an authorization
- * fact, never a promotion; the source is unchanged and the candidate is retained.
+ * `awaiting_promotion` was the V2-010 pre-promotion outcome. With V2-011 an eligible candidate
+ * proceeds INTO promotion; it lands `accepted`, or it is withheld for a specific, truthful
+ * reason: `target_moved` (the target ref advanced — no auto-merge; recovery must re-verify),
+ * `unsupported_publication` (a dirty source checkout cannot use clean-ref CAS in this slice),
+ * `operator` (the target worktree is dirty — a human must resolve it). In every withheld case
+ * the source is unchanged, nothing was published, and the candidate is retained.
  */
-export type WithheldReason = "awaiting_promotion" | "governance" | "operator" | "policy" | "dry_run";
+export type WithheldReason =
+  | "awaiting_promotion"
+  | "target_moved"
+  | "unsupported_publication"
+  | "governance"
+  | "operator"
+  | "policy"
+  | "dry_run";
 
 /** Why produced work was rejected. Closed set (mirrors v1's DiscardReason vocabulary). */
 export type RejectedReason = "verification_red" | "no_work" | "vacuous_green" | "unresolvable" | "aborted";
@@ -425,6 +435,13 @@ export interface V2RunReceipt {
    * authorization fact; NOTHING was promoted.
    */
   readonly disposition?: RunDispositionSummary;
+  /**
+   * Absent unless the promotion authority actually attempted publication. Present with the
+   * landed facts — target branch, before/after ref, published tree (== candidate tree) —
+   * ONLY when a publication landed (`accepted`). Its `degraded` flag marks a ref that moved
+   * but whose post-CAS bookkeeping did not fully complete.
+   */
+  readonly promotion?: RunPromotionSummary;
   readonly startedAt: number;
   readonly endedAt: number;
 }
@@ -457,8 +474,8 @@ export function summarizeEvidence(ledger: RunLedgerView, outcome: RunTerminalOut
     // The candidate workspace was written to iff a builder mutation was applied. This is
     // the model's work, in isolation — it says nothing about the operator's checkout.
     candidateMutated: ledger.mutations.length > 0,
-    // The operator's repository. Reachable only through promotion, which no build of ikbi
-    // performs yet, so this is structurally false rather than conventionally false.
+    // The operator's repository. Reachable ONLY through a landed promotion (V2-011) that
+    // produced an `accepted` outcome — true exactly when the target ref moved.
     sourceRepositoryMutated: accepted && ledger.promotions.length > 0,
   };
 }
@@ -501,6 +518,8 @@ export interface V2RunResult {
   readonly critic?: CriticRecord;
   /** The lawful disposition this run adjudicated, when a candidate reached disposition. */
   readonly disposition?: DispositionRecord;
+  /** The publication this run landed, when an eligible candidate was actually promoted. */
+  readonly promotion?: PromotionRecord;
   /** Every transition the run made, in order. The run's own account of itself. */
   readonly journal: readonly LifecycleTransition[];
   readonly receipt: V2RunReceipt;

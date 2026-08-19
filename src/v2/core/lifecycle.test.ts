@@ -19,7 +19,7 @@ import {
   type LifecycleStage,
   type LifecycleViolationCode,
 } from "./lifecycle.js";
-import type { V2CandidateId, V2VerificationId, V2CriticId, V2DispositionId } from "./identity.js";
+import type { V2CandidateId, V2VerificationId, V2CriticId, V2DispositionId, V2PromotionId } from "./identity.js";
 import { summarizeEvidence } from "./result.js";
 
 const ids = createSequentialIdFactory("lcx");
@@ -56,6 +56,7 @@ let verificationSeed = 0;
 const fakeVerificationId = (seed: string): V2VerificationId => (`${seed}`.repeat(64).slice(0, 64) as V2VerificationId);
 const fakeCriticId = (seed: string): V2CriticId => (`${seed}`.repeat(64).slice(0, 64) as V2CriticId);
 const fakeDispositionId = (seed: string): V2DispositionId => (`${seed}`.repeat(64).slice(0, 64) as V2DispositionId);
+const fakePromotionId = (seed: string): V2PromotionId => (`${seed}`.repeat(64).slice(0, 64) as V2PromotionId);
 
 function fresh() {
   const ids = createSequentialIdFactory("lc");
@@ -75,7 +76,7 @@ function walkTo(target: LifecycleStage) {
   const verificationId = fakeVerificationId("v");
   const criticId = fakeCriticId("c");
   const dispositionId = fakeDispositionId("p");
-  const promotionId = ids.mint("promotion");
+  const promotionId = fakePromotionId("q");
   for (const stage of LIFECYCLE_STAGES) {
     lifecycle.enter(runId, stage);
     // V2-002: model_resolution now REQUIRES a recorded configuration, so a full walk
@@ -106,7 +107,7 @@ function walkTo(target: LifecycleStage) {
     if (stage === "disposition") {
       lifecycle.record(runId, { kind: "disposition", id: dispositionId, candidateId, verificationId, criticId, decision: "acceptable_for_promotion" });
     }
-    if (stage === "promotion") lifecycle.record(runId, { kind: "promotion", id: promotionId, candidateId, verificationId });
+    if (stage === "promotion") lifecycle.record(runId, { kind: "promotion", id: promotionId, candidateId, verificationId, dispositionId });
     if (stage === target) break;
   }
   return { ...ctx, candidateId, verificationId, criticId, dispositionId, promotionId };
@@ -246,19 +247,20 @@ test("lifecycle: a verification must name a candidate that was actually recorded
 });
 
 test("lifecycle: a promotion cannot ride a verification of a DIFFERENT candidate", () => {
-  const { lifecycle, ids, runId, verificationId } = walkTo("candidate_generation");
+  const { lifecycle, ids, runId, verificationId, criticId, dispositionId } = walkTo("candidate_generation");
   const other = fakeCandidateId(String(candidateSeed += 1));
   lifecycle.record(runId, { kind: "candidate", id: other, workspaceId: ids.mint("workspace") });
   lifecycle.enter(runId, "verification");
   const firstCandidate = lifecycle.ledger.candidates[0]!;
   lifecycle.record(runId, { kind: "verification", id: verificationId, candidateId: firstCandidate });
   lifecycle.enter(runId, "criticism");
-  lifecycle.record(runId, { kind: "critic", id: fakeCriticId(String(candidateSeed += 1)), candidateId: firstCandidate, verificationId });
+  lifecycle.record(runId, { kind: "critic", id: criticId, candidateId: firstCandidate, verificationId });
   lifecycle.enter(runId, "disposition");
+  lifecycle.record(runId, { kind: "disposition", id: dispositionId, candidateId: firstCandidate, verificationId, criticId, decision: "acceptable_for_promotion" });
   lifecycle.enter(runId, "promotion");
   assert.equal(
     violation(() =>
-      lifecycle.record(runId, { kind: "promotion", id: ids.mint("promotion"), candidateId: other, verificationId }),
+      lifecycle.record(runId, { kind: "promotion", id: fakePromotionId("z"), candidateId: other, verificationId, dispositionId }),
     ),
     "evidence_mismatch",
   );
@@ -314,10 +316,11 @@ test("lifecycle: nothing may happen after a run terminalizes", () => {
 });
 
 test("lifecycle: ACCEPTED requires a promotion that was really recorded", () => {
-  const { lifecycle, ids, runId, candidateId, verificationId } = walkTo("promotion");
+  const { lifecycle, runId, candidateId, verificationId } = walkTo("promotion");
   assert.equal(
     violation(() =>
-      lifecycle.terminalize(runId, { kind: "accepted", candidateId, verificationId, promotionId: ids.mint("promotion") }),
+      // A FABRICATED promotion id (walkTo recorded "q"; this cites "z") cannot become a success.
+      lifecycle.terminalize(runId, { kind: "accepted", candidateId, verificationId, promotionId: fakePromotionId("z") }),
     ),
     "unrecorded_evidence",
     "a fabricated promotion id cannot become a success",
@@ -325,10 +328,10 @@ test("lifecycle: ACCEPTED requires a promotion that was really recorded", () => 
 });
 
 test("lifecycle: ACCEPTED is impossible without ever reaching the promotion stage", () => {
-  const { lifecycle, ids, runId, candidateId, verificationId } = walkTo("disposition");
+  const { lifecycle, runId, candidateId, verificationId } = walkTo("disposition");
   assert.equal(
     violation(() =>
-      lifecycle.terminalize(runId, { kind: "accepted", candidateId, verificationId, promotionId: ids.mint("promotion") }),
+      lifecycle.terminalize(runId, { kind: "accepted", candidateId, verificationId, promotionId: fakePromotionId("q") }),
     ),
     "outcome_stage_not_reached",
   );
@@ -408,6 +411,12 @@ test("lifecycle: MANY candidates are first-class — the spine never assumes one
   }
   assert.equal(lifecycle.ledger.critics.length, 3);
   lifecycle.enter(runId, "disposition");
+  // The SAME disposition authority adjudicates each candidate; promotion needs a recorded one.
+  const first = lifecycle.ledger.candidates[0]!;
+  const fv = lifecycle.ledger.entries.find((e) => e.kind === "verification" && e.candidateId === first)!;
+  const fc = lifecycle.ledger.entries.find((e) => e.kind === "critic" && e.candidateId === first)!;
+  const dispId = fakeDispositionId("m");
+  lifecycle.record(runId, { kind: "disposition", id: dispId, candidateId: first, verificationId: (fv as { id: V2VerificationId }).id, criticId: (fc as { id: V2CriticId }).id, decision: "acceptable_for_promotion" });
   lifecycle.enter(runId, "promotion");
   assert.equal(lifecycle.stage, "promotion", "N candidates converge on ONE promotion stage");
 });

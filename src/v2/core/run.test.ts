@@ -21,7 +21,8 @@ import { V2_001_FAILURE_CODES } from "./failure.js";
 import { createSequentialIdFactory, isV2Id } from "./identity.js";
 import { LIFECYCLE_STAGES } from "./lifecycle.js";
 import { exitCodeForOutcome } from "./result.js";
-import { FIRST_UNIMPLEMENTED_STAGE, IMPLEMENTED_THROUGH_STAGE, MAX_GOAL_LENGTH, planFor, preflight, runV2Build, type RepoProbe } from "./run.js";
+import { IMPLEMENTED_THROUGH_STAGE, MAX_GOAL_LENGTH, planFor, preflight, runV2Build, type RepoProbe } from "./run.js";
+import type { PromotionTarget, PublicationOutcome } from "./promotion.js";
 
 /** A probe that answers "yes, a healthy git repo" without touching a filesystem. */
 const goodRepo: RepoProbe = { inspect: () => ({ exists: true, isDirectory: true, hasGitDir: true }) };
@@ -235,6 +236,7 @@ function deps(
   workspaces: WorkspaceAuthority = fakeWorkspaces().authority,
   mutations: StateBoundMutationAuthority = fakeMutations().authority,
   sources: SourceSnapshotAuthority = fakeSources().authority,
+  publisher?: PromotionTarget,
 ) {
   let tick = 0;
   return {
@@ -267,6 +269,27 @@ function deps(
       ok: true as const,
       tree: { treeId: "tree".repeat(10), baseTreeId: "t".repeat(40), startTree: "tree".repeat(10), materializedStateDigest: "m".repeat(64), changed: false },
     }),
+    // V2-011: the publication target. Hermetic — the default LANDS the exact candidate tree.
+    // The real clean-ref CAS is proven in `cli/promotion-truth.test.ts`.
+    publisher: publisher ?? fakePublisher(),
+  };
+}
+
+/**
+ * A hermetic publication target. The default answers a CLEAN, unmoved target and LANDS the
+ * candidate tree; overrides drive the refusal/conflict paths without a real repository.
+ */
+function fakePublisher(over: Partial<{
+  liveHead: string | undefined;
+  liveTree: string;
+  checkout: { checkedOutPath?: string; clean: boolean };
+  publish: PublicationOutcome;
+}> = {}): PromotionTarget {
+  return {
+    liveHead: async () => ("liveHead" in over ? over.liveHead : "c".repeat(40)),
+    treeOfCommit: async () => over.liveTree ?? "live".repeat(10),
+    targetCheckout: async () => over.checkout ?? { clean: true },
+    publish: async () => over.publish ?? { kind: "landed", beforeRef: "c".repeat(40), afterCommit: "p".repeat(40), publishedTree: "tree".repeat(10), worktreeSynced: false, stashed: false },
   };
 }
 
@@ -275,30 +298,29 @@ test("run: a valid request mints task + run identities and enters the lifecycle"
   assert.ok(isV2Id("task", result.taskId));
   assert.ok(isV2Id("run", result.runId));
   assert.ok(isV2Id("receipt", result.receipt.receiptId));
-  assert.deepEqual([...result.receipt.stagesEntered], ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism", "disposition"]);
+  assert.deepEqual([...result.receipt.stagesEntered], ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism", "disposition", "promotion"]);
   assert.equal(result.journal[0]?.from, "pending");
   assert.equal(result.journal[0]?.to, "preflight");
   assert.equal(result.journal.at(-1)?.to, "terminal");
 });
 
-test("run: the spine ADJUDICATES and stops truthfully BEFORE promotion", async () => {
-  // Default deps: verification PASSES and the critic is SATISFIED, so the lawful disposition
-  // is acceptable_for_promotion — which this build reports as `withheld (awaiting_promotion)`:
-  // ELIGIBILITY, never a promotion. The promotion stage is never entered.
+test("run: a clean eligible candidate is ADJUDICATED, PUBLISHED and ACCEPTED", async () => {
+  // Default deps: verification PASSES, the critic is SATISFIED, the disposition is
+  // acceptable_for_promotion, the source is clean and the (hermetic) publisher LANDS the exact
+  // candidate tree — so the run is ACCEPTED and binds the promotion.
   const result = await runV2Build({ goal: "do a thing", repoPath: "/repo" }, deps(goodRepo));
-  assert.ok(result.outcome.kind === "withheld");
-  assert.equal(result.outcome.reason, "awaiting_promotion");
+  assert.ok(result.outcome.kind === "accepted");
+  assert.equal(result.outcome.candidateId, result.receipt.candidate!.candidateId);
+  assert.equal(result.outcome.promotionId, result.receipt.promotion!.promotionId);
   assert.equal(result.receipt.disposition?.decision, "acceptable_for_promotion");
-  assert.equal(result.receipt.disposition?.eligibleForPromotion, true);
-  assert.equal(result.receipt.disposition?.requiresRecovery, false);
-  assert.equal(result.receipt.disposition?.primaryReason, "acceptable");
-  assert.equal(result.receipt.stagesEntered.includes("promotion"), false, "promotion is never entered");
-  assert.equal(result.receipt.evidence.promoted, false, "eligibility is not promotion");
-  assert.equal(FIRST_UNIMPLEMENTED_STAGE, "promotion");
-  assert.equal(IMPLEMENTED_THROUGH_STAGE, "disposition");
+  assert.equal(result.receipt.promotion?.publishedTree, "tree".repeat(10), "the EXACT candidate tree landed");
+  assert.equal(result.receipt.promotion?.strategy, "clean_ref_cas");
+  assert.equal(result.receipt.stagesEntered.includes("promotion"), true, "the whole spine ran");
+  assert.equal(result.receipt.evidence.promoted, true);
+  assert.equal(IMPLEMENTED_THROUGH_STAGE, "promotion");
 });
 
-test("run: NO FAKE SUCCESS — the receipt reports exactly what happened, counted", async () => {
+test("run: an ACCEPTED run reports exactly what happened, counted", async () => {
   const result = await runV2Build({ goal: "build the whole product", repoPath: "/repo" }, deps(goodRepo));
   const e = result.receipt.evidence;
   assert.equal(e.modelResolutionCompleted, true, "a route WAS authorized");
@@ -306,16 +328,15 @@ test("run: NO FAKE SUCCESS — the receipt reports exactly what happened, counte
   assert.equal(e.contextAssemblyCompleted, true, "context WAS assembled");
   assert.equal(e.contextPackages, 1, "exactly one package");
   assert.equal(e.providerInvoked, true, "a model IS invoked");
-  assert.equal(e.invocations, 2, "V2-009: the builder's finish turn AND the critic's one judgment");
+  assert.equal(e.invocations, 2, "V2-009: builder + critic — promotion adds NO model call");
   assert.equal(e.workspacesAllocated, 1, "one isolated workspace");
   assert.equal(e.mutationsApplied, 0, "this builder wrote nothing — and says so");
   assert.equal(e.candidateMutated, false);
-  // V2-007: a candidate now EXISTS. It has still been verified by nothing.
   assert.equal(e.candidatesCreated, 1, "the builder finished, so there is a candidate");
   assert.equal(e.verificationsPerformed, 1, "V2-008: the produced candidate WAS verified");
-  assert.equal(e.promotionsAttempted, 0);
-  assert.equal(e.promoted, false, "nothing was promoted");
-  assert.equal(e.sourceRepositoryMutated, false, "the operator's repository was not touched");
+  assert.equal(e.promotionsAttempted, 1, "V2-011: one publication landed");
+  assert.equal(e.promoted, true, "the candidate was published");
+  assert.equal(e.sourceRepositoryMutated, true, "an accepted run changes the operator's repository");
 });
 
 test("run: a no-change candidate is LEGITIMATE — 'no diff' is not the builder's to fail", async () => {
@@ -325,15 +346,15 @@ test("run: a no-change candidate is LEGITIMATE — 'no diff' is not the builder'
   assert.deepEqual([...candidate.changedPaths], []);
   assert.equal(candidate.changed, false);
   assert.equal(candidate.claimBelievesComplete, true, "the builder's belief, recorded as a claim");
-  // A no-change candidate is still a real candidate: it is verified and adjudicated like any
-  // other. With PASS + satisfied it is eligible; the run withholds it pending promotion.
-  assert.ok(result.outcome.kind === "withheld");
+  // A no-change candidate is still a real candidate: verified, adjudicated, and (clean +
+  // eligible) published like any other.
+  assert.ok(result.outcome.kind === "accepted");
   assert.equal(result.receipt.disposition?.candidateId, candidate.candidateId);
 });
 
 test("run: the spine never claims to have reached a stage it did not run", async () => {
   const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo));
-  const implemented = new Set<string>(["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism", IMPLEMENTED_THROUGH_STAGE]);
+  const implemented = new Set<string>(["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism", "disposition", IMPLEMENTED_THROUGH_STAGE]);
   for (const stage of LIFECYCLE_STAGES) {
     if (implemented.has(stage)) continue;
     assert.equal(result.receipt.stagesEntered.includes(stage), false, `"${stage}" was never entered`);
@@ -464,7 +485,7 @@ test("run: an unknown candidate strategy is refused rather than defaulted", asyn
 test("run: shadow and tournament are ACCEPTED strategies and reach the same stop point", async () => {
   for (const candidateStrategy of ["single", "shadow", "tournament"] as const) {
     const result = await runV2Build({ goal: "go", repoPath: "/repo", candidateStrategy }, deps(goodRepo));
-    assert.ok(result.outcome.kind === "withheld", `${candidateStrategy} passes preflight and adjudicates`);
+    assert.ok(result.outcome.kind === "accepted", `${candidateStrategy} passes preflight and publishes`);
     assert.equal(result.receipt.disposition?.decision, "acceptable_for_promotion", `${candidateStrategy} reaches disposition`);
     // Every strategy runs the SAME builder controller, executor and mutation authority.
     // `single` is the only one that generates today; shadow/tournament are accepted at
@@ -489,24 +510,24 @@ test("run: the resolved strategy plan keeps multi-candidate strategies multi-can
   assert.equal(planFor(single.task).maxCandidates, 1);
 });
 
-test("run: an ELIGIBLE-but-withheld candidate is exit 0 — withholding verified work is correct", async () => {
-  // Withholding an eligible candidate (pending the promotion authority) is a correct,
-  // intended result, not an error the operator must chase.
+test("run: an ACCEPTED run is exit 0", async () => {
   const result = await runV2Build({ goal: "go", repoPath: "/repo" }, deps(goodRepo));
-  assert.ok(result.outcome.kind === "withheld");
+  assert.ok(result.outcome.kind === "accepted");
   assert.equal(exitCodeForOutcome(result.outcome), 0);
 });
 
-test("run: the real (unstubbed) probe accepts THIS repository and still does not PROMOTE", async () => {
-  // Uses the production RepoProbe against ikbi's own checkout: proves the default path is
-  // wired, and that even a perfectly good repo lands NOTHING in this slice — the candidate is
-  // adjudicated and withheld, the source repository is untouched.
+test("run: a MOVED target refuses publication — withheld, nothing landed", async () => {
+  // Uses the production RepoProbe against ikbi's own checkout, and a publisher whose live head
+  // has advanced past the authorized base: promotion REFUSES (no auto-merge), so nothing is
+  // published and the operator's repository is not mutated.
+  const staleTarget = fakePublisher({ liveHead: "moved".repeat(8) });
   const result = await runV2Build(
     { goal: "inspect ikbi itself", repoPath: process.cwd() },
     // Everything wired EXCEPT the probe, so the production RepoProbe is the one used.
-    (({ probe: _omitted, ...rest }) => rest)(deps(goodRepo)),
+    (({ probe: _omitted, ...rest }) => rest)(deps(goodRepo, workingConfiguration, noSources, fakeTransport().transport, fakeWorkspaces().authority, fakeMutations().authority, fakeSources().authority, staleTarget)),
   );
-  assert.equal(result.outcome.kind === "accepted", false, "nothing was promoted");
+  assert.ok(result.outcome.kind === "withheld");
+  assert.equal(result.outcome.reason, "target_moved", "no auto-merge — recovery must re-verify");
   assert.equal(result.receipt.evidence.promoted, false);
   assert.equal(result.receipt.evidence.sourceRepositoryMutated, false);
 });
@@ -525,12 +546,13 @@ test("run: exactly ONE workspace is allocated, bound to the run and the source t
 test("run: the workspace is RETAINED once a candidate exists — verification needs it", async () => {
   const ws = fakeWorkspaces();
   const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo, workingConfiguration, noSources, fakeTransport().transport, ws.authority));
-  assert.deepEqual(ws.dispositions, ["retain"], "a candidate is the only copy of the work — discarding it would throw it away");
+  assert.deepEqual(ws.dispositions, ["retain"], "a candidate is retained even after publication — for undo/audit");
   assert.equal(result.receipt.workspace?.disposition, "retained");
   assert.match(result.receipt.workspace?.dispositionDetail ?? "", /adjudicated acceptable_for_promotion/);
-  // RETENTION IS NOT PROMOTION. The worktree stays on disk; nothing was landed.
-  assert.equal(result.receipt.evidence.promoted, false);
-  assert.equal(result.receipt.evidence.sourceRepositoryMutated, false);
+  // The publication landed (hermetic). The workspace is still retained — deleting evidence
+  // before an undo/audit trail exists is not this slice's job.
+  assert.equal(result.receipt.evidence.promoted, true);
+  assert.equal(result.outcome.kind, "accepted");
 });
 
 test("run: a generation that FAILS discards its workspace — no leak, no half-tree kept", async () => {
@@ -593,7 +615,7 @@ test("run: a context artifact is RE-OBSERVED in the workspace before it could be
   assert.deepEqual(mut.observed, ["src/widget.ts"], "the artifact a builder would edit");
   assert.equal(result.receipt.evidence.observationsTaken, 1);
   assert.equal(result.receipt.workspace?.observations, 1);
-  assert.ok(result.outcome.kind === "withheld", "and the run adjudicates and stops normally");
+  assert.ok(result.outcome.kind === "accepted", "and the run adjudicates, publishes and completes normally");
 });
 
 test("run: workspace bytes that DIFFER from the context artifact fail — context is not rebuilt", async () => {

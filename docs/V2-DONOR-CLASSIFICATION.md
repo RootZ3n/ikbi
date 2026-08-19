@@ -8,7 +8,8 @@ mutation authority), **V2-006A** (canonical source snapshot authority), **V2-006
 (deterministic snapshot-bound retrieval), **V2-007** (canonical builder + governed tool
 loop), **V2-007A** (untrusted tool-result neutralization), **V2-008** (canonical
 verification authority), **V2-009** (canonical critic / intent-alignment
-authority) and **V2-010** (canonical disposition / adjudication authority). This is an **advisory input to future work
+authority), **V2-010** (canonical disposition / adjudication authority) and **V2-011**
+(canonical promotion / publication authority). This is an **advisory input to future work
 orders**, not a change plan and not permission to delete anything. Nothing in v1 was
 removed, disabled, or altered to produce it.
 
@@ -63,7 +64,7 @@ preserved** and the v2 lifecycle was designed around them (see "Candidate strate
 | Governed exec + sandbox | `src/modules/governed-exec/`, bubblewrap path | **ADOPT** | Allowlist + gate-wall + receipts + OS sandbox, fail-closed off-Linux. No reason to redesign. |
 | Trust (earned tiers, MAC-protected) | `src/core/trust/` | **ADOPT** | Fail-closed, MAC-protected, floor-by-default. Feeds v2's `policy` failure category unchanged. |
 | Identity (claim / verified peer / validated) | `src/core/identity/` | **ADOPT** | The claim-vs-validated posture is exactly what v2's `V2TaskRequest` → `V2Task` boundary imitates. |
-| Promotion | `worker-model/integrator.ts` + `workspace.promote` CAS | **REFINE (mechanics PARK → V2-012)** | The CAS promote itself is ADOPT-grade. V2-010 makes the disposition *decide* eligibility (`acceptable_for_promotion`) without enacting anything — a guard fails the build if the disposition module contains any promote/ref-move. The mechanical publication (the CAS promote, enacted only by the spine from a disposition) is PARKED for V2-012. |
+| Promotion | `worker-model/integrator.ts` + `workspace.promote` CAS | **REFINE (done V2-011)** | The publication MECHANICS are now v2's canonical promotion authority — see *Promotion systems (V2-011)* below. V2-011 reuses the donor CAS/worktree-sync PRIMITIVES (`updateRefCas`, `commitTree`, `syncWorktreeToRef`) but NOT `WorkspaceManager.promote` itself (which auto-merges — forbidden) and NOT the integrator (already REPLACED). The disposition decides eligibility; promotion enacts it, from the spine only, landing exactly the candidate tree. |
 | Integrator (orchestration blob) | `worker-model/integrator.ts` | **REPLACE (done V2-010)** | 274 lines that re-decide promotability by reaching into role-result detail bags (`filesWritten`, `policyViolations`, `testEvidence`, prevented-attempt thresholds, refuter) — a second adjudication path beside `decidePromotability`, coupled to `RoleFn`/`ctx.task`/`workerModelConfig`. v2 keeps the QUESTION and throws away the blob: `disposition.ts` reads only the three canonical evidence records + one explicit policy, and a guard forbids any v2 import of `worker-model/integrator`. The prevented-attempt / risk-threshold logic is safety-evidence for the disposition/recovery slices, not adjudication core. |
 | Receipts | `src/core/receipt/` | **REFINE** | Durable, attributed, ordered, append-only — keep. The refinement is truth-by-construction: v2 receipts must be *counted* from a lifecycle ledger (as `summarizeEvidence` already does) rather than assembled by callers. |
 | Cost accounting | `worker-model` costing + budget caps | **PARK** | Needs `V2InvocationId` to exist first. Migrating cost before invocation identity would reintroduce attribution-by-coincidence. |
@@ -266,6 +267,37 @@ evidence under a DIFFERENT policy is a DIFFERENT disposition identity; the secon
 decision, so an impossible combination cannot be constructed; and `acceptable_for_promotion`
 is reported as `withheld (awaiting_promotion)` — an ELIGIBILITY fact that changes no ref.
 
+## Promotion systems *(V2-011)*
+
+v1's `WorkspaceManager.promote` is a careful crash-durable CAS — but it also AUTO-MERGES a
+moved target (computing a new integrated tree the verifier never saw) and requires a governed
+`PromoteApproval`. V2-011 keeps the safe PRIMITIVES and the crash-durable posture, drops the
+auto-merge, and makes publication the enactment of an already-authorized disposition — never a
+second decision.
+
+| v1 system | Production reachability | Verdict |
+| --- | --- | --- |
+| `updateRefCas` (atomic compare-and-swap ref move) | **YES** — the one target mutation | **ADOPT.** The single load-bearing primitive. v2's `runtime/publication.ts` reuses it verbatim: `beforeRef → candidate commit`, old-sha guarded, so a concurrent target move fails the CAS. No force, no retry against a new head. |
+| `commitTree` (build a commit from a tree + parents) | **YES** | **ADOPT.** v2 materializes the candidate COMMIT mechanically: `commit(tree=candidate.treeId, parent=authorized base)`, verifies the built tree == the candidate tree BEFORE any ref move, and only then CASes. The commit's sha/timestamp/message are provenance — never candidate identity. |
+| `syncWorktreeToRef` + `worktreeForBranch` + `isWorktreeClean` (target-worktree sync) | **YES** | **ADOPT.** A clean checked-out target is brought forward to the landed commit AFTER the CAS (stashing any late work, never clobbering it). A sync failure AFTER the ref moved is a DEGRADED SUCCESS, not an ordinary failure. |
+| `verifiedAgainst` (targetHead + integratedTree binding) | **YES** | **ADOPT as SEMANTICS.** v1 binds the verdict to the exact tree/head. v2 generalizes it: the promotion SUBJECT binds run/candidate/tree/snapshot/verification/critic/disposition/policy + `eligibleForPromotion`, and rechecks the live target head == the authorized base and the retained workspace tree == the candidate tree at the promotion boundary. |
+| dirty checked-out target refusal | **YES** | **ADOPT as a SAFETY FLOOR.** v1 refuses to move a ref under a dirty checked-out target. v2 does too — AND additionally refuses to publish a dirty *source snapshot* at all (clean-ref CAS would fold the operator's pre-existing uncommitted work into an ikbi commit): `refused_dirty_source_unsupported`, terminal `withheld`, nothing touched. |
+| auto-merge (`computeMerge` on a moved target) | **YES** | **REPLACE (removed for this slice).** v2 has NO verification record for a newly-merged tree against a moved target, so a merge would land unverified bytes. A moved target is `refused_stale_target` → `withheld`; re-capture/rebuild/re-verify is recovery's job (V2-012+). The `computeMerge` primitive is PARKED until an integrated tree can be independently verified. |
+| crash-durable promoting intent + landed record | **YES** | **ADOPT (lightweight).** v2's publication adapter writes an `intent` marker before the CAS and a `landed` marker after — enough for a future recovery to reconcile a crash from the git ref state. It does not rebuild v1's full reconcile engine; that folds into the recovery slice. |
+| `PROMOTED_BUT_RECEIPT_FAILED` (degraded success) | **YES** | **ADOPT.** The exact distinction v2 is built around: if the ref moved but post-CAS bookkeeping (worktree sync, journal) did not complete, the result is `promoted_degraded` / terminal `accepted` with `degraded=true` — NEVER reported as if nothing happened. |
+| `PromoteApproval` / governance gate | **YES** | **REPLACE.** v2 receives no free-floating `approved` boolean: `promoteAuthorized` proves authorization FROM the `DispositionRecord` (`eligibleForPromotion && decision === acceptable_for_promotion`). Governance re-enters later as a disposition-policy input, not a promote-time flag. |
+| `integrator.ts` | **YES** | **REPLACE (unchanged from V2-010).** Still not imported by any v2 file. Promotion reads the four canonical records; it does not re-derive anything from role-result detail bags. |
+
+**The load-bearing v2 additions v1 has no equivalent of:** promotion is MECHANICAL and
+re-adjudicates nothing (the invocation count is unchanged from builder+critic — no model, no
+critic re-run, no verifier re-run, no repair); it refuses every unsafe condition (not-eligible,
+wrong-evidence, dirty-source, candidate-drift, stale-target, dirty-target-worktree, CAS-race)
+WITHOUT touching git; it lands EXACTLY `candidate.treeId` by a clean-ref CAS (verified before
+AND after the ref move); it is IDEMPOTENT (a target already holding the candidate tree is
+`already_promoted`, no second commit); the `PromotionRecord` identity binds what was AUTHORIZED
++ what LANDED (candidate tree, disposition, target branch, published tree — the commit sha is
+provenance); and ONLY an actually-landed publication turns `withheld` into `accepted{promotionId}`.
+
 ## Standing constraints for later slices
 
 1. **No second promote path.** Any strategy that wants to promote must do it by
@@ -352,3 +384,15 @@ is reported as `withheld (awaiting_promotion)` — an ELIGIBILITY fact that chan
    derived flags (`eligibleForPromotion`/`requiresRecovery`/`requiresOperator`) come from the
    one decision, so an impossible combination is unconstructable, and a tree that moved since
    the critic looked is quarantined over a stale subject, never adjudicated.
+19. **Promotion enacts; it never decides, merges, or commits operator dirt.** *(V2-011)*
+   The publication authority proves authorization FROM the `DispositionRecord` — no free
+   `approved` boolean. It re-adjudicates nothing (no model, no critic/verifier re-run, no
+   repair), refuses every unsafe condition WITHOUT touching git, and lands EXACTLY the
+   candidate tree by a clean-ref CAS (verified before and after the ref move). A MOVED target
+   is refused, never auto-merged — an unverified integrated tree must not land. A DIRTY source
+   checkout is refused, never silently committed. Publication is IDEMPOTENT (no duplicate
+   commit) and crash-durable (intent before the CAS, landed record after). Only an actually
+   landed publication turns `withheld` into `accepted`; a ref that moved but whose bookkeeping
+   did not finish is a DEGRADED success, never reported as if nothing happened. The target ref
+   is moved by exactly ONE adapter (`runtime/publication.ts`); no other v2 code calls
+   `update-ref` or the v1 auto-merging `WorkspaceManager.promote`.
