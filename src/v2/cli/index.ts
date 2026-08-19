@@ -119,6 +119,7 @@ export function renderRun(result: V2RunResult): string {
     ...resolutionLines(result),
     ...contextLines(result),
     ...invocationLines(result),
+    ...commandLines(result),
     ...workspaceLines(result),
     ...candidateLines(result),
     ...verificationLines(result),
@@ -127,7 +128,7 @@ export function renderRun(result: V2RunResult): string {
     ...promotionLines(result),
     `outcome     ${formatOutcome(result.outcome)}`,
     "evidence    " +
-      `provider_invoked=${e.providerInvoked} invocations=${e.invocations} mutations=${e.mutationsApplied} ` +
+      `provider_invoked=${e.providerInvoked} invocations=${e.invocations} commands=${e.commandsRun} mutations=${e.mutationsApplied} ` +
       `candidates=${e.candidatesCreated} verifications=${e.verificationsPerformed} promoted=${e.promoted} ` +
       `candidate_mutated=${e.candidateMutated} source_repo_mutated=${e.sourceRepositoryMutated}`,
     `receipt     ${result.receipt.receiptId}`,
@@ -276,6 +277,23 @@ function invocationLines(result: V2RunResult): string[] {
         (i.usage !== undefined
           ? ` · ${Object.entries(i.usage).map(([k, v]) => `${k}=${String(v)}`).join(" ") || "(no usage reported)"}`
           : ""),
+    );
+  }
+  return lines;
+}
+
+/**
+ * The READ-ONLY commands the builder ran (V2-015), when any. Program, exit and the load-bearing
+ * read-only proof (workspace unchanged) — never the untrusted output body, only its hash/size.
+ */
+function commandLines(result: V2RunResult): string[] {
+  const cmds = result.receipt.commands;
+  if (cmds.length === 0) return [];
+  const lines = [`commands    ${cmds.length} read-only command(s) · candidate unchanged by all`];
+  for (const [index, c] of cmds.entries()) {
+    lines.push(
+      `  cmd ${String(index + 1).padStart(2)}    ${[c.program, ...c.args].join(" ")} · ${c.launched ? `exit ${c.exitCode ?? "?"}` : "refused"}` +
+        `${c.timedOut ? " TIMED OUT" : ""} · workspace_unchanged=${c.workspaceUnchanged} · ${c.outputByteLength}B${c.outputTruncated ? " (truncated)" : ""}`,
     );
   }
   return lines;

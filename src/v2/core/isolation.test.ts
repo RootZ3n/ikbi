@@ -50,7 +50,8 @@ const V2_RUNTIME_ALLOWED_V1_IMPORTS = new Set([
   "../../core/workspace/mutation.js", //           THE state-bound mutation core
   "../../core/injection/index.js", //              THE untrusted-data neutralization fence (V2-007A)
   "../../modules/worker-model/checks.js", //       deterministic check DISCOVERY (V2-008)
-  "../../modules/governed-exec/index.js", //       THE governed check executor (V2-008)
+  "../../modules/governed-exec/index.js", //       THE governed check executor (V2-008) + builder terminal (V2-015)
+  "../../modules/governed-exec/sandbox.js", //     command risk classification for the read-only terminal (V2-015)
   "../../core/identity/registry.js", //            self-contained verifier identity (V2-008)
   "../../core/identity/resolver.js", //            mint the verifier's OperationContext (V2-008)
   "../../core/identity/index.js", //               OperationContext type (V2-008)
@@ -280,11 +281,16 @@ test("single authority: only the workspace adapter may create a worktree or writ
   // `publication.ts` writes a crash-durable promotion JOURNAL (intent/landed markers) under a
   // dedicated directory — never a repository or workspace file. It is the publication
   // authority's own audit trail, and the next guard proves it holds no candidate mutation.
+  // `command-executor.ts` (V2-015) creates and removes a THROWAWAY OS temp directory (mkdtemp +
+  // rm) to hand the sandbox a writable root that is NOT the candidate — exactly the same class as
+  // candidate-capture's throwaway index. It writes NO repository or workspace file; the tree
+  // before==after guard proves it, and the next guard proves it holds no candidate mutation.
   const allowed = new Set([
     join(V2_DIR, "runtime", "workspace-authority.ts"),
     join(V2_DIR, "runtime", "source-materializer.ts"),
     join(V2_DIR, "runtime", "candidate-capture.ts"),
     join(V2_DIR, "runtime", "publication.ts"),
+    join(V2_DIR, "runtime", "command-executor.ts"),
   ]);
   const offenders: string[] = [];
   for (const file of tsFiles(V2_DIR)) {
@@ -319,7 +325,10 @@ test("single authority: only the snapshot module captures working-tree state", (
   // asking git what the working TREE looks like would be a second source reality.
   // `candidate-diff.ts` diffs two immutable TREE OBJECTS (start vs candidate) — it never
   // reads the working tree — so it is allowed to run `git diff <tree> <tree>`.
-  const allowed = new Set([join(V2_DIR, "runtime", "source-snapshot.ts"), join(V2_DIR, "runtime", "candidate-diff.ts")]);
+  // `command.ts` (V2-015) NAMES read-only git subcommands (status/diff/ls-files/…) in its policy
+  // ALLOWLIST — it executes nothing and reads no working tree. Listing a permitted verb is not
+  // capturing state; the command executor runs whatever the model passes through governed-exec.
+  const allowed = new Set([join(V2_DIR, "runtime", "source-snapshot.ts"), join(V2_DIR, "runtime", "candidate-diff.ts"), join(V2_DIR, "core", "command.ts")]);
   const offenders: string[] = [];
   for (const file of tsFiles(V2_DIR)) {
     if (allowed.has(file) || file.endsWith(".test.ts") || file.endsWith("fixture-repo.ts")) continue;
@@ -761,21 +770,46 @@ test("single chokepoint: the tool executor builds NO conversation message (V2-00
   assert.equal(/RenderedMessage|renderBuilderInput|role:\s*["'](tool|system|assistant)["']/.test(source), false, "the executor produces results, not messages");
 });
 
-test("single authority: no v2 file offers the BUILDER a SHELL", () => {
-  // A terminal would let `sed -i` and `echo >` write outside the mutation authority. That
-  // is not a missing tool, it is an architectural bypass. The VERIFIER's governed check
-  // execution (V2-008) is a different thing — an infrastructure authority the MODEL never
-  // reaches — so its one adapter is excluded.
-  const allowed = new Set([join(V2_DIR, "runtime", "check-runner.ts")]);
+test("single authority: the builder terminal is STRUCTURED ARGV, never a SHELL (V2-015)", () => {
+  // V2-015 gives the builder a READ-ONLY terminal — but it is argv-only. `sed -i` / `echo >`
+  // write only through a shell, and there is none: no v2 file may set `shell: true`, spawn a
+  // shell (`sh`/`bash`/`zsh`/`dash` with `-c`), or use the string-command `child_process.exec`.
+  // Commands are program + args[], handed literally to governed-exec, so >, |, &&, ; and $()
+  // are never interpreted.
   const offenders: string[] = [];
   for (const file of tsFiles(V2_DIR)) {
-    // Test fixtures run `git init`; the fake provider spawns itself. Neither is reachable
-    // by a model — the guard is about what the BUILDER can invoke.
-    if (allowed.has(file) || file.endsWith(".test.ts") || file.endsWith("fixture-repo.ts") || file.endsWith("fake-provider-server.ts")) continue;
+    if (file.endsWith(".test.ts") || file.endsWith("fixture-repo.ts") || file.endsWith("fake-provider-server.ts")) continue;
     const source = stripComments(readFileSync(file, "utf8"));
-    if (/governed-exec|runTerminal|terminalTool|commandPolicy|execFile|spawnSync/.test(source)) offenders.push(relative(SRC, file));
+    const rel = relative(SRC, file);
+    if (/\bshell\s*:\s*true\b/.test(source)) offenders.push(`${rel} (shell:true)`);
+    if (/["'](sh|bash|zsh|dash|ksh|fish)["']\s*,\s*["']-c["']/.test(source)) offenders.push(`${rel} (shell -c)`);
+    // The string-command exec forms (execSync("…"), child_process.exec("…")) — NOT execFile.
+    if (/\bexecSync\s*\(|[^A-Za-z]exec\s*\(\s*["'`]/.test(source)) offenders.push(`${rel} (string exec)`);
   }
-  assert.deepEqual(offenders, [], "v2 exposes no command execution to a MODEL in this slice");
+  assert.deepEqual(offenders, [], "v2 executes structured argv only — no shell, anywhere");
+});
+
+test("single authority: the READ-ONLY terminal never mints an observation or holds mutation authority (V2-015)", () => {
+  // A command may INSPECT the workspace, never change it. The command files must not reach the
+  // state-bound mutation authority and must not mint an observation — to edit a file the model
+  // must still call read_file (which mints the observation) and a state-bound write. This keeps
+  // terminal execution from becoming a second mutation path.
+  const commandFiles = [join(V2_DIR, "core", "command.ts"), join(V2_DIR, "runtime", "command-executor.ts")];
+  for (const file of commandFiles) {
+    const source = stripComments(readFileSync(file, "utf8"));
+    const rel = relative(SRC, file);
+    assert.equal(/StateBoundMutationAuthority|\.mutate\s*\(|mutations\s*\./.test(source), false, `${rel} must not reach the mutation authority`);
+    assert.equal(/contentDigest\s*\(\s*["']observation|mintObservation|\.read\s*\(\s*\{/.test(source), false, `${rel} must not mint an observation`);
+  }
+});
+
+test("single authority: the model command path can NEVER set verifier:true (V2-015)", () => {
+  // `verifier: true` authorizes package SCRIPTS (pnpm test). It is the verifier's alone. The
+  // builder command executor must pass verifier:false and never the literal true, so command
+  // TEXT can never grant script-execution authority.
+  const source = stripComments(readFileSync(join(V2_DIR, "runtime", "command-executor.ts"), "utf8"));
+  assert.equal(/verifier\s*:\s*true/.test(source), false, "the builder terminal must never set verifier:true");
+  assert.ok(/verifier\s*:\s*false/.test(source), "the builder terminal must explicitly pass verifier:false");
 });
 
 test("single authority: only the candidate module mints a candidate identity", () => {
@@ -822,10 +856,12 @@ test("single authority: a candidate is VERIFIED only by the run spine (V2-008)",
   assert.deepEqual(offenders, [], "no component may run verification on its own");
 });
 
-test("single authority: only the check-runner adapter reaches governed-exec (V2-008)", () => {
-  // Verification commands run through ONE governed executor. A second importer would be a
-  // second, ungoverned execution path — and the model must never reach any of them.
-  const allowed = new Set([join(V2_DIR, "runtime", "check-runner.ts")]);
+test("single authority: only the two enumerated adapters reach governed-exec (V2-008, V2-015)", () => {
+  // Governed execution has exactly TWO callers, each a narrow adapter: the check-runner (the
+  // VERIFIER's predeclared plan, verifier:true — the model never reaches it) and the builder
+  // command executor (the READ-ONLY terminal, verifier:false — a model requests a bounded,
+  // structured, read-only command). Any THIRD importer would be an ungoverned execution path.
+  const allowed = new Set([join(V2_DIR, "runtime", "check-runner.ts"), join(V2_DIR, "runtime", "command-executor.ts")]);
   const offenders: string[] = [];
   for (const file of tsFiles(V2_DIR)) {
     if (allowed.has(file) || file.endsWith(".test.ts")) continue;
@@ -833,7 +869,7 @@ test("single authority: only the check-runner adapter reaches governed-exec (V2-
       if (spec.includes("governed-exec")) offenders.push(`${relative(SRC, file)} -> ${spec}`);
     }
   }
-  assert.deepEqual(offenders, [], "governed execution for verification is reached through the check-runner adapter alone");
+  assert.deepEqual(offenders, [], "governed execution is reached through the check-runner and command-executor adapters alone");
 });
 
 test("single authority: no v2 file spawns a process for verification outside the adapter (V2-008)", () => {

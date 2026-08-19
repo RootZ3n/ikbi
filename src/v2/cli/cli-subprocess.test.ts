@@ -134,6 +134,8 @@ test("v2 cli: the end-to-end run claims NOTHING it did not do", () => {
     // V2-005: a real HTTP call to a protocol-faithful local provider really happened.
     providerInvoked: true,
     invocations: 2,
+    // V2-015: the fake model ran no read-only commands.
+    commandsRun: 0,
     // V2-006: one isolated workspace was allocated — and nothing was written in it.
     workspacesAllocated: 1,
     observationsTaken: 1,

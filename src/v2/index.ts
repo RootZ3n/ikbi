@@ -18,4 +18,5 @@ export * from "./core/lifecycle.js";
 export * from "./core/result.js";
 export * from "./core/contract.js";
 export * from "./core/cost.js";
+export * from "./core/command.js";
 export * from "./core/run.js";

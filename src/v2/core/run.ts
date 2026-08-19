@@ -82,6 +82,7 @@ import {
 } from "./verification.js";
 import { generateCandidate, type BuilderBudget, type BuilderToolExecutor, type BuilderToolExecutorDeps, type UntrustedBoundary } from "./builder.js";
 import type { InvocationAdmission } from "./cost.js";
+import type { BuilderCommandCapability, BuilderCommandRecord } from "./command.js";
 import { judgeCandidate, summarizeCritic, type CriticRecord } from "./critic.js";
 import {
   judgeDisposition,
@@ -122,6 +123,7 @@ import {
   summarizeContext,
   summarizeEvidence,
   summarizeInvocation,
+  summarizeCommand,
   summarizeResolution,
   summarizeWorkspace,
   type V2RunReceipt,
@@ -385,6 +387,12 @@ export interface V2RunDeps {
    * budget enforcement, no accounting side-effects on any existing test path.
    */
   readonly admission?: InvocationAdmission;
+  /**
+   * OPTIONAL read-only command terminal (V2-015). When wired, the builder's `run_command` runs one
+   * bounded command with the candidate READ-ONLY and returns its output as untrusted evidence. It
+   * mints no observation and holds no mutation authority. Absent ⇒ `run_command` is refused.
+   */
+  readonly commands?: BuilderCommandCapability;
   readonly ids?: V2IdFactory;
   readonly now?: () => number;
   readonly probe?: RepoProbe;
@@ -514,6 +522,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
   let retrieval: RetrievalSummary | undefined;
   let contextPackage: ContextPackage | undefined;
   let invocations: readonly V2InvocationRecord[] = [];
+  let commands: readonly BuilderCommandRecord[] = [];
   let candidate: CandidateRecord | undefined;
   let verification: VerificationRecord | undefined;
   let critic: CriticRecord | undefined;
@@ -682,6 +691,9 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
           path: applied.path,
         });
       },
+      // V2-015: the READ-ONLY command terminal, when wired. Absent ⇒ run_command is refused as
+      // unavailable. It mints no observation and holds no mutation authority.
+      ...(deps.commands !== undefined ? { commands: deps.commands } : {}),
     });
 
     const generated = await generateCandidate({
@@ -714,6 +726,9 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
       for (const id of generated.attemptedInvocationIds) lifecycle.record(runId, { kind: "invocation", id, role: decision.role });
     }
     invocations = generated.ok ? generated.generation.invocations : generated.invocations;
+    // Read-only commands the builder ran (V2-015) — collected whether or not generation
+    // succeeded, so a failed build's terminal inspection is still on the receipt.
+    commands = generated.ok ? generated.generation.commands : generated.commands;
     if (!generated.ok) return generated.failure;
 
     // CAPTURE. The builder said it is done; now the exact resulting state is addressed,
@@ -955,13 +970,14 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     runId,
     outcome,
     stagesEntered: lifecycle.stagesEntered,
-    evidence: summarizeEvidence(lifecycle.ledger, outcome),
+    evidence: summarizeEvidence(lifecycle.ledger, outcome, commands.length),
     ...(policy !== undefined ? { configuration: summarizeConfiguration(policy) } : {}),
     ...(source !== undefined ? { sourceSnapshot: summarizeSnapshot(source.snapshot) } : {}),
     ...(decision !== undefined ? { resolution: summarizeResolution(decision) } : {}),
     ...(contextPackage !== undefined ? { context: summarizeContext(contextPackage) } : {}),
     ...(retrieval !== undefined ? { retrieval } : {}),
     invocations: invocations.map(summarizeInvocation),
+    commands: commands.map(summarizeCommand),
     ...(candidate !== undefined ? { candidate: summarizeCandidate(candidate) } : {}),
     ...(verification !== undefined ? { verification: summarizeVerification(verification) } : {}),
     ...(critic !== undefined ? { critic: summarizeCritic(critic) } : {}),
@@ -984,6 +1000,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     ...(decision !== undefined ? { decision } : {}),
     ...(contextPackage !== undefined ? { context: manifestOf(contextPackage) } : {}),
     invocations,
+    commands,
     ...(candidate !== undefined ? { candidate } : {}),
     ...(verification !== undefined ? { verification } : {}),
     ...(critic !== undefined ? { critic } : {}),

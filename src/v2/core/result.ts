@@ -44,6 +44,7 @@ import type { RuntimeModelPolicy } from "./config.js";
 import type { ModelResolutionDecision } from "./resolver.js";
 import type { ContextManifest, ContextPackage } from "./context.js";
 import type { V2InvocationRecord } from "./invocation.js";
+import type { BuilderCommandRecord } from "./command.js";
 import type { V2WorkspaceRecord, WorkspaceDisposition } from "./workspace.js";
 import type { SourceSnapshotSummary } from "./source.js";
 import type { CandidateRecord, RunCandidateSummary } from "./candidate.js";
@@ -179,6 +180,8 @@ export interface RunEvidenceSummary {
   readonly contextPackages: number;
   readonly providerInvoked: boolean;
   readonly invocations: number;
+  /** How many READ-ONLY builder commands ran (V2-015). Every one left the candidate tree unchanged. */
+  readonly commandsRun: number;
   readonly candidatesCreated: number;
   readonly verificationsPerformed: number;
   readonly promotionsAttempted: number;
@@ -338,6 +341,53 @@ export function summarizeInvocation(record: V2InvocationRecord): RunInvocationSu
 }
 
 /**
+ * One READ-ONLY command a run's builder ran (V2-015), as a receipt-safe summary. The bounded
+ * output EXCERPT is deliberately omitted from the receipt — only its hash, size and truncation
+ * flag are kept, so a receipt never reproduces untrusted command output. `workspaceUnchanged`
+ * (tree before == after) is the load-bearing read-only proof.
+ */
+export interface RunCommandSummary {
+  readonly commandId: string;
+  readonly program: string;
+  readonly args: readonly string[];
+  readonly cwd: string;
+  readonly commandPolicyId: string;
+  readonly sandboxMode: string;
+  readonly workspaceAccess: string;
+  readonly network: string;
+  readonly launched: boolean;
+  readonly exitCode: number | null;
+  readonly timedOut: boolean;
+  readonly durationMs: number;
+  readonly outputSha256: string;
+  readonly outputByteLength: number;
+  readonly outputTruncated: boolean;
+  readonly workspaceUnchanged: boolean;
+}
+
+/** Summarize a command for a receipt. Derived — nothing is asserted; the output body is not carried. */
+export function summarizeCommand(record: BuilderCommandRecord): RunCommandSummary {
+  return {
+    commandId: record.commandId,
+    program: record.program,
+    args: [...record.args],
+    cwd: record.cwd,
+    commandPolicyId: record.commandPolicyId,
+    sandboxMode: record.sandboxMode,
+    workspaceAccess: record.workspaceAccess,
+    network: record.network,
+    launched: record.launched,
+    exitCode: record.exitCode ?? null,
+    timedOut: record.timedOut,
+    durationMs: record.durationMs,
+    outputSha256: record.outputSha256,
+    outputByteLength: record.outputByteLength,
+    outputTruncated: record.outputTruncated,
+    workspaceUnchanged: record.treeBefore === record.treeAfter,
+  };
+}
+
+/**
  * The isolated workspace a run allocated, and what it observed there. Counts, identities
  * and the exact source binding — never file contents.
  */
@@ -405,6 +455,11 @@ export interface V2RunReceipt {
    * last — would understate what the run actually did and what it cost.
    */
   readonly invocations: readonly RunInvocationSummary[];
+  /**
+   * Every READ-ONLY command the builder ran, in order (V2-015). Empty when the terminal was
+   * unused or unavailable. Each proves `workspaceUnchanged` (tree before == after).
+   */
+  readonly commands: readonly RunCommandSummary[];
   /** Absent when preflight did not capture a source snapshot. */
   readonly sourceSnapshot?: SourceSnapshotSummary;
   /** Absent when no workspace was allocated. */
@@ -451,9 +506,10 @@ export interface V2RunReceipt {
  * when the run BOTH recorded a promotion AND terminalized as accepted — a recorded
  * promotion attempt that did not become the terminal outcome never reads as landed.
  */
-export function summarizeEvidence(ledger: RunLedgerView, outcome: RunTerminalOutcome): RunEvidenceSummary {
+export function summarizeEvidence(ledger: RunLedgerView, outcome: RunTerminalOutcome, commandsRun = 0): RunEvidenceSummary {
   const accepted = outcome.kind === "accepted";
   return {
+    commandsRun,
     configurationResolved: ledger.configurations.length > 0,
     modelResolutionCompleted: ledger.resolutions.length > 0,
     modelResolutions: ledger.resolutions.length,
@@ -510,6 +566,8 @@ export interface V2RunResult {
   readonly context?: ContextManifest;
   /** The full records of every model turn this run performed, in order. */
   readonly invocations: readonly V2InvocationRecord[];
+  /** The full records of every READ-ONLY command the builder ran, in order (V2-015). */
+  readonly commands: readonly BuilderCommandRecord[];
   /** The candidate this run produced, when the builder finished and it was captured. */
   readonly candidate?: CandidateRecord;
   /** The verification this run performed, when a candidate reached verification. */

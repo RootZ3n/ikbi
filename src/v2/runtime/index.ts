@@ -34,6 +34,8 @@ import { captureCandidateTree } from "./candidate-capture.js";
 import { createUntrustedBoundary } from "./untrusted-boundary.js";
 import { createChecksSource } from "./verification-checks.js";
 import { createCheckRunner } from "./check-runner.js";
+import { createCommandCapability, createGovernedCommandTransport } from "./command-executor.js";
+import { V2_DEFAULT_COMMAND_POLICY, type BuilderCommandCapability, type BuilderCommandPolicy } from "../core/command.js";
 import { createTreeProbe } from "./verification-tree.js";
 import { createCandidateDiffSource } from "./candidate-diff.js";
 import { createCasPublicationTarget } from "./publication.js";
@@ -184,6 +186,10 @@ export interface ProductionRunDeps {
   readonly checksSource?: V2RunDeps["checksSource"];
   readonly checkRunner?: V2RunDeps["checkRunner"];
   readonly treeProbe?: V2RunDeps["treeProbe"];
+  /** Test/override seam for the read-only command terminal (V2-015). */
+  readonly commands?: BuilderCommandCapability;
+  /** The frozen builder command policy (V2-015). Defaults to the shipped read-only allowlist. */
+  readonly commandPolicy?: BuilderCommandPolicy;
   readonly checkTimeoutMs?: V2RunDeps["checkTimeoutMs"];
   readonly candidateDiff?: V2RunDeps["candidateDiff"];
   readonly publisher?: V2RunDeps["publisher"];
@@ -258,6 +264,12 @@ async function wireRunDeps(deps: ProductionRunDeps): Promise<V2RunDeps> {
   // receipt can never describe a retrieval some other run performed.
   const retrieval = createRetrievalSource();
   const sources = deps.contextSources ?? [...PRODUCTION_CONTEXT_SOURCES, retrieval];
+  // THE READ-ONLY command terminal (V2-015). One tree prober is shared with verification so the
+  // command's before/after read-only proof uses the same authority. The command policy is frozen
+  // (the shipped read-only allowlist unless a caller injects one). verifier is NEVER set here.
+  const treeProbe = deps.treeProbe ?? createTreeProbe();
+  const commandPolicy = deps.commandPolicy ?? V2_DEFAULT_COMMAND_POLICY;
+  const commands = deps.commands ?? createCommandCapability({ transport: createGovernedCommandTransport(), treeProbe, policy: commandPolicy });
   return {
     workspaces: deps.workspaces ?? wired.workspaces,
     mutations: deps.mutations ?? wired.mutations,
@@ -280,7 +292,8 @@ async function wireRunDeps(deps: ProductionRunDeps): Promise<V2RunDeps> {
     // git tree probe. All three do I/O, so they are wired here, once.
     checksSource: deps.checksSource ?? createChecksSource(),
     checkRunner: deps.checkRunner ?? createCheckRunner(),
-    treeProbe: deps.treeProbe ?? createTreeProbe(),
+    treeProbe,
+    commands,
     // THE candidate diff source for the critic — model-caused change vs the source snapshot.
     candidateDiff: deps.candidateDiff ?? createCandidateDiffSource(),
     // THE publication target — the ONLY thing that moves a target ref. Clean-ref CAS.

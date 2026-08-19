@@ -204,6 +204,8 @@ test("reachability: the JSON surface carries the lifecycle journal + a counted r
     providerInvoked: true,
     // V2-009: the builder's finish turn AND the critic's one judgment.
     invocations: 2,
+    // V2-015: the builder ran no read-only commands in this hermetic run.
+    commandsRun: 0,
     workspacesAllocated: 1,
     observationsTaken: 0,
     mutationsApplied: 0,

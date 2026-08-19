@@ -22,8 +22,9 @@
  * it here would silently defeat the compare-and-swap.
  */
 
-import { MAX_TOOL_READ_CHARS, TOOL_CREATE_FILE, TOOL_DELETE_FILE, TOOL_READ_FILE, TOOL_REPLACE_FILE, type ToolOutcome } from "../core/tools.js";
+import { MAX_TOOL_READ_CHARS, TOOL_CREATE_FILE, TOOL_DELETE_FILE, TOOL_READ_FILE, TOOL_REPLACE_FILE, TOOL_RUN_COMMAND, type ToolOutcome } from "../core/tools.js";
 import type { BuilderToolExecutor, BuilderToolExecutorDeps, ToolExecution } from "../core/builder.js";
+import { commandRefusalOutcome } from "../core/command.js";
 import type { V2FileObservation, MutationOperation } from "../core/workspace.js";
 import type { V2ObservationDigest } from "../core/identity.js";
 import type { RunFailure } from "../core/failure.js";
@@ -46,6 +47,8 @@ function refusal(path: string, failure: RunFailure): ToolOutcome {
 export function createBuilderToolExecutor(deps: BuilderToolExecutorDeps): BuilderToolExecutor {
   const issued: ObservationTable = new Map();
   const { runId, workspace, mutations } = deps;
+  // A per-candidate command ordinal, so each command event has a distinct, order-preserving id.
+  let commandOrdinal = 0;
 
   /** Resolve an id the model quoted back, or explain why it is not usable. */
   function resolve(observationId: V2ObservationDigest, path: string): V2FileObservation | ToolOutcome {
@@ -152,6 +155,21 @@ export function createBuilderToolExecutor(deps: BuilderToolExecutorDeps): Builde
 
         case TOOL_DELETE_FILE:
           return applyMutation(call.path, call.observationId, { kind: "delete" }, "delete_file");
+
+        case TOOL_RUN_COMMAND: {
+          // A READ-ONLY command — it CANNOT mutate and mints NO observation. When no command
+          // capability is wired, the terminal is truthfully unavailable rather than silently absent.
+          if (deps.commands === undefined) {
+            return { outcome: commandRefusalOutcome({ program: call.program, args: call.args, cwd: call.cwd, code: "terminal_unavailable", detail: "the read-only command terminal is not available in this build" }) };
+          }
+          commandOrdinal += 1;
+          const result = await deps.commands.run({ runId, workspacePath: workspace.path, ordinal: commandOrdinal, program: call.program, args: call.args, cwd: call.cwd });
+          return {
+            outcome: result.outcome,
+            ...(result.command !== undefined ? { command: result.command } : {}),
+            ...(result.safetyFailure !== undefined ? { safetyFailure: result.safetyFailure } : {}),
+          };
+        }
 
         default:
           // `finish_candidate` is interpreted by the controller and never reaches here;

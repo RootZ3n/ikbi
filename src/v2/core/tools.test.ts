@@ -17,6 +17,7 @@ import {
   TOOL_FINISH_CANDIDATE,
   TOOL_READ_FILE,
   TOOL_REPLACE_FILE,
+  TOOL_RUN_COMMAND,
   isBuilderToolName,
   isToolFailure,
   parseToolCall,
@@ -29,10 +30,25 @@ const call = (name: string, args: unknown) => ({ id: "c1", name, arguments: JSON
 
 // ── the tool set ────────────────────────────────────────────────────────────
 
-test("tools: the builder has exactly five tools, and no shell among them", () => {
-  assert.deepEqual([...BUILDER_TOOL_NAMES], ["read_file", "replace_file", "create_file", "delete_file", "finish_candidate"]);
-  for (const forbidden of ["terminal", "bash", "exec", "run_command", "patch", "multi_edit", "delegate_task", "git_commit"]) {
+test("tools: the builder has exactly six tools — the five state-bound tools plus the read-only terminal", () => {
+  // V2-015 adds `run_command`: a READ-ONLY terminal (structured argv, no shell, no mutation).
+  assert.deepEqual([...BUILDER_TOOL_NAMES], ["read_file", "replace_file", "create_file", "delete_file", "run_command", "finish_candidate"]);
+  // A WRITE shell / patch / delegate is still absent — the terminal is read-only and mints nothing.
+  for (const forbidden of ["terminal", "bash", "exec", "shell", "patch", "multi_edit", "delegate_task", "git_commit", "apply_patch", "install_package"]) {
     assert.equal(isBuilderToolName(forbidden), false, `${forbidden} must not be reachable in this slice`);
+  }
+});
+
+test("tools: run_command is STRUCTURED ARGV (program + args[]), never a shell command string (V2-015)", () => {
+  const cmd = BUILDER_TOOLS.find((t) => t.name === TOOL_RUN_COMMAND)!;
+  const props = (cmd.parameters as { properties: Record<string, unknown>; required: string[] }).properties;
+  assert.ok(props["program"] !== undefined, "run_command takes a program");
+  assert.equal((props["args"] as { type: string }).type, "array", "args is an ARRAY, not a shell string");
+  assert.equal(props["command"], undefined, "there is NO single command string field (no shell)");
+  assert.deepEqual((cmd.parameters as { required: string[] }).required, ["program"]);
+  // No verifier/governance/network override a model could set.
+  for (const forbidden of ["verifier", "network", "shell", "sudo", "env"]) {
+    assert.equal(props[forbidden], undefined, `run_command must not expose "${forbidden}" to the model`);
   }
 });
 

@@ -48,6 +48,7 @@ import { renderBuilderInput, type RenderedMessage } from "./prompt.js";
 import type { RepairBrief } from "./repair.js";
 import { invokeAuthorized, type InvocationTransport, type ServedModelAlias, type V2InvocationRecord } from "./invocation.js";
 import type { InvocationAdmission } from "./cost.js";
+import { V2_COMMAND_FAILURE_CODES, type BuilderCommandCapability, type BuilderCommandRecord } from "./command.js";
 import type { ContextPackage } from "./context.js";
 import type { ModelResolutionDecision } from "./resolver.js";
 import type { RunFailure } from "./failure.js";
@@ -73,6 +74,8 @@ export interface BuilderBudget {
   readonly maxOutputTokens: number;
   /** Per-turn wall clock. */
   readonly turnTimeoutMs: number;
+  /** Read-only commands the builder may run across the whole candidate (V2-015). */
+  readonly maxCommands: number;
 }
 
 /**
@@ -86,6 +89,7 @@ export const DEFAULT_BUILDER_BUDGET: BuilderBudget = Object.freeze({
   maxMutations: 20,
   maxOutputTokens: 4_096,
   turnTimeoutMs: 120_000,
+  maxCommands: 24,
 });
 
 // ---------------------------------------------------------------------------
@@ -122,6 +126,12 @@ export interface BuilderToolExecutorDeps {
     readonly path: string;
     readonly observationId: V2ObservationDigest;
   }) => void;
+  /**
+   * OPTIONAL read-only command capability (V2-015). When present, `run_command` runs one bounded
+   * command with the candidate READ-ONLY and returns its output as untrusted evidence. It mints NO
+   * observation and touches NO mutation authority. Absent ⇒ `run_command` is refused as unavailable.
+   */
+  readonly commands?: BuilderCommandCapability;
 }
 
 /** What one executed tool did, plus the ledger facts the candidate will need. */
@@ -129,6 +139,13 @@ export interface ToolExecution {
   readonly outcome: ToolOutcome;
   /** Present when the call APPLIED a mutation. Absent for reads and refusals. */
   readonly mutation?: { readonly mutationId: V2MutationDigest; readonly path: string };
+  /** Present when the call RAN a command (V2-015). A command NEVER carries a mutation. */
+  readonly command?: BuilderCommandRecord;
+  /**
+   * Present ONLY when a command changed the candidate tree — a HARD safety violation. The loop
+   * MUST abort the whole build with this failure; it never continues after a command mutated state.
+   */
+  readonly safetyFailure?: RunFailure;
 }
 
 // ---------------------------------------------------------------------------
@@ -142,6 +159,8 @@ export interface BuilderGeneration {
   readonly invocationIds: readonly V2InvocationId[];
   readonly mutationIds: readonly V2MutationDigest[];
   readonly changedPaths: readonly string[];
+  /** Every read-only command the builder ran, in order (V2-015). Never carries a mutation. */
+  readonly commands: readonly BuilderCommandRecord[];
   readonly turns: number;
   readonly toolCalls: number;
   readonly toolFailures: number;
@@ -165,6 +184,8 @@ export type BuilderResult =
       readonly attemptedInvocationIds: readonly V2InvocationId[];
       /** Mutations that really applied before the failure. The workspace holds them. */
       readonly mutationIds: readonly V2MutationDigest[];
+      /** Read-only commands that ran before the failure (V2-015). Counted, never discarded. */
+      readonly commands: readonly BuilderCommandRecord[];
     };
 
 /**
@@ -242,13 +263,14 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
   const invocations: V2InvocationRecord[] = [];
   const mutationIds: V2MutationDigest[] = [];
   const changedPaths = new Set<string>();
+  const commands: BuilderCommandRecord[] = [];
   let toolCalls = 0;
   let toolFailures = 0;
   let turns = 0;
 
   const attemptedInvocationIds: V2InvocationId[] = [];
   /** Everything that really happened, for a failure that must not erase it. */
-  const partial = (failure: RunFailure): BuilderResult => ({ ok: false, failure, invocations, mutationIds, attemptedInvocationIds });
+  const partial = (failure: RunFailure): BuilderResult => ({ ok: false, failure, invocations, mutationIds, attemptedInvocationIds, commands });
 
   while (turns < budget.maxTurns) {
     // ONE TURN = ONE INVOCATION, through the one authority. There is no other doorway
@@ -359,8 +381,24 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
         break;
       }
 
+      // A COMMAND BUDGET, separate from mutations and tool calls: a model must not burn
+      // unbounded local CPU without model turns. Checked BEFORE dispatch so nothing runs past it.
+      if (parsed.name === "run_command" && commands.length >= budget.maxCommands) {
+        return partial(
+          buildFailure({
+            code: V2_COMMAND_FAILURE_CODES.commandBudgetExhausted,
+            message: `the builder ran ${commands.length} commands, which is the limit for one candidate`,
+            detail: { maxCommands: budget.maxCommands, turns },
+          }),
+        );
+      }
+
       const executed = await input.executor.execute(parsed);
+      // A COMMAND THAT MUTATED THE CANDIDATE TREE is a hard safety violation — abort the whole
+      // build immediately. It never continues after a command changed state.
+      if (executed.safetyFailure !== undefined) return partial(executed.safetyFailure);
       if (isToolFailure(executed.outcome)) toolFailures += 1;
+      if (executed.command !== undefined) commands.push(executed.command);
       if (executed.mutation !== undefined) {
         mutationIds.push(executed.mutation.mutationId);
         changedPaths.add(executed.mutation.path);
@@ -386,6 +424,7 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
           invocationIds: invocations.map((r) => r.invocationId),
           mutationIds,
           changedPaths: [...changedPaths].sort(),
+          commands,
           turns,
           toolCalls,
           toolFailures,
