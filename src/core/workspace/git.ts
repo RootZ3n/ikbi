@@ -79,6 +79,21 @@ export async function revParse(repo: string, ref: string): Promise<string> {
   return r.stdout.trim();
 }
 
+/**
+ * The CANONICAL identity of a git repository: the absolute path of its common git directory
+ * (`git rev-parse --git-common-dir`, resolved to an absolute path). This is stable across a
+ * repository's linked worktrees (they share one common dir) and independent of which lexical
+ * path alias was used to reach it, while remaining DISTINCT for two different repositories.
+ *
+ * Additive and read-only — it changes no v1 behaviour. Used by v2 promotion to bind a target's
+ * repository identity so the same candidate published to repo A/main and repo B/main cannot
+ * share a promotion identity, and to detect a target path swapped under a symlink.
+ */
+export async function gitCommonDir(repo: string): Promise<string> {
+  const r = await runGit(repo, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  return r.stdout.trim();
+}
+
 /** True if `ancestor` is an ancestor of `descendant`. */
 export async function isAncestor(repo: string, ancestor: string, descendant: string): Promise<boolean> {
   const r = await runGit(repo, ["merge-base", "--is-ancestor", ancestor, descendant], { okCodes: [1] });

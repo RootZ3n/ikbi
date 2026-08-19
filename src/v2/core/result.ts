@@ -568,6 +568,12 @@ export interface V2RunResult {
   readonly invocations: readonly V2InvocationRecord[];
   /** The full records of every READ-ONLY command the builder ran, in order (V2-015). */
   readonly commands: readonly BuilderCommandRecord[];
+  /**
+   * The isolated workspace this run allocated, when one was (V2-016). Present so the SESSION can
+   * reclaim a SUPERSEDED non-authoritative attempt's worktree under its cleanup policy — the
+   * receipt/evidence identities are unaffected, only the on-disk material is reclaimed.
+   */
+  readonly workspace?: V2WorkspaceRecord;
   /** The candidate this run produced, when the builder finished and it was captured. */
   readonly candidate?: CandidateRecord;
   /** The verification this run performed, when a candidate reached verification. */

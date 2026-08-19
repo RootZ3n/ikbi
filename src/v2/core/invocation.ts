@@ -69,15 +69,63 @@ export interface ServedModelAlias {
 }
 
 /**
- * Production alias table — deliberately EMPTY.
+ * THE declarative served-model alias catalog (V2-016). ONE owner, provider-specific, exact.
  *
- * No alias relation in this repository has been observed against a real provider, and
- * inventing plausible ones (`gpt-4o` → `gpt-4o-2024-08-06`) would be exactly the
- * guessing this policy forbids. Add an entry when a live response actually shows the
- * relation; until then an unexplained difference is a mismatch, which is the safe and
- * truthful default.
+ * Each entry says: for this provider, sending `authorizedProviderModelId` may legitimately be
+ * answered by any id in `allowedServedModelIds` — and NOTHING else. There is no regex, no prefix
+ * rule, no version-stripping, no cross-provider matching. An undeclared difference is a MISMATCH.
  */
-export const V2_SERVED_MODEL_ALIASES: readonly ServedModelAlias[] = Object.freeze([]);
+export interface ServedModelAliasCatalog {
+  readonly provider: string;
+  readonly authorizedProviderModelId: string;
+  readonly allowedServedModelIds: readonly string[];
+}
+
+/**
+ * The shipped alias catalog. Entries are the providers' OWN documented dated-snapshot ids for a
+ * floating alias — the relation a real provider response shows (`gpt-4o` served as its current
+ * dated snapshot). Exact and provider-scoped: `gpt-4o` is NOT `gpt-4o-mini`, and an OpenAI alias
+ * never authorizes an Anthropic served id. Add an entry only when the provider documents/serves it.
+ */
+export const V2_SERVED_ALIAS_TABLE: readonly ServedModelAliasCatalog[] = Object.freeze([
+  {
+    provider: "openai",
+    authorizedProviderModelId: "gpt-4o",
+    // OpenAI's floating `gpt-4o` resolves to a dated snapshot; these are the published ones.
+    allowedServedModelIds: ["gpt-4o-2024-08-06", "gpt-4o-2024-11-20", "gpt-4o-2024-05-13"],
+  },
+  {
+    provider: "anthropic",
+    authorizedProviderModelId: "claude-sonnet-4-5",
+    allowedServedModelIds: ["claude-sonnet-4-5-20250929"],
+  },
+]);
+
+/** Expand the catalog into the flat, per-relation table `classifyServedIdentity` consumes. */
+export function expandAliasCatalog(catalog: readonly ServedModelAliasCatalog[]): readonly ServedModelAlias[] {
+  const out: ServedModelAlias[] = [];
+  for (const entry of catalog) {
+    for (const served of entry.allowedServedModelIds) {
+      out.push({ providerId: entry.provider, sent: entry.authorizedProviderModelId, served, note: `declared provider snapshot alias for ${entry.provider}/${entry.authorizedProviderModelId}` });
+    }
+  }
+  return Object.freeze(out);
+}
+
+/** The production alias table, expanded from the shipped catalog and frozen for the process. */
+export const V2_SERVED_MODEL_ALIASES: readonly ServedModelAlias[] = expandAliasCatalog(V2_SERVED_ALIAS_TABLE);
+
+/**
+ * Content address of an alias catalog — so a BuildSession can FREEZE it alongside the runtime
+ * policy and pricing catalog and prove a later attempt saw the same alias set.
+ */
+export function servedAliasCatalogId(catalog: readonly ServedModelAliasCatalog[]): string {
+  return contentDigest("served_alias_catalog", {
+    entries: [...catalog]
+      .map((e) => ({ provider: e.provider, authorizedProviderModelId: e.authorizedProviderModelId, allowedServedModelIds: [...e.allowedServedModelIds].sort() }))
+      .sort((a, b) => `${a.provider} ${a.authorizedProviderModelId}`.localeCompare(`${b.provider} ${b.authorizedProviderModelId}`)),
+  }) as string;
+}
 
 /** Classify the provider's reported identity against what was sent. */
 export function classifyServedIdentity(

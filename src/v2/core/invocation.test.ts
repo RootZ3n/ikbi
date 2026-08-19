@@ -248,8 +248,16 @@ test("identity: a MISMATCH fails the invocation and preserves all three facts", 
   assert.equal(result.failure.detail?.servedModelId, "beta-v9");
 });
 
-test("identity: the production alias table is empty — an unexplained difference is a mismatch", () => {
-  assert.deepEqual([...V2_SERVED_MODEL_ALIASES], [], "no alias is asserted without having been observed");
+test("identity: the production alias table carries ONLY explicitly-declared provider snapshots (V2-016)", () => {
+  // V2-016 populated the catalog with real provider dated-snapshot relations. Every entry is
+  // provider-specific + exact; there is no regex/prefix/version-strip rule anywhere.
+  assert.ok(V2_SERVED_MODEL_ALIASES.length > 0, "the shipped catalog declares real provider aliases");
+  // A real declared alias is accepted; an undeclared date / mini / cross-provider is a mismatch.
+  assert.equal(classifyServedIdentity("openai", "gpt-4o", "gpt-4o-2024-08-06", V2_SERVED_MODEL_ALIASES), "aliased_match");
+  assert.equal(classifyServedIdentity("openai", "gpt-4o", "gpt-4o-2024-01-01", V2_SERVED_MODEL_ALIASES), "mismatch", "an undeclared date is a mismatch");
+  assert.equal(classifyServedIdentity("openai", "gpt-4o", "gpt-4o-mini", V2_SERVED_MODEL_ALIASES), "mismatch", "a different family is a mismatch");
+  assert.equal(classifyServedIdentity("anthropic", "gpt-4o", "gpt-4o-2024-08-06", V2_SERVED_MODEL_ALIASES), "mismatch", "an OpenAI alias never crosses to another provider");
+  assert.equal(classifyServedIdentity("openai", "gpt-4o", "GPT-4O-2024-08-06", V2_SERVED_MODEL_ALIASES), "mismatch", "case variation is a mismatch (exact only)");
 });
 
 // ── retry ───────────────────────────────────────────────────────────────────

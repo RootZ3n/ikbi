@@ -47,6 +47,29 @@ import {
 /** A hard ceiling on session attempts, independent of any policy value, as a loop guard. */
 export const SESSION_ATTEMPT_HARD_CAP = 8;
 
+/**
+ * THE workspace cleanup policy (V2-016). Recovery can retain up to 8 superseded attempt worktrees;
+ * safe, but undesirable for a daily driver. This policy reclaims ONLY non-authoritative superseded
+ * attempt worktrees, and NEVER: the final attempt, a quarantined (safety-forensics) attempt, or an
+ * attempt whose promotion landed DEGRADED (reconciliation may still need it). It reclaims on-disk
+ * material only — every AttemptRecord and evidence id stays on the session receipt.
+ */
+export interface WorkspaceCleanupPolicy {
+  readonly retainFinalAttempt: boolean;
+  readonly retainQuarantined: boolean;
+  readonly retainDegradedPromotion: boolean;
+  /** How many superseded ordinary attempt worktrees to KEEP (most recent first). 0 = keep none. */
+  readonly maxRetainedSuperseded: number;
+}
+
+/** The safe daily-driver default: keep the final + quarantined + degraded, discard ordinary superseded. */
+export const DEFAULT_WORKSPACE_CLEANUP_POLICY: WorkspaceCleanupPolicy = Object.freeze({
+  retainFinalAttempt: true,
+  retainQuarantined: true,
+  retainDegradedPromotion: true,
+  maxRetainedSuperseded: 0,
+});
+
 /** The session-level account. Per-attempt receipts are preserved; this adds session provenance. */
 export interface V2BuildSessionReceipt {
   readonly buildSessionId: V2BuildSessionId;
@@ -66,6 +89,11 @@ export interface V2BuildSessionReceipt {
   readonly totalInvocations: number;
   /** True when the final attempt landed but its post-CAS bookkeeping did not finish. */
   readonly reconciliationRequired: boolean;
+  /**
+   * V2-016 — the workspace ids of SUPERSEDED attempts whose on-disk worktree was reclaimed under
+   * the cleanup policy. History is untouched: every AttemptRecord + evidence id remains above.
+   */
+  readonly reclaimedWorkspaceIds: readonly string[];
   /**
    * THE canonical cost account of the whole session (V2-014). Derived by construction from the
    * per-invocation cost ledger — every InvocationId counted exactly once, unknown usage/price
@@ -108,6 +136,8 @@ export interface V2BuildSessionDeps extends V2RunDeps {
    * cannot change mid-session — the same catalog id prices every attempt, including retries.
    */
   readonly pricingCatalog?: PricingCatalog;
+  /** The workspace cleanup policy (V2-016). Defaults to `DEFAULT_WORKSPACE_CLEANUP_POLICY`. */
+  readonly workspaceCleanupPolicy?: WorkspaceCleanupPolicy;
   /** Mints the ONE session identity. Injected for hermetic tests. */
   readonly sessionId?: V2BuildSessionId;
   /**
@@ -245,9 +275,14 @@ export async function executeV2BuildSession(request: V2TaskRequest, deps: V2Buil
   }
 
   const final = attempts[attempts.length - 1]!;
-  const endedAt = now();
   const acceptedPromotionId = final.outcome.kind === "accepted" ? final.receipt.promotion?.promotionId : undefined;
 
+  // WORKSPACE CLEANUP (V2-016) — reclaim ONLY superseded, non-authoritative attempt worktrees. The
+  // final attempt, any quarantined (safety-forensics) attempt, and any degraded promotion are kept.
+  const cleanupPolicy = deps.workspaceCleanupPolicy ?? DEFAULT_WORKSPACE_CLEANUP_POLICY;
+  const reclaimedWorkspaceIds = await reclaimSupersededWorkspaces(attempts, cleanupPolicy, deps);
+
+  const endedAt = now();
   // THE canonical session cost account — derived by construction from the per-invocation ledger.
   const cost = costController.sessionSummary();
 
@@ -264,6 +299,7 @@ export async function executeV2BuildSession(request: V2TaskRequest, deps: V2Buil
     // summary, so the invocation count and the cost can never disagree.
     totalInvocations: cost.totalInvocations,
     reconciliationRequired,
+    reclaimedWorkspaceIds,
     cost,
     startedAt,
     endedAt,
@@ -281,4 +317,39 @@ export async function executeV2BuildSession(request: V2TaskRequest, deps: V2Buil
     repairBriefs,
     receipt,
   };
+}
+
+/**
+ * Reclaim SUPERSEDED, non-authoritative attempt worktrees under the cleanup policy. Pure guardrails:
+ * the LAST attempt is never touched (it owns the session outcome); a quarantined attempt is kept
+ * when `retainQuarantined`; a degraded promotion is kept when `retainDegradedPromotion`; and at most
+ * `maxRetainedSuperseded` of the remaining ordinary attempts are kept (most recent first). Only the
+ * on-disk worktree is discarded — the AttemptRecord and every evidence id remain on the receipt.
+ */
+async function reclaimSupersededWorkspaces(attempts: readonly V2RunResult[], policy: WorkspaceCleanupPolicy, deps: V2BuildSessionDeps): Promise<string[]> {
+  const reclaimed: string[] = [];
+  const lastIndex = attempts.length - 1;
+  // Ordinary superseded attempts, oldest→newest, that are eligible for cleanup.
+  const eligible: V2RunResult[] = [];
+  for (let i = 0; i < attempts.length; i += 1) {
+    const a = attempts[i]!;
+    if (policy.retainFinalAttempt && i === lastIndex) continue; // never the final attempt
+    if (a.workspace === undefined) continue; // nothing on disk to reclaim
+    if (policy.retainQuarantined && a.outcome.kind === "quarantined") continue;
+    // A degraded/reconciliation-needing promotion may still be needed — keep it.
+    if (policy.retainDegradedPromotion && a.outcome.kind === "accepted" && a.receipt.promotion?.degraded === true) continue;
+    eligible.push(a);
+  }
+  // Keep the most recent `maxRetainedSuperseded`; discard the rest.
+  const toDiscard = policy.maxRetainedSuperseded > 0 ? eligible.slice(0, Math.max(0, eligible.length - policy.maxRetainedSuperseded)) : eligible;
+  for (const a of toDiscard) {
+    try {
+      const disposition = await deps.workspaces.discard(a.workspace!);
+      // Only count a genuinely-completed discard; a failed cleanup is left in place (never claimed).
+      if (disposition.kind === "discarded") reclaimed.push(a.workspace!.workspaceId);
+    } catch {
+      // Best-effort reclamation — a cleanup failure must never fail the session.
+    }
+  }
+  return reclaimed;
 }

@@ -101,17 +101,26 @@ function fakeTarget(over: Partial<{
   liveTree: string;
   checkout: { checkedOutPath?: string; clean: boolean };
   publish: PublicationOutcome;
+  /** Scripted repository identities returned on successive calls (V2-016 symlink-swap tests). */
+  repoIdentities: readonly (string | undefined)[];
 }> = {}): { target: PromotionTarget; published: string[] } {
   const published: string[] = [];
+  let idCall = 0;
   return {
     published,
     target: {
+      repositoryIdentity: async () => {
+        if (over.repoIdentities === undefined) return "/repo/A/.git";
+        const v = over.repoIdentities[Math.min(idCall, over.repoIdentities.length - 1)];
+        idCall += 1;
+        return v;
+      },
       liveHead: async () => ("liveHead" in over ? over.liveHead : BASE),
       treeOfCommit: async () => over.liveTree ?? "live".repeat(10),
       targetCheckout: async () => over.checkout ?? { clean: true },
       publish: async (input) => {
         published.push(input.candidateTreeId);
-        return over.publish ?? { kind: "landed", beforeRef: BASE, afterCommit: "p".repeat(40), publishedTree: TREE, worktreeSynced: true, stashed: false };
+        return over.publish ?? { kind: "landed", beforeRef: BASE, afterCommit: "p".repeat(40), publishedTree: TREE, worktreeSynced: true, stashed: false, journalIntentStatus: "written", journalLandedStatus: "written", postCas: { verified: true, observedRef: "p".repeat(40), observedTree: TREE } };
       },
     },
   };
@@ -247,17 +256,20 @@ test("promote: an ALREADY-landed candidate is idempotent — no second publish",
 });
 
 test("promote: the SAME candidate to the SAME target has the SAME promotion identity", () => {
-  const a = promotionRecordDigest({ candidateId: CAND, candidateTreeId: TREE, dispositionId: DISP, sourceSnapshotId: SNAP, targetBranch: "main", publishedTree: TREE });
-  const b = promotionRecordDigest({ candidateId: CAND, candidateTreeId: TREE, dispositionId: DISP, sourceSnapshotId: SNAP, targetBranch: "main", publishedTree: TREE });
+  const a = promotionRecordDigest({ candidateId: CAND, candidateTreeId: TREE, dispositionId: DISP, sourceSnapshotId: SNAP, targetRepositoryIdentity: "/repo/A/.git", targetBranch: "main", publishedTree: TREE });
+  const b = promotionRecordDigest({ candidateId: CAND, candidateTreeId: TREE, dispositionId: DISP, sourceSnapshotId: SNAP, targetRepositoryIdentity: "/repo/A/.git", targetBranch: "main", publishedTree: TREE });
   assert.equal(a, b, "identity binds what was authorized + what landed — an idempotent re-request reproduces it");
-  const different = promotionRecordDigest({ candidateId: CAND, candidateTreeId: TREE, dispositionId: DISP, sourceSnapshotId: SNAP, targetBranch: "release", publishedTree: TREE });
-  assert.notEqual(a, different, "a different target is a different promotion");
+  const different = promotionRecordDigest({ candidateId: CAND, candidateTreeId: TREE, dispositionId: DISP, sourceSnapshotId: SNAP, targetRepositoryIdentity: "/repo/A/.git", targetBranch: "release", publishedTree: TREE });
+  assert.notEqual(a, different, "a different target BRANCH is a different promotion");
+  // V2-016: the SAME candidate/tree/disposition to a DIFFERENT repository is a DIFFERENT promotion.
+  const otherRepo = promotionRecordDigest({ candidateId: CAND, candidateTreeId: TREE, dispositionId: DISP, sourceSnapshotId: SNAP, targetRepositoryIdentity: "/repo/B/.git", targetBranch: "main", publishedTree: TREE });
+  assert.notEqual(a, otherRepo, "a different REPOSITORY is a different promotion (repo A/main ≠ repo B/main)");
 });
 
 // ── degraded success ─────────────────────────────────────────────────────────
 
 test("promote: a landed-but-desynced publish is a DEGRADED SUCCESS — the ref moved", async () => {
-  const fake = fakeTarget({ publish: { kind: "landed_desynced", beforeRef: BASE, afterCommit: "p".repeat(40), publishedTree: TREE, detail: "worktree sync failed" } });
+  const fake = fakeTarget({ publish: { kind: "landed_desynced", beforeRef: BASE, afterCommit: "p".repeat(40), publishedTree: TREE, detail: "worktree sync failed", journalIntentStatus: "written", journalLandedStatus: "written", postCas: { verified: true, observedRef: "p".repeat(40), observedTree: TREE } } });
   const r = await authorize({ publisher: fake.target });
   assert.ok(r.kind === "promoted_degraded");
   assert.equal(r.record.degraded, true);
@@ -282,4 +294,59 @@ test("summary: the projection carries target, before/after and published tree", 
   assert.equal(s.publishedTree, TREE);
   assert.equal(s.strategy, "clean_ref_cas");
   assert.equal(s.degraded, false);
+});
+
+// ── V2-016: repository identity, symlink swap, post-CAS reprobe, journal visibility ──
+
+test("V2-016 identity: the landed record binds the canonical target repository identity", async () => {
+  const fake = fakeTarget({ repoIdentities: ["/canon/repo-A/.git"] });
+  const r = await authorize({ publisher: fake.target });
+  assert.ok(r.kind === "promoted");
+  assert.equal(r.record.targetRepositoryIdentity, "/canon/repo-A/.git");
+  assert.equal(summarizePromotion(r.record).targetRepositoryIdentity, "/canon/repo-A/.git");
+});
+
+test("V2-016 symlink swap: a target identity that CHANGES between authorize and publish is refused before CAS", async () => {
+  // repositoryIdentity is called at authorization (5-PRE) and again at the publish boundary (7.5).
+  const fake = fakeTarget({ repoIdentities: ["/canon/repo-A/.git", "/canon/repo-B/.git"] });
+  const r = await authorize({ publisher: fake.target });
+  assert.ok(r.kind === "refused_stale_target", `expected refusal, got ${r.kind}`);
+  assert.deepEqual(fake.published, [], "NOTHING was published through the swapped path");
+});
+
+test("V2-016 unidentifiable target: a path that is not a readable repo is an infrastructure failure", async () => {
+  const fake = fakeTarget({ repoIdentities: [undefined] });
+  const r = await authorize({ publisher: fake.target });
+  assert.ok(r.kind === "infrastructure_failure");
+});
+
+test("V2-016 post-CAS race: the ref moved but a fresh reprobe no longer confirms it → DEGRADED, never clean", async () => {
+  const fake = fakeTarget({
+    publish: { kind: "landed", beforeRef: BASE, afterCommit: "p".repeat(40), publishedTree: TREE, worktreeSynced: true, stashed: false, journalIntentStatus: "written", journalLandedStatus: "written", postCas: { verified: false, observedRef: "race".repeat(10), observedTree: "z".repeat(40), detail: "another actor advanced main" } },
+  });
+  const r = await authorize({ publisher: fake.target });
+  assert.ok(r.kind === "promoted_degraded", `expected degraded, got ${r.kind}`);
+  assert.equal(r.record.degraded, true);
+  assert.equal(r.record.postCasVerified, false);
+  assert.equal(r.record.afterRef, "p".repeat(40), "the ref DID move — never 'nothing happened'");
+});
+
+test("V2-016 journal visibility: a post-CAS landed-journal FAILURE is a bookkeeping-degraded success, not a failure", async () => {
+  const fake = fakeTarget({
+    publish: { kind: "landed", beforeRef: BASE, afterCommit: "p".repeat(40), publishedTree: TREE, worktreeSynced: true, stashed: false, journalIntentStatus: "written", journalLandedStatus: "failed", postCas: { verified: true, observedRef: "p".repeat(40), observedTree: TREE } },
+  });
+  const r = await authorize({ publisher: fake.target });
+  assert.ok(r.kind === "promoted_degraded", "a landed-journal failure is surfaced (degraded), never hidden");
+  assert.equal(r.record.journalLandedStatus, "failed");
+  assert.equal(r.record.postCasVerified, true, "the ref is authoritative regardless of the journal");
+  assert.equal(summarizePromotion(r.record).journalLandedStatus, "failed", "the receipt reports journal durability honestly");
+});
+
+test("V2-016 clean success: journals written + post-CAS verified ⇒ a plain promoted", async () => {
+  const r = await authorize({ publisher: fakeTarget().target });
+  assert.ok(r.kind === "promoted");
+  assert.equal(r.record.journalIntentStatus, "written");
+  assert.equal(r.record.journalLandedStatus, "written");
+  assert.equal(r.record.postCasVerified, true);
+  assert.equal(r.record.degraded, false);
 });

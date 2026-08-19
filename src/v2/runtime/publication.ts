@@ -6,46 +6,60 @@
  * them; it does NOT go through `WorkspaceManager.promote`, which auto-merges (forbidden here)
  * and requires a governed approval this authority does not use.
  *
- * The publish is exact-tree-only and crash-durable at the CAS:
+ * The publish is exact-tree-only. Its authoritative landing proof is the GIT REF/TREE, NOT a
+ * journal: the journal is BEST-EFFORT (V2-016) and its write status is REPORTED, never disguised
+ * as crash durability. Sequence:
  *   commit(tree=candidateTreeId, parent=authorized base) → verify the built tree == candidate
- *   tree BEFORE any ref move → durable INTENT file → updateRefCas(beforeRef→commit) → sync a
- *   clean checked-out worktree → durable LANDED file.
+ *   tree BEFORE any ref move → best-effort INTENT marker → updateRefCas(beforeRef→commit) →
+ *   best-effort LANDED marker → sync a clean checked-out worktree → FRESH post-CAS reprobe of the
+ *   authoritative ref/tree.
  *
  * A CAS that loses the race throws (git `update-ref` old-sha guard); we map that to a
- * `cas_conflict` outcome — no force, no retry against a new head. A worktree sync failure
- * AFTER the ref moved is a DEGRADED SUCCESS (`landed_desynced`), never an ordinary failure.
+ * `cas_conflict` outcome — no force, no retry against a new head. A worktree sync failure AFTER
+ * the ref moved is a DEGRADED SUCCESS (`landed_desynced`), never an ordinary failure. A post-CAS
+ * reprobe that no longer confirms our commit/tree (another actor advanced the ref) is DEGRADED
+ * (reconciliation required), never a clean success and never "nothing happened".
  */
 
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { realpathSync } from "node:fs";
 
-import { revParse, updateRefCas, commitTree, worktreeForBranch, isWorktreeClean, syncWorktreeToRef } from "../../core/workspace/git.js";
-import type { PromotionTarget, PromotionTargetRef, PublicationOutcome } from "../core/promotion.js";
+import { revParse, updateRefCas, commitTree, worktreeForBranch, isWorktreeClean, syncWorktreeToRef, gitCommonDir } from "../../core/workspace/git.js";
+import type { JournalWriteStatus, PostCasReprobe, PromotionTarget, PromotionTargetRef, PublicationOutcome } from "../core/promotion.js";
 
-/** Where crash-durable promotion intent/landed markers are written, for reconciliation + audit. */
+/**
+ * Where best-effort promotion intent/landed markers are written, for reconciliation + audit.
+ *
+ * BEST-EFFORT, not crash-durable (V2-016): each write RETURNS whether it succeeded, so the
+ * publication result can report journal durability honestly. The git ref/tree remains the ONLY
+ * authoritative landing proof — a journal failure never turns a landed CAS into a failure.
+ */
 export interface PublicationJournal {
-  /** Write the pre-CAS intent (beforeRef, intended afterRef, candidate/disposition identity). */
-  intent(record: Readonly<Record<string, string>>): void;
-  /** Write the post-CAS landed marker (the landing proof). */
-  landed(record: Readonly<Record<string, string>>): void;
+  /** Write the pre-CAS intent (beforeRef, intended afterRef, candidate/disposition identity). Returns durability. */
+  intent(record: Readonly<Record<string, string>>): JournalWriteStatus;
+  /** Write the post-CAS landed marker. Returns durability. */
+  landed(record: Readonly<Record<string, string>>): JournalWriteStatus;
 }
 
-/** A no-op journal — used by tests that do not assert durability. */
-export const NO_JOURNAL: PublicationJournal = { intent: () => {}, landed: () => {} };
+/** A no-op journal — used by tests that do not assert durability. Reports `not_attempted`. */
+export const NO_JOURNAL: PublicationJournal = { intent: () => "not_attempted", landed: () => "not_attempted" };
 
 /**
  * A filesystem journal under a directory. Each publication writes `promotion-intent.json`
- * before the CAS and `promotion-landed.json` after — enough for a future recovery to
- * reconcile a crash (the git ref state + these markers say whether the CAS landed).
+ * before the CAS and `promotion-landed.json` after. A write that fails returns `"failed"` so
+ * the caller can mark the publication's journal durability truthfully — it is NEVER swallowed.
  */
 export function createFilePublicationJournal(dir: string): PublicationJournal {
-  const write = (name: string, record: Readonly<Record<string, string>>) => {
+  const write = (name: string, record: Readonly<Record<string, string>>): JournalWriteStatus => {
     try {
       mkdirSync(dir, { recursive: true });
       writeFileSync(join(dir, name), JSON.stringify({ ...record, at: new Date().toISOString() }, null, 2), "utf8");
+      return "written";
     } catch {
-      // Best-effort durability: a journal write failure must not, by itself, prevent a
-      // publication. The git ref state remains the ultimate source of truth.
+      // Best-effort: a journal write failure must not prevent/undo a publication (the git ref is
+      // authoritative), but it is REPORTED rather than swallowed.
+      return "failed";
     }
   };
   return {
@@ -62,6 +76,18 @@ export function createCasPublicationTarget(journal: PublicationJournal = NO_JOUR
   const branchRef = (baseBranch: string) => `refs/heads/${baseBranch}`;
 
   return {
+    async repositoryIdentity(target: PromotionTargetRef): Promise<string | undefined> {
+      // Canonical, symlink-resolved identity: git's common dir (stable across worktrees), then
+      // realpath so a lexical alias resolves to the same identity and a swapped symlink to a
+      // different repo resolves to a different identity.
+      try {
+        const common = await gitCommonDir(target.repositoryPath);
+        try { return realpathSync(common); } catch { return common; }
+      } catch {
+        return undefined;
+      }
+    },
+
     async liveHead(target: PromotionTargetRef): Promise<string | undefined> {
       try {
         return await revParse(target.repositoryPath, target.baseBranch);
@@ -112,8 +138,8 @@ export function createCasPublicationTarget(journal: PublicationJournal = NO_JOUR
         checkedOutPath = undefined;
       }
 
-      // Durable INTENT before the irreversible CAS — a crash here is reconcilable from the ref.
-      journal.intent({ beforeRef: expectedHead, afterRef: commit, publishedTree: candidateTreeId, targetBranch: target.baseBranch });
+      // BEST-EFFORT INTENT before the irreversible CAS — its durability is REPORTED, not assumed.
+      const journalIntentStatus = journal.intent({ beforeRef: expectedHead, afterRef: commit, publishedTree: candidateTreeId, targetBranch: target.baseBranch });
 
       // THE single atomic target mutation. Its old-sha guard fails the CAS if the ref moved.
       try {
@@ -132,7 +158,12 @@ export function createCasPublicationTarget(journal: PublicationJournal = NO_JOUR
 
       // The ref moved. From here, NOTHING may be reported as an ordinary failure — the
       // repository changed. A worktree sync failure is a DEGRADED SUCCESS.
-      journal.landed({ beforeRef: expectedHead, afterRef: commit, publishedTree: candidateTreeId, targetBranch: target.baseBranch });
+      const journalLandedStatus = journal.landed({ beforeRef: expectedHead, afterRef: commit, publishedTree: candidateTreeId, targetBranch: target.baseBranch });
+
+      // FRESH POST-CAS REPROBE (V2-016): read the authoritative ref and its tree AGAIN, from git,
+      // and require them to still be our commit/tree. A mismatch means another actor advanced the
+      // ref between our CAS and now — a DEGRADED landing, never a clean success.
+      const postCas = await reprobe(repo, target.baseBranch, commit, candidateTreeId);
 
       let worktreeSynced = false;
       let stashed = false;
@@ -142,11 +173,34 @@ export function createCasPublicationTarget(journal: PublicationJournal = NO_JOUR
           worktreeSynced = true;
           stashed = sync.stashed;
         } catch (err) {
-          return { kind: "landed_desynced", beforeRef: expectedHead, afterCommit: commit, publishedTree: candidateTreeId, detail: `the target ref moved ${expectedHead}→${commit} but the checked-out worktree at ${checkedOutPath} could not be synced: ${err instanceof Error ? err.message : String(err)}` };
+          return { kind: "landed_desynced", beforeRef: expectedHead, afterCommit: commit, publishedTree: candidateTreeId, detail: `the target ref moved ${expectedHead}→${commit} but the checked-out worktree at ${checkedOutPath} could not be synced: ${err instanceof Error ? err.message : String(err)}`, journalIntentStatus, journalLandedStatus, postCas };
         }
       }
 
-      return { kind: "landed", beforeRef: expectedHead, afterCommit: commit, publishedTree: candidateTreeId, worktreeSynced, stashed };
+      return { kind: "landed", beforeRef: expectedHead, afterCommit: commit, publishedTree: candidateTreeId, worktreeSynced, stashed, journalIntentStatus, journalLandedStatus, postCas };
     },
+  };
+}
+
+/**
+ * The fresh post-CAS reprobe: read `branch` and `branch^{tree}` AGAIN from git and confirm they
+ * are still our `expectedCommit` / `expectedTree`. Any mismatch (or read failure) is reported as
+ * unverified with the observed values — the caller degrades to reconciliation-required.
+ */
+async function reprobe(repo: string, branch: string, expectedCommit: string, expectedTree: string): Promise<PostCasReprobe> {
+  let observedRef: string | undefined;
+  let observedTree: string | undefined;
+  try {
+    observedRef = await revParse(repo, branch);
+    observedTree = await revParse(repo, `${branch}^{tree}`);
+  } catch (err) {
+    return { verified: false, ...(observedRef !== undefined ? { observedRef } : {}), detail: `post-CAS reprobe could not read the target ref/tree: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  const verified = observedRef === expectedCommit && observedTree === expectedTree;
+  return {
+    verified,
+    observedRef,
+    observedTree,
+    ...(verified ? {} : { detail: `post-CAS reprobe: ref ${observedRef} (expected ${expectedCommit}), tree ${observedTree} (expected ${expectedTree})` }),
   };
 }

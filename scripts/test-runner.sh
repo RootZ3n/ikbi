@@ -97,6 +97,7 @@ SUBPROCESS_SUITES=(
   "src/v2/cli/disposition-truth.test.ts"
   "src/v2/cli/promotion-truth.test.ts"
   "src/v2/cli/recovery-truth.test.ts"
+  "src/v2/cli/terminal-e2e.test.ts"
 )
 LOCALHOST_SUITES=("src/server/tasks.test.ts")
 

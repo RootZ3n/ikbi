@@ -286,10 +286,11 @@ function fakePublisher(over: Partial<{
   publish: PublicationOutcome;
 }> = {}): PromotionTarget {
   return {
+    repositoryIdentity: async () => "/repo/A/.git",
     liveHead: async () => ("liveHead" in over ? over.liveHead : "c".repeat(40)),
     treeOfCommit: async () => over.liveTree ?? "live".repeat(10),
     targetCheckout: async () => over.checkout ?? { clean: true },
-    publish: async () => over.publish ?? { kind: "landed", beforeRef: "c".repeat(40), afterCommit: "p".repeat(40), publishedTree: "tree".repeat(10), worktreeSynced: false, stashed: false },
+    publish: async () => over.publish ?? { kind: "landed", beforeRef: "c".repeat(40), afterCommit: "p".repeat(40), publishedTree: "tree".repeat(10), worktreeSynced: false, stashed: false, journalIntentStatus: "written", journalLandedStatus: "written", postCas: { verified: true, observedRef: "p".repeat(40), observedTree: "tree".repeat(10) } },
   };
 }
 

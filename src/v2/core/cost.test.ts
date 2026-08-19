@@ -444,3 +444,29 @@ test("session summary: freezes the pricing catalog id + version + budget policy 
   assert.equal(s.totalKnownCostMicroUsd, 0);
   assert.equal(s.hasUnknownCost, false);
 });
+
+// ---------------------------------------------------------------------------
+// V2-016 — alias + cost pricing: the served alias is the pricing truth
+// ---------------------------------------------------------------------------
+
+test("V2-016 alias pricing: an accepted aliased_match prices by the ACTUAL served snapshot id", () => {
+  // gpt-4o authorized, served as its dated snapshot, accepted as aliased_match. The pricing
+  // catalog declares the snapshot id as a route at the SAME rate (explicit equivalence).
+  const r = rec({ authorizedModelId: "gpt-4o", sentProviderId: "openai", sentProviderModelId: "gpt-4o", servedModelId: "gpt-4o-2024-08-06", identityStatus: "aliased_match", usage: { promptTokens: 1000, completionTokens: 1000 } });
+  const cost = buildInvocationCostRecord({ record: r, catalog: CATALOG, catalogId: CATALOG_ID });
+  assert.equal(cost.priceBasis, "served", "priced by the served identity, not the authorized name");
+  assert.equal(cost.priceModelId, "gpt-4o-2024-08-06");
+  assert.equal(cost.costStatus, "priced");
+  // gpt-4o rate: 2.5/M input, 10/M output → 1000*2.5 + 1000*10 = 2500 + 10000 = 12500 microUSD.
+  assert.equal(cost.amountMicroUsd, 12_500);
+  assert.equal(cost.hasUnknownCost, false);
+});
+
+test("V2-016 alias pricing: an UNDECLARED served snapshot with no pricing route is unpriced, never mis-priced", () => {
+  // A served id the pricing catalog does not cover must NOT fall back to the authorized name's rate.
+  const r = rec({ authorizedModelId: "gpt-4o", sentProviderId: "openai", sentProviderModelId: "gpt-4o", servedModelId: "gpt-4o-2099-01-01", identityStatus: "aliased_match", usage: { promptTokens: 10, completionTokens: 10 } });
+  const cost = buildInvocationCostRecord({ record: r, catalog: CATALOG, catalogId: CATALOG_ID });
+  assert.equal(cost.priceBasis, "unresolved");
+  assert.equal(cost.costStatus, "unpriced_model");
+  assert.equal(cost.amountMicroUsd, undefined);
+});

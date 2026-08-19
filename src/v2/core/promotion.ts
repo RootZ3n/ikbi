@@ -156,10 +156,30 @@ export interface PromotionTargetRef {
   readonly baseCommit: string;
 }
 
+/**
+ * Journal write status (V2-016). A best-effort filesystem journal MAY fail; that failure is now
+ * VISIBLE rather than swallowed. The git ref/tree remains the authoritative landing proof — a
+ * journal failure never turns a landed CAS into a failure — but the receipt reports it truthfully.
+ */
+export type JournalWriteStatus = "written" | "failed" | "not_attempted";
+
+/**
+ * The fresh post-CAS reprobe (V2-016): after the ref moved, the seam FRESHLY re-reads the
+ * authoritative branch ref and its tree. `verified` iff `ref == afterCommit` AND
+ * `ref^{tree} == candidateTreeId`. A mismatch means the repository changed under us — a DEGRADED
+ * landing (reconciliation required), never a clean success and never "nothing happened".
+ */
+export interface PostCasReprobe {
+  readonly verified: boolean;
+  readonly observedRef?: string;
+  readonly observedTree?: string;
+  readonly detail?: string;
+}
+
 /** What the seam's atomic publish did. `landed_desynced` is a DEGRADED SUCCESS: the ref moved. */
 export type PublicationOutcome =
-  | { readonly kind: "landed"; readonly beforeRef: string; readonly afterCommit: string; readonly publishedTree: string; readonly worktreeSynced: boolean; readonly stashed: boolean }
-  | { readonly kind: "landed_desynced"; readonly beforeRef: string; readonly afterCommit: string; readonly publishedTree: string; readonly detail: string }
+  | { readonly kind: "landed"; readonly beforeRef: string; readonly afterCommit: string; readonly publishedTree: string; readonly worktreeSynced: boolean; readonly stashed: boolean; readonly journalIntentStatus: JournalWriteStatus; readonly journalLandedStatus: JournalWriteStatus; readonly postCas: PostCasReprobe }
+  | { readonly kind: "landed_desynced"; readonly beforeRef: string; readonly afterCommit: string; readonly publishedTree: string; readonly detail: string; readonly journalIntentStatus: JournalWriteStatus; readonly journalLandedStatus: JournalWriteStatus; readonly postCas: PostCasReprobe }
   | { readonly kind: "cas_conflict"; readonly observedHead: string }
   | { readonly kind: "tree_mismatch"; readonly builtTree: string }
   | { readonly kind: "infrastructure_failure"; readonly detail: string };
@@ -169,6 +189,14 @@ export type PublicationOutcome =
  * publish. It never decides eligibility, never merges, never mutates the candidate.
  */
 export interface PromotionTarget {
+  /**
+   * The CANONICAL identity of the target repository (V2-016): a stable string that is the same
+   * across the repo's worktrees and lexical path aliases, distinct for different repositories, and
+   * changes when the path is swapped to a different repo (symlink swap). Undefined if the path is
+   * not a readable git repository. Resolved at authorization AND re-resolved at the publish
+   * boundary so a swapped target is refused before any CAS.
+   */
+  repositoryIdentity(target: PromotionTargetRef): Promise<string | undefined>;
   /** The commit the target branch currently points at, or undefined if the branch is absent. */
   liveHead(target: PromotionTargetRef): Promise<string | undefined>;
   /** The git tree of a commit — used for idempotency (does the live head already hold the candidate tree?). */
@@ -219,7 +247,13 @@ export interface PromotionRecord {
   readonly verificationId: V2VerificationId;
   readonly criticId: V2CriticId;
   readonly dispositionId: V2DispositionId;
+  /** Provenance/display: the absolute path the target was reached through. NOT the identity. */
   readonly targetRepositoryPath: string;
+  /**
+   * The CANONICAL target repository identity (V2-016) — bound into `promotionId`. Distinguishes
+   * repo A/main from repo B/main even when candidate/disposition/tree are identical.
+   */
+  readonly targetRepositoryIdentity: string;
   readonly targetBranch: string;
   readonly strategy: PublicationStrategy;
   /** The target ref BEFORE publication — the undo/audit anchor. */
@@ -234,6 +268,15 @@ export interface PromotionRecord {
   readonly idempotent: boolean;
   /** A degraded landing: the ref moved but post-CAS bookkeeping did not fully complete. */
   readonly degraded: boolean;
+  /** V2-016 — whether the pre-CAS intent / post-CAS landed journal markers were durably written. */
+  readonly journalIntentStatus: JournalWriteStatus;
+  readonly journalLandedStatus: JournalWriteStatus;
+  /**
+   * V2-016 — whether the FRESH post-CAS reprobe confirmed `ref == afterRef` AND `ref^{tree} ==
+   * candidateTreeId`. False means the repository changed after the CAS (reconciliation required),
+   * never that nothing happened. True for an already-authoritative idempotent landing.
+   */
+  readonly postCasVerified: boolean;
   readonly promotedAt: number;
 }
 
@@ -248,6 +291,8 @@ export function promotionRecordDigest(input: {
   readonly candidateTreeId: string;
   readonly dispositionId: V2DispositionId;
   readonly sourceSnapshotId: V2SnapshotDigest;
+  /** The CANONICAL target repository identity (V2-016) — publishing to a different repo is a different promotion. */
+  readonly targetRepositoryIdentity: string;
   readonly targetBranch: string;
   readonly publishedTree: string;
 }): V2PromotionId {
@@ -256,6 +301,7 @@ export function promotionRecordDigest(input: {
     candidateTreeId: input.candidateTreeId,
     dispositionId: input.dispositionId,
     sourceSnapshotId: input.sourceSnapshotId,
+    targetRepositoryIdentity: input.targetRepositoryIdentity,
     targetBranch: input.targetBranch,
     publishedTree: input.publishedTree,
   });
@@ -355,14 +401,22 @@ export async function promoteAuthorized(input: {
     return { kind: "refused_candidate_drift", detail: `verification ended on tree ${verification.treeAfterChecks}, not the candidate tree ${candidate.tree.treeId}`, observedTree: verification.treeAfterChecks };
   }
 
+  // 5-PRE. TARGET REPOSITORY IDENTITY (V2-016). Resolve the canonical repository identity NOW,
+  //        at authorization, and bind it into the promotion identity. A target that is not a
+  //        readable git repository cannot be published to.
+  const authorizedRepoIdentity = await input.publisher.repositoryIdentity(target);
+  if (authorizedRepoIdentity === undefined) {
+    return { kind: "infrastructure_failure", failure: promotionFailure(V2_PROMOTION_FAILURE_CODES.publicationFailed, `the target repository at ${target.repositoryPath} could not be identified (not a readable git repository)`, { candidateId: candidate.candidateId }) };
+  }
+
   // 5–6. Target facts.
   const liveHead = await input.publisher.liveHead(target);
   if (liveHead === undefined) {
     return { kind: "refused_stale_target", detail: `the target branch "${target.baseBranch}" does not exist`, expectedHead: target.baseCommit, observedHead: "<absent>" };
   }
 
-  const record = (landed: { beforeRef: string; afterRef: string; publishedTree: string; worktreeSynced: boolean; idempotent: boolean; degraded: boolean }): PromotionRecord => ({
-    promotionId: promotionRecordDigest({ candidateId: candidate.candidateId, candidateTreeId: candidate.tree.treeId, dispositionId: disposition.dispositionId, sourceSnapshotId: candidate.sourceSnapshotId, targetBranch: target.baseBranch, publishedTree: landed.publishedTree }),
+  const record = (landed: { beforeRef: string; afterRef: string; publishedTree: string; worktreeSynced: boolean; idempotent: boolean; degraded: boolean; journalIntentStatus?: JournalWriteStatus; journalLandedStatus?: JournalWriteStatus; postCasVerified?: boolean }): PromotionRecord => ({
+    promotionId: promotionRecordDigest({ candidateId: candidate.candidateId, candidateTreeId: candidate.tree.treeId, dispositionId: disposition.dispositionId, sourceSnapshotId: candidate.sourceSnapshotId, targetRepositoryIdentity: authorizedRepoIdentity, targetBranch: target.baseBranch, publishedTree: landed.publishedTree }),
     runId: candidate.runId,
     candidateId: candidate.candidateId,
     candidateTreeId: candidate.tree.treeId,
@@ -371,6 +425,7 @@ export async function promoteAuthorized(input: {
     criticId: critic.criticId,
     dispositionId: disposition.dispositionId,
     targetRepositoryPath: target.repositoryPath,
+    targetRepositoryIdentity: authorizedRepoIdentity,
     targetBranch: target.baseBranch,
     strategy: "clean_ref_cas",
     beforeRef: landed.beforeRef,
@@ -379,6 +434,9 @@ export async function promoteAuthorized(input: {
     worktreeSynced: landed.worktreeSynced,
     idempotent: landed.idempotent,
     degraded: landed.degraded,
+    journalIntentStatus: landed.journalIntentStatus ?? "not_attempted",
+    journalLandedStatus: landed.journalLandedStatus ?? "not_attempted",
+    postCasVerified: landed.postCasVerified ?? landed.idempotent,
     promotedAt: input.now(),
   });
 
@@ -401,21 +459,44 @@ export async function promoteAuthorized(input: {
     return { kind: "refused_target_worktree_dirty", detail: `the target branch "${target.baseBranch}" is checked out at ${checkout.checkedOutPath} with uncommitted changes — refusing to promote (commit or stash there first)` };
   }
 
+  // 7.5. SYMLINK-SWAP GUARD (V2-016). Re-resolve the target repository identity at the LAST moment
+  //      before the CAS. If the path now resolves to a DIFFERENT repository than the one authorized
+  //      (a symlink swapped under us between authorization and publish), REFUSE — never publish
+  //      through a swapped path.
+  const recheckedRepoIdentity = await input.publisher.repositoryIdentity(target);
+  if (recheckedRepoIdentity !== authorizedRepoIdentity) {
+    return {
+      kind: "refused_stale_target",
+      detail: `the target repository identity changed between authorization and publish (authorized ${authorizedRepoIdentity}, now ${recheckedRepoIdentity ?? "<unidentifiable>"}) — the path may have been redirected; refusing to publish`,
+      expectedHead: target.baseCommit,
+      observedHead: liveHead,
+    };
+  }
+
   // 8. Publish EXACTLY the candidate tree.
   const message = `ikbi: publish candidate ${candidate.candidateId.slice(0, 16)} (disposition ${disposition.dispositionId.slice(0, 12)})`;
   const outcome = await input.publisher.publish({ target, expectedHead: liveHead, candidateTreeId: candidate.tree.treeId, message });
   switch (outcome.kind) {
-    case "landed":
+    case "landed": {
+      const bookkeeping = { journalIntentStatus: outcome.journalIntentStatus, journalLandedStatus: outcome.journalLandedStatus, postCasVerified: outcome.postCas.verified };
       // Belt-and-braces: the seam already verified the built tree == candidate tree BEFORE the
-      // CAS. Assert the landed tree once more from the returned fact.
+      // CAS. Assert the landed tree once more, and require the FRESH post-CAS reprobe to confirm.
       if (outcome.publishedTree !== candidate.tree.treeId) {
-        return { kind: "promoted_degraded", record: record({ beforeRef: outcome.beforeRef, afterRef: outcome.afterCommit, publishedTree: outcome.publishedTree, worktreeSynced: outcome.worktreeSynced, idempotent: false, degraded: true }), detail: `LANDED TREE ${outcome.publishedTree} ≠ candidate tree ${candidate.tree.treeId} — the ref moved to an unexpected tree` };
+        return { kind: "promoted_degraded", record: record({ beforeRef: outcome.beforeRef, afterRef: outcome.afterCommit, publishedTree: outcome.publishedTree, worktreeSynced: outcome.worktreeSynced, idempotent: false, degraded: true, ...bookkeeping }), detail: `LANDED TREE ${outcome.publishedTree} ≠ candidate tree ${candidate.tree.treeId} — the ref moved to an unexpected tree` };
       }
-      return { kind: "promoted", record: record({ beforeRef: outcome.beforeRef, afterRef: outcome.afterCommit, publishedTree: outcome.publishedTree, worktreeSynced: outcome.worktreeSynced, idempotent: false, degraded: false }) };
+      // POST-CAS REPROBE (V2-016): the ref moved; if a fresh read no longer shows our commit/tree,
+      // the repository changed under us — DEGRADED (reconciliation required), never a clean success.
+      if (!outcome.postCas.verified) {
+        return { kind: "promoted_degraded", record: record({ beforeRef: outcome.beforeRef, afterRef: outcome.afterCommit, publishedTree: outcome.publishedTree, worktreeSynced: outcome.worktreeSynced, idempotent: false, degraded: true, ...bookkeeping }), detail: outcome.postCas.detail ?? `the ref moved ${outcome.beforeRef}→${outcome.afterCommit} but a fresh post-CAS reprobe no longer confirms it (observed ref ${outcome.postCas.observedRef ?? "?"}, tree ${outcome.postCas.observedTree ?? "?"}) — another actor advanced the target; reconciliation required` };
+      }
+      // The landed journal failing is bookkeeping-degraded (the ref is authoritative regardless).
+      const degraded = outcome.journalLandedStatus === "failed";
+      return { kind: degraded ? "promoted_degraded" : "promoted", record: record({ beforeRef: outcome.beforeRef, afterRef: outcome.afterCommit, publishedTree: outcome.publishedTree, worktreeSynced: outcome.worktreeSynced, idempotent: false, degraded, ...bookkeeping }), ...(degraded ? { detail: "the ref landed and was reprobed successfully, but the post-CAS landed-journal write failed — bookkeeping only" } : {}) } as PromotionResult;
+    }
     case "landed_desynced":
       // DEGRADED SUCCESS: the ref moved but the checked-out worktree did not sync. NEVER reported
       // as an ordinary failure — the repository changed.
-      return { kind: "promoted_degraded", record: record({ beforeRef: outcome.beforeRef, afterRef: outcome.afterCommit, publishedTree: outcome.publishedTree, worktreeSynced: false, idempotent: false, degraded: true }), detail: outcome.detail };
+      return { kind: "promoted_degraded", record: record({ beforeRef: outcome.beforeRef, afterRef: outcome.afterCommit, publishedTree: outcome.publishedTree, worktreeSynced: false, idempotent: false, degraded: true, journalIntentStatus: outcome.journalIntentStatus, journalLandedStatus: outcome.journalLandedStatus, postCasVerified: outcome.postCas.verified }), detail: outcome.detail };
     case "cas_conflict":
       return { kind: "cas_conflict", detail: `the target ref moved concurrently during the CAS (observed ${outcome.observedHead}) — no force, no retry`, observedHead: outcome.observedHead };
     case "tree_mismatch":
@@ -444,6 +525,12 @@ export interface RunPromotionSummary {
   readonly worktreeSynced: boolean;
   readonly idempotent: boolean;
   readonly degraded: boolean;
+  /** V2-016 — the canonical target repository identity bound into the promotion id. */
+  readonly targetRepositoryIdentity: string;
+  /** V2-016 — journal durability + fresh post-CAS reprobe, surfaced honestly on the receipt. */
+  readonly journalIntentStatus: JournalWriteStatus;
+  readonly journalLandedStatus: JournalWriteStatus;
+  readonly postCasVerified: boolean;
 }
 
 export function summarizePromotion(record: PromotionRecord): RunPromotionSummary {
@@ -460,5 +547,9 @@ export function summarizePromotion(record: PromotionRecord): RunPromotionSummary
     worktreeSynced: record.worktreeSynced,
     idempotent: record.idempotent,
     degraded: record.degraded,
+    targetRepositoryIdentity: record.targetRepositoryIdentity,
+    journalIntentStatus: record.journalIntentStatus,
+    journalLandedStatus: record.journalLandedStatus,
+    postCasVerified: record.postCasVerified,
   };
 }

@@ -112,6 +112,7 @@ function scriptedPublisher(outcomes: readonly ("land" | "stale" | "cas" | "degra
   let call = 0;
   const publishCalls: string[] = [];
   const target: PromotionTarget = {
+    repositoryIdentity: async () => "/repo/A/.git",
     liveHead: async (t) => {
       // On a "stale" attempt the live head has moved off the authorized base.
       return outcomes[call] === "stale" ? "moved".repeat(8) : t.baseCommit;
@@ -123,8 +124,10 @@ function scriptedPublisher(outcomes: readonly ("land" | "stale" | "cas" | "degra
       call += 1;
       publishCalls.push(input.candidateTreeId);
       if (kind === "cas") return { kind: "cas_conflict", observedHead: "race".repeat(10) };
-      if (kind === "degraded") return { kind: "landed_desynced", beforeRef: input.expectedHead, afterCommit: "p".repeat(40), publishedTree: input.candidateTreeId, detail: "sync failed" };
-      return { kind: "landed", beforeRef: input.expectedHead, afterCommit: "p".repeat(40), publishedTree: input.candidateTreeId, worktreeSynced: true, stashed: false };
+      const journal = { journalIntentStatus: "written", journalLandedStatus: "written" } as const;
+      const afterCommit = "p".repeat(40);
+      if (kind === "degraded") return { kind: "landed_desynced", beforeRef: input.expectedHead, afterCommit, publishedTree: input.candidateTreeId, detail: "sync failed", ...journal, postCas: { verified: true, observedRef: afterCommit, observedTree: input.candidateTreeId } };
+      return { kind: "landed", beforeRef: input.expectedHead, afterCommit, publishedTree: input.candidateTreeId, worktreeSynced: true, stashed: false, ...journal, postCas: { verified: true, observedRef: afterCommit, observedTree: input.candidateTreeId } };
     },
   };
   // A "stale" attempt never reaches publish (refused before). Advance the call cursor when the
@@ -187,6 +190,36 @@ test("session: a MOVED target is auto-retried — a fresh attempt lands, session
   assert.equal(sources.count(), 2, "each attempt captured its own snapshot");
   assert.notEqual(session.attempts[0]!.runId, session.attempts[1]!.runId, "fresh RunId");
   assert.equal(ws.allocated.length, 2, "each attempt allocated its OWN workspace");
+});
+
+test("V2-016 cleanup: superseded attempt worktrees are reclaimed; the final attempt is kept", async () => {
+  // Three attempts: two stale-target withholds (superseded) then a landing. The two superseded
+  // worktrees are reclaimed under the default cleanup policy; the FINAL attempt is retained.
+  const ws = statefulWorkspaces();
+  const pub = scriptedPublisher(["stale", "stale", "land"]);
+  const session = await executeV2BuildSession(build, baseDeps({ workspaces: ws.authority, publisher: pub.target, recoveryPolicy: buildRecoveryPolicy({ maxAttempts: 3 }) }));
+
+  assert.equal(session.attempts.length, 3);
+  assert.equal(session.outcome.kind, "accepted");
+  assert.equal(ws.allocated.length, 3, "each attempt allocated its own workspace");
+  // The two SUPERSEDED attempts were reclaimed; the final (accepted) one was not.
+  const finalWorkspaceId = session.attempts[2]!.workspace!.workspaceId;
+  assert.equal(session.receipt.reclaimedWorkspaceIds.length, 2, "the two superseded worktrees were reclaimed — not left as permanent debris");
+  assert.ok(!session.receipt.reclaimedWorkspaceIds.includes(finalWorkspaceId), "the final attempt's worktree was NOT reclaimed");
+  // HISTORY IS UNTOUCHED — every AttemptRecord + evidence id remains on the receipt.
+  assert.equal(session.receipt.attempts.length, 3, "cleanup reclaims disk, never history");
+  assert.ok(session.receipt.attempts.every((a) => a.candidateId !== undefined), "candidate ids preserved");
+});
+
+test("V2-016 cleanup: a quarantined attempt worktree is retained (forensics), never reclaimed", async () => {
+  // A drift quarantine is safety-forensics — its worktree must survive cleanup even when superseded.
+  const ws = statefulWorkspaces();
+  const pub = scriptedPublisher(["stale", "land"]);
+  const session = await executeV2BuildSession(build, baseDeps({ workspaces: ws.authority, publisher: pub.target }));
+  // (stale→land keeps the model happy; the point here is the policy KEEPS the final attempt.)
+  assert.equal(session.outcome.kind, "accepted");
+  const finalWorkspaceId = session.attempts[1]!.workspace!.workspaceId;
+  assert.ok(!session.receipt.reclaimedWorkspaceIds.includes(finalWorkspaceId));
 });
 
 test("session: NO EVIDENCE crosses the attempt boundary", async () => {

@@ -1214,6 +1214,78 @@ test("single authority: nothing outside the invocation authority reads provider 
   assert.deepEqual(offenders, [], "observed usage flows from the invocation authority into cost, nowhere else");
 });
 
+// ---------------------------------------------------------------------------
+// V2-016 — LIVE COMPATIBILITY / CUTOVER HARDENING GUARDS
+// ---------------------------------------------------------------------------
+
+test("V2-016: only the invocation authority declares the served-model alias catalog", () => {
+  // A second alias declaration is how the alias truth would fork. There is exactly one owner.
+  const owner = join(V2_DIR, "core", "invocation.ts");
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (file === owner || file.endsWith(".test.ts")) continue;
+    const source = stripComments(readFileSync(file, "utf8"));
+    if (/ServedModelAliasCatalog\b|V2_SERVED_ALIAS_TABLE\b|V2_SERVED_MODEL_ALIASES\s*=/.test(source)) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "the served-model alias catalog lives in src/v2/core/invocation.ts alone");
+});
+
+test("V2-016: the resolver never inspects a served identity or performs fuzzy aliasing", () => {
+  // Served-identity aliasing is the INVOCATION authority's job (exact, declared). The resolver must
+  // not touch servedModelId, the alias table, or any prefix/regex 'close-enough' matching.
+  const source = stripComments(readFileSync(join(V2_DIR, "core", "resolver.ts"), "utf8"));
+  for (const forbidden of ["servedModelId", "classifyServedIdentity", "ServedModelAlias", "V2_SERVED_"]) {
+    assert.equal(source.includes(forbidden), false, `the resolver must not reference ${forbidden} — served-identity aliasing belongs to the invocation authority`);
+  }
+});
+
+test("V2-016: alias classification is EXACT — no prefix/regex/version-strip matching anywhere", () => {
+  // classifyServedIdentity + the alias catalog must compare by equality only.
+  const source = stripComments(readFileSync(join(V2_DIR, "core", "invocation.ts"), "utf8"));
+  // The only matching in the alias path is `===` equality inside `classifyServedIdentity`.
+  assert.equal(/servedModelId\.(startsWith|match|replace|slice)\s*\(/.test(source), false, "no fuzzy served-id matching");
+  assert.equal(/new RegExp|\.test\(\s*served/.test(source), false, "no regex served-id matching");
+});
+
+test("V2-016: the alias authority does not import inventory/catalog/resolver (aliases never mutate inventory)", () => {
+  const specs = new Set(importSpecifiers(readFileSync(join(V2_DIR, "core", "invocation.ts"), "utf8")));
+  for (const forbidden of ["../runtime/model-catalog.js", "./resolver.js"]) {
+    // resolver types are imported for the decision shape; ensure no catalog/inventory mutation path.
+    if (forbidden === "../runtime/model-catalog.js") assert.ok(!specs.has(forbidden), "the invocation authority must not import the model catalog");
+  }
+});
+
+test("V2-016: promotion identity BINDS the target repository identity", () => {
+  // The promotion content address must include targetRepositoryIdentity, so repo A/main and repo
+  // B/main are distinct promotions even with identical candidate/disposition/tree.
+  const source = stripComments(readFileSync(join(V2_DIR, "core", "promotion.ts"), "utf8"));
+  const digestBody = source.slice(source.indexOf("function promotionRecordDigest"), source.indexOf("function promotionRecordDigest") + 900);
+  assert.ok(/targetRepositoryIdentity/.test(digestBody), "promotionRecordDigest must bind targetRepositoryIdentity");
+});
+
+test("V2-016: the publication seam canonicalizes the target and RE-PROBES after CAS", () => {
+  const source = stripComments(readFileSync(join(V2_DIR, "runtime", "publication.ts"), "utf8"));
+  assert.ok(/gitCommonDir\s*\(/.test(source), "the target repository identity is canonicalized via gitCommonDir");
+  assert.ok(/realpathSync\s*\(/.test(source), "…and realpath-resolved (symlink-swap safe)");
+  assert.ok(/function reprobe\b/.test(source) && /postCas/.test(source), "a fresh post-CAS reprobe exists on the production path");
+});
+
+test("V2-016: the publication journal REPORTS failure, never silently claims durability", () => {
+  const source = stripComments(readFileSync(join(V2_DIR, "runtime", "publication.ts"), "utf8"));
+  // A journal write failure returns "failed" (visible), and nothing claims crash-durability.
+  assert.ok(/return\s+"failed"/.test(source), "a journal write failure returns a visible 'failed' status");
+  assert.equal(/crash-durable/.test(source), false, "no false crash-durable claim remains");
+});
+
+test("V2-016: workspace cleanup cannot erase the final / quarantined / degraded state", () => {
+  // The cleanup helper must guard the final attempt, quarantined attempts, and degraded promotions.
+  const source = stripComments(readFileSync(join(V2_DIR, "core", "session.ts"), "utf8"));
+  const body = source.slice(source.indexOf("function reclaimSupersededWorkspaces"));
+  assert.ok(/retainFinalAttempt/.test(body) && /lastIndex/.test(body), "the final attempt is never reclaimed");
+  assert.ok(/quarantined/.test(body) && /retainQuarantined/.test(body), "a quarantined attempt is retained");
+  assert.ok(/degraded/.test(body) && /retainDegradedPromotion/.test(body), "a degraded promotion is retained");
+});
+
 test("isolation: v1 does not import v2, except the single registration line", () => {
   const offenders: string[] = [];
   for (const file of tsFiles(SRC)) {

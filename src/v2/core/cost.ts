@@ -238,13 +238,24 @@ export const V2_SHIPPED_PRICING: PricingCatalog = Object.freeze({
     },
     {
       canonicalModelId: "gpt-4o",
-      routes: [{ providerId: "openai", providerModelId: "gpt-4o" }],
+      // V2-016: the DECLARED served-alias snapshot ids (see invocation.ts V2_SERVED_ALIAS_CATALOG)
+      // are priced at the SAME rate — an EXPLICIT equivalence, so an accepted `aliased_match` on
+      // gpt-4o-2024-08-06 prices the model that actually served, never a fallback to another route.
+      routes: [
+        { providerId: "openai", providerModelId: "gpt-4o" },
+        { providerId: "openai", providerModelId: "gpt-4o-2024-08-06" },
+        { providerId: "openai", providerModelId: "gpt-4o-2024-11-20" },
+        { providerId: "openai", providerModelId: "gpt-4o-2024-05-13" },
+      ],
       inputPerMillionMicroUsd: 2_500_000,
       outputPerMillionMicroUsd: 10_000_000,
     },
     {
       canonicalModelId: "claude-sonnet-4-5",
-      routes: [{ providerId: "anthropic", providerModelId: "claude-sonnet-4-5" }],
+      routes: [
+        { providerId: "anthropic", providerModelId: "claude-sonnet-4-5" },
+        { providerId: "anthropic", providerModelId: "claude-sonnet-4-5-20250929" },
+      ],
       inputPerMillionMicroUsd: 3_000_000,
       outputPerMillionMicroUsd: 15_000_000,
     },

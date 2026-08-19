@@ -103,10 +103,11 @@ const fakeMutations = { observe: async () => ({ ok: false, failure: {} }) as nev
 
 function landingPublisher(): PromotionTarget {
   return {
+    repositoryIdentity: async () => "/repo/A/.git",
     liveHead: async (t) => t.baseCommit,
     treeOfCommit: async () => "live".repeat(10),
     targetCheckout: async () => ({ clean: true }),
-    publish: async (input): Promise<PublicationOutcome> => ({ kind: "landed", beforeRef: input.expectedHead, afterCommit: "p".repeat(40), publishedTree: input.candidateTreeId, worktreeSynced: true, stashed: false }),
+    publish: async (input): Promise<PublicationOutcome> => ({ kind: "landed", beforeRef: input.expectedHead, afterCommit: "p".repeat(40), publishedTree: input.candidateTreeId, worktreeSynced: true, stashed: false, journalIntentStatus: "written", journalLandedStatus: "written", postCas: { verified: true, observedRef: "p".repeat(40), observedTree: input.candidateTreeId } }),
   };
 }
 

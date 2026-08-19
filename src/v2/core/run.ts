@@ -1001,6 +1001,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     ...(contextPackage !== undefined ? { context: manifestOf(contextPackage) } : {}),
     invocations,
     commands,
+    ...(workspace !== undefined ? { workspace } : {}),
     ...(candidate !== undefined ? { candidate } : {}),
     ...(verification !== undefined ? { verification } : {}),
     ...(critic !== undefined ? { critic } : {}),
