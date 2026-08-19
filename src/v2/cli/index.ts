@@ -34,6 +34,7 @@ import type { V2BuildSessionResult } from "../core/session.js";
 import { formatMicroUsd } from "../core/cost.js";
 
 export const V2_USAGE = `Usage: ikbi v2 build "<goal>" [--repo <path>] [--strategy ${CANDIDATE_STRATEGIES.join("|")}] [--profile <name>] [--json]`;
+export const BUILD_USAGE = `Usage: ikbi build "<goal>" [--repo <path>] [--strategy ${CANDIDATE_STRATEGIES.join("|")}] [--profile <name>] [--json]`;
 
 /**
  * The experimental banner. On stderr so `--json` stdout stays machine-clean.
@@ -47,6 +48,17 @@ export const V2_USAGE = `Usage: ikbi v2 build "<goal>" [--repo <path>] [--strate
  */
 export const V2_BANNER =
   "ikbi v2: EXPERIMENTAL — builds in an ISOLATED candidate workspace, then deterministically verifies and semantically reviews it. An ELIGIBLE candidate MAY BE PUBLISHED to your target branch (ref CAS; a clean checked-out worktree is synced, late local work preserved in a stash). A dirty source checkout is never silently committed.\n";
+
+/**
+ * The CANONICAL `ikbi build` banner (V2-018 cutover). This is the governed daily-driver engine —
+ * NOT experimental language — and it tells the operator the truth about publication: a build runs
+ * in an ISOLATED candidate workspace, is deterministically verified and semantically reviewed, and
+ * an ELIGIBLE candidate MAY be published to the target branch by a clean-ref CAS (a clean checked-out
+ * worktree is synced; late local work is preserved in a git stash). A dirty source checkout is never
+ * silently committed. On stderr so `--json` stdout stays machine-clean.
+ */
+export const BUILD_BANNER =
+  "ikbi build — governed v2 build engine. Builds in an ISOLATED candidate workspace, deterministically verifies and semantically reviews it; an ELIGIBLE candidate is published to your target branch by a clean-ref CAS (a clean checked-out worktree is synced, late local work preserved in a stash). A dirty source checkout is never silently committed.\n";
 
 interface V2Args {
   readonly subcommand: string | undefined;
@@ -448,49 +460,55 @@ function promotionLines(result: V2RunResult): string[] {
 
 
 /**
- * Test seam: the command body, with injectable output sinks and — for hermetic tests —
- * an injectable configuration source. The REGISTERED command passes none of these, so
- * production always runs the real wiring; the subprocess suite is what proves that.
+ * The injectable seams. The REGISTERED commands pass none of these, so production always runs the
+ * real wiring; the subprocess + qualification suites are what prove that. Hermetic suites inject
+ * fake providers/workspaces/etc. to drive the whole matrix through the REAL command handler.
  */
-export async function runV2Cli(
-  argv: readonly string[],
-  io: {
-    readonly stdout?: (s: string) => void;
-    readonly stderr?: (s: string) => void;
-    readonly cwd?: string;
-    readonly configuration?: ConfigurationSource;
-    readonly contextSources?: readonly ContextSource[];
-    readonly transport?: InvocationTransport;
-    readonly workspaces?: WorkspaceAuthority;
-    readonly mutations?: StateBoundMutationAuthority;
-    readonly sources?: SourceSnapshotAuthority;
-    /** Builder seams, for the hermetic reachability suite. Production passes none. */
-    readonly buildTools?: ProductionRunDeps["buildTools"];
-    readonly captureTree?: ProductionRunDeps["captureTree"];
-    readonly checksSource?: ProductionRunDeps["checksSource"];
-    readonly checkRunner?: ProductionRunDeps["checkRunner"];
-    readonly treeProbe?: ProductionRunDeps["treeProbe"];
-    readonly candidateDiff?: ProductionRunDeps["candidateDiff"];
-    readonly recoveryPolicy?: ProductionRunDeps["recoveryPolicy"];
-  } = {},
-): Promise<number> {
+export interface BuildCliIo {
+  readonly stdout?: (s: string) => void;
+  readonly stderr?: (s: string) => void;
+  readonly cwd?: string;
+  readonly configuration?: ConfigurationSource;
+  readonly contextSources?: readonly ContextSource[];
+  readonly transport?: InvocationTransport;
+  readonly workspaces?: WorkspaceAuthority;
+  readonly mutations?: StateBoundMutationAuthority;
+  readonly sources?: SourceSnapshotAuthority;
+  /** Builder seams, for the hermetic reachability/qualification suites. Production passes none. */
+  readonly buildTools?: ProductionRunDeps["buildTools"];
+  readonly captureTree?: ProductionRunDeps["captureTree"];
+  readonly checksSource?: ProductionRunDeps["checksSource"];
+  readonly checkRunner?: ProductionRunDeps["checkRunner"];
+  readonly treeProbe?: ProductionRunDeps["treeProbe"];
+  readonly candidateDiff?: ProductionRunDeps["candidateDiff"];
+  readonly recoveryPolicy?: ProductionRunDeps["recoveryPolicy"];
+}
+
+/** The parsed, subcommand-free build request that BOTH `ikbi build` and `ikbi v2 build` converge on. */
+interface BuildRequest {
+  readonly goal: string;
+  readonly repo: string;
+  readonly strategy: string | undefined;
+  readonly profile: string | undefined;
+  readonly json: boolean;
+}
+
+/**
+ * THE ONE PRODUCTION BUILD CALL SITE (V2-018). Both the canonical `ikbi build` handler and the
+ * transitional `ikbi v2 build` alias funnel here — there is exactly one call to
+ * `runV2BuildSessionProduction` from CLI build handling, so the two commands CANNOT fork behavior.
+ * The `banner` differs only in wording; the engine is identical.
+ */
+async function executeProductionBuild(req: BuildRequest, banner: string, io: BuildCliIo): Promise<number> {
   const out = io.stdout ?? writeStdout;
   const err = io.stderr ?? writeStderr;
-  const args = parseV2Args(argv, io.cwd ?? process.cwd());
-
-  if (args.subcommand !== "build") {
-    err(`${V2_USAGE}\n`);
-    err(`ikbi v2: unknown subcommand ${args.subcommand === undefined ? "<none>" : `"${args.subcommand}"`} (only "build" exists in this slice)\n`);
-    return 2;
-  }
-
-  err(V2_BANNER);
+  err(banner);
   const session = await runV2BuildSessionProduction(
     {
-      goal: args.goal,
-      repoPath: args.repo,
-      ...(args.strategy !== undefined ? { candidateStrategy: args.strategy } : {}),
-      ...(args.profile !== undefined ? { profile: args.profile } : {}),
+      goal: req.goal,
+      repoPath: req.repo,
+      ...(req.strategy !== undefined ? { candidateStrategy: req.strategy } : {}),
+      ...(req.profile !== undefined ? { profile: req.profile } : {}),
     },
     {
       ...(io.configuration !== undefined ? { configuration: io.configuration } : {}),
@@ -510,14 +528,60 @@ export async function runV2Cli(
   );
   // `--json` exposes the full session (every attempt + recovery decision). The human render
   // shows the recovery trail (when there was one) then the final attempt in full.
-  out(args.json ? `${JSON.stringify(session, null, 2)}\n` : renderSession(session));
+  out(req.json ? `${JSON.stringify(session, null, 2)}\n` : renderSession(session));
   return exitCodeForOutcome(session.outcome);
 }
 
+/**
+ * THE CANONICAL PRODUCTION HANDLER for `ikbi build "<goal>"` (V2-018). No leading subcommand: every
+ * unflagged word is part of the goal. This is the daily-driver entry — the governed v2 engine.
+ */
+export async function runBuildCli(argv: readonly string[], io: BuildCliIo = {}): Promise<number> {
+  const args = parseV2Args(["build", ...argv], io.cwd ?? process.cwd());
+  return executeProductionBuild(
+    { goal: args.goal, repo: args.repo, strategy: args.strategy, profile: args.profile, json: args.json },
+    BUILD_BANNER,
+    io,
+  );
+}
+
+/**
+ * The transitional `ikbi v2 build …` ALIAS. It reaches the SAME `executeProductionBuild` as
+ * `ikbi build` — no separate engine, no separate parsing beyond stripping the `build` subcommand
+ * token. Kept so existing muscle-memory / scripts keep working during the qualification window.
+ */
+export async function runV2Cli(argv: readonly string[], io: BuildCliIo = {}): Promise<number> {
+  const err = io.stderr ?? writeStderr;
+  const args = parseV2Args(argv, io.cwd ?? process.cwd());
+  if (args.subcommand !== "build") {
+    err(`${V2_USAGE}\n`);
+    err(`ikbi v2: unknown subcommand ${args.subcommand === undefined ? "<none>" : `"${args.subcommand}"`} (only "build" exists; \`ikbi v2 build\` is an alias for \`ikbi build\`)\n`);
+    return 2;
+  }
+  return executeProductionBuild(
+    { goal: args.goal, repo: args.repo, strategy: args.strategy, profile: args.profile, json: args.json },
+    V2_BANNER,
+    io,
+  );
+}
+
+// THE CANONICAL DAILY DRIVER: `ikbi build "<goal>"` → the governed v2 BuildSession.
+registerCommand({
+  name: "build",
+  summary: "Build toward a goal with the governed v2 engine (isolated workspace, verify, review, promote an eligible candidate)",
+  usage: BUILD_USAGE,
+  run: async (argv) => {
+    const code = await runBuildCli(argv);
+    if (code !== 0) process.exitCode = code;
+  },
+});
+
+// TRANSITIONAL ALIAS: `ikbi v2 build …` reaches the SAME handler as `ikbi build`. Advanced so it
+// stays out of the golden-path help; retained during the qualification window, not a second engine.
 registerCommand({
   name: "v2",
   category: "advanced",
-  summary: "EXPERIMENTAL: run the v2 canonical lifecycle (build in isolation, verify, review, and PUBLISH an eligible candidate to the target branch)",
+  summary: "Alias for `ikbi build` (the governed v2 engine); `ikbi v2 build …` reaches the same production path",
   usage: V2_USAGE,
   run: async (argv) => {
     const code = await runV2Cli(argv);

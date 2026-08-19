@@ -489,11 +489,12 @@ async function run(argv: readonly string[]): Promise<void> {
       // `--help` prints usage and exits 0 — it must NOT run the report (which reads config).
       if (wantsHelp(doctorArgs)) {
         writeStdout(
-          "Usage: ikbi doctor [--json] [--check-providers [--json]] [--fix] [--force] [--self-repair]\n\n" +
+          "Usage: ikbi doctor [--json] [--v2] [--check-providers [--json]] [--fix] [--force] [--self-repair]\n\n" +
             "Report bootstrap config + host environment: what's set, what's missing for a build,\n" +
             "and how to fix each gap. Read-only by default (no identity, no network).\n\n" +
             "Options:\n" +
             "  --json         Emit a machine-readable health report (for CI)\n" +
+            "  --v2           Report V2 daily-driver readiness for `ikbi build` (git, sandbox, offline route selectability; no paid calls)\n" +
             "  --check-providers  Resolve local provider/model/credential readiness (no network or paid invocation)\n" +
             "  --fix          Repair common gaps (.env / state dirs / deps); creates/repairs only\n" +
             "  --force        With --fix, also reclaim stale + aged workspaces\n" +
@@ -504,6 +505,14 @@ async function run(argv: readonly string[]): Promise<void> {
       }
       if (doctorArgs.includes("--check-providers")) {
         const code = runProviderPreflightCli(doctorArgs);
+        if (code !== 0) process.exitCode = code;
+        return;
+      }
+      // `--v2` reports V2 daily-driver readiness for `ikbi build` (the governed engine): git,
+      // bubblewrap, governed-exec, and OFFLINE builder/critic route selectability. Spends no money.
+      if (doctorArgs.includes("--v2")) {
+        const { runV2ReadinessCli } = await import("../v2/runtime/readiness.js");
+        const code = await runV2ReadinessCli(doctorArgs);
         if (code !== 0) process.exitCode = code;
         return;
       }

@@ -51,7 +51,7 @@ test("helpForTopic renders usage, flags, examples, and see-also", () => {
   assert.match(rendered!, /Flags:/);
   assert.match(rendered!, /Examples:/);
   assert.match(rendered!, /See also:/);
-  assert.match(rendered!, /--max-budget-usd/);
+  assert.match(rendered!, /--strategy/);
 });
 
 test("helpForTopic returns undefined for an unknown topic", () => {

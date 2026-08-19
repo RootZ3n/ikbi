@@ -145,12 +145,22 @@ function capture() {
   };
 }
 
-test("reachability: `ikbi v2` is REGISTERED in the CLI dispatch registry", () => {
+test("reachability: `ikbi v2` is REGISTERED as an ADVANCED alias for `ikbi build`", () => {
+  // V2-018 cutover: `ikbi build` is now the governed daily driver, and `ikbi v2` is a transitional
+  // ALIAS onto the same handler — no longer experimental, still advanced (out of the golden help).
   const cmd = commands.get("v2");
   assert.ok(cmd !== undefined, "importing the v2 CLI registers the command");
-  assert.equal(cmd!.category, "advanced", "v2 is experimental — it stays out of the default help");
-  assert.match(cmd!.summary, /EXPERIMENTAL/);
+  assert.equal(cmd!.category, "advanced", "the alias stays out of the default help");
+  assert.match(cmd!.summary, /[Aa]lias for `ikbi build`/);
   assert.match(cmd!.usage ?? "", /v2 build/);
+});
+
+test("reachability: `ikbi build` is the CANONICAL v2 daily-driver command", () => {
+  const cmd = commands.get("build");
+  assert.ok(cmd !== undefined, "the v2 CLI registers the canonical `build` command");
+  assert.notEqual(cmd!.category, "advanced", "the daily driver is a golden-path command");
+  assert.match(cmd!.summary, /governed v2 engine/);
+  assert.doesNotMatch(cmd!.summary, /EXPERIMENTAL/i, "the normal command is not labelled experimental");
 });
 
 test("reachability: v2 registers into the SAME registry v1 dispatches from", () => {

@@ -64,7 +64,7 @@ test("smoke: `ikbi help <command>` shows the command's detailed page", () => {
   assert.match(r.stdout, /^ikbi build —/m, "leads with the command's one-liner");
   assert.match(r.stdout, /Usage:/);
   assert.match(r.stdout, /Examples:/);
-  assert.match(r.stdout, /--max-budget-usd/, "documents the flags");
+  assert.match(r.stdout, /--strategy/, "documents the v2 flags (governed build engine)");
   assert.match(r.stdout, /See also:/);
   assert.ok(noStack(r.combined), "no stack trace");
   // Each of the required topics resolves to a page (not the general usage).

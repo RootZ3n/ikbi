@@ -1663,11 +1663,26 @@ export async function flushBestEffort(bus: { flush(): Promise<void> }, ms: numbe
 
 // Register the LIVE command at import time (the modules barrel triggers this).
 const live = createWorkerCli();
+// V2-018 CUTOVER: `ikbi build` is now the governed v2 daily-driver engine (registered by
+// src/v2/cli/index.ts). The v1 worker pipeline is FROZEN and reachable ONLY via the explicit
+// `ikbi legacy build ...` namespace — an emergency fallback during the v2 qualification window,
+// never the default and never enterable by accident. It is not deleted; final Fable/Codex audits
+// precede any V1 removal.
 registerCommand({
-  name: "build",
-  summary: "Run a worker build pipeline toward a goal",
-  usage: "ikbi build <goal...> [--repo <path>] [--verbose] [--cost] [--yes] [--no-memory] [--memory-diff]",
-  run: (argv) => live.build(argv),
+  name: "legacy",
+  category: "advanced",
+  summary: "FROZEN v1 build engine (emergency fallback during v2 qualification; `ikbi build` is the governed v2 daily driver)",
+  usage: "ikbi legacy build <goal...> [--repo <path>] [--verbose] [--cost] [--yes] [--no-memory] [--memory-diff]",
+  run: (argv) => {
+    const sub = argv[0];
+    if (sub === "build") return live.build(argv.slice(1));
+    writeStderr(
+      "ikbi legacy: the only legacy subcommand is `legacy build` (the frozen v1 engine).\n" +
+        "For the governed v2 daily driver use `ikbi build \"<goal>\"`.\n",
+    );
+    process.exitCode = 2;
+    return Promise.resolve();
+  },
 });
 
 // SG-2: `ikbi diff <workspace-id>` prints a workspace's git diff + a one-line change summary.

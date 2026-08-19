@@ -121,9 +121,16 @@ available for advanced/operator use.
 
 ## The surfaces
 
-- **`ikbi build "<goal>" --repo <path>`** — the golden batch path: a 5-role pipeline
-  (scout → builder → critic → verifier → integrator) in an isolated git worktree; promotes only
-  on a ladder-verified pass.
+- **`ikbi build "<goal>" --repo <path>`** — **the governed v2 build engine** (the daily driver):
+  build in an isolated workspace, deterministically verify the exact candidate tree, semantically
+  review it, adjudicate a lawful disposition, and promote an **eligible** candidate to the target
+  branch by a clean-ref compare-and-swap (a dirty source checkout is never silently committed).
+  `--strategy single|shadow|tournament` chooses one, two, or a bounded set of candidates (more
+  candidates ⇒ more model spend; exactly one lawful winner is promoted). `--json` for the full
+  session receipt; `ikbi doctor --v2` checks daily-driver readiness (no paid calls).
+  - _During the v2 qualification window the frozen v1 pipeline remains available as an explicit
+    emergency fallback under `ikbi legacy build "<goal>"` — never the default, never entered by
+    accident; it is slated for removal after the final independent audits._
 - **`ikbi run --spec <file>`** — the canonical preflighted external-agent path. It resolves the
   repository and task, performs local provider/host/state checks before allocation or invocation,
   then delegates to the same authoritative worker/orchestrator path and returns one terminal result.

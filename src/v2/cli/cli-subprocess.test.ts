@@ -180,17 +180,89 @@ test("v2 cli: `ikbi v2 --help` prints help and does NOT execute a run", () => {
   assert.equal(r.stdout.includes('"journal"'), false, "help never enters the lifecycle");
 });
 
-test("v2 cli: v1's `ikbi build` is still registered and unchanged", () => {
+test("v2 cli: v1 `build`, the `legacy` namespace, and the `v2` alias are all registered", () => {
   const r = runCli(["help", "--advanced"]);
   assert.equal(r.status, 0, r.stderr);
-  for (const cmd of ["build", "fix", "repl", "doctor"]) {
-    assert.match(r.stdout, new RegExp(`\\b${cmd}\\b`), `\`ikbi ${cmd}\` is still listed`);
+  for (const cmd of ["build", "fix", "repl", "doctor", "legacy"]) {
+    assert.match(r.stdout, new RegExp(`\\b${cmd}\\b`), `\`ikbi ${cmd}\` is listed`);
   }
-  assert.match(r.stdout, /\bv2\b/, "and v2 appears in the advanced list");
+  assert.match(r.stdout, /\bv2\b/, "and the v2 alias appears in the advanced list");
 });
 
-test("v2 cli: the default help does NOT advertise the experimental command", () => {
+test("v2 cli: the default help does NOT advertise the advanced alias", () => {
   const r = runCli(["help"]);
   assert.equal(r.status, 0, r.stderr);
   assert.doesNotMatch(r.stdout, /^\s*v2\b/m, "v2 stays out of the golden-path help");
+});
+
+// ── V2-018 CUTOVER: the NORMAL command is the governed v2 engine ─────────────
+
+test("cutover: `ikbi build` (the NORMAL command) reaches the canonical v2 lifecycle end-to-end", () => {
+  const r = runCli(["build", "a real goal", "--repo", REPO, "--json"]);
+  assert.equal(r.status, 0, `expected a zero exit for a withheld candidate\n${r.stderr}`);
+  const result = sessionFinalAttempt(r.stdout);
+  assert.ok(result.taskId.startsWith("task_"), "the normal command minted a v2 task");
+  assert.ok(result.runId.startsWith("run_"));
+  assert.deepEqual(result.receipt.stagesEntered, ["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism", "disposition"]);
+  // The governed (non-experimental) banner — not the experimental one.
+  assert.match(r.stderr, /governed v2 build engine/, "the normal command announces the governed engine");
+  assert.doesNotMatch(r.stderr, /EXPERIMENTAL/, "the normal command is not labelled experimental");
+});
+
+test("cutover: `ikbi build` and `ikbi v2 build` reach the SAME v2 handler (no behavior fork)", () => {
+  const build = sessionFinalAttempt(runCli(["build", "identical goal", "--repo", REPO, "--json"]).stdout);
+  const v2 = sessionFinalAttempt(runCli(["v2", "build", "identical goal", "--repo", REPO, "--json"]).stdout);
+  // Different session/run identities (each is its own run) but IDENTICAL spine + evidence shape.
+  assert.deepEqual(build.receipt.stagesEntered, v2.receipt.stagesEntered, "same stages");
+  assert.deepEqual(build.receipt.evidence, v2.receipt.evidence, "same counted evidence");
+  assert.equal(build.outcome.kind, v2.outcome.kind, "same outcome kind");
+});
+
+test("cutover: shadow + tournament run through the NORMAL `ikbi build` command", () => {
+  for (const strategy of ["shadow", "tournament"]) {
+    const r = runCli(["build", "race it", "--repo", REPO, "--strategy", strategy, "--json"]);
+    const result = sessionFinalAttempt(r.stdout);
+    assert.ok(result.outcome.kind === "withheld", `${strategy} passed preflight and adjudicated`);
+    assert.equal(result.receipt.stagesEntered.includes("disposition"), true, `${strategy} reached disposition`);
+  }
+});
+
+test("cutover: `ikbi build` defaults to the SINGLE strategy (predictable cost)", () => {
+  const result = sessionFinalAttempt(runCli(["build", "just do it", "--repo", REPO, "--json"]).stdout);
+  assert.equal(result.receipt.strategy?.kind, "single", "the daily-driver default is one candidate");
+  assert.equal(result.receipt.strategy?.candidateCount, 1);
+});
+
+test("cutover: `ikbi build --json` emits the COMPLETE governed session receipt (build-command truth)", () => {
+  const session = JSON.parse(runCli(["build", "tell the truth", "--repo", REPO, "--json"]).stdout) as {
+    buildSessionId: string;
+    outcome: { kind: string };
+    receipt: { totalAttempts: number; cost: { totalInvocations: number; formattedKnownCostUsd: string } };
+    attempts: unknown[];
+  };
+  assert.ok(session.buildSessionId.startsWith("bsn_") || session.buildSessionId.length > 0, "a BuildSessionId is reported");
+  assert.equal(typeof session.receipt.totalAttempts, "number", "attempts are counted");
+  assert.equal(typeof session.receipt.cost.totalInvocations, "number", "cost/model-call accounting is present");
+  assert.ok(typeof session.receipt.cost.formattedKnownCostUsd === "string", "a known-cost figure is present");
+  assert.ok(session.attempts.length >= 1, "the attempt ledger is present");
+  assert.ok(["accepted", "withheld", "rejected", "quarantined", "failed"].includes(session.outcome.kind), "a lawful terminal outcome");
+});
+
+test("cutover: `ikbi build --strategy tournament --json` shows all candidates + the ONE selection", () => {
+  const result = sessionFinalAttempt(runCli(["build", "race hard", "--repo", REPO, "--strategy", "tournament", "--json"]).stdout);
+  assert.equal(result.receipt.strategy?.kind, "tournament");
+  assert.equal(result.receipt.candidates?.length, 3, "three candidates are each accounted for on the receipt");
+  assert.ok(result.receipt.selection !== undefined, "the ONE selection is recorded");
+});
+
+test("cutover: `ikbi legacy` is visibly legacy and cannot be entered by accident", () => {
+  // Bare `ikbi legacy` refuses with a pointer to the daily driver — it never runs anything.
+  const bare = runCli(["legacy"]);
+  assert.equal(bare.status, 2, "bare legacy refuses");
+  assert.match(bare.stderr, /legacy build/, "names the only legacy subcommand");
+  assert.match(bare.stderr, /ikbi build/, "points at the governed daily driver");
+  assert.equal(bare.stdout.includes('"journal"'), false, "legacy never enters the v2 lifecycle");
+  // And nothing about the golden-path help suggests legacy is the normal build.
+  const help = runCli(["help"]);
+  assert.doesNotMatch(help.stdout, /^\s*legacy\b/m, "legacy stays out of the golden-path help");
 });

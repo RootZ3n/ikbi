@@ -176,6 +176,10 @@ test("isolation: nothing under src/v2/core (or the barrel) imports v1", () => {
 
 test("isolation: src/v2/cli imports only v2 + the sanctioned v1 CLI registrar/io", () => {
   for (const file of tsFiles(join(V2_DIR, "cli"))) {
+    // Test files legitimately reach across to v1 to VERIFY the cutover wiring (e.g. cutover-guards
+    // imports the worker-model registrar to assert the `legacy` namespace) — consistent with the
+    // other isolation guards, which all exempt `.test.ts`.
+    if (file.endsWith(".test.ts")) continue;
     for (const spec of importSpecifiers(readFileSync(file, "utf8"))) {
       if (isBuiltin(spec) || V2_CLI_ALLOWED_V1_IMPORTS.has(spec)) continue;
       assert.ok(spec.startsWith("."), `${relative(SRC, file)} imports a bare package "${spec}"`);
@@ -875,7 +879,10 @@ test("single authority: only the two enumerated adapters reach governed-exec (V2
 test("single authority: no v2 file spawns a process for verification outside the adapter (V2-008)", () => {
   // The check-runner adapter is the ONLY place a check command is executed. A stray
   // child_process spawn/exec would be an ungoverned check path.
-  const allowed = new Set([join(V2_DIR, "runtime", "check-runner.ts"), join(V2_DIR, "runtime", "source-snapshot.ts"), join(V2_DIR, "runtime", "candidate-capture.ts"), join(V2_DIR, "runtime", "workspace-authority.ts"), join(V2_DIR, "runtime", "source-materializer.ts"), join(V2_DIR, "runtime", "verification-tree.ts")]);
+  // readiness.ts is allowed to spawn: it probes tool VERSIONS (`git --version`, `bwrap --version`)
+  // for `ikbi doctor --v2` daily-driver readiness — it never executes a verification check, and
+  // spends no money. It is a runtime host-probe adapter, like the others in this set.
+  const allowed = new Set([join(V2_DIR, "runtime", "check-runner.ts"), join(V2_DIR, "runtime", "source-snapshot.ts"), join(V2_DIR, "runtime", "candidate-capture.ts"), join(V2_DIR, "runtime", "workspace-authority.ts"), join(V2_DIR, "runtime", "source-materializer.ts"), join(V2_DIR, "runtime", "verification-tree.ts"), join(V2_DIR, "runtime", "readiness.ts")]);
   const offenders: string[] = [];
   for (const file of tsFiles(V2_DIR)) {
     if (allowed.has(file) || file.endsWith(".test.ts") || file.endsWith("fixture-repo.ts") || file.endsWith("fake-provider-server.ts")) continue;
@@ -1356,7 +1363,11 @@ test("isolation: v1 does not import v2, except the single registration line", ()
     const specs = importSpecifiers(readFileSync(file, "utf8")).filter((s) => /(^|\/)v2\//.test(s));
     if (specs.length === 0) continue;
     if (rel === V1_REGISTRATION_FILE) {
-      assert.deepEqual(specs, ["../v2/cli/index.js"], "the registration seam imports the v2 CLI and nothing else");
+      // The single v1→v2 seam file (src/cli/index.ts) may import ONLY: the v2 CLI registration, and
+      // the v2 daily-driver readiness surface for `ikbi doctor --v2` (V2-018). Both are deliberate,
+      // operator-facing crossings — no v1 code path reaches into the v2 build engine internals.
+      const sanctioned = new Set(["../v2/cli/index.js", "../v2/runtime/readiness.js"]);
+      for (const spec of specs) assert.ok(sanctioned.has(spec), `the registration seam imports an UN-sanctioned v2 module "${spec}"`);
       continue;
     }
     offenders.push(`${rel} -> ${specs.join(", ")}`);

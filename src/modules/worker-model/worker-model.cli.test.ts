@@ -150,9 +150,12 @@ function capture() {
 
 // ── registration ─────────────────────────────────────────────────────────────
 
-test("build is registered as a CLI command (no built-in collision)", () => {
-  assert.ok(commands.has("build"));
-  for (const b of ["version", "models", "providers", "help"]) assert.notEqual(b, "build");
+test("the v1 worker pipeline is registered under the `legacy` namespace (V2-018 cutover)", () => {
+  // V2-018: `ikbi build` is now the governed v2 engine (registered by src/v2/cli). Importing THIS
+  // module registers the frozen v1 pipeline as `ikbi legacy build …` — an explicit namespace, never
+  // a built-in collision, never the default.
+  assert.ok(commands.has("legacy"));
+  for (const b of ["version", "models", "providers", "help"]) assert.notEqual(b, "legacy");
 });
 
 test("productionRoleClaim returns the worker token for ALL roles; throws fail-closed when unset", () => {
