@@ -159,6 +159,56 @@ export interface SandboxPlan {
    * skipped (bwrap cannot bind a missing source).
    */
   readonly extraWritable?: readonly string[];
+  /**
+   * SANDBOX VIEW (V2-016A/B2). `worktree` (default) is the F1 policy: the WHOLE host is bound
+   * READ-ONLY, worktree writable. `narrow` is the BUILDER READ-ONLY TERMINAL view: the host is NOT
+   * mounted at all — only essential system dirs (for the binary to run), the explicit
+   * `readonlyRoots` (the candidate + its git object store), and a private tmpfs are visible; the
+   * `writableRoot` is the only writable host path; network is denied. Read-only host access still
+   * discloses, so a read-only terminal must NOT see the whole host — hence the narrow view.
+   */
+  readonly view?: "worktree" | "narrow";
+  /** narrow view only: the host paths bound READ-ONLY (candidate workspace + git common dir). */
+  readonly readonlyRoots?: readonly string[];
+}
+
+/**
+ * The minimal system directories a bound binary needs to run (dynamic linker, libraries, the
+ * binary itself, ld cache / nsswitch in /etc). Bound READ-ONLY in the narrow view IF they exist —
+ * everything NOT listed here (host home, /pehverse, /tmp/outside, arbitrary absolute paths) is
+ * simply absent from the mount namespace, so it cannot be read at all.
+ */
+export const NARROW_SYSTEM_DIRS: readonly string[] = Object.freeze([
+  "/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/libx32", "/etc",
+  "/nix", "/opt", "/run/current-system", "/run/opengl-driver",
+]);
+
+/**
+ * Build the NARROW bwrap argv (V2-016A/B2): the host is NOT bound; only essential system dirs, the
+ * explicit read-only roots (candidate + git store), and a writable temp + private /tmp are visible;
+ * all namespaces (incl. NETWORK) are unshared. A read-only terminal thus cannot read a synthetic
+ * file outside its candidate view, because that file is not in the namespace at all.
+ */
+export function buildNarrowBwrapArgs(plan: SandboxPlan, command: string, args: readonly string[]): string[] {
+  const a: string[] = ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--setenv", "TMPDIR", "/tmp"];
+  for (const dir of NARROW_SYSTEM_DIRS) {
+    if (existsSyncSafe(dir)) a.push("--ro-bind", dir, dir);
+  }
+  // The candidate (and its git object store) — READ-ONLY. A command may inspect, never write.
+  for (const raw of plan.readonlyRoots ?? []) {
+    const p = canonical(raw);
+    if (existsSyncSafe(p)) a.push("--ro-bind", p, p);
+  }
+  // The ONE writable host path — a throwaway temp, never the candidate.
+  if (plan.writableRoot !== undefined) {
+    const w = canonical(plan.writableRoot);
+    if (existsSyncSafe(w)) a.push("--bind", w, w);
+  }
+  const chdir = plan.cwd !== undefined ? canonical(plan.cwd) : plan.readonlyRoots?.[0];
+  if (chdir !== undefined) a.push("--chdir", chdir);
+  // NEVER share the network from the read-only terminal.
+  a.push("--unshare-all", "--die-with-parent", "--new-session", "--", command, ...args);
+  return a;
 }
 
 /**
@@ -294,7 +344,8 @@ export function buildBwrapArgs(plan: SandboxPlan, command: string, args: readonl
  */
 export function wrapWithSandbox(plan: SandboxPlan | undefined, binary: string, args: readonly string[]): { binary: string; args: readonly string[] } {
   if (plan === undefined || plan.mode !== "bwrap") return { binary, args };
-  return { binary: "bwrap", args: buildBwrapArgs(plan, binary, args) };
+  const bwrapArgs = plan.view === "narrow" ? buildNarrowBwrapArgs(plan, binary, args) : buildBwrapArgs(plan, binary, args);
+  return { binary: "bwrap", args: bwrapArgs };
 }
 
 function basename(p: string): string {

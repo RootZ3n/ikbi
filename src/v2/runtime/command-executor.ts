@@ -29,6 +29,7 @@ import { join, resolve, sep } from "node:path";
 import { createGovernedExec } from "../../modules/governed-exec/index.js";
 import type { GovernedExec } from "../../modules/governed-exec/index.js";
 import { classifyCommandRisk } from "../../modules/governed-exec/sandbox.js";
+import { gitCommonDir } from "../../core/workspace/git.js";
 import { AgentRegistry, hashToken } from "../../core/identity/registry.js";
 import { IdentityResolver, beginOperation } from "../../core/identity/resolver.js";
 import { randomBytes } from "node:crypto";
@@ -65,6 +66,12 @@ export interface CommandTransport {
     readonly timeoutMs: number;
     /** The single WRITABLE host root handed to the OS sandbox — a throwaway temp, NOT the candidate. */
     readonly writableTempRoot: string;
+    /**
+     * The host paths bound READ-ONLY in the narrow command sandbox (V2-016A/B2): the candidate
+     * workspace and its git object store. Everything else on the host is absent from the command's
+     * namespace — so an allowlisted `head`/`grep` cannot read a file outside the candidate view.
+     */
+    readonly readonlyRoots: readonly string[];
   }): Promise<CommandTransportResult>;
 }
 
@@ -110,8 +117,11 @@ export function createGovernedCommandTransport(deps: { readonly governedExec?: P
         command: input.program,
         args: [...input.args],
         cwd: input.cwd,
-        // The candidate stays READ-ONLY: the sandbox's single writable root is this throwaway temp.
-        worktreeRoot: input.writableTempRoot,
+        // NARROW READ-ONLY SANDBOX (V2-016A/B2): EVERY builder command runs in an OS filesystem view
+        // that mounts only the candidate (+ its git store) read-only, a writable temp, and essential
+        // system dirs — the host is otherwise absent and the network denied. Fail-closed if bwrap is
+        // unavailable. This is independent of governed-exec's generic risk classification.
+        commandSandbox: { readonlyRoots: [...input.readonlyRoots], writableRoot: input.writableTempRoot },
         // A MODEL COMMAND IS NEVER A VERIFIER. It cannot run package scripts.
         verifier: false,
         purpose: "v2 builder read-only terminal",
@@ -132,6 +142,20 @@ export function createGovernedCommandTransport(deps: { readonly governedExec?: P
 function isContained(parent: string, child: string): boolean {
   if (child === parent) return true;
   return child.startsWith(parent.endsWith(sep) ? parent : parent + sep);
+}
+
+/**
+ * The canonical git object store for a workspace (its common git dir), realpath'd — needed as a
+ * read-only bind so `git grep` works on a LINKED worktree whose `.git` file points into the main
+ * repo. Best-effort: undefined when the path is not a git repository (the candidate alone suffices).
+ */
+async function gitStoreOf(workspacePath: string): Promise<string | undefined> {
+  try {
+    const common = await gitCommonDir(workspacePath);
+    try { return realpathSync(common); } catch { return common; }
+  } catch {
+    return undefined;
+  }
 }
 
 export interface CommandCapabilityDeps {
@@ -177,11 +201,18 @@ export function createCommandCapability(deps: CommandCapabilityDeps): BuilderCom
       // 3. TREE BEFORE. The authoritative read-only proof is captured around the command.
       const treeBefore = await treeProbe.treeOf(request.workspacePath);
 
+      // The READ-ONLY roots the narrow sandbox exposes: the candidate workspace and — for a git
+      // worktree — its git common dir (a linked worktree's object store lives there, so `git grep`
+      // needs it). Best-effort: a non-git workspace simply gets the candidate alone.
+      const readonlyRoots = [workspaceRealpath];
+      const store = await gitStoreOf(workspaceRealpath);
+      if (store !== undefined && store !== workspaceRealpath) readonlyRoots.push(store);
+
       // A throwaway writable temp for the sandbox's single writable root — NOT the candidate.
       const tempRoot = mkdtempSync(join(tmpdir(), "ikbi-v2-cmd-"));
       let transportResult: CommandTransportResult;
       try {
-        transportResult = await transport.run({ program, args, cwd: absCwd, timeoutMs: policy.timeoutMs, writableTempRoot: tempRoot });
+        transportResult = await transport.run({ program, args, cwd: absCwd, timeoutMs: policy.timeoutMs, writableTempRoot: tempRoot, readonlyRoots });
       } finally {
         // The temp never becomes candidate state and is never promoted; drop it immediately.
         try { rmSync(tempRoot, { recursive: true, force: true }); } catch { /* best-effort */ }

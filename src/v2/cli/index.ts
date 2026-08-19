@@ -7,12 +7,14 @@
  * every other existing command are byte-unchanged. It is marked `advanced` so it does
  * not appear in the default help, and it announces itself as experimental on stderr.
  *
- * WHAT IT DOES TODAY: enters the canonical v2 lifecycle — resolving one authorized
- * model route, assembling one bounded context package, and making ONE real model call to
- * qualify that route — then reports, truthfully, that it stopped because candidate
- * generation is not implemented in this build. It allocates no workspace, mutates no
- * file, and promotes nothing; the receipt it prints is COUNTED from the lifecycle's
- * evidence ledger, so it cannot claim otherwise.
+ * WHAT IT DOES TODAY: runs the COMPLETE canonical v2 lifecycle — resolve one authorized route,
+ * assemble one bounded context package, run the governed builder loop in an ISOLATED candidate
+ * workspace, deterministically verify the exact candidate tree, semantically review it, adjudicate
+ * a lawful disposition, and — when the candidate is ELIGIBLE and the source was clean — PUBLISH it
+ * to the target branch via a clean-ref CAS (which can sync a clean checked-out worktree, preserving
+ * late local work in a stash). A dirty source checkout is never silently committed. Every truth
+ * claim in the printed receipt is COUNTED from the lifecycle's evidence ledger, so it cannot
+ * overstate OR understate what actually happened.
  *
  * This file is intentionally thin: argv parsing plus rendering. All authority lives in
  * `src/v2/core/run.ts`, which is what makes the production-reachability test meaningful.
@@ -33,9 +35,18 @@ import { formatMicroUsd } from "../core/cost.js";
 
 export const V2_USAGE = `Usage: ikbi v2 build "<goal>" [--repo <path>] [--strategy ${CANDIDATE_STRATEGIES.join("|")}] [--profile <name>] [--json]`;
 
-/** The experimental banner. On stderr so `--json` stdout stays machine-clean. */
+/**
+ * The experimental banner. On stderr so `--json` stdout stays machine-clean.
+ *
+ * IT TELLS THE TRUTH ABOUT PUBLICATION (V2-016A/B1): a build runs in an isolated candidate
+ * workspace, is deterministically verified and semantically reviewed, and — when the candidate is
+ * adjudicated ELIGIBLE — MAY be published to the target branch (a clean-ref CAS that can also
+ * synchronize a clean checked-out worktree, preserving late local work in a git stash). A DIRTY
+ * source checkout is never silently committed. The banner must not under-claim what an accepted
+ * run does; `render`/`buildProduction` below is the reachable path that actually publishes.
+ */
 export const V2_BANNER =
-  "ikbi v2: EXPERIMENTAL — resolves a route, retrieves relevant source, assembles context, and runs a governed builder loop in an ISOLATED workspace. Produces a candidate; verifies nothing, promotes nothing, and never touches your repository.\n";
+  "ikbi v2: EXPERIMENTAL — builds in an ISOLATED candidate workspace, then deterministically verifies and semantically reviews it. An ELIGIBLE candidate MAY BE PUBLISHED to your target branch (ref CAS; a clean checked-out worktree is synced, late local work preserved in a stash). A dirty source checkout is never silently committed.\n";
 
 interface V2Args {
   readonly subcommand: string | undefined;
@@ -392,13 +403,19 @@ function promotionLines(result: V2RunResult): string[] {
   const p = result.receipt.promotion;
   if (p === undefined) return [];
   const label = p.degraded ? "PUBLISHED (DEGRADED)" : p.idempotent ? "ALREADY PUBLISHED" : "PUBLISHED";
-  return [
+  const lines = [
     `promotion   ${label} · ${p.targetBranch} · ${p.strategy}`,
     `  landed    ${p.beforeRef.slice(0, 12)} -> ${p.afterRef.slice(0, 12)} · tree ${p.publishedTree.slice(0, 12)}`,
     `  worktree  ${p.worktreeSynced ? "synced" : "not synced"}`,
+  ];
+  // V2-016A/M6: late local work preserved in a stash — the operator must be told explicitly.
+  if (p.stashed) lines.push("  STASH     your late local changes at the target were PRESERVED in a git stash (not popped) — run `git stash list` / `git stash pop` to recover them");
+  lines.push(
+    `  post-CAS  reprobe ${p.postCasVerified ? "verified" : "NOT verified — reconciliation required"} · journal intent=${p.journalIntentStatus}/landed=${p.journalLandedStatus}`,
     `  id        ${p.promotionId}`,
     `  status    ${p.degraded ? "THE REF MOVED — post-CAS bookkeeping incomplete; recover/audit via this record" : "the exact candidate tree is now authoritative"}`,
-  ];
+  );
+  return lines;
 }
 
 
@@ -472,7 +489,7 @@ export async function runV2Cli(
 registerCommand({
   name: "v2",
   category: "advanced",
-  summary: "EXPERIMENTAL: enter the v2 canonical lifecycle (builds a candidate; verifies and promotes nothing)",
+  summary: "EXPERIMENTAL: run the v2 canonical lifecycle (build in isolation, verify, review, and PUBLISH an eligible candidate to the target branch)",
   usage: V2_USAGE,
   run: async (argv) => {
     const code = await runV2Cli(argv);

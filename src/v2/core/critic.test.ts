@@ -333,3 +333,24 @@ test("judge: a transport failure ends the run with no record and no retry", asyn
   assert.ok(!r.ok);
   assert.equal(r.attemptedInvocation, true);
 });
+
+// ── V2-016A/M1 cross-audit: a malformed critic response still accounts the call ──
+
+test("V2-016A/M1: a malformed critic response RETAINS the successful invocation for accounting", async () => {
+  const { result } = judge("this is not a JSON judgment at all");
+  const r = await result;
+  assert.equal(r.ok, false, "a malformed judgment is NEVER a valid verdict");
+  if (!r.ok) {
+    assert.equal(r.attemptedInvocation, true);
+    assert.ok(r.invocation !== undefined, "the successful wire call is retained for the invocation ledger / cost");
+    assert.equal(r.invocation!.identity.requestedRole, "critic");
+    assert.ok(r.invocation!.usage !== undefined || r.invocation!.responseCharacters >= 0, "the record carries the real invocation facts");
+  }
+});
+
+test("V2-016A/M1: a critic WIRE failure carries no invocation record (nothing completed)", async () => {
+  const { result } = judge("{}", { fail: true });
+  const r = await result;
+  assert.equal(r.ok, false);
+  if (!r.ok) assert.equal(r.invocation, undefined, "a failed wire call produced no record to account");
+});

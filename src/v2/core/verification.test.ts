@@ -271,3 +271,65 @@ test("receipt: the summary carries verdict, tree ids and per-check status — no
   assert.equal(s.workspaceDisposition, "retained");
   assert.ok(s.checks[0]!.outputExcerpt.length <= 1500);
 });
+
+// ── V2-016A/B4 cross-audit: candidate cannot silently redefine its own exam ────
+
+const defProbe = (files: Record<string, string | null>) => ({ capture: async () => ({ files }) });
+
+test("V2-016A/B4: a candidate that changed a verification-DEFINITION file → verification_policy_changed", async () => {
+  // A manifest-derived exam ("default"), source package.json = hashA, candidate package.json = hashB.
+  const out = await verifyCandidate({
+    runId: RUN,
+    subject: verificationSubjectOf(candidate),
+    candidate,
+    workspacePath: "/ws",
+    checksSource: { resolve: async () => oneCheck },
+    runner: { run: async () => passExec },
+    tree: { treeOf: async () => TREE },
+    checkTimeoutMs: 1000,
+    sourceDefinition: { files: { "package.json": "hashA" } },
+    definitionProbe: defProbe({ "package.json": "hashB" }),
+    now: () => 100,
+  });
+  assert.ok(out.ok);
+  assert.equal(out.record.verdict, "verification_policy_changed", "the rewritten exam is NEVER a normal PASS");
+  assert.equal(out.record.checks.length, 0, "no candidate-defined check ran");
+});
+
+test("V2-016A/B4: an UNCHANGED verification definition verifies normally (PASS)", async () => {
+  const out = await verifyCandidate({
+    runId: RUN,
+    subject: verificationSubjectOf(candidate),
+    candidate,
+    workspacePath: "/ws",
+    checksSource: { resolve: async () => oneCheck },
+    runner: { run: async () => passExec },
+    tree: { treeOf: async () => TREE },
+    checkTimeoutMs: 1000,
+    sourceDefinition: { files: { "package.json": "hashA" } },
+    definitionProbe: defProbe({ "package.json": "hashA" }),
+    now: () => 100,
+  });
+  assert.ok(out.ok);
+  assert.equal(out.record.verdict, "pass", "an ordinary source change with the same exam verifies normally");
+});
+
+test("V2-016A/B4: OPERATOR IKBI_CHECKS (source=env) is trusted policy — the guard does not apply", async () => {
+  const envChecks: ResolvedChecks = { ok: true, source: "env", checks: [{ name: "test", command: "faketest", args: ["run"] }] };
+  const out = await verifyCandidate({
+    runId: RUN,
+    subject: verificationSubjectOf(candidate),
+    candidate,
+    workspacePath: "/ws",
+    checksSource: { resolve: async () => envChecks },
+    runner: { run: async () => passExec },
+    tree: { treeOf: async () => TREE },
+    checkTimeoutMs: 1000,
+    // Even with a "changed" definition, operator env checks are trusted and run normally.
+    sourceDefinition: { files: { "package.json": "hashA" } },
+    definitionProbe: defProbe({ "package.json": "hashB" }),
+    now: () => 100,
+  });
+  assert.ok(out.ok);
+  assert.equal(out.record.verdict, "pass", "operator policy overrides manifest discovery and is not exam-tampering");
+});

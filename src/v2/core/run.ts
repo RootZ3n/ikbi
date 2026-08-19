@@ -78,6 +78,8 @@ import {
   type ChecksSource,
   type CheckRunner,
   type TreeProbe,
+  type VerificationDefinition,
+  type VerificationDefinitionProbe,
   type VerificationRecord,
 } from "./verification.js";
 import { generateCandidate, type BuilderBudget, type BuilderToolExecutor, type BuilderToolExecutorDeps, type UntrustedBoundary } from "./builder.js";
@@ -360,6 +362,13 @@ export interface V2RunDeps {
   readonly checksSource: ChecksSource;
   readonly checkRunner: CheckRunner;
   readonly treeProbe: TreeProbe;
+  /**
+   * V2-016A/B4 — the verification-definition probe. Captured from the SOURCE snapshot before the
+   * builder runs and re-captured from the candidate during verification, so a candidate that
+   * rewrote its manifest-derived exam is caught (verification_policy_changed). Wired once in
+   * `src/v2/runtime/index.ts`; absent ⇒ the guard is skipped.
+   */
+  readonly definitionProbe?: VerificationDefinitionProbe;
   /** Per-check wall-clock bound. Defaults to the donor's shared `resolveCheckTimeoutMs`. */
   readonly checkTimeoutMs?: number;
   /**
@@ -523,6 +532,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
   let contextPackage: ContextPackage | undefined;
   let invocations: readonly V2InvocationRecord[] = [];
   let commands: readonly BuilderCommandRecord[] = [];
+  let sourceVerificationDefinition: VerificationDefinition | undefined;
   let candidate: CandidateRecord | undefined;
   let verification: VerificationRecord | undefined;
   let critic: CriticRecord | undefined;
@@ -628,6 +638,13 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     if (!allocated.ok) return allocated.failure;
     workspace = allocated.workspace;
     lifecycle.record(runId, { kind: "workspace", id: workspace.workspaceId, baseTree: workspace.source.baseTree });
+
+    // VERIFICATION-POLICY SOURCE TRUTH (V2-016A/B4). The freshly materialized workspace IS the source
+    // tree; fingerprint the verification-DEFINITION artifacts NOW, before the builder can touch them.
+    // A manifest-derived exam that the candidate later rewrote is caught against this source truth.
+    if (deps.definitionProbe !== undefined) {
+      sourceVerificationDefinition = await deps.definitionProbe.capture(workspace.path);
+    }
 
     // RE-OBSERVE. The context package was assembled from the TARGET REPOSITORY before any
     // workspace existed; the workspace is a worktree at the base commit. Those are not
@@ -773,6 +790,10 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
       runner: deps.checkRunner,
       tree: deps.treeProbe,
       checkTimeoutMs: deps.checkTimeoutMs ?? DEFAULT_CHECK_TIMEOUT_MS,
+      // V2-016A/B4: the source-truth verification-definition fingerprint + the probe, so a candidate
+      // that rewrote its manifest-derived exam is caught (verification_policy_changed), fail-closed.
+      ...(sourceVerificationDefinition !== undefined ? { sourceDefinition: sourceVerificationDefinition } : {}),
+      ...(deps.definitionProbe !== undefined ? { definitionProbe: deps.definitionProbe } : {}),
       now,
     });
     if (!verified.ok) return verified.failure;
@@ -825,10 +846,13 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
       invocations = [...invocations, judged.generation.invocation];
       // Charge the critic's observed usage to the session wallet (idempotent; reconcile repeats it).
       if (deps.admission !== undefined) deps.admission.charge(judged.generation.invocation);
-    } else if (judged.attemptedInvocation) {
-      // A protocol failure means the model WAS invoked but its response was unusable; the
-      // failed call has no record object, but its cost is real. (A drift/subject refusal
-      // never reached the wire, so there is nothing to record.)
+    } else if (judged.invocation !== undefined) {
+      // M1: the critic's wire call SUCCEEDED but its response failed strict parsing. The call is
+      // real — RETAIN its InvocationRecord so the invocation ledger and session cost account it,
+      // exactly like a parsed one. It is NOT critic evidence (no CriticRecord); the run still fails.
+      lifecycle.record(runId, { kind: "invocation", id: judged.invocation.invocationId, role: "critic" });
+      invocations = [...invocations, judged.invocation];
+      if (deps.admission !== undefined) deps.admission.charge(judged.invocation);
     }
     if (!judged.ok) return judged.failure;
     const criticRecord = judged.generation.record;

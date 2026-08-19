@@ -205,6 +205,39 @@ export interface TreeProbe {
   treeOf(workspacePath: string): Promise<string>;
 }
 
+/**
+ * The VERIFICATION-DEFINITION fingerprint (V2-016A/B4): the sha256 of each well-known
+ * verification-definition artifact at a workspace root (package.json, manifests, test config), or
+ * `null` when absent. Captured from the SOURCE snapshot before the builder runs, and re-captured
+ * from the candidate; a difference means the candidate redefined its own exam.
+ */
+export interface VerificationDefinition {
+  readonly files: Readonly<Record<string, string | null>>;
+}
+
+/** Captures the verification-definition fingerprint of a workspace. Injected (reads the filesystem). */
+export interface VerificationDefinitionProbe {
+  capture(workspacePath: string): Promise<VerificationDefinition>;
+}
+
+/** The definition artifacts that constitute the manifest-derived exam. Order-independent. */
+export const VERIFICATION_DEFINITION_FILES: readonly string[] = Object.freeze([
+  "package.json", "pnpm-workspace.yaml",
+  "Cargo.toml", "go.mod", "go.sum",
+  "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts",
+  "pyproject.toml", "setup.py", "setup.cfg", "tox.ini", "pytest.ini",
+  "vitest.config.ts", "vitest.config.js", "jest.config.js", "jest.config.ts", ".mocharc.json", ".mocharc.cjs",
+]);
+
+/** Do two definition fingerprints differ in ANY tracked file? (Added, removed, or changed.) */
+export function definitionChanged(source: VerificationDefinition, candidate: VerificationDefinition): readonly string[] {
+  const changed: string[] = [];
+  for (const file of VERIFICATION_DEFINITION_FILES) {
+    if ((source.files[file] ?? null) !== (candidate.files[file] ?? null)) changed.push(file);
+  }
+  return changed;
+}
+
 // ---------------------------------------------------------------------------
 // Results
 // ---------------------------------------------------------------------------
@@ -241,6 +274,13 @@ export type VerificationVerdict =
   | "pass"
   | "fail"
   | "no_checks"
+  /**
+   * V2-016A/B4: the candidate CHANGED a verification-DEFINITION artifact (package.json scripts,
+   * a build/test manifest or config) relative to the source snapshot, so the manifest-derived exam
+   * is no longer the source-authorized one. Fail-closed: the candidate cannot silently redefine the
+   * exam that judges it. Operator-supplied IKBI_CHECKS is trusted policy and is NOT subject to this.
+   */
+  | "verification_policy_changed"
   | "timeout"
   | "infrastructure_failure"
   | "candidate_drift"
@@ -364,6 +404,14 @@ export interface VerifyCandidateInput {
   readonly runner: CheckRunner;
   readonly tree: TreeProbe;
   readonly checkTimeoutMs: number;
+  /**
+   * V2-016A/B4: the verification-definition fingerprint captured from the SOURCE snapshot before the
+   * builder ran, plus the probe to re-capture it from the candidate. When a manifest-derived exam is
+   * used and the candidate changed a definition artifact, the verdict is `verification_policy_changed`.
+   * Absent ⇒ the guard is skipped (used only by callers that cannot capture source truth).
+   */
+  readonly sourceDefinition?: VerificationDefinition;
+  readonly definitionProbe?: VerificationDefinitionProbe;
   readonly now?: () => number;
 }
 
@@ -461,6 +509,20 @@ export async function verifyCandidate(input: VerifyCandidateInput): Promise<Veri
     return finish({ planId: emptyPlan.planId, checks: [], verdict: "no_checks", treeAfterChecks: treeBefore });
   }
   const plan = buildVerificationPlan({ checks: resolved.checks, timeoutMs: input.checkTimeoutMs, source: resolved.source });
+
+  // 3.5 VERIFICATION-POLICY INTEGRITY (V2-016A/B4). A MANIFEST-derived exam (`source: "default"`) is
+  //     read from the CANDIDATE tree, so a candidate could rewrite its own exam (package.json test
+  //     script, a build/test manifest). If the candidate changed ANY verification-definition artifact
+  //     relative to the source snapshot, the exam is no longer source-authorized: fail-closed with a
+  //     structured `verification_policy_changed` verdict — never a normal PASS. Operator IKBI_CHECKS
+  //     (`source: "env"`) is trusted policy and is NOT subject to this.
+  if (resolved.source === "default" && input.sourceDefinition !== undefined && input.definitionProbe !== undefined) {
+    const candidateDefinition = await input.definitionProbe.capture(input.workspacePath);
+    const changed = definitionChanged(input.sourceDefinition, candidateDefinition);
+    if (changed.length > 0) {
+      return finish({ planId: plan.planId, checks: [], verdict: "verification_policy_changed", treeAfterChecks: treeBefore });
+    }
+  }
 
   // 4. RUN ALL, in plan order. Every check runs within budget so the record shows the full
   //    defect set rather than stopping at the first red.

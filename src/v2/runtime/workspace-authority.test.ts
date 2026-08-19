@@ -415,3 +415,38 @@ test("workspace: a mutation record is content-addressed and frozen", async () =>
   assert.equal(result.record.workspaceId, ws.workspaceId as V2WorkspaceId);
   assert.match(result.record.mutationId, /^[0-9a-f]{64}$/);
 });
+
+// ── V2-016A/M3 cross-audit: a RETAINED workspace is still reclaimable on disk ──
+
+test("V2-016A/M3: retain keeps the worktree AND the live handle, so a later discard REALLY reclaims it", async () => {
+  const { existsSync } = await import("node:fs");
+  const a = authorities();
+  const ws = await allocate(a, repo({ "src/a.ts": "x\n" }));
+  assert.ok(existsSync(ws.path), "the worktree exists after allocation");
+
+  // RETAIN — the donor keeps the worktree on disk; the v2 adapter KEEPS the live handle (M3 fix).
+  const retained = await a.workspaces.retain(ws, "superseded attempt");
+  assert.equal(retained.kind, "retained");
+  assert.ok(existsSync(ws.path), "retain does NOT delete the worktree (kept for inspection)");
+
+  // DISCARD LATER — this must ACTUALLY reclaim the worktree from disk (the M3 bug: it failed with
+  // 'no live handle'). Now it succeeds and the directory is gone.
+  const discarded = await a.workspaces.discard(ws);
+  assert.equal(discarded.kind, "discarded", `discard must reclaim a retained workspace, got ${JSON.stringify(discarded)}`);
+  assert.equal(existsSync(ws.path), false, "the superseded worktree was really removed from disk");
+});
+
+test("V2-016A/M3: a workspace can be retained and then discarded across a REAL 2-workspace session shape", async () => {
+  const a = authorities();
+  const source = repo({ "src/a.ts": "x\n" });
+  const { existsSync } = await import("node:fs");
+  // Two attempts' worktrees; the first is superseded (retained then reclaimed), the second kept.
+  const superseded = await allocate(a, source);
+  const final = await allocate(a, source);
+  await a.workspaces.retain(superseded, "superseded");
+  await a.workspaces.retain(final, "final — verified");
+  // Session cleanup reclaims ONLY the superseded one.
+  assert.equal((await a.workspaces.discard(superseded)).kind, "discarded");
+  assert.equal(existsSync(superseded.path), false, "superseded worktree reclaimed");
+  assert.ok(existsSync(final.path), "the final attempt's worktree is preserved on disk");
+});

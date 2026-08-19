@@ -24,10 +24,12 @@
  * mapped down to `ResolvedChecks`.
  */
 
-import { realpathSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { readFileSync, realpathSync } from "node:fs";
+import { join } from "node:path";
 
 import { resolveChecks } from "../../modules/worker-model/checks.js";
-import type { ChecksSource, ResolvedChecks } from "../core/verification.js";
+import { VERIFICATION_DEFINITION_FILES, type ChecksSource, type ResolvedChecks, type VerificationDefinition, type VerificationDefinitionProbe } from "../core/verification.js";
 
 /**
  * Build THE check discovery source.
@@ -53,6 +55,35 @@ export function createChecksSource(env: NodeJS.ProcessEnv = process.env): Checks
         source: resolution.source === "env" ? "env" : "default",
         checks: resolution.checks.map((c) => ({ name: c.name, command: c.command, args: [...c.args] })),
       };
+    },
+  };
+}
+
+/**
+ * THE verification-definition probe (V2-016A/B4). Fingerprints the well-known verification-definition
+ * artifacts at a workspace ROOT — package.json scripts, build/test manifests and config — by sha256,
+ * or `null` when absent. Captured from the SOURCE snapshot before the builder runs and re-captured
+ * from the candidate; a difference is `verification_policy_changed`, so a candidate cannot silently
+ * rewrite the exam that judges it. It reads ONLY these definition files, never test files.
+ */
+export function createVerificationDefinitionProbe(): VerificationDefinitionProbe {
+  return {
+    async capture(workspacePath: string): Promise<VerificationDefinition> {
+      let real: string;
+      try {
+        real = realpathSync(workspacePath);
+      } catch {
+        real = workspacePath;
+      }
+      const files: Record<string, string | null> = {};
+      for (const name of VERIFICATION_DEFINITION_FILES) {
+        try {
+          files[name] = createHash("sha256").update(readFileSync(join(real, name))).digest("hex");
+        } catch {
+          files[name] = null; // absent (or unreadable) — recorded as null, compared exactly.
+        }
+      }
+      return { files };
     },
   };
 }

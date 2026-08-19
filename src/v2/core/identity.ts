@@ -30,7 +30,17 @@ declare const V2_ID_BRAND: unique symbol;
 /** An opaque, nominally-typed v2 identifier. */
 export type V2Id<TKind extends string> = string & { readonly [V2_ID_BRAND]: TKind };
 
-/** The unit of OPERATOR INTENT: one goal. Stable across retries and across runs. */
+/**
+ * The unit of OPERATOR INTENT: one goal.
+ *
+ * V2-016A/L4 — DOCUMENTATION CORRECTION. In the current v2 spine the TaskId is MINTED PER RUN
+ * (`run.ts` mints one alongside the RunId), so it is an OCCURRENCE identity, NOT stable across a
+ * session's recovery attempts. Stable operator intent is bound by the SESSION (goal, target repo,
+ * frozen policy) — see `V2BuildSessionId`. The evidence chain never relies on TaskId equality
+ * across attempts; each attempt's records cite that attempt's own task/run. (Left intentionally as
+ * occurrence identity — changing it to a session-stable value is a semantics change out of scope
+ * for this remediation.)
+ */
 export type V2TaskId = V2Id<"task">;
 /**
  * ONE operator invocation of `ikbi v2 build`. A session binds stable operator intent (task,

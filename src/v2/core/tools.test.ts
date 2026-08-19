@@ -86,12 +86,21 @@ test("parse: a well-formed read is accepted", () => {
 });
 
 test("parse: a write WITHOUT an observationId is refused, and says why", () => {
+  // NOTE: `content` is only valid for replace/create; delete takes only {path, observationId}, so
+  // the minimal "missing observationId" case uses just {path} (V2-016A/L3 now rejects extra fields).
   for (const name of [TOOL_REPLACE_FILE, TOOL_CREATE_FILE, TOOL_DELETE_FILE]) {
-    const parsed = parseToolCall(call(name, { path: "src/a.ts", content: "x" }));
+    const parsed = parseToolCall(call(name, { path: "src/a.ts" }));
     assert.ok(!parsed.ok, `${name} must not parse without an observation`);
     assert.equal(parsed.reason, "missing_argument");
     assert.match(parsed.detail, /every write must name the state it is replacing/);
   }
+});
+
+test("parse: an EXTRA argument field is rejected (schema is additionalProperties:false) — V2-016A/L3", () => {
+  const parsed = parseToolCall(call(TOOL_READ_FILE, { path: "src/a.ts", sneaky: "smuggled" }));
+  assert.ok(!parsed.ok);
+  assert.equal(parsed.reason, "malformed_arguments");
+  assert.match(parsed.detail, /does not accept the argument\(s\): sneaky/);
 });
 
 test("parse: an UNKNOWN tool is rejected structurally, and the model is told what it has", () => {

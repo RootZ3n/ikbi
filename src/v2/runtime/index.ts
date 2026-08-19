@@ -32,7 +32,7 @@ import { createRetrievalSource } from "./retrieval-source.js";
 import { createBuilderToolExecutor } from "./builder-tools.js";
 import { captureCandidateTree } from "./candidate-capture.js";
 import { createUntrustedBoundary } from "./untrusted-boundary.js";
-import { createChecksSource } from "./verification-checks.js";
+import { createChecksSource, createVerificationDefinitionProbe } from "./verification-checks.js";
 import { createCheckRunner } from "./check-runner.js";
 import { createCommandCapability, createGovernedCommandTransport } from "./command-executor.js";
 import { V2_DEFAULT_COMMAND_POLICY, type BuilderCommandCapability, type BuilderCommandPolicy } from "../core/command.js";
@@ -40,21 +40,31 @@ import { createTreeProbe } from "./verification-tree.js";
 import { createCandidateDiffSource } from "./candidate-diff.js";
 import { createCasPublicationTarget } from "./publication.js";
 
+/**
+ * STRICT integer env parse (V2-016A/L5). `parseInt("2junk")` is 2 — a partial parse that silently
+ * accepts garbage. This requires the WHOLE trimmed value to be digits (optionally signed), so
+ * `2junk`, `2.5`, `0x10` and `  ` are rejected (undefined) rather than mis-read.
+ */
+function strictInt(raw: string): number | undefined {
+  const t = raw.trim();
+  if (!/^-?\d+$/.test(t)) return undefined;
+  const n = Number(t);
+  return Number.isSafeInteger(n) ? n : undefined;
+}
+
 /** The operator's per-check timeout knob, when set to a positive integer. */
 function envCheckTimeoutMs(): number | undefined {
-  const raw = (process.env.IKBI_CHECK_TIMEOUT_MS ?? "").trim();
-  const n = Number.parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : undefined;
+  const n = strictInt(process.env.IKBI_CHECK_TIMEOUT_MS ?? "");
+  return n !== undefined && n > 0 ? n : undefined;
 }
 
 /**
  * The operator's recovery-attempt cap, read ONCE at session start (never between attempts).
- * `IKBI_RECOVERY_MAX_ATTEMPTS` overrides the safe default; anything unparseable is ignored.
+ * `IKBI_RECOVERY_MAX_ATTEMPTS` overrides the safe default; anything not a clean integer is ignored.
  */
 function envRecoveryMaxAttempts(): number | undefined {
-  const raw = (process.env.IKBI_RECOVERY_MAX_ATTEMPTS ?? "").trim();
-  const n = Number.parseInt(raw, 10);
-  return Number.isFinite(n) && n >= 1 ? n : undefined;
+  const n = strictInt(process.env.IKBI_RECOVERY_MAX_ATTEMPTS ?? "");
+  return n !== undefined && n >= 1 ? n : undefined;
 }
 
 /**
@@ -66,11 +76,11 @@ function envRecoveryMaxAttempts(): number | undefined {
  */
 function envCostBudgetPolicy(): CostBudgetPolicy | undefined {
   const usdRaw = (process.env.IKBI_V2_MAX_SESSION_COST_USD ?? "").trim();
-  const invRaw = (process.env.IKBI_V2_MAX_INVOCATIONS ?? "").trim();
-  const usd = Number.parseFloat(usdRaw);
-  const inv = Number.parseInt(invRaw, 10);
+  // L5: strict — a full decimal number for USD, a full integer for the invocation cap.
+  const usd = /^\d+(\.\d+)?$/.test(usdRaw) ? Number(usdRaw) : NaN;
+  const inv = strictInt(process.env.IKBI_V2_MAX_INVOCATIONS ?? "");
   const maxSessionCostMicroUsd = Number.isFinite(usd) && usd > 0 ? Math.round(usd * MICRO_USD_PER_USD) : undefined;
-  const maxInvocations = Number.isFinite(inv) && inv >= 1 ? inv : undefined;
+  const maxInvocations = inv !== undefined && inv >= 1 ? inv : undefined;
   if (maxSessionCostMicroUsd === undefined && maxInvocations === undefined) return undefined;
   const behaviorRaw = (process.env.IKBI_V2_COST_UNKNOWN ?? "").trim().toLowerCase();
   const behaviorWhenCostUnknown = behaviorRaw === "allow" ? "allow_unknown" : behaviorRaw === "stop" ? "stop_on_unknown" : "operator_required_on_unknown";
@@ -184,6 +194,7 @@ export interface ProductionRunDeps {
   readonly builderBudget?: V2RunDeps["builderBudget"];
   readonly untrustedBoundary?: V2RunDeps["untrustedBoundary"];
   readonly checksSource?: V2RunDeps["checksSource"];
+  readonly definitionProbe?: V2RunDeps["definitionProbe"];
   readonly checkRunner?: V2RunDeps["checkRunner"];
   readonly treeProbe?: V2RunDeps["treeProbe"];
   /** Test/override seam for the read-only command terminal (V2-015). */
@@ -291,6 +302,8 @@ async function wireRunDeps(deps: ProductionRunDeps): Promise<V2RunDeps> {
     // THE deterministic verification seams — check discovery, governed execution, and the
     // git tree probe. All three do I/O, so they are wired here, once.
     checksSource: deps.checksSource ?? createChecksSource(),
+    // V2-016A/B4 — capture the source-truth verification definition so a candidate cannot rewrite its exam.
+    definitionProbe: deps.definitionProbe ?? createVerificationDefinitionProbe(),
     checkRunner: deps.checkRunner ?? createCheckRunner(),
     treeProbe,
     commands,

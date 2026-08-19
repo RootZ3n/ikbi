@@ -350,3 +350,34 @@ test("V2-016 clean success: journals written + post-CAS verified ⇒ a plain pro
   assert.equal(r.record.postCasVerified, true);
   assert.equal(r.record.degraded, false);
 });
+
+// ── V2-016A cross-audit: idempotent identity recheck + late stash ──────────────
+
+test("V2-016A/M4 idempotent same-tree symlink swap: refused, NOT bound to the authorized repo", async () => {
+  // The target already holds the candidate tree (idempotent), but the path was swapped to a
+  // DIFFERENT repository between authorize and the recheck. It must NOT produce an already_promoted
+  // record bound to repo A — the identity recheck runs BEFORE the idempotency shortcut.
+  const fake = fakeTarget({ liveTree: TREE, repoIdentities: ["/repo/A/.git", "/repo/B/.git"] });
+  const r = await authorize({ publisher: fake.target });
+  assert.ok(r.kind === "refused_stale_target", `expected refusal, got ${r.kind}`);
+  assert.deepEqual(fake.published, []);
+});
+
+test("V2-016A/M4 idempotent worktree state is OBSERVED, never assumed synced", async () => {
+  // Already-landed AND a DIRTY checked-out worktree ⇒ idempotent but worktreeSynced=false (degraded),
+  // never a magical worktreeSynced=true.
+  const fake = fakeTarget({ liveTree: TREE, checkout: { checkedOutPath: "/co", clean: false } });
+  const r = await authorize({ publisher: fake.target });
+  assert.ok(r.kind === "already_promoted");
+  assert.equal(r.record.idempotent, true);
+  assert.equal(r.record.worktreeSynced, false, "the dirty checkout is reported, not assumed synced");
+  assert.equal(r.record.degraded, true);
+});
+
+test("V2-016A/M6 late-stash fact surfaces on the record + summary", async () => {
+  const fake = fakeTarget({ publish: { kind: "landed", beforeRef: BASE, afterCommit: "p".repeat(40), publishedTree: TREE, worktreeSynced: true, stashed: true, journalIntentStatus: "written", journalLandedStatus: "written", postCas: { verified: true, observedRef: "p".repeat(40), observedTree: TREE } } });
+  const r = await authorize({ publisher: fake.target });
+  assert.ok(r.kind === "promoted");
+  assert.equal(r.record.stashed, true, "late local work preserved in a stash is recorded");
+  assert.equal(summarizePromotion(r.record).stashed, true, "and surfaced on the receipt summary");
+});

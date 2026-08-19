@@ -88,11 +88,26 @@ export const BUILDER_SYSTEM_INSTRUCTION = [
   "WHEN YOU ARE DONE. Call finish_candidate with a short summary and whether you believe the work is complete. That call is the only way to finish; stopping without it counts as unfinished. Your summary is recorded as YOUR CLAIM — do not describe the work as tested, verified or correct. Something else checks that afterwards, and saying so here does not make it so.",
 ].join("\n");
 
-/** Render one context artifact as a labelled, bounded block. */
-function renderArtifact(index: number, artifact: ContextPackage["artifacts"][number]): string {
+/**
+ * Render one context artifact: TRUSTED ikbi provenance (index, category, path, digest, truncation)
+ * as a header OUTSIDE the fence, then the artifact's body.
+ *
+ * V2-016A/B3: repository-derived free text is DATA, not instruction authority. Only the `task`
+ * category is trusted operator intent and stays raw; EVERY other category — repository instructions
+ * (AGENTS.md), goal-target file bodies, and retrieved repository evidence — crosses the canonical
+ * UntrustedBoundary as `source: "repo"` (LOSSLESS: the exact bytes survive and the digest still
+ * refers to the raw content). An AGENTS.md is advisory repository content, not system authority
+ * merely because of its filename.
+ */
+function renderArtifact(index: number, artifact: ContextPackage["artifacts"][number], boundary: UntrustedBoundary): string {
   const where = artifact.path ?? "(operator task)";
   const header = `--- context[${index}] ${artifact.category} · ${where} · sha256:${artifact.observedSha256.slice(0, 16)}${artifact.truncated ? " · TRUNCATED" : ""} ---`;
-  return `${header}\n${artifact.content}`;
+  // The operator TASK is trusted operator intent — never fenced. Everything else is untrusted
+  // repository-controlled content and crosses the fence, losslessly.
+  const body = artifact.category === "task"
+    ? artifact.content
+    : boundary.wrap({ content: artifact.content, source: "repo", origin: `context:${artifact.category}:${artifact.path ?? "(operator task)"}` });
+  return `${header}\n${body}`;
 }
 
 /**
@@ -103,8 +118,8 @@ function renderArtifact(index: number, artifact: ContextPackage["artifacts"][num
  * are stated rather than hidden, so a model is told what it was NOT given instead of
  * silently reasoning from a partial view.
  */
-export function renderContextBlocks(pkg: ContextPackage): string {
-  const blocks = pkg.artifacts.map((artifact, index) => renderArtifact(index, artifact));
+export function renderContextBlocks(pkg: ContextPackage, boundary: UntrustedBoundary): string {
+  const blocks = pkg.artifacts.map((artifact, index) => renderArtifact(index, artifact, boundary));
   if (pkg.omissions.length > 0) {
     blocks.push(
       `--- context omissions (${pkg.omissions.length}) ---\n` +
@@ -125,6 +140,7 @@ export function renderContextBlocks(pkg: ContextPackage): string {
 export function renderBuilderInput(
   pkg: ContextPackage,
   conversation: readonly RenderedMessage[],
+  boundary: UntrustedBoundary,
   repair?: { readonly repairBrief: RepairBrief; readonly boundary: UntrustedBoundary },
 ): RenderedModelInput {
   // The ORIGINAL task and the current context come first and outrank everything. The repair
@@ -136,7 +152,9 @@ export function renderBuilderInput(
     : `${BUILDER_SYSTEM_INSTRUCTION}\n\n${REPAIR_SYSTEM_NOTE}`;
   const messages: readonly RenderedMessage[] = [
     { role: "system", content: systemContent },
-    { role: "user", content: renderContextBlocks(pkg) },
+    // The context block carries repository-derived bodies through the untrusted fence (B3); the
+    // whole user turn is marked untrusted so nothing downstream can treat repository text as authority.
+    { role: "user", content: renderContextBlocks(pkg, boundary), untrusted: true },
     ...(repair !== undefined ? [renderRepairBrief(repair.repairBrief, repair.boundary)] : []),
     ...conversation,
   ];

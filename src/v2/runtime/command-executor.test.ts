@@ -235,3 +235,51 @@ test("REAL governed-exec: `git status` runs read-only and the tree is unchanged"
   assert.match(res.command!.outputExcerpt, /a\.txt/, "git status reported the untracked file");
   ws.cleanup();
 });
+
+// ── V2-016A/B2 cross-audit: allowlisted commands cannot read OUTSIDE the candidate ──
+
+test("V2-016A/B2: allowlisted read tools CANNOT read a synthetic file outside the candidate", async () => {
+  // Real governed-exec + the narrow command sandbox. The candidate is a git repo; a sibling
+  // 'outside' dir holds a synthetic secret. head/tail/grep/find/ls must NOT be able to read it.
+  const base = mkdtempSync(join(tmpdir(), "ikbi-b2-"));
+  const candidate = join(base, "candidate");
+  const outside = join(base, "outside");
+  mkdirSync(candidate); mkdirSync(outside);
+  try {
+    execFileSync("git", ["init", "-q"], { cwd: candidate });
+    execFileSync("git", ["config", "user.email", "t@t"], { cwd: candidate });
+    execFileSync("git", ["config", "user.name", "t"], { cwd: candidate });
+    mkdirSync(join(candidate, "src"));
+    writeFileSync(join(candidate, "src", "widget.ts"), "export const widget = 42;\n");
+    execFileSync("git", ["add", "-A"], { cwd: candidate });
+    execFileSync("git", ["commit", "-qm", "init"], { cwd: candidate });
+  } catch {
+    rmSync(base, { recursive: true, force: true });
+    return; // git unavailable — skip
+  }
+  const secret = join(outside, "synthetic-secret.txt");
+  writeFileSync(secret, "TOP-SECRET-OUTSIDE\n");
+  const cap = createCommandCapability({ transport: createGovernedCommandTransport(), treeProbe: fakeTreeProbe(["T", "T", "T", "T", "T", "T", "T", "T"]), policy: V2_DEFAULT_COMMAND_POLICY });
+
+  // Each allowlisted read tool, pointed at the OUTSIDE absolute path, must NOT disclose the secret.
+  for (const [program, args] of [["head", ["-n", "1", secret]], ["tail", ["-n", "1", secret]], ["grep", ["SECRET", secret]], ["wc", ["-c", secret]], ["ls", ["-la", secret]]] as const) {
+    const r = await cap.run(req({ workspacePath: candidate, program, args }));
+    assert.ok(r.outcome.kind === "command");
+    if (r.outcome.kind === "command") {
+      assert.equal(r.outcome.untrusted.includes("TOP-SECRET-OUTSIDE"), false, `${program} must NOT disclose the outside secret`);
+      assert.notEqual(r.outcome.exitCode, 0, `${program} on an absent (sandboxed-away) path fails`);
+    }
+  }
+
+  // find over the CANDIDATE cannot reach the outside dir either.
+  const found = await cap.run(req({ workspacePath: candidate, program: "find", args: [outside, "-name", "*.txt"] }));
+  if (found.outcome.kind === "command") assert.equal(found.outcome.untrusted.includes("synthetic-secret"), false, "find cannot traverse outside the candidate view");
+
+  // NORMAL candidate reads STILL WORK.
+  const grep = await cap.run(req({ workspacePath: candidate, program: "git", args: ["grep", "-n", "widget"] }));
+  if (grep.outcome.kind === "command") assert.match(grep.outcome.untrusted, /widget = 42/, "git grep works inside the candidate");
+  const head = await cap.run(req({ workspacePath: candidate, program: "head", args: ["-n", "1", "src/widget.ts"] }));
+  if (head.outcome.kind === "command") assert.match(head.outcome.untrusted, /widget = 42/, "head works on a candidate file");
+
+  rmSync(base, { recursive: true, force: true });
+});

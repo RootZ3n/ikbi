@@ -292,3 +292,23 @@ test("enumeration: list() is stable and sorted, and repeated calls agree", async
   assert.deepEqual([...first], [...first].sort((a, b) => a.localeCompare(b)));
   assert.deepEqual([...(await reader.list())], [...first]);
 });
+
+// ── V2-016A/M5 cross-audit: an EXCLUDED dirty file must not read as clean ──────
+
+test("V2-016A/M5: a tracked modified file OVER the capture limit → snapshot clean=false (not 'clean but excluded')", async () => {
+  const { writeFileSync } = await import("node:fs");
+  // A tracked file, committed small, then modified to exceed the 4MB capture limit.
+  const r = repo({ "big.bin": "small\n", "src/a.ts": "A\n" });
+  writeFileSync(join(r, "big.bin"), Buffer.alloc(5 * 1024 * 1024, 0x61)); // 5MB > MAX_CAPTURED_ENTRY_BYTES
+  const { snapshot } = await capture(r);
+  // The oversized modification was EXCLUDED from capture…
+  assert.ok(snapshot.exclusions.some((e) => e.path === "big.bin"), "the oversized modification is recorded as an exclusion");
+  assert.equal(snapshot.entries.some((e) => e.path === "big.bin"), false, "…and could not be captured into entries");
+  // …but the working tree is DIRTY, so clean MUST be false (M5: never 'entries.length === 0').
+  assert.equal(snapshot.clean, false, "a dirty-but-excluded file makes the snapshot NOT clean");
+});
+
+test("V2-016A/M5: a truly clean checkout is still clean (no false dirtiness)", async () => {
+  const { snapshot } = await capture(repo({ "src/a.ts": "A\n", "readme.md": "hi\n" }));
+  assert.equal(snapshot.clean, true);
+});

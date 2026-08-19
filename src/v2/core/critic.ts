@@ -418,7 +418,18 @@ export interface CriticGeneration {
 
 export type CriticResult =
   | { readonly ok: true; readonly generation: CriticGeneration }
-  | { readonly ok: false; readonly failure: RunFailure; readonly attemptedInvocation: boolean };
+  | {
+      readonly ok: false;
+      readonly failure: RunFailure;
+      readonly attemptedInvocation: boolean;
+      /**
+       * V2-016A/M1: the SUCCESSFUL provider invocation record, when the wire call completed but its
+       * response later failed strict critic parsing. Separating INVOCATION RESULT from CRITIC PARSE
+       * RESULT: the call really happened and its usage must be accounted (invocation ledger + session
+       * cost), even though no CriticRecord exists. Absent when the wire call itself failed.
+       */
+      readonly invocation?: V2InvocationRecord;
+    };
 
 export interface JudgeCandidateInput {
   readonly runId: V2RunId;
@@ -543,9 +554,13 @@ export async function judgeCandidate(input: JudgeCandidateInput): Promise<Critic
   //    it ends the run. It is NEVER downgraded into a verdict (the v1 defect, closed).
   const parsed = parseCriticResponse(called.content);
   if (!parsed.ok) {
+    // M1: the wire call SUCCEEDED (we have `called.record`); only the strict parse failed. Return
+    // the invocation record so the run accounts the call — no protocol failure ever becomes a
+    // valid critic verdict, but neither does it vanish from the invocation ledger / session cost.
     return {
       ok: false,
       attemptedInvocation: true,
+      invocation: called.record,
       failure: criticFailure(
         V2_CRITIC_FAILURE_CODES.protocolFailure,
         `the critic response was not a usable judgment (${parsed.problem}): ${parsed.detail}`,

@@ -364,7 +364,37 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
     let sandboxPlan: SandboxPlan | undefined;
     let sandboxLabel: "bwrap" | "none" | "unavailable" = "none";
     const sandboxWritableRoot = request.worktreeRoot ?? cwd;
-    if (risk.risky && config.sandbox.mode === "off") {
+
+    // (5a) NARROW COMMAND SANDBOX (V2-016A/B2). The BUILDER read-only terminal requests a narrow
+    // filesystem view: EVERY command — even a generically "safe" head/grep — runs inside bwrap with
+    // only the candidate (+ its git store) read-only, a writable temp, and essential system dirs
+    // visible. FAIL-CLOSED: without a working sandbox we DENY, never run a terminal command
+    // unconfined (read-only host access would still disclose). This is independent of `risk`.
+    if (request.commandSandbox !== undefined) {
+      const avail = sandboxAvailability();
+      if (!avail.available) {
+        return deny(`the read-only command sandbox is unavailable on this host (${avail.reason ?? "no bwrap"}) — refusing to run the command unconfined`, false);
+      }
+      sandboxPlan = {
+        mode: "bwrap",
+        view: "narrow",
+        readonlyRoots: request.commandSandbox.readonlyRoots,
+        writableRoot: request.commandSandbox.writableRoot,
+        ...(cwd !== undefined ? { cwd } : {}),
+        networkAllowed: false,
+        risk,
+      };
+      sandboxLabel = "bwrap";
+      emit(govexecExecuted, { ...base, allow: true, sandbox: "bwrap", risk: risk.kind, reason: "narrow read-only command sandbox" }, identity, EXEC_OPERATION, requestId);
+      await receipt(
+        EXEC_OPERATION,
+        identity,
+        { status: "success", detail: `narrow read-only command sandbox (bwrap) for ${command}` },
+        sandboxMetadata("sandbox.enabled", "bwrap", risk, request.commandSandbox.writableRoot, false),
+        requestId,
+        cwd,
+      );
+    } else if (risk.risky && config.sandbox.mode === "off") {
       // EXPLICIT off (IKBI_GOVERNED_EXEC_SANDBOX=off): the operator disabled OS confinement. A risky
       // command (a helper interpreter that does its own filesystem syscalls) then runs UNSANDBOXED and
       // could write outside the worktree — the F1 escape. This is NOT a silent skip: it is LOUDLY

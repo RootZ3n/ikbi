@@ -802,6 +802,13 @@ export class CostAccountingError extends Error {
 export interface InvocationAdmission {
   /** Decide whether the NEXT call is authorized, from a priced/estimate view of it. */
   admitNext(input: { readonly identity: PriceModelInput; readonly estimatedInputTokens: number; readonly maxOutputTokens: number }): CostAdmissionDecision;
+  /**
+   * V2-016A/M2: note that an invocation is ABOUT TO REACH THE WIRE, BEFORE the provider send. The
+   * `maxInvocations` cap counts WIRE ATTEMPTS — success, provider failure, no-usage, or a downstream
+   * protocol failure all consume one slot — so a failing call cannot loop for free. Idempotent per
+   * InvocationId. Separate from `charge`, which only accounts observed usage (monetary cost).
+   */
+  recordAttempt(invocationId: string): void;
   /** Charge a SUCCESSFUL invocation record. Idempotent per InvocationId; a conflict throws. */
   charge(record: V2InvocationRecord): InvocationCostRecord;
 }
@@ -834,6 +841,12 @@ export class SessionCostController implements InvocationAdmission {
   private readonly buildSessionId: string;
   /** GLOBAL dedup: an InvocationId may be charged at most once across the whole session. */
   private readonly ledger = new Map<string, InvocationCostRecord>();
+  /**
+   * V2-016A/M2: every InvocationId that reached (or is about to reach) the wire, across the WHOLE
+   * session. The `maxInvocations` cap counts THIS, not just successfully-charged records, so a
+   * failing/malformed call still consumes a slot and recovery cannot spin on the wire for free.
+   */
+  private readonly attemptedIds = new Set<string>();
   private readonly attempts: AttemptAccumulator[] = [];
   private current: AttemptAccumulator | undefined;
 
@@ -869,9 +882,15 @@ export class SessionCostController implements InvocationAdmission {
     return {
       priorKnownSpendMicroUsd: this.knownSpendOf(all),
       priorHasUnknownCost: this.hasUnknownIn(all),
-      invocationsSoFar: this.ledger.size,
+      // M2: the cap counts WIRE ATTEMPTS (attemptedIds), not just charged records.
+      invocationsSoFar: this.attemptedIds.size,
       attemptKnownSpendMicroUsd: this.knownSpendOf(attemptRecords) + 0 * attemptFailed,
     };
+  }
+
+  /** M2: note an invocation is about to reach the wire (before send). Idempotent per id. */
+  recordAttempt(invocationId: string): void {
+    this.attemptedIds.add(invocationId);
   }
 
   admitNext(input: { readonly identity: PriceModelInput; readonly estimatedInputTokens: number; readonly maxOutputTokens: number }): CostAdmissionDecision {
@@ -896,6 +915,9 @@ export class SessionCostController implements InvocationAdmission {
 
   /** Charge a successful invocation. Dedup per InvocationId: identical re-charge is idempotent. */
   charge(record: V2InvocationRecord): InvocationCostRecord {
+    // A charged invocation necessarily reached the wire — count it for the attempt cap even if the
+    // caller (e.g. the session reconcile of a no-admission attempt) never called recordAttempt.
+    this.attemptedIds.add(record.invocationId);
     const cost = buildInvocationCostRecord({ record, catalog: this.catalog, catalogId: this.catalogId });
     const existing = this.ledger.get(record.invocationId);
     if (existing !== undefined) {

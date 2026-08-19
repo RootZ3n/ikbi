@@ -248,7 +248,10 @@ export function createWorkspaceAuthority(deps: {
       }
       try {
         await deps.manager.retain(handle, reason);
-        handles.delete(record.workspaceId);
+        // V2-016A/M3: RETAIN means "do not auto-discard now" — NOT "forget how to manage it". The
+        // donor keeps the worktree on disk (record terminal-`failed`, path preserved), and its
+        // `discard(handle)` still reclaims it by that path. So we KEEP the live handle here, so the
+        // session's later cleanup of a SUPERSEDED attempt can actually reclaim the worktree.
         return { kind: "retained", reason };
       } catch (err) {
         return { kind: "failed", attempted: "retain", detail: err instanceof Error ? err.message : String(err) };

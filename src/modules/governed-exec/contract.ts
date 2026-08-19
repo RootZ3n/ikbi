@@ -58,6 +58,19 @@ export interface ExecRequest {
    */
   readonly worktreeRoot?: string;
   /**
+   * NARROW COMMAND SANDBOX (V2-016A/B2). When present, this command ALWAYS runs inside a narrow OS
+   * filesystem sandbox — regardless of the generic risk classification — that mounts ONLY the given
+   * read-only roots (candidate + its git store), a writable temp, essential system dirs, and a
+   * private tmpfs; the host is otherwise absent and the network is denied. Used by the BUILDER
+   * read-only terminal so allowlisted "safe" tools (head/grep/find/ls/…) cannot read files outside
+   * the candidate view. FAIL-CLOSED: if the OS sandbox is unavailable the command is DENIED, never
+   * run unconfined. The VERIFIER never sets this (its execution is unchanged).
+   */
+  readonly commandSandbox?: {
+    readonly readonlyRoots: readonly string[];
+    readonly writableRoot: string;
+  };
+  /**
    * Optional LIVE OUTPUT SINK (SG-1): when provided, the command's stdout/stderr are STREAMED
    * to this callback chunk-by-chunk as they arrive (so a user sees long check output live),
    * instead of only the buffered tail at the end. The returned `ExecResult` still carries the

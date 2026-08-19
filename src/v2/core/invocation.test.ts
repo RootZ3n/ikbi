@@ -24,6 +24,10 @@ import {
   type ServedModelAlias,
 } from "./invocation.js";
 import { BUILDER_SYSTEM_INSTRUCTION, renderBuilderInput } from "./prompt.js";
+import type { UntrustedBoundary } from "./builder.js";
+
+/** A deterministic fake fence for rendering tests (mirrors the production boundary shape). */
+const B: UntrustedBoundary = { wrap: ({ content, source, origin }) => `<<UNTRUSTED source=${source}${origin !== undefined ? ` origin=${origin}` : ""}>>\n${content}\n<<END UNTRUSTED>>` };
 import type { ModelResolutionDecision } from "./resolver.js";
 
 import { DEFAULT_SOURCE_POLICY, type SourceSnapshot, type SourceSnapshotReader } from "./source.js";
@@ -132,7 +136,7 @@ async function invoke(over: Partial<InvocationAuthorityInput> = {}, transport?: 
     now: () => 1_000,
     ...over,
     contextPackage: pkg,
-    rendered: renderBuilderInput(pkg, []),
+    rendered: renderBuilderInput(pkg, [], B),
   });
 }
 
@@ -313,7 +317,7 @@ test("usage: a provider that reports nothing yields no usage block", async () =>
 
 test("prompt: the model input comes only from the authorized context package", async () => {
   const pkg = await contextPackage();
-  const rendered = renderBuilderInput(pkg, []);
+  const rendered = renderBuilderInput(pkg, [], B);
   assert.equal(rendered.messages[0]?.role, "system");
   assert.equal(rendered.messages[0]?.content, BUILDER_SYSTEM_INSTRUCTION);
   assert.match(rendered.messages[1]?.content ?? "", /make the widget green/, "the goal artifact");
@@ -330,7 +334,7 @@ test("prompt: the BUILDER contract states the rules that are actually enforced",
 });
 
 test("prompt: identical packages render an identical prompt id", async () => {
-  assert.equal(renderBuilderInput(await contextPackage(), []).promptId, renderBuilderInput(await contextPackage(), []).promptId);
+  assert.equal(renderBuilderInput(await contextPackage(), [], B).promptId, renderBuilderInput(await contextPackage(), [], B).promptId);
 });
 
 test("prompt: the rendered prompt reaches the transport verbatim", async () => {
@@ -338,8 +342,8 @@ test("prompt: the rendered prompt reaches the transport verbatim", async () => {
   const t = transportOf();
   const result = await invoke({ contextPackage: pkg }, t.transport);
   assert.ok(result.ok);
-  assert.deepEqual(t.sent[0]?.messages, renderBuilderInput(pkg, []).messages);
-  assert.equal(result.record.promptId, renderBuilderInput(pkg, []).promptId);
+  assert.deepEqual(t.sent[0]?.messages, renderBuilderInput(pkg, [], B).messages);
+  assert.equal(result.record.promptId, renderBuilderInput(pkg, [], B).promptId);
 });
 
 // ── request identity ────────────────────────────────────────────────────────
@@ -358,7 +362,7 @@ test("request identity: the same semantic request digests the same", async () =>
     authorizedProviderModelId: "alpha-v1",
     sentProviderId: "p1",
     sentProviderModelId: "alpha-v1",
-    promptId: renderBuilderInput(pkg, []).promptId,
+    promptId: renderBuilderInput(pkg, [], B).promptId,
     parameters: { maxOutputTokens: 128, timeoutMs: 1_000 },
   };
   // A different invocation id is a different ATTEMPT of the same request.

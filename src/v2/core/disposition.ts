@@ -147,6 +147,7 @@ export type DispositionReason =
   | "verification_infrastructure_failure"
   | "candidate_drift"
   | "check_mutated_candidate"
+  | "verification_policy_changed"
   | "policy_requires_operator";
 
 export const DISPOSITION_REASONS: readonly DispositionReason[] = [
@@ -159,6 +160,7 @@ export const DISPOSITION_REASONS: readonly DispositionReason[] = [
   "verification_infrastructure_failure",
   "candidate_drift",
   "check_mutated_candidate",
+  "verification_policy_changed",
   "policy_requires_operator",
 ] as const;
 
@@ -291,6 +293,10 @@ export function adjudicate(input: {
     case "fail":
       // Deterministic red. The critic cannot override it — REJECT regardless of the verdict.
       return { decision: "reject", primaryReason: "verification_failed", supportingReasons: supporting };
+    case "verification_policy_changed":
+      // V2-016A/B4: the candidate redefined its own manifest-derived exam. Fail-closed — REJECT;
+      // the critic cannot override it, and it can never be a normal PASS.
+      return { decision: "reject", primaryReason: "verification_policy_changed", supportingReasons: supporting };
     case "no_checks":
       if (!policy.allowNoChecks) {
         return { decision: "withhold", primaryReason: "no_checks", supportingReasons: supporting };

@@ -205,6 +205,16 @@ export type ToolRejectionReason = "unknown_tool" | "malformed_arguments" | "miss
 
 const asString = (value: unknown): string | undefined => (typeof value === "string" ? value : undefined);
 
+/** The exact argument keys each tool accepts (mirrors each schema's `additionalProperties: false`). */
+const TOOL_ALLOWED_ARG_KEYS: Readonly<Record<BuilderToolName, readonly string[]>> = {
+  [TOOL_READ_FILE]: ["path"],
+  [TOOL_REPLACE_FILE]: ["path", "observationId", "content"],
+  [TOOL_CREATE_FILE]: ["path", "observationId", "content"],
+  [TOOL_DELETE_FILE]: ["path", "observationId"],
+  [TOOL_RUN_COMMAND]: ["program", "args", "cwd"],
+  [TOOL_FINISH_CANDIDATE]: ["summary", "believesComplete"],
+};
+
 /**
  * Parse and validate one tool call.
  *
@@ -226,6 +236,14 @@ export function parseToolCall(call: BuilderToolCall): ParsedToolCall {
       return { ok: false, reason: "malformed_arguments", detail: "arguments must be a JSON object" };
     }
     args = parsed as Record<string, unknown>;
+    // V2-016A/L3: the schemas declare `additionalProperties: false`. Enforce it — an argument key
+    // outside the tool's allowed set is a REJECTION, not silently ignored (a smuggled field could
+    // otherwise ride along unnoticed).
+    const allowed = TOOL_ALLOWED_ARG_KEYS[call.name];
+    const extra = Object.keys(args).filter((k) => !allowed.includes(k));
+    if (extra.length > 0) {
+      return { ok: false, reason: "malformed_arguments", detail: `${call.name} does not accept the argument(s): ${extra.join(", ")}` };
+    }
   } catch (err) {
     return { ok: false, reason: "malformed_arguments", detail: `arguments were not valid JSON: ${err instanceof Error ? err.message : String(err)}` };
   }

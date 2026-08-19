@@ -470,3 +470,35 @@ test("V2-016 alias pricing: an UNDECLARED served snapshot with no pricing route 
   assert.equal(cost.costStatus, "unpriced_model");
   assert.equal(cost.amountMicroUsd, undefined);
 });
+
+// ── V2-016A/M2 cross-audit: maxInvocations counts WIRE ATTEMPTS, not just charged records ──
+
+test("V2-016A/M2: a failed wire call (no usage) still consumes an invocation-cap slot", () => {
+  const policy = buildCostBudgetPolicy({ maxInvocations: 2 });
+  const ctl = new SessionCostController({ buildSessionId: "sess_m2", catalog: CATALOG, policy });
+  const identity = { authorizedModelId: "deepseek-chat", sentProviderId: "deepseek", sentProviderModelId: "deepseek-chat" };
+  const next = { identity, estimatedInputTokens: 10, maxOutputTokens: 10 };
+
+  // Two calls reach the wire and FAIL (no charge, no usage) — recorded as attempts.
+  assert.equal(ctl.admitNext(next).admit, true);
+  ctl.recordAttempt("inv_m2a");
+  assert.equal(ctl.admitNext(next).admit, true);
+  ctl.recordAttempt("inv_m2b");
+  // The cap is now reached even though NOTHING was charged.
+  const denied = ctl.admitNext(next);
+  assert.equal(denied.admit, false, "two wire attempts consumed the cap of 2");
+  if (!denied.admit) assert.equal(denied.failure.code, "policy.cost_invocation_cap_exhausted");
+});
+
+test("V2-016A/M2: attempts + charges dedup by InvocationId and span the whole session", () => {
+  const policy = buildCostBudgetPolicy({ maxInvocations: 3 });
+  const ctl = new SessionCostController({ buildSessionId: "sess_m2b", catalog: CATALOG, policy });
+  const identity = { authorizedModelId: "deepseek-chat", sentProviderId: "deepseek", sentProviderModelId: "deepseek-chat" };
+  ctl.recordAttempt("inv_x");
+  ctl.charge(rec({ invocationId: "inv_x", usage: { promptTokens: 10, completionTokens: 10 } })); // same id — not double
+  ctl.recordAttempt("inv_y");
+  // 2 distinct ids so far; a third is admitted, a fourth denied.
+  assert.equal(ctl.admitNext({ identity, estimatedInputTokens: 1, maxOutputTokens: 1 }).admit, true);
+  ctl.recordAttempt("inv_z");
+  assert.equal(ctl.admitNext({ identity, estimatedInputTokens: 1, maxOutputTokens: 1 }).admit, false, "3 distinct wire attempts hit the cap");
+});

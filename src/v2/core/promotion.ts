@@ -264,6 +264,12 @@ export interface PromotionRecord {
   readonly publishedTree: string;
   /** Whether a checked-out target worktree was brought forward to the landed commit. */
   readonly worktreeSynced: boolean;
+  /**
+   * V2-016A/M6 — whether syncing the target worktree PRESERVED late local work in a git stash. When
+   * true, the operator's uncommitted changes at the target were stashed (never auto-popped) and the
+   * receipt/CLI must say so. Only meaningful when `worktreeSynced` is true.
+   */
+  readonly stashed: boolean;
   /** True when this call detected the exact candidate was ALREADY landed and did not re-publish. */
   readonly idempotent: boolean;
   /** A degraded landing: the ref moved but post-CAS bookkeeping did not fully complete. */
@@ -415,7 +421,7 @@ export async function promoteAuthorized(input: {
     return { kind: "refused_stale_target", detail: `the target branch "${target.baseBranch}" does not exist`, expectedHead: target.baseCommit, observedHead: "<absent>" };
   }
 
-  const record = (landed: { beforeRef: string; afterRef: string; publishedTree: string; worktreeSynced: boolean; idempotent: boolean; degraded: boolean; journalIntentStatus?: JournalWriteStatus; journalLandedStatus?: JournalWriteStatus; postCasVerified?: boolean }): PromotionRecord => ({
+  const record = (landed: { beforeRef: string; afterRef: string; publishedTree: string; worktreeSynced: boolean; idempotent: boolean; degraded: boolean; stashed?: boolean; journalIntentStatus?: JournalWriteStatus; journalLandedStatus?: JournalWriteStatus; postCasVerified?: boolean }): PromotionRecord => ({
     promotionId: promotionRecordDigest({ candidateId: candidate.candidateId, candidateTreeId: candidate.tree.treeId, dispositionId: disposition.dispositionId, sourceSnapshotId: candidate.sourceSnapshotId, targetRepositoryIdentity: authorizedRepoIdentity, targetBranch: target.baseBranch, publishedTree: landed.publishedTree }),
     runId: candidate.runId,
     candidateId: candidate.candidateId,
@@ -432,6 +438,7 @@ export async function promoteAuthorized(input: {
     afterRef: landed.afterRef,
     publishedTree: landed.publishedTree,
     worktreeSynced: landed.worktreeSynced,
+    stashed: landed.stashed ?? false,
     idempotent: landed.idempotent,
     degraded: landed.degraded,
     journalIntentStatus: landed.journalIntentStatus ?? "not_attempted",
@@ -440,29 +447,10 @@ export async function promoteAuthorized(input: {
     promotedAt: input.now(),
   });
 
-  // 5. IDEMPOTENCY — the live target already holds the exact candidate tree. Do NOT publish a
-  //    second time; report the truthful already-landed state.
-  const liveTree = await input.publisher.treeOfCommit({ repositoryPath: target.repositoryPath, commit: liveHead });
-  if (liveTree === candidate.tree.treeId) {
-    return { kind: "already_promoted", record: record({ beforeRef: liveHead, afterRef: liveHead, publishedTree: candidate.tree.treeId, worktreeSynced: true, idempotent: true, degraded: false }) };
-  }
-
-  // 6. Target staleness — the live head must still be the authorized base. NO AUTO-MERGE: a
-  //    moved target means a merge would produce an unverified tree. Refuse; recovery re-captures.
-  if (liveHead !== target.baseCommit) {
-    return { kind: "refused_stale_target", detail: `the target moved since verification (authorized base ${target.baseCommit}, live head ${liveHead}) — re-verify against the new base before promoting`, expectedHead: target.baseCommit, observedHead: liveHead };
-  }
-
-  // 7. Dirty checked-out target worktree — moving the ref under it would desync it. Refuse.
-  const checkout = await input.publisher.targetCheckout(target);
-  if (checkout.checkedOutPath !== undefined && !checkout.clean) {
-    return { kind: "refused_target_worktree_dirty", detail: `the target branch "${target.baseBranch}" is checked out at ${checkout.checkedOutPath} with uncommitted changes — refusing to promote (commit or stash there first)` };
-  }
-
-  // 7.5. SYMLINK-SWAP GUARD (V2-016). Re-resolve the target repository identity at the LAST moment
-  //      before the CAS. If the path now resolves to a DIFFERENT repository than the one authorized
-  //      (a symlink swapped under us between authorization and publish), REFUSE — never publish
-  //      through a swapped path.
+  // 5. SYMLINK-SWAP GUARD (V2-016A/M4). Re-resolve the target repository identity BEFORE the
+  //    idempotency shortcut. `already_promoted` must NEVER be reported against a path swapped to a
+  //    different repository — even if that other repo happens to hold the same candidate tree, the
+  //    PromotionRecord would be bound to the wrong (authorized) repo.
   const recheckedRepoIdentity = await input.publisher.repositoryIdentity(target);
   if (recheckedRepoIdentity !== authorizedRepoIdentity) {
     return {
@@ -473,12 +461,38 @@ export async function promoteAuthorized(input: {
     };
   }
 
-  // 8. Publish EXACTLY the candidate tree.
+  // 6. Observe the checked-out target worktree state truthfully — needed BOTH to report the real
+  //    worktree-sync state on an idempotent landing (never assume it) and to refuse a dirty target.
+  const checkout = await input.publisher.targetCheckout(target);
+
+  // 7. IDEMPOTENCY — the live target already holds the exact candidate tree. Do NOT publish a second
+  //    time. Reached ONLY after the repository identity was reconfirmed above (M4), so it can never
+  //    be bound to a swapped repo. An already-landed candidate legitimately has liveHead ≠ authorized
+  //    base (the earlier landing moved the head), so idempotency is checked BEFORE staleness.
+  //    `worktreeSynced` reflects the OBSERVED checkout — never a magical `true` (M4).
+  const liveTree = await input.publisher.treeOfCommit({ repositoryPath: target.repositoryPath, commit: liveHead });
+  if (liveTree === candidate.tree.treeId) {
+    const worktreeSynced = checkout.checkedOutPath === undefined || checkout.clean;
+    return { kind: "already_promoted", record: record({ beforeRef: liveHead, afterRef: liveHead, publishedTree: candidate.tree.treeId, worktreeSynced, idempotent: true, degraded: !worktreeSynced }) };
+  }
+
+  // 8. Target staleness — the live head must still be the authorized base. NO AUTO-MERGE: a moved
+  //    target means a merge would produce an unverified tree. Refuse; recovery re-captures.
+  if (liveHead !== target.baseCommit) {
+    return { kind: "refused_stale_target", detail: `the target moved since verification (authorized base ${target.baseCommit}, live head ${liveHead}) — re-verify against the new base before promoting`, expectedHead: target.baseCommit, observedHead: liveHead };
+  }
+
+  // 9. Dirty checked-out target worktree — moving the ref under it would desync it. Refuse.
+  if (checkout.checkedOutPath !== undefined && !checkout.clean) {
+    return { kind: "refused_target_worktree_dirty", detail: `the target branch "${target.baseBranch}" is checked out at ${checkout.checkedOutPath} with uncommitted changes — refusing to promote (commit or stash there first)` };
+  }
+
+  // 10. Publish EXACTLY the candidate tree.
   const message = `ikbi: publish candidate ${candidate.candidateId.slice(0, 16)} (disposition ${disposition.dispositionId.slice(0, 12)})`;
   const outcome = await input.publisher.publish({ target, expectedHead: liveHead, candidateTreeId: candidate.tree.treeId, message });
   switch (outcome.kind) {
     case "landed": {
-      const bookkeeping = { journalIntentStatus: outcome.journalIntentStatus, journalLandedStatus: outcome.journalLandedStatus, postCasVerified: outcome.postCas.verified };
+      const bookkeeping = { journalIntentStatus: outcome.journalIntentStatus, journalLandedStatus: outcome.journalLandedStatus, postCasVerified: outcome.postCas.verified, stashed: outcome.stashed };
       // Belt-and-braces: the seam already verified the built tree == candidate tree BEFORE the
       // CAS. Assert the landed tree once more, and require the FRESH post-CAS reprobe to confirm.
       if (outcome.publishedTree !== candidate.tree.treeId) {
@@ -523,6 +537,8 @@ export interface RunPromotionSummary {
   readonly afterRef: string;
   readonly publishedTree: string;
   readonly worktreeSynced: boolean;
+  /** V2-016A/M6 — late local work at the target was preserved in a git stash (never auto-popped). */
+  readonly stashed: boolean;
   readonly idempotent: boolean;
   readonly degraded: boolean;
   /** V2-016 — the canonical target repository identity bound into the promotion id. */
@@ -545,6 +561,7 @@ export function summarizePromotion(record: PromotionRecord): RunPromotionSummary
     afterRef: record.afterRef,
     publishedTree: record.publishedTree,
     worktreeSynced: record.worktreeSynced,
+    stashed: record.stashed,
     idempotent: record.idempotent,
     degraded: record.degraded,
     targetRepositoryIdentity: record.targetRepositoryIdentity,

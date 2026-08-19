@@ -276,7 +276,7 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
     // ONE TURN = ONE INVOCATION, through the one authority. There is no other doorway
     // to a model in v2, and the controller does not hold a transport it could use
     // directly — it hands the authority the one it was given.
-    const rendered = renderBuilderInput(input.contextPackage, conversation, input.repairBrief !== undefined ? { repairBrief: input.repairBrief, boundary: input.untrustedBoundary } : undefined);
+    const rendered = renderBuilderInput(input.contextPackage, conversation, input.untrustedBoundary, input.repairBrief !== undefined ? { repairBrief: input.repairBrief, boundary: input.untrustedBoundary } : undefined);
     const turnMaxOutputTokens = Math.min(budget.maxOutputTokens, input.contextPackage.budget.reservedCompletionTokens);
     // PRE-CALL COST ADMISSION. BEFORE the money is spent, ask the session budget authority
     // whether another model call is authorized. It never selects or downgrades a model — it
@@ -291,6 +291,9 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
       if (!admitted.admit) return partial(admitted.failure);
     }
     const invocationId = input.mintInvocationId();
+    // M2: this call is about to reach the wire — count it against the session invocation cap BEFORE
+    // the send, so a failing/malformed call consumes a slot too (never a free retry on the wire).
+    if (input.admission !== undefined) input.admission.recordAttempt(invocationId);
     const called = await invokeAuthorized({
       runId: input.runId,
       taskId: input.taskId,
@@ -341,6 +344,19 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
         content:
           "You stopped without calling finish_candidate. If the work is complete, call finish_candidate now. " +
           "If it is not, continue using the tools. Prose is not a way to finish.",
+      });
+      continue;
+    }
+
+    // V2-016A/L2: DUPLICATE TOOL-CALL IDS within one assistant turn are refused BEFORE executing
+    // ANY of them — a repeated id would make a tool RESULT ambiguous (two calls answered by one
+    // message), which is exactly how a duplicated write could be mis-attributed. Nudge and reloop.
+    const callIds = called.toolCalls.map((c) => c.id);
+    if (new Set(callIds).size !== callIds.length) {
+      toolFailures += 1;
+      conversation.push({
+        role: "user",
+        content: "Your turn reused a tool_call id across two calls. Each tool call must have a UNIQUE id. No tools were executed this turn — reissue them with distinct ids.",
       });
       continue;
     }

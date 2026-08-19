@@ -227,6 +227,13 @@ export function createSourceSnapshotAuthority(deps: { readonly now?: () => numbe
       const entries: SourceEntry[] = [];
       const exclusions: SourceExclusion[] = [];
       const captured = new Map<string, Buffer>();
+      // V2-016A/M5: TRUE working-tree dirtiness — a tracked modification/deletion or an included
+      // untracked file — REGARDLESS of whether it was captured into `entries`. A modified tracked
+      // file dropped by policy OR excluded by the capture size limit is STILL dirty; `clean` must
+      // NOT be computed from `entries.length` alone, or a dirty-but-excluded file reads as clean and
+      // a candidate could be published over uncaptured local work. Ignored/untracked-excluded and
+      // .git-internal records are NOT working-tree dirtiness.
+      let workingTreeDirty = false;
 
       for (const record of parsePorcelain(porcelain)) {
         if (record.path.startsWith(".git/") || record.path === ".git") {
@@ -240,15 +247,22 @@ export function createSourceSnapshotAuthority(deps: { readonly now?: () => numbe
 
         if (untracked) {
           if (!policy.includeUntracked) {
+            // An ignored/untracked-excluded file does not affect the committed tree — NOT dirty.
             exclusions.push({ path: record.path, reason: "git_ignored" });
             continue;
           }
+          // An INCLUDED untracked file is real working-tree state.
+          workingTreeDirty = true;
         } else if (deleted) {
+          // A tracked deletion is dirty whether or not policy captures it into the snapshot.
+          workingTreeDirty = true;
           if (!policy.includeTrackedDeletions) continue;
           entries.push({ path: record.path, status: "deleted", kind: "deleted", contentSha256: null, byteLength: null, executable: false, symlinkTarget: null });
           continue;
-        } else if (!policy.includeTrackedModifications) {
-          continue;
+        } else {
+          // A tracked modification is dirty whether or not policy captures it into the snapshot.
+          workingTreeDirty = true;
+          if (!policy.includeTrackedModifications) continue;
         }
 
         const observed = captureEntry(repoPath, record.path, untracked ? "untracked" : "modified");
@@ -271,7 +285,9 @@ export function createSourceSnapshotAuthority(deps: { readonly now?: () => numbe
         repositoryRoot: repoPath,
         headCommit,
         headTree,
-        clean: entries.length === 0,
+        // V2-016A/M5: clean iff the working tree had NO relevant dirtiness — including dirty state
+        // that was EXCLUDED (a modified tracked file over the capture limit). Never `entries.length`.
+        clean: !workingTreeDirty,
         policy,
         entries: Object.freeze(entries),
         exclusions: Object.freeze(exclusions),
