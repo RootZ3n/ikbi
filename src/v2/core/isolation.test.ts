@@ -388,6 +388,54 @@ test("single authority: only the TOOL EXECUTOR writes candidate files, and it ho
   assert.equal(/writeFileSync|readFileSync|rmSync|unlinkSync|mkdirSync/.test(source), false, "no raw filesystem call");
 });
 
+test("single authority: only the repair module mints a repair-brief identity (V2-013)", () => {
+  const allowed = new Set([join(V2_DIR, "core", "repair.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    if (/contentDigest\s*\(\s*"repair_brief/.test(stripComments(readFileSync(file, "utf8")))) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "the repair-brief identity belongs to src/v2/core/repair.ts alone");
+});
+
+test("single authority: only the session controller EXTRACTS a repair brief (V2-013)", () => {
+  // `buildRepairBrief` is called only by the session controller — AFTER the ONE recovery
+  // authority decided a semantic-repair retry. The critic, verifier and builder can never
+  // create one.
+  const allowed = new Set([join(V2_DIR, "core", "session.ts"), join(V2_DIR, "core", "repair.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    if (/buildRepairBrief\s*\(/.test(stripComments(readFileSync(file, "utf8")))) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "no component extracts a repair brief on its own");
+});
+
+test("single authority: a semantic repair is AUTHORIZED only by the recovery decision (V2-013)", () => {
+  // The session only extracts a brief when the recovery decision's mode is semantic_repair. The
+  // decision is `decideRecovery`'s to make; the session reads `decision.mode` and does not invent
+  // a repair on its own.
+  const sessionSrc = stripComments(readFileSync(join(V2_DIR, "core", "session.ts"), "utf8"));
+  assert.ok(/decision\.mode\s*===\s*"semantic_repair"/.test(sessionSrc), "the session extracts a brief only when recovery authorized a semantic repair");
+});
+
+test("single authority: the REPAIR BRIEF carries no reusable prior authority (V2-013)", () => {
+  // The brief is bounded HISTORICAL evidence — never a live capability. It must not reference an
+  // observation id, a mutation id, or a workspace path/id type that a new attempt could act on.
+  const specs = importSpecifiers(readFileSync(join(V2_DIR, "core", "repair.ts"), "utf8"));
+  for (const forbidden of ["V2ObservationDigest", "V2MutationDigest", "V2WorkspaceId", "./workspace"]) {
+    assert.equal(specs.some((sp) => sp.includes(forbidden)), false, `repair.ts must not import ${forbidden}`);
+  }
+  const source = stripComments(readFileSync(join(V2_DIR, "core", "repair.ts"), "utf8"));
+  assert.equal(/observationId|mutationId|workspacePath|workspaceId/.test(source), false, "the repair brief holds no reusable observation/mutation/workspace handle");
+});
+
+test("single authority: repair evidence crosses the untrusted boundary (V2-013)", () => {
+  // Every free-text repair payload the model sees is fenced through the injected boundary.
+  const source = stripComments(readFileSync(join(V2_DIR, "core", "repair.ts"), "utf8"));
+  assert.ok(/boundary\.wrap\s*\(/.test(source), "renderRepairBrief wraps untrusted payloads through the boundary");
+});
+
 test("single authority: only the recovery module mints a recovery/policy identity (V2-012)", () => {
   const allowed = new Set([join(V2_DIR, "core", "recovery.ts")]);
   const offenders: string[] = [];
@@ -1004,8 +1052,11 @@ test("single authority: the model-input renderer consumes the package and nothin
   // `./tools.js` is TYPES ONLY (`BuilderToolCall`): a rendered assistant turn has to be
   // able to carry the calls the model made, or the tool loop cannot round-trip. It is not
   // a way to reach a repository, which is what this guard is about.
+  // V2-013: `./repair.js` (the repair-brief renderer + system note) and `./builder.js` (the
+  // `UntrustedBoundary` type) are added — neither reaches a repository reader; the repair brief
+  // is bounded historical evidence and is fenced through the boundary.
   const specs = importSpecifiers(readFileSync(join(V2_DIR, "core", "prompt.ts"), "utf8"));
-  assert.deepEqual([...new Set(specs)].sort(), ["./context.js", "./identity.js", "./tools.js"], "the renderer reads the authorized package only");
+  assert.deepEqual([...new Set(specs)].sort(), ["./builder.js", "./context.js", "./identity.js", "./repair.js", "./tools.js"], "the renderer reads the authorized package + neutralized repair evidence only");
 });
 
 test("single authority: no v2 file imports v1 CONTEXT machinery", () => {

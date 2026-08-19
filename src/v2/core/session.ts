@@ -29,10 +29,12 @@ import {
   decideRecovery,
   recoveryDecisionRecordOf,
   DEFAULT_RECOVERY_POLICY,
+  type AttemptMode,
   type AttemptRecord,
   type RecoveryDecisionRecord,
   type RecoveryPolicy,
 } from "./recovery.js";
+import { buildRepairBrief, summarizeRepairBrief, type RepairBrief, type RepairBriefSummary } from "./repair.js";
 
 /** A hard ceiling on session attempts, independent of any policy value, as a loop guard. */
 export const SESSION_ATTEMPT_HARD_CAP = 8;
@@ -45,6 +47,8 @@ export interface V2BuildSessionReceipt {
   readonly attempts: readonly AttemptRecord[];
   /** Every recovery decision, in order. */
   readonly recoveryDecisions: readonly RecoveryDecisionRecord[];
+  /** Every repair brief the session extracted, in order — bounded evidence, no bodies. */
+  readonly repairBriefs: readonly RepairBriefSummary[];
   readonly finalAttemptRunId: string;
   readonly finalOutcome: RunTerminalOutcome;
   /** Present only when a publication actually landed on the final attempt. */
@@ -69,6 +73,8 @@ export interface V2BuildSessionResult {
   readonly attempts: readonly V2RunResult[];
   readonly ledger: readonly AttemptRecord[];
   readonly recoveryDecisions: readonly RecoveryDecisionRecord[];
+  /** Every repair brief extracted during the session, in order. */
+  readonly repairBriefs: readonly RepairBrief[];
   readonly receipt: V2BuildSessionReceipt;
 }
 
@@ -114,6 +120,7 @@ export async function executeV2BuildSession(request: V2TaskRequest, deps: V2Buil
   const attempts: V2RunResult[] = [];
   const ledger: AttemptRecord[] = [];
   const recoveryDecisions: RecoveryDecisionRecord[] = [];
+  const repairBriefs: RepairBrief[] = [];
 
   let attemptNumber = 0;
   // The bound is the policy's, clamped by the independent hard cap so a misconfigured policy can
@@ -121,21 +128,44 @@ export async function executeV2BuildSession(request: V2TaskRequest, deps: V2Buil
   const cap = Math.min(policy.maxAttempts, SESSION_ATTEMPT_HARD_CAP);
   let reconciliationRequired = false;
 
+  // SEMANTIC-REPAIR LINEAGE. `currentBrief` is the bounded historical evidence the NEXT attempt
+  // should learn from; `nextMode` records why the next attempt is being made. An environmental
+  // retry that interrupts a repair lineage KEEPS the same brief (the historical evidence is
+  // unchanged) — evidence reuse is not authority reuse. `semanticRepairsSoFar` bounds how many
+  // repair attempts one failure lineage may spend.
+  let currentBrief: RepairBrief | undefined;
+  let nextMode: AttemptMode = "initial";
+  let semanticRepairsSoFar = 0;
+
   while (attemptNumber < cap) {
     attemptNumber += 1;
+    const attemptMode = nextMode;
+    const briefForThisAttempt = currentBrief;
     // A FRESH run: its own id factory (fresh RunId), the FROZEN configuration, everything else
-    // exactly the single-attempt deps. The run captures its OWN source snapshot.
+    // exactly the single-attempt deps. The run captures its OWN source snapshot. When a repair
+    // brief is present it is handed to the run as ADVISORY, untrusted historical context — never
+    // as authority, and carrying NO workspace/observation/candidate pointer.
     const result = await runV2Build(request, {
       ...deps,
       ids: attemptIdFactory(attemptNumber),
       configuration: frozenConfiguration,
+      ...(briefForThisAttempt !== undefined ? { repairBrief: briefForThisAttempt } : {}),
     });
     attempts.push(result);
 
     const trigger = classifyAttempt(result);
-    ledger.push(attemptRecordOf({ buildSessionId, attemptNumber, result, trigger }));
+    ledger.push(
+      attemptRecordOf({
+        buildSessionId,
+        attemptNumber,
+        result,
+        trigger,
+        mode: attemptMode,
+        ...(briefForThisAttempt !== undefined ? { repairBriefId: briefForThisAttempt.repairBriefId, sourceAttemptRunId: briefForThisAttempt.sourceAttemptRunId } : {}),
+      }),
+    );
 
-    const decision = decideRecovery({ attemptNumber, result, policy });
+    const decision = decideRecovery({ attemptNumber, result, policy, semanticRepairsSoFar });
     recoveryDecisions.push(
       recoveryDecisionRecordOf({
         buildSessionId,
@@ -151,6 +181,23 @@ export async function executeV2BuildSession(request: V2TaskRequest, deps: V2Buil
 
     // The ONLY thing that makes a second attempt is an explicit retry authorization.
     if (!decision.authorizesNewAttempt) break;
+
+    if (decision.mode === "semantic_repair" && decision.repairTrigger !== undefined) {
+      // Extract a bounded, neutralized brief from THIS failed attempt; the next attempt learns
+      // from it. If extraction fails (no defect evidence), fall back to an evidence-free retry.
+      const brief = buildRepairBrief({ buildSessionId, result, trigger: decision.repairTrigger });
+      if (brief !== undefined) {
+        currentBrief = brief;
+        repairBriefs.push(brief);
+        semanticRepairsSoFar += 1;
+        nextMode = "semantic_repair";
+      } else {
+        nextMode = "environmental_retry";
+      }
+    } else {
+      // An environmental retry KEEPS the existing brief (lineage) but does not itself repair.
+      nextMode = "environmental_retry";
+    }
   }
 
   const final = attempts[attempts.length - 1]!;
@@ -162,6 +209,7 @@ export async function executeV2BuildSession(request: V2TaskRequest, deps: V2Buil
     recoveryPolicyId: policy.policyId,
     attempts: ledger,
     recoveryDecisions,
+    repairBriefs: repairBriefs.map(summarizeRepairBrief),
     finalAttemptRunId: final.runId,
     finalOutcome: final.outcome,
     totalAttempts: attempts.length,
@@ -180,6 +228,7 @@ export async function executeV2BuildSession(request: V2TaskRequest, deps: V2Buil
     attempts,
     ledger,
     recoveryDecisions,
+    repairBriefs,
     receipt,
   };
 }

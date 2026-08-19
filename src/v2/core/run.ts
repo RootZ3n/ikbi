@@ -97,6 +97,7 @@ import {
   type PromotionTarget,
 } from "./promotion.js";
 import { DEFAULT_DIFF_BUDGET, type CandidateDiffSource } from "./candidate-diff.js";
+import type { RepairBrief } from "./repair.js";
 import { summarizeRetrieval, type RetrievalReporter, type RetrievalSummary } from "./retrieval.js";
 import { summarizeSnapshot, type SourceSnapshotAuthority, type SourceSnapshotReader } from "./source.js";
 import {
@@ -370,6 +371,12 @@ export interface V2RunDeps {
    * `src/v2/runtime/index.ts`; tests supply a fake and stay hermetic.
    */
   readonly publisher: PromotionTarget;
+  /**
+   * OPTIONAL advisory repair evidence (V2-013). Present only when the session controller is
+   * making a semantic-repair attempt: bounded, neutralized historical evidence about a prior
+   * FAILED attempt, handed to the builder as untrusted context — never authority.
+   */
+  readonly repairBrief?: RepairBrief;
   readonly ids?: V2IdFactory;
   readonly now?: () => number;
   readonly probe?: RepoProbe;
@@ -678,6 +685,9 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
       executor,
       untrustedBoundary: deps.untrustedBoundary,
       mintInvocationId: () => ids.mint("invocation"),
+      // V2-013: advisory repair evidence from a prior FAILED attempt, when this run is a
+      // semantic-repair attempt. Untrusted, fenced, carrying no prior authority.
+      ...(deps.repairBrief !== undefined ? { repairBrief: deps.repairBrief } : {}),
       ...(deps.builderBudget !== undefined ? { budget: deps.builderBudget } : {}),
       ...(deps.aliases !== undefined ? { aliases: deps.aliases } : {}),
       now,

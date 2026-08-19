@@ -29,6 +29,8 @@
 import { contentDigest, type V2PromptDigest } from "./identity.js";
 import type { ContextPackage } from "./context.js";
 import type { BuilderToolCall } from "./tools.js";
+import { REPAIR_SYSTEM_NOTE, renderRepairBrief, type RepairBrief } from "./repair.js";
+import type { UntrustedBoundary } from "./builder.js";
 
 /**
  * A message as v2 renders it, before the transport's own shape is applied.
@@ -120,10 +122,22 @@ export function renderContextBlocks(pkg: ContextPackage): string {
  * run have different prompt identities — which is what makes an invocation record able to
  * say which turn it was without a counter anyone could get wrong.
  */
-export function renderBuilderInput(pkg: ContextPackage, conversation: readonly RenderedMessage[]): RenderedModelInput {
+export function renderBuilderInput(
+  pkg: ContextPackage,
+  conversation: readonly RenderedMessage[],
+  repair?: { readonly repairBrief: RepairBrief; readonly boundary: UntrustedBoundary },
+): RenderedModelInput {
+  // The ORIGINAL task and the current context come first and outrank everything. The repair
+  // brief — when present — is a distinct, LOWER-priority, untrusted historical block placed after
+  // the current context (so current source truth always outranks stale historical text), and the
+  // system contract gains one repair-aware paragraph ONLY on a repair attempt.
+  const systemContent = repair === undefined
+    ? BUILDER_SYSTEM_INSTRUCTION
+    : `${BUILDER_SYSTEM_INSTRUCTION}\n\n${REPAIR_SYSTEM_NOTE}`;
   const messages: readonly RenderedMessage[] = [
-    { role: "system", content: BUILDER_SYSTEM_INSTRUCTION },
+    { role: "system", content: systemContent },
     { role: "user", content: renderContextBlocks(pkg) },
+    ...(repair !== undefined ? [renderRepairBrief(repair.repairBrief, repair.boundary)] : []),
     ...conversation,
   ];
   return {

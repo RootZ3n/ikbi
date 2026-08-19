@@ -9,8 +9,8 @@ mutation authority), **V2-006A** (canonical source snapshot authority), **V2-006
 loop), **V2-007A** (untrusted tool-result neutralization), **V2-008** (canonical
 verification authority), **V2-009** (canonical critic / intent-alignment
 authority), **V2-010** (canonical disposition / adjudication authority), **V2-011**
-(canonical promotion / publication authority) and **V2-012** (canonical recovery controller +
-attempt ledger). This is an **advisory input to future work
+(canonical promotion / publication authority), **V2-012** (canonical recovery controller +
+attempt ledger) and **V2-013** (semantic repair as fresh-attempt evidence). This is an **advisory input to future work
 orders**, not a change plan and not permission to delete anything. Nothing in v1 was
 removed, disabled, or altered to produce it.
 
@@ -310,7 +310,7 @@ and nothing else may try again.
 | v1 system | What it retries | Verdict |
 | --- | --- | --- |
 | `src/modules/recovery/` (`decideRecovery` + `runRecovery` driver) | escalates to the NEXT model up the tier ladder | **REPLACE (shape adopted).** The decision AXIS is wrong for v2 — it selects a model, which v2 forbids in recovery (no escalation, no fallback). But its ATTEMPT-LEDGER, single-terminal-verdict and trust-deferral posture are the right design, and v2's `AttemptLedger` + one `decideRecovery` generalize them. v2's recovery decides retry-vs-stop on the SAME frozen policy. |
-| `worker-model/critic-fix-loop.ts` | re-runs the builder with the critic's feedback as a fix goal | **PARK → semantic-repair extension.** A critic `defects_found` in v2 is a COMPLETED adverse judgment (`stop_withheld`), never an automatic retry. Feeding defects back into the builder is a separate, later recovery extension once this controller is proven. A guard forbids any v2 import of it. |
+| `worker-model/critic-fix-loop.ts` | re-runs the builder with the critic's feedback as a fix goal | **REPLACE (done V2-013).** The CAPABILITY — a failure teaching the next build — is now v2's semantic repair (see *Semantic repair (V2-013)* below). But the MECHANICS are inverted: v1 reuses the workspace IN-PLACE, folds fix prose INTO the goal ("fix the fix"), and re-runs verify/critic on the mutated workspace. v2 extracts a bounded, identity-bound, NEUTRALIZED `RepairBrief` from the FAILED attempt's evidence and starts a whole FRESH attempt (new RunId/snapshot/workspace/candidate). A guard still forbids any v2 import of the v1 loop. |
 | `worker-model/critic-recovery.ts` / `fix-recovery-lab.ts` / `fix*.ts` | fixer passes on a failed candidate | **PARK.** Same reason — semantic repair. Not in this slice. |
 | verifier-driven iterative loop (`runIterativeLoop`) | re-runs the builder on RED checks | **REPLACE.** A verification `fail` in v2 is `stop_rejected`; there is no builder re-entry. Objective-red repair folds into the semantic-repair extension. |
 | provider transport fallback / retry (`ProviderInvoker`, `invoke-retry`) | a different provider / a second HTTP attempt | **REPLACE (removed).** v2's `InvocationAuthority` is already single-shot (V2-005). A transient provider failure is handled by RECOVERY making a NEW ATTEMPT on the SAME frozen policy — never a provider swap, never an in-authority retry. Proven: the invocation authority makes ONE call; the second attempt is the controller's. |
@@ -327,6 +327,38 @@ source requires an operator (no endless recapture); a degraded landing is reconc
 re-publish; and configuration is FROZEN at session start (a later attempt re-reads no profile or
 env). The invocation authority stays single-shot — the SECOND attempt exists because recovery
 authorized it, not because a lower subsystem quietly tried again.
+
+*(V2-013 note: the environmental-retry "adverse judgments are never retried" clause is now
+qualified — a CONCRETE adverse judgment may earn ONE semantic-REPAIR attempt, still a fresh
+attempt authorized only by `decideRecovery`. See below.)*
+
+## Semantic repair (V2-013)
+
+The one thing v1's critic-fix loop got right — a failure can teach the next build — v2 keeps,
+but rebuilt so it cannot become an in-place fix loop. A failed candidate is HISTORY; a repair is
+a NEW ATTEMPT that carries only bounded, neutralized EVIDENCE about what went wrong.
+
+| v1 system | Mechanics | Verdict |
+| --- | --- | --- |
+| `critic-fix-loop.ts` — `formatValidatedFixGoal` / `formatCriticFixGoal` | turns validated defects into a builder fix GOAL (prose) | **REFINE (the idea) → REPLACE (the shape).** v2 does not fold fix prose into the task ("fix the fix"). It extracts a structured `RepairBrief` (defect ids/categories/severities/paths + bounded check output) presented as a DISTINCT, lower-priority, untrusted historical block — the original task is unchanged. |
+| `critic-fix-loop.ts` — the loop (`builder`→`verifier`→`critic` re-run in place) | reuses the SAME workspace; re-verifies/re-critiques the mutated tree | **REPLACE.** v2 makes a FRESH attempt: new RunId, new source snapshot, new workspace, new candidate — the prior candidate is never mutated or resurrected, and the whole pipeline re-runs independently. |
+| `critic-recovery.ts` / `fix-recovery-lab.ts` / `fix*.ts` | fixer passes | **PARK.** Still not adopted; the semantic-repair capability is now the `RepairBrief` path. |
+| `correction-library` | operator-approved cross-run memory | **PARK.** Deliberately NOT auto-wired — the `RepairBrief` is run-local historical evidence only, never a global memory. |
+| provider transient classification (`f.retryable` fallback) | — | **HARDENED (V2-012 audit cutover).** The former `TRANSIENT_PROVIDER_CODES.has(code) \|\| f.retryable` is now the CLOSED code set ALONE — a provider failure is transient iff its code is explicitly recognized, never because a boolean was set upstream. |
+
+**The load-bearing v2 additions v1 has no equivalent of:** the `RepairBrief` is the ONLY thing
+that crosses the attempt boundary — bounded (checks/defects/excerpts capped, truncation
+recorded), identity-bound (content-addressed over the source attempt + its failure evidence +
+the trigger), and NEUTRALIZED (every free-text payload is fenced through the V2-007A boundary;
+trusted provenance — ids, verdict enums, statuses — stays plain). It holds NO workspace pointer,
+NO observation id, NO mutation id, NO candidate bytes, so no prior authority is actionable in the
+new attempt. Only `decideRecovery` authorizes a semantic repair (a CONCRETE `verification_failed`
+or `critic_defects`, never `no_checks` or `critic_indeterminate` — nothing to repair — and never
+a malformed critic — a protocol failure); the budget is bounded (`maxSemanticRepairAttempts`,
+default 1); the model policy is FROZEN (no escalation, no fallback, no profile switch); current
+source truth outranks the stale repair text; and a semantic repair interrupted by an
+environmental fault KEEPS the same brief IDENTITY (evidence reuse) while still getting a fresh
+run/snapshot/workspace (never authority reuse).
 
 ## Standing constraints for later slices
 
@@ -437,4 +469,18 @@ authorized it, not because a lower subsystem quietly tried again.
    switch; the invocation authority stays single-shot and the session freezes configuration at
    its start. NO evidence crosses the attempt boundary. A `promoted_degraded` landing is
    `reconciliation_required`, NEVER re-published; git ref/tree state is authoritative over any
-   journal, which is never required.
+   journal, which is never required. *(V2-013 qualifies the "adverse judgment is never retried"
+   clause: a CONCRETE adverse judgment may earn ONE semantic-repair attempt — see #21.)*
+21. **Semantic repair is a fresh attempt with neutralized evidence, never an in-place fix.**
+   *(V2-013)* A failed candidate is HISTORY. When a CONCRETE adverse judgment (verification FAIL
+   or critic DEFECTS_FOUND) occurs, `decideRecovery` — and only it — may authorize ONE
+   semantic-repair attempt. That attempt is a genuinely new run (new RunId, snapshot, workspace,
+   candidate) that independently rebuilds, verifies, criticizes, adjudicates and publishes. The
+   ONLY thing carried forward is a bounded, identity-bound, NEUTRALIZED `RepairBrief`: it holds no
+   workspace/observation/mutation handle and no candidate bytes, and every free-text payload is
+   fenced through the untrusted boundary. `no_checks`, `critic_indeterminate` and a malformed
+   critic are NEVER repaired. The model policy is frozen (no escalation/fallback/profile switch),
+   the repair budget is bounded (default 1), current source truth outranks the repair text, and
+   the correction library is never auto-wired. Evidence reuse across a repair lineage is not
+   authority reuse — no stale candidate/observation/verification/critic/disposition/promotion
+   crosses the boundary.

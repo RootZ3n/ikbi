@@ -244,7 +244,9 @@ test("session: a TRANSIENT provider failure is auto-retried — invocation stays
 
 // ── adverse judgments are NEVER retried ───────────────────────────────────────
 
-test("session: a CRITIC DEFECT is NOT retried (no critic-fix loop)", async () => {
+const NO_REPAIR = buildRecoveryPolicy({ retryOnVerificationFailureForRepair: false, retryOnCriticDefectsForRepair: false });
+
+test("session: a CRITIC DEFECT with repair OFF is NOT retried (no in-place critic-fix loop)", async () => {
   const transport: InvocationTransport = {
     send: async (input) => {
       const isCritic = !input.messages.some((m) => m.role === "tool") && input.messages.some((m) => m.content.includes("critic"));
@@ -252,15 +254,15 @@ test("session: a CRITIC DEFECT is NOT retried (no critic-fix loop)", async () =>
       return okTransport().send(input);
     },
   };
-  const session = await executeV2BuildSession(build, baseDeps({ transport }));
+  const session = await executeV2BuildSession(build, baseDeps({ transport, recoveryPolicy: NO_REPAIR }));
   assert.equal(session.attempts.length, 1, "no retry — a defect is a completed judgment");
   assert.equal(session.outcome.kind, "withheld");
   assert.equal(session.recoveryDecisions[0]!.kind, "stop_withheld");
 });
 
-test("session: a VERIFICATION FAIL is NOT retried (no semantic repair)", async () => {
+test("session: a VERIFICATION FAIL with repair OFF is NOT retried", async () => {
   const checkRunner = { run: async () => ({ ...CHECK_PASS, exitCode: 1 }) };
-  const session = await executeV2BuildSession(build, baseDeps({ checkRunner }));
+  const session = await executeV2BuildSession(build, baseDeps({ checkRunner, recoveryPolicy: NO_REPAIR }));
   assert.equal(session.attempts.length, 1);
   assert.equal(session.attempts[0]!.receipt.verification!.verdict, "fail");
   assert.equal(session.outcome.kind, "rejected");

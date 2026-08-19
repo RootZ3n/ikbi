@@ -97,6 +97,13 @@ export type V2DispositionPolicyDigest = V2Digest<"disposition_policy">;
 /** Content address of ONE recovery policy — the explicit rules the recovery controller applied. */
 export type V2RecoveryPolicyDigest = V2Digest<"recovery_policy">;
 /**
+ * Content address of ONE repair brief — the bounded, neutralized historical evidence extracted
+ * from a completed FAILED attempt so the NEXT fresh attempt can learn what went wrong. Identity
+ * moves when the source attempt, its failure evidence, or the trigger moves; the clock and the
+ * absolute workspace path are provenance, never identity.
+ */
+export type V2RepairBriefId = V2Digest<"repair_brief">;
+/**
  * Content address of ONE recovery decision — what a completed attempt's outcome, under this
  * recovery policy, lawfully implies happens next. The clock/event is provenance, not identity.
  */

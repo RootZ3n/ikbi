@@ -71,7 +71,9 @@ const CLASSIFY: readonly [string, V2RunResult, RecoveryTrigger][] = [
   ["withheld target_moved", result({ outcome: { kind: "withheld", candidateId: "c" as never, verificationId: "v" as never, reason: "target_moved" } }), "target_moved"],
   ["withheld dirty", result({ outcome: { kind: "withheld", candidateId: "c" as never, verificationId: "v" as never, reason: "unsupported_publication" } }), "dirty_source"],
   ["withheld operator", result({ outcome: { kind: "withheld", candidateId: "c" as never, verificationId: "v" as never, reason: "operator" } }), "operator_required"],
-  ["withheld policy", result({ outcome: { kind: "withheld", candidateId: "c" as never, verificationId: "v" as never, reason: "policy" } }), "semantic_withheld"],
+  ["withheld critic_defects", result({ outcome: { kind: "withheld", candidateId: "c" as never, verificationId: "v" as never, reason: "policy" }, dispositionPrimaryReason: "critic_defects" }), "critic_defects"],
+  ["withheld indeterminate", result({ outcome: { kind: "withheld", candidateId: "c" as never, verificationId: "v" as never, reason: "policy" }, dispositionPrimaryReason: "critic_indeterminate" }), "critic_indeterminate"],
+  ["withheld no_checks", result({ outcome: { kind: "withheld", candidateId: "c" as never, verificationId: "v" as never, reason: "policy" }, dispositionPrimaryReason: "no_checks" }), "no_checks"],
   ["withheld governance", result({ outcome: { kind: "withheld", candidateId: "c" as never, verificationId: "v" as never, reason: "governance" } }), "governance_withheld"],
   ["rejected", result({ outcome: { kind: "rejected", reason: "verification_red" } }), "verification_failed"],
   ["quarantined timeout", result({ outcome: { kind: "quarantined", reason: "adjudication_incomplete", detail: "verification_timeout" }, dispositionPrimaryReason: "verification_timeout" }), "verification_timeout"],
@@ -107,16 +109,46 @@ test("decide: accepted degraded ⇒ reconciliation_required, NEVER a new attempt
   assert.equal(d.authorizesNewAttempt, false, "the ref already moved — never re-publish");
 });
 
-test("decide: verification FAIL ⇒ stop_rejected, NO retry (no semantic repair)", () => {
+test("decide: verification FAIL ⇒ ONE semantic-repair attempt under the default policy", () => {
   const d = decide(stub("rejected"));
+  assert.equal(d.kind, "retry_fresh_attempt");
+  assert.equal(d.mode, "semantic_repair");
+  assert.equal(d.repairTrigger, "verification_failure");
+  assert.equal(d.authorizesNewAttempt, true);
+});
+
+test("decide: verification FAIL with repair DISABLED ⇒ stop_rejected", () => {
+  const noRepair = buildRecoveryPolicy({ retryOnVerificationFailureForRepair: false });
+  const d = decide(stub("rejected"), 1, noRepair);
   assert.equal(d.kind, "stop_rejected");
+  assert.equal(d.reason, "repair_disabled_by_policy");
   assert.equal(d.authorizesNewAttempt, false);
 });
 
-test("decide: critic defects (withheld policy) ⇒ stop_withheld, NO retry (no critic-fix loop)", () => {
-  const d = decide(stub("withheld policy"));
-  assert.equal(d.kind, "stop_withheld");
-  assert.equal(d.authorizesNewAttempt, false);
+test("decide: critic defects ⇒ ONE semantic-repair attempt under the default policy", () => {
+  const d = decide(stub("withheld critic_defects"));
+  assert.equal(d.kind, "retry_fresh_attempt");
+  assert.equal(d.mode, "semantic_repair");
+  assert.equal(d.repairTrigger, "critic_defects");
+});
+
+test("decide: critic defects with repair DISABLED ⇒ stop_withheld (no critic-fix loop)", () => {
+  const noRepair = buildRecoveryPolicy({ retryOnCriticDefectsForRepair: false });
+  assert.equal(decide(stub("withheld critic_defects"), 1, noRepair).kind, "stop_withheld");
+});
+
+test("decide: a semantic-repair attempt that ITSELF fails again is NOT repaired (budget=1)", () => {
+  // repairsSoFar=1 ⇒ the one semantic-repair budget is spent ⇒ stop adverse.
+  const d = decideRecovery({ attemptNumber: 2, result: stub("rejected"), policy: P, semanticRepairsSoFar: 1 });
+  assert.equal(d.kind, "stop_rejected");
+  assert.equal(d.reason, "repair_budget_exhausted");
+});
+
+test("decide: critic INDETERMINATE and NO_CHECKS are NEVER repaired", () => {
+  assert.equal(decide(stub("withheld indeterminate")).kind, "stop_withheld");
+  assert.equal(decide(stub("withheld indeterminate")).authorizesNewAttempt, false);
+  assert.equal(decide(stub("withheld no_checks")).kind, "stop_withheld");
+  assert.equal(decide(stub("withheld no_checks")).authorizesNewAttempt, false);
 });
 
 test("decide: dirty source ⇒ require_operator, NEVER an auto-retry over the same dirt", () => {

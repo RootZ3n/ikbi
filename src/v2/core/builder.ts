@@ -45,6 +45,7 @@ import {
 } from "./candidate.js";
 import { BUILDER_TOOLS, isToolFailure, parseToolCall, renderToolProvenance, untrustedToolPayload, type BuilderToolCall, type ParsedToolCall, type ToolOutcome } from "./tools.js";
 import { renderBuilderInput, type RenderedMessage } from "./prompt.js";
+import type { RepairBrief } from "./repair.js";
 import { invokeAuthorized, type InvocationTransport, type ServedModelAlias, type V2InvocationRecord } from "./invocation.js";
 import type { ContextPackage } from "./context.js";
 import type { ModelResolutionDecision } from "./resolver.js";
@@ -201,6 +202,12 @@ export interface BuilderRunInput {
    * layer where the real fence cannot.
    */
   readonly untrustedBoundary: UntrustedBoundary;
+  /**
+   * OPTIONAL advisory repair evidence from a prior FAILED attempt (V2-013). When present it is
+   * rendered as ONE untrusted, fenced historical block after the context — never as authority,
+   * carrying no workspace/observation/candidate pointer. Absent on an initial attempt.
+   */
+  readonly repairBrief?: RepairBrief;
   /** Mints one fresh invocation id per turn. */
   readonly mintInvocationId: () => V2InvocationId;
   readonly budget?: BuilderBudget;
@@ -240,7 +247,7 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
     // ONE TURN = ONE INVOCATION, through the one authority. There is no other doorway
     // to a model in v2, and the controller does not hold a transport it could use
     // directly — it hands the authority the one it was given.
-    const rendered = renderBuilderInput(input.contextPackage, conversation);
+    const rendered = renderBuilderInput(input.contextPackage, conversation, input.repairBrief !== undefined ? { repairBrief: input.repairBrief, boundary: input.untrustedBoundary } : undefined);
     const invocationId = input.mintInvocationId();
     const called = await invokeAuthorized({
       runId: input.runId,

@@ -106,6 +106,7 @@ function runCli(root: string, server: FakeProviderServer, args: readonly string[
       IKBI_MODEL_DRIVER: "m1",
       IKBI_MODEL_BUILDER: "m1",
       IKBI_MODEL_CRITIC: "m1",
+      IKBI_RECOVERY_MAX_ATTEMPTS: "1",
       ...env,
       ...loopbackEgressEnv(server),
     },
