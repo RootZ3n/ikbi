@@ -200,6 +200,11 @@ export function classifyAttempt(result: V2RunResult): RecoveryTrigger {
         return TRANSIENT_PROVIDER_CODES.has(f.code) ? "provider_transient" : "provider_permanent";
       }
       if (f.category === "build") return "build_failed";
+      // A `policy` failure is an authority saying no — for V2-014 that authority is the session
+      // COST BUDGET. Work so far may be valid; the wallet is simply spent. That is an
+      // OPERATOR-required condition, never an environmental retry: a fresh attempt spends the
+      // SAME exhausted session budget and would only stop again.
+      if (f.category === "policy") return "operator_required";
       // internal / promotion(wrong_evidence) / not_implemented / context / resolution / task /
       // preflight / mutation / workspace — engine or configuration defects, not retryable.
       return "wiring_defect";

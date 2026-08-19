@@ -23,6 +23,7 @@ import type { ConfigurationInputs, ConfigurationSource } from "../core/config.js
 import type { V2RunResult } from "../core/result.js";
 import { runV2Build, type RepoProbe , type V2RunDeps } from "../core/run.js";
 import { executeV2BuildSession, type V2BuildSessionResult } from "../core/session.js";
+import { buildCostBudgetPolicy, MICRO_USD_PER_USD, type CostBudgetPolicy, type PricingCatalog } from "../core/cost.js";
 import { buildRecoveryPolicy, type RecoveryPolicy } from "../core/recovery.js";
 import type { ContextSource } from "../core/context.js";
 import type { InvocationTransport } from "../core/invocation.js";
@@ -52,6 +53,30 @@ function envRecoveryMaxAttempts(): number | undefined {
   const raw = (process.env.IKBI_RECOVERY_MAX_ATTEMPTS ?? "").trim();
   const n = Number.parseInt(raw, 10);
   return Number.isFinite(n) && n >= 1 ? n : undefined;
+}
+
+/**
+ * The operator's session COST BUDGET, read ONCE at session start (V2-014). Every ceiling is
+ * OPT-IN — a default cap would be a hidden authority. `IKBI_V2_MAX_SESSION_COST_USD` sets a
+ * whole-session dollar ceiling; `IKBI_V2_MAX_INVOCATIONS` caps model calls;
+ * `IKBI_V2_COST_UNKNOWN=allow|stop|operator` chooses what happens when cost cannot be bounded
+ * under a ceiling (default: operator-required). No ceiling ⇒ no policy (the safe no-cap default).
+ */
+function envCostBudgetPolicy(): CostBudgetPolicy | undefined {
+  const usdRaw = (process.env.IKBI_V2_MAX_SESSION_COST_USD ?? "").trim();
+  const invRaw = (process.env.IKBI_V2_MAX_INVOCATIONS ?? "").trim();
+  const usd = Number.parseFloat(usdRaw);
+  const inv = Number.parseInt(invRaw, 10);
+  const maxSessionCostMicroUsd = Number.isFinite(usd) && usd > 0 ? Math.round(usd * MICRO_USD_PER_USD) : undefined;
+  const maxInvocations = Number.isFinite(inv) && inv >= 1 ? inv : undefined;
+  if (maxSessionCostMicroUsd === undefined && maxInvocations === undefined) return undefined;
+  const behaviorRaw = (process.env.IKBI_V2_COST_UNKNOWN ?? "").trim().toLowerCase();
+  const behaviorWhenCostUnknown = behaviorRaw === "allow" ? "allow_unknown" : behaviorRaw === "stop" ? "stop_on_unknown" : "operator_required_on_unknown";
+  return buildCostBudgetPolicy({
+    ...(maxSessionCostMicroUsd !== undefined ? { maxSessionCostMicroUsd } : {}),
+    ...(maxInvocations !== undefined ? { maxInvocations } : {}),
+    behaviorWhenCostUnknown,
+  });
 }
 import { createInvocationTransport } from "./invocation-transport.js";
 import { createProductionWorkspaceAuthorities } from "./workspace-authority.js";
@@ -164,6 +189,10 @@ export interface ProductionRunDeps {
   readonly publisher?: V2RunDeps["publisher"];
   /** The frozen recovery policy for a build session. Defaults to the safe development policy. */
   readonly recoveryPolicy?: RecoveryPolicy;
+  /** The frozen session cost budget policy (V2-014). Defaults to the operator's env cap, or none. */
+  readonly costBudgetPolicy?: CostBudgetPolicy;
+  /** The frozen session pricing catalog (V2-014). Defaults to the shipped local catalog. */
+  readonly pricingCatalog?: PricingCatalog;
   readonly transport?: InvocationTransport;
   readonly workspaces?: WorkspaceAuthority;
   readonly mutations?: StateBoundMutationAuthority;
@@ -281,8 +310,13 @@ export async function runV2BuildSessionProduction(request: V2TaskRequest, deps: 
   // safe default. Nothing rereads it between attempts.
   const envMax = envRecoveryMaxAttempts();
   const recoveryPolicy = deps.recoveryPolicy ?? (envMax !== undefined ? buildRecoveryPolicy({ maxAttempts: envMax }) : undefined);
+  // Same freeze discipline for the cost budget: an injected policy wins, else the operator's env
+  // cap (read once), else no cap. The pricing catalog is the shipped constant unless injected.
+  const costBudgetPolicy = deps.costBudgetPolicy ?? envCostBudgetPolicy();
   return executeV2BuildSession(request, {
     ...runDeps,
+    ...(costBudgetPolicy !== undefined ? { costBudgetPolicy } : {}),
+    ...(deps.pricingCatalog !== undefined ? { pricingCatalog: deps.pricingCatalog } : {}),
     ...(recoveryPolicy !== undefined ? { recoveryPolicy } : {}),
   });
 }

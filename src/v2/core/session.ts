@@ -35,6 +35,14 @@ import {
   type RecoveryPolicy,
 } from "./recovery.js";
 import { buildRepairBrief, summarizeRepairBrief, type RepairBrief, type RepairBriefSummary } from "./repair.js";
+import {
+  SessionCostController,
+  DEFAULT_COST_BUDGET_POLICY,
+  V2_SHIPPED_PRICING,
+  type BuildSessionCostSummary,
+  type CostBudgetPolicy,
+  type PricingCatalog,
+} from "./cost.js";
 
 /** A hard ceiling on session attempts, independent of any policy value, as a loop guard. */
 export const SESSION_ATTEMPT_HARD_CAP = 8;
@@ -58,6 +66,13 @@ export interface V2BuildSessionReceipt {
   readonly totalInvocations: number;
   /** True when the final attempt landed but its post-CAS bookkeeping did not finish. */
   readonly reconciliationRequired: boolean;
+  /**
+   * THE canonical cost account of the whole session (V2-014). Derived by construction from the
+   * per-invocation cost ledger — every InvocationId counted exactly once, unknown usage/price
+   * kept explicitly unknown, and `sum(attempt known) == session known`. Spans every attempt,
+   * including recovery and semantic repair: no attempt reset the budget or erased earlier spend.
+   */
+  readonly cost: BuildSessionCostSummary;
   readonly startedAt: number;
   readonly endedAt: number;
 }
@@ -82,6 +97,17 @@ export interface V2BuildSessionResult {
 export interface V2BuildSessionDeps extends V2RunDeps {
   /** The frozen recovery policy the controller applies. Defaults to the safe development policy. */
   readonly recoveryPolicy?: RecoveryPolicy;
+  /**
+   * The session COST BUDGET policy (V2-014). Frozen at session start; every attempt spends the
+   * same wallet under it. Defaults to `DEFAULT_COST_BUDGET_POLICY` (no ceiling — the operator
+   * opts into a limit; a default cap would be a hidden authority).
+   */
+  readonly costBudgetPolicy?: CostBudgetPolicy;
+  /**
+   * The PRICING CATALOG frozen for this session. Defaults to the shipped local catalog. A rate
+   * cannot change mid-session — the same catalog id prices every attempt, including retries.
+   */
+  readonly pricingCatalog?: PricingCatalog;
   /** Mints the ONE session identity. Injected for hermetic tests. */
   readonly sessionId?: V2BuildSessionId;
   /**
@@ -117,6 +143,14 @@ export async function executeV2BuildSession(request: V2TaskRequest, deps: V2Buil
   const frozenLoad = await deps.configuration.load(request.profile !== undefined ? { profileOverride: request.profile } : {});
   const frozenConfiguration = freezeConfiguration(frozenLoad);
 
+  // COST + BUDGET FREEZE (V2-014). One controller spans the ENTIRE session — every attempt,
+  // including recovery and semantic repair, charges this one wallet, so no attempt resets the
+  // budget or erases earlier spend. The pricing catalog and budget policy are frozen here,
+  // alongside the configuration, and never re-read between attempts.
+  const pricingCatalog = deps.pricingCatalog ?? V2_SHIPPED_PRICING;
+  const costBudgetPolicy = deps.costBudgetPolicy ?? DEFAULT_COST_BUDGET_POLICY;
+  const costController = new SessionCostController({ buildSessionId, catalog: pricingCatalog, policy: costBudgetPolicy });
+
   const attempts: V2RunResult[] = [];
   const ledger: AttemptRecord[] = [];
   const recoveryDecisions: RecoveryDecisionRecord[] = [];
@@ -141,17 +175,27 @@ export async function executeV2BuildSession(request: V2TaskRequest, deps: V2Buil
     attemptNumber += 1;
     const attemptMode = nextMode;
     const briefForThisAttempt = currentBrief;
-    // A FRESH run: its own id factory (fresh RunId), the FROZEN configuration, everything else
-    // exactly the single-attempt deps. The run captures its OWN source snapshot. When a repair
-    // brief is present it is handed to the run as ADVISORY, untrusted historical context — never
-    // as authority, and carrying NO workspace/observation/candidate pointer.
+    const attemptIds = attemptIdFactory(attemptNumber);
+    // A FRESH run: its own id factory (fresh RunId), the FROZEN configuration, the ONE session
+    // cost guard, everything else exactly the single-attempt deps. The run captures its OWN
+    // source snapshot. When a repair brief is present it is handed to the run as ADVISORY,
+    // untrusted historical context — never as authority, and carrying NO workspace pointer.
     const result = await runV2Build(request, {
       ...deps,
-      ids: attemptIdFactory(attemptNumber),
+      ids: attemptIds,
       configuration: frozenConfiguration,
+      admission: costController,
       ...(briefForThisAttempt !== undefined ? { repairBrief: briefForThisAttempt } : {}),
     });
     attempts.push(result);
+    // Reconcile this attempt's cost: charge any records the live path did not (idempotent), and
+    // count calls that reached the wire, failed, and left no usage (real, cost unknown).
+    costController.reconcileAttempt({
+      runId: result.runId,
+      attemptNumber,
+      records: result.invocations,
+      totalInvocationCount: result.receipt.evidence.invocations,
+    });
 
     const trigger = classifyAttempt(result);
     ledger.push(
@@ -204,6 +248,9 @@ export async function executeV2BuildSession(request: V2TaskRequest, deps: V2Buil
   const endedAt = now();
   const acceptedPromotionId = final.outcome.kind === "accepted" ? final.receipt.promotion?.promotionId : undefined;
 
+  // THE canonical session cost account — derived by construction from the per-invocation ledger.
+  const cost = costController.sessionSummary();
+
   const receipt: V2BuildSessionReceipt = {
     buildSessionId,
     recoveryPolicyId: policy.policyId,
@@ -213,8 +260,11 @@ export async function executeV2BuildSession(request: V2TaskRequest, deps: V2Buil
     finalAttemptRunId: final.runId,
     finalOutcome: final.outcome,
     totalAttempts: attempts.length,
-    totalInvocations: attempts.reduce((n, a) => n + a.receipt.evidence.invocations, 0),
+    // Counted from the cost ledger's dedup'd invocation total — the SAME source as the cost
+    // summary, so the invocation count and the cost can never disagree.
+    totalInvocations: cost.totalInvocations,
     reconciliationRequired,
+    cost,
     startedAt,
     endedAt,
     ...(acceptedPromotionId !== undefined ? { acceptedPromotionId } : {}),

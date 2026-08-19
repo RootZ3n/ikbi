@@ -1134,6 +1134,50 @@ test("single authority: the catalog module cannot even IMPORT a preference", () 
   assert.deepEqual([...new Set(specs)].sort(), ["../core/config.js"], "the catalog module reads facts only");
 });
 
+// ---------------------------------------------------------------------------
+// V2-014 — SINGLE COST / ACCOUNTING AUTHORITY
+// ---------------------------------------------------------------------------
+
+test("single authority: only the cost module defines per-token pricing rates", () => {
+  // A second place defining `*PerMillion*` rates is how a shadow pricing table would fork the
+  // one accounting truth. There is exactly one, in src/v2/core/cost.ts.
+  const costFile = join(V2_DIR, "core", "cost.ts");
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (file === costFile || file.endsWith(".test.ts")) continue;
+    if (/PerMillion/.test(readFileSync(file, "utf8"))) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "token pricing rates live in src/v2/core/cost.ts alone");
+});
+
+test("single authority: the budget authority does not resolve or select models", () => {
+  // Budget is governance, not selection. The cost module must not import the resolver, the
+  // inventory catalog, the profile source or operator defaults — anything it could use to
+  // choose or downgrade a model. It prices and admits; it never picks.
+  const specs = new Set(importSpecifiers(readFileSync(join(V2_DIR, "core", "cost.ts"), "utf8")));
+  for (const forbidden of ["./resolver.js", "../runtime/model-catalog.js", "./context.js", "./prompt.js"]) {
+    assert.ok(!specs.has(forbidden), `the cost module must not import ${forbidden} — budget is not model selection`);
+  }
+});
+
+test("single authority: the resolver does not inspect the cost/budget module", () => {
+  // Model selection must not read a budget. The resolver stays a pure selection authority.
+  const specs = new Set(importSpecifiers(readFileSync(join(V2_DIR, "core", "resolver.ts"), "utf8")));
+  assert.ok(!specs.has("./cost.js"), "the resolver must not import the cost/budget module");
+});
+
+test("single authority: nothing outside the invocation authority reads provider usage into cost", () => {
+  // Cost is derived ONLY from V2InvocationRecord.usage (the invocation authority's observed
+  // fact). No other v2 module may synthesize an `ObservedUsage` to feed accounting.
+  const allowed = new Set([join(V2_DIR, "core", "cost.ts"), join(V2_DIR, "core", "invocation.ts"), join(V2_DIR, "runtime", "invocation-transport.ts"), join(V2_DIR, "core", "result.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    if (/\bObservedUsage\b/.test(readFileSync(file, "utf8"))) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "observed usage flows from the invocation authority into cost, nowhere else");
+});
+
 test("isolation: v1 does not import v2, except the single registration line", () => {
   const offenders: string[] = [];
   for (const file of tsFiles(SRC)) {

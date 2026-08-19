@@ -47,6 +47,7 @@ import { BUILDER_TOOLS, isToolFailure, parseToolCall, renderToolProvenance, untr
 import { renderBuilderInput, type RenderedMessage } from "./prompt.js";
 import type { RepairBrief } from "./repair.js";
 import { invokeAuthorized, type InvocationTransport, type ServedModelAlias, type V2InvocationRecord } from "./invocation.js";
+import type { InvocationAdmission } from "./cost.js";
 import type { ContextPackage } from "./context.js";
 import type { ModelResolutionDecision } from "./resolver.js";
 import type { RunFailure } from "./failure.js";
@@ -212,6 +213,12 @@ export interface BuilderRunInput {
   readonly mintInvocationId: () => V2InvocationId;
   readonly budget?: BuilderBudget;
   readonly aliases?: readonly ServedModelAlias[];
+  /**
+   * OPTIONAL session cost-budget guard. When present, it is consulted BEFORE each model call
+   * (admission) and charged AFTER each successful one (accounting). Absent means no budget
+   * enforcement — every existing call path is unaffected.
+   */
+  readonly admission?: InvocationAdmission;
   readonly now?: () => number;
 }
 
@@ -248,6 +255,19 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
     // to a model in v2, and the controller does not hold a transport it could use
     // directly — it hands the authority the one it was given.
     const rendered = renderBuilderInput(input.contextPackage, conversation, input.repairBrief !== undefined ? { repairBrief: input.repairBrief, boundary: input.untrustedBoundary } : undefined);
+    const turnMaxOutputTokens = Math.min(budget.maxOutputTokens, input.contextPackage.budget.reservedCompletionTokens);
+    // PRE-CALL COST ADMISSION. BEFORE the money is spent, ask the session budget authority
+    // whether another model call is authorized. It never selects or downgrades a model — it
+    // only answers proceed / stop. A denial ends the builder with a structured, non-retryable
+    // policy failure; recovery treats cost exhaustion as operator-required, never a retry.
+    if (input.admission !== undefined) {
+      const admitted = input.admission.admitNext({
+        identity: { authorizedModelId: input.decision.modelId, sentProviderId: input.decision.providerId, sentProviderModelId: input.decision.providerModelId },
+        estimatedInputTokens: input.contextPackage.budget.availableInputTokens,
+        maxOutputTokens: turnMaxOutputTokens,
+      });
+      if (!admitted.admit) return partial(admitted.failure);
+    }
     const invocationId = input.mintInvocationId();
     const called = await invokeAuthorized({
       runId: input.runId,
@@ -258,7 +278,7 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
       rendered,
       tools: BUILDER_TOOLS,
       parameters: {
-        maxOutputTokens: Math.min(budget.maxOutputTokens, input.contextPackage.budget.reservedCompletionTokens),
+        maxOutputTokens: turnMaxOutputTokens,
         timeoutMs: budget.turnTimeoutMs,
       },
       transport: input.transport,
@@ -276,6 +296,10 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
       return partial(called.failure);
     }
     invocations.push(called.record);
+    // POST-CALL ACCOUNTING. Charge the observed usage to the session wallet as it happens, so
+    // the NEXT turn's admission sees the true remaining budget. Dedup is by InvocationId; the
+    // session's later reconcile charges the same record idempotently.
+    if (input.admission !== undefined) input.admission.charge(called.record);
 
     // The model's own turn goes back on the wire verbatim, including the calls it made.
     // A conversation that dropped them would leave the provider unable to match results

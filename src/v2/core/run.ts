@@ -81,6 +81,7 @@ import {
   type VerificationRecord,
 } from "./verification.js";
 import { generateCandidate, type BuilderBudget, type BuilderToolExecutor, type BuilderToolExecutorDeps, type UntrustedBoundary } from "./builder.js";
+import type { InvocationAdmission } from "./cost.js";
 import { judgeCandidate, summarizeCritic, type CriticRecord } from "./critic.js";
 import {
   judgeDisposition,
@@ -377,6 +378,13 @@ export interface V2RunDeps {
    * FAILED attempt, handed to the builder as untrusted context — never authority.
    */
   readonly repairBrief?: RepairBrief;
+  /**
+   * OPTIONAL session cost-budget guard (V2-014). Supplied by the BuildSession controller so a
+   * pre-call admission runs before every builder and critic invocation, and every observed
+   * usage is charged to the ONE session wallet. Absent for a bare single-attempt run — no
+   * budget enforcement, no accounting side-effects on any existing test path.
+   */
+  readonly admission?: InvocationAdmission;
   readonly ids?: V2IdFactory;
   readonly now?: () => number;
   readonly probe?: RepoProbe;
@@ -690,6 +698,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
       ...(deps.repairBrief !== undefined ? { repairBrief: deps.repairBrief } : {}),
       ...(deps.builderBudget !== undefined ? { budget: deps.builderBudget } : {}),
       ...(deps.aliases !== undefined ? { aliases: deps.aliases } : {}),
+      ...(deps.admission !== undefined ? { admission: deps.admission } : {}),
       now,
     });
 
@@ -762,6 +771,18 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     // structured judgment — a bare "fail" cannot become evidence. It is semantic evidence,
     // not proof, and it decides nothing about promotion.
     lifecycle.enter(runId, "criticism");
+    // PRE-CALL COST ADMISSION for the critic's single call — the same session wallet the
+    // builder spends from. A denial stops the run with a non-retryable policy failure BEFORE
+    // the critic call is made; the candidate is retained (verified) but not adjudicated.
+    const criticMaxOutputTokens = Math.min(CRITIC_MAX_OUTPUT_TOKENS, contextPackage.budget.reservedCompletionTokens);
+    if (deps.admission !== undefined) {
+      const admittedCritic = deps.admission.admitNext({
+        identity: { authorizedModelId: criticDecision.modelId, sentProviderId: criticDecision.providerId, sentProviderModelId: criticDecision.providerModelId },
+        estimatedInputTokens: contextPackage.budget.availableInputTokens,
+        maxOutputTokens: criticMaxOutputTokens,
+      });
+      if (!admittedCritic.admit) return admittedCritic.failure;
+    }
     const judged = await judgeCandidate({
       runId,
       taskId,
@@ -777,7 +798,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
       diffBudget: DEFAULT_DIFF_BUDGET,
       probeTree: (path) => deps.treeProbe.treeOf(path),
       mintInvocationId: () => ids.mint("invocation"),
-      maxOutputTokens: Math.min(CRITIC_MAX_OUTPUT_TOKENS, contextPackage.budget.reservedCompletionTokens),
+      maxOutputTokens: criticMaxOutputTokens,
       timeoutMs: CRITIC_TIMEOUT_MS,
       ...(deps.aliases !== undefined ? { aliases: deps.aliases } : {}),
       now,
@@ -787,6 +808,8 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     if (judged.ok) {
       lifecycle.record(runId, { kind: "invocation", id: judged.generation.invocation.invocationId, role: "critic" });
       invocations = [...invocations, judged.generation.invocation];
+      // Charge the critic's observed usage to the session wallet (idempotent; reconcile repeats it).
+      if (deps.admission !== undefined) deps.admission.charge(judged.generation.invocation);
     } else if (judged.attemptedInvocation) {
       // A protocol failure means the model WAS invoked but its response was unusable; the
       // failed call has no record object, but its cost is real. (A drift/subject refusal

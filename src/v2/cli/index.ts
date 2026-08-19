@@ -29,6 +29,7 @@ import { CANDIDATE_STRATEGIES } from "../core/contract.js";
 import { exitCodeForOutcome, formatOutcome, type V2RunResult } from "../core/result.js";
 import { runV2BuildSessionProduction, type ProductionRunDeps } from "../runtime/index.js";
 import type { V2BuildSessionResult } from "../core/session.js";
+import { formatMicroUsd } from "../core/cost.js";
 
 export const V2_USAGE = `Usage: ikbi v2 build "<goal>" [--repo <path>] [--strategy ${CANDIDATE_STRATEGIES.join("|")}] [--profile <name>] [--json]`;
 
@@ -158,7 +159,33 @@ export function renderSession(session: V2BuildSessionResult): string {
   }
   // The final attempt, in full — this is the authoritative outcome.
   lines.push(renderRun(session.attempts[session.attempts.length - 1]!).trimEnd());
+  lines.push(...costLines(session));
   return `${lines.join("\n")}\n`;
+}
+
+/**
+ * The session cost block (V2-014). Compact and HONEST: it reports the cost the session KNOWS,
+ * flags any cost it cannot know (never implying exactness), and — on a multi-attempt session —
+ * attributes spend per attempt. `+ unknown usage` means the true cost is AT LEAST the figure shown.
+ */
+function costLines(session: V2BuildSessionResult): string[] {
+  const c = session.receipt.cost;
+  const unknown = c.hasUnknownCost ? " + unknown usage" : "";
+  const lines = [
+    "",
+    `attempts    ${session.receipt.totalAttempts}`,
+    `model calls ${c.totalInvocations}` + (c.failedInvocationsWithoutUsage > 0 ? ` (${c.failedInvocationsWithoutUsage} failed, cost unknown)` : ""),
+    `known cost  ${c.formattedKnownCostUsd}${unknown}`,
+  ];
+  if (c.attempts.length > 1) {
+    for (const a of c.attempts) {
+      lines.push(`  attempt ${a.attemptNumber}  ${formatMicroUsd(a.knownCostMicroUsd)}${a.hasUnknownCost ? " + unknown" : ""} · ${a.invocationCount} call(s)`);
+    }
+  }
+  if (c.roles.length > 0) {
+    lines.push(`  by role   ${c.roles.map((r) => `${r.role}=${formatMicroUsd(r.knownCostMicroUsd)}${r.hasUnknownCost ? "+?" : ""}`).join(" · ")}`);
+  }
+  return lines;
 }
 
 /**
