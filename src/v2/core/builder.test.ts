@@ -12,6 +12,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import { estimateMessagesTokens } from "./conversation.js";
 import { DEFAULT_BUILDER_BUDGET, builderBudgetWithTurns, generateCandidate, type BuilderToolExecutor, type UntrustedBoundary } from "./builder.js";
 import { BUILDER_SYSTEM_INSTRUCTION } from "./prompt.js";
 import { V2_BUILD_FAILURE_CODES } from "./candidate.js";
@@ -44,7 +45,7 @@ const contextPackage = {
   artifacts: [{ category: "task", sourceId: "task", origin: "operator", content: "change the widget", observedSha256: "a", bytes: 3, originalBytes: 3, truncated: false, estimatedTokens: 4, reason: "goal", artifactId: "x" }],
   omissions: [],
   sourcesConsulted: ["task"],
-  budget: { availableInputTokens: 90_000, reservedCompletionTokens: 4_096, contextWindowTokens: 100_000, estimated: true, accounting: "estimated_chars_per_token", charsPerToken: 4 },
+  budget: { availableInputTokens: 90_000, reservedCompletionTokens: 4_096, reservedOverheadTokens: 1_500, contextWindowTokens: 100_000, capabilityProvenance: "declared", estimated: true, accounting: "estimated_chars_per_token", charsPerToken: 4 },
   estimatedInputTokens: 4,
   sourceSnapshotId: "3".repeat(64),
 } as unknown as ContextPackage;
@@ -557,4 +558,212 @@ test("turn budget (F): a budget handed to the loop is used verbatim, whatever th
     if (before === undefined) delete process.env.IKBI_V2_MAX_BUILDER_TURNS;
     else process.env.IKBI_V2_MAX_BUILDER_TURNS = before;
   }
+});
+
+/* ── THE CONTEXT WINDOW, in the real loop ────────────────────────────────────
+
+   The window fixture is a 65,536-token model — the shape of the run where this defect
+   was found — and the conversation is grown by fat tool results until it must fold. What
+   matters is not that folding happens but that the builder keeps working across it. */
+
+/** The same package, but bound to a model with a real, smallish window. */
+const narrowPackage = {
+  ...(contextPackage as unknown as Record<string, unknown>),
+  budget: {
+    availableInputTokens: 55_844,
+    reservedCompletionTokens: 8_192,
+    reservedOverheadTokens: 1_500,
+    contextWindowTokens: 65_536,
+    capabilityProvenance: "declared",
+    estimated: true,
+    accounting: "estimated_chars_per_token",
+    charsPerToken: 4,
+  },
+} as unknown as ContextPackage;
+
+/** A big observed file, so a handful of reads overflow a 64k window. */
+const fatRead = (path: string): ToolOutcome => ({
+  kind: "observed", path, observationId: `o-${path}`, state: "regular",
+  contentSha256: "aaa", byteLength: 40_000, content: "z".repeat(40_000),
+});
+
+const narrowRun = (turns: readonly Turn[], outcomes: readonly ToolOutcome[]) => {
+  const t = scriptedTransport(turns);
+  const e = scriptedExecutor(outcomes);
+  return generateCandidate({
+    runId: RUN, taskId: TASK, decision, contextPackage: narrowPackage,
+    transport: t.transport, executor: e.executor, untrustedBoundary: fakeBoundary,
+    mintInvocationId: () => `inv_${(idSeq += 1)}` as V2InvocationId,
+    budget: builderBudgetWithTurns(24), now: () => 1000,
+  }).then((result) => ({ result, sent: t.sent, seen: e.seen }));
+};
+
+test("window (real 65k): every request sent stays under the model's ceiling", async () => {
+  /*
+    THE claim the production defect violated. Twelve fat reads across a 64k window is the
+    shape that reached ~94k tokens on the wire in the failed Ofi run.
+  */
+  const turns: Turn[] = [
+    ...Array.from({ length: 12 }, (_, i) => ({ toolCalls: [readCall(`r${i}`, `src/big${i}.ts`)] }) as Turn),
+    { toolCalls: [finishCall()] },
+  ];
+  const { result, sent } = await narrowRun(turns, Array.from({ length: 12 }, (_, i) => fatRead(`src/big${i}.ts`)));
+  assert.ok(result.ok, "the builder still finishes");
+
+  const ceiling = 65_536 - 8_192 - 1_500 - 2_048;
+  for (const [i, request] of sent.entries()) {
+    const estimate = estimateMessagesTokens(request.messages as never);
+    assert.ok(estimate <= ceiling, `turn ${i + 1} sent an estimated ${estimate} tokens, ceiling ${ceiling}`);
+    // And nothing ever approaches the raw window.
+    assert.ok(estimate < 65_536, `turn ${i + 1} exceeded the declared window outright`);
+  }
+  assert.ok(result.generation.compactions.length > 0, "this fixture must actually have folded");
+});
+
+test("window (real 65k): compaction costs ZERO extra provider calls", async () => {
+  const turns: Turn[] = [
+    ...Array.from({ length: 12 }, (_, i) => ({ toolCalls: [readCall(`r${i}`, `src/big${i}.ts`)] }) as Turn),
+    { toolCalls: [finishCall()] },
+  ];
+  const { result, sent } = await narrowRun(turns, Array.from({ length: 12 }, (_, i) => fatRead(`src/big${i}.ts`)));
+  assert.ok(result.ok);
+  // One send per turn, no matter how many folds happened in between.
+  assert.equal(sent.length, result.generation.turns);
+  assert.equal(result.generation.invocations.length, result.generation.turns);
+  assert.ok(result.generation.compactions.length >= 1, "folds happened");
+  assert.equal(sent.length, 13, "and there is no thirteenth-and-a-half summarizer call");
+});
+
+test("window (real 65k): the builder keeps working across a fold", async () => {
+  /*
+    Continuity. It reads several large files, folds, then writes — and the write must
+    still land, because the recent tail keeps the observation it is about to use.
+  */
+  const turns: Turn[] = [
+    ...Array.from({ length: 10 }, (_, i) => ({ toolCalls: [readCall(`r${i}`, `src/big${i}.ts`)] }) as Turn),
+    { toolCalls: [readCall("rz", "src/a.ts")] },
+    { toolCalls: [replaceCall("w1")] },
+    { toolCalls: [finishCall()] },
+  ];
+  const outcomes = [...Array.from({ length: 10 }, (_, i) => fatRead(`src/big${i}.ts`)), observed, applied];
+  const { result } = await narrowRun(turns, outcomes);
+  assert.ok(result.ok, "it finished");
+  assert.equal(result.generation.mutationIds.length, 1, "and the write across the fold landed");
+  assert.deepEqual(result.generation.changedPaths, ["src/a.ts"]);
+  assert.ok(result.generation.compactions.length > 0);
+});
+
+test("window (real 65k): what was folded is still TRUE in the memory block", async () => {
+  const turns: Turn[] = [
+    { toolCalls: [readCall("r0", "src/a.ts")] },
+    { toolCalls: [replaceCall("w1")] },
+    ...Array.from({ length: 10 }, (_, i) => ({ toolCalls: [readCall(`rb${i}`, `src/big${i}.ts`)] }) as Turn),
+    { toolCalls: [finishCall()] },
+  ];
+  const outcomes = [observed, applied, ...Array.from({ length: 10 }, (_, i) => fatRead(`src/big${i}.ts`))];
+  const { result, sent } = await narrowRun(turns, outcomes);
+  assert.ok(result.ok);
+
+  // The last request must still carry the fact that src/a.ts was changed, even though
+  // the exchange that changed it was folded away.
+  const last = sent[sent.length - 1]!.messages.map((m) => m.content).join("\n");
+  assert.match(last, /EARLIER WORK IN THIS CANDIDATE/);
+  assert.match(last, /FILES YOU HAVE ALREADY CHANGED/);
+  assert.match(last, /src\/a\.ts/);
+});
+
+test("window (real 65k): a folded observation cannot become new authority", async () => {
+  /*
+    The safety claim. After the fold, the model quotes an observation id from the folded
+    history; the mutation authority refuses it exactly as it would have before, because
+    compaction changed the VIEW and never the authority.
+  */
+  const turns: Turn[] = [
+    ...Array.from({ length: 11 }, (_, i) => ({ toolCalls: [readCall(`r${i}`, `src/big${i}.ts`)] }) as Turn),
+    { toolCalls: [replaceCall("w1")] },
+    { toolCalls: [finishCall()] },
+  ];
+  const outcomes = [...Array.from({ length: 11 }, (_, i) => fatRead(`src/big${i}.ts`)), stale];
+  const { result } = await narrowRun(turns, outcomes);
+  assert.ok(result.ok, "the run continues — a refusal is not a crash");
+  assert.equal(result.generation.mutationIds.length, 0, "the stale write was REFUSED, exactly as before");
+  assert.equal(result.generation.toolFailures, 1);
+});
+
+test("window: a candidate's compaction state does not leak to the next one", async () => {
+  /*
+    Each generateCandidate call builds its own conversation, ceiling and fact ledger. Two
+    candidates from the same fixture must therefore produce identical, independent results
+    — which is what makes shadow/tournament siblings safe.
+  */
+  const turns: Turn[] = [
+    ...Array.from({ length: 12 }, (_, i) => ({ toolCalls: [readCall(`r${i}`, `src/big${i}.ts`)] }) as Turn),
+    { toolCalls: [finishCall()] },
+  ];
+  const outcomes = Array.from({ length: 12 }, (_, i) => fatRead(`src/big${i}.ts`));
+  const a = await narrowRun(turns, outcomes);
+  const b = await narrowRun(turns, outcomes);
+  assert.ok(a.result.ok && b.result.ok);
+  assert.equal(a.result.generation.compactions.length, b.result.generation.compactions.length);
+  assert.deepEqual(
+    a.result.generation.compactions.map((c) => c.turn),
+    b.result.generation.compactions.map((c) => c.turn),
+    "no shared cache made the second run behave differently",
+  );
+});
+
+test("window: a run derives its ceiling from ITS model, not from the last one", async () => {
+  /*
+    Model switching between runs. Same conversation shape, two windows, two envelopes —
+    and the wide one never folds. No code knows either model's name.
+  */
+  const turns: Turn[] = [
+    ...Array.from({ length: 8 }, (_, i) => ({ toolCalls: [readCall(`r${i}`, `src/big${i}.ts`)] }) as Turn),
+    { toolCalls: [finishCall()] },
+  ];
+  const outcomes = Array.from({ length: 8 }, (_, i) => fatRead(`src/big${i}.ts`));
+
+  const narrow = await narrowRun(turns, outcomes);
+  assert.ok(narrow.result.ok);
+  assert.equal(narrow.result.generation.ceiling.contextWindowTokens, 65_536);
+
+  // The default fixture is a 100,000-token model. Same script, no fold.
+  const wide = await run(turns, outcomes, builderBudgetWithTurns(24));
+  assert.ok(wide.result.ok);
+  assert.equal(wide.result.generation.ceiling.contextWindowTokens, 100_000);
+  assert.ok(narrow.result.generation.compactions.length > wide.result.generation.compactions.length,
+    "the smaller window is the one that folds");
+});
+
+test("window: cost admission is told about the ACTUAL request, not the package budget", async () => {
+  /*
+    The stale-estimate defect. Admission used to be handed
+    `contextPackage.budget.availableInputTokens` — a constant fixed at assembly, 55,844
+    here, identical on turn 1 and turn 12. It must now vary with the real conversation.
+  */
+  const seenEstimates: number[] = [];
+  const t = scriptedTransport([
+    ...Array.from({ length: 6 }, (_, i) => ({ toolCalls: [readCall(`r${i}`, `src/big${i}.ts`)] }) as Turn),
+    { toolCalls: [finishCall()] },
+  ]);
+  const e = scriptedExecutor(Array.from({ length: 6 }, (_, i) => fatRead(`src/big${i}.ts`)));
+  const result = await generateCandidate({
+    runId: RUN, taskId: TASK, decision, contextPackage: narrowPackage,
+    transport: t.transport, executor: e.executor, untrustedBoundary: fakeBoundary,
+    mintInvocationId: () => `inv_${(idSeq += 1)}` as V2InvocationId,
+    budget: builderBudgetWithTurns(24), now: () => 1000,
+    admission: {
+      admitNext: (r: { estimatedInputTokens: number }) => {
+        seenEstimates.push(r.estimatedInputTokens);
+        return { admit: true } as never;
+      },
+      recordAttempt: () => {},
+      charge: () => ({}) as never,
+    } as never,
+  });
+  assert.ok(result.ok);
+  assert.ok(seenEstimates.length >= 6);
+  assert.notEqual(seenEstimates[0], seenEstimates[seenEstimates.length - 1], "the estimate must move with the conversation");
+  assert.ok(seenEstimates[seenEstimates.length - 1]! > seenEstimates[0]!, "and grow as history grows");
+  assert.ok(!seenEstimates.every((v) => v === 55_844), "it is no longer the frozen package budget");
 });

@@ -46,6 +46,7 @@ import type { ContextManifest, ContextPackage } from "./context.js";
 import type { V2InvocationRecord } from "./invocation.js";
 import type { BuilderCommandRecord } from "./command.js";
 import type { BuilderBudget, BuilderTurnSource } from "./builder.js";
+import type { CompactionEvent, ConversationCeiling } from "./conversation.js";
 import type { SelectionRecord, StrategyPolicy } from "./strategy.js";
 import type { V2WorkspaceRecord, WorkspaceDisposition } from "./workspace.js";
 import type { SourceSnapshotSummary } from "./source.js";
@@ -414,6 +415,49 @@ export function summarizeStrategy(policy: StrategyPolicy): RunStrategySummary {
 }
 
 /**
+ * The EXECUTION ENVELOPE this attempt's builder ran inside.
+ *
+ * Here so that swapping models is an observable act rather than a mystery. Every number
+ * is derived from the capability facts of the model resolved for THIS run, so the same
+ * engine on an 8k local model and a 200k frontier model produces two different envelopes
+ * and no different code path. An operator comparing two receipts can see exactly which
+ * facts changed and what the engine did about them.
+ *
+ * `estimator` is carried because a token count that is a heuristic must never be read as
+ * a measurement — and because the day a real tokenizer arrives, the receipts will say so.
+ */
+export interface RunContextEnvelopeSummary {
+  readonly contextWindowTokens: number;
+  readonly reservedCompletionTokens: number;
+  readonly reservedOverheadTokens: number;
+  readonly safetyMarginTokens: number;
+  /** The ceiling a rendered request had to stay under. */
+  readonly maxRenderedInputTokens: number;
+  readonly estimator: string;
+  /** Where the context-window fact came from. */
+  readonly capabilityProvenance: string;
+  /** Every fold, in order. Empty when the conversation always fitted. */
+  readonly compactions: readonly CompactionEvent[];
+}
+
+/** Summarize the envelope. Carries no prompt text, no source, no secret. */
+export function summarizeContextEnvelope(
+  ceiling: ConversationCeiling,
+  compactions: readonly CompactionEvent[],
+): RunContextEnvelopeSummary {
+  return {
+    contextWindowTokens: ceiling.contextWindowTokens,
+    reservedCompletionTokens: ceiling.reservedCompletionTokens,
+    reservedOverheadTokens: ceiling.reservedOverheadTokens,
+    safetyMarginTokens: ceiling.safetyMarginTokens,
+    maxRenderedInputTokens: ceiling.maxRenderedInputTokens,
+    estimator: ceiling.estimator,
+    capabilityProvenance: ceiling.capabilityProvenance,
+    compactions,
+  };
+}
+
+/**
  * The BOUNDS this attempt's builder actually ran under.
  *
  * On the receipt because the turn budget became operator-settable, and a number an
@@ -581,6 +625,11 @@ export interface V2RunReceipt {
    * reached; absent when the run ended before candidate generation.
    */
   readonly builderBudget?: RunBuilderBudgetSummary;
+  /**
+   * The context window this attempt ran inside, and every fold it needed. Present
+   * whenever the builder was reached.
+   */
+  readonly contextEnvelope?: RunContextEnvelopeSummary;
   /**
    * V2-017 — EVERY candidate the strategy generated, with its canonical evaluation. Losers stay
    * visible here even after their workspaces are reclaimed. Empty/absent for a failed-before-strategy

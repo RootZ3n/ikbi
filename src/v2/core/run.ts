@@ -144,6 +144,8 @@ import {
   summarizeCommand,
   summarizeStrategy,
   summarizeBuilderBudget,
+  summarizeContextEnvelope,
+  type RunContextEnvelopeSummary,
   summarizeSelection,
   type RunCandidateEvaluationSummary,
   summarizeResolution,
@@ -656,6 +658,10 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
   /* The frozen builder bounds this attempt ran under, captured at the builder call site
      and reported on the receipt. Stays undefined when the run never reached the builder. */
   let builderBudgetUsed: BuilderBudget | undefined;
+  /* The context envelope this attempt ran inside — derived per candidate from the
+     capability facts of ITS resolved model, so two candidates on different models would
+     report different envelopes without a line of policy code changing. */
+  let contextEnvelope: RunContextEnvelopeSummary | undefined;
   const ids = deps.ids ?? createIdFactory();
   const now = deps.now ?? Date.now;
   const probe = deps.probe ?? nodeRepoProbe;
@@ -871,6 +877,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
         ...(deps.admission !== undefined ? { admission: deps.admission } : {}),
         now,
       });
+      if (generated.ok) contextEnvelope = summarizeContextEnvelope(generated.generation.ceiling, generated.generation.compactions);
       for (const record of generated.ok ? generated.generation.invocations : generated.invocations) lifecycle.record(runId, { kind: "invocation", id: record.invocationId, role: builderDecision.role });
       if (!generated.ok) for (const id of generated.attemptedInvocationIds) lifecycle.record(runId, { kind: "invocation", id, role: builderDecision.role });
       s.invocations = generated.ok ? generated.generation.invocations : generated.invocations;
@@ -1107,6 +1114,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     ...(builderBudgetUsed !== undefined
       ? { builderBudget: summarizeBuilderBudget(builderBudgetUsed, deps.builderTurnSource ?? "default") }
       : {}),
+    ...(contextEnvelope !== undefined ? { contextEnvelope } : {}),
     ...(candidateResults.length > 0 ? { candidates: candidateResults.map((c) => candidateSummaryOf(c, selectionRecord?.selectedCandidateId, candidateWorkspaceDisposition)) } : {}),
     ...(selectionRecord !== undefined ? { selection: summarizeSelection(selectionRecord) } : {}),
     ...(candidate !== undefined ? { candidate: summarizeCandidate(candidate) } : {}),

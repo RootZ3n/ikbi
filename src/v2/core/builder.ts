@@ -45,6 +45,15 @@ import {
 } from "./candidate.js";
 import { BUILDER_TOOLS, isToolFailure, parseToolCall, renderToolProvenance, untrustedToolPayload, type BuilderToolCall, type ParsedToolCall, type ToolOutcome } from "./tools.js";
 import { renderBuilderInput, type RenderedMessage } from "./prompt.js";
+import {
+  conversationCeiling,
+  estimateMessagesTokens,
+  factOf,
+  fitConversation,
+  type CompactedFact,
+  type CompactionEvent,
+  type ConversationCeiling,
+} from "./conversation.js";
 import type { RepairBrief } from "./repair.js";
 import { invokeAuthorized, type InvocationTransport, type ServedModelAlias, type V2InvocationRecord } from "./invocation.js";
 import type { InvocationAdmission } from "./cost.js";
@@ -259,6 +268,10 @@ export interface BuilderGeneration {
   readonly turns: number;
   readonly toolCalls: number;
   readonly toolFailures: number;
+  /** Every conversation fold this candidate needed. Empty when it always fitted. */
+  readonly compactions: readonly CompactionEvent[];
+  /** The window this candidate ran inside, derived from ITS resolved model's facts. */
+  readonly ceiling: ConversationCeiling;
   readonly startedAt: number;
   readonly endedAt: number;
 }
@@ -362,12 +375,44 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
   let toolCalls = 0;
   let toolFailures = 0;
   let turns = 0;
+  /* The window ceiling for THIS model, derived once from the package's own budget — which
+     already failed closed if the model had no known window. */
+  const ceiling = conversationCeiling(input.contextPackage.budget);
+  /* What the harness recorded the tools doing, accumulated as they run. Never rebuilt from
+     the conversation, so folding a message can never lose or invent a fact. */
+  const facts: CompactedFact[] = [];
+  const compactions: CompactionEvent[] = [];
 
   const attemptedInvocationIds: V2InvocationId[] = [];
   /** Everything that really happened, for a failure that must not erase it. */
   const partial = (failure: RunFailure): BuilderResult => ({ ok: false, failure, invocations, mutationIds, attemptedInvocationIds, commands });
 
   while (turns < budget.maxTurns) {
+    /*
+      WINDOW MANAGEMENT, BEFORE ANYTHING REACHES THE WIRE.
+
+      The conversation is re-rendered in full every turn, so it grows without bound while
+      the model's window does not. This fits the next request under the ceiling first —
+      folding older exchanges into a harness-authored account of what the tools actually
+      did — and refuses to send at all if even the minimum lawful request does not fit.
+
+      No model call happens here. Compaction is arithmetic and string building.
+    */
+    const renderWith = (c: readonly RenderedMessage[]) =>
+      estimateMessagesTokens(
+        renderBuilderInput(input.contextPackage, c, input.untrustedBoundary, input.repairBrief !== undefined ? { repairBrief: input.repairBrief, boundary: input.untrustedBoundary } : undefined).messages,
+      );
+    const fitted = fitConversation({ conversation, memory: { facts, changedPaths: [...changedPaths] }, ceiling, turn: turns + 1, renderSize: renderWith });
+    if (!fitted.ok) return partial(fitted.failure);
+    if (fitted.event !== undefined) {
+      compactions.push(fitted.event);
+      /* The fold is durable: the conversation the loop carries forward IS the compacted
+         one, so the next turn builds on it rather than re-growing the history it just
+         folded and paying to fold it again. */
+      conversation.length = 0;
+      conversation.push(...fitted.conversation);
+    }
+
     // ONE TURN = ONE INVOCATION, through the one authority. There is no other doorway
     // to a model in v2, and the controller does not hold a transport it could use
     // directly — it hands the authority the one it was given.
@@ -380,7 +425,16 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
     if (input.admission !== undefined) {
       const admitted = input.admission.admitNext({
         identity: { authorizedModelId: input.decision.modelId, sentProviderId: input.decision.providerId, sentProviderModelId: input.decision.providerModelId },
-        estimatedInputTokens: input.contextPackage.budget.availableInputTokens,
+        /*
+          THE REQUEST THAT IS ABOUT TO BE SENT, not the package it started from.
+
+          This used to pass `contextPackage.budget.availableInputTokens` — the room the
+          package was ALLOWED, fixed at assembly and stale from turn two onward. It both
+          overstated a short first turn and understated every long one, so a session cost
+          ceiling was being enforced against a number that had nothing to do with the
+          prompt. Now it is the estimate of the exact rendered messages.
+        */
+        estimatedInputTokens: fitted.estimatedTokens,
         maxOutputTokens: turnMaxOutputTokens,
       });
       if (!admitted.admit) return partial(admitted.failure);
@@ -477,6 +531,7 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
         // A MALFORMED CALL IS A TOOL FAILURE, NOT A CRASH. The model is told precisely
         // what was wrong and may correct itself; the loop stays bounded either way.
         toolFailures += 1;
+        facts.push(factOf({ kind: "rejected", reason: parsed.reason, detail: parsed.detail }));
         appendToolResult(conversation, input.untrustedBoundary, call, { kind: "rejected", reason: parsed.reason, detail: parsed.detail });
         continue;
       }
@@ -523,6 +578,10 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
           );
         }
       }
+      /* THE fact ledger. Recorded from the executor's own outcome — the same object the
+         mutation authority produced — so what survives a fold is what happened, not what
+         anybody said happened. */
+      facts.push(factOf(executed.outcome));
       appendToolResult(conversation, input.untrustedBoundary, call, executed.outcome);
     }
 
@@ -539,6 +598,8 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
           turns,
           toolCalls,
           toolFailures,
+          compactions,
+          ceiling,
           startedAt,
           endedAt: now(),
         },

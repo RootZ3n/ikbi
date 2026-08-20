@@ -21,6 +21,8 @@ import { governedExecConfig } from "../../modules/governed-exec/config.js";
 
 import { buildRuntimeModelPolicy, isUsableReadiness, type ProviderReadiness } from "../core/config.js";
 import { resolveBuilderTurns, BUILDER_TURNS_ENV, DEFAULT_BUILDER_BUDGET } from "../core/builder.js";
+import { conversationCeiling } from "../core/conversation.js";
+import { deriveBudget } from "../core/context.js";
 import { createConfigurationSource } from "./index.js";
 
 export type ReadinessLevel = "required" | "recommended";
@@ -123,6 +125,18 @@ export interface V2ReadinessProbe {
    * allocated, so doctor must be able to say so first.
    */
   builderTurns(): { readonly ok: true; readonly maxTurns: number; readonly source: string } | { readonly ok: false; readonly reason: string };
+  /**
+   * The builder's EXECUTION ENVELOPE, derived from the resolved model's capability facts.
+   *
+   * Generic on purpose: an operator who switches models sees different numbers here with
+   * no code change, and a model whose window is unknown reports `ok: false` rather than a
+   * convenient guess — because a production builder must not drive an unknown model
+   * against an invented window.
+   */
+  contextEnvelope(): Promise<
+    | { readonly ok: true; readonly modelId: string; readonly window: number; readonly reservedCompletion: number; readonly maxInput: number; readonly estimator: string }
+    | { readonly ok: false; readonly reason: string }
+  >;
   /** Resolve the builder + critic routes OFFLINE (the V2-016 readiness rules). Never invokes a model. */
   routes(): Promise<
     | { readonly ok: true; readonly builder: RouteReadiness | undefined; readonly critic: RouteReadiness | undefined }
@@ -209,6 +223,23 @@ export async function assessV2Readiness(probe: V2ReadinessProbe, repoPath: strin
       : `NOT READY — ${turns.reason}`,
   });
 
+  /*
+    The execution envelope. Advisory rather than gating: a small window is a fact about
+    the model, not a broken host, and the engine now compacts to stay inside it. It is
+    RED only when the window is unknowable, because that is the one case where the builder
+    would otherwise be driving blind.
+  */
+  const envelope = await probe.contextEnvelope();
+  checks.push({
+    name: "builder context",
+    ok: envelope.ok,
+    level: envelope.ok ? "recommended" : "required",
+    detail: envelope.ok
+      ? `${envelope.modelId}: ${envelope.window.toLocaleString()}-token window · ${envelope.reservedCompletion.toLocaleString()} reserved for the reply · ` +
+        `${envelope.maxInput.toLocaleString()} usable for the prompt · estimator ${envelope.estimator} · conversation compaction enabled`
+      : `NOT READY — ${envelope.reason}`,
+  });
+
   const routes = await probe.routes();
   if (!routes.ok) {
     checks.push({ name: "builder route", ok: false, level: "required", detail: `configuration could not be resolved: ${routes.detail}` });
@@ -285,6 +316,31 @@ export function liveV2ReadinessProbe(): V2ReadinessProbe {
     builderTurns: () => {
       const r = resolveBuilderTurns(process.env[BUILDER_TURNS_ENV]);
       return r.ok ? { ok: true as const, maxTurns: r.maxTurns, source: r.source } : { ok: false as const, reason: r.reason };
+    },
+    contextEnvelope: async () => {
+      try {
+        const inputs = await createConfigurationSource().load({});
+        const built = buildRuntimeModelPolicy(inputs);
+        if (!built.ok) return { ok: false as const, reason: built.failure.message };
+        const pref = built.policy.rolePreferences.find((p) => p.role === "builder");
+        if (pref === undefined) return { ok: false as const, reason: "no builder model is configured" };
+        const model = built.policy.inventory.models.find((m) => m.id === pref.modelId);
+        /* deriveBudget FAILS CLOSED on unknown capabilities — that refusal is the answer,
+           not something to paper over with a default window. */
+        const budget = deriveBudget(model?.capabilities);
+        if (!budget.ok) return { ok: false as const, reason: budget.failure.message };
+        const ceiling = conversationCeiling(budget.budget);
+        return {
+          ok: true as const,
+          modelId: pref.modelId,
+          window: ceiling.contextWindowTokens,
+          reservedCompletion: ceiling.reservedCompletionTokens,
+          maxInput: ceiling.maxRenderedInputTokens,
+          estimator: ceiling.estimator,
+        };
+      } catch (err) {
+        return { ok: false as const, reason: err instanceof Error ? err.message : String(err) };
+      }
     },
     routes: async () => {
       try {
