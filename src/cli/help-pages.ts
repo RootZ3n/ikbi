@@ -105,6 +105,14 @@ export const HELP_PAGES: Readonly<Record<string, HelpPage>> = {
           "and is re-sent on later turns, so a large allowance can raise latency and spend indirectly; keep " +
           "IKBI_V2_MAX_SESSION_COST_USD on. Malformed, zero, negative or above 500 is REFUSED before the run starts.",
       },
+      {
+        flag: "IKBI_V2_MAX_COMMANDS",
+        desc:
+          "Read-only commands one candidate may run. Default 24; valid 1–250; read ONCE at session start and frozen. " +
+          "Independent of every other bound. Each command launches a real process in the sandbox and its bounded output " +
+          "re-enters the conversation, so a larger allowance raises latency, context and spend indirectly while granting " +
+          "no extra turns or tool calls. Malformed, zero, negative or above 250 is REFUSED before the run starts.",
+      },
       { flag: "IKBI_V2_MAX_SESSION_COST_USD", desc: "Whole-session dollar ceiling. Opt-in; no default cap." },
       { flag: "IKBI_V2_MAX_INVOCATIONS", desc: "Whole-session model-call cap. Opt-in; stops a run independently of the turn budget." },
       {

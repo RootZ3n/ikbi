@@ -385,6 +385,8 @@ export interface V2RunDeps {
   readonly builderTurnSource?: BuilderTurnSource;
   /** Where the effective TOOL-CALL count came from, for the receipt. Same freeze path. */
   readonly builderToolCallSource?: BuilderBoundSource;
+  /** Where the effective COMMAND count came from, for the receipt. Same freeze path. */
+  readonly builderCommandSource?: BuilderBoundSource;
   /**
    * THE deterministic verification seams. REQUIRED and injected: check discovery reads the
    * filesystem, the runner shells out through governed-exec, and the tree probe runs git —
@@ -1142,7 +1144,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     commands: commands.map(summarizeCommand),
     ...(strategyPolicy !== undefined ? { strategy: summarizeStrategy(strategyPolicy) } : {}),
     ...(builderBudgetUsed !== undefined
-      ? { builderBudget: summarizeBuilderBudget(builderBudgetUsed, deps.builderTurnSource ?? "default", deps.builderToolCallSource ?? "default") }
+      ? { builderBudget: summarizeBuilderBudget(builderBudgetUsed, deps.builderTurnSource ?? "default", deps.builderToolCallSource ?? "default", deps.builderCommandSource ?? "default") }
       : {}),
     ...(contextEnvelope !== undefined ? { contextEnvelope } : {}),
     ...(candidateResults.length > 0 ? { candidates: candidateResults.map((c) => candidateSummaryOf(c, selectionRecord?.selectedCandidateId, candidateWorkspaceDisposition)) } : {}),

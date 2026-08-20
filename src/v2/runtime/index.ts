@@ -31,8 +31,10 @@ import { PRODUCTION_CONTEXT_SOURCES } from "./context-sources.js";
 import { createRetrievalSource } from "./retrieval-source.js";
 import {
   builderBudgetWith,
+  resolveBuilderCommands,
   resolveBuilderToolCalls,
   resolveBuilderTurns,
+  BUILDER_COMMANDS_ENV,
   BUILDER_TOOL_CALLS_ENV,
   BUILDER_TURNS_ENV,
   type BuilderBoundSource,
@@ -91,15 +93,19 @@ function envBuilderBudget(): {
   readonly budget: BuilderBudget;
   readonly turnSource: BuilderTurnSource;
   readonly toolCallSource: BuilderBoundSource;
+  readonly commandSource: BuilderBoundSource;
 } {
   const turns = resolveBuilderTurns(process.env[BUILDER_TURNS_ENV]);
   if (!turns.ok) throw new Error(`invalid builder turn budget: ${turns.reason}`);
   const tools = resolveBuilderToolCalls(process.env[BUILDER_TOOL_CALLS_ENV]);
   if (!tools.ok) throw new Error(`invalid builder tool-call budget: ${tools.reason}`);
+  const commands = resolveBuilderCommands(process.env[BUILDER_COMMANDS_ENV]);
+  if (!commands.ok) throw new Error(`invalid builder command budget: ${commands.reason}`);
   return {
-    budget: builderBudgetWith({ maxTurns: turns.maxTurns, maxToolCalls: tools.value }),
+    budget: builderBudgetWith({ maxTurns: turns.maxTurns, maxToolCalls: tools.value, maxCommands: commands.value }),
     turnSource: turns.source,
     toolCallSource: tools.source,
+    commandSource: commands.source,
   };
 }
 
@@ -232,6 +238,8 @@ export interface ProductionRunDeps {
   readonly builderTurnSource?: V2RunDeps["builderTurnSource"];
   /** Where an injected budget's tool-call count came from, for receipt truth. */
   readonly builderToolCallSource?: V2RunDeps["builderToolCallSource"];
+  /** Where an injected budget's command count came from, for receipt truth. */
+  readonly builderCommandSource?: V2RunDeps["builderCommandSource"];
   readonly untrustedBoundary?: V2RunDeps["untrustedBoundary"];
   readonly checksSource?: V2RunDeps["checksSource"];
   readonly definitionProbe?: V2RunDeps["definitionProbe"];
@@ -322,6 +330,7 @@ async function wireRunDeps(deps: ProductionRunDeps): Promise<V2RunDeps> {
   const builderBudget = deps.builderBudget ?? resolved!.budget;
   const builderTurnSource: BuilderTurnSource = deps.builderTurnSource ?? resolved?.turnSource ?? "default";
   const builderToolCallSource: BuilderBoundSource = deps.builderToolCallSource ?? resolved?.toolCallSource ?? "default";
+  const builderCommandSource: BuilderBoundSource = deps.builderCommandSource ?? resolved?.commandSource ?? "default";
   // The retrieval source is built PER RUN and is the reporter for that same run, so the
   // receipt can never describe a retrieval some other run performed.
   const retrieval = createRetrievalSource();
@@ -369,6 +378,7 @@ async function wireRunDeps(deps: ProductionRunDeps): Promise<V2RunDeps> {
     builderBudget,
     builderTurnSource,
     builderToolCallSource,
+    builderCommandSource,
     ...(deps.probe !== undefined ? { probe: deps.probe } : {}),
   };
 }

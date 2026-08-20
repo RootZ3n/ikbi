@@ -1225,3 +1225,86 @@ test("tool budget line: identical budget state renders identically, whatever the
     assert.doesNotMatch(a.toLowerCase(), new RegExp(name));
   }
 });
+
+
+/* ── COMMAND BUDGET ENFORCEMENT ──────────────────────────────────────────── */
+
+test("command budget (A): the 25th command stops truthfully under the shipped 24", async () => {
+  const turns: Turn[] = Array.from({ length: 26 }, (_, t) => ({ toolCalls: [cmdCall(`c${t}`, [`dir${t}`])] }));
+  const outcomes = Array.from({ length: 26 }, (_, t) => ranCommand([`dir${t}`]));
+  const { result } = await run(turns, outcomes, builderBudgetWith({ maxTurns: 40, maxToolCalls: 150 }));
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.match(result.failure.code, /command/);
+    assert.equal(result.failure.detail?.maxCommands, 24);
+    assert.match(result.failure.message, /24 commands/);
+  }
+});
+
+test("command budget (B): the 25th command is ALLOWED when the operator authorizes 100", async () => {
+  const turns: Turn[] = [...Array.from({ length: 30 }, (_, t) => ({ toolCalls: [cmdCall(`c${t}`, [`dir${t}`])] })), { toolCalls: [finishCall()] }];
+  const outcomes = Array.from({ length: 30 }, (_, t) => ranCommand([`dir${t}`]));
+  const { result } = await run(turns, outcomes, builderBudgetWith({ maxTurns: 40, maxToolCalls: 150, maxCommands: 100 }));
+  assert.ok(result.ok, "thirty commands proceed where twenty-four did not");
+  assert.equal(result.generation.commands.length, 30, "and it used exactly what it needed");
+});
+
+test("command budget (C): command 101 stops truthfully under an authorized 100", async () => {
+  const turns: Turn[] = Array.from({ length: 102 }, (_, t) => ({ toolCalls: [cmdCall(`c${t}`, [`dir${t}`])] }));
+  const outcomes = Array.from({ length: 102 }, (_, t) => ranCommand([`dir${t}`]));
+  const { result } = await run(turns, outcomes, builderBudgetWith({ maxTurns: 120, maxToolCalls: 200, maxCommands: 100 }));
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.match(result.failure.code, /command/);
+    assert.equal(result.failure.detail?.maxCommands, 100, "the OPERATOR's limit is the one named");
+  }
+});
+
+test("command budget (D): the tool-call limit can still stop first", async () => {
+  const turns: Turn[] = Array.from({ length: 30 }, (_, t) => ({ toolCalls: [cmdCall(`c${t}`, [`dir${t}`])] }));
+  const outcomes = Array.from({ length: 30 }, (_, t) => ranCommand([`dir${t}`]));
+  const { result } = await run(turns, outcomes, { ...builderBudgetWith({ maxTurns: 40, maxCommands: 100 }), maxToolCalls: 5 });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.failure.code, "build.tool_limit_exceeded");
+});
+
+test("command budget (E): the turn limit can still stop first", async () => {
+  const turns: Turn[] = Array.from({ length: 30 }, (_, t) => ({ toolCalls: [cmdCall(`c${t}`, [`dir${t}`])] }));
+  const outcomes = Array.from({ length: 30 }, (_, t) => ranCommand([`dir${t}`]));
+  const { result } = await run(turns, outcomes, builderBudgetWith({ maxTurns: 4, maxToolCalls: 150, maxCommands: 100 }));
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.failure.code, "build.turn_limit_exceeded");
+});
+
+test("command budget (F): the mutation limit can still stop first", async () => {
+  const turns: Turn[] = Array.from({ length: 10 }, (_, t) => ({ toolCalls: [readCall(`r${t}`), replaceCall(`w${t}`)] }));
+  const outcomes = Array.from({ length: 20 }, (_, i) => (i % 2 === 0 ? observed : applied));
+  const { result } = await run(turns, outcomes, { ...builderBudgetWith({ maxTurns: 40, maxToolCalls: 150, maxCommands: 100 }), maxMutations: 2 });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.failure.code, "build.mutation_limit_exceeded");
+});
+
+test("command budget (G): cost authority can still stop first", async () => {
+  const denial = { code: "cost.session_ceiling_reached", message: "ceiling reached", category: "cost" };
+  const t = scriptedTransport([{ toolCalls: [cmdCall("c0", ["docs"])] }]);
+  const e = scriptedExecutor([ranCommand(["docs"])]);
+  const result = await generateCandidate({
+    runId: RUN, taskId: TASK, decision, contextPackage, transport: t.transport, executor: e.executor,
+    untrustedBoundary: fakeBoundary, mintInvocationId: () => `inv_${(idSeq += 1)}` as V2InvocationId,
+    budget: builderBudgetWith({ maxTurns: 32, maxToolCalls: 150, maxCommands: 100 }),
+    admission: { admitNext: () => ({ admit: false, failure: denial }), recordAttempt: () => {}, charge: () => ({}) } as never,
+    now: () => 1000,
+  });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.failure.code, "cost.session_ceiling_reached", "money stops it regardless of command authority");
+});
+
+test("command budget line: the model sees the operator's value", async () => {
+  const turns: Turn[] = [{ toolCalls: [cmdCall("c1", ["docs"])] }, { toolCalls: [cmdCall("c2", ["src"])] }, { toolCalls: [finishCall()] }];
+  const { sent } = await run(turns, [ranCommand(["docs"]), ranCommand(["src"])], builderBudgetWith({ maxTurns: 32, maxToolCalls: 150, maxCommands: 100 }));
+  assert.match(budgetLineAt(sent, 1), /commands 0\/100\b/);
+  assert.match(budgetLineAt(sent, 2), /commands 1\/100\b/);
+  assert.match(budgetLineAt(sent, 3), /commands 2\/100\b/);
+  // The whole envelope, and still no guidance.
+  assert.match(budgetLineAt(sent, 3), /turn 3\/32 · tool_calls 2\/150 · mutations 0\/20 · commands 2\/100/);
+});

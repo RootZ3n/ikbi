@@ -18,6 +18,7 @@ function probe(over: Partial<{
   gx: GovernedExecReadiness;
   turns: ReturnType<V2ReadinessProbe["builderTurns"]>;
   tools: ReturnType<V2ReadinessProbe["builderToolCalls"]>;
+  cmds: ReturnType<V2ReadinessProbe["builderCommands"]>;
   envelope: Awaited<ReturnType<V2ReadinessProbe["contextEnvelope"]>>;
   routes: Awaited<ReturnType<V2ReadinessProbe["routes"]>>;
 }> = {}): V2ReadinessProbe {
@@ -27,6 +28,7 @@ function probe(over: Partial<{
     governedExecChecks: () => over.gx ?? { resolved: true, permitted: true, programs: ["pnpm"], denied: [] },
     builderTurns: () => over.turns ?? { ok: true, maxTurns: 12, source: "default" },
     builderToolCalls: () => over.tools ?? { ok: true, maxToolCalls: 40, source: "default" },
+    builderCommands: () => over.cmds ?? { ok: true, maxCommands: 24, source: "default" },
     contextEnvelope: async () =>
       over.envelope ?? { ok: true, modelId: "alpha-1", window: 65_536, reservedCompletion: 8_192, maxInput: 53_796, estimator: "conservative_estimate", charsPerToken: 3.5, estimatorProvenance: "generic_default" },
     routes: async () => over.routes ?? { ok: true, builder: { modelId: "alpha-1", satisfiable: true }, critic: { modelId: "alpha-1", satisfiable: true } },
@@ -228,6 +230,23 @@ test("readiness: a MALFORMED tool-call budget is NOT READY, before anything is s
   assert.equal(t?.level, "required");
   assert.match(t?.detail ?? "", /NOT READY/);
   assert.match(t?.detail ?? "", /150junk/);
+});
+
+test("readiness: a RAISED command budget is reported with its indirect cost", async () => {
+  const r = await assessV2Readiness(probe({ cmds: { ok: true, maxCommands: 100, source: "operator_env" } }));
+  assert.equal(r.ready, true);
+  const c = r.checks.find((x) => x.name === "builder commands");
+  assert.match(c?.detail ?? "", /100/);
+  assert.match(c?.detail ?? "", /latency, context and spend/i);
+  assert.match(c?.detail ?? "", /no extra turns or tool calls/i);
+});
+
+test("readiness: a MALFORMED command budget is NOT READY before any spend", async () => {
+  const r = await assessV2Readiness(probe({ cmds: { ok: false, reason: 'IKBI_V2_MAX_COMMANDS="100junk" is not an integer (expected 1–250)' } }));
+  assert.equal(r.ready, false);
+  const c = r.checks.find((x) => x.name === "builder commands");
+  assert.equal(c?.level, "required");
+  assert.match(c?.detail ?? "", /100junk/);
 });
 
 test("readiness: an unresolved configuration marks BOTH routes as required failures", async () => {

@@ -546,6 +546,8 @@ export interface RunBuilderBudgetSummary {
   readonly toolCallSource: BuilderBoundSource;
   readonly maxMutations: number;
   readonly maxCommands: number;
+  /** `operator_env` when `IKBI_V2_MAX_COMMANDS` set it; `default` when shipped. */
+  readonly commandSource: BuilderBoundSource;
   readonly maxOutputTokens: number;
   readonly turnTimeoutMs: number;
 }
@@ -555,6 +557,7 @@ export function summarizeBuilderBudget(
   budget: BuilderBudget,
   turnSource: BuilderTurnSource,
   toolCallSource: BuilderBoundSource,
+  commandSource: BuilderBoundSource,
 ): RunBuilderBudgetSummary {
   return {
     maxTurns: budget.maxTurns,
@@ -563,6 +566,7 @@ export function summarizeBuilderBudget(
     toolCallSource,
     maxMutations: budget.maxMutations,
     maxCommands: budget.maxCommands,
+    commandSource,
     maxOutputTokens: budget.maxOutputTokens,
     turnTimeoutMs: budget.turnTimeoutMs,
   };

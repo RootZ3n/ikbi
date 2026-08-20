@@ -26,10 +26,12 @@ import { test } from "node:test";
 import {
   BUILDER_TURNS_ENV,
   DEFAULT_BUILDER_BUDGET,
+  MAX_BUILDER_COMMANDS_CEILING,
   MAX_BUILDER_TOOL_CALLS_CEILING,
   MAX_BUILDER_TURNS_CEILING,
   builderBudgetWith,
   builderBudgetWithTurns,
+  resolveBuilderCommands,
   resolveBuilderToolCalls,
   resolveBuilderTurns,
 } from "./builder.js";
@@ -184,7 +186,7 @@ test("turn budget: the turn budget grants no money and no extra model calls", ()
 /* ── J. receipt truth ─────────────────────────────────────────────────────── */
 
 test("turn budget: the receipt states the effective budget and where it came from", () => {
-  const raised = summarizeBuilderBudget(builderBudgetWithTurns(24), "operator_env", "default");
+  const raised = summarizeBuilderBudget(builderBudgetWithTurns(24), "operator_env", "default", "default");
   assert.equal(raised.maxTurns, 24);
   assert.equal(raised.turnSource, "operator_env");
   // It also records what did NOT move, so a reader can see the raise was narrow.
@@ -192,13 +194,13 @@ test("turn budget: the receipt states the effective budget and where it came fro
   assert.equal(raised.maxMutations, DEFAULT_BUILDER_BUDGET.maxMutations);
   assert.equal(raised.maxCommands, DEFAULT_BUILDER_BUDGET.maxCommands);
 
-  const shipped = summarizeBuilderBudget(DEFAULT_BUILDER_BUDGET, "default", "default");
+  const shipped = summarizeBuilderBudget(DEFAULT_BUILDER_BUDGET, "default", "default", "default");
   assert.equal(shipped.maxTurns, 12);
   assert.equal(shipped.turnSource, "default");
 });
 
 test("turn budget: the summary carries no credential and no free text", () => {
-  const s = summarizeBuilderBudget(builderBudgetWithTurns(30), "operator_env", "default");
+  const s = summarizeBuilderBudget(builderBudgetWithTurns(30), "operator_env", "default", "default");
   for (const [k, v] of Object.entries(s)) {
     assert.ok(typeof v === "number" || typeof v === "string", k);
     if (typeof v === "string") assert.match(v, /^(default|operator_env)$/, `${k}=${v}`);
@@ -354,7 +356,7 @@ test("tool budget: the two knobs share ONE parser, so they cannot drift", () => 
 });
 
 test("tool budget: the receipt says the effective value AND where it came from", () => {
-  const raised = summarizeBuilderBudget(builderBudgetWith({ maxToolCalls: 150 }), "default", "operator_env");
+  const raised = summarizeBuilderBudget(builderBudgetWith({ maxToolCalls: 150 }), "default", "operator_env", "default");
   assert.equal(raised.maxToolCalls, 150);
   assert.equal(raised.toolCallSource, "operator_env");
   assert.equal(raised.turnSource, "default", "and the two sources are independent");
@@ -362,7 +364,7 @@ test("tool budget: the receipt says the effective value AND where it came from",
   assert.equal(raised.maxMutations, DEFAULT_BUILDER_BUDGET.maxMutations);
   assert.equal(raised.maxCommands, DEFAULT_BUILDER_BUDGET.maxCommands);
 
-  const shipped = summarizeBuilderBudget(DEFAULT_BUILDER_BUDGET, "default", "default");
+  const shipped = summarizeBuilderBudget(DEFAULT_BUILDER_BUDGET, "default", "default", "default");
   assert.equal(shipped.maxToolCalls, 40);
   assert.equal(shipped.toolCallSource, "default");
 });
@@ -377,4 +379,123 @@ test("tool budget: resolution is pure, and the runtime reads the env exactly ONC
   // The pure core never reads an environment at all — it is handed a budget.
   const builder = readFileSync(new URL("../../../src/v2/core/builder.ts", import.meta.url), "utf8");
   assert.doesNotMatch(builder, /process\.env/, "the builder core takes its bounds as an argument");
+});
+
+
+/* ── THE COMMAND BUDGET ──────────────────────────────────────────────────────
+
+   The third bound, added for the same reason as the other two: it was measured as the
+   binding constraint on real work. With tool calls raised to 150, three independent
+   models would each have hit the command wall at roughly call 51 — every one of them had
+   already spent 19 of 24 commands inside its first forty calls, and MiniMax, the
+   productive one, was at ordinal 21 of 24 when its tool calls ran out. */
+
+test("command budget: unset is the shipped default of 24", () => {
+  const r = resolveBuilderCommands(undefined);
+  assert.ok(r.ok);
+  assert.equal(r.value, 24);
+  assert.equal(r.value, DEFAULT_BUILDER_BUDGET.maxCommands, "read from the budget, not remembered");
+  assert.equal(r.source, "default");
+});
+
+test("command budget: lawful values are used verbatim, including the boundaries", () => {
+  for (const [raw, want] of [["100", 100], ["1", 1], [String(MAX_BUILDER_COMMANDS_CEILING), MAX_BUILDER_COMMANDS_CEILING]] as const) {
+    const r = resolveBuilderCommands(raw);
+    assert.ok(r.ok, raw);
+    assert.equal(r.value, want);
+    assert.equal(r.source, "operator_env");
+  }
+});
+
+test("command budget: malformed, zero, negative and over-ceiling are refused", () => {
+  for (const raw of ["100junk", "2.5", "0x20", "1e3", "0", "-1", String(MAX_BUILDER_COMMANDS_CEILING + 1), "9999"]) {
+    const r = resolveBuilderCommands(raw);
+    assert.equal(r.ok, false, `${raw} must be refused`);
+    if (!r.ok) assert.match(r.reason, /IKBI_V2_MAX_COMMANDS/);
+  }
+  // Blank is the DEFAULT, not an error.
+  for (const blank of ["", "  "]) {
+    const r = resolveBuilderCommands(blank);
+    assert.ok(r.ok);
+    assert.equal(r.source, "default");
+  }
+});
+
+test("command budget: the ceiling leaves headroom above the observed command ratio", () => {
+  assert.equal(MAX_BUILDER_COMMANDS_CEILING, 250);
+  // Production measured ~0.47 commands per tool call; 150 tool calls implies ~71.
+  assert.ok(MAX_BUILDER_COMMANDS_CEILING > Math.ceil(150 * 0.47) * 2, "real headroom over the measured ratio");
+  assert.ok(MAX_BUILDER_COMMANDS_CEILING > DEFAULT_BUILDER_BUDGET.maxCommands);
+});
+
+/* ── ONE resolver, three bounds ──────────────────────────────────────────── */
+
+test("bounds: turns, tool calls and commands share ONE parser", () => {
+  /*
+    The same malformed input gets the same verdict from all three; the ONLY difference is
+    which variable the refusal names. Three copies of this logic would eventually
+    disagree, and the copy that drifted would be the one nobody was testing.
+  */
+  for (const raw of ["2.5", "0", "-1", "junk", "0x20", ""]) {
+    const t = resolveBuilderTurns(raw);
+    const c = resolveBuilderToolCalls(raw);
+    const m = resolveBuilderCommands(raw);
+    assert.equal(t.ok, c.ok, `turns vs tools disagree on ${JSON.stringify(raw)}`);
+    assert.equal(c.ok, m.ok, `tools vs commands disagree on ${JSON.stringify(raw)}`);
+  }
+  const [t, c, m] = [resolveBuilderTurns("2.5"), resolveBuilderToolCalls("2.5"), resolveBuilderCommands("2.5")];
+  assert.ok(!t.ok && !c.ok && !m.ok);
+  if (!t.ok && !c.ok && !m.ok) {
+    assert.match(t.reason, /IKBI_V2_MAX_BUILDER_TURNS/);
+    assert.match(c.reason, /IKBI_V2_MAX_TOOL_CALLS/);
+    assert.match(m.reason, /IKBI_V2_MAX_COMMANDS/);
+    // Same shape of complaint, different subject.
+    assert.match(m.reason, /is not an integer/);
+  }
+});
+
+test("bounds: raising commands raises NOTHING else", () => {
+  const raised = builderBudgetWith({ maxCommands: 100 });
+  assert.equal(raised.maxCommands, 100);
+  assert.equal(raised.maxTurns, DEFAULT_BUILDER_BUDGET.maxTurns);
+  assert.equal(raised.maxToolCalls, DEFAULT_BUILDER_BUDGET.maxToolCalls);
+  assert.equal(raised.maxMutations, DEFAULT_BUILDER_BUDGET.maxMutations);
+  assert.equal(raised.maxOutputTokens, DEFAULT_BUILDER_BUDGET.maxOutputTokens);
+  assert.equal(raised.turnTimeoutMs, DEFAULT_BUILDER_BUDGET.turnTimeoutMs);
+  assert.deepEqual(Object.keys(raised).sort(), Object.keys(DEFAULT_BUILDER_BUDGET).sort());
+});
+
+test("bounds: the full qualification envelope moves exactly three numbers", () => {
+  const envelope = builderBudgetWith({ maxTurns: 32, maxToolCalls: 150, maxCommands: 100 });
+  assert.equal(envelope.maxTurns, 32);
+  assert.equal(envelope.maxToolCalls, 150);
+  assert.equal(envelope.maxCommands, 100);
+  assert.equal(envelope.maxMutations, 20, "mutations stay shipped");
+  assert.equal(envelope.maxOutputTokens, DEFAULT_BUILDER_BUDGET.maxOutputTokens);
+  // And the shipped defaults are untouched by deriving from them.
+  assert.equal(DEFAULT_BUILDER_BUDGET.maxTurns, 12);
+  assert.equal(DEFAULT_BUILDER_BUDGET.maxToolCalls, 40);
+  assert.equal(DEFAULT_BUILDER_BUDGET.maxCommands, 24);
+});
+
+test("bounds: the receipt records all three sources independently", () => {
+  const s = summarizeBuilderBudget(builderBudgetWith({ maxTurns: 32, maxToolCalls: 150, maxCommands: 100 }), "operator_env", "operator_env", "operator_env");
+  assert.equal(s.maxTurns, 32);
+  assert.equal(s.maxToolCalls, 150);
+  assert.equal(s.maxCommands, 100);
+  assert.equal(s.commandSource, "operator_env");
+
+  const mixed = summarizeBuilderBudget(builderBudgetWith({ maxCommands: 100 }), "default", "default", "operator_env");
+  assert.equal(mixed.turnSource, "default");
+  assert.equal(mixed.toolCallSource, "default");
+  assert.equal(mixed.commandSource, "operator_env", "one raised bound does not relabel the others");
+});
+
+test("command budget: the runtime reads the env exactly ONCE, and the core reads none", () => {
+  const runtime = readFileSync(new URL("../../../src/v2/runtime/index.ts", import.meta.url), "utf8");
+  const reads = runtime.match(/process\.env\[BUILDER_COMMANDS_ENV\]|process\.env\.IKBI_V2_MAX_COMMANDS/g) ?? [];
+  assert.equal(reads.length, 1, `read ${reads.length} times; must be once`);
+  assert.match(runtime, /function envBuilderBudget\([\s\S]{0,900}?process\.env\[BUILDER_COMMANDS_ENV\]/);
+  const builder = readFileSync(new URL("../../../src/v2/core/builder.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(builder, /process\.env/);
 });

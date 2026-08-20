@@ -174,13 +174,19 @@ export function renderBudgetStatus(status: BuilderBudgetStatus): string {
  *   same wall, which is what distinguishes a limit that is too low from a model that is
  *   wasteful.
  *
- * WHAT THEY DELIBERATELY ARE NOT. Neither touches the other, nor `maxMutations`,
- * `maxCommands`, `maxOutputTokens`, the session invocation cap or the session cost
- * ceiling. Whichever bound is reached first is the one the failure names. Raising a
- * bound buys that resource and nothing else — never authority, never money.
+ *   COMMANDS — with tool calls raised to 150, the same three runs showed the command
+ *   budget would bind at roughly call 51: each had already spent 19 of its 24 commands
+ *   inside forty calls, and MiniMax — the productive one — was at ordinal 21 of 24 when
+ *   its tool calls ran out. Raising tool calls alone would have bought it three commands.
+ *
+ * WHAT THEY DELIBERATELY ARE NOT. None touches another, nor `maxMutations`,
+ * `maxOutputTokens`, the session invocation cap or the session cost ceiling. Whichever
+ * bound is reached first is the one the failure names. Raising a bound buys that resource
+ * and nothing else — never authority, never money.
  */
 export const BUILDER_TURNS_ENV = "IKBI_V2_MAX_BUILDER_TURNS";
 export const BUILDER_TOOL_CALLS_ENV = "IKBI_V2_MAX_TOOL_CALLS";
+export const BUILDER_COMMANDS_ENV = "IKBI_V2_MAX_COMMANDS";
 
 /**
  * The hard ceiling on tool calls. A SAFETY BOUNDARY, not a recommended operating point.
@@ -193,6 +199,18 @@ export const BUILDER_TOOL_CALLS_ENV = "IKBI_V2_MAX_TOOL_CALLS";
  * above known-good practice while still refusing a typo that would authorize thousands.
  */
 export const MAX_BUILDER_TOOL_CALLS_CEILING = 500;
+
+/**
+ * The hard ceiling on read-only commands. A SAFETY BOUNDARY, not a recommendation.
+ *
+ * Commands are the most expensive tool per unit of authority: each one launches a real
+ * process in the sandbox, and its bounded output re-enters the conversation to be re-sent
+ * on every later turn. Measured production behaviour puts them at roughly 0.47 per tool
+ * call — three independent models each ran 19 commands inside their first 40 calls — so a
+ * 150-call budget implies something near 70. Two hundred and fifty leaves real headroom
+ * above that observed ratio while still refusing an accidental order of magnitude.
+ */
+export const MAX_BUILDER_COMMANDS_CEILING = 250;
 
 /** Where an effective bound came from. Recorded so a receipt can say. */
 export type BuilderBoundSource = "default" | "operator_env";
@@ -265,6 +283,17 @@ export function resolveBuilderToolCalls(raw: string | undefined): BuilderBoundRe
   });
 }
 
+/** Resolve the operator's read-only command budget. */
+export function resolveBuilderCommands(raw: string | undefined): BuilderBoundResolution {
+  return resolveBuilderBound({
+    raw,
+    envName: BUILDER_COMMANDS_ENV,
+    shipped: DEFAULT_BUILDER_BUDGET.maxCommands,
+    ceiling: MAX_BUILDER_COMMANDS_CEILING,
+    noun: "commands",
+  });
+}
+
 /**
  * The hard ceiling. A SAFETY BOUNDARY, not a recommended operating point.
  *
@@ -320,11 +349,16 @@ export function builderBudgetWithTurns(maxTurns: number): BuilderBudget {
  * the shipped one, so a bound added later has to be considered here rather than silently
  * inherited.
  */
-export function builderBudgetWith(bounds: { readonly maxTurns?: number; readonly maxToolCalls?: number }): BuilderBudget {
+export function builderBudgetWith(bounds: {
+  readonly maxTurns?: number;
+  readonly maxToolCalls?: number;
+  readonly maxCommands?: number;
+}): BuilderBudget {
   return Object.freeze({
     ...DEFAULT_BUILDER_BUDGET,
     ...(bounds.maxTurns !== undefined ? { maxTurns: bounds.maxTurns } : {}),
     ...(bounds.maxToolCalls !== undefined ? { maxToolCalls: bounds.maxToolCalls } : {}),
+    ...(bounds.maxCommands !== undefined ? { maxCommands: bounds.maxCommands } : {}),
   });
 }
 
