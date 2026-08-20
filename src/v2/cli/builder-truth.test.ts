@@ -211,7 +211,16 @@ test("builder truth: the conversation GREW — turn 3 carries the tool results o
   const { server } = await editRun();
   const completions = (await server.received()).filter((r) => r.path.includes("chat/completions"));
   const roles = completions.map((r) => r.messages.map((m) => m.role).join(","));
-  assert.equal(roles[0], "system,user", "the first turn is the contract plus the authorized context");
+  /*
+    The first turn is the contract, the authorized context, and — since execution-budget
+    awareness — one trusted harness line stating what authority remains. The claim this
+    test exists for is unchanged: the opening turn carries no tool results, and later
+    turns accumulate them.
+  */
+  assert.equal(roles[0], "system,user,user", "contract + authorized context + the budget line");
+  assert.ok(!roles[0]!.includes("tool"), "and nothing has been executed yet");
+  const budgetLine = completions[0]!.messages.at(-1)!.content;
+  assert.match(budgetLine, /^\[ikbi execution budget\] turn 1\//, "the last message is the budget, on turn 1");
   assert.ok(roles[1]!.includes("tool"), "the second turn carries the read result");
   assert.ok(completions[2]!.messages.filter((m) => m.role === "tool").length >= 2, "the third carries both");
 });

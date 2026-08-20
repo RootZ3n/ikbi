@@ -142,6 +142,19 @@ export function renderBuilderInput(
   conversation: readonly RenderedMessage[],
   boundary: UntrustedBoundary,
   repair?: { readonly repairBrief: RepairBrief; readonly boundary: UntrustedBoundary },
+  /**
+   * The harness's own statement of what execution authority remains, already rendered.
+   *
+   * Placed LAST, after the conversation, for two reasons. It is the one part of the
+   * prompt that changes every single turn, so keeping it out of the prefix leaves the
+   * system contract and the context package stable for prompt-prefix caching. And it is
+   * the freshest thing the model reads before answering, which is where a number it is
+   * meant to plan against belongs.
+   *
+   * TRUSTED and harness-authored: it is a fact about ikbi's own counters, so it sits
+   * outside the untrusted fence and repository content cannot influence it.
+   */
+  budgetStatus?: string,
 ): RenderedModelInput {
   // The ORIGINAL task and the current context come first and outrank everything. The repair
   // brief — when present — is a distinct, LOWER-priority, untrusted historical block placed after
@@ -157,6 +170,7 @@ export function renderBuilderInput(
     { role: "user", content: renderContextBlocks(pkg, boundary), untrusted: true },
     ...(repair !== undefined ? [renderRepairBrief(repair.repairBrief, repair.boundary)] : []),
     ...conversation,
+    ...(budgetStatus !== undefined ? [{ role: "user" as const, content: budgetStatus }] : []),
   ];
   return {
     promptId: contentDigest("prompt", {

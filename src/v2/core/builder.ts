@@ -108,6 +108,53 @@ export const DEFAULT_BUILDER_BUDGET: BuilderBudget = Object.freeze({
   maxCommands: 24,
 });
 
+/* ── What the builder is allowed to know about its own limits ────────────── */
+
+/**
+ * THE EXECUTION BUDGET, as a snapshot the model may see.
+ *
+ * Every number comes from the counters that already ENFORCE the limits — there is no
+ * second tally to drift out of step with the first. It is a view, not a source.
+ */
+export interface BuilderBudgetStatus {
+  /** The turn about to be taken, 1-based. Before the first call this is 1, not 0. */
+  readonly turnUsed: number;
+  readonly turnLimit: number;
+  readonly toolCallsUsed: number;
+  readonly toolCallsLimit: number;
+  readonly mutationsUsed: number;
+  readonly mutationsLimit: number;
+  readonly commandsUsed: number;
+  readonly commandsLimit: number;
+}
+
+/**
+ * Render the budget the model sees.
+ *
+ * THE MODEL MAY KNOW WHAT AUTHORITY REMAINS. THE HARNESS DOES NOT TELL IT HOW TO SPEND
+ * THAT AUTHORITY. So this is four counters and nothing else: no "finish soon", no "stop
+ * exploring", no adjective, no warning threshold that starts nagging near the end. A
+ * builder working against a deadline it cannot see is being asked to plan blind; a
+ * builder being told what to do with the deadline is not planning at all.
+ *
+ * One line, deliberately — it is re-sent every turn, and a paragraph of framing repeated
+ * thirty-two times is real context spent on saying the same thing again.
+ *
+ * `mutations` counts APPLIED writes only; a refused write consumed none, exactly as the
+ * enforcing counter has it. `commands` counts every command the policy layer accepted as
+ * a request, INCLUDING one it then refused — because that is what the command budget
+ * itself charges, and a status that flattered the number would be a different lie.
+ */
+export function renderBudgetStatus(status: BuilderBudgetStatus): string {
+  return (
+    `[ikbi execution budget] ` +
+    `turn ${status.turnUsed}/${status.turnLimit} · ` +
+    `tool_calls ${status.toolCallsUsed}/${status.toolCallsLimit} · ` +
+    `mutations ${status.mutationsUsed}/${status.mutationsLimit} · ` +
+    `commands ${status.commandsUsed}/${status.commandsLimit}`
+  );
+}
+
 /* ── The operator's turn budget ──────────────────────────────────────────── */
 
 /**
@@ -442,9 +489,21 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
 
       No model call happens here. Compaction is arithmetic and string building.
     */
+    /* The status for the invocation ABOUT to happen: turns has not been incremented yet,
+       so the turn being taken is turns + 1. Everything else is the live counter. */
+    const budgetStatus = renderBudgetStatus({
+      turnUsed: turns + 1,
+      turnLimit: budget.maxTurns,
+      toolCallsUsed: toolCalls,
+      toolCallsLimit: budget.maxToolCalls,
+      mutationsUsed: mutationIds.length,
+      mutationsLimit: budget.maxMutations,
+      commandsUsed: commands.length,
+      commandsLimit: budget.maxCommands,
+    });
     const renderWith = (c: readonly RenderedMessage[]) =>
       estimateMessagesTokens(
-        renderBuilderInput(input.contextPackage, c, input.untrustedBoundary, input.repairBrief !== undefined ? { repairBrief: input.repairBrief, boundary: input.untrustedBoundary } : undefined).messages,
+        renderBuilderInput(input.contextPackage, c, input.untrustedBoundary, input.repairBrief !== undefined ? { repairBrief: input.repairBrief, boundary: input.untrustedBoundary } : undefined, budgetStatus).messages,
         // THE model's own estimator, resolved once with the budget and frozen for the run.
         input.contextPackage.budget.tokenEstimator,
       );
@@ -463,7 +522,7 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
     // ONE TURN = ONE INVOCATION, through the one authority. There is no other doorway
     // to a model in v2, and the controller does not hold a transport it could use
     // directly — it hands the authority the one it was given.
-    const rendered = renderBuilderInput(input.contextPackage, conversation, input.untrustedBoundary, input.repairBrief !== undefined ? { repairBrief: input.repairBrief, boundary: input.untrustedBoundary } : undefined);
+    const rendered = renderBuilderInput(input.contextPackage, conversation, input.untrustedBoundary, input.repairBrief !== undefined ? { repairBrief: input.repairBrief, boundary: input.untrustedBoundary } : undefined, budgetStatus);
     const turnMaxOutputTokens = Math.min(budget.maxOutputTokens, input.contextPackage.budget.reservedCompletionTokens);
     // PRE-CALL COST ADMISSION. BEFORE the money is spent, ask the session budget authority
     // whether another model call is authorized. It never selects or downgrades a model — it

@@ -15,6 +15,8 @@ import { test } from "node:test";
 import { estimateMessagesTokens } from "./conversation.js";
 import { TOOL_RUN_COMMAND } from "./tools.js";
 import { GENERIC_TOKEN_ESTIMATOR } from "./config.js";
+import { renderBudgetStatus } from "./builder.js";
+import { estimateTokens } from "./context.js";
 import { DEFAULT_BUILDER_BUDGET, builderBudgetWithTurns, generateCandidate, type BuilderToolExecutor, type UntrustedBoundary } from "./builder.js";
 import { BUILDER_SYSTEM_INSTRUCTION } from "./prompt.js";
 import { V2_BUILD_FAILURE_CODES } from "./candidate.js";
@@ -966,4 +968,152 @@ test("repeat feedback: three identical explorations are counted, as the real run
   const { result } = await run(turns, [ranCommand(["docs"]), ranCommand(["other"]), ranCommand(["docs"]), ranCommand(["docs"])]);
   assert.ok(result.ok);
   assert.equal(result.generation.repeatedCommands, 2, "the second and third re-asks");
+});
+
+
+/* ── EXECUTION-BUDGET AWARENESS ──────────────────────────────────────────────
+
+   Before this, the model was told NOTHING about its own limits. A rendered prompt
+   contained no turn number, no maximum, no counts — the only match for "turn" in the
+   whole system contract was inside the word "returns". It was planning against a
+   deadline it could not observe.
+
+   THE MODEL MAY KNOW WHAT AUTHORITY REMAINS. THE HARNESS DOES NOT TELL IT HOW TO SPEND
+   THAT AUTHORITY. These tests hold both halves of that sentence in place. */
+
+/** The budget line the model was shown on a given (1-based) turn. */
+const budgetLineAt = (sent: Awaited<ReturnType<typeof run>>["sent"], turn: number): string =>
+  sent[turn - 1]!.messages.map((m) => m.content).find((c) => c.startsWith("[ikbi execution budget]")) ?? "";
+
+test("budget (A): the FIRST invocation says turn 1, not turn 0", async () => {
+  const { sent } = await run([{ toolCalls: [finishCall()] }], []);
+  assert.match(budgetLineAt(sent, 1), /turn 1\/12\b/);
+});
+
+test("budget (B): the turn number advances with the turns", async () => {
+  const { sent } = await run(thinksThenFinishes(4), []);
+  for (const turn of [1, 2, 3, 5]) {
+    assert.match(budgetLineAt(sent, turn), new RegExp(`turn ${turn}/12\\b`), `turn ${turn}`);
+  }
+});
+
+test("budget (C): tool calls are counted, and shown on the NEXT invocation", async () => {
+  const turns: Turn[] = [
+    { toolCalls: [readCall("r1")] },
+    { toolCalls: [readCall("r2")] },
+    { toolCalls: [finishCall()] },
+  ];
+  const { sent } = await run(turns, [observed, observed]);
+  assert.match(budgetLineAt(sent, 1), /tool_calls 0\/40/, "nothing dispatched yet");
+  assert.match(budgetLineAt(sent, 2), /tool_calls 1\/40/);
+  assert.match(budgetLineAt(sent, 3), /tool_calls 2\/40/);
+});
+
+test("budget (D): an APPLIED mutation is counted", async () => {
+  const turns: Turn[] = [
+    { toolCalls: [readCall("r1")] },
+    { toolCalls: [replaceCall("w1")] },
+    { toolCalls: [finishCall()] },
+  ];
+  const { sent } = await run(turns, [observed, applied]);
+  assert.match(budgetLineAt(sent, 2), /mutations 0\/20/, "before the write lands");
+  assert.match(budgetLineAt(sent, 3), /mutations 1\/20/, "after it lands");
+});
+
+test("budget (E): a REFUSED write consumes no mutation budget", async () => {
+  /* Reporting matches the enforcing counter exactly — a refused write changed nothing
+     and charges nothing, and the status must not invent a different arithmetic. */
+  const turns: Turn[] = [
+    { toolCalls: [readCall("r1")] },
+    { toolCalls: [replaceCall("w1")] },
+    { toolCalls: [finishCall()] },
+  ];
+  const { sent } = await run(turns, [observed, stale]);
+  assert.match(budgetLineAt(sent, 3), /mutations 0\/20/);
+});
+
+test("budget (F): commands are counted the way the command budget charges them", async () => {
+  const turns: Turn[] = [
+    { toolCalls: [cmdCall("c1", ["docs"])] },
+    { toolCalls: [cmdCall("c2", ["other"])] },
+    { toolCalls: [finishCall()] },
+  ];
+  const { sent } = await run(turns, [ranCommand(["docs"]), ranCommand(["other"])]);
+  assert.match(budgetLineAt(sent, 1), /commands 0\/24/);
+  assert.match(budgetLineAt(sent, 2), /commands 1\/24/);
+  assert.match(budgetLineAt(sent, 3), /commands 2\/24/);
+});
+
+test("budget (G/H): the limit shown is the OPERATOR's, whatever it is", async () => {
+  const shipped = await run([{ toolCalls: [finishCall()] }], []);
+  assert.match(budgetLineAt(shipped.sent, 1), /turn 1\/12\b/, "the shipped default");
+
+  const raised = await run([{ toolCalls: [finishCall()] }], [], builderBudgetWithTurns(32));
+  assert.match(budgetLineAt(raised.sent, 1), /turn 1\/32\b/, "an operator-authorized 32");
+});
+
+test("budget (I): identical budget state renders identically, whatever the model", async () => {
+  /*
+    Model-agnosticism, stated as an equality. The status is a function of counters and
+    operator policy — there is no model or provider input to it at all.
+  */
+  const a = renderBudgetStatus({ turnUsed: 5, turnLimit: 32, toolCallsUsed: 7, toolCallsLimit: 40, mutationsUsed: 1, mutationsLimit: 20, commandsUsed: 2, commandsLimit: 24 });
+  const b = renderBudgetStatus({ turnUsed: 5, turnLimit: 32, toolCallsUsed: 7, toolCallsLimit: 40, mutationsUsed: 1, mutationsLimit: 20, commandsUsed: 2, commandsLimit: 24 });
+  assert.equal(a, b);
+  for (const name of ["mimo", "deepseek", "openai", "gpt", "claude", "gemini", "ollama", "minimax"]) {
+    assert.doesNotMatch(a.toLowerCase(), new RegExp(name), `the status must not mention "${name}"`);
+  }
+});
+
+test("budget (J): running out still fails truthfully — awareness is not coercion", async () => {
+  /*
+    Nothing in this slice reserves turns, refuses a late read, injects "finish now", or
+    synthesizes a completion. A model that spends its whole budget still gets the same
+    honest failure it always did.
+  */
+  const { result } = await run(thinksThenFinishes(12), []);
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.failure.code, "build.turn_limit_exceeded");
+    assert.match(result.failure.message, /limit 12/);
+  }
+});
+
+test("budget (J): the last authorized turn is still a full turn", async () => {
+  /* No hidden reservation: turn 12 of 12 may call tools and may finish, like any other. */
+  const turns: Turn[] = [...Array.from({ length: 11 }, () => ({ content: "working" }) as Turn), { toolCalls: [finishCall()] }];
+  const { result, sent } = await run(turns, []);
+  assert.ok(result.ok, "finishing on the final authorized turn is allowed");
+  assert.match(budgetLineAt(sent, 12), /turn 12\/12\b/);
+});
+
+test("budget (K): the block contains resource facts and NO task advice", async () => {
+  const { sent } = await run(thinksThenFinishes(3), []);
+  for (let turn = 1; turn <= 3; turn += 1) {
+    const line = budgetLineAt(sent, turn);
+    assert.notEqual(line, "", `turn ${turn} has a budget line`);
+    for (const phrase of [
+      "finish now", "stop exploring", "should", "must finish", "running out", "hurry",
+      "remaining", "left", "nearly", "almost", "soon", "consider", "recommend", "try to",
+    ]) {
+      assert.doesNotMatch(line.toLowerCase(), new RegExp(phrase), `turn ${turn}: "${phrase}" is advice, not a fact`);
+    }
+    // It is four counters and a label. Nothing else.
+    assert.match(line, /^\[ikbi execution budget\] turn \d+\/\d+ · tool_calls \d+\/\d+ · mutations \d+\/\d+ · commands \d+\/\d+$/);
+  }
+});
+
+test("budget (L): the block costs tens of tokens, not hundreds", async () => {
+  const line = renderBudgetStatus({ turnUsed: 32, turnLimit: 32, toolCallsUsed: 40, toolCallsLimit: 40, mutationsUsed: 20, mutationsLimit: 20, commandsUsed: 24, commandsLimit: 24 });
+  assert.ok(line.length < 120, `${line.length} characters`);
+  assert.ok(estimateTokens(line) < 50, `${estimateTokens(line)} estimated tokens`);
+  // It is one line, so it cannot grow into a paragraph unnoticed.
+  assert.equal(line.split("\n").length, 1);
+});
+
+test("budget: it is TRUSTED and sits outside the untrusted fence", async () => {
+  const { sent } = await run([{ toolCalls: [readCall("r1")] }, { toolCalls: [finishCall()] }], [observed]);
+  const last = sent[1]!.messages[sent[1]!.messages.length - 1]!;
+  assert.match(last.content, /^\[ikbi execution budget\]/, "it is the final thing the model reads");
+  assert.notEqual((last as { untrusted?: boolean }).untrusted, true, "harness-authored fact, not fenced data");
 });
