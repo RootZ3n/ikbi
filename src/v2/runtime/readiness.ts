@@ -20,6 +20,7 @@ import { resolveChecks } from "../../modules/checks/index.js";
 import { governedExecConfig } from "../../modules/governed-exec/config.js";
 
 import { buildRuntimeModelPolicy, isUsableReadiness, type ProviderReadiness } from "../core/config.js";
+import { resolveBuilderTurns, BUILDER_TURNS_ENV, DEFAULT_BUILDER_BUDGET } from "../core/builder.js";
 import { createConfigurationSource } from "./index.js";
 
 export type ReadinessLevel = "required" | "recommended";
@@ -116,6 +117,12 @@ export interface V2ReadinessProbe {
    * checks the way verification will (no execution, no spend) and answers about THOSE commands.
    */
   governedExecChecks(repoPath: string): GovernedExecReadiness;
+  /**
+   * The operator's builder turn budget, as the session would resolve it. Pure config
+   * reading — no spend, no probe. A malformed value fails a real run before anything is
+   * allocated, so doctor must be able to say so first.
+   */
+  builderTurns(): { readonly ok: true; readonly maxTurns: number; readonly source: string } | { readonly ok: false; readonly reason: string };
   /** Resolve the builder + critic routes OFFLINE (the V2-016 readiness rules). Never invokes a model. */
   routes(): Promise<
     | { readonly ok: true; readonly builder: RouteReadiness | undefined; readonly critic: RouteReadiness | undefined }
@@ -182,6 +189,24 @@ export async function assessV2Readiness(probe: V2ReadinessProbe, repoPath: strin
       : gx.permitted
         ? `the checks that would run (${gx.programs.join(", ")}) are all permitted by governed-exec`
         : `NOT READY — verification would run ${gx.denied.join(", ")}, which governed-exec would REFUSE; add to IKBI_GOVERNED_EXEC_ALLOWLIST`,
+  });
+
+  /*
+    The turn budget. Twelve is not a problem and must never read as one — the check is
+    green at the default and green at any lawful override. It goes RED only for a value
+    that would abort a real run, which is precisely the case an operator cannot otherwise
+    discover without paying for a build to fail.
+  */
+  const turns = probe.builderTurns();
+  checks.push({
+    name: "builder turns",
+    ok: turns.ok,
+    level: turns.ok ? "recommended" : "required",
+    detail: turns.ok
+      ? turns.source === "operator_env"
+        ? `${BUILDER_TURNS_ENV}=${turns.maxTurns} — raised from the default ${DEFAULT_BUILDER_BUDGET.maxTurns}; a turn is a full provider call, so keep a session cost ceiling on`
+        : `builder turn budget is the default ${turns.maxTurns} (raise with ${BUILDER_TURNS_ENV} if a real task needs longer)`
+      : `NOT READY — ${turns.reason}`,
   });
 
   const routes = await probe.routes();
@@ -256,6 +281,10 @@ export function liveV2ReadinessProbe(): V2ReadinessProbe {
       const allowed = new Set(governedExecConfig.allowlist);
       const denied = programs.filter((p) => !allowed.has(p));
       return { resolved: true, permitted: denied.length === 0, programs, denied };
+    },
+    builderTurns: () => {
+      const r = resolveBuilderTurns(process.env[BUILDER_TURNS_ENV]);
+      return r.ok ? { ok: true as const, maxTurns: r.maxTurns, source: r.source } : { ok: false as const, reason: r.reason };
     },
     routes: async () => {
       try {

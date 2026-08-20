@@ -92,6 +92,101 @@ export const DEFAULT_BUILDER_BUDGET: BuilderBudget = Object.freeze({
   maxCommands: 24,
 });
 
+/* ── The operator's turn budget ──────────────────────────────────────────── */
+
+/**
+ * The one bound an operator may raise, and the name they raise it with.
+ *
+ * WHY THIS ONE AND NOT THE OTHERS. The first real production task on another
+ * repository ended at `build.turn_limit_exceeded` with two mutations already applied
+ * and legitimate progress in the log. Governance was right — it failed truthfully,
+ * promoted nothing, and declined to retry — but twelve turns is the scaffold-era bound
+ * this file admits it is, and there was no way for an operator to authorize more before
+ * starting. v1 had exactly that knob; v2 shipped without it. This restores it.
+ *
+ * WHAT IT DELIBERATELY IS NOT. It does not touch `maxToolCalls`, `maxMutations`,
+ * `maxCommands`, the session invocation cap or the session cost ceiling. A thirty-turn
+ * builder is still bounded by every one of those, and whichever stops it first is the
+ * one the failure names. Raising turns buys time, never authority and never money.
+ */
+export const BUILDER_TURNS_ENV = "IKBI_V2_MAX_BUILDER_TURNS";
+
+/**
+ * The hard ceiling. A SAFETY BOUNDARY, not a recommended operating point.
+ *
+ * A turn is a provider call against a context package that, on a real repository, runs
+ * to tens of thousands of prompt tokens — the failed Ofi attempt spent $0.29 on twelve.
+ * A hundred is therefore already an expensive number; it exists so that a typo cannot
+ * authorize a thousand, and the cost ceilings remain the thing that actually stops spend.
+ */
+export const MAX_BUILDER_TURNS_CEILING = 100;
+
+/** Where the effective turn budget came from. Recorded so a receipt can say. */
+export type BuilderTurnSource = "default" | "operator_env";
+
+/** Resolving the operator's turn budget either yields one, or refuses and says why. */
+export type BuilderTurnResolution =
+  | { readonly ok: true; readonly maxTurns: number; readonly source: BuilderTurnSource }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * Resolve the effective builder turn budget from ONE raw environment string.
+ *
+ * Pure, so the whole contract is testable without a process. Absent or blank is the
+ * shipped default; anything else must be a clean positive integer inside the ceiling.
+ *
+ * IT REFUSES RATHER THAN IGNORING. The sibling env knobs in the runtime silently fall
+ * back when they cannot parse a value, and for a *cost ceiling* that is right — ignoring
+ * it fails toward less authority. Ignoring this one fails toward less WORK: an operator
+ * who typed `30junk` would be handed twelve turns, watch the build die at twelve, and
+ * blame the model for the harness — which is the exact confusion this whole repair came
+ * out of. So a malformed value is a configuration error, said out loud, before anything
+ * is spent. Nothing is partially parsed and nothing is silently clamped.
+ */
+export function resolveBuilderTurns(raw: string | undefined): BuilderTurnResolution {
+  const text = (raw ?? "").trim();
+  if (text.length === 0) return { ok: true, maxTurns: DEFAULT_BUILDER_BUDGET.maxTurns, source: "default" };
+
+  // A FULL integer, anchored. "2.5", "30junk", "1e3", " 12 x" and "" are all refused
+  // here rather than becoming 2, 30, 1 or the default.
+  if (!/^-?\d+$/.test(text)) {
+    return {
+      ok: false,
+      reason: `${BUILDER_TURNS_ENV}="${text}" is not an integer (expected 1–${MAX_BUILDER_TURNS_CEILING})`,
+    };
+  }
+  const n = Number(text);
+  if (!Number.isSafeInteger(n)) {
+    return { ok: false, reason: `${BUILDER_TURNS_ENV}="${text}" is not a representable integer` };
+  }
+  if (n < 1) {
+    return {
+      ok: false,
+      reason: `${BUILDER_TURNS_ENV}=${n} would authorize no builder turns (expected 1–${MAX_BUILDER_TURNS_CEILING})`,
+    };
+  }
+  if (n > MAX_BUILDER_TURNS_CEILING) {
+    return {
+      ok: false,
+      reason:
+        `${BUILDER_TURNS_ENV}=${n} exceeds the hard ceiling of ${MAX_BUILDER_TURNS_CEILING}. ` +
+        `The ceiling is a safety boundary, not a target — a turn is a full provider call, so raise ` +
+        `the budget deliberately and keep a session cost ceiling on.`,
+    };
+  }
+  return { ok: true, maxTurns: n, source: "operator_env" };
+}
+
+/**
+ * The default budget with ONLY its turn count replaced.
+ *
+ * Every other bound is copied unchanged, which is the point: this function is the reason
+ * "more turns" cannot quietly become "more tools", "more mutations" or "more money".
+ */
+export function builderBudgetWithTurns(maxTurns: number): BuilderBudget {
+  return Object.freeze({ ...DEFAULT_BUILDER_BUDGET, maxTurns });
+}
+
 // ---------------------------------------------------------------------------
 // The tool executor seam
 // ---------------------------------------------------------------------------
@@ -454,7 +549,9 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
   return partial(
     buildFailure({
       code: V2_BUILD_FAILURE_CODES.turnLimitExceeded,
-      message: `the builder took ${turns} turns without calling finish_candidate`,
+      // Names the EFFECTIVE limit, not a remembered constant: an operator who raised the
+      // budget must be able to read the number their run actually ran under.
+      message: `the builder took ${turns} turns without calling finish_candidate (limit ${budget.maxTurns})`,
       detail: { maxTurns: budget.maxTurns, toolCalls, mutationsApplied: mutationIds.length },
     }),
   );

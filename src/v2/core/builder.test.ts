@@ -12,7 +12,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { DEFAULT_BUILDER_BUDGET, generateCandidate, type BuilderToolExecutor, type UntrustedBoundary } from "./builder.js";
+import { DEFAULT_BUILDER_BUDGET, builderBudgetWithTurns, generateCandidate, type BuilderToolExecutor, type UntrustedBoundary } from "./builder.js";
 import { BUILDER_SYSTEM_INSTRUCTION } from "./prompt.js";
 import { V2_BUILD_FAILURE_CODES } from "./candidate.js";
 import { TOOL_FINISH_CANDIDATE, TOOL_READ_FILE, TOOL_REPLACE_FILE, type ToolOutcome } from "./tools.js";
@@ -449,4 +449,112 @@ test("neutralize: an APPLIED result is pure provenance — no boundary, not mark
   const appliedMsg = captured[2]!.find((m) => m.role === "tool" && m.toolCallId === "w1");
   assert.equal(appliedMsg?.untrusted, undefined, "an ikbi-authored acknowledgement is not untrusted data");
   assert.equal(appliedMsg?.content.includes("<<UNTRUSTED"), false, "and carries no fence");
+});
+
+/* ── THE OPERATOR'S TURN BUDGET, in the loop ─────────────────────────────────
+
+   The unit contract for parsing the knob lives in `turn-budget.test.ts`. These are the
+   claims only the real loop can settle: that the number actually bounds it, that a raised
+   number actually buys the extra turns, and that raising it does not quietly loosen any
+   other bound.
+
+   The synthetic task is the shape of the real failure it came from — a builder that keeps
+   working and only finishes on its thirteenth turn. */
+
+/** A model that thinks for `n` turns and then finishes. */
+const thinksThenFinishes = (n: number): Turn[] => [
+  ...Array.from({ length: n }, () => ({ content: "still working" }) as Turn),
+  { toolCalls: [finishCall()] },
+];
+
+test("turn budget (G): a 13-turn task fails at the default 12, truthfully", async () => {
+  const { result } = await run(thinksThenFinishes(12), []);
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.failure.code, "build.turn_limit_exceeded");
+    // The message names the EFFECTIVE limit, so an operator can see what to raise.
+    assert.match(result.failure.message, /limit 12/, result.failure.message);
+    assert.equal(result.failure.detail?.maxTurns, 12);
+    assert.equal(result.failure.retryable, false, "a budget is not an environmental flake");
+  }
+});
+
+test("turn budget (H): the SAME task completes when the operator authorizes 20", async () => {
+  const { result } = await run(thinksThenFinishes(12), [], builderBudgetWithTurns(20));
+  assert.ok(result.ok, "the extra turns are what the task needed");
+  if (result.ok) {
+    assert.equal(result.generation.invocations.length, 13, "and it used exactly the turns it needed, not all 20");
+  }
+});
+
+test("turn budget (H): the raise buys time only — no extra tools are offered", async () => {
+  const shipped = await run(thinksThenFinishes(2), []);
+  const raised = await run(thinksThenFinishes(12), [], builderBudgetWithTurns(20));
+  assert.ok(raised.result.ok);
+  // The same tool surface at 20 turns as at 12: more time, never more capability.
+  assert.deepEqual([...raised.sent[0]!.toolNames].sort(), [...shipped.sent[0]!.toolNames].sort());
+});
+
+test("turn budget (I): a tighter bound stops it FIRST, and is the one named", async () => {
+  /*
+    30 turns authorized, but only 2 tool calls. The builder must die on tool calls and say
+    so — a raised turn budget must never mask which bound actually bit.
+  */
+  const turns: Turn[] = Array.from({ length: 6 }, (_, i) => ({ toolCalls: [readCall(`r${i}`)] }));
+  const { result } = await run(turns, [observed, observed, observed], {
+    ...builderBudgetWithTurns(30),
+    maxToolCalls: 2,
+  });
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.notEqual(result.failure.code, "build.turn_limit_exceeded", "turns were not the binding constraint");
+    assert.match(result.failure.code, /tool/, result.failure.code);
+  }
+});
+
+test("turn budget (I): the mutation bound is independent of turns too", async () => {
+  const turns: Turn[] = Array.from({ length: 8 }, (_, i) => ({ toolCalls: [readCall(`r${i}`), replaceCall(`w${i}`)] }));
+  const { result } = await run(
+    turns,
+    Array.from({ length: 16 }, (_, i) => (i % 2 === 0 ? observed : applied)),
+    { ...builderBudgetWithTurns(30), maxMutations: 2 },
+  );
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.notEqual(result.failure.code, "build.turn_limit_exceeded");
+});
+
+test("turn budget (F): the builder loop never reads the environment", async () => {
+  /*
+    The freeze, proven where it matters. The runtime resolves the operator's budget ONCE
+    per session; the loop is handed a number. So a mid-run change to the environment — a
+    shell edit, another process, a test that forgot to clean up — must be invisible here.
+
+    Set the variable to 50 and run with the shipped budget: if the loop consulted the
+    environment at any point, this task would finish instead of dying at twelve.
+  */
+  const before = process.env.IKBI_V2_MAX_BUILDER_TURNS;
+  process.env.IKBI_V2_MAX_BUILDER_TURNS = "50";
+  try {
+    const { result } = await run(thinksThenFinishes(12), []);
+    assert.equal(result.ok, false, "the loop used the budget it was given, not the one in the environment");
+    if (!result.ok) {
+      assert.equal(result.failure.code, "build.turn_limit_exceeded");
+      assert.match(result.failure.message, /limit 12/);
+    }
+  } finally {
+    if (before === undefined) delete process.env.IKBI_V2_MAX_BUILDER_TURNS;
+    else process.env.IKBI_V2_MAX_BUILDER_TURNS = before;
+  }
+});
+
+test("turn budget (F): a budget handed to the loop is used verbatim, whatever the env says", async () => {
+  const before = process.env.IKBI_V2_MAX_BUILDER_TURNS;
+  process.env.IKBI_V2_MAX_BUILDER_TURNS = "1";
+  try {
+    const { result } = await run(thinksThenFinishes(12), [], builderBudgetWithTurns(20));
+    assert.ok(result.ok, "a session that started with 20 keeps 20 even if the env is lowered under it");
+  } finally {
+    if (before === undefined) delete process.env.IKBI_V2_MAX_BUILDER_TURNS;
+    else process.env.IKBI_V2_MAX_BUILDER_TURNS = before;
+  }
 });

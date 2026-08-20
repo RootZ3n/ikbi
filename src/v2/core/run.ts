@@ -98,7 +98,7 @@ import {
   type VerificationDefinitionProbe,
   type VerificationRecord,
 } from "./verification.js";
-import { generateCandidate, type BuilderBudget, type BuilderToolExecutor, type BuilderToolExecutorDeps, type UntrustedBoundary } from "./builder.js";
+import { generateCandidate, DEFAULT_BUILDER_BUDGET, type BuilderBudget, type BuilderToolExecutor, type BuilderToolExecutorDeps, type BuilderTurnSource, type UntrustedBoundary } from "./builder.js";
 import type { InvocationAdmission } from "./cost.js";
 import type { BuilderCommandCapability, BuilderCommandRecord } from "./command.js";
 import { judgeCandidate, summarizeCritic, type CriticRecord } from "./critic.js";
@@ -143,6 +143,7 @@ import {
   summarizeInvocation,
   summarizeCommand,
   summarizeStrategy,
+  summarizeBuilderBudget,
   summarizeSelection,
   type RunCandidateEvaluationSummary,
   summarizeResolution,
@@ -373,6 +374,12 @@ export interface V2RunDeps {
   readonly candidateDiff: CandidateDiffSource;
   /** Bounds on the builder loop. Defaults to `DEFAULT_BUILDER_BUDGET`. */
   readonly builderBudget?: BuilderBudget;
+  /**
+   * Where the effective TURN count came from, for the receipt. The runtime resolves the
+   * operator's `IKBI_V2_MAX_BUILDER_TURNS` once per session and says so here; anything
+   * that injects a budget without saying is recorded as the shipped default.
+   */
+  readonly builderTurnSource?: BuilderTurnSource;
   /**
    * THE deterministic verification seams. REQUIRED and injected: check discovery reads the
    * filesystem, the runner shells out through governed-exec, and the tree probe runs git —
@@ -646,6 +653,9 @@ function representativeRank(c: CandidateResult): number {
  * stages between step 3 and terminalization — they do not add exits.
  */
 export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promise<V2RunResult> {
+  /* The frozen builder bounds this attempt ran under, captured at the builder call site
+     and reported on the receipt. Stays undefined when the run never reached the builder. */
+  let builderBudgetUsed: BuilderBudget | undefined;
   const ids = deps.ids ?? createIdFactory();
   const now = deps.now ?? Date.now;
   const probe = deps.probe ?? nodeRepoProbe;
@@ -849,6 +859,9 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
         onMutation: (applied) => { lifecycle.record(runId, { kind: "mutation", id: applied.mutationId, workspaceId: ws.workspaceId, path: applied.path }); },
         ...(deps.commands !== undefined ? { commands: deps.commands } : {}),
       });
+      /* The bounds this attempt actually ran under, captured where they are applied so the
+         receipt cannot drift from the loop. Same for every candidate in a strategy. */
+      builderBudgetUsed = deps.builderBudget ?? DEFAULT_BUILDER_BUDGET;
       const generated = await generateCandidate({
         runId, taskId, decision: builderDecision, contextPackage: ctxPkg, transport: deps.transport, executor,
         untrustedBoundary: deps.untrustedBoundary, mintInvocationId: () => ids.mint("invocation"),
@@ -1091,6 +1104,9 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     invocations: invocations.map(summarizeInvocation),
     commands: commands.map(summarizeCommand),
     ...(strategyPolicy !== undefined ? { strategy: summarizeStrategy(strategyPolicy) } : {}),
+    ...(builderBudgetUsed !== undefined
+      ? { builderBudget: summarizeBuilderBudget(builderBudgetUsed, deps.builderTurnSource ?? "default") }
+      : {}),
     ...(candidateResults.length > 0 ? { candidates: candidateResults.map((c) => candidateSummaryOf(c, selectionRecord?.selectedCandidateId, candidateWorkspaceDisposition)) } : {}),
     ...(selectionRecord !== undefined ? { selection: summarizeSelection(selectionRecord) } : {}),
     ...(candidate !== undefined ? { candidate: summarizeCandidate(candidate) } : {}),

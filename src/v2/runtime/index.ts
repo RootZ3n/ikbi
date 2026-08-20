@@ -29,6 +29,13 @@ import type { ContextSource } from "../core/context.js";
 import type { InvocationTransport } from "../core/invocation.js";
 import { PRODUCTION_CONTEXT_SOURCES } from "./context-sources.js";
 import { createRetrievalSource } from "./retrieval-source.js";
+import {
+  builderBudgetWithTurns,
+  resolveBuilderTurns,
+  BUILDER_TURNS_ENV,
+  type BuilderBudget,
+  type BuilderTurnSource,
+} from "../core/builder.js";
 import { createBuilderToolExecutor } from "./builder-tools.js";
 import { captureCandidateTree } from "./candidate-capture.js";
 import { createUntrustedBoundary } from "./untrusted-boundary.js";
@@ -65,6 +72,22 @@ function envCheckTimeoutMs(): number | undefined {
 function envRecoveryMaxAttempts(): number | undefined {
   const n = strictInt(process.env.IKBI_RECOVERY_MAX_ATTEMPTS ?? "");
   return n !== undefined && n >= 1 ? n : undefined;
+}
+
+/**
+ * The operator's BUILDER TURN BUDGET, read ONCE per session and frozen for all of it.
+ *
+ * REFUSES RATHER THAN IGNORING, unlike its siblings above. A cost cap that cannot be
+ * parsed falls back toward LESS authority, so ignoring it is safe. This one falls back
+ * toward less WORK: an operator who mistyped it would silently get twelve turns, watch the
+ * build die at twelve, and conclude the model was incapable. That is the exact confusion
+ * this knob exists to end, so a bad value stops the run here — before a provider is
+ * called and before a workspace is allocated — with the reason said out loud.
+ */
+function envBuilderTurnBudget(): { readonly budget: BuilderBudget; readonly source: BuilderTurnSource } {
+  const resolved = resolveBuilderTurns(process.env[BUILDER_TURNS_ENV]);
+  if (!resolved.ok) throw new Error(`invalid builder turn budget: ${resolved.reason}`);
+  return { budget: builderBudgetWithTurns(resolved.maxTurns), source: resolved.source };
 }
 
 /**
@@ -192,6 +215,8 @@ export interface ProductionRunDeps {
   readonly buildTools?: V2RunDeps["buildTools"];
   readonly captureTree?: V2RunDeps["captureTree"];
   readonly builderBudget?: V2RunDeps["builderBudget"];
+  /** Where an injected budget's turn count came from, for receipt truth. */
+  readonly builderTurnSource?: V2RunDeps["builderTurnSource"];
   readonly untrustedBoundary?: V2RunDeps["untrustedBoundary"];
   readonly checksSource?: V2RunDeps["checksSource"];
   readonly definitionProbe?: V2RunDeps["definitionProbe"];
@@ -271,6 +296,16 @@ async function wireRunDeps(deps: ProductionRunDeps): Promise<V2RunDeps> {
     ? { workspaces: deps.workspaces!, mutations: deps.mutations!, sources: deps.sources! }
     : await productionAuthorities();
   const resolvedCheckTimeout = deps.checkTimeoutMs ?? envCheckTimeoutMs();
+  /*
+    THE BUILDER BUDGET, frozen here. `wireRunDeps` runs ONCE per build session, and the
+    resulting deps are handed to every attempt the recovery authority composes — so the
+    environment is read exactly once and a mid-run change to it cannot grant a session more
+    builder authority than it started with. An injected budget (tests) still wins outright,
+    and is recorded as the shipped default unless it says otherwise.
+  */
+  const turns = deps.builderBudget !== undefined ? undefined : envBuilderTurnBudget();
+  const builderBudget = deps.builderBudget ?? turns!.budget;
+  const builderTurnSource: BuilderTurnSource = deps.builderTurnSource ?? turns?.source ?? "default";
   // The retrieval source is built PER RUN and is the reporter for that same run, so the
   // receipt can never describe a retrieval some other run performed.
   const retrieval = createRetrievalSource();
@@ -315,7 +350,8 @@ async function wireRunDeps(deps: ProductionRunDeps): Promise<V2RunDeps> {
     // (the donor's shared knob), else the run default. A hung check is killed and classified
     // as a timeout, never as an ordinary failure.
     ...(resolvedCheckTimeout !== undefined ? { checkTimeoutMs: resolvedCheckTimeout } : {}),
-    ...(deps.builderBudget !== undefined ? { builderBudget: deps.builderBudget } : {}),
+    builderBudget,
+    builderTurnSource,
     ...(deps.probe !== undefined ? { probe: deps.probe } : {}),
   };
 }

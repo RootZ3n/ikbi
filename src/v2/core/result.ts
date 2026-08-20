@@ -45,6 +45,7 @@ import type { ModelResolutionDecision } from "./resolver.js";
 import type { ContextManifest, ContextPackage } from "./context.js";
 import type { V2InvocationRecord } from "./invocation.js";
 import type { BuilderCommandRecord } from "./command.js";
+import type { BuilderBudget, BuilderTurnSource } from "./builder.js";
 import type { SelectionRecord, StrategyPolicy } from "./strategy.js";
 import type { V2WorkspaceRecord, WorkspaceDisposition } from "./workspace.js";
 import type { SourceSnapshotSummary } from "./source.js";
@@ -413,6 +414,42 @@ export function summarizeStrategy(policy: StrategyPolicy): RunStrategySummary {
 }
 
 /**
+ * The BOUNDS this attempt's builder actually ran under.
+ *
+ * On the receipt because the turn budget became operator-settable, and a number an
+ * operator can change is a number a receipt has to state. Without it, "why did this run
+ * cost four times the last one?" is answerable only by knowing what the environment
+ * happened to hold at the time — which is exactly the sort of thing a receipt exists to
+ * stop being folklore.
+ *
+ * Every bound is carried, not just the settable one, so the record also shows what did
+ * NOT move: raising turns leaves tools, mutations and commands where they were.
+ */
+export interface RunBuilderBudgetSummary {
+  readonly maxTurns: number;
+  /** `operator_env` when `IKBI_V2_MAX_BUILDER_TURNS` set it; `default` when shipped. */
+  readonly turnSource: BuilderTurnSource;
+  readonly maxToolCalls: number;
+  readonly maxMutations: number;
+  readonly maxCommands: number;
+  readonly maxOutputTokens: number;
+  readonly turnTimeoutMs: number;
+}
+
+/** Summarize the frozen builder budget. `turnSource` is derived, never guessed at read time. */
+export function summarizeBuilderBudget(budget: BuilderBudget, turnSource: BuilderTurnSource): RunBuilderBudgetSummary {
+  return {
+    maxTurns: budget.maxTurns,
+    turnSource,
+    maxToolCalls: budget.maxToolCalls,
+    maxMutations: budget.maxMutations,
+    maxCommands: budget.maxCommands,
+    maxOutputTokens: budget.maxOutputTokens,
+    turnTimeoutMs: budget.turnTimeoutMs,
+  };
+}
+
+/**
  * ONE candidate's canonical evaluation, receipt-safe. Every loser stays visible here even after its
  * workspace is reclaimed — the evidence ids (candidate/verification/critic/disposition) are retained.
  */
@@ -539,6 +576,11 @@ export interface V2RunReceipt {
    * strategy was frozen. `single` is one candidate; `shadow`/`tournament` are >1.
    */
   readonly strategy?: RunStrategySummary;
+  /**
+   * The frozen builder bounds this attempt ran under. Present whenever the builder was
+   * reached; absent when the run ended before candidate generation.
+   */
+  readonly builderBudget?: RunBuilderBudgetSummary;
   /**
    * V2-017 — EVERY candidate the strategy generated, with its canonical evaluation. Losers stay
    * visible here even after their workspaces are reclaimed. Empty/absent for a failed-before-strategy

@@ -16,12 +16,14 @@ function probe(over: Partial<{
   git: boolean;
   bwrap: boolean;
   gx: GovernedExecReadiness;
+  turns: ReturnType<V2ReadinessProbe["builderTurns"]>;
   routes: Awaited<ReturnType<V2ReadinessProbe["routes"]>>;
 }> = {}): V2ReadinessProbe {
   return {
     git: () => over.git ?? true,
     bwrap: () => over.bwrap ?? true,
     governedExecChecks: () => over.gx ?? { resolved: true, permitted: true, programs: ["pnpm"], denied: [] },
+    builderTurns: () => over.turns ?? { ok: true, maxTurns: 12, source: "default" },
     routes: async () => over.routes ?? { ok: true, builder: { modelId: "alpha-1", satisfiable: true }, critic: { modelId: "alpha-1", satisfiable: true } },
   };
 }
@@ -155,6 +157,43 @@ test("readiness: a selectable route reports the provider that will actually serv
   }));
   assert.equal(r.ready, true);
   assert.match(r.checks.find((c) => c.name === "builder route")?.detail ?? "", /selectable via provider 'mimo'/);
+});
+
+// ── the builder turn budget ───────────────────────────────────────────────────
+
+test("readiness: the DEFAULT turn budget is not a problem", async () => {
+  // Twelve is the shipped bound, not a misconfiguration, and doctor must never imply it is.
+  const r = await assessV2Readiness(probe());
+  assert.equal(r.ready, true);
+  const turns = r.checks.find((c) => c.name === "builder turns");
+  assert.equal(turns?.ok, true);
+  assert.equal(turns?.level, "recommended");
+  assert.match(turns?.detail ?? "", /default 12/);
+});
+
+test("readiness: a RAISED turn budget is reported, with the cost warning", async () => {
+  const r = await assessV2Readiness(probe({ turns: { ok: true, maxTurns: 24, source: "operator_env" } }));
+  assert.equal(r.ready, true, "raising it is lawful, not a readiness failure");
+  const turns = r.checks.find((c) => c.name === "builder turns");
+  assert.equal(turns?.ok, true);
+  assert.match(turns?.detail ?? "", /24/);
+  assert.match(turns?.detail ?? "", /cost/i, "an operator who raised it is told what it costs");
+});
+
+test("readiness: a MALFORMED turn budget is NOT READY, before anything is spent", async () => {
+  /*
+    The case an operator cannot otherwise discover without paying for a build to abort:
+    the variable is set to something the session will refuse at startup.
+  */
+  const r = await assessV2Readiness(probe({
+    turns: { ok: false, reason: 'IKBI_V2_MAX_BUILDER_TURNS="30junk" is not an integer (expected 1–100)' },
+  }));
+  assert.equal(r.ready, false);
+  const turns = r.checks.find((c) => c.name === "builder turns");
+  assert.equal(turns?.level, "required");
+  assert.equal(turns?.ok, false);
+  assert.match(turns?.detail ?? "", /NOT READY/);
+  assert.match(turns?.detail ?? "", /30junk/, "and it quotes the value that will be refused");
 });
 
 test("readiness: an unresolved configuration marks BOTH routes as required failures", async () => {

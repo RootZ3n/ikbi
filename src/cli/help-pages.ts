@@ -26,6 +26,8 @@ export interface HelpPage {
   readonly summary: string;
   readonly usage: string;
   readonly flags?: readonly HelpFlag[];
+  /** Operator environment knobs this command honours. Rendered after the flags. */
+  readonly env?: readonly HelpFlag[];
   readonly examples: readonly HelpExample[];
   readonly seeAlso?: readonly string[];
 }
@@ -83,6 +85,22 @@ export const HELP_PAGES: Readonly<Record<string, HelpPage>> = {
       { flag: "--strategy <s>", desc: "single (default, 1 candidate) | shadow (2) | tournament (bounded multi-candidate). More candidates ⇒ more model spend; exactly one lawful winner is promoted." },
       { flag: "--profile <name>", desc: "Per-run model profile override; otherwise your standing selection." },
       { flag: "--json", desc: "Emit only the full session JSON on stdout (banner/logs go to stderr) — the CI-friendly mode. `build` is always non-interactive." },
+    ],
+    env: [
+      {
+        flag: "IKBI_V2_MAX_BUILDER_TURNS",
+        desc:
+          "Builder turns one candidate may take. Default 12; valid 1–100; read ONCE at session start and frozen for it. " +
+          "A turn is a full provider call against the whole context package, so raising this raises SPEND — keep " +
+          "IKBI_V2_MAX_SESSION_COST_USD on. It buys time only: tool calls, mutations, commands and cost ceilings are " +
+          "unchanged, and whichever bound stops the builder first is the one the failure names. Malformed, zero, " +
+          "negative or above 100 is REFUSED before the run starts, never silently clamped.",
+      },
+      { flag: "IKBI_V2_MAX_SESSION_COST_USD", desc: "Whole-session dollar ceiling. Opt-in; no default cap." },
+      { flag: "IKBI_V2_MAX_INVOCATIONS", desc: "Whole-session model-call cap. Opt-in; stops a run independently of the turn budget." },
+      { flag: "IKBI_CHECKS", desc: "JSON array of {name, command, args} — the deterministic checks verification runs." },
+      { flag: "IKBI_CHECK_TIMEOUT_MS", desc: "Per-check wall clock. Default 600000." },
+      { flag: "IKBI_RECOVERY_MAX_ATTEMPTS", desc: "Attempts the recovery authority may compose in one session." },
     ],
     examples: [
       { cmd: "ikbi build \"add a --dry-run flag to the export command\"", desc: "Build against the current repo (single candidate)." },
@@ -651,6 +669,12 @@ export function renderHelpPage(page: HelpPage): string {
     lines.push("Flags:");
     const width = Math.max(...page.flags.map((f) => f.flag.length));
     for (const f of page.flags) lines.push(`  ${f.flag.padEnd(width + 2)}${f.desc}`);
+  }
+  if (page.env !== undefined && page.env.length > 0) {
+    lines.push("");
+    lines.push("Environment:");
+    const width = Math.max(...page.env.map((f) => f.flag.length));
+    for (const f of page.env) lines.push(`  ${f.flag.padEnd(width + 2)}${f.desc}`);
   }
   if (page.examples.length > 0) {
     lines.push("");
