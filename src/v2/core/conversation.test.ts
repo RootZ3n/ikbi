@@ -27,8 +27,7 @@ import {
   DEFAULT_RECENT_GROUPS,
   ESTIMATOR_KIND,
   MIN_RECENT_GROUPS,
-  SAFETY_MARGIN_FRACTION,
-  safetyMarginFor,
+  ESTIMATOR_RESIDUAL_ALLOWANCE,
   V2_CONVERSATION_FAILURE_CODES,
   conversationCeiling,
   estimateMessagesTokens,
@@ -40,7 +39,7 @@ import {
 } from "./conversation.js";
 import { deriveBudget, estimateTokens } from "./context.js";
 import type { RenderedMessage } from "./prompt.js";
-import type { ModelCapabilityFacts } from "./config.js";
+import { GENERIC_TOKEN_ESTIMATOR, type ModelCapabilityFacts } from "./config.js";
 import { MAX_TOOL_READ_CHARS } from "./tools.js";
 import { V2_DEFAULT_COMMAND_POLICY } from "./command.js";
 
@@ -80,7 +79,7 @@ const memory: ConversationMemory = {
   changedPaths: ["src/a.ts"],
 };
 
-const render = (c: readonly RenderedMessage[]) => estimateMessagesTokens(c) + 8_000; // 8k of immutable package
+const render = (c: readonly RenderedMessage[]) => estimateMessagesTokens(c, GENERIC_TOKEN_ESTIMATOR) + 8_000; // 8k of immutable package
 const fit = (conversation: readonly RenderedMessage[], window: number, turn = 1) =>
   fitConversation({ conversation, memory, ceiling: ceilingFor(window), turn, renderSize: render });
 
@@ -152,7 +151,7 @@ test("window: it can compact again later in the same candidate", () => {
 
 test("window: an immovable request FAILS CLOSED rather than being sent", () => {
   // A tiny window and a huge immutable package: no amount of folding can help.
-  const bigRender = (c: readonly RenderedMessage[]) => estimateMessagesTokens(c) + 100_000;
+  const bigRender = (c: readonly RenderedMessage[]) => estimateMessagesTokens(c, GENERIC_TOKEN_ESTIMATOR) + 100_000;
   const r = fitConversation({
     conversation: conversationOf(6),
     memory,
@@ -269,7 +268,7 @@ test("window: the invariant holds for 8k, 64k, 128k and 200k models alike", () =
     const ceiling = ceilingFor(window);
     assert.equal(
       ceiling.maxRenderedInputTokens,
-      window - ceiling.reservedCompletionTokens - ceiling.reservedOverheadTokens - safetyMarginFor(window),
+      Math.floor((window - ceiling.reservedCompletionTokens - ceiling.reservedOverheadTokens) / ESTIMATOR_RESIDUAL_ALLOWANCE),
       `${window}: the ceiling is derived, not chosen`,
     );
     assert.ok(
@@ -342,7 +341,7 @@ test("window: the estimator never claims to be exact", () => {
 test("window: tool-call arguments are counted, not just message text", () => {
   const body = JSON.stringify({ path: "a.ts", content: "z".repeat(8_000) });
   const withCall: RenderedMessage[] = [{ role: "assistant", content: "", toolCalls: [{ id: "c", name: "replace_file", arguments: body }] }];
-  const counted = estimateMessagesTokens(withCall);
+  const counted = estimateMessagesTokens(withCall, GENERIC_TOKEN_ESTIMATOR);
   assert.ok(counted >= estimateTokens(body), `${counted} must include the ${estimateTokens(body)}-token argument`);
 });
 
@@ -363,7 +362,7 @@ test("window: the module branches on FACTS, never on model or provider names", (
   // Nor may it hard-code the window of the model the defect was found on.
   assert.doesNotMatch(code, /65_?536|131_?072|200_?000|8_?192/, "window sizes are facts, not constants here");
   // The only tuning constants it may carry are policy, and they are named.
-  assert.equal(typeof SAFETY_MARGIN_FRACTION, "number");
+  assert.equal(typeof ESTIMATOR_RESIDUAL_ALLOWANCE, "number");
   assert.equal(typeof DEFAULT_RECENT_GROUPS, "number");
 });
 

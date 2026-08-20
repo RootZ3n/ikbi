@@ -40,6 +40,15 @@ export interface ModelCapabilities {
    * opt-in thinking budget, so an unsupported model gracefully never receives a `thinking` request.
    */
   readonly supports_thinking?: boolean;
+  /**
+   * OPTIONAL characters-per-token for this model, when it is actually known.
+   *
+   * Roster DATA, not code: a model whose tokenizer runs denser than the generic
+   * fallback declares it here and the context manager adapts, with nothing in the
+   * builder changing. Absent means the generic fallback, which is the honest state for
+   * almost every model — do not populate this with guesses.
+   */
+  chars_per_token?: number;
 }
 
 /**

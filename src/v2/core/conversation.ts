@@ -45,7 +45,8 @@
  *     Metadata the harness observed itself is the harness's to state.
  */
 
-import { estimateTokens, type ContextBudget } from "./context.js";
+import { estimateTokensWith, type ContextBudget } from "./context.js";
+import type { TokenEstimatorFacts } from "./config.js";
 import { runFailure, type RunFailure } from "./failure.js";
 import type { RenderedMessage } from "./prompt.js";
 import type { ToolOutcome } from "./tools.js";
@@ -81,26 +82,25 @@ export const ESTIMATOR_KIND: TokenEstimatorKind = "conservative_estimate";
  * four characters per token. This margin is what stands between "our estimate says it
  * fits" and "the provider agrees it fits". It is deliberately generous.
  */
-export const MIN_SAFETY_MARGIN_TOKENS = 2_048;
-
 /**
- * The margin as a FRACTION of the declared window.
+ * How much DENSER than the estimator assumes a request's content might really be.
  *
- * A flat allowance cannot be right at both ends: 2,048 tokens is a quarter of an 8k
- * model and one percent of a 200k one. Estimator error scales with request size, so the
- * margin has to as well. Six percent, with the flat value as a floor, keeps a
- * ceiling-sized request inside the window across the whole 8k–200k matrix even when the
- * content is at the densest realistic end — asserted in `estimator.test.ts` rather than
- * asserted here in prose.
+ * The margin's whole job is to absorb estimator error, and estimator error is
+ * proportional to the SIZE OF THE REQUEST, not to the size of the model's window. A
+ * fraction-of-window margin gets that backwards: it over-protects a small request on a
+ * big model and under-protects a big one, and on an 8k model a flat floor ate a quarter
+ * of the budget.
  *
- * Derived from the window, which is a capability FACT. No model name is involved.
+ * So the allowance is a ratio, and the ceiling is derived by dividing rather than
+ * subtracting. 1.10 means "assume the real request could be ten percent larger than we
+ * estimated". Measured density on real builder conversations was 3.560 and 3.587
+ * chars/token against an estimator assuming 3.5 — that is, the estimator already runs
+ * ~2% conservative, and ten percent covers content materially denser than anything
+ * observed before the completion reserve is touched at all.
+ *
+ * Derived from capability facts and one policy constant. No model name is involved.
  */
-export const SAFETY_MARGIN_FRACTION = 0.06;
-
-/** The margin for one window. Capability-derived, never model-name-derived. */
-export function safetyMarginFor(contextWindowTokens: number): number {
-  return Math.max(MIN_SAFETY_MARGIN_TOKENS, Math.ceil(contextWindowTokens * SAFETY_MARGIN_FRACTION));
-}
+export const ESTIMATOR_RESIDUAL_ALLOWANCE = 1.1;
 
 /**
  * The fewest recent turn groups kept verbatim before the fit is declared impossible.
@@ -140,6 +140,8 @@ export interface ConversationCeiling {
   readonly maxRenderedInputTokens: number;
   /** How the estimate was produced. Never `exact` unless it truly is. */
   readonly estimator: TokenEstimatorKind;
+  /** The resolved estimator facts these numbers were computed with. */
+  readonly tokenEstimator: TokenEstimatorFacts;
   /** Where the window fact came from — roster-declared, table-known, and so on. */
   readonly capabilityProvenance: ContextBudget["capabilityProvenance"];
 }
@@ -171,9 +173,15 @@ export function conversationCeiling(budget: ContextBudget): ConversationCeiling 
       throw new Error(`context budget is malformed: ${name} is ${String(value)} — a conversation ceiling cannot be derived from it`);
     }
   }
-  const safetyMarginTokens = safetyMarginFor(budget.contextWindowTokens);
-  const maxRenderedInputTokens =
-    budget.contextWindowTokens - budget.reservedCompletionTokens - budget.reservedOverheadTokens - safetyMarginTokens;
+  /*
+    The room a request may occupy after the reply and prompt overhead are set aside,
+    DIVIDED by the allowance — so that even a request whose real content is denser than
+    the estimator assumed still fits the window without borrowing the completion reserve.
+  */
+  const usable = budget.contextWindowTokens - budget.reservedCompletionTokens - budget.reservedOverheadTokens;
+  const maxRenderedInputTokens = Math.max(0, Math.floor(usable / ESTIMATOR_RESIDUAL_ALLOWANCE));
+  /* What the allowance cost, expressed as tokens, so a receipt can still show a margin. */
+  const safetyMarginTokens = usable - maxRenderedInputTokens;
   return {
     contextWindowTokens: budget.contextWindowTokens,
     reservedCompletionTokens: budget.reservedCompletionTokens,
@@ -181,6 +189,7 @@ export function conversationCeiling(budget: ContextBudget): ConversationCeiling 
     safetyMarginTokens,
     maxRenderedInputTokens,
     estimator: ESTIMATOR_KIND,
+    tokenEstimator: budget.tokenEstimator,
     capabilityProvenance: budget.capabilityProvenance,
   };
 }
@@ -193,11 +202,16 @@ export function conversationCeiling(budget: ContextBudget): ConversationCeiling 
  * carries a whole file body — so a count that ignored them would understate exactly the
  * requests most at risk of overflowing.
  */
-export function estimateMessagesTokens(messages: readonly RenderedMessage[]): number {
+export function estimateMessagesTokens(
+  messages: readonly RenderedMessage[],
+  estimator: TokenEstimatorFacts,
+): number {
   let total = 0;
   for (const m of messages) {
-    total += estimateTokens(m.content);
-    for (const call of m.toolCalls ?? []) total += estimateTokens(call.name) + estimateTokens(call.arguments);
+    total += estimateTokensWith(m.content, estimator);
+    for (const call of m.toolCalls ?? []) {
+      total += estimateTokensWith(call.name, estimator) + estimateTokensWith(call.arguments, estimator);
+    }
   }
   return total;
 }

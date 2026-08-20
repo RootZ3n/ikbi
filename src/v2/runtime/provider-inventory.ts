@@ -74,6 +74,14 @@ export function capabilityFacts(modelId: string, override?: Partial<ModelCapabil
     reasoningLevel: caps.reasoning_level,
     speedClass: caps.speed_class,
     provenance: declared ? "declared" : "known",
+    /*
+      A declared density becomes a first-class estimator fact; anything else is left
+      absent so the generic fallback applies. The builder never learns which happened —
+      it is handed an estimator either way.
+    */
+    ...(typeof caps.chars_per_token === "number"
+      ? { tokenEstimator: { kind: "chars_ratio" as const, charsPerToken: caps.chars_per_token, provenance: "declared" as const } }
+      : {}),
   };
 }
 

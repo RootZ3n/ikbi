@@ -37,7 +37,7 @@ import { createHash } from "node:crypto";
 
 import { contentDigest, type V2ArtifactDigest, type V2ContextDigest, type V2DecisionDigest, type V2RunId, type V2TaskId } from "./identity.js";
 import { runFailure, type RunFailure } from "./failure.js";
-import type { ModelCapabilityFacts } from "./config.js";
+import { GENERIC_TOKEN_ESTIMATOR, estimatorFor, type ModelCapabilityFacts, type TokenEstimatorFacts } from "./config.js";
 import type { SourceSnapshotReader } from "./source.js";
 import type { V2SnapshotDigest } from "./identity.js";
 
@@ -176,47 +176,29 @@ export interface ContextSourceResult {
 // ---------------------------------------------------------------------------
 
 /**
- * Chars→tokens, and why it is 3.2 rather than 4.
+ * The default characters-per-token, kept as a named export for the many callers that
+ * have no capability facts to hand.
  *
- * It was 4, inherited from v1, and 4 is roughly right for ENGLISH PROSE under a
- * BPE tokenizer. A builder conversation is not English prose. It is TypeScript,
- * JSON tool arguments, paths, hex digests and diff hunks, all of which tokenize
- * DENSER — commonly 3.0–3.6 characters per token — because identifiers split,
- * punctuation is its own token, and a sha256 is nearly one token per two characters.
- *
- * So the old figure did not merely wobble; it undercounted SYSTEMATICALLY, in the
- * one direction that matters. Measured on a real MiMo request at the compaction
- * threshold: estimated 53,901, provider-reported 60,560 — 12.4% under. The window
- * invariant held only because the completion reserve happened to be large enough to
- * absorb it, which is not a property anyone designed and not one to rely on.
- *
- * 3.0 is chosen so that NO realistic non-digest payload class undercounts: prose
- * (~4.2), markdown (~3.8), TypeScript (~3.3), JSON arguments (~3.2) and file paths
- * (~3.0) are all covered at or above their observed density. Only long runs of pure
- * hex — a small fraction of any real conversation — remain denser, and the safety
- * margin exists for exactly that residue.
- *
- * It yields 1.33× the old estimate, which covers the measured 12.4% with room to
- * spare. It is deliberately NOT tuned to that single prompt: it is chosen from the
- * payload classes a builder conversation is made of, and `estimator.test.ts` pins it
- * against representative corpora.
- *
- * It remains an ESTIMATE and says so everywhere (`accounting`,
- * `TokenEstimatorKind`). Nothing here is model-specific: an exact tokenizer, when
- * one exists for the resolved model, would replace this and relabel the provenance
- * rather than adjusting the constant.
+ * The derivation lives on `GENERIC_TOKEN_ESTIMATOR` in config.ts, because the estimator
+ * is a capability FACT and this is only its most common value. In short: two real runs
+ * measured 3.560 and 3.587 chars/token, and 3.5 is the largest divisor that still
+ * estimates above both.
  */
-export const CHARS_PER_TOKEN = 3.0;
+export const CHARS_PER_TOKEN = GENERIC_TOKEN_ESTIMATOR.charsPerToken;
 
 /**
- * Estimate tokens from text. An ESTIMATE — see above.
+ * Estimate tokens from text under a given estimator.
  *
- * Rounds UP, always. A fractional token is a whole token on the wire, and rounding
- * down would reintroduce a small systematic undercount at the exact moment the
- * count matters.
+ * Rounds UP, always — a fractional token is a whole token on the wire. The estimator is
+ * passed in rather than looked up, so this function cannot know which model it is
+ * serving and cannot behave differently for one.
  */
+export function estimateTokensWith(text: string, estimator: TokenEstimatorFacts): number {
+  return Math.ceil(text.length / estimator.charsPerToken);
+}
+
 export function estimateTokens(text: string): number {
-  return Math.ceil(text.length / CHARS_PER_TOKEN);
+  return estimateTokensWith(text, GENERIC_TOKEN_ESTIMATOR);
 }
 
 /**
@@ -247,6 +229,8 @@ export interface ContextBudget {
   readonly reservedOverheadTokens: number;
   /** What context input may actually occupy. */
   readonly availableInputTokens: number;
+  /** The estimator these numbers were computed with. Frozen for the whole run. */
+  readonly tokenEstimator: TokenEstimatorFacts;
 }
 
 /** Derive the budget, or explain why it cannot be derived. */
@@ -280,13 +264,14 @@ export function deriveBudget(capabilities: ModelCapabilityFacts | undefined): { 
     ok: true,
     budget: {
       accounting: "estimated_chars_per_token",
-      charsPerToken: CHARS_PER_TOKEN,
+      charsPerToken: estimatorFor(capabilities).charsPerToken,
       estimated: true,
       contextWindowTokens: window,
       capabilityProvenance: capabilities.provenance,
       reservedCompletionTokens,
       reservedOverheadTokens: OVERHEAD_RESERVE_TOKENS,
       availableInputTokens,
+      tokenEstimator: estimatorFor(capabilities),
     },
   };
 }

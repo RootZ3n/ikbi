@@ -26,7 +26,7 @@ function probe(over: Partial<{
     governedExecChecks: () => over.gx ?? { resolved: true, permitted: true, programs: ["pnpm"], denied: [] },
     builderTurns: () => over.turns ?? { ok: true, maxTurns: 12, source: "default" },
     contextEnvelope: async () =>
-      over.envelope ?? { ok: true, modelId: "alpha-1", window: 65_536, reservedCompletion: 8_192, maxInput: 53_796, estimator: "conservative_estimate" },
+      over.envelope ?? { ok: true, modelId: "alpha-1", window: 65_536, reservedCompletion: 8_192, maxInput: 53_796, estimator: "conservative_estimate", charsPerToken: 3.5, estimatorProvenance: "generic_default" },
     routes: async () => over.routes ?? { ok: true, builder: { modelId: "alpha-1", satisfiable: true }, critic: { modelId: "alpha-1", satisfiable: true } },
   };
 }

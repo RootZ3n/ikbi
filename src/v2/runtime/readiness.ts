@@ -134,7 +134,7 @@ export interface V2ReadinessProbe {
    * against an invented window.
    */
   contextEnvelope(): Promise<
-    | { readonly ok: true; readonly modelId: string; readonly window: number; readonly reservedCompletion: number; readonly maxInput: number; readonly estimator: string }
+    | { readonly ok: true; readonly modelId: string; readonly window: number; readonly reservedCompletion: number; readonly maxInput: number; readonly estimator: string; readonly charsPerToken: number; readonly estimatorProvenance: string }
     | { readonly ok: false; readonly reason: string }
   >;
   /** Resolve the builder + critic routes OFFLINE (the V2-016 readiness rules). Never invokes a model. */
@@ -236,7 +236,7 @@ export async function assessV2Readiness(probe: V2ReadinessProbe, repoPath: strin
     level: envelope.ok ? "recommended" : "required",
     detail: envelope.ok
       ? `${envelope.modelId}: ${envelope.window.toLocaleString()}-token window · ${envelope.reservedCompletion.toLocaleString()} reserved for the reply · ` +
-        `${envelope.maxInput.toLocaleString()} usable for the prompt · estimator ${envelope.estimator} · conversation compaction enabled`
+        `${envelope.maxInput.toLocaleString()} usable for the prompt · estimator ${envelope.estimator} @ ${envelope.charsPerToken} chars/token (${envelope.estimatorProvenance}) · conversation compaction enabled`
       : `NOT READY — ${envelope.reason}`,
   });
 
@@ -337,6 +337,8 @@ export function liveV2ReadinessProbe(): V2ReadinessProbe {
           reservedCompletion: ceiling.reservedCompletionTokens,
           maxInput: ceiling.maxRenderedInputTokens,
           estimator: ceiling.estimator,
+          charsPerToken: ceiling.tokenEstimator.charsPerToken,
+          estimatorProvenance: ceiling.tokenEstimator.provenance,
         };
       } catch (err) {
         return { ok: false as const, reason: err instanceof Error ? err.message : String(err) };

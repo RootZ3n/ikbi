@@ -128,6 +128,64 @@ export interface ModelCapabilityFacts {
   readonly reasoningLevel: "low" | "medium" | "high";
   readonly speedClass: "fast" | "medium" | "slow";
   readonly provenance: "declared" | "known";
+  /**
+   * How this model's tokens should be counted. Absent means the generic fallback.
+   *
+   * A FACT ABOUT THE MODEL, stated by the inventory — which is the whole point. The
+   * builder and the context manager apply whatever estimator they are handed; they do not
+   * choose one, and they cannot see a model id to choose one by. A future model with a
+   * denser tokenizer declares that here and behaves correctly without a line changing in
+   * `builder.ts` or `conversation.ts`.
+   */
+  readonly tokenEstimator?: TokenEstimatorFacts;
+}
+
+/**
+ * How to count tokens for one model.
+ *
+ * One kind today, and it is honest about being an approximation. `exact` and
+ * `provider_reported` are deliberately absent from this union rather than declared and
+ * unimplemented — a kind that exists is a kind something may claim, and nothing may claim
+ * exactness until it counts with a real tokenizer.
+ */
+export interface TokenEstimatorFacts {
+  readonly kind: "chars_ratio";
+  /** Characters per token. Larger = smaller estimates. */
+  readonly charsPerToken: number;
+  /** `declared` when the roster said so; `generic_default` when nothing did. */
+  readonly provenance: "declared" | "generic_default";
+}
+
+/**
+ * THE generic fallback, derived from measurement rather than chosen.
+ *
+ * Two independent real runs against a real provider tokenizer, on real builder
+ * conversations over a real repository, put the density at **3.560 and 3.587 characters
+ * per token** — remarkably close agreement across different content and different
+ * conversation lengths. Both of ikbi's previous constants are explained exactly by that
+ * number: 4.0 undercounted by ~11% (observed 12.4%) and 3.0 overcounted by ~19% (observed
+ * 19.6%), and the second of those refused a request with 22k tokens of real headroom.
+ *
+ * 3.5 is the largest divisor that still estimates ABOVE both measurements — 1.017× and
+ * 1.025×. So it leans conservative by about two percent: enough that ordinary content
+ * never undercounts, little enough that the safety margin is doing the absorbing rather
+ * than the estimator doing it twice.
+ *
+ * It is a FALLBACK. A model that knows its own density should declare it.
+ */
+export const GENERIC_TOKEN_ESTIMATOR: TokenEstimatorFacts = Object.freeze({
+  kind: "chars_ratio",
+  charsPerToken: 3.5,
+  provenance: "generic_default",
+});
+
+/** Sane bounds for a declared ratio. Outside these it is a typo, not a policy. */
+export const MIN_CHARS_PER_TOKEN = 1;
+export const MAX_CHARS_PER_TOKEN = 10;
+
+/** The estimator a model's facts select. Absent facts ⇒ the generic fallback. */
+export function estimatorFor(capabilities: ModelCapabilityFacts | undefined): TokenEstimatorFacts {
+  return capabilities?.tokenEstimator ?? GENERIC_TOKEN_ESTIMATOR;
 }
 
 /** A model as the roster declares it. */

@@ -415,6 +415,55 @@ export function summarizeStrategy(policy: StrategyPolicy): RunStrategySummary {
 }
 
 /**
+ * ESTIMATE VERSUS OBSERVED, summarized.
+ *
+ * The only way an estimator is ever calibrated is by comparing what it predicted against
+ * what the provider charged, and until now that comparison had to be reconstructed by
+ * hand after a run went wrong. Twice it was, and twice it found a systematic error — one
+ * in each direction.
+ *
+ * Bounded on purpose: a handful of ratios, never the per-turn series and never a prompt.
+ * `ratio` is estimate ÷ observed, so above 1 is conservative and below 1 is the
+ * dangerous direction.
+ */
+export interface RunEstimateCalibrationSummary {
+  /** Invocations where the provider reported input usage AND we had an estimate. */
+  readonly comparableInvocations: number;
+  /** Largest estimate ÷ observed. The most conservative moment. */
+  readonly maxOverestimateRatio: number;
+  /** Smallest estimate ÷ observed. Below 1 means we undercounted a real request. */
+  readonly minRatio: number;
+  /** Mean ratio across comparable invocations. */
+  readonly meanRatio: number;
+  /** The estimator these predictions came from. */
+  readonly charsPerToken: number;
+  readonly estimatorProvenance: string;
+}
+
+/** Compare estimates against observed usage. Returns undefined when nothing is comparable. */
+export function summarizeEstimateCalibration(
+  invocations: readonly V2InvocationRecord[],
+  charsPerToken: number,
+  estimatorProvenance: string,
+): RunEstimateCalibrationSummary | undefined {
+  const ratios: number[] = [];
+  for (const inv of invocations) {
+    const observed = inv.usage?.promptTokens;
+    if (inv.estimatedInputTokens === undefined || observed === undefined || observed <= 0) continue;
+    ratios.push(inv.estimatedInputTokens / observed);
+  }
+  if (ratios.length === 0) return undefined;
+  return {
+    comparableInvocations: ratios.length,
+    maxOverestimateRatio: Number(Math.max(...ratios).toFixed(4)),
+    minRatio: Number(Math.min(...ratios).toFixed(4)),
+    meanRatio: Number((ratios.reduce((a, b) => a + b, 0) / ratios.length).toFixed(4)),
+    charsPerToken,
+    estimatorProvenance,
+  };
+}
+
+/**
  * The EXECUTION ENVELOPE this attempt's builder ran inside.
  *
  * Here so that swapping models is an observable act rather than a mystery. Every number
@@ -447,6 +496,8 @@ export interface RunContextEnvelopeSummary {
    * Reported so wasted exploration is visible; nothing is ever refused because of it.
    */
   readonly repeatedCommands: number;
+  /** Estimate-vs-observed calibration, when any invocation reported input usage. */
+  readonly calibration?: RunEstimateCalibrationSummary;
 }
 
 /** Summarize the envelope. Carries no prompt text, no source, no secret. */
@@ -456,6 +507,7 @@ export function summarizeContextEnvelope(
   turnsExecuted: number,
   maxEstimatedInputTokens: number,
   repeatedCommands: number,
+  calibration: RunEstimateCalibrationSummary | undefined,
 ): RunContextEnvelopeSummary {
   return {
     contextWindowTokens: ceiling.contextWindowTokens,
@@ -469,6 +521,7 @@ export function summarizeContextEnvelope(
     turnsExecuted,
     maxEstimatedInputTokens,
     repeatedCommands,
+    ...(calibration !== undefined ? { calibration } : {}),
   };
 }
 

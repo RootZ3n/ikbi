@@ -275,6 +275,14 @@ export interface V2InvocationRecord {
   readonly responseCharacters: number;
   /** Only fields the provider actually reported. Never estimated and labelled observed. */
   readonly usage?: ObservedUsage;
+  /**
+   * What ikbi ESTIMATED this request's input at, before sending it.
+   *
+   * Recorded beside the observed usage so the two can be compared — which is the only
+   * way an estimator ever gets calibrated. It is evidence, not a control input: nothing
+   * reads it back during the run, and the estimator is frozen for the session.
+   */
+  readonly estimatedInputTokens?: number;
   readonly startedAt: number;
   readonly endedAt: number;
 }
@@ -363,6 +371,11 @@ export interface InvocationAuthorityInput {
   readonly transport: InvocationTransport;
   readonly aliases?: readonly ServedModelAlias[];
   readonly now?: () => number;
+  /**
+   * The caller's pre-send estimate of this request's input tokens, when it has one.
+   * Carried onto the record for estimate-vs-observed calibration evidence.
+   */
+  readonly estimatedInputTokens?: number;
 }
 
 /**
@@ -534,6 +547,7 @@ export async function invokeAuthorized(input: InvocationAuthorityInput): Promise
       finishReason: response.finishReason,
       responseCharacters: response.content.length,
       ...(response.usage !== undefined ? { usage: Object.freeze(response.usage) } : {}),
+      ...(input.estimatedInputTokens !== undefined ? { estimatedInputTokens: input.estimatedInputTokens } : {}),
       startedAt,
       endedAt,
     }),

@@ -445,6 +445,8 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
     const renderWith = (c: readonly RenderedMessage[]) =>
       estimateMessagesTokens(
         renderBuilderInput(input.contextPackage, c, input.untrustedBoundary, input.repairBrief !== undefined ? { repairBrief: input.repairBrief, boundary: input.untrustedBoundary } : undefined).messages,
+        // THE model's own estimator, resolved once with the budget and frozen for the run.
+        input.contextPackage.budget.tokenEstimator,
       );
     const fitted = fitConversation({ conversation, memory: { facts, changedPaths: [...changedPaths] }, ceiling, turn: turns + 1, renderSize: renderWith });
     if (!fitted.ok) return partial(fitted.failure);
@@ -495,6 +497,9 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
       decision: input.decision,
       contextPackage: input.contextPackage,
       rendered,
+      // Calibration evidence: what we thought this request was, recorded beside what the
+      // provider says it was. Read by nothing during the run.
+      estimatedInputTokens: fitted.estimatedTokens,
       tools: BUILDER_TOOLS,
       parameters: {
         maxOutputTokens: turnMaxOutputTokens,

@@ -214,6 +214,19 @@ function parseCapabilitiesMaybe(v: unknown, source: string): Partial<ModelCapabi
     }
     caps.reasoning_level = r.reasoning_level as ReasoningLevel;
   }
+  if (r.chars_per_token !== undefined) {
+    /*
+      A declared token density affects EXECUTION — it decides when a conversation is
+      compacted and when a request is refused as unfittable — so a typo here must not
+      quietly become policy. Bounds are deliberately wide (a real tokenizer lives near
+      2–5); they exist to catch `0`, a negative, or a stray order of magnitude.
+    */
+    const n = asNumber(r.chars_per_token, "capabilities.chars_per_token", source);
+    if (!(n >= 1 && n <= 10)) {
+      throw new Error(`Provider roster ${source}: capabilities.chars_per_token must be between 1 and 10, got ${n}`);
+    }
+    caps.chars_per_token = n;
+  }
   if (r.speed_class !== undefined) {
     if (typeof r.speed_class !== "string" || !SPEED_CLASSES.has(r.speed_class)) {
       throw new Error(`Provider roster ${source}: capabilities.speed_class must be one of fast|medium|slow`);

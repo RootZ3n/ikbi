@@ -14,6 +14,7 @@ import { test } from "node:test";
 
 import { estimateMessagesTokens } from "./conversation.js";
 import { TOOL_RUN_COMMAND } from "./tools.js";
+import { GENERIC_TOKEN_ESTIMATOR } from "./config.js";
 import { DEFAULT_BUILDER_BUDGET, builderBudgetWithTurns, generateCandidate, type BuilderToolExecutor, type UntrustedBoundary } from "./builder.js";
 import { BUILDER_SYSTEM_INSTRUCTION } from "./prompt.js";
 import { V2_BUILD_FAILURE_CODES } from "./candidate.js";
@@ -46,7 +47,7 @@ const contextPackage = {
   artifacts: [{ category: "task", sourceId: "task", origin: "operator", content: "change the widget", observedSha256: "a", bytes: 3, originalBytes: 3, truncated: false, estimatedTokens: 4, reason: "goal", artifactId: "x" }],
   omissions: [],
   sourcesConsulted: ["task"],
-  budget: { availableInputTokens: 90_000, reservedCompletionTokens: 4_096, reservedOverheadTokens: 1_500, contextWindowTokens: 100_000, capabilityProvenance: "declared", estimated: true, accounting: "estimated_chars_per_token", charsPerToken: 4 },
+  budget: { availableInputTokens: 90_000, reservedCompletionTokens: 4_096, reservedOverheadTokens: 1_500, contextWindowTokens: 100_000, capabilityProvenance: "declared", estimated: true, accounting: "estimated_chars_per_token", charsPerToken: 3.5, tokenEstimator: GENERIC_TOKEN_ESTIMATOR },
   estimatedInputTokens: 4,
   sourceSnapshotId: "3".repeat(64),
 } as unknown as ContextPackage;
@@ -583,7 +584,8 @@ const narrowPackage = {
     capabilityProvenance: "declared",
     estimated: true,
     accounting: "estimated_chars_per_token",
-    charsPerToken: 4,
+    charsPerToken: 3.5,
+    tokenEstimator: GENERIC_TOKEN_ESTIMATOR,
   },
 } as unknown as ContextPackage;
 
@@ -618,7 +620,7 @@ test("window (real 65k): every request sent stays under the model's ceiling", as
 
   const ceiling = 65_536 - 8_192 - 1_500 - 2_048;
   for (const [i, request] of sent.entries()) {
-    const estimate = estimateMessagesTokens(request.messages as never);
+    const estimate = estimateMessagesTokens(request.messages as never, GENERIC_TOKEN_ESTIMATOR);
     assert.ok(estimate <= ceiling, `turn ${i + 1} sent an estimated ${estimate} tokens, ceiling ${ceiling}`);
     // And nothing ever approaches the raw window.
     assert.ok(estimate < 65_536, `turn ${i + 1} exceeded the declared window outright`);
@@ -839,7 +841,15 @@ test("failure envelope (F): it carries no prompt or source content", async () =>
   const serialized = JSON.stringify(e);
   assert.doesNotMatch(serialized, /zzzz/, "no file body reaches the envelope");
   assert.doesNotMatch(serialized, /src\/big/, "not even a path");
-  for (const v of Object.values(e.ceiling)) assert.ok(typeof v === "number" || typeof v === "string");
+  /* Every leaf is a scalar — no arrays of text, no nested payloads, nowhere for content
+     to hide. Recursive because the ceiling now nests the resolved estimator facts. */
+  const scalarsOnly = (o: unknown): void => {
+    for (const v of Object.values(o as Record<string, unknown>)) {
+      if (v !== null && typeof v === "object") scalarsOnly(v);
+      else assert.ok(typeof v === "number" || typeof v === "string" || typeof v === "boolean", String(v));
+    }
+  };
+  scalarsOnly(e.ceiling);
 });
 
 /* ── REPEATED READ-ONLY EXPLORATION ──────────────────────────────────────── */
