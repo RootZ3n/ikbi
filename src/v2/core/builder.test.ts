@@ -17,6 +17,7 @@ import { TOOL_RUN_COMMAND } from "./tools.js";
 import { GENERIC_TOKEN_ESTIMATOR } from "./config.js";
 import { renderBudgetStatus } from "./builder.js";
 import { estimateTokens } from "./context.js";
+import { builderBudgetWith } from "./builder.js";
 import { DEFAULT_BUILDER_BUDGET, builderBudgetWithTurns, generateCandidate, type BuilderToolExecutor, type UntrustedBoundary } from "./builder.js";
 import { BUILDER_SYSTEM_INSTRUCTION } from "./prompt.js";
 import { V2_BUILD_FAILURE_CODES } from "./candidate.js";
@@ -1116,4 +1117,111 @@ test("budget: it is TRUSTED and sits outside the untrusted fence", async () => {
   const last = sent[1]!.messages[sent[1]!.messages.length - 1]!;
   assert.match(last.content, /^\[ikbi execution budget\]/, "it is the final thing the model reads");
   assert.notEqual((last as { untrusted?: boolean }).untrusted, true, "harness-authored fact, not fenced data");
+});
+
+
+/* ── TOOL-CALL BUDGET ENFORCEMENT ────────────────────────────────────────── */
+
+/** A turn that issues `n` read calls at once, so a workload can be sized in calls. */
+const readsTurn = (turn: number, n: number): Turn => ({
+  toolCalls: Array.from({ length: n }, (_, i) => readCall(`r${turn}_${i}`)),
+});
+
+test("tool budget: the 41st call under the shipped 40 fails truthfully", async () => {
+  const turns: Turn[] = Array.from({ length: 9 }, (_, t) => readsTurn(t, 5));
+  const { result } = await run(turns, Array.from({ length: 45 }, () => observed));
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.failure.code, "build.tool_limit_exceeded");
+    assert.equal(result.failure.detail?.maxToolCalls, 40);
+    assert.match(result.failure.message, /40 tool calls/);
+  }
+});
+
+test("tool budget: the SAME workload continues when the operator authorizes 150", async () => {
+  /* THE claim the production evidence asked for: the identical work that died at forty
+     proceeds when the operator raises the bound, and nothing else was granted. */
+  const turns: Turn[] = [...Array.from({ length: 9 }, (_, t) => readsTurn(t, 5)), { toolCalls: [finishCall()] }];
+  const { result } = await run(turns, Array.from({ length: 45 }, () => observed), builderBudgetWith({ maxToolCalls: 150 }));
+  assert.ok(result.ok, "it finishes instead of dying at forty");
+  assert.equal(result.generation.toolCalls, 46, "and used exactly the calls it needed, not 150");
+});
+
+test("tool budget: turns can still stop it first", async () => {
+  const turns: Turn[] = Array.from({ length: 20 }, (_, t) => readsTurn(t, 1));
+  const { result } = await run(turns, Array.from({ length: 20 }, () => observed), builderBudgetWith({ maxTurns: 3, maxToolCalls: 150 }));
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.failure.code, "build.turn_limit_exceeded", "turns bit first, and are named");
+});
+
+test("tool budget: mutations can still stop it first", async () => {
+  const turns: Turn[] = Array.from({ length: 10 }, (_, t) => ({ toolCalls: [readCall(`r${t}`), replaceCall(`w${t}`)] }));
+  const outcomes = Array.from({ length: 20 }, (_, i) => (i % 2 === 0 ? observed : applied));
+  const { result } = await run(turns, outcomes, { ...builderBudgetWith({ maxToolCalls: 150 }), maxMutations: 2 });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.failure.code, "build.mutation_limit_exceeded");
+});
+
+test("tool budget: commands can still stop it first", async () => {
+  const turns: Turn[] = Array.from({ length: 12 }, (_, t) => ({ toolCalls: [cmdCall(`c${t}`, [`dir${t}`])] }));
+  const outcomes = Array.from({ length: 12 }, (_, t) => ranCommand([`dir${t}`]));
+  const { result } = await run(turns, outcomes, { ...builderBudgetWith({ maxToolCalls: 150 }), maxCommands: 3 });
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.notEqual(result.failure.code, "build.tool_limit_exceeded", "tool calls were not the binding bound");
+    assert.match(result.failure.code, /command/);
+  }
+});
+
+test("tool budget: cost admission can still stop it first", async () => {
+  const denial = { code: "cost.session_ceiling_reached", message: "the session cost ceiling is reached", category: "cost" };
+  const admission = {
+    admitNext: () => ({ admit: false, failure: denial }),
+    recordAttempt: () => {},
+    charge: () => ({}),
+  } as never;
+  const t = scriptedTransport([{ toolCalls: [finishCall()] }]);
+  const e = scriptedExecutor([]);
+  const result = await generateCandidate({
+    runId: RUN, taskId: TASK, decision, contextPackage, transport: t.transport, executor: e.executor,
+    untrustedBoundary: fakeBoundary, mintInvocationId: () => `inv_${(idSeq += 1)}` as V2InvocationId,
+    budget: builderBudgetWith({ maxToolCalls: 150 }), admission, now: () => 1000,
+  });
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.failure.code, "cost.session_ceiling_reached", "money still stops it regardless of tool authority");
+});
+
+/* ── The model-visible line reflects the operator's value ─────────────────── */
+
+test("tool budget line: the default shows /40", async () => {
+  const { sent } = await run([{ toolCalls: [finishCall()] }], []);
+  assert.match(budgetLineAt(sent, 1), /tool_calls 0\/40\b/);
+});
+
+test("tool budget line: an operator-raised budget shows /150, and counts up against it", async () => {
+  const turns: Turn[] = [readsTurn(0, 3), readsTurn(1, 2), { toolCalls: [finishCall()] }];
+  const { sent } = await run(turns, Array.from({ length: 6 }, () => observed), builderBudgetWith({ maxToolCalls: 150 }));
+  assert.match(budgetLineAt(sent, 1), /tool_calls 0\/150\b/);
+  assert.match(budgetLineAt(sent, 2), /tool_calls 3\/150\b/);
+  assert.match(budgetLineAt(sent, 3), /tool_calls 5\/150\b/);
+});
+
+test("tool budget line: only the numbers change — no guidance appears at any budget", async () => {
+  const { sent } = await run([readsTurn(0, 2), { toolCalls: [finishCall()] }], [observed, observed], builderBudgetWith({ maxToolCalls: 150 }));
+  for (const turn of [1, 2]) {
+    const line = budgetLineAt(sent, turn);
+    assert.match(line, /^\[ikbi execution budget\] turn \d+\/\d+ · tool_calls \d+\/\d+ · mutations \d+\/\d+ · commands \d+\/\d+$/);
+    for (const phrase of ["hurry", "finish now", "stop exploring", "running out", "should", "left", "remaining"]) {
+      assert.doesNotMatch(line.toLowerCase(), new RegExp(phrase), `"${phrase}" is guidance, not a fact`);
+    }
+  }
+});
+
+test("tool budget line: identical budget state renders identically, whatever the model", async () => {
+  const a = renderBudgetStatus({ turnUsed: 9, turnLimit: 32, toolCallsUsed: 73, toolCallsLimit: 150, mutationsUsed: 4, mutationsLimit: 20, commandsUsed: 18, commandsLimit: 24 });
+  assert.equal(a, renderBudgetStatus({ turnUsed: 9, turnLimit: 32, toolCallsUsed: 73, toolCallsLimit: 150, mutationsUsed: 4, mutationsLimit: 20, commandsUsed: 18, commandsLimit: 24 }));
+  assert.match(a, /tool_calls 73\/150/);
+  for (const name of ["mimo", "minimax", "glm", "deepseek", "openai"]) {
+    assert.doesNotMatch(a.toLowerCase(), new RegExp(name));
+  }
 });

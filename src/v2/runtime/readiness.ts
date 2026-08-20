@@ -20,7 +20,7 @@ import { resolveChecks } from "../../modules/checks/index.js";
 import { governedExecConfig } from "../../modules/governed-exec/config.js";
 
 import { buildRuntimeModelPolicy, isUsableReadiness, type ProviderReadiness } from "../core/config.js";
-import { resolveBuilderTurns, BUILDER_TURNS_ENV, DEFAULT_BUILDER_BUDGET } from "../core/builder.js";
+import { resolveBuilderToolCalls, resolveBuilderTurns, BUILDER_TOOL_CALLS_ENV, BUILDER_TURNS_ENV, DEFAULT_BUILDER_BUDGET } from "../core/builder.js";
 import { conversationCeiling } from "../core/conversation.js";
 import { deriveBudget } from "../core/context.js";
 import { createConfigurationSource } from "./index.js";
@@ -125,6 +125,12 @@ export interface V2ReadinessProbe {
    * allocated, so doctor must be able to say so first.
    */
   builderTurns(): { readonly ok: true; readonly maxTurns: number; readonly source: string } | { readonly ok: false; readonly reason: string };
+  /**
+   * The operator's tool-call budget, resolved the way a session would. Same shape and
+   * same reasoning as the turn budget: green at the default, green when raised, and RED
+   * only for a value that would abort a real run.
+   */
+  builderToolCalls(): { readonly ok: true; readonly maxToolCalls: number; readonly source: string } | { readonly ok: false; readonly reason: string };
   /**
    * The builder's EXECUTION ENVELOPE, derived from the resolved model's capability facts.
    *
@@ -240,6 +246,18 @@ export async function assessV2Readiness(probe: V2ReadinessProbe, repoPath: strin
       : `NOT READY — ${envelope.reason}`,
   });
 
+  const tools = probe.builderToolCalls();
+  checks.push({
+    name: "builder tools",
+    ok: tools.ok,
+    level: tools.ok ? "recommended" : "required",
+    detail: tools.ok
+      ? tools.source === "operator_env"
+        ? `${BUILDER_TOOL_CALLS_ENV}=${tools.maxToolCalls} — raised from the default ${DEFAULT_BUILDER_BUDGET.maxToolCalls}; every tool result re-enters the conversation, so a larger allowance can raise latency and spend even though it grants no extra turns`
+        : `builder tool-call budget is the default ${tools.maxToolCalls} (raise with ${BUILDER_TOOL_CALLS_ENV} if a real task needs more)`
+      : `NOT READY — ${tools.reason}`,
+  });
+
   const routes = await probe.routes();
   if (!routes.ok) {
     checks.push({ name: "builder route", ok: false, level: "required", detail: `configuration could not be resolved: ${routes.detail}` });
@@ -343,6 +361,10 @@ export function liveV2ReadinessProbe(): V2ReadinessProbe {
       } catch (err) {
         return { ok: false as const, reason: err instanceof Error ? err.message : String(err) };
       }
+    },
+    builderToolCalls: () => {
+      const r = resolveBuilderToolCalls(process.env[BUILDER_TOOL_CALLS_ENV]);
+      return r.ok ? { ok: true as const, maxToolCalls: r.value, source: r.source } : { ok: false as const, reason: r.reason };
     },
     routes: async () => {
       try {

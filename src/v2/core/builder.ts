@@ -158,21 +158,112 @@ export function renderBudgetStatus(status: BuilderBudgetStatus): string {
 /* ── The operator's turn budget ──────────────────────────────────────────── */
 
 /**
- * The one bound an operator may raise, and the name they raise it with.
+ * The bounds an operator may raise, and the names they raise them with.
  *
- * WHY THIS ONE AND NOT THE OTHERS. The first real production task on another
- * repository ended at `build.turn_limit_exceeded` with two mutations already applied
- * and legitimate progress in the log. Governance was right — it failed truthfully,
- * promoted nothing, and declined to retry — but twelve turns is the scaffold-era bound
- * this file admits it is, and there was no way for an operator to authorize more before
- * starting. v1 had exactly that knob; v2 shipped without it. This restores it.
+ * WHY THESE AND NOT THE OTHERS. Each was added only after a real production run proved
+ * it was the binding constraint on genuine work, never on a hunch.
  *
- * WHAT IT DELIBERATELY IS NOT. It does not touch `maxToolCalls`, `maxMutations`,
- * `maxCommands`, the session invocation cap or the session cost ceiling. A thirty-turn
- * builder is still bounded by every one of those, and whichever stops it first is the
- * one the failure names. Raising turns buys time, never authority and never money.
+ *   TURNS — a task ended at `build.turn_limit_exceeded` with mutations already applied
+ *   and progress in the log. Twelve was the scaffold-era bound this file admits it is,
+ *   and v1 had an override v2 shipped without.
+ *
+ *   TOOL CALLS — three materially different models were then measured on the same task.
+ *   MiMo burned forty calls in an exploration loop and wrote nothing; MiniMax used its
+ *   forty across seven substantial write turns with zero redundant commands, and GLM-5.2
+ *   was on the same trajectory with six. Two independent vendors doing real work hit the
+ *   same wall, which is what distinguishes a limit that is too low from a model that is
+ *   wasteful.
+ *
+ * WHAT THEY DELIBERATELY ARE NOT. Neither touches the other, nor `maxMutations`,
+ * `maxCommands`, `maxOutputTokens`, the session invocation cap or the session cost
+ * ceiling. Whichever bound is reached first is the one the failure names. Raising a
+ * bound buys that resource and nothing else — never authority, never money.
  */
 export const BUILDER_TURNS_ENV = "IKBI_V2_MAX_BUILDER_TURNS";
+export const BUILDER_TOOL_CALLS_ENV = "IKBI_V2_MAX_TOOL_CALLS";
+
+/**
+ * The hard ceiling on tool calls. A SAFETY BOUNDARY, not a recommended operating point.
+ *
+ * A tool call is cheap on its own — a read, a listing, a write — but it is never alone:
+ * each one returns a result that re-enters the conversation and is re-sent on every
+ * later turn, so a large allowance raises latency and spend indirectly even though it
+ * grants no extra turns and no extra money. Five hundred is roughly three times the ~150
+ * an operator already runs successfully in a comparable harness, which leaves real room
+ * above known-good practice while still refusing a typo that would authorize thousands.
+ */
+export const MAX_BUILDER_TOOL_CALLS_CEILING = 500;
+
+/** Where an effective bound came from. Recorded so a receipt can say. */
+export type BuilderBoundSource = "default" | "operator_env";
+
+/** Resolving one operator bound either yields a value, or refuses and says why. */
+export type BuilderBoundResolution =
+  | { readonly ok: true; readonly value: number; readonly source: BuilderBoundSource }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * Resolve ONE operator-settable bound from ONE raw environment string.
+ *
+ * Pure, so the whole contract is testable without a process. Absent or blank is the
+ * shipped default; anything else must be a clean positive integer inside the ceiling.
+ *
+ * IT REFUSES RATHER THAN IGNORING. The sibling env knobs in the runtime silently fall
+ * back when they cannot parse a value, and for a *cost ceiling* that is right — ignoring
+ * it fails toward less authority. Ignoring one of these fails toward less WORK: an
+ * operator who typed `150junk` would be handed forty, watch the build die at forty, and
+ * blame the model for the harness — the exact confusion this whole line of repair came
+ * out of. So a malformed value is a configuration error, said out loud, before anything
+ * is spent. Nothing is partially parsed and nothing is silently clamped.
+ *
+ * Shared by both knobs on purpose: two copies of this would eventually disagree about
+ * what `2.5` means, and the one that drifted would be the one nobody was testing.
+ */
+export function resolveBuilderBound(input: {
+  readonly raw: string | undefined;
+  readonly envName: string;
+  readonly shipped: number;
+  readonly ceiling: number;
+  /** What the bound counts, for the refusal message: "builder turns", "tool calls". */
+  readonly noun: string;
+}): BuilderBoundResolution {
+  const text = (input.raw ?? "").trim();
+  if (text.length === 0) return { ok: true, value: input.shipped, source: "default" };
+
+  // A FULL integer, anchored. "2.5", "150junk", "0x20", "1e3" and " 12 x" are all
+  // refused here rather than becoming 2, 150, 0, 1 or the default.
+  if (!/^-?\d+$/.test(text)) {
+    return { ok: false, reason: `${input.envName}="${text}" is not an integer (expected 1–${input.ceiling})` };
+  }
+  const n = Number(text);
+  if (!Number.isSafeInteger(n)) {
+    return { ok: false, reason: `${input.envName}="${text}" is not a representable integer` };
+  }
+  if (n < 1) {
+    return { ok: false, reason: `${input.envName}=${n} would authorize no ${input.noun} (expected 1–${input.ceiling})` };
+  }
+  if (n > input.ceiling) {
+    return {
+      ok: false,
+      reason:
+        `${input.envName}=${n} exceeds the hard ceiling of ${input.ceiling}. ` +
+        `The ceiling is a safety boundary, not a target — raise the budget deliberately ` +
+        `and keep a session cost ceiling on.`,
+    };
+  }
+  return { ok: true, value: n, source: "operator_env" };
+}
+
+/** Resolve the operator's tool-call budget. */
+export function resolveBuilderToolCalls(raw: string | undefined): BuilderBoundResolution {
+  return resolveBuilderBound({
+    raw,
+    envName: BUILDER_TOOL_CALLS_ENV,
+    shipped: DEFAULT_BUILDER_BUDGET.maxToolCalls,
+    ceiling: MAX_BUILDER_TOOL_CALLS_CEILING,
+    noun: "tool calls",
+  });
+}
 
 /**
  * The hard ceiling. A SAFETY BOUNDARY, not a recommended operating point.
@@ -185,7 +276,7 @@ export const BUILDER_TURNS_ENV = "IKBI_V2_MAX_BUILDER_TURNS";
 export const MAX_BUILDER_TURNS_CEILING = 100;
 
 /** Where the effective turn budget came from. Recorded so a receipt can say. */
-export type BuilderTurnSource = "default" | "operator_env";
+export type BuilderTurnSource = BuilderBoundSource;
 
 /** Resolving the operator's turn budget either yields one, or refuses and says why. */
 export type BuilderTurnResolution =
@@ -193,51 +284,21 @@ export type BuilderTurnResolution =
   | { readonly ok: false; readonly reason: string };
 
 /**
- * Resolve the effective builder turn budget from ONE raw environment string.
+ * Resolve the effective builder TURN budget.
  *
- * Pure, so the whole contract is testable without a process. Absent or blank is the
- * shipped default; anything else must be a clean positive integer inside the ceiling.
- *
- * IT REFUSES RATHER THAN IGNORING. The sibling env knobs in the runtime silently fall
- * back when they cannot parse a value, and for a *cost ceiling* that is right — ignoring
- * it fails toward less authority. Ignoring this one fails toward less WORK: an operator
- * who typed `30junk` would be handed twelve turns, watch the build die at twelve, and
- * blame the model for the harness — which is the exact confusion this whole repair came
- * out of. So a malformed value is a configuration error, said out loud, before anything
- * is spent. Nothing is partially parsed and nothing is silently clamped.
+ * A thin naming over the shared resolver, kept as its own export because callers and
+ * tests refer to turns by name. The parsing, the refusals and the ceiling behaviour are
+ * the shared ones — there is no second copy to drift.
  */
 export function resolveBuilderTurns(raw: string | undefined): BuilderTurnResolution {
-  const text = (raw ?? "").trim();
-  if (text.length === 0) return { ok: true, maxTurns: DEFAULT_BUILDER_BUDGET.maxTurns, source: "default" };
-
-  // A FULL integer, anchored. "2.5", "30junk", "1e3", " 12 x" and "" are all refused
-  // here rather than becoming 2, 30, 1 or the default.
-  if (!/^-?\d+$/.test(text)) {
-    return {
-      ok: false,
-      reason: `${BUILDER_TURNS_ENV}="${text}" is not an integer (expected 1–${MAX_BUILDER_TURNS_CEILING})`,
-    };
-  }
-  const n = Number(text);
-  if (!Number.isSafeInteger(n)) {
-    return { ok: false, reason: `${BUILDER_TURNS_ENV}="${text}" is not a representable integer` };
-  }
-  if (n < 1) {
-    return {
-      ok: false,
-      reason: `${BUILDER_TURNS_ENV}=${n} would authorize no builder turns (expected 1–${MAX_BUILDER_TURNS_CEILING})`,
-    };
-  }
-  if (n > MAX_BUILDER_TURNS_CEILING) {
-    return {
-      ok: false,
-      reason:
-        `${BUILDER_TURNS_ENV}=${n} exceeds the hard ceiling of ${MAX_BUILDER_TURNS_CEILING}. ` +
-        `The ceiling is a safety boundary, not a target — a turn is a full provider call, so raise ` +
-        `the budget deliberately and keep a session cost ceiling on.`,
-    };
-  }
-  return { ok: true, maxTurns: n, source: "operator_env" };
+  const r = resolveBuilderBound({
+    raw,
+    envName: BUILDER_TURNS_ENV,
+    shipped: DEFAULT_BUILDER_BUDGET.maxTurns,
+    ceiling: MAX_BUILDER_TURNS_CEILING,
+    noun: "builder turns",
+  });
+  return r.ok ? { ok: true, maxTurns: r.value, source: r.source } : r;
 }
 
 /**
@@ -248,6 +309,23 @@ export function resolveBuilderTurns(raw: string | undefined): BuilderTurnResolut
  */
 export function builderBudgetWithTurns(maxTurns: number): BuilderBudget {
   return Object.freeze({ ...DEFAULT_BUILDER_BUDGET, maxTurns });
+}
+
+/**
+ * The default budget with ONLY the operator-settable bounds replaced.
+ *
+ * Every other bound is copied unchanged, which is the point: this function is the reason
+ * "more turns" and "more tool calls" cannot quietly become "more mutations", "more
+ * commands", "more output" or "more money". A test asserts the resulting key set equals
+ * the shipped one, so a bound added later has to be considered here rather than silently
+ * inherited.
+ */
+export function builderBudgetWith(bounds: { readonly maxTurns?: number; readonly maxToolCalls?: number }): BuilderBudget {
+  return Object.freeze({
+    ...DEFAULT_BUILDER_BUDGET,
+    ...(bounds.maxTurns !== undefined ? { maxTurns: bounds.maxTurns } : {}),
+    ...(bounds.maxToolCalls !== undefined ? { maxToolCalls: bounds.maxToolCalls } : {}),
+  });
 }
 
 // ---------------------------------------------------------------------------

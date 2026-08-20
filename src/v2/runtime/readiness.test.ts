@@ -17,6 +17,7 @@ function probe(over: Partial<{
   bwrap: boolean;
   gx: GovernedExecReadiness;
   turns: ReturnType<V2ReadinessProbe["builderTurns"]>;
+  tools: ReturnType<V2ReadinessProbe["builderToolCalls"]>;
   envelope: Awaited<ReturnType<V2ReadinessProbe["contextEnvelope"]>>;
   routes: Awaited<ReturnType<V2ReadinessProbe["routes"]>>;
 }> = {}): V2ReadinessProbe {
@@ -25,6 +26,7 @@ function probe(over: Partial<{
     bwrap: () => over.bwrap ?? true,
     governedExecChecks: () => over.gx ?? { resolved: true, permitted: true, programs: ["pnpm"], denied: [] },
     builderTurns: () => over.turns ?? { ok: true, maxTurns: 12, source: "default" },
+    builderToolCalls: () => over.tools ?? { ok: true, maxToolCalls: 40, source: "default" },
     contextEnvelope: async () =>
       over.envelope ?? { ok: true, modelId: "alpha-1", window: 65_536, reservedCompletion: 8_192, maxInput: 53_796, estimator: "conservative_estimate", charsPerToken: 3.5, estimatorProvenance: "generic_default" },
     routes: async () => over.routes ?? { ok: true, builder: { modelId: "alpha-1", satisfiable: true }, critic: { modelId: "alpha-1", satisfiable: true } },
@@ -197,6 +199,35 @@ test("readiness: a MALFORMED turn budget is NOT READY, before anything is spent"
   assert.equal(turns?.ok, false);
   assert.match(turns?.detail ?? "", /NOT READY/);
   assert.match(turns?.detail ?? "", /30junk/, "and it quotes the value that will be refused");
+});
+
+test("readiness: the DEFAULT tool-call budget is not a problem", async () => {
+  const r = await assessV2Readiness(probe());
+  assert.equal(r.ready, true);
+  const t = r.checks.find((c) => c.name === "builder tools");
+  assert.equal(t?.ok, true);
+  assert.equal(t?.level, "recommended");
+  assert.match(t?.detail ?? "", /default 40/);
+});
+
+test("readiness: a RAISED tool-call budget is reported, with the indirect-cost warning", async () => {
+  const r = await assessV2Readiness(probe({ tools: { ok: true, maxToolCalls: 150, source: "operator_env" } }));
+  assert.equal(r.ready, true, "raising it is lawful, not a readiness failure");
+  const t = r.checks.find((c) => c.name === "builder tools");
+  assert.match(t?.detail ?? "", /150/);
+  assert.match(t?.detail ?? "", /latency and spend/i, "the operator is told what it costs indirectly");
+  assert.match(t?.detail ?? "", /no extra turns/i, "and what it does NOT grant");
+});
+
+test("readiness: a MALFORMED tool-call budget is NOT READY, before anything is spent", async () => {
+  const r = await assessV2Readiness(probe({
+    tools: { ok: false, reason: 'IKBI_V2_MAX_TOOL_CALLS="150junk" is not an integer (expected 1–500)' },
+  }));
+  assert.equal(r.ready, false);
+  const t = r.checks.find((c) => c.name === "builder tools");
+  assert.equal(t?.level, "required");
+  assert.match(t?.detail ?? "", /NOT READY/);
+  assert.match(t?.detail ?? "", /150junk/);
 });
 
 test("readiness: an unresolved configuration marks BOTH routes as required failures", async () => {

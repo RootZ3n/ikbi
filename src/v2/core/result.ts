@@ -45,7 +45,7 @@ import type { ModelResolutionDecision } from "./resolver.js";
 import type { ContextManifest, ContextPackage } from "./context.js";
 import type { V2InvocationRecord } from "./invocation.js";
 import type { BuilderCommandRecord } from "./command.js";
-import type { BuilderBudget, BuilderTurnSource } from "./builder.js";
+import type { BuilderBoundSource, BuilderBudget, BuilderTurnSource } from "./builder.js";
 import type { CompactionEvent, ConversationCeiling } from "./conversation.js";
 import type { SelectionRecord, StrategyPolicy } from "./strategy.js";
 import type { V2WorkspaceRecord, WorkspaceDisposition } from "./workspace.js";
@@ -542,6 +542,8 @@ export interface RunBuilderBudgetSummary {
   /** `operator_env` when `IKBI_V2_MAX_BUILDER_TURNS` set it; `default` when shipped. */
   readonly turnSource: BuilderTurnSource;
   readonly maxToolCalls: number;
+  /** `operator_env` when `IKBI_V2_MAX_TOOL_CALLS` set it; `default` when shipped. */
+  readonly toolCallSource: BuilderBoundSource;
   readonly maxMutations: number;
   readonly maxCommands: number;
   readonly maxOutputTokens: number;
@@ -549,11 +551,16 @@ export interface RunBuilderBudgetSummary {
 }
 
 /** Summarize the frozen builder budget. `turnSource` is derived, never guessed at read time. */
-export function summarizeBuilderBudget(budget: BuilderBudget, turnSource: BuilderTurnSource): RunBuilderBudgetSummary {
+export function summarizeBuilderBudget(
+  budget: BuilderBudget,
+  turnSource: BuilderTurnSource,
+  toolCallSource: BuilderBoundSource,
+): RunBuilderBudgetSummary {
   return {
     maxTurns: budget.maxTurns,
     turnSource,
     maxToolCalls: budget.maxToolCalls,
+    toolCallSource,
     maxMutations: budget.maxMutations,
     maxCommands: budget.maxCommands,
     maxOutputTokens: budget.maxOutputTokens,

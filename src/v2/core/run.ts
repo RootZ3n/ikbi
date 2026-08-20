@@ -98,7 +98,7 @@ import {
   type VerificationDefinitionProbe,
   type VerificationRecord,
 } from "./verification.js";
-import { generateCandidate, DEFAULT_BUILDER_BUDGET, type BuilderBudget, type BuilderToolExecutor, type BuilderToolExecutorDeps, type BuilderTurnSource, type UntrustedBoundary } from "./builder.js";
+import { generateCandidate, DEFAULT_BUILDER_BUDGET, type BuilderBudget, type BuilderToolExecutor, type BuilderToolExecutorDeps, type BuilderBoundSource, type BuilderTurnSource, type UntrustedBoundary } from "./builder.js";
 import type { InvocationAdmission } from "./cost.js";
 import type { BuilderCommandCapability, BuilderCommandRecord } from "./command.js";
 import { judgeCandidate, summarizeCritic, type CriticRecord } from "./critic.js";
@@ -383,6 +383,8 @@ export interface V2RunDeps {
    * that injects a budget without saying is recorded as the shipped default.
    */
   readonly builderTurnSource?: BuilderTurnSource;
+  /** Where the effective TOOL-CALL count came from, for the receipt. Same freeze path. */
+  readonly builderToolCallSource?: BuilderBoundSource;
   /**
    * THE deterministic verification seams. REQUIRED and injected: check discovery reads the
    * filesystem, the runner shells out through governed-exec, and the tree probe runs git —
@@ -1140,7 +1142,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     commands: commands.map(summarizeCommand),
     ...(strategyPolicy !== undefined ? { strategy: summarizeStrategy(strategyPolicy) } : {}),
     ...(builderBudgetUsed !== undefined
-      ? { builderBudget: summarizeBuilderBudget(builderBudgetUsed, deps.builderTurnSource ?? "default") }
+      ? { builderBudget: summarizeBuilderBudget(builderBudgetUsed, deps.builderTurnSource ?? "default", deps.builderToolCallSource ?? "default") }
       : {}),
     ...(contextEnvelope !== undefined ? { contextEnvelope } : {}),
     ...(candidateResults.length > 0 ? { candidates: candidateResults.map((c) => candidateSummaryOf(c, selectionRecord?.selectedCandidateId, candidateWorkspaceDisposition)) } : {}),

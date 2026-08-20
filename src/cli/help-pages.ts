@@ -96,6 +96,15 @@ export const HELP_PAGES: Readonly<Record<string, HelpPage>> = {
           "unchanged, and whichever bound stops the builder first is the one the failure names. Malformed, zero, " +
           "negative or above 100 is REFUSED before the run starts, never silently clamped.",
       },
+      {
+        flag: "IKBI_V2_MAX_TOOL_CALLS",
+        desc:
+          "Tool calls one candidate may make. Default 40; valid 1–500; read ONCE at session start and frozen for it. " +
+          "Independent of every other bound — it grants no extra turns, mutations, commands, invocations or money, and " +
+          "whichever bound is reached first is the one the failure names. Every tool result re-enters the conversation " +
+          "and is re-sent on later turns, so a large allowance can raise latency and spend indirectly; keep " +
+          "IKBI_V2_MAX_SESSION_COST_USD on. Malformed, zero, negative or above 500 is REFUSED before the run starts.",
+      },
       { flag: "IKBI_V2_MAX_SESSION_COST_USD", desc: "Whole-session dollar ceiling. Opt-in; no default cap." },
       { flag: "IKBI_V2_MAX_INVOCATIONS", desc: "Whole-session model-call cap. Opt-in; stops a run independently of the turn budget." },
       {

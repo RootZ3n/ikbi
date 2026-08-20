@@ -26,8 +26,11 @@ import { test } from "node:test";
 import {
   BUILDER_TURNS_ENV,
   DEFAULT_BUILDER_BUDGET,
+  MAX_BUILDER_TOOL_CALLS_CEILING,
   MAX_BUILDER_TURNS_CEILING,
+  builderBudgetWith,
   builderBudgetWithTurns,
+  resolveBuilderToolCalls,
   resolveBuilderTurns,
 } from "./builder.js";
 import { summarizeBuilderBudget } from "./result.js";
@@ -181,7 +184,7 @@ test("turn budget: the turn budget grants no money and no extra model calls", ()
 /* ── J. receipt truth ─────────────────────────────────────────────────────── */
 
 test("turn budget: the receipt states the effective budget and where it came from", () => {
-  const raised = summarizeBuilderBudget(builderBudgetWithTurns(24), "operator_env");
+  const raised = summarizeBuilderBudget(builderBudgetWithTurns(24), "operator_env", "default");
   assert.equal(raised.maxTurns, 24);
   assert.equal(raised.turnSource, "operator_env");
   // It also records what did NOT move, so a reader can see the raise was narrow.
@@ -189,13 +192,13 @@ test("turn budget: the receipt states the effective budget and where it came fro
   assert.equal(raised.maxMutations, DEFAULT_BUILDER_BUDGET.maxMutations);
   assert.equal(raised.maxCommands, DEFAULT_BUILDER_BUDGET.maxCommands);
 
-  const shipped = summarizeBuilderBudget(DEFAULT_BUILDER_BUDGET, "default");
+  const shipped = summarizeBuilderBudget(DEFAULT_BUILDER_BUDGET, "default", "default");
   assert.equal(shipped.maxTurns, 12);
   assert.equal(shipped.turnSource, "default");
 });
 
 test("turn budget: the summary carries no credential and no free text", () => {
-  const s = summarizeBuilderBudget(builderBudgetWithTurns(30), "operator_env");
+  const s = summarizeBuilderBudget(builderBudgetWithTurns(30), "operator_env", "default");
   for (const [k, v] of Object.entries(s)) {
     assert.ok(typeof v === "number" || typeof v === "string", k);
     if (typeof v === "string") assert.match(v, /^(default|operator_env)$/, `${k}=${v}`);
@@ -218,7 +221,10 @@ test("turn budget (F): the environment is read at exactly ONE place in the run p
   assert.equal(reads.length, 1, `the runtime reads the turn budget ${reads.length} times; it must be once`);
 
   // And that one read is inside the resolver that `wireRunDeps` calls once per session.
-  assert.match(runtime, /function envBuilderTurnBudget\(\)[\s\S]{0,400}?process\.env\[BUILDER_TURNS_ENV\]/);
+  /* Renamed to `envBuilderBudget` when the tool-call knob joined it — one resolver now
+     reads both bounds, still exactly once, still inside the per-session wiring seam. */
+  assert.match(runtime, /function envBuilderBudget\([\s\S]{0,600}?process\.env\[BUILDER_TURNS_ENV\]/);
+  assert.match(runtime, /function envBuilderBudget\([\s\S]{0,600}?process\.env\[BUILDER_TOOL_CALLS_ENV\]/);
 
   // The pure core never reads an environment at all — it is handed a budget.
   const builder = readFileSync(new URL("../../../src/v2/core/builder.ts", import.meta.url), "utf8");
@@ -229,4 +235,146 @@ test("turn budget (F): resolution is pure, so the same input always gives the sa
   // No hidden state: calling it twice with the same string cannot drift.
   assert.deepEqual(resolveBuilderTurns("24"), resolveBuilderTurns("24"));
   assert.deepEqual(resolveBuilderTurns("nope"), resolveBuilderTurns("nope"));
+});
+
+
+/* ── THE TOOL-CALL BUDGET ────────────────────────────────────────────────────
+
+   Added only after three materially different models were measured on the same real
+   task. MiMo burned forty calls looping and wrote nothing — a model problem. But
+   MiniMax spent its forty across seven substantial write turns with zero redundant
+   commands, and GLM-5.2 was on the same trajectory with six. Two independent vendors
+   doing genuine work hit the identical wall, which is what separates "the limit is too
+   low" from "that model is wasteful". */
+
+test("tool budget (A): unset is the shipped default of 40", () => {
+  const r = resolveBuilderToolCalls(undefined);
+  assert.ok(r.ok);
+  assert.equal(r.value, 40);
+  assert.equal(r.value, DEFAULT_BUILDER_BUDGET.maxToolCalls, "read from the budget, not remembered");
+  assert.equal(r.source, "default");
+});
+
+test("tool budget (B/C): a lawful override is used exactly as given", () => {
+  const raised = resolveBuilderToolCalls("150");
+  assert.ok(raised.ok);
+  assert.equal(raised.value, 150);
+  assert.equal(raised.source, "operator_env");
+
+  const lowered = resolveBuilderToolCalls("5");
+  assert.ok(lowered.ok);
+  assert.equal(lowered.value, 5, "an operator may also tighten it");
+});
+
+test("tool budget (D): malformed values are REFUSED, never partly parsed", () => {
+  /* Each would become a number nobody typed under loose parsing: 150junk→150, 2.5→2,
+     0x20→0 or 32, 1e3→1. */
+  for (const raw of ["150junk", "2.5", "0x20", "1e3", "forty", "1,50", "+", "--5"]) {
+    const r = resolveBuilderToolCalls(raw);
+    assert.equal(r.ok, false, `${raw} must be refused`);
+    if (!r.ok) assert.match(r.reason, /IKBI_V2_MAX_TOOL_CALLS/);
+  }
+  // Blank is the DEFAULT, not an error — `export VAR=` is how a shell says "unset".
+  for (const blank of ["", "   ", "\t"]) {
+    const r = resolveBuilderToolCalls(blank);
+    assert.ok(r.ok, JSON.stringify(blank));
+    assert.equal(r.source, "default");
+  }
+});
+
+test("tool budget (E/F): zero and negative are refused", () => {
+  for (const raw of ["0", "-1", "-150"]) assert.equal(resolveBuilderToolCalls(raw).ok, false, raw);
+  const zero = resolveBuilderToolCalls("0");
+  if (!zero.ok) assert.match(zero.reason, /no tool calls/);
+});
+
+test("tool budget (G/H): the ceiling is refused above and accepted at", () => {
+  const over = resolveBuilderToolCalls(String(MAX_BUILDER_TOOL_CALLS_CEILING + 1));
+  assert.equal(over.ok, false, "one over is over");
+  if (!over.ok) assert.match(over.reason, /ceiling/i);
+  assert.equal(resolveBuilderToolCalls("5000").ok, false, "and a typo cannot authorize thousands");
+
+  const at = resolveBuilderToolCalls(String(MAX_BUILDER_TOOL_CALLS_CEILING));
+  assert.ok(at.ok, "the ceiling itself is allowed");
+  assert.equal(at.value, 500);
+});
+
+test("tool budget: the ceiling leaves real room above known-good practice", () => {
+  assert.equal(MAX_BUILDER_TOOL_CALLS_CEILING, 500);
+  assert.ok(MAX_BUILDER_TOOL_CALLS_CEILING > 150, "150 is a real operator setting elsewhere and must fit comfortably");
+  assert.ok(MAX_BUILDER_TOOL_CALLS_CEILING > DEFAULT_BUILDER_BUDGET.maxToolCalls);
+});
+
+test("tool budget: raising tool calls raises NOTHING else", () => {
+  const raised = builderBudgetWith({ maxToolCalls: 150 });
+  assert.equal(raised.maxToolCalls, 150);
+  assert.equal(raised.maxTurns, DEFAULT_BUILDER_BUDGET.maxTurns);
+  assert.equal(raised.maxMutations, DEFAULT_BUILDER_BUDGET.maxMutations);
+  assert.equal(raised.maxCommands, DEFAULT_BUILDER_BUDGET.maxCommands);
+  assert.equal(raised.maxOutputTokens, DEFAULT_BUILDER_BUDGET.maxOutputTokens);
+  assert.equal(raised.turnTimeoutMs, DEFAULT_BUILDER_BUDGET.turnTimeoutMs);
+  // A bound added later must be considered here rather than silently inherited.
+  assert.deepEqual(Object.keys(raised).sort(), Object.keys(DEFAULT_BUILDER_BUDGET).sort());
+  assert.ok(Object.isFrozen(raised));
+});
+
+test("tool budget: both knobs can be raised together, and only those two move", () => {
+  const both = builderBudgetWith({ maxTurns: 32, maxToolCalls: 150 });
+  assert.equal(both.maxTurns, 32);
+  assert.equal(both.maxToolCalls, 150);
+  assert.equal(both.maxMutations, DEFAULT_BUILDER_BUDGET.maxMutations);
+  assert.equal(both.maxCommands, DEFAULT_BUILDER_BUDGET.maxCommands);
+  // The shipped default is never mutated by deriving from it.
+  assert.equal(DEFAULT_BUILDER_BUDGET.maxToolCalls, 40);
+  assert.equal(DEFAULT_BUILDER_BUDGET.maxTurns, 12);
+});
+
+test("tool budget: it grants no money and no extra model calls", () => {
+  const keys = Object.keys(builderBudgetWith({ maxToolCalls: 500 }));
+  assert.ok(!keys.some((k) => /cost|usd|price|invocation|spend/i.test(k)), keys.join(", "));
+});
+
+test("tool budget: the two knobs share ONE parser, so they cannot drift", () => {
+  /*
+    Same malformed input, same verdict, differing only in which variable is named. Two
+    copies of this logic would eventually disagree about what "2.5" means, and the one
+    that drifted would be the one nobody was testing.
+  */
+  for (const raw of ["2.5", "0", "-1", "junk"]) {
+    assert.equal(resolveBuilderTurns(raw).ok, resolveBuilderToolCalls(raw).ok, raw);
+  }
+  const turns = resolveBuilderTurns("2.5");
+  const tools = resolveBuilderToolCalls("2.5");
+  assert.equal(turns.ok, false);
+  assert.equal(tools.ok, false);
+  if (!turns.ok && !tools.ok) {
+    assert.match(turns.reason, /IKBI_V2_MAX_BUILDER_TURNS/);
+    assert.match(tools.reason, /IKBI_V2_MAX_TOOL_CALLS/);
+  }
+});
+
+test("tool budget: the receipt says the effective value AND where it came from", () => {
+  const raised = summarizeBuilderBudget(builderBudgetWith({ maxToolCalls: 150 }), "default", "operator_env");
+  assert.equal(raised.maxToolCalls, 150);
+  assert.equal(raised.toolCallSource, "operator_env");
+  assert.equal(raised.turnSource, "default", "and the two sources are independent");
+  // It still records what did NOT move.
+  assert.equal(raised.maxMutations, DEFAULT_BUILDER_BUDGET.maxMutations);
+  assert.equal(raised.maxCommands, DEFAULT_BUILDER_BUDGET.maxCommands);
+
+  const shipped = summarizeBuilderBudget(DEFAULT_BUILDER_BUDGET, "default", "default");
+  assert.equal(shipped.maxToolCalls, 40);
+  assert.equal(shipped.toolCallSource, "default");
+});
+
+test("tool budget: resolution is pure, and the runtime reads the env exactly ONCE", () => {
+  assert.deepEqual(resolveBuilderToolCalls("150"), resolveBuilderToolCalls("150"));
+
+  const runtime = readFileSync(new URL("../../../src/v2/runtime/index.ts", import.meta.url), "utf8");
+  const reads = runtime.match(/process\.env\[BUILDER_TOOL_CALLS_ENV\]|process\.env\.IKBI_V2_MAX_TOOL_CALLS/g) ?? [];
+  assert.equal(reads.length, 1, `the runtime reads it ${reads.length} times; it must be once`);
+
+  // The pure core never reads an environment at all — it is handed a budget.
+  const builder = readFileSync(new URL("../../../src/v2/core/builder.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(builder, /process\.env/, "the builder core takes its bounds as an argument");
 });

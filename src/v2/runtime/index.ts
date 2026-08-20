@@ -30,9 +30,12 @@ import type { InvocationTransport } from "../core/invocation.js";
 import { PRODUCTION_CONTEXT_SOURCES } from "./context-sources.js";
 import { createRetrievalSource } from "./retrieval-source.js";
 import {
-  builderBudgetWithTurns,
+  builderBudgetWith,
+  resolveBuilderToolCalls,
   resolveBuilderTurns,
+  BUILDER_TOOL_CALLS_ENV,
   BUILDER_TURNS_ENV,
+  type BuilderBoundSource,
   type BuilderBudget,
   type BuilderTurnSource,
 } from "../core/builder.js";
@@ -84,10 +87,20 @@ function envRecoveryMaxAttempts(): number | undefined {
  * this knob exists to end, so a bad value stops the run here — before a provider is
  * called and before a workspace is allocated — with the reason said out loud.
  */
-function envBuilderTurnBudget(): { readonly budget: BuilderBudget; readonly source: BuilderTurnSource } {
-  const resolved = resolveBuilderTurns(process.env[BUILDER_TURNS_ENV]);
-  if (!resolved.ok) throw new Error(`invalid builder turn budget: ${resolved.reason}`);
-  return { budget: builderBudgetWithTurns(resolved.maxTurns), source: resolved.source };
+function envBuilderBudget(): {
+  readonly budget: BuilderBudget;
+  readonly turnSource: BuilderTurnSource;
+  readonly toolCallSource: BuilderBoundSource;
+} {
+  const turns = resolveBuilderTurns(process.env[BUILDER_TURNS_ENV]);
+  if (!turns.ok) throw new Error(`invalid builder turn budget: ${turns.reason}`);
+  const tools = resolveBuilderToolCalls(process.env[BUILDER_TOOL_CALLS_ENV]);
+  if (!tools.ok) throw new Error(`invalid builder tool-call budget: ${tools.reason}`);
+  return {
+    budget: builderBudgetWith({ maxTurns: turns.maxTurns, maxToolCalls: tools.value }),
+    turnSource: turns.source,
+    toolCallSource: tools.source,
+  };
 }
 
 /**
@@ -217,6 +230,8 @@ export interface ProductionRunDeps {
   readonly builderBudget?: V2RunDeps["builderBudget"];
   /** Where an injected budget's turn count came from, for receipt truth. */
   readonly builderTurnSource?: V2RunDeps["builderTurnSource"];
+  /** Where an injected budget's tool-call count came from, for receipt truth. */
+  readonly builderToolCallSource?: V2RunDeps["builderToolCallSource"];
   readonly untrustedBoundary?: V2RunDeps["untrustedBoundary"];
   readonly checksSource?: V2RunDeps["checksSource"];
   readonly definitionProbe?: V2RunDeps["definitionProbe"];
@@ -303,9 +318,10 @@ async function wireRunDeps(deps: ProductionRunDeps): Promise<V2RunDeps> {
     builder authority than it started with. An injected budget (tests) still wins outright,
     and is recorded as the shipped default unless it says otherwise.
   */
-  const turns = deps.builderBudget !== undefined ? undefined : envBuilderTurnBudget();
-  const builderBudget = deps.builderBudget ?? turns!.budget;
-  const builderTurnSource: BuilderTurnSource = deps.builderTurnSource ?? turns?.source ?? "default";
+  const resolved = deps.builderBudget !== undefined ? undefined : envBuilderBudget();
+  const builderBudget = deps.builderBudget ?? resolved!.budget;
+  const builderTurnSource: BuilderTurnSource = deps.builderTurnSource ?? resolved?.turnSource ?? "default";
+  const builderToolCallSource: BuilderBoundSource = deps.builderToolCallSource ?? resolved?.toolCallSource ?? "default";
   // The retrieval source is built PER RUN and is the reporter for that same run, so the
   // receipt can never describe a retrieval some other run performed.
   const retrieval = createRetrievalSource();
@@ -352,6 +368,7 @@ async function wireRunDeps(deps: ProductionRunDeps): Promise<V2RunDeps> {
     ...(resolvedCheckTimeout !== undefined ? { checkTimeoutMs: resolvedCheckTimeout } : {}),
     builderBudget,
     builderTurnSource,
+    builderToolCallSource,
     ...(deps.probe !== undefined ? { probe: deps.probe } : {}),
   };
 }
