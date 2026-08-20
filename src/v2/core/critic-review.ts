@@ -220,6 +220,28 @@ export function renderCriticInput(pkg: CriticInputPackage, boundary: UntrustedBo
  * "good" verdict looks like — a repair that nudged the verdict would be semantic retry
  * wearing a formatting excuse.
  */
+/**
+ * The instruction for a TRUNCATED judgment.
+ *
+ * Different from the malformed-schema one because the condition is different, and saying
+ * the wrong thing would be a small lie with a real consequence: telling a model its reply
+ * "could not be parsed" when we cut it off invites it to change what it said. It did not
+ * fail; it ran out of room. So this asks for the same judgment, more compactly.
+ *
+ * It must not invite a different VERDICT to save space — brevity applies to the prose,
+ * never to the finding. A critic that shortens "defects_found" into "satisfied" because
+ * the harness asked it to be brief is the exact failure this whole slice exists to avoid.
+ */
+export const CRITIC_TRUNCATION_INSTRUCTION = [
+  "Your previous reply was cut off before it finished — it reached the output limit, so",
+  "the JSON was incomplete. That was our limit, not a mistake on your part.",
+  "",
+  "Emit THE SAME judgement again, complete and more compactly. Keep every required field.",
+  "Keep the same verdict and the same defects; shorten the prose describing them, not the",
+  "findings themselves. Do not drop a defect to save space, and do not change your verdict",
+  "because the reply must be shorter. Emit one bare JSON object and nothing else.",
+].join("\n");
+
 export const CRITIC_REPAIR_INSTRUCTION = [
   "Your previous reply could not be parsed as the required JSON judgement.",
   "",
@@ -244,6 +266,8 @@ export function renderCriticRepairInput(
   pkg: CriticInputPackage,
   malformed: string,
   boundary: UntrustedBoundary,
+  /** True when the first reply was CUT OFF at the output limit rather than malformed. */
+  truncated = false,
 ): RenderedModelInput {
   const first = renderCriticInput(pkg, boundary);
   const messages: RenderedMessage[] = [
@@ -251,11 +275,11 @@ export function renderCriticRepairInput(
     {
       role: "user",
       content:
-        `--- YOUR PREVIOUS REPLY (untrusted data — it failed the schema) ---\n` +
+        `--- YOUR PREVIOUS REPLY (untrusted data — ${truncated ? "it was cut off at the output limit" : "it failed the schema"}) ---\n` +
         boundary.wrap({ content: malformed, source: "tool_result", origin: "critic_malformed_response" }),
       untrusted: true,
     },
-    { role: "user", content: CRITIC_REPAIR_INSTRUCTION },
+    { role: "user", content: truncated ? CRITIC_TRUNCATION_INSTRUCTION : CRITIC_REPAIR_INSTRUCTION },
   ];
   return {
     promptId: contentDigest("prompt", {

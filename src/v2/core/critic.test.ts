@@ -9,6 +9,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { readFileSync } from "node:fs";
 
 import {
   DEFECT_CATEGORIES,
@@ -16,6 +17,7 @@ import {
   criticSubjectOf,
   defectDigest,
   isMaterialSeverity,
+  isOutputTruncated,
   judgeCandidate,
   parseCriticResponse,
   validateCriticSubject,
@@ -585,4 +587,166 @@ test("critic repair: without a repair id, behaviour is exactly the old fail-clos
     assert.doesNotMatch(r.failure.message, /repair/);
   }
   assert.equal(j.calls(), 1);
+});
+
+
+/* ── TRUNCATION IS NOT PROTOCOL FAILURE ──────────────────────────────────────
+
+   The first complete builder → verifier → critic traversal on a real repository came
+   back with finishReason "length" at exactly 2,047 tokens against a 2,048 cap. ikbi had
+   cut the judgment off mid-JSON and then reported it as the model's protocol violation.
+   The model had done nothing wrong. */
+
+/** A transport that answers a script and stamps a chosen finishReason per turn. */
+function finishingCritic(replies: readonly { content: string; finishReason: string }[]) {
+  const sent: { messages: readonly { role: string; content: string; untrusted?: boolean | undefined }[] }[] = [];
+  let i = 0;
+  const transport: InvocationTransport = {
+    async send(input): Promise<TransportOutcome> {
+      sent.push({ messages: input.messages.map((m) => ({ role: m.role, content: m.content, untrusted: m.untrusted })) });
+      const r = replies[Math.min(i, replies.length - 1)]!;
+      i += 1;
+      return { ok: true, response: { content: r.content, finishReason: r.finishReason, servedModelId: "mw", attempts: 1 } };
+    },
+  };
+  return { transport, sent, calls: () => i };
+}
+
+/** A judgment cut off mid-JSON — valid up to the point generation stopped. */
+const TRUNCATED = JSON.stringify({ verdict: "defects_found", summary: "several problems", defects: [] }).slice(0, 48);
+
+function judgeFinishing(replies: readonly { content: string; finishReason: string }[], over: { repair?: boolean; maxOutputTokens?: number } = {}) {
+  const t = finishingCritic(replies);
+  const trees = [TREE, TREE, TREE];
+  const invocationId = `inv_${(idSeq += 1)}` as V2InvocationId;
+  const repairInvocationId = `inv_${(idSeq += 1)}` as V2InvocationId;
+  return {
+    sent: t.sent, calls: t.calls, invocationId, repairInvocationId,
+    result: judgeCandidate({
+      runId: RUN, taskId: TASK, goal: "make src/a.ts correct",
+      candidate, verification, verificationSummary, workspacePath: "/ws",
+      decision, transport: t.transport, boundary, diffSource,
+      diffBudget: { maxFilesWithHunks: 40, maxHunkChars: 4000 },
+      probeTree: async () => trees.shift() ?? TREE,
+      invocationId,
+      ...(over.repair === false ? {} : { repairInvocationId }),
+      maxOutputTokens: over.maxOutputTokens ?? 8_192, timeoutMs: 1_000, now: () => 1_000,
+    }),
+  };
+}
+
+test("critic truncation (A): a normal short judgment takes one call and no repair", async () => {
+  const j = judgeFinishing([{ content: SATISFIED, finishReason: "stop" }]);
+  const r = await j.result;
+  assert.ok(r.ok);
+  assert.equal(j.calls(), 1);
+  assert.equal(r.generation.repairInvocation, undefined);
+});
+
+test("critic truncation (B/C): a long-but-complete judgment parses — the old 2048 cap no longer binds", async () => {
+  /* A verdict with many findings, comfortably past the old ceiling, arriving complete. */
+  const many = JSON.stringify({
+    verdict: "defects_found",
+    summary: "a number of material problems",
+    defects: Array.from({ length: 12 }, (_, i) => ({
+      category: "wrong_behavior", severity: "major",
+      description: `finding ${i}: ` + "the described behaviour does not match the goal. ".repeat(20),
+      paths: [`src/f${i}.ts`],
+    })),
+  });
+  assert.ok(many.length / 4 > 2_048, "the fixture really is bigger than the old cap allowed");
+  const j = judgeFinishing([{ content: many, finishReason: "stop" }]);
+  const r = await j.result;
+  assert.ok(r.ok, "it parses instead of being cut off");
+  assert.equal(r.generation.record.verdict, "defects_found");
+  assert.equal(j.calls(), 1);
+});
+
+test("critic truncation (D): finishReason=length + incomplete JSON is TRUNCATION, not malformed protocol", async () => {
+  const j = judgeFinishing([{ content: TRUNCATED, finishReason: "length" }, { content: TRUNCATED, finishReason: "length" }]);
+  const r = await j.result;
+  assert.equal(r.ok, false);
+  if (!r.ok) {
+    assert.equal(r.failure.code, "critic.output_truncated");
+    assert.notEqual(r.failure.code, "critic.protocol_failure", "the model is not blamed for our ceiling");
+    assert.match(r.failure.message, /cut off at the 8192-token output limit/);
+    assert.equal(r.failure.detail?.maxOutputTokens, 8_192);
+  }
+});
+
+test("critic truncation: the length vocabulary is provider-shaped, not provider-named", () => {
+  for (const reason of ["length", "max_tokens", "MAX_TOKENS", " Length ", "output_limit", "token_limit"]) {
+    assert.equal(isOutputTruncated(reason), true, reason);
+  }
+  for (const reason of ["stop", "tool_calls", "end_turn", "content_filter", undefined]) {
+    assert.equal(isOutputTruncated(reason), false, String(reason));
+  }
+});
+
+test("critic truncation (E): truncated first, valid repair → the judgment succeeds", async () => {
+  const j = judgeFinishing([{ content: TRUNCATED, finishReason: "length" }, { content: SATISFIED, finishReason: "stop" }]);
+  const r = await j.result;
+  assert.ok(r.ok, "the compact re-emission parsed");
+  assert.equal(j.calls(), 2);
+  assert.ok(r.generation.repairInvocation !== undefined);
+  assert.equal(r.generation.repairInvocation.invocationId, j.repairInvocationId);
+});
+
+test("critic truncation: the repair asks for COMPACTION, not reconsideration", async () => {
+  const j = judgeFinishing([{ content: TRUNCATED, finishReason: "length" }, { content: SATISFIED, finishReason: "stop" }]);
+  await j.result;
+  const instruction = j.sent[1]!.messages[j.sent[1]!.messages.length - 1]!.content;
+  assert.match(instruction, /cut off/i, "it says what actually happened");
+  assert.match(instruction, /same judgement/i);
+  assert.match(instruction, /Do not drop a defect to save space/);
+  assert.match(instruction, /do not change your verdict/i);
+  // It must not tell the model its reply was wrong, nor invite a rethink.
+  assert.doesNotMatch(instruction, /failed the schema|could not be parsed/i);
+  assert.doesNotMatch(instruction, /reconsider/i);
+});
+
+test("critic truncation (F): truncated first, malformed repair → terminal, no third call", async () => {
+  const j = judgeFinishing([{ content: TRUNCATED, finishReason: "length" }, { content: "not json at all", finishReason: "stop" }]);
+  const r = await j.result;
+  assert.equal(r.ok, false);
+  if (!r.ok) assert.equal(r.failure.code, "critic.protocol_failure", "the SECOND response finished normally and was malformed");
+  assert.equal(j.calls(), 2);
+});
+
+test("critic truncation (G): truncated first, truncated repair → truthful truncation failure", async () => {
+  const j = judgeFinishing([{ content: TRUNCATED, finishReason: "length" }, { content: TRUNCATED, finishReason: "length" }]);
+  const r = await j.result;
+  assert.equal(r.ok, false);
+  if (!r.ok) {
+    assert.equal(r.failure.code, "critic.output_truncated");
+    assert.match(r.failure.message, /one compact re-emission was requested and was also cut off/);
+    assert.equal(r.failure.detail?.repairAttempted, true);
+  }
+  assert.equal(j.calls(), 2, "two calls, then it stops");
+});
+
+test("critic truncation (H): a malformed reply that finished NORMALLY is still protocol failure", async () => {
+  const j = judgeFinishing([{ content: "here is my judgement: yes", finishReason: "stop" }, { content: "still prose", finishReason: "stop" }]);
+  const r = await j.result;
+  assert.equal(r.ok, false);
+  if (!r.ok) {
+    assert.equal(r.failure.code, "critic.protocol_failure");
+    assert.notEqual(r.failure.code, "critic.output_truncated", "nothing was cut off — this one really is protocol");
+  }
+});
+
+test("critic truncation (I): a schema-valid negative judgment is never repaired, whatever the finish reason", async () => {
+  const j = judgeFinishing([{ content: DEFECT, finishReason: "stop" }, { content: SATISFIED, finishReason: "stop" }]);
+  const r = await j.result;
+  assert.ok(r.ok);
+  assert.equal(r.generation.record.verdict, "defects_found");
+  assert.equal(j.calls(), 1, "a result is a result — re-asking would be shopping for a verdict");
+});
+
+test("critic truncation (K): the classification carries no model or provider name", () => {
+  const src = readFileSync(new URL("../../../src/v2/core/critic.ts", import.meta.url), "utf8");
+  const code = src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  for (const name of ["mimo", "minimax", "deepseek", "openai", "gpt", "anthropic", "claude", "gemini", "ollama"]) {
+    assert.doesNotMatch(code.toLowerCase(), new RegExp(`\\b${name}\\b`), `critic.ts must not branch on "${name}"`);
+  }
 });

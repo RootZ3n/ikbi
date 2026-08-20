@@ -225,6 +225,27 @@ const asString = (v: unknown): string | undefined => (typeof v === "string" ? v 
  * no coercion. The response must be exactly a JSON object of the documented shape, and
  * every self-contradiction is a protocol failure, not a downgraded verdict.
  */
+/**
+ * Finish reasons that mean "I stopped because I ran out of room", across providers.
+ *
+ * Compared case-insensitively against a small vocabulary rather than against a provider
+ * id — OpenAI-shaped transports say `length`, others say `max_tokens` or `MAX_TOKENS`.
+ * No model or provider name appears here, and an unrecognized reason is simply not
+ * treated as truncation, which fails toward the older, stricter classification.
+ */
+const LENGTH_EXHAUSTED_FINISH_REASONS: ReadonlySet<string> = new Set([
+  "length",
+  "max_tokens",
+  "max_output_tokens",
+  "output_limit",
+  "token_limit",
+]);
+
+/** Did generation stop because the output allowance ran out? */
+export function isOutputTruncated(finishReason: string | undefined): boolean {
+  return finishReason !== undefined && LENGTH_EXHAUSTED_FINISH_REASONS.has(finishReason.trim().toLowerCase());
+}
+
 export function parseCriticResponse(content: string): CriticParseResult {
   const trimmed = content.trim();
   let parsed: unknown;
@@ -391,6 +412,14 @@ export const V2_CRITIC_FAILURE_CODES = {
   subjectMismatch: "critic.subject_mismatch",
   subjectDrift: "critic.subject_drift",
   protocolFailure: "critic.protocol_failure",
+  /**
+   * The provider stopped generating at the authorized output limit and the judgment is
+   * incomplete. DISTINCT from `protocolFailure` on purpose: one says the model would not
+   * follow the schema, the other says we cut it off mid-sentence. Blaming a model for
+   * malformed protocol when the harness ended the sentence is how a real defect stayed
+   * invisible for a whole production traversal.
+   */
+  outputTruncated: "critic.output_truncated",
   invocationFailed: "critic.invocation_failed",
   diffFailed: "critic.candidate_diff_failed",
 } as const;
@@ -450,7 +479,7 @@ export function summarizeCritic(record: CriticRecord): RunCriticSummary {
 
 // Re-exported for the review package + render, which live in the same authority.
 export type { CriticInputPackage } from "./critic-review.js";
-export { buildReviewPackage, renderCriticInput, renderCriticRepairInput, CRITIC_REPAIR_INSTRUCTION, CRITIC_SYSTEM_INSTRUCTION } from "./critic-review.js";
+export { buildReviewPackage, renderCriticInput, renderCriticRepairInput, CRITIC_REPAIR_INSTRUCTION, CRITIC_TRUNCATION_INSTRUCTION, CRITIC_SYSTEM_INSTRUCTION } from "./critic-review.js";
 
 // Types referenced by the orchestration, re-exported so the run spine imports one module.
 export type { VerificationRecord, RunVerificationSummary, CandidateDiff };
@@ -648,6 +677,14 @@ export async function judgeCandidate(input: JudgeCandidateInput): Promise<Critic
   // 5. STRICT PARSE. A malformed or self-contradictory judgment is a protocol failure —
   //    it ends the run. It is NEVER downgraded into a verdict (the v1 defect, closed).
   let parsed = parseCriticResponse(called.content);
+  /*
+    WHY THE JUDGMENT IS UNUSABLE, if it is. A response that failed to parse AND stopped
+    at the output allowance was cut off by us; one that failed to parse having finished
+    normally is a protocol problem. The two are reported differently and repaired with
+    different instructions, because telling a model its reply "could not be parsed" when
+    we ended the sentence invites it to change what it said.
+  */
+  let truncated = !parsed.ok && isOutputTruncated(called.record.finishReason);
   /** Set when a protocol repair actually reached the wire, so the run can ledger it. */
   let repairRecord: V2InvocationRecord | undefined;
   let repairAttemptedId: V2InvocationId | undefined;
@@ -687,7 +724,7 @@ export async function judgeCandidate(input: JudgeCandidateInput): Promise<Critic
     }
     input.admission?.recordAttempt(repairId);
     repairAttemptedId = repairId;
-    const repairRendered = renderCriticRepairInput(reviewPackage, called.content, input.boundary);
+    const repairRendered = renderCriticRepairInput(reviewPackage, called.content, input.boundary, truncated);
     const repaired = await invokeAuthorized({
       runId: input.runId,
       taskId: input.taskId,
@@ -703,8 +740,11 @@ export async function judgeCandidate(input: JudgeCandidateInput): Promise<Critic
     });
     if (repaired.ok) {
       repairRecord = repaired.record;
-      // ONE attempt. If this still does not parse, the original refusal stands.
+      // ONE attempt. If this still does not parse, the refusal stands — and it is
+      // re-classified against THIS response, so a repair that was itself cut off is
+      // reported as truncation rather than as the model finally misbehaving.
       parsed = parseCriticResponse(repaired.content);
+      truncated = !parsed.ok && isOutputTruncated(repaired.record.finishReason);
     }
   }
 
@@ -719,12 +759,23 @@ export async function judgeCandidate(input: JudgeCandidateInput): Promise<Critic
       invocation: called.record,
       ...(repairRecord !== undefined ? { repairInvocation: repairRecord } : {}),
       ...(repairAttemptedId !== undefined ? { repairAttemptedInvocationId: repairAttemptedId } : {}),
-      failure: criticFailure(
-        V2_CRITIC_FAILURE_CODES.protocolFailure,
-        `the critic response was not a usable judgment (${parsed.problem}): ${parsed.detail}` +
-          (repairAttemptedId !== undefined ? " — one protocol-repair attempt was made and also failed to parse" : ""),
-        { candidateId: candidate.candidateId, problem: parsed.problem, ...(repairAttemptedId !== undefined ? { repairAttempted: true } : {}) },
-      ),
+      failure: truncated
+        ? criticFailure(
+            V2_CRITIC_FAILURE_CODES.outputTruncated,
+            `the critic judgment was cut off at the ${input.maxOutputTokens}-token output limit and is incomplete` +
+              (repairAttemptedId !== undefined ? " — one compact re-emission was requested and was also cut off" : ""),
+            {
+              candidateId: candidate.candidateId,
+              maxOutputTokens: input.maxOutputTokens,
+              ...(repairAttemptedId !== undefined ? { repairAttempted: true } : {}),
+            },
+          )
+        : criticFailure(
+            V2_CRITIC_FAILURE_CODES.protocolFailure,
+            `the critic response was not a usable judgment (${parsed.problem}): ${parsed.detail}` +
+              (repairAttemptedId !== undefined ? " — one protocol-repair attempt was made and also failed to parse" : ""),
+            { candidateId: candidate.candidateId, problem: parsed.problem, ...(repairAttemptedId !== undefined ? { repairAttempted: true } : {}) },
+          ),
     };
   }
 

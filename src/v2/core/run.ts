@@ -280,8 +280,21 @@ export const MAX_GOAL_LENGTH = 8000;
  */
 export const DEFAULT_CHECK_TIMEOUT_MS = 600_000;
 
-/** Completion cap for the critic's single judgment call. Bounded — a JSON verdict is small. */
-export const CRITIC_MAX_OUTPUT_TOKENS = 2_048;
+/**
+ * Completion cap for the critic's judgment call.
+ *
+ * WAS 2,048, on the reasoning that "a JSON verdict is small". It is small when the
+ * verdict is `satisfied` and the defect list is empty. It is not small when a critic has
+ * things to say: the first complete builder → verifier → critic traversal on a real
+ * repository came back with `finishReason: "length"` at exactly 2,047 tokens — cut off
+ * mid-JSON by this constant, and then reported as the model's protocol violation.
+ *
+ * 8,192 is still tightly bounded and still far above a normal response; it is headroom
+ * for a critic with several findings to describe, not licence to ramble. The session
+ * invocation cap and cost ceiling remain the things that actually bound spend, and both
+ * are independent of this.
+ */
+export const CRITIC_MAX_OUTPUT_TOKENS = 8_192;
 /** Per-attempt timeout for the critic call. One attempt; no retry follows it. */
 export const CRITIC_TIMEOUT_MS = 120_000;
 
