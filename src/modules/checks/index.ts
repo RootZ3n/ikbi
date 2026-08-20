@@ -24,7 +24,7 @@
  */
 
 import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** A fixed check. The command list is a named constant — never model-chosen. */
@@ -32,6 +32,67 @@ export interface Check {
   readonly name: string;
   readonly command: string;
   readonly args: readonly string[];
+  /**
+   * WHERE the check runs, as a repository-RELATIVE POSIX path. Absent means the
+   * repository root, which is what every check meant before this field existed.
+   *
+   * WHY THIS EXISTS. A repository whose manifest lives in a subdirectory — `frontend/`,
+   * `packages/web/` — could not express a runnable check at all. The obvious workaround,
+   * `npm --prefix frontend run build`, is refused by execution policy as a worktree
+   * escape, and correctly so: a redirect flag both moves the process somewhere else AND
+   * hides the subcommand from the script-run parse. Exempting it would have widened a
+   * security boundary to solve an ergonomics problem. A first-class, validated,
+   * containment-checked directory is narrower and says what it means.
+   *
+   * It is NOT a general path: absolute paths, `..`, NUL and anything resolving outside
+   * the candidate worktree are refused (`normalizeCheckCwd`). Changing directory grants
+   * no capability — the same allowlist, the same policy, the same read-only sandbox.
+   */
+  readonly cwd?: string;
+}
+
+/* ── The check working directory ─────────────────────────────────────────── */
+
+/** A cwd is either canonical, or refused with a reason an operator can act on. */
+export type CheckCwdResolution =
+  | { readonly ok: true; readonly cwd: string | undefined }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * Canonicalize a declared check directory, or refuse it.
+ *
+ * PURE and total, so the whole containment argument is testable without a filesystem.
+ * The output is the identity: `undefined` for the repository root, otherwise a
+ * POSIX-style relative path with no `.`/`..` segments and no trailing slash. `"."` and
+ * `"./"` normalize to `undefined` because they MEAN the root — same meaning, same
+ * identity, same hash.
+ *
+ * Everything else is refused rather than sanitized. Silently repairing `../../etc` into
+ * something safe would leave an operator believing a check ran somewhere it did not.
+ */
+export function normalizeCheckCwd(raw: string | undefined): CheckCwdResolution {
+  if (raw === undefined) return { ok: true, cwd: undefined };
+  if (typeof raw !== "string") return { ok: false, reason: "check cwd must be a string" };
+
+  if (raw.includes("\0")) return { ok: false, reason: "check cwd contains a NUL byte" };
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return { ok: false, reason: 'check cwd is empty — omit it for the repository root rather than passing ""' };
+
+  // Windows-style separators would resolve differently on different hosts; a portable
+  // verification identity cannot contain one.
+  if (trimmed.includes("\\")) return { ok: false, reason: `check cwd "${raw}" must use forward slashes` };
+  if (isAbsolute(trimmed) || trimmed.startsWith("/")) {
+    return { ok: false, reason: `check cwd "${raw}" must be repository-relative, not absolute` };
+  }
+  // A drive letter is absolute on Windows even though `isAbsolute` may disagree here.
+  if (/^[a-z]:/i.test(trimmed)) return { ok: false, reason: `check cwd "${raw}" must be repository-relative, not absolute` };
+
+  const segments = trimmed.split("/").filter((seg) => seg.length > 0 && seg !== ".");
+  if (segments.some((seg) => seg === "..")) {
+    return { ok: false, reason: `check cwd "${raw}" escapes the repository with ".."` };
+  }
+  if (segments.length === 0) return { ok: true, cwd: undefined }; // "." / "./" — the root
+  return { ok: true, cwd: segments.join("/") };
 }
 
 /** THE default, read-only check set (pnpm — ikbi's own checks; the builder previews the same). */
@@ -348,7 +409,17 @@ export function parseChecksEnv(raw: string | undefined): readonly Check[] | "mal
     if (typeof o.name !== "string" || o.name.length === 0) return "malformed";
     if (typeof o.command !== "string" || o.command.length === 0) return "malformed";
     if (!Array.isArray(o.args) || !o.args.every((a) => typeof a === "string")) return "malformed";
-    checks.push({ name: o.name, command: o.command, args: [...(o.args as string[])] });
+    // An unusable cwd is a CONFIGURATION error, refused here — before a workspace is
+    // allocated and before a provider is paid — rather than at execution time.
+    if (o.cwd !== undefined && typeof o.cwd !== "string") return "malformed";
+    const cwd = normalizeCheckCwd(o.cwd as string | undefined);
+    if (!cwd.ok) return "malformed";
+    checks.push({
+      name: o.name,
+      command: o.command,
+      args: [...(o.args as string[])],
+      ...(cwd.cwd !== undefined ? { cwd: cwd.cwd } : {}),
+    });
   }
   return checks;
 }
@@ -375,7 +446,7 @@ export function resolveChecks(worktreeReal: string, env: NodeJS.ProcessEnv = pro
   // A malformed value fails closed (RED) rather than falling back to a guessed runner.
   const fromEnv = parseChecksEnv(env.IKBI_CHECKS);
   if (fromEnv === "malformed") {
-    return { ok: false, reason: "IKBI_CHECKS is malformed (expected a non-empty JSON array of {name,command,args}) — cannot verify (RED)" };
+    return { ok: false, reason: "IKBI_CHECKS is malformed (expected a non-empty JSON array of {name,command,args,cwd?} where cwd is a repository-relative directory) — cannot verify (RED)" };
   }
   if (fromEnv !== undefined) return { ok: true, checks: fromEnv, source: "env" };
 

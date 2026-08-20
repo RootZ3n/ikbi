@@ -30,6 +30,7 @@
  * orchestration over injected seams (the diff source, the transport, the boundary).
  */
 
+import { estimateTokens } from "./context.js";
 import { contentDigest, type V2CandidateId, type V2CriticId, type V2DecisionDigest, type V2DefectId, type V2InvocationId, type V2ReviewDigest, type V2RunId, type V2SnapshotDigest, type V2TaskId, type V2VerificationId } from "./identity.js";
 import { runFailure, type RunFailure } from "./failure.js";
 import type { CandidateRecord } from "./candidate.js";
@@ -449,7 +450,7 @@ export function summarizeCritic(record: CriticRecord): RunCriticSummary {
 
 // Re-exported for the review package + render, which live in the same authority.
 export type { CriticInputPackage } from "./critic-review.js";
-export { buildReviewPackage, renderCriticInput, CRITIC_SYSTEM_INSTRUCTION } from "./critic-review.js";
+export { buildReviewPackage, renderCriticInput, renderCriticRepairInput, CRITIC_REPAIR_INSTRUCTION, CRITIC_SYSTEM_INSTRUCTION } from "./critic-review.js";
 
 // Types referenced by the orchestration, re-exported so the run spine imports one module.
 export type { VerificationRecord, RunVerificationSummary, CandidateDiff };
@@ -463,12 +464,18 @@ import type { InvocationAdmission } from "./cost.js";
 import type { ModelResolutionDecision } from "./resolver.js";
 import type { UntrustedBoundary } from "./builder.js";
 import type { CandidateDiffSource, DiffBudget } from "./candidate-diff.js";
-import { buildReviewPackage, renderCriticInput } from "./critic-review.js";
+import { buildReviewPackage, renderCriticInput, renderCriticRepairInput } from "./critic-review.js";
 
 /** What one critic judgment produced: the record and the invocation that made it. */
 export interface CriticGeneration {
   readonly record: CriticRecord;
   readonly invocation: V2InvocationRecord;
+  /**
+   * The ONE protocol-repair call, when the first reply failed the schema and a repair
+   * produced a parseable judgement. Absent on the ordinary path. It is a real provider
+   * invocation and the run ledgers and prices it exactly like the first.
+   */
+  readonly repairInvocation?: V2InvocationRecord;
 }
 
 export type CriticResult =
@@ -485,6 +492,10 @@ export type CriticResult =
        * had really been dialled, but nothing counted it, so recovery could exceed maxInvocations.
        */
       readonly attemptedInvocationId?: V2InvocationId;
+      /** The protocol-repair call's identity, when one reached the wire and still failed. */
+      readonly repairAttemptedInvocationId?: V2InvocationId;
+      /** The protocol-repair call's record, when it completed but still failed to parse. */
+      readonly repairInvocation?: V2InvocationRecord;
       /**
        * V2-016A/M1: the SUCCESSFUL provider invocation record, when the wire call completed but its
        * response later failed strict critic parsing. Separating INVOCATION RESULT from CRITIC PARSE
@@ -514,6 +525,12 @@ export interface JudgeCandidateInput {
    * when this function returns a transport failure carrying no record.
    */
   readonly invocationId: V2InvocationId;
+  /**
+   * Identity for the ONE protocol-repair call, minted by the caller alongside the first.
+   * Absent disables repair entirely — which is how every caller that has not opted in
+   * keeps the previous fail-closed behaviour byte for byte.
+   */
+  readonly repairInvocationId?: V2InvocationId;
   /**
    * The SAME session invocation/cost authority the builder uses — never a critic-private ledger.
    * The attempt is recorded through it immediately BEFORE the wire send.
@@ -630,7 +647,67 @@ export async function judgeCandidate(input: JudgeCandidateInput): Promise<Critic
 
   // 5. STRICT PARSE. A malformed or self-contradictory judgment is a protocol failure —
   //    it ends the run. It is NEVER downgraded into a verdict (the v1 defect, closed).
-  const parsed = parseCriticResponse(called.content);
+  let parsed = parseCriticResponse(called.content);
+  /** Set when a protocol repair actually reached the wire, so the run can ledger it. */
+  let repairRecord: V2InvocationRecord | undefined;
+  let repairAttemptedId: V2InvocationId | undefined;
+
+  if (!parsed.ok && input.repairInvocationId !== undefined) {
+    /*
+      ONE BOUNDED PROTOCOL REPAIR.
+
+      This is NOT a semantic retry and the distinction is the whole safety argument. It
+      fires ONLY when the provider call succeeded and the reply could not be parsed as a
+      judgement — never when a judgement parsed and said something unwelcome. A critic
+      that lawfully returns `satisfied: false` with defects is a RESULT, and re-asking
+      would be shopping for a better verdict.
+
+      Everything about it is accounted: a fresh InvocationId, the same resolved critic
+      route, cost admission before the send, the attempt counted against the session cap,
+      and the record on the receipt. There is no free call and no second model.
+    */
+    const repairId = input.repairInvocationId;
+    if (input.admission !== undefined) {
+      const admitted = input.admission.admitNext({
+        identity: { authorizedModelId: decision.modelId, sentProviderId: decision.providerId, sentProviderModelId: decision.providerModelId },
+        estimatedInputTokens: estimateTokens(rendered.messages.map((m) => m.content).join("\n")) + estimateTokens(called.content),
+        maxOutputTokens: input.maxOutputTokens,
+      });
+      if (!admitted.admit) {
+        // The cap, not the schema, is now the operative truth — report THAT, with the
+        // successful first call still on the ledger.
+        return {
+          ok: false,
+          attemptedInvocation: true,
+          attemptedInvocationId: invocationId,
+          invocation: called.record,
+          failure: admitted.failure,
+        };
+      }
+    }
+    input.admission?.recordAttempt(repairId);
+    repairAttemptedId = repairId;
+    const repairRendered = renderCriticRepairInput(reviewPackage, called.content, input.boundary);
+    const repaired = await invokeAuthorized({
+      runId: input.runId,
+      taskId: input.taskId,
+      invocationId: repairId,
+      // THE SAME ROUTE. A protocol repair may not select another model or provider.
+      decision,
+      binding: { runId: input.runId, taskId: input.taskId, resolutionDecisionId: decision.decisionId, inputId: reviewPackage.reviewPackageId },
+      rendered: repairRendered,
+      parameters: { maxOutputTokens: input.maxOutputTokens, timeoutMs: input.timeoutMs },
+      transport: input.transport,
+      ...(input.aliases !== undefined ? { aliases: input.aliases } : {}),
+      now,
+    });
+    if (repaired.ok) {
+      repairRecord = repaired.record;
+      // ONE attempt. If this still does not parse, the original refusal stands.
+      parsed = parseCriticResponse(repaired.content);
+    }
+  }
+
   if (!parsed.ok) {
     // M1: the wire call SUCCEEDED (we have `called.record`); only the strict parse failed. Return
     // the invocation record so the run accounts the call — no protocol failure ever becomes a
@@ -640,10 +717,13 @@ export async function judgeCandidate(input: JudgeCandidateInput): Promise<Critic
       attemptedInvocation: true,
       attemptedInvocationId: invocationId,
       invocation: called.record,
+      ...(repairRecord !== undefined ? { repairInvocation: repairRecord } : {}),
+      ...(repairAttemptedId !== undefined ? { repairAttemptedInvocationId: repairAttemptedId } : {}),
       failure: criticFailure(
         V2_CRITIC_FAILURE_CODES.protocolFailure,
-        `the critic response was not a usable judgment (${parsed.problem}): ${parsed.detail}`,
-        { candidateId: candidate.candidateId, problem: parsed.problem },
+        `the critic response was not a usable judgment (${parsed.problem}): ${parsed.detail}` +
+          (repairAttemptedId !== undefined ? " — one protocol-repair attempt was made and also failed to parse" : ""),
+        { candidateId: candidate.candidateId, problem: parsed.problem, ...(repairAttemptedId !== undefined ? { repairAttempted: true } : {}) },
       ),
     };
   }
@@ -675,5 +755,14 @@ export async function judgeCandidate(input: JudgeCandidateInput): Promise<Critic
     endedAt: now(),
   });
 
-  return { ok: true, generation: { record, invocation: called.record } };
+  return {
+    ok: true,
+    generation: {
+      record,
+      invocation: called.record,
+      // Present only when a protocol repair actually reached the wire. The run ledgers it
+      // like any other invocation, so the cost and the count stay honest.
+      ...(repairRecord !== undefined ? { repairInvocation: repairRecord } : {}),
+    },
+  };
 }

@@ -27,7 +27,8 @@ import {
   DEFAULT_RECENT_GROUPS,
   ESTIMATOR_KIND,
   MIN_RECENT_GROUPS,
-  SAFETY_MARGIN_TOKENS,
+  SAFETY_MARGIN_FRACTION,
+  safetyMarginFor,
   V2_CONVERSATION_FAILURE_CODES,
   conversationCeiling,
   estimateMessagesTokens,
@@ -268,7 +269,7 @@ test("window: the invariant holds for 8k, 64k, 128k and 200k models alike", () =
     const ceiling = ceilingFor(window);
     assert.equal(
       ceiling.maxRenderedInputTokens,
-      window - ceiling.reservedCompletionTokens - ceiling.reservedOverheadTokens - SAFETY_MARGIN_TOKENS,
+      window - ceiling.reservedCompletionTokens - ceiling.reservedOverheadTokens - safetyMarginFor(window),
       `${window}: the ceiling is derived, not chosen`,
     );
     assert.ok(
@@ -362,7 +363,7 @@ test("window: the module branches on FACTS, never on model or provider names", (
   // Nor may it hard-code the window of the model the defect was found on.
   assert.doesNotMatch(code, /65_?536|131_?072|200_?000|8_?192/, "window sizes are facts, not constants here");
   // The only tuning constants it may carry are policy, and they are named.
-  assert.equal(typeof SAFETY_MARGIN_TOKENS, "number");
+  assert.equal(typeof SAFETY_MARGIN_FRACTION, "number");
   assert.equal(typeof DEFAULT_RECENT_GROUPS, "number");
 });
 

@@ -104,6 +104,8 @@ export interface PlannedCheck {
   readonly name: string;
   readonly command: string;
   readonly args: readonly string[];
+  /** Repository-relative directory, canonicalized. Absent means the workspace root. */
+  readonly cwd?: string;
   readonly timeoutMs: number;
 }
 
@@ -141,17 +143,32 @@ export function verificationPlanDigest(input: {
   return contentDigest("verification_plan", {
     cwdPolicy: input.cwdPolicy,
     source: input.source,
-    checks: input.checks.map((c) => ({ name: c.name, command: c.command, args: [...c.args], timeoutMs: c.timeoutMs })),
+    /*
+      `cwd` is part of the identity, not decoration. The same command run in `frontend`
+      and in `backend` are two different exams over two different trees, and a digest that
+      could not tell them apart would let one stand in for the other. `null` for the root
+      keeps the shape stable so an old rootless plan hashes as it always did.
+    */
+    checks: input.checks.map((c) => ({ name: c.name, command: c.command, args: [...c.args], cwd: c.cwd ?? null, timeoutMs: c.timeoutMs })),
   });
 }
 
 /** Build the plan from a resolved check set. Order is preserved from discovery. */
 export function buildVerificationPlan(input: {
-  readonly checks: readonly { readonly name: string; readonly command: string; readonly args: readonly string[] }[];
+  readonly checks: readonly { readonly name: string; readonly command: string; readonly args: readonly string[]; readonly cwd?: string }[];
   readonly timeoutMs: number;
   readonly source: ChecksSourceKind;
 }): VerificationPlan {
-  const checks: PlannedCheck[] = input.checks.map((c) => ({ name: c.name, command: c.command, args: [...c.args], timeoutMs: input.timeoutMs }));
+  const checks: PlannedCheck[] = input.checks.map((c) => ({
+    name: c.name,
+    command: c.command,
+    args: [...c.args],
+    // Part of the PLAN, therefore part of its identity: the same command in two
+    // directories is two different exams, and a digest that could not tell them apart
+    // would let one stand in for the other.
+    ...(c.cwd !== undefined ? { cwd: c.cwd } : {}),
+    timeoutMs: input.timeoutMs,
+  }));
   const cwdPolicy: CwdPolicy = "candidate_workspace_root";
   return { planId: verificationPlanDigest({ checks, cwdPolicy, source: input.source }), checks, cwdPolicy, source: input.source };
 }
@@ -162,7 +179,7 @@ export function buildVerificationPlan(input: {
 
 /** What discovering the check set produced. Fail-closed: a reason, never a guessed command. */
 export type ResolvedChecks =
-  | { readonly ok: true; readonly checks: readonly { readonly name: string; readonly command: string; readonly args: readonly string[] }[]; readonly source: ChecksSourceKind }
+  | { readonly ok: true; readonly checks: readonly { readonly name: string; readonly command: string; readonly args: readonly string[]; readonly cwd?: string }[]; readonly source: ChecksSourceKind }
   | { readonly ok: false; readonly reason: string };
 
 /** Deterministic check discovery over a workspace. No model, no repository prose. */
@@ -195,7 +212,10 @@ export interface CheckRunner {
     readonly name: string;
     readonly command: string;
     readonly args: readonly string[];
+    /** The candidate workspace root, absolute. */
     readonly cwd: string;
+    /** Repository-relative subdirectory to run in. Absent means the workspace root. */
+    readonly relativeCwd?: string;
     readonly timeoutMs: number;
   }): Promise<CheckExecution>;
 }
@@ -422,7 +442,7 @@ function lexCommandLine(line: string): readonly (readonly string[])[] | undefine
  * `require`/`import`, resolves a variable, or reasons about runtime behaviour.
  */
 export function bindVerificationDefinitionScope(input: {
-  readonly checks: readonly { readonly command: string; readonly args: readonly string[] }[];
+  readonly checks: readonly { readonly command: string; readonly args: readonly string[]; readonly cwd?: string }[];
   readonly scripts: Readonly<Record<string, string>>;
 }): VerificationDefinitionScope {
   const paths = new Set<string>();
@@ -489,6 +509,8 @@ export interface CheckRecord {
   readonly name: string;
   /** The rendered command line ("binary arg1 arg2"), for audit. */
   readonly command: string;
+  /** Where it ran, repository-relative. Absent means the workspace root. */
+  readonly cwd?: string;
   readonly status: CheckStatus;
   /** Present iff the command launched. */
   readonly exitCode?: number;
@@ -790,11 +812,13 @@ export async function verifyCandidate(input: VerifyCandidateInput): Promise<Veri
       command: planned.command,
       args: planned.args,
       cwd: input.workspacePath,
+      ...(planned.cwd !== undefined ? { relativeCwd: planned.cwd } : {}),
       timeoutMs: planned.timeoutMs,
     });
     checks.push({
       name: planned.name,
       command: `${planned.command} ${planned.args.join(" ")}`.trim(),
+      ...(planned.cwd !== undefined ? { cwd: planned.cwd } : {}),
       status: classifyExecution(execution),
       ...(execution.exitCode !== undefined ? { exitCode: execution.exitCode } : {}),
       durationMs: execution.durationMs,
@@ -846,6 +870,8 @@ export interface RunVerificationSummary {
   readonly checks: readonly {
     readonly name: string;
     readonly command: string;
+    /** Where it ran, repository-relative. Absent means the workspace root. */
+    readonly cwd?: string;
     readonly status: CheckStatus;
     readonly exitCode: number | null;
     readonly durationMs: number;
@@ -869,6 +895,7 @@ export function summarizeVerification(record: VerificationRecord): RunVerificati
     checks: record.checks.map((c) => ({
       name: c.name,
       command: c.command,
+      ...(c.cwd !== undefined ? { cwd: c.cwd } : {}),
       status: c.status,
       exitCode: c.exitCode ?? null,
       durationMs: c.durationMs,

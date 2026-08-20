@@ -98,7 +98,15 @@ export const HELP_PAGES: Readonly<Record<string, HelpPage>> = {
       },
       { flag: "IKBI_V2_MAX_SESSION_COST_USD", desc: "Whole-session dollar ceiling. Opt-in; no default cap." },
       { flag: "IKBI_V2_MAX_INVOCATIONS", desc: "Whole-session model-call cap. Opt-in; stops a run independently of the turn budget." },
-      { flag: "IKBI_CHECKS", desc: "JSON array of {name, command, args} — the deterministic checks verification runs." },
+      {
+        flag: "IKBI_CHECKS",
+        desc:
+          "JSON array of {name, command, args, cwd?} — the deterministic checks verification runs. " +
+          "`cwd` is an OPTIONAL repository-relative directory (\"frontend\", \"packages/web\"); omit it for the " +
+          "repository root. Use it for a nested app rather than a package-manager path flag: `npm --prefix …`, " +
+          "`--dir`, `-C` and friends are refused as worktree escapes. Absolute paths, `..` and anything resolving " +
+          "outside the candidate are refused before the run starts.",
+      },
       { flag: "IKBI_CHECK_TIMEOUT_MS", desc: "Per-check wall clock. Default 600000." },
       { flag: "IKBI_RECOVERY_MAX_ATTEMPTS", desc: "Attempts the recovery authority may compose in one session." },
     ],

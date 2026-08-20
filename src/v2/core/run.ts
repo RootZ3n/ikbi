@@ -931,10 +931,14 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
       // before the wire send. The identity therefore exists here before the call is made, so a
       // transport failure carrying no record can still be ledgered.
       const criticInvocationId = ids.mint("invocation");
+      /* Minted here, with the first: the run must know the identity of every call that
+         could reach the wire BEFORE any of them do, so a repair that dies in transport is
+         still ledgerable. Passing it is what ENABLES the one bounded protocol repair. */
+      const criticRepairInvocationId = ids.mint("invocation");
       const judged = await judgeCandidate({
         runId, taskId, goal: task.goal, candidate: s.candidate, verification: s.verification, verificationSummary: summarizeVerification(s.verification), workspacePath: s.workspace!.path,
         decision: critDecision, transport: deps.transport, boundary: deps.untrustedBoundary, diffSource: deps.candidateDiff, diffBudget: DEFAULT_DIFF_BUDGET,
-        probeTree: (path) => deps.treeProbe.treeOf(path), invocationId: criticInvocationId, maxOutputTokens: criticMaxOutputTokens, timeoutMs: CRITIC_TIMEOUT_MS,
+        probeTree: (path) => deps.treeProbe.treeOf(path), invocationId: criticInvocationId, repairInvocationId: criticRepairInvocationId, maxOutputTokens: criticMaxOutputTokens, timeoutMs: CRITIC_TIMEOUT_MS,
         ...(deps.admission !== undefined ? { admission: deps.admission } : {}),
         ...(deps.aliases !== undefined ? { aliases: deps.aliases } : {}), now,
       });
@@ -942,10 +946,24 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
         lifecycle.record(runId, { kind: "invocation", id: judged.generation.invocation.invocationId, role: "critic" });
         s.invocations = [...s.invocations, judged.generation.invocation];
         if (deps.admission !== undefined) deps.admission.charge(judged.generation.invocation);
+        // A protocol repair is a second REAL call. Ledger and charge it like the first —
+        // there is no such thing as a free re-ask.
+        if (judged.generation.repairInvocation !== undefined) {
+          lifecycle.record(runId, { kind: "invocation", id: judged.generation.repairInvocation.invocationId, role: "critic" });
+          s.invocations = [...s.invocations, judged.generation.repairInvocation];
+          if (deps.admission !== undefined) deps.admission.charge(judged.generation.repairInvocation);
+        }
       } else if (judged.invocation !== undefined) {
         lifecycle.record(runId, { kind: "invocation", id: judged.invocation.invocationId, role: "critic" });
         s.invocations = [...s.invocations, judged.invocation];
         if (deps.admission !== undefined) deps.admission.charge(judged.invocation);
+        if (judged.repairInvocation !== undefined) {
+          lifecycle.record(runId, { kind: "invocation", id: judged.repairInvocation.invocationId, role: "critic" });
+          s.invocations = [...s.invocations, judged.repairInvocation];
+          if (deps.admission !== undefined) deps.admission.charge(judged.repairInvocation);
+        } else if (judged.repairAttemptedInvocationId !== undefined) {
+          lifecycle.record(runId, { kind: "invocation", id: judged.repairAttemptedInvocationId, role: "critic" });
+        }
       } else if (judged.attemptedInvocationId !== undefined) {
         // The wire was reached and NOTHING came back. That is still a real provider call: ledger
         // it (so `receipt.evidence.invocations` counts it and the session reconcile prices it as

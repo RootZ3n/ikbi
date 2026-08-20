@@ -81,7 +81,26 @@ export const ESTIMATOR_KIND: TokenEstimatorKind = "conservative_estimate";
  * four characters per token. This margin is what stands between "our estimate says it
  * fits" and "the provider agrees it fits". It is deliberately generous.
  */
-export const SAFETY_MARGIN_TOKENS = 2_048;
+export const MIN_SAFETY_MARGIN_TOKENS = 2_048;
+
+/**
+ * The margin as a FRACTION of the declared window.
+ *
+ * A flat allowance cannot be right at both ends: 2,048 tokens is a quarter of an 8k
+ * model and one percent of a 200k one. Estimator error scales with request size, so the
+ * margin has to as well. Six percent, with the flat value as a floor, keeps a
+ * ceiling-sized request inside the window across the whole 8k–200k matrix even when the
+ * content is at the densest realistic end — asserted in `estimator.test.ts` rather than
+ * asserted here in prose.
+ *
+ * Derived from the window, which is a capability FACT. No model name is involved.
+ */
+export const SAFETY_MARGIN_FRACTION = 0.06;
+
+/** The margin for one window. Capability-derived, never model-name-derived. */
+export function safetyMarginFor(contextWindowTokens: number): number {
+  return Math.max(MIN_SAFETY_MARGIN_TOKENS, Math.ceil(contextWindowTokens * SAFETY_MARGIN_FRACTION));
+}
 
 /**
  * The fewest recent turn groups kept verbatim before the fit is declared impossible.
@@ -152,13 +171,14 @@ export function conversationCeiling(budget: ContextBudget): ConversationCeiling 
       throw new Error(`context budget is malformed: ${name} is ${String(value)} — a conversation ceiling cannot be derived from it`);
     }
   }
+  const safetyMarginTokens = safetyMarginFor(budget.contextWindowTokens);
   const maxRenderedInputTokens =
-    budget.contextWindowTokens - budget.reservedCompletionTokens - budget.reservedOverheadTokens - SAFETY_MARGIN_TOKENS;
+    budget.contextWindowTokens - budget.reservedCompletionTokens - budget.reservedOverheadTokens - safetyMarginTokens;
   return {
     contextWindowTokens: budget.contextWindowTokens,
     reservedCompletionTokens: budget.reservedCompletionTokens,
     reservedOverheadTokens: budget.reservedOverheadTokens,
-    safetyMarginTokens: SAFETY_MARGIN_TOKENS,
+    safetyMarginTokens,
     maxRenderedInputTokens,
     estimator: ESTIMATOR_KIND,
     capabilityProvenance: budget.capabilityProvenance,

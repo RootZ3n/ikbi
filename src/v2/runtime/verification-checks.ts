@@ -54,7 +54,7 @@ export function createChecksSource(env: NodeJS.ProcessEnv = process.env): Checks
       return {
         ok: true,
         source: resolution.source === "env" ? "env" : "default",
-        checks: resolution.checks.map((c) => ({ name: c.name, command: c.command, args: [...c.args] })),
+        checks: resolution.checks.map((c) => ({ name: c.name, command: c.command, args: [...c.args], ...(c.cwd !== undefined ? { cwd: c.cwd } : {}) })),
       };
     },
   };

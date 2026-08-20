@@ -117,7 +117,17 @@ test("budget: token counts are labelled ESTIMATES, with the divisor recorded", (
   assert.equal(derived.budget.estimated, true);
   assert.equal(derived.budget.accounting, "estimated_chars_per_token");
   assert.equal(derived.budget.charsPerToken, CHARS_PER_TOKEN);
-  assert.equal(estimateTokens("abcd".repeat(10)), 10, "the adopted chars/4 heuristic");
+  /*
+    The divisor moved from 4 to 3.2 deliberately. 4 is about right for English prose;
+    a builder conversation is code, JSON, paths and digests, which tokenize denser — and
+    a real MiMo request at the compaction threshold came back 12.4% larger than chars/4
+    predicted. The claim below is the one that matters and it is stated as a PROPERTY
+    rather than a magic number: the estimate rounds up, and it is strictly more
+    conservative than the prose heuristic it replaced.
+  */
+  assert.equal(estimateTokens("abcd".repeat(10)), Math.ceil(40 / CHARS_PER_TOKEN));
+  assert.ok(estimateTokens("abcd".repeat(10)) > 40 / 4, "more conservative than chars/4");
+  assert.ok(CHARS_PER_TOKEN < 4, "the estimator must not drift back toward the prose figure");
 });
 
 test("budget: an UNKNOWN model window fails rather than being guessed", () => {

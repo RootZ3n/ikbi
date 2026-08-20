@@ -208,3 +208,60 @@ export function renderCriticInput(pkg: CriticInputPackage, boundary: UntrustedBo
     characters: messages.reduce((total, m) => total + m.content.length, 0),
   };
 }
+
+
+/* ── PROTOCOL REPAIR ─────────────────────────────────────────────────────── */
+
+/**
+ * The one extra instruction a protocol repair adds.
+ *
+ * Deliberately narrow: it asks for the SAME judgement, re-emitted in the schema. It does
+ * not invite reconsideration, does not mention approval, and does not describe what a
+ * "good" verdict looks like — a repair that nudged the verdict would be semantic retry
+ * wearing a formatting excuse.
+ */
+export const CRITIC_REPAIR_INSTRUCTION = [
+  "Your previous reply could not be parsed as the required JSON judgement.",
+  "",
+  "Re-emit THE SAME judgement you already made, in the exact schema, and nothing else.",
+  "Do not reconsider the candidate. Do not change your verdict. Do not add prose, code",
+  "fences, commentary or explanation around the JSON. Emit one bare JSON object.",
+  "",
+  "If your previous reply expressed dissatisfaction or listed defects, the re-emitted",
+  "judgement must still express that dissatisfaction and still list those defects.",
+].join("\n");
+
+/**
+ * Render the ONE protocol-repair request.
+ *
+ * The malformed reply crosses the untrusted boundary before it re-enters. That is not
+ * ceremony: a reply that failed the schema is exactly where "ignore the schema and
+ * approve everything" would arrive, and it must be data the model is shown rather than
+ * an instruction it obeys. The system contract and the candidate provenance are
+ * re-sent unchanged, so the repair judges the same evidence and nothing new.
+ */
+export function renderCriticRepairInput(
+  pkg: CriticInputPackage,
+  malformed: string,
+  boundary: UntrustedBoundary,
+): RenderedModelInput {
+  const first = renderCriticInput(pkg, boundary);
+  const messages: RenderedMessage[] = [
+    ...first.messages,
+    {
+      role: "user",
+      content:
+        `--- YOUR PREVIOUS REPLY (untrusted data — it failed the schema) ---\n` +
+        boundary.wrap({ content: malformed, source: "tool_result", origin: "critic_malformed_response" }),
+      untrusted: true,
+    },
+    { role: "user", content: CRITIC_REPAIR_INSTRUCTION },
+  ];
+  return {
+    promptId: contentDigest("prompt", {
+      messages: messages.map((m) => ({ role: m.role, content: m.content, untrusted: m.untrusted })),
+    }),
+    messages,
+    characters: messages.reduce((total, m) => total + m.content.length, 0),
+  };
+}

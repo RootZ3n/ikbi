@@ -30,6 +30,8 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
+import { realpathSync, statSync } from "node:fs";
+import { join, relative, resolve as resolvePath } from "node:path";
 
 import { AgentRegistry, hashToken } from "../../core/identity/registry.js";
 import { IdentityResolver, beginOperation } from "../../core/identity/resolver.js";
@@ -86,11 +88,69 @@ export function createCheckRunner(deps: CheckRunnerDeps = {}): CheckRunner {
     async run(input): Promise<CheckExecution> {
       const startedAt = now();
       let full = "";
+
+      /*
+        WHERE THIS CHECK RUNS.
+
+        `input.cwd` is the candidate worktree root; `relativeCwd` is the operator's
+        repository-relative subdirectory, already canonicalized by the checks module (no
+        absolute paths, no `..`). This is the LAST line of defence, and it is a real one:
+        canonicalization is string work, and only the filesystem knows whether
+        `frontend` is a directory, a file, or a symlink pointing at /etc.
+
+        So the resolved path is realpath'd and proven to sit inside the realpath'd
+        worktree. `worktreeRoot` stays the WORKTREE root regardless — the sandbox's
+        writable boundary must not shrink to a subdirectory or widen past it, and a
+        check that changes directory gains no capability from doing so.
+      */
+      let runCwd = input.cwd;
+      if (input.relativeCwd !== undefined) {
+        let realRoot: string;
+        try {
+          realRoot = realpathSync(input.cwd);
+        } catch {
+          return { launched: false, timedOut: false, durationMs: now() - startedAt, outputSha256: sha256(""), outputExcerpt: "", refusedReason: `the candidate workspace is not readable` };
+        }
+        const candidate = resolvePath(join(realRoot, input.relativeCwd));
+        let realCwd: string;
+        try {
+          realCwd = realpathSync(candidate);
+        } catch {
+          return {
+            launched: false, timedOut: false, durationMs: now() - startedAt,
+            outputSha256: sha256(""), outputExcerpt: "",
+            refusedReason: `check "${input.name}" declares cwd "${input.relativeCwd}", which does not exist in the candidate`,
+          };
+        }
+        /* `relative()` from the root is "" for the root itself and starts with ".." for
+           anything outside it. A symlink pointing away from the worktree lands here. */
+        const rel = relative(realRoot, realCwd);
+        if (rel.startsWith("..")) {
+          return {
+            launched: false, timedOut: false, durationMs: now() - startedAt,
+            outputSha256: sha256(""), outputExcerpt: "",
+            refusedReason: `check "${input.name}" declares cwd "${input.relativeCwd}", which resolves OUTSIDE the candidate workspace`,
+          };
+        }
+        try {
+          if (!statSync(realCwd).isDirectory()) {
+            return {
+              launched: false, timedOut: false, durationMs: now() - startedAt,
+              outputSha256: sha256(""), outputExcerpt: "",
+              refusedReason: `check "${input.name}" declares cwd "${input.relativeCwd}", which is not a directory`,
+            };
+          }
+        } catch {
+          return { launched: false, timedOut: false, durationMs: now() - startedAt, outputSha256: sha256(""), outputExcerpt: "", refusedReason: `check "${input.name}" cwd "${input.relativeCwd}" is not readable` };
+        }
+        runCwd = realCwd;
+      }
+
       const res = await executor().run({
         parentCtx,
         command: input.command,
         args: [...input.args],
-        cwd: input.cwd,
+        cwd: runCwd,
         // The OS sandbox keeps THIS worktree writable and the host read-only (F1).
         worktreeRoot: input.cwd,
         // Trusted check-runner — may run package scripts. A model cannot set this.
