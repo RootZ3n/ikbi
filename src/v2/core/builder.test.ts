@@ -13,6 +13,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { estimateMessagesTokens } from "./conversation.js";
+import { TOOL_RUN_COMMAND } from "./tools.js";
 import { DEFAULT_BUILDER_BUDGET, builderBudgetWithTurns, generateCandidate, type BuilderToolExecutor, type UntrustedBoundary } from "./builder.js";
 import { BUILDER_SYSTEM_INSTRUCTION } from "./prompt.js";
 import { V2_BUILD_FAILURE_CODES } from "./candidate.js";
@@ -93,6 +94,11 @@ function scriptedExecutor(outcomes: readonly ToolOutcome[]) {
       return {
         outcome,
         ...(outcome.kind === "applied" ? { mutation: { mutationId: outcome.mutationId as V2MutationDigest, path: outcome.path } } : {}),
+        /* A launched command yields a record in production, and the command ledger (and
+           therefore the repeat ordinal) is counted from it. */
+        ...(outcome.kind === "command"
+          ? { command: { commandId: `cmd_${index}`, program: outcome.program, args: outcome.args, exitCode: outcome.exitCode } as never }
+          : {}),
       };
     },
   };
@@ -766,4 +772,188 @@ test("window: cost admission is told about the ACTUAL request, not the package b
   assert.notEqual(seenEstimates[0], seenEstimates[seenEstimates.length - 1], "the estimate must move with the conversation");
   assert.ok(seenEstimates[seenEstimates.length - 1]! > seenEstimates[0]!, "and grow as history grows");
   assert.ok(!seenEstimates.every((v) => v === 55_844), "it is no longer the frozen package budget");
+});
+
+
+/* ── FAILURE RECEIPT OBSERVABILITY ───────────────────────────────────────────
+
+   The envelope used to be recorded only when the builder SUCCEEDED, so the receipt went
+   silent at exactly the moment somebody was asking it a question: a run that died at the
+   turn limit reported `{}` for its own window behaviour, and the numbers had to be
+   reconstructed afterwards from provider usage. The builder always knew them. */
+
+const envelopeFields = (r: Awaited<ReturnType<typeof run>>["result"]) =>
+  r.ok
+    ? { ceiling: r.generation.ceiling, compactions: r.generation.compactions, turns: r.generation.turns, peak: r.generation.maxEstimatedInputTokens }
+    : { ceiling: r.ceiling, compactions: r.compactions, turns: r.turns, peak: r.maxEstimatedInputTokens };
+
+test("failure envelope (A): a SUCCESSFUL generation reports its envelope", async () => {
+  const { result } = await run([{ toolCalls: [finishCall()] }], []);
+  assert.ok(result.ok);
+  const e = envelopeFields(result);
+  assert.equal(e.ceiling.contextWindowTokens, 100_000);
+  assert.ok(e.peak > 0, "and how large the request actually got");
+  assert.equal(e.turns, 1);
+});
+
+test("failure envelope (B): a TURN-LIMIT failure reports the same envelope", async () => {
+  const { result } = await run(thinksThenFinishes(12), []);
+  assert.equal(result.ok, false);
+  if (!result.ok) assert.equal(result.failure.code, "build.turn_limit_exceeded");
+  const e = envelopeFields(result);
+  assert.equal(e.ceiling.contextWindowTokens, 100_000, "the window is still known");
+  assert.equal(e.ceiling.estimator, "conservative_estimate");
+  assert.ok(e.ceiling.maxRenderedInputTokens > 0);
+  assert.equal(e.turns, 12, "and how many turns it actually executed");
+  assert.ok(e.peak > 0, "and the largest request it estimated");
+});
+
+test("failure envelope (C): a TOOL-LIMIT failure reports it too", async () => {
+  const turns: Turn[] = Array.from({ length: 6 }, (_, i) => ({ toolCalls: [readCall(`r${i}`)] }));
+  const { result } = await run(turns, [observed, observed, observed], { ...DEFAULT_BUILDER_BUDGET, maxToolCalls: 2 });
+  assert.equal(result.ok, false);
+  const e = envelopeFields(result);
+  assert.equal(e.ceiling.contextWindowTokens, 100_000);
+  assert.ok(e.turns >= 1);
+  assert.ok(e.peak > 0);
+});
+
+test("failure envelope (E): folds that happened before a failure are preserved", async () => {
+  /* A narrow window forces folds, and then the turn budget runs out. Both facts must
+     survive into the same receipt. */
+  const turns: Turn[] = Array.from({ length: 14 }, (_, i) => ({ toolCalls: [readCall(`r${i}`, `src/big${i}.ts`)] }));
+  const { result } = await narrowRun(turns, Array.from({ length: 14 }, (_, i) => fatRead(`src/big${i}.ts`)));
+  assert.equal(result.ok, false);
+  const e = envelopeFields(result);
+  assert.ok(e.compactions.length > 0, "the folds are on the failure record");
+  assert.equal(e.ceiling.contextWindowTokens, 65_536);
+  assert.ok(e.peak <= e.ceiling.maxRenderedInputTokens, "and the peak respected the ceiling");
+});
+
+test("failure envelope (F): it carries no prompt or source content", async () => {
+  const { result } = await narrowRun(
+    Array.from({ length: 14 }, (_, i) => ({ toolCalls: [readCall(`r${i}`, `src/big${i}.ts`)] })),
+    Array.from({ length: 14 }, (_, i) => fatRead(`src/big${i}.ts`)),
+  );
+  const e = envelopeFields(result);
+  const serialized = JSON.stringify(e);
+  assert.doesNotMatch(serialized, /zzzz/, "no file body reaches the envelope");
+  assert.doesNotMatch(serialized, /src\/big/, "not even a path");
+  for (const v of Object.values(e.ceiling)) assert.ok(typeof v === "number" || typeof v === "string");
+});
+
+/* ── REPEATED READ-ONLY EXPLORATION ──────────────────────────────────────── */
+
+const cmdCall = (id: string, args: readonly string[], cwd = "/ws") => ({
+  id, name: TOOL_RUN_COMMAND, arguments: JSON.stringify({ program: "ls", args: [...args], cwd }),
+});
+const ranCommand = (args: readonly string[], cwd = "/ws"): ToolOutcome => ({
+  kind: "command", program: "ls", args: [...args], cwd, launched: true, refused: false,
+  exitCode: 0, timedOut: false, workspaceUnchanged: true, outputSha256: "s",
+  outputByteLength: 4, outputTruncated: false, untrusted: "docs\n",
+});
+const refusedCommand = (args: readonly string[]): ToolOutcome => ({
+  kind: "command", program: "ls", args: [...args], cwd: "/ws", launched: false, refused: true,
+  refusalCode: "not_allowlisted", timedOut: false, workspaceUnchanged: true, outputSha256: "s",
+  outputByteLength: 0, outputTruncated: false, untrusted: "denied",
+});
+
+/** The trusted provenance halves of every tool message, where a harness note lives. */
+const toolNotes = (sent: Awaited<ReturnType<typeof run>>["sent"]) =>
+  sent[sent.length - 1]!.messages.filter((m) => m.role === "tool").map((m) => m.content);
+
+test("repeat feedback (A): the same command twice, with no mutation, is flagged", async () => {
+  const turns: Turn[] = [
+    { toolCalls: [cmdCall("c1", ["docs"])] },
+    { toolCalls: [cmdCall("c2", ["docs"])] },
+    { toolCalls: [finishCall()] },
+  ];
+  const { result, sent } = await run(turns, [ranCommand(["docs"]), ranCommand(["docs"])]);
+  assert.ok(result.ok);
+  assert.equal(result.generation.repeatedCommands, 1);
+  const notes = toolNotes(sent).filter((c) => c.includes("[ikbi] This exact command already ran"));
+  assert.equal(notes.length, 1, "exactly the second one carries the note");
+  assert.match(notes[0]!, /turn 1 \(command 1\)/, "and it says where");
+  assert.match(notes[0]!, /no files have been changed since/);
+});
+
+test("repeat feedback (A): the note states a fact and gives no instruction", async () => {
+  const turns: Turn[] = [
+    { toolCalls: [cmdCall("c1", ["docs"])] },
+    { toolCalls: [cmdCall("c2", ["docs"])] },
+    { toolCalls: [finishCall()] },
+  ];
+  const { sent } = await run(turns, [ranCommand(["docs"]), ranCommand(["docs"])]);
+  const note = toolNotes(sent).find((c) => c.includes("[ikbi] This exact command already ran"))!;
+  // The builder keeps its agency: no prohibition, no advice, no task guidance.
+  assert.doesNotMatch(note, /do not|don't|stop|avoid|should|you already know|instead/i);
+  // And it must not pretend the command was skipped.
+  assert.match(note, /run again and the output above is the fresh result/);
+});
+
+test("repeat feedback (B): the same command AFTER an applied mutation is not a repeat", async () => {
+  /* The tree moved, so looking again is a new question rather than a redundant one. */
+  const turns: Turn[] = [
+    { toolCalls: [cmdCall("c1", ["docs"])] },
+    { toolCalls: [readCall("r1")] },
+    { toolCalls: [replaceCall("w1")] },
+    { toolCalls: [cmdCall("c2", ["docs"])] },
+    { toolCalls: [finishCall()] },
+  ];
+  const { result, sent } = await run(turns, [ranCommand(["docs"]), observed, applied, ranCommand(["docs"])]);
+  assert.ok(result.ok);
+  assert.equal(result.generation.repeatedCommands, 0, "a mutation reset the epoch");
+  assert.equal(toolNotes(sent).filter((c) => c.includes("already ran")).length, 0);
+});
+
+test("repeat feedback (C/D): different args or directory are different commands", async () => {
+  const turns: Turn[] = [
+    { toolCalls: [cmdCall("c1", ["docs"])] },
+    { toolCalls: [cmdCall("c2", ["docs/architecture"])] },
+    { toolCalls: [cmdCall("c3", ["docs"], "/ws/frontend")] },
+    { toolCalls: [finishCall()] },
+  ];
+  const { result } = await run(turns, [ranCommand(["docs"]), ranCommand(["docs/architecture"]), ranCommand(["docs"], "/ws/frontend")]);
+  assert.ok(result.ok);
+  // c2 has different args; c3 has the same args but a different cwd. Neither repeats c1.
+  assert.equal(result.generation.repeatedCommands, 0);
+});
+
+test("repeat feedback (E): a REFUSED command neither counts nor makes a later real run redundant", async () => {
+  /* Nothing ran, so nothing was learned — a later successful execution is the first
+     time that question was actually answered. */
+  const turns: Turn[] = [
+    { toolCalls: [cmdCall("c1", ["docs"])] },
+    { toolCalls: [cmdCall("c2", ["docs"])] },
+    { toolCalls: [finishCall()] },
+  ];
+  const { result } = await run(turns, [refusedCommand(["docs"]), ranCommand(["docs"])]);
+  assert.ok(result.ok);
+  assert.equal(result.generation.repeatedCommands, 0);
+});
+
+test("repeat feedback (F): the note adds no content beyond the ordinary result", async () => {
+  const turns: Turn[] = [
+    { toolCalls: [cmdCall("c1", ["docs"])] },
+    { toolCalls: [cmdCall("c2", ["docs"])] },
+    { toolCalls: [finishCall()] },
+  ];
+  const { sent } = await run(turns, [ranCommand(["docs"]), ranCommand(["docs"])]);
+  const note = toolNotes(sent).find((c) => c.includes("already ran"))!;
+  // It reports ikbi's own ledger — turn and ordinal — and no repository text.
+  assert.doesNotMatch(note.split("\n").find((l) => l.startsWith("[ikbi] This exact"))!, /docs\n/);
+});
+
+test("repeat feedback: three identical explorations are counted, as the real run did", async () => {
+  /* The shape observed on Ofi: `ls docs/` at commands 1, 3 and 9. */
+  const turns: Turn[] = [
+    { toolCalls: [cmdCall("c1", ["docs"])] },
+    { toolCalls: [cmdCall("c2", ["other"])] },
+    { toolCalls: [cmdCall("c3", ["docs"])] },
+    { toolCalls: [cmdCall("c4", ["docs"])] },
+    { toolCalls: [finishCall()] },
+  ];
+  const { result } = await run(turns, [ranCommand(["docs"]), ranCommand(["other"]), ranCommand(["docs"]), ranCommand(["docs"])]);
+  assert.ok(result.ok);
+  assert.equal(result.generation.repeatedCommands, 2, "the second and third re-asks");
 });

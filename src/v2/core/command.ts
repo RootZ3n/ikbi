@@ -487,3 +487,72 @@ export interface BuilderCommandResult {
 export interface BuilderCommandCapability {
   run(request: BuilderCommandRequest): Promise<BuilderCommandResult>;
 }
+
+
+/* ── REPEATED READ-ONLY EXPLORATION ──────────────────────────────────────────
+
+   A real qualification spent sixteen of its twenty-four turns exploring, and three of
+   those turns re-ran commands it had already run against a candidate it had not changed:
+   `ls docs/` at command 1, again at 3, again at 9. Turns are the scarcest thing a builder
+   has, and nothing told it.
+
+   WHAT THIS IS NOT. It is not a cache. The command still runs, and its real output is
+   still what comes back — a shell command's result is a function of a filesystem and a
+   clock, and quietly replaying a stale one would be the harness lying about what
+   happened. It is not advice, either: the note states a fact and stops. The builder may
+   have an excellent reason to look again, and deciding that is its job.
+
+   Model-agnostic by construction: the identity is the command and the candidate's own
+   mutation epoch. Nothing here can see which model is running. */
+
+/**
+ * How many APPLIED mutations deep the candidate is.
+ *
+ * The narrowest possible notion of "has the state changed under me": it starts at 0 and
+ * advances only when a mutation actually lands. A refused write does not move it, because
+ * a refused write changed nothing. Reusing the existing mutation ledger rather than
+ * inventing a tree identity keeps this from becoming a second workspace authority.
+ */
+export type MutationEpoch = number;
+
+/**
+ * The identity of one read-only command against one candidate state.
+ *
+ * Everything that could change the answer is in it: the program, the arguments in order,
+ * the directory, and the epoch. Two commands with the same key asked the same question of
+ * the same tree; anything else is a different question.
+ */
+export function commandRepeatKey(input: {
+  readonly program: string;
+  readonly args: readonly string[];
+  readonly cwd: string;
+  readonly epoch: MutationEpoch;
+}): string {
+  // JSON rather than a join: an argument containing the separator must not be able to
+  // collide with a different argument list.
+  return JSON.stringify([input.epoch, input.program, [...input.args], input.cwd]);
+}
+
+/** Where an identical earlier run of this command happened. */
+export interface PriorCommandRun {
+  /** The builder turn it ran on (1-based). */
+  readonly turn: number;
+  /** Its ordinal in this candidate's command list (1-based). */
+  readonly ordinal: number;
+}
+
+/**
+ * The harness-authored note appended to a repeated command's result.
+ *
+ * STATES A FACT AND STOPS. It does not say "do not run this again", does not suggest what
+ * to do instead, and does not comment on whether the builder knows enough — all of which
+ * would be the harness making the builder's decisions for it. It reports that the same
+ * question was asked of the same unchanged tree, and where.
+ */
+export function repeatedCommandNote(prior: PriorCommandRun, mutationsSince: number): string {
+  return (
+    `[ikbi] This exact command already ran at turn ${prior.turn} (command ${prior.ordinal}) ` +
+    `against the same candidate state — ${mutationsSince === 0 ? "no files have been changed since" : `${mutationsSince} change(s) since`}. ` +
+    `It has been run again and the output above is the fresh result.`
+  );
+}

@@ -438,12 +438,24 @@ export interface RunContextEnvelopeSummary {
   readonly capabilityProvenance: string;
   /** Every fold, in order. Empty when the conversation always fitted. */
   readonly compactions: readonly CompactionEvent[];
+  /** Turns the builder actually executed. */
+  readonly turnsExecuted: number;
+  /** The largest request it estimated — how close the run came to its own ceiling. */
+  readonly maxEstimatedInputTokens: number;
+  /**
+   * Read-only commands the builder re-ran against a candidate it had not changed.
+   * Reported so wasted exploration is visible; nothing is ever refused because of it.
+   */
+  readonly repeatedCommands: number;
 }
 
 /** Summarize the envelope. Carries no prompt text, no source, no secret. */
 export function summarizeContextEnvelope(
   ceiling: ConversationCeiling,
   compactions: readonly CompactionEvent[],
+  turnsExecuted: number,
+  maxEstimatedInputTokens: number,
+  repeatedCommands: number,
 ): RunContextEnvelopeSummary {
   return {
     contextWindowTokens: ceiling.contextWindowTokens,
@@ -454,6 +466,9 @@ export function summarizeContextEnvelope(
     estimator: ceiling.estimator,
     capabilityProvenance: ceiling.capabilityProvenance,
     compactions,
+    turnsExecuted,
+    maxEstimatedInputTokens,
+    repeatedCommands,
   };
 }
 

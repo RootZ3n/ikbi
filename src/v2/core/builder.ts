@@ -57,7 +57,14 @@ import {
 import type { RepairBrief } from "./repair.js";
 import { invokeAuthorized, type InvocationTransport, type ServedModelAlias, type V2InvocationRecord } from "./invocation.js";
 import type { InvocationAdmission } from "./cost.js";
-import { V2_COMMAND_FAILURE_CODES, type BuilderCommandCapability, type BuilderCommandRecord } from "./command.js";
+import {
+  commandRepeatKey,
+  repeatedCommandNote,
+  V2_COMMAND_FAILURE_CODES,
+  type BuilderCommandCapability,
+  type BuilderCommandRecord,
+  type PriorCommandRun,
+} from "./command.js";
 import type { ContextPackage } from "./context.js";
 import type { ModelResolutionDecision } from "./resolver.js";
 import type { RunFailure } from "./failure.js";
@@ -272,6 +279,10 @@ export interface BuilderGeneration {
   readonly compactions: readonly CompactionEvent[];
   /** The window this candidate ran inside, derived from ITS resolved model's facts. */
   readonly ceiling: ConversationCeiling;
+  /** The largest request this generation estimated, folded or not. */
+  readonly maxEstimatedInputTokens: number;
+  /** Read-only commands re-run against an unchanged candidate. Reported, never refused. */
+  readonly repeatedCommands: number;
   readonly startedAt: number;
   readonly endedAt: number;
 }
@@ -294,6 +305,22 @@ export type BuilderResult =
       readonly mutationIds: readonly V2MutationDigest[];
       /** Read-only commands that ran before the failure (V2-015). Counted, never discarded. */
       readonly commands: readonly BuilderCommandRecord[];
+      /**
+       * THE EXECUTION ENVELOPE, preserved through the failure.
+       *
+       * A failed generation is exactly when an operator most needs to know what the
+       * builder was working inside — which window, which ceiling, how often it folded,
+       * how close it came. Reporting it only on success meant the receipt went silent at
+       * the one moment it was being asked a question, and the numbers had to be
+       * reconstructed afterwards from provider usage. The builder already knows them.
+       */
+      readonly ceiling: ConversationCeiling;
+      readonly compactions: readonly CompactionEvent[];
+      /** Turns actually executed before the failure. */
+      readonly turns: number;
+      /** The largest request this generation estimated, folded or not. */
+      readonly maxEstimatedInputTokens: number;
+      readonly repeatedCommands: number;
     };
 
 /**
@@ -382,10 +409,27 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
      the conversation, so folding a message can never lose or invent a fact. */
   const facts: CompactedFact[] = [];
   const compactions: CompactionEvent[] = [];
+  /* The high-water mark of what was actually about to be sent. Recorded so a receipt can
+     say how close a run came to its ceiling without anyone re-deriving it later. */
+  let maxEstimatedInputTokens = 0;
+  /*
+    THE CANDIDATE'S MUTATION EPOCH, and the read-only commands already asked of it.
+    The epoch advances only when a mutation actually lands, so a command repeated
+    against an unchanged tree is recognisable while the same command after a write is
+    legitimate fresh inspection.
+  */
+  let mutationEpoch = 0;
+  const commandsSeen = new Map<string, PriorCommandRun>();
+  /** Repeats observed, for the receipt. Counted, never used to refuse anything. */
+  let repeatedCommands = 0;
 
   const attemptedInvocationIds: V2InvocationId[] = [];
   /** Everything that really happened, for a failure that must not erase it. */
-  const partial = (failure: RunFailure): BuilderResult => ({ ok: false, failure, invocations, mutationIds, attemptedInvocationIds, commands });
+  const partial = (failure: RunFailure): BuilderResult => ({
+    ok: false, failure, invocations, mutationIds, attemptedInvocationIds, commands,
+    // Same evidence the success path reports, so a receipt reads identically either way.
+    ceiling, compactions, turns, maxEstimatedInputTokens, repeatedCommands,
+  });
 
   while (turns < budget.maxTurns) {
     /*
@@ -404,6 +448,7 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
       );
     const fitted = fitConversation({ conversation, memory: { facts, changedPaths: [...changedPaths] }, ceiling, turn: turns + 1, renderSize: renderWith });
     if (!fitted.ok) return partial(fitted.failure);
+    maxEstimatedInputTokens = Math.max(maxEstimatedInputTokens, fitted.estimatedTokens);
     if (fitted.event !== undefined) {
       compactions.push(fitted.event);
       /* The fold is durable: the conversation the loop carries forward IS the compacted
@@ -568,6 +613,9 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
       if (executed.mutation !== undefined) {
         mutationIds.push(executed.mutation.mutationId);
         changedPaths.add(executed.mutation.path);
+        // The tree moved. Every earlier observation of it is now history, so a command
+        // re-asked after this point is a NEW question, not a repeat.
+        mutationEpoch += 1;
         if (mutationIds.length > budget.maxMutations) {
           return partial(
             buildFailure({
@@ -582,7 +630,29 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
          mutation authority produced — so what survives a fold is what happened, not what
          anybody said happened. */
       facts.push(factOf(executed.outcome));
-      appendToolResult(conversation, input.untrustedBoundary, call, executed.outcome);
+
+      /*
+        REPEATED READ-ONLY EXPLORATION. Only a command that actually LAUNCHED is recorded
+        or matched: a policy refusal ran nothing, so it neither establishes a prior result
+        nor makes a later real execution redundant.
+      */
+      let repeatNote: string | undefined;
+      if (executed.outcome.kind === "command" && executed.outcome.launched && !executed.outcome.refused) {
+        const key = commandRepeatKey({
+          program: executed.outcome.program,
+          args: executed.outcome.args,
+          cwd: executed.outcome.cwd,
+          epoch: mutationEpoch,
+        });
+        const prior = commandsSeen.get(key);
+        if (prior !== undefined) {
+          repeatedCommands += 1;
+          repeatNote = repeatedCommandNote(prior, 0);
+        } else {
+          commandsSeen.set(key, { turn: turns, ordinal: commands.length });
+        }
+      }
+      appendToolResult(conversation, input.untrustedBoundary, call, executed.outcome, repeatNote);
     }
 
     if (finished !== undefined) {
@@ -600,6 +670,8 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
           toolFailures,
           compactions,
           ceiling,
+          maxEstimatedInputTokens,
+          repeatedCommands,
           startedAt,
           endedAt: now(),
         },
@@ -642,8 +714,15 @@ function appendToolResult(
   boundary: UntrustedBoundary,
   call: BuilderToolCall,
   outcome: ToolOutcome,
+  /**
+   * A harness-authored note to carry with this result — today, that an identical
+   * read-only command already ran against the unchanged candidate. It joins the TRUSTED
+   * provenance half of the message rather than the fenced payload, because ikbi wrote it
+   * and it is a fact about ikbi's own execution ledger, not repository-derived text.
+   */
+  note?: string,
 ): void {
-  const provenance = renderToolProvenance(outcome);
+  const provenance = note !== undefined ? `${renderToolProvenance(outcome)}\n${note}` : renderToolProvenance(outcome);
   const payload = untrustedToolPayload(outcome);
   if (payload === undefined) {
     conversation.push({ role: "tool", toolCallId: call.id, content: provenance });

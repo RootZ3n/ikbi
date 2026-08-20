@@ -877,7 +877,14 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
         ...(deps.admission !== undefined ? { admission: deps.admission } : {}),
         now,
       });
-      if (generated.ok) contextEnvelope = summarizeContextEnvelope(generated.generation.ceiling, generated.generation.compactions);
+      /*
+        BOTH branches. The envelope is execution evidence, not a success trophy — a run
+        that died at the turn limit is precisely the one whose window behaviour someone
+        will want to read, and it used to report nothing.
+      */
+      contextEnvelope = generated.ok
+        ? summarizeContextEnvelope(generated.generation.ceiling, generated.generation.compactions, generated.generation.turns, generated.generation.maxEstimatedInputTokens, generated.generation.repeatedCommands)
+        : summarizeContextEnvelope(generated.ceiling, generated.compactions, generated.turns, generated.maxEstimatedInputTokens, generated.repeatedCommands);
       for (const record of generated.ok ? generated.generation.invocations : generated.invocations) lifecycle.record(runId, { kind: "invocation", id: record.invocationId, role: builderDecision.role });
       if (!generated.ok) for (const id of generated.attemptedInvocationIds) lifecycle.record(runId, { kind: "invocation", id, role: builderDecision.role });
       s.invocations = generated.ok ? generated.generation.invocations : generated.invocations;
