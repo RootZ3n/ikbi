@@ -474,6 +474,36 @@ export class ProviderError extends Error {
   }
 }
 
+/**
+ * An error that means "stop", not "try the next provider".
+ *
+ * The fallback chain exists because providers fail in ways another provider can
+ * fix: a timeout, a 5xx, an open circuit. A *refusal* is not one of those. When
+ * a local deployment declines to serve — because nothing installed is qualified
+ * for the task, or the resident model does not fit the request — trying a
+ * different provider does not address the refusal, it bypasses it. And because
+ * the next route is usually a paid API, bypassing it silently spends money on
+ * the strength of a local policy decision the caller never saw.
+ *
+ * Marked structurally rather than by class so a provider package can raise one
+ * without importing the invoker.
+ */
+export interface ChainTerminatingError extends Error {
+  /** True when the rest of the fallback chain must not be attempted. */
+  readonly terminatesChain: boolean;
+  /** Machine-readable reason, surfaced in logs and to the caller. */
+  readonly reason: string;
+}
+
+/** Narrow an unknown throw to a chain-terminating refusal. */
+export function terminatesChain(e: unknown): e is ChainTerminatingError {
+  return (
+    e instanceof Error &&
+    (e as Partial<ChainTerminatingError>).terminatesChain === true &&
+    typeof (e as Partial<ChainTerminatingError>).reason === "string"
+  );
+}
+
 /** Thrown by `invokeModel` when the entire fallback chain is exhausted. */
 export class AllProvidersFailedError extends Error {
   readonly model: string;

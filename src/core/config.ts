@@ -270,6 +270,19 @@ export interface ProviderEndpointConfig {
   readonly apiKey: string | undefined;
 }
 
+/**
+ * Bokahli endpoint config.
+ *
+ * `tokenFile` rather than `apiKey` deliberately. See `BokahliConfig` above and
+ * `providers/bokahli.ts` for why a path is the safer shape here.
+ */
+export interface BokahliEndpointConfig {
+  readonly baseUrl: string;
+  readonly tokenFile: string;
+  /** When false, no Bokahli provider is constructed and local routes are skipped. */
+  readonly enabled: boolean;
+}
+
 /** OpenRouter endpoint config (adds the attribution headers OpenRouter recommends). */
 export interface OpenRouterEndpointConfig extends ProviderEndpointConfig {
   readonly referer: string | undefined;
@@ -328,6 +341,16 @@ export interface ProviderConfig {
   readonly mistral: ProviderEndpointConfig;
   /** Together direct API endpoint (OpenAI-compatible). */
   readonly together: ProviderEndpointConfig;
+  /**
+   * Bokahli — local inference on Mushin, over loopback or tailnet.
+   *
+   * Carries a token *file path*, not a token. Every other provider here holds
+   * its credential as a string read from the environment, which is fine for a
+   * remote API key and wrong for this one: the value would then sit in
+   * /proc/<pid>/environ and in anything that serialises config. The file is
+   * mode-0600 and is read once, at provider construction.
+   */
+  readonly bokahli: BokahliEndpointConfig;
   /**\n   * Default logical model ids for the standard roles (config-driven, not hardcoded
    * downstream). `builder` has its OWN id (IKBI_MODEL_BUILDER) that falls through to the
    * driver when unset. `competitiveModels` (IKBI_COMPETITIVE_MODELS) is the optional
@@ -441,6 +464,17 @@ function loadProviderConfig(env: NodeJS.ProcessEnv, stateRoot: string): Provider
       // MiniMax's OpenAI-compatible endpoint. Override via IKBI_MINIMAX_BASE_URL.
       baseUrl: optStr(env.IKBI_MINIMAX_BASE_URL) ?? "https://api.minimax.chat/v1",
       apiKey: optStr(env.IKBI_MINIMAX_API_KEY),
+    },
+    bokahli: {
+      // Loopback by default. A tailnet address (e.g. http://100.115.140.2:8080/v1)
+      // reaches a Mushin that is not this machine.
+      baseUrl: optStr(env.IKBI_BOKAHLI_BASE_URL) ?? "http://127.0.0.1:8080/v1",
+      // A path, never the token. IKBI_BOKAHLI_TOKEN_FILE overrides it; there is
+      // deliberately no IKBI_BOKAHLI_TOKEN, because an environment variable is
+      // exactly the wrong place for this one.
+      tokenFile: optStr(env.IKBI_BOKAHLI_TOKEN_FILE)
+        ?? `${env.HOME ?? ""}/.config/bokahli/token`,
+      enabled: optStr(env.IKBI_BOKAHLI_ENABLED) !== "false",
     },
     openai: {
       baseUrl: optStr(env.IKBI_OPENAI_BASE_URL) ?? "https://api.openai.com/v1",

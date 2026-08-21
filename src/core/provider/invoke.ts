@@ -19,6 +19,7 @@ import type { CircuitConfig } from "../config.js";
 import { CircuitBreaker, type Clock } from "./circuit-breaker.js";
 import {
   AllProvidersFailedError,
+  type ChainTerminatingError,
   type Cost,
   CONTRACT_VERSION,
   type CostRate,
@@ -34,6 +35,7 @@ import {
   type ToolCall,
   type ToolCallDelta,
   type TokenUsage,
+  terminatesChain,
 } from "./contract.js";
 import { type ModelRegistry, type ModelSpec, type ProviderRoute, resolveRate } from "./registry.js";
 
@@ -143,6 +145,10 @@ export class ProviderInvoker {
     const timeoutMs = request.timeoutMs ?? this.defaultTimeoutMs;
     const attempts: ProviderAttempt[] = [];
     let previousProvider: string | undefined;
+    // A route may decline in a way that makes the rest of the chain the wrong
+    // answer rather than the next thing to try. See the check below the retry
+    // loop; this carries the error that said so.
+    let chainTerminator: ChainTerminatingError | undefined;
 
     for (const [index, route] of spec.providers.entries()) {
       const isFallback = index > 0;
@@ -248,6 +254,8 @@ export class ProviderInvoker {
         if (permanent) breaker.recordIgnoredFailure();
         else breaker.recordFailure();
 
+        if (terminatesChain(err)) chainTerminator = err;
+
         // Surface any tokens the provider charged even on failure.
         const failUsage = isProviderErr ? err.usage : undefined;
         const failCostUsd = failUsage ? computeCost(rate, failUsage).usd : undefined;
@@ -297,6 +305,34 @@ export class ProviderInvoker {
         }
         break; // give up on this route → next route
       }
+      }
+
+      // A local deployment that *declined* has answered the question. Walking on
+      // to the next route would turn "Bokahli will not serve this" into a paid
+      // API call the operator never asked for — and it would happen silently,
+      // inside a loop, with the reason discarded on the way past.
+      //
+      // Falling back to a remote provider is not forbidden. It is a decision,
+      // and this makes the caller take it with the reason in hand instead of
+      // inheriting it from the shape of a for-loop. A caller that wants the
+      // fallback catches this and re-invokes with a remote-only model id.
+      //
+      // RUNTIME_UNHEALTHY does not land here: it is retriable, so it reads as an
+      // ordinary transient failure and the chain continues, which is right —
+      // that one means "temporarily down", not "unwilling".
+      if (chainTerminator !== undefined) {
+        this.log.warn(
+          {
+            event: "chain_terminated_by_local_refusal",
+            model: request.model,
+            provider: route.provider,
+            reason: chainTerminator.reason,
+            remainingRoutes: spec.providers.length - index - 1,
+            attempts: attempts.length,
+          },
+          "local provider declined; not falling through to remaining routes",
+        );
+        throw chainTerminator;
       }
     }
 

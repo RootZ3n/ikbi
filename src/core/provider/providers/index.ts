@@ -141,5 +141,26 @@ export function createTogetherProvider(cfg: ProviderEndpointConfig, fetchImpl?: 
   });
 }
 
+/**
+ * Bokahli — local inference on Mushin.
+ *
+ * Not built here like the others. Its token comes from a mode-0600 file rather
+ * than a config value, and it needs a wrapper that recognises a typed refusal in
+ * an otherwise successful response, so the factory lives in its own module and
+ * is re-exported.
+ */
+export {
+  BOKAHLI_PROVIDER_ID,
+  BOKAHLI_DEFAULT_BASE_URL,
+  BOKAHLI_DEFAULT_TOKEN_FILE,
+  BOKAHLI_ESCALATE_REASONS,
+  type BokahliEscalateReason,
+  type BokahliProviderConfig,
+  BokahliEscalation,
+  assertPrivateKeyFile,
+  createBokahliProvider,
+  readEscalation,
+} from "./bokahli.js";
+
 export { OpenAICompatibleProvider, type FetchLike } from "./openai-compatible.js";
 export { AnthropicProvider } from "./anthropic.js";
