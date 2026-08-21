@@ -19,7 +19,11 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { BOKAHLI_ESCALATE_REASONS, readEscalation } from "./bokahli.js";
+import {
+  BOKAHLI_ESCALATE_REASONS,
+  readEscalation,
+  readLocalBinding as readLocalBindingForTest,
+} from "./bokahli.js";
 
 const BASE = process.env["IKBI_BOKAHLI_BASE_URL"] ?? "http://127.0.0.1:8080";
 const TOKEN_FILE = process.env["IKBI_BOKAHLI_TOKEN_FILE"]
@@ -35,19 +39,75 @@ const TOKEN_FILE = process.env["IKBI_BOKAHLI_TOKEN_FILE"]
  * green run reporting "8 skipped", which is the worst possible outcome for a
  * test whose entire job is to catch drift between two repositories.
  *
- * `skipReason` is null when the deployment is reachable. When it is not null it
- * says *why*, so a skip is legible rather than a shrug.
+ * `skipReason` is null when the deployment is reachable and is the *expected*
+ * one. When it is not null it says why, so a skip is legible rather than a
+ * shrug.
+ *
+ * ## IKBI_BOKAHLI_REQUIRE_LIVE
+ *
+ * A skip is the right default for a laptop with no Mushin on the other end, and
+ * the wrong answer entirely when this suite is being used as a release gate.
+ * Set `IKBI_BOKAHLI_REQUIRE_LIVE=true` and every reason to skip becomes a
+ * reason to fail, loudly, naming the cause. Verification runs set it; a
+ * developer checkout does not.
+ *
+ * ## Identity, not just reachability
+ *
+ * Reaching *a* Bokahli proves nothing about which one. The deployment is
+ * checked for a served identity, an attested runtime, and — when
+ * `IKBI_BOKAHLI_EXPECT_MODEL` / `IKBI_BOKAHLI_EXPECT_DIGEST` are set — that the
+ * artifact is the expected one. Testing against the wrong artifact and passing
+ * is how a green suite certifies a deployment nobody meant to ship.
  */
+const REQUIRE_LIVE = process.env["IKBI_BOKAHLI_REQUIRE_LIVE"] === "true";
+const EXPECT_MODEL = process.env["IKBI_BOKAHLI_EXPECT_MODEL"] ?? null;
+const EXPECT_DIGEST = process.env["IKBI_BOKAHLI_EXPECT_DIGEST"] ?? null;
+
 const skipReason: string | null = await (async (): Promise<string | null> => {
   if (!existsSync(TOKEN_FILE)) return `no token file at ${TOKEN_FILE}`;
   if ((statSync(TOKEN_FILE).mode & 0o077) !== 0) return `${TOKEN_FILE} is not mode 0600`;
+  let tok: string;
+  try {
+    tok = readFileSync(TOKEN_FILE, "utf8").trim();
+  } catch (e) {
+    return `${TOKEN_FILE} unreadable: ${e instanceof Error ? e.message : String(e)}`;
+  }
   try {
     const r = await fetch(`${BASE}/health/live`, { signal: AbortSignal.timeout(3000) });
-    return r.ok ? null : `${BASE}/health/live returned ${r.status}`;
+    if (!r.ok) return `${BASE}/health/live returned ${r.status}`;
   } catch (e) {
     return `${BASE} unreachable: ${e instanceof Error ? e.message : String(e)}`;
   }
+  // Reachability is not identity. Confirm which deployment answered.
+  try {
+    const r = await fetch(`${BASE}/health/ready`, {
+      headers: { authorization: `Bearer ${tok}` },
+      signal: AbortSignal.timeout(180_000),
+    });
+    if (!r.ok) return `${BASE}/health/ready returned ${r.status} (authentication?)`;
+    const d = (await r.json()) as Record<string, any>;
+    if (d["status"] !== "ready") return `deployment status is ${d["status"]}, not ready`;
+    const binding = d["attestation"]?.["binding"] ?? {};
+    if (EXPECT_MODEL !== null && binding["modelId"] !== EXPECT_MODEL) {
+      return `deployment is serving ${binding["modelId"]}, expected ${EXPECT_MODEL}`;
+    }
+    if (EXPECT_DIGEST !== null && binding["artifactDigest"] !== EXPECT_DIGEST) {
+      return `deployment digest is ${binding["artifactDigest"]}, expected ${EXPECT_DIGEST}`;
+    }
+  } catch (e) {
+    return `identity probe failed: ${e instanceof Error ? e.message : String(e)}`;
+  }
+  return null;
 })();
+
+if (skipReason !== null && REQUIRE_LIVE) {
+  // Fail the process rather than the first test: a registration-time problem is
+  // not a property of any one test, and reporting it as one invites someone to
+  // "fix" the test instead of the deployment.
+  throw new Error(
+    `IKBI_BOKAHLI_REQUIRE_LIVE=true but the live Bokahli check failed: ${skipReason}`,
+  );
+}
 
 const token: string | null = skipReason === null
   ? readFileSync(TOKEN_FILE, "utf8").trim()
@@ -178,4 +238,59 @@ test("the token does not appear in any response", { skip: skip() }, async () => 
   });
   assert.ok(token && token.length > 0);
   assert.ok(!JSON.stringify(json).includes(token));
+});
+
+test("a served answer carries a binding a receipt can record", { skip: skip() }, async () => {
+  // The point of routing to Bokahli at all: the answer comes with provenance a
+  // remote API cannot offer. A receipt recording only provider+model records a
+  // *request*; the digest is what makes it record a fact.
+  const { createBokahliProvider } = await import("./bokahli.js");
+  const provider = createBokahliProvider({
+    baseUrl: `${BASE}/v1`,
+    tokenFile: TOKEN_FILE,
+  });
+
+  const catalog = await fetch(`${BASE}/v1/catalog`, {
+    headers: { authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(30_000),
+  });
+  const entries = ((await catalog.json()) as Record<string, any>)["catalog"] as any[];
+  const resident = entries.find((e) => e["modelId"] === EXPECT_MODEL) ?? entries[0];
+
+  const result = (await provider.invoke({
+    providerModelId: resident["modelId"] as string,
+    request: {
+      model: resident["modelId"] as string,
+      prompt: "Say OK.",
+      maxTokens: 4,
+      identity: { agentId: "t", functionalRole: "tester", trustTier: "verified" },
+    },
+    timeoutMs: 180_000,
+    signal: AbortSignal.timeout(180_000),
+  } as never)) as Record<string, any>;
+
+  const b = result["localBinding"];
+  assert.ok(b, "no binding was captured; a Bokahli receipt would be no better than a remote one");
+  assert.equal(b["modelId"], resident["modelId"]);
+  assert.equal(b["artifactDigest"], resident["digest"]);
+  assert.equal(b["attested"], true);
+  assert.equal(typeof b["attestationMethod"], "string");
+  assert.equal(typeof b["servedContextTokens"], "number");
+  assert.equal(typeof b["runtimeBuild"], "string");
+  // The field that must never be softened. Nothing on this deployment is
+  // qualified, and a receipt is where that has to survive.
+  assert.equal(b["qualificationStatus"], "INSTALLED_UNQUALIFIED");
+  assert.equal(b["qualificationAuthority"], "none");
+});
+
+test("the binding never claims attestation or qualification it was not given", () => {
+  // Pure, so it runs even without a deployment: absent fields must read as
+  // "unknown"/false, never as a friendlier default. A default here is a claim.
+  const b = readLocalBindingForTest({
+    bokahli: { servedIdentity: { modelId: "m", digest: "sha256:abc" } },
+  });
+  assert.ok(b);
+  assert.equal(b.attested, false, "absent attestation is not attestation");
+  assert.equal(b.qualificationStatus, "UNKNOWN", "absent qualification is not INSTALLED_UNQUALIFIED");
+  assert.equal(b.qualificationAuthority, "unknown");
 });

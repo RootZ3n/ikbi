@@ -36,8 +36,9 @@
  * the escalation reason and never the token or the artifact's filesystem path.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { statSync, readFileSync } from "node:fs";
-import type { ModelProvider } from "../contract.js";
+import type { LocalBinding, ModelProvider } from "../contract.js";
 import { ProviderError } from "../contract.js";
 import { type FetchLike, OpenAICompatibleProvider } from "./openai-compatible.js";
 
@@ -200,6 +201,80 @@ export function readEscalation(body: unknown): BokahliEscalation | null {
   return null;
 }
 
+/**
+ * Read the served identity Bokahli attaches to an OpenAI-dialect response.
+ *
+ * Bokahli returns a `bokahli.servedIdentity` block alongside the standard
+ * `choices`, carrying the artifact digest, the attestation result and the
+ * qualification state. `OpenAICompatibleProvider` maps the standard fields into
+ * `ProviderResult` and drops everything else, which is correct for a generic
+ * OpenAI client and loses exactly the part that makes a Bokahli receipt worth
+ * more than a remote one.
+ *
+ * `qualificationStatus` is copied through verbatim, never defaulted. On this
+ * deployment it is always `INSTALLED_UNQUALIFIED`, and a receipt that silently
+ * filled in something friendlier would read later as though the answer came
+ * from a model somebody had vouched for.
+ */
+export function readLocalBinding(body: unknown): LocalBinding | null {
+  if (typeof body !== "object" || body === null) return null;
+  const bok = (body as Record<string, unknown>)["bokahli"];
+  if (typeof bok !== "object" || bok === null) return null;
+  const served = (bok as Record<string, unknown>)["servedIdentity"];
+  if (typeof served !== "object" || served === null) return null;
+  const s = served as Record<string, unknown>;
+
+  const modelId = typeof s["modelId"] === "string" ? s["modelId"] : null;
+  const digest = typeof s["artifactDigest"] === "string"
+    ? (s["artifactDigest"] as string)
+    : typeof s["digest"] === "string" ? (s["digest"] as string) : null;
+  if (modelId === null || digest === null) return null;
+
+  const qual = typeof s["qualification"] === "object" && s["qualification"] !== null
+    ? (s["qualification"] as Record<string, unknown>)
+    : {};
+  const runtime = typeof s["runtime"] === "object" && s["runtime"] !== null
+    ? (s["runtime"] as Record<string, unknown>)
+    : {};
+
+  const str = (v: unknown): string | undefined => (typeof v === "string" ? v : undefined);
+  const num = (v: unknown): number | undefined => (typeof v === "number" ? v : undefined);
+  const put = <T,>(k: string, v: T | undefined) => (v === undefined ? {} : { [k]: v });
+
+  return {
+    outcome: str(s["outcome"]) ?? "ROUTED",
+    modelId,
+    artifactDigest: digest,
+    ...put("quantization", str(s["quantization"])),
+    ...put("servedContextTokens", num(s["servedContextTokens"])),
+    ...put("runtimeBuild", str(runtime["build"])),
+    ...put("backendInstanceId", str(s["backendInstanceId"])),
+    // Absent means not attested. Never default this to true.
+    attested: s["attested"] === true,
+    ...put("attestationMethod", str(s["attestationMethod"])),
+    // Deliberately not defaulted: an unknown qualification state is reported as
+    // unknown, which is a fact, rather than as unqualified, which is a claim.
+    qualificationStatus: str(qual["status"]) ?? "UNKNOWN",
+    qualificationAuthority: str(qual["authority"]) ?? "unknown",
+    ...put("requestId", str((body as Record<string, unknown>)["id"])),
+  } as LocalBinding;
+}
+
+/**
+ * Per-invocation capture slot for the raw response body.
+ *
+ * The binding lives in a field the shared OpenAI client discards before the
+ * provider ever sees a result, so it has to be read at the transport. A single
+ * mutable field on the provider would be wrong: `invoke` is concurrent, and two
+ * in-flight requests would race to overwrite each other's binding — producing a
+ * receipt that attests the wrong artifact, which is worse than one that attests
+ * nothing.
+ *
+ * `AsyncLocalStorage` gives each invocation its own slot, so the fetch wrapper
+ * writes into the cell belonging to the call that issued the request.
+ */
+const bindingSlot = new AsyncLocalStorage<{ binding: LocalBinding | null }>();
+
 export interface BokahliProviderConfig {
   /** Defaults to loopback. A tailnet address is valid for a remote Mushin. */
   readonly baseUrl?: string;
@@ -217,11 +292,33 @@ export interface BokahliProviderConfig {
  */
 export function createBokahliProvider(cfg: BokahliProviderConfig): ModelProvider {
   const apiKey = assertPrivateKeyFile(cfg.tokenFile);
+
+  // Wrap whatever fetch is in play — the hardened default, or a test double — so
+  // the response body can be read once for its binding before the shared client
+  // consumes it. The clone is what makes that safe: a body is a single-use
+  // stream, and reading the original here would leave the real client nothing.
+  const baseFetch: FetchLike | undefined = cfg.fetchImpl;
+  const capturingFetch: FetchLike = async (url, init) => {
+    const doFetch = baseFetch ?? (globalThis.fetch as unknown as FetchLike);
+    const res = await doFetch(url, init);
+    const slot = bindingSlot.getStore();
+    if (slot !== undefined && res.ok) {
+      try {
+        slot.binding = readLocalBinding(await (res as Response).clone().json());
+      } catch {
+        // A body that will not parse is the shared client's problem to report;
+        // losing the binding must not turn into a second, confusing failure.
+        slot.binding = null;
+      }
+    }
+    return res;
+  };
+
   const inner = new OpenAICompatibleProvider({
     id: BOKAHLI_PROVIDER_ID,
     baseUrl: cfg.baseUrl ?? BOKAHLI_DEFAULT_BASE_URL,
     apiKey,
-    ...(cfg.fetchImpl ? { fetchImpl: cfg.fetchImpl } : {}),
+    fetchImpl: capturingFetch,
   });
 
   // Wrap rather than subclass: the transport hardening, retry semantics and
@@ -233,10 +330,16 @@ export function createBokahliProvider(cfg: BokahliProviderConfig): ModelProvider
       const value = Reflect.get(target, prop, receiver);
       if (prop !== "invoke" || typeof value !== "function") return value;
       return async (...args: unknown[]) => {
+        const slot: { binding: LocalBinding | null } = { binding: null };
         try {
-          const result = await (value as (...a: unknown[]) => Promise<unknown>).apply(target, args);
+          const result = await bindingSlot.run(slot, () =>
+            (value as (...a: unknown[]) => Promise<unknown>).apply(target, args),
+          );
           const escalation = readEscalation(result);
           if (escalation !== null) throw escalation;
+          if (slot.binding !== null && typeof result === "object" && result !== null) {
+            return { ...(result as Record<string, unknown>), localBinding: slot.binding };
+          }
           return result;
         } catch (e) {
           if (e instanceof BokahliEscalation) throw e;

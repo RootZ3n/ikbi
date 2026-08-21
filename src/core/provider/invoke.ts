@@ -574,6 +574,11 @@ export class ProviderInvoker {
       latencyMs,
       fellBack,
       attempts: [...attempts],
+      // Carried through verbatim. The invoker does not synthesise, default or
+      // normalise it: a binding is a claim the serving provider made about what
+      // it actually ran, and anything this layer added would be a claim nobody
+      // verified.
+      ...(result.localBinding !== undefined ? { localBinding: result.localBinding } : {}),
     };
   }
 }

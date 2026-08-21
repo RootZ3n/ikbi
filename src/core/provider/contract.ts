@@ -301,6 +301,11 @@ export interface ModelResponse {
   readonly fellBack: boolean;
   /** Every provider attempt, in order, with outcome — auditable. */
   readonly attempts: readonly ProviderAttempt[];
+  /**
+   * ADDITIVE: what an attesting provider bound to this answer. See
+   * `LocalBinding`. Present only when the serving provider could attest.
+   */
+  readonly localBinding?: LocalBinding;
 }
 
 // ---------------------------------------------------------------------------
@@ -320,8 +325,62 @@ export interface ProviderInvocation {
 }
 
 /** Raw result returned by a provider; the orchestrator computes cost and assembles the response. */
+/**
+ * What a local, attesting provider binds to the answer it just gave.
+ *
+ * Every other provider here is a remote API: you send tokens, you get tokens
+ * back, and the only provenance available is the model *name* the vendor
+ * chose to report. Bokahli is different in a way receipts should record — it
+ * serves one artifact at a time, verifies which one is actually loaded, and
+ * says so with a digest.
+ *
+ * A receipt that records `provider: "bokahli", providerModelId: "qwen3.5-35b-a3b.q2-k"`
+ * has recorded a *request*, not a fact. The artifact behind that name can be
+ * swapped by an operator between two invocations, and the receipt would read
+ * identically across the change. The digest is what makes the record answer
+ * "what actually produced this" rather than "what did we ask for".
+ *
+ * `qualificationStatus` is here for the same reason and matters more. Every
+ * artifact on the current deployment is `INSTALLED_UNQUALIFIED` — Bokahli makes
+ * no claim about fitness for any task. A receipt that omits this reads, later,
+ * as though the answer came from something vouched for. It did not, and the
+ * receipt is where that distinction has to survive.
+ *
+ * Optional throughout: providers that cannot attest omit the field entirely
+ * rather than filling it with plausible defaults. Absent means "not attested",
+ * which is honest; a default would be a claim.
+ */
+export interface LocalBinding {
+  /** Typed routing outcome — `ROUTED` for a served answer. */
+  readonly outcome: string;
+  /** Catalog identity of the artifact that served this request. */
+  readonly modelId: string;
+  /** Content digest of that artifact. The fact the model name is not. */
+  readonly artifactDigest: string;
+  readonly quantization?: string;
+  /** Context actually served, which is not the artifact's trained context. */
+  readonly servedContextTokens?: number;
+  readonly runtimeBuild?: string;
+  /** Identifies the backend process; changes across a restart. */
+  readonly backendInstanceId?: string;
+  /** False means the deployment could not confirm what it was serving. */
+  readonly attested: boolean;
+  readonly attestationMethod?: string;
+  /** `INSTALLED_UNQUALIFIED` on the current deployment. Never omit it. */
+  readonly qualificationStatus: string;
+  /** `none` unless an operator trust anchor accepted evidence. */
+  readonly qualificationAuthority: string;
+  /** The deployment's own correlation id, for cross-referencing its journal. */
+  readonly requestId?: string;
+}
+
 export interface ProviderResult {
   readonly content: string;
+  /**
+   * ADDITIVE: provenance from a provider that can attest what served the
+   * request. Absent for every remote API, which cannot.
+   */
+  readonly localBinding?: LocalBinding;
   /** Separate reasoning text, when the model emits it distinctly from content. */
   readonly reasoning?: string;
   /** ADDITIVE (1.4.0): opaque signature for the reasoning block (Anthropic thinking), for verbatim round-trip. */
