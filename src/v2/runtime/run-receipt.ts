@@ -31,10 +31,24 @@ export interface RunReceiptSink {
 }
 
 /** What was written, so a caller can report durability rather than assume it. */
+/**
+ * The shape of one local advisory, as the receipt layer needs it.
+ *
+ * Structural rather than an import of `build-local.ts`: this module records evidence and must not
+ * learn which hook produced it, or it would grow a reason to care.
+ */
+export interface LocalAdvisoryEvidence {
+  readonly hook: string;
+  readonly disposition: string;
+  readonly suppliedToPrimaryProvider: boolean;
+}
+
 export interface RunReceiptOutcome {
   readonly runSummary: "written" | "failed";
   /** `not_applicable` when the session published nothing — the ordinary withheld case. */
   readonly promotion: "written" | "failed" | "not_applicable";
+  /** `not_applicable` when no local advisory was gathered — the ordinary Bokahli-off case. */
+  readonly advisories: "written" | "failed" | "not_applicable";
 }
 
 /**
@@ -71,9 +85,19 @@ export async function recordBuildSessionReceipts(
   repositoryPath: string,
   sink: RunReceiptSink = productionReceiptSink(),
   identity: AgentIdentity = V2_RECEIPT_IDENTITY,
+  /**
+   * Local advisory evidence gathered around this build, if any.
+   *
+   * Written as its OWN receipt, never folded into the run summary. The four authority layers a
+   * build produces — what the provider decided, what a local worker advised, what the deterministic
+   * verifier found, and what the operator/publication authority did — are four different kinds of
+   * claim, and a reader who cannot tell them apart cannot use any of them. Separate operations keep
+   * them separable by construction rather than by convention.
+   */
+  advisories: readonly LocalAdvisoryEvidence[] = [],
 ): Promise<RunReceiptOutcome> {
   const attempt = session.attempts[session.attempts.length - 1];
-  if (attempt === undefined) return { runSummary: "failed", promotion: "not_applicable" };
+  if (attempt === undefined) return { runSummary: "failed", promotion: "not_applicable", advisories: "not_applicable" };
 
   const receipt = attempt.receipt;
   const promotion = receipt.promotion;
@@ -127,7 +151,9 @@ export async function recordBuildSessionReceipts(
     },
   });
 
-  if (!landed) return { runSummary, promotion: "not_applicable" };
+  const advisoryStatus = await writeAdvisories(sink, identity, attempt, repositoryPath, session.buildSessionId, advisories);
+
+  if (!landed) return { runSummary, promotion: "not_applicable", advisories: advisoryStatus };
 
   const repo = repositoryPath;
   const branch = promotion.targetBranch;
@@ -175,7 +201,7 @@ export async function recordBuildSessionReceipts(
     },
   });
 
-  return { runSummary, promotion: promoteStatus };
+  return { runSummary, promotion: promoteStatus, advisories: advisoryStatus };
 }
 
 /**
@@ -194,6 +220,50 @@ export function productionReceiptSink(): RunReceiptSink {
       return receipts.append(input, identity);
     },
   };
+}
+
+/**
+ * Write the local advisory evidence as its OWN receipt.
+ *
+ * `local.advisory` is deliberately a distinct operation from `run.summary` (what the provider-led
+ * build decided) and `workspace.promote` (what the publication authority did), and distinct again
+ * from the verifier's own `govexec.run` lines. Four layers, four operations. Nothing in this
+ * receipt carries authority: it records that something was ADVISED, by which artifact, and whether
+ * anyone was shown it.
+ */
+async function writeAdvisories(
+  sink: RunReceiptSink,
+  identity: AgentIdentity,
+  attempt: { runId?: string; taskId?: string },
+  repositoryPath: string,
+  buildSessionId: string,
+  advisories: readonly LocalAdvisoryEvidence[],
+): Promise<"written" | "failed" | "not_applicable"> {
+  if (advisories.length === 0) return "not_applicable";
+  return write(sink, identity, {
+    operation: "local.advisory",
+    ...(attempt.runId !== undefined ? { requestId: attempt.runId } : {}),
+    project: repositoryPath,
+    outcome: {
+      status: "success",
+      detail: `${advisories.filter((a) => a.disposition === "accepted").length}/${advisories.length} local advisory result(s) accepted`,
+    },
+    // NO CHANGES. An advisory changed nothing; a `changes` entry here would make it look reversible,
+    // which would imply it had done something to reverse.
+    changes: [],
+    metadata: {
+      engine: "v2",
+      authorityLayer: "local_advisory",
+      ...(attempt.runId !== undefined ? { runId: attempt.runId } : {}),
+      ...(attempt.taskId !== undefined ? { taskId: attempt.taskId } : {}),
+      buildSessionId,
+      repository: repositoryPath,
+      advisoryCount: advisories.length,
+      acceptedCount: advisories.filter((a) => a.disposition === "accepted").length,
+      suppliedToPrimaryCount: advisories.filter((a) => a.suppliedToPrimaryProvider).length,
+      advisories,
+    },
+  });
 }
 
 /** Append one receipt, converting any failure into a reported status. Never throws. */

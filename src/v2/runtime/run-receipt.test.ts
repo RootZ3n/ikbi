@@ -74,7 +74,9 @@ const byOp = (s: ReturnType<typeof sink>, op: string): ReceiptInput | undefined 
 test("run receipt: a published run writes BOTH a run.summary and a workspace.promote", async () => {
   const s = sink();
   const out = await recordBuildSessionReceipts(session(), REPO, s);
-  assert.deepEqual(out, { runSummary: "written", promotion: "written" });
+  // `advisories` is "not_applicable" here: this session gathered none, which is the ordinary
+  // Bokahli-off case and a different fact from "gathered some and failed to write them".
+  assert.deepEqual(out, { runSummary: "written", promotion: "written", advisories: "not_applicable" });
   assert.deepEqual(s.appended.map((r) => r.operation), ["run.summary", "workspace.promote"]);
 });
 
@@ -171,7 +173,7 @@ test("run receipt: a store that cannot be written is REPORTED, never thrown", as
   // that already happened into an exception on the way out.
   const s = sink(true);
   const out = await recordBuildSessionReceipts(session(), REPO, s);
-  assert.deepEqual(out, { runSummary: "failed", promotion: "failed" });
+  assert.deepEqual(out, { runSummary: "failed", promotion: "failed", advisories: "not_applicable" });
 });
 
 test("run receipt: receipts are attributed to the ENGINE, not to a model", async () => {
@@ -201,6 +203,6 @@ test("run receipt: a session with no attempts fails closed rather than inventing
   const s = sink();
   const empty = { buildSessionId: "s", outcome: { kind: "failed" }, recoveryDecisions: [], receipt: { totalAttempts: 0 }, ledger: [], attempts: [] } as unknown as V2BuildSessionResult;
   const out = await recordBuildSessionReceipts(empty, REPO, s);
-  assert.deepEqual(out, { runSummary: "failed", promotion: "not_applicable" });
+  assert.deepEqual(out, { runSummary: "failed", promotion: "not_applicable", advisories: "not_applicable" });
   assert.equal(s.appended.length, 0);
 });
