@@ -242,6 +242,14 @@ export interface ProductionRunDeps {
   /** Where an injected budget's command count came from, for receipt truth. */
   readonly builderCommandSource?: V2RunDeps["builderCommandSource"];
   readonly untrustedBoundary?: V2RunDeps["untrustedBoundary"];
+  /**
+   * Local advisory context for this build.
+   *
+   * A SEPARATE channel from the goal, on purpose. The canonical goal is hashed into task identity,
+   * the context package digest, the critic's goal hash and the retrieval query; merging advice into
+   * it would let an unqualified local worker move what ikbi believes was asked for.
+   */
+  readonly advisoryContext?: V2RunDeps["advisoryContext"];
   readonly checksSource?: V2RunDeps["checksSource"];
   readonly definitionProbe?: V2RunDeps["definitionProbe"];
   readonly checkRunner?: V2RunDeps["checkRunner"];
@@ -468,6 +476,7 @@ async function wireRunDeps(deps: ProductionRunDeps): Promise<V2RunDeps> {
     // THE untrusted-data boundary — v1's neutralization fence. Every tool result crosses
     // it before re-entering the builder conversation.
     untrustedBoundary: deps.untrustedBoundary ?? createUntrustedBoundary(),
+    ...(deps.advisoryContext !== undefined ? { advisoryContext: deps.advisoryContext } : {}),
     // THE deterministic verification seams — check discovery, governed execution, and the
     // git tree probe. All three do I/O, so they are wired here, once.
     checksSource: deps.checksSource ?? createChecksSource(),

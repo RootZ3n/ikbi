@@ -30,14 +30,19 @@ import type { SourceSnapshotAuthority } from "../core/source.js";
 import { CANDIDATE_STRATEGIES } from "../core/contract.js";
 import { LOCAL_MODES, isLocalMode } from "../core/local-work.js";
 import {
+  canonicalGoalDigest,
+  composedPromptBinding,
   markSuppliedToPrimary,
-  renderAdvisoryForPrimary,
+  ineligibleAdvisory,
   runBuildLocalHook,
   shouldStopBuild,
+  toAdvisoryContextBlock,
   type BuildLocalDeps,
   type LocalAdvisoryRecord,
 } from "../runtime/build-local.js";
 import { createUntrustedBoundary } from "../runtime/untrusted-boundary.js";
+import { createCandidateDiffSource } from "../runtime/candidate-diff.js";
+import type { AdvisoryContextBlock } from "../core/prompt.js";
 import { productionTransport, type LocalExecutionPolicy } from "../runtime/index.js";
 import { exitCodeForOutcome, formatOutcome, type V2RunResult } from "../core/result.js";
 import { runV2BuildSessionProduction, type ProductionRunDeps } from "../runtime/index.js";
@@ -576,6 +581,8 @@ export interface BuildCliIo {
   readonly localTransport?: (policy: LocalExecutionPolicy) => ReturnType<typeof productionTransport> | undefined;
   /** Reads a file for the recon packet. Injected so a suite needs no repository on disk. */
   readonly readRepoFile?: (path: string) => string;
+  /** The candidate diff source. Production uses the real git-backed one. */
+  readonly candidateDiffSource?: ReturnType<typeof createCandidateDiffSource>;
   /**
    * The build session runner. Production passes none.
    *
@@ -668,26 +675,87 @@ function verificationPacket(
 }
 
 /**
- * The bounded CANDIDATE-CHANGE packet.
+ * The bounded CANDIDATE-CHANGE packet: a REAL unified diff, or a typed refusal.
  *
- * The run receipt carries the changed PATHS and the tree ids rather than a unified diff, so that
- * is what the summary hook is given — an honest description of what the record actually holds. A
- * hook asked to summarize a diff it was never shown would invent one, which is the failure mode
- * the citation rule exists to catch.
+ * WHY IT IS A REAL DIFF NOW. The first version handed the summary hook a synthetic listing of
+ * changed paths and called it a diff. That was dishonest twice over — the hook's name promised
+ * something the packet did not contain, and a model asked to summarize a diff it was never shown
+ * has nothing to do but invent one. It also made the citation rule nearly unsatisfiable: the
+ * listing's lines are trivially reorderable, so a faithful quote of it often failed to resolve.
+ *
+ * The diff is recomputed deterministically from the candidate's own trees — `git diff <baseTree>
+ * <candidateTree>` inside the retained workspace, a pure read of the object database that checks
+ * out nothing and cannot alter the candidate. Bound to the base tree and the candidate tree, so
+ * the packet is re-derivable from the receipt.
+ *
+ * IT NEVER SILENTLY TRUNCATES. Over the file or byte ceiling, or missing a workspace to read from,
+ * or carrying a file whose hunk the diff source omitted, the hook is reported INELIGIBLE with a
+ * typed reason. A summary of a quietly-clipped diff is a summary of something the operator was
+ * never told they were reading.
  */
-function candidateDiffPacketText(candidate: { readonly changedPaths?: readonly string[]; readonly treeId?: string; readonly baseTreeId?: string; readonly mutations?: number } | undefined): string {
-  const paths = candidate?.changedPaths ?? [];
-  if (paths.length === 0) return "";
-  return [
-    `base tree: ${candidate?.baseTreeId ?? "(unknown)"}`,
-    `candidate tree: ${candidate?.treeId ?? "(unknown)"}`,
-    `mutations applied: ${candidate?.mutations ?? 0}`,
-    `changed paths (${paths.length}):`,
-    ...paths.slice(0, 200).map((p) => `  ${p}`),
-  ].join("\n");
+const DIFF_PACKET_MAX_FILES = 20;
+const DIFF_PACKET_MAX_BYTES = 48 * 1024;
+
+type DiffPacketResult =
+  | { readonly ok: true; readonly content: string; readonly fromTree: string; readonly toTree: string; readonly files: number }
+  | { readonly ok: false; readonly reason: string };
+
+async function candidateDiffPacket(
+  attempt: { receipt?: { candidate?: { candidateId?: string; treeId?: string; baseTreeId?: string; sourceSnapshotId?: string; changedPaths?: readonly string[] } }; workspace?: { path?: string } } | undefined,
+  io: BuildCliIo,
+): Promise<DiffPacketResult> {
+  const candidate = attempt?.receipt?.candidate;
+  const fromTree = candidate?.baseTreeId;
+  const toTree = candidate?.treeId;
+  if (candidate?.candidateId === undefined || fromTree === undefined || toTree === undefined) {
+    return { ok: false, reason: "no candidate tree pair to diff" };
+  }
+  if (fromTree === toTree) return { ok: false, reason: "the candidate changed nothing" };
+
+  const workspacePath = attempt?.workspace?.path;
+  if (workspacePath === undefined) {
+    // The worktree is where the two tree objects live. Without it there is nothing to read.
+    return { ok: false, reason: "the candidate workspace is no longer available to diff" };
+  }
+  if ((candidate.changedPaths?.length ?? 0) > DIFF_PACKET_MAX_FILES) {
+    return { ok: false, reason: `${candidate.changedPaths!.length} changed files exceeds the ${DIFF_PACKET_MAX_FILES}-file packet ceiling` };
+  }
+
+  let diff;
+  try {
+    diff = await (io.candidateDiffSource ?? createCandidateDiffSource()).diff({
+      workspacePath,
+      candidateId: candidate.candidateId as never,
+      sourceSnapshotId: (candidate.sourceSnapshotId ?? "") as never,
+      fromTree,
+      toTree,
+      budget: { maxFilesWithHunks: DIFF_PACKET_MAX_FILES, maxHunkChars: 8_000 },
+    });
+  } catch (e) {
+    return { ok: false, reason: `the diff could not be computed: ${e instanceof Error ? e.message : String(e)}` };
+  }
+
+  const parts: string[] = [];
+  for (const f of diff.files) {
+    // A file whose hunk the diff source omitted or clipped is a file this packet cannot represent
+    // faithfully, and a citation validator comparing against a clipped body would be checking the
+    // wrong bytes. Binary content arrives with no hunk and lands here too — a typed refusal rather
+    // than a silent gap.
+    if (f.truncated || f.hunk === undefined) {
+      return { ok: false, reason: `the diff for ${f.path} is truncated or non-text; refusing to summarize a partial diff` };
+    }
+    parts.push(f.hunk);
+  }
+  if (parts.length === 0) return { ok: false, reason: "the diff carried no readable hunks" };
+
+  const content = parts.join("\n");
+  if (Buffer.byteLength(content, "utf8") > DIFF_PACKET_MAX_BYTES) {
+    return { ok: false, reason: `the diff is ${Buffer.byteLength(content, "utf8")} bytes, over the ${DIFF_PACKET_MAX_BYTES}-byte packet ceiling` };
+  }
+  return { ok: true, content, fromTree, toTree, files: diff.files.length };
 }
 
-/** Render the advisory block an operator sees without `--json`. */
+/** Render the advisory block an operator sees without `--json`. *//** Render the advisory block an operator sees without `--json`. */
 export function renderAdvisories(advisories: readonly LocalAdvisoryRecord[]): string {
   if (advisories.length === 0) return "";
   const lines = ["", "local advisories (UNTRUSTED, supervised — none of these decided anything):"];
@@ -715,18 +783,20 @@ async function executeProductionBuild(req: BuildRequest, banner: string, io: Bui
     PRE_BUILD_RECON — the only hook that runs BEFORE the build, because it is the only one whose
     output could inform it.
 
-    The advisory is appended to the goal, fenced and labelled. That is a real choice with a real
-    cost: it changes the text the builder is asked to work from, and therefore the task it sees.
-    It is done anyway, and visibly, because "informing the builder" has to mean something concrete
-    — and every alternative seam was worse. A ContextSource may not invoke a model, by contract; a
-    new dependency threaded through the pure core would put a local worker inside the build
-    authority. Appending clearly-marked untrusted text to the prompt keeps the local worker exactly
-    where it belongs: outside, talking in.
+    THE CANONICAL GOAL IS IMMUTABLE. An earlier version appended the advisory to it, which was
+    wrong well past style: the goal is hashed into task identity, into the context package digest,
+    into the critic's goal hash, and it seeds the retrieval query. Appending changed what ikbi
+    believed the operator had ASKED FOR, so an unqualified local model could move the task's own
+    identity and two builds of one request stopped being the same request.
 
-    Nothing here can mutate. The advisory is inert JSON inside a block that announces it is not
-    repository truth, not verification output, and not an instruction.
+    The advice now travels on its own typed channel — a distinct, fenced, untrusted message the
+    provider can tell apart STRUCTURALLY rather than by trusting a sentence inside it. The goal is
+    hashed here, before any hook runs, and that digest is bound into every advisory block.
   */
   const advisories: LocalAdvisoryRecord[] = [];
+  const advisoryBlocks: AdvisoryContextBlock[] = [];
+  const canonicalGoal = req.goal;
+  const canonicalGoalSha256 = canonicalGoalDigest(canonicalGoal);
   const buildSessionId = `pending-${Date.now().toString(36)}`;
 
   /*
@@ -754,7 +824,6 @@ async function executeProductionBuild(req: BuildRequest, banner: string, io: Bui
     requireLocalSuccess: req.requireLocalSuccess,
   });
 
-  let goal = req.goal;
   if (req.localMode !== "off") {
     const recon = await (io.runHook ?? runBuildLocalHook)(
       {
@@ -766,9 +835,9 @@ async function executeProductionBuild(req: BuildRequest, banner: string, io: Bui
       },
       localDeps(),
     );
-    const rendered = renderAdvisoryForPrimary(recon);
-    if (rendered !== undefined) {
-      goal = `${req.goal}\n\n${rendered}`;
+    const block = toAdvisoryContextBlock(recon, canonicalGoalSha256);
+    if (block !== undefined) {
+      advisoryBlocks.push(block);
       advisories.push(markSuppliedToPrimary(recon));
     } else {
       advisories.push(recon);
@@ -784,7 +853,8 @@ async function executeProductionBuild(req: BuildRequest, banner: string, io: Bui
 
   const session = await (io.runSession ?? runV2BuildSessionProduction)(
     {
-      goal,
+      // THE CANONICAL GOAL, BYTE-IDENTICAL. Nothing local reaches this field, in any mode.
+      goal: canonicalGoal,
       repoPath: req.repo,
       ...(req.strategy !== undefined ? { candidateStrategy: req.strategy } : {}),
       ...(req.profile !== undefined ? { profile: req.profile } : {}),
@@ -803,6 +873,8 @@ async function executeProductionBuild(req: BuildRequest, banner: string, io: Bui
       ...(io.treeProbe !== undefined ? { treeProbe: io.treeProbe } : {}),
       ...(io.candidateDiff !== undefined ? { candidateDiff: io.candidateDiff } : {}),
       ...(io.recoveryPolicy !== undefined ? { recoveryPolicy: io.recoveryPolicy } : {}),
+      // The typed advisory channel. Empty in OFF, so the composed prompt is byte-identical.
+      ...(advisoryBlocks.length > 0 ? { advisoryContext: advisoryBlocks } : {}),
     },
   );
   /*
@@ -839,19 +911,23 @@ async function executeProductionBuild(req: BuildRequest, banner: string, io: Bui
       }
     }
 
-    const diff = candidateDiffPacketText(finalAttempt?.receipt?.candidate);
-    if (diff.length > 0) {
+    const diff = await candidateDiffPacket(finalAttempt as never, io);
+    if (diff.ok) {
       const summary = await (io.runHook ?? runBuildLocalHook)(
         {
           hook: "POST_CANDIDATE_DIFF_SUMMARY",
           instruction:
-            "Summarize what this diff changes, for an operator deciding whether to keep it. Reply with " +
-            'ONE fenced JSON object: {"summary":"<two sentences>","citations":[{"sourceId":"<id>","quote":"<exact text>"}]}',
-          packet: [{ id: "candidate.diff", content: diff.slice(0, 48 * 1024), source: "repo" as const }],
+            "Summarize what this unified diff changes, for an operator deciding whether to keep it. Reply with " +
+            'ONE fenced JSON object: {"summary":"<two sentences>","citations":[{"sourceId":"candidate.diff","quote":"<a line copied exactly from the diff>"}]}',
+          packet: [{ id: "candidate.diff", content: diff.content, source: "repo" as const }],
         },
         { ...localDeps(), ...(finalAttempt?.runId !== undefined ? { runId: finalAttempt.runId } : {}) },
       );
       advisories.push(summary);
+    } else if (finalAttempt?.receipt?.candidate !== undefined) {
+      // TYPED INELIGIBILITY, recorded. A hook that could not run honestly is a fact about the
+      // build, not an absence to be inferred from a missing entry.
+      advisories.push(ineligibleAdvisory("POST_CANDIDATE_DIFF_SUMMARY", buildSessionId, req.localMode, diff.reason, finalAttempt.runId));
     }
 
     // THE VERDICT IS RE-READ AND MUST BE UNCHANGED. Advisory means advisory; if a hook could move
@@ -871,7 +947,10 @@ async function executeProductionBuild(req: BuildRequest, banner: string, io: Bui
   // Best-effort by contract: the git ref is the authoritative landing proof, and a receipt that
   // could not be written is REPORTED rather than allowed to fail a publication that already
   // happened.
-  const recorded = await (io.recordReceipts ?? recordBuildSessionReceipts)(session, req.repo, io.receipts, undefined, advisories);
+  // THE PROMPT BINDING. What the composed provider prompt was derived from, recorded so an auditor
+  // can re-derive it rather than take a narrative for it.
+  const promptBinding = composedPromptBinding(canonicalGoalSha256, advisoryBlocks);
+  const recorded = await (io.recordReceipts ?? recordBuildSessionReceipts)(session, req.repo, io.receipts, undefined, advisories, promptBinding);
   if (recorded.runSummary === "failed" || recorded.promotion === "failed") {
     err(
       "ikbi build: WARNING — the run completed but its receipt could not be written " +
@@ -884,7 +963,7 @@ async function executeProductionBuild(req: BuildRequest, banner: string, io: Bui
   // shows the recovery trail (when there was one) then the final attempt in full.
   out(
     req.json
-      ? `${JSON.stringify({ ...session, localAdvisories: advisories }, null, 2)}\n`
+      ? `${JSON.stringify({ ...session, canonicalGoalSha256, promptBinding, localAdvisories: advisories }, null, 2)}\n`
       : `${renderSession(session)}${renderAdvisories(advisories)}`,
   );
   return exitCodeForOutcome(session.outcome);

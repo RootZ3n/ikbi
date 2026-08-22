@@ -44,7 +44,7 @@ import {
   type BuilderCompletionClaim,
 } from "./candidate.js";
 import { BUILDER_TOOLS, isToolFailure, parseToolCall, renderToolProvenance, untrustedToolPayload, type BuilderToolCall, type ParsedToolCall, type ToolOutcome } from "./tools.js";
-import { renderBuilderInput, type RenderedMessage } from "./prompt.js";
+import { renderBuilderInput, type AdvisoryContextBlock, type RenderedMessage } from "./prompt.js";
 import {
   conversationCeiling,
   estimateMessagesTokens,
@@ -524,6 +524,13 @@ export interface BuilderRunInput {
    * carrying no workspace/observation/candidate pointer. Absent on an initial attempt.
    */
   readonly repairBrief?: RepairBrief;
+  /**
+   * Local advisory context for this run, if any.
+   *
+   * Carried separately from the goal and never merged into it: the goal is hashed into task
+   * identity, and an unqualified local worker must not be able to move that.
+   */
+  readonly advisoryContext?: readonly AdvisoryContextBlock[];
   /** Mints one fresh invocation id per turn. */
   readonly mintInvocationId: () => V2InvocationId;
   readonly budget?: BuilderBudget;
@@ -615,7 +622,7 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
     });
     const renderWith = (c: readonly RenderedMessage[]) =>
       estimateMessagesTokens(
-        renderBuilderInput(input.contextPackage, c, input.untrustedBoundary, input.repairBrief !== undefined ? { repairBrief: input.repairBrief, boundary: input.untrustedBoundary } : undefined, budgetStatus).messages,
+        renderBuilderInput(input.contextPackage, c, input.untrustedBoundary, input.repairBrief !== undefined ? { repairBrief: input.repairBrief, boundary: input.untrustedBoundary } : undefined, budgetStatus, input.advisoryContext !== undefined && input.advisoryContext.length > 0 ? { blocks: input.advisoryContext, boundary: input.untrustedBoundary } : undefined).messages,
         // THE model's own estimator, resolved once with the budget and frozen for the run.
         input.contextPackage.budget.tokenEstimator,
       );
@@ -634,7 +641,7 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
     // ONE TURN = ONE INVOCATION, through the one authority. There is no other doorway
     // to a model in v2, and the controller does not hold a transport it could use
     // directly — it hands the authority the one it was given.
-    const rendered = renderBuilderInput(input.contextPackage, conversation, input.untrustedBoundary, input.repairBrief !== undefined ? { repairBrief: input.repairBrief, boundary: input.untrustedBoundary } : undefined, budgetStatus);
+    const rendered = renderBuilderInput(input.contextPackage, conversation, input.untrustedBoundary, input.repairBrief !== undefined ? { repairBrief: input.repairBrief, boundary: input.untrustedBoundary } : undefined, budgetStatus, input.advisoryContext !== undefined && input.advisoryContext.length > 0 ? { blocks: input.advisoryContext, boundary: input.untrustedBoundary } : undefined);
     const turnMaxOutputTokens = Math.min(budget.maxOutputTokens, input.contextPackage.budget.reservedCompletionTokens);
     // PRE-CALL COST ADMISSION. BEFORE the money is spent, ask the session budget authority
     // whether another model call is authorized. It never selects or downgrades a model — it

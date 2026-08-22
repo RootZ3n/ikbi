@@ -98,6 +98,7 @@ import {
   type VerificationDefinitionProbe,
   type VerificationRecord,
 } from "./verification.js";
+import type { AdvisoryContextBlock } from "./prompt.js";
 import { generateCandidate, DEFAULT_BUILDER_BUDGET, type BuilderBudget, type BuilderToolExecutor, type BuilderToolExecutorDeps, type BuilderBoundSource, type BuilderTurnSource, type UntrustedBoundary } from "./builder.js";
 import type { InvocationAdmission } from "./cost.js";
 import type { BuilderCommandCapability, BuilderCommandRecord } from "./command.js";
@@ -441,6 +442,8 @@ export interface V2RunDeps {
    * FAILED attempt, handed to the builder as untrusted context — never authority.
    */
   readonly repairBrief?: RepairBrief;
+  /** Local advisory context. Never merged into the goal — see `AdvisoryContextBlock`. */
+  readonly advisoryContext?: readonly AdvisoryContextBlock[];
   /**
    * OPTIONAL session cost-budget guard (V2-014). Supplied by the BuildSession controller so a
    * pre-call admission runs before every builder and critic invocation, and every observed
@@ -890,6 +893,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
         runId, taskId, decision: builderDecision, contextPackage: ctxPkg, transport: deps.transport, executor,
         untrustedBoundary: deps.untrustedBoundary, mintInvocationId: () => ids.mint("invocation"),
         ...(deps.repairBrief !== undefined ? { repairBrief: deps.repairBrief } : {}),
+        ...(deps.advisoryContext !== undefined ? { advisoryContext: deps.advisoryContext } : {}),
         ...(deps.builderBudget !== undefined ? { budget: deps.builderBudget } : {}),
         ...(deps.aliases !== undefined ? { aliases: deps.aliases } : {}),
         ...(deps.admission !== undefined ? { admission: deps.admission } : {}),
