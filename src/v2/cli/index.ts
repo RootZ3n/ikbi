@@ -28,6 +28,17 @@ import type { InvocationTransport } from "../core/invocation.js";
 import type { StateBoundMutationAuthority, WorkspaceAuthority } from "../core/workspace.js";
 import type { SourceSnapshotAuthority } from "../core/source.js";
 import { CANDIDATE_STRATEGIES } from "../core/contract.js";
+import { LOCAL_MODES, isLocalMode } from "../core/local-work.js";
+import {
+  markSuppliedToPrimary,
+  renderAdvisoryForPrimary,
+  runBuildLocalHook,
+  shouldStopBuild,
+  type BuildLocalDeps,
+  type LocalAdvisoryRecord,
+} from "../runtime/build-local.js";
+import { createUntrustedBoundary } from "../runtime/untrusted-boundary.js";
+import { productionTransport, type LocalExecutionPolicy } from "../runtime/index.js";
 import { exitCodeForOutcome, formatOutcome, type V2RunResult } from "../core/result.js";
 import { runV2BuildSessionProduction, type ProductionRunDeps } from "../runtime/index.js";
 import { recordBuildSessionReceipts, type RunReceiptSink } from "../runtime/run-receipt.js";
@@ -37,8 +48,9 @@ import { formatMicroUsd } from "../core/cost.js";
 // convention. Imported here because this module is the one the v1 dispatcher already loads.
 import "./local.js";
 
-export const V2_USAGE = `Usage: ikbi v2 build "<goal>" [--repo <path>] [--strategy ${CANDIDATE_STRATEGIES.join("|")}] [--profile <name>] [--json]`;
-export const BUILD_USAGE = `Usage: ikbi build "<goal>" [--repo <path>] [--strategy ${CANDIDATE_STRATEGIES.join("|")}] [--profile <name>] [--json]`;
+const LOCAL_MODE_HINT = "[--local-mode off|assist|auto] [--require-local-success]";
+export const V2_USAGE = `Usage: ikbi v2 build "<goal>" [--repo <path>] [--strategy ${CANDIDATE_STRATEGIES.join("|")}] [--profile <name>] ${LOCAL_MODE_HINT} [--json]`;
+export const BUILD_USAGE = `Usage: ikbi build "<goal>" [--repo <path>] [--strategy ${CANDIDATE_STRATEGIES.join("|")}] [--profile <name>] ${LOCAL_MODE_HINT} [--json]`;
 
 /**
  * The experimental banner. On stderr so `--json` stdout stays machine-clean.
@@ -72,6 +84,10 @@ interface V2Args {
   /** Per-run profile override. Absent means "use the operator's standing selection". */
   readonly profile: string | undefined;
   readonly json: boolean;
+  /** The local advisory mode. `off` by default — a build asks Bokahli nothing unless told to. */
+  readonly localMode: string;
+  /** True when the operator wants a local advisory FAILURE to stop the build. Off by default. */
+  readonly requireLocalSuccess: boolean;
   /**
    * A USAGE REFUSAL. Present when the invocation could not be understood — an unrecognized
    * option, or a known option missing its value. The caller MUST refuse the run and print this
@@ -105,6 +121,10 @@ export function parseV2Args(argv: readonly string[], cwd: string): V2Args {
   let strategy: string | undefined;
   let profile: string | undefined;
   let json = false;
+  // DEFAULT OFF. A build with no --local-mode makes zero Bokahli requests and behaves exactly as
+  // it did before this flag existed.
+  let localMode: string = "off";
+  let requireLocalSuccess = false;
   let rejection: string | undefined;
   let endOfOptions = false;
 
@@ -128,6 +148,18 @@ export function parseV2Args(argv: readonly string[], cwd: string): V2Args {
     else if (a === "--repo") { const v = takeValue(a, argv[i + 1]); if (v !== undefined) repo = v; i += 1; }
     else if (a === "--strategy") { const v = takeValue(a, argv[i + 1]); if (v !== undefined) strategy = v; i += 1; }
     else if (a === "--profile") { const v = takeValue(a, argv[i + 1]); if (v !== undefined) profile = v; i += 1; }
+    else if (a === "--local-mode") {
+      const v = takeValue(a, argv[i + 1]);
+      i += 1;
+      // FAIL CLOSED ON A MALFORMED VALUE. `--local-mode OFF` must not become a Bokahli call, and
+      // it must not silently become `off` either — an operator who typed something ikbi cannot
+      // read is owed a refusal, not a guess about which way they meant it.
+      if (v !== undefined) {
+        if (!isLocalMode(v)) rejection ??= `option "--local-mode" must be one of ${LOCAL_MODES.join("|")} (got ${JSON.stringify(v)})`;
+        else localMode = v;
+      }
+    }
+    else if (a === "--require-local-success") requireLocalSuccess = true;
     else if (a.startsWith("-") && a !== "-") rejection ??= `unknown option "${a}"`;
     else words.push(a);
   }
@@ -142,6 +174,8 @@ export function parseV2Args(argv: readonly string[], cwd: string): V2Args {
     strategy,
     profile,
     json,
+    localMode,
+    requireLocalSuccess,
     ...(rejection !== undefined ? { rejection } : {}),
   };
 }
@@ -536,12 +570,28 @@ export interface BuildCliIo {
   readonly receipts?: RunReceiptSink;
   /** The recorder itself, so a suite can assert what a run WOULD write without a real store. */
   readonly recordReceipts?: typeof recordBuildSessionReceipts;
+  /** The advisory hook runner, so a suite can drive a hostile local worker without one. */
+  readonly runHook?: typeof runBuildLocalHook;
+  /** The transport the ADVISORY hooks use. Production resolves Bokahli lazily; suites inject. */
+  readonly localTransport?: (policy: LocalExecutionPolicy) => ReturnType<typeof productionTransport> | undefined;
+  /** Reads a file for the recon packet. Injected so a suite needs no repository on disk. */
+  readonly readRepoFile?: (path: string) => string;
+  /**
+   * The build session runner. Production passes none.
+   *
+   * Injected so the advisory-wiring suite can prove what happens AROUND a build without rebuilding
+   * a repository — the wiring is what those tests are about, and an ESM export cannot be replaced
+   * in place.
+   */
+  readonly runSession?: typeof runV2BuildSessionProduction;
 }
 
 /** The parsed, subcommand-free build request that BOTH `ikbi build` and `ikbi v2 build` converge on. */
 interface BuildRequest {
   readonly goal: string;
   readonly repo: string;
+  readonly localMode: string;
+  readonly requireLocalSuccess: boolean;
   readonly strategy: string | undefined;
   readonly profile: string | undefined;
   readonly json: boolean;
@@ -553,13 +603,188 @@ interface BuildRequest {
  * `runV2BuildSessionProduction` from CLI build handling, so the two commands CANNOT fork behavior.
  * The `banner` differs only in wording; the engine is identical.
  */
+/** The recon packet size ceiling. A local worker receives a PACKET, never a repository. */
+const RECON_PACKET_MAX_FILES = 6;
+const RECON_PACKET_MAX_BYTES = 48 * 1024;
+
+/**
+ * Assemble the bounded reconnaissance packet.
+ *
+ * BOUNDED BY CONSTRUCTION, twice over: at most a handful of files, and a hard byte ceiling that
+ * truncates rather than grows. It reads the repository's own top-level conventions and manifest —
+ * the things a builder would want oriented on — and never walks the tree. A packet that grew with
+ * the repository would be the thing the eligibility rule exists to forbid.
+ */
+async function reconPacket(repo: string, io: BuildCliIo): Promise<{ id: string; content: string; source: "repo" }[]> {
+  const { readFileSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const read = io.readRepoFile ?? ((p: string) => readFileSync(p, "utf8"));
+  const wanted = ["AGENTS.md", "CLAUDE.md", "README.md", "package.json", "Cargo.toml", "go.mod"];
+  const packet: { id: string; content: string; source: "repo" }[] = [];
+  let bytes = 0;
+  for (const name of wanted) {
+    if (packet.length >= RECON_PACKET_MAX_FILES) break;
+    let content: string;
+    try {
+      content = read(join(repo, name));
+    } catch {
+      continue; // absent is ordinary, not an error
+    }
+    const remaining = RECON_PACKET_MAX_BYTES - bytes;
+    if (remaining <= 0) break;
+    const clipped = Buffer.byteLength(content, "utf8") > remaining ? `${content.slice(0, remaining)}\n[TRUNCATED]\n` : content;
+    bytes += Buffer.byteLength(clipped, "utf8");
+    packet.push({ id: name, content: clipped, source: "repo" });
+  }
+  return packet;
+}
+
+/**
+ * The bounded VERIFICATION-FAILURE packet: the failed checks' own commands, exit codes and output.
+ *
+ * Only FAILING checks, and only their excerpts. A packet containing the green checks would be
+ * larger and less useful, and the hook is being asked why something broke, not what worked.
+ */
+function verificationPacket(
+  verification: { readonly checks?: readonly { name: string; command: string; status: string; exitCode?: number | null; outputExcerpt?: string }[] } | undefined,
+): { id: string; content: string; source: "tool_result" }[] {
+  const failing = (verification?.checks ?? []).filter((c) => c.status !== "pass");
+  const packet: { id: string; content: string; source: "tool_result" }[] = [];
+  let bytes = 0;
+  for (const c of failing) {
+    if (bytes >= 32 * 1024) break;
+    const content = [
+      `check: ${c.name}`,
+      `command: ${c.command}`,
+      `status: ${c.status}`,
+      `exit: ${c.exitCode ?? "(did not launch)"}`,
+      "output:",
+      (c.outputExcerpt ?? "").slice(0, 8 * 1024),
+    ].join("\n");
+    bytes += Buffer.byteLength(content, "utf8");
+    packet.push({ id: `check:${c.name}`, content, source: "tool_result" });
+  }
+  return packet;
+}
+
+/**
+ * The bounded CANDIDATE-CHANGE packet.
+ *
+ * The run receipt carries the changed PATHS and the tree ids rather than a unified diff, so that
+ * is what the summary hook is given — an honest description of what the record actually holds. A
+ * hook asked to summarize a diff it was never shown would invent one, which is the failure mode
+ * the citation rule exists to catch.
+ */
+function candidateDiffPacketText(candidate: { readonly changedPaths?: readonly string[]; readonly treeId?: string; readonly baseTreeId?: string; readonly mutations?: number } | undefined): string {
+  const paths = candidate?.changedPaths ?? [];
+  if (paths.length === 0) return "";
+  return [
+    `base tree: ${candidate?.baseTreeId ?? "(unknown)"}`,
+    `candidate tree: ${candidate?.treeId ?? "(unknown)"}`,
+    `mutations applied: ${candidate?.mutations ?? 0}`,
+    `changed paths (${paths.length}):`,
+    ...paths.slice(0, 200).map((p) => `  ${p}`),
+  ].join("\n");
+}
+
+/** Render the advisory block an operator sees without `--json`. */
+export function renderAdvisories(advisories: readonly LocalAdvisoryRecord[]): string {
+  if (advisories.length === 0) return "";
+  const lines = ["", "local advisories (UNTRUSTED, supervised — none of these decided anything):"];
+  for (const a of advisories) {
+    lines.push(`  ${a.hook}  ${a.disposition.toUpperCase()}  ${a.eligibilityReason}`);
+    if (a.servedModelId !== undefined) {
+      lines.push(`    served by ${a.servedModelId} (${a.qualificationStatus ?? "UNKNOWN"}) ${a.artifactDigest ?? ""}`);
+    }
+    if (a.attempts > 0) {
+      lines.push(`    ${a.attempts} attempt(s), ${a.retryCount} retry/retries, ${a.localLatencyMs}ms local + ${a.backoffLatencyMs}ms backoff, ${a.promptTokens + a.completionTokens} local token(s)`);
+    }
+    if (a.injectionSuspected) lines.push(`    WARNING: evidence contained injection-shaped content (${a.injectionSignals.join(", ")})`);
+    lines.push(`    supplied to the primary provider: ${a.suppliedToPrimaryProvider ? "YES" : "no"}`);
+    if (a.disposition !== "accepted") lines.push(`    ${a.detail}`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
 async function executeProductionBuild(req: BuildRequest, banner: string, io: BuildCliIo): Promise<number> {
   const out = io.stdout ?? writeStdout;
   const err = io.stderr ?? writeStderr;
   err(banner);
-  const session = await runV2BuildSessionProduction(
+
+  /*
+    PRE_BUILD_RECON — the only hook that runs BEFORE the build, because it is the only one whose
+    output could inform it.
+
+    The advisory is appended to the goal, fenced and labelled. That is a real choice with a real
+    cost: it changes the text the builder is asked to work from, and therefore the task it sees.
+    It is done anyway, and visibly, because "informing the builder" has to mean something concrete
+    — and every alternative seam was worse. A ContextSource may not invoke a model, by contract; a
+    new dependency threaded through the pure core would put a local worker inside the build
+    authority. Appending clearly-marked untrusted text to the prompt keeps the local worker exactly
+    where it belongs: outside, talking in.
+
+    Nothing here can mutate. The advisory is inert JSON inside a block that announces it is not
+    repository truth, not verification output, and not an instruction.
+  */
+  const advisories: LocalAdvisoryRecord[] = [];
+  const buildSessionId = `pending-${Date.now().toString(36)}`;
+
+  /*
+    THE ADVISORY TRANSPORT, resolved once and lazily.
+
+    Selecting `--local-mode assist|auto` IS the authorization for supervised-local work; there is
+    no second opt-in. It is derived from the MODE and from nothing observed — a configured or
+    reachable endpoint grants nothing. On a machine with no Bokahli this returns undefined, every
+    hook records `not_attempted`, and the build proceeds exactly as it would have.
+  */
+  const localPolicy: LocalExecutionPolicy = { supervisedLocal: req.localMode !== "off", requireQualified: false };
+  const localTransport = ((): ReturnType<typeof productionTransport> | undefined => {
+    if (req.localMode === "off") return undefined;
+    const make = io.localTransport ?? ((p: LocalExecutionPolicy) => {
+      try { return productionTransport(p); } catch { return undefined; }
+    });
+    return make(localPolicy);
+  })();
+
+  const localDeps = (): BuildLocalDeps => ({
+    mode: req.localMode,
+    buildSessionId,
+    ...(localTransport !== undefined ? { transport: localTransport } : {}),
+    boundary: createUntrustedBoundary(),
+    requireLocalSuccess: req.requireLocalSuccess,
+  });
+
+  let goal = req.goal;
+  if (req.localMode !== "off") {
+    const recon = await (io.runHook ?? runBuildLocalHook)(
+      {
+        hook: "PRE_BUILD_RECON",
+        instruction:
+          "Summarize what this repository packet shows about the code the task will touch. " +
+          'Reply with ONE fenced JSON object: {"summary":"<two sentences>","citations":[{"sourceId":"<id>","quote":"<exact text>"}]}',
+        packet: await reconPacket(req.repo, io),
+      },
+      localDeps(),
+    );
+    const rendered = renderAdvisoryForPrimary(recon);
+    if (rendered !== undefined) {
+      goal = `${req.goal}\n\n${rendered}`;
+      advisories.push(markSuppliedToPrimary(recon));
+    } else {
+      advisories.push(recon);
+      if (shouldStopBuild(recon, { requireLocalSuccess: req.requireLocalSuccess })) {
+        err(`ikbi build: refusing — --require-local-success was set and PRE_BUILD_RECON did not succeed (${recon.detail})\n`);
+        return 1;
+      }
+      // NOT SILENT. The operator asked for local assistance and did not get it; the build
+      // continues because Bokahli is the optional half, but they are told which half went missing.
+      err(`ikbi build: local PRE_BUILD_RECON unavailable (${recon.eligibilityReason}: ${recon.detail}) — continuing with the primary provider alone\n`);
+    }
+  }
+
+  const session = await (io.runSession ?? runV2BuildSessionProduction)(
     {
-      goal: req.goal,
+      goal,
       repoPath: req.repo,
       ...(req.strategy !== undefined ? { candidateStrategy: req.strategy } : {}),
       ...(req.profile !== undefined ? { profile: req.profile } : {}),
@@ -580,6 +805,64 @@ async function executeProductionBuild(req: BuildRequest, banner: string, io: Bui
       ...(io.recoveryPolicy !== undefined ? { recoveryPolicy: io.recoveryPolicy } : {}),
     },
   );
+  /*
+    THE TWO POST-BUILD HOOKS. Both are strictly after the fact.
+
+    VERIFICATION_FAILURE_TRIAGE reads a FAILED verification's own output and classifies it. It runs
+    only when verification already failed, and it cannot turn that failure into a pass — the verdict
+    was decided by the deterministic verifier before this hook existed, and nothing here is wired to
+    anything that could revise it.
+
+    POST_CANDIDATE_DIFF_SUMMARY summarizes what the candidate changed, for the operator and the
+    receipt. It runs after adjudication and cannot approve a publication: by the time it speaks, the
+    disposition has already been made and either enacted or withheld.
+  */
+  if (req.localMode !== "off") {
+    const finalAttempt = session.attempts[session.attempts.length - 1];
+    const verification = finalAttempt?.receipt?.verification;
+    const verdictBefore = verification?.verdict;
+
+    if (verdictBefore !== undefined && verdictBefore !== "pass") {
+      const packet = verificationPacket(verification);
+      if (packet.length > 0) {
+        const triage = await (io.runHook ?? runBuildLocalHook)(
+          {
+            hook: "VERIFICATION_FAILURE_TRIAGE",
+            instruction:
+              "Classify why this verification failed. Reply with ONE fenced JSON object: " +
+              '{"category":"assertion_failure|compile_error|timeout|missing_dependency|flaky|environment|unknown","summary":"<one sentence>","citations":[{"sourceId":"<id>","quote":"<exact text>"}]}',
+            packet,
+          },
+          { ...localDeps(), ...(finalAttempt?.runId !== undefined ? { runId: finalAttempt.runId } : {}) },
+        );
+        advisories.push(triage);
+      }
+    }
+
+    const diff = candidateDiffPacketText(finalAttempt?.receipt?.candidate);
+    if (diff.length > 0) {
+      const summary = await (io.runHook ?? runBuildLocalHook)(
+        {
+          hook: "POST_CANDIDATE_DIFF_SUMMARY",
+          instruction:
+            "Summarize what this diff changes, for an operator deciding whether to keep it. Reply with " +
+            'ONE fenced JSON object: {"summary":"<two sentences>","citations":[{"sourceId":"<id>","quote":"<exact text>"}]}',
+          packet: [{ id: "candidate.diff", content: diff.slice(0, 48 * 1024), source: "repo" as const }],
+        },
+        { ...localDeps(), ...(finalAttempt?.runId !== undefined ? { runId: finalAttempt.runId } : {}) },
+      );
+      advisories.push(summary);
+    }
+
+    // THE VERDICT IS RE-READ AND MUST BE UNCHANGED. Advisory means advisory; if a hook could move
+    // this, the whole arrangement would be a lie, so it is asserted rather than assumed.
+    const verdictAfter = session.attempts[session.attempts.length - 1]?.receipt?.verification?.verdict;
+    if (verdictAfter !== verdictBefore) {
+      err(`ikbi build: FATAL — a local advisory changed the verification verdict (${String(verdictBefore)} -> ${String(verdictAfter)}). Refusing to report this run.\n`);
+      return 70;
+    }
+  }
+
   // RECORD THE RUN IN THE OPERATOR RECEIPT LOG, before anything is printed.
   //
   // v2 publishes by direct clean-ref CAS rather than through `WorkspaceManager.promote`, so nothing
@@ -588,7 +871,7 @@ async function executeProductionBuild(req: BuildRequest, banner: string, io: Bui
   // Best-effort by contract: the git ref is the authoritative landing proof, and a receipt that
   // could not be written is REPORTED rather than allowed to fail a publication that already
   // happened.
-  const recorded = await (io.recordReceipts ?? recordBuildSessionReceipts)(session, req.repo, io.receipts);
+  const recorded = await (io.recordReceipts ?? recordBuildSessionReceipts)(session, req.repo, io.receipts, undefined, advisories);
   if (recorded.runSummary === "failed" || recorded.promotion === "failed") {
     err(
       "ikbi build: WARNING — the run completed but its receipt could not be written " +
@@ -599,7 +882,11 @@ async function executeProductionBuild(req: BuildRequest, banner: string, io: Bui
 
   // `--json` exposes the full session (every attempt + recovery decision). The human render
   // shows the recovery trail (when there was one) then the final attempt in full.
-  out(req.json ? `${JSON.stringify(session, null, 2)}\n` : renderSession(session));
+  out(
+    req.json
+      ? `${JSON.stringify({ ...session, localAdvisories: advisories }, null, 2)}\n`
+      : `${renderSession(session)}${renderAdvisories(advisories)}`,
+  );
   return exitCodeForOutcome(session.outcome);
 }
 
@@ -612,7 +899,7 @@ export async function runBuildCli(argv: readonly string[], io: BuildCliIo = {}):
   // REFUSE BEFORE ANYTHING IS CONSTRUCTED. An invocation we cannot read is never "close enough".
   if (args.rejection !== undefined) return refuseUsage("ikbi build", args.rejection, BUILD_USAGE, io.stderr ?? writeStderr);
   return executeProductionBuild(
-    { goal: args.goal, repo: args.repo, strategy: args.strategy, profile: args.profile, json: args.json },
+    { goal: args.goal, repo: args.repo, strategy: args.strategy, profile: args.profile, json: args.json, localMode: args.localMode, requireLocalSuccess: args.requireLocalSuccess },
     BUILD_BANNER,
     io,
   );
@@ -633,7 +920,7 @@ export async function runV2Cli(argv: readonly string[], io: BuildCliIo = {}): Pr
     return 2;
   }
   return executeProductionBuild(
-    { goal: args.goal, repo: args.repo, strategy: args.strategy, profile: args.profile, json: args.json },
+    { goal: args.goal, repo: args.repo, strategy: args.strategy, profile: args.profile, json: args.json, localMode: args.localMode, requireLocalSuccess: args.requireLocalSuccess },
     V2_BANNER,
     io,
   );

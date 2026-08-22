@@ -24,8 +24,19 @@ const WORKER_CLI_SRC = read("../../modules/worker-model/cli.ts");
 const README = read("../../../README.md");
 
 test("guard: exactly ONE production call site to runV2BuildSessionProduction in CLI build handling", () => {
-  const calls = (V2_CLI_SRC.match(/runV2BuildSessionProduction\s*\(/g) ?? []).length;
-  assert.equal(calls, 1, "both `ikbi build` and `ikbi v2 build` must funnel through ONE call site — no second engine");
+  // THE INVARIANT IS ONE CALL SITE, not one spelling. The engine is now reached through an
+  // injectable default — `(io.runSession ?? runV2BuildSessionProduction)(…)` — so a suite can drive
+  // the advisory wiring around a build without rebuilding a repository. Both forms are counted, and
+  // the total must still be one: `ikbi build` and `ikbi v2 build` funnel through the same place, and
+  // a second engine would show up here as a second call however it were written.
+  const direct = (V2_CLI_SRC.match(/(?<!\?\?\s)runV2BuildSessionProduction\s*\(/g) ?? []).length;
+  const injected = (V2_CLI_SRC.match(/\?\?\s*runV2BuildSessionProduction\s*\)\s*\(/g) ?? []).length;
+  assert.equal(direct + injected, 1, "both `ikbi build` and `ikbi v2 build` must funnel through ONE call site — no second engine");
+
+  // AND THE SEAM MUST STAY A SEAM. A default that production can silently miss would let a build
+  // run on an injected engine in production, which is the failure this guard exists to prevent.
+  assert.equal(injected, 1, "the one call site must keep its production default");
+  assert.match(V2_CLI_SRC, /readonly runSession\?:\s*typeof runV2BuildSessionProduction/, "the seam is typed to the production engine, so no other engine can be substituted");
 });
 
 test("guard: `ikbi build` is the CANONICAL golden-path command; `v2` is an advanced alias", () => {
