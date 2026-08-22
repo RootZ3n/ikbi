@@ -26,7 +26,10 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import {
+  BOKAHLI_CAPACITY_REASONS,
   BOKAHLI_ESCALATE_REASONS,
+  BOKAHLI_IDENTITY_REASONS,
+  BokahliProtocolError,
   BokahliRefusal,
   createBokahliProvider,
   readLocalBinding,
@@ -63,9 +66,9 @@ if (REQUIRE_LIVE && skipReason !== null) {
 }
 const live = { skip: skipReason ?? false };
 
-function invocation(prompt: string, maxTokens = 32): ProviderInvocation {
+function invocation(prompt: string, maxTokens = 32, modelId?: string): ProviderInvocation {
   return {
-    providerModelId: EXPECT_MODEL ?? "qwen3.5-35b-a3b.q2-k",
+    providerModelId: modelId ?? EXPECT_MODEL ?? "qwen3.5-35b-a3b.q2-k",
     request: { model: "local", prompt, maxTokens, identity: { agentId: "live", functionalRole: "builder", trustTier: "worker" } as never },
     timeoutMs: 120_000,
     signal: new AbortController().signal,
@@ -149,17 +152,45 @@ test("DD-06 live: a WRONG artifact id is refused — never silently substituted"
   }
 });
 
-test("DD-06 live: the escalate-reason list this adapter carries matches the deployment's", live, async () => {
-  // The deployment is asked for something it cannot do; whatever reason it names must be one this
-  // adapter already knows, or the hand-maintained copy has drifted.
-  const strict = createBokahliProvider({ baseUrl: BASE, credentialFile: TOKEN_FILE, routeMode: "AUTO", requireQualified: true, taskClass: "formal-verification" });
-  try {
-    await strict.invoke(invocation("hi"));
-  } catch (e) {
-    if (e instanceof BokahliRefusal) {
-      assert.ok((BOKAHLI_ESCALATE_REASONS as readonly string[]).includes(e.reason) || e.reason === "MODEL_NOT_QUALIFIED_FOR_TASK",
-        `the deployment named reason ${e.reason}, which this adapter's copy does not list`);
+test("DD-06 live: the reason list this adapter carries matches the deployment's", live, async () => {
+  // THIS TEST USED TO BE UNABLE TO FAIL FOR THE REASON IT EXISTS.
+  //
+  // It asked the deployment for something it could not do and asserted the named reason was known
+  // — but ONLY inside `if (e instanceof BokahliRefusal)`. An UNKNOWN reason does not produce a
+  // BokahliRefusal; it produces a BokahliProtocolError, which fell through the `catch` untested
+  // and the suite reported a pass. That is precisely how `EXACT_IDENTITY_UNKNOWN` reached
+  // production: a live drift detector structurally incapable of detecting drift. Dogfooding found
+  // it; this suite should have.
+  //
+  // Now a protocol error is the LOUDEST failure here, and a call that unexpectedly succeeds is
+  // reported too, because a probe that stopped probing is not evidence either.
+  const known = new Set<string>([...BOKAHLI_ESCALATE_REASONS, ...BOKAHLI_CAPACITY_REASONS, ...BOKAHLI_IDENTITY_REASONS]);
+
+  /** Provoke a refusal and return what the deployment named, or throw if it drifted. */
+  const provoke = async (cfg: Parameters<typeof createBokahliProvider>[0], modelId?: string): Promise<string | null> => {
+    try {
+      await createBokahliProvider(cfg).invoke(invocation("hi", 8, modelId));
+      return null; // served it after all — not drift, just nothing to check here
+    } catch (e) {
+      if (e instanceof BokahliProtocolError) {
+        assert.fail(`the deployment said something this adapter cannot parse — the hand-maintained reason list has DRIFTED: ${e.message}`);
+      }
+      if (e instanceof BokahliRefusal) return e.reason;
+      throw e;
     }
+  };
+
+  const seen: string[] = [];
+  // (a) a task class nothing installed is qualified for
+  const a = await provoke({ baseUrl: BASE, credentialFile: TOKEN_FILE, routeMode: "AUTO", requireQualified: true, taskClass: "formal-verification" });
+  if (a !== null) seen.push(a);
+  // (b) a PINNED artifact the deployment does not serve under that name — the EXACT_IDENTITY_UNKNOWN path
+  const b = await provoke({ baseUrl: BASE, credentialFile: TOKEN_FILE, routeMode: "AUTO", requireQualified: false, supervisedLocal: true }, "definitely-not-installed-model");
+  if (b !== null) seen.push(b);
+
+  assert.ok(seen.length > 0, "the deployment refused nothing — this probe proved nothing");
+  for (const reason of seen) {
+    assert.ok(known.has(reason), `the deployment named reason ${JSON.stringify(reason)}, which this adapter's copy does not list`);
   }
 });
 
