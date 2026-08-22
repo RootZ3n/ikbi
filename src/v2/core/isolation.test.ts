@@ -1072,11 +1072,16 @@ test("single authority: only the transport adapter may reach a provider TRANSPOR
   // Generation is the invocation authority's alone. Anything else instantiating a
   // transport, calling `provider.invoke`, or reaching for the v1 INVOKER (which is a
   // routing authority, not a transport) would be a second way to call a model.
+  //
+  // COMMENTS ARE STRIPPED FIRST, as the sibling promote guard already does. Without that, a file
+  // whose DOCUMENTATION explains the architecture — "the adapter calls `provider.invoke(...)`
+  // exactly once" — is reported as a violation for describing the rule it obeys. What is being
+  // guarded is a second CALL SITE, which only code can be.
   const allowed = new Set([join(V2_DIR, "runtime", "invocation-transport.ts")]);
   const offenders: string[] = [];
   for (const file of tsFiles(V2_DIR)) {
     if (allowed.has(file) || file.endsWith(".test.ts")) continue;
-    const source = readFileSync(file, "utf8");
+    const source = stripComments(readFileSync(file, "utf8"));
     if (/\.invoke\s*\(|\bnew (OpenAICompatible|Anthropic)Provider\b|\binvokeModel\s*\(/.test(source)) {
       offenders.push(relative(SRC, file));
     }

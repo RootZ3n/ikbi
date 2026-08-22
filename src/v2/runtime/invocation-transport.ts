@@ -21,11 +21,28 @@
  */
 
 import type { ModelProvider, ModelRequest, ProviderError } from "../../core/provider/contract.js";
-import { V2_INVOCATION_FAILURE_CODES, type InvocationTransport, type ObservedUsage, type TransportOutcome } from "../core/invocation.js";
+import { V2_INVOCATION_FAILURE_CODES, type AttestedLocalIdentity, type InvocationTransport, type ObservedUsage, type SupervisionMark, type TransportOutcome } from "../core/invocation.js";
 
 /** The narrow slice of the v1 registry this adapter needs: look one provider up by id. */
 export interface TransportProviderLookup {
   getProvider(id: string): ModelProvider | undefined;
+}
+
+/**
+ * Structural readers for the two ADDITIVE fields an attesting provider may return.
+ *
+ * Read structurally rather than by importing the provider's types: this adapter is deliberately
+ * ignorant of WHICH provider it is talking to — it is handed an id and calls it — and importing
+ * one provider's module here would make that false.
+ */
+function hasAttested(r: unknown): r is { attestedIdentity: AttestedLocalIdentity } {
+  const v = (r as { attestedIdentity?: unknown }).attestedIdentity;
+  return typeof v === "object" && v !== null && typeof (v as { artifactDigest?: unknown }).artifactDigest === "string";
+}
+
+function hasSupervision(r: unknown): r is { supervision: SupervisionMark } {
+  const v = (r as { supervision?: unknown }).supervision;
+  return typeof v === "object" && v !== null && (v as { executionClass?: unknown }).executionClass === "local";
 }
 
 /** Is this a v1 `ProviderError`? Structural, so a fake transport can produce one too. */
@@ -156,6 +173,16 @@ export function createInvocationTransport(lookup: TransportProviderLookup): Invo
             // `tool_calls` field, and nothing scraped out of prose.
             ...(result.toolCalls !== undefined && result.toolCalls.length > 0 ? { toolCalls: result.toolCalls } : {}),
             ...(result.servedModelId !== undefined ? { servedModelId: result.servedModelId } : {}),
+            /*
+              ATTESTED IDENTITY AND SUPERVISION, carried through VERBATIM.
+              Only an attesting provider produces these, and this adapter neither synthesizes nor
+              normalizes them: a binding is a claim the serving deployment made about what it
+              actually ran, and anything this layer added would be a claim nobody verified. They
+              travel beside `servedModelId` rather than replacing it, because "what was claimed"
+              and "what was proved" are two facts and their disagreement is the interesting one.
+            */
+            ...(hasAttested(result) ? { attestedIdentity: result.attestedIdentity } : {}),
+            ...(hasSupervision(result) ? { supervision: result.supervision } : {}),
             ...(observedUsage(result.usage) !== undefined ? { usage: observedUsage(result.usage)! } : {}),
             // One call to `provider.invoke` is one outbound attempt: the donor
             // transports issue a single fetch and retry nothing internally (audited).

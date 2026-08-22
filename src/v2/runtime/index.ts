@@ -132,7 +132,8 @@ function envCostBudgetPolicy(): CostBudgetPolicy | undefined {
     behaviorWhenCostUnknown,
   });
 }
-import { createInvocationTransport } from "./invocation-transport.js";
+import { createInvocationTransport, type TransportProviderLookup } from "./invocation-transport.js";
+import { BOKAHLI_PROVIDER_ID, createBokahliProvider, type BokahliProviderConfig } from "./bokahli.js";
 import { createProductionWorkspaceAuthorities } from "./workspace-authority.js";
 import { createSourceSnapshotAuthority } from "./source-snapshot.js";
 import type { StateBoundMutationAuthority, WorkspaceAuthority } from "../core/workspace.js";
@@ -303,8 +304,62 @@ export function productionTransport(): InvocationTransport {
   return {
     async send(input) {
       const { registry } = await import("../../core/provider/index.js");
-      return createInvocationTransport(registry).send(input);
+      return createInvocationTransport(withBokahli(registry)).send(input);
     },
+  };
+}
+
+/**
+ * The provider lookup, with Bokahli resolvable by id.
+ *
+ * Bokahli is not built by the v1 registry and deliberately is not taught to it: its credential
+ * comes from a mode-0600 FILE rather than a config value, and its routing policy (route mode,
+ * task class, `requireQualified`, supervised-local) is a v2 concern the v1 roster has no place
+ * to express. Teaching v1 about it would put a second, differently-configured way to reach the
+ * same deployment into a layer v2 does not otherwise use.
+ *
+ * So the lookup is DECORATED rather than replaced: every existing provider resolves exactly as
+ * before, and the single id `bokahli` resolves to the native v2 adapter. The lookup is still a
+ * lookup — it chooses nothing, and a caller that did not resolve to this id never reaches it.
+ *
+ * Construction is LAZY and per-lookup on purpose: reading the credential at module load would
+ * make every ikbi command fail on a machine that has no Bokahli, for a provider it was never
+ * going to use. A missing or ill-permissioned credential surfaces when something actually asks
+ * for Bokahli, which is when it is a real problem.
+ */
+function withBokahli(registry: TransportProviderLookup): TransportProviderLookup {
+  return {
+    getProvider(id: string) {
+      if (id !== BOKAHLI_PROVIDER_ID) return registry.getProvider(id);
+      return createBokahliProvider(readBokahliRuntimeConfig());
+    },
+  };
+}
+
+/**
+ * Bokahli's per-run policy, from the operator environment.
+ *
+ * SUPERVISED-LOCAL IS OPT-IN AND EXPLICIT. It is never inferred from the endpoint being
+ * loopback or tailnet: "local" says where inference happened, not that a human agreed to review
+ * what came back. With neither variable set, an unqualified artifact is refused rather than
+ * quietly accepted — which is the correct default for a deployment whose every artifact reports
+ * INSTALLED_UNQUALIFIED.
+ */
+export function readBokahliRuntimeConfig(env: NodeJS.ProcessEnv = process.env): BokahliProviderConfig {
+  const routeMode = (env["IKBI_BOKAHLI_ROUTE_MODE"] ?? "AUTO").toUpperCase();
+  if (routeMode !== "AUTO" && routeMode !== "PROFILE" && routeMode !== "EXACT") {
+    throw new Error(`IKBI_BOKAHLI_ROUTE_MODE must be AUTO, PROFILE or EXACT (got ${JSON.stringify(routeMode)})`);
+  }
+  const target = env["IKBI_BOKAHLI_TARGET"];
+  const taskClass = env["IKBI_BOKAHLI_TASK_CLASS"];
+  return {
+    ...(env["IKBI_BOKAHLI_BASE_URL"] !== undefined ? { baseUrl: env["IKBI_BOKAHLI_BASE_URL"] } : {}),
+    credentialFile: env["IKBI_BOKAHLI_TOKEN_FILE"] ?? `${env["HOME"] ?? ""}/.config/bokahli/token`,
+    routeMode,
+    ...(target !== undefined ? { target } : {}),
+    ...(taskClass !== undefined ? { taskClass } : {}),
+    requireQualified: env["IKBI_BOKAHLI_REQUIRE_QUALIFIED"] === "true",
+    supervisedLocal: env["IKBI_BOKAHLI_SUPERVISED_LOCAL"] === "true",
   };
 }
 

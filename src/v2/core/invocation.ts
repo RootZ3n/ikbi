@@ -205,9 +205,57 @@ export interface TransportResponse {
   readonly toolCalls?: readonly BuilderToolCall[];
   /** Verbatim from the response body, or absent when the provider reported none. */
   readonly servedModelId?: string;
+  /**
+   * What an ATTESTING provider proved, as distinct from what it claimed. Absent for every
+   * provider that cannot attest — which is every remote API.
+   */
+  readonly attestedIdentity?: AttestedLocalIdentity;
+  /** Present when the result may not be acted on unattended. See `SupervisionMark`. */
+  readonly supervision?: SupervisionMark;
   readonly usage?: ObservedUsage;
   /** How many outbound HTTP attempts the transport actually made. Must be 1 in this slice. */
   readonly attempts: number;
+}
+
+/**
+ * What an ATTESTING provider proved about the artifact that served a request.
+ *
+ * `servedModelId` is a NAME the runtime chose to report; this is a claim that can be checked
+ * against a catalog. The two are recorded side by side, never merged, because a disagreement
+ * between them is the single most informative thing a receipt can preserve about a local run.
+ *
+ * Structural and provider-agnostic on purpose: `core/` describes what evidence looks like and
+ * never learns which deployment produced it.
+ */
+export interface AttestedLocalIdentity {
+  readonly modelId: string;
+  readonly artifactDigest: string;
+  /** False means the deployment could not confirm what it was serving. Never defaulted to true. */
+  readonly attested: boolean;
+  /** Verbatim. `UNKNOWN` when the deployment said nothing — never a friendlier guess. */
+  readonly qualificationStatus: string;
+  readonly qualificationAuthority: string;
+  readonly quantization?: string;
+  readonly servedContextTokens?: number;
+  readonly runtimeBuild?: string;
+  readonly backendInstanceId?: string;
+  readonly attestationMethod?: string;
+  readonly requestId?: string;
+}
+
+/**
+ * The mark a result carries when it came from a worker nobody has vouched for.
+ *
+ * Such a result is USEFUL — an operator can read it and judge it. What it is not is trustworthy
+ * enough to act on unattended, and recording that as DATA on the record is what keeps the
+ * distinction from depending on somebody downstream remembering it.
+ */
+export interface SupervisionMark {
+  readonly executionClass: "local";
+  readonly qualified: boolean;
+  readonly humanReviewRequired: boolean;
+  readonly autonomousPromotionAllowed: boolean;
+  readonly reason: string;
 }
 
 /** A transport failure, already classified by the donor provider layer. */
@@ -255,6 +303,10 @@ export interface InvocationIdentityRecord {
   readonly sentProviderModelId: string;
   /** Verbatim provider report, or absent. NEVER synthesized. */
   readonly servedModelId?: string;
+  /** What an attesting provider PROVED, kept apart from what it claimed above. */
+  readonly attestedIdentity?: AttestedLocalIdentity;
+  /** Present when this answer may not be acted on unattended. */
+  readonly supervision?: SupervisionMark;
   readonly identityStatus: ServedIdentityStatus;
 }
 
@@ -509,6 +561,8 @@ export async function invokeAuthorized(input: InvocationAuthorityInput): Promise
     sentProviderId: request.sentProviderId,
     sentProviderModelId: request.sentProviderModelId,
     ...(response.servedModelId !== undefined ? { servedModelId: response.servedModelId } : {}),
+    ...(response.attestedIdentity !== undefined ? { attestedIdentity: response.attestedIdentity } : {}),
+    ...(response.supervision !== undefined ? { supervision: response.supervision } : {}),
     identityStatus,
   };
 
