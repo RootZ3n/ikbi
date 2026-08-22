@@ -68,9 +68,32 @@ interface V2Args {
   /** Per-run profile override. Absent means "use the operator's standing selection". */
   readonly profile: string | undefined;
   readonly json: boolean;
+  /**
+   * A USAGE REFUSAL. Present when the invocation could not be understood — an unrecognized
+   * option, or a known option missing its value. The caller MUST refuse the run and print this
+   * instead of building. Absent means the invocation parsed cleanly.
+   */
+  readonly rejection?: string;
 }
 
-/** Parse `v2 build <goal…> [flags]`. Unflagged words after the subcommand form the goal. */
+/**
+ * Parse `v2 build <goal…> [flags]`. Unflagged words after the subcommand form the goal.
+ *
+ * UNRECOGNIZED OPTIONS ARE REFUSED, NEVER IGNORED. The first version of this parser dropped any
+ * token it did not know and kept walking, which made two silent, dangerous things possible:
+ *
+ *   1. `ikbi build "…" --dry-run` — a flag that does not exist — was DISCARDED, and the build
+ *      published to the operator's branch. An operator asking for a preview got a real
+ *      publication. A safety flag that silently does nothing is worse than no flag at all.
+ *   2. `ikbi build "set widget to 2" --strategyy shadow` — one typo'd character — dropped the
+ *      option and folded its VALUE into the goal, so the engine silently built toward
+ *      "set widget to 2 shadow". The operator's task was rewritten without a word said.
+ *
+ * Both are fail-open defaults in a system whose design rule is fail-closed, so an option this
+ * parser does not recognize is a REFUSAL (`rejection`), and so is a known option whose value is
+ * missing or is itself another option. `--` ends option parsing: every token after it is a goal
+ * word, which is how a goal that legitimately starts with a dash gets through.
+ */
 export function parseV2Args(argv: readonly string[], cwd: string): V2Args {
   const subcommand = argv[0];
   const words: string[] = [];
@@ -78,31 +101,54 @@ export function parseV2Args(argv: readonly string[], cwd: string): V2Args {
   let strategy: string | undefined;
   let profile: string | undefined;
   let json = false;
+  let rejection: string | undefined;
+  let endOfOptions = false;
+
+  /**
+   * Take the value for a value-taking option. A missing value, or a value that is itself an
+   * option, is a refusal — `--repo --json` must not silently consume `--json` as a path.
+   */
+  const takeValue = (flag: string, next: string | undefined): string | undefined => {
+    if (next === undefined || next.startsWith("-")) {
+      rejection ??= `option "${flag}" requires a value`;
+      return undefined;
+    }
+    return next;
+  };
+
   for (let i = 1; i < argv.length; i += 1) {
     const a = argv[i] as string;
+    if (endOfOptions) { words.push(a); continue; }
+    if (a === "--") { endOfOptions = true; continue; }
     if (a === "--json") json = true;
-    else if (a === "--repo") {
-      const v = argv[i + 1];
-      if (v !== undefined) repo = v;
-      i += 1;
-    } else if (a === "--strategy") {
-      const v = argv[i + 1];
-      if (v !== undefined) strategy = v;
-      i += 1;
-    } else if (a === "--profile") {
-      const v = argv[i + 1];
-      if (v !== undefined) profile = v;
-      i += 1;
-    } else if (!a.startsWith("-")) words.push(a);
+    else if (a === "--repo") { const v = takeValue(a, argv[i + 1]); if (v !== undefined) repo = v; i += 1; }
+    else if (a === "--strategy") { const v = takeValue(a, argv[i + 1]); if (v !== undefined) strategy = v; i += 1; }
+    else if (a === "--profile") { const v = takeValue(a, argv[i + 1]); if (v !== undefined) profile = v; i += 1; }
+    else if (a.startsWith("-") && a !== "-") rejection ??= `unknown option "${a}"`;
+    else words.push(a);
   }
+
+  // A REJECTED PARSE YIELDS NOTHING USABLE. The goal is blanked so a caller that forgets to check
+  // `rejection` cannot build toward the half-understood task — `--strategyy shadow` left "shadow"
+  // sitting in the goal words, and an empty goal fails loudly where a corrupted one would not.
   return {
     subcommand,
-    goal: words.join(" "),
+    goal: rejection === undefined ? words.join(" ") : "",
     repo,
     strategy,
     profile,
     json,
+    ...(rejection !== undefined ? { rejection } : {}),
   };
+}
+
+/**
+ * Refuse an unparseable invocation: the reason, then the usage line, on stderr, exit 2.
+ * Nothing is constructed, no provider is reached, and no repository is touched.
+ */
+function refuseUsage(command: string, rejection: string, usage: string, err: (s: string) => void): number {
+  err(`${command}: ${rejection}\n${usage}\n`);
+  return 2;
 }
 
 /**
@@ -538,6 +584,8 @@ async function executeProductionBuild(req: BuildRequest, banner: string, io: Bui
  */
 export async function runBuildCli(argv: readonly string[], io: BuildCliIo = {}): Promise<number> {
   const args = parseV2Args(["build", ...argv], io.cwd ?? process.cwd());
+  // REFUSE BEFORE ANYTHING IS CONSTRUCTED. An invocation we cannot read is never "close enough".
+  if (args.rejection !== undefined) return refuseUsage("ikbi build", args.rejection, BUILD_USAGE, io.stderr ?? writeStderr);
   return executeProductionBuild(
     { goal: args.goal, repo: args.repo, strategy: args.strategy, profile: args.profile, json: args.json },
     BUILD_BANNER,
@@ -553,6 +601,7 @@ export async function runBuildCli(argv: readonly string[], io: BuildCliIo = {}):
 export async function runV2Cli(argv: readonly string[], io: BuildCliIo = {}): Promise<number> {
   const err = io.stderr ?? writeStderr;
   const args = parseV2Args(argv, io.cwd ?? process.cwd());
+  if (args.rejection !== undefined) return refuseUsage("ikbi v2", args.rejection, V2_USAGE, err);
   if (args.subcommand !== "build") {
     err(`${V2_USAGE}\n`);
     err(`ikbi v2: unknown subcommand ${args.subcommand === undefined ? "<none>" : `"${args.subcommand}"`} (only "build" exists; \`ikbi v2 build\` is an alias for \`ikbi build\`)\n`);
