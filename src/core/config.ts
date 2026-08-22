@@ -71,6 +71,14 @@ function autoLoadDotEnv(): void {
   // test subprocess and by nothing else; production surfaces (repl/build/server/
   // CLI) never set it, so the `.env` autoload still runs for them.
   if (process.env.NODE_TEST_CONTEXT !== undefined) return;
+  // ...but NODE_TEST_CONTEXT does not reach a CHILD the suites spawn. Those children are given a
+  // deliberately minimal environment precisely so they inherit nothing, and then this autoload
+  // refilled it from disk: the operator's real provider keys, their governed-exec allowlist and
+  // their gate-wall bypass, resolved from THIS module's project root rather than the child's cwd,
+  // so running from elsewhere did not help. A sanitized environment quietly refilled from a file
+  // nobody sees in review is not sanitized. `IKBI_HERMETIC_TEST` marks such a child, and it is set
+  // by test material only — production never sets it, so the autoload still runs there.
+  if (parseBool(process.env.IKBI_HERMETIC_TEST, false)) return;
   const here = dirname(fileURLToPath(import.meta.url));
   const root = findProjectRoot(here) ?? process.cwd();
   const envPath = join(root, ".env");

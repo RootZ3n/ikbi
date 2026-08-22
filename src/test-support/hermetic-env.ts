@@ -73,3 +73,48 @@ export const HERMETIC_DEV_KEY_ENV: Readonly<Record<string, string>> = Object.fre
 process.env.IKBI_TRUST_HMAC_KEY ??= HERMETIC_TRUST_HMAC_KEY;
 process.env.IKBI_IDENTITY_TOKEN_SALT ??= HERMETIC_IDENTITY_TOKEN_SALT;
 process.env.IKBI_HERMETIC_TEST ??= "1";
+
+/**
+ * Credential-shaped environment names, stripped from any child a suite spawns.
+ *
+ * Blocking the `.env` autoload (see `autoLoadDotEnv` in `core/config.ts`) closes the path that
+ * actually leaked. This closes the other direction: a child built by spreading an INHERITED
+ * environment rather than a minimal one. Both must hold, because a suite that starts passing only
+ * on the operator's machine fails silently — it just goes green there and red in review.
+ *
+ * Matching is by shape, not by an enumerated list, so a provider added later is covered without
+ * anybody remembering to update this. `IKBI_TRUST_HMAC_KEY` and `IKBI_IDENTITY_TOKEN_SALT` match
+ * the shape too and are deliberately re-supplied afterwards from the hermetic material.
+ */
+const CREDENTIAL_SHAPED = /(^|_)(API_KEY|APIKEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|BEARER|SALT|HMAC|KEY)$/;
+
+/** Names that are policy switches rather than credentials, but must not leak in either. */
+const HOSTILE_POLICY_ENV = new Set([
+  "IKBI_GATE_WALL_BYPASS",
+  "IKBI_GOVERNED_EXEC_ALLOWLIST",
+  "IKBI_EGRESS_ALLOWLIST",
+]);
+
+/** True when `name` must never reach a hermetic child. */
+export function isCredentialShapedEnvName(name: string): boolean {
+  return CREDENTIAL_SHAPED.test(name) || HOSTILE_POLICY_ENV.has(name);
+}
+
+/**
+ * Build the environment for a spawned child, from scratch.
+ *
+ * Starts from nothing rather than from `process.env`, so an operator shell — or a hostile one
+ * carrying planted provider keys — contributes only what is named here. `extra` is applied last so
+ * a test can still set what it is actually testing, including deliberately hostile values.
+ */
+export function hermeticChildEnv(extra: Record<string, string> = {}): Record<string, string> {
+  const base: Record<string, string> = {
+    PATH: process.env.PATH ?? "",
+    HOME: process.env.HOME ?? "",
+    ...HERMETIC_DEV_KEY_ENV,
+  };
+  for (const name of Object.keys(base)) {
+    if (isCredentialShapedEnvName(name) && !(name in HERMETIC_DEV_KEY_ENV)) delete base[name];
+  }
+  return { ...base, ...extra };
+}
