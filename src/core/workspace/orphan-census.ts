@@ -104,6 +104,16 @@ export interface CleanupStep {
 export interface OrphanCensus {
   readonly repositoryPath: string;
   readonly takenAt: number;
+  /**
+   * The repository HEAD observed when this census was taken.
+   *
+   * A census is an observation of one repository at one moment, and an approval given against it
+   * is an approval of THAT moment. Commits move branch tips and change what is reachable from
+   * where, which is exactly the input the "does deleting this ref lose work?" question depends
+   * on. An authorization that did not name the HEAD it was computed at could therefore be
+   * applied against a repository where its own reasoning no longer holds.
+   */
+  readonly boundHead: string;
   readonly worktrees: readonly WorktreeCensusEntry[];
   readonly branches: readonly BranchCensusEntry[];
   /** The refs whose reachability protects a commit from being called unique. */
@@ -200,6 +210,10 @@ export async function takeOrphanCensus(
   const registrations: WorktreeEntry[] = await listWorktrees(repositoryPath);
   const protect = await protectedRefs(repositoryPath);
   const branches = await namespaceBranches(repositoryPath);
+  // The HEAD this observation belongs to. A repository with no commits yields "", which produces
+  // an authorization `applyCleanupPlan` refuses — fail-closed, and there is nothing to clean there.
+  const headProbe = await runGit(repositoryPath, ["rev-parse", "HEAD"], { okCodes: [128, 1] });
+  const boundHead = headProbe.code === 0 ? headProbe.stdout.trim() : "";
 
   const recordsByBranch = new Map<string, WorkspaceRecord>();
   const recordsByPath = new Map<string, WorkspaceRecord>();
@@ -363,6 +377,7 @@ export async function takeOrphanCensus(
   return {
     repositoryPath,
     takenAt: now(),
+    boundHead,
     worktrees,
     branches: branchEntries,
     protectedRefs: protect,
@@ -380,6 +395,40 @@ export async function takeOrphanCensus(
     },
     plan,
   };
+}
+
+/**
+ * A CLEANUP AUTHORIZATION: the steps an operator approved, inseparable from the repository state
+ * they were approved against.
+ *
+ * WHY THE STEPS ARE NOT ENOUGH ON THEIR OWN. A bare `CleanupStep[]` is a list of things to
+ * destroy with no record of the reasoning that made them safe. That reasoning — "this ref holds
+ * nothing unreachable from elsewhere" — is computed from the repository's refs at census time,
+ * and a commit made afterwards can change it. Carrying the HEAD makes the approval self-
+ * describing: it says which repository state it is an approval OF, and `applyCleanupPlan` can
+ * refuse when that is no longer the state in front of it.
+ *
+ * `boundHead` is REQUIRED and is validated at runtime, not merely typed. An authorization that
+ * arrives without one is refused outright rather than being run with the check disabled — a
+ * missing binding is the absence of an approval, never a permission to skip verifying it.
+ */
+export interface CleanupAuthorization {
+  /** The repository HEAD the approved steps were computed against. Full 40-hex object id. */
+  readonly boundHead: string;
+  readonly steps: readonly CleanupStep[];
+}
+
+/** Full 40-hex object ids only — a short or empty binding is not a binding. */
+function isBoundHeadValid(head: unknown): head is string {
+  return typeof head === "string" && /^[0-9a-f]{40}$/.test(head);
+}
+
+/**
+ * Build the authorization for a census: its plan, bound to the HEAD it was taken at.
+ * This is the only intended way to produce one, so the binding cannot be omitted by accident.
+ */
+export function authorizeCleanup(census: OrphanCensus): CleanupAuthorization {
+  return { boundHead: census.boundHead, steps: census.plan };
 }
 
 /** What happened to one planned step. */
@@ -504,13 +553,16 @@ export async function comparePruneEligibility(
  */
 export async function applyCleanupPlan(
   repositoryPath: string,
-  plan: readonly CleanupStep[],
+  authorization: CleanupAuthorization,
   opts: { readonly receipts?: CleanupReceipts; readonly probes?: CensusProbes; readonly now?: () => number } = {},
 ): Promise<CleanupApplication> {
   const probes = opts.probes ?? defaultProbes;
   const now = opts.now ?? Date.now;
   const startedAt = now();
   const outcomes: CleanupStepOutcome[] = [];
+  // A malformed authorization still has to produce a receipt for every step it named, so the
+  // steps are read defensively rather than trusted to exist.
+  const plan: readonly CleanupStep[] = Array.isArray(authorization?.steps) ? authorization.steps : [];
 
   const emit = async (step: CleanupStep, outcome: CleanupStepOutcome["outcome"], detail: string): Promise<void> => {
     const rec: CleanupStepOutcome = { step, outcome, detail };
@@ -522,17 +574,54 @@ export async function applyCleanupPlan(
   const pruneSteps = plan.filter((s) => s.kind === "prune_registration");
 
   /*
+    THE PRE-MUTATION BARRIER. Everything that can invalidate an approval is checked HERE, before
+    a single destructive command runs, and any one of them refuses the WHOLE application. They
+    live together deliberately: a barrier with one condition outside it is a barrier with a hole,
+    and a partially-applied refusal is worse than no cleanup at all — it destroys some of the
+    evidence needed to work out what happened.
+  */
+  let barrier: string | undefined;
+
+  // 1. IS THIS AN AUTHORIZATION AT ALL? A missing or malformed binding is the ABSENCE of an
+  //    approval. It is never read as "no HEAD requested, so do not check the HEAD".
+  if (!isBoundHeadValid(authorization?.boundHead)) {
+    barrier =
+      `the cleanup authorization carries no valid bound HEAD ` +
+      `(got ${JSON.stringify(authorization?.boundHead ?? null)}). An authorization without the ` +
+      `repository state it was approved against is not an authorization; re-take the census.`;
+  }
+
+  // 2. IS IT THE SAME REPOSITORY STATE? Resolved LIVE, immediately before any mutation — not
+  //    read from the census, which is the very thing being checked.
+  if (barrier === undefined) {
+    const liveProbe = await runGit(repositoryPath, ["rev-parse", "HEAD"], { okCodes: [128, 1] });
+    const liveHead = liveProbe.code === 0 ? liveProbe.stdout.trim() : "";
+    if (liveHead !== authorization.boundHead) {
+      barrier =
+        `the repository moved since this cleanup was authorized — ` +
+        `expected HEAD ${authorization.boundHead}, observed ${liveHead === "" ? "<unreadable>" : liveHead}. ` +
+        `Reachability was computed against the expected HEAD, so the approval no longer describes ` +
+        `this repository; re-take the census and obtain fresh approval.`;
+    }
+  }
+
+  /*
+    3. THE BROAD-PRUNE GATE. `git worktree prune` is repo-wide and has no per-path form, so before
+    it may run the eligible set is recomputed and required to match the approved one. An entry
+    that appeared since the census would otherwise be swept on an approval that never covered it.
+  */
+
+  /*
     THE BROAD-PRUNE GATE. `git worktree prune` is repo-wide and has no per-path form, so before it
     may run the eligible set is recomputed and required to EXACTLY equal the approved one. An
     entry that appeared since the census would otherwise be swept on an approval that never
     covered it. Any drift aborts the ENTIRE application — including the branch deletions, which
     are ordered after the prunes and would fail anyway with their registrations still in place.
   */
-  let pruneBarrier: string | undefined;
-  if (pruneSteps.length > 0) {
+  if (barrier === undefined && pruneSteps.length > 0) {
     const drift = await comparePruneEligibility(repositoryPath, plan);
     if (!pruneEligibilityIsSafe(drift)) {
-      pruneBarrier =
+      barrier =
         `the repository's prunable set no longer matches the approved plan — ` +
         `${drift.added.length} added, ${drift.changed.length} changed ` +
         `(${drift.missing.length} already applied). Re-take the census and obtain fresh approval.` +
@@ -540,8 +629,10 @@ export async function applyCleanupPlan(
         (drift.changed.length > 0 ? ` First changed: ${drift.changed[0]?.path ?? ""}` : "");
     }
   }
-  if (pruneBarrier !== undefined) {
-    for (const step of plan) await emit(step, "skipped_unsafe", pruneBarrier);
+  if (barrier !== undefined) {
+    // ZERO MUTATIONS HAVE HAPPENED: every check above only reads. Each named step gets its own
+    // receipt saying why nothing was done, so a refusal is auditable rather than silent.
+    for (const step of plan) await emit(step, "skipped_unsafe", barrier);
     return {
       repositoryPath,
       startedAt,

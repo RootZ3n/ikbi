@@ -24,7 +24,7 @@ import { after, test } from "node:test";
 
 import { SCRATCH_BRANCH_PREFIX } from "./contract.js";
 import type { WorkspaceRecord } from "./contract.js";
-import { applyCleanupPlan, comparePruneEligibility, pruneEligibilityIsSafe, pruneEligibilityMatches, takeOrphanCensus, type CleanupStepOutcome } from "./orphan-census.js";
+import { applyCleanupPlan, authorizeCleanup, comparePruneEligibility, pruneEligibilityIsSafe, pruneEligibilityMatches, takeOrphanCensus, type CleanupStepOutcome } from "./orphan-census.js";
 
 const dirs: string[] = [];
 after(() => { for (const d of dirs) { try { rmSync(d, { recursive: true, force: true }); } catch { /* best effort */ } } });
@@ -127,7 +127,7 @@ test("DD-02: a branch holding UNIQUE commits is reported, never deleted", async 
   assert.equal(c.plan.filter((s) => s.kind === "delete_branch" && s.target === branch).length, 0);
 
   // And it really does survive an apply.
-  await applyCleanupPlan(r, c.plan);
+  await applyCleanupPlan(r, authorizeCleanup(c));
   assert.equal(git(r, "rev-parse", branch), tip, "the ref still points at the unique commit");
 });
 
@@ -184,7 +184,7 @@ test("DD-02: applying the plan cleans the repo, and RE-applying is idempotent", 
     rmSync(path, { recursive: true, force: true });
   }
   const c = await takeOrphanCensus(r, []);
-  const first = await applyCleanupPlan(r, c.plan);
+  const first = await applyCleanupPlan(r, authorizeCleanup(c));
   assert.equal(first.failed, 0, JSON.stringify(first.outcomes, null, 1));
   for (const b of branches) {
     assert.equal(git(r, "branch", "--list", b), "", `${b} should be gone`);
@@ -194,7 +194,7 @@ test("DD-02: applying the plan cleans the repo, and RE-applying is idempotent", 
   // A fresh census over the cleaned repo proposes nothing, and re-applying the OLD plan is a no-op.
   const after2 = await takeOrphanCensus(r, []);
   assert.equal(after2.plan.length, 0, "an already-clean repo yields an empty plan");
-  const second = await applyCleanupPlan(r, c.plan);
+  const second = await applyCleanupPlan(r, authorizeCleanup(c));
   assert.equal(second.failed, 0);
   assert.ok(second.outcomes.every((o) => o.outcome === "applied"), "already-gone targets count as applied, not failed");
 });
@@ -205,7 +205,7 @@ test("DD-02: every step emits a receipt, including skips", async () => {
   rmSync(path, { recursive: true, force: true });
   const c = await takeOrphanCensus(r, []);
   const seen: CleanupStepOutcome[] = [];
-  const app = await applyCleanupPlan(r, c.plan, { receipts: { record: (o) => void seen.push(o) } });
+  const app = await applyCleanupPlan(r, authorizeCleanup(c), { receipts: { record: (o) => void seen.push(o) } });
   assert.equal(seen.length, c.plan.length, "one receipt per planned step");
   assert.equal(seen.length, app.outcomes.length);
   assert.ok(seen.every((o) => o.detail.length > 0), "a receipt always says WHY");
@@ -224,7 +224,7 @@ test("DD-02: a path RECREATED after the census is NOT pruned on the stale observ
   mkdirSync(path, { recursive: true });
   writeFileSync(join(path, "live.txt"), "work in progress\n");
 
-  const app = await applyCleanupPlan(r, c.plan.filter((s) => s.kind === "prune_registration"));
+  const app = await applyCleanupPlan(r, { boundHead: c.boundHead, steps: c.plan.filter((s) => s.kind === "prune_registration") });
   const outcome = app.outcomes[0];
   assert.equal(outcome?.outcome, "skipped_changed", JSON.stringify(app.outcomes));
   assert.match(outcome?.detail ?? "", /EXISTS now/);
@@ -242,7 +242,7 @@ test("DD-02: a branch ADVANCED after the census is NOT deleted on the stale tip"
   git(path, "add", "-A");
   git(path, "commit", "-qm", "advanced after the census");
 
-  const app = await applyCleanupPlan(r, stalePlan);
+  const app = await applyCleanupPlan(r, { boundHead: git(r, "rev-parse", "HEAD"), steps: stalePlan });
   assert.equal(app.outcomes[0]?.outcome, "skipped_changed");
   assert.match(app.outcomes[0]?.detail ?? "", /moved since the census/);
   assert.equal(git(r, "branch", "--list", branch).replace(/[+*]/g, "").trim(), branch, "the branch survives");
@@ -297,7 +297,7 @@ test("DD-02: concurrent applies of the SAME plan do not double-delete or corrupt
 
   // Two workers racing the identical plan. Every step re-verifies, and an already-gone target
   // counts as applied, so the pair must converge rather than one of them erroring out.
-  const [a, b] = await Promise.all([applyCleanupPlan(r, c.plan), applyCleanupPlan(r, c.plan)]);
+  const [a, b] = await Promise.all([applyCleanupPlan(r, authorizeCleanup(c)), applyCleanupPlan(r, authorizeCleanup(c))]);
   assert.equal(a.failed, 0, JSON.stringify(a.outcomes.filter((o) => o.outcome === "failed"), null, 1));
   assert.equal(b.failed, 0, JSON.stringify(b.outcomes.filter((o) => o.outcome === "failed"), null, 1));
   for (const br of branches) assert.equal(git(r, "branch", "--list", br), "", `${br} should be gone`);
@@ -316,7 +316,7 @@ test("DD-02: a census taken while another workspace is allocated still sees the 
   assert.equal(c.plan.some((s) => s.target === live.path || s.target === live.branch), false,
     "a concurrently-live workspace must never enter the plan");
 
-  await applyCleanupPlan(r, c.plan);
+  await applyCleanupPlan(r, authorizeCleanup(c));
   assert.ok(existsSync(live.path), "the concurrent workspace survives the cleanup");
   assert.equal(git(r, "branch", "--list", live.branch).replace(/[+*]/g, "").trim(), live.branch);
   assert.equal(git(r, "branch", "--list", dead.branch), "", "the orphan was still reaped");
@@ -340,7 +340,7 @@ test("DD-02: a NEW orphan appearing after the census ABORTS the whole applicatio
   const late = addWorkspace(r, "mmm3");
   rmSync(late.path, { recursive: true, force: true });
 
-  const app = await applyCleanupPlan(r, c.plan);
+  const app = await applyCleanupPlan(r, authorizeCleanup(c));
   assert.equal(app.applied, 0, "nothing may be applied on a drifted approval");
   assert.equal(app.skipped, c.plan.length, "every step is refused, not just the prunes");
   assert.ok(app.outcomes.every((o) => o.outcome === "skipped_unsafe"));
@@ -390,8 +390,175 @@ test("DD-02: an unchanged repository applies the plan normally (the gate is not 
     rmSync(path, { recursive: true, force: true });
   }
   const c = await takeOrphanCensus(r, []);
-  const app = await applyCleanupPlan(r, c.plan);
+  const app = await applyCleanupPlan(r, authorizeCleanup(c));
   assert.equal(app.failed, 0, JSON.stringify(app.outcomes.filter((o) => o.outcome !== "applied"), null, 1));
   assert.equal(app.skipped, 0, "no drift ⇒ nothing withheld");
   for (const b of branches) assert.equal(git(r, "branch", "--list", b), "");
+});
+
+// ── HEAD binding: an approval names the repository state it approves ─────────
+
+/** Every registration + ref, exactly as git reports them. Used to prove a refusal changed nothing. */
+function repoIdentity(r: string): { worktrees: string; refs: string } {
+  return {
+    worktrees: git(r, "worktree", "list", "--porcelain"),
+    refs: git(r, "for-each-ref", "--format=%(refname) %(objectname)"),
+  };
+}
+
+/** Make a commit on `main` so HEAD moves, without touching any workspace branch. */
+function advanceHead(r: string): string {
+  writeFileSync(join(r, `moved-${Math.random().toString(36).slice(2)}.txt`), "later work\n");
+  git(r, "add", "-A");
+  git(r, "commit", "-qm", "a commit made after the census");
+  return git(r, "rev-parse", "HEAD");
+}
+
+test("DD-04: the census BINDS the HEAD it was taken at", async () => {
+  const r = repo();
+  const c = await takeOrphanCensus(r, []);
+  assert.equal(c.boundHead, git(r, "rev-parse", "HEAD"));
+  assert.match(c.boundHead, /^[0-9a-f]{40}$/, "a full object id, not an abbreviation");
+  assert.equal(authorizeCleanup(c).boundHead, c.boundHead, "the authorization carries it through");
+  assert.deepEqual(authorizeCleanup(c).steps, c.plan);
+});
+
+test("DD-04: a MATCHING HEAD preserves existing behavior exactly", async () => {
+  const r = repo();
+  const branches: string[] = [];
+  for (const id of ["hb1", "hb2"]) {
+    const { path, branch } = addWorkspace(r, id);
+    branches.push(branch);
+    rmSync(path, { recursive: true, force: true });
+  }
+  const c = await takeOrphanCensus(r, []);
+  const app = await applyCleanupPlan(r, authorizeCleanup(c));
+  assert.equal(app.failed, 0, JSON.stringify(app.outcomes.filter((o) => o.outcome !== "applied"), null, 1));
+  assert.equal(app.skipped, 0, "an unmoved repository is not refused");
+  assert.equal(app.applied, c.plan.length);
+  for (const b of branches) assert.equal(git(r, "branch", "--list", b), "", `${b} was cleaned`);
+});
+
+test("DD-04: a CHANGED HEAD refuses every action and mutates nothing", async () => {
+  const r = repo();
+  const branches: string[] = [];
+  for (const id of ["hc1", "hc2", "hc3"]) {
+    const { path, branch } = addWorkspace(r, id);
+    branches.push(branch);
+    rmSync(path, { recursive: true, force: true });
+  }
+  const c = await takeOrphanCensus(r, []);
+  const auth = authorizeCleanup(c);
+  assert.ok(auth.steps.length >= 6, "there is real work in the plan to refuse");
+
+  // The repository moves AFTER the approval — the case the binding exists for.
+  const movedTo = advanceHead(r);
+  const before = repoIdentity(r);
+
+  const app = await applyCleanupPlan(r, auth);
+  assert.equal(app.applied, 0, "ZERO actions may be performed");
+  assert.equal(app.failed, 0);
+  assert.equal(app.skipped, auth.steps.length, "every proposed action is accounted for");
+  assert.ok(app.outcomes.every((o) => o.outcome === "skipped_unsafe"), "and each as skipped_unsafe");
+
+  const detail = app.outcomes[0]?.detail ?? "";
+  assert.ok(detail.includes(c.boundHead), `the refusal names the EXPECTED head: ${detail}`);
+  assert.ok(detail.includes(movedTo), `the refusal names the OBSERVED head: ${detail}`);
+
+  const after = repoIdentity(r);
+  assert.equal(after.worktrees, before.worktrees, "registrations are byte-identical");
+  assert.equal(after.refs, before.refs, "refs are byte-identical");
+  for (const b of branches) assert.equal(git(r, "branch", "--list", b).replace(/[+*]/g, "").trim(), b, `${b} survives`);
+});
+
+test("DD-04: a MISSING bound HEAD is rejected — never read as disabling the check", async () => {
+  const r = repo();
+  const { path } = addWorkspace(r, "hm1");
+  rmSync(path, { recursive: true, force: true });
+  const c = await takeOrphanCensus(r, []);
+  const before = repoIdentity(r);
+
+  // Every shape a caller might produce by forgetting the binding. None may be treated as
+  // "the operator did not ask for a HEAD check".
+  const bad: unknown[] = [
+    { steps: c.plan },                                   // omitted
+    { boundHead: undefined, steps: c.plan },             // explicitly undefined
+    { boundHead: "", steps: c.plan },                    // empty
+    { boundHead: null, steps: c.plan },                  // null
+    { boundHead: c.boundHead.slice(0, 12), steps: c.plan }, // abbreviated — not a binding
+    { boundHead: "not-a-sha", steps: c.plan },
+  ];
+  for (const auth of bad) {
+    const app = await applyCleanupPlan(r, auth as never);
+    assert.equal(app.applied, 0, `${JSON.stringify(auth)} must perform nothing`);
+    assert.equal(app.skipped, c.plan.length, `${JSON.stringify(auth)} must account for every step`);
+    assert.match(app.outcomes[0]?.detail ?? "", /no valid bound HEAD/, JSON.stringify(auth));
+  }
+  const after = repoIdentity(r);
+  assert.equal(after.worktrees, before.worktrees);
+  assert.equal(after.refs, before.refs);
+});
+
+test("DD-04: HEAD moving BETWEEN census and apply is caught even when the plan is still valid", async () => {
+  const r = repo();
+  const { path, branch } = addWorkspace(r, "hx1");
+  rmSync(path, { recursive: true, force: true });
+  const c = await takeOrphanCensus(r, []);
+  // Nothing about the PLAN changes here — the same registration is still prunable and the same
+  // branch still holds nothing unique. Only the repository state the approval described has moved.
+  const drift = await comparePruneEligibility(r, c.plan);
+  advanceHead(r);
+  const stillNoDrift = await comparePruneEligibility(r, c.plan);
+  assert.equal(pruneEligibilityMatches(stillNoDrift), true, "the prune gate alone would have allowed this");
+  assert.equal(pruneEligibilityMatches(drift), true);
+
+  const app = await applyCleanupPlan(r, authorizeCleanup(c));
+  assert.equal(app.applied, 0, "the HEAD binding catches what the prune gate cannot see");
+  assert.match(app.outcomes[0]?.detail ?? "", /moved since this cleanup was authorized/);
+  assert.equal(git(r, "branch", "--list", branch).replace(/[+*]/g, "").trim(), branch);
+});
+
+test("DD-04: refusal is TOTAL — no step is applied before the barrier stops the rest", async () => {
+  const r = repo();
+  const branches: string[] = [];
+  for (const id of ["hp1", "hp2", "hp3", "hp4"]) {
+    const { path, branch } = addWorkspace(r, id);
+    branches.push(branch);
+    rmSync(path, { recursive: true, force: true });
+  }
+  const c = await takeOrphanCensus(r, []);
+  const auth = authorizeCleanup(c);
+  advanceHead(r);
+  const before = repoIdentity(r);
+
+  const app = await applyCleanupPlan(r, auth);
+  // The barrier runs before ANY step, so there is no "first few applied then refused" state —
+  // which is the outcome that would leave the operator unable to tell what happened.
+  assert.equal(app.outcomes.filter((o) => o.outcome === "applied").length, 0);
+  assert.equal(app.outcomes.length, auth.steps.length);
+  assert.equal(repoIdentity(r).worktrees, before.worktrees, "not one registration was pruned");
+  assert.equal(repoIdentity(r).refs, before.refs, "not one ref was deleted");
+  for (const b of branches) assert.equal(git(r, "branch", "--list", b).replace(/[+*]/g, "").trim(), b);
+});
+
+test("DD-04: the HEAD check sits in the SAME barrier as the drift gate (both refuse, neither mutates)", async () => {
+  const r = repo();
+  const { path } = addWorkspace(r, "hd1");
+  rmSync(path, { recursive: true, force: true });
+  const c = await takeOrphanCensus(r, []);
+  const auth = authorizeCleanup(c);
+
+  // Both conditions violated at once: a new orphan AND a moved HEAD.
+  const late = addWorkspace(r, "hd2");
+  rmSync(late.path, { recursive: true, force: true });
+  advanceHead(r);
+  const before = repoIdentity(r);
+
+  const app = await applyCleanupPlan(r, auth);
+  assert.equal(app.applied, 0);
+  assert.ok(app.outcomes.every((o) => o.outcome === "skipped_unsafe"));
+  // HEAD is checked first because it is the cheapest and most fundamental question: is this even
+  // the repository the approval describes?
+  assert.match(app.outcomes[0]?.detail ?? "", /moved since this cleanup was authorized/);
+  assert.equal(repoIdentity(r).refs, before.refs, "the unreviewed orphan survives too");
 });
