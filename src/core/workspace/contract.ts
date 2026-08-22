@@ -214,6 +214,14 @@ export interface ReclaimResult {
   readonly worktreesPruned: number;
   readonly branchesDeleted: number;
   readonly recordsReconciled: number;
+  /**
+   * Namespace branches reclaim DECLINED to delete, with the reason — a branch holding commits
+   * reachable from no other ref, one whose ownership the census could not prove, or one a locked
+   * worktree holds. Before this existed, reclaim force-deleted every non-live `ikbi/ws/*` branch
+   * with `git branch -D`; two branches in the canonical checkout held the only copy of their work,
+   * and that path would have destroyed both. A withheld branch is REPORTED, never silently kept.
+   */
+  readonly branchesWithheld?: readonly { readonly branch: string; readonly reason: string }[];
 }
 
 /** A typed workspace failure. */

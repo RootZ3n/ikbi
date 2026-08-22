@@ -68,6 +68,7 @@ import {
   updateRefCas,
   worktreeForBranch,
 } from "./git.js";
+import { takeOrphanCensus, type OrphanCensus } from "./orphan-census.js";
 
 export const WorkspaceEvents = {
   allocated: defineEvent<{ workspaceId: string; targetRepo: string; baseBranch: string; path: string }>("workspace.allocated"),
@@ -537,14 +538,38 @@ export class WorkspaceManager {
       const worktrees = await listWorktrees(targetRepo);
       const worktreesPruned = Math.max(0, before - worktrees.length);
 
-      const liveBranches = new Set(worktrees.map((w) => w.branch).filter((b): b is string => b !== undefined));
       const livePaths = new Set(worktrees.map((w) => w.path));
+
+      // BRANCH DELETION IS CENSUS-GOVERNED (DD-02). This loop used to delete every namespace
+      // branch no live worktree held, with `git branch -D` — a force delete, with no check on
+      // whether the ref was the last thing holding its commits. The canonical checkout contained
+      // two such branches whose work was reachable from nowhere else. The census answers the
+      // question this code was not asking: is anything lost by dropping this ref?
+      const recordsHere: WorkspaceRecord[] = [];
+      for (const id of await this.store.list()) {
+        const rec = await this.store.get(id).catch(() => undefined);
+        if (rec !== undefined && rec.targetRepo === targetRepo) recordsHere.push(rec);
+      }
+      const census = await takeOrphanCensus(targetRepo, recordsHere);
+      const deletable = new Set(census.branches.filter((b) => b.action === "delete_branch").map((b) => b.branch));
+      const branchesWithheld: { branch: string; reason: string }[] = [];
 
       let branchesDeleted = 0;
       for (const b of await listBranches(targetRepo, SCRATCH_BRANCH_PREFIX)) {
-        if (!liveBranches.has(b)) {
+        if (deletable.has(b)) {
           await deleteBranch(targetRepo, b);
           branchesDeleted += 1;
+          continue;
+        }
+        const entry = census.branches.find((x) => x.branch === b);
+        // A branch a LIVE worktree holds is the ordinary healthy case and not worth reporting;
+        // anything else was actively declined and the operator needs to know why.
+        if (entry !== undefined && entry.action !== "keep") {
+          branchesWithheld.push({ branch: b, reason: entry.reasons.join("; ") });
+          this.log.warn(
+            { event: "workspace_branch_withheld", targetRepo, branch: b, uniqueCommits: entry.uniqueCommits, ownership: entry.ownership },
+            "declined to delete a workspace branch during reclaim",
+          );
         }
       }
 
@@ -571,7 +596,12 @@ export class WorkspaceManager {
         }
       }
 
-      const result: ReclaimResult = { worktreesPruned, branchesDeleted, recordsReconciled };
+      const result: ReclaimResult = {
+        worktreesPruned,
+        branchesDeleted,
+        recordsReconciled,
+        ...(branchesWithheld.length > 0 ? { branchesWithheld } : {}),
+      };
       this.events?.publish(WorkspaceEvents.reclaimed.create({ targetRepo, branchesDeleted, recordsReconciled }, { source: "workspace" }));
       this.log.info({ event: "workspace_reclaimed", targetRepo, ...result }, "reclaimed abandoned workspaces");
       return result;
@@ -687,7 +717,30 @@ export class WorkspaceManager {
    * `ikbi clean` passes `force:false`; `ikbi clean --force` opts into removing them. The core
    * default is also `force:false` so direct/programmatic callers are safe by default.
    */
-  async cleanOrphans(opts: { force?: boolean; olderThanMs?: number } = {}): Promise<{ removed: number; checked: number; skipped: number; reclaimed: number; skippedIds: string[] }> {
+  /**
+   * THE GIT-SIDE ORPHAN CENSUS for one repository (DD-02). READ-ONLY.
+   *
+   * `cleanOrphans` discovers repositories by walking the workspace RECORD store, which cannot see
+   * the orphans that actually accumulate: a run whose STATE ROOT was deleted leaves a git worktree
+   * registration and a scratch branch with no record behind them, so no repo is ever visited and
+   * nothing ikbi runs can find them again. This asks GIT what the repository holds, so the answer
+   * survives the loss of ikbi's own bookkeeping.
+   *
+   * Taken under the repo's reclaim lock so a concurrent `reclaim`/`clean` cannot mutate the
+   * registrations and refs midway through the observation.
+   */
+  async censusOrphans(targetRepo: string): Promise<OrphanCensus> {
+    await this.preload();
+    const records: WorkspaceRecord[] = [];
+    for (const id of await this.store.list()) {
+      const rec = await this.store.get(id).catch(() => undefined);
+      if (rec !== undefined && rec.targetRepo === targetRepo) records.push(rec);
+    }
+    const reclaimKey = `workspace:reclaim:${targetRepo}`;
+    return this.locks.withLock(reclaimKey, async () => takeOrphanCensus(targetRepo, records), { file: this.lockFile(reclaimKey) });
+  }
+
+  async cleanOrphans(opts: { force?: boolean; olderThanMs?: number; repos?: readonly string[] } = {}): Promise<{ removed: number; checked: number; skipped: number; reclaimed: number; skippedIds: string[] }> {
     await this.preload();
     const force = opts.force ?? false;
     // Gap M16 — age-bounded sweep. When `olderThanMs` is set, only TERMINAL records last touched
@@ -698,7 +751,10 @@ export class WorkspaceManager {
     // Wire reclaim (previously zero production callers): reconcile crash-leaked active records +
     // prune orphan worktrees/branches per distinct repo, BEFORE sweeping terminal dirs.
     let reclaimed = 0;
-    const repos = new Set<string>();
+    // EXPLICIT REPOS FIRST (DD-02). A repository whose records were lost with its state root has
+    // nothing in the store to name it, so record-derived discovery alone can never reach its
+    // stale registrations. The caller (`ikbi clean`) supplies the repo it is standing in.
+    const repos = new Set<string>(opts.repos ?? []);
     for (const id of await this.store.list()) {
       const rec = await this.store.get(id).catch(() => undefined);
       if (rec !== undefined) repos.add(rec.targetRepo);

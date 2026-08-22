@@ -116,28 +116,76 @@ export async function pruneWorktrees(repo: string): Promise<void> {
 export interface WorktreeEntry {
   readonly path: string;
   readonly branch?: string;
+  /**
+   * The commit the registration reports as this worktree's HEAD. Present for a normal
+   * registration; absent for a bare repo entry.
+   */
+  readonly head?: string;
+  /**
+   * Set when git reports the worktree LOCKED, to the lock reason (empty string when the
+   * operator gave none). A locked worktree is one somebody deliberately protected — a removable
+   * medium, a long-running investigation — and automatic cleanup must never touch it.
+   */
+  readonly locked?: string;
+  /**
+   * Set when git itself judges the ADMINISTRATIVE ENTRY prunable, to git's own stated reason
+   * (typically "gitdir file points to non-existent location"). This is git's verdict, not ours:
+   * it means the registration can be dropped, and says nothing about the BRANCH, which is a
+   * separate ref that survives pruning and may still hold unique commits.
+   */
+  readonly prunable?: string;
 }
 
-/** List the repo's worktrees (porcelain). */
+/**
+ * List the repo's worktrees (porcelain).
+ *
+ * `locked` and `prunable` are parsed because cleanup has to distinguish three states a bare
+ * path/branch pair cannot express: a live worktree, an administrative entry whose directory is
+ * gone (git says `prunable`), and one an operator deliberately locked. Without them the only
+ * available signal is "does the directory exist", which cannot tell a deliberately-locked
+ * worktree on unmounted media apart from an abandoned one.
+ */
 export async function listWorktrees(repo: string): Promise<WorktreeEntry[]> {
   const r = await runGit(repo, ["worktree", "list", "--porcelain"]);
   const entries: WorktreeEntry[] = [];
   let path: string | undefined;
   let branch: string | undefined;
+  let head: string | undefined;
+  let locked: string | undefined;
+  let prunable: string | undefined;
+  const flush = (): void => {
+    if (path === undefined) return;
+    entries.push({
+      path,
+      ...(branch !== undefined ? { branch } : {}),
+      ...(head !== undefined ? { head } : {}),
+      ...(locked !== undefined ? { locked } : {}),
+      ...(prunable !== undefined ? { prunable } : {}),
+    });
+    path = undefined;
+    branch = undefined;
+    head = undefined;
+    locked = undefined;
+    prunable = undefined;
+  };
   for (const line of r.stdout.split("\n")) {
     if (line.startsWith("worktree ")) {
-      if (path !== undefined) entries.push({ path, ...(branch ? { branch } : {}) });
+      flush();
       path = line.slice("worktree ".length).trim();
-      branch = undefined;
     } else if (line.startsWith("branch ")) {
       branch = line.slice("branch ".length).trim().replace(/^refs\/heads\//, "");
-    } else if (line.trim() === "" && path !== undefined) {
-      entries.push({ path, ...(branch ? { branch } : {}) });
-      path = undefined;
-      branch = undefined;
+    } else if (line.startsWith("HEAD ")) {
+      head = line.slice("HEAD ".length).trim();
+    } else if (line === "locked" || line.startsWith("locked ")) {
+      // `locked` alone means locked with no reason given; `locked <reason>` carries one.
+      locked = line.length > "locked".length ? line.slice("locked ".length).trim() : "";
+    } else if (line === "prunable" || line.startsWith("prunable ")) {
+      prunable = line.length > "prunable".length ? line.slice("prunable ".length).trim() : "";
+    } else if (line.trim() === "") {
+      flush();
     }
   }
-  if (path !== undefined) entries.push({ path, ...(branch ? { branch } : {}) });
+  flush();
   return entries;
 }
 
