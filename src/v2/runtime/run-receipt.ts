@@ -110,9 +110,15 @@ export async function recordBuildSessionReceipts(
       attempts: session.receipt.totalAttempts,
       ...(receipt.candidate?.candidateId !== undefined ? { candidateId: receipt.candidate.candidateId } : {}),
       ...(receipt.candidate?.workspaceId !== undefined ? { workspaceId: receipt.candidate.workspaceId } : {}),
+      // THE VERDICT IS NOT AN IDENTITY. Two different verifications both say "pass"; only the
+      // verificationId says WHICH deterministic run authorized this publication. A receipt that
+      // records the verdict alone cannot be tied back to the evidence that produced it, which is
+      // most of what a receipt is for.
       ...(receipt.verification?.verdict !== undefined
         ? { verification: receipt.verification.verdict, verificationResult: receipt.verification.verdict }
         : {}),
+      ...(receipt.verification?.verificationId !== undefined ? { verificationId: receipt.verification.verificationId } : {}),
+      ...(receipt.candidate?.treeId !== undefined ? { candidateTreeId: receipt.candidate.treeId } : {}),
       promotion: landed ? "promoted" : "not_attempted",
       promoted: landed,
       repository: repositoryPath,
@@ -150,6 +156,14 @@ export async function recordBuildSessionReceipts(
       promotionId: promotion.promotionId,
       candidateId: promotion.candidateId,
       publishedTree: promotion.publishedTree,
+      candidateTreeId: promotion.candidateTreeId,
+      // Bound here too: `undo` reads THIS receipt, and an operator asking "what authorized the
+      // commit I am about to revert" must not have to correlate two records to find out.
+      ...(attempt.receipt.verification?.verificationId !== undefined ? { verificationId: attempt.receipt.verification.verificationId } : {}),
+      ...(attempt.receipt.verification?.verdict !== undefined ? { verificationVerdict: attempt.receipt.verification.verdict } : {}),
+      baseCommit: promotion.beforeRef,
+      promotedCommit: promotion.afterRef,
+      repository: repositoryPath,
       targetBranch: branch,
       strategy: promotion.strategy,
       worktreeSynced: promotion.worktreeSynced,
