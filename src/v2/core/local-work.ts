@@ -33,6 +33,22 @@ export const LOCAL_MODES = ["off", "assist", "auto", "exact"] as const;
 export type LocalMode = (typeof LOCAL_MODES)[number];
 
 /**
+ * Is this a mode ikbi actually knows?
+ *
+ * A `LocalMode` is a compile-time promise, and nothing about a CLI flag, an environment variable,
+ * a config file or an HTTP body is checked at compile time. The first version of this module took
+ * the promise at face value and compared `mode === "off"`, which meant an operator who typed
+ * `--mode OFF` — the string that most plainly means DO NOT CALL BOKAHLI — got an offload, because
+ * the uppercase value matched neither "off" nor "auto" and fell through every branch to the
+ * eligible path. Failing open on a value nobody recognises is the exact inverse of what this
+ * module is for, so the check lives here, in the authority, rather than in whichever caller
+ * happened to remember it.
+ */
+export function isLocalMode(value: unknown): value is LocalMode {
+  return typeof value === "string" && (LOCAL_MODES as readonly string[]).includes(value);
+}
+
+/**
  * Task classes a local worker may be asked to do.
  *
  * Every one shares two properties: the input is a BOUNDED packet rather than a repository, and
@@ -86,7 +102,12 @@ export interface LocalOperationalState {
 }
 
 export interface LocalOffloadInput {
-  readonly mode: LocalMode;
+  /**
+   * The operator's mode, AS RECEIVED. Deliberately typed loosely: this function validates it, and
+   * a parameter that could only ever hold a valid mode would make the validation unreachable and
+   * the guarantee untestable.
+   */
+  readonly mode: LocalMode | string;
   /** The task class ikbi assigned. An unrecognized value is ineligible, never "probably fine". */
   readonly taskClass: string;
   /** Whether a deterministic validator exists for THIS task's output. */
@@ -102,6 +123,7 @@ export interface LocalOffloadInput {
 
 /** Why a decision went the way it did. Stable strings — they are recorded and compared. */
 export type LocalOffloadReason =
+  | "mode_unrecognized"
   | "mode_off"
   | "not_configured"
   | "unreachable"
@@ -115,7 +137,8 @@ export type LocalOffloadReason =
 
 export interface LocalOffloadDecision {
   readonly offload: boolean;
-  readonly mode: LocalMode;
+  /** Echoed verbatim, valid or not, so a receipt records what the operator actually supplied. */
+  readonly mode: LocalMode | string;
   readonly taskClass: string;
   readonly reason: LocalOffloadReason;
   /** Human-readable, derived from `reason`. Never the only record of why. */
@@ -133,6 +156,7 @@ export interface LocalOffloadDecision {
 }
 
 const EXPLANATION: Readonly<Record<LocalOffloadReason, string>> = Object.freeze({
+  mode_unrecognized: "the local mode is not one ikbi recognises — refusing rather than guessing which was meant",
   mode_off: "local mode is OFF — no request is made to Bokahli",
   not_configured: "no Bokahli endpoint is configured; ikbi proceeds exactly as if it did not exist",
   unreachable: "the local deployment was probed and is not reachable",
@@ -159,8 +183,15 @@ export function decideLocalOffload(input: LocalOffloadInput): LocalOffloadDecisi
   const no = (reason: LocalOffloadReason): LocalOffloadDecision =>
     Object.freeze({ ...base, offload: false, reason, explanation: EXPLANATION[reason], fallbackPermitted: false });
 
-  // OFF is absolute and is checked before anything else, including whether Bokahli exists. It is
-  // the compatibility-safe default, and an operator who set it is owed zero local requests.
+  // AN UNREADABLE MODE IS CHECKED FIRST, before OFF and before eligibility. A value nobody
+  // recognises cannot be interpreted charitably in either direction: "OFF" is probably a typo for
+  // off, and "Auto" is probably a typo for auto, and acting on either guess would be ikbi deciding
+  // an authorization question on the operator's behalf. It refuses, and says so.
+  if (!isLocalMode(input.mode)) return no("mode_unrecognized");
+
+  // OFF is absolute and is checked before anything else remaining, including whether Bokahli
+  // exists. It is the compatibility-safe default, and an operator who set it is owed zero local
+  // requests.
   if (input.mode === "off") return no("mode_off");
 
   // STRUCTURAL ELIGIBILITY — properties of the TASK, independent of the deployment's health.
