@@ -299,6 +299,37 @@ AND after the ref move); it is IDEMPOTENT (a target already holding the candidat
 + what LANDED (candidate tree, disposition, target branch, published tree — the commit sha is
 provenance); and ONLY an actually-landed publication turns `withheld` into `accepted{promotionId}`.
 
+## Operator receipt-log systems *(post-cutover repair)*
+
+Promotion by direct clean-ref CAS was the right call for the REF and it quietly took the
+operator's tools with it. `ikbi undo` and `ikbi inspect` read exactly one durable source — the
+receipt log — and the only thing that ever wrote a `workspace.promote` entry was
+`WorkspaceManager.promote`, which v2 deliberately does not use. So a canonical `ikbi build` could
+land a commit on `main` while `ikbi inspect <run-id>` answered `INSPECT_NOT_FOUND` and
+`ikbi undo --latest` answered "no revertible promotion found in the receipt log". Measured, not
+theorised: a clean fixture build published, and neither command could see it.
+
+A build that cannot be undone is not a daily driver, so the engine records what it did.
+
+| v1 system | Production reachability | Verdict |
+| --- | --- | --- |
+| `receipts` store singleton (`core/receipt/index.js`) | **YES** — the one durable operator log | **ADOPT (dynamic).** `runtime/run-receipt.ts` resolves it lazily, for the same reason `productionTransport` resolves the provider registry that way: constructing it reads operator configuration, and no command should pay for a store it may never write to. |
+| `ReceiptInput` / `ReceiptChange` (`core/receipt/contract.js`) | **YES** | **ADOPT as VOCABULARY.** The `workspace.promote` shape is not a v2 preference — `src/cli/undo.ts` parses `changes[]` for a `state` change with `before.ref`, `after.ref` and a `<repo>#<branch>` target. A receipt in any other shape is one that command cannot use. |
+| `AgentIdentity` (`core/identity/contract.js`) | **YES** | **ADOPT.** Receipts are attributed, never anonymous. Both entries are attributed to the ENGINE (`ikbi-v2`) rather than to whichever model wrote the candidate — publication is a governed decision the model never made. |
+| `WorkspaceManager.promote`'s own receipt emission | **YES** | **REPLACE (unchanged from V2-011).** v2 still does not call it: it auto-merges and demands an approval the promotion authority does not use. v2 writes the receipt itself, AFTER the run, from the returned session record. |
+
+**Where it runs, and why not in the publication adapter:** the recorder is invoked from the one
+production build call site once the session is complete. The publication journal seam is
+synchronous, so a receipt appended there would have to be fire-and-forget and would race the
+process exit that follows it. Nothing in the recorder can influence what was published; it only
+writes down what already happened.
+
+**Honest about durability:** the git ref remains the authoritative landing proof. A receipt that
+could not be written is REPORTED — to the caller and to the operator on stderr — and never allowed
+to turn a publication that already landed into a failure. Only a ref that actually MOVED is
+recorded as revertible: a withheld, conflicted, or idempotent-no-op run writes no promote entry,
+because offering an undo for a change that never happened is worse than offering none.
+
 ## Recovery systems *(V2-012)*
 
 v1 has retry logic in at least four places — a model-cascade escalation core

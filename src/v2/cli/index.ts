@@ -30,6 +30,7 @@ import type { SourceSnapshotAuthority } from "../core/source.js";
 import { CANDIDATE_STRATEGIES } from "../core/contract.js";
 import { exitCodeForOutcome, formatOutcome, type V2RunResult } from "../core/result.js";
 import { runV2BuildSessionProduction, type ProductionRunDeps } from "../runtime/index.js";
+import { recordBuildSessionReceipts, type RunReceiptSink } from "../runtime/run-receipt.js";
 import type { V2BuildSessionResult } from "../core/session.js";
 import { formatMicroUsd } from "../core/cost.js";
 
@@ -528,6 +529,10 @@ export interface BuildCliIo {
   readonly treeProbe?: ProductionRunDeps["treeProbe"];
   readonly candidateDiff?: ProductionRunDeps["candidateDiff"];
   readonly recoveryPolicy?: ProductionRunDeps["recoveryPolicy"];
+  /** The receipt store the run is recorded in. Production passes none (the live core store). */
+  readonly receipts?: RunReceiptSink;
+  /** The recorder itself, so a suite can assert what a run WOULD write without a real store. */
+  readonly recordReceipts?: typeof recordBuildSessionReceipts;
 }
 
 /** The parsed, subcommand-free build request that BOTH `ikbi build` and `ikbi v2 build` converge on. */
@@ -572,6 +577,23 @@ async function executeProductionBuild(req: BuildRequest, banner: string, io: Bui
       ...(io.recoveryPolicy !== undefined ? { recoveryPolicy: io.recoveryPolicy } : {}),
     },
   );
+  // RECORD THE RUN IN THE OPERATOR RECEIPT LOG, before anything is printed.
+  //
+  // v2 publishes by direct clean-ref CAS rather than through `WorkspaceManager.promote`, so nothing
+  // on the publication path writes the log that `ikbi undo` and `ikbi inspect` read. Without this a
+  // build could land a commit on `main` that `ikbi undo --latest` then reported it could not find.
+  // Best-effort by contract: the git ref is the authoritative landing proof, and a receipt that
+  // could not be written is REPORTED rather than allowed to fail a publication that already
+  // happened.
+  const recorded = await (io.recordReceipts ?? recordBuildSessionReceipts)(session, req.repo, io.receipts);
+  if (recorded.runSummary === "failed" || recorded.promotion === "failed") {
+    err(
+      "ikbi build: WARNING — the run completed but its receipt could not be written " +
+        `(run.summary=${recorded.runSummary}, promotion=${recorded.promotion}). ` +
+        "`ikbi undo` and `ikbi inspect` will not find this run.\n",
+    );
+  }
+
   // `--json` exposes the full session (every attempt + recovery decision). The human render
   // shows the recovery trail (when there was one) then the final attempt in full.
   out(req.json ? `${JSON.stringify(session, null, 2)}\n` : renderSession(session));

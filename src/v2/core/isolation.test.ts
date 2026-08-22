@@ -65,6 +65,12 @@ const V2_RUNTIME_ALLOWED_V1_IMPORTS = new Set([
   "pino", //                                       the logger the donor manager requires (tests only)
   "../../modules/profiles/contract.js", //         Profile shape + the role vocabulary
   "../../modules/profiles/storage.js", //          READ-ONLY profile loading + the active pointer
+  "../../core/receipt/contract.js", //             ReceiptInput shape — the OPERATOR receipt log's vocabulary
+  "../../core/receipt/index.js", //                the receipt store singleton (dynamic), so a v2 build is
+  //                                               findable by `ikbi inspect` and reversible by `ikbi undo`.
+  //                                               v2 publishes by direct CAS rather than through
+  //                                               WorkspaceManager.promote, so nothing else writes that log.
+  "../../core/identity/contract.js", //            AgentIdentity — receipts are ATTRIBUTED, never anonymous
 ]);
 
 /**
