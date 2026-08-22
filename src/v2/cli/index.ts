@@ -33,6 +33,9 @@ import { runV2BuildSessionProduction, type ProductionRunDeps } from "../runtime/
 import { recordBuildSessionReceipts, type RunReceiptSink } from "../runtime/run-receipt.js";
 import type { V2BuildSessionResult } from "../core/session.js";
 import { formatMicroUsd } from "../core/cost.js";
+// SIDE-EFFECT REGISTRATION: `ikbi local` registers itself from its own file, per the CLI
+// convention. Imported here because this module is the one the v1 dispatcher already loads.
+import "./local.js";
 
 export const V2_USAGE = `Usage: ikbi v2 build "<goal>" [--repo <path>] [--strategy ${CANDIDATE_STRATEGIES.join("|")}] [--profile <name>] [--json]`;
 export const BUILD_USAGE = `Usage: ikbi build "<goal>" [--repo <path>] [--strategy ${CANDIDATE_STRATEGIES.join("|")}] [--profile <name>] [--json]`;

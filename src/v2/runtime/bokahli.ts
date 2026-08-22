@@ -54,6 +54,16 @@ export const BOKAHLI_DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1";
 export const BOKAHLI_MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 
 /**
+ * The wire value that means "you choose".
+ *
+ * Sending anything else — including a friendly-looking placeholder like "local" — is a PIN, and
+ * the deployment correctly refuses to substitute for a pin it cannot honor
+ * (`EXACT_IDENTITY_UNKNOWN`). Choosing the artifact is Bokahli's half of the responsibility
+ * boundary; this constant is how ikbi declines to do it for them.
+ */
+export const BOKAHLI_AUTO_MODEL = "auto";
+
+/**
  * The typed outcomes Bokahli reports. Anything else is unknown, and unknown fails closed —
  * a new outcome the deployment starts returning must be handled deliberately, never guessed at.
  */
@@ -84,6 +94,17 @@ export type BokahliEscalateReason = (typeof BOKAHLI_ESCALATE_REASONS)[number];
 export const BOKAHLI_CAPACITY_REASONS = ["QUEUE_FULL", "CONCURRENCY_LIMIT", "RUNTIME_UNHEALTHY"] as const;
 
 /**
+ * Reasons that are about IDENTITY rather than capability or capacity.
+ *
+ * `EXACT_IDENTITY_UNKNOWN` is what the deployment answers when a request PINS a model it cannot
+ * serve under that name — "request pinned model X but routing selected Y. Refusing to substitute."
+ * That is the deployment being exactly right, and ikbi was calling it a protocol violation purely
+ * because this hand-maintained list had never seen it. Found by dogfooding, not by the fixtures,
+ * which is the reason the list is checked against a live deployment at all.
+ */
+export const BOKAHLI_IDENTITY_REASONS = ["EXACT_IDENTITY_UNKNOWN"] as const;
+
+/**
  * Which outcomes each reason may legally accompany.
  *
  * A reason arriving under the wrong outcome is a PROTOCOL disagreement, not a routing decision,
@@ -102,6 +123,10 @@ const REASON_OUTCOMES: Readonly<Record<string, readonly BokahliOutcome[]>> = {
   RUNTIME_UNHEALTHY: ["ESCALATE", "CAPACITY_UNAVAILABLE"],
   QUEUE_FULL: ["CAPACITY_UNAVAILABLE"],
   CONCURRENCY_LIMIT: ["CAPACITY_UNAVAILABLE"],
+  // A pinned identity the deployment will not substitute for. Observed under REFUSED; ESCALATE is
+  // admitted alongside it because every other "cannot route this" reason may carry either, and a
+  // reason list that is too strict turns a correct refusal into a protocol fault.
+  EXACT_IDENTITY_UNKNOWN: ["ESCALATE", "REFUSED"],
 };
 
 /**
