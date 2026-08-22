@@ -95,6 +95,12 @@ export async function recordBuildSessionReceipts(
    * them separable by construction rather than by convention.
    */
   advisories: readonly LocalAdvisoryEvidence[] = [],
+  /**
+   * What the composed provider prompt was bound to: the canonical goal digest, the advisory packet
+   * and result digests, and the hook/validator versions. Recorded so the prompt an unqualified
+   * worker helped shape can be re-derived instead of believed.
+   */
+  promptBinding?: object,
 ): Promise<RunReceiptOutcome> {
   const attempt = session.attempts[session.attempts.length - 1];
   if (attempt === undefined) return { runSummary: "failed", promotion: "not_applicable", advisories: "not_applicable" };
@@ -151,7 +157,7 @@ export async function recordBuildSessionReceipts(
     },
   });
 
-  const advisoryStatus = await writeAdvisories(sink, identity, attempt, repositoryPath, session.buildSessionId, advisories);
+  const advisoryStatus = await writeAdvisories(sink, identity, attempt, repositoryPath, session.buildSessionId, advisories, promptBinding);
 
   if (!landed) return { runSummary, promotion: "not_applicable", advisories: advisoryStatus };
 
@@ -238,6 +244,7 @@ async function writeAdvisories(
   repositoryPath: string,
   buildSessionId: string,
   advisories: readonly LocalAdvisoryEvidence[],
+  promptBinding?: object,
 ): Promise<"written" | "failed" | "not_applicable"> {
   if (advisories.length === 0) return "not_applicable";
   return write(sink, identity, {
@@ -261,6 +268,7 @@ async function writeAdvisories(
       advisoryCount: advisories.length,
       acceptedCount: advisories.filter((a) => a.disposition === "accepted").length,
       suppliedToPrimaryCount: advisories.filter((a) => a.suppliedToPrimaryProvider).length,
+      ...(promptBinding !== undefined ? { promptBinding } : {}),
       advisories,
     },
   });
