@@ -6,6 +6,7 @@
  * document the command reads.
  */
 
+import { HERMETIC_DEV_KEY_ENV } from "../test-support/hermetic-env.js";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
@@ -28,7 +29,11 @@ function registryLockPath(home: string): string {
 function runDiff(home: string): { status: number | null; combined: string } {
   const res = spawnSync(process.execPath, [ENTRY, "diff", WS_ID], {
     cwd: mkdtempSync(join(tmpdir(), "ikbi-lockres-")),
-    env: { PATH: process.env.PATH ?? "", HOME: home },
+    env: { PATH: process.env.PATH ?? "",
+    // Hermetic trust material, injected explicitly: a sanitized child inherits no shell,
+    // and must not depend on the operator's untracked `.env` to start.
+    ...HERMETIC_DEV_KEY_ENV,
+    HOME: home },
     encoding: "utf8",
   });
   return { status: res.status, combined: `${res.stdout}\n${res.stderr}` };
@@ -72,7 +77,11 @@ test("read-only `receipts`: runs cleanly under an isolated state root (no depend
   const home = mkdtempSync(join(tmpdir(), "ikbi-rec-home-"));
   const res = spawnSync(process.execPath, [ENTRY, "receipts"], {
     cwd: mkdtempSync(join(tmpdir(), "ikbi-lockres-")),
-    env: { PATH: process.env.PATH ?? "", HOME: home },
+    env: { PATH: process.env.PATH ?? "",
+    // Hermetic trust material, injected explicitly: a sanitized child inherits no shell,
+    // and must not depend on the operator's untracked `.env` to start.
+    ...HERMETIC_DEV_KEY_ENV,
+    HOME: home },
     encoding: "utf8",
   });
   const combined = `${res.stdout}\n${res.stderr}`;

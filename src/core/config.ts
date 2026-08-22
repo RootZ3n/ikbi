@@ -539,6 +539,32 @@ function loadConfig(env: NodeJS.ProcessEnv = process.env): IkbiConfig {
     );
   }
 
+  /*
+    PRODUCTION REFUSES TEST TRUST MATERIAL.
+
+    The hermetic suites provision real, non-default trust keys so the refusal above is satisfied
+    honestly rather than waived. That closes one hole and would open another: material good enough
+    to start a test process is material good enough to start a production one, and the only thing
+    stopping somebody from copying it into a deployment would be their memory of where it came
+    from. So it carries a recognizable prefix and is refused here unless the hermetic marker is
+    present.
+
+    The marker grants nothing by itself. Without prefixed keys it changes no behavior; with them it
+    only declines to refuse. And the keys it permits are minted randomly per test process, so there
+    is no fixed secret in the repository for this to bless.
+  */
+  const TEST_KEY_PREFIX = "ikbi-test-only-";
+  const hermeticTest = parseBool(env.IKBI_HERMETIC_TEST, false);
+  const testShaped = [env.IKBI_TRUST_HMAC_KEY, env.IKBI_IDENTITY_TOKEN_SALT]
+    .filter((v): v is string => typeof v === "string" && v.startsWith(TEST_KEY_PREFIX));
+  if (testShaped.length > 0 && !hermeticTest) {
+    throw new Error(
+      `Refusing to start with TEST-ONLY trust material (${testShaped.length} key(s) prefixed ` +
+        `"${TEST_KEY_PREFIX}"). This material is generated per test run and is not a production ` +
+        `trust grant. Set real IKBI_TRUST_HMAC_KEY / IKBI_IDENTITY_TOKEN_SALT values.`,
+    );
+  }
+
   const stateRootRaw = env.IKBI_STATE_ROOT?.trim();
   const stateRoot =
     stateRootRaw && stateRootRaw.length > 0

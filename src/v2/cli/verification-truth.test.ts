@@ -14,6 +14,7 @@
  * Capability: subprocess (registered in scripts/test-runner.sh).
  */
 
+import { HERMETIC_DEV_KEY_ENV } from "../test-env.js";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -97,6 +98,9 @@ function build(root: string, server: FakeProviderServer, repo: string, ikbiCheck
     cwd: mkdtempSync(join(tmpdir(), "ikbi-v2-vcwd-")),
     env: {
       PATH: process.env.PATH ?? "",
+      // Hermetic trust material, injected explicitly: a sanitized child inherits no shell,
+      // and must not depend on the operator's untracked `.env` to start.
+      ...HERMETIC_DEV_KEY_ENV,
       HOME: mkdtempSync(join(tmpdir(), "ikbi-v2-vhome-")),
       IKBI_STATE_ROOT: root,
       IKBI_MODEL_DRIVER: "m1",
@@ -294,7 +298,11 @@ test("verification truth: the human rendering states the verdict and refuses to 
   const res = spawnSync(process.execPath, [ENTRY, "v2", "build", "set widget to 2 in src/widget.ts", "--repo", repo], {
     cwd: mkdtempSync(join(tmpdir(), "ikbi-v2-vcwd-")),
     env: {
-      PATH: process.env.PATH ?? "", HOME: mkdtempSync(join(tmpdir(), "ikbi-v2-vhome-")),
+      PATH: process.env.PATH ?? "",
+      // Hermetic trust material, injected explicitly: a sanitized child inherits no shell,
+      // and must not depend on the operator's untracked `.env` to start.
+      ...HERMETIC_DEV_KEY_ENV,
+      HOME: mkdtempSync(join(tmpdir(), "ikbi-v2-vhome-")),
       IKBI_STATE_ROOT: root, IKBI_MODEL_DRIVER: "m1", IKBI_MODEL_BUILDER: "m1", IKBI_MODEL_CRITIC: "m1",
       IKBI_RECOVERY_MAX_ATTEMPTS: "1",
       IKBI_CHECKS: GREP_WIDGET_2, ...loopbackEgressEnv(server),

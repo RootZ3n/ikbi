@@ -19,6 +19,7 @@
  * Capability: subprocess (registered in scripts/test-runner.sh).
  */
 
+import { HERMETIC_DEV_KEY_ENV } from "../test-env.js";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -87,6 +88,9 @@ function runCli(stateRoot: string, args: readonly string[]): { status: number | 
     cwd: mkdtempSync(join(tmpdir(), "ikbi-v2-ctxcwd-")),
     env: {
       PATH: process.env.PATH ?? "",
+      // Hermetic trust material, injected explicitly: a sanitized child inherits no shell,
+      // and must not depend on the operator's untracked `.env` to start.
+      ...HERMETIC_DEV_KEY_ENV,
       HOME: mkdtempSync(join(tmpdir(), "ikbi-v2-ctxhome-")),
       IKBI_STATE_ROOT: stateRoot,
       // Pin the operator layer at the fixture model so the budget is this suite's, not

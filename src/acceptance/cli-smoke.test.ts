@@ -3,6 +3,7 @@
  * environment (no IKBI_* keys, a cwd with no .env) without crashing or leaking a stack trace.
  */
 
+import { HERMETIC_DEV_KEY_ENV } from "../test-support/hermetic-env.js";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync } from "node:fs";
@@ -24,7 +25,11 @@ function runCli(args: string[], extraEnv: Record<string, string> = {}, input?: s
   const home = mkdtempSync(join(tmpdir(), "ikbi-smoke-home-"));
   const res = spawnSync(process.execPath, [ENTRY, ...args], {
     cwd: freshCwd(),
-    env: { PATH: process.env.PATH ?? "", HOME: home, ...extraEnv },
+    env: { PATH: process.env.PATH ?? "",
+    // Hermetic trust material, injected explicitly: a sanitized child inherits no shell,
+    // and must not depend on the operator's untracked `.env` to start.
+    ...HERMETIC_DEV_KEY_ENV,
+    HOME: home, ...extraEnv },
     encoding: "utf8",
     ...(input !== undefined ? { input } : {}),
   });

@@ -27,14 +27,11 @@
  *     import { commands } from "../../cli/registry.js";
  */
 
+// THE SINGLE OWNER moved to `src/test-support/`, because `src/acceptance/` and `src/cli/` need it
+// too and v1 must not import v2 to reach a helper. Re-exported here so every v2 suite's import,
+// and the guards that pin it, keep working unchanged.
+import { HERMETIC_DEV_KEY_ENV, HERMETIC_TEST_KEY_PREFIX } from "../test-support/hermetic-env.js";
+
 process.env.IKBI_ALLOW_INSECURE_DEV_KEYS ??= "true";
 
-/**
- * The dev-key opt-in for a SANITIZED CHILD environment, for suites that spawn the real built CLI.
- *
- * Those children get a deliberately minimal env (no inherited developer shell), so the opt-in must
- * be injected explicitly there too — the same single owner, so the two paths cannot drift.
- */
-export const HERMETIC_DEV_KEY_ENV: Readonly<Record<string, string>> = Object.freeze({
-  IKBI_ALLOW_INSECURE_DEV_KEYS: "true",
-});
+export { HERMETIC_DEV_KEY_ENV, HERMETIC_TEST_KEY_PREFIX };

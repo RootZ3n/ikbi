@@ -12,6 +12,7 @@
  * Single strategy on purpose: one candidate, one exam, one adjudication — the cheapest configuration
  * that still exercises the whole canonical lifecycle through to publication.
  */
+import { HERMETIC_DEV_KEY_ENV } from "../test-env.js";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync } from "node:fs";
@@ -50,10 +51,18 @@ test("QUALIFY: the shipped `ikbi build` binary builds a DISPOSABLE EXTERNAL repo
     const res = spawnSync(process.execPath, [ENTRY, "build", "make greet return hola", "--repo", repo, "--strategy", "single", "--json"], {
       cwd: mkdtempSync(join(tmpdir(), "ikbi-qualify-cwd-")),
       env: {
-        PATH: process.env.PATH ?? "", HOME: mkdtempSync(join(tmpdir(), "ikbi-qualify-home-")),
+        PATH: process.env.PATH ?? "",
+        // Hermetic trust material, injected explicitly: a sanitized child inherits no shell,
+        // and must not depend on the operator's untracked `.env` to start.
+        ...HERMETIC_DEV_KEY_ENV,
+        HOME: mkdtempSync(join(tmpdir(), "ikbi-qualify-home-")),
         IKBI_STATE_ROOT: state,
         IKBI_MODEL_DRIVER: "m1", IKBI_MODEL_BUILDER: "m1", IKBI_MODEL_CRITIC: "m1",
         IKBI_ALLOW_INSECURE_DEV_KEYS: "true",
+        // `node` is deliberately NOT in the default governed-exec allowlist. This suite runs a
+        // `node <script>` check, so it grants that permission EXPLICITLY (the override is
+        // additive) instead of inheriting it from an operator's untracked `.env`.
+        IKBI_GOVERNED_EXEC_ALLOWLIST: "node",
         IKBI_CHECKS: '[{"name":"check","command":"node","args":["check.js"]}]',
         IKBI_RECOVERY_MAX_ATTEMPTS: "1",
         ...loopbackEgressEnv(server),

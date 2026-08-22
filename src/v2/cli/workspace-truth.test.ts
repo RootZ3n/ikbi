@@ -11,6 +11,7 @@
  * Capability: subprocess (registered in scripts/test-runner.sh).
  */
 
+import { HERMETIC_DEV_KEY_ENV } from "../test-env.js";
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
@@ -73,6 +74,9 @@ function runCli(root: string, args: readonly string[]) {
     cwd: mkdtempSync(join(tmpdir(), "ikbi-v2-wscwd-")),
     env: {
       PATH: process.env.PATH ?? "",
+      // Hermetic trust material, injected explicitly: a sanitized child inherits no shell,
+      // and must not depend on the operator's untracked `.env` to start.
+      ...HERMETIC_DEV_KEY_ENV,
       HOME: mkdtempSync(join(tmpdir(), "ikbi-v2-wshome-")),
       IKBI_STATE_ROOT: root,
       IKBI_MODEL_DRIVER: "m1",
@@ -106,6 +110,9 @@ function v2RunAgainst(server: FakeProviderServer, root: string, repo: string, go
     cwd: mkdtempSync(join(tmpdir(), "ikbi-v2-wscwd-")),
     env: {
       PATH: process.env.PATH ?? "",
+      // Hermetic trust material, injected explicitly: a sanitized child inherits no shell,
+      // and must not depend on the operator's untracked `.env` to start.
+      ...HERMETIC_DEV_KEY_ENV,
       HOME: mkdtempSync(join(tmpdir(), "ikbi-v2-wshome-")),
       IKBI_STATE_ROOT: root,
       IKBI_MODEL_DRIVER: "m1",

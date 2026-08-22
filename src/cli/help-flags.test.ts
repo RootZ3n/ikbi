@@ -13,6 +13,7 @@
  *      `build --help` hang) — mirroring bootstrap.test.ts's fresh-shell doctor spawn.
  */
 
+import { HERMETIC_DEV_KEY_ENV } from "../test-support/hermetic-env.js";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -148,7 +149,11 @@ function runColdCli(args: readonly string[]): { status: number | null; stdout: s
   const res = spawnSync(process.execPath, [entry, ...args], {
     // cwd left at the test process cwd is fine — the assertion is about NO model call, and
     // the repo's own .env carries no model keys that would change help behavior.
-    env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" },
+    env: { PATH: process.env.PATH ?? "",
+    // Hermetic trust material, injected explicitly: a sanitized child inherits no shell,
+    // and must not depend on the operator's untracked `.env` to start.
+    ...HERMETIC_DEV_KEY_ENV,
+    HOME: process.env.HOME ?? "" },
     encoding: "utf8",
     timeout: 30_000,
   });

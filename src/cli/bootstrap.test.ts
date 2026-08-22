@@ -4,6 +4,7 @@
  * in a clean environment.
  */
 
+import { HERMETIC_DEV_KEY_ENV } from "../test-support/hermetic-env.js";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
@@ -128,7 +129,11 @@ test("`ikbi doctor` runs in a fresh shell — exit 0, a helpful report, NO stack
   // A CLEAN environment: only PATH + HOME, NO IKBI_* keys (a true fresh shell).
   const res = spawnSync(process.execPath, [entry, "doctor"], {
     cwd: freshCwd,
-    env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" },
+    env: { PATH: process.env.PATH ?? "",
+    // Hermetic trust material, injected explicitly: a sanitized child inherits no shell,
+    // and must not depend on the operator's untracked `.env` to start.
+    ...HERMETIC_DEV_KEY_ENV,
+    HOME: process.env.HOME ?? "" },
     encoding: "utf8",
   });
   const combined = `${res.stdout}\n${res.stderr}`;

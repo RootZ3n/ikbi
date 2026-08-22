@@ -17,6 +17,7 @@
  * Capability: subprocess (registered in scripts/test-runner.sh).
  */
 
+import { HERMETIC_DEV_KEY_ENV } from "../test-env.js";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, writeFileSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -81,6 +82,9 @@ function runCli(root: string, server: FakeProviderServer, repo: string) {
     cwd,
     env: {
       PATH: process.env.PATH ?? "",
+      // Hermetic trust material, injected explicitly: a sanitized child inherits no shell,
+      // and must not depend on the operator's untracked `.env` to start.
+      ...HERMETIC_DEV_KEY_ENV,
       HOME: mkdtempSync(join(tmpdir(), "ikbi-v2-phome-")),
       IKBI_STATE_ROOT: root,
       IKBI_MODEL_DRIVER: "m1", IKBI_MODEL_BUILDER: "m1", IKBI_MODEL_CRITIC: "m1",
@@ -228,7 +232,11 @@ test("promotion truth: the human rendering states the landed publication", async
   dirs.push(cwd);
   const res = spawnSync(process.execPath, [ENTRY, "v2", "build", "set widget to 2 in src/widget.ts", "--repo", repo], {
     cwd,
-    env: { PATH: process.env.PATH ?? "", HOME: mkdtempSync(join(tmpdir(), "ikbi-v2-ph-")), IKBI_STATE_ROOT: root, IKBI_MODEL_DRIVER: "m1", IKBI_MODEL_BUILDER: "m1", IKBI_MODEL_CRITIC: "m1", IKBI_CHECKS: GREP_WIDGET_2, ...loopbackEgressEnv(server) },
+    env: { PATH: process.env.PATH ?? "",
+    // Hermetic trust material, injected explicitly: a sanitized child inherits no shell,
+    // and must not depend on the operator's untracked `.env` to start.
+    ...HERMETIC_DEV_KEY_ENV,
+    HOME: mkdtempSync(join(tmpdir(), "ikbi-v2-ph-")), IKBI_STATE_ROOT: root, IKBI_MODEL_DRIVER: "m1", IKBI_MODEL_BUILDER: "m1", IKBI_MODEL_CRITIC: "m1", IKBI_CHECKS: GREP_WIDGET_2, ...loopbackEgressEnv(server) },
     encoding: "utf8",
   });
   assert.match(res.stdout, /promotion {3}PUBLISHED · main · clean_ref_cas/);

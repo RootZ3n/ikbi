@@ -92,6 +92,10 @@ function build(root: string, server: FakeProviderServer, repo: string, goal: str
       IKBI_MODEL_CRITIC: "m1",
       IKBI_RECOVERY_MAX_ATTEMPTS: "1",
       ...HERMETIC_DEV_KEY_ENV,
+      // `node` is deliberately NOT in the default governed-exec allowlist. This suite runs a
+      // `node <script>` check, so it grants that permission EXPLICITLY (the override is additive)
+      // instead of inheriting it from an operator's untracked `.env`.
+      IKBI_GOVERNED_EXEC_ALLOWLIST: "node",
       ...(ikbiChecks !== undefined ? { IKBI_CHECKS: ikbiChecks } : {}),
       ...loopbackEgressEnv(server),
     },
