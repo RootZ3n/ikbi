@@ -1151,7 +1151,10 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     runId,
     outcome,
     stagesEntered: lifecycle.stagesEntered,
-    evidence: summarizeEvidence(lifecycle.ledger, outcome, commands.length),
+    evidence: summarizeEvidence(lifecycle.ledger, outcome, commands.length,
+      promotionRecord !== undefined
+        ? { beforeRef: promotionRecord.beforeRef, afterRef: promotionRecord.afterRef }
+        : undefined),
     ...(policy !== undefined ? { configuration: summarizeConfiguration(policy) } : {}),
     ...(source !== undefined ? { sourceSnapshot: summarizeSnapshot(source.snapshot) } : {}),
     ...(decision !== undefined ? { resolution: summarizeResolution(decision) } : {}),

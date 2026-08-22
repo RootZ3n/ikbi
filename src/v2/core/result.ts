@@ -763,8 +763,24 @@ export interface V2RunReceipt {
  * when the run BOTH recorded a promotion AND terminalized as accepted — a recorded
  * promotion attempt that did not become the terminal outcome never reads as landed.
  */
-export function summarizeEvidence(ledger: RunLedgerView, outcome: RunTerminalOutcome, commandsRun = 0): RunEvidenceSummary {
+export function summarizeEvidence(
+  ledger: RunLedgerView,
+  outcome: RunTerminalOutcome,
+  commandsRun = 0,
+  /**
+   * The refs the promotion authority actually compared and swapped.
+   *
+   * `sourceRepositoryMutated` is a claim about the OPERATOR's repository, and a promotion is not
+   * by itself a change to it: publishing a candidate whose tree equals the base tree is a lawful
+   * no-op, and the CAS records `beforeRef === afterRef`. Without this, the field was a second copy
+   * of `promoted` and read `true` for a run that moved nothing — a receipt asserting a mutation
+   * that did not happen. `run.ts` always supplies this when a promotion landed; when it is absent
+   * there is no ref evidence to judge by and the promotion fact is all that can be claimed.
+   */
+  promotionRefs?: { readonly beforeRef: string; readonly afterRef: string },
+): RunEvidenceSummary {
   const accepted = outcome.kind === "accepted";
+  const refMoved = promotionRefs === undefined ? true : promotionRefs.beforeRef !== promotionRefs.afterRef;
   return {
     commandsRun,
     configurationResolved: ledger.configurations.length > 0,
@@ -788,8 +804,9 @@ export function summarizeEvidence(ledger: RunLedgerView, outcome: RunTerminalOut
     // the model's work, in isolation — it says nothing about the operator's checkout.
     candidateMutated: ledger.mutations.length > 0,
     // The operator's repository. Reachable ONLY through a landed promotion (V2-011) that
-    // produced an `accepted` outcome — true exactly when the target ref moved.
-    sourceRepositoryMutated: accepted && ledger.promotions.length > 0,
+    // produced an `accepted` outcome — and true exactly when the target ref actually moved, which
+    // a no-op promotion (candidate tree == base tree) does not do.
+    sourceRepositoryMutated: accepted && ledger.promotions.length > 0 && refMoved,
   };
 }
 
