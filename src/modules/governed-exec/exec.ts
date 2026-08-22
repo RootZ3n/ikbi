@@ -23,6 +23,7 @@
  */
 
 import { execFile as nodeExecFile, spawn as nodeSpawn } from "node:child_process";
+import { trackExecChild } from "./children.js";
 import { promisify } from "node:util";
 
 import { events as coreEvents } from "../../core/events/index.js";
@@ -84,7 +85,15 @@ const promisifiedExecFile = promisify(nodeExecFile);
 const defaultExecFile: ExecFileFn = (binary, args, opts) => {
   const w = wrapWithSandbox(opts.sandbox, binary, args);
   const { sandbox: _sandbox, ...rest } = opts;
-  return promisifiedExecFile(w.binary, w.args as string[], rest);
+  const pending = promisifiedExecFile(w.binary, w.args as string[], rest);
+  // TRACKED FOR SHUTDOWN. `promisify(execFile)` exposes the spawned child on the returned promise,
+  // which is the only handle on it this layer gets. Without tracking, an interrupt during
+  // verification leaves the check running in a worktree nobody is watching any more. Not detached:
+  // this child shares our process group deliberately, so a TTY Ctrl-C reaches it too.
+  const child = (pending as unknown as { child?: { pid?: number | undefined; kill(s?: NodeJS.Signals | number): boolean } }).child;
+  if (child === undefined) return pending;
+  const release = trackExecChild(child, { detached: false });
+  return pending.finally(release);
 };
 
 /**
@@ -110,6 +119,10 @@ const defaultExecFileStream: ExecFileStreamFn = (binary, args, opts, onOutput) =
       env: opts.env,
       detached: true, // own process group — lets us kill the entire tree, not just the direct child
     });
+    // TRACKED FOR SHUTDOWN. This child leads its OWN process group, which is what lets a runaway
+    // tree be killed whole — and equally what stops a terminal's Ctrl-C, delivered to the
+    // foreground group, from ever reaching it. Nothing but this registry can reclaim it.
+    const releaseTracking = trackExecChild(child, { detached: true });
     let stdout = "";
     let stderr = "";
     let timedOut = false;
@@ -137,10 +150,12 @@ const defaultExecFileStream: ExecFileStreamFn = (binary, args, opts, onOutput) =
     child.stderr?.on("data", onData("stderr"));
     child.on("error", (e) => {
       clearTimeout(timer);
+      releaseTracking();
       resolveP({ stdout, stderr: `${stderr}${e instanceof Error ? e.message : String(e)}`, code: 1 });
     });
     child.on("close", (code) => {
       clearTimeout(timer);
+      releaseTracking();
       resolveP({ stdout, stderr, code: timedOut ? 124 : code ?? 1 });
     });
   });

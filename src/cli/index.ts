@@ -45,6 +45,8 @@ import { runCapabilities } from "./capabilities.js";
 import { postureLines } from "./posture.js";
 import { printGateStatus } from "./gate-status.js";
 import { writeStderr, writeStdout } from "./io.js";
+import { installSignalShutdown } from "./shutdown.js";
+import { terminateLiveExecChildren } from "../modules/governed-exec/children.js";
 import { translateError, formatFriendlyError } from "../core/errors/index.js";
 import { helpForTopic } from "./help-pages.js";
 import { runCanonical } from "./run.js";
@@ -644,40 +646,33 @@ async function run(argv: readonly string[]): Promise<void> {
   }
 }
 
-// SIGINT (Ctrl-C): RETAIN cleanly. An interrupt mid-build would otherwise leave the allocated
-// workspace leaking the bound and silently abandon whatever the builder had written. On the first
-// Ctrl-C we mark every still-live ALLOCATED workspace as retained-failed (keeping its worktree) so
-// the work survives and is inspectable (`ikbi workspace ls` / `ikbi diff <id>`); a second Ctrl-C
-// force-exits immediately. (PROMOTING workspaces are left for crash-reconcile.)
-let interrupting = false;
-process.on("SIGINT", () => {
-  if (interrupting) process.exit(130); // second Ctrl-C — force quit
-  interrupting = true;
-  writeStderr("\nikbi: interrupted — retaining in-progress workspaces (Ctrl-C again to force quit)…\n");
-  void coreWorkspaces
-    .retainAllLive("interrupted by SIGINT")
-    .then((n) => {
-      if (n > 0) writeStderr(`ikbi: retained ${n} in-progress workspace(s) — inspect with \`ikbi workspace ls\`.\n`);
-      process.exit(130);
-    })
-    .catch(() => process.exit(130));
-});
-
-// H6: SIGTERM (systemd stop / `kill <pid>` / orchestrator shutdown) got NO handler — a mid-build
-// SIGTERM left the ALLOCATED record + worktree behind with no retain, leaking the slot. Mirror SIGINT:
-// retain live workspaces so the work survives and the record is a clean `failed` (reapable), then exit
-// 143 (128+SIGTERM). Best-effort and time-bounded — a stuck retain must never block shutdown forever.
-let terminating = false;
-process.on("SIGTERM", () => {
-  if (terminating) process.exit(143);
-  terminating = true;
-  const forceExit = setTimeout(() => process.exit(143), 3000);
-  forceExit.unref?.();
-  void coreWorkspaces
-    .retainAllLive("terminated by SIGTERM")
-    .then(() => process.exit(143))
-    .catch(() => process.exit(143));
-});
+// SIGINT (Ctrl-C) and SIGTERM (systemd stop / `kill <pid>` / orchestrator shutdown) are the SAME
+// shutdown with two exit codes. An interrupt mid-build would otherwise leave the allocated workspace
+// leaking the bound and silently abandon whatever the builder had written, so both retain every
+// still-live ALLOCATED workspace (keeping its worktree, so the work survives and is inspectable via
+// `ikbi workspace ls` / `ikbi diff <id>`) and both reclaim the exec children this process started.
+// PROMOTING workspaces are left for crash-reconcile.
+//
+// The bound lives in ONE place (`src/cli/shutdown.ts`). These were two hand-written handlers and
+// they drifted: SIGTERM forced an exit after three seconds, SIGINT waited on the workspace lock
+// forever. A second Ctrl-C still exits immediately.
+const shutdownDeps = {
+  retainAllLive: (reason: string) => coreWorkspaces.retainAllLive(reason),
+  terminateChildren: () => terminateLiveExecChildren(),
+  write: writeStderr,
+  exit: (code: number) => process.exit(code),
+  setTimer: (fn: () => void, ms: number) => setTimeout(fn, ms),
+  on: (signal: string, handler: () => void) => {
+    process.on(signal as NodeJS.Signals, handler);
+  },
+};
+installSignalShutdown(
+  "SIGINT",
+  130,
+  "\nikbi: interrupted — retaining in-progress workspaces (Ctrl-C again to force quit)…\n",
+  shutdownDeps,
+);
+installSignalShutdown("SIGTERM", 143, "", shutdownDeps);
 
 run(process.argv.slice(2)).catch((err: unknown) => {
   // A broken pipe (reader closed early — e.g. `ikbi models | head`) is normal, not a failure:

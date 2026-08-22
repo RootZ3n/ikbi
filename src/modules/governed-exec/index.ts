@@ -52,6 +52,13 @@ export {
   type GovernedExecConfig,
 } from "./config.js";
 export {
+  trackExecChild,
+  terminateLiveExecChildren,
+  liveExecChildCount,
+  resetExecChildRegistry,
+  type TrackedChild,
+} from "./children.js";
+export {
   govexecRequested,
   govexecDenied,
   govexecExecuted,
