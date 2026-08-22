@@ -300,11 +300,41 @@ async function productionAuthorities(): Promise<{
  * The registry import is dynamic for the same reason the configuration source's is: it
  * constructs every transport at module load and needs the egress guard installed first.
  */
-export function productionTransport(): InvocationTransport {
+/**
+ * The EXPLICIT local-execution policy a caller may supply instead of relying on the environment.
+ *
+ * WHY THIS EXISTS. Authorizing supervised-local used to take two separate acts: selecting a
+ * supervised mode, and also exporting IKBI_BOKAHLI_SUPERVISED_LOCAL=true. The second added no
+ * information — an operator who typed `--mode assist` has already said, in as many words, "I
+ * accept an unqualified local result for human review" — and a redundant opt-in mostly teaches
+ * people to set the variable permanently, which is the opposite of an explicit decision.
+ *
+ * The endpoint and a valid mode-0600 credential file remain mandatory, and none of this makes a
+ * REACHABLE deployment into an authorization: reachability says a worker exists, never that anyone
+ * agreed to use it. There is no path here from "Bokahli is up" to "Bokahli may run this".
+ */
+export interface LocalExecutionPolicy {
+  /** True to accept an unqualified artifact under human review. Never inferred from reachability. */
+  readonly supervisedLocal?: boolean;
+  /** True to demand a qualified artifact. Contradicts `supervisedLocal`; the pair is refused. */
+  readonly requireQualified?: boolean;
+  readonly taskClass?: string;
+  readonly target?: string;
+  readonly baseUrl?: string;
+}
+
+/**
+ * The production transport.
+ *
+ * `policy` is the caller's explicit local-execution decision. Omitting it keeps the previous
+ * behavior exactly — the environment supplies the defaults — so every existing caller, including
+ * the builder, is unaffected.
+ */
+export function productionTransport(policy?: LocalExecutionPolicy): InvocationTransport {
   return {
     async send(input) {
       const { registry } = await import("../../core/provider/index.js");
-      return createInvocationTransport(withBokahli(registry)).send(input);
+      return createInvocationTransport(withBokahli(registry, policy)).send(input);
     },
   };
 }
@@ -327,11 +357,11 @@ export function productionTransport(): InvocationTransport {
  * going to use. A missing or ill-permissioned credential surfaces when something actually asks
  * for Bokahli, which is when it is a real problem.
  */
-function withBokahli(registry: TransportProviderLookup): TransportProviderLookup {
+function withBokahli(registry: TransportProviderLookup, policy?: LocalExecutionPolicy): TransportProviderLookup {
   return {
     getProvider(id: string) {
       if (id !== BOKAHLI_PROVIDER_ID) return registry.getProvider(id);
-      return createBokahliProvider(readBokahliRuntimeConfig());
+      return createBokahliProvider(readBokahliRuntimeConfig(process.env, policy));
     },
   };
 }
@@ -345,21 +375,45 @@ function withBokahli(registry: TransportProviderLookup): TransportProviderLookup
  * quietly accepted — which is the correct default for a deployment whose every artifact reports
  * INSTALLED_UNQUALIFIED.
  */
-export function readBokahliRuntimeConfig(env: NodeJS.ProcessEnv = process.env): BokahliProviderConfig {
+export function readBokahliRuntimeConfig(
+  env: NodeJS.ProcessEnv = process.env,
+  policy?: LocalExecutionPolicy,
+): BokahliProviderConfig {
   const routeMode = (env["IKBI_BOKAHLI_ROUTE_MODE"] ?? "AUTO").toUpperCase();
   if (routeMode !== "AUTO" && routeMode !== "PROFILE" && routeMode !== "EXACT") {
     throw new Error(`IKBI_BOKAHLI_ROUTE_MODE must be AUTO, PROFILE or EXACT (got ${JSON.stringify(routeMode)})`);
   }
-  const target = env["IKBI_BOKAHLI_TARGET"];
-  const taskClass = env["IKBI_BOKAHLI_TASK_CLASS"];
+  const target = policy?.target ?? env["IKBI_BOKAHLI_TARGET"];
+  const taskClass = policy?.taskClass ?? env["IKBI_BOKAHLI_TASK_CLASS"];
+
+  // THE ENVIRONMENT IS A DEFAULT; AN EXPLICIT POLICY IS A DECISION. When a caller supplies one it
+  // wins outright, because it came from an operator saying so at the point of use — a typed
+  // argument or a typed CLI mode — which is a stronger statement than a variable that has been
+  // sitting in a shell profile since some other afternoon.
+  const requireQualified = policy?.requireQualified ?? env["IKBI_BOKAHLI_REQUIRE_QUALIFIED"] === "true";
+  const supervisedLocal = policy?.supervisedLocal ?? env["IKBI_BOKAHLI_SUPERVISED_LOCAL"] === "true";
+
+  // The two are contradictory by construction — supervised-local exists to accept an UNQUALIFIED
+  // artifact under review — and the provider constructor refuses the pair. Refusing HERE names the
+  // conflict where the operator can see both halves of it.
+  if (requireQualified && supervisedLocal) {
+    throw new Error(
+      "bokahli: a qualified artifact was required AND supervised-local was authorized. Supervised-local " +
+        "exists to accept an unqualified result for human review, so the two cannot both hold. Drop " +
+        "--require-qualified, or do not authorize supervised-local.",
+    );
+  }
+
   return {
-    ...(env["IKBI_BOKAHLI_BASE_URL"] !== undefined ? { baseUrl: env["IKBI_BOKAHLI_BASE_URL"] } : {}),
+    ...(policy?.baseUrl ?? env["IKBI_BOKAHLI_BASE_URL"] !== undefined
+      ? { baseUrl: policy?.baseUrl ?? (env["IKBI_BOKAHLI_BASE_URL"] as string) }
+      : {}),
     credentialFile: env["IKBI_BOKAHLI_TOKEN_FILE"] ?? `${env["HOME"] ?? ""}/.config/bokahli/token`,
     routeMode,
     ...(target !== undefined ? { target } : {}),
     ...(taskClass !== undefined ? { taskClass } : {}),
-    requireQualified: env["IKBI_BOKAHLI_REQUIRE_QUALIFIED"] === "true",
-    supervisedLocal: env["IKBI_BOKAHLI_SUPERVISED_LOCAL"] === "true",
+    requireQualified,
+    supervisedLocal,
   };
 }
 

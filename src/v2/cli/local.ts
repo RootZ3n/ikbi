@@ -22,7 +22,7 @@ import { LOCAL_MODES, type LocalMode } from "../core/local-work.js";
 import { runLocalLane, type LocalLaneResult, type LocalPacketItem, type LocalValidator } from "../runtime/local-lane.js";
 import { LOCAL_VALIDATORS, type LocalValidatorName } from "../runtime/local-validators.js";
 import { createUntrustedBoundary } from "../runtime/untrusted-boundary.js";
-import { productionTransport } from "../runtime/index.js";
+import { productionTransport, type LocalExecutionPolicy } from "../runtime/index.js";
 import type { InvocationTransport } from "../core/invocation.js";
 
 export const LOCAL_USAGE =
@@ -91,7 +91,7 @@ export interface LocalCliIo {
   readonly stderr?: (s: string) => void;
   readonly readFile?: (path: string) => string;
   readonly runLane?: typeof runLocalLane;
-  readonly makeTransport?: () => InvocationTransport | undefined;
+  readonly makeTransport?: (policy: LocalExecutionPolicy) => InvocationTransport | undefined;
 }
 
 /** Render a result for a human. The accounting is not optional detail; it IS the deliverable. */
@@ -163,16 +163,39 @@ export async function runLocalCli(argv: readonly string[], io: LocalCliIo = {}):
   }
 
   const validator: LocalValidator = LOCAL_VALIDATORS[args.taskClass as LocalValidatorName];
+  /*
+    SELECTING A SUPERVISED MODE *IS* THE AUTHORIZATION.
+
+    An operator who typed `--mode assist` has already said, in as many words, that they accept an
+    unqualified local result for human review; requiring them to also export
+    IKBI_BOKAHLI_SUPERVISED_LOCAL=true added no information and mostly taught people to set the
+    variable permanently, which is the opposite of an explicit decision. The typed mode travels as
+    a typed policy.
+
+    IT IS DERIVED FROM THE MODE AND FROM NOTHING ELSE. Not from the endpoint being configured, not
+    from it being reachable, not from a token existing. Reachability says a worker exists; it never
+    says anyone agreed to use it. OFF and an unreadable mode authorize nothing, and
+    `--require-qualified` withdraws the supervised authorization rather than sitting alongside it,
+    because a caller demanding a qualified artifact has asked for the opposite thing.
+  */
+  const supervisedLocal = !args.requireQualified && (args.mode === "assist" || args.mode === "auto" || args.mode === "exact");
+  const policy: LocalExecutionPolicy = {
+    supervisedLocal,
+    requireQualified: args.requireQualified,
+    taskClass: args.taskClass,
+    ...(args.model !== undefined ? { target: args.model } : {}),
+  };
+
   // THE ONE TRANSPORT. The lane calls a model exactly the way the builder does; `productionTransport`
   // resolves Bokahli by id through the decorated lookup, lazily, so a machine with no Bokahli
   // reaches the "not configured" DECISION rather than a credential error on a command it never ran.
-  const transport = (io.makeTransport ?? (() => {
+  const transport = (io.makeTransport ?? ((p: LocalExecutionPolicy) => {
     try {
-      return productionTransport();
+      return productionTransport(p);
     } catch {
       return undefined;
     }
-  }))();
+  }))(policy);
 
   const result = await (io.runLane ?? runLocalLane)(
     {
