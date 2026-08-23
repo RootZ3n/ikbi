@@ -199,13 +199,13 @@ test("builder truth: EVERY model turn went over the wire, on the SAME authorized
   }
 });
 
-test("builder truth: the provider was offered exactly the six builder tools, every turn", async () => {
+test("builder truth: the provider was offered exactly the seven builder tools, every turn", async () => {
   const { server } = await editRun();
   const completions = (await server.received()).filter((r) => r.path.includes("chat/completions"));
   const builderTurns = completions.filter((r) => r.toolNames.length > 0);
   assert.equal(builderTurns.length, 3, "the three builder turns carry tools");
   for (const request of builderTurns) {
-    assert.deepEqual([...request.toolNames], ["read_file", "replace_file", "create_file", "delete_file", "run_command", "finish_candidate"]);
+    assert.deepEqual([...request.toolNames], ["read_file", "replace_file", "create_file", "delete_file", "run_command", "run_formatter", "finish_candidate"]);
   }
   // The critic call is the one with NO tools.
   assert.equal(completions.filter((r) => r.toolNames.length === 0).length, 1, "the critic is offered no tools");
