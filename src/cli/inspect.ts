@@ -96,7 +96,16 @@ function boolValue(value: unknown): boolean | null {
 function related(receipts: readonly Receipt[], runId: string, taskId: string | null): Receipt[] {
   return receipts.filter((receipt) => {
     const metadata = receipt.metadata ?? {};
-    return receipt.requestId === runId || metadata.runId === runId || (taskId !== null && (receipt.requestId === taskId || metadata.taskId === taskId));
+    return (
+      receipt.requestId === runId ||
+      metadata.runId === runId ||
+      // A SESSION id resolves too. The v2 engine emits a buildSessionId alongside one run id per
+      // attempt, and the session id is the most prominent of them — so an operator who pastes it
+      // used to get "not found" for a run that is right there in the log. The receipt is still
+      // keyed by the final attempt's run id; this only stops the obvious guess from failing.
+      metadata.buildSessionId === runId ||
+      (taskId !== null && (receipt.requestId === taskId || metadata.taskId === taskId))
+    );
   });
 }
 
@@ -130,17 +139,28 @@ export async function inspectRun(runId: string, deps: InspectDeps = {}): Promise
   } catch {
     return buildResult(runId, "failed", "INSPECT_INTERNAL_ERROR", INSPECT_EXIT_CODES.internal, "receipt store could not be read");
   }
+  // A run id OR a build-session id resolves. The session's LAST run.summary is the canonical one
+  // (`.at(-1)`), which is exactly the attempt the receipt log is keyed by.
   const wrapper = all
-    .filter((receipt) => receipt.operation === "run.summary" && (receipt.requestId === runId || receipt.metadata?.runId === runId))
+    .filter(
+      (receipt) =>
+        receipt.operation === "run.summary" &&
+        (receipt.requestId === runId || receipt.metadata?.runId === runId || receipt.metadata?.buildSessionId === runId),
+    )
     .at(-1);
-  if (wrapper === undefined) return buildResult(runId, "not_found", "INSPECT_NOT_FOUND", INSPECT_EXIT_CODES.missing, "no canonical run.summary receipt matched this run id");
+  if (wrapper === undefined) {
+    return buildResult(runId, "not_found", "INSPECT_NOT_FOUND", INSPECT_EXIT_CODES.missing, "no canonical run.summary receipt matched this run or build-session id");
+  }
 
   const metadata = wrapper.metadata ?? {};
+  // Report the CANONICAL run id, not the string the operator happened to type: a session id
+  // resolves here, and echoing it back as the run id would keep the two indistinguishable.
+  const canonicalRunId = stringValue(metadata.runId) ?? runId;
   const taskId = stringValue(metadata.taskId) ?? stringValue(wrapper.requestSummary?.taskId);
   const repository = stringValue(metadata.repository) ?? stringValue(wrapper.project);
   const workspaceId = stringValue(metadata.workspaceId);
   const generationId = stringValue(metadata.generationId);
-  const items = related(all, runId, taskId);
+  const items = related(all, canonicalRunId, taskId);
   let workspace: WorkspaceRecord | undefined;
   if (workspaceId !== null) workspace = await (deps.getWorkspace ?? ((id: string) => coreWorkspaces.get(id)))(workspaceId).catch(() => undefined);
   const status = stringValue(metadata.status) ?? wrapper.outcome.status;
@@ -165,7 +185,7 @@ export async function inspectRun(runId: string, deps: InspectDeps = {}): Promise
     status: "found",
     code: "INSPECT_OK",
     exitCode: INSPECT_EXIT_CODES.ok,
-    runId,
+    runId: canonicalRunId,
     taskId,
     repository,
     run: {

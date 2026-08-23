@@ -323,6 +323,9 @@ export function renderSession(session: V2BuildSessionResult): string {
   // The final attempt, in full — this is the authoritative outcome.
   lines.push(renderRun(session.attempts[session.attempts.length - 1]!).trimEnd());
   lines.push(...costLines(session));
+  // The one id that resolves. A human render that showed a session id and several attempt run
+  // ids without saying which `ikbi inspect` takes was inviting the wrong guess.
+  lines.push(`inspect     ikbi inspect ${session.receipt.finalAttemptRunId}`);
   return `${lines.join("\n")}\n`;
 }
 
@@ -1017,9 +1020,26 @@ async function executeProductionBuild(req: BuildRequest, banner: string, io: Bui
 
   // `--json` exposes the full session (every attempt + recovery decision). The human render
   // shows the recovery trail (when there was one) then the final attempt in full.
+  /*
+    WHICH ID DOES `ikbi inspect` TAKE?
+
+    A session has a buildSessionId and one run id PER ATTEMPT, and the JSON showed all of them
+    with nothing saying which one the receipt log is keyed by. The buildSessionId is the most
+    prominent — it is the first field — and it is the one `ikbi inspect` does NOT resolve, so the
+    obvious guess was the wrong guess. The receipt log is keyed by the FINAL attempt's run id.
+
+    So the JSON now says so explicitly, and labels the attempt ids as the separate thing they are.
+    Nothing is renamed or removed; a consumer reading `attempts[]` is unaffected.
+  */
+  const inspection = {
+    canonicalRunId: session.receipt.finalAttemptRunId,
+    buildSessionId: session.buildSessionId,
+    attemptRunIds: session.attempts.map((attempt) => attempt.receipt.runId),
+    inspectCommand: `ikbi inspect ${session.receipt.finalAttemptRunId}`,
+  };
   out(
     req.json
-      ? `${JSON.stringify({ ...session, canonicalGoalSha256, promptBinding, localAdvisories: advisories }, null, 2)}\n`
+      ? `${JSON.stringify({ ...session, inspection, canonicalGoalSha256, promptBinding, localAdvisories: advisories }, null, 2)}\n`
       : `${renderSession(session)}${renderAdvisories(advisories)}`,
   );
   return exitCodeForOutcome(session.outcome);
