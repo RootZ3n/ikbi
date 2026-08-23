@@ -25,6 +25,7 @@ import { createTreeProbe } from "./verification-tree.js";
 import { createFormatterCapability, createGovernedFormatterTransport, resolveFormatterId, type FormatterTransport } from "./formatter-runner.js";
 import { buildMutationScope, type MutationScope } from "../core/mutation-scope.js";
 import { RUSTFMT_WORKSPACE_V1, formatterDefinition, isFormatterId, type FormatterRecord } from "../core/formatter.js";
+import { V2_DEFAULT_COMMAND_POLICY, evaluateCommand } from "../core/command.js";
 import { createSequentialIdFactory } from "../core/identity.js";
 import { initGitRepo } from "../cli/fixture-repo.js";
 import type { V2WorkspaceRecord } from "../core/workspace.js";
@@ -117,6 +118,25 @@ function fakeTransport(behaviour: {
 }
 
 const rustToolchain = (): boolean => spawnSync("cargo", ["fmt", "--version"], { encoding: "utf8" }).status === 0;
+
+// ---------------------------------------------------------------------------
+// The gap this exists to close
+// ---------------------------------------------------------------------------
+
+test("PRE-FIX: the read-only terminal cannot express `cargo fmt` — the Apela root cause, pinned", () => {
+  // Both preserved Apela runs failed a declared `fmt` check the builder had no way to satisfy.
+  // Three independent layers made it inexpressible, and all three are still in force — the
+  // formatter does not widen any of them, it adds a governed capability beside them.
+  for (const args of [["fmt", "--all"], ["fmt"], ["fmt", "--", "--emit", "files"]]) {
+    const verdict = evaluateCommand(V2_DEFAULT_COMMAND_POLICY, { program: "cargo", args });
+    assert.equal(verdict.ok, false, `cargo ${args.join(" ")} must remain unavailable to the terminal`);
+    assert.equal(verdict.code, "program_not_allowed");
+  }
+  // …and even if it were allowed, the terminal is bound READ-ONLY, so a formatting write would
+  // be a hard safety failure rather than a repair.
+  assert.equal(V2_DEFAULT_COMMAND_POLICY.workspaceAccess, "read_only");
+  assert.equal(V2_DEFAULT_COMMAND_POLICY.network, "deny");
+});
 
 // ---------------------------------------------------------------------------
 // The definition itself — what the model can and cannot influence
@@ -507,6 +527,13 @@ test("REAL rustfmt formats the candidate and `cargo fmt --check` then passes", a
   // After: the SAME check the verifier would run now passes.
   const after = spawnSync("cargo", ["fmt", "--all", "--check"], { cwd: f.workspace.path, encoding: "utf8" });
   assert.equal(after.status, 0, `cargo fmt --check still fails:\n${after.stdout}${after.stderr}`);
+
+  // FORMATTING IS NOT A CODE CHANGE. `cargo check` compiles the crate before and after; if the
+  // pass had altered the program rather than its whitespace, this is where it would show.
+  const compiles = spawnSync("cargo", ["check", "--all", "--offline"], { cwd: f.workspace.path, encoding: "utf8" });
+  if (compiles.status !== null) {
+    assert.equal(compiles.status, 0, `the formatted crate no longer compiles:\n${compiles.stdout}${compiles.stderr}`);
+  }
 
   // And the record names the real tool.
   assert.match(result.record?.executable.version ?? "", /rustfmt/);
