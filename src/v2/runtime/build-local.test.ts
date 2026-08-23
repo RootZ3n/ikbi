@@ -229,3 +229,33 @@ test("retry budget: partial text from a retried attempt is discarded, and the re
   assert.equal(r.disposition, "discarded");
   assert.equal(r.artifact, undefined);
 });
+
+/**
+ * An advisory call must carry a BOUNDED timeout.
+ *
+ * The lane's default is 120s. That is right for a model a caller depends on and wrong for advice
+ * the build is explicitly allowed to proceed without: left at the default, a deployment that
+ * accepts a connection and never answers cost an ordinary two-hook build 240s of dead wait.
+ */
+test("build advisories carry a bounded per-call timeout", async () => {
+  let seen: number | undefined;
+  const rec = await runBuildLocalHook(
+    { hook: "PRE_BUILD_RECON", instruction: "summarize", packet: [{ id: "a", content: "hello", source: "repo" }] },
+    {
+      mode: "assist",
+      buildSessionId: "s1",
+      boundary: { wrap: (i: { content: string }) => i.content } as never,
+      runLane: (async (request: { timeoutMs?: number }) => {
+        seen = request.timeoutMs;
+        return {
+          decision: { offload: false, mode: "assist", taskClass: "repo_recon_bounded", requireQualified: false, reason: "not_configured", explanation: "none", fallbackPermitted: false },
+          packetDigest: "sha256:x", fence: { items: 0, bytes: 0, injectionSuspected: false, maxConfidence: 0, signals: [], defangedCount: 0, truncated: false },
+          accepted: false, detail: "none", attempts: [], retryCount: 0, addedLatencyMs: 0, partialOutputDiscarded: false,
+        };
+      }) as never,
+    } as never,
+  );
+  assert.equal(typeof seen, "number", "the hook must pin a timeout rather than inherit the 120s default");
+  assert.ok(seen! <= 30_000, `an advisory call must be bounded well under the 120s default, got ${seen}ms`);
+  assert.equal(rec.hook, "PRE_BUILD_RECON");
+});

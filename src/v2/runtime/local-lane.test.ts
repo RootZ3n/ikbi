@@ -314,3 +314,57 @@ test("the lane NEVER returns anything that could apply an edit — only data", a
   for (const v of Object.values(r.artifact as Record<string, unknown>)) assert.notEqual(typeof v, "function");
   assert.equal((r as unknown as Record<string, unknown>)["apply"], undefined);
 });
+
+// ── the added-latency ceiling must bound the WAITING, not just the sleeping ───
+
+/**
+ * `BUILD_LOCAL_RETRY` declares a 1500ms "hard latency ceiling" and explains why: "a build that
+ * waits on a sick local appliance is a build that has forgotten which of the two is optional".
+ *
+ * `latencySpent` accumulated only the retry BACKOFF. The call itself — the part that actually
+ * costs a build its time — was never counted, so the ceiling could not fire on the case it exists
+ * for: an endpoint that accepts a connection and then says nothing. Bounded only by the lane's
+ * 120s default, an ordinary two-hook build measured 240s of dead wait with no advisory to show
+ * for it and nothing said to the operator while it waited.
+ */
+test("added-latency budget counts the CALL, not only the backoff", async () => {
+  let clock = 0;
+  const SLOW_MS = 5_000;
+  const slow: InvocationTransport = {
+    send: async () => {
+      clock += SLOW_MS; // the call itself takes real time
+      return { ok: false, failure: { code: "RUNTIME_UNHEALTHY", message: "unhealthy", providerId: "bokahli", attempts: 1 } };
+    },
+  } as unknown as InvocationTransport;
+
+  const r = await runLocalLane(
+    req({ retryPolicy: { maxAttempts: 5, baseDelayMs: 10, maxAddedLatencyMs: 1_500 } }),
+    deps({ transport: slow, now: () => clock, sleep: async () => undefined }),
+  );
+
+  assert.equal(r.accepted, false);
+  // One slow call already blows a 1500ms budget, so the lane must stop rather than keep waiting.
+  assert.equal(r.attempts.length, 1, `expected the budget to stop retrying after one slow call, got ${r.attempts.length}`);
+  assert.ok(r.addedLatencyMs >= SLOW_MS, `the call's ${SLOW_MS}ms must be counted, got ${r.addedLatencyMs}`);
+  assert.match(String(r.detail), /added-latency cap reached/);
+});
+
+test("a retryable local failure still retries when the calls are FAST", async () => {
+  // The budget must not have become so strict that a healthy lane stops working.
+  let clock = 0;
+  let sends = 0;
+  const quick: InvocationTransport = {
+    send: async () => {
+      sends += 1;
+      clock += 5; // fast call
+      return { ok: false, failure: { code: "RUNTIME_UNHEALTHY", message: "unhealthy", providerId: "bokahli", attempts: 1 } };
+    },
+  } as unknown as InvocationTransport;
+
+  const r = await runLocalLane(
+    req({ retryPolicy: { maxAttempts: 3, baseDelayMs: 10, maxAddedLatencyMs: 1_500 } }),
+    deps({ transport: quick, now: () => clock, sleep: async () => undefined }),
+  );
+  assert.equal(sends, 3, "fast calls stay within budget and exhaust the attempt allowance");
+  assert.equal(r.accepted, false);
+});

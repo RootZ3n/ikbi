@@ -208,6 +208,18 @@ export async function runLocalLane(request: LocalLaneRequest, deps: LocalLaneDep
     const started = now();
     const call = await invokeLocal(deps.transport, prompt, request);
     const latencyMs = now() - started;
+    /*
+      THE CALL COUNTS TOWARD THE ADDED-LATENCY BUDGET.
+
+      `latencySpent` used to accumulate only the retry BACKOFF, so the "hard latency ceiling"
+      bounded the sleeping between attempts and not the waiting that actually costs a build its
+      time. An endpoint that accepts a connection and never answers is bounded only by the
+      per-call timeout, and the ceiling never fires because no backoff was ever spent.
+
+      Measured before this: a build with two advisory hooks against such an endpoint spent 240s
+      waiting — 120s per hook — while the policy declared a 1500ms ceiling.
+    */
+    latencySpent += latencyMs;
 
     // A response with TEXT that we then refuse is partial output being thrown away. Recording that
     // is how an operator knows the discard happened rather than inferring it from a silence.

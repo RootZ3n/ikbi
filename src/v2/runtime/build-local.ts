@@ -67,6 +67,22 @@ export const HOOK_TASK_CLASS: Readonly<Record<BuildLocalHook, keyof typeof LOCAL
 export const BUILD_LOCAL_RETRY = Object.freeze({ maxAttempts: 3, baseDelayMs: 200, maxAddedLatencyMs: 1500 });
 
 /**
+ * How long ONE advisory call may wait for the local deployment.
+ *
+ * The lane's own default is 120s, which is a reasonable bound for a model a caller is depending
+ * on and a terrible one for advice a build is explicitly allowed to do without. Left at the
+ * default, a deployment that accepts a connection and then says nothing cost this build 120s per
+ * hook — 240s on an ordinary two-hook run — for advisories that never arrived, with nothing said
+ * to the operator while it waited.
+ *
+ * This is deliberately generous enough to be USEFUL rather than merely safe: the resident control
+ * decodes ~60 tok/s, so a 512-token advisory needs roughly ten seconds of real work, and a ceiling
+ * tight enough to guarantee 1500ms would refuse every honest answer. It bounds the pathological
+ * case without turning the feature off.
+ */
+export const BUILD_LOCAL_TIMEOUT_MS = 20_000;
+
+/**
  * THE ADVISORY EVIDENCE CONTRACT.
  *
  * Everything an operator or auditor needs to decide what this advisory was worth, bound together
@@ -188,6 +204,7 @@ export async function runBuildLocalHook(request: BuildLocalHookRequest, deps: Bu
       requireQualified: false,
       requireAttestation: true,
       retryPolicy: BUILD_LOCAL_RETRY,
+      timeoutMs: BUILD_LOCAL_TIMEOUT_MS,
     },
     {
       ...(deps.transport !== undefined ? { transport: deps.transport } : {}),
