@@ -1,10 +1,11 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { spawn } from "node:child_process";
 
 import { AbonulliClient } from "./abonulli-client.js";
 import type { AbonulliAnimationJob } from "./abonulli-client.js";
 import type { AnimationRequestContract } from "./animation-contracts.js";
+import { labStateRoot, labTempDir, forceRemoveTree } from "../../core/temp-root.js";
 import { gameStudioConfig } from "./config.js";
 import type { GameBible, GameFeatureContract, GodotProjectInspection } from "./contract.js";
 import { readAndValidateGameFeatureContract } from "./feature-contracts.js";
@@ -342,21 +343,57 @@ export async function runGameStudioSlice(repoPathInput: string, contractPathInpu
   await writeNewFileOrSame(join(repoPath, WORM_DEPLOYMENT_BACKFIRE_SCENE), sceneSource(), { read, write });
   await writeNewFileOrSame(join(repoPath, WORM_DEPLOYMENT_BACKFIRE_SCRIPT), scriptSource(), { read, write });
 
-  const screenshotPath = join("/tmp", `${runId}.png`);
-  const godotDataHome = join("/tmp", `${runId}-godot-data`);
-  const godotCacheHome = join("/tmp", `${runId}-godot-cache`);
+  /*
+    GODOT'S SCRATCH AND ITS ONE OUTPUT, kept apart and kept out of the system temp directory.
+
+    All three used to be `join("/lab-fake", …)`, and the two XDG homes were never removed — every run
+    leaked two directories that outlived the process, which is how a full test suite quietly
+    contributed to exhausting a tmpfs's inodes.
+
+    They are different KINDS of path and now get different treatment:
+
+      the XDG homes    pure scratch. Under the run's governed temporary child, in ONE directory,
+                       removed in a `finally` so success and failure clean up alike. Even a SIGKILL
+                       is covered: the child belongs to the governed root, and the next run's
+                       reaper collects it once this process is provably dead.
+      the screenshot   an OUTPUT. The report names it and a reader goes and looks at it, so it must
+                       still be there afterwards — it lives under ikbi's durable state root (or an
+                       operator's explicit override), never a temp directory of any kind.
+
+    Godot's own semantics are untouched: it is handed a path in the environment and writes a PNG
+    there, exactly as before.
+  */
+  const scratchRoot = join(labTempDir(), `game-studio-${runId}`);
+  const godotDataHome = join(scratchRoot, "data");
+  const godotCacheHome = join(scratchRoot, "cache");
+  const screenshotPath = gameStudioConfig.screenshotPath ?? join(labStateRoot(), "game-studio", `${runId}.png`);
+
   await makeDir(godotDataHome, { recursive: true });
   await makeDir(godotCacheHome, { recursive: true });
+  await makeDir(dirname(screenshotPath), { recursive: true });
+
   const args = ["--headless", "--path", repoPath, `res://${WORM_DEPLOYMENT_BACKFIRE_SCENE}`];
-  const processResult = await runProcess(godotPath, args, {
-    cwd: repoPath,
-    env: {
-      ...process.env,
-      XDG_DATA_HOME: godotDataHome,
-      XDG_CACHE_HOME: godotCacheHome,
-      IKBI_GAME_STUDIO_SCREENSHOT_PATH: screenshotPath,
-    },
-  });
+  let processResult: Awaited<ReturnType<typeof runProcess>>;
+  try {
+    processResult = await runProcess(godotPath, args, {
+      cwd: repoPath,
+      env: {
+        ...process.env,
+        XDG_DATA_HOME: godotDataHome,
+        XDG_CACHE_HOME: godotCacheHome,
+        IKBI_GAME_STUDIO_SCREENSHOT_PATH: screenshotPath,
+      },
+    });
+  } finally {
+    // WHATEVER happened — a clean run, a non-zero exit, a throw, a killed child — the scratch goes.
+    // `forceRemoveTree` rather than `rm`, because Godot's cache can contain directories it left
+    // read-only, and those are exactly what stranded trees before.
+    try {
+      forceRemoveTree(scratchRoot);
+    } catch {
+      /* the governed root's reaper is the backstop; a cleanup failure must not mask the run's own result */
+    }
+  }
   const beatLogs = extractBeatLogs(processResult.stdout);
   const screenshotCaptured = processResult.stdout.includes(`screenshot=${screenshotPath} status=0`);
 

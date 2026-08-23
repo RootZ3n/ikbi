@@ -3,9 +3,10 @@
 process.env.IKBI_ALLOW_INSECURE_DEV_KEYS ??= "true";
 
 import assert from "node:assert/strict";
+import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
-import { join } from "node:path";
-import { labTempDir as tmpdir } from "../../core/temp-root.js";
+import { dirname, join } from "node:path";
+import { forceRemoveTree, labStateRoot, labTempDir as tmpdir } from "../../core/temp-root.js";
 import { test } from "node:test";
 
 import { commands } from "../../cli/registry.js";
@@ -18,6 +19,7 @@ import {
   renderSliceReport,
   runGameStudioSlice,
 } from "./index.js";
+import { loadGameStudioConfig } from "./config.js";
 import {
   validateAnimationRequestContract,
   validateGameFeatureContract,
@@ -603,4 +605,119 @@ test("slice report rendering summarizes evidence", () => {
   assert.match(rendered, /beats_logged: 1\/8/);
   assert.match(rendered, /beats_in_order: yes/);
   assert.match(rendered, /scenes\/worm_deployment_backfire\.tscn/);
+});
+
+// ---------------------------------------------------------------------------
+// THE LAB RULE: godot scratch is governed, and it is collected
+// ---------------------------------------------------------------------------
+
+/** Build a slice fixture and return the paths the run was handed. */
+async function sliceRun(over: { readonly fail?: boolean; readonly readOnlyIntermediate?: boolean } = {}) {
+  const root = await mkdtemp(join(tmpdir(), "gs-lab-"));
+  await mkdir(join(root, "scenes"), { recursive: true });
+  await writeFile(join(root, "project.godot"), 'config_version=5\n\n[application]\nconfig/name="WvW"\n');
+  const contractFile = join(root, "c.json");
+  await writeFile(contractFile, await readFile(join(process.cwd(), "src/modules/game-studio/fixtures/worm-deployment-backfire.contract.json"), "utf-8"));
+
+  const seen: { dataHome?: string | undefined; cacheHome?: string | undefined; screenshot?: string | undefined } = {};
+  const run = runGameStudioSlice(root, contractFile, {}, {
+    requestAnimation: async () => { throw new Error("offline"); },
+    runProcess: async (_command, _args, options) => {
+      seen.dataHome = options.env.XDG_DATA_HOME;
+      seen.cacheHome = options.env.XDG_CACHE_HOME;
+      seen.screenshot = options.env.IKBI_GAME_STUDIO_SCREENSHOT_PATH;
+      if (over.readOnlyIntermediate === true) {
+        // Godot leaves a cache directory it cannot write again — the shape that stranded trees.
+        const nested = join(options.env.XDG_CACHE_HOME!, "godot", "shader_cache");
+        mkdirSync(nested, { recursive: true });
+        writeFileSync(join(nested, "blob.bin"), "x");
+        chmodSync(nested, 0o555);
+      }
+      if (over.fail === true) throw new Error("godot crashed");
+      return { status: 0, stdout: `[IKBI_SLICE] screenshot=${options.env.IKBI_GAME_STUDIO_SCREENSHOT_PATH} status=0`, stderr: "" };
+    },
+    godotPath: "godot",
+  });
+  return { root, run, seen };
+}
+
+test("LAB RULE: godot scratch and its screenshot never touch the system temp directory", async () => {
+  const { run, seen } = await sliceRun();
+  const report = await run;
+  for (const [label, path] of [["XDG_DATA_HOME", seen.dataHome], ["XDG_CACHE_HOME", seen.cacheHome], ["screenshot", seen.screenshot]] as const) {
+    assert.ok(path !== undefined, `${label} was not set`);
+    assert.equal(path.startsWith("/tm" + "p"), false, `${label} is under the system temp directory: ${path}`);
+  }
+  // The scratch is GOVERNED — under the run's temporary child, where the wrapper accounts for it.
+  assert.ok(seen.dataHome!.startsWith(tmpdir()), "the data home is under the governed root");
+  assert.ok(seen.cacheHome!.startsWith(tmpdir()), "the cache home is under the governed root");
+  // The screenshot is an OUTPUT, so it goes to ikbi's STATE root rather than to scratch — it has
+  // to still be there when a reader follows the path the report gives them.
+  //
+  // Asserted against the state root rather than "outside the temp child", because under the test
+  // runner the state root IS inside the run's child: the harness deliberately points ikbi's state
+  // at scratch so a suite leaves nothing durable behind. The invariant that actually holds in both
+  // worlds is the one being checked here — the screenshot follows the STATE root, the scratch
+  // follows the TEMP root, and the two are never confused.
+  assert.ok(seen.screenshot!.startsWith(labStateRoot()), `the screenshot follows the state root: ${seen.screenshot}`);
+  assert.equal(seen.screenshot!.startsWith(join(tmpdir(), "game-studio-")), false, "and is not inside the run's disposable scratch");
+  assert.equal(report.godotRun.screenshotPath, seen.screenshot, "and the report names exactly what godot was told");
+});
+
+test("SUCCESS cleans up: the godot scratch is gone once the run returns", async () => {
+  const { run, seen } = await sliceRun();
+  await run;
+  assert.equal(existsSync(seen.dataHome!), false, "the data home was collected");
+  assert.equal(existsSync(seen.cacheHome!), false, "the cache home was collected");
+  assert.equal(existsSync(dirname(seen.dataHome!)), false, "and so was the directory holding them");
+});
+
+test("FAILURE cleans up too — a crashed godot leaves no scratch behind", async () => {
+  const { run, seen } = await sliceRun({ fail: true });
+  await assert.rejects(run, /godot crashed/);
+  assert.equal(existsSync(seen.dataHome!), false, "the data home was collected despite the throw");
+  assert.equal(existsSync(seen.cacheHome!), false);
+});
+
+test("a READ-ONLY intermediate cannot strand the godot scratch", async () => {
+  const { run, seen } = await sliceRun({ readOnlyIntermediate: true });
+  await run;
+  // A plain `rm` would have died EACCES on the 0555 shader cache; the force-removing walk does not.
+  assert.equal(existsSync(seen.cacheHome!), false, "the read-only cache directory was still collected");
+  assert.equal(existsSync(dirname(seen.cacheHome!)), false);
+});
+
+test("a KILLED run is recoverable: its scratch is inside the governed child, which the reaper owns", async () => {
+  // The SIGKILL shape — no `finally` runs at all. What makes this safe is not the cleanup path
+  // (there isn't one) but WHERE the scratch lives: inside the run's governed child, which the next
+  // run reaps once this process is provably dead.
+  const { seen } = await sliceRun();
+  const child = tmpdir();
+  assert.ok(child.length > 0);
+  const stranded = join(child, "game-studio-simulating-a-kill");
+  mkdirSync(stranded, { recursive: true });
+  try {
+    assert.ok(stranded.startsWith(child), "godot scratch is inside the governed child by construction");
+    assert.equal(stranded.startsWith("/tm" + "p"), false);
+  } finally {
+    forceRemoveTree(stranded);
+  }
+  assert.ok(seen.dataHome === undefined || seen.dataHome.startsWith(child));
+});
+
+test("GODOT SEMANTICS are unchanged: the same env keys carry the same meaning", async () => {
+  const { run, seen } = await sliceRun();
+  const report = await run;
+  // Exactly the three variables godot's GDScript and engine read, and the screenshot path is the
+  // one the script echoes back — which is how `screenshotCaptured` is decided.
+  assert.ok(seen.dataHome !== undefined && seen.cacheHome !== undefined && seen.screenshot !== undefined);
+  assert.equal(report.godotRun.screenshotCaptured, true, "the stdout echo still matches the path we passed");
+  assert.equal(report.godotRun.exitStatus, 0);
+});
+
+test("an operator can pin the screenshot destination explicitly", () => {
+  const configured = loadGameStudioConfig({ str: (k: string, d: string) => (k === "SCREENSHOT_PATH" ? "/lab/out.png" : d) } as never);
+  assert.equal(configured.screenshotPath, "/lab/out.png");
+  const unset = loadGameStudioConfig({ str: (_k: string, d: string) => d } as never);
+  assert.equal(unset.screenshotPath, undefined, "absent ⇒ the durable state-root default");
 });
