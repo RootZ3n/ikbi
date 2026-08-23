@@ -291,6 +291,28 @@ function deps(
 
 
 /**
+ * A diff source that reports EXACTLY these tree-level changes.
+ *
+ * Used to test the publication boundary independently of the per-mutation gate: it stands in
+ * for a candidate tree that contains a path the gate did not stop, which is the only situation
+ * the second check exists for.
+ */
+function diffReporting(files: readonly { path: string; changeKind: "added" | "modified" | "deleted" }[]) {
+  return {
+    diff: async (i: { candidateId: string; sourceSnapshotId: string; fromTree: string; toTree: string }) => ({
+      diffId: "d".repeat(64) as never,
+      candidateId: i.candidateId as never,
+      sourceSnapshotId: i.sourceSnapshotId as never,
+      fromTree: i.fromTree,
+      toTree: i.toTree,
+      files: files.map((f) => ({ path: f.path, changeKind: f.changeKind, hunkSha256: "h".repeat(64), truncated: false })),
+      empty: files.length === 0,
+      truncated: false,
+    }),
+  };
+}
+
+/**
  * A hermetic publication target. The default answers a CLEAN, unmoved target and LANDS the
  * candidate tree; overrides drive the refusal/conflict paths without a real repository.
  */
@@ -936,6 +958,57 @@ test("v2-017 tournament: candidates are ISOLATED — each owns a distinct worksp
   assert.deepEqual(cands.map((c) => c.slot), [0, 1, 2], "each candidate keeps its own slot identity");
   // The selector considered every candidate (none was silently dropped or merged away).
   assert.equal(result.selection?.candidateEvaluationIds.length, 3, "all three evaluations entered the ONE selector");
+});
+
+// ── the scope at the PUBLICATION boundary ───────────────────────────────────
+
+test("publication: a candidate whose TREE left the scope is REFUSED, and nothing is published", async () => {
+  const target = fakePublisher();
+  const base = deps(goodRepo);
+  const result = await runV2Build(
+    { goal: "go", repoPath: "/repo", mutationScope: { allowTrees: ["src"] } },
+    // The per-mutation gate is bypassed here on purpose: this asserts the SECOND, independent
+    // check over the tree, which is the one that catches anything the gate does not own.
+    { ...base, candidateDiff: diffReporting([{ path: "src/a.ts", changeKind: "modified" }, { path: "README.md", changeKind: "modified" }]), publisher: target },
+  );
+
+  assert.ok(result.outcome.kind === "failed");
+  assert.equal(result.outcome.failure.code, V2_SCOPE_FAILURE_CODES.publicationOutOfScope);
+  assert.match(result.outcome.failure.message, /README\.md/, "the refusal names what left the scope");
+  assert.equal(result.receipt.evidence.promoted, false);
+  assert.equal(result.receipt.evidence.sourceRepositoryMutated, false);
+});
+
+test("publication: an in-scope tree publishes normally — the check is not a blanket refusal", async () => {
+  const base = deps(goodRepo);
+  const result = await runV2Build(
+    { goal: "go", repoPath: "/repo", mutationScope: { allowTrees: ["src"] } },
+    { ...base, candidateDiff: diffReporting([{ path: "src/a.ts", changeKind: "modified" }, { path: "src/new.ts", changeKind: "added" }]) },
+  );
+  assert.ok(result.outcome.kind === "accepted", `expected accepted, got ${result.outcome.kind}`);
+  assert.equal(result.receipt.evidence.promoted, true);
+});
+
+test("publication: the operation matters — a DELETE outside the scope is refused as a delete", async () => {
+  const base = deps(goodRepo);
+  const result = await runV2Build(
+    { goal: "go", repoPath: "/repo", mutationScope: { allowTrees: ["src"] } },
+    { ...base, candidateDiff: diffReporting([{ path: "docs/gone.md", changeKind: "deleted" }]) },
+  );
+  assert.ok(result.outcome.kind === "failed");
+  assert.equal(result.outcome.failure.code, V2_SCOPE_FAILURE_CODES.publicationOutOfScope);
+  assert.match(result.outcome.failure.message, /delete docs\/gone\.md/, "the operation is named, not just the path");
+});
+
+test("publication: repo-wide authority publishes a tree a narrow scope would refuse", async () => {
+  const base = deps(goodRepo);
+  const files = [{ path: "src/a.ts", changeKind: "modified" as const }, { path: "README.md", changeKind: "modified" as const }];
+  const wide = await runV2Build(
+    { goal: "go", repoPath: "/repo", mutationScope: REPO_WIDE },
+    { ...base, candidateDiff: diffReporting(files) },
+  );
+  assert.ok(wide.outcome.kind === "accepted");
+  assert.equal(wide.receipt.evidence.promoted, true);
 });
 
 test("receipt: the run records the AUTHORITY it held, not just what it changed", async () => {

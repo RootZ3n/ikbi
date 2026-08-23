@@ -23,6 +23,7 @@
  */
 
 import { MAX_TOOL_READ_CHARS, TOOL_CREATE_FILE, TOOL_DELETE_FILE, TOOL_READ_FILE, TOOL_REPLACE_FILE, TOOL_RUN_COMMAND, type ToolOutcome } from "../core/tools.js";
+import { decideMutation, describeScope, type MutationOperationKind } from "../core/mutation-scope.js";
 import type { BuilderToolExecutor, BuilderToolExecutorDeps, ToolExecution } from "../core/builder.js";
 import { commandRefusalOutcome } from "../core/command.js";
 import type { V2FileObservation, MutationOperation } from "../core/workspace.js";
@@ -81,9 +82,37 @@ export function createBuilderToolExecutor(deps: BuilderToolExecutorDeps): Builde
     observationId: V2ObservationDigest,
     operation: MutationOperation,
     label: string,
+    scopedOperation: MutationOperationKind,
   ): Promise<ToolExecution> {
     const resolved = resolve(observationId, path);
     if (isOutcome(resolved)) return { outcome: resolved };
+
+    /*
+      THE SCOPE GATE — before the authority is touched, and per OPERATION.
+
+      Checked here rather than only at publication because a refusal the model can still act
+      on is worth far more than a rejection after the work is done: it gets told which path it
+      may not touch, on the turn it tried, and can choose differently. Publication re-checks
+      the final tree anyway; that one is the assertion that THIS gate held, not a substitute
+      for it.
+
+      `create`, `modify` and `delete` are decided separately. They are different effects on the
+      operator's repository, and a refusal that could not say which one it refused would be a
+      worse account of what happened.
+    */
+    const decision = decideMutation(deps.mutationScope, { path, operation: scopedOperation });
+    if (!decision.allowed) {
+      return {
+        outcome: {
+          kind: "refused",
+          path,
+          code: `mutation.${decision.code}`,
+          detail:
+            `${decision.detail}. This build may change: ${describeScope(deps.mutationScope)}. ` +
+            `The scope is the operator's and cannot be widened from here — work within it, or finish and explain what is missing.`,
+        },
+      };
+    }
 
     const applied = await mutations.mutate({ runId, workspace, observation: resolved, operation });
     if (!applied.ok) {
@@ -148,13 +177,13 @@ export function createBuilderToolExecutor(deps: BuilderToolExecutorDeps): Builde
         }
 
         case TOOL_REPLACE_FILE:
-          return applyMutation(call.path, call.observationId, { kind: "replace", content: Buffer.from(call.content, "utf8") }, "replace_file");
+          return applyMutation(call.path, call.observationId, { kind: "replace", content: Buffer.from(call.content, "utf8") }, "replace_file", "modify");
 
         case TOOL_CREATE_FILE:
-          return applyMutation(call.path, call.observationId, { kind: "create", content: Buffer.from(call.content, "utf8") }, "create_file");
+          return applyMutation(call.path, call.observationId, { kind: "create", content: Buffer.from(call.content, "utf8") }, "create_file", "create");
 
         case TOOL_DELETE_FILE:
-          return applyMutation(call.path, call.observationId, { kind: "delete" }, "delete_file");
+          return applyMutation(call.path, call.observationId, { kind: "delete" }, "delete_file", "delete");
 
         case TOOL_RUN_COMMAND: {
           // A READ-ONLY command — it CANNOT mutate and mints NO observation. When no command

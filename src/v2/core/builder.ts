@@ -43,6 +43,7 @@ import {
   buildFailure,
   type BuilderCompletionClaim,
 } from "./candidate.js";
+import type { MutationScope } from "./mutation-scope.js";
 import { BUILDER_TOOLS, isToolFailure, parseToolCall, renderToolProvenance, untrustedToolPayload, type BuilderToolCall, type ParsedToolCall, type ToolOutcome } from "./tools.js";
 import { renderBuilderInput, type AdvisoryContextBlock, type RenderedMessage } from "./prompt.js";
 import {
@@ -388,6 +389,14 @@ export interface BuilderToolExecutorDeps {
   readonly runId: V2RunId;
   readonly workspace: V2WorkspaceRecord;
   readonly mutations: StateBoundMutationAuthority;
+  /**
+   * THE OPERATOR'S MUTATION SCOPE — required, because this is the mutation chokepoint.
+   *
+   * Not optional and not defaulted: an executor built without a scope would be an executor
+   * with repository-wide authority, and the one place that must never happen by omission is
+   * the place that actually writes.
+   */
+  readonly mutationScope: MutationScope;
   /** Called for every observation taken, so the run can put it on the ledger. */
   readonly onObservation: (observation: V2FileObservation) => void;
   /** Called for every mutation applied, so the run can put it on the ledger. */
@@ -531,6 +540,13 @@ export interface BuilderRunInput {
    * identity, and an unqualified local worker must not be able to move that.
    */
   readonly advisoryContext?: readonly AdvisoryContextBlock[];
+  /**
+   * This run's write authority, rendered into the system contract so the builder knows the
+   * boundary before it hits it. Optional here ONLY so a test can render the pre-scope prompt;
+   * the production spine always passes it, and the EXECUTOR enforces it regardless of what the
+   * prompt says — a model that is not told still cannot write outside the scope.
+   */
+  readonly mutationScope?: MutationScope;
   /** Mints one fresh invocation id per turn. */
   readonly mintInvocationId: () => V2InvocationId;
   readonly budget?: BuilderBudget;
@@ -622,7 +638,7 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
     });
     const renderWith = (c: readonly RenderedMessage[]) =>
       estimateMessagesTokens(
-        renderBuilderInput(input.contextPackage, c, input.untrustedBoundary, input.repairBrief !== undefined ? { repairBrief: input.repairBrief, boundary: input.untrustedBoundary } : undefined, budgetStatus, input.advisoryContext !== undefined && input.advisoryContext.length > 0 ? { blocks: input.advisoryContext, boundary: input.untrustedBoundary } : undefined).messages,
+        renderBuilderInput(input.contextPackage, c, input.untrustedBoundary, input.repairBrief !== undefined ? { repairBrief: input.repairBrief, boundary: input.untrustedBoundary } : undefined, budgetStatus, input.advisoryContext !== undefined && input.advisoryContext.length > 0 ? { blocks: input.advisoryContext, boundary: input.untrustedBoundary } : undefined, input.mutationScope).messages,
         // THE model's own estimator, resolved once with the budget and frozen for the run.
         input.contextPackage.budget.tokenEstimator,
       );
@@ -641,7 +657,7 @@ export async function generateCandidate(input: BuilderRunInput): Promise<Builder
     // ONE TURN = ONE INVOCATION, through the one authority. There is no other doorway
     // to a model in v2, and the controller does not hold a transport it could use
     // directly — it hands the authority the one it was given.
-    const rendered = renderBuilderInput(input.contextPackage, conversation, input.untrustedBoundary, input.repairBrief !== undefined ? { repairBrief: input.repairBrief, boundary: input.untrustedBoundary } : undefined, budgetStatus, input.advisoryContext !== undefined && input.advisoryContext.length > 0 ? { blocks: input.advisoryContext, boundary: input.untrustedBoundary } : undefined);
+    const rendered = renderBuilderInput(input.contextPackage, conversation, input.untrustedBoundary, input.repairBrief !== undefined ? { repairBrief: input.repairBrief, boundary: input.untrustedBoundary } : undefined, budgetStatus, input.advisoryContext !== undefined && input.advisoryContext.length > 0 ? { blocks: input.advisoryContext, boundary: input.untrustedBoundary } : undefined, input.mutationScope);
     const turnMaxOutputTokens = Math.min(budget.maxOutputTokens, input.contextPackage.budget.reservedCompletionTokens);
     // PRE-CALL COST ADMISSION. BEFORE the money is spent, ask the session budget authority
     // whether another model call is authorized. It never selects or downgrades a model — it

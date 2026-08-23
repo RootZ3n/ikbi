@@ -1126,8 +1126,12 @@ test("single authority: the model-input renderer consumes the package and nothin
   // V2-013: `./repair.js` (the repair-brief renderer + system note) and `./builder.js` (the
   // `UntrustedBoundary` type) are added — neither reaches a repository reader; the repair brief
   // is bounded historical evidence and is fenced through the boundary.
+  // MUTATION SCOPE: `./mutation-scope.js` is added for the `MutationScope` TYPE, so the system
+  // contract can state the run's write authority. It is a pure, I/O-free authority module that
+  // reaches no repository reader — the same standing as the other entries here, and the reason
+  // this guard's list is allowed to grow only with modules that cannot read a repository.
   const specs = importSpecifiers(readFileSync(join(V2_DIR, "core", "prompt.ts"), "utf8"));
-  assert.deepEqual([...new Set(specs)].sort(), ["./builder.js", "./context.js", "./identity.js", "./repair.js", "./tools.js"], "the renderer reads the authorized package + neutralized repair evidence only");
+  assert.deepEqual([...new Set(specs)].sort(), ["./builder.js", "./context.js", "./identity.js", "./mutation-scope.js", "./repair.js", "./tools.js"], "the renderer reads the authorized package + neutralized repair evidence only");
 });
 
 test("single authority: no v2 file imports v1 CONTEXT machinery", () => {

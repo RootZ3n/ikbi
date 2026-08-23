@@ -76,8 +76,25 @@ import {
   V2_SCOPE_FAILURE_CODES,
   buildMutationScope,
   mutationScopeFailure,
+  publicationScopeFailure,
   summarizeMutationScope,
+  reviewChangedPaths,
+  type MutationOperationKind,
 } from "./mutation-scope.js";
+import type { DiffChangeKind } from "./candidate-diff.js";
+
+/**
+ * How a tree-level change maps onto the operation the scope authorizes.
+ *
+ * Stated as a table rather than inferred at the call site: "added" is a CREATE and "deleted"
+ * is a DELETE, and collapsing the three into "the file changed" is precisely the loss of
+ * distinction the scope exists to preserve.
+ */
+const DIFF_KIND_TO_OPERATION: Readonly<Record<DiffChangeKind, MutationOperationKind>> = Object.freeze({
+  added: "create",
+  modified: "modify",
+  deleted: "delete",
+});
 import {
   resolveModelRoute,
   type ModelRequirements,
@@ -906,7 +923,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     for (const s of live()) {
       const ws = s.workspace!;
       const executor = deps.buildTools({
-        runId, workspace: ws, mutations: deps.mutations,
+        runId, workspace: ws, mutations: deps.mutations, mutationScope: task.mutationScope,
         onObservation: (observation) => { s.observations += 1; lifecycle.record(runId, { kind: "observation", id: observation.observationId, workspaceId: observation.workspaceId, path: observation.path }); },
         onMutation: (applied) => { lifecycle.record(runId, { kind: "mutation", id: applied.mutationId, workspaceId: ws.workspaceId, path: applied.path }); },
         ...(deps.commands !== undefined ? { commands: deps.commands } : {}),
@@ -917,6 +934,7 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
       const generated = await generateCandidate({
         runId, taskId, decision: builderDecision, contextPackage: ctxPkg, transport: deps.transport, executor,
         untrustedBoundary: deps.untrustedBoundary, mintInvocationId: () => ids.mint("invocation"),
+        mutationScope: task.mutationScope,
         ...(deps.repairBrief !== undefined ? { repairBrief: deps.repairBrief } : {}),
         ...(deps.advisoryContext !== undefined ? { advisoryContext: deps.advisoryContext } : {}),
         ...(deps.builderBudget !== undefined ? { budget: deps.builderBudget } : {}),
@@ -1089,6 +1107,36 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
       const selVer = selected.verification; const selDisp = selected.disposition; const selWs = selected.workspace; const selCand = selected.candidate; const selCrit = selected.critic;
       // Stage 9 — PROMOTION of the selected candidate. EXACTLY ONE candidate reaches promotion.
       lifecycle.enter(runId, "promotion");
+
+      /*
+        THE PUBLICATION SCOPE RE-CHECK — the last, independent statement of the authority.
+
+        The per-mutation gate in the tool executor already refused out-of-scope edits, so in an
+        honest run this finds nothing. That is exactly why it runs: it is the ASSERTION that the
+        upstream gate held, and it is derived from a different thing. The gate reasons about
+        individual tool calls; this reasons about the TREE — the diff between the source
+        snapshot and the candidate — so a path that reached the tree by any route the gate does
+        not own is still caught here, before anything is published.
+
+        It refuses; it never repairs. Dropping the offending file and publishing the rest would
+        be publishing something no authority ever verified.
+      */
+      const publishedDiff = await deps.candidateDiff.diff({
+        workspacePath: selWs.path,
+        candidateId: selCand.candidateId,
+        sourceSnapshotId: selCand.sourceSnapshotId,
+        fromTree: selCand.tree.baseTreeId,
+        toTree: selCand.tree.treeId,
+        budget: DEFAULT_DIFF_BUDGET,
+      });
+      const scopeViolations = reviewChangedPaths(
+        task.mutationScope,
+        publishedDiff.files.map((f) => ({ path: f.path, operation: DIFF_KIND_TO_OPERATION[f.changeKind] })),
+      );
+      if (scopeViolations.length > 0) {
+        return publicationScopeFailure(scopeViolations, task.mutationScope);
+      }
+
       const promoted = await promoteAuthorized({
         taskId, candidate: selCand, verification: selVer, critic: selCrit, disposition: selDisp,
         target: { repositoryPath: selWs.source.repositoryPath, baseBranch: selWs.source.baseBranch, baseCommit: selWs.source.baseCommit },
