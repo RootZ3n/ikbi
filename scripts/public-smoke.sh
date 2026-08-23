@@ -29,11 +29,48 @@ cd "$REPO_ROOT"
 
 # Isolated state + safe dev keys so the smoke never touches a real operator's state and the
 # info commands load on a fresh shell. These are the SAME guarantees `pnpm test` uses.
-SMOKE_STATE="$(mktemp -d "${TMPDIR:-/tmp}/ikbi-smoke-state.XXXXXX")"
+# THE GOVERNED TEMPORARY ROOT. No ikbi code uses the system temp directory — including this
+# smoke test, which runs on a clean checkout and must prove the rule holds there too. The root is
+# resolved by ikbi itself (IKBI_TEMP_ROOT, else its state directory); there is no `:-/tmp` default,
+# so a machine with no usable root fails loudly here instead of quietly scattering scratch.
+# ABSOLUTE. The script changes directory before it exits, so a relative path here resolved to
+# nothing by the time the trap ran — and the `|| true` that keeps cleanup from masking a real
+# failure hid that completely.
+GOVERNED="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/governed-temp.ts"
+SMOKE_RUN_ID="ikbi-smoke-$$-$(date +%s)"
+# PIN THE ROOT. This script later points IKBI_STATE_ROOT at a directory inside its own child, and
+# the root is DERIVED from the state root — so without pinning, the exit-time cleanup resolved a
+# different root, found no ownership record there, and refused to remove anything.
+IKBI_TEMP_ROOT="${IKBI_TEMP_ROOT:-$(node --import tsx "$GOVERNED" root)}"
+export IKBI_TEMP_ROOT
+GOVERNED_TEMP="$(node --import tsx "$GOVERNED" create --run-id "$SMOKE_RUN_ID" --owner-pid $$ --purpose public-smoke | tail -n 1)" || {
+  echo "public smoke: no governed temporary root available; set IKBI_TEMP_ROOT" >&2
+  exit 1
+}
+# Everything this run makes goes in ONE owned child, removed on the way out — including on a
+# failure or an interrupt. Working directly in the ROOT would leave unclaimed directories behind
+# that the reaper can only report, never collect.
+export TMPDIR="$GOVERNED_TEMP" TMP="$GOVERNED_TEMP" TEMP="$GOVERNED_TEMP"
+export IKBI_TEMP_RUN_ID="$SMOKE_RUN_ID"
+cleanup_governed_temp() {
+  unset TMPDIR TMP TEMP IKBI_TEMP_RUN_ID
+  # Reported, not silenced: a cleanup that fails should say so, even though it must not turn a
+  # passing smoke run into a failure (the reaper collects an orphan on the next run regardless).
+  node --import tsx "$GOVERNED" remove --child "$GOVERNED_TEMP" --run-id "$SMOKE_RUN_ID" >/dev/null || \
+    echo "public smoke: WARNING — governed temp child not removed: $GOVERNED_TEMP" >&2
+}
+trap cleanup_governed_temp EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+SMOKE_STATE="$(mktemp -d "$GOVERNED_TEMP/ikbi-smoke-state.XXXXXX")"
 export IKBI_STATE_ROOT="$SMOKE_STATE"
 export IKBI_ALLOW_INSECURE_DEV_KEYS=true
-TMP_WORK="$(mktemp -d "${TMPDIR:-/tmp}/ikbi-smoke-work.XXXXXX")"
-trap 'rm -rf "$TMP_WORK"' EXIT
+TMP_WORK="$(mktemp -d "$GOVERNED_TEMP/ikbi-smoke-work.XXXXXX")"
+# ONE exit trap. A second `trap ... EXIT` REPLACES the first rather than adding to it, and that is
+# exactly what happened here: the governed-temp cleanup was silently dropped and the smoke run's
+# child survived every invocation.
+trap 'rm -rf "$TMP_WORK"; cleanup_governed_temp' EXIT
 
 pass=0; fail=0; warn=0
 declare -a FAILED=()
