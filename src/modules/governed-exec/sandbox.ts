@@ -23,6 +23,7 @@
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import { join } from "node:path";
+import { labTempDir, resolveTempRoot } from "../../core/temp-root.js";
 
 /** existsSync that never throws (e.g. on EACCES of an intermediate dir). */
 function existsSyncSafe(p: string): boolean {
@@ -160,6 +161,15 @@ export interface SandboxPlan {
    */
   readonly extraWritable?: readonly string[];
   /**
+   * THE GOVERNED TEMPORARY CHILD for this run — a host path under ikbi's validated temp root.
+   *
+   * Bound WRITABLE and exported as TMPDIR/TMP/TEMP inside the sandbox, so a subprocess writes its
+   * scratch to the SAME governed place its parent does, and one wrapper cleans up after all of
+   * them. Absent ⇒ the sandbox falls back to the private tmpfs at /tmp, which is a containment
+   * barrier rather than a location anything of ours targets (see `buildBwrapArgs`).
+   */
+  readonly tempRoot?: string;
+  /**
    * SANDBOX VIEW (V2-016A/B2). `worktree` (default) is the F1 policy: the WHOLE host is bound
    * READ-ONLY, worktree writable. `narrow` is the BUILDER READ-ONLY TERMINAL view: the host is NOT
    * mounted at all — only essential system dirs (for the binary to run), the explicit
@@ -190,7 +200,9 @@ export const NARROW_SYSTEM_DIRS: readonly string[] = Object.freeze([
  * file outside its candidate view, because that file is not in the namespace at all.
  */
 export function buildNarrowBwrapArgs(plan: SandboxPlan, command: string, args: readonly string[]): string[] {
-  const a: string[] = ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--setenv", "TMPDIR", "/tmp"];
+  // `/tmp` is masked, never used — see `buildBwrapArgs`. TMPDIR is the governed child when the
+  // caller supplied one; otherwise the writable throwaway this view already hands the command.
+  const a: string[] = ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"];
   for (const dir of NARROW_SYSTEM_DIRS) {
     if (existsSyncSafe(dir)) a.push("--ro-bind", dir, dir);
   }
@@ -204,11 +216,79 @@ export function buildNarrowBwrapArgs(plan: SandboxPlan, command: string, args: r
     const w = canonical(plan.writableRoot);
     if (existsSyncSafe(w)) a.push("--bind", w, w);
   }
+  a.push(...tempRootBwrapArgs(plan, plan.writableRoot !== undefined ? canonical(plan.writableRoot) : undefined));
   const chdir = plan.cwd !== undefined ? canonical(plan.cwd) : plan.readonlyRoots?.[0];
   if (chdir !== undefined) a.push("--chdir", chdir);
   // NEVER share the network from the read-only terminal.
   a.push("--unshare-all", "--die-with-parent", "--new-session", "--", command, ...args);
   return a;
+}
+
+/**
+ * Bind the run's governed temporary child and point the standard temp variables at it.
+ *
+ * THE RULE THIS SERVES: no ikbi code uses /tmp, inside the sandbox or out. A subprocess that
+ * called `os.tmpdir()` used to land on the sandbox's private tmpfs — contained, but still /tmp,
+ * and invisible to the wrapper that accounts for scratch. Now it lands in the same governed child
+ * the parent is using, which is bound at its REAL path so a path handed across the boundary means
+ * the same thing on both sides.
+ *
+ * ONLY the run's own child is bound — never the shared root — so a subprocess cannot walk up into
+ * a concurrent run's scratch. When the child is already inside the writable root there is nothing
+ * to bind: it is writable already, and binding it twice makes bwrap fail.
+ */
+function tempRootBwrapArgs(plan: SandboxPlan, writableRoot: string | undefined, env: NodeJS.ProcessEnv = process.env): string[] {
+  if (plan.tempRoot === undefined) return ["--setenv", "TMPDIR", "/tmp"];
+  const temp = canonical(plan.tempRoot);
+  const out: string[] = [];
+  const alreadyWritable = (p: string): boolean => writableRoot !== undefined && (p === writableRoot || p.startsWith(writableRoot + "/"));
+  if (!alreadyWritable(temp) && existsSyncSafe(temp)) out.push("--bind", temp, temp);
+
+  /*
+    A HOME THAT IS ITSELF SCRATCH IS WRITABLE. Everything else about HOME is unchanged.
+
+    The real home stays read-only — that is the F1 barrier and it is not touched. But a caller
+    that points HOME at a directory inside the governed temporary root has said, structurally,
+    "this home IS scratch": hermetic children and the verifier do exactly that. Before the lab
+    rule those homes lived under /tmp, which the sandbox replaced with a writable tmpfs, so a
+    toolchain could write its caches; moving them to the governed root silently made them
+    read-only, and `pnpm test` then failed for want of a cache — a verifier result that said
+    "fail" about the harness rather than about the candidate.
+
+    Only a home UNDER the governed root qualifies, so nothing about the operator's real home, or
+    any path outside that root, becomes writable.
+  */
+  const home = env.HOME;
+  if (home !== undefined && home.length > 0) {
+    const realHome = canonical(home);
+    const governed = realHome === temp || realHome.startsWith(temp + "/") || isUnderGovernedRoot(realHome);
+    if (governed && !alreadyWritable(realHome) && realHome !== temp && existsSyncSafe(realHome)) {
+      out.push("--bind", realHome, realHome);
+    }
+  }
+
+  out.push("--setenv", "TMPDIR", temp, "--setenv", "TMP", temp, "--setenv", "TEMP", temp);
+  return out;
+}
+
+/**
+ * Is `candidate` inside the GOVERNED TEMPORARY ROOT?
+ *
+ * Compared against the ROOT rather than against this process's own child, deliberately. A spawned
+ * CLI resolves its own child under the same root, so a HOME the parent created is a cousin of the
+ * subprocess's scratch, not a descendant of it — deriving the boundary from `exec-scratch` said
+ * "not scratch" about a directory that plainly was one, and a sandboxed `pnpm` then failed for
+ * want of a writable cache.
+ *
+ * The root is still a tight boundary: it is ikbi's own validated scratch area and nothing else.
+ * A HOME anywhere outside it — the operator's real home above all — is unaffected and stays
+ * read-only.
+ */
+function isUnderGovernedRoot(candidate: string): boolean {
+  const resolution = resolveTempRoot();
+  if (!resolution.ok) return false;
+  const root = canonical(resolution.root);
+  return candidate === root || candidate.startsWith(root + "/");
 }
 
 /**
@@ -247,7 +327,17 @@ export function packageManagerStoreDirs(env: NodeJS.ProcessEnv = process.env): s
  * poison only ikbi's own build cache, never the operator's. Honors XDG_CACHE_HOME.
  */
 export function toolchainCacheBase(env: NodeJS.ProcessEnv = process.env): string {
-  const cacheHome = env.XDG_CACHE_HOME && env.XDG_CACHE_HOME.length > 0 ? env.XDG_CACHE_HOME : join(env.HOME ?? "/tmp", ".cache");
+  // NO /tmp FALLBACK. This used to read `env.HOME ?? "/tmp"`, so a process started without HOME
+  // silently put ikbi's toolchain caches in the system temp directory — which the lab rule
+  // forbids outright, and which would also have meant re-downloading every dependency each run.
+  // Without HOME the governed temporary root is the correct home for a cache: lab-owned, on real
+  // storage, and validated.
+  const cacheHome =
+    env.XDG_CACHE_HOME && env.XDG_CACHE_HOME.length > 0
+      ? env.XDG_CACHE_HOME
+      : env.HOME && env.HOME.length > 0
+        ? join(env.HOME, ".cache")
+        : join(labTempDir(env), "cache");
   return join(cacheHome, "ikbi", "toolchains");
 }
 
@@ -312,12 +402,20 @@ export function buildBwrapArgs(plan: SandboxPlan, command: string, args: readonl
     "--ro-bind", "/", "/",
     "--dev", "/dev",
     "--proc", "/proc",
+    // `/tmp` is masked with a fresh, empty tmpfs. This is a CONTAINMENT BARRIER, not a location
+    // anything of ours uses: a third-party tool that hard-codes an absolute `/tmp/x` writes into a
+    // private, ephemeral filesystem that vanishes with the process and never reaches the host.
+    // TMPDIR points somewhere else entirely (below), so no ikbi code targets it.
     "--tmpfs", "/tmp",
-    "--setenv", "TMPDIR", "/tmp",
   ];
   if (writableRoot !== undefined) {
     a.push("--bind", writableRoot, writableRoot);
   }
+  // THE GOVERNED TEMPORARY CHILD. Bound writable at its real host path and named as TMPDIR/TMP/
+  // TEMP, so `os.tmpdir()` inside the sandbox resolves to the same governed directory the parent
+  // is using — the run's own child, not the shared root, so a subprocess cannot reach a sibling's
+  // scratch by walking up.
+  a.push(...tempRootBwrapArgs(plan, writableRoot));
   // Extra writable mounts (dependency-install's store/cache only). Bind each that EXISTS read-write,
   // skipping the worktree (already bound) and any missing dir (bwrap fails on a missing bind source).
   for (const raw of plan.extraWritable ?? []) {

@@ -31,6 +31,9 @@ import type { EventInput } from "../../core/events/index.js";
 import { isValidatedIdentity } from "../../core/identity/index.js";
 import type { AgentIdentity } from "../../core/identity/contract.js";
 import { receipts as coreReceipts } from "../../core/receipt/index.js";
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { labTempDir } from "../../core/temp-root.js";
 import type { ReceiptInput } from "../../core/receipt/contract.js";
 import { asTier, autonomyForTier, TRUST_FLOOR } from "../../core/trust/index.js";
 import type { FetchLike } from "../../core/provider/providers/openai-compatible.js";
@@ -379,6 +382,35 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
     let sandboxPlan: SandboxPlan | undefined;
     let sandboxLabel: "bwrap" | "none" | "unavailable" = "none";
     const sandboxWritableRoot = request.worktreeRoot ?? cwd;
+    /*
+      THE GOVERNED TEMPORARY CHILD, handed to every sandbox plan below.
+
+      Resolved HERE, once, rather than per plan: it is the same directory for the whole process,
+      and every sandboxed command must see the same one so scratch written by a subprocess lands
+      where the wrapper accounts for it. Best-effort — a host with no usable governed root still
+      runs commands, just without a bound temp child, and `labTempDir` has already refused to
+      substitute the system temp directory for it.
+    */
+    let governedTempRoot: string | undefined;
+    try {
+      /*
+        A DEDICATED SUBDIRECTORY, never the run's child itself.
+
+        Binding the child would hand every sandboxed command the whole run's scratch — sibling
+        candidates' formatter shadows, other suites' fixtures — and it measurably did: it broke
+        the F1 containment guard (a script escaping to `join(tmpdir(), …)` suddenly landed on the
+        host) and the narrow-terminal guard (an allowlisted `head` could read a synthetic secret
+        outside its candidate). Both caught it, which is what they are for.
+
+        So the sandbox gets one directory that exists only to be a subprocess's TMPDIR. It is
+        under the governed root — so the lab rule holds and the run's cleanup collects it — and it
+        contains nothing a command could learn anything from.
+      */
+      governedTempRoot = join(labTempDir(), "exec-scratch");
+      mkdirSync(governedTempRoot, { recursive: true, mode: 0o700 });
+    } catch {
+      governedTempRoot = undefined;
+    }
 
     // (5a) NARROW COMMAND SANDBOX (V2-016A/B2). The BUILDER read-only terminal requests a narrow
     // filesystem view: EVERY command — even a generically "safe" head/grep — runs inside bwrap with
@@ -395,6 +427,7 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
         view: "narrow",
         readonlyRoots: request.commandSandbox.readonlyRoots,
         writableRoot: request.commandSandbox.writableRoot,
+        ...(governedTempRoot !== undefined ? { tempRoot: governedTempRoot } : {}),
         ...(cwd !== undefined ? { cwd } : {}),
         networkAllowed: false,
         risk,
@@ -438,6 +471,7 @@ export function createGovernedExec(deps: GovernedExecDeps = {}): GovernedExec {
           networkAllowed: risk.needsNetwork,
           risk,
           ...(extraWritable.length > 0 ? { extraWritable } : {}),
+          ...(governedTempRoot !== undefined ? { tempRoot: governedTempRoot } : {}),
         };
         sandboxLabel = "bwrap";
         emit(govexecExecuted, { ...base, allow: true, sandbox: "bwrap", risk: risk.kind }, identity, EXEC_OPERATION, requestId);
