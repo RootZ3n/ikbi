@@ -36,6 +36,7 @@ import { runFailure, type RunFailure } from "./failure.js";
 import type { CandidateRecord } from "./candidate.js";
 import type { VerificationRecord, RunVerificationSummary } from "./verification.js";
 import type { CandidateDiff } from "./candidate-diff.js";
+import { auditCriticClaims, buildDeterministicEvidence, type UnsupportedClaim } from "./critic-evidence.js";
 
 // ---------------------------------------------------------------------------
 // Subject
@@ -369,8 +370,22 @@ export interface CriticRecord {
   /** PROVENANCE, not identity: the invocation event that produced this judgment. */
   readonly invocationId: V2InvocationId;
   readonly verdict: CriticVerdict;
+  /**
+   * The judgment's prose, AFTER unsupported deterministic-success claims were removed.
+   *
+   * Never the raw model text. A sentence like "cargo fmt passed" that no evidence supports is
+   * replaced by a visible marker before it can become receipt fact.
+   */
   readonly summary: string;
   readonly defects: readonly MaterialDefect[];
+  /** The evidence set this judgment was audited against. */
+  readonly evidenceId: string;
+  /**
+   * Every deterministic-success claim the critic made that the evidence did not support, with
+   * the reason. Empty on the ordinary path. Reported, never silently dropped — a receipt that
+   * hid the over-claim would read as though it never happened.
+   */
+  readonly unsupportedClaims: readonly UnsupportedClaim[];
   readonly startedAt: number;
   readonly endedAt: number;
 }
@@ -451,7 +466,11 @@ export interface RunCriticSummary {
   readonly criticDecisionId: string;
   readonly invocationId: string;
   readonly verdict: CriticVerdict;
+  /** Sanitized prose — unsupported deterministic-success claims are already removed. */
   readonly summary: string;
+  readonly evidenceId: string;
+  /** What the critic claimed that the evidence did not support. Empty on the ordinary path. */
+  readonly unsupportedClaims: readonly UnsupportedClaim[];
   readonly defects: readonly {
     readonly defectId: string;
     readonly category: DefectCategory;
@@ -473,6 +492,8 @@ export function summarizeCritic(record: CriticRecord): RunCriticSummary {
     invocationId: record.invocationId,
     verdict: record.verdict,
     summary: record.summary,
+    evidenceId: record.evidenceId,
+    unsupportedClaims: record.unsupportedClaims,
     defects: record.defects.map((d) => ({ defectId: d.defectId, category: d.category, severity: d.severity, description: d.description, paths: d.paths })),
   };
 }
@@ -560,6 +581,13 @@ export interface JudgeCandidateInput {
    * keeps the previous fail-closed behaviour byte for byte.
    */
   readonly repairInvocationId?: V2InvocationId;
+  /**
+   * The governed formatter invocations for THIS candidate, if any.
+   *
+   * Part of the deterministic evidence a critic may cite: "the formatter succeeded" is a factual
+   * claim, and it needs a fact behind it. Checks already arrive via `verificationSummary`.
+   */
+  readonly formatterEvidence?: readonly { readonly formatterId: string; readonly argv: readonly string[]; readonly outcome: string }[];
   /**
    * The SAME session invocation/cost authority the builder uses — never a critic-private ledger.
    * The attempt is recorded through it immediately BEFORE the wire send.
@@ -779,7 +807,45 @@ export async function judgeCandidate(input: JudgeCandidateInput): Promise<Critic
     };
   }
 
-  // 6. THE RECORD. Content-addressed over the evidence + verdict + defects; the invocation
+  /*
+    6. THE EVIDENCE AUDIT — before anything is recorded.
+
+    The verdict and the defects are already strictly parsed. The PROSE was not, and prose is what
+    an operator reads: "cargo fmt passed" went into the receipt verbatim whether or not a `fmt`
+    check existed, passed, or timed out. Every deterministic-success assertion is now resolved
+    against the finite evidence for THIS run over THIS candidate, and an unsupported one is
+    replaced by a visible marker rather than deleted — a receipt that quietly tidied away an
+    over-claim would read as though the critic never made one.
+
+    Opinions, negatives and conditionals are untouched. This governs one speech act: an assertion
+    that a named check or formatter succeeded.
+  */
+  const deterministicEvidence = buildDeterministicEvidence({
+    runId: input.runId,
+    candidateId: candidate.candidateId,
+    workspaceId: candidate.workspaceId,
+    verdict: input.verificationSummary.verdict,
+    checks: input.verificationSummary.checks.map((c) => ({ name: c.name, command: c.command, status: c.status })),
+    ...(input.formatterEvidence !== undefined ? { formatters: input.formatterEvidence } : {}),
+  });
+  const summaryAudit = auditCriticClaims(parsed.summary, deterministicEvidence);
+  const defectAudits = parsed.defects.map((d) => auditCriticClaims(d.description, deterministicEvidence));
+  const unsupportedClaims: readonly UnsupportedClaim[] = Object.freeze([
+    ...summaryAudit.unsupported,
+    ...defectAudits.flatMap((a) => a.unsupported),
+  ]);
+  // A defect's identity is its content, so a sanitized description is a different defect — the id
+  // is recomputed rather than kept, or the record would cite an id for text it no longer carries.
+  const auditedDefects: readonly MaterialDefect[] = Object.freeze(
+    parsed.defects.map((d, i) => {
+      const description = defectAudits[i]?.sanitized ?? d.description;
+      return description === d.description
+        ? d
+        : { ...d, description, defectId: defectDigest({ category: d.category, severity: d.severity, description, paths: d.paths }) };
+    }),
+  );
+
+  // 7. THE RECORD. Content-addressed over the evidence + verdict + defects; the invocation
   //    is provenance.
   const record: CriticRecord = Object.freeze({
     criticId: criticDigest({
@@ -789,7 +855,7 @@ export async function judgeCandidate(input: JudgeCandidateInput): Promise<Critic
       reviewPackageId: reviewPackage.reviewPackageId,
       criticDecisionId: decision.decisionId,
       verdict: parsed.verdict,
-      defects: parsed.defects,
+      defects: auditedDefects,
     }),
     runId: input.runId,
     taskId: input.taskId,
@@ -800,8 +866,10 @@ export async function judgeCandidate(input: JudgeCandidateInput): Promise<Critic
     criticDecisionId: decision.decisionId,
     invocationId,
     verdict: parsed.verdict,
-    summary: parsed.summary,
-    defects: parsed.defects,
+    summary: summaryAudit.sanitized,
+    defects: auditedDefects,
+    evidenceId: deterministicEvidence.evidenceId,
+    unsupportedClaims,
     startedAt,
     endedAt: now(),
   });

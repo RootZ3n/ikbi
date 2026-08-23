@@ -1035,6 +1035,12 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
         runId, taskId, goal: task.goal, candidate: s.candidate, verification: s.verification, verificationSummary: summarizeVerification(s.verification), workspacePath: s.workspace!.path,
         decision: critDecision, transport: deps.transport, boundary: deps.untrustedBoundary, diffSource: deps.candidateDiff, diffBudget: DEFAULT_DIFF_BUDGET,
         probeTree: (path) => deps.treeProbe.treeOf(path), invocationId: criticInvocationId, repairInvocationId: criticRepairInvocationId, maxOutputTokens: criticMaxOutputTokens, timeoutMs: CRITIC_TIMEOUT_MS,
+        // The formatter invocations for THIS candidate's workspace — part of the deterministic
+        // evidence the critic may cite, and scoped to the candidate so a sibling's formatting
+        // can never support a claim about this one.
+        formatterEvidence: formatterRecords
+          .filter((r) => r.workspaceId === s.workspace!.workspaceId)
+          .map((r) => ({ formatterId: r.formatterId, argv: r.argv, outcome: r.outcome })),
         ...(deps.admission !== undefined ? { admission: deps.admission } : {}),
         ...(deps.aliases !== undefined ? { aliases: deps.aliases } : {}), now,
       });

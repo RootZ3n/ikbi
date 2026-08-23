@@ -692,9 +692,24 @@ test("single authority: only the critic module mints a critic/defect identity (V
   for (const file of tsFiles(V2_DIR)) {
     if (allowed.has(file) || file.endsWith(".test.ts")) continue;
     const source = stripComments(readFileSync(file, "utf8"));
-    if (/contentDigest\s*\(\s*"critic|contentDigest\s*\(\s*"defect/.test(source)) offenders.push(relative(SRC, file));
+    // The kind is matched EXACTLY, closing quote included. The looser prefix form flagged
+    // `contentDigest("critic_evidence", …)` in critic-evidence.ts, which is a different identity
+    // entirely — the finite evidence set a judgment was audited against, not the judgment. A
+    // guard that cannot tell two identities apart is not protecting either of them.
+    if (/contentDigest\s*\(\s*"critic"|contentDigest\s*\(\s*"defect"/.test(source)) offenders.push(relative(SRC, file));
   }
   assert.deepEqual(offenders, [], "critic + defect identity belong to src/v2/core/critic.ts alone");
+});
+
+test("single authority: only the critic-evidence module mints an EVIDENCE-SET identity", () => {
+  // Its own guard, so tightening the one above did not simply drop `critic_evidence` on the floor.
+  const allowed = new Set([join(V2_DIR, "core", "critic-evidence.ts")]);
+  const offenders: string[] = [];
+  for (const file of tsFiles(V2_DIR)) {
+    if (allowed.has(file) || file.endsWith(".test.ts")) continue;
+    if (/contentDigest\s*\(\s*"critic_evidence"/.test(stripComments(readFileSync(file, "utf8")))) offenders.push(relative(SRC, file));
+  }
+  assert.deepEqual(offenders, [], "the deterministic evidence set is identified by src/v2/core/critic-evidence.ts alone");
 });
 
 test("single authority: a candidate is JUDGED only by the run spine (V2-009)", () => {
