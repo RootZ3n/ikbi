@@ -249,3 +249,83 @@ test("undo preview shows the diff when gitDiff is provided", async () => {
   assert.match(cap.out, /Changes that will be undone/, "diff section header shown");
   assert.match(cap.out, /added line/, "diff content shown");
 });
+
+// ── `--latest` refusals must say which refusal it is ──────────────────────────
+
+/**
+ * `--latest` is scoped to the repository the operator is standing in, so it can never revert
+ * another repository's landing sight unseen. That scoping is right. What it SAID when it applied
+ * was not: "no revertible promotion found in the receipt log" — for a promote whose receipt was in
+ * the log, listed by `ikbi receipts`, and revertible by sha.
+ *
+ * `ikbi build --repo <path>` lands promotions in repositories the operator is not standing in, so
+ * this is the ordinary case for that flag, not a corner. An operator reading the old message
+ * concludes their promotion was never recorded and stops looking.
+ */
+test("undo --latest: a promote in ANOTHER repo is named, not denied", async () => {
+  const mem = memReceipts([promoteReceipt("/repos/service", "main", "BEFORE1111", "AFTER22222")]);
+  const cap = capture();
+  await createUndoCli({
+    receipts: mem.store,
+    operatorToken: "op-token",
+    resolveIdentity: () => VALIDATED,
+    cwd: () => "/somewhere/else",
+    stdout: cap.stdout,
+    stderr: cap.stderr,
+    setExit: cap.setExit,
+  }).undo(["--latest"]);
+
+  assert.equal(cap.exit, 1, "it still refuses — scoping is the safety property");
+  assert.doesNotMatch(
+    cap.err,
+    /no revertible promotion found in the receipt log/,
+    "must not claim the log is empty when the receipt is in it",
+  );
+  assert.match(cap.err, /\/repos\/service#main/, "names the repository that has one");
+  assert.match(cap.err, /AFTER22222/, "and the exact commit to undo");
+  assert.equal(mem.appended.length, 0, "explaining a refusal reverts nothing");
+});
+
+test("undo --latest: with NO promote receipts at all, it says exactly that", async () => {
+  const mem = memReceipts([]);
+  const cap = capture();
+  await createUndoCli({
+    receipts: mem.store,
+    operatorToken: "op-token",
+    resolveIdentity: () => VALIDATED,
+    cwd: () => "/somewhere/else",
+    stdout: cap.stdout,
+    stderr: cap.stderr,
+    setExit: cap.setExit,
+  }).undo(["--latest"]);
+
+  assert.equal(cap.exit, 1);
+  assert.match(cap.err, /no revertible promotion found in the receipt log/);
+  assert.equal(mem.appended.length, 0);
+});
+
+test("undo --latest: a promote in the CURRENT repo is still resolved normally", async () => {
+  // The scoping fix must not have made `--latest` stop working where it should work.
+  const mem = memReceipts([promoteReceipt("/repos/service", "main", "BEFORE1111", "AFTER22222")]);
+  const cap = capture();
+  const calls: { ref: string; newSha: string; oldSha: string }[] = [];
+  const git: UndoGit = {
+    revParse: async () => "AFTER22222",
+    worktreeForBranch: async () => undefined,
+    isWorktreeClean: async () => true,
+    updateRefCas: async (_repo: string, ref: string, newSha: string, oldSha: string) => {
+      calls.push({ ref, newSha, oldSha });
+    },
+    syncWorktreeToRef: async () => ({ stashed: false }),
+  };
+  await createUndoCli({
+    receipts: mem.store, git,
+    operatorToken: "op-token",
+    resolveIdentity: () => VALIDATED,
+    cwd: () => "/repos/service/src",
+    stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit,
+  }).undo(["--latest", "--yes"]);
+
+  assert.equal(cap.exit, undefined, `expected success, got: ${cap.err}`);
+  assert.deepEqual(calls, [{ ref: "refs/heads/main", newSha: "BEFORE1111", oldSha: "AFTER22222" }]);
+});

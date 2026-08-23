@@ -137,7 +137,26 @@ export function createUndoCli(deps: UndoCliDeps = {}) {
     if (useLatest) {
       revertible = await resolveLatest().catch(() => undefined);
       if (revertible === undefined) {
-        err("ikbi undo: no revertible promotion found in the receipt log\n");
+        // TELL THE TRUTH ABOUT WHY. `--latest` is deliberately scoped to the repository the
+        // operator is standing in, so it can never revert another repository's landing sight
+        // unseen. But `ikbi build --repo <path>` lands promotions in repositories the operator is
+        // NOT standing in, and for those this said the receipt log held no revertible promotion —
+        // when the `workspace.promote` receipt was sitting in it, listed by `ikbi receipts`, and
+        // revertible by sha. An operator reading that concludes the promote was never recorded.
+        const elsewhere = await revertiblePromotesElsewhere().catch(() => []);
+        if (elsewhere.length === 0) {
+          err("ikbi undo: no revertible promotion found in the receipt log\n");
+        } else {
+          const nearest = elsewhere[0]!;
+          err(
+            `ikbi undo: no revertible promotion for the current directory. ` +
+              `--latest is scoped to the repository you are in, so it cannot revert another one by surprise.\n` +
+              `  ${elsewhere.length} revertible promotion(s) recorded elsewhere, most recent first:\n` +
+              elsewhere.slice(0, 5).map((e) => `    ${e.repo}#${e.branch}  ${e.afterRef.slice(0, 8)}\n`).join("") +
+              `  Undo one by naming it here, or run --latest from inside that repository:\n` +
+              `    ikbi undo ${nearest.afterRef}\n`,
+          );
+        }
         setExit(1);
         return;
       }
@@ -241,6 +260,26 @@ export function createUndoCli(deps: UndoCliDeps = {}) {
 
     const via = revertible.source === "registry" ? "durable promote record (receipt was missing — PROMOTED_BUT_RECEIPT_FAILED recovery)" : `receipt ${revertible.correctsReceiptId}`;
     out(`undone: "${branch}" reset ${short(afterRef)} → ${short(beforeRef)} (reverting ${via})\n`);
+  }
+
+  /**
+   * Revertible promotes that `--latest` deliberately will NOT touch, newest first.
+   *
+   * Used only to explain a refusal. Naming them changes no authority: reverting one still requires
+   * the operator to name it, which is the same confirmation `--latest` gets from standing in the
+   * repository.
+   */
+  async function revertiblePromotesElsewhere(): Promise<{ repo: string; branch: string; afterRef: string }[]> {
+    const all = await receipts.query();
+    return all
+      .filter((r) => r.operation === "workspace.promote" && r.outcome.status === "success" && stateChange(r) !== undefined)
+      .sort((a, b) => b.seq - a.seq)
+      .map((r) => {
+        const t = stateChange(r)!.target;
+        const i = t.lastIndexOf("#");
+        return { repo: t.slice(0, i), branch: t.slice(i + 1), afterRef: (stateChange(r)!.after!.ref as string) ?? "" };
+      })
+      .filter((e) => e.repo.length > 0 && e.branch.length > 0 && e.afterRef.length > 0 && !cwdInRepo(e.repo));
   }
 
   /** Resolve the most recent revertible promote from the receipt log (for `--latest`). */
