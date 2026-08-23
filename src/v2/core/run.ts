@@ -73,6 +73,12 @@ import {
 } from "./contract.js";
 import { buildRuntimeModelPolicy, type ConfigurationSource, type RuntimeModelPolicy } from "./config.js";
 import {
+  V2_SCOPE_FAILURE_CODES,
+  buildMutationScope,
+  mutationScopeFailure,
+  summarizeMutationScope,
+} from "./mutation-scope.js";
+import {
   resolveModelRoute,
   type ModelRequirements,
   type ModelResolutionDecision,
@@ -509,6 +515,25 @@ export function preflight(request: V2TaskRequest, probe: RepoProbe): PreflightRe
     };
   }
 
+  // THE MUTATION SCOPE, decided before anything else is touched.
+  //
+  // Deliberately ahead of the repository probe, and far ahead of provider resolution and
+  // workspace allocation: a run with no authority to change anything must not reach a model,
+  // must not allocate a worktree, and must not cost money. Fail-closed — an absent scope is a
+  // refusal, never a fallback to the repository.
+  const scopeResult = buildMutationScope(request.mutationScope);
+  if (!scopeResult.ok) {
+    return {
+      ok: false,
+      failure: mutationScopeFailure(
+        scopeResult.code === "scope_absent" ? V2_SCOPE_FAILURE_CODES.scopeRequired : V2_SCOPE_FAILURE_CODES.scopeInvalid,
+        scopeResult.detail,
+        { code: scopeResult.code },
+      ),
+    };
+  }
+  const mutationScope = scopeResult.scope;
+
   const repoPath = isAbsolute(request.repoPath) ? request.repoPath : resolve(request.repoPath);
   const seen = probe.inspect(repoPath);
   if (!seen.exists) {
@@ -548,7 +573,7 @@ export function preflight(request: V2TaskRequest, probe: RepoProbe): PreflightRe
     };
   }
 
-  return { ok: true, task: { goal, repoPath, candidateStrategy: strategyRaw } };
+  return { ok: true, task: { goal, repoPath, candidateStrategy: strategyRaw, mutationScope } };
 }
 
 /** The candidate strategy plan a run resolved. Declared here, executed by no one yet. */
@@ -1155,6 +1180,9 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
       promotionRecord !== undefined
         ? { beforeRef: promotionRecord.beforeRef, afterRef: promotionRecord.afterRef }
         : undefined),
+    // The authority this run held. Recorded whenever preflight got far enough to establish
+    // one — a reader cannot judge "what changed" without knowing what was permitted to.
+    ...(resolvedTask !== undefined ? { mutationScope: summarizeMutationScope(resolvedTask.mutationScope) } : {}),
     ...(policy !== undefined ? { configuration: summarizeConfiguration(policy) } : {}),
     ...(source !== undefined ? { sourceSnapshot: summarizeSnapshot(source.snapshot) } : {}),
     ...(decision !== undefined ? { resolution: summarizeResolution(decision) } : {}),

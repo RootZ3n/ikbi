@@ -120,7 +120,7 @@ interface Snapshot {
 }
 
 function inventory(root: string, extraEnv: Record<string, string> = {}): Snapshot {
-  const r = runCli(root, ["v2", "build", "an inventory probe", "--repo", REPO, "--json"], extraEnv);
+  const r = runCli(root, ["v2", "build", "--allow-repo-wide", "an inventory probe", "--repo", REPO, "--json"], extraEnv);
   assert.ok(r.stdout.trim().startsWith("{"), `expected JSON on stdout, got:\n${r.stdout}\n---\n${r.stderr}`);
   const raw = sessionFinalAttempt(r.stdout);
   const models = raw.policy?.inventory.models ?? [];
@@ -326,7 +326,7 @@ test("inventory truth: no credential reaches output, the inventory, or any diges
   for (const [what, text] of [["stdout", snap.stdout], ["stderr", snap.stderr], ["result", JSON.stringify(snap.raw)]] as const) {
     assert.equal(text.includes(OPENAI_KEY), false, `the OpenAI key leaked into ${what}`);
   }
-  const human = runCli(root, ["v2", "build", "probe", "--repo", REPO]);
+  const human = runCli(root, ["v2", "build", "--allow-repo-wide", "probe", "--repo", REPO]);
   assert.equal(human.stdout.includes(OPENAI_KEY), false);
   assert.equal(human.stderr.includes(OPENAI_KEY), false);
   // The credential's PRESENCE is all that is ever recorded.

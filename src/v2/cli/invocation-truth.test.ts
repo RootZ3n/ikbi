@@ -112,7 +112,7 @@ function runCli(server: FakeProviderServer, root: string, args: readonly string[
 }
 
 function v2Run(server: FakeProviderServer, root: string, repo: string, args: readonly string[] = [], extraEnv: Record<string, string> = {}) {
-  const r = runCli(server, root, ["v2", "build", GOAL, "--repo", repo, "--json", ...args], extraEnv);
+  const r = runCli(server, root, ["v2", "build", "--allow-repo-wide", GOAL, "--repo", repo, "--json", ...args], extraEnv);
   assert.ok(r.stdout.trim().startsWith("{"), `expected JSON on stdout, got:\n${r.stdout}\n---\n${r.stderr}`);
   return { result: sessionFinalAttempt(r.stdout), stdout: r.stdout, stderr: r.stderr, status: r.status };
 }
@@ -314,7 +314,7 @@ test("invocation truth: the egress floor is NOT bypassed — loopback needs an o
   const root = makeStateRoot(server);
   activate(server, root, "prof-a");
   // Same everything, minus the operator's explicit local allowance.
-  const r = runCli(server, root, ["v2", "build", GOAL, "--repo", makeRepo(), "--json"], {
+  const r = runCli(server, root, ["v2", "build", "--allow-repo-wide", GOAL, "--repo", makeRepo(), "--json"], {
     IKBI_EGRESS_ALLOWLIST: "",
     IKBI_EGRESS_ALLOW_LOCAL: "",
   });

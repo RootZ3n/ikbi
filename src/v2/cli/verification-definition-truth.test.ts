@@ -81,7 +81,7 @@ function makeStateRoot(server: FakeProviderServer): string {
 }
 
 function build(root: string, server: FakeProviderServer, repo: string, goal: string, ikbiChecks?: string) {
-  const res = spawnSync(process.execPath, [ENTRY, "v2", "build", goal, "--repo", repo, "--json"], {
+  const res = spawnSync(process.execPath, [ENTRY, "v2", "build", "--allow-repo-wide", goal, "--repo", repo, "--json"], {
     cwd: mkdtempSync(join(tmpdir(), "ikbi-v2-defcwd-")),
     env: {
       PATH: process.env.PATH ?? "",

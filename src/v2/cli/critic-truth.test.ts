@@ -121,7 +121,7 @@ function runCli(root: string, server: FakeProviderServer, args: readonly string[
 
 function build(root: string, server: FakeProviderServer, repo: string, opts: { checks?: string; env?: Record<string, string>; goal?: string } = {}) {
   const env = { ...(opts.checks !== undefined ? { IKBI_CHECKS: opts.checks } : {}), ...(opts.env ?? {}) };
-  const r = runCli(root, server, ["v2", "build", opts.goal ?? "set widget to 2 in src/widget.ts", "--repo", repo, "--json"], env);
+  const r = runCli(root, server, ["v2", "build", "--allow-repo-wide", opts.goal ?? "set widget to 2 in src/widget.ts", "--repo", repo, "--json"], env);
   assert.ok(r.stdout.trim().startsWith("{"), `expected JSON on stdout, got:\n${r.stdout}\n---\n${r.stderr}`);
   return sessionFinalAttempt(r.stdout);
 }
@@ -328,7 +328,7 @@ test("critic truth: the human rendering states the judgment and refuses to imply
     }),
   });
   const root = makeStateRoot(server);
-  const r = runCli(root, server, ["v2", "build", "set widget to 2 in src/widget.ts", "--repo", makeRepo()], { IKBI_CHECKS: GREP_WIDGET_2 });
+  const r = runCli(root, server, ["v2", "build", "--allow-repo-wide", "set widget to 2 in src/widget.ts", "--repo", makeRepo()], { IKBI_CHECKS: GREP_WIDGET_2 });
   assert.match(r.stdout, /critic {6}DEFECTS_FOUND \(model judgment\)/);
   assert.match(r.stdout, /major {5}incomplete_implementation \[src\/widget\.ts\]: value is hard-coded/);
   assert.match(r.stdout, /SEMANTIC EVIDENCE ONLY — NOT a disposition, NOT a promotion/);

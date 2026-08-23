@@ -72,7 +72,7 @@ function makeRepo(): string {
 function runCli(root: string, server: FakeProviderServer, repo: string, json = true) {
   const cwd = mkdtempSync(join(tmpdir(), "ikbi-v2-rcwd-"));
   dirs.push(cwd);
-  const args = ["v2", "build", "set widget to 2 in src/widget.ts", "--repo", repo];
+  const args = ["v2", "build", "--allow-repo-wide", "set widget to 2 in src/widget.ts", "--repo", repo];
   if (json) args.push("--json");
   const res = spawnSync(process.execPath, [ENTRY, ...args], {
     cwd,

@@ -95,7 +95,7 @@ function runCli(root: string, args: readonly string[]) {
 }
 
 function v2Run(root: string, repo: string, goal: string) {
-  const r = runCli(root, ["v2", "build", goal, "--repo", repo, "--json"]);
+  const r = runCli(root, ["v2", "build", "--allow-repo-wide", goal, "--repo", repo, "--json"]);
   assert.ok(r.stdout.trim().startsWith("{"), `expected JSON on stdout, got:\n${r.stdout}\n---\n${r.stderr}`);
   return sessionFinalAttempt(r.stdout);
 }
@@ -273,7 +273,7 @@ test("retrieval truth: a goal with no usable terms retrieves nothing, and says s
 });
 
 test("retrieval truth: the human rendering states the retrieval account", () => {
-  const r = runCli(makeStateRoot(), ["v2", "build", "refresh the session token", "--repo", makeRepo()]);
+  const r = runCli(makeStateRoot(), ["v2", "build", "--allow-repo-wide", "refresh the session token", "--repo", makeRepo()]);
   assert.match(r.stdout, /retrieval {3}v2\.deterministic\.\d+ · examined \d+ source file\(s\), \d+ matched, \d+ admitted/);
   assert.match(r.stdout, /\+ retrieved_repository_evidence +src\/session-token\.ts/);
 });

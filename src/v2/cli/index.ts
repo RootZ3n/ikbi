@@ -27,6 +27,7 @@ import type { ContextSource } from "../core/context.js";
 import type { InvocationTransport } from "../core/invocation.js";
 import type { StateBoundMutationAuthority, WorkspaceAuthority } from "../core/workspace.js";
 import type { SourceSnapshotAuthority } from "../core/source.js";
+import { buildMutationScope } from "../core/mutation-scope.js";
 import { CANDIDATE_STRATEGIES } from "../core/contract.js";
 import { LOCAL_MODES, isLocalMode } from "../core/local-work.js";
 import {
@@ -55,7 +56,21 @@ import "./local.js";
 
 const LOCAL_MODE_HINT = "[--local-mode off|assist|auto] [--require-local-success]";
 export const V2_USAGE = `Usage: ikbi v2 build "<goal>" [--repo <path>] [--strategy ${CANDIDATE_STRATEGIES.join("|")}] [--profile <name>] ${LOCAL_MODE_HINT} [--json]`;
-export const BUILD_USAGE = `Usage: ikbi build "<goal>" [--repo <path>] [--strategy ${CANDIDATE_STRATEGIES.join("|")}] [--profile <name>] ${LOCAL_MODE_HINT} [--json]`;
+/**
+ * The scope options are listed FIRST and without brackets: they are required, and a usage line
+ * that showed them as optional would be lying about the only flag a build cannot start without.
+ */
+export const SCOPE_USAGE_HINT =
+  "(--allow-path <file> | --allow-tree <dir>)... | --allow-repo-wide";
+
+export const BUILD_USAGE = `Usage: ikbi build "<goal>" ${SCOPE_USAGE_HINT} [--repo <path>] [--strategy ${CANDIDATE_STRATEGIES.join("|")}] [--profile <name>] ${LOCAL_MODE_HINT} [--json]
+
+Mutation scope (REQUIRED — a build states what it may change, and nothing else):
+  --allow-path <file>   an exact repository-relative file this build may create/modify/delete
+  --allow-tree <dir>    a repository-relative directory, and everything beneath it
+  --allow-repo-wide     the whole repository; cannot be combined with the narrower options
+
+There is no default. A build with no scope is refused before any model is called.`;
 
 /**
  * The experimental banner. On stderr so `--json` stdout stays machine-clean.
@@ -93,6 +108,12 @@ interface V2Args {
   readonly localMode: string;
   /** True when the operator wants a local advisory FAILURE to stop the build. Off by default. */
   readonly requireLocalSuccess: boolean;
+  /** `--allow-path` — exact repository-relative files this run may change. */
+  readonly allowPaths: readonly string[];
+  /** `--allow-tree` — repository-relative directories this run may change, recursively. */
+  readonly allowTrees: readonly string[];
+  /** `--allow-repo-wide` — the whole repository, stated explicitly and never inferred. */
+  readonly allowRepoWide: boolean;
   /**
    * A USAGE REFUSAL. Present when the invocation could not be understood — an unrecognized
    * option, or a known option missing its value. The caller MUST refuse the run and print this
@@ -130,6 +151,9 @@ export function parseV2Args(argv: readonly string[], cwd: string): V2Args {
   // it did before this flag existed.
   let localMode: string = "off";
   let requireLocalSuccess = false;
+  const allowPaths: string[] = [];
+  const allowTrees: string[] = [];
+  let allowRepoWide = false;
   let rejection: string | undefined;
   let endOfOptions = false;
 
@@ -165,6 +189,12 @@ export function parseV2Args(argv: readonly string[], cwd: string): V2Args {
       }
     }
     else if (a === "--require-local-success") requireLocalSuccess = true;
+    // THE MUTATION SCOPE. Repeatable, accumulated verbatim: this parser does not normalize,
+    // deduplicate or judge the paths, so there is exactly ONE place that decides what a scope
+    // means (`buildMutationScope`) and the CLI cannot drift from it.
+    else if (a === "--allow-path") { const v = takeValue(a, argv[i + 1]); if (v !== undefined) allowPaths.push(v); i += 1; }
+    else if (a === "--allow-tree") { const v = takeValue(a, argv[i + 1]); if (v !== undefined) allowTrees.push(v); i += 1; }
+    else if (a === "--allow-repo-wide") allowRepoWide = true;
     else if (a.startsWith("-") && a !== "-") rejection ??= `unknown option "${a}"`;
     else words.push(a);
   }
@@ -181,6 +211,9 @@ export function parseV2Args(argv: readonly string[], cwd: string): V2Args {
     json,
     localMode,
     requireLocalSuccess,
+    allowPaths,
+    allowTrees,
+    allowRepoWide,
     ...(rejection !== undefined ? { rejection } : {}),
   };
 }
@@ -193,6 +226,22 @@ function refuseUsage(command: string, rejection: string, usage: string, err: (s:
   err(`${command}: ${rejection}\n${usage}\n`);
   return 2;
 }
+
+/**
+ * Refuse an unusable mutation scope as a USAGE error, before anything is constructed.
+ *
+ * It calls the SAME `buildMutationScope` preflight uses rather than re-deciding what a scope
+ * means — two implementations of an authority is how the CLI and the engine come to disagree.
+ * This one only chooses the PRESENTATION: an operator who mistyped a flag gets the usage line
+ * and exit 2, not a failed run with a receipt. Preflight still validates independently, which
+ * is what protects the callers that never come through this parser.
+ */
+function refuseUnusableScope(command: string, args: V2Args, usage: string, err: (s: string) => void): number | undefined {
+  const result = buildMutationScope({ allowPaths: args.allowPaths, allowTrees: args.allowTrees, repoWide: args.allowRepoWide });
+  if (result.ok) return undefined;
+  return refuseUsage(command, result.detail, usage, err);
+}
+
 
 /**
  * The isolated workspace. Rendered as the exact source state it was cut from, what was
@@ -602,6 +651,10 @@ interface BuildRequest {
   readonly strategy: string | undefined;
   readonly profile: string | undefined;
   readonly json: boolean;
+  /** The operator's mutation scope, forwarded VERBATIM for preflight to validate. */
+  readonly allowPaths: readonly string[];
+  readonly allowTrees: readonly string[];
+  readonly allowRepoWide: boolean;
 }
 
 /**
@@ -856,6 +909,9 @@ async function executeProductionBuild(req: BuildRequest, banner: string, io: Bui
       // THE CANONICAL GOAL, BYTE-IDENTICAL. Nothing local reaches this field, in any mode.
       goal: canonicalGoal,
       repoPath: req.repo,
+      // Handed over UNVALIDATED, exactly as typed. The CLI is a transport for the operator's
+      // intent, not a second interpreter of it — preflight owns what a scope means.
+      mutationScope: { allowPaths: req.allowPaths, allowTrees: req.allowTrees, repoWide: req.allowRepoWide },
       ...(req.strategy !== undefined ? { candidateStrategy: req.strategy } : {}),
       ...(req.profile !== undefined ? { profile: req.profile } : {}),
     },
@@ -977,8 +1033,10 @@ export async function runBuildCli(argv: readonly string[], io: BuildCliIo = {}):
   const args = parseV2Args(["build", ...argv], io.cwd ?? process.cwd());
   // REFUSE BEFORE ANYTHING IS CONSTRUCTED. An invocation we cannot read is never "close enough".
   if (args.rejection !== undefined) return refuseUsage("ikbi build", args.rejection, BUILD_USAGE, io.stderr ?? writeStderr);
+  const scopeRefusal = refuseUnusableScope("ikbi build", args, BUILD_USAGE, io.stderr ?? writeStderr);
+  if (scopeRefusal !== undefined) return scopeRefusal;
   return executeProductionBuild(
-    { goal: args.goal, repo: args.repo, strategy: args.strategy, profile: args.profile, json: args.json, localMode: args.localMode, requireLocalSuccess: args.requireLocalSuccess },
+    { goal: args.goal, repo: args.repo, strategy: args.strategy, profile: args.profile, json: args.json, localMode: args.localMode, requireLocalSuccess: args.requireLocalSuccess, allowPaths: args.allowPaths, allowTrees: args.allowTrees, allowRepoWide: args.allowRepoWide },
     BUILD_BANNER,
     io,
   );
@@ -998,8 +1056,10 @@ export async function runV2Cli(argv: readonly string[], io: BuildCliIo = {}): Pr
     err(`ikbi v2: unknown subcommand ${args.subcommand === undefined ? "<none>" : `"${args.subcommand}"`} (only "build" exists; \`ikbi v2 build\` is an alias for \`ikbi build\`)\n`);
     return 2;
   }
+  const scopeRefusal = refuseUnusableScope("ikbi v2", args, V2_USAGE, err);
+  if (scopeRefusal !== undefined) return scopeRefusal;
   return executeProductionBuild(
-    { goal: args.goal, repo: args.repo, strategy: args.strategy, profile: args.profile, json: args.json, localMode: args.localMode, requireLocalSuccess: args.requireLocalSuccess },
+    { goal: args.goal, repo: args.repo, strategy: args.strategy, profile: args.profile, json: args.json, localMode: args.localMode, requireLocalSuccess: args.requireLocalSuccess, allowPaths: args.allowPaths, allowTrees: args.allowTrees, allowRepoWide: args.allowRepoWide },
     V2_BANNER,
     io,
   );

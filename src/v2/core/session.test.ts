@@ -28,6 +28,17 @@ import type { RepoProbe } from "./run.js";
 import type { SourceSnapshotAuthority } from "./source.js";
 import type { WorkspaceAuthority, StateBoundMutationAuthority, V2WorkspaceRecord, WorkspaceDisposition } from "./workspace.js";
 
+/**
+ * The mutation scope these suites run under — REPO-WIDE, and explicitly so.
+ *
+ * They predate the operator mutation scope and exercise other authorities entirely, so the
+ * widest grant keeps them testing what they were written to test. It is stated HERE, once,
+ * because the engine itself has no default: a reader can grep this constant to find every
+ * suite holding repository-wide authority, and a suite that needs a narrow scope says so at
+ * its own call site. Scope enforcement has its own suites; these are not them.
+ */
+const REPO_WIDE = { repoWide: true } as const;
+
 const goodRepo: RepoProbe = { inspect: () => ({ exists: true, isDirectory: true, hasGitDir: true }) };
 
 const workingConfiguration: ConfigurationSource = {
@@ -170,7 +181,7 @@ function baseDeps(over: Partial<V2BuildSessionDeps> = {}): V2BuildSessionDeps {
   };
 }
 
-const build = { goal: "do a thing", repoPath: "/repo" };
+const build = { goal: "do a thing", repoPath: "/repo", mutationScope: REPO_WIDE };
 
 // ── environmental retries ─────────────────────────────────────────────────────
 
@@ -362,4 +373,23 @@ test("session: a single clean attempt is one attempt, accepted, no recovery chur
   assert.equal(session.outcome.kind, "accepted");
   assert.equal(session.recoveryDecisions[0]!.kind, "stop_accepted");
   assert.equal(session.recoveryDecisions[0]!.authorizesNewAttempt, false);
+});
+
+test("session: every recovery attempt inherits the EXACT original scope", async () => {
+  // A narrow scope, and a session that makes more than one attempt. Recovery must not be a
+  // way to acquire authority the operator never granted — the second attempt is bound by the
+  // same scope id as the first, not by a fresh or widened one.
+  const narrowBuild = { goal: "do a thing", repoPath: "/repo", mutationScope: { allowTrees: ["src"] } };
+  const ws = statefulWorkspaces();
+  const pub = scriptedPublisher(["stale", "land"]);
+  const result = await executeV2BuildSession(narrowBuild, baseDeps({ workspaces: ws.authority, publisher: pub.target }));
+
+  assert.equal(result.attempts.length, 2, "one automatic recovery attempt");
+  const scopeIds = result.attempts.map((a) => a.receipt.mutationScope?.scopeId);
+  assert.ok(scopeIds.every((id) => id !== undefined), "every attempt recorded its authority");
+  assert.equal(new Set(scopeIds).size, 1, "all attempts ran under ONE scope");
+  for (const attempt of result.attempts) {
+    assert.equal(attempt.receipt.mutationScope?.kind, "narrow", "recovery never widens to repo-wide");
+    assert.deepEqual(attempt.receipt.mutationScope?.entries.map((e) => e.path), ["src"]);
+  }
 });

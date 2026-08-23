@@ -106,7 +106,7 @@ function runCli(stateRoot: string, args: readonly string[]): { status: number | 
 }
 
 function v2Run(stateRoot: string, repo: string, goal = GOAL): { result: V2RunResult; stdout: string; stderr: string; status: number | null } {
-  const r = runCli(stateRoot, ["v2", "build", goal, "--repo", repo, "--json"]);
+  const r = runCli(stateRoot, ["v2", "build", "--allow-repo-wide", goal, "--repo", repo, "--json"]);
   assert.ok(r.stdout.trim().startsWith("{"), `expected JSON on stdout, got:\n${r.stdout}\n---\n${r.stderr}`);
   return { result: sessionFinalAttempt(r.stdout), stdout: r.stdout, stderr: r.stderr, status: r.status };
 }

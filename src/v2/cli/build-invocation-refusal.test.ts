@@ -89,7 +89,7 @@ test("DD-01: `ikbi build` refuses an unknown option with exit 2 and builds NOTHI
 
 test("DD-01: `ikbi v2 build` refuses the same way, naming its own usage", async () => {
   const cap = capture();
-  const code = await runV2Cli(["build", "goal", "--bogus"], { stderr: cap.stderr, cwd: "/cwd" });
+  const code = await runV2Cli(["build", "--allow-repo-wide", "goal", "--bogus"], { stderr: cap.stderr, cwd: "/cwd" });
   assert.equal(code, 2);
   assert.match(cap.read(), /unknown option "--bogus"/);
   assert.ok(cap.read().includes(V2_USAGE));

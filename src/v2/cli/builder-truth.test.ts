@@ -112,7 +112,7 @@ function runCli(root: string, server: FakeProviderServer, args: readonly string[
 }
 
 function build(root: string, server: FakeProviderServer, repo: string, goal = "change src/widget.ts so widget = 2") {
-  const r = runCli(root, server, ["v2", "build", goal, "--repo", repo, "--json"]);
+  const r = runCli(root, server, ["v2", "build", "--allow-repo-wide", goal, "--repo", repo, "--json"]);
   assert.ok(r.stdout.trim().startsWith("{"), `expected JSON on stdout, got:\n${r.stdout}\n---\n${r.stderr}`);
   return sessionFinalAttempt(r.stdout);
 }
@@ -503,7 +503,7 @@ test("builder truth: the receipt carries no file bodies and no conversation", as
 test("builder truth: the human rendering states the candidate and refuses to imply a verdict", async () => {
   const server = await provider(EDIT_SCRIPT);
   const root = makeStateRoot(server);
-  const r = runCli(root, server, ["v2", "build", "change src/widget.ts so widget = 2", "--repo", makeRepo()]);
+  const r = runCli(root, server, ["v2", "build", "--allow-repo-wide", "change src/widget.ts so widget = 2", "--repo", makeRepo()]);
   assert.match(r.stdout, /candidate {3}[0-9a-f]{64}/);
   assert.match(r.stdout, /work {6}3 turn\(s\), 3 tool call\(s\), 0 refused\/rejected, 1 mutation\(s\)/);
   assert.match(r.stdout, /paths {5}src\/widget\.ts/);

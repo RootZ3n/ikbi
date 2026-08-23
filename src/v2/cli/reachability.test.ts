@@ -176,7 +176,7 @@ test("reachability: v2 registers into the SAME registry v1 dispatches from", () 
 
 test("reachability: the command body enters the canonical lifecycle and reports it", async () => {
   const cap = capture();
-  const code = await runV2Cli(["build", "add", "a", "thing"], cap);
+  const code = await runV2Cli(["build", "--allow-repo-wide", "add", "a", "thing"], cap);
   assert.equal(cap.err, V2_BANNER, "the experimental banner goes to stderr, not stdout");
   assert.match(
     cap.out,
@@ -190,7 +190,7 @@ test("reachability: the command body enters the canonical lifecycle and reports 
 
 test("reachability: the JSON surface carries the lifecycle journal + a counted receipt", async () => {
   const cap = capture();
-  await runV2Cli(["build", "x", "--json"], cap);
+  await runV2Cli(["build", "--allow-repo-wide", "x", "--json"], cap);
   const result = sessionFinalAttempt(cap.out);
   // Only the real lifecycle produces this: a journal that starts at `pending`, enters
   // preflight, and ends at `terminal`. A CLI that shortcut past the spine could not.
@@ -234,7 +234,7 @@ test("reachability: the JSON surface carries the lifecycle journal + a counted r
 
 test("reachability: the CLI never claims a stage it did not run", async () => {
   const cap = capture();
-  await runV2Cli(["build", "x", "--json"], cap);
+  await runV2Cli(["build", "--allow-repo-wide", "x", "--json"], cap);
   const result = sessionFinalAttempt(cap.out);
   for (const stage of LIFECYCLE_STAGES) {
     if (stage === "preflight" || stage === "model_resolution" || stage === "context" || stage === "candidate_strategy" || stage === "candidate_generation" || stage === "verification" || stage === "criticism" || stage === "disposition") continue;
@@ -255,7 +255,7 @@ test("reachability: an unknown v2 subcommand is refused, not silently built", as
 
 test("reachability: a bad repo path fails preflight through the CLI", async () => {
   const cap = capture();
-  const code = await runV2Cli(["build", "x", "--repo", "/nonexistent/ikbi-v2-probe"], cap);
+  const code = await runV2Cli(["build", "--allow-repo-wide", "x", "--repo", "/nonexistent/ikbi-v2-probe"], cap);
   assert.notEqual(code, 0);
   assert.match(cap.out, /\[preflight\] no such path/);
 });
@@ -272,7 +272,7 @@ test("reachability: argv parsing keeps multi-word goals and flags apart", () => 
 
 test("reachability: the human rendering shows an AUTHORIZATION, not an invocation", async () => {
   const cap = capture();
-  await runV2Cli(["build", "x"], cap);
+  await runV2Cli(["build", "--allow-repo-wide", "x"], cap);
   assert.match(cap.out, /resolved\s+builder -> alpha-1 via alpha/);
   assert.match(cap.out, /authorized, NOT invoked/);
   assert.match(cap.out, /invoked\s+builder -> alpha\/a1/);

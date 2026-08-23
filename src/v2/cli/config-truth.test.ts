@@ -125,7 +125,7 @@ function runCli(root: string, args: readonly string[], extraEnv: Record<string, 
 }
 
 function v2Run(root: string, args: readonly string[] = [], extraEnv: Record<string, string> = {}): { result: V2RunResult; stdout: string; stderr: string; status: number | null } {
-  const r = runCli(root, ["v2", "build", "a configuration probe", "--repo", REPO, "--json", ...args], extraEnv);
+  const r = runCli(root, ["v2", "build", "--allow-repo-wide", "a configuration probe", "--repo", REPO, "--json", ...args], extraEnv);
   assert.ok(r.stdout.trim().startsWith("{"), `expected JSON on stdout, got:\n${r.stdout}\n---\n${r.stderr}`);
   return { result: sessionFinalAttempt(r.stdout), stdout: r.stdout, stderr: r.stderr, status: r.status };
 }
@@ -299,7 +299,7 @@ test("config truth: no credential reaches v2 output, from a provider OR a profil
   assert.equal(JSON.stringify(result).includes(PLANTED_SECRET), false, "the planted key leaked into the result");
   assert.equal(result.policy?.profile?.parameters.OPENAI_API_KEY, "[redacted]");
   // And the human rendering is clean too.
-  const human = runCli(root, ["v2", "build", "probe", "--repo", REPO]);
+  const human = runCli(root, ["v2", "build", "--allow-repo-wide", "probe", "--repo", REPO]);
   assert.equal(human.stdout.includes(PLANTED_SECRET), false);
   assert.equal(human.stderr.includes(PLANTED_SECRET), false);
 });

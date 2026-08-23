@@ -107,7 +107,7 @@ test("v2 cli: the built CLI exists (run `pnpm build` first)", () => {
 });
 
 test("v2 cli: `ikbi v2 build` reaches the canonical v2 lifecycle end-to-end", () => {
-  const r = runCli(["v2", "build", "a real goal", "--repo", REPO, "--json"]);
+  const r = runCli(["v2", "build", "--allow-repo-wide", "a real goal", "--repo", REPO, "--json"]);
   // No manifest / no IKBI_CHECKS ⇒ NO_CHECKS ⇒ the candidate is WITHHELD (a correct,
   // intended result), so the exit code is 0. Nothing was promoted.
   assert.equal(r.status, 0, `expected a zero exit for a withheld candidate\n${r.stderr}`);
@@ -123,7 +123,7 @@ test("v2 cli: `ikbi v2 build` reaches the canonical v2 lifecycle end-to-end", ()
 });
 
 test("v2 cli: the end-to-end run claims NOTHING it did not do", () => {
-  const r = runCli(["v2", "build", "promote everything", "--repo", REPO, "--json"]);
+  const r = runCli(["v2", "build", "--allow-repo-wide", "promote everything", "--repo", REPO, "--json"]);
   const result = sessionFinalAttempt(r.stdout);
   assert.equal(result.outcome.kind, "withheld");
   assert.deepEqual(result.receipt.evidence, {
@@ -258,7 +258,7 @@ test("v2 cli: a build mutates NOTHING in the repository it is pointed at, and no
   // A trivial, allowlisted verification check so the run does NOT discover and execute a full
   // test suite in the candidate worktree. The source-safety property is independent of which
   // checks run.
-  runCli(["v2", "build", "rewrite the world", "--repo", target], { IKBI_CHECKS: '[{"name":"noop","command":"echo","args":["ok"]}]' });
+  runCli(["v2", "build", "--allow-repo-wide", "rewrite the world", "--repo", target], { IKBI_CHECKS: '[{"name":"noop","command":"echo","args":["ok"]}]' });
   assertCanonicalUntouched(before, "a build pointed at a disposable fixture");
 
   assert.equal(spawnSync("git", ["status", "--porcelain"], { cwd: target, encoding: "utf8" }).stdout, targetStatus, "the target working tree is unchanged");
@@ -284,7 +284,7 @@ test("v2 cli: a SUCCESSFUL build that really PUBLISHES leaks nothing into the ca
 
     const before = canonicalIdentity();
     const r = runCli(
-      ["build", "set widget to 2 in src/widget.ts", "--repo", target, "--json"],
+      ["build", "--allow-repo-wide", "set widget to 2 in src/widget.ts", "--repo", target, "--json"],
       { IKBI_CHECKS: '[{"name":"widget","command":"grep","args":["-q","widget = 2","src/widget.ts"]}]', ...loopbackEgressEnv(scripted) },
       root,
     );
@@ -324,7 +324,7 @@ test("v2 cli: a build that FAILS after the workspace exists leaks nothing into t
 
     const before = canonicalIdentity();
     const r = runCli(
-      ["build", "this build cannot succeed", "--repo", target, "--json"],
+      ["build", "--allow-repo-wide", "this build cannot succeed", "--repo", target, "--json"],
       { IKBI_CHECKS: '[{"name":"noop","command":"echo","args":["ok"]}]', ...loopbackEgressEnv(broken) },
       root,
     );
@@ -337,7 +337,7 @@ test("v2 cli: a build that FAILS after the workspace exists leaks nothing into t
 
 test("v2 cli: shadow and tournament strategies are accepted by the spine", () => {
   for (const strategy of ["shadow", "tournament"]) {
-    const r = runCli(["v2", "build", "race it", "--repo", REPO, "--strategy", strategy, "--json"]);
+    const r = runCli(["v2", "build", "--allow-repo-wide", "race it", "--repo", REPO, "--strategy", strategy, "--json"]);
     const result = sessionFinalAttempt(r.stdout);
     assert.ok(result.outcome.kind === "withheld", `${strategy} passed preflight and adjudicated`);
     assert.equal(result.receipt.stagesEntered.includes("disposition"), true, `${strategy} reached disposition`);
@@ -371,7 +371,7 @@ test("v2 cli: the default help does NOT advertise the advanced alias", () => {
 // ── V2-018 CUTOVER: the NORMAL command is the governed v2 engine ─────────────
 
 test("cutover: `ikbi build` (the NORMAL command) reaches the canonical v2 lifecycle end-to-end", () => {
-  const r = runCli(["build", "a real goal", "--repo", REPO, "--json"]);
+  const r = runCli(["build", "--allow-repo-wide", "a real goal", "--repo", REPO, "--json"]);
   assert.equal(r.status, 0, `expected a zero exit for a withheld candidate\n${r.stderr}`);
   const result = sessionFinalAttempt(r.stdout);
   assert.ok(result.taskId.startsWith("task_"), "the normal command minted a v2 task");
@@ -383,8 +383,8 @@ test("cutover: `ikbi build` (the NORMAL command) reaches the canonical v2 lifecy
 });
 
 test("cutover: `ikbi build` and `ikbi v2 build` reach the SAME v2 handler (no behavior fork)", () => {
-  const build = sessionFinalAttempt(runCli(["build", "identical goal", "--repo", REPO, "--json"]).stdout);
-  const v2 = sessionFinalAttempt(runCli(["v2", "build", "identical goal", "--repo", REPO, "--json"]).stdout);
+  const build = sessionFinalAttempt(runCli(["build", "--allow-repo-wide", "identical goal", "--repo", REPO, "--json"]).stdout);
+  const v2 = sessionFinalAttempt(runCli(["v2", "build", "--allow-repo-wide", "identical goal", "--repo", REPO, "--json"]).stdout);
   // Different session/run identities (each is its own run) but IDENTICAL spine + evidence shape.
   assert.deepEqual(build.receipt.stagesEntered, v2.receipt.stagesEntered, "same stages");
   assert.deepEqual(build.receipt.evidence, v2.receipt.evidence, "same counted evidence");
@@ -393,7 +393,7 @@ test("cutover: `ikbi build` and `ikbi v2 build` reach the SAME v2 handler (no be
 
 test("cutover: shadow + tournament run through the NORMAL `ikbi build` command", () => {
   for (const strategy of ["shadow", "tournament"]) {
-    const r = runCli(["build", "race it", "--repo", REPO, "--strategy", strategy, "--json"]);
+    const r = runCli(["build", "--allow-repo-wide", "race it", "--repo", REPO, "--strategy", strategy, "--json"]);
     const result = sessionFinalAttempt(r.stdout);
     assert.ok(result.outcome.kind === "withheld", `${strategy} passed preflight and adjudicated`);
     assert.equal(result.receipt.stagesEntered.includes("disposition"), true, `${strategy} reached disposition`);
@@ -401,13 +401,13 @@ test("cutover: shadow + tournament run through the NORMAL `ikbi build` command",
 });
 
 test("cutover: `ikbi build` defaults to the SINGLE strategy (predictable cost)", () => {
-  const result = sessionFinalAttempt(runCli(["build", "just do it", "--repo", REPO, "--json"]).stdout);
+  const result = sessionFinalAttempt(runCli(["build", "--allow-repo-wide", "just do it", "--repo", REPO, "--json"]).stdout);
   assert.equal(result.receipt.strategy?.kind, "single", "the daily-driver default is one candidate");
   assert.equal(result.receipt.strategy?.candidateCount, 1);
 });
 
 test("cutover: `ikbi build --json` emits the COMPLETE governed session receipt (build-command truth)", () => {
-  const session = JSON.parse(runCli(["build", "tell the truth", "--repo", REPO, "--json"]).stdout) as {
+  const session = JSON.parse(runCli(["build", "--allow-repo-wide", "tell the truth", "--repo", REPO, "--json"]).stdout) as {
     buildSessionId: string;
     outcome: { kind: string };
     receipt: { totalAttempts: number; cost: { totalInvocations: number; formattedKnownCostUsd: string } };
@@ -422,7 +422,7 @@ test("cutover: `ikbi build --json` emits the COMPLETE governed session receipt (
 });
 
 test("cutover: `ikbi build --strategy tournament --json` shows all candidates + the ONE selection", () => {
-  const result = sessionFinalAttempt(runCli(["build", "race hard", "--repo", REPO, "--strategy", "tournament", "--json"]).stdout);
+  const result = sessionFinalAttempt(runCli(["build", "--allow-repo-wide", "race hard", "--repo", REPO, "--strategy", "tournament", "--json"]).stdout);
   assert.equal(result.receipt.strategy?.kind, "tournament");
   assert.equal(result.receipt.candidates?.length, 3, "three candidates are each accounted for on the receipt");
   assert.ok(result.receipt.selection !== undefined, "the ONE selection is recorded");
@@ -438,7 +438,7 @@ test("cutover: `ikbi legacy` is RETIRED — it is not a command and runs nothing
   assert.equal(bare.stdout.includes('"journal"'), false, "nothing entered any build lifecycle");
 
   // The muscle-memory invocation must refuse too — never reinterpreted as a chat prompt, never run.
-  const build = runCli(["legacy", "build", "do a thing"]);
+  const build = runCli(["legacy", "build", "--allow-repo-wide", "do a thing"]);
   assert.equal(build.status, 2, "`ikbi legacy build` cannot start the retired v1 engine");
   assert.match(build.stderr, /Nothing was run/, "it states that nothing happened");
   assert.equal(build.stdout.includes('"journal"'), false, "and it started no run of any kind");

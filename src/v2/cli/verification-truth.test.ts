@@ -94,7 +94,7 @@ function makeRepo(files: Readonly<Record<string, string>> = {}): string {
 }
 
 function build(root: string, server: FakeProviderServer, repo: string, ikbiChecks?: string, extraEnv: Record<string, string> = {}) {
-  const res = spawnSync(process.execPath, [ENTRY, "v2", "build", "set widget to 2 in src/widget.ts", "--repo", repo, "--json"], {
+  const res = spawnSync(process.execPath, [ENTRY, "v2", "build", "--allow-repo-wide", "set widget to 2 in src/widget.ts", "--repo", repo, "--json"], {
     cwd: mkdtempSync(join(tmpdir(), "ikbi-v2-vcwd-")),
     env: {
       PATH: process.env.PATH ?? "",
@@ -295,7 +295,7 @@ test("verification truth: the human rendering states the verdict and refuses to 
   const server = await provider(EDIT_TO_2);
   const root = makeStateRoot(server);
   const repo = makeRepo();
-  const res = spawnSync(process.execPath, [ENTRY, "v2", "build", "set widget to 2 in src/widget.ts", "--repo", repo], {
+  const res = spawnSync(process.execPath, [ENTRY, "v2", "build", "--allow-repo-wide", "set widget to 2 in src/widget.ts", "--repo", repo], {
     cwd: mkdtempSync(join(tmpdir(), "ikbi-v2-vcwd-")),
     env: {
       PATH: process.env.PATH ?? "",

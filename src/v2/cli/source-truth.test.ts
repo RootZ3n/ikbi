@@ -83,7 +83,7 @@ function runCli(root: string, args: readonly string[]) {
 }
 
 function v2Run(root: string, repo: string, goal = GOAL) {
-  const r = runCli(root, ["v2", "build", goal, "--repo", repo, "--json"]);
+  const r = runCli(root, ["v2", "build", "--allow-repo-wide", goal, "--repo", repo, "--json"]);
   assert.ok(r.stdout.trim().startsWith("{"), `expected JSON on stdout, got:\n${r.stdout}\n---\n${r.stderr}`);
   return { result: sessionFinalAttempt(r.stdout), stdout: r.stdout, status: r.status };
 }
@@ -259,7 +259,7 @@ test("source truth: the human rendering states the snapshot and what was materia
   const state = makeStateRoot();
   const repo = makeRepo();
   writeFiles(repo, { "src/a.ts": 'export const a = "B";\n' });
-  const r = runCli(state, ["v2", "build", GOAL, "--repo", repo]);
+  const r = runCli(state, ["v2", "build", "--allow-repo-wide", GOAL, "--repo", repo]);
   assert.match(r.stdout, /snapshot {4}[0-9a-f]{64} · dirty @ [0-9a-f]{12} · \+1 modified, 0 deleted, 0 untracked/);
   assert.match(r.stdout, /materialized 1 source entry from the snapshot/);
 });

@@ -26,6 +26,17 @@ import type { RepoProbe } from "./run.js";
 import type { SourceSnapshotAuthority } from "./source.js";
 import type { WorkspaceAuthority, StateBoundMutationAuthority, V2WorkspaceRecord, WorkspaceDisposition } from "./workspace.js";
 
+/**
+ * The mutation scope these suites run under — REPO-WIDE, and explicitly so.
+ *
+ * They predate the operator mutation scope and exercise other authorities entirely, so the
+ * widest grant keeps them testing what they were written to test. It is stated HERE, once,
+ * because the engine itself has no default: a reader can grep this constant to find every
+ * suite holding repository-wide authority, and a suite that needs a narrow scope says so at
+ * its own call site. Scope enforcement has its own suites; these are not them.
+ */
+const REPO_WIDE = { repoWide: true } as const;
+
 const goodRepo: RepoProbe = { inspect: () => ({ exists: true, isDirectory: true, hasGitDir: true }) };
 
 const workingConfiguration: ConfigurationSource = {
@@ -136,7 +147,7 @@ function baseDeps(over: Partial<V2BuildSessionDeps> & { sources?: SourceSnapshot
   };
 }
 
-const build = { goal: "make widget compute the right value", repoPath: "/repo" };
+const build = { goal: "make widget compute the right value", repoPath: "/repo", mutationScope: REPO_WIDE };
 
 // ── VERIFICATION-FAIL REPAIR ──────────────────────────────────────────────────
 

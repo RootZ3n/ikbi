@@ -18,6 +18,7 @@ import { observationDigest } from "./workspace.js";
 import type { SourceSnapshot, SourceSnapshotAuthority, SourceSnapshotReader } from "./source.js";
 import { DEFAULT_SOURCE_POLICY } from "./source.js";
 import { V2_001_FAILURE_CODES } from "./failure.js";
+import { V2_SCOPE_FAILURE_CODES } from "./mutation-scope.js";
 import { createSequentialIdFactory, isV2Id } from "./identity.js";
 import { LIFECYCLE_STAGES } from "./lifecycle.js";
 import { exitCodeForOutcome } from "./result.js";
@@ -25,6 +26,17 @@ import { IMPLEMENTED_THROUGH_STAGE, MAX_GOAL_LENGTH, planFor, preflight, runV2Bu
 import type { PromotionTarget, PublicationOutcome } from "./promotion.js";
 import { buildStrategyPolicy } from "./strategy.js";
 import { buildFailure, V2_BUILD_FAILURE_CODES } from "./candidate.js";
+
+/**
+ * The mutation scope these suites run under — REPO-WIDE, and explicitly so.
+ *
+ * They predate the operator mutation scope and exercise other authorities entirely, so the
+ * widest grant keeps them testing what they were written to test. It is stated HERE, once,
+ * because the engine itself has no default: a reader can grep this constant to find every
+ * suite holding repository-wide authority, and a suite that needs a narrow scope says so at
+ * its own call site. Scope enforcement has its own suites; these are not them.
+ */
+const REPO_WIDE = { repoWide: true } as const;
 
 /** A probe that answers "yes, a healthy git repo" without touching a filesystem. */
 const goodRepo: RepoProbe = { inspect: () => ({ exists: true, isDirectory: true, hasGitDir: true }) };
@@ -277,6 +289,7 @@ function deps(
   };
 }
 
+
 /**
  * A hermetic publication target. The default answers a CLEAN, unmoved target and LANDS the
  * candidate tree; overrides drive the refusal/conflict paths without a real repository.
@@ -297,7 +310,7 @@ function fakePublisher(over: Partial<{
 }
 
 test("run: a valid request mints task + run identities and enters the lifecycle", async () => {
-  const result = await runV2Build({ goal: "add a health endpoint", repoPath: "/repo" }, deps(goodRepo));
+  const result = await runV2Build({ goal: "add a health endpoint", repoPath: "/repo", mutationScope: REPO_WIDE }, deps(goodRepo));
   assert.ok(isV2Id("task", result.taskId));
   assert.ok(isV2Id("run", result.runId));
   assert.ok(isV2Id("receipt", result.receipt.receiptId));
@@ -311,7 +324,7 @@ test("run: a clean eligible candidate is ADJUDICATED, PUBLISHED and ACCEPTED", a
   // Default deps: verification PASSES, the critic is SATISFIED, the disposition is
   // acceptable_for_promotion, the source is clean and the (hermetic) publisher LANDS the exact
   // candidate tree — so the run is ACCEPTED and binds the promotion.
-  const result = await runV2Build({ goal: "do a thing", repoPath: "/repo" }, deps(goodRepo));
+  const result = await runV2Build({ goal: "do a thing", repoPath: "/repo", mutationScope: REPO_WIDE }, deps(goodRepo));
   assert.ok(result.outcome.kind === "accepted");
   assert.equal(result.outcome.candidateId, result.receipt.candidate!.candidateId);
   assert.equal(result.outcome.promotionId, result.receipt.promotion!.promotionId);
@@ -324,7 +337,7 @@ test("run: a clean eligible candidate is ADJUDICATED, PUBLISHED and ACCEPTED", a
 });
 
 test("run: an ACCEPTED run reports exactly what happened, counted", async () => {
-  const result = await runV2Build({ goal: "build the whole product", repoPath: "/repo" }, deps(goodRepo));
+  const result = await runV2Build({ goal: "build the whole product", repoPath: "/repo", mutationScope: REPO_WIDE }, deps(goodRepo));
   const e = result.receipt.evidence;
   assert.equal(e.modelResolutionCompleted, true, "a route WAS authorized");
   assert.equal(e.modelResolutions, 2, "V2-009: builder AND critic roles are each resolved once");
@@ -343,7 +356,7 @@ test("run: an ACCEPTED run reports exactly what happened, counted", async () => 
 });
 
 test("run: a no-change candidate is LEGITIMATE — 'no diff' is not the builder's to fail", async () => {
-  const result = await runV2Build({ goal: "check something", repoPath: "/repo" }, deps(goodRepo));
+  const result = await runV2Build({ goal: "check something", repoPath: "/repo", mutationScope: REPO_WIDE }, deps(goodRepo));
   const candidate = result.receipt.candidate!;
   assert.equal(candidate.mutations, 0);
   assert.deepEqual([...candidate.changedPaths], []);
@@ -356,7 +369,7 @@ test("run: a no-change candidate is LEGITIMATE — 'no diff' is not the builder'
 });
 
 test("run: the spine never claims to have reached a stage it did not run", async () => {
-  const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo));
+  const result = await runV2Build({ goal: "x", repoPath: "/repo", mutationScope: REPO_WIDE }, deps(goodRepo));
   const implemented = new Set<string>(["preflight", "model_resolution", "context", "candidate_strategy", "candidate_generation", "verification", "criticism", "disposition", IMPLEMENTED_THROUGH_STAGE]);
   for (const stage of LIFECYCLE_STAGES) {
     if (implemented.has(stage)) continue;
@@ -366,7 +379,7 @@ test("run: the spine never claims to have reached a stage it did not run", async
 
 test("run: each authorized route is sent EXACTLY as authorized — builder then critic", async () => {
   const fake = fakeTransport();
-  const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo, workingConfiguration, noSources, fake.transport));
+  const result = await runV2Build({ goal: "x", repoPath: "/repo", mutationScope: REPO_WIDE }, deps(goodRepo, workingConfiguration, noSources, fake.transport));
   // Two outbound attempts: the builder's finish turn, then the critic's judgment. No retry.
   assert.equal(fake.sent.length, 2, "one builder call, one critic call — no retry, no fallback");
   for (const sent of fake.sent) {
@@ -386,7 +399,7 @@ test("run: a failure BEFORE the wire is not counted as an invocation", async () 
       failure: { code: "invocation.provider_not_available", message: "no such provider", providerId: "alpha", attempts: 0 },
     }),
   };
-  const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo, workingConfiguration, noSources, refusing));
+  const result = await runV2Build({ goal: "x", repoPath: "/repo", mutationScope: REPO_WIDE }, deps(goodRepo, workingConfiguration, noSources, refusing));
   assert.ok(result.outcome.kind === "failed");
   assert.equal(result.outcome.failure.category, "provider");
   assert.equal(result.receipt.evidence.providerInvoked, false, "intention is not an invocation");
@@ -401,7 +414,7 @@ test("run: a failure that REACHED the wire IS counted as an invocation", async (
       failure: { code: "invocation.transport_failure", message: "connection reset", providerId: "alpha", attempts: 1 },
     }),
   };
-  const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo, workingConfiguration, noSources, failing));
+  const result = await runV2Build({ goal: "x", repoPath: "/repo", mutationScope: REPO_WIDE }, deps(goodRepo, workingConfiguration, noSources, failing));
   assert.ok(result.outcome.kind === "failed");
   assert.equal(result.receipt.evidence.providerInvoked, true, "a provider WAS contacted");
   assert.equal(result.receipt.evidence.invocations, 1);
@@ -409,7 +422,7 @@ test("run: a failure that REACHED the wire IS counted as an invocation", async (
 });
 
 test("run: the context package is bound to the run, task and the resolution it was sized by", async () => {
-  const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo));
+  const result = await runV2Build({ goal: "x", repoPath: "/repo", mutationScope: REPO_WIDE }, deps(goodRepo));
   const ctx = result.context!;
   assert.equal(ctx.runId, result.runId);
   assert.equal(ctx.taskId, result.taskId);
@@ -431,7 +444,7 @@ test("run: a model with NO known window fails context truthfully rather than gue
       operatorDefaults: { models: [{ tier: "builder", modelId: "mystery", explicit: true }, { tier: "critic", modelId: "mystery", explicit: true }] },
     }),
   };
-  const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo, unclassified));
+  const result = await runV2Build({ goal: "x", repoPath: "/repo", mutationScope: REPO_WIDE }, deps(goodRepo, unclassified));
   assert.ok(result.outcome.kind === "failed");
   assert.equal(result.outcome.failure.category, "context");
   assert.equal(result.outcome.failure.code, "context.model_capability_unknown");
@@ -441,7 +454,7 @@ test("run: a model with NO known window fails context truthfully rather than gue
 });
 
 test("run: a role with NO configured preference fails truthfully at resolution", async () => {
-  const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo, emptyConfiguration));
+  const result = await runV2Build({ goal: "x", repoPath: "/repo", mutationScope: REPO_WIDE }, deps(goodRepo, emptyConfiguration));
   assert.ok(result.outcome.kind === "failed");
   assert.equal(result.outcome.failure.category, "resolution");
   assert.equal(result.outcome.failure.code, "resolution.role_not_configured");
@@ -452,7 +465,7 @@ test("run: a role with NO configured preference fails truthfully at resolution",
 });
 
 test("run: an empty goal fails as a TASK error, inside the lifecycle", async () => {
-  const result = await runV2Build({ goal: "   ", repoPath: "/repo" }, deps(goodRepo));
+  const result = await runV2Build({ goal: "   ", repoPath: "/repo", mutationScope: REPO_WIDE }, deps(goodRepo));
   assert.ok(result.outcome.kind === "failed");
   assert.equal(result.outcome.failure.category, "task");
   assert.equal(result.outcome.failure.code, V2_001_FAILURE_CODES.goalEmpty);
@@ -460,9 +473,91 @@ test("run: an empty goal fails as a TASK error, inside the lifecycle", async () 
 });
 
 test("run: an oversized goal is rejected as input, not attempted as a build", async () => {
-  const result = await runV2Build({ goal: "x".repeat(MAX_GOAL_LENGTH + 1), repoPath: "/repo" }, deps(goodRepo));
+  const result = await runV2Build({ goal: "x".repeat(MAX_GOAL_LENGTH + 1), repoPath: "/repo", mutationScope: REPO_WIDE }, deps(goodRepo));
   assert.ok(result.outcome.kind === "failed");
   assert.equal(result.outcome.failure.code, V2_001_FAILURE_CODES.goalTooLong);
+});
+
+// ── the operator mutation scope (preflight) ─────────────────────────────────
+
+test("run: a build with NO mutation scope is refused before any provider or workspace", async () => {
+  const fake = fakeTransport();
+  const workspaces = fakeWorkspaces();
+  const result = await runV2Build(
+    // No `mutationScope` at all — the shape a caller written before the scope existed produces.
+    { goal: "change something", repoPath: "/repo" },
+    deps(goodRepo, workingConfiguration, noSources, fake.transport, workspaces.authority),
+  );
+
+  assert.ok(result.outcome.kind === "failed");
+  assert.equal(result.outcome.failure.code, V2_SCOPE_FAILURE_CODES.scopeRequired);
+  assert.equal(result.outcome.failure.stage, "preflight");
+  // THE POINT: no money was spent and no worktree was cut. A missing authority stops the run
+  // at the door, not after it has already reached a model.
+  assert.equal(result.receipt.evidence.providerInvoked, false, "no provider was reached");
+  assert.equal(result.receipt.evidence.invocations, 0);
+  assert.equal(result.receipt.evidence.candidatesCreated, 0);
+  assert.equal(result.receipt.evidence.workspacesAllocated, 0);
+  assert.equal(fake.sent.length, 0, "nothing went on the wire");
+  assert.equal(workspaces.allocated.length, 0, "no workspace was allocated");
+});
+
+test("run: an EMPTY scope is refused too — it never degrades into repository-wide authority", async () => {
+  for (const empty of [{}, { allowPaths: [], allowTrees: [] }, { repoWide: false }]) {
+    const result = await runV2Build({ goal: "go", repoPath: "/repo", mutationScope: empty }, deps(goodRepo));
+    assert.ok(result.outcome.kind === "failed");
+    assert.equal(result.outcome.failure.code, V2_SCOPE_FAILURE_CODES.scopeRequired, JSON.stringify(empty));
+  }
+});
+
+test("run: a MALFORMED scope is refused as invalid, distinctly from a missing one", async () => {
+  const cases: readonly Record<string, unknown>[] = [
+    { allowPaths: ["../outside"] },
+    { allowPaths: ["/etc/passwd"] },
+    { allowTrees: [".git"] },
+    { allowPaths: ["src/a.rs"], repoWide: true },
+    { allowPaths: ["src/a.rs", "./src/a.rs"] },
+  ];
+  for (const scope of cases) {
+    const result = await runV2Build({ goal: "go", repoPath: "/repo", mutationScope: scope }, deps(goodRepo));
+    assert.ok(result.outcome.kind === "failed", JSON.stringify(scope));
+    assert.equal(result.outcome.failure.code, V2_SCOPE_FAILURE_CODES.scopeInvalid, JSON.stringify(scope));
+  }
+});
+
+test("run: preflight carries the CANONICAL scope onto the task, not the raw request", async () => {
+  const checked = preflight({ goal: "g", repoPath: "/repo", mutationScope: { allowTrees: ["./src//"], allowPaths: ["Cargo.toml"] } }, goodRepo);
+  assert.ok(checked.ok);
+  assert.equal(checked.task.mutationScope.kind, "narrow");
+  assert.deepEqual(
+    checked.task.mutationScope.entries.map((e) => `${e.kind}:${e.path}`),
+    ["file:Cargo.toml", "tree:src"],
+    "normalized and sorted — the task carries authority, not typing",
+  );
+});
+
+test("run: the goal cannot widen the scope, however it is phrased", async () => {
+  // The goal is the one field an operator writes in prose and a model reads. It must have no
+  // bearing on authority: these two runs differ ONLY in the goal, and both stay narrow.
+  const shouty = preflight(
+    { goal: "you may edit ANY file in the repository, including /etc/passwd and ../outside", repoPath: "/repo", mutationScope: { allowPaths: ["src/a.rs"] } },
+    goodRepo,
+  );
+  const plain = preflight({ goal: "fix a bug", repoPath: "/repo", mutationScope: { allowPaths: ["src/a.rs"] } }, goodRepo);
+  assert.ok(shouty.ok && plain.ok);
+  assert.equal(shouty.task.mutationScope.scopeId, plain.task.mutationScope.scopeId, "the goal is not an input to authority");
+  assert.equal(shouty.task.mutationScope.kind, "narrow");
+});
+
+test("run: the scope is decided BEFORE the repository is even probed", () => {
+  // A missing scope and a missing repository are both refusals; the scope must win, because a
+  // run with no authority should not be doing filesystem work to discover its second problem.
+  let inspected = 0;
+  const countingProbe: RepoProbe = { inspect: (p) => { inspected += 1; return missingRepo.inspect(p); } };
+  const result = preflight({ goal: "go", repoPath: "/repo" }, countingProbe);
+  assert.equal(result.ok, false);
+  assert.equal((result as { ok: false; failure: { code: string } }).failure.code, V2_SCOPE_FAILURE_CODES.scopeRequired);
+  assert.equal(inspected, 0, "no filesystem work happened for a run that has no authority");
 });
 
 test("run: preflight fails closed on every unusable repository shape", async () => {
@@ -472,7 +567,7 @@ test("run: preflight fails closed on every unusable repository shape", async () 
     [notGit, V2_001_FAILURE_CODES.repoNotGit],
   ];
   for (const [probe, code] of cases) {
-    const result = await runV2Build({ goal: "go", repoPath: "/repo" }, deps(probe));
+    const result = await runV2Build({ goal: "go", repoPath: "/repo", mutationScope: REPO_WIDE }, deps(probe));
     assert.ok(result.outcome.kind === "failed");
     assert.equal(result.outcome.failure.category, "preflight");
     assert.equal(result.outcome.failure.code, code);
@@ -480,7 +575,7 @@ test("run: preflight fails closed on every unusable repository shape", async () 
 });
 
 test("run: an unknown candidate strategy is refused rather than defaulted", async () => {
-  const result = await runV2Build({ goal: "go", repoPath: "/repo", candidateStrategy: "competitive" }, deps(goodRepo));
+  const result = await runV2Build({ goal: "go", repoPath: "/repo", mutationScope: REPO_WIDE, candidateStrategy: "competitive" }, deps(goodRepo));
   assert.ok(result.outcome.kind === "failed");
   assert.equal(result.outcome.failure.code, V2_001_FAILURE_CODES.strategyUnknown);
 });
@@ -490,7 +585,7 @@ test("run: single/shadow/tournament are REAL distinct strategies (V2-017) — 1/
   // candidates through the SAME canonical builder/verify/critic/disposition, then ONE pure selector
   // picks one to promote. All candidates here are eligible ⇒ one is selected and published.
   for (const [candidateStrategy, expected] of [["single", 1], ["shadow", 2], ["tournament", 3]] as const) {
-    const result = await runV2Build({ goal: "go", repoPath: "/repo", candidateStrategy }, deps(goodRepo));
+    const result = await runV2Build({ goal: "go", repoPath: "/repo", mutationScope: REPO_WIDE, candidateStrategy }, deps(goodRepo));
     assert.ok(result.outcome.kind === "accepted", `${candidateStrategy} publishes the selected candidate`);
     assert.equal(result.receipt.strategy?.kind, candidateStrategy);
     assert.equal(result.receipt.strategy?.candidateCount, expected, `${candidateStrategy} generates ${expected} candidate(s)`);
@@ -509,23 +604,23 @@ test("run: single/shadow/tournament are REAL distinct strategies (V2-017) — 1/
 });
 
 test("run: preflight normalizes a relative repo path to absolute", () => {
-  const checked = preflight({ goal: "g", repoPath: "some/where" }, goodRepo);
+  const checked = preflight({ goal: "g", repoPath: "some/where", mutationScope: REPO_WIDE }, goodRepo);
   assert.ok(checked.ok);
   assert.ok(checked.task.repoPath.startsWith("/"), `expected an absolute path, got ${checked.task.repoPath}`);
   assert.equal(checked.task.candidateStrategy, "single", "the default strategy is single");
 });
 
 test("run: the resolved strategy plan keeps multi-candidate strategies multi-candidate", () => {
-  const shadow = preflight({ goal: "g", repoPath: "/repo", candidateStrategy: "shadow" }, goodRepo);
+  const shadow = preflight({ goal: "g", repoPath: "/repo", mutationScope: REPO_WIDE, candidateStrategy: "shadow" }, goodRepo);
   assert.ok(shadow.ok);
   assert.ok(planFor(shadow.task).maxCandidates > 1);
-  const single = preflight({ goal: "g", repoPath: "/repo" }, goodRepo);
+  const single = preflight({ goal: "g", repoPath: "/repo", mutationScope: REPO_WIDE }, goodRepo);
   assert.ok(single.ok);
   assert.equal(planFor(single.task).maxCandidates, 1);
 });
 
 test("run: an ACCEPTED run is exit 0", async () => {
-  const result = await runV2Build({ goal: "go", repoPath: "/repo" }, deps(goodRepo));
+  const result = await runV2Build({ goal: "go", repoPath: "/repo", mutationScope: REPO_WIDE }, deps(goodRepo));
   assert.ok(result.outcome.kind === "accepted");
   assert.equal(exitCodeForOutcome(result.outcome), 0);
 });
@@ -536,7 +631,7 @@ test("run: a MOVED target refuses publication — withheld, nothing landed", asy
   // published and the operator's repository is not mutated.
   const staleTarget = fakePublisher({ liveHead: "moved".repeat(8) });
   const result = await runV2Build(
-    { goal: "inspect ikbi itself", repoPath: process.cwd() },
+    { goal: "inspect ikbi itself", repoPath: process.cwd(), mutationScope: REPO_WIDE },
     // Everything wired EXCEPT the probe, so the production RepoProbe is the one used.
     (({ probe: _omitted, ...rest }) => rest)(deps(goodRepo, workingConfiguration, noSources, fakeTransport().transport, fakeWorkspaces().authority, fakeMutations().authority, fakeSources().authority, staleTarget)),
   );
@@ -550,7 +645,7 @@ test("run: a MOVED target refuses publication — withheld, nothing landed", asy
 
 test("run: exactly ONE workspace is allocated, bound to the run and the source tree", async () => {
   const ws = fakeWorkspaces();
-  const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo, workingConfiguration, noSources, fakeTransport().transport, ws.authority));
+  const result = await runV2Build({ goal: "x", repoPath: "/repo", mutationScope: REPO_WIDE }, deps(goodRepo, workingConfiguration, noSources, fakeTransport().transport, ws.authority));
   assert.equal(ws.allocated.length, 1, "the SINGLE strategy allocates one workspace");
   assert.equal(ws.allocated[0]?.runId, result.runId);
   assert.equal(result.receipt.workspace?.baseTree, "t".repeat(40), "the exact source tree is recorded");
@@ -559,7 +654,7 @@ test("run: exactly ONE workspace is allocated, bound to the run and the source t
 
 test("run: the workspace is RETAINED once a candidate exists — verification needs it", async () => {
   const ws = fakeWorkspaces();
-  const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo, workingConfiguration, noSources, fakeTransport().transport, ws.authority));
+  const result = await runV2Build({ goal: "x", repoPath: "/repo", mutationScope: REPO_WIDE }, deps(goodRepo, workingConfiguration, noSources, fakeTransport().transport, ws.authority));
   assert.deepEqual(ws.dispositions, ["retain"], "a candidate is retained even after publication — for undo/audit");
   assert.equal(result.receipt.workspace?.disposition, "retained");
   assert.match(result.receipt.workspace?.dispositionDetail ?? "", /adjudicated acceptable_for_promotion/);
@@ -575,7 +670,7 @@ test("run: a generation that FAILS discards its workspace — no leak, no half-t
   const stubborn: InvocationTransport = {
     send: async (input) => ({ ok: true, response: { content: "I am thinking about it.", finishReason: "stop", attempts: 1, servedModelId: input.providerModelId } }),
   };
-  const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo, workingConfiguration, noSources, stubborn, ws.authority));
+  const result = await runV2Build({ goal: "x", repoPath: "/repo", mutationScope: REPO_WIDE }, deps(goodRepo, workingConfiguration, noSources, stubborn, ws.authority));
   assert.ok(result.outcome.kind === "failed");
   assert.equal(result.outcome.failure.category, "build");
   assert.equal(result.receipt.candidate, undefined, "no candidate is claimed");
@@ -586,7 +681,7 @@ test("run: a cleanup that FAILS is reported as failed, never as if it worked", a
   // A successful build RETAINS, so a retention that could not complete is the cleanup
   // failure this path now has to report honestly.
   const ws = fakeWorkspaces({ retainFails: true });
-  const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo, workingConfiguration, noSources, fakeTransport().transport, ws.authority));
+  const result = await runV2Build({ goal: "x", repoPath: "/repo", mutationScope: REPO_WIDE }, deps(goodRepo, workingConfiguration, noSources, fakeTransport().transport, ws.authority));
   assert.equal(result.receipt.workspace?.disposition, "failed");
   assert.match(result.receipt.workspace?.dispositionDetail ?? "", /retain failed: worktree busy/);
 });
@@ -596,7 +691,7 @@ test("run: a DISCARD that fails on a failed build is reported as failed too", as
   const stubborn: InvocationTransport = {
     send: async (input) => ({ ok: true, response: { content: "hmm", finishReason: "stop", attempts: 1, servedModelId: input.providerModelId } }),
   };
-  const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo, workingConfiguration, noSources, stubborn, ws.authority));
+  const result = await runV2Build({ goal: "x", repoPath: "/repo", mutationScope: REPO_WIDE }, deps(goodRepo, workingConfiguration, noSources, stubborn, ws.authority));
   assert.equal(result.receipt.workspace?.disposition, "failed");
   assert.match(result.receipt.workspace?.dispositionDetail ?? "", /discard failed: worktree busy/);
 });
@@ -623,7 +718,7 @@ test("run: a context artifact is RE-OBSERVED in the workspace before it could be
   };
   const mut = fakeMutations("matching");
   const result = await runV2Build(
-    { goal: "edit src/widget.ts", repoPath: "/repo" },
+    { goal: "edit src/widget.ts", repoPath: "/repo", mutationScope: REPO_WIDE },
     deps(goodRepo, workingConfiguration, [source], fakeTransport().transport, fakeWorkspaces().authority, mut.authority),
   );
   assert.deepEqual(mut.observed, ["src/widget.ts"], "the artifact a builder would edit");
@@ -653,7 +748,7 @@ test("run: workspace bytes that DIFFER from the context artifact fail — contex
     }),
   };
   const result = await runV2Build(
-    { goal: "edit src/widget.ts", repoPath: "/repo" },
+    { goal: "edit src/widget.ts", repoPath: "/repo", mutationScope: REPO_WIDE },
     deps(goodRepo, workingConfiguration, [source], fakeTransport().transport, fakeWorkspaces().authority, fakeMutations("what-is-actually-there").authority),
   );
   assert.ok(result.outcome.kind === "failed");
@@ -664,7 +759,7 @@ test("run: workspace bytes that DIFFER from the context artifact fail — contex
 });
 
 test("run: a package with no rebindable artifact yields ZERO observations, not a probe file", async () => {
-  const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo));
+  const result = await runV2Build({ goal: "x", repoPath: "/repo", mutationScope: REPO_WIDE }, deps(goodRepo));
   assert.equal(result.receipt.evidence.observationsTaken, 0, "nothing was invented to look at");
   assert.equal(result.receipt.workspace?.observations, 0);
 });
@@ -681,7 +776,7 @@ test("run: the workspace is cleaned up even when the run FAILS", async () => {
     }),
   };
   const result = await runV2Build(
-    { goal: "edit a.ts", repoPath: "/repo" },
+    { goal: "edit a.ts", repoPath: "/repo", mutationScope: REPO_WIDE },
     deps(goodRepo, workingConfiguration, [drifting], fakeTransport().transport, ws.authority, fakeMutations("two").authority),
   );
   assert.ok(result.outcome.kind === "failed");
@@ -691,7 +786,7 @@ test("run: the workspace is cleaned up even when the run FAILS", async () => {
 // ── source snapshot (V2-006A) ───────────────────────────────────────────────
 
 test("run: exactly ONE source snapshot is captured, in preflight", async () => {
-  const result = await runV2Build({ goal: "x", repoPath: "/repo" }, deps(goodRepo));
+  const result = await runV2Build({ goal: "x", repoPath: "/repo", mutationScope: REPO_WIDE }, deps(goodRepo));
   assert.equal(result.receipt.evidence.sourceSnapshotCaptured, true);
   assert.equal(result.receipt.evidence.sourceSnapshots, 1);
   assert.equal(result.receipt.sourceSnapshot?.clean, true);
@@ -701,7 +796,7 @@ test("run: exactly ONE source snapshot is captured, in preflight", async () => {
 test("run: the context package is BOUND to the run's source snapshot", async () => {
   const src = fakeSources({});
   const result = await runV2Build(
-    { goal: "x", repoPath: "/repo" },
+    { goal: "x", repoPath: "/repo", mutationScope: REPO_WIDE },
     deps(goodRepo, workingConfiguration, noSources, fakeTransport().transport, fakeWorkspaces().authority, fakeMutations().authority, src.authority),
   );
   assert.equal(result.context?.sourceSnapshotId, src.snapshot.snapshotId);
@@ -711,7 +806,7 @@ test("run: the workspace materializes THE SAME snapshot context came from", asyn
   const src = fakeSources({});
   const ws = fakeWorkspaces();
   const result = await runV2Build(
-    { goal: "x", repoPath: "/repo" },
+    { goal: "x", repoPath: "/repo", mutationScope: REPO_WIDE },
     deps(goodRepo, workingConfiguration, noSources, fakeTransport().transport, ws.authority, fakeMutations().authority, src.authority),
   );
   assert.equal(ws.allocated[0]?.source.sourceSnapshotId, src.snapshot.snapshotId);
@@ -726,7 +821,7 @@ test("run: a capture failure stops the run before any model resolution", async (
     }),
   };
   const result = await runV2Build(
-    { goal: "x", repoPath: "/repo" },
+    { goal: "x", repoPath: "/repo", mutationScope: REPO_WIDE },
     deps(goodRepo, workingConfiguration, noSources, fakeTransport().transport, fakeWorkspaces().authority, fakeMutations().authority, failing),
   );
   assert.ok(result.outcome.kind === "failed");
@@ -759,7 +854,7 @@ test("v2-017 tournament: NO eligible candidate ⇒ nothing is promoted, source u
   // Every candidate verifies RED ⇒ rejected ⇒ ineligible. The selector finds an empty pool, no
   // candidate reaches promotion, and the operator's repository is never mutated.
   const result = await runV2Build(
-    { goal: "go", repoPath: "/repo", candidateStrategy: "tournament" },
+    { goal: "go", repoPath: "/repo", mutationScope: REPO_WIDE, candidateStrategy: "tournament" },
     { ...deps(goodRepo), checkRunner: redRunner },
   );
   assert.ok(result.outcome.kind !== "accepted", "no eligible candidate can be accepted");
@@ -779,7 +874,7 @@ test("v2-017 tournament (allow_partial): one candidate FAILS generation, a survi
   // Candidate 0's tree capture collapses; candidates 1 & 2 finish and are eligible. Under an
   // explicit allow_partial policy the attempt proceeds over the completed pool and promotes ONE.
   const result = await runV2Build(
-    { goal: "go", repoPath: "/repo", candidateStrategy: "tournament" },
+    { goal: "go", repoPath: "/repo", mutationScope: REPO_WIDE, candidateStrategy: "tournament" },
     { ...deps(goodRepo), captureTree: slotZeroCaptureFails, strategyPolicy: buildStrategyPolicy({ kind: "tournament", partialCompletion: "allow_partial" }) },
   );
   assert.ok(result.outcome.kind === "accepted", "a surviving eligible candidate is published");
@@ -800,7 +895,7 @@ test("v2-017 tournament (require_all, the DEFAULT): one incomplete candidate BLO
   // Same collapse as above, but the conservative default is require_all: even though candidates 1 & 2
   // are perfectly eligible, an incomplete sibling withholds the whole attempt. Cost of correctness.
   const result = await runV2Build(
-    { goal: "go", repoPath: "/repo", candidateStrategy: "tournament" },
+    { goal: "go", repoPath: "/repo", mutationScope: REPO_WIDE, candidateStrategy: "tournament" },
     { ...deps(goodRepo), captureTree: slotZeroCaptureFails },
   );
   assert.ok(result.outcome.kind === "failed", "require_all refuses to promote past an incomplete candidate");
@@ -818,7 +913,7 @@ test("v2-017 tournament: every candidate is COUNTED — per-candidate cost + evi
   // All three candidates are eligible. Each runs its OWN builder + critic pair through the ONE
   // invocation ledger (2 calls × 3 candidates = 6), and each carries its own cost + evidence on the
   // receipt. Exactly one is selected and its siblings are reclaimed.
-  const result = await runV2Build({ goal: "go", repoPath: "/repo", candidateStrategy: "tournament" }, deps(goodRepo));
+  const result = await runV2Build({ goal: "go", repoPath: "/repo", mutationScope: REPO_WIDE, candidateStrategy: "tournament" }, deps(goodRepo));
   assert.ok(result.outcome.kind === "accepted");
   assert.equal(result.receipt.evidence.invocations, 6, "2 invocations per candidate, all counted on the one ledger");
   const cands = result.receipt.candidates ?? [];
@@ -834,11 +929,30 @@ test("v2-017 tournament: every candidate is COUNTED — per-candidate cost + evi
 });
 
 test("v2-017 tournament: candidates are ISOLATED — each owns a distinct workspace, no sibling sharing", async () => {
-  const result = await runV2Build({ goal: "go", repoPath: "/repo", candidateStrategy: "tournament" }, deps(goodRepo));
+  const result = await runV2Build({ goal: "go", repoPath: "/repo", mutationScope: REPO_WIDE, candidateStrategy: "tournament" }, deps(goodRepo));
   const cands = result.receipt.candidates ?? [];
   const wsIds = new Set(cands.map((c) => c.workspaceId));
   assert.equal(wsIds.size, 3, "three candidates ⇒ three DISTINCT workspaces (no sharing)");
   assert.deepEqual(cands.map((c) => c.slot), [0, 1, 2], "each candidate keeps its own slot identity");
   // The selector considered every candidate (none was silently dropped or merged away).
   assert.equal(result.selection?.candidateEvaluationIds.length, 3, "all three evaluations entered the ONE selector");
+});
+
+test("receipt: the run records the AUTHORITY it held, not just what it changed", async () => {
+  const result = await runV2Build(
+    { goal: "go", repoPath: "/repo", mutationScope: { allowTrees: ["src"], allowPaths: ["Cargo.toml"] } },
+    deps(goodRepo),
+  );
+  const scope = result.receipt.mutationScope;
+  assert.ok(scope !== undefined, "the receipt states the scope");
+  assert.equal(scope.kind, "narrow");
+  assert.equal(scope.description, "Cargo.toml, src/**");
+  assert.deepEqual(scope.entries.map((e) => e.path), ["Cargo.toml", "src"]);
+  assert.ok(scope.scopeId.length > 0);
+});
+
+test("receipt: a run refused for having NO scope records no scope — there was no authority", async () => {
+  const result = await runV2Build({ goal: "go", repoPath: "/repo" }, deps(goodRepo));
+  assert.ok(result.outcome.kind === "failed");
+  assert.equal(result.receipt.mutationScope, undefined);
 });

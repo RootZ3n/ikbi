@@ -106,7 +106,7 @@ function v2RunAgainst(server: FakeProviderServer, root: string, repo: string, go
     join(root, "providers.json"),
     JSON.stringify({ ...ROSTER, providers: [{ ...ROSTER.providers[0], baseUrl: server.baseUrl }] }, null, 2),
   );
-  const res = spawnSync(process.execPath, [ENTRY, "v2", "build", goal, "--repo", repo, "--json"], {
+  const res = spawnSync(process.execPath, [ENTRY, "v2", "build", "--allow-repo-wide", goal, "--repo", repo, "--json"], {
     cwd: mkdtempSync(join(tmpdir(), "ikbi-v2-wscwd-")),
     env: {
       PATH: process.env.PATH ?? "",
@@ -127,7 +127,7 @@ function v2RunAgainst(server: FakeProviderServer, root: string, repo: string, go
 }
 
 function v2Run(root: string, repo: string, goal = GOAL) {
-  const r = runCli(root, ["v2", "build", goal, "--repo", repo, "--json"]);
+  const r = runCli(root, ["v2", "build", "--allow-repo-wide", goal, "--repo", repo, "--json"]);
   assert.ok(r.stdout.trim().startsWith("{"), `expected JSON on stdout, got:\n${r.stdout}\n---\n${r.stderr}`);
   return { result: sessionFinalAttempt(r.stdout), stdout: r.stdout, stderr: r.stderr, status: r.status };
 }
@@ -272,7 +272,7 @@ test("workspace truth: a repo with no instructions and no named target yields ZE
 test("workspace truth: the human rendering states the source binding and the disposition", () => {
   const state = makeStateRoot();
   const repo = makeRepo();
-  const r = runCli(state, ["v2", "build", GOAL, "--repo", repo]);
+  const r = runCli(state, ["v2", "build", "--allow-repo-wide", GOAL, "--repo", repo]);
   assert.match(r.stdout, /workspace {3}ws_[\w-]+ \(donor [\w-]+\) · 1 observation\(s\) · retained/);
   assert.match(r.stdout, new RegExp(`materialized 0 source entries from the snapshot · base main @ ${headCommit(repo).slice(0, 12)}`));
 });

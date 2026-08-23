@@ -153,7 +153,11 @@ async function run(argv: readonly string[], opts: {
     return (opts.sess ?? session()) as never;
   }) as never;
 
-  const code = await runBuildCli(argv.includes("--json") ? argv : [...argv, "--json"], io);
+  // EXPLICIT repository-wide authority. This suite is about the advisory wiring AROUND a build,
+  // not about the mutation scope, so it grants the widest scope deliberately and in one place
+  // rather than relying on a default the engine does not have.
+  const scoped = argv.includes("--allow-repo-wide") ? argv : [...argv, "--allow-repo-wide"];
+  const code = await runBuildCli(scoped.includes("--json") ? scoped : [...scoped, "--json"], io);
   return { code, out, err, hooks, goal, advisoryContext, advisories, transportAsked };
 }
 

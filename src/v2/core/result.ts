@@ -30,6 +30,7 @@
  */
 
 import type { RunFailure } from "./failure.js";
+import type { RunMutationScopeSummary } from "./mutation-scope.js";
 import type { LifecycleStage, LifecycleTransition, RunLedgerView } from "./lifecycle.js";
 import type {
   V2CandidateId,
@@ -673,6 +674,16 @@ export interface V2RunReceipt {
   readonly outcome: RunTerminalOutcome;
   readonly stagesEntered: readonly LifecycleStage[];
   readonly evidence: RunEvidenceSummary;
+  /**
+   * THE WRITE AUTHORITY this run held.
+   *
+   * On the receipt because it is a fact about what the run was ALLOWED to do, and a record of
+   * what changed is not readable without it: "the build touched three files" means something
+   * different under a two-file scope than under repository-wide authority. Absent only when
+   * the run failed in preflight before a scope was validated — which is exactly the case where
+   * there was no authority to record.
+   */
+  readonly mutationScope?: RunMutationScopeSummary;
   /** Absent when the run ended before configuration was established. */
   readonly configuration?: RunConfigurationSummary;
   /** Absent when the run ended before a route was authorized. */

@@ -29,6 +29,7 @@
  */
 
 import type { V2CandidateId, V2ObservationId, V2WorkspaceId } from "./identity.js";
+import type { MutationScope, MutationScopeRequest } from "./mutation-scope.js";
 
 // ---------------------------------------------------------------------------
 // The task
@@ -64,6 +65,15 @@ export interface V2TaskRequest {
    * resolved fails preflight exactly like a broken standing selection would.
    */
   readonly profile?: string;
+  /**
+   * WHICH PATHS THIS RUN MAY CHANGE — the operator's structured authority.
+   *
+   * Optional ON THIS TYPE because the request is the UNVALIDATED form and an absent scope has
+   * to be representable in order to be REFUSED. It is not optional in effect: preflight turns
+   * an absent or malformed scope into a failure before any provider is reached or any
+   * workspace exists. There is no default, and "no scope" never means "the repository".
+   */
+  readonly mutationScope?: MutationScopeRequest;
 }
 
 /** The task after normalization/validation. What the lifecycle actually carries. */
@@ -71,6 +81,12 @@ export interface V2Task {
   readonly goal: string;
   readonly repoPath: string;
   readonly candidateStrategy: CandidateStrategyKind;
+  /**
+   * The canonical, validated authority. REQUIRED here: past preflight there is no such thing
+   * as a run without a scope, and making the field optional would let some later caller
+   * construct one and inherit repository-wide authority by omission.
+   */
+  readonly mutationScope: MutationScope;
 }
 
 // ---------------------------------------------------------------------------

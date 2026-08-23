@@ -74,7 +74,7 @@ function build(script: readonly ScriptedTurn[], criticResponse: string, checks?:
     dirs.push(repo);
     const cwd = mkdtempSync(join(tmpdir(), "ikbi-v2-tcwd-"));
     dirs.push(cwd);
-    const res = spawnSync(process.execPath, [ENTRY, "v2", "build", "set widget to 2 in src/widget.ts", "--repo", repo, "--json"], {
+    const res = spawnSync(process.execPath, [ENTRY, "v2", "build", "--allow-repo-wide", "set widget to 2 in src/widget.ts", "--repo", repo, "--json"], {
       cwd,
       env: {
         PATH: process.env.PATH ?? "",

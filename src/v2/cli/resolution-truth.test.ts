@@ -126,7 +126,7 @@ function runCli(root: string, args: readonly string[], extraEnv: Record<string, 
 }
 
 function v2Run(root: string, args: readonly string[] = [], extraEnv: Record<string, string> = {}) {
-  const r = runCli(root, ["v2", "build", "a resolution probe", "--repo", REPO, "--json", ...args], extraEnv);
+  const r = runCli(root, ["v2", "build", "--allow-repo-wide", "a resolution probe", "--repo", REPO, "--json", ...args], extraEnv);
   assert.ok(r.stdout.trim().startsWith("{"), `expected JSON on stdout, got:\n${r.stdout}\n---\n${r.stderr}`);
   return { result: sessionFinalAttempt(r.stdout), stdout: r.stdout, stderr: r.stderr, status: r.status };
 }
@@ -345,7 +345,7 @@ test("resolution truth: no credential appears in output, the decision, or its id
   for (const [what, text] of [["stdout", stdout], ["stderr", stderr], ["result", JSON.stringify(result)]] as const) {
     assert.equal(text.includes(PLANTED_SECRET), false, `the planted key leaked into ${what}`);
   }
-  const human = runCli(root, ["v2", "build", "probe", "--repo", REPO]);
+  const human = runCli(root, ["v2", "build", "--allow-repo-wide", "probe", "--repo", REPO]);
   assert.equal(human.stdout.includes(PLANTED_SECRET), false);
   assert.equal(human.stderr.includes(PLANTED_SECRET), false);
   assert.equal(

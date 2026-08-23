@@ -78,7 +78,7 @@ function makeRepo(): string {
 function runCli(root: string, server: FakeProviderServer, repo: string) {
   const cwd = mkdtempSync(join(tmpdir(), "ikbi-v2-pcwd-"));
   dirs.push(cwd);
-  const res = spawnSync(process.execPath, [ENTRY, "v2", "build", "set widget to 2 in src/widget.ts", "--repo", repo, "--json"], {
+  const res = spawnSync(process.execPath, [ENTRY, "v2", "build", "--allow-repo-wide", "set widget to 2 in src/widget.ts", "--repo", repo, "--json"], {
     cwd,
     env: {
       PATH: process.env.PATH ?? "",
@@ -230,7 +230,7 @@ test("promotion truth: the human rendering states the landed publication", async
   const repo = makeRepo();
   const cwd = mkdtempSync(join(tmpdir(), "ikbi-v2-prender-"));
   dirs.push(cwd);
-  const res = spawnSync(process.execPath, [ENTRY, "v2", "build", "set widget to 2 in src/widget.ts", "--repo", repo], {
+  const res = spawnSync(process.execPath, [ENTRY, "v2", "build", "--allow-repo-wide", "set widget to 2 in src/widget.ts", "--repo", repo], {
     cwd,
     env: { PATH: process.env.PATH ?? "",
     // Hermetic trust material, injected explicitly: a sanitized child inherits no shell,

@@ -48,7 +48,7 @@ test("QUALIFY: the shipped `ikbi build` binary builds a DISPOSABLE EXTERNAL repo
       models: [{ id: "m1", role: "builder", cost: { promptPerMTok: 0, completionPerMTok: 0 }, providers: [{ provider: "p1", providerModelId: "m1-wire" }], capabilities: { context_window: 100000, supports_tools: true } }],
     }, null, 2));
 
-    const res = spawnSync(process.execPath, [ENTRY, "build", "make greet return hola", "--repo", repo, "--strategy", "single", "--json"], {
+    const res = spawnSync(process.execPath, [ENTRY, "build", "--allow-repo-wide", "make greet return hola", "--repo", repo, "--strategy", "single", "--json"], {
       cwd: mkdtempSync(join(tmpdir(), "ikbi-qualify-cwd-")),
       env: {
         PATH: process.env.PATH ?? "",
