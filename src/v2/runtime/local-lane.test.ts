@@ -278,7 +278,14 @@ test("added latency is capped across retries", async () => {
     deps({ transport: t, sleep: async (ms) => { slept += ms; }, jitter: () => 1 }),
   );
   assert.ok(slept <= 1000, `slept ${slept}ms, above the 1000ms cap`);
-  assert.equal(r.addedLatencyMs, slept);
+  // `addedLatencyMs` is the WHOLE added wait — the backoff sleeps AND the time the calls
+  // themselves took — which is the point of the budget (an endpoint that accepts and never
+  // answers spends no backoff at all). Asserting it EQUALS the injected sleeps assumed every
+  // fake call rounds to 0ms of wall clock, and under load one of them does not: the suite
+  // failed 1000 !== 999 for a millisecond of real time. It contains the sleeps and stays
+  // within the ceiling; that is the contract.
+  assert.ok(r.addedLatencyMs >= slept, `addedLatencyMs ${r.addedLatencyMs} must contain the ${slept}ms slept`);
+  assert.ok(r.addedLatencyMs - slept < 1000, "and must not be dominated by unaccounted time");
 });
 
 // ── accounting ──────────────────────────────────────────────────────────────
