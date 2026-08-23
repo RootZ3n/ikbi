@@ -63,7 +63,7 @@ test("hermetic env: keys are STABLE within a process — deterministic where tes
 test("hermetic env: PRODUCTION REFUSES test material", () => {
   // The material is good enough to start a process, so the only thing that could stop it becoming a
   // production trust grant is a refusal. Here it is.
-  const base = { IKBI_STATE_ROOT: "/tmp/hermetic-guard", HOME: "/tmp/hermetic-guard" } as NodeJS.ProcessEnv;
+  const base = { IKBI_STATE_ROOT: "/lab-fake/hermetic-guard", HOME: "/lab-fake/hermetic-guard" } as NodeJS.ProcessEnv;
   assert.throws(
     () => loadConfig({ ...base, IKBI_TRUST_HMAC_KEY: `${HERMETIC_TEST_KEY_PREFIX}hmac-abc`, IKBI_IDENTITY_TOKEN_SALT: "a-real-salt" }),
     /Refusing to start with TEST-ONLY trust material/,
@@ -77,7 +77,7 @@ test("hermetic env: PRODUCTION REFUSES test material", () => {
 test("hermetic env: the marker alone grants nothing", () => {
   // Without prefixed keys it changes no behavior; the DEFAULT-key refusal still fires.
   assert.throws(
-    () => loadConfig({ IKBI_STATE_ROOT: "/tmp/hermetic-guard", HOME: "/tmp/hermetic-guard", IKBI_HERMETIC_TEST: "1" } as NodeJS.ProcessEnv),
+    () => loadConfig({ IKBI_STATE_ROOT: "/lab-fake/hermetic-guard", HOME: "/lab-fake/hermetic-guard", IKBI_HERMETIC_TEST: "1" } as NodeJS.ProcessEnv),
     /Refusing to start with insecure default trust keys/,
   );
 });
@@ -85,7 +85,7 @@ test("hermetic env: the marker alone grants nothing", () => {
 test("hermetic env: the marker permits the test material it was minted for", () => {
   assert.doesNotThrow(() =>
     loadConfig({
-      IKBI_STATE_ROOT: "/tmp/hermetic-guard", HOME: "/tmp/hermetic-guard",
+      IKBI_STATE_ROOT: "/lab-fake/hermetic-guard", HOME: "/lab-fake/hermetic-guard",
       ...HERMETIC_DEV_KEY_ENV,
     } as NodeJS.ProcessEnv),
   );
@@ -94,7 +94,7 @@ test("hermetic env: the marker permits the test material it was minted for", () 
 test("hermetic env: real operator keys are unaffected", () => {
   assert.doesNotThrow(() =>
     loadConfig({
-      IKBI_STATE_ROOT: "/tmp/hermetic-guard", HOME: "/tmp/hermetic-guard",
+      IKBI_STATE_ROOT: "/lab-fake/hermetic-guard", HOME: "/lab-fake/hermetic-guard",
       IKBI_TRUST_HMAC_KEY: "an-operators-real-key", IKBI_IDENTITY_TOKEN_SALT: "an-operators-real-salt",
     } as NodeJS.ProcessEnv),
   );

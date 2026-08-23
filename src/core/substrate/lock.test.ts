@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
-import { hostname, tmpdir } from "node:os";
+import { hostname } from "node:os";
+import { labTempDir as tmpdir } from "../temp-root.js";
 import { join } from "node:path";
 import { test } from "node:test";
 

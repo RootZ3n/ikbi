@@ -9,7 +9,7 @@ process.env.IKBI_ALLOW_INSECURE_DEV_KEYS ??= "true";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../../core/temp-root.js";
 import { test } from "node:test";
 
 // Side-effect import: registers the correction-library routes (ESM-cached → once per process).

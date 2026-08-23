@@ -14,7 +14,7 @@
 import "../test-env.js"; // MUST be first: hermetic synthetic dev-key opt-in, before core config loads
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../../core/temp-root.js";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { after, test } from "node:test";

@@ -12,7 +12,7 @@
  */
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../../core/temp-root.js";
 import { join } from "node:path";
 import { test } from "node:test";
 
@@ -67,7 +67,7 @@ const noopBus = () => ({
 const benignCognition = { deliberate: async () => ({ decision: "answer" as const, confidence: 1, rationale: "ok", memoryUsed: [] as string[] }) };
 
 function fakeWorkspaceHandle(targetRepo: string): WorkspaceHandle {
-  return { id: "ws-hermes", targetRepo, baseBranch: "main", baseRef: "abc123", scratchBranch: "ikbi/ws/ws-hermes", path: "/tmp/ws-hermes", identity: { agentId: "lead" }, state: "allocated", createdAt: 1000 };
+  return { id: "ws-hermes", targetRepo, baseBranch: "main", baseRef: "abc123", scratchBranch: "ikbi/ws/ws-hermes", path: "/lab-fake/ws-hermes", identity: { agentId: "lead" }, state: "allocated", createdAt: 1000 };
 }
 
 function capturingRoles(capturedTasks: WorkerTask[]) {

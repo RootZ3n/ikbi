@@ -10,7 +10,7 @@
 import { spawn, spawnSync, execFileSync } from "node:child_process";
 import { closeSync, existsSync, fsyncSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../src/core/temp-root.js";
 import { createServer } from "node:net";
 
 type FailureCode = string;

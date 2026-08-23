@@ -10,7 +10,7 @@
 
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../../core/temp-root.js";
 import { join } from "node:path";
 import { test } from "node:test";
 
@@ -45,7 +45,7 @@ function capturingReceipts() {
   return { receipts: { append: async (i: unknown, _id: AgentIdentity): Promise<unknown> => { const r = i as { operation: string; metadata?: Record<string, unknown> }; appended.push({ operation: r.operation, metadata: r.metadata ?? {} }); return {}; } }, appended };
 }
 function fakeWorkspaces() {
-  const handle: WorkspaceHandle = { id: "wsabcd", targetRepo: "/repo", baseBranch: "main", baseRef: "deadbeef", scratchBranch: "s", path: "/tmp/wsabcd", identity: { agentId: "parent-1" }, state: "allocated", createdAt: 1000 };
+  const handle: WorkspaceHandle = { id: "wsabcd", targetRepo: "/repo", baseBranch: "main", baseRef: "deadbeef", scratchBranch: "s", path: "/lab-fake/wsabcd", identity: { agentId: "parent-1" }, state: "allocated", createdAt: 1000 };
   const calls = { promote: 0 };
   const workspaces: NonNullable<OrchestratorDeps["workspaces"]> = {
     allocate: async () => handle,

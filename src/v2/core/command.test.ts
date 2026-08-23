@@ -81,7 +81,7 @@ test("policy: git escape flags before the subcommand are refused (verb must be a
 
 test("policy: an allowed git verb with a WRITE flag is refused", () => {
   // `git diff --output=FILE` would write FILE even though `diff` is read-only.
-  assert.equal(ok("git", ["diff", "--output=/tmp/x"]).code, "denied_argument");
+  assert.equal(ok("git", ["diff", "--output=/lab-fake/x"]).code, "denied_argument");
   assert.equal(ok("git", ["log", "--output", "x"]).code, "denied_argument");
 });
 

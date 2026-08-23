@@ -5,7 +5,7 @@ process.env.IKBI_ALLOW_INSECURE_DEV_KEYS ??= "true";
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../../core/temp-root.js";
 import { test } from "node:test";
 
 import { commands } from "../../cli/registry.js";
@@ -17,6 +17,8 @@ import {
   inspectGodotProject,
   renderSliceReport,
   runGameStudioSlice,
+} from "./index.js";
+import {
   validateAnimationRequestContract,
   validateGameFeatureContract,
   WORM_DEPLOYMENT_BACKFIRE_BEATS,
@@ -434,16 +436,16 @@ test("Abonulli client creates project, sequence with beats, and export requests"
         id: `export-${body.format as string}`,
         project_id: "project-1",
         preset_id: `preset-${body.format as string}`,
-        path: `/tmp/${body.format as string}`,
+        path: `/lab-fake/${body.format as string}`,
         format: body.format,
         provenance: { operation: "mock_export" },
       }] };
     }
     if (call.method === "GET" && call.path === "/api/projects/project-1/exports") {
       return { status: 200, body: [
-        { id: "export-png", project_id: "project-1", preset_id: "preset-png", path: "/tmp/png", format: "png_sequence" },
-        { id: "export-sheet", project_id: "project-1", preset_id: "preset-sheet", path: "/tmp/sheet", format: "sprite_sheet" },
-        { id: "export-godot", project_id: "project-1", preset_id: "preset-godot", path: "/tmp/godot", format: "godot_manifest" },
+        { id: "export-png", project_id: "project-1", preset_id: "preset-png", path: "/lab-fake/png", format: "png_sequence" },
+        { id: "export-sheet", project_id: "project-1", preset_id: "preset-sheet", path: "/lab-fake/sheet", format: "sprite_sheet" },
+        { id: "export-godot", project_id: "project-1", preset_id: "preset-godot", path: "/lab-fake/godot", format: "godot_manifest" },
       ] };
     }
     return { status: 404, body: { detail: "not found" } };
@@ -532,7 +534,7 @@ test("slice orchestrator chains mocked inspector, bible, Abonulli, additive file
         sequence: { id: "sequence-1", project_id: "project-1", name: contract.animation, fps: contract.frame_rate },
         shot: { id: "shot-1", project_id: "project-1", sequence_id: "sequence-1", name: contract.animation, order_index: 0, frame_range: { start_frame: 0, end_frame: 83 } },
         beats: contract.beats?.map((description, index) => ({ id: `beat-${index + 1}`, project_id: "project-1", shot_id: "shot-1", order_index: index, description })) ?? [],
-        exports: [{ format: "png_sequence", artifacts: [{ id: "export-1", project_id: "project-1", preset_id: "preset-1", path: "/tmp/png", format: "png_sequence" }] }],
+        exports: [{ format: "png_sequence", artifacts: [{ id: "export-1", project_id: "project-1", preset_id: "preset-1", path: "/lab-fake/png", format: "png_sequence" }] }],
       };
     },
     runProcess: async (command, args, options) => {
@@ -567,16 +569,16 @@ test("slice orchestrator chains mocked inspector, bible, Abonulli, additive file
 test("slice report rendering summarizes evidence", () => {
   const report = {
     runId: "gsd-test",
-    repoPath: "/tmp/wvw",
-    contractPath: "/tmp/contract.json",
-    inspected: { repoPath: "/tmp/wvw", project: { path: "/tmp/wvw/project.godot", exists: true, name: "Wyrms vs Worms", features: [], autoloads: [], inputMap: [], display: {} } },
-    bible: { project: { path: "/tmp/wvw/project.godot", exists: true, name: "Wyrms vs Worms", features: [], autoloads: [], inputMap: [], display: {} }, tests: ["tests/test_hatch_sequence.gd"], gapAnalysis: [] },
+    repoPath: "/lab-fake/wvw",
+    contractPath: "/lab-fake/contract.json",
+    inspected: { repoPath: "/lab-fake/wvw", project: { path: "/lab-fake/wvw/project.godot", exists: true, name: "Wyrms vs Worms", features: [], autoloads: [], inputMap: [], display: {} } },
+    bible: { project: { path: "/lab-fake/wvw/project.godot", exists: true, name: "Wyrms vs Worms", features: [], autoloads: [], inputMap: [], display: {} }, tests: ["tests/test_hatch_sequence.gd"], gapAnalysis: [] },
     featureContract: { id: "worm_deployment_backfire", player_experience: WORM_DEPLOYMENT_BACKFIRE_BEATS, godot_requirements: {}, acceptance_tests: [] },
     animationRequest: { character: "worm", animation: "deployment_backfire", duration: 7, frame_rate: 12, camera: "fixed", background: "transparent", output: ["png_sequence"], beats: WORM_DEPLOYMENT_BACKFIRE_BEATS },
     abonulli: { mode: "mock", baseUrl: "http://abonulli.test", error: "down" },
     implementationContract: {
       id: "worm_deployment_backfire",
-      repoPath: "/tmp/wvw",
+      repoPath: "/lab-fake/wvw",
       additiveFiles: ["scenes/worm_deployment_backfire.tscn", "scripts/worm_deployment_backfire.gd"],
       boundedChange: "additive proof",
       scene: "res://scenes/worm_deployment_backfire.tscn",
@@ -585,13 +587,13 @@ test("slice report rendering summarizes evidence", () => {
     },
     godotRun: {
       command: ["godot", "--headless"],
-      cwd: "/tmp/wvw",
+      cwd: "/lab-fake/wvw",
       exitStatus: 0,
       stdout: "",
       stderr: "",
       beatLogs: ["[IKBI_SLICE] beat=1 frame=0 text=An egg shakes."],
       beatsLoggedInOrder: true,
-      screenshotPath: "/tmp/gsd-test.png",
+      screenshotPath: "/lab-fake/gsd-test.png",
       screenshotCaptured: false,
     },
   } as const;

@@ -11,7 +11,7 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../temp-root.js";
 import { join } from "node:path";
 import { test } from "node:test";
 import { pino, type Logger } from "pino";

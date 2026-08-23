@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../../core/temp-root.js";
 import { join } from "node:path";
 
 import type { ModelRequest, ModelResponse } from "../../core/provider/contract.js";
@@ -97,7 +97,7 @@ test("runReview: reads files, invokes model, returns structured result", async (
 });
 
 test("runReview: empty file set returns an explanatory error result", async () => {
-  const res = await runReview({ repoPath: "/tmp", files: [], model: "m", invokeModel: async () => mockResponse("{}") });
+  const res = await runReview({ repoPath: "/lab-fake", files: [], model: "m", invokeModel: async () => mockResponse("{}") });
   assert.notEqual(res.error, undefined);
   assert.equal(res.comments.length, 0);
 });

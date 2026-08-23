@@ -49,7 +49,7 @@ function makeIdentities(parentTier = "trusted", workerTier = "trusted") {
 }
 
 function handle(id: string): WorkspaceHandle {
-  return { id, targetRepo: "/repo", baseBranch: "main", baseRef: "deadbeef", scratchBranch: `ikbi/ws/${id}`, path: `/tmp/${id}`, identity: { agentId: "parent-1" }, state: "allocated", createdAt: 1000 };
+  return { id, targetRepo: "/repo", baseBranch: "main", baseRef: "deadbeef", scratchBranch: `ikbi/ws/${id}`, path: `/lab-fake/${id}`, identity: { agentId: "parent-1" }, state: "allocated", createdAt: 1000 };
 }
 
 const task: WorkerTask = { taskId: "t-1", targetRepo: "/repo", goal: "do the thing" };

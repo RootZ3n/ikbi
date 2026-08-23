@@ -18,7 +18,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../temp-root.js";
 import { join } from "node:path";
 import { after, test } from "node:test";
 

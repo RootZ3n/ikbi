@@ -31,7 +31,8 @@ import {
   mkdirSync, mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync,
   appendFileSync, readdirSync, statSync, cpSync,
 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir } from "node:os";
+import { labTempDir as tmpdir } from "../../src/core/temp-root.js";
 import { join, resolve, isAbsolute } from "node:path";
 
 import { SCENARIOS, SUITES } from "./scenarios.mjs";

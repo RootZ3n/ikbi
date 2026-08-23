@@ -69,7 +69,7 @@ function promotableWorkProduct(): NonNullable<OrchestratorDeps["computeWorkProdu
 
 function ws() {
   const calls = { promote: 0, discard: 0 };
-  const handle: WorkspaceHandle = { id: "wsabcd", targetRepo: "/repo", baseBranch: "main", baseRef: "x", scratchBranch: "ikbi/ws/wsabcd", path: "/tmp/wsabcd", identity: { agentId: "parent-1" }, state: "allocated", createdAt: 0 };
+  const handle: WorkspaceHandle = { id: "wsabcd", targetRepo: "/repo", baseBranch: "main", baseRef: "x", scratchBranch: "ikbi/ws/wsabcd", path: "/lab-fake/wsabcd", identity: { agentId: "parent-1" }, state: "allocated", createdAt: 0 };
   return {
     calls,
     workspaces: {

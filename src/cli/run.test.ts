@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { access, chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../core/temp-root.js";
 import { join } from "node:path";
 import { test } from "node:test";
 
@@ -76,7 +76,7 @@ function detection() {
   } as const;
 }
 
-function preflightPorts(stateRoot = "/tmp/ikbi-test-state", receiptsDir = "/tmp/ikbi-test-receipts") {
+function preflightPorts(stateRoot = "/lab-fake/ikbi-test-state", receiptsDir = "/lab-fake/ikbi-test-receipts") {
   return {
     envPorts: {
       nodeVersion: () => "v22.0.0",

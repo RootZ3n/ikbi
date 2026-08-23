@@ -10,7 +10,7 @@
 
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../../core/temp-root.js";
 import { dirname, join } from "node:path";
 
 /** Run git in `cwd`, failing loudly — a broken fixture must not look like a broken feature. */

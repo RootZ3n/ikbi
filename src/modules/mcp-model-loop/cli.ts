@@ -9,8 +9,8 @@
  *
  *   ikbi mcp --server "<command [args...]>" <goal...>
  *
- * e.g.  ikbi mcp --server "npx -y @modelcontextprotocol/server-filesystem /tmp" \
- *                "list the files under /tmp and summarize them"
+ * e.g.  ikbi mcp --server "npx -y @modelcontextprotocol/server-filesystem /lab-fake" \
+ *                "list the files under the system temp directory and summarize them"
  *
  * The --server value is the operator-configured server command (split on whitespace
  * into executable + args). It is the operator's deliberate, audited choice — like adding

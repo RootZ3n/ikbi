@@ -20,7 +20,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../../core/temp-root.js";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
@@ -85,10 +85,15 @@ function build(root: string, server: FakeProviderServer, repo: string, goal: str
     cwd: mkdtempSync(join(tmpdir(), "ikbi-v2-defcwd-")),
     env: {
       PATH: process.env.PATH ?? "",
-      // CONTAINMENT. A spawned child that inherits no TMPDIR falls back to /tmp, and every
+      // CONTAINMENT. A spawned child that inherits no TMPDIR falls back to the system temp directory, and every
       // fixture it makes there escapes the run root the wrapper cleans up. Forwarded explicitly
       // because this env is an allowlist — the child gets nothing that is not named here.
       TMPDIR: process.env.TMPDIR ?? tmpdir(),
+      // THE GOVERNED TEMPORARY ROOT, forwarded explicitly. A child that resolved its own would
+      // pick a different one (it sets its own IKBI_STATE_ROOT), and scratch would then scatter
+      // across roots that no single wrapper cleans up.
+      ...(process.env.IKBI_TEMP_ROOT !== undefined ? { IKBI_TEMP_ROOT: process.env.IKBI_TEMP_ROOT } : {}),
+      ...(process.env.IKBI_TEMP_RUN_ID !== undefined ? { IKBI_TEMP_RUN_ID: process.env.IKBI_TEMP_RUN_ID } : {}),
       HOME: mkdtempSync(join(tmpdir(), "ikbi-v2-defhome-")),
       IKBI_STATE_ROOT: root,
       IKBI_MODEL_DRIVER: "m1",

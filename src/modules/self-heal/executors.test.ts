@@ -27,7 +27,7 @@ import type { CandidateFix, SelfHealFailure, SelfHealResult, SuiteResult } from 
 
 const handle = (over: Partial<WorkspaceHandle> = {}): WorkspaceHandle => ({
   id: "ws-1", targetRepo: "/repos/ikbi", baseBranch: "main", baseRef: "abc123",
-  scratchBranch: "ikbi/ws/ws-1", path: "/tmp/wt/ws-1", identity: { agentId: "self-heal", trustTier: "trusted" },
+  scratchBranch: "ikbi/ws/ws-1", path: "/lab-fake/wt/ws-1", identity: { agentId: "self-heal", trustTier: "trusted" },
   state: "allocated", createdAt: 0, ...over,
 });
 

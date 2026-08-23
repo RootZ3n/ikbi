@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../../../core/temp-root.js";
 import { join } from "node:path";
 
 import type { FetchLike } from "../../../core/provider/providers/openai-compatible.js";

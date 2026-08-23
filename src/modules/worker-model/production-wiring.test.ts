@@ -41,7 +41,7 @@ function makeIdentities(parentTier = "trusted", workerTier = "trusted") {
 }
 
 function handle(id: string): WorkspaceHandle {
-  return { id, targetRepo: "/repo", baseBranch: "main", baseRef: "deadbeef", scratchBranch: `ikbi/ws/${id}`, path: `/tmp/${id}`, identity: { agentId: "parent-1" }, state: "allocated", createdAt: 1000 };
+  return { id, targetRepo: "/repo", baseBranch: "main", baseRef: "deadbeef", scratchBranch: `ikbi/ws/${id}`, path: `/lab-fake/${id}`, identity: { agentId: "parent-1" }, state: "allocated", createdAt: 1000 };
 }
 
 /** Roles minus scout (orchestrator builds the production scout). `verifierMode` is what the
@@ -94,7 +94,7 @@ function baseDeps(over: Partial<OrchestratorDeps>): OrchestratorDeps {
   };
 }
 
-const task: WorkerTask = { taskId: "t1", targetRepo: "/tmp/repo", goal: "do it" };
+const task: WorkerTask = { taskId: "t1", targetRepo: "/lab-fake/repo", goal: "do it" };
 
 test("F1/F2/E: production orchestrator with NO env ⇒ ladder + index wired and stamped on result + events", async () => {
   const { parentCtx } = makeIdentities();

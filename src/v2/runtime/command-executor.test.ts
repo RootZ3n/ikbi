@@ -13,7 +13,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../../core/temp-root.js";
 import { join } from "node:path";
 
 import { createCommandCapability, createGovernedCommandTransport, type CommandTransport, type CommandTransportResult } from "./command-executor.js";
@@ -113,7 +113,7 @@ test("cwd: `..` / absolute / outside paths are refused and nothing runs", async 
   const ws = makeWorkspace();
   const transport = fakeTransport();
   const cap = createCommandCapability({ transport, treeProbe: fakeTreeProbe(["T"]), policy: V2_DEFAULT_COMMAND_POLICY });
-  for (const cwd of ["..", "../..", "/etc", "/tmp"]) {
+  for (const cwd of ["..", "../..", "/etc", "/lab-fake"]) {
     const res = await cap.run(req({ workspacePath: ws.path, cwd }));
     assert.equal(res.outcome.kind, "command");
     if (res.outcome.kind === "command") {

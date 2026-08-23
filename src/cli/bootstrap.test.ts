@@ -8,7 +8,7 @@ import { HERMETIC_DEV_KEY_ENV } from "../test-support/hermetic-env.js";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../core/temp-root.js";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { test } from "node:test";

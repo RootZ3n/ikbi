@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, writeFileSync, symlinkSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../../../core/temp-root.js";
 import { join } from "node:path";
 import { test } from "node:test";
 
@@ -226,7 +226,7 @@ test("terminal: an empty command is rejected before any exec", async () => {
 
 test("terminal: denies effectful git and package-manager script commands before exec", async () => {
   const dir = tmp();
-  for (const command of ["git -C /tmp status", "git push origin main", "git update-ref refs/heads/main HEAD", "git branch -D main", "pnpm run build", "npm test", "npx tsx script.ts"]) {
+  for (const command of ["git -C the system temp directory status", "git push origin main", "git update-ref refs/heads/main HEAD", "git branch -D main", "pnpm run build", "npm test", "npx tsx script.ts"]) {
     const spy = execSpy({ executed: true, exitCode: 0 });
     const out = await runTerminal({ governedExec: spy.exec, parentCtx: FAKE_CTX }, dir, { command });
     assert.match(out, /DENIED:/, command);

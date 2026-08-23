@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../../core/temp-root.js";
 import { join } from "node:path";
 import { test } from "node:test";
 
@@ -40,7 +40,7 @@ function makeIdentities(parentTier: string, workerTier: string) {
 }
 
 function baseHandle(id: string): WorkspaceHandle {
-  return { id, targetRepo: "/repo", baseBranch: "main", baseRef: "deadbeef", scratchBranch: `ikbi/ws/${id}`, path: `/tmp/${id}`, identity: { agentId: "parent-1" }, state: "allocated", createdAt: 1000 };
+  return { id, targetRepo: "/repo", baseBranch: "main", baseRef: "deadbeef", scratchBranch: `ikbi/ws/${id}`, path: `/lab-fake/${id}`, identity: { agentId: "parent-1" }, state: "allocated", createdAt: 1000 };
 }
 
 /** Fake workspaces: ids "ws0","ws1",…; promote honors governance; records lifecycle. */
@@ -427,7 +427,7 @@ test("C1: a candidate whose builder mutated package.json scripts → verifier UN
   // HOW the mutation is detected — so it is excluded here.)
   for (const req of governedRuns) {
     if (req.command === "git") continue; // the working-tree script-integrity probe is expected
-    assert.notEqual(req.cwd, "/tmp/ws0", "the mutated candidate's check never executed");
+    assert.notEqual(req.cwd, "/lab-fake/ws0", "the mutated candidate's check never executed");
   }
 });
 

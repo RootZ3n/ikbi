@@ -224,7 +224,7 @@ const noopBus = () => ({
 const benignCognition = { deliberate: async () => ({ decision: "answer" as const, confidence: 1, rationale: "ok", memoryUsed: [] as string[] }) };
 
 function fakeWorkspaceHandle(targetRepo = "/delegated/repo"): WorkspaceHandle {
-  return { id: "ws-deleg", targetRepo, baseBranch: "main", baseRef: "abc123", scratchBranch: "ikbi/ws/ws-deleg", path: "/tmp/ws-deleg", identity: { agentId: "lead" }, state: "allocated", createdAt: 1000 };
+  return { id: "ws-deleg", targetRepo, baseBranch: "main", baseRef: "abc123", scratchBranch: "ikbi/ws/ws-deleg", path: "/lab-fake/ws-deleg", identity: { agentId: "lead" }, state: "allocated", createdAt: 1000 };
 }
 
 function capturingRoles(capturedTasks: WorkerTask[]) {

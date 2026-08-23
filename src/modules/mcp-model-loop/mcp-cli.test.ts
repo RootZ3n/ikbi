@@ -49,7 +49,7 @@ test("parseMcpArgs extracts --server / --model; the rest is the goal", () => {
 });
 
 test("splitServerCommand splits executable + args on whitespace", () => {
-  assert.deepEqual(splitServerCommand("npx -y @scope/server /tmp"), { command: "npx", args: ["-y", "@scope/server", "/tmp"] });
+  assert.deepEqual(splitServerCommand("npx -y @scope/server /lab-fake"), { command: "npx", args: ["-y", "@scope/server", "/lab-fake"] });
   assert.deepEqual(splitServerCommand("  server-bin  "), { command: "server-bin", args: [] });
 });
 
@@ -59,8 +59,8 @@ test("with a server + goal, the command connects the transport and runs the loop
   const w = fakeWiring(okResult({ content: "the answer" }));
   const cap = capture();
   const cli = createMcpCli({ resolveIdentity: operatorResolver(), operatorToken: OPERATOR_TOKEN, createTransport: w.createTransport, createLoop: w.createLoop, stdout: cap.stdout, stderr: cap.stderr, setExit: cap.setExit, now: () => 1 });
-  return cli.run(["--server", "npx -y server /tmp", "summarize the files"]).then(() => {
-    assert.deepEqual(w.transports, [{ command: "npx", args: ["-y", "server", "/tmp"] }], "transport built from --server");
+  return cli.run(["--server", "npx -y server /lab-fake", "summarize the files"]).then(() => {
+    assert.deepEqual(w.transports, [{ command: "npx", args: ["-y", "server", "/lab-fake"] }], "transport built from --server");
     assert.equal(w.requests.length, 1, "the loop ran once");
     assert.equal(w.requests[0]?.goal, "summarize the files");
     assert.match(cap.out, /mcp loop: completed \(2 round\(s\), stop: stop\)/);

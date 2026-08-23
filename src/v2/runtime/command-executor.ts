@@ -23,7 +23,7 @@
  */
 
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../../core/temp-root.js";
 import { join, resolve, sep } from "node:path";
 
 import { createGovernedExec } from "../../modules/governed-exec/index.js";

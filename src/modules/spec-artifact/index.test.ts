@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../../core/temp-root.js";
 import { test } from "node:test";
 
 import type { SpecCardFields, SpecStep } from "./contract.js";

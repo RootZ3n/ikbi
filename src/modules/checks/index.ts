@@ -146,7 +146,7 @@ const DOTNET_CHECKS: readonly Check[] = [{ name: "test", command: "dotnet", args
 
 /** Maven native checks — `mvn test` (NOT `-q`, which hides the Surefire "Tests run:" summary the
  *  evidence gate reads). Deps + plugins fetch from Central over the shared net into the sandbox's
- *  redirected local repo (/tmp/.m2 via MAVEN_OPTS). */
+ *  redirected local repo (/lab-fake/.m2 via MAVEN_OPTS). */
 const MAVEN_CHECKS: readonly Check[] = [{ name: "test", command: "mvn", args: ["test"] }];
 
 /** Absolute path to the ikbi-shipped Gradle init script (resolved from this module, works under both

@@ -7,9 +7,9 @@ set -euo pipefail
 # provider configuration to exercise the model-backed C/D cases.
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-FIXTURE=${IKBI_COLD_FIXTURE:-/tmp/ikbi-cold-test}
+FIXTURE=${IKBI_COLD_FIXTURE:-/lab-fake/ikbi-cold-test}
 BIN=(node "$ROOT_DIR/dist/cli/index.js")
-TEMP_ROOT=$(mktemp -d /tmp/ikbi-release-acceptance.XXXXXX)
+TEMP_ROOT=$(mktemp -d /lab-fake/ikbi-release-acceptance.XXXXXX)
 trap 'rm -rf "$TEMP_ROOT"' EXIT
 
 if [[ ! -d "$FIXTURE/.git" ]]; then

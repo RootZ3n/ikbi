@@ -11,7 +11,7 @@ import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../core/temp-root.js";
 import { promisify } from "node:util";
 import { join } from "node:path";
 import { pino } from "pino";

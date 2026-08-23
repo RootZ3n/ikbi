@@ -12,7 +12,7 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../../core/temp-root.js";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
 

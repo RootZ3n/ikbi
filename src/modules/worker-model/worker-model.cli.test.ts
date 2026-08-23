@@ -16,7 +16,7 @@ import { WORKER_ROLES, WorkerError, CONTRACT_VERSION, type RoleContext, type Rol
 // Importing cli.js registers the `build` command at module load.
 import { createWorkerCli, loadScopePlan, parseBuildArgs, productionRoleClaim } from "./cli.js";
 import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../../core/temp-root.js";
 import { join as tmpJoin } from "node:path";
 
 const silent = () => pino({ level: "silent" });
@@ -57,7 +57,7 @@ function capturingRoles() {
 }
 
 function fakeWorkspaceHandle(): WorkspaceHandle {
-  return { id: "wsabcd", targetRepo: "/repo", baseBranch: "main", baseRef: "deadbeef", scratchBranch: "ikbi/ws/wsabcd", path: "/tmp/wsabcd", identity: { agentId: "lead" }, state: "allocated", createdAt: 1000 };
+  return { id: "wsabcd", targetRepo: "/repo", baseBranch: "main", baseRef: "deadbeef", scratchBranch: "ikbi/ws/wsabcd", path: "/lab-fake/wsabcd", identity: { agentId: "lead" }, state: "allocated", createdAt: 1000 };
 }
 
 /**

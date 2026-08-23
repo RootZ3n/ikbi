@@ -27,7 +27,7 @@
 
 import { createHash } from "node:crypto";
 import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../../core/temp-root.js";
 import { dirname, join, relative, sep } from "node:path";
 import { randomBytes } from "node:crypto";
 import pino from "pino";

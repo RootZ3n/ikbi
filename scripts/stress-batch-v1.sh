@@ -25,7 +25,7 @@ set -uo pipefail
 
 export IKBI_ALLOW_INSECURE_DEV_KEYS=true
 IKBI="npx ikbi"
-RESULTS_DIR="/tmp/stress-batch-v1"
+RESULTS_DIR="/lab-fake/stress-batch-v1"
 rm -rf "$RESULTS_DIR"
 mkdir -p "$RESULTS_DIR"
 
@@ -123,7 +123,7 @@ contamination=0
 for id in "${ORDER[@]}"; do
   IFS='|' read -r name goal <<< "${SCENARIOS[$id]}"
   manifest="${MANIFESTS[$id]}"
-  dir="/tmp/stress-$id"
+  dir="/lab-fake/stress-$id"
   
   echo "═══════════════════════════════════════════════════════════════"
   echo " $id: $name"

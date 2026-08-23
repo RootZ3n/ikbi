@@ -5,7 +5,7 @@
 
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile, readFile, access } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../core/temp-root.js";
 import { join } from "node:path";
 import { test } from "node:test";
 

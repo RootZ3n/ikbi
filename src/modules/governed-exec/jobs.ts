@@ -20,7 +20,7 @@
 import { spawn as nodeSpawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { appendFileSync, closeSync, mkdtempSync, openSync, readSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../../core/temp-root.js";
 import { join } from "node:path";
 
 import { DEFAULT_JOB_KILL_GRACE_MS, DEFAULT_MAX_BUFFER } from "./config.js";

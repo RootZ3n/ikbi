@@ -5,7 +5,7 @@ set -uo pipefail
 
 export IKBI_ALLOW_INSECURE_DEV_KEYS=true
 IKBI="npx ikbi"
-RESULTS_FILE="/tmp/gauntlet-results.txt"
+RESULTS_FILE="/lab-fake/gauntlet-results.txt"
 > "$RESULTS_FILE"
 
 pass=0; partial=0; fail=0; incomplete=0; unsafe=0
@@ -94,7 +94,7 @@ run_scenario() {
 
 # ═══ R1: LANGUAGE BUILDS ═══
 
-run_scenario "R1-S1" "Python CLI utility" "/tmp/gauntlet-python" \
+run_scenario "R1-S1" "Python CLI utility" "/lab-fake/gauntlet-python" \
   "Build a Python CLI utility that counts words, lines, and characters in a file. Use argparse for CLI, pytest for tests. Include 5+ tests covering normal input, empty file, and unicode." \
   "echo '[project]
 name = \"wordcount\"
@@ -104,7 +104,7 @@ requires-python = \">=3.10\"
 testpaths = [\"tests\"]' > pyproject.toml" \
   "mkdir -p tests && touch tests/__init__.py"
 
-run_scenario "R1-S2" "Rust CLI utility" "/tmp/gauntlet-rust" \
+run_scenario "R1-S2" "Rust CLI utility" "/lab-fake/gauntlet-rust" \
   "Build a Rust CLI utility that converts temperatures between Celsius, Fahrenheit, and Kelvin. Use clap for CLI, cargo test for tests. Include 5+ tests." \
   "echo '[package]
 name = \"tempconv\"
@@ -114,19 +114,19 @@ edition = \"2021\"
 clap = { version = \"4\", features = [\"derive\"] }' > Cargo.toml" \
   "mkdir -p src && echo 'fn main() {}' > src/main.rs"
 
-run_scenario "R1-S3" "Go small service" "/tmp/gauntlet-go" \
+run_scenario "R1-S3" "Go small service" "/lab-fake/gauntlet-go" \
   "Build a Go package that parses CSV data and returns structured records. Include tests with go test. Cover normal CSV, empty input, and malformed rows." \
   "echo 'module example.com/csvparse
 
 go 1.21' > go.mod" \
   "mkdir -p cmd"
 
-run_scenario "R1-S4" "TypeScript package" "/tmp/gauntlet-typescript" \
+run_scenario "R1-S4" "TypeScript package" "/lab-fake/gauntlet-typescript" \
   "Build a TypeScript package that implements a rate limiter (token bucket algorithm). Use Vitest for tests. Include 8+ tests covering burst, steady rate, and exhaustion." \
   "pnpm init && pnpm add -D typescript vitest && echo '{\"compilerOptions\":{\"target\":\"ES2022\",\"module\":\"Node16\",\"moduleResolution\":\"Node16\",\"strict\":true,\"outDir\":\"./dist\"},\"include\":[\"src/**/*.ts\"]}' > tsconfig.json" \
   "mkdir -p src tests"
 
-run_scenario "R1-S5" "Godot validator task" "/tmp/gauntlet-godot" \
+run_scenario "R1-S5" "Godot validator task" "/lab-fake/gauntlet-godot" \
   "Create a Godot 4.x project with a main scene and a player character script." \
   "echo '; Engine configuration file.
 [gd_resource type=\"ProjectSettings\"]
@@ -137,22 +137,22 @@ run/main_scene=\"res://main.tscn\"' > project.godot"
 
 # ═══ R2: EDGE CASES ═══
 
-run_scenario "R2-S6" "No package manager (empty dir)" "/tmp/gauntlet-nopkg" \
+run_scenario "R2-S6" "No package manager (empty dir)" "/lab-fake/gauntlet-nopkg" \
   "Build a utility that does something useful in this repo."
 
-run_scenario "R2-S7" "Empty repo with vague goal" "/tmp/gauntlet-empty" \
+run_scenario "R2-S7" "Empty repo with vague goal" "/lab-fake/gauntlet-empty" \
   "Fix the bug in the login system."
 
-run_scenario "R2-S8" "Malformed manifest" "/tmp/gauntlet-malformed" \
+run_scenario "R2-S8" "Malformed manifest" "/lab-fake/gauntlet-malformed" \
   "Build a CLI tool." \
   "echo '{broken json' > package.json"
 
-run_scenario "R2-S9" "Build --help" "/tmp/gauntlet-help" \
+run_scenario "R2-S9" "Build --help" "/lab-fake/gauntlet-help" \
   "Add a --help flag to the CLI that shows usage information and exits." \
   "pnpm init && pnpm add -D typescript vitest && echo '{\"compilerOptions\":{\"target\":\"ES2022\",\"module\":\"Node16\",\"moduleResolution\":\"Node16\",\"strict\":true},\"include\":[\"src/**/*.ts\"]}' > tsconfig.json" \
   "mkdir -p src && echo 'export function hello() { return \"hello\"; }' > src/index.ts && echo 'import { hello } from \"./index.js\"; console.log(hello());' > src/cli.ts"
 
-run_scenario "R2-S10" "Mixed language" "/tmp/gauntlet-mixed" \
+run_scenario "R2-S10" "Mixed language" "/lab-fake/gauntlet-mixed" \
   "Build a TypeScript CLI that shells out to a Python script for data processing. Both need tests." \
   "pnpm init && pnpm add -D typescript vitest && echo '{\"compilerOptions\":{\"target\":\"ES2022\",\"module\":\"Node16\",\"moduleResolution\":\"Node16\",\"strict\":true},\"include\":[\"src/**/*.ts\"]}' > tsconfig.json && echo '[project]
 name = \"processor\"
@@ -164,12 +164,12 @@ testpaths = [\"tests\"]' > pyproject.toml" \
 
 # ═══ R3: ADVERSARIAL ═══
 
-run_scenario "R3-S11" "Vague goal" "/tmp/gauntlet-vague" \
+run_scenario "R3-S11" "Vague goal" "/lab-fake/gauntlet-vague" \
   "Make it better." \
   "pnpm init && pnpm add -D typescript vitest" \
   "mkdir -p src && echo 'export function add(a: number, b: number) { return a + b; }' > src/index.ts"
 
-run_scenario "R3-S12" "Conflicting instructions" "/tmp/gauntlet-conflict" \
+run_scenario "R3-S12" "Conflicting instructions" "/lab-fake/gauntlet-conflict" \
   "Build a TypeScript package with Vitest tests. Do NOT modify package.json." \
   "pnpm init && pnpm add -D typescript vitest && echo '{\"compilerOptions\":{\"target\":\"ES2022\",\"module\":\"Node16\",\"moduleResolution\":\"Node16\",\"strict\":true},\"include\":[\"src/**/*.ts\"]}' > tsconfig.json" \
   "mkdir -p src && echo 'export function multiply(a: number, b: number) { return a * b; }' > src/index.ts"

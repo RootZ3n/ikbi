@@ -29,7 +29,15 @@ const SRC = resolve(fileURLToPath(new URL("../../", import.meta.url)));
 const V2_DIR = join(SRC, "v2");
 
 /** v1 modules `src/v2/cli/**` is allowed to import (relative to the importing file). */
-const V2_CLI_ALLOWED_V1_IMPORTS = new Set(["../../cli/registry.js", "../../cli/io.js"]);
+const V2_CLI_ALLOWED_V1_IMPORTS = new Set([
+  "../../cli/registry.js",
+  "../../cli/io.js",
+  // THE GOVERNED TEMPORARY ROOT. A core primitive with no dependencies of its own beyond node
+  // builtins, and the ONLY sanctioned way anything in this repository obtains scratch — the lab
+  // rule forbids /tmp and `os.tmpdir()` outright, so a v2 file that needs a temp directory has
+  // exactly one place to get one. Deliberate, and enforced repo-wide by `scripts/governed-temp.ts guard`.
+  "../../core/temp-root.js",
+]);
 
 /**
  * v1 donor modules the ADAPTER layer may import. Every entry is a deliberate decision
@@ -57,6 +65,9 @@ const V2_RUNTIME_ALLOWED_V1_IMPORTS = new Set([
   "../../modules/governed-exec/config.js", //      the ALLOWLIST as DATA — read by `doctor --v2` readiness to prove the
   //                                               repository's real check commands are permitted (V2-020/Phase 20).
   //                                               Config only: it carries no way to EXECUTE anything (see the guard below).
+  "../../core/temp-root.js", //                    THE governed temporary root — the only sanctioned source of
+  //                                               scratch anywhere in the repository (the lab rule forbids /tmp
+  //                                               and os.tmpdir()). Node builtins only; holds no capability.
   "../../core/identity/registry.js", //            self-contained verifier identity (V2-008)
   "../../core/identity/resolver.js", //            mint the verifier's OperationContext (V2-008)
   "../../core/identity/index.js", //               OperationContext type (V2-008)
@@ -221,9 +232,18 @@ test("isolation: src/v2/runtime imports only v2 + the ENUMERATED v1 donor module
 test("isolation: the adapter layer is the ONLY part of v2 that touches v1 donor code", () => {
   // A guard against the easy mistake: reaching for v1 from core or cli because the
   // adapter did not expose quite the right shape yet.
+  //
+  // `core/temp-root.js` is exempt, and the distinction is the point of this guard rather than a
+  // hole in it: it is not DONOR code. It is a neutral primitive — node builtins only, no
+  // capability, owned by no pipeline — in the same class as `modules/checks`. It appears in the
+  // runtime allowlist because runtime imports it too, not because it is v1. And it has to be
+  // reachable from every layer: the lab rule forbids `/tmp` and `os.tmpdir()`, so this is the one
+  // place anything in the repository can obtain scratch, including a pure core module's tests.
+  const NEUTRAL_PRIMITIVES = new Set(["../../core/temp-root.js"]);
   for (const dir of ["core", "cli"] as const) {
     for (const file of tsFiles(join(V2_DIR, dir))) {
       for (const spec of importSpecifiers(readFileSync(file, "utf8"))) {
+        if (NEUTRAL_PRIMITIVES.has(spec)) continue;
         assert.equal(
           V2_RUNTIME_ALLOWED_V1_IMPORTS.has(spec),
           false,

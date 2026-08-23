@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../core/temp-root.js";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
@@ -372,7 +372,7 @@ test("doctor SAFETY POSTURE honors an explicit hardened opt-in (IKBI_VERIFY=ladd
 
 /** A config with deterministic state paths (so tests can name the dirs --fix should create). */
 function fixConfig() {
-  return loadConfig({ IKBI_ALLOW_INSECURE_DEV_KEYS: "true", IKBI_STATE_ROOT: "/tmp/doctorfix-state" });
+  return loadConfig({ IKBI_ALLOW_INSECURE_DEV_KEYS: "true", IKBI_STATE_ROOT: "/lab-fake/doctorfix-state" });
 }
 
 /** Records every side effect the fix ports are asked to perform. */

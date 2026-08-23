@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
 import { access, mkdtemp, rm, rmdir, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
-import { hostname, tmpdir } from "node:os";
+import { hostname } from "node:os";
+import { labTempDir as tmpdir } from "../temp-root.js";
 import { join } from "node:path";
 import { test } from "node:test";
 

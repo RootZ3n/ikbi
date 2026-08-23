@@ -22,7 +22,7 @@ function fakeGit(responses: { porcelain?: string; writeTree?: string; baseTree?:
   return { git, calls };
 }
 
-const OPTS = { baseRef: "base-sha", tempIndexPath: "/tmp/adj.index" };
+const OPTS = { baseRef: "base-sha", tempIndexPath: "/lab-fake/adj.index" };
 
 test("nonEmpty from tree comparison; filesChanged from porcelain; treeHash from write-tree", async () => {
   const { git } = fakeGit({
@@ -88,8 +88,8 @@ test("treeHash is written from a THROWAWAY index (GIT_INDEX_FILE), never the rea
   await computeWorkProduct(git, OPTS);
   const add = calls.find((c) => c.args[0] === "add");
   const writeTree = calls.find((c) => c.args[0] === "write-tree");
-  assert.equal(add?.env?.GIT_INDEX_FILE, "/tmp/adj.index", "add uses the throwaway index");
-  assert.equal(writeTree?.env?.GIT_INDEX_FILE, "/tmp/adj.index", "write-tree uses the throwaway index");
+  assert.equal(add?.env?.GIT_INDEX_FILE, "/lab-fake/adj.index", "add uses the throwaway index");
+  assert.equal(writeTree?.env?.GIT_INDEX_FILE, "/lab-fake/adj.index", "write-tree uses the throwaway index");
   assert.deepEqual(add?.args, ["add", "-A"], "stages the full tree incl. untracked");
   // status/diff/rev-parse read the REAL tree (no override).
   const status = calls.find((c) => c.args[0] === "status");

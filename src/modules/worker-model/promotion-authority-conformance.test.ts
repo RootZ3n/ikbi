@@ -21,7 +21,7 @@ import { execFileSync } from "node:child_process";
 import { readFileSync, mkdtempSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../../core/temp-root.js";
 import { test } from "node:test";
 
 import { pino } from "pino";
@@ -198,7 +198,7 @@ test("B6 (req 9): a genuinely non-git (in-memory) workspace is exempt from the t
 
 function fakeManager(promoted = true) {
   const captured: Array<{ evaluatorId: string | undefined; hasVerifiedAgainst: boolean }> = [];
-  const handle: WorkspaceHandle = { id: "repl-ws", targetRepo: "/tmp/repl-target", baseBranch: "main", baseRef: "x", scratchBranch: "s", path: "/tmp/repl-scratch", identity: { agentId: "ikbi-chat" }, state: "allocated", createdAt: 0 };
+  const handle: WorkspaceHandle = { id: "repl-ws", targetRepo: "/lab-fake/repl-target", baseBranch: "main", baseRef: "x", scratchBranch: "s", path: "/lab-fake/repl-scratch", identity: { agentId: "ikbi-chat" }, state: "allocated", createdAt: 0 };
   const mgr: WorkspaceManagerLike = {
     allocate: async () => handle,
     commit: async () => true,
@@ -222,7 +222,7 @@ async function manualReceiptsFor(workspaceId: string) {
 
 test("C1 [MUTATION 5] (req 13,15): REPL /apply emits a MANUAL-UNVERIFIED receipt, never an autonomous worker.promotion", async () => {
   const { mgr, captured } = fakeManager(true);
-  const ws = await allocateSessionWorkspace({ targetRepo: "/tmp/repl-target", sessionId: "sess-c1", manager: mgr, gateWall: allowGate });
+  const ws = await allocateSessionWorkspace({ targetRepo: "/lab-fake/repl-target", sessionId: "sess-c1", manager: mgr, gateWall: allowGate });
   const result = await ws.promote("apply my work");
   assert.equal(result.promoted, true);
   assert.equal(captured[0]!.evaluatorId, "repl-operator", "the manual apply is attributed to the operator, not a worker strategy");
@@ -237,7 +237,7 @@ test("C1 [MUTATION 5] (req 13,15): REPL /apply emits a MANUAL-UNVERIFIED receipt
 
 test("C2 [MUTATION 6] (req 14): the manual apply awards NO success trust and is unmistakably labelled", async () => {
   const { mgr } = fakeManager(true);
-  const ws = await allocateSessionWorkspace({ targetRepo: "/tmp/repl-target", sessionId: "sess-c2", manager: mgr, gateWall: allowGate });
+  const ws = await allocateSessionWorkspace({ targetRepo: "/lab-fake/repl-target", sessionId: "sess-c2", manager: mgr, gateWall: allowGate });
   await ws.promote("apply");
   const manual = (await manualReceiptsFor("repl-ws")).find((r) => r.operation === "workspace.manual_apply" && (r.metadata as Record<string, unknown>).sessionId === "sess-c2");
   assert.ok(manual !== undefined);
@@ -248,7 +248,7 @@ test("C2 [MUTATION 6] (req 14): the manual apply awards NO success trust and is 
 
 test("C3 (req 13): a DENYING gate-wall blocks the manual apply and records it as not-promoted (fail-closed)", async () => {
   const { mgr, captured } = fakeManager(true);
-  const ws = await allocateSessionWorkspace({ targetRepo: "/tmp/repl-target", sessionId: "sess-c3", manager: mgr, gateWall: denyGate });
+  const ws = await allocateSessionWorkspace({ targetRepo: "/lab-fake/repl-target", sessionId: "sess-c3", manager: mgr, gateWall: denyGate });
   const result = await ws.promote("apply");
   assert.equal(result.promoted, false, "a gate-wall deny blocks the manual apply");
   assert.equal(captured.length, 0, "the low-level promote is never reached on a deny");

@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../../core/temp-root.js";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { test } from "node:test";

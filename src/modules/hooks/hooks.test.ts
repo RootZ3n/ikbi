@@ -12,7 +12,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../../core/temp-root.js";
 import { join } from "node:path";
 
 import { buildHookEnv, fireHooks, fireStopHooks, isSecretEnvKey, loadHooks, type HookConfig, type HookContext } from "./index.js";
@@ -22,7 +22,7 @@ function tmpDir(): string {
 }
 
 function preCtx(over: Partial<HookContext> = {}): HookContext {
-  return { type: "PreToolUse", toolName: "Write", projectDir: "/tmp", ...over };
+  return { type: "PreToolUse", toolName: "Write", projectDir: "/lab-fake", ...over };
 }
 
 // ── BLOCK semantics ──────────────────────────────────────────────────────────
@@ -64,7 +64,7 @@ test("a hook killed by SIGTERM (the timeout path) fails open and is flagged time
 test("PostToolUse IKBI_TOOL_OUTPUT env is truncated to 32KB", async () => {
   const big = "z".repeat(50_000);
   const hooks: HookConfig[] = [{ type: "PostToolUse", command: 'printf "%s" "${#IKBI_TOOL_OUTPUT}"' }];
-  const res = await fireHooks(hooks, { type: "PostToolUse", toolName: "Write", toolOutput: big, projectDir: "/tmp" });
+  const res = await fireHooks(hooks, { type: "PostToolUse", toolName: "Write", toolOutput: big, projectDir: "/lab-fake" });
   assert.equal(Number(res[0]!.stdout.trim()), 32_000);
 });
 
@@ -72,7 +72,7 @@ test("PostToolUse IKBI_TOOL_OUTPUT env is truncated to 32KB", async () => {
 
 test("PostToolUse receives the tool name + output in the environment", async () => {
   const hooks: HookConfig[] = [{ type: "PostToolUse", command: 'printf "%s:%s" "$IKBI_TOOL_NAME" "$IKBI_TOOL_OUTPUT"' }];
-  const res = await fireHooks(hooks, { type: "PostToolUse", toolName: "Write", toolOutput: "RESULT", projectDir: "/tmp" });
+  const res = await fireHooks(hooks, { type: "PostToolUse", toolName: "Write", toolOutput: "RESULT", projectDir: "/lab-fake" });
   assert.equal(res[0]!.stdout, "Write:RESULT");
 });
 
@@ -104,7 +104,7 @@ test("RC1: a hook does NOT inherit secret-like process env vars by default", asy
     const hooks: HookConfig[] = [
       { type: "PostToolUse", command: 'printf "%s|%s|%s|%s|%s|%s|%s" "$OPENAI_API_KEY" "$ANTHROPIC_API_KEY" "$GITHUB_TOKEN" "$AWS_SECRET_ACCESS_KEY" "$DB_PASSWORD" "$MY_OAUTH_TOKEN" "$IKBI_OPERATOR_TOKEN"' },
     ];
-    const res = await fireHooks(hooks, { type: "PostToolUse", toolName: "Write", projectDir: "/tmp" });
+    const res = await fireHooks(hooks, { type: "PostToolUse", toolName: "Write", projectDir: "/lab-fake" });
     // Every secret resolves to empty — none were forwarded into the hook subprocess.
     assert.equal(res[0]!.stdout, "||||||");
   } finally {
@@ -113,19 +113,19 @@ test("RC1: a hook does NOT inherit secret-like process env vars by default", asy
 });
 
 test("RC1: PATH is forwarded so a normal hook command can still run", () => {
-  const env = buildHookEnv({ type: "Stop", projectDir: "/tmp" }, {});
+  const env = buildHookEnv({ type: "Stop", projectDir: "/lab-fake" }, {});
   assert.equal(typeof env.PATH, "string");
   assert.ok((env.PATH ?? "").length > 0, "PATH must be in the minimal passthrough");
   // The IKBI_* context is always present.
   assert.equal(env.IKBI_HOOK_TYPE, "Stop");
-  assert.equal(env.IKBI_PROJECT_DIR, "/tmp");
+  assert.equal(env.IKBI_PROJECT_DIR, "/lab-fake");
 });
 
 test("RC1: explicit literal `env` override reaches the hook (the safe escape hatch)", async () => {
   const hooks: HookConfig[] = [
     { type: "PostToolUse", command: 'printf "%s" "$MY_DEPLOY_FLAG"', env: { MY_DEPLOY_FLAG: "green" } },
   ];
-  const res = await fireHooks(hooks, { type: "PostToolUse", toolName: "Write", projectDir: "/tmp" });
+  const res = await fireHooks(hooks, { type: "PostToolUse", toolName: "Write", projectDir: "/lab-fake" });
   assert.equal(res[0]!.stdout, "green");
 });
 
@@ -140,7 +140,7 @@ test("RC1: `passEnv` forwards a NAMED safe var, but refuses a secret-like name",
         passEnv: ["MY_SAFE_REGION", "MY_SUPER_TOKEN"],
       },
     ];
-    const res = await fireHooks(hooks, { type: "PostToolUse", toolName: "Write", projectDir: "/tmp" });
+    const res = await fireHooks(hooks, { type: "PostToolUse", toolName: "Write", projectDir: "/lab-fake" });
     // Safe var forwarded; the *_TOKEN name is refused even though it was explicitly listed.
     assert.equal(res[0]!.stdout, "us-east-1|");
   } finally {
@@ -151,7 +151,7 @@ test("RC1: `passEnv` forwards a NAMED safe var, but refuses a secret-like name",
 
 test("RC1: a literal `env` override wins over the IKBI_* context and passthrough", () => {
   const env = buildHookEnv(
-    { type: "PostToolUse", toolName: "Write", projectDir: "/tmp" },
+    { type: "PostToolUse", toolName: "Write", projectDir: "/lab-fake" },
     { env: { IKBI_PROJECT_DIR: "/override" } },
   );
   assert.equal(env.IKBI_PROJECT_DIR, "/override");
@@ -204,7 +204,7 @@ test("fireStopHooks runs Stop hooks", async () => {
 
 test("fireStopHooks never throws even when the hook command fails", async () => {
   const hooks: HookConfig[] = [{ type: "Stop", command: "exit 7" }];
-  await assert.doesNotReject(fireStopHooks(hooks, "/tmp"));
+  await assert.doesNotReject(fireStopHooks(hooks, "/lab-fake"));
 });
 
 // ── Config loading ─────────────────────────────────────────────────────────────
@@ -238,7 +238,7 @@ test("loadHooks does NOT read project hooks by default (Codex C5)", () => {
     mkdirSync(join(dir, ".ikbi"), { recursive: true });
     writeFileSync(
       join(dir, ".ikbi", "hooks.json"),
-      JSON.stringify([{ type: "Stop", command: "touch /tmp/pwned-by-untrusted-repo" }]),
+      JSON.stringify([{ type: "Stop", command: "touch /lab-fake/pwned-by-untrusted-repo" }]),
     );
     const hooks = loadHooks(dir);
     assert.equal(hooks.some((h) => h.command.includes("pwned")), false, "untrusted project hook must NOT be loaded");

@@ -351,7 +351,7 @@ test("P0/T1: detectScriptMutation guards the extended script keys (lint/check/e2
 // ── P0 Fix 1: the script-integrity guard inspects the WORKING-TREE diff, not the empty committed range
 import { execFileSync as _execFileSync } from "node:child_process";
 import { mkdtempSync as _mkdtempSync, mkdirSync as _mkdirSync, writeFileSync as _writeFileSync, rmSync as _rmSync } from "node:fs";
-import { tmpdir as _tmpdir } from "node:os";
+import { labTempDir as _tmpdir } from "../../core/temp-root.js";
 import { join as _join } from "node:path";
 import { captureStreamedStdout, committedPackageJsonDiff, workingTreePackageJsonDiff } from "./checks.js";
 

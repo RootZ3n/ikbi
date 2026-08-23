@@ -15,7 +15,7 @@
  * to `IkbiConfig`) by its EXACT name rather than through the auto-prefixing `moduleEnv`
  * reader, because the variable is `IKBI_MCP_SERVERS`, not `IKBI_MCP_MODEL_LOOP_SERVERS`.
  * DEFAULT: empty (no MCP servers — zero behavior change). Example:
- *   IKBI_MCP_SERVERS='[{"name":"fs","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/tmp"]}]'
+ *   IKBI_MCP_SERVERS='[{"name":"fs","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/lab-fake"]}]'
  */
 
 import { configEnv } from "../../core/config.js";

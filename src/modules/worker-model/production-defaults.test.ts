@@ -82,7 +82,7 @@ function ladderFakes() {
   };
 }
 
-const ctx = { workspace: { path: "/tmp/x", baseRef: "HEAD" } } as unknown as RoleContext;
+const ctx = { workspace: { path: "/lab-fake/x", baseRef: "HEAD" } } as unknown as RoleContext;
 
 test("F1 (wiring): a verifier built with mode:'ladder' runs the LADDER path (scope-stamped green)", async () => {
   const f = ladderFakes();

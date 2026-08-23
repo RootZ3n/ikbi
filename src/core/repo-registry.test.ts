@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "./temp-root.js";
 import { loadRepoRegistry, resetRepoRegistry } from "./repo-registry.js";
 
 function setupState(reposJson: object): string {

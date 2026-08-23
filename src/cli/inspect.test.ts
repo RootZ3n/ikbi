@@ -30,7 +30,7 @@ test("inspect locates completed run evidence without a parallel event store", as
       metadata: {
         runId,
         taskId,
-        repository: "/tmp/target",
+        repository: "/lab-fake/target",
         status: "completed",
         phase: "completed",
         workspaceId: "workspace-1",
@@ -41,25 +41,25 @@ test("inspect locates completed run evidence without a parallel event store", as
         mutationApplied: true,
         partialMutation: false,
         retryable: false,
-        diagnosticBundle: "/tmp/run-inspect.stderr.log",
+        diagnosticBundle: "/lab-fake/run-inspect.stderr.log",
         recovery: [],
       },
     }),
   ];
   const result = await inspectRun(runId, {
     readReceipts: async () => all,
-    receiptPath: "/tmp/receipts.ndjson",
-    getWorkspace: async () => ({ id: "workspace-1", path: "/tmp/workspace-1", state: "promoted", targetRepo: "/tmp/target" } as never),
+    receiptPath: "/lab-fake/receipts.ndjson",
+    getWorkspace: async () => ({ id: "workspace-1", path: "/lab-fake/workspace-1", state: "promoted", targetRepo: "/lab-fake/target" } as never),
   });
   assert.equal(result.status, "found");
   assert.equal(result.run?.status, "completed");
-  assert.equal(result.workspace.path, "/tmp/workspace-1");
+  assert.equal(result.workspace.path, "/lab-fake/workspace-1");
   assert.equal(result.candidate.id, "candidate-1");
   assert.equal(result.verification.status, "passed");
   assert.equal(result.promotion.status, "promoted");
   assert.deepEqual(result.evidence.invocationLedger, ["receipt:invoke-1"]);
   assert.deepEqual(result.evidence.verification, ["receipt:verify-1"]);
-  assert.deepEqual(result.evidence.logs, ["/tmp/run-inspect.stderr.log"]);
+  assert.deepEqual(result.evidence.logs, ["/lab-fake/run-inspect.stderr.log"]);
   assert.equal(result.run?.retryable, false);
 });
 
@@ -78,7 +78,7 @@ test("inspect locates failed run evidence and gives a stable not-found result", 
       recovery: ["Inspect the retained workspace before retrying."],
     },
   });
-  const found = await inspectRun("run-inspect-failed", { readReceipts: async () => [failed], receiptPath: "/tmp/receipts.ndjson" });
+  const found = await inspectRun("run-inspect-failed", { readReceipts: async () => [failed], receiptPath: "/lab-fake/receipts.ndjson" });
   assert.equal(found.status, "found");
   assert.equal(found.run?.status, "failed");
   assert.equal(found.run?.retryable, true);

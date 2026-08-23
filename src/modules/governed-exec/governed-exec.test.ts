@@ -146,9 +146,9 @@ test("an allowlisted binary with an allowing gate executes", async () => {
 
 test("effect policy denies dangerous git forms and package scripts outside checks", async () => {
   for (const [command, args] of [
-    ["git", ["-C", "/tmp", "status"]],
+    ["git", ["-C", "/lab-fake", "status"]],
     ["git", ["--git-dir=.git", "status"]],
-    ["git", ["--work-tree", "/tmp", "status"]],
+    ["git", ["--work-tree", "/lab-fake", "status"]],
     ["git", ["push", "origin", "main"]],
     ["git", ["update-ref", "refs/heads/main", "HEAD"]],
     ["git", ["branch", "-D", "main"]],

@@ -9,7 +9,7 @@
  * outcomes?" — WITHOUT paying for a dedicated observation campaign. Evidence accrues on normal usage.
  *
  *   node scripts/proving-ground/risk-telemetry.mjs [<receipts.ndjson> ...]
- *   # defaults to ~/.ikbi/state/receipts/receipts.ndjson + /tmp/ikbi-*-state/receipts/receipts.ndjson
+ *   # defaults to ~/.ikbi/state/receipts/receipts.ndjson + /lab-fake/ikbi-*-state/receipts/receipts.ndjson
  */
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
@@ -18,8 +18,8 @@ import { join } from "node:path";
 function defaultPaths() {
   const out = [join(homedir(), ".ikbi", "state", "receipts", "receipts.ndjson")];
   try {
-    for (const d of readdirSync("/tmp")) {
-      if (/^ikbi-.*-state$/.test(d)) out.push(join("/tmp", d, "receipts", "receipts.ndjson"));
+    for (const d of readdirSync("/lab-fake")) {
+      if (/^ikbi-.*-state$/.test(d)) out.push(join("/lab-fake", d, "receipts", "receipts.ndjson"));
     }
   } catch {}
   return out.filter(existsSync);

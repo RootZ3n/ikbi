@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../../core/temp-root.js";
 import { test } from "node:test";
 
 import { DIMENSIONS, runAllAnalyzers, runAnalyzer, resolveRepoPath, RepoDoctorPathError, getReport, resetReportCache } from "./index.js";
@@ -270,7 +270,7 @@ test("runAllAnalyzers on empty repo returns valid report", () => {
 // ── Path confinement + per-path cache (Codex H9) ───────────────────────────────
 
 test("resolveRepoPath rejects a path outside the allowed roots", () => {
-  const outside = tmpRepo(); // a /tmp dir — not under cwd, not opted in
+  const outside = tmpRepo(); // a the system temp directory dir — not under cwd, not opted in
   try {
     assert.throws(() => resolveRepoPath(outside), RepoDoctorPathError);
   } finally {

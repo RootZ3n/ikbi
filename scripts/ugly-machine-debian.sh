@@ -6,7 +6,12 @@
 # Runs the committed tree (git archive HEAD) — exactly what a public cloner gets.
 set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ART="$(mktemp -d "${TMPDIR:-/tmp}/ikbi-ugly.XXXXXX")"
+# The governed temporary root — no `:-/tmp` default, per the lab rule.
+GOVERNED_TEMP="$(node --import tsx "$REPO_ROOT/scripts/governed-temp.ts" root)" || {
+  echo "ugly-machine: no governed temporary root available; set IKBI_TEMP_ROOT" >&2
+  exit 1
+}
+ART="$(mktemp -d "$GOVERNED_TEMP/ikbi-ugly.XXXXXX")"
 git -C "$REPO_ROOT" archive --format=tar HEAD -o "$ART/ikbi-src.tar"
 echo "archive: $(du -h "$ART/ikbi-src.tar" | cut -f1)  ->  running in node:22-bookworm (Debian)"
 
@@ -31,7 +36,7 @@ podman run --rm \
     echo "--- pnpm typecheck ---" ; pnpm typecheck >/dev/null 2>&1 && echo "TYPECHECK_OK" || { echo "TYPECHECK_FAIL"; exit 1; }
     echo "--- pnpm build ---" ; pnpm build >/dev/null 2>&1 && echo "BUILD_OK" || { echo "BUILD_FAIL"; exit 1; }
 
-    export IKBI_STATE_ROOT=$(mktemp -d /tmp/ikbi-state.XXXXXX)
+    export IKBI_STATE_ROOT=$(mktemp -d /lab-fake/ikbi-state.XXXXXX)
     export IKBI_ALLOW_INSECURE_DEV_KEYS=true
     echo "--- ikbi doctor: PLATFORM & SANDBOX (expect FAILS CLOSED) ---"
     node dist/cli/index.js doctor 2>&1 | sed -n "/PLATFORM & SANDBOX/,/^$/p"
@@ -43,7 +48,7 @@ podman run --rm \
       src/modules/governed-exec/governed-exec.test.ts \
       src/modules/dependency-install/dependency-install-sandbox.test.ts 2>&1 | grep -E "^# (tests|pass|fail|skipped)"
     echo "--- assert NO host escape file from any test ---"
-    ls /tmp/ikbi-f1-escape* 2>&1 || echo "no escape artifacts (correct)"
+    ls /lab-fake/ikbi-f1-escape* 2>&1 || echo "no escape artifacts (correct)"
 
     echo ; echo "############ PHASE B — WITH bubblewrap ############"
     apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq bubblewrap >/dev/null 2>&1

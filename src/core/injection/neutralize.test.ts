@@ -26,7 +26,7 @@ test("neutralizeUntrusted returns the canonical safe form with scan + provenance
 
 test("wrapping is UNCONDITIONAL — clean content is still fenced", () => {
   const raw = "totally benign sentence";
-  const out = neutralizeUntrusted(raw, { source: "file", origin: "/tmp/notes.txt" });
+  const out = neutralizeUntrusted(raw, { source: "file", origin: "/lab-fake/notes.txt" });
   assert.equal(out.scan.verdict, "clean");
   assert.ok(out.wrapped.includes("UNTRUSTED DATA"), "still wrapped despite clean scan");
   assert.equal(extractFenced(out.wrapped, out.fenceId), raw);

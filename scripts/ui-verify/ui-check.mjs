@@ -9,7 +9,7 @@
  *        [--present=<sel>] [--absent=<sel>] [--text=<substring>]
  * Example (verifies the mobile Grove: star gone, welcome text there, no errors):
  *   node ui-check.mjs http://127.0.0.1:18796 --mobile --fresh \
- *        --absent='.peh-onboard-help' --text='Welcome to the Grove' --shot=/tmp/grove.png
+ *        --absent='.peh-onboard-help' --text='Welcome to the Grove' --shot=/lab-fake/grove.png
  */
 import { chromium } from 'playwright-core';
 const BRAVE = '/usr/bin/brave-browser';

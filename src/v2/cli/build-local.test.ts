@@ -66,7 +66,7 @@ function session(over: { verdict?: string; changedPaths?: string[]; checks?: unk
       runId: "run_1", taskId: "task_1", repoPath: "/repo", journal: [{ from: "publication", to: "terminal" }],
       outcome: { kind: "accepted" },
       // A retained workspace: the two tree objects the diff is read from live in its worktree.
-      workspace: { workspaceId: "ws_1", donorWorkspaceId: "d1", path: "/tmp/ws", status: "retained" },
+      workspace: { workspaceId: "ws_1", donorWorkspaceId: "d1", path: "/lab-fake/ws", status: "retained" },
       receipt: {
         stagesEntered: ["preflight", "publication"],
         evidence: { providerInvoked: true, invocations: 1, commandsRun: 0, mutationsApplied: 1, candidatesCreated: 1, verificationsPerformed: 1, promoted: true },

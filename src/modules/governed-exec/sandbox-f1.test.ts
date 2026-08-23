@@ -17,7 +17,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { mkdtempSync, writeFileSync, existsSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../../core/temp-root.js";
 import { join, resolve } from "node:path";
 
 import { pino } from "pino";
@@ -89,7 +89,7 @@ test("F1-A/B (node): a script cannot write outside the worktree — relative ../
     const res = await ge.run({ parentCtx: ctx(), command: "node", args: ["escape.js"], cwd: wt, worktreeRoot: wt, purpose: "f1 test" });
     assert.equal(res.executed, true, "the command runs (inside the sandbox)");
     assert.equal(existsSync(relHostPath), false, "relative ../../ escape must NOT create a host file outside the worktree");
-    assert.equal(existsSync(absPath), false, "absolute /tmp escape must NOT create a host file");
+    assert.equal(existsSync(absPath), false, "absolute the system temp directory escape must NOT create a host file");
     assert.equal(existsSync(join(wt, "inside.txt")), true, "a legitimate in-worktree write still works");
     assert.ok(cap.all.some((r) => (r.metadata as Record<string, unknown>)?.sandbox === "bwrap"), "a receipt records sandbox=bwrap");
   } finally {

@@ -13,7 +13,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../../core/temp-root.js";
 import { createHash } from "node:crypto";
 import { applyFileProposal, createBrainApply, createCombinedApply } from "./apply.js";
 import { createProductionGovernor } from "./create.js";
@@ -263,8 +263,8 @@ test("createProductionGovernor: shared default store is visible to all governors
   const gov1 = createProductionGovernor({ store: inMemoryStore() });
   const gov2 = createProductionGovernor({ store: inMemoryStore() });
 
-  await gov1.propose({ surface: "instruction_file", target: "/tmp/a.md", content: "a", agentId: "x" });
-  await gov2.propose({ surface: "instruction_file", target: "/tmp/b.md", content: "b", agentId: "x" });
+  await gov1.propose({ surface: "instruction_file", target: "/lab-fake/a.md", content: "a", agentId: "x" });
+  await gov2.propose({ surface: "instruction_file", target: "/lab-fake/b.md", content: "b", agentId: "x" });
 
   // Each governor uses its own in-memory store — proposals don't leak
   const stats1 = await gov1.stats();

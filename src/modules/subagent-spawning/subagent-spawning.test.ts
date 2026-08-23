@@ -115,7 +115,7 @@ function governanceHonoringWorkspaces() {
   const calls = { promote: 0, discard: 0 };
   const handle: WorkspaceHandle = {
     id: "wsabcd", targetRepo: "/repo", baseBranch: "main", baseRef: "deadbeef",
-    scratchBranch: "ikbi/ws/wsabcd", path: "/tmp/wsabcd", identity: { agentId: "child-1" }, state: "allocated", createdAt: 1000,
+    scratchBranch: "ikbi/ws/wsabcd", path: "/lab-fake/wsabcd", identity: { agentId: "child-1" }, state: "allocated", createdAt: 1000,
   };
   const workspaces: NonNullable<OrchestratorDeps["workspaces"]> = {
     allocate: async () => handle,

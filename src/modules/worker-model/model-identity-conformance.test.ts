@@ -16,7 +16,7 @@
 
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../../core/temp-root.js";
 import { join } from "node:path";
 import { test } from "node:test";
 
@@ -283,7 +283,7 @@ test("pre-dispatch failure (dirty repo) writes NO builder role receipt — nothi
   const bus = fakeBus();
   const rc = capturingReceipts();
   const handle: WorkspaceHandle = {
-    id: "wsdirty", targetRepo: "/repo", baseBranch: "main", baseRef: "d", scratchBranch: "s", path: "/tmp/x", identity: { agentId: "parent-1" }, state: "allocated", createdAt: 1000,
+    id: "wsdirty", targetRepo: "/repo", baseBranch: "main", baseRef: "d", scratchBranch: "s", path: "/lab-fake/x", identity: { agentId: "parent-1" }, state: "allocated", createdAt: 1000,
   };
   const orch = createOrchestrator({
     config: { enabled: true, roleTimeoutMs: 1000, maxConcurrentRuns: 1, trustLadder: false },

@@ -33,7 +33,7 @@ function makeIdentities() {
 }
 
 function fakeWorkspaces() {
-  const handle: WorkspaceHandle = { id: "wsabcd", targetRepo: "/repo", baseBranch: "main", baseRef: "deadbeef", scratchBranch: "ikbi/ws/wsabcd", path: "/tmp/wsabcd", identity: { agentId: "parent-1" }, state: "allocated", createdAt: 1000 };
+  const handle: WorkspaceHandle = { id: "wsabcd", targetRepo: "/repo", baseBranch: "main", baseRef: "deadbeef", scratchBranch: "ikbi/ws/wsabcd", path: "/lab-fake/wsabcd", identity: { agentId: "parent-1" }, state: "allocated", createdAt: 1000 };
   const calls = { promote: 0, discard: 0, allocate: 0 };
   const workspaces: NonNullable<OrchestratorDeps["workspaces"]> = {
     allocate: async () => { calls.allocate += 1; return handle; },
@@ -184,7 +184,7 @@ test("REUSE WORKSPACE: the governor is skipped on a step-planner sub-step (fires
   const orch = orchestratorWith(drift, roles.roles, { ws, ids });
 
   // reuseWorkspace set ⇒ mid-chain step ⇒ the governor must not fire (and so must not block).
-  const reuseHandle: WorkspaceHandle = { id: "wsabcd", targetRepo: "/repo", baseBranch: "main", baseRef: "deadbeef", scratchBranch: "ikbi/ws/wsabcd", path: "/tmp/wsabcd", identity: { agentId: "parent-1" }, state: "allocated", createdAt: 1000 };
+  const reuseHandle: WorkspaceHandle = { id: "wsabcd", targetRepo: "/repo", baseBranch: "main", baseRef: "deadbeef", scratchBranch: "ikbi/ws/wsabcd", path: "/lab-fake/wsabcd", identity: { agentId: "parent-1" }, state: "allocated", createdAt: 1000 };
   const r = await orch.run({ ...task, reuseWorkspace: reuseHandle }, ids.parentCtx);
 
   assert.equal(consulted, false, "the drift governor is not consulted on a reuseWorkspace step");

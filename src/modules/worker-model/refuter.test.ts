@@ -5,7 +5,7 @@
 
 import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../../core/temp-root.js";
 import { join } from "node:path";
 import { test } from "node:test";
 
@@ -360,7 +360,7 @@ test("HIGH-3: semantic off (default) — result_matches_spec uses heuristic, pas
 test("HIGH-3: semantic on — invokes model for result_matches_spec", async () => {
   let modelCalled = false;
   const ctx: RoleContext = {
-    task: { taskId: "t-semantic", targetRepo: "/tmp/fake", goal: "add a health endpoint" },
+    task: { taskId: "t-semantic", targetRepo: "/lab-fake/fake", goal: "add a health endpoint" },
     role: "refuter",
     identity: IDENTITY,
     autonomy: autonomyForTier("verified"),
@@ -403,7 +403,7 @@ test("HIGH-3: semantic mode catches off-target builds (model says matched=false)
   ].join("\n");
 
   const ctx: RoleContext = {
-    task: { taskId: "t-offtarget", targetRepo: "/tmp/fake", goal: "fix the authentication bug in login endpoint" },
+    task: { taskId: "t-offtarget", targetRepo: "/lab-fake/fake", goal: "fix the authentication bug in login endpoint" },
     role: "refuter",
     identity: IDENTITY,
     autonomy: autonomyForTier("verified"),
@@ -432,7 +432,7 @@ test("HIGH-3: semantic mode catches off-target builds (model says matched=false)
 test("HIGH-3: semantic model failure falls through to heuristic gracefully", async () => {
   // If the model throws, #7 should fall through to the deterministic heuristic.
   const ctx: RoleContext = {
-    task: { taskId: "t-fallback", targetRepo: "/tmp/fake", goal: "add a health endpoint" },
+    task: { taskId: "t-fallback", targetRepo: "/lab-fake/fake", goal: "add a health endpoint" },
     role: "refuter",
     identity: IDENTITY,
     autonomy: autonomyForTier("verified"),

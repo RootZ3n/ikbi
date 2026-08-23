@@ -20,7 +20,7 @@ function cfg(extra: NodeJS.ProcessEnv = {}) {
     IKBI_WORKER_TOKEN: "worker-token",
     IKBI_TRUST_HMAC_KEY: "hmac",
     IKBI_IDENTITY_TOKEN_SALT: "salt",
-    IKBI_PROVIDER_CONFIG: "/tmp/ikbi-provider-preflight/providers.json",
+    IKBI_PROVIDER_CONFIG: "/lab-fake/ikbi-provider-preflight/providers.json",
     ...extra,
   });
 }
@@ -134,7 +134,7 @@ test("credential source is exposed without exposing credential contents", () => 
   const report = resolveProviderPreflight({
     config: cfg({ IKBI_MIMO_API_KEY: SECRET }),
     env: { IKBI_MIMO_API_KEY: SECRET },
-    dotenvProvenance: new Map([["IKBI_MIMO_API_KEY", "/tmp/provider.env"]]),
+    dotenvProvenance: new Map([["IKBI_MIMO_API_KEY", "/lab-fake/provider.env"]]),
     registry: registry([model("driver-model", "mimo")], [{
       id: "mimo",
       ready: () => true,
@@ -144,8 +144,8 @@ test("credential source is exposed without exposing credential contents", () => 
   });
   const serialized = JSON.stringify(report);
   assert.equal(serialized.includes(SECRET), false);
-  assert.equal(report.roles[0]?.credentialSource, ".env (/tmp/provider.env)");
-  assert.equal(report.resolvedConfiguration.sources.find((source) => source.key === "IKBI_MIMO_API_KEY")?.source, ".env (/tmp/provider.env)");
+  assert.equal(report.roles[0]?.credentialSource, ".env (/lab-fake/provider.env)");
+  assert.equal(report.resolvedConfiguration.sources.find((source) => source.key === "IKBI_MIMO_API_KEY")?.source, ".env (/lab-fake/provider.env)");
 });
 
 test("multiple simultaneous role issues are retained rather than collapsed", () => {

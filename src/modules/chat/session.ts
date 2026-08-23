@@ -27,7 +27,7 @@
 
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../../core/temp-root.js";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { execFileSync } from "node:child_process";
 

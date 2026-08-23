@@ -29,7 +29,7 @@ function makeCtx(tier: string, opts: { dryRun?: boolean } = {}): OperationContex
 
 const WORKSPACE: WorkspaceHandle = {
   id: "wsabcd", targetRepo: "/repo", baseBranch: "main", baseRef: "deadbeef",
-  scratchBranch: "ikbi/ws/wsabcd", path: "/tmp/wsabcd", identity: { agentId: "caller-1" }, state: "allocated", createdAt: 1000,
+  scratchBranch: "ikbi/ws/wsabcd", path: "/lab-fake/wsabcd", identity: { agentId: "caller-1" }, state: "allocated", createdAt: 1000,
 };
 
 const NPM_REGISTRY = "https://registry.npmjs.org/";

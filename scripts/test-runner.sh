@@ -20,95 +20,88 @@ KEEP_LOGS="${IKBI_TEST_KEEP_LOGS:-false}"
 TEST_CONCURRENCY=""
 TEST_TIMEOUT_SECONDS="${IKBI_TEST_GROUP_TIMEOUT_SECONDS:-180}"
 
-# ── FIXTURE CONTAINMENT ──────────────────────────────────────────────────────
+# ── GOVERNED TEMPORARY CONTAINMENT ────────────────────────────────────────────
 #
-# Suites create scratch directories through `os.tmpdir()`, and a suite that throws before its
-# cleanup leaks one. Nothing ever collected them: a real incident left 65,645 entries in a
-# 16 GB tmpfs and exhausted its 1,048,576 INODES while `df` still reported 13 GB free — every
-# subsequent write failed ENOSPC and the suite reported hundreds of "failures" that were only
-# a full filesystem.
+# THE LAB RULE: no ikbi code uses /tmp — not fixtures, not subprocess scratch, not the implicit
+# os.tmpdir() fallback. Every scratch path in a run lives under ONE governed child of a validated,
+# lab-owned root (IKBI_TEMP_ROOT, else ikbi's state directory), and that child is removed when the
+# run ends: normally, on failure, on SIGINT and on SIGTERM.
 #
-# So the run gets ONE owned root and TMPDIR points at it. Every fixture lands inside it by
-# construction, and the trap below removes it on normal exit, on failure, on SIGINT and on
-# SIGTERM. A leaked fixture then dies with its run instead of outliving the machine.
-#
-# The base is configuration, never a path baked into this repo: IKBI_TEST_FIXTURE_BASE moves
-# fixtures to a filesystem with inode headroom. Unset, it is the ambient temp directory.
-FIXTURE_HELPER=(node --import tsx "$ROOT_DIR/scripts/test-fixture-root.ts")
-FIXTURE_RUN_ID="ikbi-${ORDER}-$$-$(date +%s)"
-FIXTURE_ROOT=""
+# Two failures made this necessary. A run once exhausted a tmpfs's 1,048,576 INODES with 65,645
+# leaked fixture directories while `df` still showed 13 GB free, and every write afterwards failed
+# ENOSPC — reported as hundreds of test "failures" that were nothing of the kind. Separately,
+# fixtures left directories mode 0555, which defeat `rmSync` outright, so even correct cleanups
+# leaked.
+GOVERNED=(node --import tsx "$ROOT_DIR/scripts/governed-temp.ts")
+TEMP_RUN_ID="ikbi-${ORDER}-$$-$(date +%s)"
+TEMP_CHILD=""
 RUN_ROOT=""
-# Resolved ONCE, before TMPDIR is redirected. Every later call passes it explicitly: once
-# TMPDIR points at the run root, re-resolving the default base would compute the run root's
-# own child — and the cleanup would then look for its record in the wrong place.
-FIXTURE_BASE="$("${FIXTURE_HELPER[@]}" base)"
-# Captured before redirection so cleanup can restore it; the helpers must not write into the
-# very root they are removing.
-ORIGINAL_TMPDIR="${TMPDIR:-/tmp}"
-ORIGINAL_TMP="${TMP:-/tmp}"
-ORIGINAL_TEMP="${TEMP:-/tmp}"
+
+# The sentinel baseline: which ikbi-owned names already exist under the system temp directory.
+# Anything NEW there after the run means something bypassed the governed root.
+TMP_SENTINEL_BASELINE="$("${GOVERNED[@]}" sentinel)"
 
 cleanup() {
   local status=$?
-  # Put TMPDIR back FIRST. The cleanup helpers are themselves node processes, and tsx writes
-  # a compile cache into TMPDIR — with TMPDIR still pointing at the run root, the helper that
-  # had just emptied the root promptly recreated it and the survivor check failed on the
-  # cache it had made itself.
-  export TMPDIR="$ORIGINAL_TMPDIR"
-  export TMP="$ORIGINAL_TMP"
-  export TEMP="$ORIGINAL_TEMP"
-  # Remove the fixture root through the helper, which re-reads the ownership record and
-  # refuses anything that is not this run's root. A bare `rm -rf "$VAR"` here would be one
-  # unset variable away from deleting the wrong tree.
-  if [[ -n "$FIXTURE_ROOT" && -d "$FIXTURE_ROOT" ]]; then
+  # Put the temp variables back FIRST. The cleanup helpers are node processes, and tsx writes a
+  # compile cache into TMPDIR — with TMPDIR still pointing at the child, the helper that had just
+  # emptied it promptly recreated it and the survivor check failed on the cache it made itself.
+  unset TMPDIR TMP TEMP IKBI_TEMP_RUN_ID
+
+  if [[ -n "$TEMP_CHILD" && -d "$TEMP_CHILD" ]]; then
     if [[ "$KEEP_LOGS" == "true" ]]; then
-      local preserved="${IKBI_TEST_LOG_BASE:-${FIXTURE_BASE}-logs}/$FIXTURE_RUN_ID"
+      local preserved="${IKBI_TEST_LOG_BASE:-$("${GOVERNED[@]}" root)/_logs}/$TEMP_RUN_ID"
       mkdir -p "$preserved" 2>/dev/null && cp -r "$RUN_ROOT/." "$preserved/" 2>/dev/null \
         && echo "# test runner logs preserved at $preserved"
     fi
-    # A cleanup that failed must not be swallowed: a stranded root that nobody reported is
-    # how the original incident stayed invisible until the filesystem filled.
-    if ! "${FIXTURE_HELPER[@]}" remove --base "$FIXTURE_BASE" --root "$FIXTURE_ROOT" --run-id "$FIXTURE_RUN_ID"; then
+    # A cleanup that failed must not be swallowed: a stranded tree nobody reported is how the
+    # original incident stayed invisible until the filesystem filled.
+    if ! "${GOVERNED[@]}" remove --child "$TEMP_CHILD" --run-id "$TEMP_RUN_ID"; then
       [[ "$status" -eq 0 ]] && status=1
     fi
   fi
-  # Prove it: this run must leave no owned fixture root anywhere under the base.
-  if [[ -n "$FIXTURE_BASE" ]]; then
-    if ! "${FIXTURE_HELPER[@]}" survivors --base "$FIXTURE_BASE" --run-id "$FIXTURE_RUN_ID" --root "$FIXTURE_ROOT"; then
-      echo "# FAIL fixture survivors remain after this run"
-      [[ "$status" -eq 0 ]] && status=1
-    fi
-    "${FIXTURE_HELPER[@]}" inodes --base "$FIXTURE_BASE" || true
+
+  if ! "${GOVERNED[@]}" survivors --run-id "$TEMP_RUN_ID" --child "$TEMP_CHILD"; then
+    echo "# FAIL temporary survivors remain after this run"
+    [[ "$status" -eq 0 ]] && status=1
+  fi
+  # THE LAB RULE, checked empirically rather than trusted.
+  if ! "${GOVERNED[@]}" sentinel --baseline "$TMP_SENTINEL_BASELINE"; then
+    echo "# FAIL the run created ikbi-owned paths under the system temp directory"
+    [[ "$status" -eq 0 ]] && status=1
   fi
   trap - EXIT
   exit "$status"
 }
-# EXIT alone is not enough: a shell killed by SIGINT or SIGTERM does not reliably run its
-# EXIT trap, and those are exactly the interruptions that stranded roots before.
+# EXIT alone is not enough: a shell killed by SIGINT or SIGTERM does not reliably run its EXIT
+# trap, and those are exactly the interruptions that stranded children before.
 trap cleanup EXIT
 trap 'echo "# interrupted (SIGINT)"; exit 130' INT
 trap 'echo "# terminated (SIGTERM)"; exit 143' TERM
 
-# Refuse to start on a filesystem that cannot hold the run, and reap roots whose owners are
-# provably dead (the SIGKILL case, collected one run late). A refusal here is far cheaper
-# than a suite whose ENOSPC failures get read as product defects.
-if ! "${FIXTURE_HELPER[@]}" guard; then exit 1; fi
-if ! "${FIXTURE_HELPER[@]}" preflight --base "$FIXTURE_BASE"; then exit 1; fi
+# Refuse to start on a source tree that reaches for /tmp, or a root that cannot be validated.
+if ! "${GOVERNED[@]}" guard; then exit 1; fi
+if ! "${GOVERNED[@]}" preflight; then exit 1; fi
 
-FIXTURE_ROOT="$("${FIXTURE_HELPER[@]}" create --base "$FIXTURE_BASE" --run-id "$FIXTURE_RUN_ID" --owner-pid $$ | tail -n 1)"
-if [[ -z "$FIXTURE_ROOT" || ! -d "$FIXTURE_ROOT" ]]; then
-  echo "# REFUSE could not create a fixture run root"
+TEMP_CHILD="$("${GOVERNED[@]}" create --run-id "$TEMP_RUN_ID" --owner-pid $$ --purpose test-run | tail -n 1)"
+if [[ -z "$TEMP_CHILD" || ! -d "$TEMP_CHILD" ]]; then
+  echo "# REFUSE could not create a governed temporary child"
   exit 1
 fi
-echo "# fixture_root=$FIXTURE_ROOT run_id=$FIXTURE_RUN_ID base=$FIXTURE_BASE"
+echo "# temp_child=$TEMP_CHILD run_id=$TEMP_RUN_ID"
 
-# THE containment itself. Node's os.tmpdir() reads TMPDIR; TMP and TEMP are set too so a
-# child that consults either lands in the same place.
-export TMPDIR="$FIXTURE_ROOT"
-export TMP="$FIXTURE_ROOT"
-export TEMP="$FIXTURE_ROOT"
+# THE CONTAINMENT ITSELF. `labTempDir()` resolves through IKBI_TEMP_RUN_ID so every child process
+# JOINS this child rather than minting its own; TMPDIR/TMP/TEMP are set too so third-party code
+# calling the platform temp directory lands here as well.
+# Both are exported: the ROOT so every child resolves the same one even when it sets its own
+# IKBI_STATE_ROOT, and the RUN ID so each child JOINS this run's single governed child.
+export IKBI_TEMP_ROOT="$("${GOVERNED[@]}" root)"
+export IKBI_TEMP_RUN_ID="$TEMP_RUN_ID"
+export TMPDIR="$TEMP_CHILD"
+export TMP="$TEMP_CHILD"
+export TEMP="$TEMP_CHILD"
 
-RUN_ROOT="$FIXTURE_ROOT/_runner"
+RUN_ROOT="$TEMP_CHILD/_runner"
 mkdir -p "$RUN_ROOT"
 
 doctor_shell="$(node --import tsx scripts/test-doctor.ts --shell 2>&1)"

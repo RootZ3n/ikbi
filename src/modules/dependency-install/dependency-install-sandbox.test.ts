@@ -14,7 +14,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, existsSync, rmSync, readFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../../core/temp-root.js";
 import { join, resolve } from "node:path";
 
 import { pino } from "pino";
@@ -56,12 +56,12 @@ const meta = (r: ReceiptInput) => (r.metadata ?? {}) as Record<string, unknown>;
 test("scripts are DISABLED by default (--ignore-scripts); enabled only on opt-in", async () => {
   const off = spyExec();
   await createDependencyInstall({ config: cfg({ sandboxMode: "off" }), gateWall: gate(), execFile: off.fn, readLockfile: lockfile, receipts: recs().receipts, publish: () => {} })
-    .run({ parentCtx: ctx(), workspace: ws("/tmp/x") });
+    .run({ parentCtx: ctx(), workspace: ws("/lab-fake/x") });
   assert.ok(off.calls[0]?.args.includes("--ignore-scripts"), "default install passes --ignore-scripts");
 
   const on = spyExec();
   await createDependencyInstall({ config: cfg({ sandboxMode: "off", allowScripts: true }), gateWall: gate(), execFile: on.fn, readLockfile: lockfile, receipts: recs().receipts, publish: () => {} })
-    .run({ parentCtx: ctx(), workspace: ws("/tmp/x") });
+    .run({ parentCtx: ctx(), workspace: ws("/lab-fake/x") });
   assert.ok(!on.calls[0]?.args.includes("--ignore-scripts"), "allowScripts opt-in does NOT pass --ignore-scripts");
 });
 
@@ -71,7 +71,7 @@ test("a bwrap sandbox plan is attached when the sandbox is available", async () 
     config: cfg(), gateWall: gate(), execFile: ex.fn, readLockfile: lockfile, receipts: recs().receipts, publish: () => {},
     sandboxAvailability: (): SandboxAvailability => ({ available: true, tool: "bwrap", version: "t" }),
     storeDirs: () => [],
-  }).run({ parentCtx: ctx(), workspace: ws("/tmp/x") });
+  }).run({ parentCtx: ctx(), workspace: ws("/lab-fake/x") });
   const plan = (ex.calls[0]?.opts as { sandbox?: { mode: string; networkAllowed: boolean } }).sandbox;
   assert.equal(plan?.mode, "bwrap", "install carries a bwrap sandbox plan");
   assert.equal(plan?.networkAllowed, true, "install sandbox keeps network (registry fetch)");
@@ -83,7 +83,7 @@ test("sandbox UNAVAILABLE + scripts ENABLED ⇒ FAILS CLOSED (no unsafe default)
     config: cfg({ allowScripts: true }), gateWall: gate(), readLockfile: lockfile, receipts: recs().receipts, publish: () => {},
     execFile: async () => { throw new Error("must NOT run a script-enabled install without a sandbox"); },
     sandboxAvailability: () => ({ available: false, reason: "test: no bwrap" }),
-  }).run({ parentCtx: ctx(), workspace: ws("/tmp/x") });
+  }).run({ parentCtx: ctx(), workspace: ws("/lab-fake/x") });
   assert.equal(r.denied, true);
   assert.match(r.reason ?? "", /sandbox is unavailable/i);
   assert.equal(ex.calls.length, 0);
@@ -94,7 +94,7 @@ test("sandbox UNAVAILABLE + scripts DISABLED (default) ⇒ proceeds (no untruste
   const r = await createDependencyInstall({
     config: cfg(), gateWall: gate(), execFile: ex.fn, readLockfile: lockfile, receipts: recs().receipts, publish: () => {},
     sandboxAvailability: () => ({ available: false, reason: "test: no bwrap" }),
-  }).run({ parentCtx: ctx(), workspace: ws("/tmp/x") });
+  }).run({ parentCtx: ctx(), workspace: ws("/lab-fake/x") });
   assert.equal(r.installed, true, "scripts-disabled install proceeds without a sandbox");
   assert.ok(ex.calls[0]?.args.includes("--ignore-scripts"));
 });
@@ -104,7 +104,7 @@ test("sandboxMode=required + unavailable ⇒ FAILS CLOSED even with scripts disa
     config: cfg({ sandboxMode: "required" }), gateWall: gate(), readLockfile: lockfile, receipts: recs().receipts, publish: () => {},
     execFile: async () => { throw new Error("must not run"); },
     sandboxAvailability: () => ({ available: false, reason: "test" }),
-  }).run({ parentCtx: ctx(), workspace: ws("/tmp/x") });
+  }).run({ parentCtx: ctx(), workspace: ws("/lab-fake/x") });
   assert.equal(r.denied, true);
 });
 
@@ -114,7 +114,7 @@ test("trusted-local override runs a script-enabled install UNSANDBOXED but recei
   await createDependencyInstall({
     config: cfg({ allowScripts: true, sandboxTrustedLocalOverride: true }), gateWall: gate(), execFile: ex.fn, readLockfile: lockfile, receipts: rc.receipts, publish: () => {},
     sandboxAvailability: () => ({ available: false, reason: "test" }),
-  }).run({ parentCtx: ctx(), workspace: ws("/tmp/x") });
+  }).run({ parentCtx: ctx(), workspace: ws("/lab-fake/x") });
   assert.equal(ex.calls.length, 1, "override lets it run");
   assert.equal((ex.calls[0]?.opts as { sandbox?: unknown }).sandbox, undefined, "ran unsandboxed");
   assert.ok(rc.calls.some((r) => meta(r).sandbox === "unavailable"), "receipt records sandbox=unavailable");
@@ -125,7 +125,7 @@ test("receipts record sandbox / script / network policy", async () => {
   await createDependencyInstall({
     config: cfg(), gateWall: gate(), execFile: spyExec().fn, readLockfile: lockfile, receipts: rc.receipts, publish: () => {},
     sandboxAvailability: (): SandboxAvailability => ({ available: true, tool: "bwrap", version: "t" }), storeDirs: () => [],
-  }).run({ parentCtx: ctx(), workspace: ws("/tmp/x") });
+  }).run({ parentCtx: ctx(), workspace: ws("/lab-fake/x") });
   const success = rc.calls.find((r) => r.outcome.status === "success");
   assert.equal(meta(success!).sandbox, "bwrap");
   assert.equal(meta(success!).scriptPolicy, "ignore-scripts");
@@ -149,7 +149,7 @@ test("[bwrap] a package postinstall cannot escape the worktree (rel + abs)", { s
     const r = await createDependencyInstall({ config: cfg({ allowScripts: true }), gateWall: gate(), readLockfile: (p, n) => { try { return readFileSync(join(p, n), "utf8"); } catch { return undefined; } }, receipts: recs().receipts, publish: () => {} })
       .run({ parentCtx: ctx(), workspace: ws(wt) });
     // The install may pass or fail (no deps), but the host must be intact either way.
-    assert.equal(existsSync(absHost), false, "absolute /tmp escape contained");
+    assert.equal(existsSync(absHost), false, "absolute the system temp directory escape contained");
     assert.equal(existsSync(relHost), false, "relative ../../ escape contained");
     assert.ok(r !== undefined);
   } finally {

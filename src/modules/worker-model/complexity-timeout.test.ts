@@ -84,7 +84,7 @@ function delayedBuilderRoles(builderDelayMs: number) {
 }
 
 function fakeWorkspaces() {
-  const handle: WorkspaceHandle = { id: "wsabcd", targetRepo: "/repo", baseBranch: "main", baseRef: "deadbeef", scratchBranch: "ikbi/ws/wsabcd", path: "/tmp/wsabcd", identity: { agentId: "parent-1" }, state: "allocated", createdAt: 1000 };
+  const handle: WorkspaceHandle = { id: "wsabcd", targetRepo: "/repo", baseBranch: "main", baseRef: "deadbeef", scratchBranch: "ikbi/ws/wsabcd", path: "/lab-fake/wsabcd", identity: { agentId: "parent-1" }, state: "allocated", createdAt: 1000 };
   const calls = { promote: 0 };
   const workspaces: NonNullable<OrchestratorDeps["workspaces"]> = {
     allocate: async () => handle,

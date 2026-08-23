@@ -18,7 +18,7 @@ import { recordBuildSessionReceipts, V2_RECEIPT_IDENTITY } from "./run-receipt.j
 import type { ReceiptInput } from "../../core/receipt/contract.js";
 import type { V2BuildSessionResult } from "../core/session.js";
 
-const REPO = "/tmp/some/repo";
+const REPO = "/lab-fake/some/repo";
 
 /** A sink that records what it was asked to append. `fail` makes every append throw. */
 function sink(fail = false) {

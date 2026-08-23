@@ -202,7 +202,7 @@ interface EscalationHandoffFields {
 
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, mkdirSync, type Dirent } from "node:fs";
-import { tmpdir } from "node:os";
+import { labTempDir as tmpdir } from "../../core/temp-root.js";
 import { join, basename, isAbsolute, relative, resolve, sep } from "node:path";
 
 import { computeWorkProduct, decidePromotability, type Decision, type GitRunner, type SafetyAssessment, type Verdict, type WorkAssessment } from "./adjudication/index.js";
@@ -5184,7 +5184,7 @@ export function createOrchestrator(deps: OrchestratorDeps = {}) {
           };
           // Phase-16 (IKBI-REAUDIT3-017): own the physical snapshot across the throw-prone promotion +
           // receipt appends. `promoteCandidate` (and its mandatory receipt appends / `workspaces.promote`) can
-          // throw; without this the detached read-only worktree would leak into /tmp. Cleanup is idempotent, so
+          // throw; without this the detached read-only worktree would leak into the system temp directory. Cleanup is idempotent, so
           // the success-path cleanup below is harmless if this already ran.
           let canon: Awaited<ReturnType<typeof promoteCandidate>>;
           try {
