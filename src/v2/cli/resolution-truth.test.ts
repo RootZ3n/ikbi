@@ -112,6 +112,10 @@ function runCli(root: string, args: readonly string[], extraEnv: Record<string, 
     cwd: mkdtempSync(join(tmpdir(), "ikbi-v2-resolve-cwd-")),
     env: {
       PATH: process.env.PATH ?? "",
+      // CONTAINMENT. A spawned child that inherits no TMPDIR falls back to /tmp, and every
+      // fixture it makes there escapes the run root the wrapper cleans up. Forwarded explicitly
+      // because this env is an allowlist — the child gets nothing that is not named here.
+      TMPDIR: process.env.TMPDIR ?? tmpdir(),
       // Hermetic trust material, injected explicitly: a sanitized child inherits no shell,
       // and must not depend on the operator's untracked `.env` to start.
       ...HERMETIC_DEV_KEY_ENV,

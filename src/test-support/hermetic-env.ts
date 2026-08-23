@@ -111,6 +111,13 @@ export function hermeticChildEnv(extra: Record<string, string> = {}): Record<str
   const base: Record<string, string> = {
     PATH: process.env.PATH ?? "",
     HOME: process.env.HOME ?? "",
+    // CONTAINMENT. This env is an allowlist, so a child inherits nothing that is not named
+    // here — including TMPDIR, which left every spawned child writing its fixtures to /tmp,
+    // outside the per-run root the test wrapper cleans up. Forwarded so the child's
+    // `os.tmpdir()` lands in the same place the parent's does.
+    ...(process.env.TMPDIR !== undefined && process.env.TMPDIR.length > 0
+      ? { TMPDIR: process.env.TMPDIR, TMP: process.env.TMPDIR, TEMP: process.env.TMPDIR }
+      : {}),
     ...HERMETIC_DEV_KEY_ENV,
   };
   for (const name of Object.keys(base)) {

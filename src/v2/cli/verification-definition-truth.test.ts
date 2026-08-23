@@ -85,6 +85,10 @@ function build(root: string, server: FakeProviderServer, repo: string, goal: str
     cwd: mkdtempSync(join(tmpdir(), "ikbi-v2-defcwd-")),
     env: {
       PATH: process.env.PATH ?? "",
+      // CONTAINMENT. A spawned child that inherits no TMPDIR falls back to /tmp, and every
+      // fixture it makes there escapes the run root the wrapper cleans up. Forwarded explicitly
+      // because this env is an allowlist — the child gets nothing that is not named here.
+      TMPDIR: process.env.TMPDIR ?? tmpdir(),
       HOME: mkdtempSync(join(tmpdir(), "ikbi-v2-defhome-")),
       IKBI_STATE_ROOT: root,
       IKBI_MODEL_DRIVER: "m1",

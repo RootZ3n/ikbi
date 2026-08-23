@@ -81,6 +81,10 @@ function runCli(args: readonly string[], extraEnv: Record<string, string> = {}, 
     // model, so this suite tests the SPINE rather than this machine's model setup.
     env: {
       PATH: process.env.PATH ?? "",
+      // CONTAINMENT. A spawned child that inherits no TMPDIR falls back to /tmp, and every
+      // fixture it makes there escapes the run root the wrapper cleans up. Forwarded explicitly
+      // because this env is an allowlist — the child gets nothing that is not named here.
+      TMPDIR: process.env.TMPDIR ?? tmpdir(),
       HOME: home,
       IKBI_STATE_ROOT: stateRoot,
       IKBI_MODEL_DRIVER: "alpha-1",
