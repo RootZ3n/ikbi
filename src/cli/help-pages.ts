@@ -28,6 +28,12 @@ export interface HelpPage {
   readonly flags?: readonly HelpFlag[];
   /** Operator environment knobs this command honours. Rendered after the flags. */
   readonly env?: readonly HelpFlag[];
+  /**
+   * Standing facts an operator needs before running the command — what a flag GRANTS, and what it
+   * does not. Rendered after the flags because a flag list can say what an option is called and
+   * still leave someone believing it does more than it does.
+   */
+  readonly notes?: readonly string[];
   readonly examples: readonly HelpExample[];
   readonly seeAlso?: readonly string[];
 }
@@ -79,12 +85,48 @@ export const HELP_PAGES: Readonly<Record<string, HelpPage>> = {
   build: {
     name: "build",
     summary: "Governed v2 build engine: build in an isolated workspace, verify, review, and promote an eligible candidate by clean-ref CAS.",
-    usage: "ikbi build \"<goal>\" [--repo <path>] [--strategy single|shadow|tournament] [--profile <name>] [--json]",
+    usage: "ikbi build \"<goal>\" [--repo <path>] [--strategy single|shadow|tournament] [--profile <name>] [--local-mode off|assist|auto] [--require-local-success] [--json]",
     flags: [
       { flag: "--repo <path>", desc: "Target repository (defaults to the current directory)." },
       { flag: "--strategy <s>", desc: "single (default, 1 candidate) | shadow (2) | tournament (bounded multi-candidate). More candidates ⇒ more model spend; exactly one lawful winner is promoted." },
       { flag: "--profile <name>", desc: "Per-run model profile override; otherwise your standing selection." },
       { flag: "--json", desc: "Emit only the full session JSON on stdout (banner/logs go to stderr) — the CI-friendly mode. `build` is always non-interactive." },
+      {
+        flag: "--local-mode <m>",
+        desc:
+          "off (DEFAULT) | assist | auto — whether a local Bokahli worker may be asked for bounded ADVICE. " +
+          "Bokahli is optional: with `off`, or with no flag at all, ikbi makes ZERO local requests and behaves " +
+          "exactly as it does on a machine that has none. `assist` is your explicit opt-in; `auto` additionally " +
+          "lets ikbi decide per hook, and is the only mode that may fall back to the primary provider after a " +
+          "failed local call. A value ikbi cannot read is REFUSED, never guessed — `--local-mode OFF` is an error, " +
+          "not a synonym for off.",
+      },
+      {
+        flag: "--require-local-success",
+        desc:
+          "Fail the run when the local worker cannot produce advice the deterministic validator accepts. Without " +
+          "it, a local failure is survivable: the advisory is discarded and the build continues on the primary " +
+          "provider alone. Use it when you would rather stop than proceed unadvised.",
+      },
+    ],
+    notes: [
+      "SUPERVISED LOCAL ADVICE IS DATA, NEVER AUTHORITY. Anything a local worker returns reaches the " +
+        "primary provider as fenced UNTRUSTED evidence, on its own channel, and only after a deterministic " +
+        "validator accepts it. It cannot change your goal, authorize a mutation, satisfy verification, or " +
+        "publish anything. The canonical goal and its digest are frozen before any local call and are " +
+        "recorded in the receipt so they can be checked rather than believed.",
+      "UNQUALIFIED BY DEFAULT. The current deployment reports INSTALLED_UNQUALIFIED, so every local result " +
+        "is stamped humanReviewRequired=true and autonomousPromotionAllowed=false. Read it; do not act on it " +
+        "unattended.",
+      "STRUCTURED-OUTPUT LIMITATION. Every local task class requires a JSON answer, and Bokahli's " +
+        "OpenAI-compatible endpoint accepts `response_format` but does NOT enforce it — a schema sent that way " +
+        "is silently ignored. ikbi therefore relies on the validator to reject a non-conforming answer rather " +
+        "than on the endpoint to prevent one. Constrained generation is available only on Bokahli's native " +
+        "endpoint, which ikbi does not yet call.",
+      "AFTERWARDS: `ikbi inspect <run-id>` locates a run's receipts and candidate evidence, `ikbi receipts` " +
+        "lists the receipt log (including `local.advisory` lines that record each hook's disposition and " +
+        "whether the advice was supplied to the primary provider), and `ikbi undo --latest` or " +
+        "`ikbi undo <commit|receipt-id> --yes` reverts a promotion.",
     ],
     env: [
       {
@@ -700,6 +742,11 @@ export function renderHelpPage(page: HelpPage): string {
     lines.push("Environment:");
     const width = Math.max(...page.env.map((f) => f.flag.length));
     for (const f of page.env) lines.push(`  ${f.flag.padEnd(width + 2)}${f.desc}`);
+  }
+  if (page.notes !== undefined && page.notes.length > 0) {
+    lines.push("");
+    lines.push("Notes:");
+    for (const n of page.notes) lines.push(`  - ${n}`);
   }
   if (page.examples.length > 0) {
     lines.push("");
