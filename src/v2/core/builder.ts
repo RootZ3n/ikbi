@@ -44,6 +44,7 @@ import {
   type BuilderCompletionClaim,
 } from "./candidate.js";
 import type { MutationScope } from "./mutation-scope.js";
+import type { FormatterCapability, FormatterRecord } from "./formatter.js";
 import { BUILDER_TOOLS, isToolFailure, parseToolCall, renderToolProvenance, untrustedToolPayload, type BuilderToolCall, type ParsedToolCall, type ToolOutcome } from "./tools.js";
 import { renderBuilderInput, type AdvisoryContextBlock, type RenderedMessage } from "./prompt.js";
 import {
@@ -411,6 +412,14 @@ export interface BuilderToolExecutorDeps {
    * observation and touches NO mutation authority. Absent ⇒ `run_command` is refused as unavailable.
    */
   readonly commands?: BuilderCommandCapability;
+  /**
+   * OPTIONAL governed formatter capability. When present, `run_formatter` runs the project's
+   * canonical formatter against an isolated shadow copy and applies the scope-accepted result
+   * through the state-bound authority. Absent ⇒ `run_formatter` is refused as unavailable.
+   */
+  readonly formatter?: FormatterCapability;
+  /** Called for every formatter invocation, so the run can put its record on the receipt. */
+  readonly onFormatter?: (record: FormatterRecord) => void;
 }
 
 /** What one executed tool did, plus the ledger facts the candidate will need. */

@@ -74,6 +74,7 @@ import {
 import { buildRuntimeModelPolicy, type ConfigurationSource, type RuntimeModelPolicy } from "./config.js";
 import {
   V2_SCOPE_FAILURE_CODES,
+  type MutationScope,
   buildMutationScope,
   mutationScopeFailure,
   publicationScopeFailure,
@@ -82,6 +83,7 @@ import {
   type MutationOperationKind,
 } from "./mutation-scope.js";
 import type { DiffChangeKind } from "./candidate-diff.js";
+import { summarizeFormatter, type FormatterCapability, type FormatterRecord } from "./formatter.js";
 
 /**
  * How a tree-level change maps onto the operation the scope authorizes.
@@ -158,7 +160,7 @@ import {
   type V2InvocationRecord,
 } from "./invocation.js";
 import { V2_001_FAILURE_CODES, runFailure, type RunFailure } from "./failure.js";
-import { createIdFactory, type V2IdFactory } from "./identity.js";
+import { createIdFactory, type V2IdFactory, type V2RunId } from "./identity.js";
 import { RunLifecycle, type LifecycleStage } from "./lifecycle.js";
 import {
   summarizeConfiguration,
@@ -396,6 +398,20 @@ export interface V2RunDeps {
    * imports no v1 code and no filesystem API.
    */
   readonly buildTools: (deps: BuilderToolExecutorDeps) => BuilderToolExecutor;
+  /**
+   * OPTIONAL governed formatter, built PER CANDIDATE WORKSPACE.
+   *
+   * A factory rather than an instance because the capability holds a workspace, a mutation
+   * authority and the run's scope — a shared instance would be a shared write authority across
+   * candidates, which is exactly the isolation a tournament depends on.
+   */
+  readonly buildFormatter?: (input: {
+    readonly runId: V2RunId;
+    readonly workspace: V2WorkspaceRecord;
+    readonly mutations: StateBoundMutationAuthority;
+    readonly mutationScope: MutationScope;
+    readonly treeProbe: TreeProbe;
+  }) => FormatterCapability;
   /**
    * Addresses the exact resulting state of a candidate workspace. Injected because it
    * shells out to git; wired once, in `src/v2/runtime/index.ts`.
@@ -747,6 +763,8 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
   let contextPackage: ContextPackage | undefined;
   let invocations: readonly V2InvocationRecord[] = [];
   let commands: readonly BuilderCommandRecord[] = [];
+  /** Every formatter invocation this run made, across all candidates, in order. */
+  const formatterRecords: FormatterRecord[] = [];
   let sourceVerificationDefinition: VerificationDefinition | undefined;
   let candidate: CandidateRecord | undefined;
   let verification: VerificationRecord | undefined;
@@ -922,8 +940,12 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     lifecycle.enter(runId, "candidate_generation");
     for (const s of live()) {
       const ws = s.workspace!;
+      const formatter = deps.buildFormatter?.({
+        runId, workspace: ws, mutations: deps.mutations, mutationScope: task.mutationScope, treeProbe: deps.treeProbe,
+      });
       const executor = deps.buildTools({
         runId, workspace: ws, mutations: deps.mutations, mutationScope: task.mutationScope,
+        ...(formatter !== undefined ? { formatter, onFormatter: (record) => { formatterRecords.push(record); } } : {}),
         onObservation: (observation) => { s.observations += 1; lifecycle.record(runId, { kind: "observation", id: observation.observationId, workspaceId: observation.workspaceId, path: observation.path }); },
         onMutation: (applied) => { lifecycle.record(runId, { kind: "mutation", id: applied.mutationId, workspaceId: ws.workspaceId, path: applied.path }); },
         ...(deps.commands !== undefined ? { commands: deps.commands } : {}),
@@ -1231,6 +1253,10 @@ export async function runV2Build(request: V2TaskRequest, deps: V2RunDeps): Promi
     // The authority this run held. Recorded whenever preflight got far enough to establish
     // one — a reader cannot judge "what changed" without knowing what was permitted to.
     ...(resolvedTask !== undefined ? { mutationScope: summarizeMutationScope(resolvedTask.mutationScope) } : {}),
+    // Every formatter invocation, in order — including the refused and the timed out. A
+    // formatter that changed nothing is evidence too; a formatter that was refused for scope is
+    // the evidence that matters most.
+    ...(formatterRecords.length > 0 ? { formatters: formatterRecords.map(summarizeFormatter) } : {}),
     ...(policy !== undefined ? { configuration: summarizeConfiguration(policy) } : {}),
     ...(source !== undefined ? { sourceSnapshot: summarizeSnapshot(source.snapshot) } : {}),
     ...(decision !== undefined ? { resolution: summarizeResolution(decision) } : {}),

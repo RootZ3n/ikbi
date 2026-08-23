@@ -31,6 +31,7 @@
 
 import type { RunFailure } from "./failure.js";
 import type { RunMutationScopeSummary } from "./mutation-scope.js";
+import type { RunFormatterSummary } from "./formatter.js";
 import type { LifecycleStage, LifecycleTransition, RunLedgerView } from "./lifecycle.js";
 import type {
   V2CandidateId,
@@ -705,6 +706,15 @@ export interface V2RunReceipt {
    * unused or unavailable. Each proves `workspaceUnchanged` (tree before == after).
    */
   readonly commands: readonly RunCommandSummary[];
+  /**
+   * Every governed formatter invocation, in order. Absent when the formatter was never called.
+   *
+   * Each entry names the tool that ran, its observed version and resolved executable, the FIXED
+   * argv (so a receipt proves nothing was appended), the candidate tree before and after, and the
+   * scope decision. A refused or timed-out invocation appears here too — evidence is not a reward
+   * for succeeding, and "the formatter was refused for scope" is the entry most worth reading.
+   */
+  readonly formatters?: readonly RunFormatterSummary[];
   /**
    * V2-017 — the candidate strategy this attempt used. Absent only when the run failed before the
    * strategy was frozen. `single` is one candidate; `shadow`/`tournament` are >1.

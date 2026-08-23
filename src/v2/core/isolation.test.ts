@@ -300,12 +300,18 @@ test("single authority: only the workspace adapter may create a worktree or writ
   // rm) to hand the sandbox a writable root that is NOT the candidate — exactly the same class as
   // candidate-capture's throwaway index. It writes NO repository or workspace file; the tree
   // before==after guard proves it, and the next guard proves it holds no candidate mutation.
+  // `formatter-runner.ts` is the SAME class again, and the distinction is the whole design: it
+  // materializes a throwaway SHADOW copy under the OS temp directory, lets the formatter rewrite
+  // THAT, and then applies the accepted bytes to the candidate through `mutations.mutate` like any
+  // other edit. Its writes are to its own scratch; the candidate is never a writable root, and
+  // `formatter-runner.test.ts` asserts the tree is unmoved on every outcome except `applied`.
   const allowed = new Set([
     join(V2_DIR, "runtime", "workspace-authority.ts"),
     join(V2_DIR, "runtime", "source-materializer.ts"),
     join(V2_DIR, "runtime", "candidate-capture.ts"),
     join(V2_DIR, "runtime", "publication.ts"),
     join(V2_DIR, "runtime", "command-executor.ts"),
+    join(V2_DIR, "runtime", "formatter-runner.ts"),
   ]);
   const offenders: string[] = [];
   for (const file of tsFiles(V2_DIR)) {
@@ -343,7 +349,17 @@ test("single authority: only the snapshot module captures working-tree state", (
   // `command.ts` (V2-015) NAMES read-only git subcommands (status/diff/ls-files/…) in its policy
   // ALLOWLIST — it executes nothing and reads no working tree. Listing a permitted verb is not
   // capturing state; the command executor runs whatever the model passes through governed-exec.
-  const allowed = new Set([join(V2_DIR, "runtime", "source-snapshot.ts"), join(V2_DIR, "runtime", "candidate-diff.ts"), join(V2_DIR, "core", "command.ts")]);
+  // `formatter-runner.ts` runs `git ls-files` against the CANDIDATE worktree to learn which paths
+  // a formatter may see. That is not a second SOURCE reality: it captures no snapshot, produces no
+  // reader, and describes the candidate rather than the operator's checkout. It uses git rather
+  // than a directory walk precisely so the shadow's population matches `.gitignore` — and
+  // therefore matches what the candidate tree id is computed over.
+  const allowed = new Set([
+    join(V2_DIR, "runtime", "source-snapshot.ts"),
+    join(V2_DIR, "runtime", "candidate-diff.ts"),
+    join(V2_DIR, "core", "command.ts"),
+    join(V2_DIR, "runtime", "formatter-runner.ts"),
+  ]);
   const offenders: string[] = [];
   for (const file of tsFiles(V2_DIR)) {
     if (allowed.has(file) || file.endsWith(".test.ts") || file.endsWith("fixture-repo.ts")) continue;
@@ -871,12 +887,18 @@ test("single authority: a candidate is VERIFIED only by the run spine (V2-008)",
   assert.deepEqual(offenders, [], "no component may run verification on its own");
 });
 
-test("single authority: only the two enumerated adapters reach governed-exec (V2-008, V2-015)", () => {
-  // Governed execution has exactly TWO callers, each a narrow adapter: the check-runner (the
-  // VERIFIER's predeclared plan, verifier:true — the model never reaches it) and the builder
-  // command executor (the READ-ONLY terminal, verifier:false — a model requests a bounded,
-  // structured, read-only command). Any THIRD importer would be an ungoverned execution path.
-  const allowed = new Set([join(V2_DIR, "runtime", "check-runner.ts"), join(V2_DIR, "runtime", "command-executor.ts")]);
+test("single authority: only the enumerated adapters reach governed-exec (V2-008, V2-015)", () => {
+  // Governed execution has exactly THREE callers, each a narrow adapter:
+  //   check-runner       the VERIFIER's predeclared plan (verifier:true — the model never reaches it)
+  //   command-executor   the READ-ONLY terminal (verifier:false — bounded, structured, read-only)
+  //   formatter-runner   the GOVERNED FORMATTER (verifier:false — a FIXED argv from a closed set,
+  //                      run against a throwaway shadow whose directory is the only writable root)
+  // Any FOURTH importer would be an ungoverned execution path.
+  const allowed = new Set([
+    join(V2_DIR, "runtime", "check-runner.ts"),
+    join(V2_DIR, "runtime", "command-executor.ts"),
+    join(V2_DIR, "runtime", "formatter-runner.ts"),
+  ]);
   // V2-020/Phase 20: `readiness.ts` reads the ALLOWLIST as DATA (`governed-exec/config.js`) so
   // `doctor --v2` can prove the repository's real check commands are permitted. That module exports
   // configuration only — no runner, no spawn — so reading it is not an execution path. Every OTHER

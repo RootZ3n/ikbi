@@ -30,9 +30,12 @@ const call = (name: string, args: unknown) => ({ id: "c1", name, arguments: JSON
 
 // ── the tool set ────────────────────────────────────────────────────────────
 
-test("tools: the builder has exactly six tools — the five state-bound tools plus the read-only terminal", () => {
+test("tools: the builder has exactly seven tools — state-bound edits, a read-only terminal, one governed formatter", () => {
   // V2-015 adds `run_command`: a READ-ONLY terminal (structured argv, no shell, no mutation).
-  assert.deepEqual([...BUILDER_TOOL_NAMES], ["read_file", "replace_file", "create_file", "delete_file", "run_command", "finish_candidate"]);
+  // The governed formatter adds `run_formatter`, whose ONLY argument is an identifier from a
+  // closed set — no program, no argv, no cwd, no environment. It is the narrowest possible way to
+  // close the capability gap that made two Apela runs unsatisfiable.
+  assert.deepEqual([...BUILDER_TOOL_NAMES], ["read_file", "replace_file", "create_file", "delete_file", "run_command", "run_formatter", "finish_candidate"]);
   // A WRITE shell / patch / delegate is still absent — the terminal is read-only and mints nothing.
   for (const forbidden of ["terminal", "bash", "exec", "shell", "patch", "multi_edit", "delegate_task", "git_commit", "apply_patch", "install_package"]) {
     assert.equal(isBuilderToolName(forbidden), false, `${forbidden} must not be reachable in this slice`);

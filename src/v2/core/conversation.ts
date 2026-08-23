@@ -288,6 +288,18 @@ export function factOf(outcome: ToolOutcome): CompactedFact {
               ? "TIMED OUT"
               : `exit ${outcome.exitCode ?? "?"}`),
       };
+    case "formatted":
+      // The compacted fact keeps the two things a later turn actually needs: whether the
+      // candidate changed, and how many files. No path list — that would grow unboundedly for
+      // a workspace-wide formatter, and compaction exists to stop exactly that.
+      return {
+        kind: "formatted",
+        line:
+          `ran formatter ${outcome.formatterId} — ` +
+          (outcome.outcome === "applied"
+            ? `applied to ${outcome.changedPaths.length} file(s)`
+            : `${outcome.outcome}, nothing applied`),
+      };
     case "rejected":
       // The harness refused the CALL — a malformed argument, an unknown tool, a bad path.
       // The reason is ikbi's own classification, so it is safe to state; the detail may

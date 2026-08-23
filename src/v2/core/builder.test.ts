@@ -176,7 +176,7 @@ test("builder: every turn offers the SAME tools and uses the SAME authorized rou
   const { result, sent } = await run([{ toolCalls: [readCall()] }, { toolCalls: [finishCall()] }], [observed]);
   assert.ok(result.ok);
   for (const turn of sent) {
-    assert.deepEqual([...turn.toolNames], ["read_file", "replace_file", "create_file", "delete_file", "run_command", "finish_candidate"]);
+    assert.deepEqual([...turn.toolNames], ["read_file", "replace_file", "create_file", "delete_file", "run_command", "run_formatter", "finish_candidate"]);
   }
   const routes = new Set(result.generation.invocations.map((i) => `${i.identity.sentProviderId}/${i.identity.sentProviderModelId}`));
   assert.deepEqual([...routes], ["p1/m1-wire"], "no fallback, no second route, no escalation");

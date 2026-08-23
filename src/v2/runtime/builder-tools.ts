@@ -22,7 +22,8 @@
  * it here would silently defeat the compare-and-swap.
  */
 
-import { MAX_TOOL_READ_CHARS, TOOL_CREATE_FILE, TOOL_DELETE_FILE, TOOL_READ_FILE, TOOL_REPLACE_FILE, TOOL_RUN_COMMAND, type ToolOutcome } from "../core/tools.js";
+import { MAX_TOOL_READ_CHARS, TOOL_CREATE_FILE, TOOL_DELETE_FILE, TOOL_READ_FILE, TOOL_REPLACE_FILE, TOOL_RUN_COMMAND, TOOL_RUN_FORMATTER, type ToolOutcome } from "../core/tools.js";
+import { FORMATTER_IDS, isFormatterId } from "../core/formatter.js";
 import { decideMutation, describeScope, type MutationOperationKind } from "../core/mutation-scope.js";
 import type { BuilderToolExecutor, BuilderToolExecutorDeps, ToolExecution } from "../core/builder.js";
 import { commandRefusalOutcome } from "../core/command.js";
@@ -50,6 +51,8 @@ export function createBuilderToolExecutor(deps: BuilderToolExecutorDeps): Builde
   const { runId, workspace, mutations } = deps;
   // A per-candidate command ordinal, so each command event has a distinct, order-preserving id.
   let commandOrdinal = 0;
+  // A per-candidate formatter ordinal, so each invocation has a distinct, ordered identity.
+  let formatterOrdinal = 0;
 
   /** Resolve an id the model quoted back, or explain why it is not usable. */
   function resolve(observationId: V2ObservationDigest, path: string): V2FileObservation | ToolOutcome {
@@ -196,6 +199,59 @@ export function createBuilderToolExecutor(deps: BuilderToolExecutorDeps): Builde
           return {
             outcome: result.outcome,
             ...(result.command !== undefined ? { command: result.command } : {}),
+            ...(result.safetyFailure !== undefined ? { safetyFailure: result.safetyFailure } : {}),
+          };
+        }
+
+        case TOOL_RUN_FORMATTER: {
+          if (deps.formatter === undefined) {
+            return {
+              outcome: {
+                kind: "formatted", formatterId: call.formatter, outcome: "refused_unavailable",
+                changedPaths: [], refusedPaths: [], timedOut: false,
+                untrusted: "no formatter capability is wired into this build",
+              },
+            };
+          }
+          // The identifier is validated against the CLOSED set before anything else. An unknown
+          // name is refused here — the capability is never asked to interpret model text.
+          if (!isFormatterId(call.formatter)) {
+            const applicable = await deps.formatter.available(workspace.path);
+            return {
+              outcome: {
+                kind: "formatted", formatterId: call.formatter, outcome: "refused_unavailable",
+                changedPaths: [], refusedPaths: [], timedOut: false,
+                untrusted:
+                  `"${call.formatter}" is not a formatter. Known formatters: ${FORMATTER_IDS.join(", ")}. ` +
+                  `Applicable to this repository: ${applicable.length > 0 ? applicable.join(", ") : "(none)"}.`,
+              },
+            };
+          }
+          const applicable = await deps.formatter.available(workspace.path);
+          if (!applicable.includes(call.formatter)) {
+            return {
+              outcome: {
+                kind: "formatted", formatterId: call.formatter, outcome: "refused_unavailable",
+                changedPaths: [], refusedPaths: [], timedOut: false,
+                untrusted: `"${call.formatter}" does not apply to this repository (its marker files are absent). Nothing ran.`,
+              },
+            };
+          }
+          formatterOrdinal += 1;
+          const result = await deps.formatter.run({
+            runId,
+            ordinal: formatterOrdinal,
+            formatterId: call.formatter,
+            workspaceId: workspace.workspaceId,
+            workspacePath: workspace.path,
+            baseCommit: workspace.source.baseCommit,
+          });
+          // A formatter that APPLIED wrote through the mutation authority, so every observation the
+          // model holds for a changed path is now stale. Nothing here re-observes on its behalf —
+          // that is its decision, exactly as it is after any refused compare-and-swap.
+          if (result.record !== undefined) deps.onFormatter?.(result.record);
+          return {
+            outcome: result.outcome,
             ...(result.safetyFailure !== undefined ? { safetyFailure: result.safetyFailure } : {}),
           };
         }

@@ -42,6 +42,7 @@ import {
   type BuilderTurnSource,
 } from "../core/builder.js";
 import { createBuilderToolExecutor } from "./builder-tools.js";
+import { createFormatterCapability, createGovernedFormatterTransport } from "./formatter-runner.js";
 import { captureCandidateTree } from "./candidate-capture.js";
 import { createUntrustedBoundary } from "./untrusted-boundary.js";
 import { createChecksSource, createVerificationDefinitionProbe } from "./verification-checks.js";
@@ -233,6 +234,7 @@ export interface ProductionRunDeps {
   readonly contextSources?: readonly ContextSource[];
   /** Test seams. Production uses the canonical executor and git tree capture. */
   readonly buildTools?: V2RunDeps["buildTools"];
+  readonly buildFormatter?: V2RunDeps["buildFormatter"];
   readonly captureTree?: V2RunDeps["captureTree"];
   readonly builderBudget?: V2RunDeps["builderBudget"];
   /** Where an injected budget's turn count came from, for receipt truth. */
@@ -472,6 +474,20 @@ async function wireRunDeps(deps: ProductionRunDeps): Promise<V2RunDeps> {
     // cannot construct and a tree-capture it cannot perform, so neither the loop nor the
     // model is ever holding the authority itself.
     buildTools: deps.buildTools ?? createBuilderToolExecutor,
+    // THE GOVERNED FORMATTER, built per candidate workspace. It holds a write authority, so it
+    // is never shared between candidates — a tournament's isolation is only as real as the
+    // narrowest thing two candidates could both reach.
+    buildFormatter:
+      deps.buildFormatter ??
+      ((input) =>
+        createFormatterCapability({
+          transport: createGovernedFormatterTransport(),
+          treeProbe: input.treeProbe,
+          mutations: input.mutations,
+          workspace: input.workspace,
+          mutationScope: input.mutationScope,
+          runId: input.runId,
+        })),
     captureTree: deps.captureTree ?? captureCandidateTree,
     // THE untrusted-data boundary — v1's neutralization fence. Every tool result crosses
     // it before re-entering the builder conversation.
