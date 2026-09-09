@@ -1,5 +1,30 @@
 # ikbi external-agent quickstart
 
+> **WHICH ENGINE — read this first.**
+>
+> `ikbi build` is the **canonical v2 engine** and the proven production path. It is what the
+> Pehverse Trio's `delegate_implementation` calls, and what produced every governed candidate
+> in the lab's evidence.
+>
+> `ikbi run --spec` is the **LEGACY v1 engine**. The binary says so itself. Most of this
+> document still describes it, and it is retained for the v1 path only.
+>
+> `ikbi inspect <run-id>` is likewise **v1** and returns `not_found` for a v2 run id. v2
+> evidence lives in the build session JSON plus `~/.ikbi/state/receipts/receipts.ndjson`
+> (`identity.agentId: "ikbi-v2"`, operations `run.summary` and `workspace.promote`).
+>
+> A v2 build in one line — mutation scope is required and there is no default:
+>
+> ```bash
+> ikbi build "<goal>" --repo <path> --allow-path <file> --profile deepseek --json
+> ```
+>
+> Verification checks travel in `IKBI_CHECKS` as a JSON array of
+> `{name, command, args, cwd?}`. Exit 0 alone is not success: ikbi itself requires
+> `status: completed`, `verification.status: passed` and `promotion.status: promoted`.
+> `--local-mode off|assist|auto` selects Bokahli participation; its advice is data and never
+> authority.
+
 This is the shortest supported path for an unfamiliar agent to build one task.
 Use the canonical `run` command; it owns local preflight and then delegates to
 ikbi's existing authoritative worker/orchestrator pipeline.
@@ -140,10 +165,17 @@ Common stable run codes include `RUN_SPEC_MISSING`, `RUN_SPEC_INVALID`,
 
 ## Ordinary-work boundaries
 
-Agents should use `run`, `self-test`, `doctor`, and `inspect` for the normal
-workflow. Do not use `ikbi build` as a second runner, directly mutate ikbi
-state/receipt files, manually delete a retained workspace, or enable
-`*_TRUSTED_LOCAL` overrides to bypass a failed capability check. Use
+Agents on the **v2 path** use `build`, `self-test` and `doctor`, and read v2 evidence from
+the session JSON and `receipts.ndjson`. Agents on the retained **v1 path** use `run`,
+`self-test`, `doctor` and `inspect`.
+
+CORRECTED 2026-09-09: this paragraph previously said "do not use `ikbi build` as a second
+runner" and directed every agent to `run`. That was written when v1 was the only engine and
+it is now backwards — `build` is the canonical engine and `run --spec` is the legacy one.
+The instruction was actively steering new integrations onto the legacy path.
+
+Do not directly mutate ikbi state/receipt files, manually delete a retained workspace, or
+enable `*_TRUSTED_LOCAL` overrides to bypass a failed capability check. Use
 `doctor --fix`, workspace discard, kill-switch recovery, and other mutating
 operator commands only when the returned recovery action explicitly calls for
 them and the operator has authorized that action.
